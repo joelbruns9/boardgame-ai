@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "BGA Game Capture",
+  "version": "1.0",
+  "description": "Captures game state from Board Game Arena for ML training",
+
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+
+  "host_permissions": [
+    "*://*.boardgamearena.com/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": ["*://*.boardgamearena.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Capture Game State"
+  }
+}
