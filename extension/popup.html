@@ -30,24 +30,8 @@
     </style>
   </head>
   <body>
-    <button id="captureBtn">📸 Capture Game State</button>
+    <button id="captureBtn">Capture Game State</button>
     <div id="status"></div>
-
-    <script>
-      // When the button is clicked, send "capture" message to content.js
-      document.getElementById("captureBtn").addEventListener("click", function() {
-
-        // Find the active BGA tab
-        browser.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-
-          // Send the capture message to content.js running on that tab
-          browser.tabs.sendMessage(tabs[0].id, { action: "capture" });
-
-          // Update the status text so user knows it worked
-          document.getElementById("status").textContent = "✓ State captured!";
-
-        });
-      });
-    </script>
+    <script src="popup.js"></script>
   </body>
 </html>
