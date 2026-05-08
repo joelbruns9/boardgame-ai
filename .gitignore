@@ -1,0 +1,12 @@
+# Virtual environment - can always be recreated
+.venv/
+
+# Private settings - never share these
+.env
+
+# Data files - too large for GitHub, backed up separately
+data/
+
+# Python clutter - auto-generated, not needed
+__pycache__/
+*.pyc
