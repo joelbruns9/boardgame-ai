@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body {
+        width: 200px;
+        padding: 16px;
+        font-family: sans-serif;
+        text-align: center;
+      }
+      button {
+        width: 100%;
+        padding: 10px;
+        background: #2563eb;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #1d4ed8;
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="captureBtn">📸 Capture Game State</button>
+    <div id="status"></div>
+
+    <script>
+      // When the button is clicked, send "capture" message to content.js
+      document.getElementById("captureBtn").addEventListener("click", function() {
+
+        // Find the active BGA tab
+        browser.tabs.query({ active: true, currentWindow: true }, function(tabs) {
+
+          // Send the capture message to content.js running on that tab
+          browser.tabs.sendMessage(tabs[0].id, { action: "capture" });
+
+          // Update the status text so user knows it worked
+          document.getElementById("status").textContent = "✓ State captured!";
+
+        });
+      });
+    </script>
+  </body>
+</html>
