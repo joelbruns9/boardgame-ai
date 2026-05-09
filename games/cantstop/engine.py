@@ -1,82 +1,102 @@
 # engine.py
-# The brain of our Can't Stop game engine.
+# Can't Stop game engine with efficient state cloning.
+# Clone/restore pattern replaces deepcopy for performance.
 
-# ---- IMPORTS ----
-# random lets us simulate dice rolls
 import random
 
-# ---- THE BOARD ----
-# Each column has a different number of steps to claim it.
-# Column 7 is longest (hardest), 2 and 12 are shortest (easiest).
+# ---- BOARD CONSTANTS ----
 COLUMN_HEIGHTS = {
     2: 3,  3: 5,  4: 7,  5: 9,  6: 11,
     7: 13, 8: 11, 9: 9, 10: 7, 11: 5, 12: 3
 }
 
-# Number of columns a player must claim to win
 COLUMNS_TO_WIN = 3
-
-# Maximum runners a player can have active at once
 MAX_RUNNERS = 3
 
 
 # ---- GAME STATE ----
-# This class holds everything about a game at one moment in time.
-# Think of it like a photograph of the board.
-
 class GameState:
     def __init__(self, player_ids):
-        """
-        Set up a brand new game.
-        player_ids: a list of player identifiers e.g. ["Alice", "Bob"]
-        """
-
-        # Who is playing?
         self.players = player_ids
-
-        # Whose turn is it? Start with the first player.
         self.active_player = player_ids[0]
 
-        # Which columns has each player fully claimed?
-        # e.g. {"Alice": [7, 9], "Bob": [2]}
-        self.claimed = {p: [] for p in player_ids}
-
-        # Where is each player's permanent progress on each column?
-        # e.g. {"Alice": {7: 5, 9: 3}, "Bob": {2: 2}}
-        # This is progress that is SAVED after stopping
+        # Permanent progress saved after stopping
+        # {player: {column: steps}}
+        self.claimed = {p: set() for p in player_ids}
         self.progress = {p: {} for p in player_ids}
 
-        # Where are the active runners THIS turn?
-        # Runners are temporary — lost if player busts
-        # e.g. {7: 6, 9: 4}  means runner on col 7 at step 6
+        # Temporary runners this turn
+        # {column: steps_this_turn}
         self.runners = {}
 
-        # What did the dice show this roll?
+        # Current dice roll
         self.dice = []
 
-        # Is the game over?
         self.game_over = False
         self.winner = None
 
     def roll_dice(self):
-        """Roll 4 dice. Returns the values."""
+        """Roll 4 fresh dice. Only call at start of a new turn."""
         self.dice = [random.randint(1, 6) for _ in range(4)]
         return self.dice
 
     def get_current_progress(self, player, column):
-        """
-        How far is a player on a given column RIGHT NOW?
-        Combines their saved progress + any active runner.
-        """
         saved = self.progress[player].get(column, 0)
-        runner = self.runners.get(column, 0)
+        # Only add runner if this player is currently active
+        # Runners belong to the active player only
+        runner = self.runners.get(column, 0) if player == self.active_player else 0
         return saved + runner
 
+    def save_snapshot(self):
+        """
+        Save a lightweight snapshot of mutable state.
+        Much faster than deepcopy — only saves what can change.
+
+        Think of this as writing down the current board position
+        on a notepad so you can restore it after exploring a move.
+        """
+        return {
+            "active_player": self.active_player,
+            "claimed": {p: set(cols) for p, cols in self.claimed.items()},
+            "progress": {p: dict(prog) for p, prog in self.progress.items()},
+            "runners": dict(self.runners),
+            "dice": list(self.dice),
+            "game_over": self.game_over,
+            "winner": self.winner,
+        }
+
+    def restore_snapshot(self, snapshot):
+        """
+        Restore state from a snapshot.
+        Undoes any moves made since the snapshot was taken.
+        """
+        self.active_player = snapshot["active_player"]
+        self.claimed = {p: set(cols) for p, cols in snapshot["claimed"].items()}
+        self.progress = {p: dict(prog) for p, prog in snapshot["progress"].items()}
+        self.runners = dict(snapshot["runners"])
+        self.dice = list(snapshot["dice"])
+        self.game_over = snapshot["game_over"]
+        self.winner = snapshot["winner"]
+
+    def clone(self):
+        """
+        Create a full independent copy of the game state.
+        Used when we need a truly separate state (e.g. for rollouts
+        that will play out to completion independently).
+
+        Faster than deepcopy because we know exactly what to copy.
+        """
+        new = GameState(list(self.players))
+        new.active_player = self.active_player
+        new.claimed = {p: set(cols) for p, cols in self.claimed.items()}
+        new.progress = {p: dict(prog) for p, prog in self.progress.items()}
+        new.runners = dict(self.runners)
+        new.dice = list(self.dice)
+        new.game_over = self.game_over
+        new.winner = self.winner
+        return new
+
     def __repr__(self):
-        """
-        This is what prints when you do print(state).
-        Like a scoreboard snapshot.
-        """
         lines = [
             f"\n=== Can't Stop ===",
             f"Active player: {self.active_player}",
@@ -84,7 +104,10 @@ class GameState:
             f"Runners: {self.runners}",
         ]
         for p in self.players:
-            lines.append(f"{p} - claimed: {self.claimed[p]} | progress: {self.progress[p]}")
+            lines.append(
+                f"{p} - claimed: {sorted(self.claimed[p])} "
+                f"| progress: {self.progress[p]}"
+            )
         if self.game_over:
             lines.append(f"GAME OVER - Winner: {self.winner}")
         return "\n".join(lines)
@@ -92,184 +115,214 @@ class GameState:
 
 # ---- MOVE CALCULATION ----
 def get_possible_moves(dice):
-    """
-    Given 4 dice, return all unique column pair combinations.
-    Same as before — the three ways to split 4 dice into 2 pairs.
-    """
     splits = [
-        (dice[0] + dice[1], dice[2] + dice[3]),
-        (dice[0] + dice[2], dice[1] + dice[3]),
-        (dice[0] + dice[3], dice[1] + dice[2]),
+        tuple(sorted((dice[0] + dice[1], dice[2] + dice[3]))),
+        tuple(sorted((dice[0] + dice[2], dice[1] + dice[3]))),
+        tuple(sorted((dice[0] + dice[3], dice[1] + dice[2]))),
     ]
     return list(set(splits))
 
 
-# ---- VALID MOVES ----
 def get_valid_moves(state):
     """
-    Not all possible moves are valid.
-    A move is invalid if:
-    - The column is already claimed by someone
-    - Adding a runner would exceed MAX_RUNNERS active runners
-    - The runner is already at the top of the column
-
-    Returns a list of valid (col_a, col_b) pairs.
-    Think of this as filtering the rulebook:
-    "you CAN pair these dice, but are you ALLOWED to move there?"
+    Filter possible moves to only legal ones.
+    Handles double moves like (7,7) correctly —
+    same column twice = 1 runner, 2 steps.
     """
     possible = get_possible_moves(state.dice)
     player = state.active_player
     valid = []
 
+    # All claimed columns across all players
+    all_claimed = set()
+    for p in state.players:
+        all_claimed.update(state.claimed[p])
+
     for col_a, col_b in possible:
-        move_valid = False
+        # Get unique columns in this move
+        unique_cols = set([col_a, col_b])
 
-        for col in [col_a, col_b]:
-            # Skip columns already fully claimed
-            if any(col in state.claimed[p] for p in state.players):
-                continue
+        # Check each unique column is usable
+        usable_cols = {
+            col for col in unique_cols
+            if _can_use_column(state, player, col, all_claimed)
+        }
 
-            # Current position on this column
-            current_pos = state.get_current_progress(player, col)
+        if not usable_cols:
+            continue
 
-            # Already at the top?
-            if current_pos >= COLUMN_HEIGHTS[col]:
-                continue
+        # How many NEW runners would this move need?
+        # Only count unique columns not already having a runner
+        new_runners_needed = len(
+            usable_cols - set(state.runners.keys())
+        )
 
-            # Would this add a NEW runner beyond our limit?
-            new_runner = col not in state.runners
-            active_runners = len(state.runners)
-            if new_runner and active_runners >= MAX_RUNNERS:
-                continue
+        current_runners = len(state.runners)
 
-            move_valid = True
+        if current_runners + new_runners_needed > MAX_RUNNERS:
+            # Can't place enough new runners for the full move
+            # But maybe we can still use columns we already have runners on
+            partial_cols = usable_cols & set(state.runners.keys())
+            if partial_cols:
+                # Add partial moves using only existing runner columns
+                for col in partial_cols:
+                    valid.append(tuple(sorted((col, col))))
+            continue
 
-        if move_valid:
-            valid.append((col_a, col_b))
+        valid.append(tuple(sorted((col_a, col_b))))
 
-    return valid
+    # Normalize and deduplicate
+    return list(set(valid))
 
 
-# ---- APPLY A MOVE ----
+def can_use_column_check(state, col, all_claimed):
+    """Can this column accept a runner?"""
+    if col in all_claimed:
+        return False
+    player = state.active_player
+    current = state.get_current_progress(player, col)
+    return current < COLUMN_HEIGHTS[col]
+
+
+def _can_use_column(state, player, col, all_claimed):
+    """Internal helper — can this player use this column?"""
+    if col in all_claimed:
+        return False
+    current = state.get_current_progress(player, col)
+    return current < COLUMN_HEIGHTS[col]
+
+
 def apply_move(state, move):
     """
-    Actually move the runners based on the chosen column pair.
-    move: a tuple like (7, 9) meaning advance on columns 7 and 9.
+    Advance runners based on chosen column pair.
+    Double moves like (7,7) advance one column by 2 steps
+    but still only use 1 runner.
+    Modifies state in place.
     """
     player = state.active_player
 
-    for col in move:
-        # Skip claimed columns
-        if any(col in state.claimed[p] for p in state.players):
-            continue
+    all_claimed = set()
+    for p in state.players:
+        all_claimed.update(state.claimed[p])
 
-        # Skip if already at top
-        current_pos = state.get_current_progress(player, col)
-        if current_pos >= COLUMN_HEIGHTS[col]:
-            continue
+    col_a, col_b = move
 
-        # Skip if would exceed runner limit
+    if col_a == col_b:
+        # Double move — same column twice, advance by 2 steps
+        col = col_a
+        if not _can_use_column(state, player, col, all_claimed):
+            return state
         if col not in state.runners and len(state.runners) >= MAX_RUNNERS:
-            continue
-
-        # Advance the runner by 1
-        state.runners[col] = state.runners.get(col, 0) + 1
+            return state
+        # Advance by 2 but cap at column height
+        current = state.get_current_progress(player, col)
+        steps = min(2, COLUMN_HEIGHTS[col] - current)
+        state.runners[col] = state.runners.get(col, 0) + steps
+    else:
+        # Normal move — two different columns, each advances by 1
+        for col in [col_a, col_b]:
+            if not _can_use_column(state, player, col, all_claimed):
+                continue
+            if col not in state.runners and len(state.runners) >= MAX_RUNNERS:
+                continue
+            state.runners[col] = state.runners.get(col, 0) + 1
 
     return state
 
 
-# ---- STOP: SAVE PROGRESS ----
 def stop_turn(state):
-    """
-    Player chose to stop. Save runner positions as permanent progress.
-    Check if any columns are now fully claimed.
-    Then pass to next player.
-    """
     player = state.active_player
 
-    for col, runner_pos in state.runners.items():
-        # Add runner progress to saved progress
+    # Build all claimed columns across all players
+    all_claimed = set()
+    for p in state.players:
+        all_claimed.update(state.claimed[p])
+
+    for col, runner_steps in list(state.runners.items()):
         saved = state.progress[player].get(col, 0)
-        new_pos = saved + runner_pos
-        state.progress[player][col] = new_pos
+        new_pos = saved + runner_steps
 
-        # Has this player reached the top of this column?
-        if new_pos >= COLUMN_HEIGHTS[col]:
-            state.claimed[player].append(col)
-            # Remove from progress — it's fully claimed now
-            del state.progress[player][col]
+        if new_pos >= COLUMN_HEIGHTS[col] and col not in all_claimed:
+            # Column completed — claim it, no need to save progress
+            state.claimed[player].add(col)
+            state.progress[player].pop(col, None)
 
-            # Check win condition
             if len(state.claimed[player]) >= COLUMNS_TO_WIN:
                 state.game_over = True
                 state.winner = player
+        else:
+            # Column not yet complete — save progress
+            state.progress[player][col] = new_pos
 
-    # Clear runners for next turn
     state.runners = {}
 
-    # Pass to next player (if game not over)
     if not state.game_over:
         _next_player(state)
 
     return state
 
 
-# ---- BUST: LOSE PROGRESS ----
 def bust_turn(state):
-    """
-    Player busted — no valid moves available.
-    Runners are lost. Progress is NOT saved.
-    Pass to next player.
-    """
-    # Just clear runners — no progress saved
+    """Lose all runner progress. Pass to next player."""
     state.runners = {}
     _next_player(state)
     return state
 
 
-# ---- NEXT PLAYER ----
 def _next_player(state):
-    """Rotate to the next player in order."""
-    current_index = state.players.index(state.active_player)
-    next_index = (current_index + 1) % len(state.players)
-    state.active_player = state.players[next_index]
+    """Rotate to next player."""
+    idx = state.players.index(state.active_player)
+    state.active_player = state.players[(idx + 1) % len(state.players)]
 
 
-# ---- TEST: PLAY A RANDOM GAME ----
-# This simulates a full game with random decisions
-# to verify all the rules work correctly together.
-
+# ---- TEST ----
 if __name__ == "__main__":
-    print("Simulating a random game of Can't Stop...\n")
+    print("Testing clone vs snapshot performance...\n")
+
+    import time
 
     state = GameState(["Alice", "Bob"])
-    turn_count = 0
-    max_turns = 200  # safety limit
 
-    while not state.game_over and turn_count < max_turns:
-        turn_count += 1
-        player = state.active_player
+    # Benchmark clone
+    start = time.time()
+    for _ in range(10000):
+        cloned = state.clone()
+    clone_time = time.time() - start
 
-        # Roll dice
-        dice = state.roll_dice()
+    # Benchmark snapshot/restore
+    start = time.time()
+    for _ in range(10000):
+        snap = state.save_snapshot()
+        state.restore_snapshot(snap)
+    snap_time = time.time() - start
 
-        # Get valid moves
+    # Benchmark deepcopy for comparison
+    import copy
+    start = time.time()
+    for _ in range(10000):
+        copied = copy.deepcopy(state)
+    deep_time = time.time() - start
+
+    print(f"10,000 iterations:")
+    print(f"  deepcopy:          {deep_time:.3f} sec")
+    print(f"  clone():           {clone_time:.3f} sec")
+    print(f"  snapshot/restore:  {snap_time:.3f} sec")
+    print(f"\nClone speedup over deepcopy: {deep_time/clone_time:.1f}x")
+    print(f"Snapshot speedup over deepcopy: {deep_time/snap_time:.1f}x")
+
+    # Test a random game still works
+    print("\nSimulating random game to verify engine still works...")
+    state = GameState(["Alice", "Bob"])
+    turns = 0
+    while not state.game_over and turns < 200:
+        turns += 1
+        state.roll_dice()
         valid = get_valid_moves(state)
-
         if not valid:
-            # No valid moves — bust!
-            print(f"Turn {turn_count}: {player} rolled {dice} — BUST!")
             bust_turn(state)
         else:
-            # Pick a random valid move
-            move = random.choice(valid)
-            apply_move(state, move)
-
-            # Randomly decide to stop or continue (50/50)
-            if random.random() < 0.5 or not get_valid_moves(state):
-                print(f"Turn {turn_count}: {player} rolled {dice}, moved {move}, STOPS")
+            import random
+            apply_move(state, random.choice(valid))
+            if random.random() < 0.5:
                 stop_turn(state)
-            else:
-                print(f"Turn {turn_count}: {player} rolled {dice}, moved {move}, continues...")
-
     print(state)
