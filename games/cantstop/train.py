@@ -304,19 +304,32 @@ def evaluate(model, loader, device):
 # ---- CHECKPOINT ----
 
 def save_checkpoint(model, optimizer, epoch, metrics, path):
-    """Save model checkpoint."""
+    """Save model checkpoint with pure Python types for compatibility."""
+
+    def to_python(obj):
+        """Recursively convert numpy types to plain Python."""
+        if isinstance(obj, dict):
+            return {k: to_python(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(to_python(v) for v in obj)
+        elif hasattr(obj, 'item'):
+            # numpy scalar → Python scalar
+            return obj.item()
+        else:
+            return obj
+
     torch.save({
-        'epoch':      epoch,
+        'epoch':       int(epoch),
         'model_state': model.state_dict(),
         'optim_state': optimizer.state_dict(),
-        'metrics':    metrics,
+        'metrics':     to_python(metrics),
     }, path)
     print(f"  Saved checkpoint: {path}")
 
 
 def load_checkpoint(model, optimizer, path, device):
     """Load model checkpoint."""
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state'])
     optimizer.load_state_dict(checkpoint['optim_state'])
     epoch = checkpoint['epoch']

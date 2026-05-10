@@ -59,7 +59,7 @@ def nn_player(state, model, device='cuda'):
 def load_model(path, device='cuda'):
     """Load a trained model from checkpoint."""
     model = CantStopNet().to(device)
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
     print(f"Loaded model from {path}")
