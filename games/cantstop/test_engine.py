@@ -477,6 +477,36 @@ check(
 
 print(f"\n  ({elapsed:.2f}s for 100 games)")
 
+section("Game Length Distribution")
+
+import time
+turn_counts = []
+for _ in range(200):
+    state = GameState(2)
+    turns = 0
+    while not state.game_over and turns < 500:
+        turns += 1
+        state.roll_dice()
+        valid = get_valid_moves(state)
+        if not valid:
+            bust_turn(state)
+            continue
+        apply_move(state, random.choice(valid))
+        if random.random() < 0.5:
+            stop_turn(state)
+    turn_counts.append(turns)
+
+check(
+    "Games finish well under 200 turns (max observed ~156)",
+    max(turn_counts) < 200,
+    f"Max turns: {max(turn_counts)}"
+)
+check(
+    "Average game length is reasonable (50-120 turns)",
+    50 <= sum(turn_counts)/len(turn_counts) <= 120,
+    f"Average: {sum(turn_counts)/len(turn_counts):.1f}"
+)
+
 # ========================================
 # SUMMARY
 # ========================================

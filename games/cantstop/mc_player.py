@@ -1,11 +1,12 @@
 # mc_player.py
 # Monte Carlo player for Can't Stop.
 #
-# Key design decisions:
-# - snapshot/restore for move exploration (fast)
-# - clone() for full rollouts (necessary)
-# - unified (move, decision) evaluation
-# - separate rollout modes for stop vs continue
+# Architecture:
+# - Single unified rollout function (mid_turn flag replaces two functions)
+# - Lightweight fast rollout policy (no EV table lookups)
+# - snapshot/restore for move exploration
+# - clone() for full rollouts
+# - Unified (move, decision) evaluation
 
 import random
 import sys
@@ -15,143 +16,137 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from games.cantstop.engine import (
     GameState, get_valid_moves, apply_move,
-    stop_turn, bust_turn, COLUMN_HEIGHTS
+    stop_turn, bust_turn, COLUMN_HEIGHTS, MAX_RUNNERS
 )
-from games.cantstop.ev_player import (
-    run_tournament, random_player, ev_player
-)
+from games.cantstop.ev_player import run_tournament, random_player, ev_player
 
 
-# ---- ROLLOUT FROM TURN START ----
-def rollout_from_turn_start(state, perspective_player):
+# ---- FAST ROLLOUT POLICY ----
+# Used inside rollouts — must be fast.
+# Captures good play without expensive EV table lookups.
+
+def fast_move(state):
     """
-    Complete a game from the START of a fresh turn.
-    The active player rolls and makes decisions using EV player.
-    
-    This is used to evaluate the "stop" decision —
-    we've banked our progress and it's now a fresh turn.
+    Pick a move quickly — prefer columns we already have runners on.
+    No EV table lookup needed.
+    """
+    valid = get_valid_moves(state)
+    if not valid:
+        return None
+
+    runner_cols = state.runners
+
+    def move_score(move):
+        # Count overlap with existing runners
+        overlap = sum(1 for col in move if col in runner_cols)
+        # Prefer middle columns (closer to 7 = more likely to roll)
+        centrality = sum(6 - abs(7 - col) for col in set(move))
+        return (overlap, centrality)
+
+    return max(valid, key=move_score)
+
+
+def fast_stop_decision(state, turns_taken):
+    """
+    Decide stop/continue quickly using simple thresholds.
+    No weighted progress calculation needed.
+
+    Logic:
+    - More runners placed → more to lose → stop sooner
+    - More turns taken this sequence → more progress → stop sooner
+    - Random element to avoid determinism
+    """
+    num_runners = len(state.runners)
+    total_steps = sum(state.runners.values())
+
+    # Base stop probability increases with runners and steps taken
+    # 0 runners: never stop (nothing at risk yet)
+    # 3 runners, many steps: high stop probability
+    stop_prob = (num_runners / MAX_RUNNERS) * (total_steps / 6)
+
+    # Cap between 0.1 and 0.9 — never completely deterministic
+    stop_prob = max(0.1, min(0.9, stop_prob))
+
+    return random.random() < stop_prob
+
+
+# ---- UNIFIED ROLLOUT ----
+def rollout(state, perspective_player, mid_turn=False):
+    """
+    Play a full game to completion using fast rollout policy.
+
+    mid_turn=False: start of fresh turn — roll dice first
+    mid_turn=True:  middle of turn — player has runners, rolls again now
+
+    Single function replaces rollout_from_turn_start and
+    rollout_from_mid_turn — avoids code duplication.
+
+    Returns 1 if perspective_player wins, 0 otherwise.
+    Uses heuristic_value if max_turns reached.
     """
     state = state.clone()
-    max_turns = 500
+    max_turns = 200  # consistent with play_game, covers all observed games
+    turns_this_sequence = 0
 
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         if state.game_over:
             break
 
-        # Fresh turn — roll dice
+        # Roll dice
         state.roll_dice()
         valid = get_valid_moves(state)
 
         if not valid:
             bust_turn(state)
+            turns_this_sequence = 0
             continue
 
-        move, decision = ev_player(state, use_corrected=False)
-
+        # Pick move
+        move = fast_move(state)
         if move is None:
             bust_turn(state)
+            turns_this_sequence = 0
             continue
 
         apply_move(state, move)
+        turns_this_sequence += 1
 
-        if decision == "stop":
+        # Stop or continue
+        if fast_stop_decision(state, turns_this_sequence):
             stop_turn(state)
+            turns_this_sequence = 0
 
-    return 1 if state.winner == perspective_player else 0
-
-
-# ---- ROLLOUT FROM MID-TURN (CONTINUE) ----
-def rollout_from_mid_turn(state, perspective_player):
-    """
-    Complete a game from the MIDDLE of a turn.
-    The active player already has runners placed and
-    must roll again (they chose to continue).
-    
-    This is used to evaluate the "continue" decision —
-    runners are at risk, player rolls again now.
-    """
-    state = state.clone()
-    max_turns = 500
-    mid_turn = True  # first iteration is a continuation
-
-    for _ in range(max_turns):
-        if state.game_over:
-            break
-
-        if mid_turn:
-            # Roll again — this is the continuation roll
-            state.roll_dice()
-            valid = get_valid_moves(state)
-            mid_turn = False
-
-            if not valid:
-                # Busted immediately on continuation roll
-                bust_turn(state)
-                # Now it's opponent's turn — continue normally
-                continue
-
-            move, decision = ev_player(state, use_corrected=False)
-
-            if move is None:
-                bust_turn(state)
-                continue
-
-            apply_move(state, move)
-
-            if decision == "stop":
-                stop_turn(state)
-            # If continue — loop back, same player rolls again
-
-        else:
-            # Normal turn start
-            state.roll_dice()
-            valid = get_valid_moves(state)
-
-            if not valid:
-                bust_turn(state)
-                continue
-
-            move, decision = ev_player(state, use_corrected=False)
-
-            if move is None:
-                bust_turn(state)
-                continue
-
-            apply_move(state, move)
-
-            if decision == "stop":
-                stop_turn(state)
-
-    return 1 if state.winner == perspective_player else 0
+    if state.game_over:
+        return 1 if state.winner == perspective_player else 0
+    else:
+        # Game didn't finish — use heuristic
+        return state.heuristic_value(perspective_player)
 
 
 # ---- EVALUATE STOP ----
 def evaluate_stop(state, perspective_player, num_simulations):
-    """
-    Win probability if we stop now and bank current progress.
-    Simulates from a fresh turn for the next player.
-    """
+    """Win probability if we stop now and bank current progress."""
     if state.game_over:
         return 1.0 if state.winner == perspective_player else 0.0
 
+    snap = state.save_snapshot()
+    stop_turn(state)
     wins = sum(
-        rollout_from_turn_start(state, perspective_player)
+        rollout(state, perspective_player, mid_turn=False)
         for _ in range(num_simulations)
     )
+    state.restore_snapshot(snap)
     return wins / num_simulations
 
 
 # ---- EVALUATE CONTINUE ----
 def evaluate_continue(state, perspective_player, num_simulations):
-    """
-    Win probability if we continue rolling with current runners.
-    Simulates rolling again immediately from current position.
-    """
+    """Win probability if we roll again from current runner position."""
     if state.game_over:
         return 1.0 if state.winner == perspective_player else 0.0
 
     wins = sum(
-        rollout_from_mid_turn(state, perspective_player)
+        rollout(state, perspective_player, mid_turn=True)
         for _ in range(num_simulations)
     )
     return wins / num_simulations
@@ -160,9 +155,9 @@ def evaluate_continue(state, perspective_player, num_simulations):
 # ---- MONTE CARLO PLAYER ----
 def mc_player(state, num_simulations=50):
     """
-    Evaluates all (move, decision) combinations in one unified pass.
+    Evaluates all (move, decision) combinations.
     Uses snapshot/restore for move exploration.
-    Uses separate rollout functions for stop vs continue.
+    Uses unified rollout for evaluation.
     """
     player = state.active_player
     valid = get_valid_moves(state)
@@ -175,38 +170,24 @@ def mc_player(state, num_simulations=50):
     best_decision = "stop"
 
     for move in valid:
-
-        # Save pre-move state
         snap = state.save_snapshot()
-
-        # Apply this move
         apply_move(state, move)
 
-        # ---- EVALUATE STOP ----
-        # Stop means saving progress and ending turn
-        stop_snap = state.save_snapshot()
-        stop_turn(state)
+        # Evaluate stop
         stop_score = evaluate_stop(state, player, num_simulations)
 
-        # Restore to after-move position
-        state.restore_snapshot(stop_snap)
+        # Evaluate continue
+        cont_score = evaluate_continue(state, player, num_simulations)
 
-        # ---- EVALUATE CONTINUE ----
-        # Continue means rolling again from current runner position
-        continue_score = evaluate_continue(state, player, num_simulations)
-
-        # Restore to pre-move position
         state.restore_snapshot(snap)
 
-        # ---- PICK BEST FOR THIS MOVE ----
-        if stop_score >= continue_score:
+        if stop_score >= cont_score:
             move_score = stop_score
             move_decision = "stop"
         else:
-            move_score = continue_score
+            move_score = cont_score
             move_decision = "continue"
 
-        # ---- UPDATE BEST OVERALL ----
         if move_score > best_score:
             best_score = move_score
             best_move = move
@@ -218,15 +199,14 @@ def mc_player(state, num_simulations=50):
 # ---- WATCH A GAME ----
 def watch_mc_game(turns=5, num_simulations=50):
     """Watch MC player decisions in detail."""
-    state = GameState(["A", "B"])
-
+    state = GameState(2)
     print(f"Watching MC player ({num_simulations} sims/decision)...\n")
     turn = 0
 
     while not state.game_over and turn < turns:
         player = state.active_player
 
-        if player != "A":
+        if player != 0:
             state.roll_dice()
             valid = get_valid_moves(state)
             if not valid:
@@ -256,20 +236,13 @@ def watch_mc_game(turns=5, num_simulations=50):
         for move in valid:
             snap = state.save_snapshot()
             apply_move(state, move)
-
-            stop_snap = state.save_snapshot()
-            stop_turn(state)
-            s_score = evaluate_stop(state, player, num_simulations)
-            state.restore_snapshot(stop_snap)
-
-            c_score = evaluate_continue(state, player, num_simulations)
+            s = evaluate_stop(state, player, num_simulations)
+            c = evaluate_continue(state, player, num_simulations)
             state.restore_snapshot(snap)
-
-            print(f"  {move}: stop={s_score:.1%}  continue={c_score:.1%}")
+            print(f"  {move}: stop={s:.1%}  continue={c:.1%}")
 
         move, decision = mc_player(state, num_simulations)
-        print(f"  Chosen: {move} → {decision}")
-        print()
+        print(f"  Chosen: {move} → {decision}\n")
 
         apply_move(state, move)
         if decision == "stop":
@@ -278,18 +251,31 @@ def watch_mc_game(turns=5, num_simulations=50):
 
 # ---- MAIN ----
 if __name__ == "__main__":
-    print("Monte Carlo player (EV rollouts, unified evaluation)\n")
+    import time
 
+    print("Timing fast rollout policy...\n")
+
+    state = GameState(2)
+    state.roll_dice()
+
+    start = time.time()
+    move, decision = mc_player(state, num_simulations=50)
+    elapsed = time.time() - start
+
+    print(f"One MC decision (50 sims): {elapsed:.3f}s")
+    print(f"Estimated per game (~50 decisions): {elapsed*50:.1f}s")
+    print(f"Estimated 1000 games: {elapsed*50*1000/3600:.2f} hours")
+
+    print("\nWatching decisions...\n")
     watch_mc_game(turns=5, num_simulations=50)
 
     print("\nRunning tournaments (1,000 games each)...\n")
 
-    mc_50 = lambda s: mc_player(s, num_simulations=50)
+    mc_10 = lambda s: mc_player(s, num_simulations=10)
     rand  = lambda s: random_player(s)
     ev    = lambda s: ev_player(s, use_corrected=False)
 
-    # Uncomment to run tournaments
-    run_tournament(rand, mc_50, "Random",    "MC (50 sims)", games=1000)
-    run_tournament(ev,   mc_50, "EV Player", "MC (50 sims)", games=1000)
+    run_tournament(rand, mc_10, "Random",    "MC (10 sims)", games=1000)
+    run_tournament(ev,   mc_10, "EV Player", "MC (10 sims)", games=1000)
 
     print("\nDone!")
