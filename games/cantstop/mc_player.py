@@ -7,10 +7,13 @@
 # - snapshot/restore for move exploration
 # - clone() for full rollouts
 # - Unified (move, decision) evaluation
+# - Parallel rollouts via multiprocessing (mc_player_parallel)
+# - Parallel tournament runner (run_parallel_tournament)
 
 import random
 import sys
 import os
+import multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -18,7 +21,7 @@ from games.cantstop.engine import (
     GameState, get_valid_moves, apply_move,
     stop_turn, bust_turn, COLUMN_HEIGHTS, MAX_RUNNERS
 )
-from games.cantstop.ev_player import run_tournament, random_player, ev_player
+from games.cantstop.ev_player import run_tournament, random_player, ev_player, play_game
 
 
 # ---- FAST ROLLOUT POLICY ----
@@ -196,6 +199,181 @@ def mc_player(state, num_simulations=50):
     return best_move, best_decision
 
 
+# ============================================================
+# PARALLEL SUPPORT — module-level functions required for pickle
+# ============================================================
+
+def _rollout_task(snap, player_id, mid_turn):
+    """Rollout worker: rebuild state from snapshot and run rollout."""
+    state = GameState(2)
+    state.restore_snapshot(snap)
+    return rollout(state, player_id, mid_turn=mid_turn)
+
+
+def _spec_to_strategy(spec):
+    """Build a strategy callable from a spec dict. Called inside worker processes."""
+    t = spec['type']
+    if t == 'random':
+        return random_player
+    elif t == 'ev':
+        c = spec.get('corrected', False)
+        return lambda s: ev_player(s, use_corrected=c)
+    elif t == 'mc':
+        n = spec.get('sims', 50)
+        return lambda s: mc_player(s, num_simulations=n)
+    raise ValueError(f"Unknown strategy type: {t!r}")
+
+
+def _run_game_batch(args):
+    """
+    Run a batch of games. Worker function for parallel tournaments.
+    Returns (wins_a, wins_b, draws).
+    """
+    spec_a, spec_b, swaps, seed = args
+    random.seed(seed)
+    strat_a = _spec_to_strategy(spec_a)
+    strat_b = _spec_to_strategy(spec_b)
+
+    wins_a = wins_b = draws = 0
+    for swap in swaps:
+        if not swap:
+            winner = play_game(strat_a, strat_b)
+            if winner == 0:   wins_a += 1
+            elif winner == 1: wins_b += 1
+            else:             draws += 1
+        else:
+            winner = play_game(strat_b, strat_a)
+            if winner == 0:   wins_b += 1
+            elif winner == 1: wins_a += 1
+            else:             draws += 1
+    return wins_a, wins_b, draws
+
+
+# ---- PARALLEL MC PLAYER ----
+
+def mc_player_parallel(state, num_simulations=50, pool=None):
+    """
+    MC player using a persistent process pool for rollouts.
+
+    All rollouts for all (move, stop/continue) combinations are batched
+    into a single pool.starmap call to minimize per-call overhead.
+    Falls back to sequential mc_player when pool is None.
+    """
+    if pool is None:
+        return mc_player(state, num_simulations)
+
+    player = state.active_player
+    valid = get_valid_moves(state)
+
+    if not valid:
+        return None, "bust"
+
+    # Build all rollout tasks across all moves in one pass
+    tasks = []
+    entries = []  # (move, stop_fixed_or_None, stop_slice, cont_slice)
+
+    for move in valid:
+        snap0 = state.save_snapshot()
+        apply_move(state, move)
+
+        if state.game_over:
+            # Move completed a column immediately — stop is trivially known
+            stop_fixed = 1.0 if state.winner == player else 0.0
+            mid_snap = state.save_snapshot()
+            state.restore_snapshot(snap0)
+            s0 = len(tasks)
+            tasks.extend([(mid_snap, player, True)] * num_simulations)
+            entries.append((move, stop_fixed, None, slice(s0, s0 + num_simulations)))
+            continue
+
+        mid_snap = state.save_snapshot()
+        stop_turn(state)
+
+        if state.game_over:
+            stop_fixed = 1.0 if state.winner == player else 0.0
+            state.restore_snapshot(snap0)
+            s0 = len(tasks)
+            tasks.extend([(mid_snap, player, True)] * num_simulations)
+            entries.append((move, stop_fixed, None, slice(s0, s0 + num_simulations)))
+        else:
+            stop_snap = state.save_snapshot()
+            state.restore_snapshot(snap0)
+            s_stop = len(tasks)
+            tasks.extend([(stop_snap, player, False)] * num_simulations)
+            s_cont = len(tasks)
+            tasks.extend([(mid_snap, player, True)] * num_simulations)
+            entries.append((move, None, slice(s_stop, s_cont), slice(s_cont, s_cont + num_simulations)))
+
+    # Single parallel dispatch for all rollouts
+    chunksize = max(1, len(tasks) // (pool._processes * 4))
+    results = pool.starmap(_rollout_task, tasks, chunksize=chunksize)
+
+    best_score = -1
+    best_move = valid[0]
+    best_decision = "stop"
+
+    for move, stop_fixed, stop_sl, cont_sl in entries:
+        stop_score = stop_fixed if stop_fixed is not None else sum(results[stop_sl]) / num_simulations
+        cont_score = sum(results[cont_sl]) / num_simulations
+
+        if stop_score >= cont_score:
+            score, decision = stop_score, "stop"
+        else:
+            score, decision = cont_score, "continue"
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+            best_decision = decision
+
+    return best_move, best_decision
+
+
+# ---- PARALLEL TOURNAMENT ----
+
+def run_parallel_tournament(spec_a, spec_b, name_a, name_b, games=1000, workers=None):
+    """
+    Run a tournament using multiple worker processes (game-level parallelism).
+
+    Strategies are specified as dicts so they can be pickled:
+        {"type": "random"}
+        {"type": "ev", "corrected": False}
+        {"type": "mc", "sims": 10}
+
+    Each worker runs a batch of full games independently.
+    """
+    import time
+
+    if workers is None:
+        workers = mp.cpu_count()
+
+    rng = random.Random(42)
+    swaps = [rng.random() < 0.5 for _ in range(games)]
+
+    batch_size = max(1, (games + workers - 1) // workers)
+    batches = []
+    for i in range(0, games, batch_size):
+        batch_swaps = swaps[i:i + batch_size]
+        seed = rng.randint(0, 2**31)
+        batches.append((spec_a, spec_b, batch_swaps, seed))
+
+    t0 = time.time()
+    with mp.Pool(workers) as pool:
+        results = pool.map(_run_game_batch, batches)
+    elapsed = time.time() - t0
+
+    total_a = sum(r[0] for r in results)
+    total_b = sum(r[1] for r in results)
+    total = total_a + total_b
+
+    print(f"\n{'='*45}")
+    print(f"  {name_a} vs {name_b}  ({workers} workers, {elapsed:.1f}s)")
+    print(f"  {games:,} games played")
+    print(f"{'='*45}")
+    print(f"  {name_a:<25} {total_a:>5} wins  ({100*total_a/total:.1f}%)")
+    print(f"  {name_b:<25} {total_b:>5} wins  ({100*total_b/total:.1f}%)")
+
+
 # ---- WATCH A GAME ----
 def watch_mc_game(turns=5, num_simulations=50):
     """Watch MC player decisions in detail."""
@@ -253,29 +431,48 @@ def watch_mc_game(turns=5, num_simulations=50):
 if __name__ == "__main__":
     import time
 
-    print("Timing fast rollout policy...\n")
+    mp.freeze_support()  # required for Windows frozen executables
+
+    print("=" * 50)
+    print("Timing: sequential vs parallel MC player")
+    print("=" * 50)
 
     state = GameState(2)
     state.roll_dice()
 
+    # Sequential baseline
+    N_TIMING = 20
     start = time.time()
-    move, decision = mc_player(state, num_simulations=50)
-    elapsed = time.time() - start
+    for _ in range(N_TIMING):
+        state2 = state.clone()
+        mc_player(state2, num_simulations=50)
+    seq_time = (time.time() - start) / N_TIMING
+    print(f"\nSequential  mc_player(50 sims): {seq_time*1000:.1f}ms/decision")
 
-    print(f"One MC decision (50 sims): {elapsed:.3f}s")
-    print(f"Estimated per game (~50 decisions): {elapsed*50:.1f}s")
-    print(f"Estimated 1000 games: {elapsed*50*1000/3600:.2f} hours")
+    # Parallel within-decision
+    workers = mp.cpu_count()
+    with mp.Pool(workers) as pool:
+        # Warm up pool
+        mc_player_parallel(state, num_simulations=50, pool=pool)
 
-    print("\nWatching decisions...\n")
-    watch_mc_game(turns=5, num_simulations=50)
+        start = time.time()
+        for _ in range(N_TIMING):
+            state2 = state.clone()
+            mc_player_parallel(state2, num_simulations=50, pool=pool)
+        par_time = (time.time() - start) / N_TIMING
 
-    print("\nRunning tournaments (1,000 games each)...\n")
+    print(f"Parallel    mc_player(50 sims): {par_time*1000:.1f}ms/decision  ({workers} workers)")
+    print(f"Speedup: {seq_time/par_time:.1f}x")
 
-    mc_10 = lambda s: mc_player(s, num_simulations=10)
-    rand  = lambda s: random_player(s)
-    ev    = lambda s: ev_player(s, use_corrected=False)
+    print("\n" + "=" * 50)
+    print("Tournaments — parallel (game-level, 1,000 games)")
+    print("=" * 50)
 
-    run_tournament(rand, mc_10, "Random",    "MC (10 sims)", games=1000)
-    run_tournament(ev,   mc_10, "EV Player", "MC (10 sims)", games=1000)
+    mc10  = {"type": "mc",     "sims": 10}
+    rand  = {"type": "random"}
+    ev    = {"type": "ev",     "corrected": False}
+
+    run_parallel_tournament(rand, mc10, "Random",    "MC (10 sims)", games=1000)
+    run_parallel_tournament(ev,   mc10, "EV Player", "MC (10 sims)", games=1000)
 
     print("\nDone!")

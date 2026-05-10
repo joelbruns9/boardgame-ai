@@ -14,7 +14,14 @@ from games.cantstop.engine import (
 )
 from games.cantstop.ev_table import build_ev_table
 
-EV_TABLE = build_ev_table()
+_EV_TABLE = None
+
+
+def _get_ev_table():
+    global _EV_TABLE
+    if _EV_TABLE is None:
+        _EV_TABLE = build_ev_table()
+    return _EV_TABLE
 
 
 # ---- HELPER: WEIGHTED PROGRESS ----
@@ -86,7 +93,7 @@ def ev_player(state, use_corrected=False):
 
     # Look up EV for current runner columns if we have exactly 3
     runner_cols = tuple(sorted(state_copy.runners.keys()))
-    entry = EV_TABLE.get(runner_cols) if len(runner_cols) == 3 else None
+    entry = _get_ev_table().get(runner_cols) if len(runner_cols) == 3 else None
 
     if not entry:
         return move, "continue"
@@ -211,7 +218,7 @@ def watch_game(strategy, turns=15):
         apply_move(display, move)
         progress = get_total_runner_progress(display)
         runner_cols = tuple(sorted(display.runners.keys()))
-        entry = EV_TABLE.get(runner_cols, {})
+        entry = _get_ev_table().get(runner_cols, {})
 
         print(f"Turn {turn} | Dice: {state.dice}")
         print(f"  Valid moves:        {valid}")
