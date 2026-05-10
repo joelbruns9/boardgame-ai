@@ -65,13 +65,12 @@ def section(name):
 def generate_sample(num_games=500):
     """Generate a sample dataset for validation."""
     print(f"\nGenerating {num_games} games for validation...")
-    ev_table = build_ev_table()
     records = []
     game_outcomes = []  # track (game_id, player, outcome) for consistency check
 
     # Generate games and tag each record with a game ID
     for game_id in range(num_games):
-        game_records = generate_game(ev_table)
+        game_records = generate_game()
         for rec in game_records:
             rec['game_id'] = game_id
         records.extend(game_records)
