@@ -8,7 +8,7 @@
 # - Buffered writes for faster I/O
 # - imap_unordered for better CPU utilization
 # - EV table built once per worker via initializer
-# - Removed unused ev_table parameter
+# - Pre-generates all batch args upfront (fixes early termination bug)
 
 import json
 import os
@@ -28,69 +28,39 @@ from games.cantstop.ev_player import ev_player, get_total_runner_progress
 from games.cantstop.ev_table import build_ev_table
 
 # ---- EXPLORATION RATE ----
-# 15% of moves will be random instead of EV player
-# This exposes the network to a wider range of positions
 EPSILON = 0.15
 
 # ---- WRITE BUFFER SIZE ----
-BUFFER_SIZE = 10_000
+BUFFER_SIZE = 1_000
+
+# ---- AVERAGE RECORDS PER GAME ----
+# Used to estimate batch count — measured at ~77
+AVG_RECORDS_PER_GAME = 77
 
 
 # ---- STATE SERIALIZATION ----
 def serialize_state(state, move, decision, valid_moves, step_index):
-    """
-    Convert game state + decision into a training record.
-
-    Includes:
-    - Full board state
-    - The decision made (move + stop/continue)
-    - All valid moves (for policy gradient training later)
-    - Step index within game (for discounted outcomes later)
-    - Outcome filled in after game ends
-    """
+    """Convert game state + decision into a training record."""
     player = state.active_player
     opponent = 1 - player
 
     return {
-        # Who is deciding
-        "active_player": player,
-
-        # Dice rolled this turn
-        "dice": list(state.dice),
-
-        # Runner positions this turn
-        "runners": dict(state.runners),
-
-        # Saved progress per column
-        "progress_active":   dict(state.progress[player]),
-        "progress_opponent": dict(state.progress[opponent]),
-
-        # Columns claimed
+        "active_player":    player,
+        "dice":             list(state.dice),
+        "runners":          dict(state.runners),
+        "progress_active":  dict(state.progress[player]),
+        "progress_opponent":dict(state.progress[opponent]),
         "claimed_active":   sorted(state.claimed[player]),
         "claimed_opponent": sorted(state.claimed[opponent]),
-
-        # Scores
-        "score_active":   len(state.claimed[player]),
-        "score_opponent": len(state.claimed[opponent]),
-
-        # All legal moves available (for policy training)
-        "valid_moves": [list(m) for m in valid_moves],
-
-        # The decision made
-        "move":     list(move),
-        "decision": decision,
-
-        # Weighted progress at risk
-        "weighted_progress": round(get_total_runner_progress(state), 6),
-
-        # Position in game sequence (for discounting)
-        "step_index": step_index,
-
-        # Whether this was an exploratory (random) move
-        "is_exploration": False,  # set by caller
-
-        # Outcome filled in after game ends
-        "outcome": None,
+        "score_active":     len(state.claimed[player]),
+        "score_opponent":   len(state.claimed[opponent]),
+        "valid_moves":      [list(m) for m in valid_moves],
+        "move":             list(move),
+        "decision":         decision,
+        "weighted_progress":round(get_total_runner_progress(state), 6),
+        "step_index":       step_index,
+        "is_exploration":   False,
+        "outcome":          None,
     }
 
 
@@ -98,12 +68,7 @@ def serialize_state(state, move, decision, valid_moves, step_index):
 def generate_game():
     """
     Play one full game recording every decision point.
-
-    Uses epsilon-greedy exploration:
-    - 85% of moves: EV player decision
-    - 15% of moves: random decision
-
-    Returns list of training records with outcomes filled in.
+    Uses epsilon-greedy exploration (EPSILON % random moves).
     """
     state = GameState(2)
     records = []
@@ -125,30 +90,24 @@ def generate_game():
         is_exploration = random.random() < EPSILON
 
         if is_exploration:
-            # Random exploration move
             move = random.choice(valid)
             decision = random.choice(["stop", "continue"])
         else:
-            # EV player decision
             move, decision = ev_player(state, use_corrected=False)
             if move is None:
                 bust_turn(state)
                 continue
 
-        # Record this decision point BEFORE applying
         record = serialize_state(state, move, decision, valid, step_index)
         record["is_exploration"] = is_exploration
         records.append((record, player))
-
         step_index += 1
 
-        # Apply the decision
         apply_move(state, move)
-
         if decision == "stop":
             stop_turn(state)
 
-    # Fill in outcomes now that we know who won
+    # Fill in outcomes
     winner = state.winner
     labeled = []
     for record, player in records:
@@ -159,12 +118,8 @@ def generate_game():
 
 
 # ---- WORKER INITIALIZER ----
-# Called once per worker process — builds EV table once
-# instead of rebuilding it for every batch
 def worker_init():
-    """Initialize worker process — build EV table once."""
-    # ev_player uses module-level lazy loading so just
-    # trigger it here to warm up the cache
+    """Warm up EV table once per worker process."""
     from games.cantstop.ev_player import ev_player
     from games.cantstop.engine import GameState
     state = GameState(2)
@@ -174,18 +129,12 @@ def worker_init():
 
 # ---- WORKER FUNCTION ----
 def worker_generate_batch(args):
-    """
-    Generate a batch of games.
-    EV table is already warmed up by worker_init.
-    Returns list of training records.
-    """
+    """Generate a batch of games. Returns list of training records."""
     batch_size, seed = args
     random.seed(seed)
-
     all_records = []
     for _ in range(batch_size):
         all_records.extend(generate_game())
-
     return all_records
 
 
@@ -196,12 +145,7 @@ def generate_training_data(
     workers=None,
     output_path=None
 ):
-    """
-    Generate training data using all available CPU cores.
-
-    Uses imap_unordered for better CPU utilization and
-    buffered writes for faster I/O.
-    """
+    """Generate training data using all available CPU cores."""
     if workers is None:
         workers = mp.cpu_count()
 
@@ -214,41 +158,41 @@ def generate_training_data(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+    # Calculate how many batches we need upfront
+    records_per_batch = batch_size * AVG_RECORDS_PER_GAME
+    num_batches = (target_records // records_per_batch) + workers * 2
+
     print(f"\n{'='*55}")
     print(f"  Can't Stop Training Data Generator v2")
     print(f"{'='*55}")
     print(f"  Target records:  {target_records:,}")
     print(f"  CPU workers:     {workers}")
     print(f"  Batch size:      {batch_size} games/batch")
+    print(f"  Num batches:     {num_batches:,}")
     print(f"  Exploration:     {EPSILON:.0%} random moves")
     print(f"  Output:          {output_path}")
     print(f"{'='*55}\n")
+
+    # Pre-generate all batch args upfront
+    rng = random.Random(42)
+    batch_args = [
+        (batch_size, rng.randint(0, 2**31))
+        for _ in range(num_batches)
+    ]
 
     total_records = 0
     total_games = 0
     start_time = time.time()
     write_buffer = []
 
-    # Generate enough batches to fill the pipeline
-    def batch_generator():
-        rng = random.Random(42)
-        while True:
-            yield (batch_size, rng.randint(0, 2**31))
-
     with open(output_path, 'w') as f:
         with mp.Pool(workers, initializer=worker_init) as pool:
 
-            gen = batch_generator()
-            # Pre-fill the pipeline
-            batch_args = [next(gen) for _ in range(workers * 4)]
-
-            # Use imap_unordered for better CPU utilization
             for batch_records in pool.imap_unordered(
                 worker_generate_batch,
                 batch_args,
                 chunksize=1
             ):
-                # Buffer records
                 for record in batch_records:
                     write_buffer.append(json.dumps(record))
                     total_records += 1
@@ -260,7 +204,7 @@ def generate_training_data(
                     f.write('\n'.join(write_buffer) + '\n')
                     write_buffer.clear()
 
-                # Print progress
+                # Progress update
                 elapsed = time.time() - start_time
                 rate = total_records / elapsed if elapsed > 0 else 0
                 eta = (target_records - total_records) / rate / 3600 \
@@ -277,11 +221,6 @@ def generate_training_data(
 
                 if total_records >= target_records:
                     break
-
-                # Queue next batch
-                batch_args = [next(gen) for _ in range(workers)]
-                for args in batch_args:
-                    pool.apply_async(worker_generate_batch, (args,))
 
         # Flush remaining buffer
         if write_buffer:
@@ -311,7 +250,6 @@ def quick_test():
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Rate: {len(records)/elapsed:,.0f} records/second (single core)")
 
-    # Show exploration stats
     explored = sum(1 for r in records if r.get('is_exploration'))
     print(f"  Exploration: {explored}/{len(records)} ({100*explored/len(records):.1f}%)")
 
@@ -320,11 +258,9 @@ def quick_test():
     for key, val in sample.items():
         print(f"    {key}: {val}")
 
-    # Parallel estimate
     workers = mp.cpu_count()
-    estimated_parallel = len(records) / elapsed * workers * 3600 * 8
-    print(f"\n  Estimated records in 8 hours ({workers} cores): "
-          f"{int(estimated_parallel):,}")
+    estimated = len(records) / elapsed * workers * 3600 * 8
+    print(f"\n  Estimated records in 8 hours ({workers} cores): {int(estimated):,}")
 
 
 # ---- ENTRY POINT ----
@@ -335,15 +271,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate Can't Stop training data"
     )
-    parser.add_argument("--test", action="store_true",
+    parser.add_argument("--test",    action="store_true",
                         help="Run quick test only")
     parser.add_argument("--records", type=int, default=5_000_000,
                         help="Target records")
     parser.add_argument("--workers", type=int, default=None,
                         help="CPU workers (default: all)")
-    parser.add_argument("--batch", type=int, default=50,
+    parser.add_argument("--batch",   type=int, default=50,
                         help="Games per batch")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output",  type=str, default=None,
                         help="Output file path")
     args = parser.parse_args()
 
