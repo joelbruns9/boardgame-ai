@@ -63,12 +63,21 @@ def load_model(path, device='cuda'):
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
     print(f"Loaded model from {path}")
-    print(f"  Trained epoch: {checkpoint['epoch']}")
+
+    # Handle both supervised and self-play checkpoint formats
+    if 'epoch' in checkpoint:
+        print(f"  Trained epoch: {checkpoint['epoch']}")
+    if 'iteration' in checkpoint:
+        print(f"  Self-play iteration: {checkpoint['iteration']}")
+        print(f"  Win rate: {checkpoint.get('win_rate', 'N/A'):.1%}")
     if 'metrics' in checkpoint:
         metrics = checkpoint['metrics']
         if isinstance(metrics, dict) and 'val' in metrics:
             print(f"  Val loss: {metrics['val']['loss']:.4f}")
             print(f"  Policy acc: {metrics['val']['policy_acc']:.3f}")
+    if 'val_loss' in checkpoint:
+        print(f"  Val loss: {checkpoint['val_loss']:.4f}")
+
     return model
 
 
