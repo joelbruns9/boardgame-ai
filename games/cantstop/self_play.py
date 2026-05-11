@@ -168,19 +168,27 @@ def _worker_generate_batch(args):
     """
     Generate a batch of MCTS games in a worker process.
     Uses pre-initialized _worker_mcts instance.
+    Returns [] on any error so the pool doesn't hang overnight.
     """
     num_games, num_simulations, temp_mult, seed = args
     random.seed(seed)
     np.random.seed(seed)
 
     all_records = []
-    for _ in range(num_games):
-        records = play_mcts_game(
-            _worker_mcts,
-            num_simulations=num_simulations,
-            global_temp_mult=temp_mult,
-        )
-        all_records.extend(records)
+    for i in range(num_games):
+        try:
+            records = play_mcts_game(
+                _worker_mcts,
+                num_simulations=num_simulations,
+                global_temp_mult=temp_mult,
+            )
+            all_records.extend(records)
+        except Exception as e:
+            import traceback
+            print(f"  [worker] Game {i+1}/{num_games} failed: {e}", flush=True)
+            traceback.print_exc()
+            continue  # skip bad game, keep going
+
     return all_records
 
 
@@ -357,10 +365,12 @@ def train_on_buffer(model, replay_buffer, device,
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = total_samples = 0
+        nan_batches = total_batches = 0
 
         for batch in train_loader:
             feat, msk, pol, val_t, act = [b.to(device) for b in batch]
             optimizer.zero_grad()
+            total_batches += 1
 
             val_pred, logits = model(feat, msk)
             loss, v_loss, p_loss = combined_loss_mcts(
@@ -369,6 +379,7 @@ def train_on_buffer(model, replay_buffer, device,
 
             if torch.isnan(loss):
                 optimizer.zero_grad()
+                nan_batches += 1
                 continue
 
             loss.backward()
@@ -379,6 +390,7 @@ def train_on_buffer(model, replay_buffer, device,
             )
             if has_nan:
                 optimizer.zero_grad()
+                nan_batches += 1
                 continue
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -386,6 +398,12 @@ def train_on_buffer(model, replay_buffer, device,
 
             total_loss    += loss.item() * feat.shape[0]
             total_samples += feat.shape[0]
+
+        if nan_batches > 0:
+            nan_pct = nan_batches / max(total_batches, 1) * 100
+            warn = "⚠️  WARNING: high NaN rate" if nan_pct > 1.0 else "note"
+            print(f"    [{warn}] Skipped {nan_batches}/{total_batches} "
+                  f"batches ({nan_pct:.1f}%) due to NaN loss/grads")
 
         model.eval()
         vl_loss_total = vl_correct = vl_total = entropy_sum = 0

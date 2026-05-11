@@ -59,7 +59,7 @@ class MCTSNode:
         'state', 'parent', 'action', 'prior',
         'children', 'N', 'W',
         'valid_moves', 'mask', 'is_terminal',
-        'is_expanded',
+        'is_expanded', 'virtual_loss',
     ]
 
     def __init__(self, state, parent=None, action=None, prior=0.0):
@@ -73,6 +73,7 @@ class MCTSNode:
         self.W           = 0.0       # total value
         self.is_terminal = state.game_over
         self.is_expanded = False
+        self.virtual_loss = 0
 
         # Cache valid moves and mask
         if not self.is_terminal:
@@ -184,23 +185,10 @@ class MCTS:
         return results
 
     def evaluate(self, state, valid_moves, mask):
-        """Single node evaluation — used for terminal checks."""
-        self.model.eval()
-        with torch.no_grad():
-            features = extract_features(state, valid_moves)
-            features_t = torch.tensor(features, dtype=torch.float32)\
-                             .unsqueeze(0).to(self.device)
-            mask_t = torch.tensor(mask, dtype=torch.bool)\
-                         .unsqueeze(0).to(self.device)
-            value, logits = self.model(features_t, mask_t)
-            probs = F.softmax(logits.squeeze(0), dim=-1).cpu().numpy()
-            probs = probs * mask
-            total = probs.sum()
-            if total > 0:
-                probs /= total
-            else:
-                probs = mask.astype(np.float32) / mask.sum()
-        return float(value.item()), probs
+        """Single node evaluation — delegates to evaluate_batch."""
+        node = MCTSNode(state.clone())
+        value, probs = self.evaluate_batch([node])[0]
+        return value, probs
 
     def expand_no_eval(self, node, value, priors):
         """
@@ -246,7 +234,7 @@ class MCTS:
             node    = node.parent
 
     def search(self, state, num_simulations=50,
-               dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
+           dirichlet_alpha=0.5, dirichlet_epsilon=0.25):
         """
         Batched MCTS search.
         
@@ -270,7 +258,8 @@ class MCTS:
             root.state, root.valid_moves, root.mask
         )
         self.expand_no_eval(root, root_value, root_priors)
-        self.backpropagate(root, root_value)
+        root.N = 1
+        root.W = root_value
 
         # Add Dirichlet noise to root priors
         if root.children and dirichlet_epsilon > 0:
@@ -296,34 +285,41 @@ class MCTS:
             # Collect a batch of leaf nodes via tree traversal
             for _ in range(current_batch):
                 node = root
+                traversal_path = []
 
-                # Selection — traverse to leaf
+                # Selection — traverse to leaf, applying virtual loss
                 while not node.is_leaf() and not node.is_terminal:
                     if not node.children:
                         break
+                    node.N += 1
+                    node.W -= 1
+                    node.virtual_loss += 1
+                    traversal_path.append(node)
                     node = node.select_child()
 
                 if node.is_terminal:
                     # Terminal — value is known
                     winner = node.state.winner
-                    if node.parent:
-                        acting = node.parent.state.active_player
-                        val = 1.0 if winner == acting else 0.0
-                    else:
-                        val = 0.5
-                    paths.append((node, val, None))
+                    acting = node.state.active_player
+                    val = 1.0 if winner == acting else 0.0
+                    paths.append((node, val, None, traversal_path))
                 elif not node.valid_moves:
-                    paths.append((node, 0.0, None))
+                    paths.append((node, 0.0, None, traversal_path))
                 else:
                     leaves_to_eval.append(node)
-                    paths.append((node, None, len(leaves_to_eval) - 1))
+                    paths.append((node, None, len(leaves_to_eval) - 1, traversal_path))
 
             # Batch evaluate all non-terminal leaves
             if leaves_to_eval:
                 batch_results = self.evaluate_batch(leaves_to_eval)
 
                 # Expand and backpropagate
-                for node, term_val, leaf_idx in paths:
+                for node, term_val, leaf_idx, traversal_path in paths:
+                    # Remove virtual loss before real backprop
+                    for vnode in traversal_path:
+                        vnode.N -= 1
+                        vnode.W += 1
+                        vnode.virtual_loss -= 1
                     if leaf_idx is not None:
                         value, priors = batch_results[leaf_idx]
                         self.expand_no_eval(node, value, priors)
@@ -332,7 +328,11 @@ class MCTS:
                         self.backpropagate(node, term_val)
             else:
                 # All terminal
-                for node, term_val, _ in paths:
+                for node, term_val, _, traversal_path in paths:
+                    for vnode in traversal_path:
+                        vnode.N -= 1
+                        vnode.W += 1
+                        vnode.virtual_loss -= 1
                     self.backpropagate(node, term_val)
 
             remaining -= current_batch
@@ -352,17 +352,17 @@ class MCTS:
         """Run MCTS and return chosen action with training targets."""
         policy, value = self.search(state, num_simulations)
 
+        # Training target is always raw normalized visit counts
+        train_policy = policy  # already normalized in search()
+
         if temperature <= 0.01:
-            action_idx   = policy.argmax()
-            train_policy = np.zeros_like(policy)
-            train_policy[action_idx] = 1.0
+            action_idx = policy.argmax()
         else:
             visits_temp = policy ** (1.0 / temperature)
             total = visits_temp.sum()
             if total > 0:
                 visits_temp /= total
-            action_idx   = np.random.choice(ACTION_SPACE, p=visits_temp)
-            train_policy = visits_temp
+            action_idx = np.random.choice(ACTION_SPACE, p=visits_temp)
 
         move, decision = action_to_move_decision(int(action_idx))
         return int(action_idx), move, decision, train_policy, value

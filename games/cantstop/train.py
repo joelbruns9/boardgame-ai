@@ -83,7 +83,8 @@ class CantStopDataset(Dataset):
         # Features: float32 — unavoidable
         self.features       = np.zeros((n, FEATURE_SIZE), dtype=np.float32)
         # Masks: packed bits — 154 bits = 20 bytes per record vs 154 bytes
-        self.masks_packed   = np.zeros((n, 20),            dtype=np.uint8)
+        packed_size         = (ACTION_SPACE + 7) // 8
+        self.masks_packed   = np.zeros((n, packed_size),   dtype=np.uint8)
         self.value_targets  = np.zeros(n,                  dtype=np.float32)
         self.policy_targets = np.zeros(n,                  dtype=np.int32)
 
@@ -106,7 +107,8 @@ class CantStopDataset(Dataset):
                 try:
                     action_idx = move_to_action(move, decision)
                 except ValueError:
-                    action_idx = int(mask.nonzero()[0])
+                    errors += 1
+                    continue
                 self.policy_targets[i] = action_idx
 
             except Exception as e:
@@ -144,10 +146,10 @@ class CantStopDataset(Dataset):
         ).astype(bool)
 
         return (
-            torch.tensor(self.features[idx],       dtype=torch.float32),
-            torch.tensor(mask,                     dtype=torch.bool),
-            torch.tensor(self.value_targets[idx],  dtype=torch.float32),
-            torch.tensor(self.policy_targets[idx], dtype=torch.long),
+            torch.from_numpy(self.features[idx].copy()),
+            torch.from_numpy(mask),
+            torch.tensor(float(self.value_targets[idx])),
+            torch.tensor(int(self.policy_targets[idx])),
         )
 
 
@@ -225,7 +227,8 @@ def train_epoch(model, loader, optimizer, device, epoch):
         total_samples += batch_size
 
         # Policy accuracy — did we predict the chosen action?
-        predicted = policy_logits.argmax(dim=1)
+        masked_logits = policy_logits.masked_fill(~masks, -1e9)
+        predicted = masked_logits.argmax(dim=1)
         correct_policy += (predicted == policy_targets).sum().item()
 
         # Progress update every 100 batches
@@ -262,7 +265,7 @@ def evaluate(model, loader, device):
     total_p_loss = 0.0
     total_samples = 0
     correct_policy = 0
-    value_errors = []
+    total_mae = 0.0
 
     with torch.no_grad():
         for features, masks, value_targets, policy_targets in loader:
@@ -284,12 +287,12 @@ def evaluate(model, loader, device):
             total_p_loss += p_loss.item() * batch_size
             total_samples += batch_size
 
-            predicted = policy_logits.argmax(dim=1)
+            masked_logits = policy_logits.masked_fill(~masks, -1e9)
+            predicted = masked_logits.argmax(dim=1)
             correct_policy += (predicted == policy_targets).sum().item()
 
             # Value MAE — mean absolute error in win probability
-            mae = (value_pred - value_targets).abs().mean().item()
-            value_errors.append(mae)
+            total_mae += (value_pred - value_targets).abs().sum().item()
 
     n = total_samples
     return {
@@ -297,7 +300,7 @@ def evaluate(model, loader, device):
         'value_loss':    total_v_loss / n,
         'policy_loss':   total_p_loss / n,
         'policy_acc':    correct_policy / n,
-        'value_mae':     np.mean(value_errors),
+        'value_mae': total_mae / max(n, 1),
     }
 
 
@@ -391,18 +394,23 @@ def train(
     train_size = len(dataset) - val_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
+    num_dl_workers = 4 if device == 'cuda' else 0
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=num_dl_workers,
+        persistent_workers=(num_dl_workers > 0),
+        prefetch_factor=(2 if num_dl_workers > 0 else None),
         pin_memory=(device == 'cuda'),
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_dl_workers,
+        persistent_workers=(num_dl_workers > 0),
+        prefetch_factor=(2 if num_dl_workers > 0 else None),
         pin_memory=(device == 'cuda'),
     )
 
