@@ -366,8 +366,10 @@ def apply_move(state, move):
                 continue
             if col not in runners and num_runners >= MAX_RUNNERS:
                 continue
+            added_new = col not in runners
             runners[col] = runners.get(col, 0) + 1
-            num_runners += 1
+            if added_new:
+                num_runners += 1
 
     return state
 
