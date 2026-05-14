@@ -47,7 +47,7 @@ from games.cantstop.features import (
     FEATURE_SIZE, ACTION_SPACE
 )
 from games.cantstop.model import CantStopNet
-from games.cantstop.mcts import MCTS
+from games.cantstop.mcts import MCTS, BatchedSyncSearch
 from games.cantstop.evaluate import load_model
 from games.cantstop.inference_server import (
     InferenceServerManager, InferenceClient, ThreadSafeInferenceClient,
@@ -166,6 +166,265 @@ def play_mcts_game(mcts, num_simulations=20, global_temp_mult=1.0,
     return labeled
 
 
+
+
+# ---- FIX C: BATCHED SYNC SELF-PLAY GAME POOL ----
+
+class _BatchedGameRunner:
+    """
+    One live self-play game managed by the Fix C worker coordinator.
+
+    The runner owns exactly one GameState and at most one current
+    BatchedSyncSearch for the position where a decision is needed. The
+    coordinator keeps many runners alive at once and batches the pending
+    eval chunks from all their current searches into one inference call.
+    """
+
+    __slots__ = [
+        'mcts', 'num_simulations', 'global_temp_mult', 'game_id',
+        'state', 'records', 'step_index', 'turns', 'max_turns', 'done',
+        'search', 'pending_player', 'pending_temp', 'pending_valid',
+        'pending_features', 'pending_mask',
+    ]
+
+    def __init__(self, mcts, num_simulations, global_temp_mult, game_id):
+        self.mcts = mcts
+        self.num_simulations = num_simulations
+        self.global_temp_mult = global_temp_mult
+        self.game_id = game_id
+
+        self.state = GameState(2)
+        self.records = []
+        self.step_index = 0
+        self.turns = 0
+        self.max_turns = 200
+        self.done = False
+
+        self.search = None
+        self.pending_player = None
+        self.pending_temp = None
+        self.pending_valid = None
+        self.pending_features = None
+        self.pending_mask = None
+
+    def advance_until_search_needed(self):
+        """
+        Advance cheap game mechanics until this runner either needs MCTS
+        for a legal decision, already has an active search, or finishes.
+        """
+        while not self.done and self.search is None:
+            if self.state.game_over or self.turns >= self.max_turns:
+                self.done = True
+                return
+
+            self.turns += 1
+
+            if not self.state.dice:
+                self.state.roll_dice()
+
+            valid = get_valid_moves(self.state)
+            if not valid:
+                bust_turn(self.state)
+                self.state.dice = []
+                continue
+
+            self.pending_player = self.state.active_player
+            self.pending_temp = get_temperature(
+                self.step_index, self.state, self.global_temp_mult
+            )
+            self.pending_valid = valid
+            self.pending_features = extract_features(self.state, valid)
+            self.pending_mask = get_legal_action_mask(valid)
+            self.search = BatchedSyncSearch(
+                self.mcts,
+                self.state,
+                num_simulations=self.num_simulations,
+                # Match normal self-play MCTS.get_action/search defaults.
+                dirichlet_alpha=0.5,
+                dirichlet_epsilon=0.25,
+                batch_size_cap=8,
+            )
+            return
+
+    def search_done(self):
+        return self.search is not None and self.search.is_done()
+
+    def finish_search_and_apply(self):
+        """Consume a completed search, record target row, and apply move."""
+        if self.search is None or not self.search.is_done():
+            return
+
+        mcts_policy, mcts_value = self.search.result()
+        temp = self.pending_temp
+
+        if temp <= 0.01:
+            action_idx = int(mcts_policy.argmax())
+        else:
+            visits_temp = mcts_policy ** (1.0 / temp)
+            total = visits_temp.sum()
+            if total > 0:
+                visits_temp = visits_temp / total
+                action_idx = int(np.random.choice(ACTION_SPACE, p=visits_temp))
+            else:
+                action_idx = int(mcts_policy.argmax())
+
+        move, decision = action_to_move_decision(int(action_idx))
+
+        self.records.append({
+            'features':    self.pending_features,
+            'mask':        self.pending_mask,
+            'mcts_policy': mcts_policy,
+            'mcts_value':  mcts_value,
+            'action_idx':  action_idx,
+            'player':      self.pending_player,
+            'step_index':  self.step_index,
+            'game_id':     self.game_id,
+        })
+
+        self.step_index += 1
+        apply_move(self.state, move)
+        if decision == "stop":
+            stop_turn(self.state)
+            self.state.dice = []
+        else:
+            self.state.dice = []
+
+        self.search = None
+        self.pending_player = None
+        self.pending_temp = None
+        self.pending_valid = None
+        self.pending_features = None
+        self.pending_mask = None
+
+    def labeled_records(self):
+        """Return records with final blended value targets filled in."""
+        winner = self.state.winner
+        lambda_blend = 0.7
+        labeled = []
+        for rec in self.records:
+            final_outcome = 1.0 if rec['player'] == winner else 0.0
+            rec['value_target'] = (
+                lambda_blend * final_outcome +
+                (1 - lambda_blend) * rec['mcts_value']
+            )
+            labeled.append(rec)
+        return labeled
+
+
+def play_mcts_games_batched_sync(mcts, num_games, num_simulations=20,
+                                 global_temp_mult=1.0,
+                                 batch_sync_searches=8):
+    """
+    Fix C: play many self-play games with per-search sync MCTS semantics,
+    but batch NN eval chunks across independent active games/searches.
+
+    Unlike within-tree async, this never has multiple concurrent sims inside
+    the same MCTS root. Each BatchedSyncSearch preserves the legacy
+    target_inflight=1 chunk semantics. The only batching gain comes from
+    concatenating eval leaves from several independent search roots.
+    """
+    width = max(1, int(batch_sync_searches))
+    records_out = []
+    runners = []
+    games_started = 0
+    games_finished = 0
+
+    # Lightweight diagnostics for this worker. Printed only once per worker
+    # batch so small tests can verify Fix C is really coordinating searches.
+    coord_calls = 0
+    coord_samples = 0
+    coord_searches = 0
+    coord_max_samples = 0
+
+    def _start_runner():
+        nonlocal games_started
+        gid = _next_game_id()
+        runner = _BatchedGameRunner(
+            mcts=mcts,
+            num_simulations=num_simulations,
+            global_temp_mult=global_temp_mult,
+            game_id=gid,
+        )
+        games_started += 1
+        return runner
+
+    while games_finished < num_games:
+        # Keep a pool of live independent games. This is the core Fix C
+        # behavior missing from the previous attempt.
+        while len(runners) < width and games_started < num_games:
+            runners.append(_start_runner())
+
+        # Advance every runner until it has an active search, is done, or is
+        # waiting for the next coordinator eval batch.
+        for r in runners:
+            r.advance_until_search_needed()
+
+        # Consume completed searches and immediately advance those games to
+        # their next decision point if possible. This keeps the pool full.
+        progressed = True
+        while progressed:
+            progressed = False
+            for r in runners:
+                if r.search_done():
+                    r.finish_search_and_apply()
+                    r.advance_until_search_needed()
+                    progressed = True
+
+        # Remove finished games and replace them below.
+        still_live = []
+        for r in runners:
+            if r.done:
+                records_out.extend(r.labeled_records())
+                games_finished += 1
+            else:
+                still_live.append(r)
+        runners = still_live
+
+        if games_finished >= num_games:
+            break
+        if not runners:
+            continue
+
+        # Ask each active search for its next legacy sync eval chunk, then
+        # merge all chunks into one remote inference call.
+        all_nodes = []
+        chunks = []  # (search, n_nodes)
+        for r in runners:
+            if r.search is None or r.search.is_done():
+                continue
+            nodes = r.search.prepare_next_eval()
+            if nodes:
+                chunks.append((r.search, len(nodes)))
+                all_nodes.extend(nodes)
+
+        # Some prepare_next_eval() calls may have finished terminal-only
+        # chunks without needing NN eval. Loop back to consume them.
+        if not all_nodes:
+            continue
+
+        results = mcts.evaluate_batch(all_nodes)
+        coord_calls += 1
+        coord_samples += len(all_nodes)
+        coord_searches += len(chunks)
+        if len(all_nodes) > coord_max_samples:
+            coord_max_samples = len(all_nodes)
+
+        offset = 0
+        for search, n in chunks:
+            search.apply_eval_results(results[offset:offset + n])
+            offset += n
+
+    coord_stats = {
+        'batch_sync_calls': coord_calls,
+        'batch_sync_samples': coord_samples,
+        'batch_sync_searches': coord_searches,
+        'batch_sync_max_samples': coord_max_samples,
+        'batch_sync_width': width,
+    }
+
+    return records_out, coord_stats
+
+
 # ---- PARALLEL WORKER FUNCTIONS ----
 # Must be top-level for multiprocessing pickling on Windows.
 #
@@ -261,7 +520,8 @@ def _next_game_id():
 
 
 def _game_thread_body(num_games, num_simulations, temp_mult, seed,
-                       result_list, result_lock, error_box):
+                       result_list, result_lock, error_box,
+                       coord_stats_list, batch_sync_searches=0):
     """
     Body for one game thread inside a worker process.
 
@@ -298,26 +558,42 @@ def _game_thread_body(num_games, num_simulations, temp_mult, seed,
         mcts = MCTS(_worker_client, 'cpu', **_worker_mcts_kwargs)
 
         local_records = []
-        for i in range(num_games):
-            try:
-                game_id = _next_game_id()
-                records = play_mcts_game(
-                    mcts,
-                    num_simulations=num_simulations,
-                    global_temp_mult=temp_mult,
-                    game_id=game_id,
-                )
-                local_records.extend(records)
-            except Exception as e:
-                import traceback
-                print(f"  [worker thread] Game {i+1}/{num_games} "
-                      f"failed: {e}", flush=True)
-                traceback.print_exc()
-                continue  # skip bad game, keep going
+        local_coord_stats = None
+        if batch_sync_searches and batch_sync_searches > 1:
+            # Fix C path: this thread owns a pool of active games and batches
+            # their legacy-sync MCTS eval chunks together.
+            records, local_coord_stats = play_mcts_games_batched_sync(
+                mcts,
+                num_games=num_games,
+                num_simulations=num_simulations,
+                global_temp_mult=temp_mult,
+                batch_sync_searches=batch_sync_searches,
+            )
+            local_records.extend(records)
+        else:
+            # Original path: one complete game at a time.
+            for i in range(num_games):
+                try:
+                    game_id = _next_game_id()
+                    records = play_mcts_game(
+                        mcts,
+                        num_simulations=num_simulations,
+                        global_temp_mult=temp_mult,
+                        game_id=game_id,
+                    )
+                    local_records.extend(records)
+                except Exception as e:
+                    import traceback
+                    print(f"  [worker thread] Game {i+1}/{num_games} "
+                          f"failed: {e}", flush=True)
+                    traceback.print_exc()
+                    continue  # skip bad game, keep going
 
         # Splice into shared result list atomically.
         with result_lock:
             result_list.extend(local_records)
+            if local_coord_stats is not None:
+                coord_stats_list.append(local_coord_stats)
 
     except Exception as e:
         # Fatal thread error — surface to main thread via error_box.
@@ -345,7 +621,7 @@ def _worker_generate_batch(args):
     import threading as _th
 
     (num_games, num_simulations, temp_mult, seed,
-     games_per_worker) = args
+     games_per_worker, batch_sync_searches) = args
 
     worker_t0 = _t.perf_counter()
 
@@ -369,6 +645,7 @@ def _worker_generate_batch(args):
     result_list = []
     result_lock = _th.Lock()
     error_box = []   # thread errors surface here
+    coord_stats_list = []
 
     threads = []
     for i in range(games_per_worker):
@@ -378,7 +655,8 @@ def _worker_generate_batch(args):
             target=_game_thread_body,
             args=(thread_game_counts[i], num_simulations,
                   temp_mult, thread_seeds[i],
-                  result_list, result_lock, error_box),
+                  result_list, result_lock, error_box,
+                  coord_stats_list, batch_sync_searches),
             name=f"game-w{_worker_id_prefix & 0xFFFF}-t{i}",
             daemon=False,
         )
@@ -396,6 +674,16 @@ def _worker_generate_batch(args):
 
     worker_t1 = _t.perf_counter()
 
+    batch_sync_calls = sum(s.get('batch_sync_calls', 0) for s in coord_stats_list)
+    batch_sync_samples = sum(s.get('batch_sync_samples', 0) for s in coord_stats_list)
+    batch_sync_searches_total = sum(s.get('batch_sync_searches', 0) for s in coord_stats_list)
+    batch_sync_max_samples = max(
+        [s.get('batch_sync_max_samples', 0) for s in coord_stats_list] or [0]
+    )
+    batch_sync_width = max(
+        [s.get('batch_sync_width', 0) for s in coord_stats_list] or [0]
+    )
+
     # Pull final stats from the shared client. Stats are accumulated
     # across all calls from all threads in this worker.
     if _worker_client is not None and hasattr(_worker_client, 'get_stats'):
@@ -408,6 +696,12 @@ def _worker_generate_batch(args):
             'total_samples': cs['total_samples'],
             'records':       len(result_list),
             'games_per_worker': games_per_worker,
+            'batch_sync_searches': batch_sync_searches,
+            'batch_sync_calls': batch_sync_calls,
+            'batch_sync_samples': batch_sync_samples,
+            'batch_sync_searches_total': batch_sync_searches_total,
+            'batch_sync_max_samples': batch_sync_max_samples,
+            'batch_sync_width': batch_sync_width,
         }
     else:
         stats = {
@@ -418,6 +712,12 @@ def _worker_generate_batch(args):
             'total_samples': 0,
             'records':       len(result_list),
             'games_per_worker': games_per_worker,
+            'batch_sync_searches': batch_sync_searches,
+            'batch_sync_calls': batch_sync_calls,
+            'batch_sync_samples': batch_sync_samples,
+            'batch_sync_searches_total': batch_sync_searches_total,
+            'batch_sync_max_samples': batch_sync_max_samples,
+            'batch_sync_width': batch_sync_width,
         }
 
     # Shut down the client's dispatcher thread cleanly. The worker
@@ -436,7 +736,8 @@ def generate_games_parallel(server_manager, num_games, num_simulations,
                              temp_mult, num_workers=None,
                              iteration_seed=None,
                              target_inflight=16, warmup_sims=16,
-                             games_per_worker=2):
+                             games_per_worker=2,
+                             batch_sync_searches=0):
     """
     Generate MCTS games across multiple CPU worker processes.
     Workers send inference requests to the GPU server held by the
@@ -486,7 +787,8 @@ def generate_games_parallel(server_manager, num_games, num_simulations,
         if n > 0:
             seed = rng.randint(0, 2**31 - 1)
             batch_args.append(
-                (n, num_simulations, temp_mult, seed, games_per_worker)
+                (n, num_simulations, temp_mult, seed, games_per_worker,
+                 batch_sync_searches)
             )
 
     actual_workers = len(batch_args)
@@ -594,6 +896,19 @@ def generate_games_parallel(server_manager, num_games, num_simulations,
         print(f"    Inference calls/worker: {n_calls // n_workers:,}")
         print(f"    Mean samples/call:     {avg_samples_per_call:6.2f}")
         print(f"    Mean blocked/call:     {avg_call_blocked_us:6.0f} µs")
+
+        bs_calls = sum(s.get('batch_sync_calls', 0) for s in worker_stats)
+        if bs_calls > 0:
+            bs_samples = sum(s.get('batch_sync_samples', 0) for s in worker_stats)
+            bs_searches = sum(s.get('batch_sync_searches_total', 0) for s in worker_stats)
+            bs_max = max(s.get('batch_sync_max_samples', 0) for s in worker_stats)
+            bs_width = max(s.get('batch_sync_width', 0) for s in worker_stats)
+            print(f"    Batch-sync width:      {bs_width:6d}")
+            print(f"    Batch-sync calls:      {bs_calls:6,}")
+            print(f"    Mean searches/call:    {bs_searches / bs_calls:6.2f}")
+            print(f"    Mean coord samples:    {bs_samples / bs_calls:6.2f}")
+            print(f"    Max coord samples:     {bs_max:6d}")
+
         print(f"  --------------------------------------------------------")
 
         # Sanity-check verdict — now uses per-thread blocked %.
@@ -1197,6 +1512,7 @@ def self_play_loop(
     target_inflight=16,
     warmup_sims=16,
     games_per_worker=2,
+    batch_sync_searches=0,
 ):
     """
     Main training loop.
@@ -1242,6 +1558,8 @@ def self_play_loop(
     print(f"  Inflight:      {target_inflight} (async scheduler)")
     print(f"  Warmup:        {warmup_sims} sequential sims/search")
     print(f"  Games/worker:  {games_per_worker} concurrent threads")
+    if batch_sync_searches and batch_sync_searches > 1:
+        print(f"  Batch-sync:    {batch_sync_searches} active sync searches per worker")
     print(f"  Buffer size:   {buffer_size:,}")
     print(f"  Sample size:   {sample_size:,}")
     print(f"  Train epochs:  {train_epochs}")
@@ -1343,6 +1661,7 @@ def self_play_loop(
                 target_inflight=target_inflight,
                 warmup_sims=warmup_sims,
                 games_per_worker=games_per_worker,
+                batch_sync_searches=batch_sync_searches,
             )
 
             gen_time = time.time() - gen_start
@@ -1509,6 +1828,13 @@ if __name__ == "__main__":
                              "78%% of wall time previously spent "
                              "blocked. Set to 1 for the legacy single-"
                              "threaded behavior.")
+    parser.add_argument("--batch-sync-searches", type=int, default=0,
+                        dest="batch_sync_searches",
+                        help="Fix C experimental path: number of active "
+                             "independent games/searches per worker thread "
+                             "whose legacy-sync MCTS eval chunks are "
+                             "merged into one inference request. Set 0 or 1 "
+                             "to disable.")
     args = parser.parse_args()
 
     self_play_loop(
@@ -1530,4 +1856,5 @@ if __name__ == "__main__":
         target_inflight=args.inflight,
         warmup_sims=args.warmup,
         games_per_worker=args.games_per_worker,
+        batch_sync_searches=args.batch_sync_searches,
     )

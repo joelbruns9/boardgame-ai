@@ -1142,6 +1142,203 @@ class MCTS:
         return int(action_idx), move, decision, train_policy, value
 
 
+
+
+# ---- INDEPENDENT SYNC SEARCH SESSION (FIX C) ----
+
+class BatchedSyncSearch:
+    """
+    Resumable version of the legacy synchronous MCTS search.
+
+    Purpose:
+      Preserve the exact per-tree semantics of MCTS(target_inflight=1),
+      including the legacy `batch_size_cap=8` traversal chunks, while
+      allowing a worker-level coordinator to merge eval chunks from many
+      independent searches into one larger inference call.
+
+    Contract:
+      - `prepare_next_eval()` advances this search until it has a list of
+        DecisionNodes that need network evaluation, or until the search is
+        complete.
+      - The caller evaluates those nodes, potentially concatenated with
+        nodes from other BatchedSyncSearch objects.
+      - `apply_eval_results(results)` resumes this search with the returned
+        `(value, priors)` pairs.
+
+    This class deliberately does NOT run multiple in-flight simulations
+    inside one tree. Each chunk is the same legacy sync chunk that
+    `_run_sync_simulations()` would have run locally.
+    """
+
+    __slots__ = [
+        'mcts', 'num_simulations', 'dirichlet_alpha', 'dirichlet_epsilon',
+        'root', 'remaining', 'phase', 'pending_traversals',
+        'pending_leaves', 'done', '_policy', '_value', 'batch_size_cap',
+    ]
+
+    _PHASE_ROOT = 0
+    _PHASE_CHUNK = 1
+
+    def __init__(self, mcts, state, num_simulations=50,
+                 dirichlet_alpha=0.5, dirichlet_epsilon=0.25,
+                 batch_size_cap=8):
+        self.mcts = mcts
+        self.num_simulations = int(num_simulations)
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+        self.batch_size_cap = int(batch_size_cap)
+
+        if not state.dice:
+            state = state.clone()
+            state.roll_dice()
+
+        root_state = state.clone()
+        self.root = DecisionNode(
+            state=root_state,
+            parent=None,
+            parent_action=None,
+            prior=0.0,
+            flip_from_parent=False,
+        )
+
+        self.remaining = max(0, self.num_simulations - 1)
+        self.phase = self._PHASE_ROOT
+        self.pending_traversals = []
+        self.pending_leaves = []
+        self.done = False
+        self._policy = None
+        self._value = None
+
+        if not self.root.valid_moves:
+            self._policy = np.zeros(ACTION_SPACE, dtype=np.float32)
+            self._value = 0.0
+            self.done = True
+
+    def is_done(self):
+        return self.done
+
+    def prepare_next_eval(self):
+        """
+        Return a list of DecisionNodes requiring NN evaluation.
+
+        The caller must pass the corresponding results to
+        apply_eval_results(). If [] is returned, the search is already done
+        or the method completed terminal-only chunks internally and should be
+        called again by the coordinator on a future loop iteration.
+        """
+        if self.done:
+            return []
+
+        if self.phase == self._PHASE_ROOT:
+            self.pending_leaves = [self.root]
+            return self.pending_leaves
+
+        # Legacy sync simulation chunk. This mirrors MCTS._run_sync_simulations:
+        # collect up to batch_size_cap traversals, evaluate their leaves as one
+        # batch, then backpropagate every traversal in order.
+        while self.remaining > 0:
+            current_batch = min(self.batch_size_cap, self.remaining)
+            traversals = []
+            leaves_for_eval = []
+
+            for _ in range(current_batch):
+                kind, leaf, val, dpath = self.mcts._traverse(self.root)
+                if kind == 'terminal':
+                    traversals.append(('terminal', leaf, val, dpath))
+                else:
+                    leaves_for_eval.append(leaf)
+                    traversals.append(('eval', leaf, None, dpath))
+
+            self.remaining -= current_batch
+
+            if leaves_for_eval:
+                self.pending_traversals = traversals
+                self.pending_leaves = leaves_for_eval
+                return leaves_for_eval
+
+            # Terminal-only chunk: no NN eval needed. Backprop immediately and
+            # continue to the next chunk. This case is uncommon but important
+            # for correctness in late/bust-chain positions.
+            for _, leaf, val, dpath in traversals:
+                self.mcts.backpropagate(leaf, val, dpath)
+
+        self._finalize()
+        return []
+
+    def apply_eval_results(self, results):
+        """Resume after the caller evaluated the nodes from prepare_next_eval."""
+        if self.done:
+            return
+
+        if self.phase == self._PHASE_ROOT:
+            if len(results) != 1:
+                raise RuntimeError(
+                    f"Root eval expected 1 result, got {len(results)}"
+                )
+            root_value, root_priors = results[0]
+            self.mcts.expand_decision_node(self.root, root_priors)
+            self.root.N = 1
+            self.root.W = root_value
+
+            if self.root.children and self.dirichlet_epsilon > 0:
+                noise = np.random.dirichlet(
+                    [self.dirichlet_alpha] * len(self.root.children)
+                )
+                for i, child in enumerate(self.root.children.values()):
+                    child.prior = (
+                        (1 - self.dirichlet_epsilon) * child.prior +
+                        self.dirichlet_epsilon * noise[i]
+                    )
+
+            self.phase = self._PHASE_CHUNK
+            self.pending_leaves = []
+            if self.remaining <= 0:
+                self._finalize()
+            return
+
+        # Chunk resume. Results correspond only to eval traversals, in the
+        # order leaves_for_eval was built. Terminal traversals do not consume
+        # a result, matching legacy _run_sync_simulations exactly.
+        eval_iter = iter(results)
+        for kind, leaf, val, dpath in self.pending_traversals:
+            if kind == 'terminal':
+                self.mcts.backpropagate(leaf, val, dpath)
+            else:
+                value, priors = next(eval_iter)
+                # Legacy sync always expands leaf here. Duplicate leaves inside
+                # a chunk are rare but possible; guard to avoid rebuilding
+                # children if a previous traversal in this same chunk expanded it.
+                if not leaf.is_expanded:
+                    self.mcts.expand_decision_node(leaf, priors)
+                self.mcts.backpropagate(leaf, value, dpath)
+
+        self.pending_traversals = []
+        self.pending_leaves = []
+        if self.remaining <= 0:
+            self._finalize()
+
+    def _finalize(self):
+        visits = np.zeros(ACTION_SPACE, dtype=np.float32)
+        for action_idx, child in self.root.children.items():
+            visits[action_idx] = child.N
+
+        total = visits.sum()
+        if total > 0:
+            policy = visits / total
+        else:
+            mask_f = self.root.mask.astype(np.float32)
+            policy = mask_f / mask_f.sum() if mask_f.sum() > 0 else mask_f
+
+        self._policy = policy
+        self._value = self.root.Q
+        self.done = True
+
+    def result(self):
+        if not self.done:
+            raise RuntimeError("BatchedSyncSearch.result() before completion")
+        return self._policy, self._value
+
+
 # ---- SELF-TEST ----
 
 if __name__ == "__main__":
