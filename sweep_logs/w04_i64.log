@@ -1,0 +1,133 @@
+Building feature extraction tables... Building feature extraction tables... done.
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] started on device=cuda, initial model=models\cantstop\self_play\model_iter_003_accepted.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] model updated from models\cantstop\self_play\model_iter_003_accepted.pt
+Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from sweep_logs\out_w04_i64\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] shutdown. 40701 batches, 128411 requests, avg batch=3.2, 330 batches/s, 123.5s wall
+done.
+
+=======================================================
+  Can't Stop MCTS Self-Play
+=======================================================
+  Device:        cuda
+  GPU:           NVIDIA GeForce RTX 3070 Laptop GPU
+  Workers:       8 (CPU)
+  Iterations:    1
+  Games/iter:    200
+  MCTS sims:     200
+  Inflight:      64 (async scheduler)
+  Warmup:        4 sequential sims/search
+  Buffer size:   200,000
+  Sample size:   100,000
+  Train epochs:  3
+  Eval games:    50 @ 20 sims (CPU MCTS)
+  Accept floor:  0%
+=======================================================
+
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+
+  Starting inference server (device=cuda, num_workers=8)...
+
+───────────────────────────────────────────────────────
+  Iteration 1/1 | Temp: 1.00 | Sims: 200 | Buffer: 0
+───────────────────────────────────────────────────────
+
+  Generating 200 MCTS games (200 sims/move, 8 workers, GPU inference)...
+  Generated 14,383 records in 89.7s (2.23 games/s)
+  Buffer: 14,383 / 200,000
+
+  Training on 12,916 records (val: 1,467 | buffer: 14,383) for 3 epochs [on-device]...
+    Epoch 1/3 | Train: 1.9412 | Val: 1.9535 | Policy match (vs MCTS argmax): 0.535 | Entropy: 1.283
+    Epoch 2/3 | Train: 1.9181 | Val: 1.9441 | Policy match (vs MCTS argmax): 0.528 | Entropy: 1.296
+    Epoch 3/3 | Train: 1.9091 | Val: 1.9429 | Policy match (vs MCTS argmax): 0.536 | Entropy: 1.303
+
+  Evaluating new vs old (50 MCTS games @ 20 sims, 8 workers)...
+  Eval done in 30.2s (1.7 games/s aggregate)
+  New model: 21/50 (42.0%)  draws: 0
+  Old model: 29/50 (58.0%)
+
+  ✓ ACCEPTED (42.0% >= 0%)
+  Saved iteration checkpoint: sweep_logs\out_w04_i64\model_iter_001_accepted.pt
+  Updated best model:         sweep_logs\out_w04_i64\best_model.pt
+
+  Time: 122.4s | Accepted: 1 | Rejected: 0
+
+  Stopping inference server...
+
+=======================================================
+  MCTS Self-Play Complete!
+  Iterations: 1
+  Accepted:   1
+  Rejected:   0
+
+  Win rate progression:
+    Iter  1: 42.0% ✓ (122s)
+=======================================================
+
+  Final model: sweep_logs\out_w04_i64\final_20260513_161904.pt
+  Best model:  sweep_logs\out_w04_i64\best_model.pt

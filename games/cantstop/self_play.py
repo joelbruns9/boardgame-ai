@@ -16,6 +16,18 @@ import time
 import random
 import argparse
 import numpy as np
+
+# Windows + redirected stdout defaults to cp1252, which can't encode the
+# unicode box-drawing characters (─ ✓ ✗ ⚠ ◐) used in our logs. Reconfigure
+# stdout/stderr to UTF-8 with error replacement so log files always work.
+# Has no effect on terminals that already use UTF-8.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, ValueError):
+    # reconfigure() was added in Python 3.7; older versions skip silently.
+    pass
+
 from collections import deque, defaultdict
 from datetime import datetime
 import multiprocessing as mp
@@ -37,6 +49,9 @@ from games.cantstop.features import (
 from games.cantstop.model import CantStopNet
 from games.cantstop.mcts import MCTS
 from games.cantstop.evaluate import load_model
+from games.cantstop.inference_server import (
+    InferenceServerManager, InferenceClient, ThreadSafeInferenceClient,
+)
 
 
 # ---- PHASE-BASED TEMPERATURE ----
@@ -61,12 +76,6 @@ def get_temperature(step_index, state, global_temp_mult=1.0):
 
 
 # ---- SELF-PLAY GAME WITH MCTS ----
-
-# Module-level counter for assigning unique game IDs from a single worker.
-# Each worker process maintains its own counter; we combine with worker
-# seed to make IDs globally unique across the pool.
-_worker_game_counter = 0
-_worker_id_prefix = 0
 
 
 def play_mcts_game(mcts, num_simulations=20, global_temp_mult=1.0,
@@ -159,122 +168,450 @@ def play_mcts_game(mcts, num_simulations=20, global_temp_mult=1.0,
 
 # ---- PARALLEL WORKER FUNCTIONS ----
 # Must be top-level for multiprocessing pickling on Windows.
+#
+# Workers no longer load a model. Instead, each worker holds a shared
+# ThreadSafeInferenceClient wired to the GPU inference server. The
+# server is owned and managed by the main process and runs on CUDA.
+# Each worker can run N game threads concurrently sharing one client
+# (see --games-per-worker). When one thread is blocked on inference,
+# other threads can use the CPU.
 
-_worker_mcts = None
+
+# Worker-process globals — populated by _init_worker, consumed by
+# _worker_generate_batch. Per-process, not per-thread.
+_worker_client = None             # ThreadSafeInferenceClient (shared by threads)
+_worker_mcts_kwargs = None        # dict of MCTS kwargs for per-thread instances
+_worker_game_counter = 0          # atomic via _worker_game_counter_lock below
+_worker_game_counter_lock = None  # threading.Lock — created in _init_worker
+_worker_id_prefix = 0
 
 
-def _init_worker(model_path, iteration_seed):
+def _init_worker(request_queue, response_queues, worker_counter,
+                 iteration_seed, target_inflight, warmup_sims):
     """
-    Initialize worker process with CPU-based model and MCTS.
-    Called once per worker — avoids reloading for each batch.
-    Workers use CPU to avoid CUDA multiprocessing issues on Windows.
-    Network inference is only 3% of time so CPU is fine.
+    Initialize worker process.
 
-    Sets up a per-worker game_id prefix combining the iteration seed
-    (varies across iterations) with os.getpid() (varies across workers
-    within a pool). Together these give unique game IDs across all
-    games ever generated.
+    Atomically claims a worker_id (0..num_workers-1) via the shared
+    `worker_counter` Value. Builds ONE ThreadSafeInferenceClient bound to:
+      - the shared request_queue (all workers push to one queue)
+      - this worker's private response_queue (response_queues[worker_id])
+
+    The client is shared across N game threads (set by --games-per-worker).
+    The client owns a dispatcher thread that routes responses by request_id
+    so threads can call infer() concurrently without colliding.
+
+    Each game thread gets its OWN MCTS instance pointing at this shared
+    client — separate trees, separate per-search statistics, no cross-
+    thread MCTS interaction. Quality of MCTS targets is unchanged.
+
+    `target_inflight` and `warmup_sims` are stored for game-thread use.
     """
-    global _worker_mcts, _worker_game_counter, _worker_id_prefix
-    worker_device = 'cpu'
-    model = load_model(model_path, worker_device)
-    _worker_mcts = MCTS(model, worker_device)
+    global _worker_client, _worker_mcts_kwargs
+    global _worker_game_counter, _worker_game_counter_lock
+    global _worker_id_prefix
+
+    # Atomically claim a worker_id. The shared Value is created by the
+    # parent so this is safe across worker processes.
+    with worker_counter.get_lock():
+        worker_id = worker_counter.value
+        worker_counter.value += 1
+
+    if worker_id >= len(response_queues):
+        # Defensive: if pool spawns more workers than expected (e.g.
+        # maxtasksperchild causing recycling), we'd run out of response
+        # queues. This shouldn't happen with our config, but bail
+        # cleanly if it does.
+        raise RuntimeError(
+            f"Worker_id {worker_id} exceeds response_queues count "
+            f"{len(response_queues)}. Pool worker recycling not supported."
+        )
+
+    # ONE thread-safe client per worker, shared across game threads.
+    _worker_client = ThreadSafeInferenceClient(
+        request_queue=request_queue,
+        response_queue=response_queues[worker_id],
+        worker_id=worker_id,
+    )
+    _worker_client.start()
+
+    # MCTS kwargs — used to build a fresh MCTS in each game thread.
+    _worker_mcts_kwargs = dict(
+        target_inflight=target_inflight,
+        warmup_sims=warmup_sims,
+    )
+
+    # Per-thread game ID counter, with a lock for atomic increment.
+    import threading as _t
     _worker_game_counter = 0
-    # Combine iteration seed (16 bits) + pid (16 bits) for the prefix.
-    # The counter occupies the low 32 bits, leaving room for ~4B games
-    # per worker per iteration before overflow (way beyond practical).
+    _worker_game_counter_lock = _t.Lock()
+
+    # game_id prefix: iteration_seed[16] | worker_id[16]
     iter_bits = (int(iteration_seed) & 0xFFFF) << 16
-    pid_bits  = (os.getpid() & 0xFFFF)
-    _worker_id_prefix = iter_bits | pid_bits
+    wid_bits  = (worker_id & 0xFFFF)
+    _worker_id_prefix = iter_bits | wid_bits
+
+
+def _next_game_id():
+    """Atomically allocate the next game_id within this worker."""
+    global _worker_game_counter
+    with _worker_game_counter_lock:
+        gid = (_worker_id_prefix << 32) | (_worker_game_counter & 0xFFFFFFFF)
+        _worker_game_counter += 1
+    return gid
+
+
+def _game_thread_body(num_games, num_simulations, temp_mult, seed,
+                       result_list, result_lock, error_box):
+    """
+    Body for one game thread inside a worker process.
+
+    Each thread:
+      - Seeds its own RNGs (so different threads see different dice).
+        Note: random and numpy RNGs are NOT thread-safe globally, so
+        we seed per-thread. Multiple threads sharing the same generator
+        without locks would corrupt internal state. The seeding here
+        relies on the fact that random.seed() in Python is thread-local
+        via the random module's _inst — but numpy.random.seed() sets a
+        global. For our purposes, the dice rolls happen via random.choices
+        (in engine.roll_dice) and numpy is used by mcts/features; the
+        risk of cross-thread state corruption is real but minor for
+        training data quality. If we ever need stricter isolation, swap
+        to thread-local Generator instances.
+
+      - Builds its OWN MCTS instance pointing at the shared client.
+        Per-search statistics, virtual loss, warmup are all per-tree.
+
+      - Plays games sequentially until its quota is done.
+
+      - Appends records to result_list under result_lock.
+
+      - On any fatal error, stores into error_box and exits.
+    """
+    try:
+        import random as _r
+        import numpy as _np
+
+        # Per-thread RNG seeding. (See caveat above.)
+        _r.seed(seed)
+        _np.random.seed(seed & 0xFFFFFFFF)
+
+        mcts = MCTS(_worker_client, 'cpu', **_worker_mcts_kwargs)
+
+        local_records = []
+        for i in range(num_games):
+            try:
+                game_id = _next_game_id()
+                records = play_mcts_game(
+                    mcts,
+                    num_simulations=num_simulations,
+                    global_temp_mult=temp_mult,
+                    game_id=game_id,
+                )
+                local_records.extend(records)
+            except Exception as e:
+                import traceback
+                print(f"  [worker thread] Game {i+1}/{num_games} "
+                      f"failed: {e}", flush=True)
+                traceback.print_exc()
+                continue  # skip bad game, keep going
+
+        # Splice into shared result list atomically.
+        with result_lock:
+            result_list.extend(local_records)
+
+    except Exception as e:
+        # Fatal thread error — surface to main thread via error_box.
+        import traceback
+        error_box.append((e, traceback.format_exc()))
 
 
 def _worker_generate_batch(args):
     """
     Generate a batch of MCTS games in a worker process.
-    Uses pre-initialized _worker_mcts instance.
-    Returns [] on any error so the pool doesn't hang overnight.
+
+    With games_per_worker=N, spawns N threads that share one
+    ThreadSafeInferenceClient. Each thread runs its share of games
+    sequentially. When one thread is blocked on inference, others
+    can use the CPU — overlapping the CPU/GPU phases that previously
+    serialized.
+
+    Returns a tuple (records, stats):
+        records: list of training records from all games
+        stats:   dict with timing breakdown (per-worker totals)
+
+    Returns ([], {}) on fatal error so the pool doesn't hang.
     """
-    global _worker_game_counter
-    num_games, num_simulations, temp_mult, seed = args
-    random.seed(seed)
-    np.random.seed(seed)
+    import time as _t
+    import threading as _th
 
-    all_records = []
-    for i in range(num_games):
+    (num_games, num_simulations, temp_mult, seed,
+     games_per_worker) = args
+
+    worker_t0 = _t.perf_counter()
+
+    # Distribute games among threads. Threads get a contiguous range
+    # of game IDs each; if the work doesn't divide evenly, earlier
+    # threads get one extra game.
+    games_per_worker = max(1, int(games_per_worker))
+    base = num_games // games_per_worker
+    leftover = num_games % games_per_worker
+    thread_game_counts = [
+        base + (1 if i < leftover else 0)
+        for i in range(games_per_worker)
+    ]
+
+    # Per-thread seeds derived from the worker seed — independent
+    # dice across threads.
+    thread_seeds = [(seed * 1000003 + i * 9176) & 0x7FFFFFFF
+                    for i in range(games_per_worker)]
+
+    # Shared collection state.
+    result_list = []
+    result_lock = _th.Lock()
+    error_box = []   # thread errors surface here
+
+    threads = []
+    for i in range(games_per_worker):
+        if thread_game_counts[i] <= 0:
+            continue
+        t = _th.Thread(
+            target=_game_thread_body,
+            args=(thread_game_counts[i], num_simulations,
+                  temp_mult, thread_seeds[i],
+                  result_list, result_lock, error_box),
+            name=f"game-w{_worker_id_prefix & 0xFFFF}-t{i}",
+            daemon=False,
+        )
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    if error_box:
+        # At least one thread had a fatal error — report and continue.
+        for exc, tb in error_box:
+            print(f"  [worker] game thread fatal: {exc}\n{tb}",
+                  flush=True)
+
+    worker_t1 = _t.perf_counter()
+
+    # Pull final stats from the shared client. Stats are accumulated
+    # across all calls from all threads in this worker.
+    if _worker_client is not None and hasattr(_worker_client, 'get_stats'):
+        cs = _worker_client.get_stats()
+        stats = {
+            'wall_s':        worker_t1 - worker_t0,
+            'blocked_s':     cs['blocked_s'],
+            'put_s':         cs['put_s'],
+            'n_calls':       cs['n_calls'],
+            'total_samples': cs['total_samples'],
+            'records':       len(result_list),
+            'games_per_worker': games_per_worker,
+        }
+    else:
+        stats = {
+            'wall_s':        worker_t1 - worker_t0,
+            'blocked_s':     0.0,
+            'put_s':         0.0,
+            'n_calls':       0,
+            'total_samples': 0,
+            'records':       len(result_list),
+            'games_per_worker': games_per_worker,
+        }
+
+    # Shut down the client's dispatcher thread cleanly. The worker
+    # process is about to exit (pool.map returns), but explicit shutdown
+    # is cleaner and surfaces any lingering errors.
+    if _worker_client is not None and hasattr(_worker_client, 'shutdown'):
         try:
-            # Assign a globally-unique game_id.
-            # Prefix is iteration_seed[16] | pid[16] in upper 32 bits;
-            # counter occupies lower 32 bits.
-            game_id = (_worker_id_prefix << 32) | (_worker_game_counter & 0xFFFFFFFF)
-            _worker_game_counter += 1
+            _worker_client.shutdown(timeout=2.0)
+        except Exception:
+            pass  # best-effort; pool exits anyway
 
-            records = play_mcts_game(
-                _worker_mcts,
-                num_simulations=num_simulations,
-                global_temp_mult=temp_mult,
-                game_id=game_id,
-            )
-            all_records.extend(records)
-        except Exception as e:
-            import traceback
-            print(f"  [worker] Game {i+1}/{num_games} failed: {e}", flush=True)
-            traceback.print_exc()
-            continue  # skip bad game, keep going
-
-    return all_records
+    return result_list, stats
 
 
-def generate_games_parallel(model_path, num_games, num_simulations,
+def generate_games_parallel(server_manager, num_games, num_simulations,
                              temp_mult, num_workers=None,
-                             iteration_seed=None):
+                             iteration_seed=None,
+                             target_inflight=16, warmup_sims=16,
+                             games_per_worker=2):
     """
     Generate MCTS games across multiple CPU worker processes.
-    Each worker has its own model and MCTS instance.
-    Main process keeps GPU for training.
+    Workers send inference requests to the GPU server held by the
+    server_manager (main process owns it).
+
+    The server must already be running when this is called. The caller
+    (self_play_loop) is responsible for server lifecycle — start before
+    the first iteration, update_model() between iterations, stop after
+    the last iteration.
 
     `iteration_seed` ensures different iterations produce different
-    dice sequences. The original code used a fixed seed=42 inside this
-    function, which meant every iteration generated statistically
-    identical games — a silent diversity bug. We now thread the
-    iteration through so each iteration explores fresh randomness.
+    dice sequences and unique game_id prefixes.
+
+    `target_inflight` and `warmup_sims` are forwarded to each worker's
+    MCTS instance. See _init_worker for the rationale.
+
+    `games_per_worker` controls how many games each worker process plays
+    CONCURRENTLY using threads. When >1, the worker holds N game threads
+    that share one ThreadSafeInferenceClient. While one thread is
+    blocked waiting on inference, others can use the CPU — overlapping
+    the CPU/GPU phases that previously serialized. Default 2; the
+    measurement data showed ~78% of worker wall time was blocked on
+    inference, so 2 threads should recover most of that.
     """
     if num_workers is None:
         num_workers = min(mp.cpu_count(), 8)
 
-    # Distribute games evenly
-    games_per_worker = num_games // num_workers
+    if num_workers > len(server_manager.response_queues):
+        raise ValueError(
+            f"num_workers ({num_workers}) exceeds server manager's "
+            f"configured response_queues ({len(server_manager.response_queues)}). "
+            f"Recreate the server with a larger num_workers."
+        )
+
+    # Quota — how many games each worker process plays in total.
+    # Worker then splits its quota across its N game threads.
+    quota_per_worker = num_games // num_workers
     leftover = num_games % num_workers
 
     if iteration_seed is None:
-        # Non-reproducible default (time-based) — better than fixed 42.
         iteration_seed = int(time.time() * 1000) & 0x7FFFFFFF
 
     rng = random.Random(iteration_seed)
     batch_args = []
     for i in range(num_workers):
-        n = games_per_worker + (1 if i < leftover else 0)
+        n = quota_per_worker + (1 if i < leftover else 0)
         if n > 0:
             seed = rng.randint(0, 2**31 - 1)
-            batch_args.append((n, num_simulations, temp_mult, seed))
+            batch_args.append(
+                (n, num_simulations, temp_mult, seed, games_per_worker)
+            )
 
     actual_workers = len(batch_args)
 
-    # Each worker initializer needs the model path AND its own seed
-    # for the game_id prefix. mp.Pool can only pass one initargs tuple
-    # to ALL workers, so we use a trick: pass model_path globally and
-    # let each worker derive its seed from its first batch_args entry.
-    # Simpler: pass a wrapper that uses the seed from os.getpid + time.
-    # We use os.getpid to give each worker a stable, unique prefix.
-    with mp.Pool(
+    # Worker counter — atomic across worker processes — assigns each
+    # worker its unique worker_id during _init_worker.
+    ctx = server_manager.ctx
+    worker_counter = ctx.Value('i', 0)
+
+    with ctx.Pool(
         processes=actual_workers,
         initializer=_init_worker,
-        initargs=(model_path, iteration_seed),
+        initargs=(
+            server_manager.request_queue,
+            server_manager.response_queues,
+            worker_counter,
+            iteration_seed,
+            target_inflight,
+            warmup_sims,
+        ),
     ) as pool:
         results = pool.map(_worker_generate_batch, batch_args)
 
     all_records = []
+    worker_stats = []
     for batch in results:
-        all_records.extend(batch)
+        # New protocol: workers return (records, stats). Be tolerant if
+        # we somehow receive an old-style bare list.
+        if isinstance(batch, tuple) and len(batch) == 2:
+            recs, stats = batch
+        else:
+            recs, stats = batch, {}
+        all_records.extend(recs)
+        if stats:
+            worker_stats.append(stats)
+
+    # ---- Aggregate timing breakdown ----
+    if worker_stats:
+        n_workers = len(worker_stats)
+        wall_total    = sum(s['wall_s']    for s in worker_stats)
+        blocked_total = sum(s['blocked_s'] for s in worker_stats)
+        put_total     = sum(s['put_s']     for s in worker_stats)
+        n_calls       = sum(s['n_calls']   for s in worker_stats)
+        total_samples = sum(s['total_samples'] for s in worker_stats)
+
+        # When a worker has multiple game threads, blocked_total
+        # accumulates time across ALL threads (the wrapper's stats
+        # don't know which thread called). Average per-thread blocked
+        # time is what tells us about contention; the overall worker
+        # CPU utilization comes from a different formula entirely.
+        gpw_values = [s.get('games_per_worker', 1) for s in worker_stats]
+        avg_gpw = sum(gpw_values) / n_workers if n_workers > 0 else 1
+        n_threads_total = sum(gpw_values)  # total game threads across all workers
+
+        # Per-worker wall time.
+        avg_wall = wall_total / n_workers
+        avg_put  = put_total  / n_workers
+
+        # Per-THREAD blocked time. Normalize blocked_total by number
+        # of threads, not workers. With N threads per worker each
+        # spending B fraction of time blocked, blocked_total ≈ N × wall × B.
+        avg_thread_blocked = blocked_total / max(n_threads_total, 1)
+        if avg_wall > 0:
+            pct_thread_blocked = 100.0 * avg_thread_blocked / avg_wall
+        else:
+            pct_thread_blocked = 0.0
+
+        # Aggregate CPU utilization: how much CPU work did we do, across
+        # all threads, as a fraction of the wall-clock × thread-count
+        # budget? "100%" would mean every thread did CPU work for the
+        # entire wall time (impossible — must wait on GPU at least
+        # sometimes). With 1 thread/worker and 79% blocked, util = 21%.
+        # With 2 threads/worker and equal blocking, util might be 30-50%
+        # depending on how well threads cover each others' waits.
+        thread_time_budget = wall_total * 1.0   # wall × (avg threads / workers)
+        # Actually we want: total CPU time / total wall × thread-count budget
+        # Total CPU = thread_count × wall − blocked_total (only true when
+        # each thread runs to completion within wall time, which is the case)
+        total_thread_seconds = sum(s['wall_s'] * s.get('games_per_worker', 1)
+                                    for s in worker_stats)
+        total_cpu_seconds    = total_thread_seconds - blocked_total
+        if total_thread_seconds > 0:
+            pct_cpu_util = 100.0 * total_cpu_seconds / total_thread_seconds
+        else:
+            pct_cpu_util = 0.0
+
+        # Per-call averages.
+        if n_calls > 0:
+            avg_call_blocked_us = (blocked_total / n_calls) * 1e6
+            avg_samples_per_call = total_samples / n_calls
+        else:
+            avg_call_blocked_us = 0.0
+            avg_samples_per_call = 0.0
+
+        print(f"\n  ---- Worker timing breakdown "
+              f"({n_workers} workers × {avg_gpw:.0f} threads) ----")
+        print(f"    Per-worker wall avg:   {avg_wall:7.2f}s")
+        print(f"    Per-thread blocked:    {avg_thread_blocked:7.2f}s "
+              f"({pct_thread_blocked:5.1f}% of wall) — "
+              f"how much each thread waits")
+        print(f"    Aggregate CPU util:    {pct_cpu_util:5.1f}% "
+              f"(across {n_threads_total} game threads, total)")
+        print(f"    Per-worker put time:   {avg_put:7.3f}s "
+              f"(negligible if << wall)")
+        print(f"    Inference calls/worker: {n_calls // n_workers:,}")
+        print(f"    Mean samples/call:     {avg_samples_per_call:6.2f}")
+        print(f"    Mean blocked/call:     {avg_call_blocked_us:6.0f} µs")
+        print(f"  --------------------------------------------------------")
+
+        # Sanity-check verdict — now uses per-thread blocked %.
+        if pct_thread_blocked > 60:
+            if avg_gpw == 1:
+                print(f"  ⇒ Threads are BLOCKED majority of wall time. "
+                      f"Try --games-per-worker 2+ to overlap CPU/GPU.")
+            else:
+                print(f"  ⇒ Threads are still blocked majority of wall "
+                      f"time. Try higher --games-per-worker or "
+                      f"investigate server-side bottlenecks.")
+        elif pct_thread_blocked > 40:
+            print(f"  ⇒ Threads are moderately blocked. Configuration "
+                  f"is reasonable; marginal gain from more threads.")
+        else:
+            print(f"  ⇒ Threads are mostly CPU-bound. GPU/IPC overlap "
+                  f"is good — further parallelism won't help much.")
+
     return all_records
 
 
@@ -857,6 +1194,9 @@ def self_play_loop(
     final_temp_mult=0.7,
     num_workers=None,
     device=None,
+    target_inflight=16,
+    warmup_sims=16,
+    games_per_worker=2,
 ):
     """
     Main training loop.
@@ -899,6 +1239,9 @@ def self_play_loop(
     print(f"  Iterations:    {iterations}")
     print(f"  Games/iter:    {games_per_iter:,}")
     print(f"  MCTS sims:     {num_simulations}")
+    print(f"  Inflight:      {target_inflight} (async scheduler)")
+    print(f"  Warmup:        {warmup_sims} sequential sims/search")
+    print(f"  Games/worker:  {games_per_worker} concurrent threads")
     print(f"  Buffer size:   {buffer_size:,}")
     print(f"  Sample size:   {sample_size:,}")
     print(f"  Train epochs:  {train_epochs}")
@@ -915,120 +1258,178 @@ def self_play_loop(
 
     replay_buffer = ReplayBuffer(max_size=buffer_size)
 
+    # ---- INFERENCE SERVER ----
+    # Owns the GPU during game generation. Stays alive across iterations
+    # so we don't pay model-load + CUDA-init overhead each time. Between
+    # iterations we send a control-queue message to reload weights.
+    #
+    # During training, the server is idle (workers aren't sending
+    # requests); its model occupies ~1MB of VRAM which is negligible
+    # next to ~300MB of training data on the same GPU.
+    server_device = device if device == 'cuda' else 'cpu'
+    server_manager = InferenceServerManager(
+        model_path=current_model_path,
+        device=server_device,
+        num_workers=num_workers,
+        mp_context=mp.get_context('spawn'),
+    )
+    print(f"\n  Starting inference server (device={server_device}, "
+          f"num_workers={num_workers})...")
+    server_manager.start()
+    # Give the server time to load the model + initialize CUDA. If we
+    # ship the first request before this is done it'll just wait, but
+    # explicit wait surfaces startup failures cleanly.
+    time.sleep(2.0)
+    if not server_manager.is_alive():
+        raise RuntimeError(
+            "Inference server failed to start. Check the model path "
+            "and CUDA availability."
+        )
+
     history  = []
     accepted = 0
     rejected = 0
 
-    for iteration in range(1, iterations + 1):
-        iter_start = time.time()
+    try:
+        for iteration in range(1, iterations + 1):
+            iter_start = time.time()
 
-        temp_mult = initial_temp_mult - (
-            (initial_temp_mult - final_temp_mult) *
-            (iteration - 1) / max(iterations - 1, 1)
-        )
-
-        print(f"\n{'─'*55}")
-        print(f"  Iteration {iteration}/{iterations} | "
-              f"Temp: {temp_mult:.2f} | "
-              f"Sims: {num_simulations} | "
-              f"Buffer: {replay_buffer.size():,}")
-        print(f"{'─'*55}")
-
-        # ---- STAGE 1: PARALLEL GAME GENERATION ----
-        print(f"\n  Generating {games_per_iter:,} MCTS games "
-              f"({num_simulations} sims/move, "
-              f"{num_workers} workers)...")
-        gen_start = time.time()
-
-        # Per-iteration seed ensures different games each iteration.
-        iter_seed = (int(time.time() * 1000) ^ (iteration * 2654435761)) & 0x7FFFFFFF
-
-        all_new_records = generate_games_parallel(
-            model_path=current_model_path,
-            num_games=games_per_iter,
-            num_simulations=num_simulations,
-            temp_mult=temp_mult,
-            num_workers=num_workers,
-            iteration_seed=iter_seed,
-        )
-
-        gen_time = time.time() - gen_start
-        print(f"  Generated {len(all_new_records):,} records "
-              f"in {gen_time:.1f}s "
-              f"({games_per_iter/max(gen_time, 1e-6):.2f} games/s)")
-
-        replay_buffer.add(all_new_records)
-        print(f"  Buffer: {replay_buffer.size():,} / {buffer_size:,}")
-
-        # ---- STAGE 2: TRAIN NEW MODEL ----
-        new_model = CantStopNet().to(device)
-        new_model.load_state_dict(current_model.state_dict())
-
-        val_loss = train_on_buffer(
-            new_model, replay_buffer, device,
-            epochs=train_epochs,
-            sample_size=sample_size,
-            lr=3e-5,
-        )
-
-        # ---- STAGE 3: EVALUATE (MCTS vs MCTS, parallel workers) ----
-        win_rate = evaluate_networks(
-            new_model,
-            old_model_path=current_model_path,
-            num_games=eval_games,
-            eval_sims=eval_sims,
-            num_workers=num_workers,
-            output_dir=output_dir,
-        )
-
-        iter_time = time.time() - iter_start
-
-        # ---- ACCEPT OR REJECT ----
-        if win_rate >= accept_floor:
-            print(f"\n  ✓ ACCEPTED ({win_rate:.1%} >= "
-                  f"{accept_floor:.0%})")
-            current_model = new_model
-
-            save_path = os.path.join(
-                output_dir,
-                f'model_iter_{iteration:03d}_accepted.pt'
+            temp_mult = initial_temp_mult - (
+                (initial_temp_mult - final_temp_mult) *
+                (iteration - 1) / max(iterations - 1, 1)
             )
-            checkpoint = {
+
+            print(f"\n{'─'*55}")
+            print(f"  Iteration {iteration}/{iterations} | "
+                  f"Temp: {temp_mult:.2f} | "
+                  f"Sims: {num_simulations} | "
+                  f"Buffer: {replay_buffer.size():,}")
+            print(f"{'─'*55}")
+
+            # ---- STAGE 0: SYNC INFERENCE SERVER ----
+            # Push the current model weights to the server. On iter 1
+            # the server already has them (loaded at start()), so this
+            # is a no-op cost (server reloads same file). From iter 2
+            # onward it picks up the latest accepted model.
+            server_manager.update_model(current_model_path)
+            # Small grace period for the server to pick up the new
+            # weights before workers send requests. The control queue
+            # is checked at the top of each server loop iteration; with
+            # SERVER_POLL_INTERVAL=50ms this is more than enough.
+            time.sleep(0.5)
+
+            # ---- STAGE 1: PARALLEL GAME GENERATION ----
+            print(f"\n  Generating {games_per_iter:,} MCTS games "
+                  f"({num_simulations} sims/move, "
+                  f"{num_workers} workers, GPU inference)...")
+            gen_start = time.time()
+
+            # Per-iteration seed ensures different games each iteration.
+            iter_seed = (int(time.time() * 1000) ^ (iteration * 2654435761)) & 0x7FFFFFFF
+
+            if not server_manager.is_alive():
+                raise RuntimeError(
+                    "Inference server died during training. "
+                    "Workers cannot generate games without it."
+                )
+
+            all_new_records = generate_games_parallel(
+                server_manager=server_manager,
+                num_games=games_per_iter,
+                num_simulations=num_simulations,
+                temp_mult=temp_mult,
+                num_workers=num_workers,
+                iteration_seed=iter_seed,
+                target_inflight=target_inflight,
+                warmup_sims=warmup_sims,
+                games_per_worker=games_per_worker,
+            )
+
+            gen_time = time.time() - gen_start
+            print(f"  Generated {len(all_new_records):,} records "
+                  f"in {gen_time:.1f}s "
+                  f"({games_per_iter/max(gen_time, 1e-6):.2f} games/s)")
+
+            replay_buffer.add(all_new_records)
+            print(f"  Buffer: {replay_buffer.size():,} / {buffer_size:,}")
+
+            # ---- STAGE 2: TRAIN NEW MODEL ----
+            new_model = CantStopNet().to(device)
+            new_model.load_state_dict(current_model.state_dict())
+
+            val_loss = train_on_buffer(
+                new_model, replay_buffer, device,
+                epochs=train_epochs,
+                sample_size=sample_size,
+                lr=3e-5,
+            )
+
+            # ---- STAGE 3: EVALUATE (MCTS vs MCTS, parallel workers) ----
+            # Eval continues to use CPU MCTS for both new and old models.
+            # The server only holds one model at a time and eval needs
+            # both simultaneously; spinning up a second GPU server isn't
+            # worth the complexity for this size of game.
+            win_rate = evaluate_networks(
+                new_model,
+                old_model_path=current_model_path,
+                num_games=eval_games,
+                eval_sims=eval_sims,
+                num_workers=num_workers,
+                output_dir=output_dir,
+            )
+
+            iter_time = time.time() - iter_start
+
+            # ---- ACCEPT OR REJECT ----
+            if win_rate >= accept_floor:
+                print(f"\n  ✓ ACCEPTED ({win_rate:.1%} >= "
+                      f"{accept_floor:.0%})")
+                current_model = new_model
+
+                save_path = os.path.join(
+                    output_dir,
+                    f'model_iter_{iteration:03d}_accepted.pt'
+                )
+                checkpoint = {
+                    'iteration':   iteration,
+                    'win_rate':    float(win_rate),
+                    'val_loss':    float(val_loss),
+                    'temp_mult':   float(temp_mult),
+                    'model_state': new_model.state_dict(),
+                }
+                torch.save(checkpoint, save_path)
+
+                # ALSO save to the stable best_model.pt path, so the
+                # strongest accepted model is always at a known location
+                # regardless of crashes or stops.
+                torch.save(checkpoint, best_model_path)
+
+                current_model_path = save_path  # workers use new model
+                accepted += 1
+                print(f"  Saved iteration checkpoint: {save_path}")
+                print(f"  Updated best model:         {best_model_path}")
+
+            else:
+                print(f"\n  ✗ REJECTED ({win_rate:.1%} < "
+                      f"{accept_floor:.0%}) — keeping current model")
+                rejected += 1
+
+            history.append({
                 'iteration':   iteration,
                 'win_rate':    float(win_rate),
                 'val_loss':    float(val_loss),
                 'temp_mult':   float(temp_mult),
-                'model_state': new_model.state_dict(),
-            }
-            torch.save(checkpoint, save_path)
+                'buffer_size': replay_buffer.size(),
+                'accepted':    bool(win_rate >= accept_floor),
+                'time':        float(iter_time),
+            })
 
-            # ALSO save to the stable best_model.pt path, so the
-            # strongest accepted model is always at a known location
-            # regardless of crashes or stops.
-            torch.save(checkpoint, best_model_path)
-
-            current_model_path = save_path  # workers use new model
-            accepted += 1
-            print(f"  Saved iteration checkpoint: {save_path}")
-            print(f"  Updated best model:         {best_model_path}")
-
-        else:
-            print(f"\n  ✗ REJECTED ({win_rate:.1%} < "
-                  f"{accept_floor:.0%}) — keeping current model")
-            rejected += 1
-
-        history.append({
-            'iteration':   iteration,
-            'win_rate':    float(win_rate),
-            'val_loss':    float(val_loss),
-            'temp_mult':   float(temp_mult),
-            'buffer_size': replay_buffer.size(),
-            'accepted':    bool(win_rate >= accept_floor),
-            'time':        float(iter_time),
-        })
-
-        print(f"\n  Time: {iter_time:.1f}s | "
-              f"Accepted: {accepted} | Rejected: {rejected}")
+            print(f"\n  Time: {iter_time:.1f}s | "
+                  f"Accepted: {accepted} | Rejected: {rejected}")
+    finally:
+        # Always stop the server, even if an iteration raised.
+        print("\n  Stopping inference server...")
+        server_manager.stop()
 
     # ---- SUMMARY ----
     print(f"\n{'='*55}")
@@ -1086,6 +1487,28 @@ if __name__ == "__main__":
     parser.add_argument("--temp_end",   type=float, default=0.7)
     parser.add_argument("--workers",    type=int,   default=None)
     parser.add_argument("--device",     type=str,   default=None)
+    parser.add_argument("--inflight",   type=int,   default=16,
+                        help="Concurrent in-flight MCTS sims per "
+                             "worker in the async scheduler. Default "
+                             "16. Higher values give bigger GPU "
+                             "batches but worse training signal "
+                             "without proportionally more warmup. "
+                             "Set to 1 to force the legacy sync path.")
+    parser.add_argument("--warmup",     type=int,   default=16,
+                        help="Sequential warmup sims at the start of "
+                             "each MCTS search. Default 16. Required "
+                             "for usable training targets when "
+                             "--inflight > 1 — covers the worst-case "
+                             "branching factor at the root.")
+    parser.add_argument("--games-per-worker", type=int, default=2,
+                        dest="games_per_worker",
+                        help="Concurrent games per worker process "
+                             "(threads sharing one inference client). "
+                             "Default 2. When >1, threads cover each "
+                             "others' inference waits — recovers the "
+                             "78%% of wall time previously spent "
+                             "blocked. Set to 1 for the legacy single-"
+                             "threaded behavior.")
     args = parser.parse_args()
 
     self_play_loop(
@@ -1104,4 +1527,7 @@ if __name__ == "__main__":
         final_temp_mult=args.temp_end,
         num_workers=args.workers,
         device=args.device,
+        target_inflight=args.inflight,
+        warmup_sims=args.warmup,
+        games_per_worker=args.games_per_worker,
     )

@@ -1,0 +1,188 @@
+Building feature extraction tables... Building feature extraction tables... done.
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] started on device=cuda, initial model=models\cantstop\self_play\model_iter_003_accepted.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] model updated from models\cantstop\self_play\model_iter_003_accepted.pt
+Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+done.
+Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... Building feature extraction tables... done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+done.
+Loaded model from models/cantstop/self_play\_eval_new_tmp.pt
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+[inference-server] shutdown. 41299 batches, 379951 requests, avg batch=9.2, 202 batches/s, 204.7s wall
+done.
+
+=======================================================
+  Can't Stop MCTS Self-Play
+=======================================================
+  Device:        cuda
+  GPU:           NVIDIA GeForce RTX 3070 Laptop GPU
+  Workers:       16 (CPU)
+  Iterations:    1
+  Games/iter:    200
+  MCTS sims:     200
+  Inflight:      16 (async scheduler)
+  Warmup:        16 sequential sims/search
+  Buffer size:   200,000
+  Sample size:   100,000
+  Train epochs:  5
+  Eval games:    100 @ 20 sims (CPU MCTS)
+  Accept floor:  50%
+=======================================================
+
+Loaded model from models\cantstop\self_play\model_iter_003_accepted.pt
+  Self-play iteration: 3
+  Win rate: 51.0%
+  Val loss: 1.7866
+
+  Starting inference server (device=cuda, num_workers=16)...
+
+───────────────────────────────────────────────────────
+  Iteration 1/1 | Temp: 1.00 | Sims: 200 | Buffer: 0
+───────────────────────────────────────────────────────
+
+  Generating 200 MCTS games (200 sims/move, 16 workers, GPU inference)...
+  Generated 13,234 records in 140.7s (1.42 games/s)
+  Buffer: 13,234 / 200,000
+
+  Training on 11,873 records (val: 1,361 | buffer: 13,234) for 5 epochs [on-device]...
+    Epoch 1/5 | Train: 1.8613 | Val: 1.8539 | Policy match (vs MCTS argmax): 0.773 | Entropy: 1.300
+    Epoch 2/5 | Train: 1.8518 | Val: 1.8537 | Policy match (vs MCTS argmax): 0.782 | Entropy: 1.301
+    Epoch 3/5 | Train: 1.8466 | Val: 1.8548 | Policy match (vs MCTS argmax): 0.782 | Entropy: 1.305
+    Epoch 4/5 | Train: 1.8425 | Val: 1.8584 | Policy match (vs MCTS argmax): 0.780 | Entropy: 1.303
+    Epoch 5/5 | Train: 1.8392 | Val: 1.8602 | Policy match (vs MCTS argmax): 0.780 | Entropy: 1.304
+
+  Evaluating new vs old (100 MCTS games @ 20 sims, 16 workers)...
+  Eval done in 60.6s (1.6 games/s aggregate)
+  New model: 41/100 (41.0%)  draws: 0
+  Old model: 59/100 (59.0%)
+
+  ✗ REJECTED (41.0% < 50%) — keeping current model
+
+  Time: 204.7s | Accepted: 0 | Rejected: 1
+
+  Stopping inference server...
+
+=======================================================
+  MCTS Self-Play Complete!
+  Iterations: 1
+  Accepted:   0
+  Rejected:   1
+
+  Win rate progression:
+    Iter  1: 41.0% ✗ (205s)
+=======================================================
+
+  Final model: models/cantstop/self_play\final_20260513_184648.pt
+  Best model:  models/cantstop/self_play\best_model.pt

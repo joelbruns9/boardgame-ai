@@ -147,7 +147,7 @@ def generate_training_data(
 ):
     """Generate training data using all available CPU cores."""
     if workers is None:
-        workers = mp.cpu_count()
+        workers = min(mp.cpu_count() // 2, 8)  # physical cores
 
     if output_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -181,48 +181,56 @@ def generate_training_data(
     ]
 
     total_records = 0
-    total_games = 0
-    start_time = time.time()
-    write_buffer = []
+    total_games   = 0
+    start_time    = time.time()
+    write_buffer  = []
 
     with open(output_path, 'w') as f:
         with mp.Pool(workers, initializer=worker_init) as pool:
 
-            for batch_records in pool.imap_unordered(
-                worker_generate_batch,
-                batch_args,
-                chunksize=1
-            ):
-                for record in batch_records:
-                    write_buffer.append(json.dumps(record))
-                    total_records += 1
+            # Submit batches in chunks to limit memory usage
+            # Only keep workers*4 batches in flight at once
+            chunk_size = workers * 4
+            batch_idx  = 0
 
-                total_games += batch_size
+            while total_records < target_records and batch_idx < len(batch_args):
+                # Submit next chunk of batches
+                chunk = batch_args[batch_idx:batch_idx + chunk_size]
+                batch_idx += chunk_size
 
-                # Flush buffer when full
-                if len(write_buffer) >= BUFFER_SIZE:
-                    f.write('\n'.join(write_buffer) + '\n')
-                    write_buffer.clear()
+                for batch_records in pool.imap_unordered(
+                    worker_generate_batch, chunk, chunksize=1
+                ):
+                    for record in batch_records:
+                        write_buffer.append(json.dumps(record))
+                        total_records += 1
 
-                # Progress update
-                elapsed = time.time() - start_time
-                rate = total_records / elapsed if elapsed > 0 else 0
-                eta = (target_records - total_records) / rate / 3600 \
-                    if rate > 0 else 0
-                pct = 100 * total_records / target_records
+                    total_games += batch_size
 
-                print(
-                    f"\r  Records: {total_records:>8,} / {target_records:,}"
-                    f"  ({pct:.1f}%)"
-                    f"  Rate: {rate:,.0f}/s"
-                    f"  ETA: {eta:.1f}h",
-                    end="", flush=True
-                )
+                    if len(write_buffer) >= BUFFER_SIZE:
+                        f.write('\n'.join(write_buffer) + '\n')
+                        write_buffer.clear()
+
+                    elapsed = time.time() - start_time
+                    rate    = total_records / elapsed if elapsed > 0 else 0
+                    eta     = (target_records - total_records) / rate / 3600 \
+                              if rate > 0 else 0
+                    pct     = 100 * total_records / target_records
+
+                    print(
+                        f"\r  Records: {total_records:>8,} / {target_records:,}"
+                        f"  ({pct:.1f}%)"
+                        f"  Rate: {rate:,.0f}/s"
+                        f"  ETA: {eta:.1f}h",
+                        end="", flush=True
+                    )
+
+                    if total_records >= target_records:
+                        break
 
                 if total_records >= target_records:
                     break
 
-        # Flush remaining buffer
         if write_buffer:
             f.write('\n'.join(write_buffer) + '\n')
 
@@ -258,9 +266,9 @@ def quick_test():
     for key, val in sample.items():
         print(f"    {key}: {val}")
 
-    workers = mp.cpu_count()
+    workers = min(mp.cpu_count() // 2, 8)
     estimated = len(records) / elapsed * workers * 3600 * 8
-    print(f"\n  Estimated records in 8 hours ({workers} cores): {int(estimated):,}")
+    print(f"\n  Estimated records in 8 hours ({workers} workers): {int(estimated):,}")
 
 
 # ---- ENTRY POINT ----
