@@ -1,5 +1,5 @@
 name,path,channels,blocks,bilinear_dim,fixed_rating,is_anchor,is_active
-local_cont_iter100,checkpoints_ol_local_cont/iter_0100.pt,32,4,64,875.73,True,True
-local_cont_iter070,checkpoints_ol_local_cont/iter_0070.pt,32,4,64,780.78,True,True
-cloud_iter100,checkpoints_ol_cloud/iter_0100.pt,32,4,64,509.56,True,True
+local_cont_iter100,runs/kingdomino/checkpoints_ol_local_cont/iter_0100.pt,32,4,64,875.73,True,True
+local_cont_iter070,runs/kingdomino/checkpoints_ol_local_cont/iter_0070.pt,32,4,64,780.78,True,False
+cloud_iter100,runs/kingdomino/checkpoints_ol_cloud/iter_0100.pt,32,4,64,509.56,True,True
 greedy_bot,GREEDY_BOT,0,0,0,0.00,True,False
