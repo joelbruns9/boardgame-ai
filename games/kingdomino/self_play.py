@@ -1,0 +1,2310 @@
+"""
+self_play.py — serial AlphaZero self-play training for 2-player Kingdomino.
+
+This is the correctness-first build (Session 1 of the plan): a single-process
+loop that generates self-play games, trains both heads, and benchmarks
+progress.  It is deliberately serial — slow but easy to verify.  The throughput
+layer (batched inference server + multi-process workers) is added later and
+must reproduce this version's data given the same seeds.
+
+THE LOOP (one iteration):
+  1. Self-play: the current network drives MCTS to play games.  Engine
+     'python' uses AlphaZeroMCTS+PIMC (closed-loop); 'open_loop' uses
+     OpenLoopMCTS (resamples deck order per simulation, no outer PIMC loop).
+     For each move we store (encoded public state, MCTS visit policy, legal
+     mask, current actor); at game end every stored position is labelled with
+     the terminal outcome z from its actor's perspective.
+  2. Train: sample batches from the replay buffer (with on-the-fly D4
+     augmentation) and minimise value MSE + masked policy cross-entropy.
+  3. Benchmark + checkpoint: play the new network against a baseline to track
+     progress, and save the weights.
+
+KEY CORRECTNESS POINTS:
+  - Imperfect information: run_pimc redeterminizes the hidden deck INSIDE the
+    search; the stored training state is the PUBLIC state, encoded info-set
+    safe (encoder never reads deck order).  No determinized world leaks out.
+  - Perspective: value target and the encoder share the current-actor frame;
+    the policy target indices come from encode_action in the same frame as the
+    policy head's output, so target and prediction align.
+  - Masked policy loss: the softmax denominator covers LEGAL actions only,
+    matching how priors are extracted at inference.  The legal mask is stored
+    and augmented by the SAME D4 element as the policy, so they stay consistent
+    under rotation/flip.
+
+DOES NOT IMPORT evaluation.py.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from games.kingdomino.game import GameState, Phase, determine_winner
+from games.kingdomino.encoder import (
+    encode_state, compute_target_z,
+    compute_target_own_score, compute_target_opponent_score, compute_target_win,
+)
+from games.kingdomino.action_codec import encode_action, decode_action, NUM_JOINT_ACTIONS
+from games.kingdomino.augmentation import (
+    augment, augment_mask, NUM_D4_TRANSFORMS,
+    _D4_ELEMENTS, _transform_spatial, _transform_policy,
+)
+from games.kingdomino.network import KingdominoNet, masked_log_softmax
+from games.kingdomino.mcts_az import (
+    AlphaZeroMCTS, OpenLoopMCTS,
+    make_serial_evaluator, make_batched_evaluator,
+    run_pimc, run_pimc_open_loop,
+    visit_counts_to_policy, select_move,
+)
+# Module alias so make_rust_evaluator reads MARGIN_GAIN/ALPHA at call time —
+# the run_self_play_training / worker-init override (mcts_az.MARGIN_GAIN =
+# cfg.margin_gain) mutates this same module object, so the override propagates.
+import games.kingdomino.mcts_az as _mcts_az
+from games.kingdomino.bots import GreedyBot
+
+
+# ─── 1. Configuration ─────────────────────────────────────────────────────
+@dataclass
+class SelfPlayConfig:
+    """Self-play training config.
+
+    CLOUD RUN (Phase 5) rationale — the settled launch settings and WHY:
+      - sims=800: target quality regime (visit targets sharpen meaningfully
+        between 200 and 800; this is where open-loop's averaging over futures
+        matters).
+      - batch_slots=32, leaf_batch=6: confirmed optimal by a sweep on the 3070
+        (32ch/4b, sims=100, 64 games): games/s peaked at bs=32 (4.12) and FELL
+        on either side (16:3.42, 24:3.46, 48:3.93, 64:3.83) — at bs=32 the GPU
+        forward is already ~88% filled and compute-bound, so larger batches add
+        per-tick latency + CPU tree work with no gain.  (games_per_iter=50 also
+        caps usable slots at ~50.)  inference_amp left OFF: fp16 autocast was a
+        0.74x SLOWDOWN here (1.22→0.90 games/s) — the net is small enough to be
+        latency-bound, so the fp16 cast overhead exceeds any compute saving.
+      - leaf-eval D2H readback is f32 (make_rust_evaluator .float(), Rust widens
+        to f64 on entry): halves the K×3390 logit transfer; tree math stays f64.
+      - alpha=0.8: margin-dominant leaf value (plan §1.4).
+      - lambda_score=0.5, lambda_w=0.25: start low; policy is the core signal.
+      - buffer_capacity=100_000: 50 iters × 50 games × ~80 positions ≈ 200k
+        total; the 100k cap holds roughly the most recent ~25 iterations.
+      - min_buffer_to_train=5_000: at ~4000 positions/iter, training starts
+        after iter 2.
+      - engine='batched_open_loop' with workers=1: a single Rust BatchedMCTS;
+        parallelism comes from batch_slots, NOT workers (a hard constraint).
+    """
+    # network
+    channels: int = 96
+    blocks: int = 8
+    bilinear_dim: int = 64
+    # search
+    n_simulations: int = 100
+    n_determinizations: int = 1   # PIMC worlds sampled per move
+    leaf_batch: int = 1           # leaf-parallel batch for self-play search
+                                  # (1 = serial; >1 validated via policy_compare)
+    batch_slots: int = 32         # concurrent slots for --engine batched
+    c_puct: float = 1.5
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.25
+    fpu: float = 0.0              # first-play-urgency value for unvisited children
+    virtual_loss: int = 1        # leaf-parallel / batched virtual loss magnitude
+    allow_tf32: bool = True       # speed up CUDA float32 conv/linear inference
+    inference_amp: bool = False   # optional autocast for self-play inference
+    eval_pad_to_batch: int = 0     # pad inference batches to fixed size (CUDA graphs)
+    pin_transfer: bool = False     # stage evaluator inputs in pinned host memory
+    profile_eval_timing: bool = False
+    temp_moves: int = 20          # sample ∝ visits for this many plies, then greedy
+    # replay buffer
+    buffer_capacity: int = 50_000
+    # training
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    batch_size: int = 256
+    # Threads for ReplayBuffer.sample_batch densify+augment.  Default 1 (serial):
+    # the per-example work is dominated by small GIL-held numpy ops, and the
+    # GIL-free Rust augment is too short to overlap — measured threading REGRESSES
+    # this workload ~2x (see ReplayBuffer.sample_batch).  The real speedup came
+    # from moving augment_mask into Rust (~1.8x serial).  Kept configurable for
+    # platforms/workloads where threading may help.
+    sample_workers: int = 1
+    value_weight: float = 1.0
+    policy_weight: float = 1.0
+    lambda_score: float = 0.5     # weight on own + opp score MSE losses
+    lambda_w: float = 0.25        # weight on win BCE loss
+    score_scale: float = 100.0    # normalization divisor for score heads
+    grad_clip: float = 1.0        # max global grad norm; <=0 disables clipping
+    augment: bool = True
+    # Leaf-value mix (open-loop / batched_open_loop): leaf_value =
+    #   alpha * tanh((own_norm - opp_norm) * margin_gain) + (1-alpha)*(2*win-1).
+    # These override the module-level mcts_az.MARGIN_GAIN / mcts_az.ALPHA at the
+    # top of run_self_play_training, and are saved in the checkpoint config so an
+    # old checkpoint's leaf-value formula is recoverable.  alpha=0.8 is the
+    # margin-dominant cloud setting (plan §1.4); mcts_az's own default is 0.5.
+    margin_gain: float = 2.0
+    alpha: float = 0.8
+    # loop
+    n_iterations: int = 40
+    games_per_iteration: int = 50
+    train_steps_per_iteration: int = 200
+    min_buffer_to_train: int = 2_000   # don't train until the buffer has warmed up
+    # benchmark
+    benchmark_every: int = 1
+    benchmark_seeds: int = 10
+    benchmark_sims: int = 50
+    benchmark_determinizations: Optional[int] = None  # None → reuse n_determinizations
+    # Elo rating integration (Phase 2).  Periodic rating of saved checkpoints
+    # against the anchor pool via elo_rating.py.  Optional — a missing
+    # elo_rating.py or anchors file degrades to a no-op, never crashing training.
+    elo_every: int = 0              # rate checkpoint every N iters (0 = disabled)
+    elo_anchors: str = ""           # path to elo_anchors.csv (default: auto-find)
+    elo_db: str = ""                # path to elo_db.json (default: auto-find)
+    elo_games_log: str = ""         # path to elo_games.jsonl (default: auto-find)
+    elo_sims: int = 400             # sims for rating games
+    elo_games_per_anchor: int = 20  # paired seeds per anchor (40 games each)
+    # io / misc
+    device: str = "cpu"
+    seed: int = 0
+    warm_start_path: Optional[str] = None
+    checkpoint_dir: Optional[str] = None
+    # Replay-buffer persistence (see ReplayBuffer.save / .load).
+    save_buffer: str = ""
+    # Path to save the final replay buffer after training completes (also saved
+    # on KeyboardInterrupt).  Empty string = don't save.  Not auto-derived from
+    # checkpoint_dir — must be requested explicitly so a multi-GB pickle is never
+    # written by surprise.  Example: checkpoints_ol_local_cont/buffer_final.pkl
+    warm_buffer: str = ""
+    # Path to a previously saved buffer to load before iteration 1.  Empty string
+    # = start with an empty buffer.  Only meaningful alongside --warm_start (the
+    # network weights should match the policy that produced the buffer).
+    warm_buffer_max_staleness: int = 200
+    # Discard examples older than this many iterations when loading warm_buffer.
+    # Default 200 is permissive — keeps everything in a typical run.  Set lower
+    # (e.g. 50) to drop very old examples from a much weaker policy.
+    # Per-iteration structured log (JSON Lines).  If None, auto-derive from
+    # checkpoint_dir ({checkpoint_dir}/training_log.jsonl) or, if that is also
+    # None, ./training_log_{timestamp}.jsonl.  Always appended, so resuming a
+    # run continues the same log.
+    log_path: Optional[str] = None
+    # engine: "python"    = AlphaZeroMCTS + PIMC (closed-loop, oracle);
+    #         "open_loop" = OpenLoopMCTS (open-loop, averages over deck
+    #                       orders internally; n_determinizations ignored);
+    #         "rust"      = RustMCTS (in-process leaf-eval callback, no IPC server);
+    #         "batched"   = one Rust BatchedMCTS driving batch_slots games.
+    engine: str = "python"
+    # Item 20: wrap the INFERENCE net (make_rust_evaluator) with torch.compile on
+    # CUDA.  Inference-only — never the training net.  Off by default (A/B flag).
+    compile_net: bool = False
+    # Item 19: prefetch the next training batch on a background thread while the
+    # GPU runs train_step on the current one.  Off by default (A/B flag).
+    prefetch_batches: bool = False
+    # Item 17: run two BatchedMCTS instances over disjoint halves of the game
+    # batch, overlapping one's CPU tree work with the other's GPU forward.  Only
+    # for engine=batched / batched_open_loop.  Off by default (A/B flag).
+    double_buffer: bool = False
+
+
+# ─── 2. Replay buffer ─────────────────────────────────────────────────────
+@dataclass
+class Example:
+    """One training example.  Boards/flat stored as float16 to halve memory
+    (their values — one-hot, small fractions — lose nothing meaningful); the
+    policy target and legal mask are stored sparse since both are far smaller
+    than their dense 3390-wide form."""
+    my_board: np.ndarray    # float16 (9, 13, 13)
+    opp_board: np.ndarray   # float16 (9, 13, 13)
+    flat: np.ndarray        # float16 (261,)
+    policy_idx: np.ndarray  # int32 — non-zero policy indices
+    policy_val: np.ndarray  # float32 — corresponding visit-proportional mass
+    legal_idx: np.ndarray   # int32 — all legal joint indices (⊇ policy_idx)
+    z: float                # value target in [-1, 1], current-actor frame
+    own_score: float        # raw own final score (un-normalized), this actor's view
+    opp_score: float        # raw opponent final score (un-normalized), this actor's view
+    win_target: float       # 1.0 win / 0.5 draw / 0.0 loss, this actor's view
+    # Training iteration that generated this example.  Used by
+    # ReplayBuffer.mean_age to track buffer staleness.  Defaults to 0 so any
+    # construction site that misses the kwarg yields a (stale) age reading
+    # rather than crashing.
+    iteration: int = 0
+
+
+def configure_torch_performance(cfg: SelfPlayConfig) -> None:
+    """Set CUDA matmul/convolution knobs used by self-play inference."""
+    if not str(cfg.device).startswith("cuda"):
+        return
+    torch.backends.cuda.matmul.allow_tf32 = bool(cfg.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(cfg.allow_tf32)
+    if cfg.allow_tf32 and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
+def _apply_augment(mb: np.ndarray, ob: np.ndarray, flat: np.ndarray,
+                   policy: np.ndarray, t_id: int):
+    """Apply a D4 transform to the array components only (the scalar targets are
+    rotation-invariant and handled by the caller).  Uses the Rust d4_augment when
+    available — it releases the GIL, so this is the part that actually runs in
+    parallel across sample_batch worker threads — and falls back to the numpy
+    path otherwise.  Bit-identical to augmentation.augment() for the arrays."""
+    try:
+        from kingdomino_rust import d4_augment as _rd4
+        return _rd4(mb, ob, flat, policy, int(t_id))
+    except ImportError:
+        k, flip, dp = _D4_ELEMENTS[t_id]
+        return (_transform_spatial(mb, k, flip),
+                _transform_spatial(ob, k, flip),
+                flat.copy(),
+                _transform_policy(policy, k, flip, dp))
+
+
+class ReplayBuffer:
+    """Fixed-capacity ring buffer with O(1) random access for sampling."""
+    def __init__(self, capacity: int, n_sample_workers: int = 1):
+        self.capacity = capacity
+        self.data: List[Example] = []
+        self._pos = 0
+        # Persistent thread pool reused across every sample_batch call (creating
+        # one per call would swamp the per-batch work with pool-startup cost at
+        # ~200 batches/iteration).  None => serial (n_sample_workers <= 1).
+        self._n_workers = int(n_sample_workers)
+        self._pool = (ThreadPoolExecutor(max_workers=self._n_workers)
+                      if self._n_workers > 1 else None)
+
+    def close(self) -> None:
+        """Shut down the sample-batch thread pool.  Call at training end."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Pickle the buffer contents to disk.
+
+        Only the ring-buffer state ('data', 'pos', 'capacity') is written —
+        the ThreadPoolExecutor (_pool) is intentionally NOT pickled; it is
+        reconstructed fresh in __init__ on load.  The write goes to a temp
+        file that is atomically renamed into place, so a crash mid-write
+        cannot leave a half-written buffer behind.
+        """
+        import pickle
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'data': self.data,
+            'pos': self._pos,
+            'capacity': self.capacity,
+        }
+        tmp = out.with_suffix('.tmp')
+        with open(tmp, 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(out)  # atomic replace — no half-written file on crash
+        print(f"Buffer saved: {len(self.data)} examples -> {out}")
+
+    def load(self, path: Union[str, Path], *,
+             current_iteration: int = 0,
+             max_staleness: Optional[int] = None) -> int:
+        """Load buffer contents from disk.  Returns number of examples loaded.
+
+        max_staleness: if set, discard examples where
+            current_iteration - example.iteration > max_staleness.
+        This prevents loading very old examples from a much weaker policy.
+        """
+        import pickle
+        with open(path, 'rb') as f:
+            payload = pickle.load(f)
+        examples = payload['data']
+        if max_staleness is not None:
+            before = len(examples)
+            examples = [
+                e for e in examples
+                if current_iteration - e.iteration <= max_staleness
+            ]
+            dropped = before - len(examples)
+            if dropped:
+                print(f"Buffer load: dropped {dropped} stale examples "
+                      f"(staleness > {max_staleness})")
+        # Respect current buffer capacity — truncate if saved buffer was larger
+        if len(examples) > self.capacity:
+            examples = examples[-self.capacity:]
+        self.data = list(examples)
+        self._pos = payload.get('pos', 0) % max(1, len(self.data))
+        print(f"Buffer loaded: {len(self.data)} examples from {path}")
+        return len(self.data)
+
+    def add(self, examples: List[Example]) -> None:
+        for ex in examples:
+            if len(self.data) < self.capacity:
+                self.data.append(ex)
+            else:
+                self.data[self._pos] = ex
+                self._pos = (self._pos + 1) % self.capacity
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def mean_age(self, current_iteration: int) -> float:
+        """Mean iteration age of examples in the buffer.
+
+        Each Example stores the iteration it was generated in;
+        mean_age = current_iteration - mean(example.iteration).  Rising age
+        means the buffer holds increasingly stale self-play data.  Returns 0.0
+        if the buffer is empty.
+        """
+        if not self.data:
+            return 0.0
+        return current_iteration - float(
+            np.mean([ex.iteration for ex in self.data])
+        )
+
+    def sample_batch(self, batch_size: int, rng: np.random.Generator,
+                     device: str = "cpu", augment_d4: bool = True):
+        """Return a training batch as tensors:
+        (my_board, opp_board, flat, policy, legal_mask, z,
+         own_score, opp_score, win_target).
+        Each example is densified and (optionally) given a random D4 transform.
+        own_score/opp_score are raw (un-normalized); win_target is 1/0.5/0.
+
+        The per-example densify + cast + augment work is independent across
+        examples and (via Rust d4_augment, which drops the GIL) parallelisable, so
+        it is dispatched over a persistent thread pool when n_sample_workers > 1.
+        ALL rng draws happen up front in this (main) thread — np.random.Generator
+        is not thread-safe — and the only torch / .to(device) calls happen here in
+        the main thread AFTER the pool returns (CUDA contexts are per-thread; the
+        workers touch CPU numpy only).
+        """
+        # Pre-draw every random choice in the main thread (rng is not thread-safe).
+        idxs = rng.integers(0, len(self.data), size=batch_size)
+        t_ids = (rng.integers(0, NUM_D4_TRANSFORMS, size=batch_size)
+                 if augment_d4 else None)
+
+        def _process_one(args):
+            buf_idx, t_id = args
+            ex = self.data[int(buf_idx)]
+            policy = np.zeros(NUM_JOINT_ACTIONS, dtype=np.float32)
+            policy[ex.policy_idx] = ex.policy_val
+            mask = np.zeros(NUM_JOINT_ACTIONS, dtype=bool)
+            mask[ex.legal_idx] = True
+            mb = ex.my_board.astype(np.float32)
+            ob = ex.opp_board.astype(np.float32)
+            flat = ex.flat.astype(np.float32)
+            z = float(ex.z)
+            own_score = float(ex.own_score)
+            opp_score = float(ex.opp_score)
+            win_tgt = float(ex.win_target)
+            if t_id is not None:
+                # d4_augment (Rust) releases the GIL — true parallelism here.  The
+                # three scalar targets are rotation-invariant (augmentation
+                # contract 7), so they pass through unchanged.
+                mb, ob, flat, policy = _apply_augment(mb, ob, flat, policy, int(t_id))
+                mask = augment_mask(mask, int(t_id))
+            return mb, ob, flat, policy, mask, z, own_score, opp_score, win_tgt
+
+        args = [(idxs[i], int(t_ids[i]) if t_ids is not None else None)
+                for i in range(batch_size)]
+        if self._pool is not None and batch_size > 1:
+            # chunksize matters: 256 individually-submitted tasks would drown the
+            # ~40µs/example work in per-future dispatch overhead.  Hand each worker
+            # a contiguous block (a few chunks per worker for light load-balancing)
+            # so the GIL-free Rust augment work actually overlaps across threads.
+            chunk = max(1, batch_size // (self._n_workers * 4))
+            results = list(self._pool.map(_process_one, args, chunksize=chunk))
+        else:
+            results = [_process_one(a) for a in args]
+
+        mbs, obs, flats, pols, masks = [], [], [], [], []
+        zs, own_ss, opp_ss, win_ts = [], [], [], []
+        for mb, ob, flat, pol, mask, z, own_s, opp_s, win_t in results:
+            mbs.append(mb); obs.append(ob); flats.append(flat)
+            pols.append(pol); masks.append(mask); zs.append(z)
+            own_ss.append(own_s); opp_ss.append(opp_s); win_ts.append(win_t)
+
+        # torch / device transfers only here, in the main thread.
+        to = lambda arr: torch.from_numpy(np.stack(arr)).to(device)
+        f32 = lambda vals: torch.tensor(vals, dtype=torch.float32, device=device)
+        return (
+            to(mbs).float(), to(obs).float(), to(flats).float(),
+            to(pols).float(),
+            torch.from_numpy(np.stack(masks)).to(device),       # bool
+            f32(zs),
+            f32(own_ss), f32(opp_ss), f32(win_ts),
+        )
+
+
+# ─── 3. Self-play game generation ─────────────────────────────────────────
+def _game_rngs(game_seed: int) -> Tuple[random.Random, np.random.Generator]:
+    """Derive the (py_rng, np_rng) for one self-play game purely from its seed.
+
+    A game's entire output (determinizations, root Dirichlet noise, stochastic
+    move selection) must be a deterministic function of game_seed ALONE — not of
+    shared mutable RNG state or which worker/iteration ran it.  That property is
+    what lets the parallel loop reproduce the serial loop exactly (see
+    correctness_oracle).  It also makes self-play data independent of execution
+    order, which is good for reproducibility and debugging regardless.
+
+    The two streams are seeded from independently-mixed derivations of game_seed
+    (via SeedSequence) so the Python and NumPy generators don't share low-bit
+    structure.
+    """
+    ss = np.random.SeedSequence(game_seed)
+    py_seed, np_seed = (int(x) for x in ss.generate_state(2, dtype=np.uint64))
+    return random.Random(py_seed), np.random.default_rng(np_seed)
+
+
+def _temperature(move_num: int, temp_moves: int) -> float:
+    """τ=1 (sample ∝ visits) for the first `temp_moves` plies, then greedy."""
+    return 1.0 if move_num < temp_moves else 0.0
+
+
+def play_selfplay_game(
+    mcts: Union[AlphaZeroMCTS, OpenLoopMCTS],
+    *,
+    n_determinizations: int,
+    temp_moves: int,
+    seed: int,
+    py_rng: random.Random,
+    np_rng: np.random.Generator,
+    leaf_batch: int = 1,
+    open_loop: bool = False,
+    iteration: int = 0,
+) -> Tuple[List[Example], Tuple[int, int]]:
+    """Play one self-play game; return (training examples, final scores).
+
+    `leaf_batch` is forwarded to each search (see AlphaZeroMCTS.search):
+    leaf_batch=1 is the serial reference; >1 batches leaf evaluations with
+    virtual loss for throughput.  The MCTS must carry a batched_evaluator for
+    leaf_batch>1 to give a GPU-feed win (otherwise it loops the single one).
+
+    When `open_loop` is True, `mcts` is an OpenLoopMCTS and the search routes
+    through run_pimc_open_loop instead: it resamples the deck per simulation and
+    averages internally, so n_determinizations and leaf_batch are not used (the
+    outer PIMC loop is redundant).  The Example format produced is identical, so
+    all downstream plumbing (buffer, train_step, augmentation) is unchanged.
+    """
+    state = GameState.new(seed=seed)
+    records = []  # (mb, ob, flat, policy_idx, policy_val, legal_idx, actor)
+    move_num = 0
+
+    while state.phase != Phase.GAME_OVER:
+        # Root Dirichlet noise on every self-play move (standard AlphaZero).
+        if open_loop:
+            # Open-loop averages over deck orders internally (one fresh
+            # determinization per simulation); no outer PIMC loop.  It derives
+            # its own Python RNG from np_rng, so py_rng / n_determinizations /
+            # leaf_batch are intentionally not passed here.
+            visit_counts, _ = run_pimc_open_loop(
+                mcts, state, add_noise=True, rng=np_rng,
+            )
+        else:
+            visit_counts, _ = run_pimc(
+                mcts, state, py_rng,
+                n_determinizations=n_determinizations,
+                add_noise=True, np_rng=np_rng,
+                leaf_batch=leaf_batch,
+            )
+        # Training target is the visit distribution itself (τ=1), independent
+        # of the selection temperature below.
+        policy = visit_counts_to_policy(visit_counts, state, temperature=1.0)
+
+        actor = state.current_actor
+        mb, ob, flat = encode_state(state, actor)            # PUBLIC, info-set safe
+        legal = state.legal_actions()
+        legal_idx = np.fromiter((encode_action(a, state) for a in legal),
+                                dtype=np.int32, count=len(legal))
+        pidx = np.nonzero(policy)[0].astype(np.int32)
+        pval = policy[pidx].astype(np.float32)
+        records.append((
+            mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
+            pidx, pval, legal_idx, actor,
+        ))
+
+        temp = _temperature(move_num, temp_moves)
+        action = select_move(visit_counts, temp, np_rng)
+        state = state.step(action)
+        move_num += 1
+
+    # Terminal targets, all from player-0's frame; flipped per record's actor.
+    z0 = compute_target_z(state, player=0)              # kept for buffer compat
+    own0 = compute_target_own_score(state, player=0)    # raw P0 final score
+    opp0 = compute_target_opponent_score(state, player=0)  # raw P1 final score
+    win0 = compute_target_win(state, player=0)          # 1.0/0.5/0.0 via cascade
+    examples = []
+    for (mb, ob, flat, pidx, pval, lidx, actor) in records:
+        if actor == 0:
+            z = z0
+            own_s, opp_s, win_t = own0, opp0, win0
+        else:
+            z = -z0
+            # Flip to actor-1's frame: scores swap; win complements (draw stays
+            # 0.5).  Hand-check: P0 won (win0=1.0) → P1 win_target = 0.0. ✓
+            own_s, opp_s = opp0, own0
+            win_t = (1.0 - win0) if win0 != 0.5 else 0.5
+        examples.append(
+            Example(mb, ob, flat, pidx, pval, lidx, z, own_s, opp_s, win_t,
+                    iteration=iteration)
+        )
+    scores = (state.boards[0].score().total, state.boards[1].score().total)
+    return examples, scores
+
+
+# ─── 3b. Rust-engine self-play generation ──────────────────────────────────
+# The Rust engine (--engine rust) plays the ENTIRE game inside a RustGameState
+# and runs RustMCTS.search in place of AlphaZeroMCTS+PIMC.  It produces the same
+# (examples, scores) contract as play_selfplay_game, so the loop / buffer /
+# training / checkpointing below are completely unchanged.  Leaf evaluation goes
+# through an in-process Python callable (make_rust_evaluator) — NOT the IPC
+# inference server.  This is a SEPARATE engine, not a bit-for-bit reproduction of
+# the Python path (its Dirichlet noise and leaf FP differ); the Python path
+# remains the oracle.
+# Module-level latch so the "Triton missing" heads-up (Item 20) prints at most
+# once per process — make_rust_evaluator is called fresh every iteration.
+_COMPILE_TRITON_WARNED = False
+
+
+def _triton_available() -> bool:
+    """True if the Triton package is importable.  torch.compile's inductor
+    backend needs Triton to generate GPU kernels; without it, compilation of a
+    CUDA graph raises TritonMissing and dynamo falls back to eager."""
+    import importlib.util
+    return importlib.util.find_spec("triton") is not None
+
+
+def make_rust_evaluator(
+    net: KingdominoNet,
+    device: str = "cpu",
+    amp: bool = False,
+    pad_to_batch: int = 0,
+    pin_transfer: bool = False,
+    profile_timing: bool = False,
+    *,
+    margin_gain: float = _mcts_az.MARGIN_GAIN,
+    alpha: float = _mcts_az.ALPHA,
+    compile_net: bool = False,
+):
+    """In-process batched leaf evaluator for RustMCTS.search / BatchedMCTS.update.
+    Contract:
+    (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,261) f32, idxs_list)
+      -> (values (K,) f32, [gathered_logits_i f32]).
+    Returns f32 to HALVE the D2H transfer volume (logits are K×3390); the Rust
+    tree casts to f64 on entry and keeps its internal accumulation in f64.
+
+    compile_net (Item 20): when True and on CUDA, wrap the INFERENCE copy of the
+    net with torch.compile.  This is the leaf-eval net only — never the training
+    net (which calls .backward()).  net.eval() is already set above (BatchNorm
+    requires eval before compile).  Batch size varies tick to tick; torch.compile
+    recompiles on each new shape then caches, so steady-state ticks hit the cache.
+    """
+    net = net.to(device).eval()
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    if compile_net and use_cuda and hasattr(torch, "compile"):
+        # Heads-up (once per process): without Triton, inductor can't codegen GPU
+        # kernels — torch.compile silently falls back to EAGER (no speedup), with
+        # the real cause buried in dynamo's WON'T CONVERT logs.  Surface it plainly.
+        global _COMPILE_TRITON_WARNED
+        if not _triton_available() and not _COMPILE_TRITON_WARNED:
+            print("WARNING: --compile requested but Triton is not installed; "
+                  "torch.compile's inductor backend will fall back to EAGER "
+                  "(no speedup). Install triton to enable GPU compilation.")
+            _COMPILE_TRITON_WARNED = True
+        # Fall back to eager on any dynamo capture error rather than crashing the
+        # run (e.g. an op the backend can't trace) — perf feature, not correctness.
+        torch._dynamo.config.suppress_errors = True
+        net = torch.compile(net)
+    use_pinned = bool(pin_transfer and use_cuda)
+    # Fix 2: bind the leaf-value blend params at construction (no module-global
+    # reads at call time).  Callers forward cfg.margin_gain / cfg.alpha.
+    mg = float(margin_gain)
+    al = float(alpha)
+    timing = {"h2d": 0.0, "forward": 0.0, "readback": 0.0, "calls": 0}
+
+    def _sync() -> None:
+        if profile_timing and use_cuda:
+            torch.cuda.synchronize()
+
+    def _to_device(arr: np.ndarray) -> torch.Tensor:
+        src = torch.from_numpy(arr)
+        if use_pinned:
+            pinned = torch.empty(src.shape, dtype=src.dtype, pin_memory=True)
+            pinned.copy_(src)
+            return pinned.to(device, non_blocking=True)
+        return src.to(device)
+
+    def evaluator(mbs, obs, flats, idxs_list):
+        n = len(mbs)
+        mb_np = np.ascontiguousarray(mbs)
+        ob_np = np.ascontiguousarray(obs)
+        flat_np = np.ascontiguousarray(flats)
+        pad_to = int(pad_to_batch)
+        if pad_to > n:
+            mb_pad = np.zeros((pad_to, *mb_np.shape[1:]), dtype=mb_np.dtype)
+            ob_pad = np.zeros((pad_to, *ob_np.shape[1:]), dtype=ob_np.dtype)
+            flat_pad = np.zeros((pad_to, flat_np.shape[1]), dtype=flat_np.dtype)
+            mb_pad[:n] = mb_np
+            ob_pad[:n] = ob_np
+            flat_pad[:n] = flat_np
+            mb_np, ob_np, flat_np = mb_pad, ob_pad, flat_pad
+        t0 = time.perf_counter() if profile_timing else 0.0
+        mb_t = _to_device(mb_np)
+        ob_t = _to_device(ob_np)
+        flat_t = _to_device(flat_np)
+        if profile_timing:
+            _sync()
+            timing["h2d"] += time.perf_counter() - t0
+        use_amp = bool(amp and str(device).startswith("cuda"))
+        t1 = time.perf_counter() if profile_timing else 0.0
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                own, opp, win_prob, logits = net(mb_t, ob_t, flat_t)
+        if profile_timing:
+            _sync()
+            timing["forward"] += time.perf_counter() - t1
+        t2 = time.perf_counter() if profile_timing else 0.0
+        # Full leaf value formula.  This evaluator is IN-PROCESS and is the one the
+        # batched / batched_open_loop engines use; mg/al are bound at construction
+        # (Fix 2) from cfg.margin_gain / cfg.alpha — no module-global reads.
+        margin_val = torch.tanh((own - opp) * mg)
+        win_val = 2.0 * win_prob - 1.0
+        # f32 readback (was .double()): halves D2H bytes for values and the
+        # K×3390 logits.  .float() is a no-op for an already-f32 forward and
+        # promotes f16 (AMP) up to f32; the Rust tree casts to f64 on entry.
+        values = (al * margin_val + (1.0 - al) * win_val).reshape(-1)[:n].float().cpu().numpy()
+        full = logits[:n].float().cpu().numpy()
+        if profile_timing:
+            timing["readback"] += time.perf_counter() - t2
+            timing["calls"] += 1
+        gathered = [full[i][idxs_list[i]] for i in range(len(idxs_list))]
+        return values, gathered
+
+    if profile_timing:
+        evaluator.timing = timing
+    return evaluator
+
+
+def make_rust_coalescing_evaluator(client):
+    """Adapt an InferenceClient (e.g. LocalInferenceService.make_client()) into the
+    Rust batched-evaluator contract, COALESCING leaves across concurrent game
+    threads into one forward.  Each thread's RustMCTS, while blocked in the
+    client's future (event.wait releases the GIL), lets the others submit — so the
+    batcher assembles a batch spanning many games.  Returns f32 values + f32
+    gathered logits (the Rust tree casts to f64 on entry; f32 halves D2H volume).
+    Use this (not make_rust_evaluator) whenever multiple games run concurrently.
+    """
+    from games.kingdomino.inference_service import make_ipc_batched_evaluator
+    base = make_ipc_batched_evaluator(client)
+
+    def evaluator(mbs, obs, flats, idxs_list):
+        values, gathered = base(mbs, obs, flats, idxs_list)
+        return (np.asarray(values, dtype=np.float32),
+                [np.asarray(g, dtype=np.float32) for g in gathered])
+
+    return evaluator
+
+
+def _select_idx(counts: dict, temperature: float, rng: np.random.Generator) -> int:
+    """Pick a joint index from {joint_idx: visit_count}; temperature=0 → greedy.
+    Rust-engine counterpart of select_move (which keys on action objects)."""
+    idxs = list(counts.keys())
+    c = np.array([counts[i] for i in idxs], dtype=np.float64)
+    if c.sum() <= 0:
+        raise ValueError("All root visit counts are zero; increase n_simulations.")
+    if temperature <= 1e-6:
+        return idxs[int(c.argmax())]
+    w = c ** (1.0 / temperature)
+    w /= w.sum()
+    return idxs[int(rng.choice(len(idxs), p=w))]
+
+
+def _rust_idx_to_action(rs_state, joint_idx: int):
+    """Map a chosen joint index to the (placement, pick) step args for rs_state,
+    via the state's own legal actions (ascending-index order, parallel to
+    legal_action_indices)."""
+    acts = rs_state.legal_actions()
+    idxs = rs_state.legal_action_indices()
+    for a, i in zip(acts, idxs):
+        if int(i) == joint_idx:
+            return a
+    raise ValueError(f"joint index {joint_idx} is not legal in the current state.")
+
+
+def play_selfplay_game_rust(
+    rust_mcts, evaluator, *,
+    n_simulations: int, n_determinizations: int, temp_moves: int,
+    c_puct: float, dirichlet_alpha: float, dirichlet_epsilon: float,
+    leaf_batch: int, virtual_loss: int, seed: int,
+    py_rng: random.Random, np_rng: np.random.Generator,
+    score_scale: float = 100.0, margin_gain: float = 2.0, alpha: float = 0.8,
+    iteration: int = 0,
+) -> Tuple[List[Example], Tuple[int, int]]:
+    """Rust-engine self-play game.  Mirrors play_selfplay_game's outputs.
+
+    The game runs in a RustGameState seeded to match GameState.new(seed)'s
+    opening position; RustMCTS.search drives play.  PIMC redeterminizes the Rust
+    deck per determinization and aggregates root visit counts; root Dirichlet
+    noise is applied inside the search.  Training states are the PUBLIC encoding
+    (info-set safe — the encoder reads no deck order)."""
+    import kingdomino_rust
+    game_over = int(Phase.GAME_OVER)
+
+    py_init = GameState.new(seed=seed)
+    rs = kingdomino_rust.RustGameState(
+        py_init.start_player, list(py_init.deck), list(py_init.current_row))
+
+    records = []  # (mb, ob, flat, pidx, pval, legal_idx, actor)
+    move_num = 0
+    while rs.phase != game_over:
+        agg: dict = {}
+        for _ in range(n_determinizations):
+            det = rs.redeterminize(seed=int(np_rng.integers(0, 2**63 - 1)))
+            pairs = rust_mcts.search(
+                det, evaluator, n_simulations,
+                dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_epsilon,
+                fpu=0.0, cpuct=c_puct, seed=int(np_rng.integers(0, 2**63 - 1)),
+                leaf_batch=leaf_batch, virtual_loss=virtual_loss,
+                score_scale=score_scale, margin_gain=margin_gain, alpha=alpha,
+            )
+            for idx, cnt in pairs:
+                agg[int(idx)] = agg.get(int(idx), 0) + int(cnt)
+
+        actor = rs.current_actor()
+        mb, ob, flat = rs.encode(actor)                       # PUBLIC, info-set safe
+        mb = np.asarray(mb); ob = np.asarray(ob); flat = np.asarray(flat)
+        legal_idx = np.asarray(rs.legal_action_indices(), dtype=np.int32)
+
+        total = sum(agg.values())
+        policy = np.zeros(NUM_JOINT_ACTIONS, dtype=np.float32)
+        for idx, cnt in agg.items():
+            policy[idx] = cnt / total
+        pidx = np.nonzero(policy)[0].astype(np.int32)
+        pval = policy[pidx].astype(np.float32)
+        records.append((
+            mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
+            pidx, pval, legal_idx, actor,
+        ))
+
+        temp = _temperature(move_num, temp_moves)
+        chosen = _select_idx(agg, temp, np_rng)
+        placement, pick = _rust_idx_to_action(rs, chosen)
+        rs = rs.step(placement, pick)
+        move_num += 1
+
+    s0, s1 = rs.scores()
+    z0 = math.tanh((s0 - s1) / 30.0)   # = compute_target_z(player=0), sigma=30
+    own0, opp0 = float(s0), float(s1)
+    # LIMITATION: RustGameState does not expose tiebreaker data (largest
+    # territory, total crowns). Score ties fall through to draw (win_target=0.5).
+    # The Python path (play_selfplay_game) correctly routes through determine_winner.
+    if s0 > s1:
+        win0 = 1.0
+    elif s1 > s0:
+        win0 = 0.0
+    else:
+        win0 = 0.5  # score tie → call it a draw (cascade unavailable)
+    examples = []
+    for (mb, ob, flat, pidx, pval, lidx, actor) in records:
+        if actor == 0:
+            z = z0
+            own_s, opp_s, win_t = own0, opp0, win0
+        else:
+            z = -z0
+            own_s, opp_s = opp0, own0
+            win_t = (1.0 - win0) if win0 != 0.5 else 0.5
+        examples.append(
+            Example(mb, ob, flat, pidx, pval, lidx, z, own_s, opp_s, win_t,
+                    iteration=iteration)
+        )
+    return examples, (s0, s1)
+
+
+def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
+    """Convert BatchedMCTS's sparse training tuple to the existing buffer type.
+
+    Phase 3R: the tuple is now 10 elements — the Rust engine fills own_score,
+    opp_score, win_target at game end (score-only win; no tiebreaker cascade in
+    Rust, matching play_selfplay_game_rust's documented limitation).  The Rust
+    tuple carries no iteration field, so the caller passes it in.
+    """
+    mb, ob, flat, pidx, pval, lidx, z, own_score, opp_score, win_target = tup
+    return Example(
+        np.asarray(mb, dtype=np.float16),
+        np.asarray(ob, dtype=np.float16),
+        np.asarray(flat, dtype=np.float16),
+        np.asarray(pidx, dtype=np.int32),
+        np.asarray(pval, dtype=np.float32),
+        np.asarray(lidx, dtype=np.int32),
+        float(z),
+        own_score=float(own_score),
+        opp_score=float(opp_score),
+        win_target=float(win_target),
+        iteration=iteration,
+    )
+
+
+def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
+    """Drive two BatchedMCTS instances (A, B) with one background CPU worker so
+    one instance's Rust tree work overlaps the other's GPU forward (Item 17).
+
+    Schedule per tick (the overlap comes from a single-worker thread pool; the
+    evaluator releases the GIL during the CUDA forward and step/update release
+    it during the Rust work, so they run concurrently):
+      1. evaluator(A's leaves)              ← GPU, main; B's CPU (from last tick)
+                                              runs in the background concurrently
+      2. collect B's background leaves
+      3. submit A's CPU work (update+step) to the background
+      4. evaluator(B's leaves)              ← GPU, main; A's CPU runs concurrently
+      5. collect A's next leaves
+      6. submit B's CPU work; it overlaps step (1) of the next tick
+
+    Correctness invariants:
+      - update(vals, gath) is always called with the results of the step() that
+        produced those leaves — A's results never reach B's update and vice versa.
+      - each instance is touched by exactly one thread at a time (main does
+        priming + the evaluator over its leaf arrays; the per-instance future
+        does that instance's update()+step(); futures never overlap per instance).
+      - the evaluator (torch/CUDA) is called from the MAIN thread only.
+
+    Seeds match the single-buffer case exactly: A covers games
+    [seed_start, seed_start+games_a), B covers [seed_start+games_a, ...), so
+    game i still uses seed seed_start + i.  Returns
+    (finished, batch_sizes, ticks, step_sec, eval_sec, update_sec, elapsed);
+    step_sec/update_sec are summed across both instances and OVERLAP eval_sec
+    (their sum can exceed elapsed — that overlap is the speedup).
+    """
+    games_a = n_games // 2
+    games_b = n_games - games_a
+    A = make_batched(games_a, seed_start)
+    B = make_batched(games_b, seed_start + games_a)
+
+    finished_a: list = []
+    finished_b: list = []
+    batch_sizes: List[int] = []
+    prof = {"step": 0.0, "update": 0.0}   # written only by the active CPU thread
+    ticks = 0
+
+    def _timed_step(inst):
+        ts = time.perf_counter()
+        leaves = inst.step()
+        prof["step"] += time.perf_counter() - ts
+        return leaves
+
+    def _cpu_work(inst, finished_list, vals, gath):
+        """Background-thread work for one instance: scatter the forward results
+        and advance, then produce the next leaves (None if now done)."""
+        ts = time.perf_counter()
+        finished_list.extend(inst.update(vals, gath))
+        prof["update"] += time.perf_counter() - ts
+        if inst.done():
+            return None
+        return _timed_step(inst)
+
+    t0 = time.time()
+    eval_sec = 0.0
+
+    def _eval(leaves):
+        nonlocal eval_sec, ticks
+        mb, ob, flat, idxs = leaves
+        batch_sizes.append(int(mb.shape[0]))
+        ts = time.perf_counter()
+        vals, gath = evaluator(mb, ob, flat, idxs)
+        eval_sec += time.perf_counter() - ts
+        ticks += 1
+        return vals, gath
+
+    # Prime both instances on the main thread (n_games >= 2, so each has >=1 game).
+    leaves_a = _timed_step(A)
+    leaves_b = _timed_step(B)
+    a_future = None
+    b_future = None
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        while not (A.done() and B.done()):
+            # (1) GPU forward for A; B's CPU work (submitted last tick) overlaps.
+            vals_a = gath_a = None
+            if leaves_a is not None:
+                vals_a, gath_a = _eval(leaves_a)
+
+            # (2) Collect B's leaves produced in the background during step (1).
+            if b_future is not None:
+                leaves_b = b_future.result()
+                b_future = None
+
+            # (3) Submit A's CPU work so it overlaps B's GPU forward below.
+            if leaves_a is not None:
+                a_future = executor.submit(_cpu_work, A, finished_a, vals_a, gath_a)
+
+            # (4) GPU forward for B; A's CPU work runs concurrently.
+            vals_b = gath_b = None
+            if leaves_b is not None:
+                vals_b, gath_b = _eval(leaves_b)
+
+            # (5) Collect A's next leaves (its CPU work ran during step (4)).
+            if a_future is not None:
+                leaves_a = a_future.result()
+                a_future = None
+
+            # (6) Submit B's CPU work; it overlaps step (1) of the next tick.
+            if leaves_b is not None:
+                b_future = executor.submit(_cpu_work, B, finished_b, vals_b, gath_b)
+
+            if ticks > 2_000_000:
+                raise RuntimeError("BatchedMCTS exceeded tick guard")
+    finally:
+        executor.shutdown(wait=True)
+
+    elapsed = time.time() - t0
+    finished = finished_a + finished_b
+    return (finished, batch_sizes, ticks,
+            prof["step"], eval_sec, prof["update"], elapsed)
+
+
+def play_selfplay_games_batched(
+    net: KingdominoNet,
+    cfg: SelfPlayConfig,
+    *,
+    n_games: int,
+    game_seed_start: int,
+    iteration: int = 0,
+    double_buffer: bool = False,
+) -> Tuple[List[List[Example]], List[Tuple[int, int]], dict]:
+    """Generate self-play games with a Rust BatchedMCTS.
+
+    double_buffer (Item 17): run TWO independent BatchedMCTS instances (A and B)
+    over disjoint halves of the game batch, alternating so one instance's CPU
+    tree work (Rust step/update) overlaps the other's GPU forward.  A single
+    background thread (one at a time) runs the off-instance's update()+step()
+    while the main thread runs the evaluator; both release the GIL during their
+    heavy work, so they overlap.  Falls back to the single-buffer loop when
+    n_games < 2.  Produces the SAME games (seeding unchanged: game i uses seed
+    game_seed_start + i) and the same stats keys as the single-buffer path."""
+    if cfg.n_determinizations != 1:
+        raise ValueError("--engine batched currently requires --determinizations 1")
+
+    import kingdomino_rust
+
+    evaluator = make_rust_evaluator(
+        net, device=cfg.device, amp=cfg.inference_amp,
+        pad_to_batch=cfg.eval_pad_to_batch,
+        pin_transfer=cfg.pin_transfer,
+        profile_timing=cfg.profile_eval_timing,
+        margin_gain=cfg.margin_gain, alpha=cfg.alpha,
+        compile_net=cfg.compile_net,
+    )
+    n_slots = max(1, int(cfg.batch_slots))
+    lb = max(1, int(cfg.leaf_batch))
+
+    def _make_batched(games: int, seed_start: int):
+        """Build one BatchedMCTS.  Each instance gets the FULL n_slots (not
+        halved) — slots are concurrent positions within an instance, so the
+        per-forward GPU batch stays up to n_slots*leaf_batch per instance."""
+        return kingdomino_rust.BatchedMCTS(
+            n_slots,
+            int(games),
+            int(seed_start),
+            int(cfg.n_simulations),
+            leaf_batch=lb,
+            virtual_loss=int(cfg.virtual_loss),
+            cpuct=float(cfg.c_puct),
+            fpu=float(cfg.fpu),
+            dirichlet_alpha=float(cfg.dirichlet_alpha),
+            dirichlet_eps=float(cfg.dirichlet_epsilon),
+            temp_moves=int(cfg.temp_moves),
+            open_loop=(cfg.engine == "batched_open_loop"),
+            score_scale=float(cfg.score_scale),
+            margin_gain=float(cfg.margin_gain),
+            alpha=float(cfg.alpha),
+        )
+
+    use_db = bool(double_buffer)
+    if use_db and n_games < 2:
+        print("WARNING: --double_buffer requested but n_games < 2; "
+              "falling back to single-buffer.")
+        use_db = False
+
+    if not use_db:
+        # ── Single-buffer path (unchanged) ──
+        batched = _make_batched(n_games, game_seed_start)
+        finished = []
+        batch_sizes: List[int] = []
+        t0 = time.time()
+        step_sec = 0.0
+        eval_sec = 0.0
+        update_sec = 0.0
+        ticks = 0
+        while not batched.done():
+            ts = time.perf_counter()
+            mb, ob, flat, idxs_list = batched.step()
+            step_sec += time.perf_counter() - ts
+            b = int(mb.shape[0])
+            batch_sizes.append(b)
+            ts = time.perf_counter()
+            values, gathered = evaluator(mb, ob, flat, idxs_list)
+            eval_sec += time.perf_counter() - ts
+            ts = time.perf_counter()
+            finished.extend(batched.update(values, gathered))
+            update_sec += time.perf_counter() - ts
+            ticks += 1
+            if ticks > 2_000_000:
+                raise RuntimeError("BatchedMCTS exceeded tick guard")
+        elapsed = time.time() - t0
+    else:
+        # ── Double-buffer path (Item 17) ──
+        (finished, batch_sizes, ticks,
+         step_sec, eval_sec, update_sec, elapsed) = _double_buffer_loop(
+            _make_batched, evaluator, n_games, game_seed_start)
+
+    finished.sort(key=lambda r: int(r[0]))
+    all_examples: List[List[Example]] = []
+    all_scores: List[Tuple[int, int]] = []
+    for _seed, examples, scores in finished:
+        all_examples.append(
+            [_example_from_rust_tuple(ex, iteration=iteration) for ex in examples])
+        all_scores.append((int(scores[0]), int(scores[1])))
+
+    nonzero_batches = [b for b in batch_sizes if b > 0]
+    total_evals = int(sum(batch_sizes))
+    cap = n_slots * lb
+    mean_batch = float(np.mean(nonzero_batches)) if nonzero_batches else 0.0
+    stats = {
+        "ticks": ticks,
+        "elapsed": elapsed,
+        "total_evals": total_evals,
+        "mean_batch": mean_batch,
+        "max_batch_cap": cap,
+        "fill_ratio": mean_batch / cap if cap > 0 else 0.0,
+        "max_batch_seen": max(nonzero_batches) if nonzero_batches else 0,
+        "requests_per_sec": total_evals / elapsed if elapsed > 0 else 0.0,
+        "step_sec": step_sec,
+        "eval_sec": eval_sec,
+        "update_sec": update_sec,
+    }
+    ev_timing = getattr(evaluator, "timing", None)
+    if ev_timing:
+        stats.update({
+            "eval_h2d_sec": float(ev_timing.get("h2d", 0.0)),
+            "eval_forward_sec": float(ev_timing.get("forward", 0.0)),
+            "eval_readback_sec": float(ev_timing.get("readback", 0.0)),
+            "eval_calls": int(ev_timing.get("calls", 0)),
+        })
+    return all_examples, all_scores, stats
+
+
+# ─── 3c. Per-iteration logging helpers ─────────────────────────────────────
+def _grad_norm(params) -> float:
+    """L2 norm of the gradients across a parameter group.
+
+    Cheap — iterates over the existing param.grad tensors after a backward
+    pass.  Call it AFTER optimizer.step() but BEFORE the next zero_grad (the
+    grads are still populated; train_step zeros at the START of each step, not
+    the end).  Params with no .grad (e.g. unused this step) are skipped.
+    """
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    return total ** 0.5
+
+
+def _policy_params(net: KingdominoNet) -> list:
+    """The policy-head parameters of KingdominoNet.
+
+    The network has no single ``policy_head`` module — the joint policy logits
+    are produced by the bilinear stack: flat_policy_mlp + placement_conv +
+    special_placement + pick_mlp + no_pick + W (see network.py forward()).  The
+    shared trunk and the three scalar heads are excluded.
+    """
+    params: list = []
+    params += list(net.flat_policy_mlp.parameters())
+    params += list(net.placement_conv.parameters())
+    params.append(net.special_placement)
+    params += list(net.pick_mlp.parameters())
+    params.append(net.no_pick)
+    params.append(net.W)
+    return params
+
+
+def _diag_metrics(net: KingdominoNet, diag_batch) -> Tuple[float, float]:
+    """(policy_entropy, win_brier) on a FIXED diagnostic batch.
+
+    Both metrics share the same fixed sample so their trends reflect the net
+    changing on identical positions, not batch-to-batch sampling noise.
+    policy_entropy is the mean masked-policy entropy (decreasing ⇒ the policy is
+    sharpening); win_brier is MSE(win_prob, win_target) — the win head's
+    calibration on that consistent set.  Pure diagnostic (no_grad); the caller
+    is responsible for restoring train/eval mode as needed.
+    """
+    mb_d, ob_d, flat_d, _pol_d, legal_mask_d, _z_d, _own_d, _opp_d, win_t_d = diag_batch
+    net.eval()
+    with torch.no_grad():
+        _, _, win_prob_d, logits_d = net(mb_d, ob_d, flat_d)
+        logp_d = masked_log_softmax(logits_d, legal_mask_d)
+        logp_d = torch.where(legal_mask_d, logp_d, torch.zeros_like(logp_d))
+        p_d = torch.exp(logp_d)
+        entropy = -(p_d * logp_d).sum(dim=1).mean().item()
+        win_brier = F.mse_loss(win_prob_d, win_t_d).item()
+    return float(entropy), float(win_brier)
+
+
+def _derive_log_path(cfg: "SelfPlayConfig") -> str:
+    """Resolve the per-iteration JSONL log path (see SelfPlayConfig.log_path)."""
+    if cfg.log_path is not None:
+        path = cfg.log_path
+    elif cfg.checkpoint_dir is not None:
+        path = os.path.join(cfg.checkpoint_dir, "training_log.jsonl")
+    else:
+        path = f"./training_log_{int(time.time())}.jsonl"
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    return path
+
+
+def _log_row(log_path: str, row: dict) -> None:
+    """Append one iteration's metrics as a single JSON line."""
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _compact_summary(it: int, *, sp_games: int, row: dict, trained: bool,
+                     buf_n: int, min_buf: int) -> str:
+    """One-line, greppable per-iteration summary built from the log row.
+
+    Sections (joined by ' | '): always sp; train/grads/diag only when training
+    ran (else a 'skipped (buf n/min)' note); bench only when a benchmark ran.
+    """
+    parts = [f"iter {it:03d}"]
+    parts.append(
+        f"sp: {sp_games} games {row['games_per_sec']:.2f}/s "
+        f"diff={row['sp_score_diff_mean']:.1f}±{row['sp_score_diff_std']:.1f} "
+        f"buf={row['buffer_size']}(age={row['buffer_mean_age']:.1f})")
+    if trained:
+        parts.append(
+            f"train: pol={row['policy_loss']:.3f} own={row['own_loss']:.3f} "
+            f"opp={row['opp_loss']:.3f} win={row['win_loss']:.3f} "
+            f"brier={row['win_brier']:.3f}/{row['baseline_brier']:.3f}")
+        parts.append(
+            f"grads: pol={row['grad_norm_policy']:.3f} "
+            f"win={row['grad_norm_win']:.3f} own={row['grad_norm_own']:.3f} "
+            f"opp={row['grad_norm_opp']:.3f}")
+        ent = row['policy_entropy']
+        wbd = row['win_brier_diag']
+        parts.append(
+            f"diag: entropy={ent:.2f} brier_diag="
+            + (f"{wbd:.3f}" if wbd is not None else "n/a"))
+    else:
+        parts.append(f"train: skipped (buf {buf_n}/{min_buf})")
+    if row.get("bench_win_rate") is not None:
+        bwb = row.get("bench_win_brier")
+        bench = f"bench: win={row['bench_win_rate']:.1%} margin={row['bench_score_margin']:+.1f}"
+        if bwb is not None:
+            bench += f" brier={bwb:.3f}"
+        parts.append(bench)
+    return " | ".join(parts)
+
+
+def _new_history() -> dict:
+    """Fresh per-iteration history dict (shared by the serial + parallel loops).
+
+    Removed vs older builds: ``value_loss`` (the single-head loss, gone since
+    Phase 1b) and ``selfplay_score_diff`` (replaced by sp_score_diff_mean).
+    Benchmark keys are sparse — only appended on iterations a benchmark runs.
+    """
+    return {
+        # Training losses (per iteration, mean over train_steps)
+        "policy_loss":        [],
+        "own_loss":           [],
+        "opp_loss":           [],
+        "win_loss":           [],
+        "win_brier":          [],
+        "baseline_brier":     [],
+
+        # Gradient norms (per iteration, mean over train_steps)
+        "grad_norm_policy":   [],
+        "grad_norm_win":      [],
+        "grad_norm_own":      [],
+        "grad_norm_opp":      [],
+
+        # Self-play stats (per iteration)
+        "sp_score_diff_mean": [],
+        "sp_score_diff_std":  [],
+        "games_per_sec":      [],
+        "buffer_size":        [],
+        "buffer_mean_age":    [],
+
+        # Diagnostic batch (per iteration, fixed sample)
+        "policy_entropy":     [],
+        "win_brier_diag":     [],
+
+        # Benchmark (sparse — only when a benchmark runs)
+        "benchmark":          [],   # [(iter, win_rate), ...]
+        "score_margin":       [],   # [margin, ...] aligned with benchmark
+    }
+
+
+# ─── 4. Training step ─────────────────────────────────────────────────────
+def train_step(
+    net: KingdominoNet, batch, optimizer, *,
+    policy_weight: float = 1.0, lambda_score: float = 0.5,
+    lambda_w: float = 0.25, score_scale: float = 100.0,
+    grad_clip: float = 1.0,
+) -> Tuple[float, float, float, float, float, float]:
+    """One optimiser step on a batch.  Returns (policy_loss, own_loss, opp_loss,
+    win_loss, win_brier, baseline_brier).
+
+    Four-head loss (replaces the old single value-MSE head):
+      - own_loss / opp_loss: MSE of the score heads against the raw final
+        scores normalized by score_scale.
+      - win_loss: binary cross-entropy of win_prob against the 1/0.5/0 target.
+      - policy_loss: masked cross-entropy — the target visit distribution π is
+        zero on illegal actions, the masked log-softmax denominator covers
+        legal actions only, and illegal entries get a large-but-finite log-prob
+        so the 0·(−big) products are 0 rather than NaN.
+
+    Diagnostics (no_grad — do NOT affect the gradient):
+      - win_brier: mean((win_prob - win_target)^2) — the proper scoring rule
+        for the win head (MSE on the probability).
+      - baseline_brier: the trivial constant-predictor Brier at the batch base
+        rate = base_rate*(1-base_rate) (Bernoulli variance).  The win head
+        beats the trivial baseline when win_brier < baseline_brier; a Brier
+        that rises over training signals a frame-conversion / calibration bug.
+
+    Hardening (cheap relative to MCTS, left on permanently):
+      - Batch invariants checked before the forward pass: every row has at
+        least one legal action, and every policy-target row sums to 1 (D4
+        augmentation is a permutation, so this holds to float precision).
+      - Loss checked finite before backward, failing loudly on the first bad
+        batch instead of silently poisoning the weights.
+      - Global grad-norm clipping before the step guards against the occasional
+        high-variance batch (noisy early self-play targets).
+    """
+    mb, ob, flat, policy, legal_mask, z, own_t, opp_t, win_t = batch
+    # z is unpacked but unused — kept for buffer format compatibility.
+    # Will be removed in a future cleanup pass once tests are updated.
+
+    # ── batch invariants (fast-fail before the forward pass) ──
+    if not legal_mask.any(dim=1).all():
+        raise ValueError("Batch contains a row with no legal actions.")
+    if not torch.allclose(policy.sum(dim=1), torch.ones(policy.shape[0],
+                                                        device=policy.device),
+                          atol=1e-4):
+        raise ValueError("Policy target row does not sum to 1.")
+
+    own_pred, opp_pred, win_prob, logits = net(mb, ob, flat)
+
+    own_norm = own_t / score_scale
+    opp_norm = opp_t / score_scale
+    own_loss = F.mse_loss(own_pred, own_norm)
+    opp_loss = F.mse_loss(opp_pred, opp_norm)
+    win_loss = F.binary_cross_entropy(win_prob, win_t)
+
+    # Brier diagnostics (no_grad — purely for logging, not the gradient).
+    with torch.no_grad():
+        win_brier = F.mse_loss(win_prob, win_t).item()
+        base_rate = win_t.mean()
+        baseline_brier = (base_rate * (1.0 - base_rate)).item()
+
+    logp = masked_log_softmax(logits, legal_mask)        # (B, 3390)
+    # Zero the (very negative) illegal log-probs BEFORE multiplying.  The target
+    # π is already zero there, so this changes nothing on-support while making
+    # the off-support products exactly 0 rather than 0 * (−huge) — guaranteeing
+    # a finite loss regardless of how saturated the illegal logits become.
+    logp = torch.where(legal_mask, logp, torch.zeros_like(logp))
+    policy_loss = -(policy * logp).sum(dim=1).mean()
+
+    loss = (policy_weight * policy_loss
+            + lambda_score * (own_loss + opp_loss)
+            + lambda_w * win_loss)
+
+    if not torch.isfinite(loss):
+        raise FloatingPointError(
+            f"non-finite loss: policy={policy_loss.item()}, "
+            f"own={own_loss.item()}, opp={opp_loss.item()}, "
+            f"win={win_loss.item()}"
+        )
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    if grad_clip and grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+    optimizer.step()
+    return (float(policy_loss.item()), float(own_loss.item()),
+            float(opp_loss.item()), float(win_loss.item()),
+            float(win_brier), float(baseline_brier))
+
+
+# ─── 5. Benchmark ─────────────────────────────────────────────────────────
+class AZPlayer:
+    """Adapts AlphaZeroMCTS+PIMC to the bot interface for evaluation matches.
+
+    Greedy play: no root noise, pick the most-visited root action (τ=0).
+    """
+    def __init__(self, mcts: AlphaZeroMCTS, n_determinizations: int = 1,
+                 np_rng: Optional[np.random.Generator] = None):
+        self.mcts = mcts
+        self.n_determinizations = n_determinizations
+        self._np_rng = np_rng or np.random.default_rng()
+
+    def choose_action(self, state, actions, rng=None):
+        py_rng = rng or random.Random()
+        vc, _ = run_pimc(self.mcts, state, py_rng,
+                         n_determinizations=self.n_determinizations,
+                         add_noise=False, np_rng=self._np_rng)
+        return select_move(vc, 0.0, self._np_rng)
+
+
+class OpenLoopAZPlayer:
+    """Adapts OpenLoopMCTS to the bot interface for evaluation matches.
+
+    Greedy play (no root noise, τ=0).  Open-loop averages over deck orders
+    internally, so there is no n_determinizations argument — run_pimc_open_loop
+    is called directly.
+    """
+    def __init__(self, mcts: OpenLoopMCTS,
+                 np_rng: Optional[np.random.Generator] = None):
+        self.mcts = mcts
+        self._np_rng = np_rng or np.random.default_rng()
+
+    def choose_action(self, state, actions, rng=None):
+        vc, _ = run_pimc_open_loop(
+            self.mcts, state,
+            add_noise=False, rng=self._np_rng,
+        )
+        return select_move(vc, 0.0, self._np_rng)
+
+
+def benchmark_vs(
+    az_player, opponent, n_seeds: int, *, seed: int = 0, verbose: bool = False,
+) -> dict:
+    """Paired-seed match (each deck played twice, sides swapped).  Returns AZ
+    win counts.  Total games = 2 * n_seeds."""
+    az_wins = opp_wins = draws = 0
+    games = 0
+    margin_sum = 0.0   # Σ (az_score - opp_score) over benchmark games
+    for i in range(n_seeds):
+        for az_is_p0 in (True, False):
+            p0, p1 = (az_player, opponent) if az_is_p0 else (opponent, az_player)
+            state = GameState.new(seed=seed + i)
+            rng = random.Random(seed * 7919 + i * 2 + int(az_is_p0))
+            while state.phase != Phase.GAME_OVER:
+                bot = p0 if state.current_actor == 0 else p1
+                state = state.step(bot.choose_action(state, state.legal_actions(), rng=rng))
+            # Route through the authoritative cascade (score → largest
+            # territory → total crowns → draw). A raw score comparison would
+            # mis-credit genuine score ties that the tiebreaker resolves.
+            winner = determine_winner(state)
+            az_idx = 0 if az_is_p0 else 1
+            if winner is None:
+                draws += 1
+            elif winner == az_idx:
+                az_wins += 1
+            else:
+                opp_wins += 1
+            scores = state.scores()
+            margin_sum += scores[az_idx] - scores[1 - az_idx]
+            games += 1
+        if verbose and (i + 1) % max(1, n_seeds // 5) == 0:
+            print(f"    bench seed {i+1}/{n_seeds}: az={az_wins} draw={draws} opp={opp_wins}")
+    return {"az_wins": az_wins, "opp_wins": opp_wins, "draws": draws,
+            "n_games": games, "az_win_rate": az_wins / max(1, games),
+            "mean_margin": margin_sum / max(1, games)}
+
+
+def benchmark_vs_rust(
+    net: KingdominoNet, cfg: "SelfPlayConfig", n_seeds: int, *,
+    seed: int = 0, opponent=None, opponent_net: Optional[KingdominoNet] = None,
+    opp_rng_seed: int = 12345, verbose: bool = False,
+) -> dict:
+    """Fast Rust-backed benchmark for the ``batched_open_loop`` engine.
+
+    Drop-in replacement for ``benchmark_vs`` when the engine is batched_open_loop:
+    same paired-seed match (sides swapped), same return dict.  The Python
+    ``OpenLoopMCTS`` benchmark player is ~50x too slow because its per-simulation
+    tree descent is pure Python; this routes the AZ player's moves through
+    ``kingdomino_rust.RustMCTS`` (Rust tree descent + the GPU forward via
+    ``make_rust_evaluator``) instead.
+
+    WHY A DEDICATED FUNCTION, NOT A ``choose_action`` PLAYER:
+      Neither Rust search API can search an arbitrary mid-game position handed in
+      from Python.  ``RustGameState`` has only a fresh-game constructor (no
+      mid-game injection), and ``BatchedMCTS`` plays *complete* self-play games
+      from a seed (it exposes ``step``/``update``/``done`` — no per-move
+      interface).  So a Rust search must be driven from a ``RustGameState`` built
+      from the seed and stepped from the start.  This plays each benchmark game in
+      LOCKSTEP: a Python ``GameState`` (drives the opponent bot + the
+      ``determine_winner`` cascade) and a mirrored ``RustGameState`` stepped
+      move-for-move via the shared joint action index — the same lockstep used by
+      ``test_rust_augment``.  A ``choose_action(state)`` player cannot do this:
+      it never sees the opponent's moves, so it cannot keep a Rust mirror in sync.
+
+    SEARCH TYPE: ``RustMCTS`` is CLOSED-loop (the only fast per-move Rust search).
+    The root is redeterminized before each search for info-set fairness
+    (single-determinization PIMC — the exact search the ``rust`` engine
+    self-plays with).  This differs from the training OPEN-loop search (which
+    resamples the deck per simulation); an open-loop per-move Rust search would
+    require a Rust-side addition.  As a consistent, fast relative-strength metric
+    tracked across iterations, the closed-loop proxy is appropriate.
+
+    ``opponent_net`` (optional): if given, the opponent also plays via RustMCTS
+    with that frozen net (eval-vs-checkpoint); otherwise ``opponent`` (default
+    ``GreedyBot``) chooses on the Python state.
+    """
+    import kingdomino_rust as kr
+    az_eval = make_rust_evaluator(net, device=cfg.device,
+                                  margin_gain=cfg.margin_gain, alpha=cfg.alpha)
+    opp_eval = None
+    if opponent_net is not None:
+        opp_eval = make_rust_evaluator(opponent_net, device=cfg.device,
+                                       margin_gain=cfg.margin_gain, alpha=cfg.alpha)
+    if opponent is None:
+        opponent = GreedyBot()
+    rust_mcts = kr.RustMCTS()
+
+    def _search_idx(rs, evaluator, np_rng) -> int:
+        """Redeterminize the root, run one RustMCTS search, return the greedy
+        (most-visited, tau=0) joint index."""
+        det = rs.redeterminize(seed=int(np_rng.integers(0, 2**63 - 1)))
+        pairs = rust_mcts.search(
+            det, evaluator, cfg.benchmark_sims,
+            dirichlet_alpha=cfg.dirichlet_alpha, dirichlet_eps=0.0,   # greedy: no root noise
+            fpu=cfg.fpu, cpuct=cfg.c_puct,
+            seed=int(np_rng.integers(0, 2**63 - 1)),
+            leaf_batch=cfg.leaf_batch, virtual_loss=cfg.virtual_loss,
+            score_scale=cfg.score_scale, margin_gain=cfg.margin_gain, alpha=cfg.alpha,
+        )
+        return int(max(pairs, key=lambda kv: kv[1])[0])
+
+    az_wins = opp_wins = draws = 0
+    games = 0
+    margin_sum = 0.0
+    for i in range(n_seeds):
+        for az_is_p0 in (True, False):
+            py = GameState.new(seed=seed + i)
+            rs = kr.RustGameState(py.start_player, list(py.deck), list(py.current_row),
+                                  py.config.harmony, py.config.middle_kingdom)
+            az_idx = 0 if az_is_p0 else 1
+            az_rng = np.random.default_rng(seed * 7919 + i * 2 + int(az_is_p0))
+            opp_np_rng = np.random.default_rng(opp_rng_seed + i * 2 + int(az_is_p0))
+            opp_bot_rng = random.Random(seed * 104729 + i * 2 + int(az_is_p0))
+            while py.phase != Phase.GAME_OVER:
+                if py.current_actor == az_idx:
+                    joint = _search_idx(rs, az_eval, az_rng)
+                elif opp_eval is not None:
+                    joint = _search_idx(rs, opp_eval, opp_np_rng)
+                else:
+                    action = opponent.choose_action(py, py.legal_actions(), rng=opp_bot_rng)
+                    joint = int(encode_action(action, py))
+                # Step BOTH states with the SAME joint index, keeping the mirror
+                # exact: _rust_idx_to_action / decode_action both resolve `joint`
+                # against the (identical, public) current state.
+                placement, pick = _rust_idx_to_action(rs, joint)
+                rs = rs.step(placement, pick)
+                py = py.step(decode_action(joint, py))
+            winner = determine_winner(py)
+            if winner is None:
+                draws += 1
+            elif winner == az_idx:
+                az_wins += 1
+            else:
+                opp_wins += 1
+            scores = py.scores()
+            margin_sum += scores[az_idx] - scores[1 - az_idx]
+            games += 1
+        if verbose and (i + 1) % max(1, n_seeds // 5) == 0:
+            print(f"    bench seed {i+1}/{n_seeds}: az={az_wins} draw={draws} opp={opp_wins}")
+    return {"az_wins": az_wins, "opp_wins": opp_wins, "draws": draws,
+            "n_games": games, "az_win_rate": az_wins / max(1, games),
+            "mean_margin": margin_sum / max(1, games)}
+
+
+# ─── 6. The self-play training loop ───────────────────────────────────────
+def make_mcts(net: KingdominoNet, cfg: SelfPlayConfig, n_simulations: int) -> AlphaZeroMCTS:
+    # The batched evaluator backs leaf_batch>1 (one forward over N leaves); it is
+    # never called when leaf_batch=1 (that path uses the single evaluator), so
+    # building it unconditionally is harmless and keeps the seam ready.
+    return AlphaZeroMCTS(
+        make_serial_evaluator(net, device=cfg.device,
+                              margin_gain=cfg.margin_gain, alpha=cfg.alpha),
+        batched_evaluator=make_batched_evaluator(net, device=cfg.device,
+                              margin_gain=cfg.margin_gain, alpha=cfg.alpha),
+        c_puct=cfg.c_puct,
+        n_simulations=n_simulations,
+        dirichlet_alpha=cfg.dirichlet_alpha,
+        dirichlet_epsilon=cfg.dirichlet_epsilon,
+        fpu=cfg.fpu,
+        virtual_loss=cfg.virtual_loss,
+        score_scale=cfg.score_scale,
+        margin_gain=cfg.margin_gain,
+        alpha=cfg.alpha,
+    )
+
+
+def make_open_loop_mcts(
+    net: KingdominoNet, cfg: SelfPlayConfig, n_simulations: int,
+) -> OpenLoopMCTS:
+    """Build an OpenLoopMCTS instance from config.
+
+    No batched_evaluator — open-loop simulation is inherently serial
+    (each sim follows a different concrete state path).  Throughput comes
+    from the Rust port (Phase 3R), not Python leaf-batching.
+
+    n_determinizations is intentionally not forwarded: OpenLoopMCTS
+    averages over deck orders internally (one fresh determinization per
+    simulation), so the outer PIMC loop is redundant and should not be
+    applied on top.  Callers must use run_pimc_open_loop, not run_pimc.
+    """
+    return OpenLoopMCTS(
+        make_serial_evaluator(net, device=cfg.device,
+                              margin_gain=cfg.margin_gain, alpha=cfg.alpha),
+        c_puct=cfg.c_puct,
+        n_simulations=n_simulations,
+        dirichlet_alpha=cfg.dirichlet_alpha,
+        dirichlet_epsilon=cfg.dirichlet_epsilon,
+        fpu=cfg.fpu,
+        virtual_loss=cfg.virtual_loss,
+        score_scale=cfg.score_scale,
+        margin_gain=cfg.margin_gain,
+        alpha=cfg.alpha,
+    )
+
+
+def save_checkpoint(path: str, net: KingdominoNet, cfg: SelfPlayConfig,
+                    iteration: int, history: dict) -> None:
+    torch.save({
+        "model_state": net.state_dict(),
+        "kind": "alphazero_selfplay",
+        "policy_head_trained": True,
+        "checkpoint_version": KingdominoNet.checkpoint_version,
+        "iteration": iteration,
+        # vars(cfg) records every SelfPlayConfig field — incl. margin_gain/alpha,
+        # so the leaf-value formula is recoverable from the checkpoint alone.
+        "config": vars(cfg),
+        "history": history,
+    }, path)
+
+
+def validate_checkpoint_config(ckpt: dict, cfg: SelfPlayConfig) -> None:
+    """Warn if the loaded checkpoint's config differs from the current
+    SelfPlayConfig on fields that affect training correctness.
+
+    Called after loading a checkpoint to resume training. Mismatches on
+    architecture fields (channels, blocks) are errors; mismatches on
+    hyperparameter fields are warnings.
+    """
+    saved = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    if not saved:
+        print("WARNING: checkpoint has no config dict — cannot validate.")
+        return
+
+    # Hard errors: architecture must match exactly.  checkpoint_version lives on
+    # the network class, not the config; compare against KingdominoNet's value.
+    for field in ("channels", "blocks"):
+        if field in saved and saved[field] != getattr(cfg, field, None):
+            raise ValueError(
+                f"Checkpoint config mismatch on '{field}': "
+                f"saved={saved[field]}, current={getattr(cfg, field)}"
+            )
+    saved_ver = ckpt.get("checkpoint_version", saved.get("checkpoint_version"))
+    if saved_ver is not None and saved_ver != KingdominoNet.checkpoint_version:
+        raise ValueError(
+            f"Checkpoint version mismatch: saved={saved_ver}, "
+            f"current={KingdominoNet.checkpoint_version}"
+        )
+
+    # Warnings: hyperparameter drift is allowed but should be visible.
+    warn_fields = ("n_simulations", "lr", "lambda_score", "lambda_w",
+                   "margin_gain", "alpha", "batch_slots", "leaf_batch")
+    for field in warn_fields:
+        if field in saved and saved[field] != getattr(cfg, field, None):
+            print(f"WARNING: checkpoint config '{field}' differs: "
+                  f"saved={saved[field]}, current={getattr(cfg, field)}")
+
+
+def _run_elo_rating(
+    checkpoint_path: str,
+    checkpoint_name: str,
+    cfg: "SelfPlayConfig",
+    verbose: bool = True,
+) -> Optional[dict]:
+    """Rate a saved checkpoint against the active anchor pool via elo_rating.py.
+
+    Returns {"elo_rating", "elo_stderr", "elo_n_games"} or None if rating is
+    skipped (missing module/anchors/active anchors) or fails.  ALL errors are
+    caught and printed as warnings — an Elo failure must never crash training.
+    The import is deferred so elo_rating.py is an optional dependency.
+    """
+    try:
+        from games.kingdomino.elo_rating import (
+            EloConfig, load_anchors, rate_checkpoint,
+        )
+    except ImportError as e:
+        if verbose:
+            print(f"  [elo] skipped: {e}")
+        return None
+
+    try:
+        anchors_path = cfg.elo_anchors or str(
+            Path(__file__).parent / "elo_anchors.csv")
+        db_path = cfg.elo_db or "elo_db.json"
+        games_path = cfg.elo_games_log or "elo_games.jsonl"
+
+        if not os.path.exists(anchors_path):
+            if verbose:
+                print(f"  [elo] skipped: anchors not found at {anchors_path}")
+            return None
+
+        elo_cfg = EloConfig(
+            anchors_csv=anchors_path,
+            db_path=db_path,
+            games_path=games_path,
+            games_per_anchor=cfg.elo_games_per_anchor,
+            sims=cfg.elo_sims,
+            device=cfg.device,
+            n_slots=cfg.batch_slots,
+            leaf_batch=cfg.leaf_batch,
+            c_puct=cfg.c_puct,
+            margin_gain=cfg.margin_gain,
+            alpha=cfg.alpha,
+        )
+
+        anchors = load_anchors(anchors_path)
+        active_anchors = [a for a in anchors if a.is_active]
+        if not active_anchors:
+            if verbose:
+                print("  [elo] skipped: no active anchors")
+            return None
+
+        if verbose:
+            print(f"  [elo] rating {checkpoint_name} vs "
+                  f"{len(active_anchors)} anchors at sims={cfg.elo_sims}...",
+                  flush=True)
+
+        t0 = time.time()
+        rating, stderr, n_games = rate_checkpoint(
+            checkpoint_path=checkpoint_path,
+            checkpoint_name=checkpoint_name,
+            cfg=elo_cfg,
+            anchors=active_anchors,
+        )
+        elapsed = time.time() - t0
+        if verbose:
+            print(f"  [elo] {checkpoint_name}: Elo {rating:.0f} +/- {stderr:.0f} "
+                  f"({n_games} games, {elapsed:.0f}s)", flush=True)
+        return {"elo_rating": rating, "elo_stderr": stderr,
+                "elo_n_games": n_games}
+
+    except Exception as e:
+        if verbose:
+            print(f"  [elo] WARNING: rating failed: {e}")
+        return None
+
+
+def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
+    """Run the serial self-play loop.  Returns the trained net and history."""
+    configure_torch_performance(cfg)
+    # Fix 2: the leaf-value blend params (cfg.margin_gain / cfg.alpha) and the
+    # terminal-value params (cfg.score_scale) are now bound at MCTS / evaluator /
+    # BatchedMCTS construction time (make_mcts / make_open_loop_mcts /
+    # make_rust_evaluator / play_selfplay_games_batched), so the old
+    # `mcts_az.MARGIN_GAIN = cfg.margin_gain` global override is gone — that
+    # eliminates the multiprocessing fragility (spawned workers re-importing the
+    # module fresh).
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
+                        bilinear_dim=cfg.bilinear_dim).to(cfg.device)
+    # Iteration the warm-start checkpoint reached (0 = fresh run).  Used only as
+    # the reference point for warm_buffer staleness filtering — the training loop
+    # below always counts iterations from 1.
+    start_iteration = 0
+    if cfg.warm_start_path:
+        ckpt = torch.load(cfg.warm_start_path, map_location=cfg.device)
+        validate_checkpoint_config(ckpt, cfg)   # error on arch drift, warn on hparams
+        state = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
+        net.load_state_dict(state)
+        if isinstance(ckpt, dict):
+            start_iteration = int(ckpt.get("iteration", 0))
+        if verbose:
+            print(f"Warm-started from {cfg.warm_start_path} "
+                  f"(iteration={start_iteration})")
+
+    buffer = ReplayBuffer(cfg.buffer_capacity, n_sample_workers=cfg.sample_workers)
+    # Pre-load a previously saved replay buffer (warm start of the DATA, not just
+    # the weights).  Done after the buffer is built and before the first
+    # iteration, so iteration 1 already has examples to train on.
+    if cfg.warm_buffer:
+        if not cfg.warm_start_path:
+            print("WARNING: --warm_buffer provided without --warm_start; "
+                  "buffer will be loaded but network weights are random.")
+        n = buffer.load(
+            cfg.warm_buffer,
+            current_iteration=start_iteration,
+            max_staleness=cfg.warm_buffer_max_staleness,
+        )
+        print(f"Warm buffer: {n} examples pre-loaded "
+              f"(start_iteration={start_iteration})")
+    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr,
+                                 weight_decay=cfg.weight_decay)
+    np_rng = np.random.default_rng(cfg.seed)   # used by training/benchmark only
+    history = _new_history()
+    log_path = _derive_log_path(cfg)
+    if verbose:
+        print(f"Per-iteration log: {log_path}")
+    game_seed = cfg.seed * 1_000_003  # disjoint from benchmark seeds
+
+    # EARLY STOPPING CRITERIA (defined pre-launch per plan §5.3):
+    # - Investigate if win Brier NOT improving after 20 iters
+    #   (check lambda_w, frame conversion in mcts_az.py MARGIN_GAIN/ALPHA).
+    # - Investigate if policy entropy NOT decreasing after 20 iters
+    #   (check open-loop correctness, sims count).
+    # - Plateau: win rate vs GreedyBot within ±5% for 10 consecutive iters
+    #   AND all losses still decreasing → continue.
+    # - Hard stop: win rate vs GreedyBot within ±5% for 10 consecutive iters
+    #   AND losses flat → stop.
+    # These are monitoring criteria, not automated — check the history dict.
+
+    # Fixed probe batch for the policy-entropy metric: sampled once (the first
+    # iteration that trains) and reused every iteration, so the entropy trend
+    # measures the policy sharpening on identical positions rather than batch-to-
+    # batch sampling noise.  Its own deterministic RNG keeps np_rng (and thus the
+    # training/benchmark stream) unperturbed.
+    diag_entropy_batch = None
+    diag_rng = np.random.default_rng(cfg.seed + 7919)
+
+    it = 0   # defined before the loop so the finally block's final-rating is safe
+    try:
+        for it in range(1, cfg.n_iterations + 1):
+            if verbose:
+                print(f"\n{'='*60}\nIteration {it}/{cfg.n_iterations}\n{'='*60}")
+
+            # Per-iteration metrics for the structured log; None = not computed
+            # this iteration (training skipped / no benchmark).  Filled below.
+            trained = False
+            pol_m = own_m = opp_m = win_m = None
+            win_brier_m = baseline_brier_m = None
+            gn_pol = gn_win = gn_own = gn_opp = None
+            entropy = win_brier_diag = None
+            bench_win_rate = bench_score_margin = bench_win_brier = None
+            elo_result = None   # set by the Elo block if elo_every triggers
+
+            # ── 1. Self-play ──
+            net.eval()
+            if cfg.engine == "rust":
+                import kingdomino_rust
+                rust_mcts = kingdomino_rust.RustMCTS()
+                rust_eval = make_rust_evaluator(net, device=cfg.device, amp=cfg.inference_amp,
+                                                margin_gain=cfg.margin_gain, alpha=cfg.alpha,
+                                                compile_net=cfg.compile_net)
+            elif cfg.engine in ("batched", "batched_open_loop"):
+                pass
+            elif cfg.engine == "open_loop":
+                ol_mcts = make_open_loop_mcts(net, cfg, cfg.n_simulations)
+            else:  # "python"
+                mcts = make_mcts(net, cfg, cfg.n_simulations)
+            t0 = time.time()
+            diffs = []
+            batched_stats = None
+            if cfg.engine in ("batched", "batched_open_loop"):
+                all_examples, all_scores, batched_stats = play_selfplay_games_batched(
+                    net, cfg, n_games=cfg.games_per_iteration,
+                    game_seed_start=game_seed, iteration=it,
+                    double_buffer=cfg.double_buffer,
+                )
+                for examples, scores in zip(all_examples, all_scores):
+                    buffer.add(examples)
+                    diffs.append(scores[0] - scores[1])
+                game_seed += cfg.games_per_iteration
+            else:
+                for g in range(cfg.games_per_iteration):
+                    # Per-game RNGs derived from game_seed alone (see _game_rngs): keeps
+                    # self-play data independent of execution order and lets the
+                    # parallel loop reproduce this exactly.
+                    g_py_rng, g_np_rng = _game_rngs(game_seed)
+                    if cfg.engine == "rust":
+                        examples, scores = play_selfplay_game_rust(
+                            rust_mcts, rust_eval,
+                            n_simulations=cfg.n_simulations,
+                            n_determinizations=cfg.n_determinizations,
+                            temp_moves=cfg.temp_moves, c_puct=cfg.c_puct,
+                            dirichlet_alpha=cfg.dirichlet_alpha,
+                            dirichlet_epsilon=cfg.dirichlet_epsilon,
+                            leaf_batch=cfg.leaf_batch, virtual_loss=1,
+                            seed=game_seed, py_rng=g_py_rng, np_rng=g_np_rng,
+                            score_scale=cfg.score_scale,
+                            margin_gain=cfg.margin_gain, alpha=cfg.alpha,
+                            iteration=it,
+                        )
+                    elif cfg.engine == "open_loop":
+                        examples, scores = play_selfplay_game(
+                            ol_mcts,
+                            n_determinizations=1,   # ignored internally; required by signature
+                            temp_moves=cfg.temp_moves,
+                            seed=game_seed,
+                            py_rng=g_py_rng,
+                            np_rng=g_np_rng,
+                            leaf_batch=1,            # not used by open-loop
+                            open_loop=True,
+                            iteration=it,
+                        )
+                    else:  # "python"
+                        examples, scores = play_selfplay_game(
+                            mcts, n_determinizations=cfg.n_determinizations,
+                            temp_moves=cfg.temp_moves, seed=game_seed,
+                            py_rng=g_py_rng,
+                            np_rng=g_np_rng,
+                            leaf_batch=cfg.leaf_batch,
+                            iteration=it,
+                        )
+                    buffer.add(examples)
+                    diffs.append(scores[0] - scores[1])
+                    game_seed += 1
+            sp_elapsed = time.time() - t0
+            sp_rate = cfg.games_per_iteration / sp_elapsed if sp_elapsed > 0 else 0.0
+            diffs_arr = np.array(diffs, dtype=np.float32)
+            sp_score_diff_mean = float(diffs_arr.mean()) if len(diffs_arr) else 0.0
+            sp_score_diff_std = float(diffs_arr.std()) if len(diffs_arr) else 0.0
+            buffer_size = len(buffer)
+            buffer_mean_age = buffer.mean_age(it)
+            history["sp_score_diff_mean"].append(sp_score_diff_mean)
+            history["sp_score_diff_std"].append(sp_score_diff_std)
+            history["games_per_sec"].append(sp_rate)
+            history["buffer_size"].append(buffer_size)
+            history["buffer_mean_age"].append(buffer_mean_age)
+            if verbose:
+                print(f"  self-play: {cfg.games_per_iteration} games "
+                      f"({sp_rate:.2f} games/sec), buffer={buffer_size}")
+                if batched_stats is not None:
+                    print(f"  batched: mean_batch={batched_stats['mean_batch']:.1f}/"
+                          f"{batched_stats['max_batch_cap']} "
+                          f"(fill {batched_stats['fill_ratio']:.0%}), "
+                          f"{batched_stats['requests_per_sec']:.0f} evals/sec, "
+                          f"max_batch_seen={batched_stats['max_batch_seen']}, "
+                          f"ticks={batched_stats['ticks']}")
+                    total = max(1e-9, batched_stats["elapsed"])
+                    print(f"  batched timing: step={batched_stats['step_sec']:.1f}s "
+                          f"({batched_stats['step_sec']/total:.0%}), "
+                          f"eval={batched_stats['eval_sec']:.1f}s "
+                          f"({batched_stats['eval_sec']/total:.0%}), "
+                          f"update={batched_stats['update_sec']:.1f}s "
+                          f"({batched_stats['update_sec']/total:.0%})")
+                    if "eval_forward_sec" in batched_stats:
+                        print(f"  eval timing: h2d={batched_stats['eval_h2d_sec']:.1f}s, "
+                              f"forward={batched_stats['eval_forward_sec']:.1f}s, "
+                              f"readback={batched_stats['eval_readback_sec']:.1f}s, "
+                              f"calls={batched_stats['eval_calls']}")
+
+            # ── 2. Train ──
+            if len(buffer) < cfg.min_buffer_to_train:
+                if verbose:
+                    print(f"  buffer below warmup ({len(buffer)}/{cfg.min_buffer_to_train}); "
+                          f"skipping training this iteration")
+            elif cfg.train_steps_per_iteration <= 0:
+                if verbose:
+                    print("  train: train_steps_per_iteration=0; skipping training")
+            else:
+                trained = True
+                net.train()
+                p_sum = o_sum = q_sum = w_sum = 0.0
+                brier_sum = baseline_sum = 0.0
+                gnp_sum = gnw_sum = gno_sum = gnq_sum = 0.0
+
+                def _run_train_step(batch):
+                    """Run one optimiser step on `batch` and accumulate metrics."""
+                    nonlocal p_sum, o_sum, q_sum, w_sum, brier_sum, baseline_sum
+                    nonlocal gnp_sum, gnw_sum, gno_sum, gnq_sum
+                    (policy_loss, own_loss, opp_loss, win_loss,
+                     win_brier, baseline_brier) = train_step(
+                        net, batch, optimizer,
+                        policy_weight=cfg.policy_weight,
+                        lambda_score=cfg.lambda_score,
+                        lambda_w=cfg.lambda_w,
+                        score_scale=cfg.score_scale,
+                        grad_clip=cfg.grad_clip,
+                    )
+                    # Grad norms: train_step zeros grads at the START of each step
+                    # (not the end), so the grads are still populated here, after
+                    # optimizer.step() (post-clip values).
+                    gnp_sum += _grad_norm(_policy_params(net))
+                    gnw_sum += _grad_norm(net.win_mlp.parameters())
+                    gno_sum += _grad_norm(net.own_score_mlp.parameters())
+                    gnq_sum += _grad_norm(net.opponent_score_mlp.parameters())
+                    p_sum += policy_loss; o_sum += own_loss
+                    q_sum += opp_loss; w_sum += win_loss
+                    brier_sum += win_brier; baseline_sum += baseline_brier
+
+                # Item 19: prefetch the next batch on a background thread while the
+                # GPU runs train_step on the current one.  Only worthwhile with >1
+                # step.  The prefetch thread uses its OWN rng (np_rng is not
+                # thread-safe) and does only CPU numpy/Rust augment + a blocking
+                # H2D copy; the main thread's train_step (the sole CUDA user) never
+                # overlaps it because we .result() before stepping.
+                use_prefetch = (cfg.prefetch_batches
+                                and cfg.train_steps_per_iteration > 1)
+                if use_prefetch:
+                    prefetch_rng = np.random.default_rng(int(np_rng.integers(2**63)))
+                    sample_fn = lambda: buffer.sample_batch(
+                        cfg.batch_size, prefetch_rng,
+                        device=cfg.device, augment_d4=cfg.augment)
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    next_batch_future = executor.submit(sample_fn)   # prime
+                    try:
+                        for step in range(cfg.train_steps_per_iteration):
+                            batch = next_batch_future.result()
+                            if step + 1 < cfg.train_steps_per_iteration:
+                                next_batch_future = executor.submit(sample_fn)
+                            _run_train_step(batch)
+                    finally:
+                        executor.shutdown(wait=False)
+                else:
+                    for step in range(cfg.train_steps_per_iteration):
+                        batch = buffer.sample_batch(cfg.batch_size, np_rng,
+                                                    device=cfg.device,
+                                                    augment_d4=cfg.augment)
+                        _run_train_step(batch)
+                n = cfg.train_steps_per_iteration
+                pol_m, own_m, opp_m, win_m = p_sum/n, o_sum/n, q_sum/n, w_sum/n
+                win_brier_m, baseline_brier_m = brier_sum/n, baseline_sum/n
+                gn_pol, gn_win = gnp_sum/n, gnw_sum/n
+                gn_own, gn_opp = gno_sum/n, gnq_sum/n
+                history["policy_loss"].append(pol_m)
+                history["own_loss"].append(own_m)
+                history["opp_loss"].append(opp_m)
+                history["win_loss"].append(win_m)
+                history["win_brier"].append(win_brier_m)
+                history["baseline_brier"].append(baseline_brier_m)
+                history["grad_norm_policy"].append(gn_pol)
+                history["grad_norm_win"].append(gn_win)
+                history["grad_norm_own"].append(gn_own)
+                history["grad_norm_opp"].append(gn_opp)
+                if verbose:
+                    print(f"  train: policy={pol_m:.4f}  own={own_m:.4f}  "
+                          f"opp={opp_m:.4f} win={win_m:.4f}  "
+                          f"brier={win_brier_m:.4f}  base={baseline_brier_m:.4f}")
+
+                # ── Diagnostic batch (once per iteration, not per step) ──
+                # policy_entropy + win_brier_diag share a single FIXED probe batch
+                # (sampled once on the first training iteration), so both trends
+                # reflect the net changing on identical positions rather than
+                # batch sampling noise.  Decreasing entropy ⇒ the policy is
+                # sharpening; win_brier_diag tracks win-head calibration.  The
+                # probe's own RNG keeps np_rng (training/benchmark stream)
+                # unperturbed.
+                if diag_entropy_batch is None:
+                    # Sample once (positions are densified into independent tensors,
+                    # so later ring-buffer eviction doesn't touch them).
+                    diag_entropy_batch = buffer.sample_batch(
+                        min(256, len(buffer)), diag_rng,
+                        device=cfg.device, augment_d4=False,
+                    )
+                entropy, win_brier_diag = _diag_metrics(net, diag_entropy_batch)
+                history["policy_entropy"].append(entropy)
+                history["win_brier_diag"].append(win_brier_diag)
+                net.train()  # restore train mode (_diag_metrics set eval)
+                if verbose:
+                    print(f"  diag: entropy={entropy:.4f}  "
+                          f"brier_diag={win_brier_diag:.4f}")
+
+            # ── 3. Benchmark + checkpoint ──
+            if cfg.benchmark_every and it % cfg.benchmark_every == 0:
+                net.eval()
+                bench_dets = (cfg.benchmark_determinizations
+                              if cfg.benchmark_determinizations is not None
+                              else cfg.n_determinizations)
+                if cfg.engine == "batched_open_loop":
+                    # Rust-backed lockstep benchmark (~50x faster than the Python
+                    # OpenLoopMCTS player; see benchmark_vs_rust docstring).
+                    stats = benchmark_vs_rust(net, cfg, cfg.benchmark_seeds,
+                                              seed=cfg.seed + 99, verbose=False)
+                else:
+                    if cfg.engine == "open_loop":
+                        az = OpenLoopAZPlayer(
+                            make_open_loop_mcts(net, cfg, cfg.benchmark_sims),
+                            np_rng=np_rng,
+                        )
+                    else:
+                        az = AZPlayer(make_mcts(net, cfg, cfg.benchmark_sims),
+                                      n_determinizations=bench_dets, np_rng=np_rng)
+                    stats = benchmark_vs(az, GreedyBot(), cfg.benchmark_seeds,
+                                         seed=cfg.seed + 99, verbose=False)
+                bench_win_rate = stats["az_win_rate"]
+                bench_score_margin = stats["mean_margin"]
+                # Brier on the fixed diagnostic batch at benchmark time (a
+                # benchmark-time calibration reading on the same consistent set).
+                if diag_entropy_batch is not None:
+                    _, bench_win_brier = _diag_metrics(net, diag_entropy_batch)
+                    net.eval()  # benchmark already runs in eval mode
+                history["benchmark"].append((it, bench_win_rate))
+                history["score_margin"].append(bench_score_margin)
+                if verbose:
+                    print(f"  benchmark vs Greedy: {stats['az_win_rate']:.1%} "
+                          f"({stats['az_wins']}-{stats['draws']}-{stats['opp_wins']} "
+                          f"over {stats['n_games']} games), "
+                          f"mean_margin={stats['mean_margin']:+.1f}")
+
+            if cfg.checkpoint_dir:
+                os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+                save_checkpoint(os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
+                                net, cfg, it, history)
+
+            # ── 3b. Elo rating (periodic) ──  AFTER the checkpoint is on disk so
+            # the rater can load it; BEFORE the log row so its result can be logged.
+            if cfg.elo_every and it % cfg.elo_every == 0 and cfg.checkpoint_dir:
+                run_id = Path(cfg.checkpoint_dir).name
+                elo_result = _run_elo_rating(
+                    checkpoint_path=os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
+                    checkpoint_name=f"{run_id}_iter_{it:04d}",
+                    cfg=cfg,
+                    verbose=verbose,
+                )
+
+            # ── 4. Structured log row + compact summary (END of iteration) ──
+            row = {
+                "iter": it,
+                "timestamp": time.time(),
+                "policy_loss": pol_m,
+                "own_loss": own_m,
+                "opp_loss": opp_m,
+                "win_loss": win_m,
+                "win_brier": win_brier_m,
+                "baseline_brier": baseline_brier_m,
+                "grad_norm_policy": gn_pol,
+                "grad_norm_win": gn_win,
+                "grad_norm_own": gn_own,
+                "grad_norm_opp": gn_opp,
+                "sp_score_diff_mean": sp_score_diff_mean,
+                "sp_score_diff_std": sp_score_diff_std,
+                "games_per_sec": sp_rate,
+                "buffer_size": buffer_size,
+                "buffer_mean_age": buffer_mean_age,
+                "policy_entropy": entropy,
+                "win_brier_diag": win_brier_diag,
+                "bench_win_rate": bench_win_rate,
+                "bench_score_margin": bench_score_margin,
+                "bench_win_brier": bench_win_brier,
+                "elo_rating": elo_result["elo_rating"] if elo_result else None,
+                "elo_stderr": elo_result["elo_stderr"] if elo_result else None,
+                "elo_n_games": elo_result["elo_n_games"] if elo_result else None,
+            }
+            _log_row(log_path, row)
+            if verbose:
+                print(_compact_summary(
+                    it, sp_games=cfg.games_per_iteration, row=row,
+                    trained=trained, buf_n=buffer_size,
+                    min_buf=cfg.min_buffer_to_train))
+
+    finally:
+        # Save the buffer on EXIT — clean completion AND KeyboardInterrupt — so a
+        # long run that the user Ctrl+C's still yields its replay buffer.  Guarded
+        # so a save failure can't mask the original exception or skip buffer.close().
+        if cfg.save_buffer:
+            try:
+                buffer.save(cfg.save_buffer)
+                print(f"Buffer saved on exit: {cfg.save_buffer}")
+            except Exception as e:
+                print(f"WARNING: buffer save failed: {e}")
+
+        # Final-checkpoint Elo rating (runs on clean completion AND on
+        # Ctrl+C/exception, so the last checkpoint is always placed on the
+        # ladder).  Guarded so it can never mask the original exception.
+        if cfg.elo_every and cfg.checkpoint_dir and it:
+            try:
+                run_id = Path(cfg.checkpoint_dir).name
+                final_path = os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt")
+                if os.path.exists(final_path):
+                    _run_elo_rating(
+                        checkpoint_path=final_path,
+                        checkpoint_name=f"{run_id}_iter_{it:04d}_final",
+                        cfg=cfg,
+                        verbose=verbose,
+                    )
+            except Exception as e:
+                print(f"WARNING: final Elo rating failed: {e}")
+
+        # Global ladder re-solve: one joint Bradley-Terry fit over the FULL game
+        # log, so every rated checkpoint is placed on a mutually-consistent scale
+        # (not just its own per-checkpoint MLE).  Cheap, in-memory; guarded so it
+        # can never crash the run.
+        if cfg.elo_every:
+            try:
+                from games.kingdomino.elo_rating import resolve_ladder
+                games_path = cfg.elo_games_log or "elo_games.jsonl"
+                db_path = cfg.elo_db or "elo_db.json"
+                if os.path.exists(games_path):
+                    if verbose:
+                        print("  [elo] resolving global ladder from full game log...")
+                    resolve_ladder(
+                        games_path=games_path,
+                        db_path=db_path,
+                        verbose=verbose,
+                    )
+                    if verbose:
+                        print("  [elo] ladder updated in elo_db.json")
+            except Exception as e:
+                if verbose:
+                    print(f"  [elo] WARNING: resolve failed: {e}")
+
+        buffer.close()
+
+    return {"net": net, "history": history, "buffer": buffer}
+
+
+# ─── 7. CLI ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Serial AlphaZero self-play for Kingdomino")
+    p.add_argument("--iterations", type=int, default=40)
+    p.add_argument("--games_per_iter", type=int, default=50)
+    p.add_argument("--train_steps", type=int, default=200)
+    p.add_argument("--sims", type=int, default=100)
+    p.add_argument("--determinizations", type=int, default=1)
+    p.add_argument("--leaf_batch", type=int, default=1,
+                   help="leaf-parallel batch for self-play search (1=serial). "
+                        "Validate divergence with policy_compare before using >1; "
+                        "applies to the serial in-process generation path.")
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--sample_workers", type=int, default=1,
+                   help="threads for ReplayBuffer.sample_batch densify+augment "
+                        "(1 = serial; >1 measured to REGRESS this GIL-bound "
+                        "workload ~2x — kept for experimentation)")
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--buffer", type=int, default=50_000)
+    p.add_argument("--channels", type=int, default=96)
+    p.add_argument("--blocks", type=int, default=8)
+    p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--benchmark_seeds", type=int, default=10)
+    p.add_argument("--benchmark_determinizations", type=int, default=None,
+                   help="PIMC worlds per benchmark move (default: reuse --determinizations)")
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--policy_weight", type=float, default=1.0,
+                   help="weight on the masked policy cross-entropy loss")
+    p.add_argument("--lambda_score", type=float, default=0.5,
+                   help="weight on own+opp score MSE losses")
+    p.add_argument("--lambda_w", type=float, default=0.25,
+                   help="weight on win BCE loss")
+    p.add_argument("--score_scale", type=float, default=100.0,
+                   help="normalization divisor for the score heads")
+    p.add_argument("--grad_clip", type=float, default=1.0,
+                   help="max global grad norm; <=0 disables clipping")
+    p.add_argument("--c_puct", type=float, default=1.5)
+    p.add_argument("--temp_moves", type=int, default=20,
+                   help="sample ∝ visits for this many plies, then greedy")
+    p.add_argument("--fpu", type=float, default=0.0,
+                   help="first-play-urgency value for unvisited children")
+    p.add_argument("--virtual_loss", type=int, default=1,
+                   help="virtual loss magnitude (leaf-parallel / batched paths)")
+    p.add_argument("--margin_gain", type=float, default=2.0,
+                   help="leaf value: scales (own_norm-opp_norm) before tanh "
+                        "(overrides mcts_az.MARGIN_GAIN)")
+    p.add_argument("--alpha", type=float, default=0.8,
+                   help="leaf value: weight on margin vs win term "
+                        "(overrides mcts_az.ALPHA; 0.8 = margin-dominant)")
+    p.add_argument("--benchmark_every", type=int, default=1,
+                   help="benchmark vs GreedyBot every N iterations")
+    p.add_argument("--benchmark_sims", type=int, default=50,
+                   help="MCTS sims per move during benchmarking")
+    p.add_argument("--elo_every", type=int, default=0,
+                   help="Rate checkpoint against anchor pool every N iterations "
+                        "(0 = disabled). Uses batched open-loop engine at elo_sims.")
+    p.add_argument("--elo_anchors", default="",
+                   help="Path to elo_anchors.csv (default: auto-find in package dir)")
+    p.add_argument("--elo_db", default="",
+                   help="Path to elo_db.json (default: elo_db.json in cwd)")
+    p.add_argument("--elo_games_log", default="",
+                   help="Path to elo_games.jsonl (default: elo_games.jsonl in cwd)")
+    p.add_argument("--elo_sims", type=int, default=400,
+                   help="MCTS sims per move for Elo rating games")
+    p.add_argument("--elo_games_per_anchor", type=int, default=20,
+                   help="Paired seeds per anchor for rating (40 games total per anchor)")
+    p.add_argument("--no_augment", action="store_true",
+                   help="disable D4 augmentation (useful when debugging policy/mask)")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--no_tf32", action="store_true",
+                   help="disable TF32 CUDA matmul/convolution for inference/training")
+    p.add_argument("--amp_inference", action="store_true",
+                   help="use CUDA float16 autocast for self-play inference")
+    p.add_argument("--engine",
+                   choices=["python", "open_loop", "rust", "batched", "batched_open_loop"],
+                   default="python",
+                   help="Search engine: 'python' (AlphaZeroMCTS+PIMC, closed-loop "
+                        "oracle); 'open_loop' (OpenLoopMCTS, resamples deck order "
+                        "per simulation, averages internally — n_determinizations/"
+                        "leaf_batch ignored); 'rust' (RustMCTS, in-process leaf "
+                        "eval, no IPC server); 'batched' (one synchronized Rust "
+                        "BatchedMCTS); 'batched_open_loop' (Rust BatchedMCTS with "
+                        "per-simulation deck resampling — the fast open-loop path).")
+    p.add_argument("--batch_slots", type=int, default=32,
+                   help="concurrent slots for --engine batched; separate from "
+                        "--games_per_iter.")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--warm_start", default=None)
+    p.add_argument("--min_buffer", type=int, default=None,
+                   help="don't train until this many positions are in the buffer "
+                        "(default: one iteration's worth, so training starts on iter 2)")
+    p.add_argument("--checkpoint_dir", default=None)
+    p.add_argument("--save_buffer", default="",
+                   help="path to save the final replay buffer when training ends "
+                        "(also saved on Ctrl+C); empty = don't save")
+    p.add_argument("--warm_buffer", default="",
+                   help="path to a previously saved buffer to load before iter 1 "
+                        "(use with --warm_start); empty = start empty")
+    p.add_argument("--warm_buffer_max_staleness", type=int, default=200,
+                   help="discard warm_buffer examples older than this many "
+                        "iterations (default 200 = permissive)")
+    p.add_argument("--log_path", default=None,
+                   help="per-iteration JSONL log path (default: auto-derive "
+                        "{checkpoint_dir}/training_log.jsonl, else "
+                        "./training_log_{timestamp}.jsonl)")
+    p.add_argument("--compile", action="store_true",
+                   help="(Item 20) torch.compile the inference net on CUDA "
+                        "(leaf-eval only; training net stays uncompiled)")
+    p.add_argument("--prefetch_batches", action="store_true",
+                   help="(Item 19) prefetch the next training batch on a "
+                        "background thread while the GPU runs train_step")
+    p.add_argument("--double_buffer", action="store_true",
+                   help="(Item 17) Run two BatchedMCTS instances in parallel, "
+                        "overlapping CPU tree work with GPU forward. Only for "
+                        "engine=batched or batched_open_loop.")
+    a = p.parse_args()
+
+    # Default warmup = one full iteration's worth of positions, so training
+    # starts on the second iteration rather than never (when smoke-testing with
+    # few games) or immediately (before the buffer has any diversity).
+    min_buf = a.min_buffer if a.min_buffer is not None else a.games_per_iter * 52
+
+    cfg = SelfPlayConfig(
+        n_iterations=a.iterations, games_per_iteration=a.games_per_iter,
+        train_steps_per_iteration=a.train_steps, n_simulations=a.sims,
+        n_determinizations=a.determinizations, leaf_batch=a.leaf_batch,
+        batch_slots=a.batch_slots,
+        batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
+        buffer_capacity=a.buffer, channels=a.channels, blocks=a.blocks,
+        bilinear_dim=a.bilinear_dim, benchmark_seeds=a.benchmark_seeds,
+        benchmark_determinizations=a.benchmark_determinizations,
+        grad_clip=a.grad_clip, augment=not a.no_augment,
+        weight_decay=a.weight_decay, policy_weight=a.policy_weight,
+        lambda_score=a.lambda_score, lambda_w=a.lambda_w,
+        score_scale=a.score_scale,
+        c_puct=a.c_puct, temp_moves=a.temp_moves,
+        fpu=a.fpu, virtual_loss=a.virtual_loss,
+        margin_gain=a.margin_gain, alpha=a.alpha,
+        benchmark_every=a.benchmark_every, benchmark_sims=a.benchmark_sims,
+        elo_every=a.elo_every, elo_anchors=a.elo_anchors, elo_db=a.elo_db,
+        elo_games_log=a.elo_games_log, elo_sims=a.elo_sims,
+        elo_games_per_anchor=a.elo_games_per_anchor,
+        device=a.device, seed=a.seed, warm_start_path=a.warm_start,
+        checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,
+        save_buffer=a.save_buffer, warm_buffer=a.warm_buffer,
+        warm_buffer_max_staleness=a.warm_buffer_max_staleness,
+        min_buffer_to_train=min_buf,
+        engine=a.engine, allow_tf32=not a.no_tf32,
+        inference_amp=a.amp_inference,
+        compile_net=a.compile, prefetch_batches=a.prefetch_batches,
+        double_buffer=a.double_buffer,
+    )
+    run_self_play_training(cfg, verbose=True)

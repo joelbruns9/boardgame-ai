@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "BGA Kingdomino Advisor",
+  "version": "0.1.0",
+  "description": "Scrapes Kingdomino state from Board Game Arena and queries a local advisor.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "*://*.boardgamearena.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ],
+      "js": [
+        "placement_mapping.js",
+        "content.js"
+      ]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Kingdomino Advisor"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  }
+}

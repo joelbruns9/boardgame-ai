@@ -1,0 +1,249 @@
+Here's a clean setup guide you can give to someone who has never installed the advisor before.
+
+# Can't Stop Advisor Setup Guide (Firefox)
+
+## Overview
+
+The Can't Stop Advisor consists of:
+
+1. A local Python inference server
+2. A Firefox extension
+3. A trained model checkpoint
+
+The extension reads the live Board Game Arena game state, sends it to the local inference server, and displays move recommendations directly on the game page.
+
+---
+
+# Prerequisites
+
+Required:
+
+* Python 3.10+
+* Firefox
+* Project repository checked out locally
+* Trained model checkpoint (`.pt` file)
+
+---
+
+# Step 1: Open a Terminal
+
+Navigate to the project root.
+
+Example:
+
+```text
+C:\Users\<username>\projects\boardgame-ai
+```
+
+---
+
+# Step 2: Activate the Virtual Environment
+
+Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```cmd
+.venv\Scripts\activate
+```
+
+Verify:
+
+```text
+(.venv)
+```
+
+appears at the beginning of the command prompt.
+
+---
+
+# Step 3: Start the Advisor Server
+
+Example:
+
+```cmd
+python games\cantstop\inference_server.py ^
+  --model models\cantstop\run_highsims_pilot\model_iter_012_accepted.pt ^
+  --device cuda ^
+  --sims 500
+```
+
+Recommended settings:
+
+### Fast analysis
+
+```text
+200-500 sims
+```
+
+### Strong analysis
+
+```text
+1000-2000 sims
+```
+
+### Deep analysis
+
+```text
+5000+ sims
+```
+
+Keep the terminal window open while using the advisor.
+
+---
+
+# Step 4: Load the Firefox Extension
+
+Open Firefox and navigate to:
+
+```text
+about:debugging#/runtime/this-firefox
+```
+
+Click:
+
+```text
+Load Temporary Add-on...
+```
+
+Navigate to:
+
+```text
+extension/
+```
+
+Select:
+
+```text
+manifest.json
+```
+
+Firefox will install the extension.
+
+---
+
+# Step 5: Open Board Game Arena
+
+Navigate to:
+
+```text
+https://boardgamearena.com
+```
+
+Open an active Can't Stop game.
+
+---
+
+# Step 6: Verify Advisor Connection
+
+The advisor should:
+
+* detect the game
+* scrape the board state
+* contact the local inference server
+* display recommendations
+
+If recommendations appear, setup is complete.
+
+---
+
+# Updating the Extension After Code Changes
+
+After modifying extension files:
+
+Open:
+
+```text
+about:debugging#/runtime/this-firefox
+```
+
+Find the extension.
+
+Click:
+
+```text
+Reload
+```
+
+Then refresh the BGA page.
+
+---
+
+# Updating the Model
+
+Stop the inference server.
+
+Restart with a different checkpoint:
+
+```cmd
+python games\cantstop\inference_server.py ^
+  --model path\to\new_model.pt ^
+  --device cuda ^
+  --sims 500
+```
+
+The extension will automatically use the newly loaded model.
+
+---
+
+# Common Issues
+
+## No recommendations displayed
+
+Check:
+
+* inference server is running
+* correct model path supplied
+* extension loaded successfully
+* BGA page refreshed after extension install
+
+---
+
+## Extension loaded but not updating
+
+Reload extension:
+
+```text
+about:debugging#/runtime/this-firefox
+```
+
+Click:
+
+```text
+Reload
+```
+
+Refresh the BGA tab.
+
+---
+
+## Slow recommendations
+
+Reduce simulations:
+
+```text
+5000 → 1000
+1000 → 500
+```
+
+The advisor and training runs share CPU/GPU resources.
+
+---
+
+# Recommended Production Model
+
+Current strongest tested checkpoint:
+
+```text
+models/cantstop/run_highsims_pilot/model_iter_012_accepted.pt
+```
+
+This model currently outperforms:
+
+* run_60h_v2/model_iter_077_accepted.pt
+* run_60h_v2/best_model.pt
+* later checkpoints from the high-sim pilot

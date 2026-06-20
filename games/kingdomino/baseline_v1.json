@@ -1,0 +1,141 @@
+{
+  "name": "kingdomino_baseline_v1",
+  "locked_on": "2026-06-08",
+  "purpose": "Frozen local baseline for M9 model/search/training pilots. Change one variable at a time from this baseline.",
+  "current_best": {
+    "checkpoint": "checkpoints_best/kingdomino_current_best.pt",
+    "metadata": "checkpoints_best/kingdomino_current_best.json",
+    "source_checkpoint": "checkpoints_baseline_v1_32x4_s800/iter_0080.pt",
+    "promoted_on": "2026-06-09",
+    "promotion_eval": "eval_results/m10a_top3_s100_g300_leaderboard.csv"
+  },
+  "architecture_family": {
+    "network": "KingdominoNet",
+    "board_trunk": "shared my/opp board trunk",
+    "norm": "group",
+    "context": "avg+max pooled board context",
+    "policy_head": "current bilinear full policy head",
+    "value_head": "current value MLP",
+    "bilinear_dim": 64,
+    "value_hidden": 256,
+    "pick_hidden": 128,
+    "flat_policy_hidden": 256,
+    "model_size_variables": [
+      "channels",
+      "blocks"
+    ],
+    "scout_model": {
+      "channels": 32,
+      "blocks": 4
+    }
+  },
+  "data_and_targets": {
+    "value_target": "tanh(score_margin / 30)",
+    "policy_target": "MCTS visit distribution",
+    "policy_loss": "legal-only masked cross entropy",
+    "legal_mask": "stored legal joint-action indices",
+    "perspective": "current actor frame",
+    "augmentation": "D4 augmentation enabled",
+    "example_storage": {
+      "boards": "float16",
+      "flat": "float16",
+      "policy_indices": "sparse int32",
+      "policy_values": "sparse float32",
+      "legal_indices": "sparse int32"
+    }
+  },
+  "local_inference_defaults": {
+    "device": "cuda",
+    "allow_tf32": true,
+    "amp_inference": true,
+    "compile_net": false,
+    "compile_backend": "",
+    "eval_pad_to_batch": 0,
+    "pin_transfer": false,
+    "profile_eval_timing": false
+  },
+  "self_play_search": {
+    "engine": "batched",
+    "n_simulations": 800,
+    "n_determinizations": 1,
+    "batch_slots": 86,
+    "leaf_batch": 6,
+    "virtual_loss": 1,
+    "c_puct": 1.5,
+    "fpu": 0.0,
+    "dirichlet_alpha": 0.3,
+    "dirichlet_epsilon": 0.25,
+    "temp_moves": 20,
+    "rayon_slot_parallelism": true
+  },
+  "training": {
+    "optimizer": "Adam",
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 256,
+    "train_steps_per_iteration": 200,
+    "buffer_capacity": 50000,
+    "min_buffer_to_train_policy": "default to games_per_iteration * 52 from CLI unless explicitly overridden",
+    "value_weight": 1.0,
+    "policy_weight": 1.0,
+    "grad_clip": 1.0,
+    "augment": true,
+    "checkpoint_cadence": "every iteration when checkpoint_dir is set"
+  },
+  "loop_defaults": {
+    "n_iterations": 40,
+    "games_per_iteration": 50,
+    "seed": 0
+  },
+  "current_builtin_benchmark": {
+    "benchmark_every": 1,
+    "benchmark_seeds": 10,
+    "benchmark_sims": 50,
+    "benchmark_determinizations": "reuse n_determinizations",
+    "opponent": "GreedyBot",
+    "status": "sanity only; not a promotion harness"
+  },
+  "m10a_lite_eval_defaults_to_build": {
+    "paired_seeds": "fixed and versioned",
+    "eval_sims": 800,
+    "eval_determinizations": 1,
+    "selection": "greedy after search, no training temperature",
+    "games_per_match": 200,
+    "promotion_rule": "candidate must convincingly beat current best under fixed paired seeds",
+    "report": [
+      "win/draw/loss",
+      "score margin",
+      "confidence interval",
+      "config hash or config file path"
+    ]
+  },
+  "logging_required": [
+    "baseline file path",
+    "model config",
+    "search config",
+    "throughput config",
+    "training config",
+    "games/hour",
+    "examples/hour",
+    "value loss",
+    "policy loss",
+    "eval result",
+    "checkpoint path",
+    "seed",
+    "git/worktree status when practical"
+  ],
+  "reproducibility_policy": {
+    "run_seed": "fixed per run",
+    "game_seed_derivation": "seed * 1000003 plus game index",
+    "eval_seeds": "fixed paired seed set once M10A-lite is built",
+    "cuda_determinism": "not required to be bit deterministic; compare by paired evaluations"
+  },
+  "default_off_retest_on_cloud": [
+    "compile_net",
+    "fixed_shape_padding",
+    "pin_transfer",
+    "larger batch_slots",
+    "larger leaf_batch",
+    "legal/readback reductions"
+  ]
+}

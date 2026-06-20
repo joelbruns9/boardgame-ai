@@ -1,12 +1,45 @@
-# Virtual environment - can always be recreated
-.venv/
-
 # Private settings - never share these
 .env
 
 # Data files - too large for GitHub, backed up separately
 data/
 
-# Python clutter - auto-generated, not needed
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Rust build artifacts
+target/
+*.so
+Cargo.lock
+
+# Checkpoints and large binary artifacts
+checkpoints*/
+*.pkl
+# Exception: allow the best_checkpoint directory
+!best_checkpoint/
+!best_checkpoint/*.pt
+
+# Training logs (large, machine-specific)
+# Do NOT exclude elo_db.json or elo_games.jsonl — these are project
+# artifacts that should be committed
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temp test directories created during validation runs
+tmp_*/
+
+# Claude local context
+.claude/

@@ -1,0 +1,196 @@
+# Can't Stop AI Match Integration Guide
+
+## Goal
+
+Run head-to-head matches between independently developed Can't Stop AI systems.
+
+Each AI runs locally as its own server.
+
+A neutral match runner:
+
+* owns dice rolls
+* validates legality
+* applies game rules
+* alternates first player
+* records results
+
+Each AI only returns move recommendations.
+
+---
+
+# High-Level Architecture
+
+```text
+neutral_match_runner.py
+        ├── calls Player A server
+        └── calls Player B server
+```
+
+Each server:
+
+* loads its own engine
+* loads its own model
+* runs its own MCTS
+* returns a move recommendation
+
+The match runner:
+
+* owns the authoritative game state
+* validates legality
+* applies moves
+* determines winners
+
+---
+
+# Server API
+
+## Endpoint
+
+```text
+POST /recommend
+```
+
+---
+
+# Request Format
+
+```json id="e8s4yv"
+{
+  "state": {
+    "active_player": 0,
+
+    "dice": [2, 3, 4, 6],
+
+    "progress": [
+      { "4": 2, "7": 3 },
+      { "5": 1 }
+    ],
+
+    "claimed": [
+      [4],
+      []
+    ],
+
+    "runners": {
+      "6": 1,
+      "8": 2
+    }
+  },
+
+  "num_simulations": 500
+}
+```
+
+---
+
+# Response Format
+
+```json id="n5w55e"
+{
+  "move": [6, 8],
+  "decision": "continue"
+}
+```
+
+Examples:
+
+```json id="rwj5cz"
+{
+  "move": [7, 7],
+  "decision": "stop"
+}
+```
+
+```json id="lynhbm"
+{
+  "move": [4],
+  "decision": "continue"
+}
+```
+
+---
+
+# Important Rules
+
+* The match runner owns legality validation.
+* Illegal move = immediate loss.
+* Timeout = immediate loss.
+* Suggested timeout: 30 seconds/move.
+
+---
+
+# Match Settings
+
+Initial testing:
+
+* 100 simulations/move
+
+Main testing:
+
+* 500 simulations/move
+
+Deep testing:
+
+* 1000+ simulations/move
+
+---
+
+# Fairness Rules
+
+* Alternate first player.
+* Shared random seeds controlled by match runner.
+* Same simulation count for both agents.
+* Same timeout rules for both agents.
+
+---
+
+# Local Setup Example
+
+Player A server:
+
+```text
+http://127.0.0.1:8765/recommend
+```
+
+Player B server:
+
+```text
+http://127.0.0.1:8766/recommend
+```
+
+---
+
+# Files Included From My Side
+
+I’ll provide:
+
+* engine.py
+* features.py
+* model.py
+* mcts.py
+* inference server
+* trained checkpoint
+* protocol examples
+
+You only need to implement:
+
+* compatible request parsing
+* response formatting
+* recommendation endpoint
+
+---
+
+# Recommended Tech
+
+Python + Flask or FastAPI.
+
+---
+
+# Suggested First Test
+
+Before full matches:
+
+1. Send identical states to both systems.
+2. Confirm legal responses.
+3. Run 10-game smoke test.
+4. Then scale to larger tournaments.

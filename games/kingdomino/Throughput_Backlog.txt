@@ -1,0 +1,149 @@
+Good — I have enough from history plus this conversation to give a complete picture. Here is the full summary:
+
+---
+
+## Throughput Items — Complete Summary
+
+### ✅ DONE AND IMPLEMENTED
+
+**1. Rust BatchedMCTS — open-loop port (Phase 3R)**
+- **Impact:** 48× speedup over Python open-loop. 0.02 games/s → 0.962 games/s at sims=200; ~0.27 games/s at sims=1600 in the actual cloud run.
+- **Highest-impact item in the project.**
+
+**2. Rust encode_arrays_into — direct batch buffer writes (R2)**
+- **Impact:** Eliminated 192 Array3/Array1 allocation+copy pairs per tick (batch_slots=32 × leaf_batch=6). Measured +5% at GPU-dominated workload; real value is on CPU-bound rented hardware.
+
+**3. Two-pointer merge in ol_select_child — replaced HashMap (R2)**
+- **Impact:** Eliminated one HashMap allocation per tree node per descent. Zero-allocation O(n+m) merge. +2–5% on GPU-bound workload; larger gain when CPU-bound.
+
+**4. Double-clone elimination in ol_descend (R2)**
+- **Impact:** Removed one redundant RustGameState clone per simulation. Modest but free.
+
+**5. Rust d4_augment — augmentation in Rust**
+- **Impact:** 3× speedup on sample_batch augmentation path (~37k vs ~11k calls/s). Saved ~1.9s per iteration in training loop.
+
+**6. Rust augment_mask — mask transform in Rust**
+- **Impact:** 1.76× speedup on sample_batch (16.5 → 9.4 ms/batch). The real win from the "sample_batch parallelism" prompt — threading failed but this succeeded.
+
+**7. Rust legal_mask — legal mask construction**
+- **Impact:** Eliminated Python encode_action loop per position during sample_batch. Modest but clean.
+
+**8. GPU-side logit gather — index_select before D2H transfer (mcts_az fixes)**
+- **Impact:** Reduced D2H transfer from K×3390×4 bytes to K×n_legal×4 bytes per forward. At n_legal≈50: ~68× less data per leaf. Meaningful on PCIe 3.0 x4 (common cloud VMs); marginal on the 3070's PCIe 4.0.
+
+**9. f32 readback — dropped .double() cast (pre-launch fixes)**
+- **Impact:** Halved D2H transfer volume for values and logits. Same rationale as #8 — bigger win on slower PCIe links.
+
+**10. torch.inference_mode() replacing no_grad()**
+- **Impact:** Marginal on modern PyTorch but correct semantics for pure inference. No measurable overhead change but reduces internal tracking cost.
+
+**11. Rust benchmark player (benchmark_vs_rust)**
+- **Impact:** 8.9× speedup on benchmark games. Made benchmark_every=1 viable (~34s per benchmark run vs ~13 minutes for the Python path).
+
+**12. Batch-generate per-simulation shuffle seeds (Phase 3b throughput)**
+- **Impact:** Zero throughput impact currently (serial, so pre-generation vs inline generation is identical). Groundwork for future cross-simulation parallelism.
+
+**13. batch_slots sweep — confirmed 32 is optimal**
+- **Impact:** No change (32 was already optimal). Prevented a wrong config choice.
+
+**14. IPC batched-send protocol (pre-Rust era, A3 architecture)**
+- **Impact:** 1.74× on the old Python parallel path (0.081 → 0.141 games/s). Now superseded by the Rust batched engine.
+
+---
+
+### ❌ DONE BUT NO IMPACT / REGRESSED
+
+**15. AMP inference (fp16 autocast)**
+- **Result:** 0.74× — a slowdown. The 32ch/4b network at batch ~192 is latency-bound, not compute-bound. FP16 cast overhead exceeded compute savings on the 3070. **Correctly rejected and documented.**
+
+**16. sample_batch threading (ThreadPoolExecutor)**
+- **Result:** 0.44–0.50× — a 2× regression. GIL-held small-array numpy dominated; Rust augmentation doesn't fully release GIL at fine granularity. Threading infra left as opt-in (`--sample_workers`) but defaulted off.
+
+---
+
+### 🔲 NOT DONE — BACKLOG
+
+**Priority: HIGH (meaningful impact, architecturally clean)**
+
+**17. Double-buffer two BatchedMCTS instances (Tier 2, item 5)**
+- **What:** Run two independent game-batches A and B: while A is in GPU forward, B does CPU step()/update(). Throughput approaches max(CPU, GPU) instead of sum.
+- **Why backlog:** Substantial rewrite of the step/eval/update loop. Should not be added to unreviewed lib.rs code. Most valuable when GPU-bound ratio changes (rented hardware or larger network).
+- **Recommendation: HIGH priority for next cloud run prep if moving to rented GPU.**
+
+**18. Overlap self-play with training (Tier 2, item 6)**
+- **What:** Generate iteration N+1 games while training on N's buffer. Standard AlphaZero off-policy approach.
+- **Why backlog:** Changes the on-policy/off-policy staleness profile — a research decision, not just engineering. Need data on staleness tolerance from the current run first.
+- **Recommendation: MEDIUM — evaluate after a second training run.**
+
+**19. Single prefetch thread for sample_batch (Tier 2, item 7)**
+- **What:** One background thread prepares batch N+1 while GPU runs train_step on batch N. Coarse overlap, one GIL handoff per batch.
+- **Why backlog:** Threading failed at fine granularity but this is coarse-grained — different mechanism. Should work. Low implementation risk.
+- **Recommendation: HIGH — easy win, implement before next run.**
+
+**20. torch.compile the inference network (Tier 1, item 4)**
+- **What:** Fuses conv/BN/head kernels. Typically 1.2–1.5× on small networks. One-line wrap at net creation.
+- **Why backlog:** First-run compilation overhead and occasional shape-mismatch footguns. Worth doing before next cloud run.
+- **Recommendation: MEDIUM-HIGH — low effort, test on a short run first.**
+
+**21. CUDA graph / eval_pad_to_batch (Tier 1, item 3)**
+- **What:** Fixed-shape batches enable cuDNN graph capture, cutting kernel launch latency.
+- **Why backlog:** Pairs with batch_slots tuning. More complex than torch.compile.
+- **Recommendation: MEDIUM — try after torch.compile is validated.**
+
+**22. Rayon cross-simulation parallelism within a slot (sim-level)**
+- **What:** Parallelize the leaf_batch simulations within one BatchedMCTS slot using rayon. Pre-generated seeds (already in place from Phase 3b) are the prerequisite.
+- **Why backlog:** Requires ol_arena to be shareable across threads (Arc<Mutex> or split-arena design). Complex, high correctness risk, capped at ~10% gain on current GPU-bound workload.
+- **Recommendation: LOW — only pursue if profiling shows Rust descent as bottleneck on rented hardware.**
+
+**23. pin_transfer + non-blocking H2D (Tier 3, item 9)**
+- **What:** Overlap input copy with compute using pinned memory.
+- **Why backlog:** Marginal on current hardware. More relevant on rented hardware with slower host memory.
+- **Recommendation: LOW — situational.**
+
+**24. Eval cache for repeated shallow nodes (Tier 3, item 10)**
+- **What:** LRU cache of encoded-state → eval for nodes near the root that repeat across simulations/ticks.
+- **Why backlog:** Complex, needs careful design around open-loop redeterminization (shallow nodes do repeat but their encoded state depends on public info which is stable). Non-trivial cache invalidation.
+- **Recommendation: MEDIUM — interesting but needs profiling to confirm cache hit rate justifies complexity.**
+
+**25. Multi-worker for CPU-bound regime (Tier 3, item 11)**
+- **What:** parallel_self_play --workers N with IPC inference server topology for CPU-rich/GPU-modest rented hardware.
+- **Why backlog:** batched_open_loop requires workers=1. The IPC server path (rust/python engines) supports N workers and is the right topology for that hardware profile.
+- **Recommendation: SITUATIONAL — relevant only on rented hardware with modest GPU.**
+
+**26. encode_arrays_into for the closed-loop path**
+- **What:** The R2 direct-buffer encoding only applies to the open-loop path. The closed-loop RustMCTS path still allocates intermediate arrays.
+- **Why backlog:** Closed-loop is no longer the training path. Only matters for benchmark_vs_rust games.
+- **Recommendation: LOW.**
+
+---
+
+### Summary table
+
+| # | Item | Status | Impact | Backlog priority |
+|---|------|--------|--------|-----------------|
+| 1 | Rust BatchedMCTS open-loop | ✅ Done | 48× | — |
+| 2 | encode_arrays_into | ✅ Done | +5% | — |
+| 3 | Two-pointer merge | ✅ Done | +2–5% | — |
+| 4 | Double-clone elimination | ✅ Done | small | — |
+| 5 | Rust d4_augment | ✅ Done | 3× sample_batch | — |
+| 6 | Rust augment_mask | ✅ Done | 1.76× sample_batch | — |
+| 7 | Rust legal_mask | ✅ Done | small | — |
+| 8 | GPU-side logit gather | ✅ Done | large on slow PCIe | — |
+| 9 | f32 readback | ✅ Done | moderate | — |
+| 10 | inference_mode | ✅ Done | negligible | — |
+| 11 | Rust benchmark player | ✅ Done | 8.9× benchmark | — |
+| 12 | Batch shuffle seeds | ✅ Done | 0 (groundwork) | — |
+| 13 | batch_slots=32 confirmed | ✅ Done | 0 (correct config) | — |
+| 14 | IPC batched-send | ✅ Done (superseded) | 1.74× old path | — |
+| 15 | AMP inference | ❌ Regressed | −26% | Don't do |
+| 16 | sample_batch threading | ❌ Regressed | −50% | Don't do |
+| 17 | Double-buffer BatchedMCTS | 🔲 Not done | large | HIGH |
+| 18 | Overlap self-play+training | 🔲 Not done | large | MEDIUM |
+| 19 | Prefetch thread sample_batch | 🔲 Not done | moderate | HIGH |
+| 20 | torch.compile inference | 🔲 Not done | 1.2–1.5× | MEDIUM-HIGH |
+| 21 | CUDA graph / pad_to_batch | 🔲 Not done | moderate | MEDIUM |
+| 22 | Rayon cross-sim parallelism | 🔲 Not done | <10% | LOW |
+| 23 | pin_transfer H2D | 🔲 Not done | small | LOW |
+| 24 | Eval cache shallow nodes | 🔲 Not done | unknown | MEDIUM |
+| 25 | Multi-worker IPC for cloud | 🔲 Not done | situational | SITUATIONAL |
+| 26 | encode_arrays_into closed-loop | 🔲 Not done | negligible | LOW |

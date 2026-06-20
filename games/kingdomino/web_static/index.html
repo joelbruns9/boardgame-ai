@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kingdomino Web Lab</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Kingdomino Web Lab</h1>
+    <p>Local engine viewer, bug tester, and reference client for the future advisor API.</p>
+  </header>
+
+  <section class="toolbar">
+    <label>Seed <input id="seedInput" type="number" value="0" /></label>
+    <button id="newGameBtn">New game</button>
+    <button id="refreshBtn" class="secondary">Refresh</button>
+    <button id="undoBtn" class="secondary" disabled>Undo</button>
+    <label class="jump-control">Jump to step <input id="jumpStepInput" type="number" min="0" value="0" /></label>
+    <button id="jumpBtn" class="secondary" disabled>Jump</button>
+    <span id="timelineInfo" class="timeline-info">Step 0 / 0</span>
+    <button id="exportBtn" class="secondary">Export debug JSON</button>
+    <label class="checkbox"><input id="cropToggle" type="checkbox" /> Crop boards</label>
+    <span id="status"></span>
+  </section>
+
+  <section id="task" class="task-shell"></section>
+
+  <main class="layout">
+    <section class="panel state-panel">
+      <h2>State</h2>
+      <div id="summary"></div>
+      <h3>Current domino</h3>
+      <div id="currentDomino"></div>
+      <h3>Current row</h3>
+      <div id="currentRow" class="tile-row"></div>
+      <h3>Mouse placement</h3>
+      <div id="placementHelp"></div>
+      <h3>Claims</h3>
+      <div id="claims"></div>
+      <h3>Bot play</h3>
+      <div id="botControls" class="bot-controls">
+        <div class="bot-row"><label>Player 0 <select id="botMode0"><option value="human">Human</option><option value="random">Random</option><option value="greedy">Greedy</option><option value="nn">NN/MCTS</option></select></label></div>
+        <div class="bot-row"><label>Player 1 <select id="botMode1"><option value="human">Human</option><option value="random">Random</option><option value="greedy">Greedy</option><option value="nn">NN/MCTS</option></select></label></div>
+        <label>Checkpoint <input id="nnCheckpointInput" type="text" placeholder="optional path to iter_0030.pt" /></label>
+        <div class="bot-grid">
+          <label>Sims <input id="nnSimsInput" type="number" value="50" min="1" max="5000" /></label>
+          <label>Device <select id="nnDeviceSelect"><option value="cpu">cpu</option><option value="cuda">cuda</option></select></label>
+        </div>
+        <div class="bot-buttons">
+          <button id="botMoveBtn">Bot move now</button>
+          <button id="autoToHumanBtn" class="secondary">Auto-play to human</button>
+        </div>
+        <p class="hint">NN/MCTS loads a checkpoint on demand. Use low sims first for UI testing.</p>
+        <div id="botInfo" class="bot-info"></div>
+      </div>
+    </section>
+
+    <section class="boards" id="boards"></section>
+
+    <section class="panel side-panel">
+      <div class="actions-panel">
+        <h2>Legal actions</h2>
+        <p class="hint">You can still apply actions from this list. Hover to preview placement. Use Undo/Jump to step backward during bug tests.</p>
+        <div id="actions"></div>
+      </div>
+      <hr />
+      <div class="advisor-panel">
+        <h2>Advisor</h2>
+        <p class="hint">Runs through the shared advisor API that the future BGA extension should reuse.</p>
+        <div class="advisor-controls">
+          <label>Engine
+            <select id="advisorEngineSelect">
+              <option value="greedy">Greedy</option>
+              <option value="random">Random</option>
+              <option value="nn">NN/MCTS</option>
+            </select>
+          </label>
+          <label>Top K <input id="advisorTopKInput" type="number" value="8" min="1" max="50" /></label>
+          <label>Sims <input id="advisorSimsInput" type="number" value="50" min="1" max="5000" /></label>
+          <button id="recommendBtn2">Recommend</button>
+        </div>
+        <p class="hint">NN/MCTS uses the same checkpoint/device fields as Bot play.</p>
+        <div id="advisor"></div>
+      </div>
+    </section>
+  </main>
+
+  <section class="panel json-panel">
+    <h2>Debug JSON</h2>
+    <textarea id="jsonBox" spellcheck="false"></textarea>
+    <div class="json-buttons">
+      <button id="importBtn">Import JSON into current/new session</button>
+      <button id="clearJsonBtn" class="secondary">Clear</button>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

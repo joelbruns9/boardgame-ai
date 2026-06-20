@@ -54,6 +54,26 @@ def nn_player(state, model, device='cuda'):
     return move, decision
 
 
+def _fmt_pct(value):
+    """Format an optional float as a percentage without crashing on None."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.1%}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_float(value, digits=4):
+    """Format an optional numeric value without crashing on None."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 # ---- LOAD MODEL ----
 
 def load_model(path, device='cuda'):
@@ -69,14 +89,14 @@ def load_model(path, device='cuda'):
         print(f"  Trained epoch: {checkpoint['epoch']}")
     if 'iteration' in checkpoint:
         print(f"  Self-play iteration: {checkpoint['iteration']}")
-        print(f"  Win rate: {checkpoint.get('win_rate', 'N/A'):.1%}")
+        print(f"  Win rate: {_fmt_pct(checkpoint.get('win_rate'))}")
     if 'metrics' in checkpoint:
         metrics = checkpoint['metrics']
         if isinstance(metrics, dict) and 'val' in metrics:
-            print(f"  Val loss: {metrics['val']['loss']:.4f}")
-            print(f"  Policy acc: {metrics['val']['policy_acc']:.3f}")
+            print(f"  Val loss: {_fmt_float(metrics['val'].get('loss') if isinstance(metrics['val'], dict) else None)}")
+            print(f"  Policy acc: {_fmt_float(metrics['val'].get('policy_acc') if isinstance(metrics['val'], dict) else None, digits=3)}")
     if 'val_loss' in checkpoint:
-        print(f"  Val loss: {checkpoint['val_loss']:.4f}")
+        print(f"  Val loss: {_fmt_float(checkpoint.get('val_loss'))}")
 
     return model
 

@@ -1,0 +1,411 @@
+Lessons from Implementing AlphaZero
+Medium Articles
+
+
+Part 1: https://medium.com/oracledevs/lessons-from-implementing-alphazero-7e36e9054191
+DeepMind’s AlphaZero publication was a landmark in reinforcement learning (RL) for board game play. The algorithm achieved superhuman performance in chess, shogi, and go, each with under 24 hours of self-play, using almost no specialized or hardcoded knowledge of the games other than the rules.
+
+We thought it would be instructive to replicate and extend their results in novel ways, discovering in the process how various choices affect the performance of the algorithm. Machine learning as a whole is only slowly being put on firm theoretical foundations, and so there’s often much to gain by exploring new directions.
+
+This article is the first in a series where we share insights gleaned during our exploration.
+
+For this first article we’ll just give an overview of the unmodified AlphaZero algorithm. Instead of making you read the paper yourself, we’ll try to lay it out in a way comprehensible to a relative novice in RL, linking to external resources for more detail.
+
+At a high level, it uses a modified Monte-Carlo Tree Search (MCTS) backed by a deep residual neural network (or “ResNet”). AlphaZero plays against itself, with each side choosing moves selected by MCTS. The results of these self-play games are used to continually improve the ResNet. The self-play and ResNet training occur in parallel, each improving the other.
+
+ResNet architectures are a popular way to train deep networks, often for image recognition. For AlphaZero’s network, the input is the board state, and there are two outputs:
+
+    The estimated value (v) of the position, ranging from 1 (win) to -1 (loss).
+    A vector of prior probabilities (p) for playing each next possible action.
+
+The network is initialized randomly. After some self-play has occurred, training data consists of randomly chosen board positions from played games, in the form of (board state, game result, child visit counts from MCTS).
+MCTS
+
+This video does an excellent walk-through of standard MCTS. To choose a move given a board position, we perform 800 iterations of the following algorithm. We build a tree, initially having just one node (representing the current board state).
+
+    Start at the root node (current board state). Walk to the child that gives the best tradeoff between exploiting current information and exploring new moves (formalized by the UCB1 formula). Recurse ’til you hit a leaf node.
+    If this is the first visit to that node, perform a rollout: randomly simulate moves until end of game, and then use that game result to update the values of all nodes from the leaf back to the root.
+    If it is the second visit, expand it (i.e., create its children), and visit+rollout one of them.
+    There is no third visit, because it is no longer a leaf node.
+
+In AlphaZero, rollouts are replaced by fetching predictions from the NN, and UCB1 is replaced by PUCT (polynomial upper confidence tree). The algorithm looks like this:
+
+    Start at the root. Walk to the child with best PUCT score. Recurse ’til you hit a leaf node.
+    On the first visit, invoke the NN to fetch (1) the estimated game score (or value, v) and (2) the suggested probabilities (p) for visiting each child, to be used in PUCT. Create the children but do not visit them.
+    There is no second visit.
+
+Tying it Together
+
+After 800 iterations of MCTS, a move is chosen by selecting the child that was visited most. Then the other side plays in the same way. This continues until the game is over. At that point, each board position from the game is annotated with the game score and the child visit counts. These samples get added to the training set for the ResNet. As the ResNet trains, it gets used in subsequent MCTS self-play.
+
+This back-and-forth between MCTS self-play and ResNet training is very powerful. The ResNet helps to generalize the learnings from MCTS, and the self-play uses that generalized knowledge to learn the game more deeply. As we saw from the paper, this allows AlphaZero to outperform basically all existing algorithms — the best of which have been painstakingly hand-tuned with the help of masters of their respective games.
+
+
+Part 2: https://medium.com/oracledevs/lessons-from-alphazero-connect-four-e4a0ae82af68
+Lessons from AlphaZero: Connect Four
+
+Welcome back! In our last installment, we briefly reviewed of how DeepMind’s AlphaZero algorithm quickly learns to play games better than the best humans (and sometimes the best existing algorithms). Recall that it uses a neural network-based Monte-Carlo Tree Search (MCTS) to play against itself, and uses the results of those self-play games to further train the network, in a self-reinforcing cycle.
+
+In the next few posts, we’re going to share some lessons we learned from teaching it to play Connect Four.
+Why Connect Four?
+
+To implement and test AlphaZero, we first had to choose a game for it to play. Unlike the games Go (at one extreme of difficulty) or tic-tac-toe (at the other), Connect Four seemed to offer enough complexity to be interesting, while still being small enough to rapidly iterate on. In particular, we chose the common 6x7 variant (as pictured above).
+
+It also has another benefit: being a fully solved game, we could test our model against the optimal strategy. That is, once we trained our network using AlphaZero, we could feed it test board positions for which we know the correct answer, to get a meaningful “ground truth” accuracy.
+
+Additionally, it allowed us to discover how close to perfect our network could become with a given architecture. Let’s take a look at how that works.
+Training
+
+The training and evaluation process goes like this:
+
+    Use a Connect Four solver (i.e., program that will tell you the correct move for any board position) to generate labelled training and test sets.
+    Select a neural network architecture. The AlphaZero paper gives a good starting point, but it stands to reason that different games will benefit from tweaks to it.
+    Use supervised learning to train the network the labelled training set. This gives us an upper bound on how well the architecture ought to be able to learn.
+    Train AlphaZero using the same network architecture, and evaluate it with the labelled test set, to see how close it gets to that upper bound.
+
+Suppose the AlphaZero-trained network achieves a test accuracy of 90%. What does this tell us?
+
+    If the same architecture achieved 99% with supervised training, then the network can learn more than AlphaZero taught it, and we should improve the self-play component of AlphaZero.
+    If supervised training only gets to 91%, then the network architecture itself is probably the limiting factor, and should be improved.
+
+Using this strategy helped us tune the network architecture, find bugs, and make other improvements in our MCTS self-play.
+Challenges
+
+When generating labelled training data, we feed random board positions to a Connect Four solver. The question is, what constitutes “random?”
+
+Because AlphaZero should learn to play only perfect games, its network will eventually stop seeing poorly-played positions. Therefore it would be unfair to test it on them. On the other hand, Connect Four is simple enough that there are only a small handful of perfect games, so it’s not possible to build a large training set using only perfect board positions.
+
+The other difficulty is determining what constitutes a correct answer for a position. In any given position, there may be multiple moves that lead to a win. Are faster wins better? How much better? If there is not a guaranteed win, should you pick the move that loses most slowly (assuming a perfect opponent), or one that has the highest potential to trip them up (if they are imperfect)? How do you make that precise?
+
+In the end we decided to generate our labelled sets using positions from highly imperfect games, putting our AlphaZero-trained network at a disadvantage in the comparison. Yet it did surprisingly well with this handicap, as we shall soon see.
+
+We also decided to use two different definitions of “best move.” When generating “strong” training/test sets, we label a move correct only if it leads to the fastest possible win (or slowest possible loss). In the “weak” case, all winning moves are given equal weight. To keep the comparison fair, we also trained AlphaZero in strong and weak modes, encouraging it to prefer faster wins in the former case (by scaling final result values based on game length). Let’s look at that briefly.
+Strong vs Weak AlphaZero
+
+During MCTS simulation, non-terminal positions get an initial value from the network, indicating the expected game result (in the range [-1, 1]). Terminal positions, on the other hand, don’t need such an estimate; we can assign them +/-1 directly. This is fine for weak training, where two winning positions are considered equally good no matter how long it took to get there. For strong training, we scale terminal results by the game length.
+
+The fastest Connect Four win is 7 total moves, and the longest is 42 (using up the whole board). Some quick algebra shows that if n is the actual game length, then the expression 1.18–(9*n/350) will yield a value in [0.1, 1] for a win. This makes MCTS prefer quick wins (and slow losses).
+Evaluations
+
+We ran two kinds of evaluations:
+
+    Network-only: Feed the network a test board position and check whether its predicted move is correct.
+    MCTS: Run MCTS (with 800 simulations) backed by the network and evaluate its preferred move.
+
+Recall that we used two different training methods:
+
+    AlphaZero (“AZ”) training.
+    Supervised training (i.e., using labelled training data from the solver).
+
+This gives us four combinations to evaluate: AZ-Network, AZ-MCTS, Supervised-Network, Supervised-MCTS.
+
+And finally, there are two training modes (strong vs. weak). We’ll look at each in turn.
+Results
+Strong Results
+
+    Supervised-Network: 96.20%
+    Supervised-MCTS: 97.29%
+    AZ-Network: 95.70%
+    AZ-MCTS: 96.95%
+
+What this tells us is that:
+
+    Our AlphaZero training does nearly as well as supervised training (despite being at the disadvantage mentioned previously).
+    Although the network alone does remarkably well, using it in MCTS further reduces the error rate by about 29% (from ~4% to ~3%).
+
+Weak results
+
+    Supervised-Network: 98.93%
+    Supervised-MCTS: 99.79%
+    AZ-Network: 98.83%
+    AZ-MCTS: 99.76%
+
+This time, AlphaZero training got even closer to supervised training, nearly matching it. Additionally, MCTS reduces the error rate by a whopping ~80%, getting nearly every position correct.
+
+In the weak test set, there are on average 4.07 correct moves in a position (compared to 2.16 for the strong test set). This means that randomly guessing amongst the 7 possible moves would only get us to 58.1%.
+Conclusion
+
+Connect Four is a great game to use for training (and finding bugs in) your implementation of AlphaZero. It allows for quick iteration, and is complex enough to be interesting. Since it is a solved game, it’s also possible to get an objective measure of how successful the training is.
+
+When only looking for any optimal move (regardless of how quickly it wins, or avoids losing), and coupled with MCTS, the AlphaZero-trained network only makes a wrong move once in 400 positions. Even when having to find the fastest win (or non-loss), and using the network prediction alone, it only makes mistakes once in 25 positions. Pretty good!
+
+
+Part 3: https://medium.com/oracledevs/lessons-from-alphazero-part-3-parameter-tweaking-4dceb78ed1e5
+Lessons from AlphaZero: Parameter Tweaking
+
+Hello again! In this week’s installment, we’ll be sharing some thoughts on tweaking (hyper)parameters in AlphaZero. These are parameters that are not learned during training (like network weights), but are fixed in advance. By picking good values, training might proceed faster or top out higher.
+
+Many of these parameters affect the so-called exploration-exploitation tradeoff: the algorithm needs to balance between exploiting its existing knowledge and exploring new possibilities. Exploration is important when training AlphaZero to play against highly skilled opponents (as in the paper), but even more important when training it to play well in a wider variety of positions. As covered in the last post, our test set includes imperfect games. Therefore, we spent some time tuning our implementation to explore broadly enough to be not just a good optimal player, but a good general player.
+Hyperparameters in AlphaZero
+
+Let’s take a look at some of the hyperparameters we might want to optimize. Here we’ll just take a glance at what they are and do.
+c_puct
+
+During Monte-Carlo Tree Search (MCTS) simulation, the algorithm evaluates potential next moves based on both their expected game result, and how much it has already explored them. A constant c is used to control this trade-off.
+
+Standard MCTS uses a variant of the Upper Confidence Bound-1 (UCB-1) formula called UCT (UCB for trees). AlphaZero uses a version called polynomial upper confidence trees (PUCT). If we are at state s and considering action a, we need three values to calculate PUCT(s, a):
+
+    Q — The mean action value. This is the average game result across current simulations that took action a.
+    P — The prior probabilities as fetched from the network.
+    N — The visit count, or number of times we’ve taken this action during current simulations.
+
+We calculate PUCT(s, a) = Q(s, a) + U(s, a), where U is calculated as follows:
+
+Notice how we sum across all potential actions (b) in the numerator, and the visit count for the action under consideration (a) is in the denominator. Therefore, the less we have tried this action, the greater U will be. This encourages exploration.
+
+By increasing c_puct, we put more weight toward this exploration term. By decreasing it, we more strongly value exploiting the expected result (Q).
+
+After trying out a handful of values (from 1 to 6), we found that approximately 4 was optimal.
+Dirichlet ɑ (alpha)
+
+One innovation of AlphaZero was introducing noise into MCTS.
+
+During an MCTS simulation, we repeatedly simulate play from a root node (s) representing the current board state. The first thing we do is query the neural network for the prior probability vector (p) of potential actions from s.
+
+Instead of using p as-is, AlphaZero adds noise according to the Dirichlet distribution with parameter ɑ, aka Dir(ɑ). To help understand what this means, let’s see some examples of the Dirichlet distribution with different ɑ. For these examples, we’ll assume that there are n potential next actions.
+
+First, recall that the support of Dirichlet (i.e., the values where it is defined) is the set of vectors (x_1, x_2, …, x_n) whose coordinates are nonnegative and sum to 1. If n=3, then some examples would be (0.1, 0.5, 0.4) and (0.3, 0, 0.7). This set is also called the (n-dimensional) simplex.
+
+Now note that Dir(1) is uniform. This means that sampling from it will produce either of the above two vectors (or any other valid vector) with equal chance. As ɑ gets smaller, Dirichlet starts to prefer vectors near the basis vectors: (0.98, 0.01, 0.01) or (0.1, 0.9, 0) will be more likely to be drawn than (0.3, 0.3, 0.4). For values greater than 1, the opposite is true — the basis vectors are de-emphasized, and more-balanced vectors are preferred.
+
+To add noise to p, we sample a value d from Dir(ɑ), and take a weighted sum: x*p + (1-x)*d. Because both p and d have coordinates summing to one (and the weights x and 1-x sum to 1), this property is preserved in the weighted sum, making it a valid probability distribution. In the paper, x is set to 0.75. Below, we’ll use x=0.5 to exaggerate the effect of d.
+
+When ɑ is larger than one, this tends to “flatten” p, making us less strongly prefer any one move:
+Dir(20) tends to flatten the weighted sum
+
+For ɑ<1, it will cause a random component to become more emphasized:
+Dir(0.8) tends to exaggerate (a random component of) the weighted sum
+
+In both cases, we are encouraged to explore away from our prior (which strongly preferred the middle move).
+
+To pick a value, we first looked at the values they used for chess, shogi, and Go: 0.3, 0.15, and 0.03. The average number of legal moves in those games are 35, 92, and 250. It’s hard to know how to optimally extrapolate, but a reasonable first guess looks to be choosing ɑ = 10/n. Since there are approximately four legal moves in a Connect Four position, this gives us ɑ=2.5. It’s true that this is greater than one while the rest are less, and yet this number seemed to do well in our testing. With a little playing around, we found that 1.75 did even better.
+
+UPDATE: while early versions of our training did best with a=1.75, we ultimately settled on a=1.0 as the optimal value for our training.
+
+More research (and compute time) would be helpful to get more insight here.
+Temperature, τ (tau)
+
+After MCTS has completed a round of simulations, and before it has chosen a move to play, it has accumulated a visit count (N above) for each potential next move. MCTS works such that good moves are eventually visited more often than bad moves, and are a good indication of where to play.
+
+Normally, these counts are normalized and used as a distribution to choose the actual move. But a so-called temperature parameter (τ) can be used to first exponentiate these counts: N^(1/τ). They set τ=1 for the first 30 moves of the game (which has no effect) and then set it to an infinitesimal value for the rest of the game (which, post-normalization, suppresses all values except the maximum).
+
+    N = (1, 2, 3, 4)
+    Normalized N: (0.1, 0.2, 0.3, 0.4)
+    Using τ=1: (0.1, 0.2, 0.3, 0.4)
+    Using τ~0: (0, 0, 0, 1)
+
+Therefore, the first 30 moves are somewhat exploratory, and the rest will play only the most-visited action.
+
+We decided to play around with this a bit. First, we tried leaving τ at 1 instead of reducing it. This resulted in a significant improvement in performance. Emboldened by this success, we tried some living on the edge and bumped it up to 1.75 for the whole game:
+
+    Using τ=1.75: (0.15, 0.23, 0.29, 0.34)
+
+The larger τ gets, the more this flattens the distribution, leading to more even exploration. Although τ=1.75 gave us the best results amongst values we tried, we discovered that it was no better than simply increasing c_puct. So we simply left it at 1.
+Other tweaks
+
+In addition to tuning hyperparameters, we tried a few other modifications.
+Nvidia-TensorRT and int8
+
+Nvidia offers an inference optimization tool that sped up our inference by 3-4x. In addition to optimizing the TensorFlow graph, it enables 8-bit quantization, trading off precision for throughput.
+
+A side-effect of this quantization is that it encourages exploration. For example, if the neural net predicts that two positions have slightly different results (a number in the range [-1, 1]), with a little loss of precision they may come out looking equal.
+Position deduplication
+
+When training the neural net, positions are selected at random amongst the most recent games. Because Connect Four has very few reasonable opening lines, we found this led to a significant overrepresentation of early board positions. This caused the network to focus too much on them.
+
+We mitigated this problem by deduplicating positions before randomly selecting them for training. In the process, we averaged the priors and result values. This seemed to work well.
+Conclusion
+
+As in much of machine learning, the AlphaZero paper has lots of “magic numbers” that aren’t adequately explained. It’s hard to know how much exploration was done to settle on the provided values. For some parameters, a principled approach can help narrow the choices, but in general, it’s a game of “try it and see.”
+
+Exploration vs exploitation is a central concept in reinforcement learning, and as such, much of the tweaking we did affected that tradeoff in various ways.
+
+We certainly haven’t found the optimal choices, but through a lot of experimentation, we helped AlphaZero do much better on Connect Four than it did “out of the box.”
+
+Part 4: https://medium.com/oracledevs/lessons-from-alphazero-part-4-improving-the-training-target-6efba2e71628
+Lessons From AlphaZero: Improving the Training Target
+
+One novel innovation in our AlphaZero approach involves the target for the value output of the network. We have found an an alternative training target for the network’s value output that outperforms the AlphaZero approach.
+Training Target Review
+
+The original paper specifies two outputs for the neural network: a policy output and a value output. The policy output, which predicts the best move in the current game position, is trained against a value represented by π, which is a probability distribution based on the visit count accumulated by MCTS search during self-play. The value output, which predicts the result of the game, is trained against the value z, which is the result of the self-play game from the perspective of the current player. In other words, if the current player ultimately won the game from which the position was sampled, the z value for training would be +1, and if it lost the game the z value would be -1. Drawn games are scored as 0.
+
+Lets unpack the process for generating a training target using z during the AlphaZero self-play process. Starting with an empty board (and player 1 to move) a game is played as follows:
+
+    Run 800 simulations from the current state.
+    Generate a policy from the visit counts of the children of the current state.
+    Probabilistically play a move based on the policy, resulting in a new state.
+    Perform the above two steps for the opponent.
+    Repeat until the game is over. The game result is in {-1, 0, 1}.
+
+At the end of the game, every state gets labelled with the policy and the game result (taking care to negate the value for positions where it’s player 2 to move). The two outputs of the neural network are trained against this policy (π) and game result (z). If the MCTS simulation portion is still fuzzy, there is a very detailed explanation here.
+An Alternative Training Target
+
+There is another potential target for training the value output. During the MCTS search, each node accumulates an expected result of the game through the backup step. This value is known as the Q value for the node and is simply W/N, where W is the total score that has been propagated up the tree during simulation and N is the number of visits to the node. The root node of the search tree represents the current position in the game and therefore its Q represents the expected result of the game from this position. When we save the π value based on the visit count, we could also save the Q value of this root node as q and train the network against q instead of z. 
+
+The self-play steps for generating this training target are exactly the same as the five steps listed above. The only difference is in the labelling process at the end of the game. Instead of using the game result, every state gets labelled with the policy and the root node’s Q value. The two outputs of the neural network are trained against this policy (π) and Q value (q).
+
+A similar target was used in Thinking Fast and Slow with Deep Learning and Tree Search, with one crucial difference. Their MCTS used full playouts, whereas AlphaZero uses a truncated policy, backing up values directly from the neural network predictions instead of playing out the game for each simulation. The authors suggest this training target is a good proxy for z, but requires a smaller dataset to be significant.
+
+The Difference Between z and q
+
+When training with either z or q, we are attempting to encode information learned from MCTS into the network, but there are meaningful differences between the two approaches. Training against z attempts to encode the expected result of the game by condensing all of the simulations from the playout into a single discrete value: win, loss or draw. In contrast, Training against q attempts to encode the expected result of the game as a continuous value using only the 800 simulations from the current position.
+
+Based on these descriptions, z seems superior, but there is one large drawback of using z: each game has only a single result, and that single result can be heavily influenced by randomness. For example: imagine a position early in the game where the network has made the correct move, but later ends up choosing a suboptimal move and losing the game. In this case z will be -1 and training will incorrectly associate a low score with the position.
+
+With enough training data, one would hope that these mistakes get overshadowed by correct play. Unfortunately, it is impossible to completely eradicate the mistakes, because the network explores during self-play due to its probabilistic policy. We theorize that this is one of the reasons dropping the temperature after 30 moves was so important to AlphaZero. Otherwise, randomness in move choice towards the end of game play could compromise the accuracy of z.
+
+Training against q doesn’t suffer from the randomness problem. It doesn’t matter if the network ultimately lost the game. If the simulations give a good result for a move, the network will train against a positive value. In one sense, you can think of q as the average of 800 self-play games instead of one. These “games” are guesses by the network so they aren’t as accurate as 800 true z values would be, but they can achieve more consistency than the z values with a much smaller set of self-play games.
+
+Unfortunately, q is not a perfect solution. It can suffer from something called the “horizon effect”. This can happen when the simulations return a positive result, but there is a killer response that is just beyond the search horizon, i.e. not visited during the 800 simulations. Additionally q is somewhat meaningless for early moves in the first few generations of training because the network doesn’t know how to evaluate the position. In this case q stays close to 0 and it can take many generations for the value output to become significant.
+
+Testing the New Target
+
+Our conclusion from the above analysis is that both z and q have the potential to work, but each may suffer from unique drawbacks. Empirically, we can train a network successfully using q instead of z. In fact, for a short game like Connect Four, training against q works slightly better than training against z. But, can we use our understanding to significantly improve AlphaZero’s approach?
+
+Our experimentation shows that we can achieve better results by using both q and z together. One way to combine q and z is to average them for each example position and use that average to train the network. This seems to give the benefits of both: z helps counteract q’s horizon effect and q helps counteract z’s randomness. Another promising approach is to begin by training against z, but linearly falloff to q over a number of generations.
+
+During the early cycles of training Connect Four, both of the averaging and falloff perform equally well. Ultimately the falloff approach is able to achieve a slightly lower error percentage than averaging. Training speed with both of these approaches were significant improvements over using either z or q alone. Below you can see a graph of the error percentage achieved by the first 20 generations of our Connect Four model using each of the four targets. In the linear falloff case we start using 100% z for the first generation and transition to 100% q by the 20th generation.
+
+We have begun experimenting with training using both q and z for longer games, and so far the results look promising. It would be fascinating to see this approach applied to larger AlphaZero efforts like Leela Chess Zero.
+
+Part 5: https://medium.com/oracledevs/lessons-from-alpha-zero-part-5-performance-optimization-664b38dc509e
+Lessons From Alpha Zero: Performance Optimization
+
+In this post, we review aspects of our AlphaZero implementation that allowed us to dramatically improve the speed of game generation and training.
+Overview
+
+The task of implementing AlphaZero is daunting, not just because the algorithm itself is intricate, but also due to the massive resources the authors employed to do their research: 5000 TPUs were used over the course of many hours to train their algorithm, and that is presumably after a tremendous amount of time was spent determining the best parameters to allow it to train that quickly.
+
+By choosing Connect Four as our first game, we hoped to make a solid implementation of AlphaZero while utilizing more modest resources. But soon after starting, we realized that even a simple game like Connect Four could require significant resources to train: in our initial implementation, training would have taken weeks on a single gpu-enabled computer.
+
+Fortunately, we were able to make a number of improvements that made our training cycle time shrink from weeks to about a day. In this post I’ll go over some of our most impactful changes.
+The Bottleneck
+
+Before diving into some of the tweaks we made to reduce AZ training time, let’s describe our training cycle. Although the authors of AlphaZero used a continuous and asynchronous process to perform model training and updates, for our experiments we used the following three stage synchronous process, which we chose for its simplicity and debugability:
+
+While (my model is not good enough):
+
+    Generate Games: every model cycle, using the most recent model, game play agents generate 7168 games, which equates to about 140–220K game positions.
+    Train a New Model: based on a windowing algorithm, we sample from historical data and train an improved neural network.
+    Deploy the New Model: we now take our new model, transform it into a deployable format, and push it into our cloud for the next cycle of training
+
+Far and away, the biggest bottleneck of this process is game generation, which was taking more than an hour per cycle when we first got started. Because of this, minimizing game generation time became the focus of our attention.
+Model Size
+
+Alpha Zero is very inference heavy during self-play. In fact, during one of our typcal game generation cycles, MCTS requires over 120 Million position evaluations. Depending on the size of your model, this can translate to siginificant GPU time.
+
+In the original implementation of AlphaZero, the authors used an architecture where the bulk of computation was performed in 20 residual layers each with 256 filters. This amounts to a model in excess of 90 megabytes, which seemed overkill for Connect Four. Also, using a model of that size was impractical given our initially limited GPU resources.
+
+Instead, we started with a very small model, using just 5 layers and 64 filters, just to see if we could make our implementation learn anything at all. As we continued to optimize our pipeline and improve our results, we were able to bump our model size to 20X128 while still maintaining a reasonable game generation speed on our hardware.
+
+Distributed Inference
+
+From the get-go, we knew that we would need more than one GPU in order to achieve the training cycle time that we were seeking, so we created software that allowed our Connect 4 game agent to perform remote inference to evaluate positions. This allowed us to scale GPU-heavy inference resources separately from game play resources, which need only CPU.
+Parallel Game Generation
+
+GPU resources are expensive, so we wanted to make sure that we were saturating them as much as possible during playouts. This turned out to be trickier than we imagined.
+
+One of the first optimizations we put in place was to run many games on parallel threads from the same process. Perhaps the largest direct benefit of this, is that it allowed us to cache position evaluations, which could be shared amongst different threads. This cut the number of requests getting sent to our remote inference server by more than a factor of 2:
+
+Caching was a huge win, but we still wanted to deal with the remaining uncached requests in an efficient manner. To minimize network latency and best leverage GPU parallelization, we combined inference requests from different worker threads into a bucket before sending them to our inference service. The downside to this is that if a bucket was not promptly filled, any calling thread would be stuck waiting until the bucket’s timeout expired. Under this scheme, choosing an appropriate inference bucket size and timeout value was very important.
+
+We found that bucket fill rate varied throughout the course of a game generation batch, mostly because some games would finish sooner than others, leaving behind fewer and fewer threads to fill the bucket. This caused the final games of a batch to take a long time to complete, all while GPU utilization dwindled to zero. We needed a better way to keep our buckets filled.
+Parallel MCTS
+
+To help with our unfilled bucket problem, we implemented Parallel MCTS, which was discussed in the AZ paper. Initially we had punted on this detail, as it seemed mostly important for competitive one-on-one game play, where parallel game play is not applicable. After running into the issues mentioned previously, we decided to give it a try.
+
+The idea behind Parallel MCTS is to allow multiple threads to take on the work of accumulting tree statistics. While this sounds simple, the naiive approach suffers from a basic problem: if N threads all start at the same time and choose a path based on the current tree statistics, they will all choose exactly the same path, thus crippling MCTS’ exploration component.
+
+To counteract this, AlphaZero uses the concept of Virtual Loss, an algorithm that temporarily adds a game loss to any node that is traversed during a simulation. A lock is used to prevent multiple threads from simultaneously modifying a node’s simulation and virtual loss statistics. After a node is visited and a virtual loss is applied, when the next thread visits the same node, it will be discouraged from following the same path. Once a thread reaches a terminal point and backs up its result, this virtual loss is removed, restoring the true statistics from the simulation.
+
+With virtual loss in place, we were finally able to achieve >95% GPU utilization during most of our game generation cycle, which was a sign that we were approaching the real limits of our hardware setup.
+
+Technically, virtual loss adds some degree of exploration to game playouts, as it forces move selection down paths that MCTS may not naturally be inclined to visit, but we never measured any detrimental (or beneficial) effect due to its use.
+TensorRT/TensorRT+INT8
+
+Though it was not necessary to use a model quite as large as that described in the AlphaZero paper, we saw better learning from larger models, and so wanted to use the biggest one possible. To help with this, we tried TensorRT, which is a technology created by Nvidia to optimize the performance of model inference.
+
+It is easy to convert an existing Tensorflow/Keras model to TensorRT using just a few scripts. Unfortunately, at the time we were working on this, there was no released TensorRT remote serving component, so we wrote our own.
+
+With TensorRT’s default configuration, we noticed a small increase in inference throughput (~11%). We were pleased by this modest improvement, but were hopeful to see an even larger performance increase by using TensorRT’s INT8 mode. INT8 mode required a bit more effort to get going, since when using INT8 you must first generate a calibration file to tell the inference engine what scale factors to apply to your layer activations when using 8-bit approximated math. This calibration is done by feeding a sample of your data into Nvidia’s calibration library.
+
+Because we observed some variation in the quality of calibration runs, we would attempt calibration against 3 different sets of sample data, and then validate the resulting configuraton against hold-out data. Of the three calibration attempts, we chose the one with the lowest validation error.
+
+Once our INT8 implementation was in place, we saw an almost 4X increase in inference throughput vs. stock libtensorflow, which allowed us to use larger models than would have otherwise been feasible.
+
+One downside of using INT8 is that it can be lossy and imprecise in certain situations. While we didn’t observe serious precision issues during the early parts of training, as learning progressed we would observe the quality of inference start to degrade, particularly on our value output. This initially led us to use INT8 only during the very early stages of training.
+
+Serendipitously, we were able to virtually eliminate our INT8 precision problem when we began experimenting with increasing the number of convolutional filters in our head networks, an idea we got from Leela Chess. Below is a chart of our value output’s mean average error with 32 filters in the value head, vs. the AZ default of 1:
+
+We theorize that adding additional cardinality to these layers reduces the variance in the activations, which makes the model easier to accurately quantize. These days, we always perfom our game generation with INT8 enabled and see no ill effects even towards the end of AZ training.
+Summary
+
+By using all of these approaches, we were finally able to train a decent-sized model with high GPU utilization and good cycle time. It was initially looking like it would take weeks to perform a full train, but now we could train a decent model in less than a day. This was great, but it turned out we were just getting started — in the next article we’ll talk about how we tuned AlphaZero itself to get even better learning speed.
+
+Part 6: https://medium.com/oracledevs/lessons-from-alpha-zero-part-6-hyperparameter-tuning-b1cfcbe4ca9a
+Lessons From Alpha Zero: Hyperparameter Tuning
+
+In this post, we summarize the configuration and hyperparameter choices that gave us our best training performance with Connect Four.
+Overview
+
+While we were implementing AlphaZero, it took us some time to realize just how finicky the algorithm can be, because even when you have all the hyperparameters way off, it still can learn, albeit slowly. Further, there are quite a few hyperparameters, many of which are not fully explained in the AZ papers.
+
+Thanks to our performance optimization efforts, we were able to generate games much more quickly than when we first started. But it still took many model generations to create a nearly-perfect connect four player. Here is a graph of a run similar to our original configuration.
+
+With ~150 model generations, at 12 minutes per generation, it took more than a day for us to execute the above run.
+
+In the previous article we looked at ways to make our training cycle time faster. Now, we will look at ways we actually reduced the number of training cycles required to get an expert algorithm.
+Our Improvements
+
+There wasn’t a single silver bullet, but rather the combination of parameter adjustments that led to our training speedup.
+Cyclical Learning Rate
+
+In AlphaZero, the authors train their network with a fixed learning rate which they periodically tweak. Although we started with that approach, we ultimately implemented a 1cycle learning rate schedule as described here. The idea behind this is that rather than choosing a singular learning rate for the training, we explicitly vary the learning rate up and down as training progresses. We tried a few cyclical schedules, such as cosine with restarts, but found 1cycle be the best of the methods we tried.
+
+Although the schedule of 1cycle is typically applied over multiple epochs, we found it to be helpful even when adjusting over batches in a single epoch.
+
+As training progressed, we did decrease our base learning rate, but found we did not have to do this as precisely or frequently as we did without 1cycle.
+C-PUCT
+
+During playout, MCTS uses PUCT, a variant of UCT, to balance exploration vs. exploitation. See our previous post on this topic for details on how the algorithm works.
+
+During our experimentation, we tried a variety of values for C-PUCT, but ultimately found c in the range of 3–4 to be a sweet spot.
+
+Alpha
+
+The use of Dirichlet noise is an interesting innovation of AlphaGo that adds noise to the priors of the root node during game playouts. This noise tends to be spiky in the recommended configuration, creating noise that concentrates exploration from the root node down a small subset of off-policy paths, a property that may be especially useful to encourage focused exploration in games with high branching factor. To learn more about Dirichlet noise and alpha see our previous post on the topic.
+
+Below is a chart of learning curves for various values of alpha. We found that an alpha of 1 performed best in our testing.
+
+Position Averaging
+
+At some point during our experimentation, we started tracking the number of unique positions present in our training set as a way to monitor the effect of AlphaZero’s various exploration parameters. For example, when C=1, we would observe a large amount of redundancy in generated positions, indicating that the algorithm was choosing the same paths with high frequency and potentially not exploring enough. At C=4, the number of repeated positions was lower. In general, with Connect Four, it is not unusual to have ~30–50% duplicated data in your training window.
+
+When repeated positions are found in your training window, they are likely from different model generations, which means that their associated priors and values may differ. By presenting these positions with varying targets to the neural network, we are effectively asking it to average the target values for us.
+
+Rather than asking our network to average the data on its own, we experimented with performing de-duplication and averaging of the data prior to presenting it to the network. In theory, this creates less work for the network, as it does not have to learn this average itself. Also, de-duplication allows us to present more unique positions to a network each training cycle.
+Extra Last Layer Filters
+
+In the AlphaZero paper, the neural network takes the game input, and then runs it through 20 residual convolutional layers. The output of these residual convolutional layers is then fed into a convolutional policy and value head, which have 2 and 1 filters respectively.
+
+We initially implemented the model and its head networks as described in the paper. Based on findings reported by Leela Chess, we increased the number of filters in our head networks to 32, which sped up training significantly.
+
+Adding extra head filters had the unexpected side-effect of also reducing our precision errors during INT8 training, which allowed us to use TensorRT+INT8 during our entire training cycle. 
+Multiple epochs per generation
+
+After game generation, training is then performed so that our model can learn from recently generated data to create even more refined gameplay examples in the next cycle. We found that using 2 epochs of training per window sample provided a good bump in learning over single epoch training, without bottlenecking our synchronous training cycle for too long.
+Slow Window
+
+In AlphaZero, the authors used a sliding window of size 500,000 games, from which they sampled their training data uniformly. In our first implementation, we used a sliding training window composed of 20 generations of data, which amounts to 143360 games. During our experiments, we noticed that at model 21, there would be a large drop in training error, and a noticeable bump in evaluation performance, just as the amount of available data exceeded the training window size and old data started to get expunged. This seemed to imply that older, less refined data, could be holding back learning.
+
+To counteract this, we implemented a slowly increasing sampling window, where the size of the window would start off small, and then slowly increase as the model generation count increased. This allowed us to quickly phase out very early data before settling to our fixed window size. We began with a window size of 4, so that by model 5, the first (and worst) generation of data was phased out. We then increased the history size by one every two models, until we reached our full 20 model history size at generation 35.
+
+An alternative way to achieve something similar would be to alter our sampling distribution, though we chose the above described method for its simplicity.
+Putting it Together
+
+So with all these tweaks, how much faster can we learn? Almost 4X faster: while it used to take ~150 generations to train a Connect Four player, we could now train in ~40 model generations.
+
+For us, this amounted to a reduction from 77 GPU hours down 21 GPU hours. We estimate that our original training, without the improvements mentioned here or in the previous article (such as INT8, parallel caching, etc.), would have taken over 450 GPU hours.
+
+Going through the exercise of tweaking these parameters gave us a sense for just how important hyper-parameter tuning is in Alpha Zero. Hopefully we will be able to take some of this knowledge and apply it to larger games.

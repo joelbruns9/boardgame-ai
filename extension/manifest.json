@@ -1,27 +1,34 @@
 {
   "manifest_version": 3,
-  "name": "BGA Game Capture",
+  "name": "BGA Can't Stop Advisor",
   "version": "1.0",
-  "description": "Captures game state from Board Game Arena for ML training",
-
+  "description": "Scrapes Can't Stop state from Board Game Arena and queries a local advisor",
   "permissions": [
     "storage",
     "activeTab"
   ],
-
   "host_permissions": [
-    "*://*.boardgamearena.com/*"
+    "*://*.boardgamearena.com/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
   ],
-
   "content_scripts": [
     {
-      "matches": ["*://*.boardgamearena.com/*"],
-      "js": ["content.js"]
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ],
+      "js": [
+        "content.js"
+      ]
     }
   ],
-
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Capture Game State"
+    "default_title": "Can't Stop Advisor"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
   }
 }

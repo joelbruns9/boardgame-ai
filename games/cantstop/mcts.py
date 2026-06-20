@@ -442,7 +442,7 @@ class MCTS:
     client; otherwise as a model.
     """
 
-    def __init__(self, model, device, target_inflight=16, warmup_sims=16):
+    def __init__(self, model, device, target_inflight=1, warmup_sims=0):
         """
         Args:
             model: either a torch.nn.Module or an InferenceClient.
@@ -453,9 +453,8 @@ class MCTS:
                 batches (good for throughput) but increase the chance
                 that many in-flight sims pile up on the same path before
                 tree statistics differentiate them (bad for training
-                signal). 16 is a balanced default — see the sweep test
-                for tuning. target_inflight=1 forces the legacy sync
-                path entirely.
+                signal). 1 is the default so within-tree async is opt-in. Use higher
+                values only for explicit async experiments.
             warmup_sims: number of simulations to run SEQUENTIALLY
                 (inflight=1) at the start of each search before
                 switching to the async batched scheduler. Sequential
@@ -465,7 +464,7 @@ class MCTS:
                 arrival order. Set to 0 to disable warmup (matches the
                 buggy original async behavior — kept available for A/B
                 testing). For typical Can't Stop positions, 16 covers
-                the worst-case branching factor.
+                the worst-case branching factor when async is enabled.
         """
         self.device = device
         self.target_inflight = max(1, int(target_inflight))
@@ -1114,7 +1113,8 @@ class MCTS:
 
     # ---- ACTION SELECTION ----
 
-    def get_action(self, state, num_simulations=50, temperature=1.0):
+    def get_action(self, state, num_simulations=50, temperature=1.0,
+                   dirichlet_alpha=0.5, dirichlet_epsilon=0.25):
         """
         Run MCTS and return:
             (action_idx, move, decision, train_policy, value)
@@ -1123,8 +1123,17 @@ class MCTS:
         the root DecisionNode — this is the policy training target.
         Temperature is applied only to action sampling, never to the
         training target.
+
+        Dirichlet noise is useful for self-play exploration but should be
+        disabled for evaluation, tournaments, and human play by passing
+        dirichlet_epsilon=0.0.
         """
-        policy, value = self.search(state, num_simulations)
+        policy, value = self.search(
+            state,
+            num_simulations=num_simulations,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+        )
         train_policy = policy  # raw normalized visit counts
 
         if temperature <= 0.01:
