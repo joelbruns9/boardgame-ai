@@ -25,6 +25,9 @@ checkpoints*/
 !best_checkpoint/
 !best_checkpoint/*.pt
 
+# Training output (checkpoints, buffers, logs)
+runs/
+
 # Training logs (large, machine-specific)
 # Do NOT exclude elo_db.json or elo_games.jsonl — these are project
 # artifacts that should be committed

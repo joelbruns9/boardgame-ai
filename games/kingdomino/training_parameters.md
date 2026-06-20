@@ -6,8 +6,8 @@
 python -m games.kingdomino.self_play `
   --engine batched_open_loop `
   --device cuda `
-  --warm_start checkpoints_ol_local_cont3\iter_0055.pt `
-  --warm_buffer checkpoints_ol_local_cont3\buffer_final.pkl `
+  --warm_start games\kingdomino\best_checkpoint\best_32x4.pt `
+  --warm_buffer runs\kingdomino\local_cont3\buffer_final.pkl `
   --iterations 55 `
   --games_per_iter 150 `
   --train_steps 600 `
@@ -34,8 +34,8 @@ python -m games.kingdomino.self_play `
   --benchmark_every 10 `
   --benchmark_sims 50 `
   --benchmark_seeds 20 `
-  --checkpoint_dir checkpoints_ol_local_cont4 `
-  --save_buffer checkpoints_ol_local_cont4\buffer_final.pkl `
+  --checkpoint_dir runs\kingdomino\local_cont4 `
+  --save_buffer runs\kingdomino\local_cont4\buffer_final.pkl `
   --elo_every 10 `
   --elo_sims 400 `
   --elo_games_per_anchor 40 `
