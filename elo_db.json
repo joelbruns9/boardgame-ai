@@ -1,17 +1,17 @@
 {
   "checkpoints": {
     "local_cont_iter100": {
-      "rating": 875.73,
-      "rating_stderr": 47.899830847201585,
-      "n_games": 80,
+      "rating": 854.41,
+      "rating_stderr": 36.13429497891987,
+      "n_games": 160,
       "sims": 400,
-      "path": "checkpoints_ol_local_cont/iter_0100.pt",
+      "path": "runs/kingdomino/checkpoints_ol_local_cont/iter_0100.pt",
       "channels": 32,
       "blocks": 4,
       "bilinear_dim": 64,
-      "timestamp": "2026-06-19T18:35:22.147940+00:00",
+      "timestamp": "2026-06-21T00:07:16.142751+00:00",
       "is_anchor": true,
-      "fixed_rating": 875.73
+      "fixed_rating": 854.41
     },
     "local_cont_iter070": {
       "rating": 780.78,
@@ -27,17 +27,17 @@
       "fixed_rating": 780.78
     },
     "cloud_iter100": {
-      "rating": 509.56,
-      "rating_stderr": 56.708746124671045,
+      "rating": 454.38,
+      "rating_stderr": 71.0867973038098,
       "n_games": 80,
       "sims": 400,
-      "path": "checkpoints_ol_cloud/iter_0100.pt",
+      "path": "runs/kingdomino/checkpoints_ol_cloud/iter_0100.pt",
       "channels": 32,
       "blocks": 4,
       "bilinear_dim": 64,
-      "timestamp": "2026-06-19T18:26:30.498131+00:00",
+      "timestamp": "2026-06-20T23:59:47.640768+00:00",
       "is_anchor": true,
-      "fixed_rating": 509.56
+      "fixed_rating": 454.38
     },
     "greedy_bot": {
       "rating": 0.0,
@@ -53,8 +53,8 @@
       "fixed_rating": 0.0
     },
     "local_cont3_iter055": {
-      "rating": 951.61,
-      "rating_stderr": 38.69,
+      "rating": 934.75,
+      "rating_stderr": 38.86,
       "n_games": 120,
       "sims": 400,
       "path": "checkpoints_ol_local_cont3/iter_0055.pt",
@@ -66,15 +66,106 @@
       "fixed_rating": null
     },
     "local_cont5_lr2e4_iter055": {
-      "rating": 1026.82,
-      "rating_stderr": 38.52,
+      "rating": 1009.2,
+      "rating_stderr": 38.51435582139904,
       "n_games": 160,
       "sims": 400,
       "path": "runs/kingdomino/checkpoints_ol_local_cont5_lr2e4/iter_0055.pt",
       "channels": 32,
       "blocks": 4,
       "bilinear_dim": 64,
-      "timestamp": "2026-06-20T15:53:07.349813+00:00",
+      "timestamp": "2026-06-21T00:03:29.769257+00:00",
+      "is_anchor": true,
+      "fixed_rating": 1009.2
+    },
+    "local_cont6_iter_0010": {
+      "rating": 1046.06,
+      "rating_stderr": 41.58,
+      "n_games": 160,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-20T23:42:58.772266+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter_0020": {
+      "rating": 966.59,
+      "rating_stderr": 37.17,
+      "n_games": 160,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-20T23:42:58.772266+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter_0030": {
+      "rating": 1022.1,
+      "rating_stderr": 40.06,
+      "n_games": 160,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-20T23:42:58.772266+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter_0040": {
+      "rating": 947.15,
+      "rating_stderr": 36.36,
+      "n_games": 160,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-20T23:42:58.772266+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter_0040_final": {
+      "rating": 947.15,
+      "rating_stderr": 36.36,
+      "n_games": 160,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-20T23:42:58.772266+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter040": {
+      "rating": 982.82,
+      "rating_stderr": 37.93,
+      "n_games": 160,
+      "sims": 400,
+      "path": "runs/kingdomino/local_cont6/iter_0040.pt",
+      "channels": 32,
+      "blocks": 4,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-20T23:57:05.477636+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_cont6_iter010": {
+      "rating": 1028.93,
+      "rating_stderr": 28.05,
+      "n_games": 240,
+      "sims": 400,
+      "path": "runs/kingdomino/local_cont6/iter_0010.pt",
+      "channels": 32,
+      "blocks": 4,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-21T00:16:23.959940+00:00",
       "is_anchor": false,
       "fixed_rating": null
     }
