@@ -439,8 +439,10 @@ def _subject_outcome(game: GameResult, subject: str) -> float:
 
 
 def _game_record(game: GameResult, checkpoint: str, opponent: str,
-                 sims: int, engine: str) -> dict:
-    """One elo_games.jsonl row, from the checkpoint's perspective."""
+                 sims: int, engine: str, cfg: EloConfig) -> dict:
+    """One elo_games.jsonl row, from the checkpoint's perspective. The search
+    params (alpha/c_puct/margin_gain) are recorded so --resolve can distinguish
+    the same checkpoint rated under different sweep settings."""
     if game.p0 == checkpoint:
         orientation, score_ck, score_opp = 0, game.score0, game.score1
     else:
@@ -456,6 +458,9 @@ def _game_record(game: GameResult, checkpoint: str, opponent: str,
         "sims": sims,
         "engine": engine,
         "routing": "searcher",
+        "alpha": cfg.alpha,
+        "c_puct": cfg.c_puct,
+        "margin_gain": cfg.margin_gain,
         "timestamp": _now_iso(),
     }
 
@@ -504,7 +509,7 @@ def rate_checkpoint(checkpoint_path: str, checkpoint_name: str,
             outcomes.append(_subject_outcome(g, checkpoint_name))
             opp_ratings.append(anchor.fixed_rating)
             records.append(_game_record(g, checkpoint_name, anchor.name,
-                                         cfg.sims, engine))
+                                         cfg.sims, engine, cfg))
         total_games += len(games)
 
         if cfg.verbose:
@@ -797,6 +802,9 @@ def _cfg_from_args(args: argparse.Namespace) -> EloConfig:
         sims=args.sims,
         device=args.device,
         n_slots=args.n_slots,
+        alpha=args.alpha,
+        margin_gain=args.margin_gain,
+        c_puct=args.c_puct,
         verbose=args.verbose,
     )
 
@@ -812,6 +820,13 @@ def main() -> None:
     p.add_argument("--sims", type=int, default=400)
     p.add_argument("--device", default="cuda")
     p.add_argument("--n_slots", type=int, default=32)
+    p.add_argument("--alpha", type=float, default=EloConfig.alpha,
+                   help="Weight on margin vs win-probability in the leaf value "
+                        "formula (1.0=pure margin, 0.0=pure win prob).")
+    p.add_argument("--margin_gain", type=float, default=EloConfig.margin_gain,
+                   help="Scaling factor for tanh in the leaf value formula.")
+    p.add_argument("--c_puct", type=float, default=EloConfig.c_puct,
+                   help="PUCT exploration constant for rating games.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--leaderboard", action="store_true",
                    help="Print the leaderboard and exit (no rating).")
