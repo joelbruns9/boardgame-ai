@@ -89,6 +89,32 @@ def main() -> None:
     print(f"\n(double-buffer {'FASTER' if impr > 0 else 'SLOWER'} by {abs(impr):.1f}% "
           f"games/sec; game count {'matches' if done_s == done_d else 'MISMATCH'})")
 
+    # ── Recommendation ──
+    # Double-buffer overlaps CPU tree-work with GPU eval on two threads, so it
+    # only helps when the two phases are comparably costly (a fast GPU that has
+    # left the CPU as a co-bottleneck).  On the RTX 3070 it was -8.5% because the
+    # GPU was the sole bottleneck — overlap bought nothing and added thread
+    # overhead.  A game-count MISMATCH means the two paths didn't run the same
+    # work, so the % is not comparable and we must not recommend turning it on.
+    print("\n" + "#" * 70)
+    print("# RECOMMENDATION")
+    print("#" * 70)
+    threshold = 3.0  # ignore sub-noise wins
+    if done_s != done_d:
+        print(f"  - game count MISMATCH ({done_s} vs {done_d}): results are not "
+              f"comparable; rerun before trusting the delta.")
+        print("\n>>> DO NOT USE --double_buffer <<<")
+    elif impr >= threshold:
+        print(f"  - double-buffer is {impr:+.1f}% games/s (> {threshold:.0f}% "
+              f"threshold): the GPU now finishes eval fast enough that overlapping "
+              f"CPU tree-work pays off.")
+        print("\n>>> USE --double_buffer <<<")
+    else:
+        print(f"  - double-buffer is only {impr:+.1f}% games/s (< {threshold:.0f}% "
+              f"threshold): GPU eval is still the bottleneck, so the overlap buys "
+              f"little and adds thread overhead.")
+        print("\n>>> DO NOT USE --double_buffer <<<")
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,18 @@
+# Kingdomino AlphaZero — Python dependencies.
+#
+# IMPORTANT (cloud / RTX 5090 Blackwell, sm_120):
+#   torch/torchvision are installed SEPARATELY from the cu128 index BEFORE this
+#   file (see setup_cloud.sh), because the default PyPI wheel is built for cu126
+#   and ships NO sm_120 kernels ("no kernel image available for execution on the
+#   device").  setup_cloud.sh strips the torch/torchvision lines below before
+#   running `pip install -r requirements.txt` so they cannot pull a wrong wheel.
+#
+# These two are intentionally LEFT UNPINNED (and version-free) so that even if a
+# future caller forgets to strip them, pip keeps the already-installed cu128
+# build rather than downgrading to a cu126 PyPI wheel.  Do NOT add a +cu126 pin.
+torch
+torchvision
+
+# Actual runtime / build dependencies:
+numpy>=1.24
+maturin>=1.5        # builds the kingdomino_rust crate (needs Rust >= 1.85)

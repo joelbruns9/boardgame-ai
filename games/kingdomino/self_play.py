@@ -203,6 +203,12 @@ class SelfPlayConfig:
     # Item 20: wrap the INFERENCE net (make_rust_evaluator) with torch.compile on
     # CUDA.  Inference-only — never the training net.  Off by default (A/B flag).
     compile_net: bool = False
+    # compile_dynamic: forwarded as torch.compile(dynamic=...).  None = torch's
+    # default (auto).  True compiles ONE shape-generic graph, avoiding the
+    # per-shape recompilation storm the variable leaf-eval batch (mean ~45,
+    # range 6-192) causes with static graphs — set it if bench_compile flags a
+    # dynamic=False storm.  False forces static per-shape graphs.
+    compile_dynamic: bool | None = None
     # Item 19: prefetch the next training batch on a background thread while the
     # GPU runs train_step on the current one.  Off by default (A/B flag).
     prefetch_batches: bool = False
@@ -585,6 +591,7 @@ def make_rust_evaluator(
     margin_gain: float = _mcts_az.MARGIN_GAIN,
     alpha: float = _mcts_az.ALPHA,
     compile_net: bool = False,
+    compile_dynamic: bool | None = None,
 ):
     """In-process batched leaf evaluator for RustMCTS.search / BatchedMCTS.update.
     Contract:
@@ -598,6 +605,9 @@ def make_rust_evaluator(
     net (which calls .backward()).  net.eval() is already set above (BatchNorm
     requires eval before compile).  Batch size varies tick to tick; torch.compile
     recompiles on each new shape then caches, so steady-state ticks hit the cache.
+    compile_dynamic is forwarded to torch.compile(dynamic=...): None (torch
+    default/auto), True (one shape-generic graph — avoids per-shape recompile
+    storms under the variable batch), or False (static per-shape graphs).
     """
     net = net.to(device).eval()
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
@@ -614,7 +624,7 @@ def make_rust_evaluator(
         # Fall back to eager on any dynamo capture error rather than crashing the
         # run (e.g. an op the backend can't trace) — perf feature, not correctness.
         torch._dynamo.config.suppress_errors = True
-        net = torch.compile(net)
+        net = torch.compile(net, dynamic=compile_dynamic)
     use_pinned = bool(pin_transfer and use_cuda)
     # Fix 2: bind the leaf-value blend params at construction (no module-global
     # reads at call time).  Callers forward cfg.margin_gain / cfg.alpha.
@@ -992,7 +1002,7 @@ def play_selfplay_games_batched(
         pin_transfer=cfg.pin_transfer,
         profile_timing=cfg.profile_eval_timing,
         margin_gain=cfg.margin_gain, alpha=cfg.alpha,
-        compile_net=cfg.compile_net,
+        compile_net=cfg.compile_net, compile_dynamic=cfg.compile_dynamic,
     )
     n_slots = max(1, int(cfg.batch_slots))
     lb = max(1, int(cfg.leaf_batch))
@@ -1801,7 +1811,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 rust_mcts = kingdomino_rust.RustMCTS()
                 rust_eval = make_rust_evaluator(net, device=cfg.device, amp=cfg.inference_amp,
                                                 margin_gain=cfg.margin_gain, alpha=cfg.alpha,
-                                                compile_net=cfg.compile_net)
+                                                compile_net=cfg.compile_net,
+                                                compile_dynamic=cfg.compile_dynamic)
             elif cfg.engine in ("batched", "batched_open_loop"):
                 pass
             elif cfg.engine == "open_loop":
@@ -2263,6 +2274,13 @@ if __name__ == "__main__":
     p.add_argument("--compile", action="store_true",
                    help="(Item 20) torch.compile the inference net on CUDA "
                         "(leaf-eval only; training net stays uncompiled)")
+    p.add_argument("--compile_dynamic", choices=["auto", "on", "off"],
+                   default="auto",
+                   help="dynamic= passed to torch.compile when --compile is set: "
+                        "auto=torch default; on=dynamic=True (one shape-generic "
+                        "graph — avoids the per-shape recompile storm the variable "
+                        "leaf-eval batch causes; recommended if bench_compile flags "
+                        "one); off=dynamic=False (static per-shape graphs).")
     p.add_argument("--prefetch_batches", action="store_true",
                    help="(Item 19) prefetch the next training batch on a "
                         "background thread while the GPU runs train_step")
@@ -2304,7 +2322,9 @@ if __name__ == "__main__":
         min_buffer_to_train=min_buf,
         engine=a.engine, allow_tf32=not a.no_tf32,
         inference_amp=a.amp_inference,
-        compile_net=a.compile, prefetch_batches=a.prefetch_batches,
+        compile_net=a.compile,
+        compile_dynamic={"auto": None, "on": True, "off": False}[a.compile_dynamic],
+        prefetch_batches=a.prefetch_batches,
         double_buffer=a.double_buffer,
     )
     run_self_play_training(cfg, verbose=True)

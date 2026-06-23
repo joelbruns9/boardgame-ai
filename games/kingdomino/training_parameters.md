@@ -328,8 +328,10 @@ Weight on the own_score + opponent_score MSE loss terms.
 **Current:** 0.25
 
 Weight on the win probability BCE loss term. Lower than lambda_score
-because win targets are noisier. Increase once the model is mature and
-you want to improve win head calibration for the α sweep experiment.
+because win targets are noisier. Once the model is mature (win_brier
+stabilized), consider increasing to 0.5 to sharpen win head calibration
+— a well-calibrated win head is essential since α=0.0 search relies
+entirely on the win probability signal.
 
 #### `--score_scale`
 **Values:** 50.0 – 200.0
@@ -355,14 +357,24 @@ so search behavior is unaffected.
 
 #### `--c_puct`
 **Values:** 0.5 – 3.0
-**Current:** 1.5
+**Current:** 1.5 *(confirmed optimal by sweep)*
 
 PUCT exploration constant. Balances exploiting high-value moves vs
 exploring less-visited moves.
 
-- Kingdomino's small branching factor (~30-50 actions) supports higher
-  values than Go/Chess. Post-convergence sweep: try 2.0 and 2.5.
-- 1.5 is a safe default for active training.
+**Sweep results (α=0.0 fixed, sims=400, 240 games per config):**
+
+| c_puct | Elo | vs local_cont_iter100 |
+|--------|-----|-----------------------|
+| 1.5 | **1020** | 71.2% |
+| 1.0 | 1007 | 72.5% |
+| 2.0 | 989 | 68.8% |
+| 2.5 | 985 | 60.0% |
+
+1.5 is confirmed optimal. Higher values spread visits too thin at
+sims=1600 with Kingdomino's small branching factor (~30-50 actions).
+Lower values are slightly under-exploratory. Do not change without
+re-sweeping on a new architecture.
 
 #### `--temp_moves`
 **Values:** 0 – 40
@@ -424,19 +436,53 @@ tanh(0.4) ≈ 0.38, meaningful but not saturated.
 
 #### `--alpha`
 **Values:** 0.0 – 1.0
-**Current:** 0.8
+**Current:** 0.8 for early training → 0.0 once win head calibrates
 
 Weight on the margin term vs win probability term in the leaf value:
 - `α=1.0`: pure margin (ignores win head during search)
 - `α=0.0`: pure win probability (AlphaZero style)
-- `α=0.8`: margin-dominant (current)
+- `α=0.8`: margin-dominant
 
 Controls MCTS search behavior only — training loss is unaffected.
 With α=0.8, a move with margin +10 and win prob 70% beats a move with
 margin +8 and win prob 80% — the margin signal dominates.
 
-Post-convergence sweep planned: α ∈ {0.8, 0.5, 0.2, 0.0} via round-robin
-on a fixed checkpoint to find optimal search weighting without retraining.
+**Sweep results (c_puct=1.5, sims=400, 240 games per config):**
+
+| α | Elo | vs local_cont_iter100 |
+|----|-----|-----------------------|
+| 0.0 | **1020** | 71.2% |
+| 0.2 | 1007 | 70.6% |
+| 0.8 | 1004 | 66.9% |
+| 0.5 | 987 | 60.6% |
+
+**α=0.0 (pure win probability) is confirmed best for evaluation and
+mature training.** α=0.5 underperforms both extremes — avoid it.
+
+**Training schedule recommendation:**
+
+The optimal α depends on training stage because it governs search
+quality during self-play:
+
+- **Early training (iterations 1–50):** use α=0.8. The win head is
+  uncalibrated at the start of a new run (especially after a cold start
+  or architecture change). Pure win probability search (α=0.0) with an
+  uncalibrated win head produces poor self-play quality — MCTS follows
+  a misleading signal. Margin is more reliable until the win head has
+  seen enough games to calibrate (win_brier stabilizing, typically
+  ~30-50 iterations).
+
+- **Mature training (iterations 50+):** switch to α=0.0. Once the win
+  head is calibrated, pure win probability search correctly prefers the
+  higher-win-prob move even when it has lower score margin — the
+  strategically correct behavior. The sweep confirmed a ~16 Elo gain
+  from this switch on a mature model.
+
+**How to switch mid-run:** warm-start from the iter-50 checkpoint with
+`--alpha 0.0`. No other changes needed.
+
+**For Elo evaluation:** always use α=0.0 regardless of training stage.
+The canonical rating agent is α=0.0, c_puct=1.5, sims=400.
 
 ---
 
@@ -491,14 +537,15 @@ MLE per checkpoint inline, then a global Bradley-Terry re-solve
 - `elo_games.jsonl` — append-only game log (accumulates across all runs)
 - `elo_rating.py` — rating driver, standalone CLI
 
-**Current anchor pool (sims=400, fpu=-0.2):**
+**Current anchor pool (sims=400, fpu=-0.2, α=0.0):**
 
 | Anchor | Elo | Active |
 |--------|-----|--------|
 | greedy_bot | 0 | No (reference floor only) |
-| cloud_iter100 | ~510 | Yes |
-| local_cont_iter070 | ~781 | Yes |
-| local_cont_iter100 | ~876 | Yes |
+| cloud_iter100 | ~454 | Yes |
+| local_cont_iter070 | ~781 | No (checkpoint deleted) |
+| local_cont_iter100 | ~854 | Yes |
+| local_cont5_lr2e4_iter055 | ~1009 | Yes |
 
 #### `--elo_every`
 **Values:** 0 (disabled) | 5 | 10 | 20
@@ -580,7 +627,7 @@ score_opponent, winner, sims, engine, routing, timestamp.
 
 **Rate a checkpoint:**
 ```
-python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --alpha 0.0 --sims 400 --games_per_anchor 40 --device cuda --verbose
 ```
 
 **Re-solve global ladder from game log:**
@@ -597,6 +644,13 @@ python -m games.kingdomino.elo_rating --reanchor --sims 400 --games_per_anchor 4
 ```
 python -m games.kingdomino.elo_rating --leaderboard
 ```
+
+**Search parameter sweep (α or c_puct):**
+```
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha00 --alpha 0.0 --c_puct 1.5 --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha08 --alpha 0.8 --c_puct 1.5 --sims 400 --games_per_anchor 40 --device cuda --verbose
+```
+Then run `--resolve` to get globally consistent ratings across all configurations.
 
 ---
 
@@ -720,9 +774,13 @@ rating sessions. Promote it via `--reanchor`.
 checkpoint from training history that falls in the gap and add it.
 
 **Current spacing:**
-- cloud_iter100 (~510) → local_cont_iter070 (~781): gap 271 ✓
-- local_cont_iter070 (~781) → local_cont_iter100 (~876): gap 95 — close
-  but acceptable since new checkpoints trend above iter100 anyway
+- cloud_iter100 (~454) → local_cont_iter100 (~854): gap 400 — large,
+  no mid anchor (local_cont_iter070 checkpoint was deleted)
+- local_cont_iter100 (~854) → local_cont5_lr2e4_iter055 (~1009): gap 155 ✓
+
+The 400 Elo gap between the bottom two anchors means checkpoints in
+the 600-800 range will have wider confidence intervals. Add a mid anchor
+when a suitable checkpoint from that range is available.
 
 **After adding an anchor:** run `--reanchor --sims 400 --games_per_anchor 40`
 to re-bootstrap the pool with the new anchor included.
