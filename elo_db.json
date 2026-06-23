@@ -272,6 +272,58 @@
       "timestamp": "2026-06-21T02:19:05.238267+00:00",
       "is_anchor": false,
       "fixed_rating": null
+    },
+    "local_48x6_run1_iter108": {
+      "rating": 683.37,
+      "rating_stderr": 16.19,
+      "n_games": 720,
+      "sims": 400,
+      "path": "runs/kingdomino/local_48x6_run1/iter_0108.pt",
+      "channels": 48,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-21T22:51:03.953918+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run2_iter_0050": {
+      "rating": 803.62,
+      "rating_stderr": 15.43,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-22T20:58:09.228945+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run2_iter_0100": {
+      "rating": 885.92,
+      "rating_stderr": 15.26,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-22T20:58:09.228945+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run2_iter_0100_final": {
+      "rating": 885.92,
+      "rating_stderr": 15.26,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-22T20:58:09.228945+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
     }
   }
 }
