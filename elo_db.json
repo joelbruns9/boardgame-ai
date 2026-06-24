@@ -324,6 +324,45 @@
       "timestamp": "2026-06-22T20:58:09.228945+00:00",
       "is_anchor": false,
       "fixed_rating": null
+    },
+    "local_48x6_run3_iter_0050": {
+      "rating": 929.69,
+      "rating_stderr": 15.36,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-23T21:00:21.135665+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run3_iter_0100": {
+      "rating": 973.79,
+      "rating_stderr": 15.62,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-23T21:00:21.135665+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run3_iter_0100_final": {
+      "rating": 973.79,
+      "rating_stderr": 15.62,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-23T21:00:21.135665+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
     }
   }
 }
