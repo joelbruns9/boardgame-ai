@@ -1,0 +1,100 @@
+This page is in Almost Standards Mode. Page layout may be impacted. For Standards Mode use “<!DOCTYPE html>”. kingdomino
+Fingerprinting Protection is altering screen.availWidth and screen.availHeight. These values may not match your actual screen dimensions. This protection helps prevent websites building a fingerprint that can be used to track users. Learn more: https://support.mozilla.org/kb/firefox-protection-against-fingerprinting dojo.js:1:18207
+[kingdomino-advisor] content.js loaded content.js:26:9
+This page is in Quirks Mode. Page layout may be impacted. For Standards Mode use “<!DOCTYPE html>”. blank
+Content-Security-Policy: Ignoring ‘x-frame-options’ because of ‘frame-ancestors’ directive.
+This page is in Almost Standards Mode. Page layout may be impacted. For Standards Mode use “<!DOCTYPE html>”. kingdomino
+Fingerprinting Protection is altering screen.availWidth and screen.availHeight. These values may not match your actual screen dimensions. This protection helps prevent websites building a fingerprint that can be used to track users. Learn more: https://support.mozilla.org/kb/firefox-protection-against-fingerprinting dojo.js:1:18207
+This page is in Quirks Mode. Page layout may be impacted. For Standards Mode use “<!DOCTYPE html>”. blank
+// Find all placed domino elements and dump their attributes
+document.querySelectorAll("[id*='_placed']").forEach(el => {
+    console.log({
+        id: el.id,
+        className: el.className,…
+Object { id: "domino_21_placed", className: "domino shadow-rotation-3", dataset: "{}", style_left: "-50px", style_top: "-150px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_25_placed", className: "domino shadow-rotation-2", dataset: "{}", style_left: "100px", style_top: "0px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_18_placed", className: "domino shadow-rotation-3", dataset: "{}", style_left: "150px", style_top: "-150px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_41_placed", className: "domino shadow-rotation-3", dataset: "{}", style_left: "50px", style_top: "-150px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_10_placed", className: "domino shadow-rotation-0", dataset: "{}", style_left: "100px", style_top: "-300px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_16_placed", className: "domino shadow-rotation-2", dataset: "{}", style_left: "-200px", style_top: "0px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_24_placed", className: "domino shadow-rotation-2", dataset: "{}", style_left: "100px", style_top: "100px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_29_placed", className: "domino shadow-rotation-3", dataset: "{}", style_left: "250px", style_top: "-250px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_11_placed", className: "domino shadow-rotation-0", dataset: "{}", style_left: "-100px", style_top: "-300px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_42_placed", className: "domino shadow-rotation-0", dataset: "{}", style_left: "-300px", style_top: "-300px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_9_placed", className: "domino shadow-rotation-1", dataset: "{}", style_left: "-350px", style_top: "-150px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+Object { id: "domino_28_placed", className: "domino shadow-rotation-1 last-placed", dataset: "{}", style_left: "250px", style_top: "-50px", style_transform: "", parent_id: "kingdom_84634030", parent_class: "kingdom", parent_dataset: '{"value":"ff1493"}', parent_style_left: "240px", … }
+index.js:1:71174
+undefined
+// Find the board/kingdom container to understand coordinate system
+document.querySelectorAll("[id*='kingdom'], [id*='board'], [id*='grid']").forEach(el => {
+    console.log({
+        id: el.id,
+        className: el.className,…
+Object { id: "dominoes_and_player_kingdom", className: "", dataset: "{}", children_count: 2 }
+index.js:1:71174
+Object { id: "kingdom", className: "kingdom", dataset: '{"value":"0000ff"}', children_count: 2 }
+index.js:1:71174
+Object { id: "kingdom_label", className: "", dataset: "{}", children_count: 1 }
+index.js:1:71174
+Object { id: "other_players_kingdoms", className: "", dataset: "{}", children_count: 1 }
+index.js:1:71174
+Object { id: "kingdom_84634030", className: "kingdom", dataset: '{"value":"ff1493"}', children_count: 13 }
+index.js:1:71174
+Object { id: "player_boards", className: "", dataset: "{}", children_count: 2 }
+index.js:1:71174
+Object { id: "overall_player_board_89146710", className: "player-board current-player-board", dataset: "{}", children_count: 1 }
+index.js:1:71174
+Object { id: "player_board_inner_0000ff", className: "player_board_inner", dataset: "{}", children_count: 7 }
+index.js:1:71174
+Object { id: "player_board_89146710", className: "player_board_content", dataset: "{}", children_count: 4 }
+index.js:1:71174
+Object { id: "current_player_board", className: "", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "overall_player_board_84634030", className: "player-board ", dataset: "{}", children_count: 1 }
+index.js:1:71174
+Object { id: "player_board_inner_ff1493", className: "player_board_inner", dataset: "{}", children_count: 6 }
+index.js:1:71174
+Object { id: "player_board_84634030", className: "player_board_content", dataset: "{}", children_count: 4 }
+index.js:1:71174
+Object { id: "grid", className: "", dataset: "{}", children_count: 1 }
+index.js:1:71174
+Object { id: "grid_inner", className: "", dataset: "{}", children_count: 12 }
+index.js:1:71174
+Object { id: "grid_1", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_2", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_3", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_4", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_5", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_6", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_7", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_8", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_9", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_10", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_11", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "grid_12", className: "grid_column", dataset: "{}", children_count: 0 }
+index.js:1:71174
+Object { id: "kingdomino-advisor-overlay", className: "", dataset: "{}", children_count: 4 }
+index.js:1:71174
+undefined

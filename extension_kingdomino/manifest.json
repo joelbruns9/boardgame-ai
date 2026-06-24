@@ -3,6 +3,12 @@
   "name": "BGA Kingdomino Advisor",
   "version": "0.1.0",
   "description": "Scrapes Kingdomino state from Board Game Arena and queries a local advisor.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "kingdomino-advisor@local",
+      "strict_min_version": "111.0"
+    }
+  },
   "permissions": [
     "storage",
     "activeTab",
@@ -29,6 +35,8 @@
     "default_title": "Kingdomino Advisor"
   },
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ]
   }
 }

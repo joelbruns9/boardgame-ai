@@ -5,7 +5,8 @@
   "description": "Scrapes Kingdomino state from Board Game Arena and queries a local advisor.",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "*://*.boardgamearena.com/*",
@@ -28,8 +29,6 @@
     "default_title": "Kingdomino Advisor"
   },
   "background": {
-    "scripts": [
-      "background.js"
-    ]
+    "service_worker": "background.js"
   }
 }

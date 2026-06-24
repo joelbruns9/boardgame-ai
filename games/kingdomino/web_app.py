@@ -48,6 +48,7 @@ from typing import Any, Optional
 from uuid import uuid4
 import random
 import glob
+import re
 
 try:
     from fastapi import FastAPI, HTTPException, Query
@@ -149,9 +150,12 @@ class RecommendRequest(BaseModel):
     determinizations: int = Field(default=1, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
     device: str = "cpu"
-    channels: int = 64
-    blocks: int = 6
-    bilinear_dim: int = 64
+    # Architecture is normally read from the checkpoint's stored config.  These
+    # are optional overrides, only used as a fallback for old checkpoints that
+    # predate the saved config dict.  Leave them None to trust the checkpoint.
+    channels: Optional[int] = None
+    blocks: Optional[int] = None
+    bilinear_dim: Optional[int] = None
     seed: int = 0
 
 
@@ -166,9 +170,10 @@ class BotActionRequest(BaseModel):
     determinizations: int = Field(default=1, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
     device: str = "cpu"
-    channels: int = 64
-    blocks: int = 6
-    bilinear_dim: int = 64
+    # Optional architecture overrides; normally read from the checkpoint config.
+    channels: Optional[int] = None
+    blocks: Optional[int] = None
+    bilinear_dim: Optional[int] = None
     seed: int = 0
 
 
@@ -572,33 +577,27 @@ def _choose_greedy_action(state: GameState):
 
 
 def _newest_checkpoint_path() -> Optional[str]:
-    promoted = Path("checkpoints_best/kingdomino_current_best.pt")
-    if promoted.exists():
-        return str(promoted)
+    # 1) Canonical best model for the BGA advisor.  Copy the promoted checkpoint
+    #    here as current_best.pt; the server loads it automatically when no
+    #    checkpoint_path is supplied.
+    canonical = Path("runs/kingdomino/best_checkpoint/current_best.pt")
+    if canonical.exists():
+        return str(canonical)
 
-    patterns = [
-        "checkpoints_scratch_s800_64x6/iter_*.pt",
-        "checkpoints*/iter_*.pt",
-        "**/iter_*.pt",
-    ]
+    # 2) Otherwise fall back to the highest-iteration checkpoint under any run.
+    #    Rank by iteration number parsed from the filename (iter_NNNN.pt) so we
+    #    do not have to torch.load every candidate; break ties by mtime.
     best: Optional[tuple[int, float, str]] = None
-    for pat in patterns:
-        for path in glob.glob(pat, recursive=True):
-            try:
-                import torch
-                ck = torch.load(path, map_location="cpu")
-                iteration = int(ck.get("iteration", -1)) if isinstance(ck, dict) else -1
-            except Exception:
-                iteration = -1
-            try:
-                mtime = Path(path).stat().st_mtime
-            except Exception:
-                mtime = 0.0
-            item = (iteration, mtime, path)
-            if best is None or item > best:
-                best = item
-        if best is not None:
-            break
+    for path in glob.glob("runs/kingdomino/**/iter_*.pt", recursive=True):
+        m = re.search(r"iter_(\d+)\.pt$", path)
+        iteration = int(m.group(1)) if m else -1
+        try:
+            mtime = Path(path).stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        item = (iteration, mtime, path)
+        if best is None or item > best:
+            best = item
     return None if best is None else best[2]
 
 
@@ -607,10 +606,14 @@ def _load_nn_evaluator(req: BotActionRequest):
     if not checkpoint_path:
         raise HTTPException(
             status_code=400,
-            detail="NN bot needs a checkpoint_path, checkpoints_best/kingdomino_current_best.pt, or an iter_*.pt checkpoint in a checkpoints* folder.",
+            detail="NN bot needs a checkpoint_path, runs/kingdomino/best_checkpoint/current_best.pt, or an iter_*.pt checkpoint under runs/kingdomino/.",
         )
     path = str(Path(checkpoint_path))
-    key = (path, req.device, int(req.channels), int(req.blocks), int(req.bilinear_dim))
+    # Cache key includes the request-supplied overrides so a forced re-arch of
+    # the same path/device does not return a stale net.  The resolved arch is
+    # otherwise a pure function of the file, so (path, device) keys the common
+    # case where overrides are None.
+    key = (path, req.device, req.channels, req.blocks, req.bilinear_dim)
     cached = _NN_EVALUATOR_CACHE.get(key)
     if cached is not None:
         return cached, path
@@ -625,12 +628,37 @@ def _load_nn_evaluator(req: BotActionRequest):
     if not Path(path).exists():
         raise HTTPException(status_code=400, detail=f"Checkpoint not found: {path}")
     try:
-        ck = torch.load(path, map_location=req.device)
+        # Load on CPU first so we can read the stored config and build the net at
+        # the checkpoint's own architecture before moving it to the device.  The
+        # server is the single source of truth for architecture: it reads
+        # channels/blocks/bilinear_dim from checkpoint["config"] (saved by
+        # self_play.py's save_checkpoint).  Request fields are only fallbacks for
+        # legacy checkpoints that predate the config dict; if both are absent we
+        # fall back to KingdominoNet's own defaults.
+        ck = torch.load(path, map_location="cpu")
         sd = ck.get("model_state", ck) if isinstance(ck, dict) else ck
+        cfg = ck.get("config", {}) if isinstance(ck, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        # Precedence per field: checkpoint config → request override → the
+        # KingdominoNet constructor defaults (96/8/64), matching
+        # elo_rating.checkpoint_arch().
+        def _arch(field: str, override: Optional[int], default: int) -> int:
+            if field in cfg and cfg[field] is not None:
+                return int(cfg[field])
+            if override is not None:
+                return int(override)
+            return default
+
+        channels = _arch("channels", req.channels, 96)
+        blocks = _arch("blocks", req.blocks, 8)
+        bilinear_dim = _arch("bilinear_dim", req.bilinear_dim, 64)
+
         net = KingdominoNet(
-            channels=int(req.channels),
-            blocks=int(req.blocks),
-            bilinear_dim=int(req.bilinear_dim),
+            channels=channels,
+            blocks=blocks,
+            bilinear_dim=bilinear_dim,
         ).to(req.device)
         net.load_state_dict(sd)
         net.eval()
@@ -975,9 +1003,11 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             determinizations=int(req.determinizations),
             temperature=float(req.temperature),
             device=req.device,
-            channels=int(req.channels),
-            blocks=int(req.blocks),
-            bilinear_dim=int(req.bilinear_dim),
+            # Pass architecture overrides through untouched (may be None, in
+            # which case the loader reads arch from the checkpoint config).
+            channels=req.channels,
+            blocks=req.blocks,
+            bilinear_dim=req.bilinear_dim,
             seed=int(req.seed),
         )
         evaluator, checkpoint_path = _load_nn_evaluator(bot_req)

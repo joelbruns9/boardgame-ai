@@ -5,15 +5,16 @@ const ADVISOR_URL = "http://127.0.0.1:8000/api/recommend";
 const RESULT_EVENT = "kingdomino-advisor-state";
 const OVERLAY_ID = "kingdomino-advisor-overlay";
 
+// Architecture (channels/blocks/bilinear_dim) is intentionally NOT here. The
+// server is the single source of truth for model architecture: it reads those
+// values from the checkpoint's own config. The extension only sends a checkpoint
+// path (or nothing, to use the server's autodiscovered current_best.pt).
 const DEFAULT_OPTIONS = {
   engine: "nn",
   sims: 800,
   topK: 8,
   checkpoint: "",
   device: "cuda",
-  channels: 32,
-  blocks: 4,
-  bilinearDim: 64,
 };
 
 const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200];
@@ -70,9 +71,6 @@ async function loadOptions() {
     topK: Number.isFinite(topK) && topK > 0 ? Math.round(topK) : DEFAULT_OPTIONS.topK,
     checkpoint: stored.kingdomino_checkpoint || DEFAULT_OPTIONS.checkpoint,
     device: stored.kingdomino_device || DEFAULT_OPTIONS.device,
-    channels: DEFAULT_OPTIONS.channels,
-    blocks: DEFAULT_OPTIONS.blocks,
-    bilinearDim: DEFAULT_OPTIONS.bilinearDim,
   };
 }
 
@@ -174,6 +172,12 @@ function pageReadKingdominoState() {
   }
 
   function terrainId(name) {
+    // Case-insensitive by design: the live BGA capture (2026-06-23) confirmed
+    // the kingdom-grid terrain strings are lowercase except the castle, which
+    // BGA capitalizes as "Castle". The toLowerCase() below maps "Castle"→castle
+    // →1, so do NOT remove it. Verified BGA names: field, forest, lake,
+    // grassland, swamp, mountain, Castle. (wheat/water/grass/mine are kept as
+    // engine-name aliases for the dominoesDescription path.)
     const key = String(name || "").toLowerCase();
     const ids = {
       castle: 1,
@@ -215,6 +219,14 @@ function pageReadKingdominoState() {
           const bx = asInt(xk, null), by = asInt(yk, null);
           if (!Number.isFinite(bx) || !Number.isFinite(by)) return;
           const terr = String(c.terrain);
+          // Reject cells outside the ±6 engine window around the castle; one
+          // out-of-range cell makes the server reject the whole state (400).
+          // bx/by are castle-relative (engine x = castle + bx = x - castlePos[0]).
+          if (Math.abs(bx) > 6 || Math.abs(by) > 6) {
+            console.warn('[advisor] buildBoardFromKingdomArg: skipping out-of-bounds cell',
+              { x: castle + bx, y: castle + by, terrain: terr });
+            return;
+          }
           const isCastle = terr.toLowerCase() === "castle";
           if (isCastle) hasCastle = true;
           cells.push({
@@ -232,6 +244,122 @@ function pageReadKingdominoState() {
       cells.push({ x: castle, y: castle, terrain: "CASTLE", terrain_id: 1, crowns: 0, domino_id: -1 });
     }
     return { canvas_size: canvasSize, castle_pos: [castle, castle], cells };
+  }
+
+  function buildBoardFromDom(bgaPlayerId, descriptions, castlePos) {
+    // DOM-based reconstruction for a player whose authoritative per-cell grid is
+    // NOT exposed in gamedatas — i.e. the OPPONENT (BGA only surfaces
+    // gamestate.args.kingdom for the active player, and sends x/y/rotation=null
+    // for every placed domino in gamedatas.dominoes). The placed tiles ARE in the
+    // DOM though:
+    //   <div id="kingdom_<bgaId>">
+    //     <div id="domino_<N>[_placed]" class="domino shadow-rotation-<R>"
+    //          style="left:<L>px; top:<T>px"> …
+    // The castle sits at pixel (0,0) of the kingdom container and each cell is
+    // 50px, so grid = (left/50, top/50) and engine = castlePos + grid.
+    //
+    // Tile selection: we match by the `shadow-rotation-` class, NOT by an
+    // `_placed` id suffix. The 2026-06-23 live capture showed the OPPONENT's
+    // placed tiles use a bare `domino_<N>` id (e.g. domino_19, domino_32) while
+    // the active player's use `domino_<N>_placed` (domino_21_placed,
+    // domino_25_placed). An `[id*='_placed']` selector would therefore miss the
+    // opponent entirely — the one player this path exists to serve. Row/hand
+    // tiles carry class "domino" with no shadow-rotation, so the rotation class
+    // is the reliable "placed on the board" signal.
+    //
+    // Runs in the MAIN world (DOM available via chrome.scripting). Returns a
+    // board in the same shape as buildBoardFromKingdomArg, or null when the
+    // kingdom container is absent (e.g. spectator mode) so the caller can fall
+    // back gracefully to a castle-only board.
+    if (typeof document === "undefined" || !document.getElementById) return null;
+    const container = document.getElementById("kingdom_" + bgaPlayerId);
+    if (!container) return null;
+
+    // The castle is not necessarily at pixel (0,0) of the kingdom container, so
+    // read its actual rendered position and make every tile offset relative to
+    // it. This keeps gx/gy castle-relative regardless of where BGA lays out the
+    // castle within the container.
+    const castleEl = container.querySelector('.castle');
+    if (!castleEl) {
+      console.warn('[advisor] buildBoardFromDom: no castle element found');
+      return null;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const castleRect = castleEl.getBoundingClientRect();
+    const castlePx = Math.round(castleRect.left - containerRect.left);
+    const castlePy = Math.round(castleRect.top - containerRect.top);
+    console.log('[advisor] castle px offset:', castlePx, castlePy);
+
+    const castle = Array.isArray(castlePos) && castlePos.length === 2
+      ? [asInt(castlePos[0], 7), asInt(castlePos[1], 7)]
+      : [7, 7];
+    const cells = [
+      { x: castle[0], y: castle[1], terrain: "CASTLE", terrain_id: 1, crowns: 0, domino_id: -1 },
+    ];
+
+    let placed;
+    try {
+      placed = container.querySelectorAll("[class*='shadow-rotation-']");
+    } catch (e) {
+      return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells };
+    }
+
+    placed.forEach((el) => {
+      const idm = String(el.id || "").match(/domino_(\d+)/);
+      if (!idm) return;
+      const dominoId = asInt(idm[1], null);
+      if (!Number.isFinite(dominoId)) return;
+
+      // Pixel anchor → grid. Require finite, 50px-aligned offsets.
+      const left = parseInt(el.style && el.style.left, 10);
+      const top = parseInt(el.style && el.style.top, 10);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+      if ((left - castlePx) % 50 !== 0 || (top - castlePy) % 50 !== 0) return;
+
+      const cls = typeof el.className === "string" ? el.className : "";
+      const rm = cls.match(/shadow-rotation-([0-3])/);
+      if (!rm) return;
+      const rotation = asInt(rm[1], null);
+
+      const desc = descriptions && descriptions[String(dominoId)];
+      if (!desc || !desc.left || !desc.right) return;
+
+      // Anchor half = desc.left; second half = desc.right at rotationOffset(R).
+      // VERIFIED against the live authoritative board (dominoes 25 @rot2, 21
+      // @rot3). This mirrors KingdominoPlacement.domDominoCells, which the Node
+      // test covers; kept inline because the MAIN world cannot import it.
+      const gx = (left - castlePx) / 50, gy = (top - castlePy) / 50;
+      const [dx, dy] = rotationOffset(rotation);
+      const halves = [
+        { x: castle[0] + gx, y: castle[1] + gy, side: desc.left },
+        { x: castle[0] + gx + dx, y: castle[1] + gy + dy, side: desc.right },
+      ];
+      // Bounds-check BOTH halves before adding either cell. A single cell
+      // outside the ±6 engine window around the castle makes the server reject
+      // the whole state (HTTP 400), and an edge-anchored tile's second half can
+      // exceed ±6 even when the anchor does not — so skip the ENTIRE domino if
+      // either half is out of range.
+      const halfOutOfBounds = halves.some((h) =>
+        Math.abs(h.x - castle[0]) > 6 || Math.abs(h.y - castle[1]) > 6
+      );
+      if (halfOutOfBounds) {
+        console.warn('[advisor] buildBoardFromDom: skipping domino', dominoId,
+          'out-of-bounds half (anchor offset', gx, gy, 'rotation', rotation + ')');
+        return;
+      }
+      halves.forEach((h) => {
+        cells.push({
+          x: h.x,
+          y: h.y,
+          terrain: String(h.side.terrain || "").toUpperCase(),
+          terrain_id: terrainId(h.side.terrain),
+          crowns: asInt(h.side.crowns, 0),
+          domino_id: dominoId,
+        });
+      });
+    });
+
+    return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells };
   }
 
   function looksLikeKingdomGrid(obj) {
@@ -307,6 +435,24 @@ function pageReadKingdominoState() {
       if (!desc) return;
       const bx = asInt(d.x, null);
       const by = asInt(d.y, null);
+      // LIMITATION (confirmed by the 2026-06-23 live capture): for KINGDOM
+      // dominoes BGA sends x:null, y:null, rotation:null in gamedatas.dominoes.
+      // Without an anchor (bx,by) this approximate reconstruction cannot place
+      // the tile, so every placed domino is skipped here and the owner's board
+      // falls back to castle-only. This is the root cause of the empty opponent
+      // board: the ACTIVE player's board is rebuilt authoritatively from
+      // gamestate.args.kingdom (see buildBoardFromKingdomArg), but BGA does not
+      // expose a per-cell grid for the opponent, so the opponent has only this
+      // path available.
+      //
+      // The DOM does expose rotation via the placed tile's class
+      // (e.g. id="domino_25_placed" class="domino shadow-rotation-2"), but NOT a
+      // usable board anchor: position is pixel-based CSS (style.left/top) that
+      // would require calibrating the board origin and cell size, and the
+      // current scrape does not capture it. Rotation alone is insufficient
+      // without (bx,by), so we intentionally do not partially reconstruct here.
+      // Skipping (rather than guessing) keeps the fallback graceful: no crash,
+      // and the owner board is castle-only instead of wrong.
       if (!Number.isFinite(bx) || !Number.isFinite(by)) return;
       const [dx, dy] = rotationOffset(d.rotation);
       const halves = [
@@ -353,6 +499,14 @@ function pageReadKingdominoState() {
     const samples = [];
     let cellsSeen = 0;
     let nonEmptyCount = 0;
+    // Bounds were previously read as kingdom.xMin/xMax/yMin/yMax, but those
+    // fields do not live on the grid object. The live capture (2026-06-23)
+    // shows BGA stores them as siblings of `kingdom` on gamestate.args
+    // (args.xMin, args.xMax, ...), so kingdom.xMin was always undefined → null.
+    // Instead, derive the bounding box from the non-empty cells we actually
+    // see. These are BGA coordinates (castle at 0,0) and match
+    // gd.players[id].kingdom.{minX,minY,maxX,maxY} as a cross-check.
+    let xMin = null, xMax = null, yMin = null, yMax = null;
     Object.keys(kingdom).forEach((xKey) => {
       const col = kingdom[xKey];
       if (!col || typeof col !== "object") return;
@@ -370,6 +524,16 @@ function pageReadKingdominoState() {
           /empty/i.test(text);
         if (!isEmpty) {
           nonEmptyCount += 1;
+          const bx = asInt(xKey, null);
+          const by = asInt(yKey, null);
+          if (Number.isFinite(bx)) {
+            xMin = xMin === null ? bx : Math.min(xMin, bx);
+            xMax = xMax === null ? bx : Math.max(xMax, bx);
+          }
+          if (Number.isFinite(by)) {
+            yMin = yMin === null ? by : Math.min(yMin, by);
+            yMax = yMax === null ? by : Math.max(yMax, by);
+          }
           if (samples.length < 80) {
             samples.push({
               x: asInt(xKey, xKey),
@@ -385,12 +549,7 @@ function pageReadKingdominoState() {
       cells_seen: cellsSeen,
       non_empty_count: nonEmptyCount,
       samples,
-      bounds: {
-        xMin: asInt(kingdom.xMin, null),
-        xMax: asInt(kingdom.xMax, null),
-        yMin: asInt(kingdom.yMin, null),
-        yMax: asInt(kingdom.yMax, null),
-      },
+      bounds: { xMin, xMax, yMin, yMax },
     };
   }
 
@@ -482,21 +641,42 @@ function pageReadKingdominoState() {
     let initialPickCount = 0;
     let startPlayer = activeIndex === undefined ? 0 : activeIndex;
     const boardBuild = buildBoardsFromDominoes(dominoes, dominoesDescription, playerToIndex, players, canvasSize);
+    const castleCenter = Math.floor(canvasSize / 2);
 
-    // Authoritative per-cell board reconstruction, applied symmetrically to
-    // EVERY player. For each player we prefer BGA's kingdom grid (exact terrain
-    // and crowns per cell); only where no authoritative grid is available do we
-    // keep the approximate dominoes reconstruction built above. Historically only
-    // the active player's board was upgraded this way, leaving the opponent on
-    // the fragile dominoes path — this loop closes that gap.
+    // Per-player board resolution, in priority order:
+    //   1. Authoritative BGA kingdom grid (gamestate.args.kingdom) — active
+    //      player only; exact terrain/crowns per cell.
+    //   2. DOM reconstruction (buildBoardFromDom) — opponents, whose grid BGA
+    //      does not expose and whose gamedatas x/y/rotation are null. Reads the
+    //      rendered tiles' pixel position + shadow-rotation class.
+    //   3. Approximate dominoes reconstruction (buildBoardsFromDominoes, built
+    //      above) — legacy fallback; inert when BGA sends null coords.
+    //   4. Castle-only board — last resort (already present in every board).
+    const domCastle = [castleCenter, castleCenter];
     for (let p = 0; p < boardBuild.boards.length; p++) {
       const grid = resolveKingdomForPlayer(gd, p, playerorder, activeIndex);
       if (grid) {
         boardBuild.boards[p] = buildBoardFromKingdomArg(grid, canvasSize);
         debug.notes.push(`Player ${p} board built from authoritative BGA kingdom grid.`);
-      } else {
-        debug.notes.push(`Player ${p} board uses APPROXIMATE dominoes reconstruction (no authoritative kingdom grid available${p === activeIndex ? "" : "; BGA typically exposes the kingdom grid for the active player only"}).`);
+        console.log('[advisor] board', p, 'built via: authoritative-grid',
+          JSON.stringify(boardBuild.boards[p].cells.map(c => [c.x, c.y])));
+        continue;
       }
+      const bgaId = playerorder ? playerorder[p] : undefined;
+      const domBoard = bgaId != null ? buildBoardFromDom(bgaId, dominoesDescription, domCastle) : null;
+      console.log('[advisor] board', p, 'buildBoardFromDom ->',
+        domBoard === null ? 'null' : (domBoard.cells.length + ' cell(s)'),
+        domBoard ? JSON.stringify(domBoard.cells.map(c => [c.x, c.y])) : '');
+      if (domBoard && domBoard.cells.length > 1) {
+        boardBuild.boards[p] = domBoard;
+        debug.notes.push(`Player ${p} board built from DOM reconstruction (${domBoard.cells.length - 1} placed cell(s) from rendered tiles).`);
+        console.log('[advisor] board', p, 'built via: DOM');
+        continue;
+      }
+      debug.notes.push(`Player ${p} board uses APPROXIMATE dominoes reconstruction / castle-only (no authoritative kingdom grid and no DOM-placed tiles found${p === activeIndex ? "" : "; BGA exposes the kingdom grid for the active player only"}).`);
+      console.log('[advisor] board', p, 'built via:',
+        boardBuild.boards[p].cells.length > 1 ? 'approx' : 'castle-only',
+        JSON.stringify(boardBuild.boards[p].cells.map(c => [c.x, c.y])));
     }
 
     if (gameStateName === "chooseDomino") {
@@ -513,7 +693,13 @@ function pageReadKingdominoState() {
       }
       debug.notes.push("Mapped BGA chooseDomino to engine INITIAL_SELECTION.");
     } else if (gameStateName === "placeDomino") {
-      phase = "PLACE_AND_SELECT";
+      // Final round: the deck is exhausted so there are no future dominoes to
+      // pick. The engine models this as FINAL_PLACEMENT (place only, no pick);
+      // PLACE_AND_SELECT would require a pick from current_row and, with an
+      // empty row, yields ZERO legal actions (place+pick over an empty row) —
+      // which is why the advisor returned "No recommendations" on the last turn.
+      const isFinalRound = unownedFuture.length === 0;
+      phase = isFinalRound ? "FINAL_PLACEMENT" : "PLACE_AND_SELECT";
       currentRow = unownedFuture;
       pendingClaims = currentOwned.length ? currentOwned : (activeClaim ? [activeClaim] : allClaims);
       if (activeClaim && !pendingClaims.some((c) => c.player === activeClaim.player && c.domino_id === activeClaim.domino_id)) {
@@ -532,7 +718,9 @@ function pageReadKingdominoState() {
       debug.current_owned_claims = currentOwned;
       debug.next_owned_claims = futureOwned;
       debug.actor_claim = pendingClaims[actorIndex] || null;
-      debug.notes.push("Mapped BGA placeDomino to engine PLACE_AND_SELECT using CURRENT owned dominoes as remaining pending claims.");
+      debug.notes.push(isFinalRound
+        ? "Mapped BGA placeDomino (no future dominoes left) to engine FINAL_PLACEMENT — place only, no pick."
+        : "Mapped BGA placeDomino to engine PLACE_AND_SELECT using CURRENT owned dominoes as remaining pending claims.");
     } else {
       return {
         ok: false,
@@ -1155,6 +1343,15 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     list.appendChild(empty);
   }
 
+  // Phase + current row come from the captured BGA state (carried on the
+  // payload). current_row lets us resolve an INITIAL_SELECTION rec's
+  // legal_index (0-based into the row) to a concrete domino id; spriteUrl and
+  // spriteMap (already params) render the tile thumbnail.
+  const statePhase = (payload && payload.state && payload.state.phase) || null;
+  const currentRow = (payload && payload.state && Array.isArray(payload.state.current_row))
+    ? payload.state.current_row
+    : [];
+
   const maxVisit = Math.max(...recs.map((r) => firstNumber(r, ["visit_frac", "visit_share", "prob"]) || 0), 0.000001);
   recs.slice(0, options.topK).forEach((rec, idx) => {
     const row = document.createElement("div");
@@ -1180,15 +1377,56 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     const rightCol = document.createElement("div");
     rightCol.style.cssText = "display:flex;flex-direction:column;gap:5px;flex:1;";
 
-    const { pickId } = parseDominoIds(rec);
-    const pickRow = document.createElement("div");
-    pickRow.style.cssText = "display:flex;align-items:center;gap:6px;";
-    const pickLabel = document.createElement("span");
-    pickLabel.textContent = "then pick";
-    pickLabel.style.cssText = "color:#64748b;font-size:11px;";
-    pickRow.appendChild(pickLabel);
-    if (pickId) pickRow.appendChild(dominoTileEl(pickId, spriteUrl, spriteMap));
-    rightCol.appendChild(pickRow);
+    // Action identity row: shows the domino(s) involved with a sprite + label.
+    // The previous version always printed a bare "then pick" because
+    // parseDominoIds looked for rec.pick_id (the server sends pick_domino_id)
+    // and the "Pick domino N" label did not match its pick regex.
+    const actionRow = document.createElement("div");
+    actionRow.style.cssText = "display:flex;align-items:center;gap:6px;flex-wrap:wrap;";
+
+    if (statePhase === "INITIAL_SELECTION") {
+      // Opening selection: rec.legal_index indexes current_row. Fall back to the
+      // server-provided rec.domino_id if the row/index is unavailable.
+      let dominoId = null;
+      if (Number.isFinite(rec.legal_index) && rec.legal_index >= 0 && rec.legal_index < currentRow.length) {
+        dominoId = currentRow[rec.legal_index];
+      }
+      if (dominoId == null && Number.isFinite(rec.domino_id)) dominoId = rec.domino_id;
+
+      const label = document.createElement("span");
+      label.style.cssText = "color:#cbd5e1;font-size:12px;";
+      label.textContent = dominoId != null ? `pick domino ${dominoId}` : "pick";
+      actionRow.appendChild(label);
+      if (dominoId != null) actionRow.appendChild(dominoTileEl(dominoId, spriteUrl, spriteMap));
+    } else {
+      // PLACE_AND_SELECT: place rec.domino_id (sprite + coords), then pick the
+      // next domino (rec.pick_domino_id).
+      const fallback = parseDominoIds(rec);
+      const placedId = Number.isFinite(rec.domino_id) ? rec.domino_id : fallback.placeId;
+      const nextPick = Number.isFinite(rec.pick_domino_id) ? rec.pick_domino_id : fallback.pickId;
+
+      const p = rec.placement;
+      const coords = p && Number.isFinite(p.x1)
+        ? `(${p.x1},${p.y1})→(${p.x2},${p.y2})${p.flipped ? " flipped" : ""}`
+        : "";
+
+      const placeLabel = document.createElement("span");
+      placeLabel.style.cssText = "color:#cbd5e1;font-size:12px;";
+      placeLabel.textContent = placedId != null
+        ? `place ${placedId}${coords ? " " + coords : ""}`
+        : (coords || "place");
+      actionRow.appendChild(placeLabel);
+      if (placedId != null) actionRow.appendChild(dominoTileEl(placedId, spriteUrl, spriteMap));
+
+      if (nextPick != null) {
+        const thenLabel = document.createElement("span");
+        thenLabel.textContent = "then pick";
+        thenLabel.style.cssText = "color:#64748b;font-size:11px;";
+        actionRow.appendChild(thenLabel);
+        actionRow.appendChild(dominoTileEl(nextPick, spriteUrl, spriteMap));
+      }
+    }
+    rightCol.appendChild(actionRow);
 
     const barRow = document.createElement("div");
     barRow.style.cssText = "display:flex;align-items:center;gap:6px;";
@@ -1223,6 +1461,8 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
 }
 
 function buildRecommendPayload(state, options) {
+  // Note: no channels/blocks/bilinear_dim here. The server reads the model
+  // architecture from the checkpoint config, so the extension never sends it.
   const payload = {
     state,
     engine: options.engine,
@@ -1232,9 +1472,6 @@ function buildRecommendPayload(state, options) {
     determinizations: 1,
     temperature: 0.0,
     device: options.device,
-    channels: options.channels,
-    blocks: options.blocks,
-    bilinear_dim: options.bilinearDim,
   };
   if (options.checkpoint && options.checkpoint.trim()) {
     payload.checkpoint_path = options.checkpoint.trim();
