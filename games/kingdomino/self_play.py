@@ -72,6 +72,9 @@ from games.kingdomino.mcts_az import (
 # cfg.margin_gain) mutates this same module object, so the override propagates.
 import games.kingdomino.mcts_az as _mcts_az
 from games.kingdomino.bots import GreedyBot
+from games.kingdomino.diagnostics import (
+    compute_all_diagnostics, check_alpha_transition,
+)
 
 
 # ─── 1. Configuration ─────────────────────────────────────────────────────
@@ -162,6 +165,11 @@ class SelfPlayConfig:
     games_per_iteration: int = 50
     train_steps_per_iteration: int = 200
     min_buffer_to_train: int = 2_000   # don't train until the buffer has warmed up
+    # Phase-sliced calibration diagnostics (Milestone 2): run compute_all_diagnostics
+    # every N iterations (amortises the ~1-2s cost without losing curve resolution).
+    # 0 disables.  Logged keys: win_brier_by_phase, policy_kl_by_phase, calibration
+    # curve, value bias, mcts_lift_rate, and the alpha_trigger stub.
+    diag_every: int = 5
     # benchmark
     benchmark_every: int = 1
     benchmark_seeds: int = 10
@@ -1236,6 +1244,15 @@ def _compact_summary(it: int, *, sp_games: int, row: dict, trained: bool,
             + (f"{wbd:.3f}" if wbd is not None else "n/a"))
     else:
         parts.append(f"train: skipped (buf {buf_n}/{min_buf})")
+    if row.get("win_brier_endgame") is not None:
+        parts.append(
+            f"diag_phase: brier=["
+            f"{row.get('win_brier_opening', 0) or 0:.3f}/"
+            f"{row.get('win_brier_midgame', 0) or 0:.3f}/"
+            f"{row.get('win_brier_endgame', 0) or 0:.3f}] "
+            f"kl=[{row.get('policy_kl_opening', 0) or 0:.2f}/"
+            f"{row.get('policy_kl_midgame', 0) or 0:.2f}/"
+            f"{row.get('policy_kl_endgame', 0) or 0:.2f}]")
     if row.get("bench_win_rate") is not None:
         bwb = row.get("bench_win_brier")
         bench = f"bench: win={row['bench_win_rate']:.1%} margin={row['bench_score_margin']:+.1f}"
@@ -1817,6 +1834,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     diag_entropy_batch = None
     diag_rng = np.random.default_rng(cfg.seed + 7919)
 
+    # Accumulated structured log rows for the empirical alpha-transition trigger
+    # (check_alpha_transition needs the recent win_brier_endgame / baseline ratios).
+    _diag_rows: List[dict] = []
+
     it = 0   # defined before the loop so the finally block's final-rating is safe
     try:
         for it in range(1, cfg.n_iterations + 1):
@@ -2136,6 +2157,29 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "elo_stderr": elo_result["elo_stderr"] if elo_result else None,
                 "elo_n_games": elo_result["elo_n_games"] if elo_result else None,
             }
+
+            # ── Phase-sliced calibration diagnostics (Milestone 2) ──  Run every
+            # cfg.diag_every iterations on a buffer snapshot, after training.
+            # Guarded so a diagnostics bug can never crash a long training run.
+            if (cfg.diag_every and it % cfg.diag_every == 0
+                    and len(buffer) >= cfg.min_buffer_to_train):
+                try:
+                    phase_diag = compute_all_diagnostics(
+                        list(buffer.data), net, device=str(cfg.device),
+                        score_scale=cfg.score_scale,
+                        margin_gain=cfg.margin_gain,
+                        alpha=cfg.alpha,
+                    )
+                    row.update(phase_diag)
+                except Exception as e:
+                    if verbose:
+                        print(f"  diagnostics failed: {e}")
+                finally:
+                    net.train()  # compute_all_diagnostics leaves the net in eval
+            # Alpha-transition trigger (stub — logged, not yet acted on; M5).
+            _diag_rows.append(row)
+            row["alpha_trigger"] = check_alpha_transition(_diag_rows)
+
             _log_row(log_path, row)
             if verbose:
                 print(_compact_summary(
