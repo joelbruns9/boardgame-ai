@@ -151,6 +151,12 @@ class SelfPlayConfig:
     # margin-dominant cloud setting (plan §1.4); mcts_az's own default is 0.5.
     margin_gain: float = 2.0
     alpha: float = 0.8
+    # Exact endgame solver budget for the batched engines. When a self-play root
+    # reaches a terminal-adjacent position (deck∈{0,4}), it is solved exactly
+    # (minimax) instead of MCTS — perfect value/policy targets, no GPU forwards.
+    # 0 disables it (ablation). 500k was the best routine-training throughput
+    # point in the 1600-sim smoke; higher budgets remain useful for quality runs.
+    exact_endgame_max_nodes: int = 500_000
     # loop
     n_iterations: int = 40
     games_per_iteration: int = 50
@@ -503,7 +509,7 @@ def play_selfplay_game(
             # determinization per simulation); no outer PIMC loop.  It derives
             # its own Python RNG from np_rng, so py_rng / n_determinizations /
             # leaf_batch are intentionally not passed here.
-            visit_counts, _ = run_pimc_open_loop(
+            visit_counts, _, _ = run_pimc_open_loop(
                 mcts, state, add_noise=True, rng=np_rng,
             )
         else:
@@ -880,7 +886,9 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     Seeds match the single-buffer case exactly: A covers games
     [seed_start, seed_start+games_a), B covers [seed_start+games_a, ...), so
     game i still uses seed seed_start + i.  Returns
-    (finished, batch_sizes, ticks, step_sec, eval_sec, update_sec, elapsed);
+    (finished, batch_sizes, ticks, exact_solve_count, exact_tree_solve_count,
+     exact_cache_hit_count, exact_fallback_count, step_sec, eval_sec,
+     update_sec, elapsed);
     step_sec/update_sec are summed across both instances and OVERLAP eval_sec
     (their sum can exceed elapsed — that overlap is the speedup).
     """
@@ -968,7 +976,13 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
 
     elapsed = time.time() - t0
     finished = finished_a + finished_b
+    exact_solve_count = int(A.exact_solve_count) + int(B.exact_solve_count)
+    exact_tree_solve_count = int(A.exact_tree_solve_count) + int(B.exact_tree_solve_count)
+    exact_cache_hit_count = int(A.exact_cache_hit_count) + int(B.exact_cache_hit_count)
+    exact_fallback_count = int(A.exact_fallback_count) + int(B.exact_fallback_count)
     return (finished, batch_sizes, ticks,
+            exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
+            exact_fallback_count,
             prof["step"], eval_sec, prof["update"], elapsed)
 
 
@@ -1027,6 +1041,7 @@ def play_selfplay_games_batched(
             score_scale=float(cfg.score_scale),
             margin_gain=float(cfg.margin_gain),
             alpha=float(cfg.alpha),
+            exact_endgame_max_nodes=int(cfg.exact_endgame_max_nodes),
         )
 
     use_db = bool(double_buffer)
@@ -1035,6 +1050,10 @@ def play_selfplay_games_batched(
               "falling back to single-buffer.")
         use_db = False
 
+    exact_solve_count = 0
+    exact_tree_solve_count = 0
+    exact_cache_hit_count = 0
+    exact_fallback_count = 0
     if not use_db:
         # ── Single-buffer path (unchanged) ──
         batched = _make_batched(n_games, game_seed_start)
@@ -1061,9 +1080,15 @@ def play_selfplay_games_batched(
             if ticks > 2_000_000:
                 raise RuntimeError("BatchedMCTS exceeded tick guard")
         elapsed = time.time() - t0
+        exact_solve_count = int(batched.exact_solve_count)
+        exact_tree_solve_count = int(batched.exact_tree_solve_count)
+        exact_cache_hit_count = int(batched.exact_cache_hit_count)
+        exact_fallback_count = int(batched.exact_fallback_count)
     else:
         # ── Double-buffer path (Item 17) ──
         (finished, batch_sizes, ticks,
+         exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
+         exact_fallback_count,
          step_sec, eval_sec, update_sec, elapsed) = _double_buffer_loop(
             _make_batched, evaluator, n_games, game_seed_start)
 
@@ -1091,6 +1116,10 @@ def play_selfplay_games_batched(
         "step_sec": step_sec,
         "eval_sec": eval_sec,
         "update_sec": update_sec,
+        "exact_solve_count": exact_solve_count,
+        "exact_tree_solve_count": exact_tree_solve_count,
+        "exact_cache_hit_count": exact_cache_hit_count,
+        "exact_fallback_count": exact_fallback_count,
     }
     ev_timing = getattr(evaluator, "timing", None)
     if ev_timing:
@@ -1379,7 +1408,7 @@ class OpenLoopAZPlayer:
         self._np_rng = np_rng or np.random.default_rng()
 
     def choose_action(self, state, actions, rng=None):
-        vc, _ = run_pimc_open_loop(
+        vc, _, _ = run_pimc_open_loop(
             self.mcts, state,
             add_noise=False, rng=self._np_rng,
         )
@@ -1910,6 +1939,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                               f"forward={batched_stats['eval_forward_sec']:.1f}s, "
                               f"readback={batched_stats['eval_readback_sec']:.1f}s, "
                               f"calls={batched_stats['eval_calls']}")
+                    print(f"  exact endgame: solved={batched_stats.get('exact_solve_count', 0)} "
+                          f"trees={batched_stats.get('exact_tree_solve_count', 0)} "
+                          f"cache_hits={batched_stats.get('exact_cache_hit_count', 0)} "
+                          f"fallback={batched_stats.get('exact_fallback_count', 0)}")
 
             # ── 2. Train ──
             if len(buffer) < cfg.min_buffer_to_train:
@@ -2288,6 +2321,10 @@ if __name__ == "__main__":
                    help="(Item 17) Run two BatchedMCTS instances in parallel, "
                         "overlapping CPU tree work with GPU forward. Only for "
                         "engine=batched or batched_open_loop.")
+    p.add_argument("--exact_endgame_max_nodes", type=int, default=500_000,
+                   help="BatchedMCTS exact endgame node budget. 0 disables exact "
+                        "endgame solving; 500k is the routine training default; "
+                        "higher values are useful for quality/reanalysis runs.")
     a = p.parse_args()
 
     # Default warmup = one full iteration's worth of positions, so training
@@ -2326,5 +2363,6 @@ if __name__ == "__main__":
         compile_dynamic={"auto": None, "on": True, "off": False}[a.compile_dynamic],
         prefetch_batches=a.prefetch_batches,
         double_buffer=a.double_buffer,
+        exact_endgame_max_nodes=a.exact_endgame_max_nodes,
     )
     run_self_play_training(cfg, verbose=True)

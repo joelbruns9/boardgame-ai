@@ -104,6 +104,7 @@ import torch
 
 from games.kingdomino.game import GameState, Phase
 from games.kingdomino.encoder import encode_state, compute_target_z, redeterminize
+from games.kingdomino.endgame_solver import exact_endgame_value
 from games.kingdomino.action_codec import (
     NUM_JOINT_ACTIONS, encode_action, decode_action,
 )
@@ -224,7 +225,7 @@ class OpenLoopNode:
     _postprocess handles the per-actor perspective flip, same as before.
     """
     __slots__ = ("action", "depth", "prior", "visit_count",
-                 "value_sum", "children", "is_expanded")
+                 "value_sum", "children", "is_expanded", "exact_value")
 
     def __init__(self, action: object, depth: int, prior: float):
         self.action: object = action          # action that led to this node
@@ -235,6 +236,13 @@ class OpenLoopNode:
         self.value_sum: float = 0.0           # player-0 frame
         self.children: Dict[object, "OpenLoopNode"] = {}
         self.is_expanded: bool = False
+        # OPT-1 solve-once cache: when an exact endgame leaf is solved, the
+        # player-0 value is stored here and the node stays unexpanded, so every
+        # later simulation reaching it returns the cached value in O(1) instead
+        # of re-solving. Only set when exact solving is "active" for the search
+        # (root terminal-adjacent ⇒ this node's concrete state is the same for
+        # every determinization, so a single cached value is correct for all).
+        self.exact_value: Optional[float] = None
 
     @property
     def value(self) -> float:
@@ -772,6 +780,9 @@ class OpenLoopMCTS:
         score_scale: float = 100.0,
         margin_gain: float = 2.0,
         alpha: float = 0.8,
+        exact_endgame_max_nodes: int = 500_000,
+        exact_endgame_max_hidden_tiles: int = 4,
+        exact_endgame_enabled: bool = True,
     ):
         self.evaluator = evaluator
         self.c_puct = c_puct
@@ -791,6 +802,17 @@ class OpenLoopMCTS:
         self._score_scale = float(score_scale)
         self._margin_gain = float(margin_gain)
         self._alpha = float(alpha)
+        self._exact_endgame_max_nodes = int(exact_endgame_max_nodes)
+        self._exact_endgame_max_hidden_tiles = int(exact_endgame_max_hidden_tiles)
+        self._exact_endgame_enabled = bool(exact_endgame_enabled)
+        # Whether exact endgame solving is active for the CURRENT search. Set per
+        # search() from the root: only true when the root is terminal-adjacent
+        # (deck small enough to solve), which is also the condition under which a
+        # solved leaf's value is determinization-independent and therefore safe
+        # to cache (OPT-1). See search().
+        self._exact_endgame_active = False
+        self._exact_solve_count = 0      # leaves solved exactly this search
+        self._exact_cache_hits = 0       # leaves served from OPT-1 cache
         # Diagnostic: number of times _select_child found no stored child legal
         # in the current determinization (a deep-node divergence). Reset per
         # search(); expected to be rare. See _select_child.
@@ -828,6 +850,24 @@ class OpenLoopMCTS:
         # given a fixed np rng seed.
         py_rng = random.Random(int(rng.integers(0, 2**63 - 1)))
         self._fallback_count = 0
+        self._exact_solve_count = 0
+        self._exact_cache_hits = 0
+
+        # Exact endgame solving is enabled for this search only when the ROOT is
+        # terminal-adjacent (deck <= max_hidden_tiles). In that regime the only
+        # hidden information is the ORDER of the few remaining deck tiles, which
+        # is irrelevant — they are dealt as a sorted row — so every node's
+        # concrete state is identical across determinizations. That makes the
+        # exact solver's value (a) correct to back up and (b) safe to cache once
+        # per node (OPT-1). From a non-terminal-adjacent root, a deck=4 leaf's
+        # board would depend on which tiles a determinization happened to deal,
+        # so a single cached value would be wrong; we fall back to the network
+        # there and let the exact grounding happen later, when the game actually
+        # reaches a terminal-adjacent position and that search solves it.
+        self._exact_endgame_active = (
+            self._exact_endgame_enabled
+            and len(root_state.deck) <= self._exact_endgame_max_hidden_tiles
+        )
 
         # Expand root using a fresh determinization. redeterminize preserves
         # the public current_row, so the root's child joint indices are the
@@ -920,8 +960,36 @@ class OpenLoopMCTS:
             # re-expand (that would mix determinizations' children). Just use
             # the network's value estimate for the current concrete state.
             value0, _ = self._evaluate(state)
+        elif node.exact_value is not None:
+            # OPT-1 solve-once cache: this leaf was already solved exactly in a
+            # previous simulation. The value is determinization-independent (see
+            # search()'s _exact_endgame_active note), so return it directly. The
+            # node stays unexpanded, so the PUCT descent never goes below it.
+            value0 = node.exact_value
+            self._exact_cache_hits += 1
         else:
-            value0 = self._expand_and_evaluate(node, state)
+            if self._should_exact_solve(state):
+                # The exact solver is deterministic and public-bag exhaustive;
+                # the seed is stable documentation of this simulation's
+                # determinized hidden bag if future tie-breaking ever needs it.
+                seed = sum((i + 1) * int(d) for i, d in enumerate(state.deck))
+                value0, solved = exact_endgame_value(
+                    state,
+                    max_nodes=self._exact_endgame_max_nodes,
+                    rng=random.Random(seed),
+                    score_scale=self._score_scale,
+                    margin_gain=self._margin_gain,
+                    alpha=self._alpha,
+                )
+                if solved:
+                    # Cache on the node and leave it unexpanded: every later
+                    # simulation reaching this leaf takes the O(1) branch above.
+                    node.exact_value = value0
+                    self._exact_solve_count += 1
+                else:
+                    value0 = self._expand_and_evaluate(node, state)
+            else:
+                value0 = self._expand_and_evaluate(node, state)
 
         # ── undo virtual loss, then backup (player-0 frame, no sign flips) ──
         for i, (n, vl) in enumerate(zip(path, vl_values)):
@@ -951,6 +1019,21 @@ class OpenLoopMCTS:
     def _expand_and_evaluate(self, node: "OpenLoopNode", state: GameState) -> float:
         """Expand a leaf node during simulation and return value0. See _expand_node."""
         return self._expand_node(node, state)
+
+    def _should_exact_solve(self, state: GameState) -> bool:
+        """Whether to try public-bag exact endgame solving for this leaf.
+
+        Requires `_exact_endgame_active` (set per search() from the root): exact
+        solving only runs when the root is terminal-adjacent, which guarantees
+        this leaf's concrete state is determinization-independent. The per-leaf
+        deck check is then always satisfied (deck only shrinks while descending),
+        but is kept as a cheap, explicit guard.
+        """
+        return (
+            self._exact_endgame_active
+            and state.phase in (Phase.PLACE_AND_SELECT, Phase.FINAL_PLACEMENT)
+            and len(state.deck) <= self._exact_endgame_max_hidden_tiles
+        )
 
     def _evaluate(self, state: GameState) -> Tuple[float, Dict[int, float]]:
         """Network evaluation. Returns (value_player0, {joint_idx: prior}).
@@ -1152,20 +1235,26 @@ def run_pimc_open_loop(
     *,
     add_noise: bool = False,
     rng: Optional[np.random.Generator] = None,
-) -> Tuple[Dict[object, int], float]:
+) -> Tuple[Dict[object, int], float, "OpenLoopNode"]:
     """Single open-loop MCTS search (no outer determinization loop needed).
 
     Open-loop MCTS internally averages over many deck orders, so the outer
     PIMC loop of run_pimc is redundant. This wrapper provides a compatible
     interface for callers that currently use run_pimc.
 
-    Returns (visit_counts, root_value_player0).
+    Exact endgame search is active through OpenLoopMCTS constructor flags
+    (exact_endgame_enabled=True by default). Advisor callers should keep that
+    default unless deliberately benchmarking network-only leaf values.
+
+    Returns (visit_counts, root_value_player0, root). The root node is exposed
+    so callers can read per-child priors and Q values (its children are keyed
+    by slot-relative joint index — use encode_action to look one up).
     """
     if rng is None:
         rng = np.random.default_rng()
     visit_counts, root = mcts.search(
         public_state, add_noise=add_noise, rng=rng)
-    return visit_counts, root.value
+    return visit_counts, root.value, root
 
 
 if __name__ == "__main__":

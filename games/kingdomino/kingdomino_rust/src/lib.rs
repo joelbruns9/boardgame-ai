@@ -1,15 +1,18 @@
-use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyList, PyTuple};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
 use numpy::ndarray::{Array1, Array2, Array3, Array4, Axis};
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray3,
+};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyTuple};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // Terrain constants matching Python's Terrain IntEnum
-const EMPTY:  u8 = 0;
+const EMPTY: u8 = 0;
 const CASTLE: u8 = 1;
 // WHEAT=2, FOREST=3, WATER=4, GRASS=5, SWAMP=6, MINE=7
 
@@ -36,15 +39,15 @@ fn in_bounds(x: i8, y: i8) -> bool {
 /// legal_placements) are plain array reads, which is why this is fast.
 #[pyclass]
 struct RustBoard {
-    terrain:  [u8; CELLS],   // 0=empty 1=castle 2-7=terrain types
-    crowns:   [u8; CELLS],   // 0-3
+    terrain: [u8; CELLS], // 0=empty 1=castle 2-7=terrain types
+    crowns: [u8; CELLS],  // 0-3
     castle_x: i8,
     castle_y: i8,
-    min_x:    i8,
-    max_x:    i8,
-    min_y:    i8,
-    max_y:    i8,
-    occupied: u8,            // count of occupied cells (for harmony check)
+    min_x: i8,
+    max_x: i8,
+    min_y: i8,
+    max_y: i8,
+    occupied: u8, // count of occupied cells (for harmony check)
 }
 
 #[pymethods]
@@ -70,16 +73,26 @@ impl RustBoard {
 
     fn copy(&self) -> Self {
         RustBoard {
-            terrain:  self.terrain,
-            crowns:   self.crowns,
+            terrain: self.terrain,
+            crowns: self.crowns,
             castle_x: self.castle_x,
             castle_y: self.castle_y,
-            min_x:    self.min_x,
-            max_x:    self.max_x,
-            min_y:    self.min_y,
-            max_y:    self.max_y,
+            min_x: self.min_x,
+            max_x: self.max_x,
+            min_y: self.min_y,
+            max_y: self.max_y,
             occupied: self.occupied,
         }
+    }
+
+    #[staticmethod]
+    fn from_flat_arrays(
+        terrain_vec: Vec<u8>,
+        crowns_vec: Vec<u8>,
+        castle_x: i8,
+        castle_y: i8,
+    ) -> PyResult<Self> {
+        RustBoard::from_flat_parts(terrain_vec, crowns_vec, castle_x, castle_y)
     }
 
     fn is_empty(&self, x: i8, y: i8) -> bool {
@@ -113,10 +126,14 @@ impl RustBoard {
     ///   flipped: if true, half B goes to (x1,y1) and half A to (x2,y2)
     fn is_legal_placement(
         &self,
-        t_a: u8, _c_a: u8,
-        t_b: u8, _c_b: u8,
-        x1: i8, y1: i8,
-        x2: i8, y2: i8,
+        t_a: u8,
+        _c_a: u8,
+        t_b: u8,
+        _c_b: u8,
+        x1: i8,
+        y1: i8,
+        x2: i8,
+        y2: i8,
         flipped: bool,
     ) -> bool {
         // Cells must be adjacent
@@ -153,11 +170,7 @@ impl RustBoard {
     /// Arguments:
     ///   t_a, c_a: terrain/crowns of half A
     ///   t_b, c_b: terrain/crowns of half B
-    fn legal_placements(
-        &self,
-        t_a: u8, c_a: u8,
-        t_b: u8, c_b: u8,
-    ) -> Vec<(i8, i8, i8, i8, bool)> {
+    fn legal_placements(&self, t_a: u8, c_a: u8, t_b: u8, c_b: u8) -> Vec<(i8, i8, i8, i8, bool)> {
         // Collect frontier: empty in-bounds cells adjacent to any occupied cell.
         // We scan occupied cells directly from the terrain array within the
         // bounding box (plus one cell of padding for adjacency).
@@ -190,7 +203,7 @@ impl RustBoard {
         // De-duplication key: ((x1,y1,t1,c1), (x2,y2,t2,c2)) sorted so
         // symmetric placements collapse. We use a small Vec of seen keys
         // (frontier is small so linear scan is fast and avoids hash overhead).
-        let mut seen: Vec<((i8,i8,u8,u8),(i8,i8,u8,u8))> = Vec::with_capacity(64);
+        let mut seen: Vec<((i8, i8, u8, u8), (i8, i8, u8, u8))> = Vec::with_capacity(64);
         let mut moves: Vec<(i8, i8, i8, i8, bool)> = Vec::with_capacity(32);
 
         for (fx, fy) in &frontier {
@@ -229,10 +242,14 @@ impl RustBoard {
     /// Place a domino. Raises ValueError if the placement is illegal.
     fn place(
         &mut self,
-        t_a: u8, c_a: u8,
-        t_b: u8, c_b: u8,
-        x1: i8, y1: i8,
-        x2: i8, y2: i8,
+        t_a: u8,
+        c_a: u8,
+        t_b: u8,
+        c_b: u8,
+        x1: i8,
+        y1: i8,
+        x2: i8,
+        y2: i8,
         flipped: bool,
     ) -> PyResult<()> {
         if !self.is_legal_placement(t_a, c_a, t_b, c_b, x1, y1, x2, y2, flipped) {
@@ -248,10 +265,18 @@ impl RustBoard {
             self.terrain[i] = t;
             self.crowns[i] = c;
             self.occupied += 1;
-            if x < self.min_x { self.min_x = x; }
-            if x > self.max_x { self.max_x = x; }
-            if y < self.min_y { self.min_y = y; }
-            if y > self.max_y { self.max_y = y; }
+            if x < self.min_x {
+                self.min_x = x;
+            }
+            if x > self.max_x {
+                self.max_x = x;
+            }
+            if y < self.min_y {
+                self.min_y = y;
+            }
+            if y > self.max_y {
+                self.max_y = y;
+            }
         }
         Ok(())
     }
@@ -297,29 +322,50 @@ impl RustBoard {
         let harmony_bonus = if harmony {
             let w = (self.max_x - self.min_x + 1) as i32;
             let h = (self.max_y - self.min_y + 1) as i32;
-            if w == 7 && h == 7 && self.occupied == 49 { 5 } else { 0 }
-        } else { 0 };
+            if w == 7 && h == 7 && self.occupied == 49 {
+                5
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         let middle_bonus = if middle_kingdom {
             let w = (self.max_x - self.min_x + 1) as i32;
             let h = (self.max_y - self.min_y + 1) as i32;
-            if w == 7 && h == 7
+            if w == 7
+                && h == 7
                 && self.castle_x == self.min_x + 3
                 && self.castle_y == self.min_y + 3
-            { 10 } else { 0 }
-        } else { 0 };
+            {
+                10
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         (territory_score, harmony_bonus, middle_bonus)
     }
 
     /// Read terrain at (x, y). Returns 0 (EMPTY) if out of bounds.
     fn get_terrain(&self, x: i8, y: i8) -> u8 {
-        if in_bounds(x, y) { self.terrain[idx(x, y)] } else { EMPTY }
+        if in_bounds(x, y) {
+            self.terrain[idx(x, y)]
+        } else {
+            EMPTY
+        }
     }
 
     /// Read crowns at (x, y). Returns 0 if out of bounds.
     fn get_crowns(&self, x: i8, y: i8) -> u8 {
-        if in_bounds(x, y) { self.crowns[idx(x, y)] } else { 0 }
+        if in_bounds(x, y) {
+            self.crowns[idx(x, y)]
+        } else {
+            0
+        }
     }
 
     /// Bounding box as (min_x, min_y, max_x, max_y).
@@ -329,6 +375,82 @@ impl RustBoard {
 
     fn castle_pos(&self) -> (i8, i8) {
         (self.castle_x, self.castle_y)
+    }
+}
+
+impl RustBoard {
+    fn from_flat_parts(
+        terrain_vec: Vec<u8>,
+        crowns_vec: Vec<u8>,
+        castle_x: i8,
+        castle_y: i8,
+    ) -> PyResult<Self> {
+        if terrain_vec.len() != CELLS || crowns_vec.len() != CELLS {
+            return Err(PyValueError::new_err(format!(
+                "RustBoard::from_flat_parts expected {} terrain/crown cells, got {}/{}",
+                CELLS,
+                terrain_vec.len(),
+                crowns_vec.len()
+            )));
+        }
+        if !in_bounds(castle_x, castle_y) {
+            return Err(PyValueError::new_err("castle position outside board"));
+        }
+
+        let mut terrain = [EMPTY; CELLS];
+        let mut crowns = [0u8; CELLS];
+        let mut occupied: u8 = 0;
+        let mut min_x = castle_x;
+        let mut max_x = castle_x;
+        let mut min_y = castle_y;
+        let mut max_y = castle_y;
+
+        for y in 0..N {
+            for x in 0..N {
+                let i = y * N + x;
+                let t = terrain_vec[i];
+                let c = crowns_vec[i];
+                if t > 7 {
+                    return Err(PyValueError::new_err(format!(
+                        "terrain cell {i} has invalid terrain {t}"
+                    )));
+                }
+                terrain[i] = t;
+                crowns[i] = c;
+                if t != EMPTY {
+                    occupied = occupied.saturating_add(1);
+                    let xi = x as i8;
+                    let yi = y as i8;
+                    min_x = min_x.min(xi);
+                    max_x = max_x.max(xi);
+                    min_y = min_y.min(yi);
+                    max_y = max_y.max(yi);
+                }
+            }
+        }
+
+        let castle_i = idx(castle_x, castle_y);
+        if terrain[castle_i] != CASTLE {
+            return Err(PyValueError::new_err(format!(
+                "castle cell ({castle_x},{castle_y}) has terrain {}, expected CASTLE",
+                terrain[castle_i]
+            )));
+        }
+        if occupied == 0 {
+            return Err(PyValueError::new_err("board has no occupied cells"));
+        }
+
+        Ok(RustBoard {
+            terrain,
+            crowns,
+            castle_x,
+            castle_y,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            occupied,
+        })
     }
 }
 
@@ -458,7 +580,13 @@ fn write_row_slot(buf: &mut [f32], off: usize, domino: Option<u16>) {
 /// Claim slot (16): tile features + is_mine flag + status flag.  Empty stays 0.
 /// `player` is the perspective player (is_mine = claim.player == player).
 #[inline]
-fn write_claim_slot(buf: &mut [f32], off: usize, claim: Option<(u8, u16)>, player: u8, status: f32) {
+fn write_claim_slot(
+    buf: &mut [f32],
+    off: usize,
+    claim: Option<(u8, u16)>,
+    player: u8,
+    status: f32,
+) {
     if let Some((cp, did)) = claim {
         write_tile(buf, off, did);
         buf[off + TILE_FEAT] = if cp == player { 1.0 } else { 0.0 };
@@ -569,11 +697,8 @@ fn pick_positions(state: &RustGameState, player: u8) -> [f32; 4] {
 
     // Collect and sort next_claims by domino_id ascending.
     // next_claims items are (player, domino_id).
-    let mut committed: Vec<(u16, u8)> = state
-        .next_claims
-        .iter()
-        .map(|&(p, did)| (did, p))
-        .collect();
+    let mut committed: Vec<(u16, u8)> =
+        state.next_claims.iter().map(|&(p, did)| (did, p)).collect();
     committed.sort_by_key(|&(did, _)| did);
 
     let mut out = [0.0f32; 4];
@@ -638,11 +763,14 @@ impl RustGameState {
         // whole number of future rows (a multiple of 4, ≥ 4 when non-empty).
         debug_assert!(
             self.deck.is_empty() || self.deck.len() >= 4,
-            "advance_round: deck has {} tiles — expected 0 or >= 4", self.deck.len()
+            "advance_round: deck has {} tiles — expected 0 or >= 4",
+            self.deck.len()
         );
         debug_assert_eq!(
-            self.deck.len() % 4, 0,
-            "advance_round: deck length {} is not a multiple of 4", self.deck.len()
+            self.deck.len() % 4,
+            0,
+            "advance_round: deck length {} is not a multiple of 4",
+            self.deck.len()
         );
         if !self.deck.is_empty() {
             self.deal_row();
@@ -671,7 +799,11 @@ impl RustGameState {
     fn encode_placement(&self, p: (i8, i8, i8, i8, bool)) -> Option<u16> {
         let (x1, y1, x2, y2, flipped) = p;
         // Canonical form: A-half is the anchor; B-half's offset gives direction.
-        let (ax, ay, bx, by) = if flipped { (x2, y2, x1, y1) } else { (x1, y1, x2, y2) };
+        let (ax, ay, bx, by) = if flipped {
+            (x2, y2, x1, y1)
+        } else {
+            (x1, y1, x2, y2)
+        };
         let actor = self.actor().ok()?;
         let board = &self.boards[actor as usize];
         let out_x = ax - board.castle_x + OUT_CENTER;
@@ -724,7 +856,8 @@ impl RustGameState {
         if self.phase == FINAL_PLACEMENT {
             debug_assert!(
                 pick.is_none(),
-                "enc_action: pick must be None in FINAL_PLACEMENT, got {:?}", pick
+                "enc_action: pick must be None in FINAL_PLACEMENT, got {:?}",
+                pick
             );
         }
         match self.phase {
@@ -791,7 +924,13 @@ impl RustGameState {
         let mut v: Vec<(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)> = self
             .legal_actions_raw()
             .into_iter()
-            .map(|(p, pk)| (self.enc_action(p, pk).expect("legal action must encode"), p, pk))
+            .map(|(p, pk)| {
+                (
+                    self.enc_action(p, pk).expect("legal action must encode"),
+                    p,
+                    pk,
+                )
+            })
             .collect();
         v.sort_by_key(|t| t.0);
         // Joint indices are unique per legal action; a duplicate means the codec
@@ -837,23 +976,37 @@ impl RustGameState {
 
         // 1. Domino in hand (only when it's this player's turn to place).
         if let Some(d) = self.domino_in_hand(player) {
-            write_tile(flat,OFF_DOMINO_IN_HAND, d);
+            write_tile(flat, OFF_DOMINO_IN_HAND, d);
         }
         // 2. Current row (up to 4 slots).
         for i in 0..4 {
-            write_row_slot(flat,OFF_CURRENT_ROW + i * ROW_SLOT, self.current_row.get(i).copied());
+            write_row_slot(
+                flat,
+                OFF_CURRENT_ROW + i * ROW_SLOT,
+                self.current_row.get(i).copied(),
+            );
         }
         // 3. Pending claims — status flag marks claims already resolved (placed).
         for i in 0..4 {
             let claim = self.pending_claims.get(i).copied();
-            let already_placed = if claim.is_some() && i < self.actor_index { 1.0 } else { 0.0 };
-            write_claim_slot(flat,OFF_PENDING + i * CLAIM_SLOT, claim, player, already_placed);
+            let already_placed = if claim.is_some() && i < self.actor_index {
+                1.0
+            } else {
+                0.0
+            };
+            write_claim_slot(
+                flat,
+                OFF_PENDING + i * CLAIM_SLOT,
+                claim,
+                player,
+                already_placed,
+            );
         }
         // 4. Next claims — status flag just marks the slot as filled.
         for i in 0..4 {
             let claim = self.next_claims.get(i).copied();
             let slot_filled = if claim.is_some() { 1.0 } else { 0.0 };
-            write_claim_slot(flat,OFF_NEXT + i * CLAIM_SLOT, claim, player, slot_filled);
+            write_claim_slot(flat, OFF_NEXT + i * CLAIM_SLOT, claim, player, slot_filled);
         }
         // 5. Bag — derived from deck membership (the deck is exactly the set of
         //    unrevealed tiles, i.e. the complement of row ∪ claims ∪ placed).
@@ -883,10 +1036,7 @@ impl RustGameState {
 
     /// Allocating encoder: (my_board (9,13,13), opp_board (9,13,13), flat (261,)).
     /// Thin wrapper over encode_into_slices (which holds the canonical logic).
-    fn encode_arrays(
-        &self,
-        player: u8,
-    ) -> PyResult<(Array3<f32>, Array3<f32>, Array1<f32>)> {
+    fn encode_arrays(&self, player: u8) -> PyResult<(Array3<f32>, Array3<f32>, Array1<f32>)> {
         let mut mb = vec![0f32; N_BOARD_CH * OUT_N * OUT_N];
         let mut ob = vec![0f32; N_BOARD_CH * OUT_N * OUT_N];
         let mut flat = vec![0f32; FLAT_SIZE];
@@ -951,6 +1101,85 @@ impl RustGameState {
         }
     }
 
+    /// Build a RustGameState from an arbitrary Python GameState snapshot.
+    /// Board arrays are flat row-major 15x15 terrain/crown vectors.
+    #[staticmethod]
+    #[pyo3(signature = (
+        deck,
+        current_row,
+        pending_claims,
+        next_claims,
+        phase,
+        actor_index,
+        initial_pick_count,
+        start_player,
+        board0_terrain,
+        board0_crowns,
+        board1_terrain,
+        board1_crowns,
+        harmony=true,
+        middle_kingdom=true,
+        castle_x=7,
+        castle_y=7
+    ))]
+    fn from_parts(
+        deck: Vec<u16>,
+        current_row: Vec<u16>,
+        pending_claims: Vec<(u8, u16)>,
+        next_claims: Vec<(u8, u16)>,
+        phase: u8,
+        actor_index: usize,
+        initial_pick_count: usize,
+        start_player: u8,
+        board0_terrain: Vec<u8>,
+        board0_crowns: Vec<u8>,
+        board1_terrain: Vec<u8>,
+        board1_crowns: Vec<u8>,
+        harmony: bool,
+        middle_kingdom: bool,
+        castle_x: i8,
+        castle_y: i8,
+    ) -> PyResult<Self> {
+        if phase > GAME_OVER {
+            return Err(PyValueError::new_err(format!("invalid phase {phase}")));
+        }
+        if start_player > 1 {
+            return Err(PyValueError::new_err(format!(
+                "invalid start_player {start_player}"
+            )));
+        }
+        if phase == INITIAL_SELECTION && initial_pick_count >= 4 {
+            return Err(PyValueError::new_err(format!(
+                "INITIAL_SELECTION initial_pick_count must be < 4, got {initial_pick_count}"
+            )));
+        }
+        if (phase == PLACE_AND_SELECT || phase == FINAL_PLACEMENT)
+            && actor_index >= pending_claims.len()
+        {
+            return Err(PyValueError::new_err(format!(
+                "actor_index {actor_index} outside pending_claims length {}",
+                pending_claims.len()
+            )));
+        }
+
+        Ok(RustGameState {
+            boards: [
+                RustBoard::from_flat_parts(board0_terrain, board0_crowns, castle_x, castle_y)?,
+                RustBoard::from_flat_parts(board1_terrain, board1_crowns, castle_x, castle_y)?,
+            ],
+            deck,
+            current_row,
+            pending_claims,
+            next_claims,
+            phase,
+            actor_index,
+            initial_pick_count,
+            start_player,
+            harmony,
+            middle_kingdom,
+        })
+    }
+
     /// Apply one action, returning a new state (the receiver is unchanged).
     ///
     /// Action encoding mirrors `step`'s two arguments, disambiguated by phase:
@@ -971,9 +1200,8 @@ impl RustGameState {
                         "INITIAL_SELECTION takes a pick only, no placement",
                     ));
                 }
-                let d = pick_domino_id.ok_or_else(|| {
-                    PyValueError::new_err("INITIAL_SELECTION requires a pick")
-                })?;
+                let d = pick_domino_id
+                    .ok_or_else(|| PyValueError::new_err("INITIAL_SELECTION requires a pick"))?;
                 let pos = s
                     .current_row
                     .iter()
@@ -996,13 +1224,11 @@ impl RustGameState {
                 let (player, domino_id) = s.pending_claims[s.actor_index];
                 if let Some((x1, y1, x2, y2, flipped)) = placement {
                     let (ta, ca, tb, cb) = dom(domino_id);
-                    s.boards[player as usize]
-                        .place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                    s.boards[player as usize].place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
                 }
                 if s.phase == PLACE_AND_SELECT {
-                    let pick = pick_domino_id.ok_or_else(|| {
-                        PyValueError::new_err("PLACE_AND_SELECT requires a pick")
-                    })?;
+                    let pick = pick_domino_id
+                        .ok_or_else(|| PyValueError::new_err("PLACE_AND_SELECT requires a pick"))?;
                     let pos = s
                         .current_row
                         .iter()
@@ -1037,7 +1263,10 @@ impl RustGameState {
 
     /// Joint indices of all legal actions, ascending (the canonical order).
     fn legal_action_indices(&self) -> Vec<u16> {
-        self.legal_actions_indexed().into_iter().map(|(i, _, _)| i).collect()
+        self.legal_actions_indexed()
+            .into_iter()
+            .map(|(i, _, _)| i)
+            .collect()
     }
 
     /// Boolean legal-action mask as a (3390,) bool numpy array.
@@ -1167,6 +1396,75 @@ impl RustGameState {
     fn board_crowns(&self, player: usize) -> Vec<u8> {
         self.boards[player].crowns.to_vec()
     }
+
+    /// Benchmark-only: run the alpha-beta solver to completion (or until
+    /// `hard_cap` nodes) and return (value, fully_solved, nodes_visited,
+    /// elapsed_ms).
+    ///
+    /// Unlike `exact_endgame_value_no_chance`, this is intended for measuring the
+    /// real tree-size distribution. `hard_cap` should be set high (e.g.
+    /// 100_000_000) as a safety ceiling, not a routine budget. `fully_solved` is
+    /// False only if `hard_cap` was hit.
+    ///
+    /// Uses the SAME solver (alpha-beta + move ordering) as production, so node
+    /// counts reflect production pruning behavior. `alpha` defaults to 0.8 (the
+    /// training frame): alpha-beta cutoffs depend on leaf values, so pruning — and
+    /// therefore the node count — can vary with alpha. Measure at the alpha
+    /// training actually uses.
+    ///
+    /// `parallel=True` (default) uses the YBW parallel solver (`solve_endgame_ab_parallel`)
+    /// to measure wall-clock; its `nodes` is the per-thread sum (≥ serial, weaker
+    /// sibling pruning). `parallel=False` uses the serial solver, whose `nodes` is
+    /// the true single-traversal tree size — use that to compare node counts.
+    #[pyo3(signature = (hard_cap=100_000_000, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true))]
+    fn measure_endgame_tree(
+        &self,
+        hard_cap: u64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+        parallel: bool,
+    ) -> PyResult<(f64, bool, u64, f64)> {
+        if self.phase == GAME_OVER {
+            return Err(PyValueError::new_err("Cannot measure a terminal state"));
+        }
+        if self.deck.len() > 4 {
+            return Err(PyValueError::new_err(format!(
+                "deck.len()={} > 4; measure only supports no-chance endgames (deck <= 4)",
+                self.deck.len()
+            )));
+        }
+        if !is_no_chance_endgame_state(self) {
+            return Err(PyValueError::new_err(
+                "measure_endgame_tree requires a no-chance endgame state (deck in {0,4})",
+            ));
+        }
+        let start = std::time::Instant::now();
+        let (value, solved, nodes) = if parallel {
+            match solve_endgame_ab_parallel(self, hard_cap, score_scale, margin_gain, alpha)? {
+                Some((v, n)) => (v, true, n),
+                None => (0.0, false, hard_cap),
+            }
+        } else {
+            let mut nodes = 0u64;
+            let result = solve_endgame_ab(
+                self,
+                &mut nodes,
+                hard_cap,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                score_scale,
+                margin_gain,
+                alpha,
+            )?;
+            match result {
+                Some(v) => (v, true, nodes),
+                None => (0.0, false, nodes),
+            }
+        };
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        Ok((value, solved, nodes, elapsed_ms))
+    }
 }
 
 // ─── AlphaZero MCTS (arena tree) ─────────────────────────────────────────────
@@ -1185,7 +1483,7 @@ impl RustGameState {
 struct Node {
     prior: f64,
     visit_count: i32,
-    value_sum: f64, // PLAYER-0 frame
+    value_sum: f64,                                        // PLAYER-0 frame
     virtual_loss: i32, // unused by serial _simulate; for the batched path later
     children: Vec<(u16, u32)>, // (joint_index, child node id), ascending index
     state: Option<RustGameState>, // set lazily on first descent / at root
@@ -1225,8 +1523,486 @@ fn terminal_search_value(
     let own_norm = s0 as f64 / score_scale;
     let opp_norm = s1 as f64 / score_scale;
     let margin_value = ((own_norm - opp_norm) * margin_gain).tanh();
-    let win_value = if s0 > s1 { 1.0 } else if s1 > s0 { -1.0 } else { 0.0 };
+    let win_value = if s0 > s1 {
+        1.0
+    } else if s1 > s0 {
+        -1.0
+    } else {
+        0.0
+    };
     alpha * margin_value + (1.0 - alpha) * win_value
+}
+
+fn is_no_chance_endgame_state(state: &RustGameState) -> bool {
+    match state.phase {
+        GAME_OVER => true,
+        PLACE_AND_SELECT => state.deck.is_empty() || state.deck.len() == 4,
+        FINAL_PLACEMENT => state.deck.is_empty(),
+        _ => false,
+    }
+}
+
+fn exact_count_no_chance_bounded(state: &RustGameState, cap: u64) -> PyResult<u64> {
+    if state.phase == GAME_OVER {
+        return Ok(0);
+    }
+    if !is_no_chance_endgame_state(state) {
+        return Ok(cap.saturating_add(1));
+    }
+
+    let legal = state.legal_actions_indexed();
+    let mut total = 1u64;
+    for &(_idx, placement, pick) in &legal {
+        let child = state.step(placement, pick)?;
+        let child_count = exact_count_no_chance_bounded(&child, cap.saturating_sub(total))?;
+        total = total.saturating_add(child_count.max(1));
+        if total > cap {
+            return Ok(total);
+        }
+    }
+    Ok(total)
+}
+
+/// Plain (unpruned, unbudgeted) minimax reference solver.  Superseded in the hot
+/// path by `solve_endgame_ab`, but kept as the simplest correct implementation:
+/// the Python expectiminimax in `endgame_solver.py` is equivalence-tested against
+/// the alpha-beta solver, and this mirrors that reference shape in Rust.
+#[allow(dead_code)]
+fn exact_solve_no_chance(
+    state: &RustGameState,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha: f64,
+) -> PyResult<f64> {
+    if state.phase == GAME_OVER {
+        return Ok(terminal_search_value(
+            state,
+            score_scale,
+            margin_gain,
+            alpha,
+        ));
+    }
+    if !is_no_chance_endgame_state(state) {
+        return Err(PyValueError::new_err(
+            "exact_solve_no_chance requires PLACE_AND_SELECT with deck len 0 or 4, or FINAL_PLACEMENT with deck len 0",
+        ));
+    }
+
+    let actor = state.actor()?;
+    let legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "non-terminal state has no legal actions (phase={})",
+            state.phase
+        )));
+    }
+
+    let mut best = if actor == 0 {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    for &(_idx, placement, pick) in &legal {
+        let child = state.step(placement, pick)?;
+        let v = exact_solve_no_chance(&child, score_scale, margin_gain, alpha)?;
+        if actor == 0 {
+            best = best.max(v);
+        } else {
+            best = best.min(v);
+        }
+    }
+    Ok(best)
+}
+
+/// Flood one connected same-terrain region from (sx, sy), marking `visited`,
+/// returning (area, crowns).  Scoped helper for `placement_score_delta`.
+fn bfs_region(board: &RustBoard, sx: i8, sy: i8, t: u8, visited: &mut [bool; CELLS]) -> (i32, i32) {
+    let mut stack: Vec<(i8, i8)> = vec![(sx, sy)];
+    visited[idx(sx, sy)] = true;
+    let mut area = 0i32;
+    let mut crowns = 0i32;
+    while let Some((cx, cy)) = stack.pop() {
+        area += 1;
+        crowns += board.crowns[idx(cx, cy)] as i32;
+        for (dx, dy) in DIRS {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            if in_bounds(nx, ny) {
+                let ni = idx(nx, ny);
+                if !visited[ni] && board.terrain[ni] == t {
+                    visited[ni] = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+    }
+    (area, crowns)
+}
+
+/// Territory-score delta of one terrain group's new cells (`seeds` = list of
+/// (x, y, crowns)) merging with the existing same-terrain regions they touch.
+/// `visited` is shared across the two halves of a placement so a region adjacent
+/// to both isn't double-counted.  Returns new_contribution − old_contribution.
+fn terrain_group_delta(
+    board: &RustBoard,
+    t: u8,
+    seeds: &[(i8, i8, i32)],
+    visited: &mut [bool; CELLS],
+) -> i32 {
+    let nc = seeds.len() as i32;
+    let sc: i32 = seeds.iter().map(|s| s.2).sum();
+    let mut old_contrib = 0i32;
+    let mut tot_area = 0i32;
+    let mut tot_crowns = 0i32;
+    for &(sx, sy, _) in seeds {
+        for (dx, dy) in DIRS {
+            let nx = sx + dx;
+            let ny = sy + dy;
+            if in_bounds(nx, ny) {
+                let ni = idx(nx, ny);
+                // New cells are still EMPTY on the board, so they never match `t`
+                // here — only existing same-terrain neighbours are flooded.
+                if !visited[ni] && board.terrain[ni] == t {
+                    let (a, cr) = bfs_region(board, nx, ny, t, visited);
+                    old_contrib += a * cr;
+                    tot_area += a;
+                    tot_crowns += cr;
+                }
+            }
+        }
+    }
+    let merged_area = nc + tot_area;
+    let merged_crowns = sc + tot_crowns;
+    merged_area * merged_crowns - old_contrib
+}
+
+/// Move-ordering heuristic (OPT-4b): the exact immediate territory-score delta of
+/// a placement — the increase in Σ(region_area × region_crowns) caused by adding
+/// the two cells (terrains/crowns `t_a/c_a` at (x1,y1), `t_b/c_b` at (x2,y2)).
+/// Harmony/middle-kingdom bonuses are end-state properties and are intentionally
+/// excluded.  Advisory only: never changes the minimax value, only pruning order.
+#[allow(clippy::too_many_arguments)]
+fn placement_score_delta(
+    board: &RustBoard,
+    t_a: u8,
+    c_a: u8,
+    x1: i8,
+    y1: i8,
+    t_b: u8,
+    c_b: u8,
+    x2: i8,
+    y2: i8,
+) -> i32 {
+    let mut visited = [false; CELLS];
+    if t_a == t_b {
+        // Same terrain: the two halves form one connected unit and merge with all
+        // same-terrain regions adjacent to either.
+        terrain_group_delta(
+            board,
+            t_a,
+            &[(x1, y1, c_a as i32), (x2, y2, c_b as i32)],
+            &mut visited,
+        )
+    } else {
+        terrain_group_delta(board, t_a, &[(x1, y1, c_a as i32)], &mut visited)
+            + terrain_group_delta(board, t_b, &[(x2, y2, c_b as i32)], &mut visited)
+    }
+}
+
+/// Count occupied cells per terrain type (indices 2..=7) on a board.
+fn terrain_counts(board: &RustBoard) -> [u8; 8] {
+    let mut counts = [0u8; 8];
+    for y in board.min_y..=board.max_y {
+        for x in board.min_x..=board.max_x {
+            let t = board.terrain[idx(x, y)] as usize;
+            if (2..=7).contains(&t) {
+                counts[t] += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Pick-ordering heuristic (OPT-4b): value of claiming `domino_id` for `player` —
+/// each half's crowns weighted by how many cells of that terrain the player
+/// already owns (a tile that extends an established terrain is worth more).
+fn pick_order_score(domino_id: u16, terrain_counts: &[u8; 8]) -> i32 {
+    let (t_a, c_a, t_b, c_b) = dom(domino_id);
+    (c_a as i32) * (terrain_counts[t_a as usize] as i32)
+        + (c_b as i32) * (terrain_counts[t_b as usize] as i32)
+}
+
+/// Sort legal actions in place by descending move-ordering heuristic, breaking
+/// ties by ascending joint index for determinism.  Primary key: placement score
+/// delta; secondary: pick value; both descending for the mover (the same sort
+/// serves max and min nodes — each tries its locally strongest moves first).
+fn order_legal_for_solver(
+    state: &RustGameState,
+    legal: &mut [(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+) {
+    if legal.len() < 2 {
+        return;
+    }
+    let actor = match state.actor() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let board = &state.boards[actor as usize];
+    let halves = state.domino_in_hand(actor).map(dom);
+    // terrain_counts is board-wide and constant across this node's actions, so
+    // compute it once rather than per-action.
+    let tc = terrain_counts(board);
+    legal.sort_by_cached_key(|&(idx_key, p, pk)| {
+        let key_placement = match (p, halves) {
+            (Some((x1, y1, x2, y2, flipped)), Some((t_a, c_a, t_b, c_b))) => {
+                // Resolve which half lands on which cell (matches RustBoard::place).
+                let (th1, ch1, th2, ch2) = if flipped {
+                    (t_b, c_b, t_a, c_a)
+                } else {
+                    (t_a, c_a, t_b, c_b)
+                };
+                placement_score_delta(board, th1, ch1, x1, y1, th2, ch2, x2, y2)
+            }
+            _ => 0,
+        };
+        let key_pick = match pk {
+            Some(pid) => pick_order_score(pid, &tc),
+            None => 0,
+        };
+        // Negate so the natural ascending sort yields descending benefit;
+        // (placement, pick, idx) lexicographic with idx as the stable tiebreaker.
+        (-key_placement, -key_pick, idx_key)
+    });
+}
+
+/// Single-pass, budgeted, alpha-beta minimax over a no-chance endgame (OPT-2 +
+/// OPT-3 + OPT-4).  Returns `Ok(Some(value))` in the player-0 frame, or
+/// `Ok(None)` when the node budget was exhausted mid-traversal.  Unlike the
+/// count-then-solve pair it replaces, it never traverses the tree twice and
+/// prunes subtrees that cannot affect the result.
+///
+/// Correctness of pruning: `terminal_search_value` is monotone non-decreasing in
+/// (score0 - score1), so the position value is a standard min/max over a scalar
+/// in [-1, 1]; alpha-beta applies without modification.  The max/min layers need
+/// not strictly alternate — each node is typed by `actor()` and the (alpha, beta)
+/// window stays valid through any sequence of max and min nodes.
+///
+/// Caller guarantees `state` is a no-chance endgame state (deck ∈ {0, 4} in a
+/// turn phase, or GAME_OVER); descendants of such states are likewise no-chance,
+/// so the property is not re-checked in the hot recursion.
+#[allow(clippy::too_many_arguments)]
+fn solve_endgame_ab(
+    state: &RustGameState,
+    nodes: &mut u64,
+    max_nodes: u64,
+    mut alpha: f64,
+    mut beta: f64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+) -> PyResult<Option<f64>> {
+    if *nodes >= max_nodes {
+        return Ok(None);
+    }
+    *nodes += 1;
+    if state.phase == GAME_OVER {
+        return Ok(Some(terminal_search_value(
+            state,
+            score_scale,
+            margin_gain,
+            alpha_param,
+        )));
+    }
+
+    let actor = state.actor()?;
+    let mut legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "non-terminal state has no legal actions (phase={})",
+            state.phase
+        )));
+    }
+    order_legal_for_solver(state, &mut legal);
+
+    if actor == 0 {
+        let mut best = f64::NEG_INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab(
+                &child,
+                nodes,
+                max_nodes,
+                alpha,
+                beta,
+                score_scale,
+                margin_gain,
+                alpha_param,
+            )? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v > best {
+                        best = v;
+                    }
+                    if best > alpha {
+                        alpha = best;
+                    }
+                    if alpha >= beta {
+                        break; // beta cutoff
+                    }
+                }
+            }
+        }
+        Ok(Some(best))
+    } else {
+        let mut best = f64::INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab(
+                &child,
+                nodes,
+                max_nodes,
+                alpha,
+                beta,
+                score_scale,
+                margin_gain,
+                alpha_param,
+            )? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v < best {
+                        best = v;
+                    }
+                    if best < beta {
+                        beta = best;
+                    }
+                    if beta <= alpha {
+                        break; // alpha cutoff
+                    }
+                }
+            }
+        }
+        Ok(Some(best))
+    }
+}
+
+/// Young Brothers Wait (YBW) parallel alpha-beta solver (OPT-6).
+///
+/// Solves the first (best-ordered) root child serially to establish an alpha/beta
+/// bound, then solves the remaining root children in parallel via Rayon, each
+/// seeded with that bound. Returns `Ok(Some((value, total_nodes)))` when every
+/// subtree completed within budget, `Ok(None)` when some subtree hit `max_nodes`,
+/// or `Err` on an internal error.
+///
+/// **Call ONLY at the root.** The recursive calls use the serial `solve_endgame_ab`,
+/// so there is exactly one fan-out — no nested Rayon / thread explosion.
+///
+/// Budget semantics differ from the serial solver on purpose: each remaining
+/// child gets the FULL `max_nodes` as its own cap (not `max_nodes / n`). A divided
+/// budget would make large-subtree tail positions falsely fail — exactly the
+/// positions always-solve exists for. So total work is up to ~`n_children ×
+/// max_nodes`, and `total_nodes` is the per-thread sum (approximate, may exceed
+/// `max_nodes`); a solve fails only if a single child subtree genuinely exceeds
+/// `max_nodes`. YBW also seeds siblings with only the first child's bound (not the
+/// progressively tightened serial bound), so parallel subtrees visit ≥ as many
+/// nodes as serial: wall-clock drops via parallelism, node counts do not.
+fn solve_endgame_ab_parallel(
+    state: &RustGameState,
+    max_nodes: u64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+) -> PyResult<Option<(f64, u64)>> {
+    if state.phase == GAME_OVER {
+        return Ok(Some((
+            terminal_search_value(state, score_scale, margin_gain, alpha_param),
+            0,
+        )));
+    }
+    let actor = state.actor()?;
+    let mut legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "non-terminal state has no legal actions (phase={})",
+            state.phase
+        )));
+    }
+    order_legal_for_solver(state, &mut legal);
+
+    // Step 1: solve the first (best-ordered) child serially to establish a bound.
+    let (_i0, p0, pk0) = legal[0];
+    let first_next = state.step(p0, pk0)?;
+    let mut nodes_first = 0u64;
+    let first_val = match solve_endgame_ab(
+        &first_next,
+        &mut nodes_first,
+        max_nodes,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        score_scale,
+        margin_gain,
+        alpha_param,
+    )? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let mut best_val = first_val;
+    let mut alpha = f64::NEG_INFINITY;
+    let mut beta = f64::INFINITY;
+    if actor == 0 {
+        alpha = alpha.max(first_val);
+    } else {
+        beta = beta.min(first_val);
+    }
+    // First child alone caused a cutoff, or it was the only child.
+    if alpha >= beta {
+        return Ok(Some((best_val, nodes_first)));
+    }
+    let remaining = &legal[1..];
+    if remaining.is_empty() {
+        return Ok(Some((best_val, nodes_first)));
+    }
+    let (captured_alpha, captured_beta) = (alpha, beta);
+
+    // Step 2: solve the remaining children in parallel, each with its own node
+    // counter, the full budget, and the first child's bound.
+    let results: Vec<PyResult<Option<(f64, u64)>>> = remaining
+        .par_iter()
+        .map(|&(_idx, p, pk)| -> PyResult<Option<(f64, u64)>> {
+            let next = state.step(p, pk)?;
+            let mut n = 0u64;
+            let v = solve_endgame_ab(
+                &next,
+                &mut n,
+                max_nodes,
+                captured_alpha,
+                captured_beta,
+                score_scale,
+                margin_gain,
+                alpha_param,
+            )?;
+            Ok(v.map(|val| (val, n)))
+        })
+        .collect();
+
+    // Step 3: combine. Any subtree that hit budget fails the whole solve.
+    let mut total_nodes = nodes_first;
+    for r in results {
+        match r? {
+            None => return Ok(None),
+            Some((val, n)) => {
+                total_nodes += n;
+                if actor == 0 {
+                    if val > best_val {
+                        best_val = val;
+                    }
+                } else if val < best_val {
+                    best_val = val;
+                }
+            }
+        }
+    }
+    Ok(Some((best_val, total_nodes)))
 }
 
 /// Stable softmax over legal logits, matching encoder/mcts `_postprocess`
@@ -1309,7 +2085,11 @@ fn expand(arena: &mut Vec<Node>, node_id: u32, ev: &Py<PyAny>) -> PyResult<f64> 
             let list = list.downcast::<PyList>()?;
             let g0 = list.get_item(0)?;
             let arr = g0.downcast::<PyArray1<f32>>()?;
-            arr.readonly().as_slice()?.iter().map(|&x| x as f64).collect()
+            arr.readonly()
+                .as_slice()?
+                .iter()
+                .map(|&x| x as f64)
+                .collect()
         };
         Ok((value, gathered))
     })?;
@@ -1329,8 +2109,16 @@ fn expand(arena: &mut Vec<Node>, node_id: u32, ev: &Py<PyAny>) -> PyResult<f64> 
 /// One serial simulation (mirrors `_simulate`): descend by PUCT to an unexpanded
 /// or terminal leaf, evaluate/expand it, back the value up the path (player-0
 /// frame, no sign flips).
-fn simulate(arena: &mut Vec<Node>, root_id: u32, ev: &Py<PyAny>, fpu: f64, cpuct: f64,
-            score_scale: f64, margin_gain: f64, alpha: f64) -> PyResult<()> {
+fn simulate(
+    arena: &mut Vec<Node>,
+    root_id: u32,
+    ev: &Py<PyAny>,
+    fpu: f64,
+    cpuct: f64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha: f64,
+) -> PyResult<()> {
     let mut path: Vec<u32> = vec![root_id];
     let mut node_id = root_id;
     loop {
@@ -1359,7 +2147,10 @@ fn simulate(arena: &mut Vec<Node>, root_id: u32, ev: &Py<PyAny>, fpu: f64, cpuct
         if terminal {
             terminal_search_value(
                 arena[node_id as usize].state.as_ref().unwrap(),
-                score_scale, margin_gain, alpha)
+                score_scale,
+                margin_gain,
+                alpha,
+            )
         } else {
             expand(arena, node_id, ev)?
         }
@@ -1484,7 +2275,11 @@ fn evaluate_batch(
         let values: Vec<f64> = {
             let arr = tuple.get_item(0)?;
             let arr = arr.downcast::<PyArray1<f32>>()?;
-            arr.readonly().as_slice()?.iter().map(|&x| x as f64).collect()
+            arr.readonly()
+                .as_slice()?
+                .iter()
+                .map(|&x| x as f64)
+                .collect()
         };
         let gathered: Vec<Vec<f64>> = {
             let list = tuple.get_item(1)?;
@@ -1493,7 +2288,13 @@ fn evaluate_batch(
             for i in 0..k {
                 let g = list.get_item(i)?;
                 let arr = g.downcast::<PyArray1<f32>>()?;
-                out.push(arr.readonly().as_slice()?.iter().map(|&x| x as f64).collect());
+                out.push(
+                    arr.readonly()
+                        .as_slice()?
+                        .iter()
+                        .map(|&x| x as f64)
+                        .collect(),
+                );
             }
             out
         };
@@ -1546,7 +2347,11 @@ fn simulate_batch(
         let (values, gathered, actors, legals) = evaluate_batch(arena, &unique, ev)?;
         for (k, &leaf) in unique.iter().enumerate() {
             let priors = softmax_f64(&gathered[k]);
-            let value0 = if actors[k] == 0 { values[k] } else { -values[k] };
+            let value0 = if actors[k] == 0 {
+                values[k]
+            } else {
+                -values[k]
+            };
             if !arena[leaf as usize].is_expanded {
                 for (i, &(idx, placement, pick)) in legals[k].iter().enumerate() {
                     let child_id = arena.len() as u32;
@@ -1570,7 +2375,10 @@ fn simulate_batch(
         let v0 = if arena[leaf as usize].state.as_ref().unwrap().phase == GAME_OVER {
             terminal_search_value(
                 arena[leaf as usize].state.as_ref().unwrap(),
-                score_scale, margin_gain, alpha)
+                score_scale,
+                margin_gain,
+                alpha,
+            )
         } else {
             leaf_v0[&leaf]
         };
@@ -1588,7 +2396,11 @@ fn simulate_batch(
 /// RNG, so noise-on search is not bit-comparable — the equivalence gate uses
 /// eps=0 (this is never called).
 fn add_dirichlet_noise(arena: &mut [Node], root_id: u32, alpha: f64, eps: f64, seed: Option<u64>) {
-    let child_ids: Vec<u32> = arena[root_id as usize].children.iter().map(|&(_, c)| c).collect();
+    let child_ids: Vec<u32> = arena[root_id as usize]
+        .children
+        .iter()
+        .map(|&(_, c)| c)
+        .collect();
     let n = child_ids.len();
     if n == 0 {
         return;
@@ -1748,7 +2560,7 @@ fn ol_select_child(
 fn ol_descend(
     arena: &[OLNode],
     root_id: u32,
-    mut state: RustGameState,   // owned: the caller's `det` is moved in, not cloned
+    mut state: RustGameState, // owned: the caller's `det` is moved in, not cloned
     fpu: f64,
     cpuct: f64,
     fallback_count: &mut u32,
@@ -1766,7 +2578,15 @@ fn ol_descend(
             break;
         }
         let actor = state.actor()?;
-        match ol_select_child(arena, node_id, &state, fpu, cpuct, fallback_count, missing_child_count) {
+        match ol_select_child(
+            arena,
+            node_id,
+            &state,
+            fpu,
+            cpuct,
+            fallback_count,
+            missing_child_count,
+        ) {
             None => break, // dead-end / missing children: re-evaluate this node as the leaf
             Some((child_id, placement, pick)) => {
                 actors.push(actor);
@@ -1795,18 +2615,26 @@ fn ol_add_missing_children(
     for (i, &(idx, placement, pick)) in legal.iter().enumerate() {
         // children stays ascending, so binary_search both detects presence and
         // gives the in-order insertion point — no post-insert re-sort needed.
-        match arena[node_id as usize].children.binary_search_by_key(&idx, |&(c, _)| c) {
+        match arena[node_id as usize]
+            .children
+            .binary_search_by_key(&idx, |&(c, _)| c)
+        {
             Ok(_) => {} // already present
             Err(insert_at) => {
                 let cid = arena.len() as u32;
                 arena.push(OLNode::new(priors[i], (placement, pick)));
-                arena[node_id as usize].children.insert(insert_at, (idx, cid));
+                arena[node_id as usize]
+                    .children
+                    .insert(insert_at, (idx, cid));
                 added += 1;
             }
         }
     }
     debug_assert!(
-        arena[node_id as usize].children.windows(2).all(|w| w[0].0 < w[1].0),
+        arena[node_id as usize]
+            .children
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0),
         "ol_add_missing_children: children not strictly ascending after insert"
     );
     added
@@ -1816,13 +2644,7 @@ fn ol_add_missing_children(
 /// Mirrors apply_virtual_loss but takes the per-node actor explicitly (nodes are
 /// stateless): non-root node path[i] nudged by vl_value0 = -1 if its chooser
 /// (actors[i-1]) is player 0 else +1.  Removal is the exact additive inverse.
-fn ol_apply_virtual_loss(
-    arena: &mut [OLNode],
-    path: &[u32],
-    actors: &[u8],
-    sign: i32,
-    n_vl: i32,
-) {
+fn ol_apply_virtual_loss(arena: &mut [OLNode], path: &[u32], actors: &[u8], sign: i32, n_vl: i32) {
     if n_vl <= 0 {
         return;
     }
@@ -1839,8 +2661,18 @@ fn ol_apply_virtual_loss(
 /// Dirichlet noise on the open-loop root's child priors (OLNode analogue of
 /// add_dirichlet_noise).  Noise-on search is not bit-comparable to Python, so
 /// the equivalence gate runs with eps=0 (this is never called there).
-fn ol_add_dirichlet_noise(arena: &mut [OLNode], root_id: u32, alpha: f64, eps: f64, seed: Option<u64>) {
-    let child_ids: Vec<u32> = arena[root_id as usize].children.iter().map(|&(_, c)| c).collect();
+fn ol_add_dirichlet_noise(
+    arena: &mut [OLNode],
+    root_id: u32,
+    alpha: f64,
+    eps: f64,
+    seed: Option<u64>,
+) {
+    let child_ids: Vec<u32> = arena[root_id as usize]
+        .children
+        .iter()
+        .map(|&(_, c)| c)
+        .collect();
     let n = child_ids.len();
     if n == 0 {
         return;
@@ -1908,8 +2740,7 @@ fn ol_select_from_visits(arena: &[OLNode], temp: f64, rng: &mut StdRng) -> u16 {
 /// move_num).  Exposed as `batched_det_seed` so the M6 reference can replay the
 /// EXACT redeterminization BatchedMCTS used (splitmix64 mixing).
 fn det_seed(game_seed: u64, move_num: usize) -> u64 {
-    let mut z = game_seed
-        .wrapping_add((move_num as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
+    let mut z = game_seed.wrapping_add((move_num as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
@@ -2009,16 +2840,34 @@ impl RustMCTS {
             if leaf_batch <= 1 {
                 // Serial path — bit-identical to the pre-leaf-parallel search.
                 for _ in 0..n_sims {
-                    simulate(&mut arena, root_id, &ev, fpu, cpuct,
-                             score_scale, margin_gain, alpha)?;
+                    simulate(
+                        &mut arena,
+                        root_id,
+                        &ev,
+                        fpu,
+                        cpuct,
+                        score_scale,
+                        margin_gain,
+                        alpha,
+                    )?;
                 }
             } else {
                 // Leaf-parallel path (virtual loss); total leaf budget stays n_sims.
                 let mut remaining = n_sims;
                 while remaining > 0 {
                     let b = remaining.min(leaf_batch);
-                    simulate_batch(&mut arena, root_id, &ev, fpu, cpuct, b, virtual_loss,
-                                   score_scale, margin_gain, alpha)?;
+                    simulate_batch(
+                        &mut arena,
+                        root_id,
+                        &ev,
+                        fpu,
+                        cpuct,
+                        b,
+                        virtual_loss,
+                        score_scale,
+                        margin_gain,
+                        alpha,
+                    )?;
                     remaining -= b;
                 }
             }
@@ -2043,32 +2892,65 @@ struct MoveRecord {
     policy_val: Vec<f32>,
     legal_idx: Vec<i32>,
     actor: u8,
-    own_score: f32,   // raw own final score (filled at game end in finalize_move)
-    opp_score: f32,   // raw opponent final score (filled at game end)
-    win_target: f32,  // 1.0 win / 0.5 draw / 0.0 loss, actor frame (filled at end)
+    own_score: f32,  // raw own final score (filled at game end in finalize_move)
+    opp_score: f32,  // raw opponent final score (filled at game end)
+    win_target: f32, // 1.0 win / 0.5 draw / 0.0 loss, actor frame (filled at end)
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SlotState {
     NeedsRootEval, // root set but unexpanded; contributes the root as 1 leaf
+    ExactSolving,  // root is a terminal-adjacent endgame; solved exactly, no GPU
     Searching,     // contributes up to leaf_batch descended leaves per tick
     Idle,          // no game (quota met); contributes nothing
+}
+
+/// Cached result of an exact endgame solve at the current move's root, present
+/// only while a slot is resolving a terminal-adjacent (deck ∈ {0,4}) endgame.
+/// `finalize_move` uses `child_values` to build the policy target and pick the
+/// minimax-optimal move. own/opp/win and the value target `z` are NOT taken from
+/// here — the game plays out to GAME_OVER under exact-optimal moves, so they are
+/// filled from the real terminal scores at game end, exactly as for MCTS moves.
+#[derive(Clone)]
+struct ExactSolveResult {
+    /// (joint_index, minimax value player-0 frame) for ALL legal root actions.
+    child_values: Vec<(u16, f64)>,
+}
+
+struct ExactPlanItem {
+    result: ExactSolveResult,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct EndgameKey {
+    phase: u8,
+    actor_index: usize,
+    deck: Vec<u16>,
+    current_row: Vec<u16>,
+    pending_claims: Vec<(u8, u16)>,
+    next_claims: Vec<(u8, u16)>,
+    board0_terrain: [u8; CELLS],
+    board0_crowns: [u8; CELLS],
+    board1_terrain: [u8; CELLS],
+    board1_crowns: [u8; CELLS],
 }
 
 /// One game's search tree + real state.  Per-tick the slot runs exactly one
 /// `simulate_batch` chunk; root handling mirrors `RustMCTS::search`.
 struct SearchSlot {
     state: SlotState,
-    arena: Vec<Node>,        // closed-loop tree (empty when open_loop)
-    ol_arena: Vec<OLNode>,   // open-loop tree (empty when !open_loop)
+    arena: Vec<Node>,      // closed-loop tree (empty when open_loop)
+    ol_arena: Vec<OLNode>, // open-loop tree (empty when !open_loop)
     real_state: RustGameState,
     sims_done: usize,
     move_num: usize,
     game_seed: u64,
     rng: StdRng, // Dirichlet noise + move selection + per-sim determinization
     records: Vec<MoveRecord>,
-    fallback_count: u32,     // open-loop: deep-node legal-filter fallbacks (diagnostic)
+    fallback_count: u32, // open-loop: deep-node legal-filter fallbacks (diagnostic)
     missing_child_count: u32, // open-loop: descents stopped to add newly-legal children (diagnostic)
+    exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
+    exact_plan: Vec<ExactPlanItem>, // chosen-line plan for the deterministic endgame
 }
 
 impl SearchSlot {
@@ -2086,8 +2968,15 @@ impl SearchSlot {
             arena[0].state = Some(root_state);
             (arena, Vec::new())
         };
+        // A fresh game starts at INITIAL_SELECTION with a full deck, so this is
+        // virtually never an endgame — but check anyway so the trigger is uniform.
+        let state = if is_no_chance_endgame_state(&real_state) {
+            SlotState::ExactSolving
+        } else {
+            SlotState::NeedsRootEval
+        };
         SearchSlot {
-            state: SlotState::NeedsRootEval,
+            state,
             arena,
             ol_arena,
             real_state,
@@ -2098,6 +2987,8 @@ impl SearchSlot {
             records: Vec::new(),
             fallback_count: 0,
             missing_child_count: 0,
+            exact_result: None,
+            exact_plan: Vec::new(),
         }
     }
 
@@ -2116,6 +3007,8 @@ impl SearchSlot {
             records: Vec::new(),
             fallback_count: 0,
             missing_child_count: 0,
+            exact_result: None,
+            exact_plan: Vec::new(),
         }
     }
 
@@ -2126,49 +3019,82 @@ impl SearchSlot {
         &mut self,
         temp_moves: usize,
         open_loop: bool,
+        exact_enabled: bool,
     ) -> PyResult<Option<(u64, Vec<MoveRecord>, (i32, i32))>> {
-        // Training record: encode the REAL (public) state + visit-count policy.
-        // Read visit counts from whichever tree this engine drives.
+        // Training record: encode the REAL (public) state + policy target.
         let actor = self.real_state.actor()?;
         let (my, opp, flat) = self.real_state.encode_arrays(actor)?;
-        // Root children as (joint_index, visit_count) from the active tree.
-        let root_children: Vec<(u16, i32)> = if open_loop {
-            self.ol_arena[0]
-                .children
-                .iter()
-                .map(|&(idx, c)| (idx, self.ol_arena[c as usize].visit_count))
-                .collect()
-        } else {
-            self.arena[0]
-                .children
-                .iter()
-                .map(|&(idx, c)| (idx, self.arena[c as usize].visit_count))
-                .collect()
-        };
-        let total: i32 = root_children.iter().map(|&(_, vc)| vc).sum();
-        let mut policy_idx = Vec::new();
-        let mut policy_val = Vec::new();
-        let mut legal_idx = Vec::new();
-        for &(idx, vc) in &root_children {
-            legal_idx.push(idx as i32);
-            if vc > 0 {
-                policy_idx.push(idx as i32);
-                policy_val.push(vc as f32 / total as f32);
-            }
-        }
-        self.records.push(MoveRecord {
-            my, opp, flat, policy_idx, policy_val, legal_idx, actor,
-            own_score: 0.0, opp_score: 0.0, win_target: 0.5,
-        });
 
-        // Select a move from root visit counts (τ=1 for the first temp_moves
-        // plies, then greedy) and apply it to the real state.
-        let temp = if self.move_num < temp_moves { 1.0 } else { 0.0 };
-        let chosen = if open_loop {
-            ol_select_from_visits(&self.ol_arena, temp, &mut self.rng)
+        // Take any exact-solve result for this move (clears it so the next move,
+        // if MCTS-driven, never sees a stale value).
+        let exact = self.exact_result.take();
+
+        let (policy_idx, policy_val, legal_idx, chosen) = if let Some(exact) = exact {
+            // ── Exact endgame path: policy + move from minimax child values ──
+            let (policy_idx, policy_val, legal_idx) =
+                exact_policy_target(&exact.child_values, actor);
+            // The optimal move is unambiguous; always play the minimax-best child
+            // (temperature does not apply — there is a single correct answer).
+            let best = if actor == 0 {
+                exact
+                    .child_values
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            } else {
+                exact
+                    .child_values
+                    .iter()
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            };
+            let chosen = best.map(|&(idx, _)| idx).unwrap_or(legal_idx[0] as u16);
+            (policy_idx, policy_val, legal_idx, chosen)
         } else {
-            select_from_visits(&self.arena, temp, &mut self.rng)
+            // ── Normal MCTS path: visit-count policy + visit-count selection ──
+            let root_children: Vec<(u16, i32)> = if open_loop {
+                self.ol_arena[0]
+                    .children
+                    .iter()
+                    .map(|&(idx, c)| (idx, self.ol_arena[c as usize].visit_count))
+                    .collect()
+            } else {
+                self.arena[0]
+                    .children
+                    .iter()
+                    .map(|&(idx, c)| (idx, self.arena[c as usize].visit_count))
+                    .collect()
+            };
+            let total: i32 = root_children.iter().map(|&(_, vc)| vc).sum();
+            let mut policy_idx = Vec::new();
+            let mut policy_val = Vec::new();
+            let mut legal_idx = Vec::new();
+            for &(idx, vc) in &root_children {
+                legal_idx.push(idx as i32);
+                if vc > 0 {
+                    policy_idx.push(idx as i32);
+                    policy_val.push(vc as f32 / total as f32);
+                }
+            }
+            let temp = if self.move_num < temp_moves { 1.0 } else { 0.0 };
+            let chosen = if open_loop {
+                ol_select_from_visits(&self.ol_arena, temp, &mut self.rng)
+            } else {
+                select_from_visits(&self.arena, temp, &mut self.rng)
+            };
+            (policy_idx, policy_val, legal_idx, chosen)
         };
+
+        self.records.push(MoveRecord {
+            my,
+            opp,
+            flat,
+            policy_idx,
+            policy_val,
+            legal_idx,
+            actor,
+            own_score: 0.0,
+            opp_score: 0.0,
+            win_target: 0.5,
+        });
         let (placement, pick) = self
             .real_state
             .legal_actions_indexed()
@@ -2185,7 +3111,13 @@ impl SearchSlot {
             // tiebreaker cascade in Rust (RustGameState lacks determine_winner);
             // score-only win, matching play_selfplay_game_rust's documented
             // limitation.  Draw → 0.5 for both (1.0 - 0.5 = 0.5).
-            let win0: f32 = if s0 > s1 { 1.0 } else if s1 > s0 { 0.0 } else { 0.5 };
+            let win0: f32 = if s0 > s1 {
+                1.0
+            } else if s1 > s0 {
+                0.0
+            } else {
+                0.5
+            };
             for rec in &mut self.records {
                 let (own_s, opp_s, win_t) = if rec.actor == 0 {
                     (s0 as f32, s1 as f32, win0)
@@ -2196,7 +3128,11 @@ impl SearchSlot {
                 rec.opp_score = opp_s;
                 rec.win_target = win_t;
             }
-            Ok(Some((self.game_seed, std::mem::take(&mut self.records), (s0, s1))))
+            Ok(Some((
+                self.game_seed,
+                std::mem::take(&mut self.records),
+                (s0, s1),
+            )))
         } else {
             // Next move: reset the active tree to a bare root.  Closed-loop
             // re-stores a redeterminized root state; open-loop is stateless and
@@ -2213,8 +3149,301 @@ impl SearchSlot {
                 self.arena[0].state = Some(root_state);
             }
             self.sims_done = 0;
-            self.state = SlotState::NeedsRootEval;
+            // If the solver is enabled and the new root is terminal-adjacent
+            // (deck ∈ {0,4}), hand it to the exact solver instead of GPU-backed
+            // MCTS. The deck only shrinks, so once a game enters ExactSolving it
+            // stays there until GAME_OVER — resolve_exact_slots cascades the whole
+            // endgame with zero forwards. When disabled (budget 0), endgames go
+            // through normal MCTS.
+            self.state = if exact_enabled && is_no_chance_endgame_state(&self.real_state) {
+                SlotState::ExactSolving
+            } else {
+                SlotState::NeedsRootEval
+            };
             Ok(None)
+        }
+    }
+}
+
+/// Derive a policy-target distribution from exact minimax child values via an
+/// advantage-weighted softmax with a self-calibrating temperature.
+///
+/// `advantage_i = |v_i - v_worst|` (0 at the worst move, `range` at the best);
+/// `T = range / 3`, so the best move gets ~95% of the mass when the value range
+/// is large (a clear best move) and the distribution is flatter when moves are
+/// close (a genuinely ambiguous endgame). No fixed hyperparameter. If all moves
+/// tie (`range ≈ 0`), fall back to uniform.
+///
+/// Returns (policy_idx, policy_val, legal_idx) in MoveRecord format: legal_idx
+/// lists every legal action; policy_idx/policy_val carry the non-negligible mass.
+fn exact_policy_target(child_values: &[(u16, f64)], actor: u8) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let legal_idx: Vec<i32> = child_values.iter().map(|&(idx, _)| idx as i32).collect();
+
+    let (v_best, v_worst) = if actor == 0 {
+        (
+            child_values
+                .iter()
+                .map(|&(_, v)| v)
+                .fold(f64::NEG_INFINITY, f64::max),
+            child_values
+                .iter()
+                .map(|&(_, v)| v)
+                .fold(f64::INFINITY, f64::min),
+        )
+    } else {
+        // Minimising player: "best" is the smallest value.
+        (
+            child_values
+                .iter()
+                .map(|&(_, v)| v)
+                .fold(f64::INFINITY, f64::min),
+            child_values
+                .iter()
+                .map(|&(_, v)| v)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let range = (v_best - v_worst).abs();
+
+    let weights: Vec<f64> = if range < 1e-9 {
+        vec![1.0 / child_values.len() as f64; child_values.len()]
+    } else {
+        let temperature = range / 3.0;
+        // advantage = |v - v_worst| / T  ∈ [0, 3]; softmax with max-shift for stability.
+        let adv: Vec<f64> = child_values
+            .iter()
+            .map(|&(_, v)| (v - v_worst).abs() / temperature)
+            .collect();
+        let max_adv = adv.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = adv.iter().map(|&a| (a - max_adv).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        exps.iter().map(|&e| e / sum).collect()
+    };
+
+    let mut policy_idx = Vec::new();
+    let mut policy_val = Vec::new();
+    for (i, &(idx, _)) in child_values.iter().enumerate() {
+        let w = weights[i] as f32;
+        if w > 1e-7 {
+            policy_idx.push(idx as i32);
+            policy_val.push(w);
+        }
+    }
+    (policy_idx, policy_val, legal_idx)
+}
+
+fn endgame_key(state: &RustGameState) -> EndgameKey {
+    let mut deck = state.deck.clone();
+    deck.sort_unstable();
+    EndgameKey {
+        phase: state.phase,
+        actor_index: state.actor_index,
+        deck,
+        current_row: state.current_row.clone(),
+        pending_claims: state.pending_claims.clone(),
+        next_claims: state.next_claims.clone(),
+        board0_terrain: state.boards[0].terrain,
+        board0_crowns: state.boards[0].crowns,
+        board1_terrain: state.boards[1].terrain,
+        board1_crowns: state.boards[1].crowns,
+    }
+}
+
+fn best_exact_joint(result: &ExactSolveResult, actor: u8) -> Option<u16> {
+    let best = if actor == 0 {
+        result
+            .child_values
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        result
+            .child_values
+            .iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    best.map(|&(idx, _)| idx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_endgame_ab_value_cached(
+    state: &RustGameState,
+    nodes: &mut u64,
+    max_nodes: u64,
+    alpha: f64,
+    beta: f64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+    value_cache: &mut HashMap<EndgameKey, f64>,
+) -> PyResult<Option<f64>> {
+    let full_window = alpha == f64::NEG_INFINITY && beta == f64::INFINITY;
+    let key = if full_window {
+        Some(endgame_key(state))
+    } else {
+        None
+    };
+    if let Some(k) = key.as_ref() {
+        if let Some(&v) = value_cache.get(k) {
+            return Ok(Some(v));
+        }
+    }
+
+    let v = solve_endgame_ab(
+        state,
+        nodes,
+        max_nodes,
+        alpha,
+        beta,
+        score_scale,
+        margin_gain,
+        alpha_param,
+    )?;
+    if let (Some(k), Some(value)) = (key, v) {
+        value_cache.insert(k, value);
+    }
+    Ok(v)
+}
+
+/// Solve a terminal-adjacent root exactly, returning per-child minimax values for
+/// ALL legal root actions (player-0 frame). Each child is solved with a full
+/// (-∞, +∞) window so its value is exact (needed for the policy target), sharing
+/// one `max_nodes` budget across children. Returns `Ok(None)` if the budget is
+/// exhausted (caller falls back to MCTS) — empirically does not happen at 15M.
+fn solve_root_exact_cached(
+    state: &RustGameState,
+    nodes: &mut u64,
+    max_nodes: u64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+    value_cache: &mut HashMap<EndgameKey, f64>,
+    result_cache: &mut HashMap<EndgameKey, ExactSolveResult>,
+) -> PyResult<Option<ExactSolveResult>> {
+    let key = endgame_key(state);
+    if let Some(result) = result_cache.get(&key) {
+        return Ok(Some(result.clone()));
+    }
+
+    let mut legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Ok(None); // not GAME_OVER but no actions — fall back defensively
+    }
+    order_legal_for_solver(state, &mut legal);
+
+    let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
+    for &(joint_idx, placement, pick) in &legal {
+        if *nodes >= max_nodes {
+            return Ok(None);
+        }
+        let next = state.step(placement, pick)?;
+        match solve_endgame_ab_value_cached(
+            &next,
+            nodes,
+            max_nodes,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            score_scale,
+            margin_gain,
+            alpha_param,
+            value_cache,
+        )? {
+            Some(v) => child_values.push((joint_idx, v)),
+            None => return Ok(None),
+        }
+    }
+    let result = ExactSolveResult { child_values };
+    result_cache.insert(key, result.clone());
+    Ok(Some(result))
+}
+
+fn solve_exact_plan(
+    state: &RustGameState,
+    max_nodes: u64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+) -> PyResult<Option<Vec<ExactPlanItem>>> {
+    let mut cur = state.cloned();
+    let mut nodes = 0u64;
+    let mut value_cache: HashMap<EndgameKey, f64> = HashMap::new();
+    let mut result_cache: HashMap<EndgameKey, ExactSolveResult> = HashMap::new();
+    let mut plan = Vec::new();
+
+    while cur.phase != GAME_OVER {
+        if !is_no_chance_endgame_state(&cur) || nodes >= max_nodes {
+            return Ok(None);
+        }
+        let result = match solve_root_exact_cached(
+            &cur,
+            &mut nodes,
+            max_nodes,
+            score_scale,
+            margin_gain,
+            alpha_param,
+            &mut value_cache,
+            &mut result_cache,
+        )? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let actor = cur.actor()?;
+        let chosen = best_exact_joint(&result, actor)
+            .ok_or_else(|| PyValueError::new_err("exact plan state has no best action"))?;
+        let (placement, pick) = cur
+            .legal_actions_indexed()
+            .into_iter()
+            .find(|t| t.0 == chosen)
+            .map(|t| (t.1, t.2))
+            .ok_or_else(|| PyValueError::new_err("exact plan selected illegal action"))?;
+        plan.push(ExactPlanItem { result });
+        cur = cur.step(placement, pick)?;
+    }
+    Ok(Some(plan))
+}
+
+#[cfg(test)]
+mod exact_policy_tests {
+    use super::exact_policy_target;
+
+    fn argmax(policy_idx: &[i32], policy_val: &[f32]) -> i32 {
+        let mut best_i = 0usize;
+        for i in 1..policy_val.len() {
+            if policy_val[i] > policy_val[best_i] {
+                best_i = i;
+            }
+        }
+        policy_idx[best_i]
+    }
+
+    #[test]
+    fn peaks_on_best_for_maximiser() {
+        // actor 0 maximises: best child is the highest value (idx 10).
+        let cv = vec![(10u16, 0.9f64), (20, 0.1), (30, -0.5)];
+        let (pidx, pval, lidx) = exact_policy_target(&cv, 0);
+        assert_eq!(lidx, vec![10, 20, 30]);
+        let sum: f32 = pval.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "policy must sum to 1, got {sum}");
+        assert_eq!(argmax(&pidx, &pval), 10);
+    }
+
+    #[test]
+    fn peaks_on_best_for_minimiser() {
+        // actor 1 minimises: best child is the lowest value (idx 30).
+        let cv = vec![(10u16, 0.9f64), (20, 0.1), (30, -0.5)];
+        let (pidx, pval, _lidx) = exact_policy_target(&cv, 1);
+        let sum: f32 = pval.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert_eq!(argmax(&pidx, &pval), 30);
+    }
+
+    #[test]
+    fn uniform_on_ties() {
+        let cv = vec![(10u16, 0.3f64), (20, 0.3), (30, 0.3)];
+        let (_pidx, pval, _lidx) = exact_policy_target(&cv, 0);
+        let sum: f32 = pval.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        for &w in &pval {
+            assert!((w - 1.0 / 3.0).abs() < 1e-5, "expected uniform, got {w}");
         }
     }
 }
@@ -2326,6 +3555,15 @@ struct BatchedMCTS {
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
     cum_missing_child_count: u64,
+    // Exact endgame solver (deck ∈ {0,4} roots). 0 disables it (ablation).
+    exact_endgame_max_nodes: u64,
+    cum_exact_solve_count: u64,      // root moves solved exactly
+    cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
+    cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
+    cum_exact_fallback_count: u64,   // budget exceeded → fell back to MCTS (≈0)
+    // Games finished entirely inside resolve_exact_slots during step(); drained
+    // by update() into the finished-games list it returns.
+    pending_exact: Vec<(u64, Vec<MoveRecord>, (i32, i32))>,
 }
 
 #[pymethods]
@@ -2335,7 +3573,8 @@ impl BatchedMCTS {
                         virtual_loss=1, cpuct=1.5, fpu=0.0, dirichlet_alpha=0.3,
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
-                        score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+                        score_scale=100.0, margin_gain=2.0, alpha=0.8,
+                        exact_endgame_max_nodes=500_000))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -2354,13 +3593,26 @@ impl BatchedMCTS {
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
+        exact_endgame_max_nodes: u64,
     ) -> Self {
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
         // rather than producing degenerate searches or div-by-zero later.
-        assert!(n_sims > 0, "BatchedMCTS: n_sims must be > 0, got {}", n_sims);
-        assert!(n_slots > 0, "BatchedMCTS: n_slots must be > 0, got {}", n_slots);
-        assert!(leaf_batch > 0, "BatchedMCTS: leaf_batch must be > 0, got {}", leaf_batch);
+        assert!(
+            n_sims > 0,
+            "BatchedMCTS: n_sims must be > 0, got {}",
+            n_sims
+        );
+        assert!(
+            n_slots > 0,
+            "BatchedMCTS: n_slots must be > 0, got {}",
+            n_slots
+        );
+        assert!(
+            leaf_batch > 0,
+            "BatchedMCTS: leaf_batch must be > 0, got {}",
+            leaf_batch
+        );
         let mut slots = Vec::with_capacity(n_slots);
         let mut games_started = 0usize;
         for _ in 0..n_slots {
@@ -2398,7 +3650,146 @@ impl BatchedMCTS {
             open_loop,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
+            exact_endgame_max_nodes,
+            cum_exact_solve_count: 0,
+            cum_exact_tree_solve_count: 0,
+            cum_exact_cache_hit_count: 0,
+            cum_exact_fallback_count: 0,
+            pending_exact: Vec::new(),
         }
+    }
+
+    /// Diagnostic: total root moves solved exactly by the endgame solver across
+    /// the whole run (deck ∈ {0,4} positions resolved without GPU forwards).
+    #[getter]
+    fn exact_solve_count(&self) -> u64 {
+        self.cum_exact_solve_count
+    }
+
+    /// Diagnostic: expensive exact continuation plans built. With plan reuse,
+    /// this should be roughly one per game endgame rather than one per move.
+    #[getter]
+    fn exact_tree_solve_count(&self) -> u64 {
+        self.cum_exact_tree_solve_count
+    }
+
+    /// Diagnostic: exact moves served from an already-built continuation plan.
+    #[getter]
+    fn exact_cache_hit_count(&self) -> u64 {
+        self.cum_exact_cache_hit_count
+    }
+
+    /// Diagnostic: endgame roots where the node budget was exceeded and the slot
+    /// fell back to GPU-backed MCTS. Expected to stay 0 at the default 15M budget.
+    #[getter]
+    fn exact_fallback_count(&self) -> u64 {
+        self.cum_exact_fallback_count
+    }
+
+    /// Resolve every `ExactSolving` slot: solve the terminal-adjacent root exactly
+    /// and finalize the move without any GPU forward, cascading through the whole
+    /// endgame (deck only shrinks, so a slot stays `ExactSolving` until GAME_OVER).
+    /// Finished games are stashed in `pending_exact` for `update()` to return.
+    /// On budget exhaustion (≈never at 15M) the slot falls back to `NeedsRootEval`.
+    /// Called serially at the start of `step()`; `solve_endgame_ab` is itself
+    /// single-threaded and BatchedMCTS already parallelises across slots.
+    fn resolve_exact_slots(&mut self) -> PyResult<()> {
+        if self.exact_endgame_max_nodes == 0 {
+            return Ok(());
+        }
+        let (score_scale, margin_gain, val_alpha) =
+            (self.score_scale, self.margin_gain, self.alpha);
+        let max_nodes = self.exact_endgame_max_nodes;
+        let (temp_moves, open_loop) = (self.temp_moves, self.open_loop);
+
+        // Phase 1: solve + finalize each ExactSolving slot to completion, holding
+        // a single-slot borrow. Finished games are collected with their slot index
+        // so recycling (which needs &mut self) happens after, like update() does.
+        let mut finished: Vec<(usize, (u64, Vec<MoveRecord>, (i32, i32)))> = Vec::new();
+        for si in 0..self.slots.len() {
+            loop {
+                if self.slots[si].state != SlotState::ExactSolving {
+                    break;
+                }
+                let built_plan = if self.slots[si].exact_plan.is_empty() {
+                    match solve_exact_plan(
+                        &self.slots[si].real_state,
+                        max_nodes,
+                        score_scale,
+                        margin_gain,
+                        val_alpha,
+                    )? {
+                        Some(plan) if !plan.is_empty() => {
+                            self.slots[si].exact_plan = plan;
+                            self.cum_exact_tree_solve_count += 1;
+                            true
+                        }
+                        _ => {
+                            // Budget exceeded (or degenerate): fall back to MCTS.
+                            self.cum_exact_fallback_count += 1;
+                            self.slots[si].exact_result = None;
+                            self.slots[si].exact_plan.clear();
+                            self.slots[si].state = SlotState::NeedsRootEval;
+                            self.slots[si].sims_done = 0;
+                            if open_loop {
+                                self.slots[si].ol_arena.clear();
+                                self.slots[si].ol_arena.push(OLNode::new(1.0, (None, None)));
+                            } else {
+                                let root_state = self.slots[si].real_state.redeterminize(Some(
+                                    det_seed(self.slots[si].game_seed, self.slots[si].move_num),
+                                ));
+                                self.slots[si].arena.clear();
+                                self.slots[si].arena.push(Node::new(1.0, (None, None)));
+                                self.slots[si].arena[0].state = Some(root_state);
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                let item = self.slots[si].exact_plan.remove(0);
+                if !built_plan {
+                    self.cum_exact_cache_hit_count += 1;
+                }
+                self.cum_exact_solve_count += 1;
+                self.slots[si].exact_result = Some(item.result);
+                // finalize_move consumes exact_result, applies the optimal
+                // move, and sets the next state (ExactSolving again, or
+                // NeedsRootEval on fallback, or returns the finished game).
+                match self.slots[si].finalize_move(temp_moves, open_loop, true)? {
+                    Some(fg) => {
+                        self.slots[si].exact_plan.clear();
+                        finished.push((si, fg));
+                        break;
+                    }
+                    None => { /* loop: next move is still ExactSolving */ }
+                }
+            }
+        }
+
+        // Phase 2: recycle finished slots (mirrors update()'s tail).
+        for (si, fg) in finished {
+            self.cum_fallback_count += self.slots[si].fallback_count as u64;
+            self.cum_missing_child_count += self.slots[si].missing_child_count as u64;
+            self.pending_exact.push(fg);
+            if self.games_started < self.games_target {
+                let ns = self.next_seed;
+                self.next_seed += 1;
+                self.games_started += 1;
+                self.slots[si] = SearchSlot::new_for_game(
+                    new_game(ns, self.harmony, self.middle_kingdom),
+                    ns,
+                    self.open_loop,
+                );
+            } else {
+                self.slots[si].state = SlotState::Idle;
+                self.slots[si].fallback_count = 0;
+                self.slots[si].missing_child_count = 0;
+            }
+        }
+        Ok(())
     }
 
     /// Open-loop diagnostic: total deep-node fallbacks (a determinization reached
@@ -2407,7 +3798,11 @@ impl BatchedMCTS {
     #[getter]
     fn fallback_count(&self) -> u64 {
         self.cum_fallback_count
-            + self.slots.iter().map(|s| s.fallback_count as u64).sum::<u64>()
+            + self
+                .slots
+                .iter()
+                .map(|s| s.fallback_count as u64)
+                .sum::<u64>()
     }
 
     /// Open-loop diagnostic: total descents stopped to add newly-legal children
@@ -2416,7 +3811,11 @@ impl BatchedMCTS {
     #[getter]
     fn missing_child_count(&self) -> u64 {
         self.cum_missing_child_count
-            + self.slots.iter().map(|s| s.missing_child_count as u64).sum::<u64>()
+            + self
+                .slots
+                .iter()
+                .map(|s| s.missing_child_count as u64)
+                .sum::<u64>()
     }
 
     /// True once every game is finished and all slots are Idle.
@@ -2429,25 +3828,36 @@ impl BatchedMCTS {
     /// collide on the same node under different determinizations contribute their
     /// OWN distinct values to the backup (value_sum = v1+v2, not 2*v1).
     fn debug_ol_node(&self, slot: usize, node_id: usize) -> PyResult<(i32, f64)> {
-        let s = self.slots.get(slot)
+        let s = self
+            .slots
+            .get(slot)
             .ok_or_else(|| PyValueError::new_err("slot out of range"))?;
-        let n = s.ol_arena.get(node_id)
+        let n = s
+            .ol_arena
+            .get(node_id)
             .ok_or_else(|| PyValueError::new_err("node_id out of range"))?;
         Ok((n.visit_count, n.value_sum))
     }
 
     /// Diagnostic (open-loop): number of children of an OLNode in a slot's tree.
     fn debug_ol_n_children(&self, slot: usize, node_id: usize) -> PyResult<usize> {
-        let s = self.slots.get(slot)
+        let s = self
+            .slots
+            .get(slot)
             .ok_or_else(|| PyValueError::new_err("slot out of range"))?;
-        let n = s.ol_arena.get(node_id)
+        let n = s
+            .ol_arena
+            .get(node_id)
             .ok_or_else(|| PyValueError::new_err("node_id out of range"))?;
         Ok(n.children.len())
     }
 
     /// Number of slots still working on a game.
     fn n_active(&self) -> usize {
-        self.slots.iter().filter(|s| s.state != SlotState::Idle).count()
+        self.slots
+            .iter()
+            .filter(|s| s.state != SlotState::Idle)
+            .count()
     }
 
     /// Actor id for each row returned by the most recent step().
@@ -2520,16 +3930,28 @@ impl BatchedMCTS {
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyList>,
     )> {
-        let (fpu, cpuct, leaf_batch, vl, n_sims, open_loop) =
-            (self.fpu, self.cpuct, self.leaf_batch, self.virtual_loss, self.n_sims,
-             self.open_loop);
+        // Resolve any terminal-adjacent endgame slots exactly first — they
+        // contribute nothing to the GPU batch and may finish games (stashed in
+        // pending_exact for update()). After this, no slot is ExactSolving.
+        self.resolve_exact_slots()?;
+
+        let (fpu, cpuct, leaf_batch, vl, n_sims, open_loop) = (
+            self.fpu,
+            self.cpuct,
+            self.leaf_batch,
+            self.virtual_loss,
+            self.n_sims,
+            self.open_loop,
+        );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
             .slots
             .par_iter_mut()
             .enumerate()
             .filter_map(|(si, slot)| match slot.state {
-                SlotState::Idle => None,
+                // Idle never contributes; ExactSolving should already be resolved
+                // by resolve_exact_slots above (skip defensively rather than panic).
+                SlotState::Idle | SlotState::ExactSolving => None,
                 _ => Some((si, slot)),
             })
             .map(|(si, slot)| -> PyResult<SlotStepOutput> {
@@ -2545,6 +3967,9 @@ impl BatchedMCTS {
                     // SlotTick), not node-stored states.
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
+                        SlotState::ExactSolving => {
+                            unreachable!("ExactSolving slots are resolved before the batch")
+                        }
                         SlotState::NeedsRootEval => {
                             // Root is evaluated from the PUBLIC real_state (its
                             // legal joint indices are determinization-independent).
@@ -2559,10 +3984,20 @@ impl BatchedMCTS {
                             ob_data.resize(board_sz, 0.0);
                             flat_data.resize(FLAT_SIZE, 0.0);
                             state.encode_arrays_into(
-                                actor, &mut mb_data, &mut ob_data, &mut flat_data, row)?;
+                                actor,
+                                &mut mb_data,
+                                &mut ob_data,
+                                &mut flat_data,
+                                row,
+                            )?;
                             idxs_per.push(legal.iter().map(|t| t.0 as i64).collect());
                             // Single root eval leaf at row 0 (row is not reused).
-                            let ev = EvalLeaf { leaf: 0, row, actor, legal };
+                            let ev = EvalLeaf {
+                                leaf: 0,
+                                row,
+                                actor,
+                                legal,
+                            };
                             SlotTick {
                                 slot: si,
                                 is_root: true,
@@ -2578,8 +4013,7 @@ impl BatchedMCTS {
                             let chunk = leaf_batch.min(n_sims - slot.sims_done);
                             let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
                             let mut ol_actors: Vec<Vec<u8>> = Vec::with_capacity(chunk);
-                            let mut ol_leaf_states: Vec<RustGameState> =
-                                Vec::with_capacity(chunk);
+                            let mut ol_leaf_states: Vec<RustGameState> = Vec::with_capacity(chunk);
                             // Pre-generate all per-simulation deck-shuffle seeds from
                             // the slot RNG BEFORE descent begins.  Materialising the
                             // sequence up front keeps it deterministic (identical to
@@ -2592,13 +4026,15 @@ impl BatchedMCTS {
                             for &seed in &sim_seeds {
                                 let det = slot.real_state.redeterminize(Some(seed));
                                 let (path, actors, leaf_state) = ol_descend(
-                                    &slot.ol_arena, 0, det, fpu, cpuct,  // det moved in (no clone)
+                                    &slot.ol_arena,
+                                    0,
+                                    det,
+                                    fpu,
+                                    cpuct, // det moved in (no clone)
                                     &mut slot.fallback_count,
                                     &mut slot.missing_child_count,
                                 )?;
-                                ol_apply_virtual_loss(
-                                    &mut slot.ol_arena, &path, &actors, 1, vl,
-                                );
+                                ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
                                 paths.push(path);
                                 ol_actors.push(actors);
                                 ol_leaf_states.push(leaf_state);
@@ -2617,8 +4053,10 @@ impl BatchedMCTS {
                             // count, then write each leaf's encoding DIRECTLY into
                             // its row — no per-leaf Array3/Array1 alloc + copy.
                             let board_sz = N_BOARD_CH * OUT_N * OUT_N;
-                            let n_nonterm =
-                                ol_leaf_states.iter().filter(|ls| ls.phase != GAME_OVER).count();
+                            let n_nonterm = ol_leaf_states
+                                .iter()
+                                .filter(|ls| ls.phase != GAME_OVER)
+                                .count();
                             mb_data.resize(n_nonterm * board_sz, 0.0);
                             ob_data.resize(n_nonterm * board_sz, 0.0);
                             flat_data.resize(n_nonterm * FLAT_SIZE, 0.0);
@@ -2631,9 +4069,19 @@ impl BatchedMCTS {
                                 let actor = ls.actor()?;
                                 let legal = ls.legal_actions_indexed();
                                 ls.encode_arrays_into(
-                                    actor, &mut mb_data, &mut ob_data, &mut flat_data, row)?;
+                                    actor,
+                                    &mut mb_data,
+                                    &mut ob_data,
+                                    &mut flat_data,
+                                    row,
+                                )?;
                                 idxs_per.push(legal.iter().map(|t| t.0 as i64).collect());
-                                evals.push(EvalLeaf { leaf, row, actor, legal });
+                                evals.push(EvalLeaf {
+                                    leaf,
+                                    row,
+                                    actor,
+                                    legal,
+                                });
                                 eval_path_indices.push(pi);
                                 row += 1;
                             }
@@ -2650,9 +4098,12 @@ impl BatchedMCTS {
                         }
                     }
                 } else {
-                    let mut push_leaf = |arena: &Vec<Node>, leaf: u32,
-                                         mb: &mut Vec<f32>, ob: &mut Vec<f32>,
-                                         fl: &mut Vec<f32>, ix: &mut Vec<Vec<i64>>|
+                    let mut push_leaf = |arena: &Vec<Node>,
+                                         leaf: u32,
+                                         mb: &mut Vec<f32>,
+                                         ob: &mut Vec<f32>,
+                                         fl: &mut Vec<f32>,
+                                         ix: &mut Vec<Vec<i64>>|
                      -> PyResult<EvalLeaf> {
                         let state = arena[leaf as usize].state.as_ref().unwrap();
                         let actor = state.actor()?;
@@ -2662,17 +4113,29 @@ impl BatchedMCTS {
                         ob.extend_from_slice(opp.as_slice().expect("contig"));
                         fl.extend_from_slice(flat.as_slice().expect("contig"));
                         ix.push(legal.iter().map(|t| t.0 as i64).collect());
-                        let ev = EvalLeaf { leaf, row, actor, legal };
+                        let ev = EvalLeaf {
+                            leaf,
+                            row,
+                            actor,
+                            legal,
+                        };
                         row += 1;
                         Ok(ev)
                     };
 
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
+                        SlotState::ExactSolving => {
+                            unreachable!("ExactSolving slots are resolved before the batch")
+                        }
                         SlotState::NeedsRootEval => {
                             let ev = push_leaf(
-                                &slot.arena, 0, &mut mb_data, &mut ob_data,
-                                &mut flat_data, &mut idxs_per,
+                                &slot.arena,
+                                0,
+                                &mut mb_data,
+                                &mut ob_data,
+                                &mut flat_data,
+                                &mut idxs_per,
                             )?;
                             SlotTick {
                                 slot: si,
@@ -2704,8 +4167,12 @@ impl BatchedMCTS {
                                 }
                                 if seen.insert(leaf) {
                                     let ev = push_leaf(
-                                        &slot.arena, leaf, &mut mb_data, &mut ob_data,
-                                        &mut flat_data, &mut idxs_per,
+                                        &slot.arena,
+                                        leaf,
+                                        &mut mb_data,
+                                        &mut ob_data,
+                                        &mut flat_data,
+                                        &mut idxs_per,
                                     )?;
                                     evals.push(ev);
                                 }
@@ -2724,7 +4191,13 @@ impl BatchedMCTS {
                     }
                 };
 
-                Ok(SlotStepOutput { tick, mb_data, ob_data, flat_data, idxs_per })
+                Ok(SlotStepOutput {
+                    tick,
+                    mb_data,
+                    ob_data,
+                    flat_data,
+                    idxs_per,
+                })
             })
             .collect();
 
@@ -2779,8 +4252,13 @@ impl BatchedMCTS {
         gathered: Bound<'py, PyList>,
     ) -> PyResult<Bound<'py, PyList>> {
         let (n_sims, vl, temp_moves, alpha, eps, harmony, mk, open_loop) = (
-            self.n_sims, self.virtual_loss, self.temp_moves,
-            self.dirichlet_alpha, self.dirichlet_eps, self.harmony, self.middle_kingdom,
+            self.n_sims,
+            self.virtual_loss,
+            self.temp_moves,
+            self.dirichlet_alpha,
+            self.dirichlet_eps,
+            self.harmony,
+            self.middle_kingdom,
             self.open_loop,
         );
         // Terminal-value formula params (Fix 1).  `alpha` above is the DIRICHLET
@@ -2788,6 +4266,7 @@ impl BatchedMCTS {
         // par_iter_mut closure captures them, not &self.
         let (score_scale, margin_gain, val_alpha) =
             (self.score_scale, self.margin_gain, self.alpha);
+        let exact_enabled = self.exact_endgame_max_nodes != 0;
         // Python passes f32 (values/logits are .float()) to halve D2H transfer;
         // cast to f64 here for the tree's internal accumulation (unchanged).
         let vals: Vec<f64> = values.as_slice()?.iter().map(|&v| v as f64).collect();
@@ -2808,8 +4287,7 @@ impl BatchedMCTS {
         }
 
         let finished_by_slot: PyResult<Vec<(usize, Option<(u64, Vec<MoveRecord>, (i32, i32))>)>> =
-            self
-                .slots
+            self.slots
                 .par_iter_mut()
                 .zip(pending_by_slot.into_par_iter())
                 .enumerate()
@@ -2821,11 +4299,16 @@ impl BatchedMCTS {
                     if tick.is_root {
                         let ev = &tick.evals[0];
                         let priors = softmax_f64(&gvecs[ev.row]);
-                        let value0 = if ev.actor == 0 { vals[ev.row] } else { -vals[ev.row] };
+                        let value0 = if ev.actor == 0 {
+                            vals[ev.row]
+                        } else {
+                            -vals[ev.row]
+                        };
                         if open_loop {
                             for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
                                 let cid = slot.ol_arena.len() as u32;
-                                slot.ol_arena.push(OLNode::new(priors[i], (placement, pick)));
+                                slot.ol_arena
+                                    .push(OLNode::new(priors[i], (placement, pick)));
                                 slot.ol_arena[0].children.push((idx, cid));
                             }
                             slot.ol_arena[0].is_expanded = true;
@@ -2833,7 +4316,13 @@ impl BatchedMCTS {
                             slot.ol_arena[0].value_sum = value0;
                             if eps > 0.0 {
                                 let dseed = slot.rng.r#gen::<u64>();
-                                ol_add_dirichlet_noise(&mut slot.ol_arena, 0, alpha, eps, Some(dseed));
+                                ol_add_dirichlet_noise(
+                                    &mut slot.ol_arena,
+                                    0,
+                                    alpha,
+                                    eps,
+                                    Some(dseed),
+                                );
                             }
                         } else {
                             for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
@@ -2863,7 +4352,11 @@ impl BatchedMCTS {
                         let mut path_v0: Vec<Option<f64>> = vec![None; tick.paths.len()];
                         for (ei, ev) in tick.evals.iter().enumerate() {
                             let priors = softmax_f64(&gvecs[ev.row]);
-                            let value0 = if ev.actor == 0 { vals[ev.row] } else { -vals[ev.row] };
+                            let value0 = if ev.actor == 0 {
+                                vals[ev.row]
+                            } else {
+                                -vals[ev.row]
+                            };
                             if !slot.ol_arena[ev.leaf as usize].is_expanded {
                                 // First expansion of this OLNode (this tick or ever):
                                 // create children from this concrete state's legal
@@ -2873,7 +4366,8 @@ impl BatchedMCTS {
                                 // missing-child branch below.
                                 for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
                                     let cid = slot.ol_arena.len() as u32;
-                                    slot.ol_arena.push(OLNode::new(priors[i], (placement, pick)));
+                                    slot.ol_arena
+                                        .push(OLNode::new(priors[i], (placement, pick)));
                                     slot.ol_arena[ev.leaf as usize].children.push((idx, cid));
                                 }
                                 slot.ol_arena[ev.leaf as usize].is_expanded = true;
@@ -2887,14 +4381,24 @@ impl BatchedMCTS {
                                 // (running-average priors or deferred expansion) is a
                                 // known open-loop approximation, deferred.
                                 ol_add_missing_children(
-                                    &mut slot.ol_arena, ev.leaf, &ev.legal, &priors);
+                                    &mut slot.ol_arena,
+                                    ev.leaf,
+                                    &ev.legal,
+                                    &priors,
+                                );
                             }
                             // Always record THIS eval's value for its own path.
                             path_v0[tick.eval_path_indices[ei]] = Some(value0);
                         }
                         // Remove VL using each path's recorded per-node actors.
                         for (pi, path) in tick.paths.iter().enumerate() {
-                            ol_apply_virtual_loss(&mut slot.ol_arena, path, &tick.ol_actors[pi], -1, vl);
+                            ol_apply_virtual_loss(
+                                &mut slot.ol_arena,
+                                path,
+                                &tick.ol_actors[pi],
+                                -1,
+                                vl,
+                            );
                         }
                         // Backup: terminal value from each path's own concrete leaf
                         // state (deck-dependent), else this path's own eval value.
@@ -2916,7 +4420,11 @@ impl BatchedMCTS {
                         let mut leaf_v0: HashMap<u32, f64> = HashMap::new();
                         for ev in &tick.evals {
                             let priors = softmax_f64(&gvecs[ev.row]);
-                            let value0 = if ev.actor == 0 { vals[ev.row] } else { -vals[ev.row] };
+                            let value0 = if ev.actor == 0 {
+                                vals[ev.row]
+                            } else {
+                                -vals[ev.row]
+                            };
                             if !slot.arena[ev.leaf as usize].is_expanded {
                                 for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
                                     let cid = slot.arena.len() as u32;
@@ -2937,7 +4445,10 @@ impl BatchedMCTS {
                             {
                                 terminal_search_value(
                                     slot.arena[leaf as usize].state.as_ref().unwrap(),
-                                    score_scale, margin_gain, val_alpha)
+                                    score_scale,
+                                    margin_gain,
+                                    val_alpha,
+                                )
                             } else {
                                 leaf_v0[&leaf]
                             };
@@ -2948,7 +4459,7 @@ impl BatchedMCTS {
                         slot.sims_done += tick.paths.len();
                     }
                     let finished_game = if slot.sims_done >= n_sims {
-                        slot.finalize_move(temp_moves, open_loop)?
+                        slot.finalize_move(temp_moves, open_loop, exact_enabled)?
                     } else {
                         None
                     };
@@ -2958,7 +4469,11 @@ impl BatchedMCTS {
 
         let mut finished_by_slot = finished_by_slot?;
         finished_by_slot.sort_unstable_by_key(|(si, _)| *si);
-        let mut finished_rust: Vec<(u64, Vec<MoveRecord>, (i32, i32))> = Vec::new();
+        // Games finished by the exact endgame solver during step() (their slots
+        // were already recycled there) are returned alongside the MCTS-finished
+        // games of this tick.
+        let mut finished_rust: Vec<(u64, Vec<MoveRecord>, (i32, i32))> =
+            std::mem::take(&mut self.pending_exact);
         for (si, finished_game) in finished_by_slot {
             if let Some(fg) = finished_game {
                 finished_rust.push(fg);
@@ -3015,27 +4530,27 @@ fn arena_backup(arena: &mut [Node], node_id: u32, v0: f64) {
 }
 
 // ─── D4 augmentation ─────────────────────────────────────────────────────
-const NUM_D4:        usize = 8;
-const N_BOARD_CH_AUG: usize = 9;   // same as N_BOARD_CH — alias for clarity
-const POLICY_SIZE:   usize = 3390; // NUM_JOINT_ACTIONS
+const NUM_D4: usize = 8;
+const N_BOARD_CH_AUG: usize = 9; // same as N_BOARD_CH — alias for clarity
+const POLICY_SIZE: usize = 3390; // NUM_JOINT_ACTIONS
 const PLACEMENT_AXIS: usize = 678; // PLACEMENT_AXIS_SIZE
-const PICK_AXIS:     usize = 5;    // PICK_AXIS_SIZE
-const NUM_SPATIAL:   usize = 676;  // NUM_SPATIAL_PLACEMENTS = 4 * 169
-const NUM_DIRS:      usize = 4;
-const CANVAS:        usize = 13;   // CANVAS_SIZE
+const PICK_AXIS: usize = 5; // PICK_AXIS_SIZE
+const NUM_SPATIAL: usize = 676; // NUM_SPATIAL_PLACEMENTS = 4 * 169
+const NUM_DIRS: usize = 4;
+const CANVAS: usize = 13; // CANVAS_SIZE
 
 // Each D4 element: (ccw_rotations, h_flip, direction_permutation).
 // Direction permutation: new_dir_channel[d] = old[perm[d]].
 // Mirrors augmentation.py _D4_ELEMENTS exactly.
 const D4_ELEMENTS: [(u8, bool, [usize; 4]); 8] = [
-    (0, false, [0, 1, 2, 3]),  // 0: IDENTITY
-    (1, false, [1, 2, 3, 0]),  // 1: ROT90 CCW
-    (2, false, [2, 3, 0, 1]),  // 2: ROT180
-    (3, false, [3, 0, 1, 2]),  // 3: ROT270 CCW
-    (0, true,  [2, 1, 0, 3]),  // 4: FLIP_H
-    (1, true,  [3, 2, 1, 0]),  // 5: ROT90 + FLIP_H
-    (2, true,  [0, 3, 2, 1]),  // 6: ROT180 + FLIP_H (= FLIP_V)
-    (3, true,  [1, 0, 3, 2]),  // 7: ROT270 + FLIP_H
+    (0, false, [0, 1, 2, 3]), // 0: IDENTITY
+    (1, false, [1, 2, 3, 0]), // 1: ROT90 CCW
+    (2, false, [2, 3, 0, 1]), // 2: ROT180
+    (3, false, [3, 0, 1, 2]), // 3: ROT270 CCW
+    (0, true, [2, 1, 0, 3]),  // 4: FLIP_H
+    (1, true, [3, 2, 1, 0]),  // 5: ROT90 + FLIP_H
+    (2, true, [0, 3, 2, 1]),  // 6: ROT180 + FLIP_H (= FLIP_V)
+    (3, true, [1, 0, 3, 2]),  // 7: ROT270 + FLIP_H
 ];
 
 const INVERSE_D4: [usize; 8] = [0, 3, 2, 1, 4, 5, 6, 7];
@@ -3102,7 +4617,9 @@ fn transform_policy(src: &[f32], k: u8, flip: bool, dir_perm: &[usize; 4]) -> Ve
                     ry = n - 1 - rx;
                     rx = tmp;
                 }
-                if flip { rx = n - 1 - rx; }
+                if flip {
+                    rx = n - 1 - rx;
+                }
 
                 // Permute direction: new direction d gets old direction perm[d].
                 // We are writing src_dir's data into dst_dir = perm^{-1}[src_dir].
@@ -3111,11 +4628,10 @@ fn transform_policy(src: &[f32], k: u8, flip: bool, dir_perm: &[usize; 4]) -> Ve
                 let dst_dir = dir_perm.iter().position(|&p| p == src_dir).unwrap();
 
                 let dst_placement = dst_dir * n * n + ry * n + rx;
-                let src_placement = src_dir * n * n + y  * n + x;
+                let src_placement = src_dir * n * n + y * n + x;
 
                 for pk in 0..PICK_AXIS {
-                    out[dst_placement * PICK_AXIS + pk] =
-                        src[src_placement * PICK_AXIS + pk];
+                    out[dst_placement * PICK_AXIS + pk] = src[src_placement * PICK_AXIS + pk];
                 }
             }
         }
@@ -3153,26 +4669,28 @@ fn d4_augment<'py>(
     Bound<'py, PyArray1<f32>>,
 )> {
     if transform_id >= NUM_D4 {
-        return Err(PyValueError::new_err(
-            format!("transform_id must be in [0, {NUM_D4}); got {transform_id}")
-        ));
+        return Err(PyValueError::new_err(format!(
+            "transform_id must be in [0, {NUM_D4}); got {transform_id}"
+        )));
     }
     let (k, flip, dir_perm) = D4_ELEMENTS[transform_id];
-    let mb_sl  = my_board.as_slice()?;
-    let ob_sl  = opp_board.as_slice()?;
-    let fl_sl  = flat.as_slice()?;
+    let mb_sl = my_board.as_slice()?;
+    let ob_sl = opp_board.as_slice()?;
+    let fl_sl = flat.as_slice()?;
     let pol_sl = policy.as_slice()?;
 
-    let mb_t  = transform_spatial(mb_sl,  N_BOARD_CH_AUG, k, flip);
-    let ob_t  = transform_spatial(ob_sl,  N_BOARD_CH_AUG, k, flip);
+    let mb_t = transform_spatial(mb_sl, N_BOARD_CH_AUG, k, flip);
+    let ob_t = transform_spatial(ob_sl, N_BOARD_CH_AUG, k, flip);
     let fl_cp = fl_sl.to_vec();
     let pol_t = transform_policy(pol_sl, k, flip, &dir_perm);
 
     Ok((
         Array3::from_shape_vec((N_BOARD_CH_AUG, CANVAS, CANVAS), mb_t)
-            .expect("board shape").into_pyarray(py),
+            .expect("board shape")
+            .into_pyarray(py),
         Array3::from_shape_vec((N_BOARD_CH_AUG, CANVAS, CANVAS), ob_t)
-            .expect("board shape").into_pyarray(py),
+            .expect("board shape")
+            .into_pyarray(py),
         Array1::from_vec(fl_cp).into_pyarray(py),
         Array1::from_vec(pol_t).into_pyarray(py),
     ))
@@ -3183,9 +4701,9 @@ fn d4_augment<'py>(
 #[pyfunction]
 fn d4_inverse_transform_id(t: usize) -> PyResult<usize> {
     if t >= NUM_D4 {
-        return Err(PyValueError::new_err(
-            format!("transform_id must be in [0, {NUM_D4}); got {t}")
-        ));
+        return Err(PyValueError::new_err(format!(
+            "transform_id must be in [0, {NUM_D4}); got {t}"
+        )));
     }
     Ok(INVERSE_D4[t])
 }
@@ -3213,13 +4731,14 @@ fn transform_mask(src: &[bool], k: u8, flip: bool, dir_perm: &[usize; 4]) -> Vec
                     ry = n - 1 - rx;
                     rx = tmp;
                 }
-                if flip { rx = n - 1 - rx; }
+                if flip {
+                    rx = n - 1 - rx;
+                }
                 let dst_dir = dir_perm.iter().position(|&p| p == src_dir).unwrap();
                 let dst_placement = dst_dir * n * n + ry * n + rx;
                 let src_placement = src_dir * n * n + y * n + x;
                 for pk in 0..PICK_AXIS {
-                    out[dst_placement * PICK_AXIS + pk] =
-                        src[src_placement * PICK_AXIS + pk];
+                    out[dst_placement * PICK_AXIS + pk] = src[src_placement * PICK_AXIS + pk];
                 }
             }
         }
@@ -3238,9 +4757,9 @@ fn d4_augment_mask<'py>(
     transform_id: usize,
 ) -> PyResult<Bound<'py, PyArray1<bool>>> {
     if transform_id >= NUM_D4 {
-        return Err(PyValueError::new_err(
-            format!("transform_id must be in [0, {NUM_D4}); got {transform_id}")
-        ));
+        return Err(PyValueError::new_err(format!(
+            "transform_id must be in [0, {NUM_D4}); got {transform_id}"
+        )));
     }
     let (k, flip, dir_perm) = D4_ELEMENTS[transform_id];
     let m = mask.as_slice()?;
@@ -3256,14 +4775,16 @@ mod augment_tests {
     fn sim_seeds_match_sequential_gen() {
         // Pre-generating the per-simulation seeds in a batch must yield the exact
         // same sequence as calling rng.gen() once per simulation inside the loop.
-        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(42);
         let n = 6usize;
         let seeds_batch: Vec<u64> = (0..n).map(|_| rng_a.r#gen::<u64>()).collect();
-        let seeds_seq:   Vec<u64> = (0..n).map(|_| rng_b.r#gen::<u64>()).collect();
-        assert_eq!(seeds_batch, seeds_seq,
-            "pre-generated seeds must match sequential gen()");
+        let seeds_seq: Vec<u64> = (0..n).map(|_| rng_b.r#gen::<u64>()).collect();
+        assert_eq!(
+            seeds_batch, seeds_seq,
+            "pre-generated seeds must match sequential gen()"
+        );
     }
 
     #[test]
@@ -3271,13 +4792,15 @@ mod augment_tests {
         // transform_mask must agree with transform_policy on a bool mask cast to
         // f32 (the mask must transform by the same element as the policy).
         let mut mask = vec![false; POLICY_SIZE];
-        for i in (0..POLICY_SIZE).step_by(7) { mask[i] = true; }
-        let polf: Vec<f32> = mask.iter().map(|&b| if b {1.0} else {0.0}).collect();
+        for i in (0..POLICY_SIZE).step_by(7) {
+            mask[i] = true;
+        }
+        let polf: Vec<f32> = mask.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
         for t in 0..8 {
             let (k, flip, dp) = D4_ELEMENTS[t];
             let mt = transform_mask(&mask, k, flip, &dp);
             let pt = transform_policy(&polf, k, flip, &dp);
-            let mt_f: Vec<f32> = mt.iter().map(|&b| if b {1.0} else {0.0}).collect();
+            let mt_f: Vec<f32> = mt.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
             assert_eq!(mt_f, pt, "mask vs policy transform mismatch at t={t}");
         }
     }
@@ -3285,7 +4808,7 @@ mod augment_tests {
     #[test]
     fn identity_is_noop() {
         // transform_id=0 (identity): output == input for both board and policy.
-        let board: Vec<f32> = (0..9*13*13).map(|i| i as f32).collect();
+        let board: Vec<f32> = (0..9 * 13 * 13).map(|i| i as f32).collect();
         let out = transform_spatial(&board, 9, 0, false);
         assert_eq!(board, out);
 
@@ -3303,7 +4826,8 @@ mod augment_tests {
         for &(k, flip, _) in &D4_ELEMENTS {
             let out = transform_spatial(&board, 9, k, flip);
             assert_eq!(
-                out[castle_ch * 13 * 13 + 6 * 13 + 6], 1.0,
+                out[castle_ch * 13 * 13 + 6 * 13 + 6],
+                1.0,
                 "castle moved under k={k} flip={flip}"
             );
         }
@@ -3312,7 +4836,7 @@ mod augment_tests {
     #[test]
     fn four_rotations_return_to_identity() {
         // Applying ROT90 four times gives back the original.
-        let board: Vec<f32> = (0..9*13*13).map(|i| i as f32).collect();
+        let board: Vec<f32> = (0..9 * 13 * 13).map(|i| i as f32).collect();
         let mut cur = board.clone();
         for _ in 0..4 {
             cur = transform_spatial(&cur, 9, 1, false);
@@ -3329,7 +4853,7 @@ mod augment_tests {
             let (k, flip, dir_perm) = D4_ELEMENTS[t];
             let inv_t = INVERSE_D4[t];
             let (ki, fi, dpi) = D4_ELEMENTS[inv_t];
-            let mid  = transform_policy(&policy, k, flip, &dir_perm);
+            let mid = transform_policy(&policy, k, flip, &dir_perm);
             let back = transform_policy(&mid, ki, fi, &dpi);
             assert_eq!(policy, back, "inverse failed for t={t}");
         }
@@ -3353,15 +4877,18 @@ mod ol_tests {
         for ei in 0..2 {
             path_v0[eval_path_indices[ei]] = Some(eval_values[ei]);
         }
-        assert_eq!(path_v0, vec![Some(0.3), Some(0.7)],
-            "colliding-leaf sims must keep distinct per-path values");
+        assert_eq!(
+            path_v0,
+            vec![Some(0.3), Some(0.7)],
+            "colliding-leaf sims must keep distinct per-path values"
+        );
         assert_eq!(tick_eval_leaf[0], tick_eval_leaf[1]); // they really do collide
 
         // Backup both paths (each = root→child) and confirm the shared child's
         // value_sum is v1+v2 (not 2*v1, which the de-dup bug produced).
         let mut arena = vec![
-            OLNode::new(1.0, (None, None)),               // 0: root
-            OLNode::new(0.5, (None, Some(0))),            // 1: shared child
+            OLNode::new(1.0, (None, None)),    // 0: root
+            OLNode::new(0.5, (None, Some(0))), // 1: shared child
         ];
         arena[0].children.push((0, 1));
         arena[0].is_expanded = true;
@@ -3373,8 +4900,11 @@ mod ol_tests {
                 arena[n as usize].value_sum += v0;
             }
         }
-        assert!((arena[1].value_sum - 1.0).abs() < 1e-12,
-            "shared child value_sum should be 0.3+0.7=1.0, got {}", arena[1].value_sum);
+        assert!(
+            (arena[1].value_sum - 1.0).abs() < 1e-12,
+            "shared child value_sum should be 0.3+0.7=1.0, got {}",
+            arena[1].value_sum
+        );
         assert_eq!(arena[1].visit_count, 2);
     }
 
@@ -3384,7 +4914,7 @@ mod ol_tests {
         // determinization whose legal set is {1,2,3,5}.  ol_add_missing_children
         // must add 2 and 5 (with this det's priors) and keep children ascending.
         let mut arena = vec![
-            OLNode::new(1.0, (None, None)),  // 0: node under test
+            OLNode::new(1.0, (None, None)), // 0: node under test
             OLNode::new(0.5, (None, Some(0))),
             OLNode::new(0.5, (None, Some(1))),
         ];
@@ -3392,17 +4922,31 @@ mod ol_tests {
         arena[0].children.push((3, 2));
         arena[0].is_expanded = true;
         let legal: Vec<(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)> = vec![
-            (1, None, Some(0)), (2, None, Some(1)),
-            (3, None, Some(2)), (5, None, Some(3)),
+            (1, None, Some(0)),
+            (2, None, Some(1)),
+            (3, None, Some(2)),
+            (5, None, Some(3)),
         ];
         let priors = vec![0.25f64, 0.25, 0.25, 0.25];
         let added = ol_add_missing_children(&mut arena, 0, &legal, &priors);
-        assert_eq!(added, 2, "should add exactly the two missing children (2 and 5)");
+        assert_eq!(
+            added, 2,
+            "should add exactly the two missing children (2 and 5)"
+        );
         let idxs: Vec<u16> = arena[0].children.iter().map(|&(i, _)| i).collect();
-        assert_eq!(idxs, vec![1, 2, 3, 5], "children must be the union, ascending");
+        assert_eq!(
+            idxs,
+            vec![1, 2, 3, 5],
+            "children must be the union, ascending"
+        );
         // Sorted ascending → binary search (ol_select_child) finds every index.
         for q in [1u16, 2, 3, 5] {
-            assert!(arena[0].children.binary_search_by_key(&q, |&(i, _)| i).is_ok());
+            assert!(
+                arena[0]
+                    .children
+                    .binary_search_by_key(&q, |&(i, _)| i)
+                    .is_ok()
+            );
         }
         // Idempotent: re-adding the same legal set adds nothing.
         let again = ol_add_missing_children(&mut arena, 0, &legal, &priors);
@@ -3458,7 +5002,10 @@ mod pick_pos_tests {
         let s = mk_state(PLACE_AND_SELECT, vec![(1, 45), (0, 5), (1, 20), (0, 40)]);
         let p0 = pick_positions(&s, 0);
         assert_eq!(p0, [1.0, -1.0, 1.0, -1.0]);
-        assert!((p0.iter().sum::<f32>()).abs() < 1e-6, "fully committed sums to 0");
+        assert!(
+            (p0.iter().sum::<f32>()).abs() < 1e-6,
+            "fully committed sums to 0"
+        );
         // Perspective flip: P1 is the exact negation.
         let p1 = pick_positions(&s, 1);
         for k in 0..4 {
@@ -3511,5 +5058,77 @@ mod kingdomino_rust {
     #[pyo3(signature = (seed, harmony=true, middle_kingdom=true))]
     fn batched_new_game(seed: u64, harmony: bool, middle_kingdom: bool) -> RustGameState {
         super::new_game(seed, harmony, middle_kingdom)
+    }
+
+    /// Exact minimax endgame solve for states with no chance branching:
+    /// PLACE_AND_SELECT with deck length 0 or 4, or FINAL_PLACEMENT with deck
+    /// length 0. When deck length is 4, the next row is forced to be exactly
+    /// those four tiles, so no public bag expectation is needed. Returns
+    /// (value_player0, solved_exactly, counted_nodes). Falls back with solved=false
+    /// if the state still has chance branching or the estimated node count
+    /// exceeds max_nodes.
+    #[pyfunction]
+    #[pyo3(signature = (state, max_nodes=50_000, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    fn exact_endgame_value_no_chance(
+        state: &RustGameState,
+        max_nodes: u64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(f64, bool, u64)> {
+        if state.phase == GAME_OVER {
+            return Ok((
+                super::terminal_search_value(state, score_scale, margin_gain, alpha),
+                true,
+                0,
+            ));
+        }
+        if !super::is_no_chance_endgame_state(state) {
+            return Ok((0.0, false, max_nodes.saturating_add(1)));
+        }
+        // YBW parallel alpha-beta (OPT-2/3/4/6): first child serial to set a
+        // bound, remaining children in parallel. `nodes` is the per-thread sum
+        // (approximate). solved=false only if some child subtree exceeds
+        // max_nodes. See solve_endgame_ab_parallel for budget semantics.
+        match super::solve_endgame_ab_parallel(state, max_nodes, score_scale, margin_gain, alpha)? {
+            Some((value, nodes)) => Ok((value, true, nodes)),
+            None => Ok((0.0, false, max_nodes)),
+        }
+    }
+
+    /// Count exact minimax nodes for a no-chance endgame, with the same
+    /// conservative max_nodes cap as exact_endgame_value_no_chance.
+    #[pyfunction]
+    #[pyo3(signature = (state, max_nodes=50_000))]
+    fn count_endgame_nodes_no_chance(state: &RustGameState, max_nodes: u64) -> PyResult<u64> {
+        if state.phase == GAME_OVER {
+            return Ok(0);
+        }
+        if !super::is_no_chance_endgame_state(state) {
+            return Ok(max_nodes.saturating_add(1));
+        }
+        super::exact_count_no_chance_bounded(state, max_nodes)
+    }
+
+    /// Compatibility alias for the original deck-empty export. It now also
+    /// accepts deck length 4, because that is likewise no-chance: all four
+    /// hidden tiles form the next row.
+    #[pyfunction]
+    #[pyo3(signature = (state, max_nodes=50_000, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    fn exact_endgame_value_deck_empty(
+        state: &RustGameState,
+        max_nodes: u64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(f64, bool, u64)> {
+        exact_endgame_value_no_chance(state, max_nodes, score_scale, margin_gain, alpha)
+    }
+
+    /// Compatibility alias for the original deck-empty count export.
+    #[pyfunction]
+    #[pyo3(signature = (state, max_nodes=50_000))]
+    fn count_endgame_nodes_deck_empty(state: &RustGameState, max_nodes: u64) -> PyResult<u64> {
+        count_endgame_nodes_no_chance(state, max_nodes)
     }
 }
