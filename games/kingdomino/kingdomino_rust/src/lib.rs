@@ -1398,33 +1398,32 @@ impl RustGameState {
     }
 
     /// Benchmark-only: run the alpha-beta solver to completion (or until
-    /// `hard_cap` nodes) and return (value, fully_solved, nodes_visited,
-    /// elapsed_ms).
+    /// `max_secs` wall-clock elapses) and return (value, fully_solved,
+    /// elapsed_secs).
     ///
     /// Unlike `exact_endgame_value_no_chance`, this is intended for measuring the
-    /// real tree-size distribution. `hard_cap` should be set high (e.g.
-    /// 100_000_000) as a safety ceiling, not a routine budget. `fully_solved` is
-    /// False only if `hard_cap` was hit.
+    /// real solve-time distribution. `max_secs` should be set high (e.g. 60.0) as
+    /// a safety ceiling, not a routine budget. `fully_solved` is False only if the
+    /// deadline was hit.
     ///
-    /// Uses the SAME solver (alpha-beta + move ordering) as production, so node
-    /// counts reflect production pruning behavior. `alpha` defaults to 0.8 (the
-    /// training frame): alpha-beta cutoffs depend on leaf values, so pruning — and
-    /// therefore the node count — can vary with alpha. Measure at the alpha
-    /// training actually uses.
+    /// Uses the SAME solver (alpha-beta + move ordering) as production, so timings
+    /// reflect production pruning behavior. `alpha` defaults to 0.8 (the training
+    /// frame): alpha-beta cutoffs depend on leaf values, so pruning — and
+    /// therefore solve time — can vary with alpha. Measure at the alpha training
+    /// actually uses.
     ///
-    /// `parallel=True` (default) uses the YBW parallel solver (`solve_endgame_ab_parallel`)
-    /// to measure wall-clock; its `nodes` is the per-thread sum (≥ serial, weaker
-    /// sibling pruning). `parallel=False` uses the serial solver, whose `nodes` is
-    /// the true single-traversal tree size — use that to compare node counts.
-    #[pyo3(signature = (hard_cap=100_000_000, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true))]
+    /// `parallel=True` (default) uses the YBW parallel solver
+    /// (`solve_endgame_ab_parallel`) to measure wall-clock; `parallel=False` uses
+    /// the serial solver — use that to compare single-core solve times.
+    #[pyo3(signature = (max_secs=60.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true))]
     fn measure_endgame_tree(
         &self,
-        hard_cap: u64,
+        max_secs: f64,
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
         parallel: bool,
-    ) -> PyResult<(f64, bool, u64, f64)> {
+    ) -> PyResult<(f64, bool, f64)> {
         if self.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot measure a terminal state"));
         }
@@ -1440,30 +1439,28 @@ impl RustGameState {
             ));
         }
         let start = std::time::Instant::now();
-        let (value, solved, nodes) = if parallel {
-            match solve_endgame_ab_parallel(self, hard_cap, score_scale, margin_gain, alpha)? {
-                Some((v, n)) => (v, true, n),
-                None => (0.0, false, hard_cap),
+        let deadline = start + std::time::Duration::from_secs_f64(max_secs);
+        let (value, solved) = if parallel {
+            match solve_endgame_ab_parallel(self, deadline, score_scale, margin_gain, alpha)? {
+                Some(v) => (v, true),
+                None => (0.0, false),
             }
         } else {
-            let mut nodes = 0u64;
-            let result = solve_endgame_ab(
+            match solve_endgame_ab(
                 self,
-                &mut nodes,
-                hard_cap,
+                deadline,
                 f64::NEG_INFINITY,
                 f64::INFINITY,
                 score_scale,
                 margin_gain,
                 alpha,
-            )?;
-            match result {
-                Some(v) => (v, true, nodes),
-                None => (0.0, false, nodes),
+            )? {
+                Some(v) => (v, true),
+                None => (0.0, false),
             }
         };
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        Ok((value, solved, nodes, elapsed_ms))
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        Ok((value, solved, elapsed_secs))
     }
 }
 
@@ -1793,18 +1790,16 @@ fn order_legal_for_solver(
 #[allow(clippy::too_many_arguments)]
 fn solve_endgame_ab(
     state: &RustGameState,
-    nodes: &mut u64,
-    max_nodes: u64,
+    deadline: std::time::Instant,
     mut alpha: f64,
     mut beta: f64,
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
 ) -> PyResult<Option<f64>> {
-    if *nodes >= max_nodes {
-        return Ok(None);
-    }
-    *nodes += 1;
+    // GAME_OVER returns a value with zero further work, so resolve it before the
+    // deadline check — a timed-out search should still return exact terminal leaves
+    // it has already reached rather than abort on them.
     if state.phase == GAME_OVER {
         return Ok(Some(terminal_search_value(
             state,
@@ -1812,6 +1807,13 @@ fn solve_endgame_ab(
             margin_gain,
             alpha_param,
         )));
+    }
+    // Wall-clock budget (replaces the old node-count budget). Per-node
+    // Instant::now() is ~5ns — negligible against the ~1μs+ of step()+ordering
+    // work each interior node does. Ok(None) == deadline exceeded (caller falls
+    // back), matching the previous budget-exceeded sentinel.
+    if std::time::Instant::now() >= deadline {
+        return Ok(None);
     }
 
     let actor = state.actor()?;
@@ -1830,8 +1832,7 @@ fn solve_endgame_ab(
             let child = state.step(p, pk)?;
             match solve_endgame_ab(
                 &child,
-                nodes,
-                max_nodes,
+                deadline,
                 alpha,
                 beta,
                 score_scale,
@@ -1859,8 +1860,7 @@ fn solve_endgame_ab(
             let child = state.step(p, pk)?;
             match solve_endgame_ab(
                 &child,
-                nodes,
-                max_nodes,
+                deadline,
                 alpha,
                 beta,
                 score_scale,
@@ -1889,33 +1889,33 @@ fn solve_endgame_ab(
 ///
 /// Solves the first (best-ordered) root child serially to establish an alpha/beta
 /// bound, then solves the remaining root children in parallel via Rayon, each
-/// seeded with that bound. Returns `Ok(Some((value, total_nodes)))` when every
-/// subtree completed within budget, `Ok(None)` when some subtree hit `max_nodes`,
-/// or `Err` on an internal error.
+/// seeded with that bound. Returns `Ok(Some(value))` when every subtree completed
+/// before the deadline, `Ok(None)` when some subtree hit it, or `Err` on an
+/// internal error.
 ///
 /// **Call ONLY at the root.** The recursive calls use the serial `solve_endgame_ab`,
 /// so there is exactly one fan-out — no nested Rayon / thread explosion.
 ///
-/// Budget semantics differ from the serial solver on purpose: each remaining
-/// child gets the FULL `max_nodes` as its own cap (not `max_nodes / n`). A divided
-/// budget would make large-subtree tail positions falsely fail — exactly the
-/// positions always-solve exists for. So total work is up to ~`n_children ×
-/// max_nodes`, and `total_nodes` is the per-thread sum (approximate, may exceed
-/// `max_nodes`); a solve fails only if a single child subtree genuinely exceeds
-/// `max_nodes`. YBW also seeds siblings with only the first child's bound (not the
-/// progressively tightened serial bound), so parallel subtrees visit ≥ as many
-/// nodes as serial: wall-clock drops via parallelism, node counts do not.
+/// Budget semantics: every child (the serial first child and all parallel
+/// siblings) shares the SAME wall-clock `deadline`, so total solve time for the
+/// position is bounded by the deadline regardless of fan-out. YBW seeds siblings
+/// with only the first child's bound (not the progressively tightened serial
+/// bound), so parallel subtrees visit ≥ as many nodes as serial: wall-clock drops
+/// via parallelism, node counts do not. Returns `Ok(Some(value))` when every
+/// subtree completed before the deadline, `Ok(None)` when any subtree hit it.
 fn solve_endgame_ab_parallel(
     state: &RustGameState,
-    max_nodes: u64,
+    deadline: std::time::Instant,
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
-) -> PyResult<Option<(f64, u64)>> {
+) -> PyResult<Option<f64>> {
     if state.phase == GAME_OVER {
-        return Ok(Some((
-            terminal_search_value(state, score_scale, margin_gain, alpha_param),
-            0,
+        return Ok(Some(terminal_search_value(
+            state,
+            score_scale,
+            margin_gain,
+            alpha_param,
         )));
     }
     let actor = state.actor()?;
@@ -1931,11 +1931,9 @@ fn solve_endgame_ab_parallel(
     // Step 1: solve the first (best-ordered) child serially to establish a bound.
     let (_i0, p0, pk0) = legal[0];
     let first_next = state.step(p0, pk0)?;
-    let mut nodes_first = 0u64;
     let first_val = match solve_endgame_ab(
         &first_next,
-        &mut nodes_first,
-        max_nodes,
+        deadline,
         f64::NEG_INFINITY,
         f64::INFINITY,
         score_scale,
@@ -1956,42 +1954,37 @@ fn solve_endgame_ab_parallel(
     }
     // First child alone caused a cutoff, or it was the only child.
     if alpha >= beta {
-        return Ok(Some((best_val, nodes_first)));
+        return Ok(Some(best_val));
     }
     let remaining = &legal[1..];
     if remaining.is_empty() {
-        return Ok(Some((best_val, nodes_first)));
+        return Ok(Some(best_val));
     }
     let (captured_alpha, captured_beta) = (alpha, beta);
 
-    // Step 2: solve the remaining children in parallel, each with its own node
-    // counter, the full budget, and the first child's bound.
-    let results: Vec<PyResult<Option<(f64, u64)>>> = remaining
+    // Step 2: solve the remaining children in parallel, all sharing the deadline
+    // and the first child's bound.
+    let results: Vec<PyResult<Option<f64>>> = remaining
         .par_iter()
-        .map(|&(_idx, p, pk)| -> PyResult<Option<(f64, u64)>> {
+        .map(|&(_idx, p, pk)| -> PyResult<Option<f64>> {
             let next = state.step(p, pk)?;
-            let mut n = 0u64;
-            let v = solve_endgame_ab(
+            solve_endgame_ab(
                 &next,
-                &mut n,
-                max_nodes,
+                deadline,
                 captured_alpha,
                 captured_beta,
                 score_scale,
                 margin_gain,
                 alpha_param,
-            )?;
-            Ok(v.map(|val| (val, n)))
+            )
         })
         .collect();
 
-    // Step 3: combine. Any subtree that hit budget fails the whole solve.
-    let mut total_nodes = nodes_first;
+    // Step 3: combine. Any subtree that hit the deadline fails the whole solve.
     for r in results {
         match r? {
             None => return Ok(None),
-            Some((val, n)) => {
-                total_nodes += n;
+            Some(val) => {
                 if actor == 0 {
                     if val > best_val {
                         best_val = val;
@@ -2002,7 +1995,7 @@ fn solve_endgame_ab_parallel(
             }
         }
     }
-    Ok(Some((best_val, total_nodes)))
+    Ok(Some(best_val))
 }
 
 /// Stable softmax over legal logits, matching encoder/mcts `_postprocess`
@@ -2951,6 +2944,11 @@ struct SearchSlot {
     missing_child_count: u32, // open-loop: descents stopped to add newly-legal children (diagnostic)
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
     exact_plan: Vec<ExactPlanItem>, // chosen-line plan for the deterministic endgame
+    // Set once the exact solver times out on this game's endgame: the position is
+    // too hard to solve within budget, so fall through to MCTS for ALL remaining
+    // moves of this game instead of re-attempting the (still-failing) solve every
+    // move. Reset to false when the slot starts a new game (new_for_game).
+    exact_unsolvable: bool,
 }
 
 impl SearchSlot {
@@ -2989,6 +2987,7 @@ impl SearchSlot {
             missing_child_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
+            exact_unsolvable: false,
         }
     }
 
@@ -3009,6 +3008,7 @@ impl SearchSlot {
             missing_child_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
+            exact_unsolvable: false,
         }
     }
 
@@ -3155,7 +3155,10 @@ impl SearchSlot {
             // stays there until GAME_OVER — resolve_exact_slots cascades the whole
             // endgame with zero forwards. When disabled (budget 0), endgames go
             // through normal MCTS.
-            self.state = if exact_enabled && is_no_chance_endgame_state(&self.real_state) {
+            self.state = if exact_enabled
+                && !self.exact_unsolvable
+                && is_no_chance_endgame_state(&self.real_state)
+            {
                 SlotState::ExactSolving
             } else {
                 SlotState::NeedsRootEval
@@ -3267,8 +3270,7 @@ fn best_exact_joint(result: &ExactSolveResult, actor: u8) -> Option<u16> {
 #[allow(clippy::too_many_arguments)]
 fn solve_endgame_ab_value_cached(
     state: &RustGameState,
-    nodes: &mut u64,
-    max_nodes: u64,
+    deadline: std::time::Instant,
     alpha: f64,
     beta: f64,
     score_scale: f64,
@@ -3290,8 +3292,7 @@ fn solve_endgame_ab_value_cached(
 
     let v = solve_endgame_ab(
         state,
-        nodes,
-        max_nodes,
+        deadline,
         alpha,
         beta,
         score_scale,
@@ -3307,12 +3308,11 @@ fn solve_endgame_ab_value_cached(
 /// Solve a terminal-adjacent root exactly, returning per-child minimax values for
 /// ALL legal root actions (player-0 frame). Each child is solved with a full
 /// (-∞, +∞) window so its value is exact (needed for the policy target), sharing
-/// one `max_nodes` budget across children. Returns `Ok(None)` if the budget is
-/// exhausted (caller falls back to MCTS) — empirically does not happen at 15M.
+/// one wall-clock `deadline` across children. Returns `Ok(None)` if the deadline
+/// is exceeded (caller falls back to MCTS).
 fn solve_root_exact_cached(
     state: &RustGameState,
-    nodes: &mut u64,
-    max_nodes: u64,
+    deadline: std::time::Instant,
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
@@ -3332,14 +3332,13 @@ fn solve_root_exact_cached(
 
     let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
     for &(joint_idx, placement, pick) in &legal {
-        if *nodes >= max_nodes {
+        if std::time::Instant::now() >= deadline {
             return Ok(None);
         }
         let next = state.step(placement, pick)?;
         match solve_endgame_ab_value_cached(
             &next,
-            nodes,
-            max_nodes,
+            deadline,
             f64::NEG_INFINITY,
             f64::INFINITY,
             score_scale,
@@ -3358,25 +3357,27 @@ fn solve_root_exact_cached(
 
 fn solve_exact_plan(
     state: &RustGameState,
-    max_nodes: u64,
+    max_secs: f64,
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
 ) -> PyResult<Option<Vec<ExactPlanItem>>> {
     let mut cur = state.cloned();
-    let mut nodes = 0u64;
+    // One shared deadline for the whole endgame cascade from this root. The plan
+    // is built once and reused (cache hits) for the deterministic continuation,
+    // so this bounds the once-per-game expensive solve, not each move.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(max_secs);
     let mut value_cache: HashMap<EndgameKey, f64> = HashMap::new();
     let mut result_cache: HashMap<EndgameKey, ExactSolveResult> = HashMap::new();
     let mut plan = Vec::new();
 
     while cur.phase != GAME_OVER {
-        if !is_no_chance_endgame_state(&cur) || nodes >= max_nodes {
+        if !is_no_chance_endgame_state(&cur) || std::time::Instant::now() >= deadline {
             return Ok(None);
         }
         let result = match solve_root_exact_cached(
             &cur,
-            &mut nodes,
-            max_nodes,
+            deadline,
             score_scale,
             margin_gain,
             alpha_param,
@@ -3555,8 +3556,9 @@ struct BatchedMCTS {
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
     cum_missing_child_count: u64,
-    // Exact endgame solver (deck ∈ {0,4} roots). 0 disables it (ablation).
-    exact_endgame_max_nodes: u64,
+    // Exact endgame solver (deck ∈ {0,4} roots). Per-position wall-clock budget
+    // in seconds; <= 0.0 disables it (ablation).
+    exact_endgame_max_secs: f64,
     cum_exact_solve_count: u64,      // root moves solved exactly
     cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
     cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
@@ -3574,7 +3576,7 @@ impl BatchedMCTS {
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
                         score_scale=100.0, margin_gain=2.0, alpha=0.8,
-                        exact_endgame_max_nodes=500_000))]
+                        exact_endgame_max_secs=3.0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -3593,7 +3595,7 @@ impl BatchedMCTS {
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
-        exact_endgame_max_nodes: u64,
+        exact_endgame_max_secs: f64,
     ) -> Self {
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
@@ -3650,7 +3652,7 @@ impl BatchedMCTS {
             open_loop,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
-            exact_endgame_max_nodes,
+            exact_endgame_max_secs,
             cum_exact_solve_count: 0,
             cum_exact_tree_solve_count: 0,
             cum_exact_cache_hit_count: 0,
@@ -3694,12 +3696,12 @@ impl BatchedMCTS {
     /// Called serially at the start of `step()`; `solve_endgame_ab` is itself
     /// single-threaded and BatchedMCTS already parallelises across slots.
     fn resolve_exact_slots(&mut self) -> PyResult<()> {
-        if self.exact_endgame_max_nodes == 0 {
+        if self.exact_endgame_max_secs <= 0.0 {
             return Ok(());
         }
         let (score_scale, margin_gain, val_alpha) =
             (self.score_scale, self.margin_gain, self.alpha);
-        let max_nodes = self.exact_endgame_max_nodes;
+        let max_secs = self.exact_endgame_max_secs;
         let (temp_moves, open_loop) = (self.temp_moves, self.open_loop);
 
         // Phase 1: solve + finalize each ExactSolving slot to completion, holding
@@ -3714,7 +3716,7 @@ impl BatchedMCTS {
                 let built_plan = if self.slots[si].exact_plan.is_empty() {
                     match solve_exact_plan(
                         &self.slots[si].real_state,
-                        max_nodes,
+                        max_secs,
                         score_scale,
                         margin_gain,
                         val_alpha,
@@ -3725,8 +3727,16 @@ impl BatchedMCTS {
                             true
                         }
                         _ => {
-                            // Budget exceeded (or degenerate): fall back to MCTS.
+                            // Deadline exceeded (or degenerate): this game's endgame
+                            // is too hard to solve exactly within the budget. Mark
+                            // the slot Unsolvable so finalize_move never re-enters
+                            // ExactSolving for the remaining moves of THIS game (the
+                            // next root is usually still deck∈{0,4} and would just
+                            // time out again — the retry storm). The flag is cleared
+                            // when the slot is recycled for a new game in
+                            // new_for_game, so each game gets a fresh attempt.
                             self.cum_exact_fallback_count += 1;
+                            self.slots[si].exact_unsolvable = true;
                             self.slots[si].exact_result = None;
                             self.slots[si].exact_plan.clear();
                             self.slots[si].state = SlotState::NeedsRootEval;
@@ -4266,7 +4276,7 @@ impl BatchedMCTS {
         // par_iter_mut closure captures them, not &self.
         let (score_scale, margin_gain, val_alpha) =
             (self.score_scale, self.margin_gain, self.alpha);
-        let exact_enabled = self.exact_endgame_max_nodes != 0;
+        let exact_enabled = self.exact_endgame_max_secs > 0.0;
         // Python passes f32 (values/logits are .float()) to halve D2H transfer;
         // cast to f64 here for the tree's internal accumulation (unchanged).
         let vals: Vec<f64> = values.as_slice()?.iter().map(|&v| v as f64).collect();
@@ -5064,35 +5074,37 @@ mod kingdomino_rust {
     /// PLACE_AND_SELECT with deck length 0 or 4, or FINAL_PLACEMENT with deck
     /// length 0. When deck length is 4, the next row is forced to be exactly
     /// those four tiles, so no public bag expectation is needed. Returns
-    /// (value_player0, solved_exactly, counted_nodes). Falls back with solved=false
-    /// if the state still has chance branching or the estimated node count
-    /// exceeds max_nodes.
+    /// (value_player0, solved_exactly, elapsed_secs). Falls back with solved=false
+    /// if the state still has chance branching or the per-position wall-clock
+    /// budget `max_secs` is exceeded.
     #[pyfunction]
-    #[pyo3(signature = (state, max_nodes=50_000, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
     fn exact_endgame_value_no_chance(
         state: &RustGameState,
-        max_nodes: u64,
+        max_secs: f64,
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
-    ) -> PyResult<(f64, bool, u64)> {
+    ) -> PyResult<(f64, bool, f64)> {
         if state.phase == GAME_OVER {
             return Ok((
                 super::terminal_search_value(state, score_scale, margin_gain, alpha),
                 true,
-                0,
+                0.0,
             ));
         }
         if !super::is_no_chance_endgame_state(state) {
-            return Ok((0.0, false, max_nodes.saturating_add(1)));
+            return Ok((0.0, false, 0.0));
         }
         // YBW parallel alpha-beta (OPT-2/3/4/6): first child serial to set a
-        // bound, remaining children in parallel. `nodes` is the per-thread sum
-        // (approximate). solved=false only if some child subtree exceeds
-        // max_nodes. See solve_endgame_ab_parallel for budget semantics.
-        match super::solve_endgame_ab_parallel(state, max_nodes, score_scale, margin_gain, alpha)? {
-            Some((value, nodes)) => Ok((value, true, nodes)),
-            None => Ok((0.0, false, max_nodes)),
+        // bound, remaining children in parallel, all sharing one wall-clock
+        // deadline. solved=false only if the deadline was hit. See
+        // solve_endgame_ab_parallel for budget semantics.
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs_f64(max_secs);
+        match super::solve_endgame_ab_parallel(state, deadline, score_scale, margin_gain, alpha)? {
+            Some(value) => Ok((value, true, start.elapsed().as_secs_f64())),
+            None => Ok((0.0, false, start.elapsed().as_secs_f64())),
         }
     }
 
@@ -5114,15 +5126,15 @@ mod kingdomino_rust {
     /// accepts deck length 4, because that is likewise no-chance: all four
     /// hidden tiles form the next row.
     #[pyfunction]
-    #[pyo3(signature = (state, max_nodes=50_000, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
     fn exact_endgame_value_deck_empty(
         state: &RustGameState,
-        max_nodes: u64,
+        max_secs: f64,
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
-    ) -> PyResult<(f64, bool, u64)> {
-        exact_endgame_value_no_chance(state, max_nodes, score_scale, margin_gain, alpha)
+    ) -> PyResult<(f64, bool, f64)> {
+        exact_endgame_value_no_chance(state, max_secs, score_scale, margin_gain, alpha)
     }
 
     /// Compatibility alias for the original deck-empty count export.

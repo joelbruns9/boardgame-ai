@@ -97,7 +97,7 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -189,6 +189,11 @@ class Node:
         return self.value_sum / self.visit_count if self.visit_count else 0.0
 
 
+# Sentinel for OpenLoopNode.exact_value's "Unsolvable" state (solver timed out).
+# A distinct object so it is never confused with a real solved float value.
+_EXACT_UNSOLVABLE = object()
+
+
 class OpenLoopNode:
     """A search-tree node for open-loop MCTS.
 
@@ -236,13 +241,16 @@ class OpenLoopNode:
         self.value_sum: float = 0.0           # player-0 frame
         self.children: Dict[object, "OpenLoopNode"] = {}
         self.is_expanded: bool = False
-        # OPT-1 solve-once cache: when an exact endgame leaf is solved, the
-        # player-0 value is stored here and the node stays unexpanded, so every
-        # later simulation reaching it returns the cached value in O(1) instead
-        # of re-solving. Only set when exact solving is "active" for the search
-        # (root terminal-adjacent ⇒ this node's concrete state is the same for
-        # every determinization, so a single cached value is correct for all).
-        self.exact_value: Optional[float] = None
+        # OPT-1 solve-once cache, three states (cf. Rust ExactCache):
+        #   None                -> Unsolved: not yet attempted this search.
+        #   float               -> Solved: exact player-0 value; node stays
+        #                          unexpanded so later sims return it in O(1).
+        #   _EXACT_UNSOLVABLE   -> solver timed out; the node was expanded once
+        #                          via the network and is never re-solved.
+        # Only set when exact solving is "active" for the search (root
+        # terminal-adjacent ⇒ this node's concrete state is the same for every
+        # determinization, so a single cached value is correct for all).
+        self.exact_value: Union[float, object, None] = None
 
     @property
     def value(self) -> float:
@@ -780,7 +788,7 @@ class OpenLoopMCTS:
         score_scale: float = 100.0,
         margin_gain: float = 2.0,
         alpha: float = 0.8,
-        exact_endgame_max_nodes: int = 500_000,
+        exact_endgame_max_secs: float = 3.0,
         exact_endgame_max_hidden_tiles: int = 4,
         exact_endgame_enabled: bool = True,
     ):
@@ -802,7 +810,7 @@ class OpenLoopMCTS:
         self._score_scale = float(score_scale)
         self._margin_gain = float(margin_gain)
         self._alpha = float(alpha)
-        self._exact_endgame_max_nodes = int(exact_endgame_max_nodes)
+        self._exact_endgame_max_secs = float(exact_endgame_max_secs)
         self._exact_endgame_max_hidden_tiles = int(exact_endgame_max_hidden_tiles)
         self._exact_endgame_enabled = bool(exact_endgame_enabled)
         # Whether exact endgame solving is active for the CURRENT search. Set per
@@ -813,6 +821,7 @@ class OpenLoopMCTS:
         self._exact_endgame_active = False
         self._exact_solve_count = 0      # leaves solved exactly this search
         self._exact_cache_hits = 0       # leaves served from OPT-1 cache
+        self._exact_fallback_count = 0   # solver timed out this search (≤1: see _simulate)
         # Diagnostic: number of times _select_child found no stored child legal
         # in the current determinization (a deep-node divergence). Reset per
         # search(); expected to be rare. See _select_child.
@@ -852,6 +861,7 @@ class OpenLoopMCTS:
         self._fallback_count = 0
         self._exact_solve_count = 0
         self._exact_cache_hits = 0
+        self._exact_fallback_count = 0
 
         # Exact endgame solving is enabled for this search only when the ROOT is
         # terminal-adjacent (deck <= max_hidden_tiles). In that regime the only
@@ -960,22 +970,24 @@ class OpenLoopMCTS:
             # re-expand (that would mix determinizations' children). Just use
             # the network's value estimate for the current concrete state.
             value0, _ = self._evaluate(state)
-        elif node.exact_value is not None:
-            # OPT-1 solve-once cache: this leaf was already solved exactly in a
-            # previous simulation. The value is determinization-independent (see
-            # search()'s _exact_endgame_active note), so return it directly. The
-            # node stays unexpanded, so the PUCT descent never goes below it.
+        elif isinstance(node.exact_value, float):
+            # OPT-1 solve-once cache (Solved): this leaf was already solved exactly
+            # in a previous simulation. The value is determinization-independent
+            # (see search()'s _exact_endgame_active note), so return it directly.
+            # The node stays unexpanded, so PUCT descent never goes below it.
             value0 = node.exact_value
             self._exact_cache_hits += 1
         else:
-            if self._should_exact_solve(state):
+            # node.exact_value is None (Unsolved) — an Unsolvable node was expanded
+            # on its timeout, so descent never stops on it again.
+            if node.exact_value is None and self._should_exact_solve(state):
                 # The exact solver is deterministic and public-bag exhaustive;
                 # the seed is stable documentation of this simulation's
                 # determinized hidden bag if future tie-breaking ever needs it.
                 seed = sum((i + 1) * int(d) for i, d in enumerate(state.deck))
                 value0, solved = exact_endgame_value(
                     state,
-                    max_nodes=self._exact_endgame_max_nodes,
+                    max_secs=self._exact_endgame_max_secs,
                     rng=random.Random(seed),
                     score_scale=self._score_scale,
                     margin_gain=self._margin_gain,
@@ -987,6 +999,14 @@ class OpenLoopMCTS:
                     node.exact_value = value0
                     self._exact_solve_count += 1
                 else:
+                    # Timed out: mark this node Unsolvable, expand it once via the
+                    # network, and give up exact solving for the REST of this
+                    # search. The position is too hard within budget, so other
+                    # endgame leaves would just time out too — re-attempting them
+                    # is the retry storm. (Mirrors the Rust per-game sentinel.)
+                    node.exact_value = _EXACT_UNSOLVABLE
+                    self._exact_fallback_count += 1
+                    self._exact_endgame_active = False
                     value0 = self._expand_and_evaluate(node, state)
             else:
                 value0 = self._expand_and_evaluate(node, state)

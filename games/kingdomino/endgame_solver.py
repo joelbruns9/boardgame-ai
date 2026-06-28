@@ -136,7 +136,7 @@ def _rust_count_no_chance(state: GameState, max_nodes: int) -> int | None:
 def _rust_exact_no_chance(
     state: GameState,
     *,
-    max_nodes: int,
+    max_secs: float,
     score_scale: float,
     margin_gain: float,
     alpha: float,
@@ -148,9 +148,9 @@ def _rust_exact_no_chance(
         return None
     try:
         import kingdomino_rust
-        value0, solved, _nodes = kingdomino_rust.exact_endgame_value_no_chance(
+        value0, solved, _elapsed = kingdomino_rust.exact_endgame_value_no_chance(
             rs,
-            int(max_nodes),
+            float(max_secs),
             float(score_scale),
             float(margin_gain),
             float(alpha),
@@ -175,10 +175,17 @@ def count_endgame_nodes(state: GameState, max_nodes: int = _COUNT_CAP) -> int:
     return _count_bounded(state, int(max_nodes))
 
 
+# Node ceiling for the pure-Python expectiminimax fallback (used only when the
+# Rust extension is unavailable, on tiny deck=0 reference cases). The hot path is
+# Rust and time-budgeted; this guard just prevents the Python reference solver
+# from attempting an intractable tree.
+_PY_FALLBACK_NODE_CAP = 200_000
+
+
 def exact_endgame_value(
     state: GameState,
     *,
-    max_nodes: int = 50_000,
+    max_secs: float = 3.0,
     rng: random.Random,
     score_scale: float,
     margin_gain: float,
@@ -190,6 +197,10 @@ def exact_endgame_value(
     network values. It enumerates legal actions with state.legal_actions() and
     terminal leaves with terminal_search_value().
 
+    `max_secs` is the per-position wall-clock budget for the Rust solver (the hot
+    path); `max_secs <= 0` disables solving. The pure-Python reference fallback
+    (Rust unavailable) is exhaustive and instead bounded by a fixed node cap.
+
     Hidden-order safety: callers may pass a concrete open-loop determinization,
     but the solver treats `state.deck` as an unordered public bag. Future row
     reveals are averaged uniformly over all row combinations from that bag, so
@@ -198,7 +209,7 @@ def exact_endgame_value(
     the current exhaustive solver is deterministic and does not consume it.
     """
     del rng
-    if max_nodes < 1:
+    if max_secs <= 0.0:
         return 0.0, False
 
     from games.kingdomino.mcts_az import terminal_search_value
@@ -217,7 +228,7 @@ def exact_endgame_value(
 
     rust_result = _rust_exact_no_chance(
         state,
-        max_nodes=max_nodes,
+        max_secs=max_secs,
         score_scale=score_scale,
         margin_gain=margin_gain,
         alpha=alpha,
@@ -225,8 +236,8 @@ def exact_endgame_value(
     if rust_result is not None:
         return rust_result
 
-    node_count = _count_bounded(state, max_nodes)
-    if node_count > max_nodes:
+    node_count = _count_bounded(state, _PY_FALLBACK_NODE_CAP)
+    if node_count > _PY_FALLBACK_NODE_CAP:
         return 0.0, False
 
     def solve(s: _StateLike) -> float:

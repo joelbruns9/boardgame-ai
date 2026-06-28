@@ -52,7 +52,7 @@ import torch.nn.functional as F
 
 from games.kingdomino.game import GameState, Phase, determine_winner
 from games.kingdomino.encoder import (
-    encode_state, compute_target_z,
+    encode_state, compute_target_z, FLAT_LAYOUT,
     compute_target_own_score, compute_target_opponent_score, compute_target_win,
 )
 from games.kingdomino.action_codec import encode_action, decode_action, NUM_JOINT_ACTIONS
@@ -157,9 +157,13 @@ class SelfPlayConfig:
     # Exact endgame solver budget for the batched engines. When a self-play root
     # reaches a terminal-adjacent position (deck∈{0,4}), it is solved exactly
     # (minimax) instead of MCTS — perfect value/policy targets, no GPU forwards.
-    # 0 disables it (ablation). 500k was the best routine-training throughput
-    # point in the 1600-sim smoke; higher budgets remain useful for quality runs.
-    exact_endgame_max_nodes: int = 500_000
+    # Per-position wall-clock limit in seconds; <= 0.0 disables it (ablation).
+    # Higher budgets reduce fallbacks but spend more CPU on the hardest endgames.
+    exact_endgame_max_secs: float = 3.0
+    # Training-batch sampling weight for endgame positions (game_progress >= 0.75)
+    # relative to others. Endgames carry exact minimax labels, so concentrating
+    # gradient there is high-value. 1.0 = uniform; 2.0 = endgames drawn 2x.
+    endgame_oversample: float = 2.0
     # loop
     n_iterations: int = 40
     games_per_iteration: int = 50
@@ -296,6 +300,10 @@ class ReplayBuffer:
         self._n_workers = int(n_sample_workers)
         self._pool = (ThreadPoolExecutor(max_workers=self._n_workers)
                       if self._n_workers > 1 else None)
+        # Endgame-oversampling weight cache (Change 4). Recomputing per-example
+        # weights every batch is O(buffer); cache and invalidate only on add().
+        self._weight_cache: Optional[np.ndarray] = None
+        self._weight_cache_oversample: float = 1.0
 
     def close(self) -> None:
         """Shut down the sample-batch thread pool.  Call at training end."""
@@ -364,6 +372,9 @@ class ReplayBuffer:
             else:
                 self.data[self._pos] = ex
                 self._pos = (self._pos + 1) % self.capacity
+        # Any change to the buffer contents invalidates the oversampling weights.
+        if examples:
+            self._weight_cache = None
 
     def __len__(self) -> int:
         return len(self.data)
@@ -382,8 +393,43 @@ class ReplayBuffer:
             np.mean([ex.iteration for ex in self.data])
         )
 
+    def _endgame_weights(self, oversample: float) -> Optional[np.ndarray]:
+        """Cached per-example sampling probabilities for endgame oversampling.
+
+        Returns None when `oversample == 1.0` (uniform — caller uses fast
+        integers()). Otherwise returns a normalized probability vector that gives
+        endgame examples (game_progress >= 0.75) `oversample`x the weight of
+        others. Cached and invalidated on add() since it is O(buffer) to build.
+        """
+        if oversample == 1.0:
+            return None
+        if (self._weight_cache is None
+                or self._weight_cache_oversample != oversample):
+            prog_idx = FLAT_LAYOUT['game_progress'].start
+            weights = np.array(
+                [oversample if float(ex.flat[prog_idx]) >= 0.75 else 1.0
+                 for ex in self.data],
+                dtype=np.float32,
+            )
+            total = weights.sum()
+            if total > 0:
+                weights /= total
+            self._weight_cache = weights
+            self._weight_cache_oversample = oversample
+        return self._weight_cache
+
+    def _draw_idxs(self, batch_size: int, rng: np.random.Generator,
+                   oversample: float = 1.0) -> np.ndarray:
+        """Draw `batch_size` buffer indices, optionally oversampling endgames."""
+        weights = self._endgame_weights(oversample)
+        if weights is not None:
+            return rng.choice(len(self.data), size=batch_size, p=weights,
+                              replace=True)
+        return rng.integers(0, len(self.data), size=batch_size)
+
     def sample_batch(self, batch_size: int, rng: np.random.Generator,
-                     device: str = "cpu", augment_d4: bool = True):
+                     device: str = "cpu", augment_d4: bool = True,
+                     endgame_oversample_weight: float = 1.0):
         """Return a training batch as tensors:
         (my_board, opp_board, flat, policy, legal_mask, z,
          own_score, opp_score, win_target).
@@ -399,7 +445,7 @@ class ReplayBuffer:
         workers touch CPU numpy only).
         """
         # Pre-draw every random choice in the main thread (rng is not thread-safe).
-        idxs = rng.integers(0, len(self.data), size=batch_size)
+        idxs = self._draw_idxs(batch_size, rng, endgame_oversample_weight)
         t_ids = (rng.integers(0, NUM_D4_TRANSFORMS, size=batch_size)
                  if augment_d4 else None)
 
@@ -1049,7 +1095,7 @@ def play_selfplay_games_batched(
             score_scale=float(cfg.score_scale),
             margin_gain=float(cfg.margin_gain),
             alpha=float(cfg.alpha),
-            exact_endgame_max_nodes=int(cfg.exact_endgame_max_nodes),
+            exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
         )
 
     use_db = bool(double_buffer)
@@ -1259,6 +1305,11 @@ def _compact_summary(it: int, *, sp_games: int, row: dict, trained: bool,
         if bwb is not None:
             bench += f" brier={bwb:.3f}"
         parts.append(bench)
+    if row.get("exact_tree_solve_count"):
+        parts.append(
+            f"exact: trees={row['exact_tree_solve_count']} "
+            f"hits={row['exact_cache_hit_count']} "
+            f"fallback={row['exact_fallback_count']}")
     return " | ".join(parts)
 
 
@@ -1624,6 +1675,7 @@ def make_open_loop_mcts(
         score_scale=cfg.score_scale,
         margin_gain=cfg.margin_gain,
         alpha=cfg.alpha,
+        exact_endgame_max_secs=cfg.exact_endgame_max_secs,
     )
 
 
@@ -1847,6 +1899,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             # Per-iteration metrics for the structured log; None = not computed
             # this iteration (training skipped / no benchmark).  Filled below.
             trained = False
+            n_endgame_in_batch = None  # set on diag iterations (oversample check)
             pol_m = own_m = opp_m = win_m = None
             win_brier_m = baseline_brier_m = None
             gn_pol = gn_win = gn_own = gn_opp = None
@@ -2016,7 +2069,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     prefetch_rng = np.random.default_rng(int(np_rng.integers(2**63)))
                     sample_fn = lambda: buffer.sample_batch(
                         cfg.batch_size, prefetch_rng,
-                        device=cfg.device, augment_d4=cfg.augment)
+                        device=cfg.device, augment_d4=cfg.augment,
+                        endgame_oversample_weight=cfg.endgame_oversample)
                     executor = ThreadPoolExecutor(max_workers=1)
                     next_batch_future = executor.submit(sample_fn)   # prime
                     try:
@@ -2029,9 +2083,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         executor.shutdown(wait=False)
                 else:
                     for step in range(cfg.train_steps_per_iteration):
-                        batch = buffer.sample_batch(cfg.batch_size, np_rng,
-                                                    device=cfg.device,
-                                                    augment_d4=cfg.augment)
+                        batch = buffer.sample_batch(
+                            cfg.batch_size, np_rng,
+                            device=cfg.device, augment_d4=cfg.augment,
+                            endgame_oversample_weight=cfg.endgame_oversample)
                         _run_train_step(batch)
                 n = cfg.train_steps_per_iteration
                 pol_m, own_m, opp_m, win_m = p_sum/n, o_sum/n, q_sum/n, w_sum/n
@@ -2130,6 +2185,20 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 )
 
             # ── 4. Structured log row + compact summary (END of iteration) ──
+            # Oversampling check (diag iterations only): draw one batch's worth of
+            # indices with the configured endgame weight and count how many land in
+            # the endgame (game_progress >= 0.75). Uses diag_rng so the training
+            # stream is unperturbed; an independent draw is statistically equivalent
+            # to inspecting the real training batches.
+            if (cfg.diag_every and it % cfg.diag_every == 0
+                    and len(buffer) >= cfg.min_buffer_to_train):
+                prog_idx = FLAT_LAYOUT['game_progress'].start
+                diag_idxs = buffer._draw_idxs(
+                    cfg.batch_size, diag_rng, cfg.endgame_oversample)
+                n_endgame_in_batch = int(sum(
+                    1 for i in diag_idxs
+                    if float(buffer.data[int(i)].flat[prog_idx]) >= 0.75))
+
             row = {
                 "iter": it,
                 "timestamp": time.time(),
@@ -2156,6 +2225,17 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "elo_rating": elo_result["elo_rating"] if elo_result else None,
                 "elo_stderr": elo_result["elo_stderr"] if elo_result else None,
                 "elo_n_games": elo_result["elo_n_games"] if elo_result else None,
+                # Exact endgame solver stats (batched engines only; None otherwise).
+                "exact_solve_count": (batched_stats.get("exact_solve_count", 0)
+                                      if batched_stats else None),
+                "exact_tree_solve_count": (batched_stats.get("exact_tree_solve_count", 0)
+                                           if batched_stats else None),
+                "exact_cache_hit_count": (batched_stats.get("exact_cache_hit_count", 0)
+                                          if batched_stats else None),
+                "exact_fallback_count": (batched_stats.get("exact_fallback_count", 0)
+                                         if batched_stats else None),
+                "endgame_oversample": cfg.endgame_oversample,
+                "n_endgame_in_batch": n_endgame_in_batch,
             }
 
             # ── Phase-sliced calibration diagnostics (Milestone 2) ──  Run every
@@ -2365,10 +2445,15 @@ if __name__ == "__main__":
                    help="(Item 17) Run two BatchedMCTS instances in parallel, "
                         "overlapping CPU tree work with GPU forward. Only for "
                         "engine=batched or batched_open_loop.")
-    p.add_argument("--exact_endgame_max_nodes", type=int, default=500_000,
-                   help="BatchedMCTS exact endgame node budget. 0 disables exact "
-                        "endgame solving; 500k is the routine training default; "
-                        "higher values are useful for quality/reanalysis runs.")
+    p.add_argument("--exact_endgame_max_secs", type=float, default=3.0,
+                   help="Per-position wall-clock time limit for the exact endgame "
+                        "solver (seconds). 0.0 disables exact endgame solving; "
+                        "higher values reduce fallbacks on the hardest endgames.")
+    p.add_argument("--endgame_oversample", type=float, default=2.0,
+                   help="Sampling weight for endgame positions (game_progress >= "
+                        "0.75) relative to other positions. 1.0 = uniform. 2.0 = "
+                        "endgame positions drawn 2x as often as their buffer "
+                        "frequency.")
     a = p.parse_args()
 
     # Default warmup = one full iteration's worth of positions, so training
@@ -2407,6 +2492,7 @@ if __name__ == "__main__":
         compile_dynamic={"auto": None, "on": True, "off": False}[a.compile_dynamic],
         prefetch_batches=a.prefetch_batches,
         double_buffer=a.double_buffer,
-        exact_endgame_max_nodes=a.exact_endgame_max_nodes,
+        exact_endgame_max_secs=a.exact_endgame_max_secs,
+        endgame_oversample=a.endgame_oversample,
     )
     run_self_play_training(cfg, verbose=True)

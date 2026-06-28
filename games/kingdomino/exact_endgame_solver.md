@@ -86,10 +86,10 @@ special handling in the solver.
 solver. `BatchedMCTS::resolve_exact_slots` solves terminal-adjacent roots once,
 skips GPU/MCTS for those moves, emits exact child-value policy targets, and
 exposes `exact_solve_count` / `exact_fallback_count`. The routine self-play
-default is `exact_endgame_max_nodes=500_000`, exposed as a CLI/run setting; `0`
+default is `exact_endgame_max_secs=3.0`, exposed as a CLI/run setting; `0.0`
 disables exact solving for ablation and higher values are available for
-quality-first/reanalysis runs. The current focused suite is 21 tests passing,
-including BatchedMCTS integration tests.
+quality-first/reanalysis runs. The focused suite is 27 tests passing, including
+BatchedMCTS integration tests.
 
 1600-sim smoke result over 32 games, 48x6 CUDA: `off=0.0742 games/s`,
 `500k=0.0816`, `2M=0.0769`, `5M=0.0760`. 500k gave the best throughput in that
@@ -100,26 +100,34 @@ and deck=1 (which never occurs). For deck=4, Python is too slow — Rust only.
 
 ### API Shape (actual, not the original prompt spec)
 
+The solver budget is **wall-clock time** (`max_secs`), not a node count. The
+node-count budget was replaced because throughput is what matters: a node budget
+times out at a roughly fixed wall-clock cost regardless of position complexity,
+whereas a time budget bounds the thing we actually care about. `count_endgame_nodes`
+and the Rust `count_endgame_nodes_no_chance` still report full unpruned tree sizes
+for diagnostics, but the solver itself no longer exposes a pruned-node count.
+
 ```python
 # Python-side bridge
 from games.kingdomino.endgame_solver import exact_endgame_value
 
 value, solved = exact_endgame_value(
     state,
-    max_nodes=500_000,
+    max_secs=3.0,      # per-position wall-clock budget; <= 0 disables
     rng=...,           # unused in deterministic minimax; API compat only
     score_scale=100.0,
     margin_gain=2.0,
     alpha=0.0,         # use 0.0 for eval/advisor; 0.8 for training
 )
 
-# Rust direct call (for benchmarking/testing)
-rust_state = kr.RustGameState.from_parts(...)
-value, solved, nodes = rust_state.exact_endgame_value_no_chance(
-    max_nodes=500_000,
-    score_scale=100.0,
-    margin_gain=2.0,
-    alpha=0.0,
+# Rust direct call (for benchmarking/testing) — note it returns elapsed_secs,
+# not a node count.
+value, solved, elapsed_secs = kr.exact_endgame_value_no_chance(
+    rust_state,
+    3.0,               # max_secs
+    100.0,             # score_scale
+    2.0,               # margin_gain
+    0.0,               # alpha
 )
 ```
 
@@ -266,10 +274,25 @@ sub-second-p99 goal (p99 still ~3 s). True sub-second p99 needs deeper paralleli
 
 ### Current defaults / recommendation (post BatchedMCTS integration)
 
-- **Routine training: serial exact solves with `exact_endgame_max_nodes=500_000`.** This was the best measured throughput point in the real 1600-sim batched smoke (`0.0742 -> 0.0816 games/s`) while still solving most eligible roots. Higher budgets reduce fallbacks, but 2M and 5M lost throughput in that sample.
-- **Quality/reanalysis: use higher budgets (`2M+`) selectively.** This is the right place to pay for hard endgames if the goal is cleaner labels rather than maximum self-play throughput.
-- **Advisor: parallel solver and higher budget.** User-facing advisor mode should prefer coverage and wall-clock latency over training throughput. OPT-6 improved the tail (max 8.6 s -> 3.7 s), but true sub-second p99 likely needs deeper/recursive YBW or additional pruning improvements.
-- The production `exact_endgame_value_no_chance` pyfunction routes through the parallel solver. The batched training path controls its own budget through `SelfPlayConfig.exact_endgame_max_nodes` / CLI `--exact_endgame_max_nodes`.
+The budget is now **wall-clock seconds** (`exact_endgame_max_secs`, default `3.0`),
+not a node count. The earlier node-budget tuning (500k best, 2M/5M slower) is
+historical; see the smoke-result tables below for context.
+
+- **Routine training: serial exact solves with `exact_endgame_max_secs=3.0`.** The
+  per-game `exact_unsolvable` sentinel means a hard endgame costs at most one
+  timeout per game (≤ `max_secs`) instead of repeatedly re-solving every remaining
+  move, so the previous fallback-retry overhead is gone.
+- **Quality/reanalysis: use a larger `max_secs` selectively.** This is the right
+  place to pay for hard endgames if the goal is cleaner labels rather than maximum
+  self-play throughput.
+- **Advisor: parallel solver and a larger `max_secs`.** User-facing advisor mode
+  should prefer coverage and wall-clock latency over training throughput. OPT-6
+  improved the tail (max 8.6 s -> 3.7 s), but true sub-second p99 likely needs
+  deeper/recursive YBW or additional pruning improvements.
+- The production `exact_endgame_value_no_chance` pyfunction routes through the
+  parallel solver and returns `(value, solved, elapsed_secs)`. The batched training
+  path controls its own budget through `SelfPlayConfig.exact_endgame_max_secs` / CLI
+  `--exact_endgame_max_secs`.
 
 
 ### Current MCTS hook behavior
@@ -288,6 +311,27 @@ Current Rust `BatchedMCTS` behavior:
 - `BatchedMCTS::resolve_exact_slots` checks terminal-adjacent roots before GPU evaluation/MCTS expansion.
 - When solvable, it builds an exact continuation plan, emits exact child-value policy targets, chooses the minimax move, and skips GPU evaluation for those moves.
 - Plan reuse means one expensive exact tree solve can serve the deterministic continuation moves from that root; diagnostics expose tree solves, cache hits, total exact moves, and fallbacks.
+
+### No-retry-after-timeout (retry-storm fix)
+
+Both paths avoid re-attempting an expensive solve that has already timed out:
+
+- **Rust `BatchedMCTS` — per-game sentinel.** When `solve_exact_plan` exceeds the
+  per-position `exact_endgame_max_secs` budget, the slot sets an `exact_unsolvable`
+  flag and falls back to MCTS. `finalize_move` then refuses to re-enter
+  `ExactSolving` for the rest of that game — without this, the next root (still
+  deck∈{0,4}, since the deck only shrinks) would just re-solve the same hard
+  endgame and time out again, once per remaining move. The flag is reset in
+  `new_for_game`, so each new game gets a fresh attempt. Net effect:
+  `exact_fallback_count` is at most one per game instead of one per remaining
+  endgame move.
+
+- **Python `OpenLoopMCTS` — three-state node cache.** `OpenLoopNode.exact_value`
+  is one of three states: `None` (Unsolved), a `float` (Solved — returned in O(1),
+  node stays unexpanded), or the `_EXACT_UNSOLVABLE` sentinel (timed out — the node
+  was expanded once via the network and is never re-solved). On the first timeout
+  the search also clears `_exact_endgame_active`, so no other leaf in that search
+  re-attempts the solver. Counters reset per `search()`.
 
 ---
 
@@ -644,7 +688,10 @@ Interpretation:
 | 2M | 0.0769 | 77.405 | 329.244 | 379 | 32 | 347 | 5 |
 | 5M | 0.0760 | 89.488 | 322.226 | 382 | 32 | 350 | 2 |
 
-Current training default: `exact_endgame_max_nodes=500_000`. This was the best measured throughput point in the real 1600-sim smoke. Larger budgets reduce fallbacks but increase CPU step time enough to lose throughput in this sample.
+The table above is **historical** — it was measured under the old node-count
+budget, where `500_000` was the best throughput point. The budget is now
+wall-clock (`exact_endgame_max_secs`, default `3.0`); these node figures are kept
+only for context.
 
 ### Viability thresholds
 
@@ -722,9 +769,9 @@ This suggests separate operating modes:
 
 | Mode | Solver budget policy | Goal |
 |------|----------------------|------|
-| Routine training | `exact_endgame_max_nodes=500_000` | Best measured throughput/quality tradeoff |
-| Training ablation | `exact_endgame_max_nodes=0` | Measure baseline without exact solves |
-| Quality/reanalysis | `2_000_000+`, possibly offline | Produce cleaner labels for selected hard positions |
+| Routine training | `exact_endgame_max_secs=3.0` | Bound per-position solve cost; sentinel avoids retry storms |
+| Training ablation | `exact_endgame_max_secs=0.0` | Measure baseline without exact solves |
+| Quality/reanalysis | larger `max_secs`, possibly offline | Produce cleaner labels for selected hard positions |
 | Advisor | higher budget, parallel/cache-friendly | Solve all eligible user-facing endgames |
 
 Known compromise: optimizing routine training throughput and optimizing advisor
@@ -741,7 +788,7 @@ where they improve pre-endgame judgment without dominating self-play wall-clock.
 OpenLoopMCTS(
     ...
     exact_endgame_max_hidden_tiles=4,
-    exact_endgame_max_nodes=500_000,   # post OPT-1: paid once per node, not per sim
+    exact_endgame_max_secs=3.0,        # per-position wall-clock budget
     exact_endgame_enabled=True,
 )
 
@@ -749,16 +796,33 @@ OpenLoopMCTS(
 OpenLoopMCTS(
     ...
     exact_endgame_max_hidden_tiles=4,
-    exact_endgame_max_nodes=2_000_000,
+    exact_endgame_max_secs=10.0,
     exact_endgame_enabled=True,
 )
 ```
+
+The batched training path is configured through `SelfPlayConfig.exact_endgame_max_secs`
+/ CLI `--exact_endgame_max_secs` (default `3.0`; `0.0` disables for ablation).
 
 Revisit these defaults after each optimization step is benchmarked.
 
 ---
 
-## Value Formula
+## Endgame Oversampling in Training
+
+Endgame positions (game_progress ≥ 0.75) carry the best labels in the buffer —
+exact minimax values and exact-derived policy targets — but at natural frequency
+they are only ~20-23% of training batches. `ReplayBuffer.sample_batch` accepts an
+`endgame_oversample_weight` (config/CLI `--endgame_oversample`, default `2.0`) that
+weights those examples `2×` relative to the rest, concentrating gradient where the
+labels are most reliable.
+
+- The per-example weight vector is O(buffer) to build, so it is cached and
+  invalidated only when `add()` mutates the buffer.
+- `1.0` recovers exact uniform sampling (fast `rng.integers` path, no weights).
+- The realised endgame fraction is logged as `n_endgame_in_batch` on diagnostic
+  iterations to confirm the oversampling is taking effect (≈33% at weight 2.0 on a
+  20%-endgame buffer).
 
 All exact values use `terminal_search_value` — the single source of truth:
 
@@ -856,10 +920,17 @@ File: `games/kingdomino/test_endgame_exact.py`
 | Test | Covers | Status |
 |------|--------|--------|
 | `test_solve_once_cache` | OPT-1: later sims served from cache, each leaf solved once | ✅ |
+| `test_three_state_cache_no_retry` | Change 1: timed-out leaf marked Unsolvable; ≤1 solve attempt per search; resets per search | ✅ |
+| `test_timeout_fires_quickly` | Change 2: 1ms budget on a deck=4 position returns unsolved within <0.1s | ✅ |
 | `test_exact_solving_gated_off_at_non_terminal_adjacent_root` | OPT-1 correctness gate: no solve from deck≥8 roots | ✅ |
-| `test_alpha_beta_prunes_full_tree` | OPT-3/4: pruned traversal < full tree | ✅ |
+| `test_alpha_beta_solves_nontrivial_deck4` | OPT-3/4: solves real ≥100k-node deck=4 trees within the wall-clock budget | ✅ |
 | `test_alpha_beta_value_exact_and_public_consistent` | OPT-3: budget- and deck-order-invariant exact value | ✅ |
-| `test_solve_rate_deck4_500k` | OPT-2+3+4: solve rate high (≥50% floor; measured ~97%) at 500k | ✅ |
+| `test_solve_rate_deck4` | OPT-2+3+4: solve rate high (≥50% floor; ~100% within a few seconds) | ✅ |
+| `test_solves_deck4_within_budget` | OPT-4b: median deck=4 solve time fits the wall-clock budget | ✅ |
+| `test_oversample_increases_endgame_fraction` | Change 4: weight 2.0 lifts endgame fraction 20%→~33% | ✅ |
+| `test_oversample_weight_cache_invalidates_on_add` | Change 4: cached weights rebuilt after `add()` | ✅ |
+| `test_exact_stats_in_log_row` | Change 3: all four exact-solver keys present in every JSONL row | ✅ |
+| `test_disabled_solver_returns_unsolved` | `max_secs<=0` disables solving (returns 0.0, unsolved) | ✅ |
 | `test_undo_redo_equivalent` | OPT-5: undo/redo solver gives same values as cloning solver | ⏳ pending |
 
 ---
@@ -892,8 +963,8 @@ File: `games/kingdomino/test_endgame_exact.py`
 |------|------|
 | `games/kingdomino/kingdomino_rust/src/lib.rs` | Rust exact solver and integration: `solve_endgame_ab`, `solve_endgame_ab_parallel`, `exact_solve_no_chance` reference path, `exact_count_no_chance_bounded`, `is_no_chance_endgame_state`, `terminal_search_value`, `placement_score_delta`, `pick_order_score`, `order_legal_for_solver`, `exact_policy_target`, `ExactSolveResult`, exact continuation plan support, `BatchedMCTS::resolve_exact_slots`, `RustGameState.from_parts`, and PyO3 exports |
 | `games/kingdomino/endgame_solver.py` | Python bridge: `exact_endgame_value`, `_python_state_to_rust`, and Python fallback for deck-empty/reference cases |
-| `games/kingdomino/mcts_az.py` | Python `OpenLoopMCTS` exact hook: `exact_endgame_enabled`, `exact_endgame_max_hidden_tiles`, `exact_endgame_max_nodes`, `_should_exact_solve`, solve counters, root gate, and implemented `OpenLoopNode.exact_value` solve-once cache |
-| `games/kingdomino/self_play.py` | Batched training wiring: `SelfPlayConfig.exact_endgame_max_nodes`, CLI `--exact_endgame_max_nodes`, pass-through into Rust `BatchedMCTS`, and exact-solver diagnostic logging/stat aggregation |
+| `games/kingdomino/mcts_az.py` | Python `OpenLoopMCTS` exact hook: `exact_endgame_enabled`, `exact_endgame_max_hidden_tiles`, `exact_endgame_max_secs`, `_should_exact_solve`, solve counters (`_exact_solve_count`/`_exact_cache_hits`/`_exact_fallback_count`), root gate, and the three-state `OpenLoopNode.exact_value` cache (`None`/float/`_EXACT_UNSOLVABLE`) with give-up-on-timeout |
+| `games/kingdomino/self_play.py` | Batched training wiring: `SelfPlayConfig.exact_endgame_max_secs`, CLI `--exact_endgame_max_secs`, pass-through into Rust `BatchedMCTS`; exact-solver stats (`exact_solve_count`/`exact_tree_solve_count`/`exact_cache_hit_count`/`exact_fallback_count`) in the JSONL log row + `_compact_summary`; endgame oversampling (`ReplayBuffer.sample_batch(endgame_oversample_weight=...)` with cached weights, `SelfPlayConfig.endgame_oversample`, CLI `--endgame_oversample`, `n_endgame_in_batch` diagnostic) |
 | `games/kingdomino/test_endgame_exact.py` | Exact solver test suite, currently 21 tests including Rust deck=0/deck=4 agreement, alpha-beta correctness, solve-once cache, BatchedMCTS integration, policy validity, fallback counters, and value sanity checks |
 | `games/kingdomino/print_model_contract.py` | Milestone 0 contract checker; adjacent project artifact, not part of exact solving |
 

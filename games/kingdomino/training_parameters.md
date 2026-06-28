@@ -28,6 +28,8 @@ python -m games.kingdomino.self_play `
   --margin_gain 2.0 `
   --alpha 0.8 `
   --c_puct 1.5 `
+  --exact_endgame_max_secs 3.0 `
+  --endgame_oversample 2.0 `
   --temp_moves 20 `
   --fpu -0.2 `
   --virtual_loss 1 `
@@ -210,6 +212,77 @@ quality parameter — controls how good the policy targets are.
 - **Higher (3200):** better targets but directly costs throughput.
   At 0.29 games/s for sims=1600, 3200 would halve throughput.
 - **Does not affect benchmark or Elo rating** — those use separate sim counts.
+
+---
+
+#### `--exact_endgame_max_secs`
+**Values:** `0.0` (disabled), `3.0`, larger for quality runs
+**Current:** `3.0`
+
+Per-position **wall-clock** budget (seconds) for the exact solver on
+terminal-adjacent self-play roots in the Rust `BatchedMCTS` path. `0.0` disables
+exact endgame solving for ablation. This replaced the old node-count budget
+(`--exact_endgame_max_nodes`): wall-clock is what bounds throughput, and a node
+budget timed out at a roughly fixed wall-clock cost regardless of complexity.
+
+When a solve exceeds the budget, the slot sets a per-game `exact_unsolvable`
+sentinel and falls back to MCTS for **all** remaining moves of that game (the next
+root is usually still deck∈{0,4} and would just time out again). The flag resets
+when the slot starts a new game, so `exact_fallback_count` is at most ~one per
+game instead of one per remaining endgame move.
+
+The exact solver applies when the game has no remaining chance branching:
+
+- `deck=0`: final placements only.
+- `deck=4`: the last hidden row is deterministic because those four tiles are
+  sorted into the next `current_row`.
+
+When a batched self-play slot reaches one of these roots, `BatchedMCTS` attempts
+an exact minimax solve before spending MCTS simulations or GPU inference. If the
+solve fits within budget, the move is selected from exact child values, an exact
+policy target is emitted, and the deterministic continuation can reuse the
+precomputed exact plan. If the budget is exceeded, the slot falls back to normal
+MCTS for that root.
+
+**Historical 1600-sim smoke** (old node budget, 32 games, 48x6 CUDA,
+`batch_slots=4`, `leaf_batch=6`) — kept for context; `500000` nodes was the best
+throughput point before the switch to a wall-clock budget:
+
+| Old node setting | games/s | exact moves | trees | cache hits | fallback |
+|------------------|---------|-------------|-------|------------|----------|
+| `0` | 0.0742 | 0 | 0 | 0 | 0 |
+| `500000` | **0.0816** | 369 | 32 | 337 | 15 |
+| `2000000` | 0.0769 | 379 | 32 | 347 | 5 |
+| `5000000` | 0.0760 | 382 | 32 | 350 | 2 |
+
+Interpretation:
+
+- `3.0s` is the routine-training default: enough to solve essentially all eligible
+  deck=4 roots (p90 ~1.3s at alpha=0.8) while capping the rare hard tail.
+- Larger budgets reduce fallbacks but spend more CPU time in exactly the tail
+  positions where the solver is most expensive.
+- `0.0` is useful for measuring whether exact solving is helping a particular run.
+- Advisor/reanalysis use cases should prefer larger budgets and more aggressive
+  solver work; training should optimize the throughput/label-quality tradeoff.
+
+Exact policy targets are soft expert targets, not one-hot best-move labels. The
+solver converts exact child values into an advantage-weighted softmax with
+`temperature = value_range / 3`; if all legal moves are equal value, the target is
+uniform across legal moves. This keeps ambiguous endgames soft and decisive
+endgames sharp without a fixed temperature hyperparameter.
+
+---
+
+#### `--endgame_oversample`
+**Values:** `1.0` (uniform), `2.0`
+**Current:** `2.0`
+
+Training-batch sampling weight for endgame positions (`game_progress >= 0.75`)
+relative to other positions. Endgame examples carry the best labels in the buffer
+(exact minimax values + exact-derived policy targets), so weighting them `2×`
+concentrates gradient where the labels are most reliable. `1.0` recovers exact
+uniform sampling. The realised fraction is logged as `n_endgame_in_batch` on
+diagnostic iterations (≈33% at weight 2.0 on a ~20%-endgame buffer).
 
 ---
 
@@ -735,7 +808,8 @@ before any cloud run:
 total_wall_time ≈ iterations × (games_per_iter/throughput + train_steps×0.1s)
                 + (iterations/elo_every) × elo_rating_time
 
-throughput (games/s) driven by: sims, batch_slots, leaf_batch, channels, blocks
+throughput (games/s) driven by: sims, batch_slots, leaf_batch, channels, blocks,
+exact_endgame_max_secs
 
 elo_rating_time ≈ (anchors × games_per_anchor × 2) / 0.72 games/s
   e.g. 3 anchors × 40 games = 240 games ÷ 0.72 = ~5.5 min per rating session
@@ -754,11 +828,11 @@ Elo ±CI ≈ 400 / (log(10) × √(total_elo_games × p × (1-p)))
 
 | Use case | sims | games/iter | train_steps | buffer | elo_every | notes |
 |----------|------|------------|-------------|--------|-----------|-------|
-| Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors |
-| Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams |
-| Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config |
+| Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors; exact budget 500k default |
+| Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams; exact budget 500k default |
+| Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config; exact budget 500k default |
 | Cloud overnight | 1600 | 300 | 1200 | 500000 | 10 | ~3× throughput |
-| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates |
+| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates; exact budget 500k default |
 
 ## Elo Anchor Pool Maintenance
 

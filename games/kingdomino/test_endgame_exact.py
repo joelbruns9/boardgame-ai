@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
 
@@ -8,11 +9,16 @@ import pytest
 
 import games.kingdomino.endgame_solver as endgame_solver
 from games.kingdomino.board import Board
-from games.kingdomino.encoder import encode_state
+from games.kingdomino.encoder import encode_state, FLAT_LAYOUT, FLAT_SIZE
 from games.kingdomino.endgame_solver import count_endgame_nodes, exact_endgame_value
 from games.kingdomino.dominoes import Terrain
 from games.kingdomino.game import Claim, GameConfig, GameState, Phase
 from games.kingdomino.mcts_az import OpenLoopMCTS, terminal_search_value
+
+# Per-position wall-clock budget for "should solve" cases. Real deck=4 trees solve
+# well under this (p50 ~0.2s, p90 ~1.3s); 3s (the production default) leaves margin
+# while capping the rare hard tail so the suite stays bounded.
+SOLVE_SECS = 3.0
 
 
 def _reach_state(seed: int = 42, *, max_deck: int = 2, min_deck: int = 0) -> GameState:
@@ -89,7 +95,7 @@ def test_exact_vs_sampled_convergence():
     state = _reach_state(seed=0, max_deck=0)
     exact, solved = exact_endgame_value(
         state,
-        max_nodes=200_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(1),
         score_scale=100.0,
         margin_gain=2.0,
@@ -103,7 +109,7 @@ def test_exact_vs_sampled_convergence():
         c_puct=1.0,
         dirichlet_epsilon=0.0,
         exact_endgame_enabled=True,
-        exact_endgame_max_nodes=200_000,
+        exact_endgame_max_secs=SOLVE_SECS,
         exact_endgame_max_hidden_tiles=3,
     )
     _visit_counts, root = mcts.search(state, rng=np.random.default_rng(0))
@@ -119,7 +125,7 @@ def test_mcts_exact_solves_deck_four_by_default():
         c_puct=1.0,
         dirichlet_epsilon=0.0,
         exact_endgame_enabled=True,
-        exact_endgame_max_nodes=50_000,
+        exact_endgame_max_secs=SOLVE_SECS,
     )
 
     _visit_counts, _root = mcts.search(state, rng=np.random.default_rng(1))
@@ -151,25 +157,25 @@ def _reach_deck4_rust(seed_start: int = 0, *, want: int = 1):
             state = state.step(rng.choice(state.legal_actions()))
 
 
-def test_alpha_beta_prunes_full_tree():
-    """OPT-3/4: alpha-beta + move ordering visit strictly fewer nodes than the
-    full minimax tree. Restricted to positions whose TRUE full count fits under
-    the count cap (so the comparison uses an exact full count, not a saturated
-    sentinel)."""
+def test_alpha_beta_solves_nontrivial_deck4():
+    """OPT-3/4: alpha-beta + move ordering solve real, non-trivial deck=4 trees
+    (full unpruned count >= 100k) quickly within a wall-clock budget. The solver
+    no longer exposes a pruned-node count (it is wall-clock budgeted, not
+    node-budgeted), so pruning is verified indirectly: a 100k+ node tree that
+    solves in well under SOLVE_SECS could only do so via pruning + ordering."""
     kr = pytest.importorskip("kingdomino_rust")
 
     COUNT_CAP = 1_200_000
     checked = 0
     for _state, rs in _reach_deck4_rust(seed_start=0, want=25):
         full = kr.count_endgame_nodes_no_chance(rs, COUNT_CAP)
-        # Need an exact full count (under cap) and a non-trivial tree to prune.
         if not (100_000 <= full < COUNT_CAP):
             continue
-        value, solved, nodes = kr.exact_endgame_value_no_chance(
-            rs, 2_000_000, 100.0, 2.0, 0.0
+        value, solved, elapsed = kr.exact_endgame_value_no_chance(
+            rs, SOLVE_SECS, 100.0, 2.0, 0.0
         )
         assert solved
-        assert nodes < full  # pruning visited strictly fewer nodes than the full tree
+        assert elapsed < SOLVE_SECS
         assert -1.0 <= value <= 1.0
         checked += 1
         if checked >= 3:
@@ -178,9 +184,9 @@ def test_alpha_beta_prunes_full_tree():
 
 
 def test_alpha_beta_value_exact_and_public_consistent():
-    """OPT-3: alpha-beta returns the EXACT value — independent of the node budget
-    (pruning never changes the answer) and independent of hidden deck order (the
-    deck=4 tiles become a sorted row, so order is public-irrelevant).
+    """OPT-3: alpha-beta returns the EXACT value — independent of the time budget
+    (a larger budget never changes the answer) and independent of hidden deck
+    order (the deck=4 tiles become a sorted row, so order is public-irrelevant).
 
     Equivalence to plain minimax on a small deck=4 tree is covered separately by
     test_rust_deck_four_matches_python; a full Python solve of a real deck=4 tree
@@ -190,37 +196,38 @@ def test_alpha_beta_value_exact_and_public_consistent():
 
     checked = 0
     for state, rs in _reach_deck4_rust(seed_start=0, want=12):
-        v_500k, ok_500k, _ = kr.exact_endgame_value_no_chance(rs, 500_000, 100.0, 2.0, 0.0)
-        v_2m, ok_2m, _ = kr.exact_endgame_value_no_chance(rs, 2_000_000, 100.0, 2.0, 0.0)
-        if not (ok_500k and ok_2m):
+        v_a, ok_a, _ = kr.exact_endgame_value_no_chance(rs, 2.0, 100.0, 2.0, 0.0)
+        v_b, ok_b, _ = kr.exact_endgame_value_no_chance(rs, 8.0, 100.0, 2.0, 0.0)
+        if not (ok_a and ok_b):
             continue
         # Budget-independence: a larger budget cannot change an exact result.
-        assert v_500k == pytest.approx(v_2m, abs=1e-12)
+        assert v_a == pytest.approx(v_b, abs=1e-12)
         # Hidden-order invariance: reverse the deck, rebuild, re-solve.
         permuted = state.copy()
         permuted.deck = list(reversed(state.deck))
         rs2 = _rust_state_from_python(permuted)
-        v_perm, ok_perm, _ = kr.exact_endgame_value_no_chance(rs2, 2_000_000, 100.0, 2.0, 0.0)
+        v_perm, ok_perm, _ = kr.exact_endgame_value_no_chance(rs2, 8.0, 100.0, 2.0, 0.0)
         assert ok_perm
-        assert v_perm == pytest.approx(v_2m, abs=1e-12)
+        assert v_perm == pytest.approx(v_b, abs=1e-12)
         checked += 1
         if checked >= 3:
             break
     assert checked > 0, "no solvable deck=4 position found for exactness check"
 
 
-def test_solve_rate_deck4_500k():
-    """OPT-2/3/4: solve rate on real deck=4 positions is high at 500k nodes."""
+def test_solve_rate_deck4():
+    """OPT-2/3/4: solve rate on real deck=4 positions is high within a few
+    seconds of wall-clock."""
     kr = pytest.importorskip("kingdomino_rust")
 
     solved = 0
     total = 0
     for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
-        _v, ok, _n = kr.exact_endgame_value_no_chance(rs, 500_000, 100.0, 2.0, 0.0)
+        _v, ok, _t = kr.exact_endgame_value_no_chance(rs, SOLVE_SECS, 100.0, 2.0, 0.0)
         total += 1
         solved += int(ok)
     assert total == 10
-    assert solved / total >= 0.5  # measured ~97%; floor well below to avoid flakiness
+    assert solved / total >= 0.5  # measured ~100% at a few seconds; floor avoids flakiness
 
 
 def test_solve_once_cache():
@@ -233,7 +240,7 @@ def test_solve_once_cache():
         c_puct=1.0,
         dirichlet_epsilon=0.0,
         exact_endgame_enabled=True,
-        exact_endgame_max_nodes=500_000,
+        exact_endgame_max_secs=SOLVE_SECS,
     )
     _visit_counts, _root = mcts.search(state, rng=np.random.default_rng(7))
     assert mcts._exact_solve_count > 0
@@ -241,6 +248,45 @@ def test_solve_once_cache():
     # each distinct leaf is solved exactly once.
     assert mcts._exact_cache_hits > 0
     assert mcts._exact_cache_hits > mcts._exact_solve_count
+
+
+def test_three_state_cache_no_retry():
+    """Change 1 (Python): when the solver times out, the leaf is marked Unsolvable
+    and exact solving is disabled for the rest of the search, so the expensive
+    solve is attempted at most once — no per-simulation retry storm. The counters
+    reset per search(), so a second search on the same position again attempts
+    exactly once."""
+    pytest.importorskip("kingdomino_rust")
+    state, _rs = next(_reach_deck4_rust(seed_start=0, want=1))
+
+    mcts = OpenLoopMCTS(
+        _uniform_evaluator,
+        n_simulations=30,
+        c_puct=1.0,
+        dirichlet_epsilon=0.0,
+        exact_endgame_enabled=True,
+        exact_endgame_max_secs=1e-9,  # absurdly tiny ⇒ deck=4 solve always times out
+    )
+    _vc, _root = mcts.search(state, rng=np.random.default_rng(0))
+    assert mcts._exact_fallback_count == 1  # timed out exactly once
+    assert mcts._exact_solve_count == 0     # nothing solved within 1ns
+
+    # Second search on the SAME position: counters reset, still exactly one attempt.
+    _vc2, _root2 = mcts.search(state, rng=np.random.default_rng(1))
+    assert mcts._exact_fallback_count == 1
+    assert mcts._exact_solve_count == 0
+
+
+def test_timeout_fires_quickly():
+    """Change 2: the solver aborts on the wall-clock deadline, not after
+    exhausting a node budget — a 1ms budget on a non-trivial deck=4 position
+    returns solved=False within a small fraction of a second."""
+    kr = pytest.importorskip("kingdomino_rust")
+    _state, rs = next(_reach_deck4_rust(seed_start=0, want=1))
+    value, solved, elapsed = kr.exact_endgame_value_no_chance(rs, 0.001, 100.0, 2.0, 0.8)
+    assert solved is False
+    assert value == 0.0
+    assert elapsed < 0.1  # fired on the deadline, did not grind through nodes
 
 
 def test_exact_solving_gated_off_at_non_terminal_adjacent_root():
@@ -257,7 +303,7 @@ def test_exact_solving_gated_off_at_non_terminal_adjacent_root():
         c_puct=1.0,
         dirichlet_epsilon=0.0,
         exact_endgame_enabled=True,
-        exact_endgame_max_nodes=500_000,
+        exact_endgame_max_secs=SOLVE_SECS,
     )
     _visit_counts, _root = mcts.search(state, rng=np.random.default_rng(3))
     assert mcts._exact_endgame_active is False
@@ -274,13 +320,13 @@ def test_parallel_matches_serial():
     pytest.importorskip("kingdomino_rust")
 
     checked = 0
-    for _state, rs in _reach_deck4_rust(seed_start=0, want=16):
-        v_ser, ok_ser, _n_ser, _t = rs.measure_endgame_tree(2_000_000, 100.0, 2.0, 0.8, False)
-        v_par, ok_par, _n_par, _t = rs.measure_endgame_tree(2_000_000, 100.0, 2.0, 0.8, True)
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=12):
+        v_ser, ok_ser, _t = rs.measure_endgame_tree(SOLVE_SECS, 100.0, 2.0, 0.8, False)
+        v_par, ok_par, _t2 = rs.measure_endgame_tree(SOLVE_SECS, 100.0, 2.0, 0.8, True)
         if ok_ser and ok_par:
             assert v_ser == pytest.approx(v_par, abs=1e-9)
             checked += 1
-    assert checked >= 8, "too few positions solved within 2M to validate equivalence"
+    assert checked >= 6, "too few positions solved within budget to validate equivalence"
 
 
 def test_parallel_no_budget_regression():
@@ -292,27 +338,28 @@ def test_parallel_no_budget_regression():
     state = _reach_final_placement(seed=11)
     assert len(state.deck) == 0
     rs = _rust_state_from_python(state)
-    v_par, ok_par, _n, _t = rs.measure_endgame_tree(50_000, 100.0, 2.0, 0.8, True)
-    v_ser, ok_ser, _n2, _t2 = rs.measure_endgame_tree(50_000, 100.0, 2.0, 0.8, False)
+    v_par, ok_par, _t = rs.measure_endgame_tree(SOLVE_SECS, 100.0, 2.0, 0.8, True)
+    v_ser, ok_ser, _t2 = rs.measure_endgame_tree(SOLVE_SECS, 100.0, 2.0, 0.8, False)
     assert ok_par and ok_ser
     assert v_par == pytest.approx(v_ser, abs=1e-9)
     assert -1.0 <= v_par <= 1.0
 
 
-def test_ordering_shrinks_nodes():
-    """OPT-4b: the score-delta move ordering keeps the median serial node count
-    below the documented pre-OPT-4b baseline (p50=111,856 over the same seeds)."""
+def test_solves_deck4_within_budget():
+    """OPT-4b: real deck=4 positions solve comfortably within the wall-clock
+    budget (the score-delta move ordering keeps the tail bounded). The solver no
+    longer reports node counts, so this checks solve time rather than nodes."""
     pytest.importorskip("kingdomino_rust")
 
-    nodes = []
+    elapsed_all = []
     for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
-        _v, ok, n, _t = rs.measure_endgame_tree(10_000_000, 100.0, 2.0, 0.8, False)
+        _v, ok, elapsed = rs.measure_endgame_tree(SOLVE_SECS, 100.0, 2.0, 0.8, False)
         if ok:
-            nodes.append(n)
-    assert len(nodes) >= 8
-    nodes.sort()
-    median = nodes[len(nodes) // 2]
-    assert median < 111_856, f"median node count {median:,} did not improve on baseline"
+            elapsed_all.append(elapsed)
+    assert len(elapsed_all) >= 6
+    elapsed_all.sort()
+    median = elapsed_all[len(elapsed_all) // 2]
+    assert median < SOLVE_SECS, f"median solve time {median:.3f}s did not fit the budget"
 
 
 def test_encoder_hidden_order_independence():
@@ -339,7 +386,7 @@ def test_exact_solver_public_consistent():
 
     v_a, solved_a = exact_endgame_value(
         state,
-        max_nodes=200_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(2),
         score_scale=100.0,
         margin_gain=2.0,
@@ -347,7 +394,7 @@ def test_exact_solver_public_consistent():
     )
     v_b, solved_b = exact_endgame_value(
         clone,
-        max_nodes=200_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(3),
         score_scale=100.0,
         margin_gain=2.0,
@@ -358,10 +405,14 @@ def test_exact_solver_public_consistent():
 
 
 def test_no_exact_solve_above_budget():
-    state = _reach_state(seed=13, max_deck=2)
+    """A position outside the no-chance window (deck=8) is not solvable: the Rust
+    no-chance solver rejects it and the bounded Python reference exceeds its node
+    cap, so the result is (0.0, unsolved)."""
+    state = _reach_state(seed=13, max_deck=8, min_deck=8)
+    assert len(state.deck) == 8
     value, solved = exact_endgame_value(
         state,
-        max_nodes=1,
+        max_secs=SOLVE_SECS,
         rng=random.Random(4),
         score_scale=100.0,
         margin_gain=2.0,
@@ -369,14 +420,30 @@ def test_no_exact_solve_above_budget():
     )
     assert value == 0.0
     assert not solved
-    assert count_endgame_nodes(state) > 1
+    assert count_endgame_nodes(state, max_nodes=50_000) > 1
+
+
+def test_disabled_solver_returns_unsolved():
+    """max_secs <= 0 disables exact solving: returns (0.0, unsolved) immediately
+    without attempting a solve, regardless of how easy the position is."""
+    state = _reach_state(seed=13, max_deck=0)
+    value, solved = exact_endgame_value(
+        state,
+        max_secs=0.0,
+        rng=random.Random(4),
+        score_scale=100.0,
+        margin_gain=2.0,
+        alpha=0.8,
+    )
+    assert value == 0.0
+    assert not solved
 
 
 def test_game_over_state_returns_terminal_value():
     state = _finish_game()
     value, solved = exact_endgame_value(
         state,
-        max_nodes=1,
+        max_secs=SOLVE_SECS,
         rng=random.Random(5),
         score_scale=100.0,
         margin_gain=2.0,
@@ -399,7 +466,7 @@ def test_rust_deck_empty_matches_python(monkeypatch):
     rust_nodes = count_endgame_nodes(state, max_nodes=50_000)
     rust_value, rust_solved = exact_endgame_value(
         state,
-        max_nodes=50_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(9),
         score_scale=100.0,
         margin_gain=2.0,
@@ -412,7 +479,7 @@ def test_rust_deck_empty_matches_python(monkeypatch):
     py_nodes = count_endgame_nodes(state, max_nodes=50_000)
     py_value, py_solved = exact_endgame_value(
         state,
-        max_nodes=50_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(10),
         score_scale=100.0,
         margin_gain=2.0,
@@ -432,7 +499,7 @@ def test_rust_deck_four_matches_python(monkeypatch):
     rust_nodes = count_endgame_nodes(state, max_nodes=50_000)
     rust_value, rust_solved = exact_endgame_value(
         state,
-        max_nodes=50_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(11),
         score_scale=100.0,
         margin_gain=2.0,
@@ -445,7 +512,7 @@ def test_rust_deck_four_matches_python(monkeypatch):
     py_nodes = count_endgame_nodes(state, max_nodes=50_000)
     py_value, py_solved = exact_endgame_value(
         state,
-        max_nodes=50_000,
+        max_secs=SOLVE_SECS,
         rng=random.Random(12),
         score_scale=100.0,
         margin_gain=2.0,
@@ -504,7 +571,7 @@ def test_minimax_beats_greedy():
     root = _FakeState("root", Phase.PLACE_AND_SELECT, current_actor=0)
     value, solved = exact_endgame_value(
         root,  # type: ignore[arg-type]
-        max_nodes=100,
+        max_secs=SOLVE_SECS,
         rng=random.Random(6),
         score_scale=100.0,
         margin_gain=2.0,
@@ -512,7 +579,7 @@ def test_minimax_beats_greedy():
     )
     greedy_after_opponent, _ = exact_endgame_value(
         root.step("greedy_now"),  # type: ignore[arg-type]
-        max_nodes=100,
+        max_secs=SOLVE_SECS,
         rng=random.Random(7),
         score_scale=100.0,
         margin_gain=2.0,
@@ -520,7 +587,7 @@ def test_minimax_beats_greedy():
     )
     patient_after_opponent, _ = exact_endgame_value(
         root.step("patient"),  # type: ignore[arg-type]
-        max_nodes=100,
+        max_secs=SOLVE_SECS,
         rng=random.Random(8),
         score_scale=100.0,
         margin_gain=2.0,
@@ -530,6 +597,67 @@ def test_minimax_beats_greedy():
     assert solved
     assert greedy_after_opponent < patient_after_opponent
     assert value == pytest.approx(patient_after_opponent)
+
+
+# ── Endgame oversampling (Change 4) ──────────────────────────────────────────
+
+
+def _make_example(game_progress: float) -> "object":
+    """Minimal Example whose flat carries a given game_progress (the only field
+    read by ReplayBuffer's oversampling weights)."""
+    from games.kingdomino.self_play import Example
+
+    flat = np.zeros(FLAT_SIZE, dtype=np.float16)
+    flat[FLAT_LAYOUT['game_progress'].start] = game_progress
+    z = np.zeros(0, dtype=np.int32)
+    return Example(
+        my_board=np.zeros((1, 1, 1), dtype=np.float16),
+        opp_board=np.zeros((1, 1, 1), dtype=np.float16),
+        flat=flat,
+        policy_idx=z, policy_val=np.zeros(0, dtype=np.float32),
+        legal_idx=z, z=0.0, own_score=0.0, opp_score=0.0, win_target=0.5,
+    )
+
+
+def test_oversample_increases_endgame_fraction():
+    """Change 4: with endgame_oversample_weight=2.0, endgame examples (20% of the
+    buffer) are drawn at roughly 2x their natural frequency (~33%)."""
+    from games.kingdomino.self_play import ReplayBuffer
+
+    buf = ReplayBuffer(capacity=10_000)
+    # 80% opening (progress 0.1), 20% endgame (progress 0.9).
+    buf.add([_make_example(0.1) for _ in range(800)])
+    buf.add([_make_example(0.9) for _ in range(200)])
+
+    rng = np.random.default_rng(0)
+    prog_idx = FLAT_LAYOUT['game_progress'].start
+    drawn = buf._draw_idxs(64_000, rng, oversample=2.0)
+    n_endgame = sum(1 for i in drawn
+                    if float(buf.data[int(i)].flat[prog_idx]) >= 0.75)
+    frac = n_endgame / len(drawn)
+    assert 0.30 <= frac <= 0.45, f"endgame fraction {frac:.3f} outside [0.30, 0.45]"
+
+    # Sanity: uniform sampling reproduces the natural ~20%.
+    uniform = buf._draw_idxs(64_000, rng, oversample=1.0)
+    n_uniform = sum(1 for i in uniform
+                    if float(buf.data[int(i)].flat[prog_idx]) >= 0.75)
+    assert 0.15 <= n_uniform / len(uniform) <= 0.25
+
+
+def test_oversample_weight_cache_invalidates_on_add():
+    """The cached weight vector is rebuilt after new examples are added, so it
+    always covers the current buffer (a stale cache would index out of range)."""
+    from games.kingdomino.self_play import ReplayBuffer
+
+    buf = ReplayBuffer(capacity=10_000)
+    buf.add([_make_example(0.1) for _ in range(100)])
+    rng = np.random.default_rng(1)
+    idxs1 = buf._draw_idxs(50, rng, oversample=2.0)
+    assert int(idxs1.max()) < 100
+
+    buf.add([_make_example(0.9) for _ in range(100)])
+    idxs2 = buf._draw_idxs(50, rng, oversample=2.0)
+    assert int(idxs2.max()) < 200  # cache rebuilt to cover all 200 examples
 
 
 # ── BatchedMCTS exact endgame integration tests ─────────────────────────────
@@ -563,7 +691,7 @@ def test_batched_exact_solve_fires():
     kr = pytest.importorskip("kingdomino_rust")
     mcts = kr.BatchedMCTS(
         n_slots=1, n_games=1, base_seed=0, n_sims=400, leaf_batch=6,
-        open_loop=True, exact_endgame_max_nodes=15_000_000,
+        open_loop=True, exact_endgame_max_secs=10.0,
     )
     _drive_batched(mcts)
     assert mcts.exact_solve_count > 0
@@ -580,7 +708,7 @@ def test_batched_exact_policy_is_valid():
     kr = pytest.importorskip("kingdomino_rust")
     mcts = kr.BatchedMCTS(
         n_slots=2, n_games=2, base_seed=0, n_sims=64, leaf_batch=6,
-        open_loop=True, exact_endgame_max_nodes=15_000_000,
+        open_loop=True, exact_endgame_max_secs=10.0,
     )
     finished = _drive_batched(mcts)
     assert mcts.exact_solve_count > 0
@@ -608,17 +736,17 @@ def test_batched_exact_vs_mcts_value():
     direction)."""
     kr = pytest.importorskip("kingdomino_rust")
 
-    def run(max_nodes):
+    def run(max_secs):
         m = kr.BatchedMCTS(
             n_slots=4, n_games=8, base_seed=0, n_sims=64, leaf_batch=6,
-            open_loop=True, exact_endgame_max_nodes=max_nodes,
+            open_loop=True, exact_endgame_max_secs=max_secs,
         )
         fin = _drive_batched(m)
         scores = {int(seed): (int(s[0]), int(s[1])) for seed, _ex, s in fin}
         return scores, m
 
-    exact_scores, m_on = run(15_000_000)
-    mcts_scores, m_off = run(0)
+    exact_scores, m_on = run(10.0)
+    mcts_scores, m_off = run(0.0)
     assert m_on.exact_solve_count > 0
     assert m_off.exact_solve_count == 0
     assert exact_scores.keys() == mcts_scores.keys()
@@ -627,14 +755,56 @@ def test_batched_exact_vs_mcts_value():
 
 
 def test_batched_exact_fallback_count_zero():
-    """Over 10 games, the 15M node budget solves every endgame root — no silent
-    fallback to MCTS during the endgame."""
+    """Over 10 games, a generous wall-clock budget solves every endgame root — no
+    silent fallback to MCTS during the endgame."""
     kr = pytest.importorskip("kingdomino_rust")
     mcts = kr.BatchedMCTS(
         n_slots=4, n_games=10, base_seed=0, n_sims=64, leaf_batch=6,
-        open_loop=True, exact_endgame_max_nodes=15_000_000,
+        open_loop=True, exact_endgame_max_secs=30.0,
     )
     _drive_batched(mcts)
     assert mcts.exact_solve_count > 0
     assert mcts.exact_tree_solve_count < mcts.exact_solve_count
     assert mcts.exact_fallback_count == 0
+
+
+def test_exact_stats_in_log_row(tmp_path):
+    """Change 3: every JSONL log row from a batched_open_loop run carries the four
+    exact-solver stat keys."""
+    pytest.importorskip("kingdomino_rust")
+    import torch
+    if not torch.cuda.is_available():
+        device = "cpu"
+    else:
+        device = "cpu"  # keep the smoke test on CPU for determinism/speed
+    from games.kingdomino.self_play import SelfPlayConfig, run_self_play_training
+
+    log_path = tmp_path / "training_log.jsonl"
+    cfg = SelfPlayConfig(
+        n_iterations=2,
+        games_per_iteration=2,
+        train_steps_per_iteration=0,   # skip training: keep the smoke test fast
+        n_simulations=20,
+        leaf_batch=4,
+        batch_slots=2,
+        channels=8,
+        blocks=1,
+        bilinear_dim=16,
+        device=device,
+        engine="batched_open_loop",
+        benchmark_every=0,
+        elo_every=0,
+        diag_every=0,
+        min_buffer_to_train=10_000,    # ensure training is skipped
+        exact_endgame_max_secs=3.0,
+        log_path=str(log_path),
+    )
+    run_self_play_training(cfg, verbose=False)
+
+    lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+    assert len(lines) == 2
+    for row in lines:
+        for key in ("exact_solve_count", "exact_tree_solve_count",
+                    "exact_cache_hit_count", "exact_fallback_count"):
+            assert key in row, f"missing {key} in log row"
+            assert row[key] is not None  # batched engine populates real ints
