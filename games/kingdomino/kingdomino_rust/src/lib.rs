@@ -3609,6 +3609,7 @@ fn spawn_endgame_solver(
     score_scale: f64,
     margin_gain: f64,
     alpha: f64,
+    solver_pool: rayon::ThreadPool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
@@ -3619,20 +3620,27 @@ fn spawn_endgame_solver(
                 game_seed,
             } = job;
             let t0 = std::time::Instant::now();
-            let result = match solve_exact_plan(&state, max_secs, score_scale, margin_gain, alpha) {
-                Ok(Some(plan)) if !plan.is_empty() => {
-                    let n = plan.len() as u64;
-                    match play_out_exact_endgame(state, records, game_seed, plan) {
-                        Ok(fg) => (SolveResult::Finished(fg), n),
-                        Err(_) => (SolveResult::Fallback, 0),
+            // Confine the within-solve YBW par_iter to the DEDICATED solver pool so
+            // its long, non-preemptible subtree-solves never head-of-line-block the
+            // GLOBAL pool that step()/update() use to feed the GPU. The pool's thread
+            // count is the gen/solver core split (solver_cpus); generation gets the
+            // rest via the global pool.
+            let (result, n_solved) = solver_pool.install(move || {
+                match solve_exact_plan(&state, max_secs, score_scale, margin_gain, alpha) {
+                    Ok(Some(plan)) if !plan.is_empty() => {
+                        let n = plan.len() as u64;
+                        match play_out_exact_endgame(state, records, game_seed, plan) {
+                            Ok(fg) => (SolveResult::Finished(fg), n),
+                            Err(_) => (SolveResult::Fallback, 0),
+                        }
                     }
+                    _ => (SolveResult::Fallback, 0),
                 }
-                _ => (SolveResult::Fallback, 0),
-            };
+            });
             let outcome = SolveOutcome {
                 slot_idx,
-                result: result.0,
-                n_solved: result.1,
+                result,
+                n_solved,
                 solve_secs: t0.elapsed().as_secs_f64(),
             };
             if out_tx.send(outcome).is_err() {
@@ -4052,7 +4060,7 @@ impl BatchedMCTS {
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
                         score_scale=100.0, margin_gain=2.0, alpha=0.8,
-                        exact_endgame_max_secs=3.0, async_solve=false))]
+                        exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -4073,6 +4081,7 @@ impl BatchedMCTS {
         alpha: f64,
         exact_endgame_max_secs: f64,
         async_solve: bool,
+        solver_cpus: usize,
     ) -> Self {
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
@@ -4112,8 +4121,31 @@ impl BatchedMCTS {
         // BatchedMCTS is dropped (job_tx closes).
         let (job_tx, job_rx) = std::sync::mpsc::channel::<SolveJob>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<SolveOutcome>();
-        let solver_handle =
-            spawn_endgame_solver(job_rx, out_tx, exact_endgame_max_secs, score_scale, margin_gain, alpha);
+        // Dedicated solver pool. solver_cpus = threads for solving; generation gets
+        // the rest via the global Rayon pool. 0 => auto (half of available threads).
+        let solver_threads = if solver_cpus > 0 {
+            solver_cpus
+        } else {
+            (std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                / 2)
+            .max(1)
+        };
+        let solver_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(solver_threads)
+            .thread_name(|i| format!("endgame-solver-{i}"))
+            .build()
+            .expect("failed to build the dedicated endgame solver pool");
+        let solver_handle = spawn_endgame_solver(
+            job_rx,
+            out_tx,
+            exact_endgame_max_secs,
+            score_scale,
+            margin_gain,
+            alpha,
+            solver_pool,
+        );
         BatchedMCTS {
             slots,
             n_sims,

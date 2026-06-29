@@ -238,6 +238,10 @@ class SelfPlayConfig:
     # Pair with a larger batch_slots (overbooking) so slots out solving don't
     # collapse the GPU batch.  Off by default.
     async_solve: bool = False
+    # CPU split for async_solve: threads in the dedicated solver pool; game
+    # generation (descent/backup) gets the rest via the global Rayon pool.  Tune
+    # per machine (e.g. 6 on an 8-core box).  0 => auto (half of available).
+    solver_cpus: int = 0
 
 
 # ─── 2. Replay buffer ─────────────────────────────────────────────────────
@@ -1102,6 +1106,7 @@ def play_selfplay_games_batched(
             alpha=float(cfg.alpha),
             exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
             async_solve=bool(cfg.async_solve),
+            solver_cpus=int(cfg.solver_cpus),
         )
 
     use_db = bool(double_buffer)
@@ -2463,6 +2468,14 @@ if __name__ == "__main__":
                    help="(Step 1.5) Solve endgames on a background thread so they "
                         "overlap the GPU eval. Pair with a larger --batch_slots "
                         "(overbooking) so solving slots don't collapse the batch.")
+    p.add_argument("--solver_cpus", type=int, default=0,
+                   help="(Step 1.5) Threads in the dedicated endgame-solver pool; "
+                        "game generation gets the rest. Tune per machine "
+                        "(e.g. 6 on an 8-core box). 0 = auto (half of available).")
+    p.add_argument("--profile_eval_timing", action="store_true",
+                   help="Split eval_sec into h2d / forward / readback to see "
+                        "whether the evaluator is forward-bound or transfer/"
+                        "packaging-bound.")
     p.add_argument("--exact_endgame_max_secs", type=float, default=3.0,
                    help="Per-position wall-clock time limit for the exact endgame "
                         "solver (seconds). 0.0 disables exact endgame solving; "
@@ -2511,6 +2524,8 @@ if __name__ == "__main__":
         prefetch_batches=a.prefetch_batches,
         double_buffer=a.double_buffer,
         async_solve=a.async_solve,
+        solver_cpus=a.solver_cpus,
+        profile_eval_timing=a.profile_eval_timing,
         exact_endgame_max_secs=a.exact_endgame_max_secs,
         endgame_oversample=a.endgame_oversample,
     )

@@ -258,42 +258,47 @@ completed solve to its game. This is the same machinery as Step 2's "solver inli
 in worker," so it doubles as a Step-2 stepping stone — **design the slot/job
 separation in from the start; retrofitting it is expensive.**
 
-### Attempt 2 — measured (built, correct, CPU-contention-capped on the laptop)
+### Attempt 2 — measured (built, correct, and a net win once the pools are split)
 
 Built: standalone `play_out_exact_endgame` (owned data) + a background solver
 thread + `SolvingInBackground` slot state + dispatch/harvest + in-place fallback
 resume + overbooking via `--batch_slots`, behind `--async_solve` (default off).
+A **dedicated solver thread pool** (`--solver_cpus N`) confines the within-solve
+YBW `par_iter`; game generation gets the rest of the cores via the global pool.
 Correctness: deterministic, **identical per-seed games vs sync**; sync path 38/38.
 
-| | games/s | step | eval | update | wall |
-|---|---|---|---|---|---|
-| sync@32 (baseline) | 0.122 | 244.6s | 565.7s | 11.5s | 822s |
-| async@32 | 0.118 | 168.7s | **631.4s** | **46.3s** | 846s |
-| async@48 (overbook) | 0.128 | 143.8s | 587.7s | 48.0s | 779s |
-| solver-off@32 | 0.140 | 61.2s | 630.3s | 12.8s | 704s |
+| | games/s | step | eval | update | wall | solved |
+|---|---|---|---|---|---|---|
+| sync@32 (baseline) | 0.122 | 244.6s | 565.7s | 11.5s | 822s | 70 |
+| async@32 (shared pool) | 0.118 | 168.7s | 631.4s | 46.3s | 846s | 64 |
+| async@48 (shared, overbook) | 0.128 | 143.8s | 587.7s | 48.0s | 779s | 69 |
+| **async@32, solver_cpus=6** | **0.139** | 62.7s | 643.7s | 13.4s | 720s | 59 |
+| solver-off@32 | 0.140 | 61.2s | 630.3s | 12.8s | 704s | 0 |
 
-**Finding — the overlap is correct but CPU-contention-capped.** async@32 vs
-sync@32 (same slots/batch/ticks): `step` dropped 244.6→168.7s (solver moved off
-the main thread ✓), but `eval` *rose* 565.7→631.4s and `update` 11.5→46.3s. In
-sync the solver and eval run sequentially (no contention); in async the
-background solve runs concurrently and — because each solve grabs all 8 cores via
-the within-solve YBW `par_iter` — **starves the main thread's CPU-side eval work
-(tensor prep, kernel launch, next-batch descent)**. The eval/update inflation ~=
-the step saving, so async@32 is net slightly slower. Overbooking (async@48) gets
-bigger batches and recovers to 0.128, but its per-slot overhead caps it.
+**The first "contention" diagnosis was wrong; the real cause was a shared pool.**
+It is *not* raw core starvation — ~1 core feeds the GPU (pre-solver fact), so 8
+cores have room for solving + feeding. The problem was that the solver and the
+GPU-feeding **shared the global Rayon pool**: the within-solve YBW submits long,
+non-preemptible subtree-solves, and `step()`/`update()`'s descent/backup
+`par_iter` queued *behind* them (head-of-line blocking). That inflated `step`,
+`eval`, **and** `update` together (all contend for the shared pool / cores).
 
-**Implications:**
-- The async architecture is right, but its payoff needs **spare cores**. On the
-  8-core laptop (CPU/GPU-balanced) the 187s of solver CPU has nowhere free to
-  hide — overlapped or not. On the **cloud 5090 (16–32 vCPUs)** there are enough
-  cores for solver + GPU-feeding, so the overlap should pay off there (the
-  intended target).
-- On the laptop the lever is a **cheaper solver** (value/policy decoupling +
-  partial targets), not overlap — the solver's CPU cost can't hide on a core-
-  bound box.
-- A targeted mitigation: **cap the background solver's thread count** (own Rayon
-  pool, leave ~2 cores for GPU-feeding) — the "reserve M workers" admission idea.
-  Likely recovers some laptop games/s, but bounded on 8 cores.
+**The fix — a dedicated solver pool — works.** With `solver_cpus=6` (6 cores
+solving, ~2 reserved for generation), all three phases snap back to the
+solver-off levels (`step` 62.7s ≈ 61.2s; `update` 13.4s ≈ 12.8s — confirming the
+`update` blow-up was contention, **not** a bug), and **games/s = 0.139 ≈
+solver-off 0.140**. The solver is now **throughput-free on the laptop** while
+delivering exact targets for 59/100 games. The earlier "needs cloud cores"
+conclusion was premature.
+
+**The knob trades throughput vs solve-success.** Fewer solver cores → faster
+generation but slower per-solve → fewer endgames solved in budget (solver_cpus=6:
+59 solved; the shared-pool/full-machine runs solved ~64–70 but contended). That
+is exactly the per-machine `--solver_cpus` dial. The **cheaper-solver lever**
+(value/policy decoupling) compounds: more solve-success per core means the same
+quality at fewer cores, freeing more for generation. Next steps: sweep
+`solver_cpus` (e.g. 5/6/7) for the throughput↔solve-success knee, and carry the
+dedicated-pool design into Step 2 (where it *is* the admission control).
 
 ### Step 1.5 gate (stricter than games/s alone)
 
