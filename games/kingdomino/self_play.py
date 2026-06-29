@@ -1034,9 +1034,10 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     exact_tree_solve_count = int(A.exact_tree_solve_count) + int(B.exact_tree_solve_count)
     exact_cache_hit_count = int(A.exact_cache_hit_count) + int(B.exact_cache_hit_count)
     exact_fallback_count = int(A.exact_fallback_count) + int(B.exact_fallback_count)
+    exact_solver_secs = float(A.exact_solver_secs) + float(B.exact_solver_secs)
     return (finished, batch_sizes, ticks,
             exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
-            exact_fallback_count,
+            exact_fallback_count, exact_solver_secs,
             prof["step"], eval_sec, prof["update"], elapsed)
 
 
@@ -1108,6 +1109,7 @@ def play_selfplay_games_batched(
     exact_tree_solve_count = 0
     exact_cache_hit_count = 0
     exact_fallback_count = 0
+    exact_solver_secs = 0.0
     if not use_db:
         # ── Single-buffer path (unchanged) ──
         batched = _make_batched(n_games, game_seed_start)
@@ -1138,11 +1140,12 @@ def play_selfplay_games_batched(
         exact_tree_solve_count = int(batched.exact_tree_solve_count)
         exact_cache_hit_count = int(batched.exact_cache_hit_count)
         exact_fallback_count = int(batched.exact_fallback_count)
+        exact_solver_secs = float(batched.exact_solver_secs)
     else:
         # ── Double-buffer path (Item 17) ──
         (finished, batch_sizes, ticks,
          exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
-         exact_fallback_count,
+         exact_fallback_count, exact_solver_secs,
          step_sec, eval_sec, update_sec, elapsed) = _double_buffer_loop(
             _make_batched, evaluator, n_games, game_seed_start)
 
@@ -1174,6 +1177,7 @@ def play_selfplay_games_batched(
         "exact_tree_solve_count": exact_tree_solve_count,
         "exact_cache_hit_count": exact_cache_hit_count,
         "exact_fallback_count": exact_fallback_count,
+        "exact_solver_secs": exact_solver_secs,
     }
     ev_timing = getattr(evaluator, "timing", None)
     if ev_timing:
@@ -1306,10 +1310,13 @@ def _compact_summary(it: int, *, sp_games: int, row: dict, trained: bool,
             bench += f" brier={bwb:.3f}"
         parts.append(bench)
     if row.get("exact_tree_solve_count"):
-        parts.append(
+        exact_part = (
             f"exact: trees={row['exact_tree_solve_count']} "
             f"hits={row['exact_cache_hit_count']} "
             f"fallback={row['exact_fallback_count']}")
+        if row.get("exact_solver_secs") is not None:
+            exact_part += f" solver={row['exact_solver_secs']:.1f}s"
+        parts.append(exact_part)
     return " | ".join(parts)
 
 
@@ -2234,6 +2241,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                           if batched_stats else None),
                 "exact_fallback_count": (batched_stats.get("exact_fallback_count", 0)
                                          if batched_stats else None),
+                "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
+                                      if batched_stats else None),
                 "endgame_oversample": cfg.endgame_oversample,
                 "n_endgame_in_batch": n_endgame_in_batch,
             }

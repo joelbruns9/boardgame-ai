@@ -1415,7 +1415,7 @@ impl RustGameState {
     /// `parallel=True` (default) uses the YBW parallel solver
     /// (`solve_endgame_ab_parallel`) to measure wall-clock; `parallel=False` uses
     /// the serial solver — use that to compare single-core solve times.
-    #[pyo3(signature = (max_secs=60.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true))]
+    #[pyo3(signature = (max_secs=60.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true, ordering="lookahead2_clustered"))]
     fn measure_endgame_tree(
         &self,
         max_secs: f64,
@@ -1423,6 +1423,7 @@ impl RustGameState {
         margin_gain: f64,
         alpha: f64,
         parallel: bool,
+        ordering: &str,
     ) -> PyResult<(f64, bool, f64)> {
         if self.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot measure a terminal state"));
@@ -1438,26 +1439,20 @@ impl RustGameState {
                 "measure_endgame_tree requires a no-chance endgame state (deck in {0,4})",
             ));
         }
+        let mode = SolverOrderMode::from_str(ordering)?;
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_secs_f64(max_secs);
-        let (value, solved) = if parallel {
-            match solve_endgame_ab_parallel(self, deadline, score_scale, margin_gain, alpha)? {
-                Some(v) => (v, true),
-                None => (0.0, false),
-            }
+        let raw = if parallel {
+            solve_endgame_ab_parallel(self, deadline, mode)?
         } else {
-            match solve_endgame_ab(
-                self,
-                deadline,
-                f64::NEG_INFINITY,
-                f64::INFINITY,
-                score_scale,
-                margin_gain,
-                alpha,
-            )? {
-                Some(v) => (v, true),
-                None => (0.0, false),
-            }
+            solve_endgame_ab(self, deadline, MARGIN_LO, MARGIN_HI, mode, 0)?
+        };
+        let (value, solved) = match raw {
+            Some(raw_margin) => (
+                margin_to_training_value(raw_margin, score_scale, margin_gain, alpha),
+                true,
+            ),
+            None => (0.0, false),
         };
         let elapsed_secs = start.elapsed().as_secs_f64();
         Ok((value, solved, elapsed_secs))
@@ -1529,6 +1524,29 @@ fn terminal_search_value(
     };
     alpha * margin_value + (1.0 - alpha) * win_value
 }
+
+/// Convert a raw score margin (s0 - s1, player-0 frame) into the training value.
+/// Called AFTER the alpha-beta solve — the search itself runs on raw margins for
+/// tightest pruning, and this is a monotone transform of the margin, so the
+/// minimax-optimal move is unchanged. Bit-identical to `terminal_search_value`
+/// evaluated on the same final scores (which is why values match the old solver).
+fn margin_to_training_value(margin: f64, score_scale: f64, margin_gain: f64, alpha: f64) -> f64 {
+    let win_value = if margin > 0.0 {
+        1.0
+    } else if margin < 0.0 {
+        -1.0
+    } else {
+        0.0
+    };
+    let margin_value = (margin / score_scale * margin_gain).tanh();
+    alpha * margin_value + (1.0 - alpha) * win_value
+}
+
+/// Full-window sentinel for the raw-margin solver. Margins live in ~[-80, 80], so
+/// ±200 brackets every possible value with room to spare; callers use these as the
+/// "exact, untightened" alpha-beta bounds (replacing ±∞).
+const MARGIN_LO: f64 = -200.0;
+const MARGIN_HI: f64 = 200.0;
 
 fn is_no_chance_endgame_state(state: &RustGameState) -> bool {
     match state.phase {
@@ -1729,6 +1747,118 @@ fn pick_order_score(domino_id: u16, terrain_counts: &[u8; 8]) -> i32 {
         + (c_b as i32) * (terrain_counts[t_b as usize] as i32)
 }
 
+/// Estimate how valuable the picked tile would be to the opponent if they had
+/// taken it instead. Used to score the denial value of a pick.
+fn opponent_denial_score(domino_id: u16, opponent_terrain_counts: &[u8; 8]) -> i32 {
+    pick_order_score(domino_id, opponent_terrain_counts)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolverOrderMode {
+    Baseline,
+    Denial,
+    Lookahead,
+    Lookahead2,
+    Lookahead2Adaptive8,
+    Lookahead2Adaptive,
+    Lookahead2Adaptive16,
+    Lookahead2Adaptive20,
+    Lookahead2Clustered,
+    Lookahead1Clustered,
+    Combined,
+}
+
+const ADAPTIVE_LOOKAHEAD_MIN_LEGAL: usize = 12;
+const CLUSTERED_LOOKAHEAD_MIN_LEGAL: usize = 8;
+const CLUSTERED_LOOKAHEAD_DELTA: i32 = 4;
+const CLUSTERED_LOOKAHEAD_MIN_TOP_BAND: usize = 4;
+
+impl SolverOrderMode {
+    fn from_str(s: &str) -> PyResult<Self> {
+        match s {
+            "baseline" => Ok(Self::Baseline),
+            "denial" | "option_a" => Ok(Self::Denial),
+            "lookahead" | "option_b" => Ok(Self::Lookahead),
+            "lookahead2" | "recursive_lookahead2" => Ok(Self::Lookahead2),
+            "lookahead2_adaptive8" => Ok(Self::Lookahead2Adaptive8),
+            "lookahead2_adaptive" | "adaptive_lookahead2" | "lookahead2_adaptive12" => {
+                Ok(Self::Lookahead2Adaptive)
+            }
+            "lookahead2_adaptive16" => Ok(Self::Lookahead2Adaptive16),
+            "lookahead2_adaptive20" => Ok(Self::Lookahead2Adaptive20),
+            "lookahead2_clustered" | "clustered_lookahead2" => Ok(Self::Lookahead2Clustered),
+            "lookahead1_clustered" | "clustered_lookahead1" => Ok(Self::Lookahead1Clustered),
+            "combined" | "option_c" => Ok(Self::Combined),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown solver ordering '{s}' (expected baseline, denial, lookahead, lookahead2, lookahead2_adaptive8, lookahead2_adaptive, lookahead2_adaptive16, lookahead2_adaptive20, lookahead2_clustered, lookahead1_clustered, combined)"
+            ))),
+        }
+    }
+
+    fn uses_denial(self) -> bool {
+        matches!(self, Self::Denial | Self::Combined)
+    }
+
+    fn uses_lookahead_at_depth(self, depth: u32) -> bool {
+        match self {
+            Self::Lookahead | Self::Combined => depth == 0,
+            Self::Lookahead2 => depth <= 2,
+            Self::Lookahead2Adaptive8
+            | Self::Lookahead2Adaptive
+            | Self::Lookahead2Adaptive16
+            | Self::Lookahead2Adaptive20
+            | Self::Lookahead2Clustered
+            | Self::Lookahead1Clustered => depth == 0,
+            _ => false,
+        }
+    }
+
+    fn adaptive_lookahead_min_legal(self) -> Option<usize> {
+        match self {
+            Self::Lookahead2Adaptive8 => Some(8),
+            Self::Lookahead2Adaptive => Some(ADAPTIVE_LOOKAHEAD_MIN_LEGAL),
+            Self::Lookahead2Adaptive16 => Some(16),
+            Self::Lookahead2Adaptive20 => Some(20),
+            _ => None,
+        }
+    }
+
+    fn uses_adaptive_lookahead(self, depth: u32, legal_len: usize) -> bool {
+        self.adaptive_lookahead_min_legal()
+            .is_some_and(|min_legal| (1..=2).contains(&depth) && legal_len >= min_legal)
+    }
+}
+
+fn cheap_order_score_for_solver(
+    board: &RustBoard,
+    halves: Option<(u8, u8, u8, u8)>,
+    tc: &[u8; 8],
+    opp_tc: Option<&[u8; 8]>,
+    p: Option<(i8, i8, i8, i8, bool)>,
+    pk: Option<u16>,
+) -> i32 {
+    let key_placement = match (p, halves) {
+        (Some((x1, y1, x2, y2, flipped)), Some((t_a, c_a, t_b, c_b))) => {
+            let (th1, ch1, th2, ch2) = if flipped {
+                (t_b, c_b, t_a, c_a)
+            } else {
+                (t_a, c_a, t_b, c_b)
+            };
+            placement_score_delta(board, th1, ch1, x1, y1, th2, ch2, x2, y2)
+        }
+        _ => 0,
+    };
+    let key_pick = match pk {
+        Some(pid) => pick_order_score(pid, tc),
+        None => 0,
+    };
+    let key_denial = match (pk, opp_tc) {
+        (Some(pid), Some(counts)) => opponent_denial_score(pid, counts),
+        _ => 0,
+    };
+    key_placement + key_pick + key_denial
+}
+
 /// Sort legal actions in place by descending move-ordering heuristic, breaking
 /// ties by ascending joint index for determinism.  Primary key: placement score
 /// delta; secondary: pick value; both descending for the mover (the same sort
@@ -1736,6 +1866,7 @@ fn pick_order_score(domino_id: u16, terrain_counts: &[u8; 8]) -> i32 {
 fn order_legal_for_solver(
     state: &RustGameState,
     legal: &mut [(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+    mode: SolverOrderMode,
 ) {
     if legal.len() < 2 {
         return;
@@ -1749,27 +1880,137 @@ fn order_legal_for_solver(
     // terrain_counts is board-wide and constant across this node's actions, so
     // compute it once rather than per-action.
     let tc = terrain_counts(board);
+    let opp_tc = if mode.uses_denial() {
+        Some(terrain_counts(&state.boards[(1 - actor) as usize]))
+    } else {
+        None
+    };
     legal.sort_by_cached_key(|&(idx_key, p, pk)| {
-        let key_placement = match (p, halves) {
-            (Some((x1, y1, x2, y2, flipped)), Some((t_a, c_a, t_b, c_b))) => {
-                // Resolve which half lands on which cell (matches RustBoard::place).
-                let (th1, ch1, th2, ch2) = if flipped {
-                    (t_b, c_b, t_a, c_a)
-                } else {
-                    (t_a, c_a, t_b, c_b)
-                };
-                placement_score_delta(board, th1, ch1, x1, y1, th2, ch2, x2, y2)
-            }
-            _ => 0,
-        };
-        let key_pick = match pk {
-            Some(pid) => pick_order_score(pid, &tc),
-            None => 0,
-        };
+        let score = cheap_order_score_for_solver(
+            board,
+            halves,
+            &tc,
+            opp_tc.as_ref(),
+            p,
+            pk,
+        );
         // Negate so the natural ascending sort yields descending benefit;
-        // (placement, pick, idx) lexicographic with idx as the stable tiebreaker.
-        (-key_placement, -key_pick, idx_key)
+        // (score, idx) lexicographic with idx as the stable tiebreaker.
+        (-score, idx_key)
     });
+}
+
+fn cheap_scores_clustered_for_solver(
+    state: &RustGameState,
+    legal: &[(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+    mode: SolverOrderMode,
+) -> bool {
+    if legal.len() < CLUSTERED_LOOKAHEAD_MIN_LEGAL {
+        return false;
+    }
+    let actor = match state.actor() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let board = &state.boards[actor as usize];
+    let halves = state.domino_in_hand(actor).map(dom);
+    let tc = terrain_counts(board);
+    let opp_tc = if mode.uses_denial() {
+        Some(terrain_counts(&state.boards[(1 - actor) as usize]))
+    } else {
+        None
+    };
+    let mut best = i32::MIN;
+    let mut scores = Vec::with_capacity(legal.len());
+    for &(_idx_key, p, pk) in legal {
+        let score = cheap_order_score_for_solver(
+            board,
+            halves,
+            &tc,
+            opp_tc.as_ref(),
+            p,
+            pk,
+        );
+        best = best.max(score);
+        scores.push(score);
+    }
+    scores
+        .into_iter()
+        .filter(|&score| best - score <= CLUSTERED_LOOKAHEAD_DELTA)
+        .take(CLUSTERED_LOOKAHEAD_MIN_TOP_BAND)
+        .count()
+        >= CLUSTERED_LOOKAHEAD_MIN_TOP_BAND
+}
+
+/// Compute the raw margin (s0 - s1) after applying `action` to `state`.
+/// Used for 1-ply look-ahead move ordering at root nodes.
+fn one_ply_margin(
+    state: &RustGameState,
+    placement: Option<(i8, i8, i8, i8, bool)>,
+    pick: Option<u16>,
+) -> PyResult<i32> {
+    let next = state.step(placement, pick)?;
+    let (s0, s1) = next.scores();
+    Ok(s0 - s1)
+}
+
+/// Order legal actions using 1-ply look-ahead margin evaluation.
+fn order_legal_for_solver_lookahead(
+    state: &RustGameState,
+    legal: &mut [(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+    mode: SolverOrderMode,
+) -> PyResult<()> {
+    if legal.len() < 2 {
+        return Ok(());
+    }
+    let actor = state.actor()?;
+    let opp_tc = if mode == SolverOrderMode::Combined {
+        Some(terrain_counts(&state.boards[(1 - actor) as usize]))
+    } else {
+        None
+    };
+    let mut keyed: Vec<_> = legal
+        .iter()
+        .map(|&(idx_key, p, pk)| {
+            let margin = one_ply_margin(state, p, pk)?;
+            let denial = match (pk, opp_tc.as_ref()) {
+                (Some(pid), Some(counts)) => opponent_denial_score(pid, counts),
+                _ => 0,
+            };
+            let key = if actor == 0 {
+                (-margin, -denial, idx_key)
+            } else {
+                (margin, -denial, idx_key)
+            };
+            Ok((key, (idx_key, p, pk)))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    keyed.sort_unstable_by_key(|(key, _action)| *key);
+    for (dst, (_key, action)) in legal.iter_mut().zip(keyed.into_iter()) {
+        *dst = action;
+    }
+    Ok(())
+}
+
+fn order_legal_for_solver_at_depth(
+    state: &RustGameState,
+    legal: &mut [(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+    mode: SolverOrderMode,
+    depth: u32,
+) -> PyResult<()> {
+    let clustered_depth = match mode {
+        SolverOrderMode::Lookahead2Clustered => (1..=2).contains(&depth),
+        SolverOrderMode::Lookahead1Clustered => depth == 1,
+        _ => false,
+    };
+    let clustered = clustered_depth
+        && cheap_scores_clustered_for_solver(state, legal, mode);
+    if mode.uses_lookahead_at_depth(depth) || mode.uses_adaptive_lookahead(depth, legal.len()) || clustered {
+        order_legal_for_solver_lookahead(state, legal, mode)
+    } else {
+        order_legal_for_solver(state, legal, mode);
+        Ok(())
+    }
 }
 
 /// Single-pass, budgeted, alpha-beta minimax over a no-chance endgame (OPT-2 +
@@ -1793,20 +2034,21 @@ fn solve_endgame_ab(
     deadline: std::time::Instant,
     mut alpha: f64,
     mut beta: f64,
-    score_scale: f64,
-    margin_gain: f64,
-    alpha_param: f64,
+    mode: SolverOrderMode,
+    depth: u32,
 ) -> PyResult<Option<f64>> {
+    // The search runs on the RAW integer score margin (s0 - s1), player-0 frame,
+    // range ~[-80, 80]. Integer margins give the widest spread and therefore the
+    // tightest alpha-beta bounds, and contain no training hyperparameters. The
+    // training value is a monotone transform applied AFTER the solve, so the
+    // minimax-optimal move is identical to the old value-space search.
+    //
     // GAME_OVER returns a value with zero further work, so resolve it before the
     // deadline check — a timed-out search should still return exact terminal leaves
     // it has already reached rather than abort on them.
     if state.phase == GAME_OVER {
-        return Ok(Some(terminal_search_value(
-            state,
-            score_scale,
-            margin_gain,
-            alpha_param,
-        )));
+        let (s0, s1) = state.scores();
+        return Ok(Some((s0 - s1) as f64));
     }
     // Wall-clock budget (replaces the old node-count budget). Per-node
     // Instant::now() is ~5ns — negligible against the ~1μs+ of step()+ordering
@@ -1824,21 +2066,13 @@ fn solve_endgame_ab(
             state.phase
         )));
     }
-    order_legal_for_solver(state, &mut legal);
+    order_legal_for_solver_at_depth(state, &mut legal, mode, depth)?;
 
     if actor == 0 {
         let mut best = f64::NEG_INFINITY;
         for &(_idx, p, pk) in &legal {
             let child = state.step(p, pk)?;
-            match solve_endgame_ab(
-                &child,
-                deadline,
-                alpha,
-                beta,
-                score_scale,
-                margin_gain,
-                alpha_param,
-            )? {
+            match solve_endgame_ab(&child, deadline, alpha, beta, mode, depth + 1)? {
                 None => return Ok(None),
                 Some(v) => {
                     if v > best {
@@ -1858,15 +2092,7 @@ fn solve_endgame_ab(
         let mut best = f64::INFINITY;
         for &(_idx, p, pk) in &legal {
             let child = state.step(p, pk)?;
-            match solve_endgame_ab(
-                &child,
-                deadline,
-                alpha,
-                beta,
-                score_scale,
-                margin_gain,
-                alpha_param,
-            )? {
+            match solve_endgame_ab(&child, deadline, alpha, beta, mode, depth + 1)? {
                 None => return Ok(None),
                 Some(v) => {
                     if v < best {
@@ -1906,17 +2132,13 @@ fn solve_endgame_ab(
 fn solve_endgame_ab_parallel(
     state: &RustGameState,
     deadline: std::time::Instant,
-    score_scale: f64,
-    margin_gain: f64,
-    alpha_param: f64,
+    mode: SolverOrderMode,
 ) -> PyResult<Option<f64>> {
+    // Returns the RAW score margin (s0 - s1); callers convert to the training value
+    // via `margin_to_training_value`. See `solve_endgame_ab`.
     if state.phase == GAME_OVER {
-        return Ok(Some(terminal_search_value(
-            state,
-            score_scale,
-            margin_gain,
-            alpha_param,
-        )));
+        let (s0, s1) = state.scores();
+        return Ok(Some((s0 - s1) as f64));
     }
     let actor = state.actor()?;
     let mut legal = state.legal_actions_indexed();
@@ -1926,27 +2148,19 @@ fn solve_endgame_ab_parallel(
             state.phase
         )));
     }
-    order_legal_for_solver(state, &mut legal);
+    order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
 
     // Step 1: solve the first (best-ordered) child serially to establish a bound.
     let (_i0, p0, pk0) = legal[0];
     let first_next = state.step(p0, pk0)?;
-    let first_val = match solve_endgame_ab(
-        &first_next,
-        deadline,
-        f64::NEG_INFINITY,
-        f64::INFINITY,
-        score_scale,
-        margin_gain,
-        alpha_param,
-    )? {
+    let first_val = match solve_endgame_ab(&first_next, deadline, MARGIN_LO, MARGIN_HI, mode, 1)? {
         Some(v) => v,
         None => return Ok(None),
     };
 
     let mut best_val = first_val;
-    let mut alpha = f64::NEG_INFINITY;
-    let mut beta = f64::INFINITY;
+    let mut alpha = MARGIN_LO;
+    let mut beta = MARGIN_HI;
     if actor == 0 {
         alpha = alpha.max(first_val);
     } else {
@@ -1968,15 +2182,7 @@ fn solve_endgame_ab_parallel(
         .par_iter()
         .map(|&(_idx, p, pk)| -> PyResult<Option<f64>> {
             let next = state.step(p, pk)?;
-            solve_endgame_ab(
-                &next,
-                deadline,
-                captured_alpha,
-                captured_beta,
-                score_scale,
-                margin_gain,
-                alpha_param,
-            )
+            solve_endgame_ab(&next, deadline, captured_alpha, captured_beta, mode, 1)
         })
         .collect();
 
@@ -3273,12 +3479,12 @@ fn solve_endgame_ab_value_cached(
     deadline: std::time::Instant,
     alpha: f64,
     beta: f64,
-    score_scale: f64,
-    margin_gain: f64,
-    alpha_param: f64,
+    mode: SolverOrderMode,
     value_cache: &mut HashMap<EndgameKey, f64>,
 ) -> PyResult<Option<f64>> {
-    let full_window = alpha == f64::NEG_INFINITY && beta == f64::INFINITY;
+    // Cache only full-window solves (exact raw margins). ±200 brackets every real
+    // margin, so any window at least that wide is "full" and its result is exact.
+    let full_window = alpha <= MARGIN_LO && beta >= MARGIN_HI;
     let key = if full_window {
         Some(endgame_key(state))
     } else {
@@ -3290,15 +3496,7 @@ fn solve_endgame_ab_value_cached(
         }
     }
 
-    let v = solve_endgame_ab(
-        state,
-        deadline,
-        alpha,
-        beta,
-        score_scale,
-        margin_gain,
-        alpha_param,
-    )?;
+    let v = solve_endgame_ab(state, deadline, alpha, beta, mode, 0)?;
     if let (Some(k), Some(value)) = (key, v) {
         value_cache.insert(k, value);
     }
@@ -3328,26 +3526,40 @@ fn solve_root_exact_cached(
     if legal.is_empty() {
         return Ok(None); // not GAME_OVER but no actions — fall back defensively
     }
-    order_legal_for_solver(state, &mut legal);
+    let mode = SolverOrderMode::Lookahead2Clustered;
+    order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
 
+    if std::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+    // Solve each root child with a full window (the exact per-child value is needed
+    // for the policy target) IN PARALLEL across cores. This is the YBW-style
+    // within-solve parallelism (mirrors solve_endgame_ab_parallel) that lets ONE
+    // endgame use the whole machine and finish within budget — the axis that
+    // actually matters for the per-solve wall-clock deadline. Children are
+    // independent (each owns its `next` state), so the shared value_cache is not
+    // threaded through here; cross-move reuse via `result_cache` below is
+    // unaffected. The solver returns the exact RAW margin per child; convert to the
+    // (monotone) training value so argmax/argmin over children is unchanged.
+    let _ = &value_cache; // intentionally unused by the parallel per-child solves
+    let child_results: Vec<PyResult<Option<(u16, f64)>>> = legal
+        .par_iter()
+        .map(|&(joint_idx, placement, pick)| -> PyResult<Option<(u16, f64)>> {
+            let next = state.step(placement, pick)?;
+            match solve_endgame_ab(&next, deadline, MARGIN_LO, MARGIN_HI, mode, 0)? {
+                Some(raw_margin) => Ok(Some((
+                    joint_idx,
+                    margin_to_training_value(raw_margin, score_scale, margin_gain, alpha_param),
+                ))),
+                None => Ok(None),
+            }
+        })
+        .collect();
     let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
-    for &(joint_idx, placement, pick) in &legal {
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let next = state.step(placement, pick)?;
-        match solve_endgame_ab_value_cached(
-            &next,
-            deadline,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            score_scale,
-            margin_gain,
-            alpha_param,
-            value_cache,
-        )? {
-            Some(v) => child_values.push((joint_idx, v)),
-            None => return Ok(None),
+    for r in child_results {
+        match r? {
+            Some(cv) => child_values.push(cv),
+            None => return Ok(None), // a child hit the deadline → whole solve fails
         }
     }
     let result = ExactSolveResult { child_values };
@@ -3563,6 +3775,7 @@ struct BatchedMCTS {
     cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
     cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
     cum_exact_fallback_count: u64,   // budget exceeded → fell back to MCTS (≈0)
+    cum_exact_solver_secs: f64,      // wall time spent in resolve_exact_slots (solve + finalize)
     // Games finished entirely inside resolve_exact_slots during step(); drained
     // by update() into the finished-games list it returns.
     pending_exact: Vec<(u64, Vec<MoveRecord>, (i32, i32))>,
@@ -3657,6 +3870,7 @@ impl BatchedMCTS {
             cum_exact_tree_solve_count: 0,
             cum_exact_cache_hit_count: 0,
             cum_exact_fallback_count: 0,
+            cum_exact_solver_secs: 0.0,
             pending_exact: Vec::new(),
         }
     }
@@ -3673,6 +3887,15 @@ impl BatchedMCTS {
     #[getter]
     fn exact_tree_solve_count(&self) -> u64 {
         self.cum_exact_tree_solve_count
+    }
+
+    /// Diagnostic: cumulative wall-clock seconds spent inside resolve_exact_slots
+    /// (parallel plan build + serial finalize) across the whole run. The Step-1
+    /// parallelism target metric — log the per-iteration delta to see solver time
+    /// drop after the par_iter change.
+    #[getter]
+    fn exact_solver_secs(&self) -> f64 {
+        self.cum_exact_solver_secs
     }
 
     /// Diagnostic: exact moves served from an already-built continuation plan.
@@ -3692,20 +3915,38 @@ impl BatchedMCTS {
     /// and finalize the move without any GPU forward, cascading through the whole
     /// endgame (deck only shrinks, so a slot stays `ExactSolving` until GAME_OVER).
     /// Finished games are stashed in `pending_exact` for `update()` to return.
-    /// On budget exhaustion (≈never at 15M) the slot falls back to `NeedsRootEval`.
-    /// Called serially at the start of `step()`; `solve_endgame_ab` is itself
-    /// single-threaded and BatchedMCTS already parallelises across slots.
-    fn resolve_exact_slots(&mut self) -> PyResult<()> {
+    /// On budget exhaustion the slot falls back to `NeedsRootEval`.
+    ///
+    /// Slots are processed SERIALLY here on purpose: each solve uses the whole
+    /// machine via within-solve (YBW) parallelism over root children in
+    /// `solve_root_exact_cached`. Running internally-parallel solves concurrently
+    /// would oversubscribe the cores and inflate every solve's wall time past the
+    /// per-solve deadline (the cause of the high-fallback regression).
+    fn resolve_exact_slots(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.exact_endgame_max_secs <= 0.0 {
             return Ok(());
         }
+        let solver_t0 = std::time::Instant::now();
+        // Solve with the GIL RELEASED. The whole inner body is pure Rust
+        // (solve_exact_plan; finalize_move/encode_arrays return ndarray, not
+        // PyArray; counters + recycle touch only Rust fields), so releasing the GIL
+        // is sound and lets the OTHER double-buffer instance drive the GPU forward
+        // concurrently while this one solves — the Step 1.5 overlap. Each solve still
+        // uses the whole machine via the within-solve par_iter; slots are serial here.
+        let result = py.detach(|| self.resolve_exact_slots_inner());
+        self.cum_exact_solver_secs += solver_t0.elapsed().as_secs_f64();
+        result
+    }
+
+    /// Pure-Rust body of `resolve_exact_slots`, run with the GIL released.
+    fn resolve_exact_slots_inner(&mut self) -> PyResult<()> {
         let (score_scale, margin_gain, val_alpha) =
             (self.score_scale, self.margin_gain, self.alpha);
         let max_secs = self.exact_endgame_max_secs;
         let (temp_moves, open_loop) = (self.temp_moves, self.open_loop);
 
-        // Phase 1: solve + finalize each ExactSolving slot to completion, holding
-        // a single-slot borrow. Finished games are collected with their slot index
+        // Solve + finalize each ExactSolving slot to completion, holding a
+        // single-slot borrow. Finished games are collected with their slot index
         // so recycling (which needs &mut self) happens after, like update() does.
         let mut finished: Vec<(usize, (u64, Vec<MoveRecord>, (i32, i32)))> = Vec::new();
         for si in 0..self.slots.len() {
@@ -3943,7 +4184,7 @@ impl BatchedMCTS {
         // Resolve any terminal-adjacent endgame slots exactly first — they
         // contribute nothing to the GPU batch and may finish games (stashed in
         // pending_exact for update()). After this, no slot is ExactSolving.
-        self.resolve_exact_slots()?;
+        self.resolve_exact_slots(py)?;
 
         let (fpu, cpuct, leaf_batch, vl, n_sims, open_loop) = (
             self.fpu,
@@ -5070,6 +5311,19 @@ mod kingdomino_rust {
         super::new_game(seed, harmony, middle_kingdom)
     }
 
+    /// Convert a raw score margin (s0 - s1) to the training value formula. Exposed
+    /// for tests: the raw-margin alpha-beta solver applies this AFTER the solve.
+    #[pyfunction]
+    #[pyo3(signature = (margin, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    fn margin_to_training_value(
+        margin: f64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> f64 {
+        super::margin_to_training_value(margin, score_scale, margin_gain, alpha)
+    }
+
     /// Exact minimax endgame solve for states with no chance branching:
     /// PLACE_AND_SELECT with deck length 0 or 4, or FINAL_PLACEMENT with deck
     /// length 0. When deck length is 4, the next row is forced to be exactly
@@ -5102,8 +5356,16 @@ mod kingdomino_rust {
         // solve_endgame_ab_parallel for budget semantics.
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_secs_f64(max_secs);
-        match super::solve_endgame_ab_parallel(state, deadline, score_scale, margin_gain, alpha)? {
-            Some(value) => Ok((value, true, start.elapsed().as_secs_f64())),
+        match super::solve_endgame_ab_parallel(
+            state,
+            deadline,
+            super::SolverOrderMode::Lookahead2Clustered,
+        )? {
+            Some(raw_margin) => {
+                let value =
+                    super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha);
+                Ok((value, true, start.elapsed().as_secs_f64()))
+            }
             None => Ok((0.0, false, start.elapsed().as_secs_f64())),
         }
     }
@@ -5142,5 +5404,73 @@ mod kingdomino_rust {
     #[pyo3(signature = (state, max_nodes=50_000))]
     fn count_endgame_nodes_deck_empty(state: &RustGameState, max_nodes: u64) -> PyResult<u64> {
         count_endgame_nodes_no_chance(state, max_nodes)
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (state, domino_id, actor))]
+    fn debug_opponent_denial_score(
+        state: &RustGameState,
+        domino_id: u16,
+        actor: u8,
+    ) -> PyResult<i32> {
+        if actor > 1 {
+            return Err(PyValueError::new_err("actor must be 0 or 1"));
+        }
+        let opponent = (1 - actor) as usize;
+        Ok(super::opponent_denial_score(
+            domino_id,
+            &super::terrain_counts(&state.boards[opponent]),
+        ))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (state, ordering="combined"))]
+    fn debug_ordered_legal_indices(
+        state: &RustGameState,
+        ordering: &str,
+    ) -> PyResult<Vec<u16>> {
+        let mode = super::SolverOrderMode::from_str(ordering)?;
+        let mut legal = state.legal_actions_indexed();
+        super::order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
+        Ok(legal.into_iter().map(|(idx, _p, _pk)| idx).collect())
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, ordering="combined", parallel=true))]
+    fn exact_endgame_value_no_chance_ordered(
+        state: &RustGameState,
+        max_secs: f64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+        ordering: &str,
+        parallel: bool,
+    ) -> PyResult<(f64, bool, f64)> {
+        if state.phase == GAME_OVER {
+            return Ok((
+                super::terminal_search_value(state, score_scale, margin_gain, alpha),
+                true,
+                0.0,
+            ));
+        }
+        if !super::is_no_chance_endgame_state(state) {
+            return Ok((0.0, false, 0.0));
+        }
+        let mode = super::SolverOrderMode::from_str(ordering)?;
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs_f64(max_secs);
+        let raw = if parallel {
+            super::solve_endgame_ab_parallel(state, deadline, mode)?
+        } else {
+            super::solve_endgame_ab(state, deadline, super::MARGIN_LO, super::MARGIN_HI, mode, 0)?
+        };
+        match raw {
+            Some(raw_margin) => {
+                let value =
+                    super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha);
+                Ok((value, true, start.elapsed().as_secs_f64()))
+            }
+            None => Ok((0.0, false, start.elapsed().as_secs_f64())),
+        }
     }
 }
