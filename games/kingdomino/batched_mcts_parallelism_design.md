@@ -121,16 +121,35 @@ dipped to 69% and games/s to 0.12. That's the cost of the solver actually
 running. It is **not** a regression in value — it's latency that should be
 **hidden behind GPU eval**, not removed. See Step 1.5.
 
-### Levers to push solve success past 70% (later, once overlapped)
+### Levers to push solve success past 70% (separate quality experiment)
 
-- The training solve does **full-window per child** (no cross-child alpha-beta
-  cutoffs, because every child's exact value feeds the policy target) — heavier
-  than the bench's single best-move YBW solve, so its in-budget rate is below the
-  bench's ~88%. Revisit only if the policy target can tolerate pruned child
-  values.
-- **Bigger budget** (3s→8–10s) becomes affordable once solves overlap the GPU.
+- **Decouple exact value from exact policy (highest-potential lever).** The
+  training solve currently does **full-window per child** — an exact value for
+  *every* root child, no cross-child alpha-beta cutoffs, because the policy target
+  consumes all child values. That is the expensive, deadline-sensitive mode: you
+  pay full-window cost even on children that will get ~0 policy mass, and one
+  child missing the deadline reverts the *whole* endgame to MCTS. A best-move
+  solve (alpha-beta *with* cutoffs, like the bench's YBW path) gets the exact game
+  value + principal move far more cheaply — potentially pushing success well past
+  70% at the same 3s budget, a bigger win than parallelism.
+  - **Prerequisite check:** confirm whether `exact_policy_target` builds a *soft*
+    distribution over all child values or is effectively one-hot on the optimal
+    move. If one-hot, the all-child solve is pure waste and decoupling is free; if
+    soft, decoupling trades target richness for solve speed and needs a
+    **training-quality A/B**, not just a throughput measurement.
+  - **Partial > binary fallback:** exact mass on proven-optimal children + prior/
+    visit mass on the unproven rest is likely better supervision than full
+    fallback. Keep it simple — do *not* blend exact values with MCTS visit counts
+    in one target (different scales, injects noise); bounded-interval targets are
+    over-engineering for now.
+- **Bigger budget** (3s→8–10s) becomes affordable once solves overlap the GPU —
+  but test it only *after* the decoupling above; if the tail needs minutes, more
+  budget won't reach it.
 - Move ordering already tuned (`lookahead2_clustered`, see
   `docs/heuristic_testing.md`).
+
+This is **orthogonal to the overlap work** and gated on a training-quality
+comparison — defer until after Step 1.5 is measured.
 
 ---
 
@@ -200,22 +219,98 @@ Two findings:
    buys training quality at ~13% throughput cost.
 
 **This is the motivation for the overlap.** Hide the 183s behind the 630s of eval
-and — because the solver *also* cuts eval by 64s — overlapped solver-on should
-land near wall ≈ 600s → games/s ≈ 0.15–0.16, i.e. **faster than solver-off AND
-with exact targets.** The async solve queue flips the solver from a 13% cost to a
-net gain.
+and — because the solver *also* cuts eval by 64s — overlapped solver-on could in
+the **best case** approach wall ≈ 600s → games/s ≈ 0.15–0.16, faster than
+solver-off AND with exact targets, flipping the solver from a 13% cost to a net
+gain. Treat that as an optimistic *ceiling*, not a projection: it assumes most CPU
+solve time is hideable and ignores reduced active slots during clusters,
+solver/eval CPU interference, encoding/update work, and cache contention. The
+realistic gate is below.
 
-### Attempt 2 — single-buffer async solve queue (recommended next)
+### Attempt 2 — async solve jobs + overbooked search slots (recommended next)
 
-Overlap **within one instance**, no batch split, phase-independent: when a slot
-enters `ExactSolving`, dispatch its solve to a **background solver thread**; the
-main loop excludes that slot from the batch and keeps `step→eval→update` on the
-other ~30 slots; harvest completed solves and rejoin. While the GPU evaluates the
-non-endgame slots, the background thread (GIL already released) solves the endgame
-ones — different slots of the same instance, so overlap is intrinsic and does not
-depend on phase. This is the same machinery as Step 2's "solver inline in worker,"
-so it doubles as a Step-2 stepping stone. Staggering (see below) further smooths
-the background queue's load but is secondary.
+Overlap **within one instance**, no batch split, phase-independent. Two coupled
+ideas:
+
+1. **Detached solve jobs.** When a position enters `ExactSolving`, snapshot it
+   (`real_state` clone — already cheap) and dispatch the solve to a **background
+   solver thread**, carrying the *game identity + records* so the completed solve
+   re-attaches to its game, not its old slot. The main loop never blocks on a
+   solve. While the GPU evaluates non-endgame positions, the background thread
+   (GIL already released) solves the endgame ones — overlap is intrinsic and
+   phase-independent.
+
+2. **Overbooked search slots (the key throughput idea).** Do *not* simply
+   "exclude the solving slot and continue with ~30" — under clustering, 20 slots
+   entering `ExactSolving` together collapses the GPU-fed batch exactly when solve
+   load peaks. Instead **separate "active search slots" from "pending solve
+   jobs"**: maintain a `target_active_search_slots` population by **backfilling a
+   replacement game** into any slot whose game is out on a pending solve. Solved
+   endgames rejoin later; the GPU-facing search population stays full regardless
+   of how many games are mid-solve. This *tolerates* clustering instead of trying
+   to prevent it, and without splitting batches (what sank double-buffering). It
+   strictly dominates staggering for batch fill; staggering only smooths the
+   solve-arrival rate and is secondary.
+
+Cost: more concurrent game state in flight (≈ `target_active_search_slots`
+searching + the pending-solve backlog + snapshots) and bookkeeping to attach a
+completed solve to its game. This is the same machinery as Step 2's "solver inline
+in worker," so it doubles as a Step-2 stepping stone — **design the slot/job
+separation in from the start; retrofitting it is expensive.**
+
+### Attempt 2 — measured (built, correct, CPU-contention-capped on the laptop)
+
+Built: standalone `play_out_exact_endgame` (owned data) + a background solver
+thread + `SolvingInBackground` slot state + dispatch/harvest + in-place fallback
+resume + overbooking via `--batch_slots`, behind `--async_solve` (default off).
+Correctness: deterministic, **identical per-seed games vs sync**; sync path 38/38.
+
+| | games/s | step | eval | update | wall |
+|---|---|---|---|---|---|
+| sync@32 (baseline) | 0.122 | 244.6s | 565.7s | 11.5s | 822s |
+| async@32 | 0.118 | 168.7s | **631.4s** | **46.3s** | 846s |
+| async@48 (overbook) | 0.128 | 143.8s | 587.7s | 48.0s | 779s |
+| solver-off@32 | 0.140 | 61.2s | 630.3s | 12.8s | 704s |
+
+**Finding — the overlap is correct but CPU-contention-capped.** async@32 vs
+sync@32 (same slots/batch/ticks): `step` dropped 244.6→168.7s (solver moved off
+the main thread ✓), but `eval` *rose* 565.7→631.4s and `update` 11.5→46.3s. In
+sync the solver and eval run sequentially (no contention); in async the
+background solve runs concurrently and — because each solve grabs all 8 cores via
+the within-solve YBW `par_iter` — **starves the main thread's CPU-side eval work
+(tensor prep, kernel launch, next-batch descent)**. The eval/update inflation ~=
+the step saving, so async@32 is net slightly slower. Overbooking (async@48) gets
+bigger batches and recovers to 0.128, but its per-slot overhead caps it.
+
+**Implications:**
+- The async architecture is right, but its payoff needs **spare cores**. On the
+  8-core laptop (CPU/GPU-balanced) the 187s of solver CPU has nowhere free to
+  hide — overlapped or not. On the **cloud 5090 (16–32 vCPUs)** there are enough
+  cores for solver + GPU-feeding, so the overlap should pay off there (the
+  intended target).
+- On the laptop the lever is a **cheaper solver** (value/policy decoupling +
+  partial targets), not overlap — the solver's CPU cost can't hide on a core-
+  bound box.
+- A targeted mitigation: **cap the background solver's thread count** (own Rayon
+  pool, leave ~2 cores for GPU-feeding) — the "reserve M workers" admission idea.
+  Likely recovers some laptop games/s, but bounded on 8 cores.
+
+### Step 1.5 gate (stricter than games/s alone)
+
+Whole-iteration games/s is too coarse. Gate on:
+
+- **evaluator busy fraction** (the real overlap proof — should approach the
+  no-solver eval-bound regime) and **mean active non-solving slots / batch fill**.
+- **solve-queue depth** over time (does the backlog drain, or grow unboundedly
+  during clusters?).
+- **p50 / p90 / p99 solve latency** (the p99 tail is what creates fallbacks).
+- **fallback rate** (must not regress vs the 30% single-buffer baseline).
+- **end-to-end games/s** vs both solver-off (0.140) and single-buffer solver-on
+  (0.122).
+
+Pass = games/s recovers toward/above solver-off **and** fallback holds, with the
+evaluator measurably busier. Unbounded solve-queue growth during clusters (even
+with overbooking) signals the admission-control problem (below) has arrived early.
 
 ---
 
@@ -227,13 +322,23 @@ single-core descent starves the GPU; and cloud boxes give 16–32 vCPUs to explo
 So the real target is a model where **descent and solving both overlap the GPU**
 and the scheduler allocates cores dynamically — Step 2.
 
-### The dynamic-allocation principle
+### The dynamic-allocation principle (with a caveat)
 
-> Never statically assign threads to roles. Put all CPU work (descent tasks +
-> within-solve YBW child tasks) into **one work-stealing pool** and let it
-> balance. Rayon's global pool already does this — the within-solve `par_iter`
-> tasks simply become more items in the shared pool, so no manual solve-vs-gen
-> budget is ever needed.
+> Never statically *partition* threads into fixed role quotas. Put descent tasks
+> and within-solve YBW child tasks into **one work-stealing pool** so no core sits
+> idle while there is work.
+
+But work-stealing is **load balancing, not admission control.** Rayon has no
+notion that descent is latency-critical (it feeds the GPU) while solves are
+throughput-work — so if many games enter `ExactSolving` together, a flood of YBW
+child tasks can crowd out descent and starve the GPU, oscillating between great
+solve latency and poor GPU feed. "No manual budget ever needed" is too strong. At
+cloud scale Step 2 likely needs an explicit policy — at most *K* active root
+solves, or *M* workers reserved for search/eval submission, or solve admission
+driven by evaluator-queue depth / GPU-busy fraction. On the laptop (GPU-bound, CPU
+slack) pure-pool contention is unlikely to bind, so this is a **Step-2 concern,
+deferred until measurement shows it actually binds** — don't build the controller
+speculatively.
 
 ---
 
@@ -249,31 +354,43 @@ evaluator** batch NN requests across concurrent game threads (~6151 evals/s).
 Run **N OS worker threads**, each driving a subset of games end-to-end with the
 GIL released; a shared coalescing evaluator gathers leaf requests into GPU
 batches. **The endgame solver runs inline in the worker** that owns the game
-(pure Rust, GIL already released).
+(pure Rust, GIL already released), via the same detached-job + overbooking design
+as Step 1.5.
 
 - **Descent and solving both overlap the GPU** — while a worker waits on the
   evaluator, others do CPU work.
-- **Dynamic allocation for free** — workers in endgames solve, workers in normal
-  play descend; the OS scheduler + the shared Rayon pool balance. No budget.
+- **Cores stay busy without fixed role quotas** — workers in endgames solve,
+  workers in normal play descend; one work-stealing pool keeps cores fed. But see
+  the admission-control caveat above: load balancing is not prioritization.
 - **Scales to the 5090 + many vCPUs.**
 
 ### Step 2 scope
 
 1. Adopt the multi-thread `RustMCTS` + coalescing-evaluator path for the training
    driver (today: synchronous `BatchedMCTS` `step`/`update`).
-2. Run the (within-solve-parallel) endgame solver inline in the worker loop.
+2. Run the (within-solve-parallel) endgame solver as detached jobs in the worker
+   loop, with overbooked search workers (carry the Step-1.5 design forward).
 3. Wire self-play data collection / finished-game handling into the worker model.
-4. **Bound total solve parallelism via the single shared Rayon pool** — do *not*
-   let every worker launch an independent full-machine YBW solve (that is the
-   oversubscription failure at cloud scale). Let YBW child-tasks and descent
-   tasks contend in one pool so work-stealing arbitrates.
+4. **Tune the coalescing evaluator explicitly.** Worker-per-game async submission
+   can fragment batches vs. synchronized `BatchedMCTS`, so CPU parallelism can
+   rise while GPU efficiency falls — a net wash. Specify and gate on `max_batch`,
+   `max_wait_ms`, and worker count, with a **mean-batch / fill acceptance
+   criterion on the 5090**. (The evaluator exists and batches across threads,
+   ~6151 evals/s; what's unmeasured is its fill vs. the synchronized model.)
+5. **Admission / adaptive solve control — only if measurement requires it.** Start
+   with the shared pool. If Step-2 metrics show solve work starving the GPU feed
+   (solve-queue growth + dropping evaluator-busy fraction), add a knob: cap active
+   root solves at *K*, and/or drive solve admission from live evaluator-queue
+   depth and GPU-busy fraction (fewer active solves when the GPU is starved, more
+   when it is saturated and the solve queue grows). Do not build this speculatively.
 
 ### Step 2 gate
 
-- CPU utilization **during the GPU-eval window** rises toward saturating spare
-  cores (proves overlap).
-- Endgame fallback rate stays low (the per-solve deadline still met under cloud
-  oversubscription — re-check with the same instrumentation).
+- **Evaluator busy fraction** stays high (overlap holds) and **mean batch / fill**
+  meets the acceptance criterion (coalescing not fragmenting batches).
+- Endgame fallback rate stays low (per-solve deadline still met under cloud
+  oversubscription — re-check with the Step-1.5 instrumentation).
+- **solve-queue depth bounded** (admission control engaged if not).
 - Training-quality curves unchanged; games/s scales with cores.
 
 ---
@@ -305,7 +422,25 @@ batches. **The endgame solver runs inline in the worker** that owns the game
 
 1. **Step 1 is done and validated** — solver success 5%→70%, fallback 95%→30%.
    The solver now earns its place.
-2. **Step 1.5 (overlap)** recovers the GPU fill the working solver now costs on
-   the laptop; optional if going straight to Step 2.
+2. **Step 1.5 (async solve jobs + overbooked search slots)** is the next build.
+   Design the slot/job separation in from the start; gate on the stricter metrics
+   above, not just games/s.
 3. **Step 2** is the cloud-5090 answer for dynamic all-core use; reuse the
-   milestone-6 coalescing path and keep all CPU work in one Rayon pool.
+   milestone-6 coalescing path, carry the detached-job + overbooking design
+   forward, and tune the coalescing evaluator explicitly.
+
+### Build simple first; defer the rest until measurement demands it
+
+The design can grow into a sophisticated system (adaptive controllers,
+interval-blended targets, admission policies). That is the right *eventual* shape
+but the wrong *first* build — tuning machinery for contention that may not bind at
+this scale wastes effort. Build the simple version, instrument it, and add
+complexity only where the numbers show a real problem.
+
+**Deferred until after Step-1.5 testing (pending measurement):**
+- Admission / adaptive solve-concurrency control (Step 2; only if the shared pool
+  starves the GPU feed).
+- Hybrid / partial exact-target mode and value/policy decoupling (a separate
+  *training-quality* experiment; verify the target is soft first).
+- Raising the solve budget (3s→8–10s) — test only after the decoupling lever.
+- Coalescing-evaluator tuning targets for the 5090 (Step 2).

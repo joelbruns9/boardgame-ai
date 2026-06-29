@@ -234,6 +234,10 @@ class SelfPlayConfig:
     # batch, overlapping one's CPU tree work with the other's GPU forward.  Only
     # for engine=batched / batched_open_loop.  Off by default (A/B flag).
     double_buffer: bool = False
+    # Step 1.5: solve endgames on a background thread (overlaps the GPU eval).
+    # Pair with a larger batch_slots (overbooking) so slots out solving don't
+    # collapse the GPU batch.  Off by default.
+    async_solve: bool = False
 
 
 # ─── 2. Replay buffer ─────────────────────────────────────────────────────
@@ -1097,6 +1101,7 @@ def play_selfplay_games_batched(
             margin_gain=float(cfg.margin_gain),
             alpha=float(cfg.alpha),
             exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
+            async_solve=bool(cfg.async_solve),
         )
 
     use_db = bool(double_buffer)
@@ -2454,6 +2459,10 @@ if __name__ == "__main__":
                    help="(Item 17) Run two BatchedMCTS instances in parallel, "
                         "overlapping CPU tree work with GPU forward. Only for "
                         "engine=batched or batched_open_loop.")
+    p.add_argument("--async_solve", action="store_true",
+                   help="(Step 1.5) Solve endgames on a background thread so they "
+                        "overlap the GPU eval. Pair with a larger --batch_slots "
+                        "(overbooking) so solving slots don't collapse the batch.")
     p.add_argument("--exact_endgame_max_secs", type=float, default=3.0,
                    help="Per-position wall-clock time limit for the exact endgame "
                         "solver (seconds). 0.0 disables exact endgame solving; "
@@ -2501,6 +2510,7 @@ if __name__ == "__main__":
         compile_dynamic={"auto": None, "on": True, "off": False}[a.compile_dynamic],
         prefetch_batches=a.prefetch_batches,
         double_buffer=a.double_buffer,
+        async_solve=a.async_solve,
         exact_endgame_max_secs=a.exact_endgame_max_secs,
         endgame_oversample=a.endgame_oversample,
     )

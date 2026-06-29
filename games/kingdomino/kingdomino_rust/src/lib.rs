@@ -3083,6 +3083,7 @@ impl RustMCTS {
 
 // One finished move's training data (pure-Rust ndarrays; converted to numpy only
 // when the game finishes and examples are returned to Python).
+#[derive(Clone)]
 struct MoveRecord {
     my: Array3<f32>,
     opp: Array3<f32>,
@@ -3099,9 +3100,13 @@ struct MoveRecord {
 #[derive(PartialEq, Clone, Copy)]
 enum SlotState {
     NeedsRootEval, // root set but unexpanded; contributes the root as 1 leaf
-    ExactSolving,  // root is a terminal-adjacent endgame; solved exactly, no GPU
-    Searching,     // contributes up to leaf_batch descended leaves per tick
-    Idle,          // no game (quota met); contributes nothing
+    ExactSolving,  // root is a terminal-adjacent endgame; awaiting exact solve
+    // Async (Step 1.5): the endgame was dispatched to the background solver. The
+    // slot KEEPS its game (real_state/records/move_num) so a timed-out solve
+    // resumes MCTS in place; a solved one rejoins as a finished game on harvest.
+    SolvingInBackground,
+    Searching, // contributes up to leaf_batch descended leaves per tick
+    Idle,      // no game (quota met); contributes nothing
 }
 
 /// Cached result of an exact endgame solve at the current move's root, present
@@ -3567,6 +3572,150 @@ fn solve_root_exact_cached(
     Ok(Some(result))
 }
 
+/// A dispatched endgame solve (Step 1.5 async path): an owned snapshot of the
+/// slot's game. Sent to the background solver thread; the slot keeps its own copy.
+struct SolveJob {
+    slot_idx: usize,
+    state: RustGameState,
+    records: Vec<MoveRecord>,
+    game_seed: u64,
+}
+
+enum SolveResult {
+    /// The endgame solved to GAME_OVER: the full finished game (seed, records, scores).
+    Finished((u64, Vec<MoveRecord>, (i32, i32))),
+    /// Deadline exceeded (or solve error): the slot must resume MCTS in place.
+    Fallback,
+}
+
+/// Result of one background solve, harvested by the main thread on the next step().
+struct SolveOutcome {
+    slot_idx: usize,
+    result: SolveResult,
+    n_solved: u64, // plan length (for counters); 0 on fallback
+    solve_secs: f64,
+}
+
+/// Spawn the single background solver thread (concurrency 1, so each solve keeps
+/// the whole machine via the within-solve YBW `par_iter`). It pulls jobs, solves
+/// each endgame to completion (or fails to Fallback), and returns outcomes. Pure
+/// Rust — no GIL touched (solve_exact_plan / play_out_exact_endgame only build a
+/// `PyErr` lazily on the error path, which is discarded here). Exits when the job
+/// channel closes (BatchedMCTS dropped).
+fn spawn_endgame_solver(
+    job_rx: std::sync::mpsc::Receiver<SolveJob>,
+    out_tx: std::sync::mpsc::Sender<SolveOutcome>,
+    max_secs: f64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha: f64,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let SolveJob {
+                slot_idx,
+                state,
+                records,
+                game_seed,
+            } = job;
+            let t0 = std::time::Instant::now();
+            let result = match solve_exact_plan(&state, max_secs, score_scale, margin_gain, alpha) {
+                Ok(Some(plan)) if !plan.is_empty() => {
+                    let n = plan.len() as u64;
+                    match play_out_exact_endgame(state, records, game_seed, plan) {
+                        Ok(fg) => (SolveResult::Finished(fg), n),
+                        Err(_) => (SolveResult::Fallback, 0),
+                    }
+                }
+                _ => (SolveResult::Fallback, 0),
+            };
+            let outcome = SolveOutcome {
+                slot_idx,
+                result: result.0,
+                n_solved: result.1,
+                solve_secs: t0.elapsed().as_secs_f64(),
+            };
+            if out_tx.send(outcome).is_err() {
+                break; // main side dropped the receiver
+            }
+        }
+    })
+}
+
+/// Play a solved endgame to completion on OWNED data — no slot, no MCTS tree.
+/// `plan` is the exact continuation from `state` (item i's child_values are for
+/// the position after i moves); `records` already holds the game's pre-endgame
+/// MCTS moves and gets one MoveRecord appended per endgame move. The plan always
+/// reaches GAME_OVER (solve_exact_plan only returns a full plan), so this finishes
+/// the game and fills every record's final-score targets. This is the standalone
+/// unit shared by the synchronous solver and the async background solver (Step 1.5).
+fn play_out_exact_endgame(
+    mut state: RustGameState,
+    mut records: Vec<MoveRecord>,
+    game_seed: u64,
+    plan: Vec<ExactPlanItem>,
+) -> PyResult<(u64, Vec<MoveRecord>, (i32, i32))> {
+    for item in plan {
+        let exact = item.result;
+        let actor = state.actor()?;
+        let (my, opp, flat) = state.encode_arrays(actor)?;
+        let (policy_idx, policy_val, legal_idx) = exact_policy_target(&exact.child_values, actor);
+        // Optimal move is unambiguous: minimax-best child (no temperature).
+        let best = if actor == 0 {
+            exact
+                .child_values
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        } else {
+            exact
+                .child_values
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        };
+        let chosen = best.map(|&(idx, _)| idx).unwrap_or(legal_idx[0] as u16);
+        records.push(MoveRecord {
+            my,
+            opp,
+            flat,
+            policy_idx,
+            policy_val,
+            legal_idx,
+            actor,
+            own_score: 0.0,
+            opp_score: 0.0,
+            win_target: 0.5,
+        });
+        let (placement, pick) = state
+            .legal_actions_indexed()
+            .into_iter()
+            .find(|t| t.0 == chosen)
+            .map(|t| (t.1, t.2))
+            .ok_or_else(|| PyValueError::new_err("exact endgame: selected index not legal"))?;
+        state = state.step(placement, pick)?;
+    }
+    // Plan plays to GAME_OVER; fill per-move targets from the final scores
+    // (score-only win, draw -> 0.5, matching finalize_move).
+    let (s0, s1) = state.scores();
+    let win0: f32 = if s0 > s1 {
+        1.0
+    } else if s1 > s0 {
+        0.0
+    } else {
+        0.5
+    };
+    for rec in &mut records {
+        let (own_s, opp_s, win_t) = if rec.actor == 0 {
+            (s0 as f32, s1 as f32, win0)
+        } else {
+            (s1 as f32, s0 as f32, 1.0 - win0)
+        };
+        rec.own_score = own_s;
+        rec.opp_score = opp_s;
+        rec.win_target = win_t;
+    }
+    Ok((game_seed, records, (s0, s1)))
+}
+
 fn solve_exact_plan(
     state: &RustGameState,
     max_secs: f64,
@@ -3779,6 +3928,120 @@ struct BatchedMCTS {
     // Games finished entirely inside resolve_exact_slots during step(); drained
     // by update() into the finished-games list it returns.
     pending_exact: Vec<(u64, Vec<MoveRecord>, (i32, i32))>,
+    // Async endgame solver (Step 1.5). When async_solve, step() dispatches
+    // ExactSolving slots to the background thread and harvests results instead of
+    // solving synchronously; inflight_solves counts dispatched-not-yet-harvested.
+    async_solve: bool,
+    inflight_solves: usize,
+    // Mutex-wrapped so BatchedMCTS stays Sync (pyclass requirement); access is
+    // GIL-serialized on the main thread, so the lock is always uncontended.
+    job_tx: std::sync::Mutex<std::sync::mpsc::Sender<SolveJob>>,
+    out_rx: std::sync::Mutex<std::sync::mpsc::Receiver<SolveOutcome>>,
+    _solver_handle: std::thread::JoinHandle<()>,
+}
+
+impl BatchedMCTS {
+    /// Async path (Step 1.5): drain every completed background solve and apply it.
+    fn harvest_solves(&mut self) {
+        loop {
+            // Scoped so the lock guard drops before apply_outcome (needs &mut self).
+            let outcome = match self.out_rx.lock().unwrap().try_recv() {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            self.apply_outcome(outcome);
+        }
+    }
+
+    /// Apply one harvested outcome. Finished → record the game + recycle the slot
+    /// (overbooking: a freed slot starts the next game). Fallback → resume MCTS in
+    /// the SAME slot, which kept its game state while the solve was in flight.
+    fn apply_outcome(&mut self, outcome: SolveOutcome) {
+        let si = outcome.slot_idx;
+        self.inflight_solves = self.inflight_solves.saturating_sub(1);
+        self.cum_exact_solver_secs += outcome.solve_secs;
+        let open_loop = self.open_loop;
+        match outcome.result {
+            SolveResult::Finished(fg) => {
+                self.cum_exact_tree_solve_count += 1;
+                self.cum_exact_solve_count += outcome.n_solved;
+                self.cum_exact_cache_hit_count += outcome.n_solved.saturating_sub(1);
+                self.cum_fallback_count += self.slots[si].fallback_count as u64;
+                self.cum_missing_child_count += self.slots[si].missing_child_count as u64;
+                self.pending_exact.push(fg);
+                // Recycle the slot: next game if quota remains, else Idle.
+                if self.games_started < self.games_target {
+                    let ns = self.next_seed;
+                    self.next_seed += 1;
+                    self.games_started += 1;
+                    self.slots[si] =
+                        SearchSlot::new_for_game(new_game(ns, self.harmony, self.middle_kingdom), ns, open_loop);
+                } else {
+                    self.slots[si].state = SlotState::Idle;
+                    self.slots[si].fallback_count = 0;
+                    self.slots[si].missing_child_count = 0;
+                }
+            }
+            SolveResult::Fallback => {
+                self.cum_exact_fallback_count += 1;
+                let slot = &mut self.slots[si];
+                slot.exact_unsolvable = true;
+                slot.exact_result = None;
+                slot.exact_plan.clear();
+                slot.state = SlotState::NeedsRootEval;
+                slot.sims_done = 0;
+                if open_loop {
+                    slot.ol_arena.clear();
+                    slot.ol_arena.push(OLNode::new(1.0, (None, None)));
+                } else {
+                    let root_state = slot
+                        .real_state
+                        .redeterminize(Some(det_seed(slot.game_seed, slot.move_num)));
+                    slot.arena.clear();
+                    slot.arena.push(Node::new(1.0, (None, None)));
+                    slot.arena[0].state = Some(root_state);
+                }
+            }
+        }
+    }
+
+    /// Async path: dispatch every `ExactSolving` slot to the background solver,
+    /// cloning a snapshot so the slot keeps its game (for in-place fallback resume).
+    fn dispatch_solves(&mut self) {
+        for si in 0..self.slots.len() {
+            if self.slots[si].state == SlotState::ExactSolving {
+                let job = SolveJob {
+                    slot_idx: si,
+                    state: self.slots[si].real_state.cloned(),
+                    records: self.slots[si].records.clone(),
+                    game_seed: self.slots[si].game_seed,
+                };
+                self.slots[si].state = SlotState::SolvingInBackground;
+                self.inflight_solves += 1;
+                let _ = self.job_tx.lock().unwrap().send(job);
+            }
+        }
+    }
+
+    /// Async path top-of-step: harvest, dispatch, and — if nothing is searchable
+    /// but solves are in flight — block for outcomes so the loop drains in-flight
+    /// solves at end-of-iteration instead of spinning on empty batches.
+    fn pump_async_solves(&mut self) {
+        self.harvest_solves();
+        self.dispatch_solves();
+        while self.inflight_solves > 0
+            && !self.slots.iter().any(|s| {
+                matches!(s.state, SlotState::Searching | SlotState::NeedsRootEval)
+            })
+        {
+            let outcome = match self.out_rx.lock().unwrap().recv() {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            self.apply_outcome(outcome);
+            self.dispatch_solves();
+        }
+    }
 }
 
 #[pymethods]
@@ -3789,7 +4052,7 @@ impl BatchedMCTS {
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
                         score_scale=100.0, margin_gain=2.0, alpha=0.8,
-                        exact_endgame_max_secs=3.0))]
+                        exact_endgame_max_secs=3.0, async_solve=false))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -3809,6 +4072,7 @@ impl BatchedMCTS {
         margin_gain: f64,
         alpha: f64,
         exact_endgame_max_secs: f64,
+        async_solve: bool,
     ) -> Self {
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
@@ -3843,6 +4107,13 @@ impl BatchedMCTS {
                 slots.push(SearchSlot::idle(harmony, middle_kingdom));
             }
         }
+        // Background endgame solver (used only when async_solve). Always spawned —
+        // it just blocks on an empty channel otherwise — and exits when this
+        // BatchedMCTS is dropped (job_tx closes).
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<SolveJob>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<SolveOutcome>();
+        let solver_handle =
+            spawn_endgame_solver(job_rx, out_tx, exact_endgame_max_secs, score_scale, margin_gain, alpha);
         BatchedMCTS {
             slots,
             n_sims,
@@ -3872,6 +4143,11 @@ impl BatchedMCTS {
             cum_exact_fallback_count: 0,
             cum_exact_solver_secs: 0.0,
             pending_exact: Vec::new(),
+            async_solve,
+            inflight_solves: 0,
+            job_tx: std::sync::Mutex::new(job_tx),
+            out_rx: std::sync::Mutex::new(out_rx),
+            _solver_handle: solver_handle,
         }
     }
 
@@ -3943,79 +4219,62 @@ impl BatchedMCTS {
         let (score_scale, margin_gain, val_alpha) =
             (self.score_scale, self.margin_gain, self.alpha);
         let max_secs = self.exact_endgame_max_secs;
-        let (temp_moves, open_loop) = (self.temp_moves, self.open_loop);
+        let open_loop = self.open_loop;
 
-        // Solve + finalize each ExactSolving slot to completion, holding a
-        // single-slot borrow. Finished games are collected with their slot index
-        // so recycling (which needs &mut self) happens after, like update() does.
+        // Solve each ExactSolving slot's whole endgame, then play it out on the
+        // slot's OWNED data via play_out_exact_endgame (the standalone unit the
+        // async solver will also use). solve_exact_plan returns Some only when it
+        // solves to GAME_OVER, so the playout always finishes the game. Finished
+        // games are collected with their slot index so recycling (which needs
+        // &mut self) happens after, like update() does.
         let mut finished: Vec<(usize, (u64, Vec<MoveRecord>, (i32, i32)))> = Vec::new();
         for si in 0..self.slots.len() {
-            loop {
-                if self.slots[si].state != SlotState::ExactSolving {
-                    break;
+            if self.slots[si].state != SlotState::ExactSolving {
+                continue;
+            }
+            match solve_exact_plan(
+                &self.slots[si].real_state,
+                max_secs,
+                score_scale,
+                margin_gain,
+                val_alpha,
+            )? {
+                Some(plan) if !plan.is_empty() => {
+                    // Accounting matches the old per-move loop: one tree solve per
+                    // endgame, n total solved moves, n-1 served from the built plan.
+                    let n = plan.len() as u64;
+                    self.cum_exact_tree_solve_count += 1;
+                    self.cum_exact_solve_count += n;
+                    self.cum_exact_cache_hit_count += n.saturating_sub(1);
+                    let fg = play_out_exact_endgame(
+                        self.slots[si].real_state.cloned(),
+                        std::mem::take(&mut self.slots[si].records),
+                        self.slots[si].game_seed,
+                        plan,
+                    )?;
+                    finished.push((si, fg));
                 }
-                let built_plan = if self.slots[si].exact_plan.is_empty() {
-                    match solve_exact_plan(
-                        &self.slots[si].real_state,
-                        max_secs,
-                        score_scale,
-                        margin_gain,
-                        val_alpha,
-                    )? {
-                        Some(plan) if !plan.is_empty() => {
-                            self.slots[si].exact_plan = plan;
-                            self.cum_exact_tree_solve_count += 1;
-                            true
-                        }
-                        _ => {
-                            // Deadline exceeded (or degenerate): this game's endgame
-                            // is too hard to solve exactly within the budget. Mark
-                            // the slot Unsolvable so finalize_move never re-enters
-                            // ExactSolving for the remaining moves of THIS game (the
-                            // next root is usually still deck∈{0,4} and would just
-                            // time out again — the retry storm). The flag is cleared
-                            // when the slot is recycled for a new game in
-                            // new_for_game, so each game gets a fresh attempt.
-                            self.cum_exact_fallback_count += 1;
-                            self.slots[si].exact_unsolvable = true;
-                            self.slots[si].exact_result = None;
-                            self.slots[si].exact_plan.clear();
-                            self.slots[si].state = SlotState::NeedsRootEval;
-                            self.slots[si].sims_done = 0;
-                            if open_loop {
-                                self.slots[si].ol_arena.clear();
-                                self.slots[si].ol_arena.push(OLNode::new(1.0, (None, None)));
-                            } else {
-                                let root_state = self.slots[si].real_state.redeterminize(Some(
-                                    det_seed(self.slots[si].game_seed, self.slots[si].move_num),
-                                ));
-                                self.slots[si].arena.clear();
-                                self.slots[si].arena.push(Node::new(1.0, (None, None)));
-                                self.slots[si].arena[0].state = Some(root_state);
-                            }
-                            break;
-                        }
+                _ => {
+                    // Deadline exceeded (or degenerate): too hard within budget.
+                    // Mark Unsolvable so the rest of THIS game falls back to MCTS
+                    // (cleared when the slot is recycled in new_for_game).
+                    self.cum_exact_fallback_count += 1;
+                    self.slots[si].exact_unsolvable = true;
+                    self.slots[si].exact_result = None;
+                    self.slots[si].exact_plan.clear();
+                    self.slots[si].state = SlotState::NeedsRootEval;
+                    self.slots[si].sims_done = 0;
+                    if open_loop {
+                        self.slots[si].ol_arena.clear();
+                        self.slots[si].ol_arena.push(OLNode::new(1.0, (None, None)));
+                    } else {
+                        let root_state = self.slots[si].real_state.redeterminize(Some(
+                            det_seed(self.slots[si].game_seed, self.slots[si].move_num),
+                        ));
+                        self.slots[si].arena.clear();
+                        self.slots[si].arena.push(Node::new(1.0, (None, None)));
+                        self.slots[si].arena[0].state = Some(root_state);
                     }
-                } else {
-                    false
-                };
-
-                let item = self.slots[si].exact_plan.remove(0);
-                if !built_plan {
-                    self.cum_exact_cache_hit_count += 1;
-                }
-                self.cum_exact_solve_count += 1;
-                self.slots[si].exact_result = Some(item.result);
-                // finalize_move consumes exact_result, applies the optimal
-                // move, and sets the next state (ExactSolving again, or
-                // NeedsRootEval on fallback, or returns the finished game).
-                match self.slots[si].finalize_move(temp_moves, open_loop, true)? {
-                    Some(fg) => {
-                        self.slots[si].exact_plan.clear();
-                        finished.push((si, fg));
-                        break;
-                    }
-                    None => { /* loop: next move is still ExactSolving */ }
                 }
             }
         }
@@ -4184,7 +4443,13 @@ impl BatchedMCTS {
         // Resolve any terminal-adjacent endgame slots exactly first — they
         // contribute nothing to the GPU batch and may finish games (stashed in
         // pending_exact for update()). After this, no slot is ExactSolving.
-        self.resolve_exact_slots(py)?;
+        if self.async_solve {
+            // Step 1.5: harvest completed background solves + dispatch new ones.
+            // The solve itself overlaps the GPU eval that follows this step().
+            self.pump_async_solves();
+        } else {
+            self.resolve_exact_slots(py)?;
+        }
 
         let (fpu, cpuct, leaf_batch, vl, n_sims, open_loop) = (
             self.fpu,
@@ -4200,9 +4465,9 @@ impl BatchedMCTS {
             .par_iter_mut()
             .enumerate()
             .filter_map(|(si, slot)| match slot.state {
-                // Idle never contributes; ExactSolving should already be resolved
-                // by resolve_exact_slots above (skip defensively rather than panic).
-                SlotState::Idle | SlotState::ExactSolving => None,
+                // Idle never contributes; ExactSolving is resolved/dispatched above;
+                // SolvingInBackground is out on the async solver (skip defensively).
+                SlotState::Idle | SlotState::ExactSolving | SlotState::SolvingInBackground => None,
                 _ => Some((si, slot)),
             })
             .map(|(si, slot)| -> PyResult<SlotStepOutput> {
@@ -4218,8 +4483,8 @@ impl BatchedMCTS {
                     // SlotTick), not node-stored states.
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
-                        SlotState::ExactSolving => {
-                            unreachable!("ExactSolving slots are resolved before the batch")
+                        SlotState::ExactSolving | SlotState::SolvingInBackground => {
+                            unreachable!("ExactSolving/SolvingInBackground filtered before the batch")
                         }
                         SlotState::NeedsRootEval => {
                             // Root is evaluated from the PUBLIC real_state (its
@@ -4376,8 +4641,8 @@ impl BatchedMCTS {
 
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
-                        SlotState::ExactSolving => {
-                            unreachable!("ExactSolving slots are resolved before the batch")
+                        SlotState::ExactSolving | SlotState::SolvingInBackground => {
+                            unreachable!("ExactSolving/SolvingInBackground filtered before the batch")
                         }
                         SlotState::NeedsRootEval => {
                             let ev = push_leaf(
