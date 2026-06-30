@@ -272,7 +272,32 @@ function pageReadKingdominoState() {
     // kingdom container is absent (e.g. spectator mode) so the caller can fall
     // back gracefully to a castle-only board.
     if (typeof document === "undefined" || !document.getElementById) return null;
-    const container = document.getElementById("kingdom_" + bgaPlayerId);
+    // Resolve the opponent kingdom container. The id is kingdom_<bgaPlayerId>,
+    // but bgaPlayerId rotates per game/opponent and the direct id lookup can
+    // miss (timing, id mismatch). When it does, the old code returned null and
+    // the model got an EMPTY opponent board (inflated win prob). So fall back to
+    // a STRUCTURAL lookup: BGA nests the opponent kingdom(s) inside the stable
+    // container #other_players_kingdoms (the active player's own kingdom is NOT
+    // in there). In a 2-player game there is exactly one kingdom div inside it.
+    let container = document.getElementById("kingdom_" + bgaPlayerId);
+    const directHit = !!container;
+    if (!container) {
+      const others = document.getElementById("other_players_kingdoms");
+      if (others) {
+        const kings = others.querySelectorAll("[id^='kingdom_']");
+        // Prefer the one whose id matches bgaPlayerId (n-player safe); else, in
+        // a 2-player game there is only one, so take it as a last resort.
+        let match = null;
+        for (const k of kings) {
+          if (k.id === "kingdom_" + bgaPlayerId) { match = k; break; }
+        }
+        if (!match && kings.length === 1) match = kings[0];
+        container = match;
+      }
+    }
+    console.log('[advisor] buildBoardFromDom: resolved opponent kingdom via',
+      directHit ? 'direct id' : 'other_players_kingdoms fallback',
+      '-> container id:', container ? container.id : 'NONE');
     if (!container) return null;
 
     // The castle is not necessarily at pixel (0,0) of the kingdom container, so
@@ -284,11 +309,29 @@ function pageReadKingdominoState() {
       console.warn('[advisor] buildBoardFromDom: no castle element found');
       return null;
     }
-    const containerRect = container.getBoundingClientRect();
+    // Coordinate system: derive every cell from RENDERED geometry
+    // (getBoundingClientRect), using the castle's CENTER as the origin and its
+    // rendered width as the cell pitch. Both castle and tiles are post-transform
+    // screen pixels, so dividing their center difference by the rendered pitch
+    // cancels any uniform scale — transform- and zoom-invariant, no hardcoded
+    // pixel pitch. We use the element CENTER (not its corner): BGA renders each
+    // domino as a 200x100 (2x1 cell) element and rotates it via CSS transform,
+    // so getBoundingClientRect().left/top (the rotated bounding-box corner) is
+    // offset by half a cell for vertical (rot1/rot3) tiles, which produced
+    // half-cell positions that tripped the alignment guard. The center is
+    // rotation-invariant and lands cleanly on the SEAM between the two cells.
     const castleRect = castleEl.getBoundingClientRect();
-    const castlePx = Math.round(castleRect.left - containerRect.left);
-    const castlePy = Math.round(castleRect.top - containerRect.top);
-    console.log('[advisor] castle px offset:', castlePx, castlePy);
+    const pitch = castleRect.width; // rendered cell size (handles scale/zoom)
+    if (!pitch || !isFinite(pitch)) {
+      console.warn('[advisor] buildBoardFromDom: castle has no rendered width; cannot reconstruct');
+      return null; // caller falls back; warning banner will fire
+    }
+    const castleCx = castleRect.left + castleRect.width / 2;
+    const castleCy = castleRect.top + castleRect.height / 2;
+    console.log('[advisor] buildBoardFromDom: pitch=', pitch,
+      'transform=',
+      (typeof window !== "undefined" && window.getComputedStyle)
+        ? window.getComputedStyle(container).transform : 'n/a');
 
     const castle = Array.isArray(castlePos) && castlePos.length === 2
       ? [asInt(castlePos[0], 7), asInt(castlePos[1], 7)]
@@ -296,12 +339,16 @@ function pageReadKingdominoState() {
     const cells = [
       { x: castle[0], y: castle[1], terrain: "CASTLE", terrain_id: 1, crowns: 0, domino_id: -1 },
     ];
+    // IDs of dominoes dropped from the reconstruction because a half fell outside
+    // the engine bounds. Surfaced to the caller so an incomplete opponent board
+    // becomes a visible failure rather than silently wrong recommendations.
+    const skippedDominoes = [];
 
     let placed;
     try {
       placed = container.querySelectorAll("[class*='shadow-rotation-']");
     } catch (e) {
-      return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells };
+      return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells, skipped_dominoes: skippedDominoes };
     }
 
     placed.forEach((el) => {
@@ -309,12 +356,6 @@ function pageReadKingdominoState() {
       if (!idm) return;
       const dominoId = asInt(idm[1], null);
       if (!Number.isFinite(dominoId)) return;
-
-      // Pixel anchor → grid. Require finite, 50px-aligned offsets.
-      const left = parseInt(el.style && el.style.left, 10);
-      const top = parseInt(el.style && el.style.top, 10);
-      if (!Number.isFinite(left) || !Number.isFinite(top)) return;
-      if ((left - castlePx) % 50 !== 0 || (top - castlePy) % 50 !== 0) return;
 
       const cls = typeof el.className === "string" ? el.className : "";
       const rm = cls.match(/shadow-rotation-([0-3])/);
@@ -324,27 +365,79 @@ function pageReadKingdominoState() {
       const desc = descriptions && descriptions[String(dominoId)];
       if (!desc || !desc.left || !desc.right) return;
 
-      // Anchor half = desc.left; second half = desc.right at rotationOffset(R).
-      // VERIFIED against the live authoritative board (dominoes 25 @rot2, 21
-      // @rot3). This mirrors KingdominoPlacement.domDominoCells, which the Node
-      // test covers; kept inline because the MAIN world cannot import it.
-      const gx = (left - castlePx) / 50, gy = (top - castlePy) / 50;
-      const [dx, dy] = rotationOffset(rotation);
+      // Center-based grid math. The element center is rotation-invariant and
+      // lands on the SEAM between the domino's two cells (half-integer on the
+      // seam axis, integer on the other). cgx/cgy = element center in grid units
+      // relative to the castle center.
+      const r = el.getBoundingClientRect();
+      const ex = r.left + r.width / 2;
+      const ey = r.top + r.height / 2;
+      const cgx = (ex - castleCx) / pitch;
+      const cgy = (ey - castleCy) / pitch;
+
+      // Two physical cells from the center, by orientation:
+      //   rot 0/2 (horizontal): seam along x → center.x ~ half-int, center.y ~ int
+      //   rot 1/3 (vertical):   seam along y → center.x ~ int,      center.y ~ half-int
+      const horizontal = (rotation === 0 || rotation === 2);
+      let seamFracOk;
+      if (horizontal) {
+        seamFracOk = Math.abs((cgx - Math.floor(cgx)) - 0.5) < 0.2
+                  && Math.abs(cgy - Math.round(cgy)) < 0.2;
+      } else {
+        seamFracOk = Math.abs((cgy - Math.floor(cgy)) - 0.5) < 0.2
+                  && Math.abs(cgx - Math.round(cgx)) < 0.2;
+      }
+      // Alignment sanity: the tile must sit cleanly on the seam (clean half/int
+      // split). A poor fit means it is mid-animation; skip and record so the
+      // caller's warning fires rather than committing a wrong cell.
+      if (!seamFracOk) {
+        skippedDominoes.push(dominoId);
+        return;
+      }
+
+      // Map the two physical cells to the terrain halves with EXPLICIT
+      // per-rotation anchors. rot1 and rot3 are vertical in OPPOSITE directions
+      // and need OPPOSITE anchor-cell selection, so a single uniform y rule does
+      // not work for both (a -oy negation fixes rot1 but collides on rot3).
+      // cgx/cgy are grid units from the castle CENTER; smaller y is higher on
+      // screen. Confirmed by live collision detection on opponent boards:
+      //   rot0 (offset [1,0]):  desc.left=LEFT cell,  desc.right=RIGHT
+      //   rot2 (offset [-1,0]): desc.left=RIGHT cell, desc.right=LEFT
+      //   rot1 (offset [0,-1]): desc.left=UPPER cell, desc.right=LOWER
+      //   rot3 (offset [0,+1]): desc.left=LOWER cell, desc.right=UPPER
+      let leftX, leftY, rightX, rightY;
+      if (rotation === 0) {
+        leftX  = Math.floor(cgx); leftY  = Math.round(cgy);
+        rightX = leftX + 1;       rightY = leftY;
+      } else if (rotation === 2) {
+        leftX  = Math.ceil(cgx);  leftY  = Math.round(cgy);
+        rightX = leftX - 1;       rightY = leftY;
+      } else if (rotation === 1) {
+        leftX  = Math.round(cgx); leftY  = Math.floor(cgy);
+        rightX = leftX;           rightY = leftY + 1;
+      } else { // rotation === 3
+        leftX  = Math.round(cgx); leftY  = Math.ceil(cgy);
+        rightX = leftX;           rightY = leftY - 1;
+      }
+      // castle[] re-centers castle-relative grid coords into engine board coords;
+      // the downstream bounds check and cell push both expect engine x/y.
       const halves = [
-        { x: castle[0] + gx, y: castle[1] + gy, side: desc.left },
-        { x: castle[0] + gx + dx, y: castle[1] + gy + dy, side: desc.right },
+        { x: castle[0] + leftX,  y: castle[1] + leftY,  side: desc.left },
+        { x: castle[0] + rightX, y: castle[1] + rightY, side: desc.right },
       ];
-      // Bounds-check BOTH halves before adding either cell. A single cell
-      // outside the ±6 engine window around the castle makes the server reject
-      // the whole state (HTTP 400), and an edge-anchored tile's second half can
-      // exceed ±6 even when the anchor does not — so skip the ENTIRE domino if
+      // Bounds-check BOTH halves before adding either cell: a cell outside the
+      // 0..14 canvas would index out of the server's board array. With the
+      // rendered-geometry math this should never trigger for a real tile — it is
+      // a safety net against a wildly mis-read tile. Skip the ENTIRE domino if
       // either half is out of range.
       const halfOutOfBounds = halves.some((h) =>
-        Math.abs(h.x - castle[0]) > 6 || Math.abs(h.y - castle[1]) > 6
+        h.x < 0 || h.x >= 15 || h.y < 0 || h.y >= 15
       );
       if (halfOutOfBounds) {
         console.warn('[advisor] buildBoardFromDom: skipping domino', dominoId,
-          'out-of-bounds half (anchor offset', gx, gy, 'rotation', rotation + ')');
+          'out-of-bounds half (center grid', cgx.toFixed(2), cgy.toFixed(2),
+          'rotation', rotation + ')');
+        skippedDominoes.push(dominoId);
         return;
       }
       halves.forEach((h) => {
@@ -359,7 +452,7 @@ function pageReadKingdominoState() {
       });
     });
 
-    return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells };
+    return { canvas_size: 15, castle_pos: [castle[0], castle[1]], cells, skipped_dominoes: skippedDominoes };
   }
 
   function looksLikeKingdomGrid(obj) {
@@ -566,6 +659,23 @@ function pageReadKingdominoState() {
     const boardSize = asInt(gd.gridSize, 7);
     const canvasSize = 15;
 
+    // Count dominoes on each player's board, by player index. Used to validate
+    // the DOM-reconstructed opponent board: each placed domino occupies 2 cells,
+    // so a complete board has 1 (castle) + placedCount*2 cells.
+    // NOTE: BGA's location string for a tile placed on a board is "KINGDOM"
+    // (confirmed via live gamedatas.dominoes capture), NOT "PLACED". Using
+    // "PLACED" here counted 0 for every player, so expectedCells was always 1
+    // (castle only) and the board_reconstruction_warning never fired.
+    const placedCountByPlayer = {};
+    Object.keys(dominoes).forEach((k) => {
+      const d = dominoes[k];
+      if (String(d.location || "").toUpperCase() !== "KINGDOM") return;
+      const pi = playerToIndex[String(d.owner_player)];
+      if (Number.isFinite(pi)) {
+        placedCountByPlayer[pi] = (placedCountByPlayer[pi] || 0) + 1;
+      }
+    });
+
     const allClaims = Object.keys(dominoes)
       .map((k) => dominoes[k])
       .map((d) => claimFromDomino(d, playerToIndex))
@@ -617,6 +727,11 @@ function pageReadKingdominoState() {
       bga_state_name: gameStateName,
       bga_active_player: activePlayer == null ? null : String(activePlayer),
       bga_playerorder: playerorder,
+      // Histogram of raw BGA location strings. Confirmed live values:
+      //   "KINGDOM" = tile placed on a player's board
+      //   "CURRENT" = tile in hand / being placed this turn
+      //   "FUTURE"  = tile in the future row (claimed if owner_player set)
+      // (Do not assume "PLACED" — BGA never uses it; see placedCountByPlayer.)
       bga_locations: Object.keys(dominoes).reduce((acc, k) => {
         const loc = String(dominoes[k].location || "UNKNOWN").toUpperCase();
         acc[loc] = (acc[loc] || 0) + 1;
@@ -653,6 +768,10 @@ function pageReadKingdominoState() {
     //      above) — legacy fallback; inert when BGA sends null coords.
     //   4. Castle-only board — last resort (already present in every board).
     const domCastle = [castleCenter, castleCenter];
+    // Set when a DOM-reconstructed opponent board has fewer cells than BGA says
+    // it should — surfaced to the UI as a loud failure banner (see
+    // renderRecommendations). Last incomplete board wins if several are bad.
+    let boardReconstructionWarning = null;
     for (let p = 0; p < boardBuild.boards.length; p++) {
       const grid = resolveKingdomForPlayer(gd, p, playerorder, activeIndex);
       if (grid) {
@@ -671,6 +790,24 @@ function pageReadKingdominoState() {
         boardBuild.boards[p] = domBoard;
         debug.notes.push(`Player ${p} board built from DOM reconstruction (${domBoard.cells.length - 1} placed cell(s) from rendered tiles).`);
         console.log('[advisor] board', p, 'built via: DOM');
+
+        // Validate completeness against BGA's KINGDOM (on-board) tile count. A short board means
+        // tiles were dropped (out-of-bounds skips) and the model would be fed a
+        // partial opponent board — keep what we have but flag it loudly.
+        const expectedCells = 1 + ((placedCountByPlayer[p] || 0) * 2);
+        const actualCells = domBoard.cells.length;
+        const boardIncomplete = actualCells < expectedCells;
+        const skippedIds = domBoard.skipped_dominoes ? domBoard.skipped_dominoes : [];
+        if (boardIncomplete) {
+          debug.notes.push(`Player ${p} board INCOMPLETE: expected ${expectedCells} cells (${placedCountByPlayer[p] || 0} placed dominoes × 2 + castle), got ${actualCells}. Skipped domino IDs: ${skippedIds.join(", ") || "unknown (out-of-bounds)"}.`);
+          boardReconstructionWarning = {
+            player: p,
+            expected_cells: expectedCells,
+            actual_cells: actualCells,
+            skipped_domino_ids: skippedIds,
+            message: `Opponent board missing ${expectedCells - actualCells} cell(s) — advisor recommendations may be unreliable.`,
+          };
+        }
         continue;
       }
       debug.notes.push(`Player ${p} board uses APPROXIMATE dominoes reconstruction / castle-only (no authoritative kingdom grid and no DOM-placed tiles found${p === activeIndex ? "" : "; BGA exposes the kingdom grid for the active player only"}).`);
@@ -756,6 +893,9 @@ function pageReadKingdominoState() {
         deck_count: hiddenDeck.length,
         boards: boardBuild.boards,
         visible_history: [],
+        // Present only when an opponent board failed completeness validation;
+        // renderRecommendations reads this to show a loud warning banner.
+        board_reconstruction_warning: boardReconstructionWarning,
         debug: {
           ...debug,
           reconstructed_placements: boardBuild.placements,
@@ -1279,6 +1419,19 @@ function renderErrorOverlay(message) {
 function renderRecommendations(response, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells) {
   const box = makeOverlayBase("Kingdomino Advisor");
 
+  // Loud failure: an incomplete opponent board reconstruction means the model
+  // saw wrong information. Warn the player prominently — first child of box,
+  // above controls and recommendations — but still show the recommendations.
+  const reconWarn = payload && payload.state && payload.state.board_reconstruction_warning;
+  if (reconWarn) {
+    const banner = document.createElement("div");
+    banner.style.cssText = "background:rgba(127,29,29,0.95);border:1px solid #f87171;border-radius:6px;padding:8px 10px;margin-bottom:8px;color:#fecaca;font-size:12px;line-height:1.4;";
+    // Safe: every interpolated value is a number or string produced by our own
+    // code (normalizeBgaState), never raw BGA DOM text.
+    banner.innerHTML = `⚠️ <b>Opponent board incomplete</b> — missing ${reconWarn.expected_cells - reconWarn.actual_cells} cell(s). Recommendations may be unreliable.<br><span style="color:#fca5a5;font-size:11px;">${reconWarn.message}${reconWarn.skipped_domino_ids.length ? " Skipped tile IDs: " + reconWarn.skipped_domino_ids.join(", ") + "." : ""}</span>`;
+    box.insertBefore(banner, box.firstChild);
+  }
+
   const controls = document.createElement("div");
   controls.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:10px;";
 
@@ -1323,7 +1476,13 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   const valueText = typeof response.value === "number" ? formatValue(response.value) : "-";
   const searchMs = response.search_ms !== undefined ? `${response.search_ms}ms` : "-";
   const sims = response.num_simulations !== undefined ? response.num_simulations : options.sims;
-  meta.innerHTML = `Value: <b style="color:#f8fafc">${valueText}</b><br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
+  // Prefer the network's win probability (root_inference) over response.value:
+  // for NN, response.value is the root Q in [-1,1] actor frame, less readable.
+  const ri = response.root_inference;
+  const valueLine = (ri && typeof ri.win_prob === "number")
+    ? `Win prob: <b style="color:#f8fafc">${formatPct(ri.win_prob)}</b>`
+    : `Value: <b style="color:#f8fafc">${valueText}</b>`;
+  meta.innerHTML = `${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
   if (response.checkpoint_path) {
     const ck = document.createElement("div");
     ck.style.cssText = "font-size:11px;color:#94a3b8;margin-top:3px;word-break:break-all;";
@@ -1331,6 +1490,45 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     meta.appendChild(ck);
   }
   box.appendChild(meta);
+
+  // Root inference summary: the network's pre-search prediction (single forward
+  // pass, NOT MCTS-updated). Only NN engines return root_inference.
+  const engineName = String(response.engine || payload.engine || "");
+  if (ri && engineName.startsWith("nn")) {
+    const panel = document.createElement("div");
+    panel.style.cssText = "background:rgba(15,23,42,0.9);border:1px solid rgba(71,85,105,0.6);border-radius:6px;padding:6px 10px;margin-bottom:8px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;";
+    panel.title = "Network's prediction before MCTS search. Own/Opp are projected final scores.";
+
+    const bold = (text, color) => {
+      const b = document.createElement("b");
+      b.textContent = text;
+      if (color) b.style.color = color;
+      return b;
+    };
+    const stat = (prefix, boldEl) => {
+      const span = document.createElement("span");
+      span.style.cssText = "color:#94a3b8;font-size:12px;";
+      span.appendChild(document.createTextNode(prefix));
+      span.appendChild(boldEl);
+      return span;
+    };
+
+    panel.appendChild(stat("You: ", bold(String(Math.round(ri.own_score_est)))));
+    panel.appendChild(stat("Opp: ", bold(String(Math.round(ri.opp_score_est)))));
+
+    const margin = ri.score_margin_est;
+    const marginText = (margin >= 0 ? "+" : "") + Math.round(margin);
+    panel.appendChild(stat("Margin: ", bold(marginText, margin >= 0 ? "#4ade80" : "#f87171")));
+
+    panel.appendChild(stat("Win: ", bold(formatPct(ri.win_prob), ri.win_prob >= 0.5 ? "#4ade80" : "#f87171")));
+
+    const note = document.createElement("span");
+    note.textContent = "(pre-search estimates)";
+    note.style.cssText = "color:#475569;font-size:10px;font-style:italic;";
+    panel.appendChild(note);
+
+    box.appendChild(panel);
+  }
 
   const recs = Array.isArray(response.recommendations) ? response.recommendations : [];
   const list = document.createElement("div");
@@ -1359,8 +1557,7 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
 
     const visit = firstNumber(rec, ["visit_frac", "visit_share", "prob"]);
     const prior = firstNumber(rec, ["prior", "policy_prior", "nn_prior"]);
-    const value = firstNumber(rec, ["q_value", "q", "Q", "value", "win_prob"]);
-    const visits = firstNumber(rec, ["visit_count", "visits", "N"]);
+    const qWinProb = firstNumber(rec, ["q_win_prob", "q_value", "q", "Q"]);
 
     const rowFlex = document.createElement("div");
     rowFlex.style.cssText = "display:flex;align-items:center;gap:10px;";
@@ -1446,11 +1643,11 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
 
     const chips = document.createElement("div");
     chips.style.cssText = "margin-top:2px;";
+    // Order: visit (what the search concluded) → prior (initial network belief)
+    // → win% (win probability if this move is played).
     if (visit !== null) chips.appendChild(metricChip("visit", formatPct(visit), "MCTS visit share"));
-    if (prior !== null) chips.appendChild(metricChip("prior", formatPct(prior), "NN policy prior"));
-    if (value !== null) chips.appendChild(metricChip("value", formatValue(value), "Estimated action/root value"));
-    if (visits !== null) chips.appendChild(metricChip("N", String(Math.round(visits)), "Raw visit count"));
-    if (rec.legal_index !== undefined) chips.appendChild(metricChip("legal", String(rec.legal_index), "Legal action index"));
+    if (prior !== null) chips.appendChild(metricChip("prior", formatPct(prior), "Network prior (pre-search)"));
+    if (qWinProb !== null) chips.appendChild(metricChip("win%", formatPct(qWinProb), "Search win probability (MCTS-updated)"));
     if (chips.children.length) row.appendChild(chips);
 
     list.appendChild(row);
@@ -1508,7 +1705,9 @@ async function postRecommend(payload) {
         resolve({ ok: false, error: String((e && e.message) || e) });
       }
     });
+    console.log("[advisor] background response:", JSON.stringify(wrapped));
     if (!wrapped || !wrapped.ok) {
+      console.error("[advisor] background fetch failed:", wrapped && wrapped.error);
       throw new Error((wrapped && wrapped.error) || String((directError && directError.message) || directError));
     }
     return { data: wrapped.data, transport: "background" };

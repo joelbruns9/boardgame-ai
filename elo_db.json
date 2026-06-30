@@ -363,6 +363,97 @@
       "timestamp": "2026-06-23T21:00:21.135665+00:00",
       "is_anchor": false,
       "fixed_rating": null
+    },
+    "local_48x6_run4_iter_0050": {
+      "rating": 1014.01,
+      "rating_stderr": 16.01,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-24T20:56:10.168936+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run4_iter_0100": {
+      "rating": 1005.21,
+      "rating_stderr": 15.91,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-24T20:56:10.168936+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run4_iter_0100_final": {
+      "rating": 1005.21,
+      "rating_stderr": 15.91,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-24T20:56:10.168936+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run4_iter_0030_final": {
+      "rating": 986.5,
+      "rating_stderr": 15.72,
+      "n_games": 720,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-25T13:43:14.620628+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run6_iter_0025": {
+      "rating": 954.66,
+      "rating_stderr": 18.96,
+      "n_games": 480,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-26T14:42:10.628142+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run6_iter_0050": {
+      "rating": 976.6,
+      "rating_stderr": 19.15,
+      "n_games": 480,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-26T14:42:10.628142+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "local_48x6_run6_iter_0050_final": {
+      "rating": 976.6,
+      "rating_stderr": 19.15,
+      "n_games": 480,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-06-26T14:42:10.628142+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
     }
   }
 }

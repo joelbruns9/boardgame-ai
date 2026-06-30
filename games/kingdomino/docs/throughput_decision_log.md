@@ -68,8 +68,10 @@ Update this section after any representative run.
 | exact fallback | 41/100 (solver_cpus=6) |
 | exact solver time | ~210s (fully hidden under eval on the dedicated pool) |
 | eval timing split | **forward-bound**: forward 601.7s (90.5%), h2d 26.7s (4%), readback 29.6s (4.5%), 50923 calls (async@32, solver_cpus=6) |
-| Forward bench (48ch/6b, cudnn_benchmark) | batch 32/64/128/137/192/256 -> 2.85/5.29/11.91/12.46/17.63/23.56 ms; µs/sample ~89/82.6/93/91/91.8/92; peak 12.1k evals/s at batch 64. Scales linearly with batch, µs/sample ~constant => **GPU-compute-bound, NOT launch-bound**. In-loop forward (11.8 ms @137) == bench (12.46 ms), so the forward is NOT solver-inflated. |
-| Throughput ceiling note | Laptop self-play is **GPU-forward-compute-bound at ~0.14 games/s**; solver is free. Floor = ~90µs/sample x positions. Double-buffer marginal (hides only ~75s CPU, ceiling ~0.15). CUDA graph / torch.compile low value (compute-bound, little launch overhead). channels-last is the one real forward lever (modest). Forward most efficient at batch ~64 (82.6µs) vs ~137 (91µs) -> batch_slots sweep could be retested. Real win is the 5090. |
+| Forward bench (48ch/6b, cudnn_benchmark) | Scales linearly with batch, µs/sample ~constant => **GPU-compute-bound, NOT launch-bound**. In-loop forward == bench (not solver-inflated). **POWER-DEPENDENT** (see below): weak brick @137 = 12.46 ms / 91µs / 11k evals-s; bigger brick @137 = 8.26 ms / 60µs / 16.6k evals-s (-34%). |
+| Brick / thermal (measured, counterintuitive) | Bigger brick made the SHORT forward_bench 1.3-1.57x faster (boost clock) but made the SUSTAINED training run WORSE: games/s 0.139 -> 0.118, in-loop forward 11.8 -> 13.7 ms (vs bench 8.26 ms). So the bench measures peak boost, not the thermal-limited steady state. Sustained self-play is **thermal-bound in a shared CPU+GPU laptop envelope**, not a clean power cap. The cooler power-limited (old) brick gave better sustained throughput. |
+| Thermal context | Pre-solver telemetry: 100% GPU util @ 79-80C, CPU 10% (negligible). GPU is the dominant heat source. The solver now runs ~6 CPU cores hard -> a NEW heat source into an already-saturated shared envelope -> can throttle the GPU. So the solver is free on CPU SCHEDULING but not free THERMALLY. |
+| Throughput ceiling note | Laptop sustained self-play is thermal-bound (~0.12-0.14 games/s depending on brick/cooling); the run3 0.174 was likely a cooler thermal state. Levers are now thermal (cooling, fewer solver_cpus, undervolt, GPU power cap) -- see the deferred Thermal card. The real throughput win remains the 5090. Forward levers (channels-last) help compute but not the thermal cap. |
 
 Important distinction: `eval_sec` is the whole evaluator call, not just neural-net
 math. It can include NumPy contiguity/padding, H2D transfer, forward pass,
@@ -420,6 +422,39 @@ Reopen if:
   lifts the GPU floor so throughput can grow past ~0.14, AND batch fill (currently
   72% async vs 78% sync, from slots out solving) then shows up as the next limiter.
   Staggering is the cheaper fill fix vs overbooking (no extra slots / overhead).
+
+## GPU/CPU Thermal Throttling On The Laptop
+
+Status: deferred
+Priority: low (laptop is a dev box, not the training target)
+Owner/date: 2026-06-29
+
+Hypothesis:
+- Sustained solver-on self-play is thermal-bound in a shared CPU+GPU laptop
+  envelope. Pre-solver: 100% GPU @ 79-80C, CPU 10% (GPU = nearly all the heat).
+  The solver adds ~6 hot CPU cores -> extra heat into an already-saturated cooler
+  -> throttles the GPU. Evidence: the bigger power brick made the short
+  forward_bench faster (boost) but sustained training WORSE (0.139 -> 0.118), and
+  in-loop forward (13.7ms) >> bench (8.26ms) only on the new brick. So the solver
+  is free on CPU SCHEDULING but not free THERMALLY (laptop only).
+
+Why deferred:
+- The laptop is a dev box; the real training target is the cloud 5090 with its
+  own (much larger) thermal/power envelope, so laptop thermal tuning does not
+  transfer. The thermal cost is a hardware artifact, not an algorithmic problem.
+
+If revisited, capture telemetry to confirm + quantify:
+- Log `nvidia-smi --query-gpu=timestamp,temperature.gpu,clocks.sm,power.draw,
+  clocks_throttle_reasons.active --format=csv -l 2` (+ CPU temp/clock) across one
+  iteration, three ways: solver-off, solver_cpus=6, solver_cpus=3.
+- Decision rule: if GPU clock decays as temp rises and throttle_reason is
+  thermal/power, the levers are cooling / fewer solver_cpus / undervolt / GPU
+  power cap, and the cooler (power-limited) brick may be preferable. The short
+  forward_bench overstates sustained throughput (boost vs steady-state clock).
+
+Reopen if:
+- Sustained laptop throughput matters again (long local runs), or the same
+  shared-envelope throttling shows up on the chosen cloud instance.
 
 ## Profile Evaluator Timing
 

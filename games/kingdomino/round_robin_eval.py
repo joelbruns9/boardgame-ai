@@ -176,7 +176,7 @@ class OpenLoopEvalBot(BotProtocol):
             return legal[0]
         py_rng = rng or random.Random()
         np_rng = np.random.default_rng(py_rng.randrange(0, 2**63 - 1))
-        visit_counts, _ = run_pimc_open_loop(
+        visit_counts, _, _ = run_pimc_open_loop(
             self.mcts, state, add_noise=False, rng=np_rng,
         )
         return select_move(visit_counts, temperature=self.temperature,

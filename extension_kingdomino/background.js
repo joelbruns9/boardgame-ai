@@ -9,6 +9,26 @@ function timeoutSignal(ms) {
   return controller.signal;
 }
 
+// Startup diagnostics — visible in about:debugging → Inspect. Confirms the
+// background script initialized and whether fetch exists in its context.
+console.log("[bg] background.js loaded, fetch available:",
+  typeof fetch !== "undefined");
+
+// One-shot connectivity probe: does the background context reach the local
+// advisor server at all? Fires immediately on load (independent of any
+// content-script message), so a FAILED here isolates network reachability
+// from message-passing problems.
+fetch("http://127.0.0.1:8000/api/recommend", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ engine: "greedy", num_simulations: 0 }),
+  signal: timeoutSignal(5000),
+})
+  .then((r) => r.json())
+  .then((d) => console.log("[bg] startup connectivity test: OK, engine:", d.engine))
+  .catch((e) => console.error("[bg] startup connectivity test FAILED:",
+    e.name, e.message));
+
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: "POST",
@@ -79,8 +99,14 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Proxy recommend POST to localhost (bypasses BGA page CSP / CORS).
   if (message.action === "recommend") {
     postJson(message.url, message.payload)
-      .then((data) => sendResponse({ ok: true, data }))
-      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      .then((data) => {
+        console.log("[bg] recommend success, keys:", Object.keys(data || {}));
+        sendResponse({ ok: true, data });
+      })
+      .catch((e) => {
+        console.error("[bg] recommend FAILED:", e.name, e.message, String(e));
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      });
     return true;
   }
 

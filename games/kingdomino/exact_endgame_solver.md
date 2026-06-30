@@ -441,11 +441,18 @@ with single `solve_endgame_budgeted`)
 **Status:** ✅ Implemented (in `solve_endgame_ab`)
 **Priority:** High — multiplicative gain on node count
 
-> Standard fail-soft alpha-beta over the scalar `terminal_search_value` (monotone
-> in score_diff), window in [-1, 1]. Max/min layers are typed per node by
-> `actor()` and need not strictly alternate. Value is bit-identical to plain
-> minimax — verified against the Python expectiminimax (`test_rust_deck_four_matches_python`)
-> and via budget/order invariance (`test_alpha_beta_value_exact_and_public_consistent`).
+> Standard fail-soft alpha-beta. **The search runs on the RAW integer score margin
+> `(s0 - s1)`, player-0 frame, range ~[-80, 80]**, with the window initialised to
+> [-200, 200] (`MARGIN_LO`/`MARGIN_HI`). Integer margins have the widest spread →
+> tightest bounds, and carry no training hyperparameters. The training value
+> (`terminal_search_value`/`margin_to_training_value`) is a monotone transform
+> applied AFTER the solve, so the minimax-optimal move is identical to a search run
+> directly in value space (the monotonicity guarantee). Max/min layers are typed
+> per node by `actor()` and need not strictly alternate. Value is bit-identical to
+> the value-space search — verified against the Python expectiminimax
+> (`test_rust_deck_four_matches_python`), via budget/order invariance
+> (`test_alpha_beta_value_exact_and_public_consistent`), and via ranking invariance
+> (`test_raw_margin_matches_training_value_ranking`).
 
 **Problem:** Plain minimax evaluates every node in the tree. Alpha-beta prunes
 subtrees that cannot affect the result.

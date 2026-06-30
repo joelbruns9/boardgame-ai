@@ -409,7 +409,13 @@ def test_degenerate_bag():
     vc_az, _ = az.search(fp, rng=np.random.default_rng(0))
     top_az = select_move(vc_az, 0.0, np.random.default_rng(0))
 
-    ol = OpenLoopMCTS(ev, n_simulations=30)
+    # Exact endgame solving is disabled here so the comparison is apples-to-apples:
+    # this test checks the open-loop SEARCH MACHINERY matches closed-loop at a
+    # degenerate (empty-bag) tree. With exact solving on, open-loop replaces the
+    # network leaf value with the exact minimax score at deck=0 leaves, while
+    # AlphaZeroMCTS has no exact solver — so they would legitimately diverge.
+    # Exact-solver equivalence is covered separately in test_endgame_exact.py.
+    ol = OpenLoopMCTS(ev, n_simulations=30, exact_endgame_enabled=False)
     vc_ol, _ = ol.search(fp, rng=np.random.default_rng(0))
     top_ol = select_move(vc_ol, 0.0, np.random.default_rng(0))
 

@@ -147,9 +147,11 @@ class RecommendRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=100)
     checkpoint_path: Optional[str] = None
     nn_sims: int = Field(default=50, ge=1, le=5000)
+    # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
+    # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
-    device: str = "cpu"
+    device: str = "cuda"
     # Architecture is normally read from the checkpoint's stored config.  These
     # are optional overrides, only used as a fallback for old checkpoints that
     # predate the saved config dict.  Leave them None to trust the checkpoint.
@@ -167,9 +169,11 @@ class BotActionRequest(BaseModel):
     # Kingdomino iter_*.pt checkpoint is used when available.
     checkpoint_path: Optional[str] = None
     nn_sims: int = Field(default=50, ge=1, le=5000)
+    # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
+    # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
-    device: str = "cpu"
+    device: str = "cuda"
     # Optional architecture overrides; normally read from the checkpoint config.
     channels: Optional[int] = None
     blocks: Optional[int] = None
@@ -616,7 +620,7 @@ def _load_nn_evaluator(req: BotActionRequest):
     key = (path, req.device, req.channels, req.blocks, req.bilinear_dim)
     cached = _NN_EVALUATOR_CACHE.get(key)
     if cached is not None:
-        return cached, path
+        return cached["evaluator"], cached["net"], path
 
     try:
         import torch
@@ -662,40 +666,79 @@ def _load_nn_evaluator(req: BotActionRequest):
         ).to(req.device)
         net.load_state_dict(sd)
         net.eval()
-        evaluator = make_serial_evaluator(net, device=req.device)
+        # The advisor deliberately searches with alpha=0.0 — a PURE win-probability
+        # objective — rather than the training-time alpha=0.8 (80% win / 20%
+        # score-margin blend).  This makes backed-up Q values map cleanly to win
+        # probability via (Q + 1) / 2, and matches the known-best eval config
+        # (alpha=0.0, c_puct=1.5).  margin_gain is left at its default; with
+        # alpha=0.0 the margin term is multiplied by zero, so it has no effect.
+        evaluator = make_serial_evaluator(net, device=req.device, alpha=0.0)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to load NN checkpoint {path}: {exc}") from exc
 
-    _NN_EVALUATOR_CACHE[key] = evaluator
-    return evaluator, path
+    _NN_EVALUATOR_CACHE[key] = {"evaluator": evaluator, "net": net}
+    return evaluator, net, path
+
+
+def _root_trajectory(net, state: GameState, device: str) -> dict[str, Any]:
+    """One forward pass on the root state — the network's pre-search trajectory
+    estimate (projected final scores + win probability).
+
+    This is a SINGLE root forward pass, NOT search-averaged: it reflects the
+    network's prior belief before any tree exploration.  (The per-action Q
+    values in the recommendations ARE search-updated, and are win probabilities
+    under the advisor's alpha=0.0 search.)  Surfacing the un-searched root
+    readout is a known, accepted limitation.
+
+    The own/opp heads are normalized by score_scale=100 and are from the CURRENT
+    ACTOR's perspective (own = the actor's projected final score, opp = the
+    opponent's), so they are multiplied back to point estimates here.
+    """
+    import torch
+    from games.kingdomino.encoder import encode_state
+
+    mb, ob, flat = encode_state(state, state.current_actor)
+    with torch.inference_mode():
+        mb_t = torch.from_numpy(mb).unsqueeze(0).to(device)
+        ob_t = torch.from_numpy(ob).unsqueeze(0).to(device)
+        flat_t = torch.from_numpy(flat).unsqueeze(0).to(device)
+        own, opp, win_prob, _logits = net(mb_t, ob_t, flat_t)
+    return {
+        "own_score_est": float(own.item() * 160.0),
+        "opp_score_est": float(opp.item() * 160.0),
+        "score_margin_est": float((own.item() - opp.item()) * 160.0),
+        "win_prob": float(win_prob.item()),
+    }
 
 
 def _choose_nn_action(state: GameState, req: BotActionRequest):
     if state.phase == Phase.GAME_OVER:
         raise HTTPException(status_code=400, detail="Game is already over.")
-    evaluator, checkpoint_path = _load_nn_evaluator(req)
+    # Bot-action path ignores the net (no trajectory/prior readout needed here).
+    evaluator, _net, checkpoint_path = _load_nn_evaluator(req)
     try:
         import numpy as np
-        from games.kingdomino.mcts_az import AlphaZeroMCTS, run_pimc, select_move
+        from games.kingdomino.mcts_az import OpenLoopMCTS, run_pimc_open_loop, select_move
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not import MCTS dependencies: {exc}") from exc
 
-    mcts = AlphaZeroMCTS(
+    # Open-loop MCTS resamples the deck on every simulation, averaging over deck
+    # uncertainty — the correct search for a live advisory context.  (Closed-loop
+    # PIMC with n_determinizations=1 would just deepen one fixed hypothetical
+    # future, so raising sim counts barely changes the visit distribution.)
+    mcts = OpenLoopMCTS(
         evaluator,
         c_puct=1.5,
         n_simulations=int(req.nn_sims),
         dirichlet_alpha=0.3,
         dirichlet_epsilon=0.25,
     )
-    py_rng = random.Random(int(req.seed) + 9176 * (len(state.history) + 1))
     np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
-    visit_counts, value0 = run_pimc(
+    visit_counts, value0, _root = run_pimc_open_loop(
         mcts,
         state,
-        py_rng,
-        n_determinizations=int(req.determinizations),
         add_noise=False,
-        np_rng=np_rng,
+        rng=np_rng,
     )
     action = select_move(visit_counts, temperature=float(req.temperature), rng=np_rng)
     total_visits = sum(float(v) for v in visit_counts.values()) or 1.0
@@ -705,7 +748,6 @@ def _choose_nn_action(state: GameState, req: BotActionRequest):
         "engine": "nn-mcts",
         "checkpoint_path": checkpoint_path,
         "nn_sims": int(req.nn_sims),
-        "determinizations": int(req.determinizations),
         "temperature": float(req.temperature),
         "root_value_player0": float(value0),
         "root_value_actor": value_actor,
@@ -937,7 +979,7 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
     Engines:
       - greedy / heuristic: fast deterministic model-free scoring
       - random: useful sanity check for UI rendering
-      - nn / mcts / alphazero: AlphaZeroMCTS + PIMC using a checkpoint
+      - nn / mcts / alphazero: OpenLoopMCTS (deck resampled per simulation) using a checkpoint
 
     The local web UI and the future BGA extension should both consume this
     endpoint.  Bot-play helpers may apply a move; /api/recommend only reports.
@@ -1010,31 +1052,36 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             bilinear_dim=req.bilinear_dim,
             seed=int(req.seed),
         )
-        evaluator, checkpoint_path = _load_nn_evaluator(bot_req)
+        evaluator, net, checkpoint_path = _load_nn_evaluator(bot_req)
         try:
             import numpy as np
-            from games.kingdomino.mcts_az import AlphaZeroMCTS, run_pimc
+            from games.kingdomino.mcts_az import OpenLoopMCTS, run_pimc_open_loop
+            from games.kingdomino.action_codec import encode_action
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Could not import MCTS dependencies: {exc}") from exc
 
+        # Single root forward pass (pre-search trajectory estimate); surfaced as
+        # "root_inference" below.  Done before the search so it reflects the
+        # network's prior belief, independent of tree exploration.
+        root_traj = _root_trajectory(net, state, req.device)
+
         sims = int(bot_req.nn_sims)
-        mcts = AlphaZeroMCTS(
+        # Open-loop MCTS resamples the deck per simulation, so raising sim counts
+        # genuinely explores varied futures rather than deepening one fixed deck.
+        mcts = OpenLoopMCTS(
             evaluator,
             c_puct=1.5,
             n_simulations=sims,
             dirichlet_alpha=0.3,
             dirichlet_epsilon=0.25,
         )
-        py_rng = random.Random(int(req.seed) + 9176 * (len(state.history) + 1))
         np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
         try:
-            visit_counts, value0 = run_pimc(
+            visit_counts, value0, root = run_pimc_open_loop(
                 mcts,
                 state,
-                py_rng,
-                n_determinizations=int(bot_req.determinizations),
                 add_noise=False,
-                np_rng=np_rng,
+                rng=np_rng,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -1058,22 +1105,35 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             action_to_json(state, a, i)["action_id"]: i
             for i, a in enumerate(actions)
         }
+        actor = int(state.current_actor)
         rows = []
         for action, count in visit_counts.items():
             aj = action_to_json(state, action, -1)
             idx = id_to_index.get(aj["action_id"], -1)
             if idx >= 0:
                 aj = action_to_json(state, actions[idx], idx)
-            rows.append((float(count), idx, aj))
+            # Open-loop root children are keyed by slot-relative joint index, not
+            # action objects, so re-encode the action to find its child node.
+            child = root.children.get(encode_action(action, state))
+            prior = float(child.prior) if child is not None else None
+            # child.value is player-0 frame; flip to the acting player's frame,
+            # then map the [-1, 1] value to a [0, 1] win probability.  Under the
+            # advisor's alpha=0.0 search, this Q is search-updated win prob.
+            if child is not None and child.visit_count > 0:
+                q_actor = child.value if actor == 0 else -child.value
+                q_win_prob = (q_actor + 1.0) / 2.0
+            else:
+                q_win_prob = None
+            rows.append((float(count), idx, aj, prior, q_win_prob))
         rows.sort(key=lambda x: x[0], reverse=True)
         recs = []
-        for rank, (count, idx, aj) in enumerate(rows[:top_k], start=1):
+        for rank, (count, idx, aj, prior, q_win_prob) in enumerate(rows[:top_k], start=1):
             recs.append({
                 "rank": rank,
                 **aj,
-                "prior": None,
+                "prior": prior,
                 "visit_frac": count / total_visits,
-                "visit_count": int(count),
+                "q_win_prob": q_win_prob,
                 "q_value": None,
                 "is_legal": idx >= 0,
                 "debug": {"engine": "nn-mcts", "legal_index_resolved": idx},
@@ -1085,9 +1145,11 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             "checkpoint_path": checkpoint_path,
             "value": value_actor,
             "root_value_player0": float(value0),
+            # Network's pre-search trajectory readout (own/opp/win_prob); a single
+            # root forward pass, not search-averaged.  See _root_trajectory.
+            "root_inference": root_traj,
             "search_ms": int(round((time.perf_counter() - t0) * 1000)),
             "num_simulations": sims,
-            "determinizations": int(bot_req.determinizations),
             "total_visits": total_visits,
             "recommendations": recs,
         }

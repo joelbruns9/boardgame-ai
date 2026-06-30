@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 
@@ -289,6 +290,73 @@ def test_timeout_fires_quickly():
     assert elapsed < 0.1  # fired on the deadline, did not grind through nodes
 
 
+# ── Raw-margin alpha-beta (search on s0-s1, convert after) ───────────────────
+
+
+def test_margin_to_training_value_formula():
+    """Unit test the raw-margin → training-value conversion exposed for tests."""
+    kr = pytest.importorskip("kingdomino_rust")
+    # margin=+20, scale=160, gain=2.0, alpha=0.8 → 0.8*tanh(0.25) + 0.2*(+1)
+    expected = 0.8 * math.tanh(20.0 / 160.0 * 2.0) + 0.2 * 1.0
+    assert kr.margin_to_training_value(20.0, 160.0, 2.0, 0.8) == pytest.approx(expected, abs=1e-9)
+    # Draw (margin=0) is symmetric → exactly 0.0.
+    assert kr.margin_to_training_value(0.0, 160.0, 2.0, 0.8) == pytest.approx(0.0, abs=1e-12)
+    # Negative margin → negative value.
+    assert kr.margin_to_training_value(-30.0, 160.0, 2.0, 0.8) < 0.0
+    # Sign component flips at the boundary even for a tiny margin.
+    assert kr.margin_to_training_value(1.0, 160.0, 2.0, 0.0) == pytest.approx(1.0, abs=1e-12)
+    assert kr.margin_to_training_value(-1.0, 160.0, 2.0, 0.0) == pytest.approx(-1.0, abs=1e-12)
+
+
+def test_raw_margin_solver_value_in_range():
+    """The solver searches on raw margins (~[-80,80]) but `exact_endgame_value_no_chance`
+    converts before returning, so the reported value is in training space [-1, 1]."""
+    kr = pytest.importorskip("kingdomino_rust")
+    _state, rs = next(_reach_deck4_rust(seed_start=0, want=1))
+    value, solved, _elapsed = kr.exact_endgame_value_no_chance(rs, SOLVE_SECS, 160.0, 2.0, 0.8)
+    assert solved
+    assert -1.0 <= value <= 1.0
+
+
+def test_raw_margin_matches_training_value_ranking():
+    """Monotonicity guarantee: the minimax-optimal root action is identical under
+    any strictly-monotone transform of the raw score margin. We pick the optimal
+    root child under two such transforms — the training formula (alpha=0.8) and
+    pure tanh-margin (alpha=1.0, the strictly-monotone proxy for the raw margin the
+    solver searches on) — and assert they agree. deck=0 roots keep child solves
+    cheap; the guarantee is deck-independent."""
+    pytest.importorskip("kingdomino_rust")
+
+    def best_action_idx(state, legal, alpha):
+        vals = []
+        for a in legal:
+            child = state.step(a)
+            v, solved = exact_endgame_value(
+                child, max_secs=SOLVE_SECS, rng=random.Random(0),
+                score_scale=160.0, margin_gain=2.0, alpha=alpha)
+            assert solved
+            vals.append(v)
+        # Acting player maximises (p0) / minimises (p1) the player-0-frame value.
+        if state.current_actor == 0:
+            return max(range(len(vals)), key=vals.__getitem__)
+        return min(range(len(vals)), key=vals.__getitem__)
+
+    checked = 0
+    seed = 0
+    while checked < 12 and seed < 200:
+        seed += 1
+        try:
+            state = _reach_state(seed=seed, max_deck=0)
+        except AssertionError:
+            continue
+        legal = state.legal_actions()
+        if len(legal) < 2:
+            continue
+        assert best_action_idx(state, legal, 0.8) == best_action_idx(state, legal, 1.0)
+        checked += 1
+    assert checked > 0, "no multi-action deck=0 position found"
+
+
 def test_exact_solving_gated_off_at_non_terminal_adjacent_root():
     """Correctness gate: from a root that is NOT terminal-adjacent (deck >
     max_hidden_tiles), exact solving never fires. A deck=4 leaf reached from such
@@ -360,6 +428,156 @@ def test_solves_deck4_within_budget():
     elapsed_all.sort()
     median = elapsed_all[len(elapsed_all) // 2]
     assert median < SOLVE_SECS, f"median solve time {median:.3f}s did not fit the budget"
+
+
+def _mark_cell(board: Board, x: int, y: int, terrain: Terrain, crowns: int = 0) -> None:
+    board.terrain[y, x] = int(terrain)
+    board.crowns[y, x] = crowns
+    board.domino_id[y, x] = 99
+    board._occupied.add((x, y))
+    board._cell[(x, y)] = int(terrain)
+    board._min_x = min(board._min_x, x)
+    board._max_x = max(board._max_x, x)
+    board._min_y = min(board._min_y, y)
+    board._max_y = max(board._max_y, y)
+
+
+def test_opponent_denial_score_positive():
+    kr = pytest.importorskip("kingdomino_rust")
+    from games.kingdomino.endgame_solver import _rust_state_from_python
+
+    state = GameState.new(seed=0)
+    state.phase = Phase.PLACE_AND_SELECT
+    state.deck = [40, 41, 42, 43]
+    state.current_row = [19, 28, 29, 30]
+    state.pending_claims = [Claim(0, 1), Claim(1, 2)]
+    state.next_claims = []
+    state.actor_index = 0
+
+    opp = state.boards[1]
+    cx, cy = opp.castle_pos
+    for dx, dy in [(-1, 0), (-2, 0), (-1, 1), (-2, 1), (-1, -1)]:
+        _mark_cell(opp, cx + dx, cy + dy, Terrain.WHEAT)
+
+    rs = _rust_state_from_python(state)
+    wheat_tile = 19  # WHEAT crown + FOREST no crown
+    forest_tile = 28  # FOREST crown + WATER no crown
+    assert kr.debug_opponent_denial_score(rs, wheat_tile, 0) > kr.debug_opponent_denial_score(
+        rs, forest_tile, 0
+    )
+
+
+def test_one_ply_margin_beats_heuristic_on_obvious_move():
+    kr = pytest.importorskip("kingdomino_rust")
+    from games.kingdomino.action_codec import encode_action
+    from games.kingdomino.endgame_solver import _rust_state_from_python
+
+    checked = 0
+    for state, rs in _reach_deck4_rust(seed_start=0, want=20):
+        legal = state.legal_actions()
+        if len(legal) < 2:
+            continue
+        child_margins = []
+        for action in legal:
+            child = state.step(action)
+            score0, score1 = child.scores()
+            child_margins.append((score0 - score1, encode_action(action, state)))
+        if state.current_actor == 0:
+            best_margin = max(m for m, _idx in child_margins)
+        else:
+            best_margin = min(m for m, _idx in child_margins)
+        expected = min(idx for m, idx in child_margins if m == best_margin)
+
+        lookahead_first = kr.debug_ordered_legal_indices(rs, "lookahead")[0]
+        baseline_first = kr.debug_ordered_legal_indices(rs, "baseline")[0]
+        if lookahead_first == expected and baseline_first == expected:
+            checked += 1
+            break
+    assert checked == 1, "no sampled obvious move where baseline and lookahead agreed"
+
+
+def test_option_a_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_a, ok_a, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "denial", False
+        )
+        if ok_base and ok_a:
+            assert v_a == pytest.approx(v_base, abs=1e-12)
+
+
+def test_option_b_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_b, ok_b, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "lookahead", False
+        )
+        if ok_base and ok_b:
+            assert v_b == pytest.approx(v_base, abs=1e-12)
+
+
+def test_recursive_lookahead2_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_l2, ok_l2, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "lookahead2", False
+        )
+        if ok_base and ok_l2:
+            assert v_l2 == pytest.approx(v_base, abs=1e-12)
+
+
+def test_adaptive_lookahead2_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_adapt, ok_adapt, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "lookahead2_adaptive", False
+        )
+        if ok_base and ok_adapt:
+            assert v_adapt == pytest.approx(v_base, abs=1e-12)
+
+
+def test_clustered_lookahead2_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_clustered, ok_clustered, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "lookahead2_clustered", False
+        )
+        if ok_base and ok_clustered:
+            assert v_clustered == pytest.approx(v_base, abs=1e-12)
+
+
+def test_clustered_lookahead1_does_not_change_optimal_value():
+    kr = pytest.importorskip("kingdomino_rust")
+
+    for _state, rs in _reach_deck4_rust(seed_start=0, want=10):
+        v_base, ok_base, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "baseline", False
+        )
+        v_clustered, ok_clustered, _ = kr.exact_endgame_value_no_chance_ordered(
+            rs, 8.0, 160.0, 2.0, 0.8, "lookahead1_clustered", False
+        )
+        if ok_base and ok_clustered:
+            assert v_clustered == pytest.approx(v_base, abs=1e-12)
 
 
 def test_encoder_hidden_order_independence():
