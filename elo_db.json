@@ -454,6 +454,45 @@
       "timestamp": "2026-06-26T14:42:10.628142+00:00",
       "is_anchor": false,
       "fixed_rating": null
+    },
+    "m5_run4warm_iter_0007": {
+      "rating": 912.79,
+      "rating_stderr": 26.5,
+      "n_games": 240,
+      "sims": 400,
+      "path": "runs/kingdomino/m5_throughput_signal_10h_run4warm/iter_0007.pt",
+      "channels": 48,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-30T13:36:13.272078+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "m5_run4warm_iter_0025": {
+      "rating": 1031.2,
+      "rating_stderr": 28.1,
+      "n_games": 240,
+      "sims": 400,
+      "path": "runs/kingdomino/m5_throughput_signal_10h_run4warm/iter_0025.pt",
+      "channels": 48,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-30T13:50:55.960303+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "m5_run4warm_iter_0060": {
+      "rating": 991.5,
+      "rating_stderr": 27.31,
+      "n_games": 240,
+      "sims": 400,
+      "path": "runs/kingdomino/m5_throughput_signal_10h_run4warm/iter_0060.pt",
+      "channels": 48,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-06-30T14:09:05.660607+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
     }
   }
 }
