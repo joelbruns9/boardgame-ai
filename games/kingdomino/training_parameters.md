@@ -262,6 +262,23 @@ Schedule keys are zero-based curriculum steps: key `0` applies on iteration 1,
 key `50` applies on iteration 51, etc. The active value is the greatest key less
 than or equal to the current step.
 
+Implementation method during a training run:
+
+1. At startup, the run loop parses each schedule string into sorted
+   `(step, value)` pairs.
+2. At the start of iteration `it`, it computes `step = it - 1`.
+3. For each scheduled field, it selects the greatest schedule key `<= step`.
+   If no schedule entry applies, the base CLI/config value remains active.
+4. The loop builds an iteration-local config from those active values.
+5. That iteration-local config is used for self-play generation, optimizer LR,
+   replay buffer capacity, training steps/batches, benchmark construction,
+   checkpoints, diagnostics, and JSONL logging.
+
+The schedule update happens once per iteration, before self-play. It does not
+change settings mid-iteration. For example, `--sims_schedule "0:800,20:1600"`
+means iterations 1-20 use 800 full-search sims, and iteration 21 onward uses
+1600 until another schedule key overrides it.
+
 ---
 
 #### `--fast_game_fraction`, `--fast_game_sims`
@@ -959,6 +976,16 @@ Directory where checkpoint `.pt` files are saved after each iteration,
 plus `training_log.jsonl`. Checkpoints are saved as `iter_XXXX.pt`.
 All iterations are saved — disk usage is modest (~5-10 MB per checkpoint
 at 32ch/4b).
+
+When `--checkpoint_dir` is set, the run also writes the Milestone 5.5
+provenance bundle into the same directory:
+`run_manifest.json`, `git_commit.txt`, `dirty_diff.patch`,
+`model_contract.json`, `ruleset_hash.json`, `schedule_config.json`, and
+`hardware_benchmark.json`. The `.pt` checkpoint embeds a compact
+`run_manifest` block with the manifest path, git commit/dirty flag, ruleset
+hash, model-contract path, schedule-config path, and hardware-context path.
+`run_manifest.json` is updated after each checkpoint with `last_checkpoint`
+and the full checkpoint list.
 
 The checkpoint_dir basename is used as the run-id prefix for Elo
 checkpoint names in the game log (e.g. `checkpoints_ol_local_cont4_iter_0010`),

@@ -119,6 +119,9 @@ from games.kingdomino.inference_service import (
     RemoteInferenceServer, RemoteInferenceWorkerClient, make_ipc_batched_evaluator,
 )
 from games.kingdomino.bots import GreedyBot
+from games.kingdomino.run_manifest import (
+    initialize_run_manifest, record_checkpoint,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,8 +557,15 @@ def run_parallel_self_play_training(
     np_rng = np.random.default_rng(cfg.seed)
     history = _new_history()
     log_path = _derive_log_path(cfg)
+    run_manifest = None
+    if cfg.checkpoint_dir:
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        run_manifest = initialize_run_manifest(
+            cfg, cfg.checkpoint_dir, log_path=log_path, net=net)
     if verbose:
         print(f"Per-iteration log: {log_path}")
+        if run_manifest is not None:
+            print(f"Run manifest: {run_manifest['run_manifest_path']}")
     game_seed = cfg.seed * 1_000_003
 
     # Fixed diagnostic probe batch (shared by policy_entropy + win_brier_diag),
@@ -786,9 +796,11 @@ def run_parallel_self_play_training(
 
             if cfg.checkpoint_dir:
                 os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt")
                 save_checkpoint(
-                    os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
-                    net, cfg, it, history)
+                    checkpoint_path, net, cfg, it, history,
+                    run_manifest=run_manifest)
+                record_checkpoint(cfg.checkpoint_dir, checkpoint_path, it)
 
             # ── 4. Structured log row + compact summary (END of iteration) ──
             row = {

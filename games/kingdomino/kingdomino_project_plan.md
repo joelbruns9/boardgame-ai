@@ -467,6 +467,9 @@ removed after verification.
 ## Milestone 5.5 — Run Manifests and Model Contracts
 **Gate: every checkpoint traceable to exact code, rules, schedules, architecture, and provenance**
 
+Status: implemented in `games/kingdomino/run_manifest.py` and wired into
+`self_play.py` for runs that set `--checkpoint_dir`.
+
 Every run saves:
 ```
 run_manifest.json
@@ -482,6 +485,14 @@ Placed before promotion gating and HOF deliberately — once those systems are a
 
 ### Where
 `games/kingdomino/run_manifest.py`, invoked at run start and checkpoint save
+
+At run start the trainer writes the full provenance bundle beside the
+checkpoints. Each saved `.pt` also embeds compact `run_manifest` metadata:
+manifest path, git commit/dirty flag, ruleset hash, model-contract path,
+schedule-config path, and hardware-context path. On each checkpoint save,
+`run_manifest.json` appends the checkpoint name/path/iteration and updates
+`last_checkpoint`, so a promoted model can be traced without relying on terminal
+scrollback or a separate notebook.
 
 ---
 

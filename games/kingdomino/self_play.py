@@ -75,6 +75,9 @@ from games.kingdomino.bots import GreedyBot
 from games.kingdomino.diagnostics import (
     compute_all_diagnostics, check_alpha_transition,
 )
+from games.kingdomino.run_manifest import (
+    initialize_run_manifest, record_checkpoint,
+)
 
 
 # ─── 1. Configuration ─────────────────────────────────────────────────────
@@ -2153,7 +2156,8 @@ def make_open_loop_mcts(
 
 
 def save_checkpoint(path: str, net: KingdominoNet, cfg: SelfPlayConfig,
-                    iteration: int, history: dict) -> None:
+                    iteration: int, history: dict,
+                    run_manifest: Optional[dict] = None) -> None:
     torch.save({
         "model_state": net.state_dict(),
         "kind": "alphazero_selfplay",
@@ -2164,6 +2168,7 @@ def save_checkpoint(path: str, net: KingdominoNet, cfg: SelfPlayConfig,
         # so the leaf-value formula is recoverable from the checkpoint alone.
         "config": vars(cfg),
         "history": history,
+        "run_manifest": run_manifest or {},
     }, path)
 
 
@@ -2336,8 +2341,15 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     np_rng = np.random.default_rng(cfg.seed)   # used by training/benchmark only
     history = _new_history()
     log_path = _derive_log_path(cfg)
+    run_manifest = None
+    if cfg.checkpoint_dir:
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        run_manifest = initialize_run_manifest(
+            cfg, cfg.checkpoint_dir, log_path=log_path, net=net)
     if verbose:
         print(f"Per-iteration log: {log_path}")
+        if run_manifest is not None:
+            print(f"Run manifest: {run_manifest['run_manifest_path']}")
     game_seed = cfg.seed * 1_000_003  # disjoint from benchmark seeds
 
     # EARLY STOPPING CRITERIA (defined pre-launch per plan §5.3):
@@ -2751,8 +2763,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
 
             if cfg.checkpoint_dir:
                 os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-                save_checkpoint(os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
-                                net, iter_cfg, it, history)
+                checkpoint_path = os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt")
+                save_checkpoint(checkpoint_path, net, iter_cfg, it, history,
+                                run_manifest=run_manifest)
+                record_checkpoint(cfg.checkpoint_dir, checkpoint_path, it)
 
             # ── 3b. Elo rating (periodic) ──  AFTER the checkpoint is on disk so
             # the rater can load it; BEFORE the log row so its result can be logged.
