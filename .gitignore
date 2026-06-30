@@ -18,6 +18,9 @@ target/
 *.so
 Cargo.lock
 
+# Reference papers (large PDFs kept locally, backed up separately)
+references/
+
 # Checkpoints and large binary artifacts
 checkpoints*/
 *.pkl
