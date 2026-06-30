@@ -7,6 +7,18 @@ def assert_true(condition, message):
         raise AssertionError(message)
 
 
+def set_cell(board, x, y, terrain, crowns=0, domino_id=99):
+    board.terrain[y, x] = terrain
+    board.crowns[y, x] = crowns
+    board.domino_id[y, x] = domino_id
+    board._occupied.add((x, y))
+    board._cell[(x, y)] = int(terrain)
+    board._min_x = min(board._min_x, x)
+    board._max_x = max(board._max_x, x)
+    board._min_y = min(board._min_y, y)
+    board._max_y = max(board._max_y, y)
+
+
 def test_castle_can_be_corner_of_7x7():
     board = Board()
     castle = board.castle_pos
@@ -15,9 +27,7 @@ def test_castle_can_be_corner_of_7x7():
     for x in range(castle[0], castle[0] + 7):
         for y in range(castle[1], castle[1] + 7):
             if (x, y) != castle:
-                board.terrain[x, y] = 2  # WHEAT
-                board.crowns[x, y] = 0
-                board.domino_id[x, y] = 99
+                set_cell(board, x, y, 2)  # WHEAT
 
     assert_true(board.bbox_fits(), f"Expected 7x7 bbox to fit, got {board.occupied_bbox()}")
 
@@ -26,8 +36,7 @@ def test_bounding_box_rejects_8_wide():
     board = Board()
     castle = board.castle_pos
 
-    board.terrain[castle[0] + 7, castle[1]] = 2  # WHEAT, creates 8-wide bbox
-    board.domino_id[castle[0] + 7, castle[1]] = 99
+    set_cell(board, castle[0] + 7, castle[1], 2)  # WHEAT, creates 8-wide bbox
 
     assert_true(not board.bbox_fits(), f"Expected oversized bbox to fail, got {board.occupied_bbox()}")
 

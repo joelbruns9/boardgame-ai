@@ -1,10 +1,10 @@
 """
-REFERENCE COPY — Original Board implementation before optimization.
+REFERENCE COPY â€” Original Board implementation before optimization.
 Used by test_board_equiv.py as a correctness oracle to verify that
 the optimized Board in board.py produces identical results for all
 legal move generation and placement validation.
 
-Do not use this in production code — import from board.py instead.
+Do not use this in production code â€” import from board.py instead.
 """
 from __future__ import annotations
 

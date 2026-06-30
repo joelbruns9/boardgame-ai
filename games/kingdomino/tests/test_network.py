@@ -265,7 +265,7 @@ check("value loss drops substantially (memorises batch)",
       f"first={first_value_loss:.4f} final={final_value_loss:.4f}")
 check("total loss approaches the policy entropy floor",
       final_total < first_total and final_total < policy_floor + 0.2,
-      f"first={first_total:.4f} final={final_total:.4f} floor≈{policy_floor:.4f}")
+      f"first={first_total:.4f} final={final_total:.4f} floor~={policy_floor:.4f}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ print("\n=== TEST 12: win head is not saturated at initialisation ===")
 # activations; without small-init on the win head's final layer the pre-sigmoid
 # logit is driven far from 0, saturating the sigmoid near 0/1 where its gradient
 # vanishes and training can freeze.  A freshly-initialised net should output
-# win_prob ≈ 0.5 (well away from the 0/1 rails) on real encoded states.
+# win_prob ~= 0.5 (well away from the 0/1 rails) on real encoded states.
 # forward_value removed in Phase 1a; using win_prob from the full forward pass.
 from games.kingdomino.game import GameState
 import random as _random
@@ -329,8 +329,8 @@ _fl = torch.stack([torch.from_numpy(encode_state(s, s.current_actor)[2]).float()
 _fresh.eval()
 with torch.no_grad():
     _own, _opp, _win, _logits = _fresh(_mb, _ob, _fl)
-_mean_win = _win.mean().item()  # win_prob ∈ (0,1); .abs() redundant
-check(f"initial mean win_prob is near 0.5 ({_mean_win:.3f} ∈ (0.3, 0.7))",
+_mean_win = _win.mean().item()  # win_prob in (0,1); .abs() redundant
+check(f"initial mean win_prob is near 0.5 ({_mean_win:.3f} in (0.3, 0.7))",
       0.3 < _mean_win < 0.7)
 check(f"no initial win_prob pinned at 0/1 "
       f"(min={_win.min():.3f}, max={_win.max():.3f})",

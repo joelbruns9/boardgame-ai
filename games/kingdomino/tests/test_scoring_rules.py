@@ -7,9 +7,15 @@ def assert_equal(actual, expected, message):
 
 
 def set_cell(board, x, y, terrain, crowns=0, domino_id=99):
-    board.terrain[x, y] = terrain
-    board.crowns[x, y] = crowns
-    board.domino_id[x, y] = domino_id
+    board.terrain[y, x] = terrain
+    board.crowns[y, x] = crowns
+    board.domino_id[y, x] = domino_id
+    board._occupied.add((x, y))
+    board._cell[(x, y)] = int(terrain)
+    board._min_x = min(board._min_x, x)
+    board._max_x = max(board._max_x, x)
+    board._min_y = min(board._min_y, y)
+    board._max_y = max(board._max_y, y)
 
 
 def test_single_region_score():

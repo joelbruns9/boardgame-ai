@@ -227,9 +227,11 @@ class KingdominoNet(nn.Module):
         # gradients.  Without this the large activations from max-pooling drive
         # the pre-activation logits far from 0, which for the win head saturates
         # the sigmoid where its gradient vanishes and training can freeze.
-        for head in (self.own_score_mlp, self.opponent_score_mlp, self.win_mlp):
+        for head in (self.own_score_mlp, self.opponent_score_mlp):
             nn.init.normal_(head[-1].weight, std=0.01)
             nn.init.zeros_(head[-1].bias)
+        nn.init.normal_(self.win_mlp[-1].weight, std=0.001)
+        nn.init.zeros_(self.win_mlp[-1].bias)
 
     # ── trunk ──
     def _trunk(self, x: torch.Tensor) -> torch.Tensor:

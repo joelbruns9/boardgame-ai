@@ -748,7 +748,7 @@ def test_win_target_perspective():
         s0, s1 = int(scores[0]), int(scores[1])
         owns = set()
         for ex in examples:
-            own, opp, win = float(ex[7]), float(ex[8]), float(ex[9])
+            own, opp, win = float(ex[8]), float(ex[9]), float(ex[10])
             assert abs((own + opp) - (s0 + s1)) < 1e-4, (
                 f"own+opp={own + opp} != s0+s1={s0 + s1}")
             assert own in (float(s0), float(s1)), f"own {own} not in scores {scores}"
@@ -762,7 +762,7 @@ def test_win_target_perspective():
         if s0 != s1:
             # Decisive game: both perspectives must be present with complementary
             # win targets (one actor's examples win=1.0, the other's win=0.0).
-            wins = {float(ex[7]): float(ex[9]) for ex in examples}
+            wins = {float(ex[8]): float(ex[10]) for ex in examples}
             assert wins.get(float(max(s0, s1))) == 1.0, "winner perspective win!=1.0"
             assert wins.get(float(min(s0, s1))) == 0.0, "loser perspective win!=0.0"
             decisive_checked += 1
