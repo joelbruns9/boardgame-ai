@@ -3,6 +3,11 @@
 
 # Data files - too large for GitHub, backed up separately
 data/
+!data/
+data/*
+!data/kingdomino/
+data/kingdomino/*
+!data/kingdomino/eval_suite_v1.jsonl
 
 # Python
 __pycache__/
@@ -30,6 +35,8 @@ checkpoints*/
 
 # Training output (checkpoints, buffers, logs)
 runs/
+
+training_log_*.jsonl
 
 # Training logs (large, machine-specific)
 # Do NOT exclude elo_db.json or elo_games.jsonl — these are project
