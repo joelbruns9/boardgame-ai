@@ -42,7 +42,7 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -242,6 +242,38 @@ class SelfPlayConfig:
     # generation (descent/backup) gets the rest via the global Rayon pool.  Tune
     # per machine (e.g. 6 on an 8-core box).  0 => auto (half of available).
     solver_cpus: int = 0
+    # Milestone 5 dynamic schedules. Format: "0:value,50:value,..."; iteration
+    # uses the greatest key <= current iteration (0-based in config, 1-based run
+    # iteration maps to schedule step iteration-1).
+    lr_schedule: str = ""
+    alpha_schedule: str = ""
+    sims_schedule: str = ""
+    games_per_iter_schedule: str = ""
+    c_puct_schedule: str = ""
+    dirichlet_epsilon_schedule: str = ""
+    temp_moves_schedule: str = ""
+    train_steps_schedule: str = ""
+    buffer_capacity_schedule: str = ""
+    # KataGo-inspired playout-cap randomization: a fraction of self-play games
+    # use a smaller sim cap to diversify value targets while the rest keep the
+    # full scheduled cap for sharper policy targets.
+    fast_game_fraction: float = 0.0
+    fast_game_fraction_schedule: str = ""
+    fast_game_sims: int = 100
+    # KataGo-style move-level playout-cap randomization. When enabled, each
+    # move independently chooses a full or fast search. Fast moves default to
+    # strong cheap play: no root noise, greedy selection, and no policy record.
+    playout_cap_randomization: bool = False
+    full_search_fraction: float = 0.25
+    fast_move_sims: int = 100
+    record_fast_moves: bool = False
+    fast_move_dirichlet_epsilon: float = 0.0
+    fast_move_temp_moves: int = 0
+    # KataGo-inspired target cleanup. Current implementation prunes one-visit
+    # exploration noise from MCTS visit targets and leaves exact endgame targets
+    # untouched. Full forced-playout subtraction needs root priors in the record
+    # contract and is intentionally deferred to the Rust-side follow-up.
+    policy_target_pruning: bool = False
 
 
 # ─── 2. Replay buffer ─────────────────────────────────────────────────────
@@ -510,6 +542,213 @@ class ReplayBuffer:
         )
 
 
+# ─── Milestone 5 schedules / target cleanup ─────────────────────────────────
+def _parse_schedule(text: str, *, cast):
+    """Parse "0:foo,50:bar" into sorted (iteration, value) pairs."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Invalid schedule entry {part!r}; expected iter:value")
+        k, v = part.split(":", 1)
+        out.append((int(k.strip()), cast(v.strip())))
+    out.sort(key=lambda x: x[0])
+    if out and out[0][0] < 0:
+        raise ValueError(f"Schedule iterations must be >= 0: {text!r}")
+    return out
+
+
+def _schedule_value(schedule, step: int, default):
+    value = default
+    for at, candidate in schedule:
+        if step >= at:
+            value = candidate
+        else:
+            break
+    return value
+
+
+def _compiled_schedules(cfg: SelfPlayConfig) -> dict:
+    return {
+        "lr": _parse_schedule(cfg.lr_schedule, cast=float),
+        "alpha": _parse_schedule(cfg.alpha_schedule, cast=float),
+        "n_simulations": _parse_schedule(cfg.sims_schedule, cast=int),
+        "games_per_iteration": _parse_schedule(cfg.games_per_iter_schedule, cast=int),
+        "c_puct": _parse_schedule(cfg.c_puct_schedule, cast=float),
+        "dirichlet_epsilon": _parse_schedule(cfg.dirichlet_epsilon_schedule, cast=float),
+        "temp_moves": _parse_schedule(cfg.temp_moves_schedule, cast=int),
+        "train_steps_per_iteration": _parse_schedule(cfg.train_steps_schedule, cast=int),
+        "buffer_capacity": _parse_schedule(cfg.buffer_capacity_schedule, cast=int),
+        "fast_game_fraction": _parse_schedule(cfg.fast_game_fraction_schedule, cast=float),
+    }
+
+
+def _active_config_for_iteration(cfg: SelfPlayConfig, schedules: dict, it: int) -> SelfPlayConfig:
+    """Return a shallow config copy with iteration-local schedule values."""
+    step = it - 1
+    values = {}
+    for field, schedule in schedules.items():
+        if schedule:
+            values[field] = _schedule_value(schedule, step, getattr(cfg, field))
+    if not values:
+        return cfg
+    return replace(cfg, **values)
+
+
+def _apply_optimizer_schedule(optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def _apply_buffer_capacity(buffer: ReplayBuffer, capacity: int) -> None:
+    capacity = int(capacity)
+    if capacity <= 0:
+        raise ValueError(f"buffer capacity must be positive, got {capacity}")
+    if capacity == buffer.capacity:
+        return
+    if len(buffer.data) > capacity:
+        buffer.data = buffer.data[-capacity:]
+        buffer._pos = 0
+    else:
+        buffer._pos %= max(1, len(buffer.data))
+    buffer.capacity = capacity
+    buffer._weight_cache = None
+
+
+def _is_exact_endgame_example(ex: Example) -> bool:
+    """Best-effort detector for roots exact-solved by the current M1 engine."""
+    bag_len = int(np.asarray(ex.flat, dtype=np.float32)[FLAT_LAYOUT["bag"]].sum())
+    return bag_len in (0, 4)
+
+
+def _prune_policy_target(
+    pidx: np.ndarray,
+    pval: np.ndarray,
+    *,
+    total_visits: int,
+) -> tuple[np.ndarray, np.ndarray, int, float]:
+    """Prune one-visit visit-count noise and renormalize.
+
+    KataGo's full policy target pruning subtracts forced playouts using root
+    priors. The current training record only carries visits, so this conservative
+    M5 pass applies the unambiguous second half: remove children whose target
+    mass is consistent with <=1 visit. It keeps at least one child and preserves
+    exact targets by caller policy.
+    """
+    if len(pidx) <= 1 or total_visits <= 1:
+        return pidx, pval, 0, 0.0
+    pval64 = np.asarray(pval, dtype=np.float64)
+    threshold = (1.0 / float(total_visits)) + 1e-8
+    keep = pval64 > threshold
+    if not np.any(keep):
+        keep[int(np.argmax(pval64))] = True
+    removed = int(len(pidx) - int(np.count_nonzero(keep)))
+    removed_mass = float(pval64[~keep].sum())
+    if removed == 0:
+        return pidx, pval, 0, 0.0
+    new_idx = np.asarray(pidx, dtype=np.int32)[keep]
+    new_val = pval64[keep]
+    new_val /= new_val.sum()
+    return new_idx.astype(np.int32), new_val.astype(np.float32), removed, removed_mass
+
+
+def _prune_examples_policy_targets(
+    examples_by_game: List[List[Example]],
+    *,
+    total_visits: int,
+    skip_exact: bool,
+) -> dict:
+    pruned_actions = 0
+    pruned_mass = 0.0
+    changed_examples = 0
+    for game in examples_by_game:
+        for ex in game:
+            if skip_exact and _is_exact_endgame_example(ex):
+                continue
+            new_idx, new_val, removed, mass = _prune_policy_target(
+                ex.policy_idx, ex.policy_val, total_visits=total_visits)
+            if removed:
+                ex.policy_idx = new_idx
+                ex.policy_val = new_val
+                pruned_actions += removed
+                pruned_mass += mass
+                changed_examples += 1
+    return {
+        "policy_pruned_actions": pruned_actions,
+        "policy_pruned_mass": pruned_mass,
+        "policy_pruned_examples": changed_examples,
+    }
+
+
+def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
+    stats_list = [s for s in stats_list if s]
+    if not stats_list:
+        return None
+    elapsed = sum(float(s.get("elapsed", 0.0)) for s in stats_list)
+    total_evals = sum(int(s.get("total_evals", 0)) for s in stats_list)
+    ticks = sum(int(s.get("ticks", 0)) for s in stats_list)
+    out = {
+        "ticks": ticks,
+        "elapsed": elapsed,
+        "total_evals": total_evals,
+        "mean_batch": (
+            sum(float(s.get("mean_batch", 0.0)) * int(s.get("ticks", 0))
+                for s in stats_list)
+            / max(1, ticks)
+        ),
+        "max_batch_cap": max(int(s.get("max_batch_cap", 0)) for s in stats_list),
+        "max_batch_seen": max(int(s.get("max_batch_seen", 0)) for s in stats_list),
+        "requests_per_sec": total_evals / elapsed if elapsed > 0 else 0.0,
+        "step_sec": sum(float(s.get("step_sec", 0.0)) for s in stats_list),
+        "eval_sec": sum(float(s.get("eval_sec", 0.0)) for s in stats_list),
+        "update_sec": sum(float(s.get("update_sec", 0.0)) for s in stats_list),
+        "exact_solve_count": sum(int(s.get("exact_solve_count", 0)) for s in stats_list),
+        "exact_tree_solve_count": sum(int(s.get("exact_tree_solve_count", 0)) for s in stats_list),
+        "exact_cache_hit_count": sum(int(s.get("exact_cache_hit_count", 0)) for s in stats_list),
+        "exact_fallback_count": sum(int(s.get("exact_fallback_count", 0)) for s in stats_list),
+        "exact_solver_secs": sum(float(s.get("exact_solver_secs", 0.0)) for s in stats_list),
+        "fast_move_count": sum(int(s.get("fast_move_count", 0)) for s in stats_list),
+        "full_move_count": sum(int(s.get("full_move_count", 0)) for s in stats_list),
+        "recorded_fast_move_count": sum(
+            int(s.get("recorded_fast_move_count", 0)) for s in stats_list),
+        "recorded_full_move_count": sum(
+            int(s.get("recorded_full_move_count", 0)) for s in stats_list),
+        "exact_recorded_move_count": sum(
+            int(s.get("exact_recorded_move_count", 0)) for s in stats_list),
+    }
+    cap = out["max_batch_cap"]
+    out["fill_ratio"] = out["mean_batch"] / cap if cap > 0 else 0.0
+    for key in ("eval_h2d_sec", "eval_forward_sec", "eval_readback_sec", "eval_calls"):
+        if any(key in s for s in stats_list):
+            out[key] = sum(s.get(key, 0) for s in stats_list)
+    return out
+
+
+def _choose_playout_profile(
+    cfg: SelfPlayConfig,
+    rng: np.random.Generator,
+) -> tuple[bool, int, float, int, bool]:
+    """Return (is_full, sims, root_noise_eps, temp_moves, record_example)."""
+    if not cfg.playout_cap_randomization:
+        return True, int(cfg.n_simulations), float(cfg.dirichlet_epsilon), int(cfg.temp_moves), True
+    fraction = max(0.0, min(1.0, float(cfg.full_search_fraction)))
+    is_full = bool(rng.random() < fraction)
+    if is_full:
+        return True, int(cfg.n_simulations), float(cfg.dirichlet_epsilon), int(cfg.temp_moves), True
+    return (
+        False,
+        max(1, int(cfg.fast_move_sims)),
+        float(cfg.fast_move_dirichlet_epsilon),
+        int(cfg.fast_move_temp_moves),
+        bool(cfg.record_fast_moves),
+    )
+
+
 # ─── 3. Self-play game generation ─────────────────────────────────────────
 def _game_rngs(game_seed: int) -> Tuple[random.Random, np.random.Generator]:
     """Derive the (py_rng, np_rng) for one self-play game purely from its seed.
@@ -546,6 +785,7 @@ def play_selfplay_game(
     leaf_batch: int = 1,
     open_loop: bool = False,
     iteration: int = 0,
+    playout_cfg: Optional[SelfPlayConfig] = None,
 ) -> Tuple[List[Example], Tuple[int, int]]:
     """Play one self-play game; return (training examples, final scores).
 
@@ -565,6 +805,21 @@ def play_selfplay_game(
     move_num = 0
 
     while state.phase != Phase.GAME_OVER:
+        if playout_cfg is not None:
+            _is_full, move_sims, noise_eps, move_temp_moves, record_example = (
+                _choose_playout_profile(playout_cfg, np_rng)
+            )
+            old_sims = getattr(mcts, "n_simulations", None)
+            old_eps = getattr(mcts, "dirichlet_epsilon", None)
+            mcts.n_simulations = move_sims
+            if old_eps is not None:
+                mcts.dirichlet_epsilon = noise_eps
+            add_noise = noise_eps > 0.0
+        else:
+            move_temp_moves = temp_moves
+            record_example = True
+            old_sims = old_eps = None
+            add_noise = True
         # Root Dirichlet noise on every self-play move (standard AlphaZero).
         if open_loop:
             # Open-loop averages over deck orders internally (one fresh
@@ -572,32 +827,38 @@ def play_selfplay_game(
             # its own Python RNG from np_rng, so py_rng / n_determinizations /
             # leaf_batch are intentionally not passed here.
             visit_counts, _, _ = run_pimc_open_loop(
-                mcts, state, add_noise=True, rng=np_rng,
+                mcts, state, add_noise=add_noise, rng=np_rng,
             )
         else:
             visit_counts, _ = run_pimc(
                 mcts, state, py_rng,
                 n_determinizations=n_determinizations,
-                add_noise=True, np_rng=np_rng,
+                add_noise=add_noise, np_rng=np_rng,
                 leaf_batch=leaf_batch,
             )
+        if playout_cfg is not None:
+            if old_sims is not None:
+                mcts.n_simulations = old_sims
+            if old_eps is not None:
+                mcts.dirichlet_epsilon = old_eps
         # Training target is the visit distribution itself (τ=1), independent
         # of the selection temperature below.
         policy = visit_counts_to_policy(visit_counts, state, temperature=1.0)
 
         actor = state.current_actor
-        mb, ob, flat = encode_state(state, actor)            # PUBLIC, info-set safe
-        legal = state.legal_actions()
-        legal_idx = np.fromiter((encode_action(a, state) for a in legal),
-                                dtype=np.int32, count=len(legal))
-        pidx = np.nonzero(policy)[0].astype(np.int32)
-        pval = policy[pidx].astype(np.float32)
-        records.append((
-            mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
-            pidx, pval, legal_idx, actor,
-        ))
+        if record_example:
+            mb, ob, flat = encode_state(state, actor)        # PUBLIC, info-set safe
+            legal = state.legal_actions()
+            legal_idx = np.fromiter((encode_action(a, state) for a in legal),
+                                    dtype=np.int32, count=len(legal))
+            pidx = np.nonzero(policy)[0].astype(np.int32)
+            pval = policy[pidx].astype(np.float32)
+            records.append((
+                mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
+                pidx, pval, legal_idx, actor,
+            ))
 
-        temp = _temperature(move_num, temp_moves)
+        temp = _temperature(move_num, move_temp_moves)
         action = select_move(visit_counts, temp, np_rng)
         state = state.step(action)
         move_num += 1
@@ -817,6 +1078,7 @@ def play_selfplay_game_rust(
     py_rng: random.Random, np_rng: np.random.Generator,
     score_scale: float = 100.0, margin_gain: float = 2.0, alpha: float = 0.8,
     iteration: int = 0,
+    playout_cfg: Optional[SelfPlayConfig] = None,
 ) -> Tuple[List[Example], Tuple[int, int]]:
     """Rust-engine self-play game.  Mirrors play_selfplay_game's outputs.
 
@@ -835,12 +1097,21 @@ def play_selfplay_game_rust(
     records = []  # (mb, ob, flat, pidx, pval, legal_idx, actor)
     move_num = 0
     while rs.phase != game_over:
+        if playout_cfg is not None:
+            _is_full, move_sims, noise_eps, move_temp_moves, record_example = (
+                _choose_playout_profile(playout_cfg, np_rng)
+            )
+        else:
+            move_sims = n_simulations
+            noise_eps = dirichlet_epsilon
+            move_temp_moves = temp_moves
+            record_example = True
         agg: dict = {}
         for _ in range(n_determinizations):
             det = rs.redeterminize(seed=int(np_rng.integers(0, 2**63 - 1)))
             pairs = rust_mcts.search(
-                det, evaluator, n_simulations,
-                dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_epsilon,
+                det, evaluator, int(move_sims),
+                dirichlet_alpha=dirichlet_alpha, dirichlet_eps=float(noise_eps),
                 fpu=0.0, cpuct=c_puct, seed=int(np_rng.integers(0, 2**63 - 1)),
                 leaf_batch=leaf_batch, virtual_loss=virtual_loss,
                 score_scale=score_scale, margin_gain=margin_gain, alpha=alpha,
@@ -848,23 +1119,23 @@ def play_selfplay_game_rust(
             for idx, cnt in pairs:
                 agg[int(idx)] = agg.get(int(idx), 0) + int(cnt)
 
-        actor = rs.current_actor()
-        mb, ob, flat = rs.encode(actor)                       # PUBLIC, info-set safe
-        mb = np.asarray(mb); ob = np.asarray(ob); flat = np.asarray(flat)
-        legal_idx = np.asarray(rs.legal_action_indices(), dtype=np.int32)
-
         total = sum(agg.values())
         policy = np.zeros(NUM_JOINT_ACTIONS, dtype=np.float32)
         for idx, cnt in agg.items():
             policy[idx] = cnt / total
-        pidx = np.nonzero(policy)[0].astype(np.int32)
-        pval = policy[pidx].astype(np.float32)
-        records.append((
-            mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
-            pidx, pval, legal_idx, actor,
-        ))
+        actor = rs.current_actor()
+        if record_example:
+            mb, ob, flat = rs.encode(actor)                   # PUBLIC, info-set safe
+            mb = np.asarray(mb); ob = np.asarray(ob); flat = np.asarray(flat)
+            legal_idx = np.asarray(rs.legal_action_indices(), dtype=np.int32)
+            pidx = np.nonzero(policy)[0].astype(np.int32)
+            pval = policy[pidx].astype(np.float32)
+            records.append((
+                mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
+                pidx, pval, legal_idx, actor,
+            ))
 
-        temp = _temperature(move_num, temp_moves)
+        temp = _temperature(move_num, move_temp_moves)
         chosen = _select_idx(agg, temp, np_rng)
         placement, pick = _rust_idx_to_action(rs, chosen)
         rs = rs.step(placement, pick)
@@ -949,7 +1220,9 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     [seed_start, seed_start+games_a), B covers [seed_start+games_a, ...), so
     game i still uses seed seed_start + i.  Returns
     (finished, batch_sizes, ticks, exact_solve_count, exact_tree_solve_count,
-     exact_cache_hit_count, exact_fallback_count, step_sec, eval_sec,
+     exact_cache_hit_count, exact_fallback_count, exact_solver_secs,
+     fast_move_count, full_move_count, recorded_fast_move_count,
+     recorded_full_move_count, exact_recorded_move_count, step_sec, eval_sec,
      update_sec, elapsed);
     step_sec/update_sec are summed across both instances and OVERLAP eval_sec
     (their sum can exceed elapsed — that overlap is the speedup).
@@ -1043,9 +1316,20 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     exact_cache_hit_count = int(A.exact_cache_hit_count) + int(B.exact_cache_hit_count)
     exact_fallback_count = int(A.exact_fallback_count) + int(B.exact_fallback_count)
     exact_solver_secs = float(A.exact_solver_secs) + float(B.exact_solver_secs)
+    fast_move_count = int(A.fast_move_count) + int(B.fast_move_count)
+    full_move_count = int(A.full_move_count) + int(B.full_move_count)
+    recorded_fast_move_count = (
+        int(A.recorded_fast_move_count) + int(B.recorded_fast_move_count))
+    recorded_full_move_count = (
+        int(A.recorded_full_move_count) + int(B.recorded_full_move_count))
+    exact_recorded_move_count = (
+        int(A.exact_recorded_move_count) + int(B.exact_recorded_move_count))
     return (finished, batch_sizes, ticks,
             exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
             exact_fallback_count, exact_solver_secs,
+            fast_move_count, full_move_count,
+            recorded_fast_move_count, recorded_full_move_count,
+            exact_recorded_move_count,
             prof["step"], eval_sec, prof["update"], elapsed)
 
 
@@ -1107,6 +1391,12 @@ def play_selfplay_games_batched(
             exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
             async_solve=bool(cfg.async_solve),
             solver_cpus=int(cfg.solver_cpus),
+            playout_cap_randomization=bool(cfg.playout_cap_randomization),
+            full_search_fraction=float(cfg.full_search_fraction),
+            fast_move_sims=int(cfg.fast_move_sims),
+            record_fast_moves=bool(cfg.record_fast_moves),
+            fast_move_dirichlet_eps=float(cfg.fast_move_dirichlet_epsilon),
+            fast_move_temp_moves=int(cfg.fast_move_temp_moves),
         )
 
     use_db = bool(double_buffer)
@@ -1120,6 +1410,11 @@ def play_selfplay_games_batched(
     exact_cache_hit_count = 0
     exact_fallback_count = 0
     exact_solver_secs = 0.0
+    fast_move_count = 0
+    full_move_count = 0
+    recorded_fast_move_count = 0
+    recorded_full_move_count = 0
+    exact_recorded_move_count = 0
     if not use_db:
         # ── Single-buffer path (unchanged) ──
         batched = _make_batched(n_games, game_seed_start)
@@ -1151,11 +1446,19 @@ def play_selfplay_games_batched(
         exact_cache_hit_count = int(batched.exact_cache_hit_count)
         exact_fallback_count = int(batched.exact_fallback_count)
         exact_solver_secs = float(batched.exact_solver_secs)
+        fast_move_count = int(batched.fast_move_count)
+        full_move_count = int(batched.full_move_count)
+        recorded_fast_move_count = int(batched.recorded_fast_move_count)
+        recorded_full_move_count = int(batched.recorded_full_move_count)
+        exact_recorded_move_count = int(batched.exact_recorded_move_count)
     else:
         # ── Double-buffer path (Item 17) ──
         (finished, batch_sizes, ticks,
          exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
          exact_fallback_count, exact_solver_secs,
+         fast_move_count, full_move_count,
+         recorded_fast_move_count, recorded_full_move_count,
+         exact_recorded_move_count,
          step_sec, eval_sec, update_sec, elapsed) = _double_buffer_loop(
             _make_batched, evaluator, n_games, game_seed_start)
 
@@ -1188,6 +1491,11 @@ def play_selfplay_games_batched(
         "exact_cache_hit_count": exact_cache_hit_count,
         "exact_fallback_count": exact_fallback_count,
         "exact_solver_secs": exact_solver_secs,
+        "fast_move_count": fast_move_count,
+        "full_move_count": full_move_count,
+        "recorded_fast_move_count": recorded_fast_move_count,
+        "recorded_full_move_count": recorded_full_move_count,
+        "exact_recorded_move_count": exact_recorded_move_count,
     }
     ev_timing = getattr(evaluator, "timing", None)
     if ev_timing:
@@ -1906,12 +2214,23 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     # Accumulated structured log rows for the empirical alpha-transition trigger
     # (check_alpha_transition needs the recent win_brier_endgame / baseline ratios).
     _diag_rows: List[dict] = []
+    schedules = _compiled_schedules(cfg)
+    has_active_schedules = any(bool(schedule) for schedule in schedules.values())
 
     it = 0   # defined before the loop so the finally block's final-rating is safe
     try:
         for it in range(1, cfg.n_iterations + 1):
+            iter_cfg = _active_config_for_iteration(cfg, schedules, it)
+            _apply_optimizer_schedule(optimizer, iter_cfg.lr)
+            _apply_buffer_capacity(buffer, iter_cfg.buffer_capacity)
             if verbose:
                 print(f"\n{'='*60}\nIteration {it}/{cfg.n_iterations}\n{'='*60}")
+                if has_active_schedules:
+                    print("  schedule: "
+                          f"lr={iter_cfg.lr:g} sims={iter_cfg.n_simulations} "
+                          f"alpha={iter_cfg.alpha:g} games={iter_cfg.games_per_iteration} "
+                          f"train_steps={iter_cfg.train_steps_per_iteration} "
+                          f"fast_frac={iter_cfg.fast_game_fraction:g}")
 
             # Per-iteration metrics for the structured log; None = not computed
             # this iteration (training skipped / no benchmark).  Filled below.
@@ -1926,78 +2245,139 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
 
             # ── 1. Self-play ──
             net.eval()
-            if cfg.engine == "rust":
+            if iter_cfg.engine == "rust":
                 import kingdomino_rust
                 rust_mcts = kingdomino_rust.RustMCTS()
-                rust_eval = make_rust_evaluator(net, device=cfg.device, amp=cfg.inference_amp,
-                                                margin_gain=cfg.margin_gain, alpha=cfg.alpha,
-                                                compile_net=cfg.compile_net,
-                                                compile_dynamic=cfg.compile_dynamic)
-            elif cfg.engine in ("batched", "batched_open_loop"):
+                rust_eval = make_rust_evaluator(net, device=iter_cfg.device, amp=iter_cfg.inference_amp,
+                                                margin_gain=iter_cfg.margin_gain, alpha=iter_cfg.alpha,
+                                                compile_net=iter_cfg.compile_net,
+                                                compile_dynamic=iter_cfg.compile_dynamic)
+            elif iter_cfg.engine in ("batched", "batched_open_loop"):
                 pass
-            elif cfg.engine == "open_loop":
-                ol_mcts = make_open_loop_mcts(net, cfg, cfg.n_simulations)
+            elif iter_cfg.engine == "open_loop":
+                ol_mcts = make_open_loop_mcts(net, iter_cfg, iter_cfg.n_simulations)
             else:  # "python"
-                mcts = make_mcts(net, cfg, cfg.n_simulations)
+                mcts = make_mcts(net, iter_cfg, iter_cfg.n_simulations)
             t0 = time.time()
             diffs = []
             batched_stats = None
-            if cfg.engine in ("batched", "batched_open_loop"):
-                all_examples, all_scores, batched_stats = play_selfplay_games_batched(
-                    net, cfg, n_games=cfg.games_per_iteration,
-                    game_seed_start=game_seed, iteration=it,
-                    double_buffer=cfg.double_buffer,
-                )
+            policy_prune_stats = {
+                "policy_pruned_actions": 0,
+                "policy_pruned_mass": 0.0,
+                "policy_pruned_examples": 0,
+            }
+            if iter_cfg.playout_cap_randomization:
+                fast_games = 0
+            else:
+                fast_games = int(round(
+                    iter_cfg.games_per_iteration
+                    * max(0.0, min(1.0, iter_cfg.fast_game_fraction))))
+                fast_games = max(0, min(int(iter_cfg.games_per_iteration), fast_games))
+            full_games = int(iter_cfg.games_per_iteration) - fast_games
+            if iter_cfg.engine in ("batched", "batched_open_loop"):
+                all_examples, all_scores = [], []
+                stat_parts = []
+                if fast_games:
+                    fast_cfg = replace(iter_cfg, n_simulations=max(1, int(iter_cfg.fast_game_sims)))
+                    ex_fast, sc_fast, st_fast = play_selfplay_games_batched(
+                        net, fast_cfg, n_games=fast_games,
+                        game_seed_start=game_seed, iteration=it,
+                        double_buffer=fast_cfg.double_buffer,
+                    )
+                    all_examples.extend(ex_fast); all_scores.extend(sc_fast)
+                    stat_parts.append(st_fast)
+                    if iter_cfg.policy_target_pruning:
+                        ps = _prune_examples_policy_targets(
+                            ex_fast, total_visits=max(1, int(fast_cfg.n_simulations)),
+                            skip_exact=fast_cfg.exact_endgame_max_secs > 0.0)
+                        for k, v in ps.items():
+                            policy_prune_stats[k] += v
+                    game_seed += fast_games
+                if full_games:
+                    ex_full, sc_full, st_full = play_selfplay_games_batched(
+                        net, iter_cfg, n_games=full_games,
+                        game_seed_start=game_seed, iteration=it,
+                        double_buffer=iter_cfg.double_buffer,
+                    )
+                    all_examples.extend(ex_full); all_scores.extend(sc_full)
+                    stat_parts.append(st_full)
+                    if iter_cfg.policy_target_pruning:
+                        ps = _prune_examples_policy_targets(
+                            ex_full, total_visits=max(1, int(iter_cfg.n_simulations)),
+                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0)
+                        for k, v in ps.items():
+                            policy_prune_stats[k] += v
+                    game_seed += full_games
+                batched_stats = _merge_batched_stats(stat_parts)
                 for examples, scores in zip(all_examples, all_scores):
                     buffer.add(examples)
                     diffs.append(scores[0] - scores[1])
-                game_seed += cfg.games_per_iteration
             else:
-                for g in range(cfg.games_per_iteration):
+                for g in range(iter_cfg.games_per_iteration):
                     # Per-game RNGs derived from game_seed alone (see _game_rngs): keeps
                     # self-play data independent of execution order and lets the
                     # parallel loop reproduce this exactly.
                     g_py_rng, g_np_rng = _game_rngs(game_seed)
-                    if cfg.engine == "rust":
+                    game_sims = (
+                        int(iter_cfg.n_simulations)
+                        if iter_cfg.playout_cap_randomization
+                        else (max(1, int(iter_cfg.fast_game_sims))
+                              if g < fast_games else int(iter_cfg.n_simulations))
+                    )
+                    if iter_cfg.engine == "rust":
                         examples, scores = play_selfplay_game_rust(
                             rust_mcts, rust_eval,
-                            n_simulations=cfg.n_simulations,
-                            n_determinizations=cfg.n_determinizations,
-                            temp_moves=cfg.temp_moves, c_puct=cfg.c_puct,
-                            dirichlet_alpha=cfg.dirichlet_alpha,
-                            dirichlet_epsilon=cfg.dirichlet_epsilon,
-                            leaf_batch=cfg.leaf_batch, virtual_loss=1,
+                            n_simulations=game_sims,
+                            n_determinizations=iter_cfg.n_determinizations,
+                            temp_moves=iter_cfg.temp_moves, c_puct=iter_cfg.c_puct,
+                            dirichlet_alpha=iter_cfg.dirichlet_alpha,
+                            dirichlet_epsilon=iter_cfg.dirichlet_epsilon,
+                            leaf_batch=iter_cfg.leaf_batch, virtual_loss=1,
                             seed=game_seed, py_rng=g_py_rng, np_rng=g_np_rng,
-                            score_scale=cfg.score_scale,
-                            margin_gain=cfg.margin_gain, alpha=cfg.alpha,
+                            score_scale=iter_cfg.score_scale,
+                            margin_gain=iter_cfg.margin_gain, alpha=iter_cfg.alpha,
                             iteration=it,
+                            playout_cfg=(iter_cfg if iter_cfg.playout_cap_randomization else None),
                         )
-                    elif cfg.engine == "open_loop":
+                    elif iter_cfg.engine == "open_loop":
+                        if game_sims != getattr(ol_mcts, "n_simulations", None):
+                            ol_mcts = make_open_loop_mcts(net, iter_cfg, game_sims)
                         examples, scores = play_selfplay_game(
                             ol_mcts,
                             n_determinizations=1,   # ignored internally; required by signature
-                            temp_moves=cfg.temp_moves,
+                            temp_moves=iter_cfg.temp_moves,
                             seed=game_seed,
                             py_rng=g_py_rng,
                             np_rng=g_np_rng,
                             leaf_batch=1,            # not used by open-loop
                             open_loop=True,
                             iteration=it,
+                            playout_cfg=(iter_cfg if iter_cfg.playout_cap_randomization else None),
                         )
                     else:  # "python"
+                        if game_sims != getattr(mcts, "n_simulations", None):
+                            mcts = make_mcts(net, iter_cfg, game_sims)
                         examples, scores = play_selfplay_game(
-                            mcts, n_determinizations=cfg.n_determinizations,
-                            temp_moves=cfg.temp_moves, seed=game_seed,
+                            mcts, n_determinizations=iter_cfg.n_determinizations,
+                            temp_moves=iter_cfg.temp_moves, seed=game_seed,
                             py_rng=g_py_rng,
                             np_rng=g_np_rng,
-                            leaf_batch=cfg.leaf_batch,
+                            leaf_batch=iter_cfg.leaf_batch,
                             iteration=it,
+                            playout_cfg=(iter_cfg if iter_cfg.playout_cap_randomization else None),
                         )
+                    if iter_cfg.policy_target_pruning:
+                        wrapped = [examples]
+                        ps = _prune_examples_policy_targets(
+                            wrapped, total_visits=max(1, int(game_sims)),
+                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0)
+                        for k, v in ps.items():
+                            policy_prune_stats[k] += v
                     buffer.add(examples)
                     diffs.append(scores[0] - scores[1])
                     game_seed += 1
             sp_elapsed = time.time() - t0
-            sp_rate = cfg.games_per_iteration / sp_elapsed if sp_elapsed > 0 else 0.0
+            sp_rate = iter_cfg.games_per_iteration / sp_elapsed if sp_elapsed > 0 else 0.0
             diffs_arr = np.array(diffs, dtype=np.float32)
             sp_score_diff_mean = float(diffs_arr.mean()) if len(diffs_arr) else 0.0
             sp_score_diff_std = float(diffs_arr.std()) if len(diffs_arr) else 0.0
@@ -2009,8 +2389,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             history["buffer_size"].append(buffer_size)
             history["buffer_mean_age"].append(buffer_mean_age)
             if verbose:
-                print(f"  self-play: {cfg.games_per_iteration} games "
+                print(f"  self-play: {iter_cfg.games_per_iteration} games "
                       f"({sp_rate:.2f} games/sec), buffer={buffer_size}")
+                if fast_games:
+                    print(f"  fast games: {fast_games}/{iter_cfg.games_per_iteration} "
+                          f"at {iter_cfg.fast_game_sims} sims "
+                          f"(full={full_games} at {iter_cfg.n_simulations})")
+                if iter_cfg.policy_target_pruning:
+                    print(f"  policy pruning: examples={policy_prune_stats['policy_pruned_examples']} "
+                          f"actions={policy_prune_stats['policy_pruned_actions']} "
+                          f"mass={policy_prune_stats['policy_pruned_mass']:.4f}")
                 if batched_stats is not None:
                     print(f"  batched: mean_batch={batched_stats['mean_batch']:.1f}/"
                           f"{batched_stats['max_batch_cap']} "
@@ -2034,13 +2422,21 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                           f"trees={batched_stats.get('exact_tree_solve_count', 0)} "
                           f"cache_hits={batched_stats.get('exact_cache_hit_count', 0)} "
                           f"fallback={batched_stats.get('exact_fallback_count', 0)}")
+                    if iter_cfg.playout_cap_randomization:
+                        print(
+                            f"  playout cap: full={batched_stats.get('full_move_count', 0)} "
+                            f"fast={batched_stats.get('fast_move_count', 0)} "
+                            f"recorded_full={batched_stats.get('recorded_full_move_count', 0)} "
+                            f"recorded_fast={batched_stats.get('recorded_fast_move_count', 0)} "
+                            f"exact_recorded={batched_stats.get('exact_recorded_move_count', 0)}"
+                        )
 
             # ── 2. Train ──
-            if len(buffer) < cfg.min_buffer_to_train:
+            if len(buffer) < iter_cfg.min_buffer_to_train:
                 if verbose:
-                    print(f"  buffer below warmup ({len(buffer)}/{cfg.min_buffer_to_train}); "
+                    print(f"  buffer below warmup ({len(buffer)}/{iter_cfg.min_buffer_to_train}); "
                           f"skipping training this iteration")
-            elif cfg.train_steps_per_iteration <= 0:
+            elif iter_cfg.train_steps_per_iteration <= 0:
                 if verbose:
                     print("  train: train_steps_per_iteration=0; skipping training")
             else:
@@ -2057,11 +2453,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     (policy_loss, own_loss, opp_loss, win_loss,
                      win_brier, baseline_brier) = train_step(
                         net, batch, optimizer,
-                        policy_weight=cfg.policy_weight,
-                        lambda_score=cfg.lambda_score,
-                        lambda_w=cfg.lambda_w,
-                        score_scale=cfg.score_scale,
-                        grad_clip=cfg.grad_clip,
+                        policy_weight=iter_cfg.policy_weight,
+                        lambda_score=iter_cfg.lambda_score,
+                        lambda_w=iter_cfg.lambda_w,
+                        score_scale=iter_cfg.score_scale,
+                        grad_clip=iter_cfg.grad_clip,
                     )
                     # Grad norms: train_step zeros grads at the START of each step
                     # (not the end), so the grads are still populated here, after
@@ -2080,32 +2476,32 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 # thread-safe) and does only CPU numpy/Rust augment + a blocking
                 # H2D copy; the main thread's train_step (the sole CUDA user) never
                 # overlaps it because we .result() before stepping.
-                use_prefetch = (cfg.prefetch_batches
-                                and cfg.train_steps_per_iteration > 1)
+                use_prefetch = (iter_cfg.prefetch_batches
+                                and iter_cfg.train_steps_per_iteration > 1)
                 if use_prefetch:
                     prefetch_rng = np.random.default_rng(int(np_rng.integers(2**63)))
                     sample_fn = lambda: buffer.sample_batch(
-                        cfg.batch_size, prefetch_rng,
-                        device=cfg.device, augment_d4=cfg.augment,
-                        endgame_oversample_weight=cfg.endgame_oversample)
+                        iter_cfg.batch_size, prefetch_rng,
+                        device=iter_cfg.device, augment_d4=iter_cfg.augment,
+                        endgame_oversample_weight=iter_cfg.endgame_oversample)
                     executor = ThreadPoolExecutor(max_workers=1)
                     next_batch_future = executor.submit(sample_fn)   # prime
                     try:
-                        for step in range(cfg.train_steps_per_iteration):
+                        for step in range(iter_cfg.train_steps_per_iteration):
                             batch = next_batch_future.result()
-                            if step + 1 < cfg.train_steps_per_iteration:
+                            if step + 1 < iter_cfg.train_steps_per_iteration:
                                 next_batch_future = executor.submit(sample_fn)
                             _run_train_step(batch)
                     finally:
                         executor.shutdown(wait=False)
                 else:
-                    for step in range(cfg.train_steps_per_iteration):
+                    for step in range(iter_cfg.train_steps_per_iteration):
                         batch = buffer.sample_batch(
-                            cfg.batch_size, np_rng,
-                            device=cfg.device, augment_d4=cfg.augment,
-                            endgame_oversample_weight=cfg.endgame_oversample)
+                            iter_cfg.batch_size, np_rng,
+                            device=iter_cfg.device, augment_d4=iter_cfg.augment,
+                            endgame_oversample_weight=iter_cfg.endgame_oversample)
                         _run_train_step(batch)
-                n = cfg.train_steps_per_iteration
+                n = iter_cfg.train_steps_per_iteration
                 pol_m, own_m, opp_m, win_m = p_sum/n, o_sum/n, q_sum/n, w_sum/n
                 win_brier_m, baseline_brier_m = brier_sum/n, baseline_sum/n
                 gn_pol, gn_win = gnp_sum/n, gnw_sum/n
@@ -2138,7 +2534,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     # so later ring-buffer eviction doesn't touch them).
                     diag_entropy_batch = buffer.sample_batch(
                         min(256, len(buffer)), diag_rng,
-                        device=cfg.device, augment_d4=False,
+                        device=iter_cfg.device, augment_d4=False,
                     )
                 entropy, win_brier_diag = _diag_metrics(net, diag_entropy_batch)
                 history["policy_entropy"].append(entropy)
@@ -2149,27 +2545,27 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                           f"brier_diag={win_brier_diag:.4f}")
 
             # ── 3. Benchmark + checkpoint ──
-            if cfg.benchmark_every and it % cfg.benchmark_every == 0:
+            if iter_cfg.benchmark_every and it % iter_cfg.benchmark_every == 0:
                 net.eval()
-                bench_dets = (cfg.benchmark_determinizations
-                              if cfg.benchmark_determinizations is not None
-                              else cfg.n_determinizations)
-                if cfg.engine == "batched_open_loop":
+                bench_dets = (iter_cfg.benchmark_determinizations
+                              if iter_cfg.benchmark_determinizations is not None
+                              else iter_cfg.n_determinizations)
+                if iter_cfg.engine == "batched_open_loop":
                     # Rust-backed lockstep benchmark (~50x faster than the Python
                     # OpenLoopMCTS player; see benchmark_vs_rust docstring).
-                    stats = benchmark_vs_rust(net, cfg, cfg.benchmark_seeds,
-                                              seed=cfg.seed + 99, verbose=False)
+                    stats = benchmark_vs_rust(net, iter_cfg, iter_cfg.benchmark_seeds,
+                                              seed=iter_cfg.seed + 99, verbose=False)
                 else:
-                    if cfg.engine == "open_loop":
+                    if iter_cfg.engine == "open_loop":
                         az = OpenLoopAZPlayer(
-                            make_open_loop_mcts(net, cfg, cfg.benchmark_sims),
+                            make_open_loop_mcts(net, iter_cfg, iter_cfg.benchmark_sims),
                             np_rng=np_rng,
                         )
                     else:
-                        az = AZPlayer(make_mcts(net, cfg, cfg.benchmark_sims),
+                        az = AZPlayer(make_mcts(net, iter_cfg, iter_cfg.benchmark_sims),
                                       n_determinizations=bench_dets, np_rng=np_rng)
-                    stats = benchmark_vs(az, GreedyBot(), cfg.benchmark_seeds,
-                                         seed=cfg.seed + 99, verbose=False)
+                    stats = benchmark_vs(az, GreedyBot(), iter_cfg.benchmark_seeds,
+                                         seed=iter_cfg.seed + 99, verbose=False)
                 bench_win_rate = stats["az_win_rate"]
                 bench_score_margin = stats["mean_margin"]
                 # Brier on the fixed diagnostic batch at benchmark time (a
@@ -2188,7 +2584,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             if cfg.checkpoint_dir:
                 os.makedirs(cfg.checkpoint_dir, exist_ok=True)
                 save_checkpoint(os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
-                                net, cfg, it, history)
+                                net, iter_cfg, it, history)
 
             # ── 3b. Elo rating (periodic) ──  AFTER the checkpoint is on disk so
             # the rater can load it; BEFORE the log row so its result can be logged.
@@ -2197,7 +2593,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 elo_result = _run_elo_rating(
                     checkpoint_path=os.path.join(cfg.checkpoint_dir, f"iter_{it:04d}.pt"),
                     checkpoint_name=f"{run_id}_iter_{it:04d}",
-                    cfg=cfg,
+                    cfg=iter_cfg,
                     verbose=verbose,
                 )
 
@@ -2207,11 +2603,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             # the endgame (game_progress >= 0.75). Uses diag_rng so the training
             # stream is unperturbed; an independent draw is statistically equivalent
             # to inspecting the real training batches.
-            if (cfg.diag_every and it % cfg.diag_every == 0
-                    and len(buffer) >= cfg.min_buffer_to_train):
+            if (iter_cfg.diag_every and it % iter_cfg.diag_every == 0
+                    and len(buffer) >= iter_cfg.min_buffer_to_train):
                 prog_idx = FLAT_LAYOUT['game_progress'].start
                 diag_idxs = buffer._draw_idxs(
-                    cfg.batch_size, diag_rng, cfg.endgame_oversample)
+                    iter_cfg.batch_size, diag_rng, iter_cfg.endgame_oversample)
                 n_endgame_in_batch = int(sum(
                     1 for i in diag_idxs
                     if float(buffer.data[int(i)].flat[prog_idx]) >= 0.75))
@@ -2253,21 +2649,54 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                          if batched_stats else None),
                 "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
                                       if batched_stats else None),
-                "endgame_oversample": cfg.endgame_oversample,
+                "playout_cap_randomization": iter_cfg.playout_cap_randomization,
+                "full_search_fraction": iter_cfg.full_search_fraction,
+                "fast_move_sims": iter_cfg.fast_move_sims,
+                "record_fast_moves": iter_cfg.record_fast_moves,
+                "fast_move_dirichlet_epsilon": iter_cfg.fast_move_dirichlet_epsilon,
+                "fast_move_temp_moves": iter_cfg.fast_move_temp_moves,
+                "fast_move_count": (batched_stats.get("fast_move_count", 0)
+                                    if batched_stats else None),
+                "full_move_count": (batched_stats.get("full_move_count", 0)
+                                    if batched_stats else None),
+                "recorded_fast_move_count": (
+                    batched_stats.get("recorded_fast_move_count", 0)
+                    if batched_stats else None),
+                "recorded_full_move_count": (
+                    batched_stats.get("recorded_full_move_count", 0)
+                    if batched_stats else None),
+                "exact_recorded_move_count": (
+                    batched_stats.get("exact_recorded_move_count", 0)
+                    if batched_stats else None),
+                "endgame_oversample": iter_cfg.endgame_oversample,
                 "n_endgame_in_batch": n_endgame_in_batch,
+                "lr": iter_cfg.lr,
+                "alpha": iter_cfg.alpha,
+                "n_simulations": iter_cfg.n_simulations,
+                "games_per_iteration": iter_cfg.games_per_iteration,
+                "train_steps_per_iteration": iter_cfg.train_steps_per_iteration,
+                "buffer_capacity": iter_cfg.buffer_capacity,
+                "c_puct": iter_cfg.c_puct,
+                "dirichlet_epsilon": iter_cfg.dirichlet_epsilon,
+                "temp_moves": iter_cfg.temp_moves,
+                "fast_game_fraction": iter_cfg.fast_game_fraction,
+                "fast_game_sims": iter_cfg.fast_game_sims,
+                "fast_games": fast_games,
+                "policy_target_pruning": iter_cfg.policy_target_pruning,
+                **policy_prune_stats,
             }
 
             # ── Phase-sliced calibration diagnostics (Milestone 2) ──  Run every
             # cfg.diag_every iterations on a buffer snapshot, after training.
             # Guarded so a diagnostics bug can never crash a long training run.
-            if (cfg.diag_every and it % cfg.diag_every == 0
-                    and len(buffer) >= cfg.min_buffer_to_train):
+            if (iter_cfg.diag_every and it % iter_cfg.diag_every == 0
+                    and len(buffer) >= iter_cfg.min_buffer_to_train):
                 try:
                     phase_diag = compute_all_diagnostics(
-                        list(buffer.data), net, device=str(cfg.device),
-                        score_scale=cfg.score_scale,
-                        margin_gain=cfg.margin_gain,
-                        alpha=cfg.alpha,
+                        list(buffer.data), net, device=str(iter_cfg.device),
+                        score_scale=iter_cfg.score_scale,
+                        margin_gain=iter_cfg.margin_gain,
+                        alpha=iter_cfg.alpha,
                     )
                     row.update(phase_diag)
                 except Exception as e:
@@ -2282,9 +2711,9 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             _log_row(log_path, row)
             if verbose:
                 print(_compact_summary(
-                    it, sp_games=cfg.games_per_iteration, row=row,
+                    it, sp_games=iter_cfg.games_per_iteration, row=row,
                     trained=trained, buf_n=buffer_size,
-                    min_buf=cfg.min_buffer_to_train))
+                    min_buf=iter_cfg.min_buffer_to_train))
 
     finally:
         # Save the buffer on EXIT — clean completion AND KeyboardInterrupt — so a
@@ -2360,6 +2789,24 @@ if __name__ == "__main__":
                         "(1 = serial; >1 measured to REGRESS this GIL-bound "
                         "workload ~2x — kept for experimentation)")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr_schedule", default="",
+                   help="piecewise schedule, e.g. '0:1e-3,50:3e-4'")
+    p.add_argument("--alpha_schedule", default="",
+                   help="piecewise schedule for value blend alpha")
+    p.add_argument("--sims_schedule", default="",
+                   help="piecewise schedule for full self-play MCTS simulations")
+    p.add_argument("--games_per_iter_schedule", default="",
+                   help="piecewise schedule for self-play games per iteration")
+    p.add_argument("--c_puct_schedule", default="",
+                   help="piecewise schedule for MCTS c_puct")
+    p.add_argument("--dirichlet_epsilon_schedule", default="",
+                   help="piecewise schedule for root Dirichlet noise epsilon")
+    p.add_argument("--temp_moves_schedule", default="",
+                   help="piecewise schedule for temperature sampling plies")
+    p.add_argument("--train_steps_schedule", default="",
+                   help="piecewise schedule for training steps per iteration")
+    p.add_argument("--buffer_capacity_schedule", default="",
+                   help="piecewise schedule for replay buffer capacity")
     p.add_argument("--buffer", type=int, default=50_000)
     p.add_argument("--channels", type=int, default=96)
     p.add_argument("--blocks", type=int, default=8)
@@ -2472,6 +2919,32 @@ if __name__ == "__main__":
                    help="(Step 1.5) Threads in the dedicated endgame-solver pool; "
                         "game generation gets the rest. Tune per machine "
                         "(e.g. 6 on an 8-core box). 0 = auto (half of available).")
+    p.add_argument("--fast_game_fraction", type=float, default=0.0,
+                   help="KataGo-style playout-cap randomization: fraction of "
+                        "self-play games using --fast_game_sims instead of the "
+                        "scheduled full sim cap.")
+    p.add_argument("--fast_game_fraction_schedule", default="",
+                   help="piecewise schedule for --fast_game_fraction")
+    p.add_argument("--fast_game_sims", type=int, default=100,
+                   help="simulations for fast exploration games")
+    p.add_argument("--playout_cap_randomization", action="store_true",
+                   help="KataGo-style move-level playout-cap randomization: "
+                        "sample full/fast search per move instead of per game.")
+    p.add_argument("--full_search_fraction", type=float, default=0.25,
+                   help="fraction of non-exact moves searched at --sims when "
+                        "--playout_cap_randomization is enabled")
+    p.add_argument("--fast_move_sims", type=int, default=100,
+                   help="simulations for fast moves under move-level playout caps")
+    p.add_argument("--record_fast_moves", action="store_true",
+                   help="store fast-move policy targets; default off so fast "
+                        "moves only advance self-play")
+    p.add_argument("--fast_move_dirichlet_epsilon", type=float, default=0.0,
+                   help="root Dirichlet epsilon for fast moves; default 0.0")
+    p.add_argument("--fast_move_temp_moves", type=int, default=0,
+                   help="temperature plies for fast moves; default 0 (greedy)")
+    p.add_argument("--policy_target_pruning", action="store_true",
+                   help="KataGo-inspired target cleanup: prune <=1-visit MCTS "
+                        "policy noise before storing replay examples.")
     p.add_argument("--profile_eval_timing", action="store_true",
                    help="Split eval_sec into h2d / forward / readback to see "
                         "whether the evaluator is forward-bound or transfer/"
@@ -2498,6 +2971,14 @@ if __name__ == "__main__":
         n_determinizations=a.determinizations, leaf_batch=a.leaf_batch,
         batch_slots=a.batch_slots,
         batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
+        lr_schedule=a.lr_schedule, alpha_schedule=a.alpha_schedule,
+        sims_schedule=a.sims_schedule,
+        games_per_iter_schedule=a.games_per_iter_schedule,
+        c_puct_schedule=a.c_puct_schedule,
+        dirichlet_epsilon_schedule=a.dirichlet_epsilon_schedule,
+        temp_moves_schedule=a.temp_moves_schedule,
+        train_steps_schedule=a.train_steps_schedule,
+        buffer_capacity_schedule=a.buffer_capacity_schedule,
         buffer_capacity=a.buffer, channels=a.channels, blocks=a.blocks,
         bilinear_dim=a.bilinear_dim, benchmark_seeds=a.benchmark_seeds,
         benchmark_determinizations=a.benchmark_determinizations,
@@ -2525,6 +3006,16 @@ if __name__ == "__main__":
         double_buffer=a.double_buffer,
         async_solve=a.async_solve,
         solver_cpus=a.solver_cpus,
+        fast_game_fraction=a.fast_game_fraction,
+        fast_game_fraction_schedule=a.fast_game_fraction_schedule,
+        fast_game_sims=a.fast_game_sims,
+        playout_cap_randomization=a.playout_cap_randomization,
+        full_search_fraction=a.full_search_fraction,
+        fast_move_sims=a.fast_move_sims,
+        record_fast_moves=a.record_fast_moves,
+        fast_move_dirichlet_epsilon=a.fast_move_dirichlet_epsilon,
+        fast_move_temp_moves=a.fast_move_temp_moves,
+        policy_target_pruning=a.policy_target_pruning,
         profile_eval_timing=a.profile_eval_timing,
         exact_endgame_max_secs=a.exact_endgame_max_secs,
         endgame_oversample=a.endgame_oversample,

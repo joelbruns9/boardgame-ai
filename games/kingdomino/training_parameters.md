@@ -6,14 +6,17 @@
 python -m games.kingdomino.self_play `
   --engine batched_open_loop `
   --device cuda `
-  --warm_start games\kingdomino\best_checkpoint\best_32x4.pt `
-  --warm_buffer runs\kingdomino\local_cont3\buffer_final.pkl `
+  --async_solve `
+  --solver_cpus 6 `
+  --warm_start runs\kingdomino\local_48x6_run6\iter_0050.pt `
+  --warm_buffer runs\kingdomino\local_48x6_run6\buffer_final.pkl `
+  --warm_buffer_max_staleness 200 `
   --iterations 55 `
   --games_per_iter 150 `
   --train_steps 600 `
   --sims 1600 `
-  --channels 32 `
-  --blocks 4 `
+  --channels 48 `
+  --blocks 6 `
   --batch_slots 32 `
   --leaf_batch 6 `
   --batch_size 256 `
@@ -36,8 +39,8 @@ python -m games.kingdomino.self_play `
   --benchmark_every 10 `
   --benchmark_sims 50 `
   --benchmark_seeds 20 `
-  --checkpoint_dir runs\kingdomino\local_cont4 `
-  --save_buffer runs\kingdomino\local_cont4\buffer_final.pkl `
+  --checkpoint_dir runs\kingdomino\local_48x6_run7 `
+  --save_buffer runs\kingdomino\local_48x6_run7\buffer_final.pkl `
   --elo_every 10 `
   --elo_sims 400 `
   --elo_games_per_anchor 40 `
@@ -48,6 +51,15 @@ python -m games.kingdomino.self_play `
 
 > Note: PowerShell requires single-line commands (no backslash continuation).
 > The above uses backtick line continuation for readability only.
+
+> **Throughput-optimal solver settings (`--async_solve --solver_cpus N`):** these
+> make the exact endgame solver effectively *free* on throughput. Without them the
+> solver runs on the synchronous critical path and costs ~13% games/s; with them it
+> overlaps the GPU eval on a dedicated thread pool and recovers to the solver-off
+> rate (~0.14 vs ~0.12 games/s on the 8-core laptop) while still emitting exact
+> endgame targets. Set `--solver_cpus` to roughly `physical_cores − 2` (6 here),
+> re-tuning per machine. See the two parameters below for details. `--channels 48
+> --blocks 6` reflects the current production architecture (32ch/4b is saturated).
 
 ---
 
@@ -215,6 +227,156 @@ quality parameter — controls how good the policy targets are.
 
 ---
 
+#### Dynamic schedule flags
+**Values:** comma-separated `iteration:value` pairs, zero-based schedule steps
+**Current:** optional
+
+Milestone 5 added single-run curriculum schedules. The run loop applies the
+active per-iteration config to self-play, training, benchmark construction,
+checkpoints, diagnostics, and JSONL logging.
+
+Available schedule flags:
+
+| Flag | Controls |
+|------|----------|
+| `--lr_schedule` | optimizer learning rate |
+| `--alpha_schedule` | search leaf-value blend |
+| `--sims_schedule` | full self-play MCTS simulations |
+| `--games_per_iter_schedule` | games generated per iteration |
+| `--c_puct_schedule` | PUCT exploration constant |
+| `--dirichlet_epsilon_schedule` | root Dirichlet noise strength |
+| `--temp_moves_schedule` | opening plies sampled from visits |
+| `--train_steps_schedule` | optimizer steps per iteration |
+| `--buffer_capacity_schedule` | replay buffer capacity |
+| `--fast_game_fraction_schedule` | fraction of fast-sim games |
+
+Example:
+
+```powershell
+--lr_schedule "0:1e-3,50:3e-4,150:1e-4" `
+--alpha_schedule "0:0.8,50:0.0" `
+--sims_schedule "0:800,20:1600,100:3200"
+```
+
+Schedule keys are zero-based curriculum steps: key `0` applies on iteration 1,
+key `50` applies on iteration 51, etc. The active value is the greatest key less
+than or equal to the current step.
+
+---
+
+#### `--fast_game_fraction`, `--fast_game_sims`
+**Values:** fraction `0.0-1.0`, integer sims
+**Current:** legacy/off unless specified
+
+Legacy game-level playout-cap mix. Each iteration splits self-play into:
+
+- **Fast games:** `fast_game_fraction * games_per_iter`, using `fast_game_sims`
+- **Full games:** the remainder, using the active `--sims` / `--sims_schedule`
+
+This decouples two competing goals:
+
+- policy targets want high-sim searches so visit distributions are sharp
+- value targets want more diverse states, which cheaper searches produce faster
+
+Recommended starting point: `--fast_game_fraction 0.15 --fast_game_sims 100`
+paired with a normal full sim cap such as 1600. The log records `fast_games`,
+`fast_game_fraction`, and the active sim cap for each iteration.
+
+This is now mostly kept for compatibility. It is coarser than KataGo's actual
+playout-cap randomization because every move in a fast game is fast and every
+move in a full game is full.
+
+#### `--playout_cap_randomization`
+**Values:** flag (off by default)
+**Current:** preferred KataGo-style mode for new experiments
+
+Move-level playout-cap randomization. When enabled, every non-exact self-play
+move independently chooses either:
+
+- **Full search:** `--sims` / `--sims_schedule`, normal root Dirichlet noise,
+  normal `--temp_moves`, and the position is recorded.
+- **Fast search:** `--fast_move_sims`, `--fast_move_dirichlet_epsilon`,
+  `--fast_move_temp_moves`, and recorded only if `--record_fast_moves` is set.
+
+Agreed defaults:
+
+```text
+--record_fast_moves            false
+--fast_move_temp_moves         0
+--fast_move_dirichlet_epsilon  0.0
+```
+
+These defaults make fast moves strong cheap play rather than noisy training
+targets: no root noise, greedy selection, and no replay example. Exact-solved
+endgame moves are still recorded because their targets come from the solver, not
+from a collapsed low-sim search.
+
+Additional knobs:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--full_search_fraction` | `0.25` | probability that a non-exact move uses the full sim cap |
+| `--fast_move_sims` | `100` | simulations for fast moves |
+| `--record_fast_moves` | off | store fast-search policy targets |
+| `--fast_move_dirichlet_epsilon` | `0.0` | root noise epsilon for fast moves |
+| `--fast_move_temp_moves` | `0` | sampled plies for fast moves |
+
+When `--playout_cap_randomization` is enabled, the training loop bypasses the
+legacy `--fast_game_fraction` split so the two modes do not stack.
+
+---
+
+#### `--policy_target_pruning`
+**Values:** flag (off by default)
+**Current:** optional Milestone 5 feature
+
+KataGo-inspired cleanup for policy targets before examples enter the replay
+buffer. The current implementation removes children whose stored policy mass is
+consistent with one visit or less, then renormalizes the remaining target. Exact
+endgame examples are left untouched because their targets already come from
+exact child values rather than MCTS exploration noise.
+
+This is the safe part of KataGo's policy target pruning that can be applied with
+the current self-play record. Full KataGo forced-playout subtraction is not
+implemented yet.
+
+What is missing for full forced-playout subtraction:
+
+- the current Python `Example` stores only `policy_idx`, `policy_val`, and
+  `legal_idx`; it does not store root prior probabilities
+- the normal Rust `MoveRecord` exports the same sparse visit-policy fields, even
+  though the Rust tree internally has `prior` on each root child
+- the Python paths similarly collapse the search result to visit counts via
+  `visit_counts_to_policy` before recording the example
+
+KataGo's formula needs the root prior `P(c)` for every root child:
+
+```text
+n_forced(c) = sqrt(k * P(c) * sum_N(c'))
+```
+
+Without `P(c)`, the loop can identify and remove obvious one-visit noise, but it
+cannot distinguish visits caused by the network prior / Dirichlet exploration
+from visits earned by backed-up value.
+
+Implementation difficulty: moderate. The data model change is small, but it
+crosses the hot self-play boundary:
+
+1. Add sparse root-prior fields to `Example` and replay serialization.
+2. Export `(joint_idx, visit_count, prior)` from Rust normal MCTS records
+   (`MoveRecord` / batched tuple conversion), for both closed-loop and open-loop.
+3. Preserve the same information in the Python self-play paths.
+4. Apply forced-playout subtraction before converting visits to the stored policy
+   target, then keep the existing <=1-visit pruning/renormalization.
+5. Add parity tests that pruning is disabled for exact endgames, deterministic
+   for fixed seeds, and produces identical legal masks / action indexing.
+
+The likely risk is not algorithmic complexity; it is accidentally changing the
+Rust/Python tuple contract or replay-buffer compatibility. Treat it as a focused
+Milestone 5 follow-up, not a broad refactor.
+
+---
+
 #### `--exact_endgame_max_secs`
 **Values:** `0.0` (disabled), `3.0`, larger for quality runs
 **Current:** `3.0`
@@ -283,6 +445,56 @@ relative to other positions. Endgame examples carry the best labels in the buffe
 concentrates gradient where the labels are most reliable. `1.0` recovers exact
 uniform sampling. The realised fraction is logged as `n_endgame_in_batch` on
 diagnostic iterations (≈33% at weight 2.0 on a ~20%-endgame buffer).
+
+---
+
+#### `--async_solve`
+**Values:** flag (off by default)
+**Recommended:** on (paired with `--solver_cpus`)
+
+Run the exact endgame solver on a dedicated **background thread** so it overlaps
+the GPU eval instead of blocking the synchronous `step()` critical path. When a
+slot reaches a terminal-adjacent endgame it is snapshotted and dispatched to the
+background solver; the slot keeps its game and resumes MCTS in place if the solve
+times out, while the main loop keeps feeding the GPU from the other slots. Solved
+games rejoin on the next harvest.
+
+- **Default (off):** the solver runs synchronously inside `step()` and costs ~13%
+  games/s (it is otherwise free in CPU-scheduling terms — the cost is just that it
+  sits on the critical path).
+- **On (with `--solver_cpus N`):** the solver becomes throughput-free. On the
+  8-core laptop it recovers to ~0.14 games/s (== solver-off) vs ~0.12 sync, while
+  still emitting exact endgame targets.
+- **Correctness is identical** — deterministic, bit-for-bit the same per-seed
+  games and finished results as the sync path (verified).
+
+Off by default so the simpler sync path stays the baseline. Turn it on for routine
+solver-on training. Its real payoff grows on the cloud 5090 (more spare cores).
+
+#### `--solver_cpus`
+**Values:** 0 (auto) – physical core count, integer
+**Default:** 0 (auto = half of available threads)
+**Recommended:** `physical_cores − 2` (e.g. 6 on an 8-core box)
+
+Size of the dedicated Rayon thread pool that runs the within-solve (YBW) endgame
+parallelism when `--async_solve` is on. Game generation (MCTS descent + backup)
+gets the remaining cores via the global pool. Confining the solver to its own pool
+is what makes the overlap pay off — a single shared pool lets the solver's long,
+non-preemptible subtree-solves head-of-line-block the latency-critical work that
+feeds the GPU, which *inflates* eval/update and makes async slower than sync.
+
+**Sweep (8-core laptop, `--async_solve`, batch_slots=32):**
+
+| solver_cpus | games/s | endgames solved / 100 |
+|-------------|---------|-----------------------|
+| 5 | 0.140 | 54 |
+| **6** | **0.139** | **59** |
+| 7 | 0.141 | 59 |
+
+Throughput is flat across 5–7 (GPU-bound, solver fully hidden); solve-success
+peaks at 6 then plateaus. So `physical_cores − 2` is the knee — give the solver
+everything except ~2 cores reserved for generation. Re-tune per machine; the cloud
+5090 (16–32 vCPUs) has far more headroom. Only has effect with `--async_solve`.
 
 ---
 
@@ -792,6 +1004,17 @@ runs the current `train_step`.
 Measured regression locally — `sample_batch` is too fast relative to
 `train_step` for the overlap to pay off. Leave off.
 
+#### `--profile_eval_timing`
+Split `eval_sec` into `eval_h2d_sec` / `eval_forward_sec` / `eval_readback_sec`
+(host→device transfer, GPU forward pass, device→host readback) in the training log,
+to see whether the evaluator is forward-bound or transfer/packaging-bound.
+
+Diagnostic only — adds CUDA syncs around each stage, so use it for a short profiling
+run, not routine training. Measured (48ch/6b, async@32, batch ~137): forward ≈90% of
+eval, transfers ≈8%, so the evaluator is **GPU-forward-compute-bound** — the lever
+is the forward itself (channels-last / smaller net / faster GPU), not transfer
+slimming or double-buffering.
+
 #### `--compile`
 Wrap the inference network with `torch.compile` (requires Triton,
 Linux only). Estimated 1.2–1.5× speedup on eval_sec.
@@ -809,7 +1032,7 @@ total_wall_time ≈ iterations × (games_per_iter/throughput + train_steps×0.1s
                 + (iterations/elo_every) × elo_rating_time
 
 throughput (games/s) driven by: sims, batch_slots, leaf_batch, channels, blocks,
-exact_endgame_max_secs
+exact_endgame_max_secs (cost hidden by --async_solve --solver_cpus)
 
 elo_rating_time ≈ (anchors × games_per_anchor × 2) / 0.72 games/s
   e.g. 3 anchors × 40 games = 240 games ÷ 0.72 = ~5.5 min per rating session
@@ -828,11 +1051,11 @@ Elo ±CI ≈ 400 / (log(10) × √(total_elo_games × p × (1-p)))
 
 | Use case | sims | games/iter | train_steps | buffer | elo_every | notes |
 |----------|------|------------|-------------|--------|-----------|-------|
-| Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors; exact budget 500k default |
-| Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams; exact budget 500k default |
-| Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config; exact budget 500k default |
-| Cloud overnight | 1600 | 300 | 1200 | 500000 | 10 | ~3× throughput |
-| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates; exact budget 500k default |
+| Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors; exact off (`--exact_endgame_max_secs 0`) |
+| Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams; exact 3.0s |
+| Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config; exact 3.0s + `--async_solve --solver_cpus 6` |
+| Cloud overnight | 1600 | 300 | 1200 | 500000 | 10 | ~3× throughput; `--async_solve --solver_cpus <vcpus−2>` |
+| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates; exact 3.0s + `--async_solve` |
 
 ## Elo Anchor Pool Maintenance
 

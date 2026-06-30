@@ -3097,6 +3097,27 @@ struct MoveRecord {
     win_target: f32, // 1.0 win / 0.5 draw / 0.0 loss, actor frame (filled at end)
 }
 
+#[derive(Clone, Copy)]
+struct MoveSearchProfile {
+    target_sims: usize,
+    record_example: bool,
+    is_full_search: bool,
+    dirichlet_eps: f64,
+    temp_moves: usize,
+}
+
+impl MoveSearchProfile {
+    fn full(n_sims: usize, dirichlet_eps: f64, temp_moves: usize) -> Self {
+        Self {
+            target_sims: n_sims.max(1),
+            record_example: true,
+            is_full_search: true,
+            dirichlet_eps,
+            temp_moves,
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SlotState {
     NeedsRootEval, // root set but unexpanded; contributes the root as 1 leaf
@@ -3148,6 +3169,7 @@ struct SearchSlot {
     real_state: RustGameState,
     sims_done: usize,
     move_num: usize,
+    move_profile: MoveSearchProfile,
     game_seed: u64,
     rng: StdRng, // Dirichlet noise + move selection + per-sim determinization
     records: Vec<MoveRecord>,
@@ -3160,6 +3182,11 @@ struct SearchSlot {
     // moves of this game instead of re-attempting the (still-failing) solve every
     // move. Reset to false when the slot starts a new game (new_for_game).
     exact_unsolvable: bool,
+    fast_move_count: u32,
+    full_move_count: u32,
+    recorded_fast_move_count: u32,
+    recorded_full_move_count: u32,
+    exact_recorded_move_count: u32,
 }
 
 impl SearchSlot {
@@ -3191,6 +3218,7 @@ impl SearchSlot {
             real_state,
             sims_done: 0,
             move_num: 0,
+            move_profile: MoveSearchProfile::full(1, 0.0, 0),
             game_seed,
             rng: StdRng::seed_from_u64(game_seed),
             records: Vec::new(),
@@ -3199,6 +3227,11 @@ impl SearchSlot {
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
+            fast_move_count: 0,
+            full_move_count: 0,
+            recorded_fast_move_count: 0,
+            recorded_full_move_count: 0,
+            exact_recorded_move_count: 0,
         }
     }
 
@@ -3212,6 +3245,7 @@ impl SearchSlot {
             real_state: new_game(0, harmony, middle_kingdom),
             sims_done: 0,
             move_num: 0,
+            move_profile: MoveSearchProfile::full(1, 0.0, 0),
             game_seed: 0,
             rng: StdRng::seed_from_u64(0),
             records: Vec::new(),
@@ -3220,7 +3254,44 @@ impl SearchSlot {
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
+            fast_move_count: 0,
+            full_move_count: 0,
+            recorded_fast_move_count: 0,
+            recorded_full_move_count: 0,
+            exact_recorded_move_count: 0,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn choose_move_profile(
+        &mut self,
+        playout_cap_randomization: bool,
+        full_search_fraction: f64,
+        n_sims: usize,
+        fast_move_sims: usize,
+        record_fast_moves: bool,
+        dirichlet_eps: f64,
+        fast_move_dirichlet_eps: f64,
+        temp_moves: usize,
+        fast_move_temp_moves: usize,
+    ) {
+        if !playout_cap_randomization {
+            self.move_profile = MoveSearchProfile::full(n_sims, dirichlet_eps, temp_moves);
+            return;
+        }
+        let p = full_search_fraction.clamp(0.0, 1.0);
+        let is_full = self.rng.r#gen::<f64>() < p;
+        self.move_profile = if is_full {
+            MoveSearchProfile::full(n_sims, dirichlet_eps, temp_moves)
+        } else {
+            MoveSearchProfile {
+                target_sims: fast_move_sims.max(1),
+                record_example: record_fast_moves,
+                is_full_search: false,
+                dirichlet_eps: fast_move_dirichlet_eps,
+                temp_moves: fast_move_temp_moves,
+            }
+        };
     }
 
     /// Finalize the current move (sims complete): record the training example,
@@ -3228,17 +3299,25 @@ impl SearchSlot {
     /// (→ NeedsRootEval) or, if the game is over, return its finished records.
     fn finalize_move(
         &mut self,
-        temp_moves: usize,
         open_loop: bool,
         exact_enabled: bool,
+        playout_cap_randomization: bool,
+        full_search_fraction: f64,
+        n_sims: usize,
+        fast_move_sims: usize,
+        record_fast_moves: bool,
+        dirichlet_eps: f64,
+        fast_move_dirichlet_eps: f64,
+        temp_moves: usize,
+        fast_move_temp_moves: usize,
     ) -> PyResult<Option<(u64, Vec<MoveRecord>, (i32, i32))>> {
         // Training record: encode the REAL (public) state + policy target.
         let actor = self.real_state.actor()?;
-        let (my, opp, flat) = self.real_state.encode_arrays(actor)?;
 
         // Take any exact-solve result for this move (clears it so the next move,
         // if MCTS-driven, never sees a stale value).
         let exact = self.exact_result.take();
+        let is_exact = exact.is_some();
 
         let (policy_idx, policy_val, legal_idx, chosen) = if let Some(exact) = exact {
             // ── Exact endgame path: policy + move from minimax child values ──
@@ -3285,7 +3364,11 @@ impl SearchSlot {
                     policy_val.push(vc as f32 / total as f32);
                 }
             }
-            let temp = if self.move_num < temp_moves { 1.0 } else { 0.0 };
+            let temp = if self.move_num < self.move_profile.temp_moves {
+                1.0
+            } else {
+                0.0
+            };
             let chosen = if open_loop {
                 ol_select_from_visits(&self.ol_arena, temp, &mut self.rng)
             } else {
@@ -3294,18 +3377,36 @@ impl SearchSlot {
             (policy_idx, policy_val, legal_idx, chosen)
         };
 
-        self.records.push(MoveRecord {
-            my,
-            opp,
-            flat,
-            policy_idx,
-            policy_val,
-            legal_idx,
-            actor,
-            own_score: 0.0,
-            opp_score: 0.0,
-            win_target: 0.5,
-        });
+        let should_record = is_exact || self.move_profile.record_example;
+        if is_exact {
+            self.exact_recorded_move_count += 1;
+        } else if self.move_profile.is_full_search {
+            self.full_move_count += 1;
+            if should_record {
+                self.recorded_full_move_count += 1;
+            }
+        } else {
+            self.fast_move_count += 1;
+            if should_record {
+                self.recorded_fast_move_count += 1;
+            }
+        }
+
+        if should_record {
+            let (my, opp, flat) = self.real_state.encode_arrays(actor)?;
+            self.records.push(MoveRecord {
+                my,
+                opp,
+                flat,
+                policy_idx,
+                policy_val,
+                legal_idx,
+                actor,
+                own_score: 0.0,
+                opp_score: 0.0,
+                win_target: 0.5,
+            });
+        }
         let (placement, pick) = self
             .real_state
             .legal_actions_indexed()
@@ -3360,6 +3461,17 @@ impl SearchSlot {
                 self.arena[0].state = Some(root_state);
             }
             self.sims_done = 0;
+            self.choose_move_profile(
+                playout_cap_randomization,
+                full_search_fraction,
+                n_sims,
+                fast_move_sims,
+                record_fast_moves,
+                dirichlet_eps,
+                fast_move_dirichlet_eps,
+                temp_moves,
+                fast_move_temp_moves,
+            );
             // If the solver is enabled and the new root is terminal-adjacent
             // (deck ∈ {0,4}), hand it to the exact solver instead of GPU-backed
             // MCTS. The deck only shrinks, so once a game enters ExactSolving it
@@ -3909,6 +4021,12 @@ struct BatchedMCTS {
     dirichlet_alpha: f64,
     dirichlet_eps: f64,
     temp_moves: usize,
+    playout_cap_randomization: bool,
+    full_search_fraction: f64,
+    fast_move_sims: usize,
+    record_fast_moves: bool,
+    fast_move_dirichlet_eps: f64,
+    fast_move_temp_moves: usize,
     // Terminal-value formula params (Fix 1): GAME_OVER backup uses
     // terminal_search_value with these, matching the non-terminal leaf scale.
     score_scale: f64,
@@ -3933,6 +4051,11 @@ struct BatchedMCTS {
     cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
     cum_exact_fallback_count: u64,   // budget exceeded → fell back to MCTS (≈0)
     cum_exact_solver_secs: f64,      // wall time spent in resolve_exact_slots (solve + finalize)
+    cum_fast_move_count: u64,
+    cum_full_move_count: u64,
+    cum_recorded_fast_move_count: u64,
+    cum_recorded_full_move_count: u64,
+    cum_exact_recorded_move_count: u64,
     // Games finished entirely inside resolve_exact_slots during step(); drained
     // by update() into the finished-games list it returns.
     pending_exact: Vec<(u64, Vec<MoveRecord>, (i32, i32))>,
@@ -3949,6 +4072,14 @@ struct BatchedMCTS {
 }
 
 impl BatchedMCTS {
+    fn absorb_slot_move_counts(&mut self, si: usize) {
+        self.cum_fast_move_count += self.slots[si].fast_move_count as u64;
+        self.cum_full_move_count += self.slots[si].full_move_count as u64;
+        self.cum_recorded_fast_move_count += self.slots[si].recorded_fast_move_count as u64;
+        self.cum_recorded_full_move_count += self.slots[si].recorded_full_move_count as u64;
+        self.cum_exact_recorded_move_count += self.slots[si].exact_recorded_move_count as u64;
+    }
+
     /// Async path (Step 1.5): drain every completed background solve and apply it.
     fn harvest_solves(&mut self) {
         loop {
@@ -3974,16 +4105,33 @@ impl BatchedMCTS {
                 self.cum_exact_tree_solve_count += 1;
                 self.cum_exact_solve_count += outcome.n_solved;
                 self.cum_exact_cache_hit_count += outcome.n_solved.saturating_sub(1);
+                self.cum_exact_recorded_move_count += outcome.n_solved;
                 self.cum_fallback_count += self.slots[si].fallback_count as u64;
                 self.cum_missing_child_count += self.slots[si].missing_child_count as u64;
+                self.absorb_slot_move_counts(si);
                 self.pending_exact.push(fg);
                 // Recycle the slot: next game if quota remains, else Idle.
                 if self.games_started < self.games_target {
                     let ns = self.next_seed;
                     self.next_seed += 1;
                     self.games_started += 1;
-                    self.slots[si] =
-                        SearchSlot::new_for_game(new_game(ns, self.harmony, self.middle_kingdom), ns, open_loop);
+                    let mut slot = SearchSlot::new_for_game(
+                        new_game(ns, self.harmony, self.middle_kingdom),
+                        ns,
+                        open_loop,
+                    );
+                    slot.choose_move_profile(
+                        self.playout_cap_randomization,
+                        self.full_search_fraction,
+                        self.n_sims,
+                        self.fast_move_sims,
+                        self.record_fast_moves,
+                        self.dirichlet_eps,
+                        self.fast_move_dirichlet_eps,
+                        self.temp_moves,
+                        self.fast_move_temp_moves,
+                    );
+                    self.slots[si] = slot;
                 } else {
                     self.slots[si].state = SlotState::Idle;
                     self.slots[si].fallback_count = 0;
@@ -4060,7 +4208,10 @@ impl BatchedMCTS {
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
                         score_scale=100.0, margin_gain=2.0, alpha=0.8,
-                        exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0))]
+                        exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0,
+                        playout_cap_randomization=false, full_search_fraction=0.25,
+                        fast_move_sims=100, record_fast_moves=false,
+                        fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -4082,6 +4233,12 @@ impl BatchedMCTS {
         exact_endgame_max_secs: f64,
         async_solve: bool,
         solver_cpus: usize,
+        playout_cap_randomization: bool,
+        full_search_fraction: f64,
+        fast_move_sims: usize,
+        record_fast_moves: bool,
+        fast_move_dirichlet_eps: f64,
+        fast_move_temp_moves: usize,
     ) -> Self {
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
@@ -4106,11 +4263,23 @@ impl BatchedMCTS {
         for _ in 0..n_slots {
             if games_started < n_games {
                 let seed = base_seed + games_started as u64;
-                slots.push(SearchSlot::new_for_game(
+                let mut slot = SearchSlot::new_for_game(
                     new_game(seed, harmony, middle_kingdom),
                     seed,
                     open_loop,
-                ));
+                );
+                slot.choose_move_profile(
+                    playout_cap_randomization,
+                    full_search_fraction,
+                    n_sims,
+                    fast_move_sims,
+                    record_fast_moves,
+                    dirichlet_eps,
+                    fast_move_dirichlet_eps,
+                    temp_moves,
+                    fast_move_temp_moves,
+                );
+                slots.push(slot);
                 games_started += 1;
             } else {
                 slots.push(SearchSlot::idle(harmony, middle_kingdom));
@@ -4156,6 +4325,12 @@ impl BatchedMCTS {
             dirichlet_alpha,
             dirichlet_eps,
             temp_moves,
+            playout_cap_randomization,
+            full_search_fraction,
+            fast_move_sims: fast_move_sims.max(1),
+            record_fast_moves,
+            fast_move_dirichlet_eps,
+            fast_move_temp_moves,
             score_scale,
             margin_gain,
             alpha,
@@ -4174,6 +4349,11 @@ impl BatchedMCTS {
             cum_exact_cache_hit_count: 0,
             cum_exact_fallback_count: 0,
             cum_exact_solver_secs: 0.0,
+            cum_fast_move_count: 0,
+            cum_full_move_count: 0,
+            cum_recorded_fast_move_count: 0,
+            cum_recorded_full_move_count: 0,
+            cum_exact_recorded_move_count: 0,
             pending_exact: Vec::new(),
             async_solve,
             inflight_solves: 0,
@@ -4217,6 +4397,61 @@ impl BatchedMCTS {
     #[getter]
     fn exact_fallback_count(&self) -> u64 {
         self.cum_exact_fallback_count
+    }
+
+    /// Diagnostic: non-exact moves searched with the fast per-move sim cap.
+    #[getter]
+    fn fast_move_count(&self) -> u64 {
+        self.cum_fast_move_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.fast_move_count as u64)
+                .sum::<u64>()
+    }
+
+    /// Diagnostic: non-exact moves searched with the full per-move sim cap.
+    #[getter]
+    fn full_move_count(&self) -> u64 {
+        self.cum_full_move_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.full_move_count as u64)
+                .sum::<u64>()
+    }
+
+    /// Diagnostic: fast-search moves that were stored as training examples.
+    #[getter]
+    fn recorded_fast_move_count(&self) -> u64 {
+        self.cum_recorded_fast_move_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.recorded_fast_move_count as u64)
+                .sum::<u64>()
+    }
+
+    /// Diagnostic: full-search moves that were stored as training examples.
+    #[getter]
+    fn recorded_full_move_count(&self) -> u64 {
+        self.cum_recorded_full_move_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.recorded_full_move_count as u64)
+                .sum::<u64>()
+    }
+
+    /// Diagnostic: exact-solved moves stored as training examples.
+    #[getter]
+    fn exact_recorded_move_count(&self) -> u64 {
+        self.cum_exact_recorded_move_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.exact_recorded_move_count as u64)
+                .sum::<u64>()
     }
 
     /// Resolve every `ExactSolving` slot: solve the terminal-adjacent root exactly
@@ -4278,6 +4513,7 @@ impl BatchedMCTS {
                     self.cum_exact_tree_solve_count += 1;
                     self.cum_exact_solve_count += n;
                     self.cum_exact_cache_hit_count += n.saturating_sub(1);
+                    self.cum_exact_recorded_move_count += n;
                     let fg = play_out_exact_endgame(
                         self.slots[si].real_state.cloned(),
                         std::mem::take(&mut self.slots[si].records),
@@ -4315,16 +4551,29 @@ impl BatchedMCTS {
         for (si, fg) in finished {
             self.cum_fallback_count += self.slots[si].fallback_count as u64;
             self.cum_missing_child_count += self.slots[si].missing_child_count as u64;
+            self.absorb_slot_move_counts(si);
             self.pending_exact.push(fg);
             if self.games_started < self.games_target {
                 let ns = self.next_seed;
                 self.next_seed += 1;
                 self.games_started += 1;
-                self.slots[si] = SearchSlot::new_for_game(
+                let mut slot = SearchSlot::new_for_game(
                     new_game(ns, self.harmony, self.middle_kingdom),
                     ns,
                     self.open_loop,
                 );
+                slot.choose_move_profile(
+                    self.playout_cap_randomization,
+                    self.full_search_fraction,
+                    self.n_sims,
+                    self.fast_move_sims,
+                    self.record_fast_moves,
+                    self.dirichlet_eps,
+                    self.fast_move_dirichlet_eps,
+                    self.temp_moves,
+                    self.fast_move_temp_moves,
+                );
+                self.slots[si] = slot;
             } else {
                 self.slots[si].state = SlotState::Idle;
                 self.slots[si].fallback_count = 0;
@@ -4483,12 +4732,11 @@ impl BatchedMCTS {
             self.resolve_exact_slots(py)?;
         }
 
-        let (fpu, cpuct, leaf_batch, vl, n_sims, open_loop) = (
+        let (fpu, cpuct, leaf_batch, vl, open_loop) = (
             self.fpu,
             self.cpuct,
             self.leaf_batch,
             self.virtual_loss,
-            self.n_sims,
             self.open_loop,
         );
 
@@ -4558,7 +4806,8 @@ impl BatchedMCTS {
                             }
                         }
                         SlotState::Searching => {
-                            let chunk = leaf_batch.min(n_sims - slot.sims_done);
+                            let chunk = leaf_batch
+                                .min(slot.move_profile.target_sims - slot.sims_done);
                             let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
                             let mut ol_actors: Vec<Vec<u8>> = Vec::with_capacity(chunk);
                             let mut ol_leaf_states: Vec<RustGameState> = Vec::with_capacity(chunk);
@@ -4697,7 +4946,8 @@ impl BatchedMCTS {
                             }
                         }
                         SlotState::Searching => {
-                            let chunk = leaf_batch.min(n_sims - slot.sims_done);
+                            let chunk = leaf_batch
+                                .min(slot.move_profile.target_sims - slot.sims_done);
                             let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
                             for _ in 0..chunk {
                                 let path = descend(&mut slot.arena, 0, fpu, cpuct)?;
@@ -4799,7 +5049,22 @@ impl BatchedMCTS {
         values: PyReadonlyArray1<'py, f32>,
         gathered: Bound<'py, PyList>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let (n_sims, vl, temp_moves, alpha, eps, harmony, mk, open_loop) = (
+        let (
+            n_sims,
+            vl,
+            temp_moves,
+            alpha,
+            dirichlet_eps,
+            harmony,
+            mk,
+            open_loop,
+            playout_cap_randomization,
+            full_search_fraction,
+            fast_move_sims,
+            record_fast_moves,
+            fast_move_dirichlet_eps,
+            fast_move_temp_moves,
+        ) = (
             self.n_sims,
             self.virtual_loss,
             self.temp_moves,
@@ -4808,6 +5073,12 @@ impl BatchedMCTS {
             self.harmony,
             self.middle_kingdom,
             self.open_loop,
+            self.playout_cap_randomization,
+            self.full_search_fraction,
+            self.fast_move_sims,
+            self.record_fast_moves,
+            self.fast_move_dirichlet_eps,
+            self.fast_move_temp_moves,
         );
         // Terminal-value formula params (Fix 1).  `alpha` above is the DIRICHLET
         // alpha; the value-formula weight is `val_alpha`.  Copied to locals so the
@@ -4862,13 +5133,13 @@ impl BatchedMCTS {
                             slot.ol_arena[0].is_expanded = true;
                             slot.ol_arena[0].visit_count = 1;
                             slot.ol_arena[0].value_sum = value0;
-                            if eps > 0.0 {
+                            if slot.move_profile.dirichlet_eps > 0.0 {
                                 let dseed = slot.rng.r#gen::<u64>();
                                 ol_add_dirichlet_noise(
                                     &mut slot.ol_arena,
                                     0,
                                     alpha,
-                                    eps,
+                                    slot.move_profile.dirichlet_eps,
                                     Some(dseed),
                                 );
                             }
@@ -4881,9 +5152,15 @@ impl BatchedMCTS {
                             slot.arena[0].is_expanded = true;
                             slot.arena[0].visit_count = 1;
                             slot.arena[0].value_sum = value0;
-                            if eps > 0.0 {
+                            if slot.move_profile.dirichlet_eps > 0.0 {
                                 let dseed = slot.rng.r#gen::<u64>();
-                                add_dirichlet_noise(&mut slot.arena, 0, alpha, eps, Some(dseed));
+                                add_dirichlet_noise(
+                                    &mut slot.arena,
+                                    0,
+                                    alpha,
+                                    slot.move_profile.dirichlet_eps,
+                                    Some(dseed),
+                                );
                             }
                         }
                         slot.sims_done = 0;
@@ -5006,8 +5283,20 @@ impl BatchedMCTS {
                         }
                         slot.sims_done += tick.paths.len();
                     }
-                    let finished_game = if slot.sims_done >= n_sims {
-                        slot.finalize_move(temp_moves, open_loop, exact_enabled)?
+                    let finished_game = if slot.sims_done >= slot.move_profile.target_sims {
+                        slot.finalize_move(
+                            open_loop,
+                            exact_enabled,
+                            playout_cap_randomization,
+                            full_search_fraction,
+                            n_sims,
+                            fast_move_sims,
+                            record_fast_moves,
+                            dirichlet_eps,
+                            fast_move_dirichlet_eps,
+                            temp_moves,
+                            fast_move_temp_moves,
+                        )?
                     } else {
                         None
                     };
@@ -5029,12 +5318,25 @@ impl BatchedMCTS {
                 // before it is reset/idled, so the getters survive across games.
                 self.cum_fallback_count += self.slots[si].fallback_count as u64;
                 self.cum_missing_child_count += self.slots[si].missing_child_count as u64;
+                self.absorb_slot_move_counts(si);
                 if self.games_started < self.games_target {
                     let ns = self.next_seed;
                     self.next_seed += 1;
                     self.games_started += 1;
-                    self.slots[si] =
+                    let mut slot =
                         SearchSlot::new_for_game(new_game(ns, harmony, mk), ns, open_loop);
+                    slot.choose_move_profile(
+                        playout_cap_randomization,
+                        full_search_fraction,
+                        n_sims,
+                        fast_move_sims,
+                        record_fast_moves,
+                        dirichlet_eps,
+                        fast_move_dirichlet_eps,
+                        temp_moves,
+                        fast_move_temp_moves,
+                    );
+                    self.slots[si] = slot;
                 } else {
                     self.slots[si].state = SlotState::Idle;
                     self.slots[si].fallback_count = 0;

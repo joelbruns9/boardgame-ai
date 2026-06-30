@@ -149,7 +149,7 @@ Key techniques and their applicability:
 |-----------|---------------|---------------|
 | Score/value aux targets (NoVAux) | Second-largest ablation loss | ✅ Already implemented (own_score, opp_score, win_prob heads) |
 | Game-specific features (NoGoFeat) | Largest ablation loss | ✅ Already implemented (flat encoder: terrain counts, crowns, claims, progress) |
-| Playout cap randomization | Outperforms all fixed-N alternatives | ✅ Added to Milestone 5 (`--fast_game_fraction`) |
+| Playout cap randomization | Outperforms all fixed-N alternatives | ✅ Added to Milestone 5 (`--playout_cap_randomization`; legacy `--fast_game_fraction` retained) |
 | Policy target pruning | Decouples MCTS noise from policy learning | ✅ Added to Milestone 5 (`--policy_target_pruning`) |
 | Global pooling bias | Third-largest ablation loss | ⏳ Future — investigate if training plateaus; score head may benefit from nonlocal board context |
 | Auxiliary policy target | Modest benefit | ⏳ Future — architecture change, defer until capacity limit is reached |
@@ -283,6 +283,7 @@ Monitor `win_brier_by_phase` every N iterations. Trigger alpha transition when `
 
 ## Milestone 3 — Fixed Evaluation Suite
 **Gate: suite produces stable, reproducible scores across checkpoints**
+**Status: Complete**
 
 ### Storage strategy
 - Small, committed, reviewable `eval_suite_v1.jsonl`
@@ -308,20 +309,49 @@ Endgame (validated against exact search values), model-disagreement, phase-repre
 ### Where
 `scripts/build_eval_suite.py`, `scripts/run_eval_suite.py`, `data/kingdomino/eval_suite_v1.jsonl`
 
+### Results
+- `data/kingdomino/eval_suite_v1.jsonl`: 17 committed public-state roots
+  - opening: 4
+  - midgame: 4
+  - endgame: 9
+  - exact-valued endgames: 9
+- `scripts/build_eval_suite.py`: deterministic suite builder; stores sorted hidden-bag membership, not true deck order
+- `scripts/run_eval_suite.py`: deterministic raw-network fixed-suite runner for any checkpoint, with summary JSON and per-position JSONL details
+- Self-test command:
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_eval_suite.py --suite .\data\kingdomino\eval_suite_v1.jsonl --out .\eval_results\eval_suite_v1_selftest_summary.json --details_out .\eval_results\eval_suite_v1_selftest_details.jsonl --device cpu --channels 8 --blocks 1 --bilinear_dim 16 --selftest
+```
+- Reproducibility gate passed: two self-test runs produced byte-identical summary and detail outputs
+
 ---
 
 ## Milestone 4 — Expanded Open-Loop / PIMC Leak Tests
 **Gate: all tests pass before any cloud spend**
+**Status: Complete once the Milestone 4 public-info gate command passes**
 
 Beyond terminal-boundary tests (Milestone 1): training game generation (no deck leak into encoded positions), buffer storage (public state only), encoder symmetry (player-0 vs player-1 relative encoding), advisor state reconstruction (`normalizeBgaState` sends only public info), determinization independence (each simulation draws independently from the public-consistent bag).
 
 ### Where
-Extended `test_open_loop.py`, run in CI before cloud-run approval
+Extended `test_open_loop.py`, run in CI before cloud-run approval.
+
+### Gate command
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_milestone4_public_info_gate.py
+```
+
+The named gate covers:
+- encoder/public bag invariance under hidden-deck reorder and redeterminization
+- root policy/legality invariance for public states
+- replay-buffer schema guard: stored examples cannot carry true deck order
+- advisor import guard: `debug.deck` order is encoding-inert, and the BGA extension sends a sorted hidden-bag membership list
+- Python and Rust redeterminization independence from the same public bag
+- Python/Rust open-loop equivalence and exact-endgame public-consistency tests
 
 ---
 
 ## Milestone 5 — Dynamic Training Schedules
 **Gate: single run executes full curriculum without manual intervention**
+**Status: Complete for schedule plumbing + KataGo-inspired playout-cap/pruning smoke; strength ablation pending**
 
 ### Schedule flags
 ```
@@ -338,7 +368,13 @@ Extended `test_open_loop.py`, run in CI before cloud-run approval
 --reanalyze_fraction_schedule
 --fast_game_fraction            0.15   # KataGo: fraction of games per iter using fast sims for exploration
 --fast_game_sims                100    # sim count for fast exploration games (pairs with --sims_schedule full cap)
---policy_target_pruning         True   # KataGo: subtract forced-playout visits before storing π; prune ≤1-visit children
+--playout_cap_randomization     True   # preferred KataGo-style move-level fast/full search mix
+--full_search_fraction          0.25   # probability a non-exact move uses the full sim cap
+--fast_move_sims                100    # sim count for fast moves
+--record_fast_moves             False  # fast moves advance play but are not policy examples by default
+--fast_move_dirichlet_epsilon   0.0    # fast moves are noiseless by default
+--fast_move_temp_moves          0      # fast moves are greedy by default
+--policy_target_pruning         True   # KataGo-inspired: prune <=1-visit policy noise before storing pi
 ```
 
 `hof_fraction` ramps gradually — a cold jump to 30% HOF games would destabilize a still-forming policy.
@@ -347,7 +383,7 @@ Alpha transitions should happen after the buffer has flushed data at the prior a
 
 ### KataGo-derived additions
 
-**Playout cap randomization** (`--fast_game_fraction`): within each iteration,
+**Legacy game-level playout-cap mix** (`--fast_game_fraction`): within each iteration,
 a fraction of games use a small fixed sim count (e.g. 100) for exploration while
 the remainder use the full scheduled cap. KataGo ablations show this outperforms
 any fixed-N alternative — it decouples the tension between policy targets (which
@@ -355,13 +391,23 @@ want many simulations to be accurate) and value targets (which want diverse boar
 states). `--fast_game_fraction_schedule` is available but a fixed value is the
 recommended starting point.
 
-**Policy target pruning** (`--policy_target_pruning`): after MCTS, subtract
-forced-playout visit counts from non-best children (KataGo formula:
-`n_forced(c) = sqrt(k * P(c) * sum_N(c'))` with k=2) before storing the policy
-target, and prune children reduced to ≤1 visit. Sharpens the training signal by
-removing exploration noise from policy targets. Complements the exact endgame
-policy target (advantage-weighted softmax) which already handles endgame positions
-optimally — pruning applies to opening/midgame MCTS targets.
+**Preferred move-level playout cap randomization**
+(`--playout_cap_randomization`): each non-exact self-play move independently
+chooses a full or fast search. Full moves use the scheduled sim cap, normal root
+noise, normal temperature, and are recorded. Fast moves default to strong cheap
+play: `--fast_move_sims 100`, `--fast_move_dirichlet_epsilon 0.0`,
+`--fast_move_temp_moves 0`, and `--record_fast_moves` off. This is closer to
+KataGo than the older game-level mix because it mixes fast/full searches within
+games instead of making whole games fast or whole games full. Exact-solved
+endgame moves are still recorded. When this flag is enabled, the loop bypasses
+the legacy `--fast_game_fraction` split so the two modes do not stack.
+
+**Policy target pruning** (`--policy_target_pruning`): current implementation
+performs the replay-record-safe part of KataGo's cleanup: prune MCTS policy
+children whose mass is consistent with <=1 visit, renormalize the target, and
+leave exact endgame targets untouched. Full forced-playout subtraction
+(`n_forced(c) = sqrt(k * P(c) * sum_N(c'))` with k=2) requires root priors in
+the Rust/Python self-play record contract and is deferred as a follow-up.
 
 Gate addition for these two: after 20 iterations with/without, check that
 `policy_kl_opening` decreases faster with pruning enabled and that `sp_score_diff_std`
@@ -371,6 +417,37 @@ Enhancement: add empirical alpha trigger based on `win_brier_by_phase` threshold
 
 ### Where
 `games/kingdomino/self_play.py`
+
+### Implemented
+- CLI schedule flags for LR, alpha, simulations, games/iteration, `c_puct`,
+  root noise epsilon, temperature moves, train steps, buffer capacity, and
+  fast-game fraction.
+- Per-iteration active config is applied to self-play, training, benchmark
+  construction, checkpoints, diagnostics, and JSONL logging.
+- KataGo-inspired move-level playout-cap randomization via
+  `--playout_cap_randomization`, `--full_search_fraction`,
+  `--fast_move_sims`, `--record_fast_moves`,
+  `--fast_move_dirichlet_epsilon`, and `--fast_move_temp_moves`.
+- Legacy game-level playout-cap mix remains available via
+  `--fast_game_fraction`, `--fast_game_fraction_schedule`, and
+  `--fast_game_sims`.
+- Conservative policy target pruning via `--policy_target_pruning`, with
+  exact-endgame examples skipped.
+
+### Gate commands run
+```
+.\.venv\Scripts\python.exe -m py_compile .\games\kingdomino\self_play.py .\games\kingdomino\test_milestone5_schedules.py
+.\.venv\Scripts\python.exe -m pytest -q .\games\kingdomino\test_milestone5_schedules.py
+.\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine python --device cpu --iterations 2 --games_per_iter 2 --train_steps 0 --sims 2 --sims_schedule 0:2,1:3 --games_per_iter_schedule 0:2,1:2 --lr_schedule 0:0.001,1:0.0005 --alpha_schedule 0:0.8,1:0.2 --fast_game_fraction 0.5 --fast_game_sims 1 --policy_target_pruning --channels 8 --blocks 1 --bilinear_dim 16 --benchmark_every 0 --elo_every 0 --exact_endgame_max_secs 0 --log_path .\tmp_m5_smoke.jsonl
+cargo check
+.\.venv\Scripts\python.exe -m maturin develop --release --manifest-path .\games\kingdomino\kingdomino_rust\Cargo.toml
+.\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine batched_open_loop --device cpu --iterations 1 --games_per_iter 2 --train_steps 0 --sims 4 --playout_cap_randomization --full_search_fraction 0.5 --fast_move_sims 1 --channels 8 --blocks 1 --bilinear_dim 16 --batch_slots 2 --leaf_batch 2 --benchmark_every 0 --elo_every 0 --exact_endgame_max_secs 0 --log_path .\tmp_m5_playout_cap_smoke.jsonl
+```
+
+Results: compile passed, 7/7 M5 tests passed, Rust `cargo check` passed, the
+extension rebuilt via maturin, and the playout-cap smoke completed with fast
+moves played but not recorded (`recorded_fast=0`). Temporary smoke logs removed
+after verification.
 
 ---
 
