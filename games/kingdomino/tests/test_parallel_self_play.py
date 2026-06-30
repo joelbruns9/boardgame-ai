@@ -84,7 +84,7 @@ def _tiny_cfg(**overrides) -> SelfPlayConfig:
 
 
 def _dummy_example(iteration: int = 0, *, pidx=(0,), pval=(1.0,), lidx=(0,)) -> Example:
-    """A minimal well-formed Example matching the current 11-field schema."""
+    """A minimal well-formed Example matching the current sparse schema."""
     return Example(
         my_board=np.zeros((NUM_BOARD_CHANNELS, CANVAS_SIZE, CANVAS_SIZE), np.float16),
         opp_board=np.zeros((NUM_BOARD_CHANNELS, CANVAS_SIZE, CANVAS_SIZE), np.float16),
@@ -106,12 +106,13 @@ class TestExampleSchema(unittest.TestCase):
         self.assertEqual(FLAT_SIZE, 261)
 
     def test_example_fields(self):
-        """Example carries the 10 data fields plus the logging-phase iteration."""
+        """Example carries training fields, optional root stats, and iteration."""
         names = [f.name for f in dataclasses.fields(Example)]
         self.assertEqual(names, [
             "my_board", "opp_board", "flat",
             "policy_idx", "policy_val", "legal_idx",
             "z", "own_score", "opp_score", "win_target",
+            "root_prior_idx", "root_prior_val", "root_visit_count",
             "iteration",
         ])
 

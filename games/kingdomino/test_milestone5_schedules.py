@@ -9,6 +9,7 @@ from games.kingdomino.self_play import (
     _apply_buffer_capacity,
     _compiled_schedules,
     _choose_playout_profile,
+    _forced_playout_subtract_policy_target,
     _parse_schedule,
     _prune_examples_policy_targets,
     _prune_policy_target,
@@ -32,6 +33,14 @@ def _example(policy_vals, *, bag_count=12):
         opp_score=0.0,
         win_target=0.5,
     )
+
+
+def _example_with_root_stats(policy_vals, priors, visits, *, bag_count=12):
+    ex = _example(policy_vals, bag_count=bag_count)
+    ex.root_prior_idx = np.arange(len(priors), dtype=np.int32)
+    ex.root_prior_val = np.asarray(priors, dtype=np.float32)
+    ex.root_visit_count = np.asarray(visits, dtype=np.int32)
+    return ex
 
 
 def test_piecewise_schedule_uses_zero_based_iteration_steps():
@@ -85,6 +94,91 @@ def test_policy_target_pruning_can_skip_exact_endgame_examples():
     assert len(exact.policy_idx) == 3
     assert len(midgame.policy_idx) == 2
     assert np.isclose(float(midgame.policy_val.sum()), 1.0)
+
+
+def test_forced_playout_subtraction_reduces_prior_driven_visits():
+    idx, vals, removed, removed_mass, sub_visits, effective = (
+        _forced_playout_subtract_policy_target(
+            np.array([0, 1, 2], dtype=np.int32),
+            np.array([0.90, 0.05, 0.05], dtype=np.float32),
+            np.array([90, 6, 1], dtype=np.int32),
+            k=2.0,
+        )
+    )
+
+    assert np.array_equal(idx, np.array([0, 1], dtype=np.int32))
+    assert np.isclose(float(vals.sum()), 1.0)
+    assert removed == 1
+    assert np.isclose(removed_mass, 1.0 / 97.0, atol=1e-6)
+    assert sub_visits > 0.0
+    assert effective < 97
+
+
+def test_forced_playout_subtraction_disabled_is_policy_noop_with_metadata():
+    ex = _example_with_root_stats(
+        [0.90, 0.06, 0.04],
+        priors=[0.90, 0.05, 0.05],
+        visits=[90, 6, 4],
+    )
+    old_idx = ex.policy_idx.copy()
+    old_val = ex.policy_val.copy()
+
+    stats = _prune_examples_policy_targets(
+        [[ex]],
+        total_visits=100,
+        skip_exact=False,
+        one_visit_pruning=False,
+        forced_playout_subtraction=False,
+    )
+
+    assert np.array_equal(ex.policy_idx, old_idx)
+    assert np.array_equal(ex.policy_val, old_val)
+    assert stats["forced_pruned_examples"] == 0
+    assert stats["policy_pruned_examples"] == 0
+
+
+def test_forced_playout_subtraction_skips_exact_endgame_examples():
+    exact = _example_with_root_stats(
+        [0.90, 0.06, 0.04],
+        priors=[0.90, 0.05, 0.05],
+        visits=[90, 6, 4],
+        bag_count=4,
+    )
+    old_idx = exact.policy_idx.copy()
+    old_val = exact.policy_val.copy()
+
+    stats = _prune_examples_policy_targets(
+        [[exact]],
+        total_visits=100,
+        skip_exact=True,
+        one_visit_pruning=False,
+        forced_playout_subtraction=True,
+    )
+
+    assert np.array_equal(exact.policy_idx, old_idx)
+    assert np.array_equal(exact.policy_val, old_val)
+    assert stats["forced_pruned_examples"] == 0
+
+
+def test_replay_sampling_ignores_root_stats_training_contract():
+    ex = _example_with_root_stats(
+        [0.5, 0.5],
+        priors=[0.5, 0.5],
+        visits=[10, 10],
+    )
+    buffer = ReplayBuffer(capacity=2)
+    try:
+        buffer.add([ex])
+        batch = buffer.sample_batch(
+            1, np.random.default_rng(0), device="cpu", augment_d4=False)
+    finally:
+        buffer.close()
+
+    policy = batch[3]
+    legal_mask = batch[4]
+    assert policy.shape[1] == 3390
+    assert np.isclose(float(policy.sum().item()), 1.0)
+    assert int(legal_mask.sum().item()) == 2
 
 
 def test_buffer_capacity_schedule_truncates_oldest_examples():

@@ -3091,6 +3091,9 @@ struct MoveRecord {
     policy_idx: Vec<i32>,
     policy_val: Vec<f32>,
     legal_idx: Vec<i32>,
+    root_prior_idx: Vec<i32>,
+    root_prior_val: Vec<f32>,
+    root_visit_count: Vec<i32>,
     actor: u8,
     own_score: f32,  // raw own final score (filled at game end in finalize_move)
     opp_score: f32,  // raw opponent final score (filled at game end)
@@ -3319,7 +3322,15 @@ impl SearchSlot {
         let exact = self.exact_result.take();
         let is_exact = exact.is_some();
 
-        let (policy_idx, policy_val, legal_idx, chosen) = if let Some(exact) = exact {
+        let (
+            policy_idx,
+            policy_val,
+            legal_idx,
+            root_prior_idx,
+            root_prior_val,
+            root_visit_count,
+            chosen,
+        ) = if let Some(exact) = exact {
             // ── Exact endgame path: policy + move from minimax child values ──
             let (policy_idx, policy_val, legal_idx) =
                 exact_policy_target(&exact.child_values, actor);
@@ -3337,28 +3348,48 @@ impl SearchSlot {
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             };
             let chosen = best.map(|&(idx, _)| idx).unwrap_or(legal_idx[0] as u16);
-            (policy_idx, policy_val, legal_idx, chosen)
+            (
+                policy_idx,
+                policy_val,
+                legal_idx,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                chosen,
+            )
         } else {
             // ── Normal MCTS path: visit-count policy + visit-count selection ──
-            let root_children: Vec<(u16, i32)> = if open_loop {
+            let root_children: Vec<(u16, i32, f64)> = if open_loop {
                 self.ol_arena[0]
                     .children
                     .iter()
-                    .map(|&(idx, c)| (idx, self.ol_arena[c as usize].visit_count))
+                    .map(|&(idx, c)| {
+                        let child = &self.ol_arena[c as usize];
+                        (idx, child.visit_count, child.prior)
+                    })
                     .collect()
             } else {
                 self.arena[0]
                     .children
                     .iter()
-                    .map(|&(idx, c)| (idx, self.arena[c as usize].visit_count))
+                    .map(|&(idx, c)| {
+                        let child = &self.arena[c as usize];
+                        (idx, child.visit_count, child.prior)
+                    })
                     .collect()
             };
-            let total: i32 = root_children.iter().map(|&(_, vc)| vc).sum();
+            let total: i32 = root_children.iter().map(|&(_, vc, _)| vc).sum();
             let mut policy_idx = Vec::new();
             let mut policy_val = Vec::new();
             let mut legal_idx = Vec::new();
-            for &(idx, vc) in &root_children {
+            let mut root_prior_idx = Vec::new();
+            let mut root_prior_val = Vec::new();
+            let mut root_visit_count = Vec::new();
+            for &(idx, vc, prior) in &root_children {
                 legal_idx.push(idx as i32);
+                root_prior_idx.push(idx as i32);
+                root_prior_val.push(prior as f32);
+                root_visit_count.push(vc);
                 if vc > 0 {
                     policy_idx.push(idx as i32);
                     policy_val.push(vc as f32 / total as f32);
@@ -3374,7 +3405,15 @@ impl SearchSlot {
             } else {
                 select_from_visits(&self.arena, temp, &mut self.rng)
             };
-            (policy_idx, policy_val, legal_idx, chosen)
+            (
+                policy_idx,
+                policy_val,
+                legal_idx,
+                root_prior_idx,
+                root_prior_val,
+                root_visit_count,
+                chosen,
+            )
         };
 
         let should_record = is_exact || self.move_profile.record_example;
@@ -3401,6 +3440,9 @@ impl SearchSlot {
                 policy_idx,
                 policy_val,
                 legal_idx,
+                root_prior_idx,
+                root_prior_val,
+                root_visit_count,
                 actor,
                 own_score: 0.0,
                 opp_score: 0.0,
@@ -3800,6 +3842,9 @@ fn play_out_exact_endgame(
             policy_idx,
             policy_val,
             legal_idx,
+            root_prior_idx: Vec::new(),
+            root_prior_val: Vec::new(),
+            root_visit_count: Vec::new(),
             actor,
             own_score: 0.0,
             opp_score: 0.0,
@@ -5352,6 +5397,11 @@ impl BatchedMCTS {
             let examples = PyList::empty(py);
             for r in records {
                 let z = if r.actor == 0 { z0 } else { -z0 };
+                let root_stats = (
+                    r.root_prior_idx.into_pyarray(py),
+                    r.root_prior_val.into_pyarray(py),
+                    r.root_visit_count.into_pyarray(py),
+                );
                 let tup = (
                     r.my.into_pyarray(py),
                     r.opp.into_pyarray(py),
@@ -5359,6 +5409,7 @@ impl BatchedMCTS {
                     r.policy_idx.into_pyarray(py),
                     r.policy_val.into_pyarray(py),
                     r.legal_idx.into_pyarray(py),
+                    root_stats,
                     z,
                     r.own_score,
                     r.opp_score,

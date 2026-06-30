@@ -405,9 +405,16 @@ the legacy `--fast_game_fraction` split so the two modes do not stack.
 **Policy target pruning** (`--policy_target_pruning`): current implementation
 performs the replay-record-safe part of KataGo's cleanup: prune MCTS policy
 children whose mass is consistent with <=1 visit, renormalize the target, and
-leave exact endgame targets untouched. Full forced-playout subtraction
-(`n_forced(c) = sqrt(k * P(c) * sum_N(c'))` with k=2) requires root priors in
-the Rust/Python self-play record contract and is deferred as a follow-up.
+leave exact endgame targets untouched.
+
+**Forced-playout subtraction** (`--forced_playout_subtraction`,
+`--forced_playout_k 2.0`): opt-in fuller KataGo cleanup. Rust batched MCTS
+records root child priors and raw visits; before replay insertion the loop
+subtracts `n_forced(c) = sqrt(k * P(c) * sum_N(c'))`, clamps at zero, and
+renormalizes. Exact endgame examples are skipped. Training-quality safeguards:
+off by default, replay sampling ignores root metadata, disabled mode is tested
+as a target no-op, old 10-field Rust tuples remain readable, and collapse-to-zero
+falls back to the original target.
 
 Gate addition for these two: after 20 iterations with/without, check that
 `policy_kl_opening` decreases faster with pruning enabled and that `sp_score_diff_std`
@@ -433,21 +440,27 @@ Enhancement: add empirical alpha trigger based on `win_brier_by_phase` threshold
   `--fast_game_sims`.
 - Conservative policy target pruning via `--policy_target_pruning`, with
   exact-endgame examples skipped.
+- Opt-in forced-playout subtraction via `--forced_playout_subtraction` and
+  `--forced_playout_k`, using root priors/visits from Rust batched MCTS records.
 
 ### Gate commands run
 ```
 .\.venv\Scripts\python.exe -m py_compile .\games\kingdomino\self_play.py .\games\kingdomino\test_milestone5_schedules.py
 .\.venv\Scripts\python.exe -m pytest -q .\games\kingdomino\test_milestone5_schedules.py
+.\.venv\Scripts\python.exe -m pytest -q .\games\kingdomino\tests\test_parallel_self_play.py
 .\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine python --device cpu --iterations 2 --games_per_iter 2 --train_steps 0 --sims 2 --sims_schedule 0:2,1:3 --games_per_iter_schedule 0:2,1:2 --lr_schedule 0:0.001,1:0.0005 --alpha_schedule 0:0.8,1:0.2 --fast_game_fraction 0.5 --fast_game_sims 1 --policy_target_pruning --channels 8 --blocks 1 --bilinear_dim 16 --benchmark_every 0 --elo_every 0 --exact_endgame_max_secs 0 --log_path .\tmp_m5_smoke.jsonl
 cargo check
 .\.venv\Scripts\python.exe -m maturin develop --release --manifest-path .\games\kingdomino\kingdomino_rust\Cargo.toml
 .\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine batched_open_loop --device cpu --iterations 1 --games_per_iter 2 --train_steps 0 --sims 4 --playout_cap_randomization --full_search_fraction 0.5 --fast_move_sims 1 --channels 8 --blocks 1 --bilinear_dim 16 --batch_slots 2 --leaf_batch 2 --benchmark_every 0 --elo_every 0 --exact_endgame_max_secs 0 --log_path .\tmp_m5_playout_cap_smoke.jsonl
+.\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine batched_open_loop --device cpu --iterations 1 --games_per_iter 2 --train_steps 0 --sims 4 --forced_playout_subtraction --channels 8 --blocks 1 --bilinear_dim 16 --batch_slots 2 --leaf_batch 2 --benchmark_every 0 --elo_every 0 --exact_endgame_max_secs 0 --log_path .\tmp_m5_forced_enabled_smoke.jsonl
 ```
 
-Results: compile passed, 7/7 M5 tests passed, Rust `cargo check` passed, the
-extension rebuilt via maturin, and the playout-cap smoke completed with fast
-moves played but not recorded (`recorded_fast=0`). Temporary smoke logs removed
-after verification.
+Results: compile passed, 11/11 M5 tests passed, parallel self-play/schema tests
+passed (8 passed, 2 skipped), Rust `cargo check` passed, the extension rebuilt
+via maturin, the playout-cap smoke completed with fast moves played but not
+recorded (`recorded_fast=0`), and the forced-subtraction smoke completed with
+root stats present (`forced_missing_stats_examples=0`). Temporary smoke logs
+removed after verification.
 
 ---
 

@@ -269,11 +269,12 @@ class SelfPlayConfig:
     record_fast_moves: bool = False
     fast_move_dirichlet_epsilon: float = 0.0
     fast_move_temp_moves: int = 0
-    # KataGo-inspired target cleanup. Current implementation prunes one-visit
-    # exploration noise from MCTS visit targets and leaves exact endgame targets
-    # untouched. Full forced-playout subtraction needs root priors in the record
-    # contract and is intentionally deferred to the Rust-side follow-up.
+    # KataGo-inspired target cleanup. Conservative pruning removes one-visit
+    # exploration noise. Forced-playout subtraction is opt-in and consumes root
+    # priors/visit counts when the self-play path exports them.
     policy_target_pruning: bool = False
+    forced_playout_subtraction: bool = False
+    forced_playout_k: float = 2.0
 
 
 # ─── 2. Replay buffer ─────────────────────────────────────────────────────
@@ -293,6 +294,12 @@ class Example:
     own_score: float        # raw own final score (un-normalized), this actor's view
     opp_score: float        # raw opponent final score (un-normalized), this actor's view
     win_target: float       # 1.0 win / 0.5 draw / 0.0 loss, this actor's view
+    # Optional root-search metadata used only by KataGo-style target cleanup.
+    # Training batches ignore these fields; old replay buffers remain compatible
+    # because they simply won't have useful values here.
+    root_prior_idx: Optional[np.ndarray] = None   # int32 action indices
+    root_prior_val: Optional[np.ndarray] = None   # float32 root priors after noise
+    root_visit_count: Optional[np.ndarray] = None # int32 visits aligned to prior_idx
     # Training iteration that generated this example.  Used by
     # ReplayBuffer.mean_age to track buffer staleness.  Defaults to 0 so any
     # construction site that misses the kwarg yields a (stale) age reading
@@ -657,31 +664,159 @@ def _prune_policy_target(
     return new_idx.astype(np.int32), new_val.astype(np.float32), removed, removed_mass
 
 
+def _has_root_search_stats(ex: Example) -> bool:
+    return (
+        getattr(ex, "root_prior_idx", None) is not None
+        and getattr(ex, "root_prior_val", None) is not None
+        and getattr(ex, "root_visit_count", None) is not None
+        and len(ex.root_prior_idx) == len(ex.root_prior_val) == len(ex.root_visit_count)
+        and len(ex.root_prior_idx) > 0
+    )
+
+
+def _forced_playout_subtract_policy_target(
+    prior_idx: np.ndarray,
+    prior_val: np.ndarray,
+    visit_count: np.ndarray,
+    *,
+    k: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, int, float, float, int]:
+    """Apply KataGo-style forced-playout subtraction to root visits.
+
+    Returns (policy_idx, policy_val, removed_actions, removed_mass,
+    subtracted_visits, effective_total_visits). If subtraction would collapse
+    every action to zero, the original visit target is returned. The priors are
+    expected to be the actual root priors used by search after Dirichlet noise.
+    """
+    idx = np.asarray(prior_idx, dtype=np.int32)
+    priors = np.asarray(prior_val, dtype=np.float64)
+    visits = np.asarray(visit_count, dtype=np.float64)
+    if len(idx) == 0 or len(idx) != len(priors) or len(idx) != len(visits):
+        raise ValueError("root prior idx/val/visit arrays must be non-empty and aligned")
+    visits = np.maximum(visits, 0.0)
+    total = float(visits.sum())
+    if total <= 0.0:
+        raise ValueError("Cannot subtract forced playouts from zero root visits")
+    original = visits / total
+    if k <= 0.0:
+        keep = visits > 0.0
+        return (
+            idx[keep],
+            original[keep].astype(np.float32),
+            0,
+            0.0,
+            0.0,
+            int(round(total)),
+        )
+
+    priors = np.maximum(priors, 0.0)
+    prior_sum = float(priors.sum())
+    if prior_sum <= 0.0:
+        keep = visits > 0.0
+        return (
+            idx[keep],
+            original[keep].astype(np.float32),
+            0,
+            0.0,
+            0.0,
+            int(round(total)),
+        )
+    priors = priors / prior_sum
+    forced = np.sqrt(float(k) * priors * total)
+    adjusted = np.maximum(0.0, visits - forced)
+    adjusted_total = float(adjusted.sum())
+    if adjusted_total <= 1e-12:
+        keep = visits > 0.0
+        return (
+            idx[keep],
+            original[keep].astype(np.float32),
+            0,
+            0.0,
+            0.0,
+            int(round(total)),
+        )
+
+    keep = adjusted > 1e-12
+    removed_actions = int(np.count_nonzero((visits > 0.0) & ~keep))
+    removed_mass = float(original[(visits > 0.0) & ~keep].sum())
+    policy_val = adjusted[keep] / adjusted_total
+    subtracted_visits = float((visits - adjusted).sum())
+    return (
+        idx[keep].astype(np.int32),
+        policy_val.astype(np.float32),
+        removed_actions,
+        removed_mass,
+        subtracted_visits,
+        max(1, int(round(adjusted_total))),
+    )
+
+
 def _prune_examples_policy_targets(
     examples_by_game: List[List[Example]],
     *,
     total_visits: int,
     skip_exact: bool,
+    one_visit_pruning: bool = True,
+    forced_playout_subtraction: bool = False,
+    forced_playout_k: float = 2.0,
 ) -> dict:
     pruned_actions = 0
     pruned_mass = 0.0
     changed_examples = 0
+    forced_actions = 0
+    forced_mass = 0.0
+    forced_examples = 0
+    forced_subtracted_visits = 0.0
+    forced_missing_stats = 0
     for game in examples_by_game:
         for ex in game:
             if skip_exact and _is_exact_endgame_example(ex):
                 continue
-            new_idx, new_val, removed, mass = _prune_policy_target(
-                ex.policy_idx, ex.policy_val, total_visits=total_visits)
-            if removed:
-                ex.policy_idx = new_idx
-                ex.policy_val = new_val
-                pruned_actions += removed
-                pruned_mass += mass
-                changed_examples += 1
+            target_total_visits = total_visits
+            if forced_playout_subtraction:
+                if _has_root_search_stats(ex):
+                    old_idx = np.asarray(ex.policy_idx, dtype=np.int32)
+                    old_val = np.asarray(ex.policy_val, dtype=np.float32)
+                    (new_idx, new_val, removed, mass, sub_visits,
+                     effective_visits) = _forced_playout_subtract_policy_target(
+                        ex.root_prior_idx,
+                        ex.root_prior_val,
+                        ex.root_visit_count,
+                        k=forced_playout_k,
+                    )
+                    same_target = (
+                        np.array_equal(old_idx, new_idx)
+                        and old_val.shape == new_val.shape
+                        and np.allclose(old_val, new_val, atol=1e-7)
+                    )
+                    if not same_target:
+                        ex.policy_idx = new_idx
+                        ex.policy_val = new_val
+                        forced_actions += removed
+                        forced_mass += mass
+                        forced_subtracted_visits += sub_visits
+                        forced_examples += 1
+                    target_total_visits = effective_visits
+                else:
+                    forced_missing_stats += 1
+            if one_visit_pruning:
+                new_idx, new_val, removed, mass = _prune_policy_target(
+                    ex.policy_idx, ex.policy_val, total_visits=target_total_visits)
+                if removed:
+                    ex.policy_idx = new_idx
+                    ex.policy_val = new_val
+                    pruned_actions += removed
+                    pruned_mass += mass
+                    changed_examples += 1
     return {
         "policy_pruned_actions": pruned_actions,
         "policy_pruned_mass": pruned_mass,
         "policy_pruned_examples": changed_examples,
+        "forced_pruned_actions": forced_actions,
+        "forced_pruned_mass": forced_mass,
+        "forced_pruned_examples": forced_examples,
+        "forced_subtracted_visits": forced_subtracted_visits,
+        "forced_missing_stats_examples": forced_missing_stats,
     }
 
 
@@ -1177,7 +1312,14 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
     Rust, matching play_selfplay_game_rust's documented limitation).  The Rust
     tuple carries no iteration field, so the caller passes it in.
     """
-    mb, ob, flat, pidx, pval, lidx, z, own_score, opp_score, win_target = tup
+    if len(tup) == 11:
+        mb, ob, flat, pidx, pval, lidx, root_stats, z, own_score, opp_score, win_target = tup
+        root_prior_idx, root_prior_val, root_visit_count = root_stats
+    elif len(tup) == 10:
+        mb, ob, flat, pidx, pval, lidx, z, own_score, opp_score, win_target = tup
+        root_prior_idx = root_prior_val = root_visit_count = None
+    else:
+        raise ValueError(f"Unexpected Rust example tuple length: {len(tup)}")
     return Example(
         np.asarray(mb, dtype=np.float16),
         np.asarray(ob, dtype=np.float16),
@@ -1189,6 +1331,12 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
         own_score=float(own_score),
         opp_score=float(opp_score),
         win_target=float(win_target),
+        root_prior_idx=(None if root_prior_idx is None
+                        else np.asarray(root_prior_idx, dtype=np.int32)),
+        root_prior_val=(None if root_prior_val is None
+                        else np.asarray(root_prior_val, dtype=np.float32)),
+        root_visit_count=(None if root_visit_count is None
+                          else np.asarray(root_visit_count, dtype=np.int32)),
         iteration=iteration,
     )
 
@@ -2265,6 +2413,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "policy_pruned_actions": 0,
                 "policy_pruned_mass": 0.0,
                 "policy_pruned_examples": 0,
+                "forced_pruned_actions": 0,
+                "forced_pruned_mass": 0.0,
+                "forced_pruned_examples": 0,
+                "forced_subtracted_visits": 0.0,
+                "forced_missing_stats_examples": 0,
             }
             if iter_cfg.playout_cap_randomization:
                 fast_games = 0
@@ -2286,10 +2439,13 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     )
                     all_examples.extend(ex_fast); all_scores.extend(sc_fast)
                     stat_parts.append(st_fast)
-                    if iter_cfg.policy_target_pruning:
+                    if fast_cfg.policy_target_pruning or fast_cfg.forced_playout_subtraction:
                         ps = _prune_examples_policy_targets(
                             ex_fast, total_visits=max(1, int(fast_cfg.n_simulations)),
-                            skip_exact=fast_cfg.exact_endgame_max_secs > 0.0)
+                            skip_exact=fast_cfg.exact_endgame_max_secs > 0.0,
+                            one_visit_pruning=fast_cfg.policy_target_pruning,
+                            forced_playout_subtraction=fast_cfg.forced_playout_subtraction,
+                            forced_playout_k=fast_cfg.forced_playout_k)
                         for k, v in ps.items():
                             policy_prune_stats[k] += v
                     game_seed += fast_games
@@ -2301,10 +2457,13 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     )
                     all_examples.extend(ex_full); all_scores.extend(sc_full)
                     stat_parts.append(st_full)
-                    if iter_cfg.policy_target_pruning:
+                    if iter_cfg.policy_target_pruning or iter_cfg.forced_playout_subtraction:
                         ps = _prune_examples_policy_targets(
                             ex_full, total_visits=max(1, int(iter_cfg.n_simulations)),
-                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0)
+                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
+                            one_visit_pruning=iter_cfg.policy_target_pruning,
+                            forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
+                            forced_playout_k=iter_cfg.forced_playout_k)
                         for k, v in ps.items():
                             policy_prune_stats[k] += v
                     game_seed += full_games
@@ -2366,11 +2525,14 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             iteration=it,
                             playout_cfg=(iter_cfg if iter_cfg.playout_cap_randomization else None),
                         )
-                    if iter_cfg.policy_target_pruning:
+                    if iter_cfg.policy_target_pruning or iter_cfg.forced_playout_subtraction:
                         wrapped = [examples]
                         ps = _prune_examples_policy_targets(
                             wrapped, total_visits=max(1, int(game_sims)),
-                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0)
+                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
+                            one_visit_pruning=iter_cfg.policy_target_pruning,
+                            forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
+                            forced_playout_k=iter_cfg.forced_playout_k)
                         for k, v in ps.items():
                             policy_prune_stats[k] += v
                     buffer.add(examples)
@@ -2399,6 +2561,12 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     print(f"  policy pruning: examples={policy_prune_stats['policy_pruned_examples']} "
                           f"actions={policy_prune_stats['policy_pruned_actions']} "
                           f"mass={policy_prune_stats['policy_pruned_mass']:.4f}")
+                if iter_cfg.forced_playout_subtraction:
+                    print(f"  forced playout subtraction: examples={policy_prune_stats['forced_pruned_examples']} "
+                          f"actions={policy_prune_stats['forced_pruned_actions']} "
+                          f"mass={policy_prune_stats['forced_pruned_mass']:.4f} "
+                          f"visits={policy_prune_stats['forced_subtracted_visits']:.1f} "
+                          f"missing_stats={policy_prune_stats['forced_missing_stats_examples']}")
                 if batched_stats is not None:
                     print(f"  batched: mean_batch={batched_stats['mean_batch']:.1f}/"
                           f"{batched_stats['max_batch_cap']} "
@@ -2683,6 +2851,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "fast_game_sims": iter_cfg.fast_game_sims,
                 "fast_games": fast_games,
                 "policy_target_pruning": iter_cfg.policy_target_pruning,
+                "forced_playout_subtraction": iter_cfg.forced_playout_subtraction,
+                "forced_playout_k": iter_cfg.forced_playout_k,
                 **policy_prune_stats,
             }
 
@@ -2945,6 +3115,11 @@ if __name__ == "__main__":
     p.add_argument("--policy_target_pruning", action="store_true",
                    help="KataGo-inspired target cleanup: prune <=1-visit MCTS "
                         "policy noise before storing replay examples.")
+    p.add_argument("--forced_playout_subtraction", action="store_true",
+                   help="KataGo-style target cleanup: subtract forced playouts "
+                        "using root priors before storing policy targets.")
+    p.add_argument("--forced_playout_k", type=float, default=2.0,
+                   help="KataGo forced-playout subtraction constant k")
     p.add_argument("--profile_eval_timing", action="store_true",
                    help="Split eval_sec into h2d / forward / readback to see "
                         "whether the evaluator is forward-bound or transfer/"
@@ -3016,6 +3191,8 @@ if __name__ == "__main__":
         fast_move_dirichlet_epsilon=a.fast_move_dirichlet_epsilon,
         fast_move_temp_moves=a.fast_move_temp_moves,
         policy_target_pruning=a.policy_target_pruning,
+        forced_playout_subtraction=a.forced_playout_subtraction,
+        forced_playout_k=a.forced_playout_k,
         profile_eval_timing=a.profile_eval_timing,
         exact_endgame_max_secs=a.exact_endgame_max_secs,
         endgame_oversample=a.endgame_oversample,

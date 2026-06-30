@@ -331,23 +331,20 @@ legacy `--fast_game_fraction` split so the two modes do not stack.
 **Current:** optional Milestone 5 feature
 
 KataGo-inspired cleanup for policy targets before examples enter the replay
-buffer. The current implementation removes children whose stored policy mass is
-consistent with one visit or less, then renormalizes the remaining target. Exact
-endgame examples are left untouched because their targets already come from
-exact child values rather than MCTS exploration noise.
+buffer. With only `--policy_target_pruning`, the implementation removes children
+whose stored policy mass is consistent with one visit or less, then
+renormalizes the remaining target. Exact endgame examples are left untouched
+because their targets already come from exact child values rather than MCTS
+exploration noise.
 
-This is the safe part of KataGo's policy target pruning that can be applied with
-the current self-play record. Full KataGo forced-playout subtraction is not
-implemented yet.
+#### `--forced_playout_subtraction`, `--forced_playout_k`
+**Values:** flag plus float (`k=2.0` default)
+**Current:** optional Milestone 5 feature
 
-What is missing for full forced-playout subtraction:
-
-- the current Python `Example` stores only `policy_idx`, `policy_val`, and
-  `legal_idx`; it does not store root prior probabilities
-- the normal Rust `MoveRecord` exports the same sparse visit-policy fields, even
-  though the Rust tree internally has `prior` on each root child
-- the Python paths similarly collapse the search result to visit counts via
-  `visit_counts_to_policy` before recording the example
+Fuller KataGo-style policy cleanup. When enabled, normal Rust batched MCTS
+records export root priors and raw visit counts alongside the stored sparse
+policy target. Before the example enters replay, the loop subtracts the expected
+forced-exploration visits:
 
 KataGo's formula needs the root prior `P(c)` for every root child:
 
@@ -355,25 +352,31 @@ KataGo's formula needs the root prior `P(c)` for every root child:
 n_forced(c) = sqrt(k * P(c) * sum_N(c'))
 ```
 
-Without `P(c)`, the loop can identify and remove obvious one-visit noise, but it
-cannot distinguish visits caused by the network prior / Dirichlet exploration
-from visits earned by backed-up value.
+Then it clamps at zero and renormalizes the remaining visit counts into the
+stored policy target. If subtraction would collapse the entire target to zero,
+the original target is kept. Exact endgame examples are skipped.
 
-Implementation difficulty: moderate. The data model change is small, but it
-crosses the hot self-play boundary:
+Recommended first use:
 
-1. Add sparse root-prior fields to `Example` and replay serialization.
-2. Export `(joint_idx, visit_count, prior)` from Rust normal MCTS records
-   (`MoveRecord` / batched tuple conversion), for both closed-loop and open-loop.
-3. Preserve the same information in the Python self-play paths.
-4. Apply forced-playout subtraction before converting visits to the stored policy
-   target, then keep the existing <=1-visit pruning/renormalization.
-5. Add parity tests that pruning is disabled for exact endgames, deterministic
-   for fixed seeds, and produces identical legal masks / action indexing.
+```powershell
+--forced_playout_subtraction --forced_playout_k 2.0
+```
 
-The likely risk is not algorithmic complexity; it is accidentally changing the
-Rust/Python tuple contract or replay-buffer compatibility. Treat it as a focused
-Milestone 5 follow-up, not a broad refactor.
+Training-quality guardrails:
+
+- The feature is off by default.
+- Training batches ignore the auxiliary root-prior fields.
+- Disabled pruning is tested to leave policy targets unchanged even when root
+  metadata exists.
+- Replay sampling is tested to produce the same dense policy/legal-mask contract
+  with root metadata present.
+- Exact endgame examples are tested to remain untouched.
+- The Rust tuple reader accepts both old 10-field and new 11-field examples
+  with nested root stats.
+
+Log fields include `forced_pruned_examples`, `forced_pruned_actions`,
+`forced_pruned_mass`, `forced_subtracted_visits`, and
+`forced_missing_stats_examples`.
 
 ---
 
