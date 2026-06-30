@@ -41,11 +41,17 @@ def _input_shapes():
     return mb.shape, ob.shape, flat.shape[0]
 
 
+def _maybe_channels_last(x: torch.Tensor, enabled: bool) -> torch.Tensor:
+    if enabled:
+        return x.contiguous(memory_format=torch.channels_last)
+    return x
+
+
 def bench_batch(net, B, device, mb_shape, ob_shape, flat_size, iters, warmup,
-                amp: bool = False):
+                amp: bool = False, channels_last: bool = False):
     cuda = device.startswith("cuda")
-    mb = torch.rand(B, *mb_shape, device=device)
-    ob = torch.rand(B, *ob_shape, device=device)
+    mb = _maybe_channels_last(torch.rand(B, *mb_shape, device=device), channels_last)
+    ob = _maybe_channels_last(torch.rand(B, *ob_shape, device=device), channels_last)
     flat = torch.rand(B, flat_size, device=device)
     use_amp = bool(amp and cuda)
     with torch.inference_mode():
@@ -67,10 +73,11 @@ def bench_batch(net, B, device, mb_shape, ob_shape, flat_size, iters, warmup,
 
 
 def bench_legal_batch(net, B, legal_n, device, mb_shape, ob_shape, flat_size,
-                      iters, warmup, amp: bool = False):
+                      iters, warmup, amp: bool = False,
+                      channels_last: bool = False):
     cuda = device.startswith("cuda")
-    mb = torch.rand(B, *mb_shape, device=device)
-    ob = torch.rand(B, *ob_shape, device=device)
+    mb = _maybe_channels_last(torch.rand(B, *mb_shape, device=device), channels_last)
+    ob = _maybe_channels_last(torch.rand(B, *ob_shape, device=device), channels_last)
     flat = torch.rand(B, flat_size, device=device)
     legal_idx = torch.randint(0, 3390, (B, legal_n), device=device)
     use_amp = bool(amp and cuda)
@@ -98,6 +105,8 @@ def main() -> None:
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--norm", choices=["group", "batch"], default="group",
+                   help="normalization layer in the residual trunk")
     p.add_argument("--batches", default="1,2,4,8,16,24,32,48,64,96,128,192,256")
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=15)
@@ -109,6 +118,9 @@ def main() -> None:
                    help="disable TF32 CUDA matmul/convolution")
     p.add_argument("--amp_inference", action="store_true",
                    help="use CUDA float16 autocast during the forward benchmark")
+    p.add_argument("--channels_last", action="store_true",
+                   help="use channels-last memory format for board tensors and "
+                        "conv weights")
     p.add_argument("--legal_counts", default=None,
                    help="optional comma list of legal action counts to benchmark "
                         "with net.forward_legal, e.g. 20,50,100")
@@ -124,13 +136,17 @@ def main() -> None:
 
     mb_shape, ob_shape, flat_size = _input_shapes()
     net = KingdominoNet(channels=a.channels, blocks=a.blocks,
-                        bilinear_dim=a.bilinear_dim).to(a.device).eval()
+                        bilinear_dim=a.bilinear_dim,
+                        norm=a.norm).to(a.device).eval()
+    if a.channels_last:
+        net = net.to(memory_format=torch.channels_last)
     batches = [int(x) for x in a.batches.split(",") if x.strip()]
 
-    print(f"device={a.device}  net={a.channels}ch/{a.blocks}b  "
+    print(f"device={a.device}  net={a.channels}ch/{a.blocks}b norm={a.norm}  "
           f"mb={tuple(mb_shape)} flat={flat_size}  "
           f"cudnn_benchmark={a.cudnn_benchmark}  "
-          f"tf32={not a.no_tf32}  amp={a.amp_inference}")
+          f"tf32={not a.no_tf32}  amp={a.amp_inference}  "
+          f"channels_last={a.channels_last}")
     print(f"{'batch':>6}{'ms/fwd':>10}{'evals/s':>12}{'us/sample':>12}{'vs live':>9}")
     print("-" * 49)
 
@@ -140,7 +156,8 @@ def main() -> None:
         try:
             ms, eps = bench_batch(net, B, a.device, mb_shape, ob_shape,
                                   flat_size, a.iters, a.warmup,
-                                  amp=a.amp_inference)
+                                  amp=a.amp_inference,
+                                  channels_last=a.channels_last)
         except RuntimeError as e:
             msg = str(e).splitlines()[0][:42]
             print(f"{B:>6}   stopped (likely OOM): {msg}")
@@ -154,7 +171,7 @@ def main() -> None:
     print("-" * 49)
     print(f"peak forward throughput : {best_eps:,.0f} evals/s at batch {best_b}")
     print(f"live A3 baseline        : {a.baseline_evals:,.0f} evals/s "
-          f"(fill ~74%)  →  headroom ~{best_eps/a.baseline_evals:.1f}x")
+          f"(fill ~74%)  ->  headroom ~{best_eps/a.baseline_evals:.1f}x")
     print("Read: the knee (evals/s stops climbing) = max_batch worth targeting; "
           "peak evals/s = the ceiling batching changes can approach. If peak >> "
           "live, you're starved and leaf parallelization has room.")
@@ -170,7 +187,8 @@ def main() -> None:
                 try:
                     ms, eps = bench_legal_batch(
                         net, B, legal_n, a.device, mb_shape, ob_shape,
-                        flat_size, a.iters, a.warmup, amp=a.amp_inference)
+                        flat_size, a.iters, a.warmup, amp=a.amp_inference,
+                        channels_last=a.channels_last)
                 except RuntimeError as e:
                     msg = str(e).splitlines()[0][:32]
                     print(f"{legal_n:>6}{B:>8}   stopped: {msg}")
