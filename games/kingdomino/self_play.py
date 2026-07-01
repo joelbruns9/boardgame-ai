@@ -88,6 +88,14 @@ from games.kingdomino.promotion import (
     promote_current_best,
     promotion_payload,
 )
+from games.kingdomino.hof import (
+    DEFAULT_HOF_DIR,
+    HOFEntry,
+    add_hof_entry,
+    load_hof_net,
+    read_hof_index,
+    sample_hof_entry,
+)
 
 
 # ─── 1. Configuration ─────────────────────────────────────────────────────
@@ -218,6 +226,20 @@ class SelfPlayConfig:
     promotion_fixed_suite_tolerance: float = 0.05
     promotion_skip_fixed_suite: bool = False
     promotion_update_best: bool = False
+    # Milestone 7 Hall-of-Fame opponent mixing. Default off. The first
+    # implementation samples one HOF opponent per iteration and runs HOF games
+    # as a separate mixed-model open-loop block to keep the high-throughput
+    # self-play path unchanged.
+    hof_dir: str = str(DEFAULT_HOF_DIR)
+    hof_fraction: float = 0.0
+    hof_fraction_schedule: str = ""
+    hof_start_iter: int = 50
+    hof_sample_weights: str = "recency"
+    hof_sims: int = 200
+    hof_temp_moves: int = 0
+    hof_dirichlet_epsilon: float = 0.0
+    hof_add_every: int = 0
+    hof_add_tag: str = "current_best"
     # io / misc
     device: str = "cpu"
     seed: int = 0
@@ -330,6 +352,12 @@ class Example:
     root_prior_idx: Optional[np.ndarray] = None   # int32 action indices
     root_prior_val: Optional[np.ndarray] = None   # float32 root priors after noise
     root_visit_count: Optional[np.ndarray] = None # int32 visits aligned to prior_idx
+    # Sample ownership/provenance for HOF mixing. The training sampler only
+    # consumes trainable examples; default values keep old buffers compatible.
+    owner: str = "self"       # self | current | hof
+    trainable: bool = True
+    game_type: str = "self"
+    opponent_source: str = ""
     # Training iteration that generated this example.  Used by
     # ReplayBuffer.mean_age to track buffer staleness.  Defaults to 0 so any
     # construction site that misses the kwarg yields a (stale) age reading
@@ -444,6 +472,8 @@ class ReplayBuffer:
 
     def add(self, examples: List[Example]) -> None:
         for ex in examples:
+            if not getattr(ex, "trainable", True):
+                continue
             if len(self.data) < self.capacity:
                 self.data.append(ex)
             else:
@@ -622,6 +652,7 @@ def _compiled_schedules(cfg: SelfPlayConfig) -> dict:
         "train_steps_per_iteration": _parse_schedule(cfg.train_steps_schedule, cast=int),
         "buffer_capacity": _parse_schedule(cfg.buffer_capacity_schedule, cast=int),
         "fast_game_fraction": _parse_schedule(cfg.fast_game_fraction_schedule, cast=float),
+        "hof_fraction": _parse_schedule(cfg.hof_fraction_schedule, cast=float),
     }
 
 
@@ -876,6 +907,18 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
         "exact_tree_solve_count": sum(int(s.get("exact_tree_solve_count", 0)) for s in stats_list),
         "exact_cache_hit_count": sum(int(s.get("exact_cache_hit_count", 0)) for s in stats_list),
         "exact_fallback_count": sum(int(s.get("exact_fallback_count", 0)) for s in stats_list),
+        "exact_attempt_deck4_initial_count": sum(
+            int(s.get("exact_attempt_deck4_initial_count", 0)) for s in stats_list),
+        "exact_attempt_deck4_retry_count": sum(
+            int(s.get("exact_attempt_deck4_retry_count", 0)) for s in stats_list),
+        "exact_attempt_deck0_count": sum(
+            int(s.get("exact_attempt_deck0_count", 0)) for s in stats_list),
+        "exact_fallback_deck4_initial_count": sum(
+            int(s.get("exact_fallback_deck4_initial_count", 0)) for s in stats_list),
+        "exact_fallback_deck4_retry_count": sum(
+            int(s.get("exact_fallback_deck4_retry_count", 0)) for s in stats_list),
+        "exact_fallback_deck0_count": sum(
+            int(s.get("exact_fallback_deck0_count", 0)) for s in stats_list),
         "exact_solver_secs": sum(float(s.get("exact_solver_secs", 0.0)) for s in stats_list),
         "fast_move_count": sum(int(s.get("fast_move_count", 0)) for s in stats_list),
         "full_move_count": sum(int(s.get("full_move_count", 0)) for s in stats_list),
@@ -1050,6 +1093,86 @@ def play_selfplay_game(
         )
     scores = (state.boards[0].score().total, state.boards[1].score().total)
     return examples, scores
+
+
+def play_current_vs_hof_game(
+    current_mcts: OpenLoopMCTS,
+    hof_mcts: OpenLoopMCTS,
+    *,
+    current_player: int,
+    current_cfg: SelfPlayConfig,
+    seed: int,
+    np_rng: np.random.Generator,
+    iteration: int = 0,
+    opponent_source: str = "",
+) -> Tuple[List[Example], Tuple[int, int], dict]:
+    """Play one mixed current-vs-HOF game and keep only current-owned labels."""
+    state = GameState.new(seed=seed)
+    records = []
+    move_num = 0
+    current_records = 0
+    hof_moves = 0
+
+    while state.phase != Phase.GAME_OVER:
+        actor = int(state.current_actor)
+        is_current = actor == int(current_player)
+        mcts = current_mcts if is_current else hof_mcts
+        add_noise = is_current and float(current_cfg.dirichlet_epsilon) > 0.0
+        visit_counts, _, _ = run_pimc_open_loop(
+            mcts, state, add_noise=add_noise, rng=np_rng)
+        policy = visit_counts_to_policy(visit_counts, state, temperature=1.0)
+
+        if is_current:
+            mb, ob, flat = encode_state(state, actor)
+            legal = state.legal_actions()
+            legal_idx = np.fromiter((encode_action(a, state) for a in legal),
+                                    dtype=np.int32, count=len(legal))
+            pidx = np.nonzero(policy)[0].astype(np.int32)
+            pval = policy[pidx].astype(np.float32)
+            records.append((
+                mb.astype(np.float16), ob.astype(np.float16), flat.astype(np.float16),
+                pidx, pval, legal_idx, actor,
+            ))
+            current_records += 1
+            temp = _temperature(move_num, int(current_cfg.temp_moves))
+        else:
+            hof_moves += 1
+            temp = 0.0
+
+        action = select_move(visit_counts, temp, np_rng)
+        state = state.step(action)
+        move_num += 1
+
+    z0 = compute_target_z(state, player=0)
+    own0 = compute_target_own_score(state, player=0)
+    opp0 = compute_target_opponent_score(state, player=0)
+    win0 = compute_target_win(state, player=0)
+    examples = []
+    game_type = "current_vs_hof" if current_player == 0 else "hof_vs_current"
+    for (mb, ob, flat, pidx, pval, lidx, actor) in records:
+        if actor == 0:
+            z = z0
+            own_s, opp_s, win_t = own0, opp0, win0
+        else:
+            z = -z0
+            own_s, opp_s = opp0, own0
+            win_t = (1.0 - win0) if win0 != 0.5 else 0.5
+        examples.append(
+            Example(
+                mb, ob, flat, pidx, pval, lidx, z, own_s, opp_s, win_t,
+                owner="current",
+                trainable=True,
+                game_type=game_type,
+                opponent_source=opponent_source,
+                iteration=iteration,
+            )
+        )
+    scores = (state.boards[0].score().total, state.boards[1].score().total)
+    return examples, scores, {
+        "current_records": current_records,
+        "hof_moves": hof_moves,
+        "current_player": int(current_player),
+    }
 
 
 # ─── 3b. Rust-engine self-play generation ──────────────────────────────────
@@ -1493,6 +1616,22 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     exact_tree_solve_count = int(A.exact_tree_solve_count) + int(B.exact_tree_solve_count)
     exact_cache_hit_count = int(A.exact_cache_hit_count) + int(B.exact_cache_hit_count)
     exact_fallback_count = int(A.exact_fallback_count) + int(B.exact_fallback_count)
+    exact_attempt_deck4_initial_count = (
+        int(A.exact_attempt_deck4_initial_count)
+        + int(B.exact_attempt_deck4_initial_count))
+    exact_attempt_deck4_retry_count = (
+        int(A.exact_attempt_deck4_retry_count)
+        + int(B.exact_attempt_deck4_retry_count))
+    exact_attempt_deck0_count = (
+        int(A.exact_attempt_deck0_count) + int(B.exact_attempt_deck0_count))
+    exact_fallback_deck4_initial_count = (
+        int(A.exact_fallback_deck4_initial_count)
+        + int(B.exact_fallback_deck4_initial_count))
+    exact_fallback_deck4_retry_count = (
+        int(A.exact_fallback_deck4_retry_count)
+        + int(B.exact_fallback_deck4_retry_count))
+    exact_fallback_deck0_count = (
+        int(A.exact_fallback_deck0_count) + int(B.exact_fallback_deck0_count))
     exact_solver_secs = float(A.exact_solver_secs) + float(B.exact_solver_secs)
     fast_move_count = int(A.fast_move_count) + int(B.fast_move_count)
     full_move_count = int(A.full_move_count) + int(B.full_move_count)
@@ -1505,6 +1644,14 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     return (finished, batch_sizes, ticks,
             exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
             exact_fallback_count, exact_solver_secs,
+            {
+                "exact_attempt_deck4_initial_count": exact_attempt_deck4_initial_count,
+                "exact_attempt_deck4_retry_count": exact_attempt_deck4_retry_count,
+                "exact_attempt_deck0_count": exact_attempt_deck0_count,
+                "exact_fallback_deck4_initial_count": exact_fallback_deck4_initial_count,
+                "exact_fallback_deck4_retry_count": exact_fallback_deck4_retry_count,
+                "exact_fallback_deck0_count": exact_fallback_deck0_count,
+            },
             fast_move_count, full_move_count,
             recorded_fast_move_count, recorded_full_move_count,
             exact_recorded_move_count,
@@ -1587,6 +1734,14 @@ def play_selfplay_games_batched(
     exact_tree_solve_count = 0
     exact_cache_hit_count = 0
     exact_fallback_count = 0
+    exact_split_stats = {
+        "exact_attempt_deck4_initial_count": 0,
+        "exact_attempt_deck4_retry_count": 0,
+        "exact_attempt_deck0_count": 0,
+        "exact_fallback_deck4_initial_count": 0,
+        "exact_fallback_deck4_retry_count": 0,
+        "exact_fallback_deck0_count": 0,
+    }
     exact_solver_secs = 0.0
     fast_move_count = 0
     full_move_count = 0
@@ -1623,6 +1778,18 @@ def play_selfplay_games_batched(
         exact_tree_solve_count = int(batched.exact_tree_solve_count)
         exact_cache_hit_count = int(batched.exact_cache_hit_count)
         exact_fallback_count = int(batched.exact_fallback_count)
+        exact_split_stats = {
+            "exact_attempt_deck4_initial_count": int(
+                batched.exact_attempt_deck4_initial_count),
+            "exact_attempt_deck4_retry_count": int(
+                batched.exact_attempt_deck4_retry_count),
+            "exact_attempt_deck0_count": int(batched.exact_attempt_deck0_count),
+            "exact_fallback_deck4_initial_count": int(
+                batched.exact_fallback_deck4_initial_count),
+            "exact_fallback_deck4_retry_count": int(
+                batched.exact_fallback_deck4_retry_count),
+            "exact_fallback_deck0_count": int(batched.exact_fallback_deck0_count),
+        }
         exact_solver_secs = float(batched.exact_solver_secs)
         fast_move_count = int(batched.fast_move_count)
         full_move_count = int(batched.full_move_count)
@@ -1633,7 +1800,7 @@ def play_selfplay_games_batched(
         # ── Double-buffer path (Item 17) ──
         (finished, batch_sizes, ticks,
          exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
-         exact_fallback_count, exact_solver_secs,
+         exact_fallback_count, exact_solver_secs, exact_split_stats,
          fast_move_count, full_move_count,
          recorded_fast_move_count, recorded_full_move_count,
          exact_recorded_move_count,
@@ -1668,6 +1835,7 @@ def play_selfplay_games_batched(
         "exact_tree_solve_count": exact_tree_solve_count,
         "exact_cache_hit_count": exact_cache_hit_count,
         "exact_fallback_count": exact_fallback_count,
+        **exact_split_stats,
         "exact_solver_secs": exact_solver_secs,
         "fast_move_count": fast_move_count,
         "full_move_count": full_move_count,
@@ -2460,6 +2628,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             bench_win_rate = bench_score_margin = bench_win_brier = None
             elo_result = None   # set by the Elo block if elo_every triggers
             promotion_result = None
+            hof_added_entry = None
 
             # ── 1. Self-play ──
             generation_net = selfplay_net if cfg.gated_selfplay else net
@@ -2490,14 +2659,46 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "forced_subtracted_visits": 0.0,
                 "forced_missing_stats_examples": 0,
             }
+            hof_stats = {
+                "enabled": False,
+                "games": 0,
+                "trainable_examples": 0,
+                "opponent": None,
+                "opponent_sha256": None,
+                "mean_diff": None,
+            }
+            total_games = int(iter_cfg.games_per_iteration)
+            hof_games = 0
+            hof_entry: Optional[HOFEntry] = None
+            if (float(iter_cfg.hof_fraction) > 0.0
+                    and it >= int(iter_cfg.hof_start_iter)):
+                requested = int(round(
+                    total_games * max(0.0, min(1.0, float(iter_cfg.hof_fraction)))))
+                if requested > 0:
+                    entries = read_hof_index(iter_cfg.hof_dir)
+                    hof_rng = random.Random(iter_cfg.seed + it * 100_003)
+                    hof_entry = sample_hof_entry(
+                        entries, rng=hof_rng,
+                        weights=iter_cfg.hof_sample_weights)
+                    if hof_entry is None:
+                        if verbose:
+                            print(f"  HOF: no entries in {iter_cfg.hof_dir}; "
+                                  "running normal self-play only")
+                    else:
+                        hof_games = max(1, min(total_games, requested))
+                        hof_stats["enabled"] = True
+                        hof_stats["games"] = hof_games
+                        hof_stats["opponent"] = hof_entry.path
+                        hof_stats["opponent_sha256"] = hof_entry.sha256
+            normal_games = total_games - hof_games
             if iter_cfg.playout_cap_randomization:
                 fast_games = 0
             else:
                 fast_games = int(round(
-                    iter_cfg.games_per_iteration
+                    normal_games
                     * max(0.0, min(1.0, iter_cfg.fast_game_fraction))))
-                fast_games = max(0, min(int(iter_cfg.games_per_iteration), fast_games))
-            full_games = int(iter_cfg.games_per_iteration) - fast_games
+                fast_games = max(0, min(normal_games, fast_games))
+            full_games = normal_games - fast_games
             if iter_cfg.engine in ("batched", "batched_open_loop"):
                 all_examples, all_scores = [], []
                 stat_parts = []
@@ -2543,7 +2744,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     buffer.add(examples)
                     diffs.append(scores[0] - scores[1])
             else:
-                for g in range(iter_cfg.games_per_iteration):
+                for g in range(normal_games):
                     # Per-game RNGs derived from game_seed alone (see _game_rngs): keeps
                     # self-play data independent of execution order and lets the
                     # parallel loop reproduce this exactly.
@@ -2609,8 +2810,60 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     buffer.add(examples)
                     diffs.append(scores[0] - scores[1])
                     game_seed += 1
+            if hof_games and hof_entry is not None:
+                hof_net = load_hof_net(hof_entry.path, device=iter_cfg.device)
+                current_hof_mcts = make_open_loop_mcts(
+                    generation_net, iter_cfg, int(iter_cfg.n_simulations))
+                hof_cfg = replace(
+                    iter_cfg,
+                    n_simulations=max(1, int(iter_cfg.hof_sims)),
+                    temp_moves=int(iter_cfg.hof_temp_moves),
+                    dirichlet_epsilon=float(iter_cfg.hof_dirichlet_epsilon),
+                    playout_cap_randomization=False,
+                )
+                hof_mcts = make_open_loop_mcts(
+                    hof_net, hof_cfg, int(hof_cfg.n_simulations))
+                hof_diffs = []
+                for h in range(hof_games):
+                    _, g_np_rng = _game_rngs(game_seed)
+                    current_player = h % 2
+                    examples, scores, mixed_stats = play_current_vs_hof_game(
+                        current_hof_mcts,
+                        hof_mcts,
+                        current_player=current_player,
+                        current_cfg=iter_cfg,
+                        seed=game_seed,
+                        np_rng=g_np_rng,
+                        iteration=it,
+                        opponent_source=hof_entry.path,
+                    )
+                    if (iter_cfg.policy_target_pruning
+                            or iter_cfg.forced_playout_subtraction):
+                        wrapped = [examples]
+                        ps = _prune_examples_policy_targets(
+                            wrapped, total_visits=max(1, int(iter_cfg.n_simulations)),
+                            skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
+                            one_visit_pruning=iter_cfg.policy_target_pruning,
+                            forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
+                            forced_playout_k=iter_cfg.forced_playout_k)
+                        for k, v in ps.items():
+                            policy_prune_stats[k] += v
+                    buffer.add(examples)
+                    diff = scores[0] - scores[1]
+                    diffs.append(diff)
+                    hof_diffs.append(diff if current_player == 0 else -diff)
+                    hof_stats["trainable_examples"] += int(
+                        mixed_stats["current_records"])
+                    game_seed += 1
+                if hof_diffs:
+                    hof_stats["mean_diff"] = float(
+                        np.asarray(hof_diffs, dtype=np.float32).mean())
+                hof_net.to("cpu")
+                if str(iter_cfg.device).startswith("cuda"):
+                    torch.cuda.empty_cache()
             sp_elapsed = time.time() - t0
-            sp_rate = iter_cfg.games_per_iteration / sp_elapsed if sp_elapsed > 0 else 0.0
+            played_games = normal_games + hof_games
+            sp_rate = played_games / sp_elapsed if sp_elapsed > 0 else 0.0
             diffs_arr = np.array(diffs, dtype=np.float32)
             sp_score_diff_mean = float(diffs_arr.mean()) if len(diffs_arr) else 0.0
             sp_score_diff_std = float(diffs_arr.std()) if len(diffs_arr) else 0.0
@@ -2622,10 +2875,15 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             history["buffer_size"].append(buffer_size)
             history["buffer_mean_age"].append(buffer_mean_age)
             if verbose:
-                print(f"  self-play: {iter_cfg.games_per_iteration} games "
+                print(f"  self-play: {played_games} games "
                       f"({sp_rate:.2f} games/sec), buffer={buffer_size}")
+                if hof_games:
+                    print(f"  HOF: {hof_games}/{played_games} games, "
+                          f"opponent={Path(str(hof_stats['opponent'])).name}, "
+                          f"trainable_examples={hof_stats['trainable_examples']}, "
+                          f"current_mean_diff={hof_stats['mean_diff']:+.1f}")
                 if fast_games:
-                    print(f"  fast games: {fast_games}/{iter_cfg.games_per_iteration} "
+                    print(f"  fast games: {fast_games}/{normal_games} "
                           f"at {iter_cfg.fast_game_sims} sims "
                           f"(full={full_games} at {iter_cfg.n_simulations})")
                 if iter_cfg.policy_target_pruning:
@@ -2661,6 +2919,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                           f"trees={batched_stats.get('exact_tree_solve_count', 0)} "
                           f"cache_hits={batched_stats.get('exact_cache_hit_count', 0)} "
                           f"fallback={batched_stats.get('exact_fallback_count', 0)}")
+                    print(
+                        f"  exact attempts: deck4_initial="
+                        f"{batched_stats.get('exact_attempt_deck4_initial_count', 0)} "
+                        f"deck4_retry={batched_stats.get('exact_attempt_deck4_retry_count', 0)} "
+                        f"deck0={batched_stats.get('exact_attempt_deck0_count', 0)}; "
+                        f"fallbacks: deck4_initial="
+                        f"{batched_stats.get('exact_fallback_deck4_initial_count', 0)} "
+                        f"deck4_retry={batched_stats.get('exact_fallback_deck4_retry_count', 0)} "
+                        f"deck0={batched_stats.get('exact_fallback_deck0_count', 0)}"
+                    )
                     if iter_cfg.playout_cap_randomization:
                         print(
                             f"  playout cap: full={batched_stats.get('full_move_count', 0)} "
@@ -2925,6 +3193,32 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             )
                             selfplay_source = str(iter_cfg.current_best_path)
 
+            if (iter_cfg.hof_add_every and it % int(iter_cfg.hof_add_every) == 0):
+                if iter_cfg.current_best_path and os.path.exists(iter_cfg.current_best_path):
+                    existing_hof_hashes = {
+                        e.sha256 for e in read_hof_index(iter_cfg.hof_dir)
+                    }
+                    maybe_added_entry = add_hof_entry(
+                        iter_cfg.current_best_path,
+                        hof_dir=iter_cfg.hof_dir,
+                        tag=iter_cfg.hof_add_tag,
+                        iteration=it,
+                        metadata={
+                            "source": "self_play.hof_add_every",
+                            "checkpoint_dir": cfg.checkpoint_dir,
+                        },
+                    )
+                    if maybe_added_entry.sha256 not in existing_hof_hashes:
+                        hof_added_entry = maybe_added_entry
+                    if verbose:
+                        if hof_added_entry is not None:
+                            print(f"  HOF: added {Path(hof_added_entry.path).name}")
+                        else:
+                            print("  HOF: current_best already present; skipped add")
+                elif verbose:
+                    print(f"  HOF: skipped add; current_best_path missing: "
+                          f"{iter_cfg.current_best_path}")
+
             # ── 3b. Elo rating (periodic) ──  AFTER the checkpoint is on disk so
             # the rater can load it; BEFORE the log row so its result can be logged.
             if cfg.elo_every and it % cfg.elo_every == 0 and cfg.checkpoint_dir:
@@ -2979,6 +3273,15 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "elo_n_games": elo_result["elo_n_games"] if elo_result else None,
                 "gated_selfplay": iter_cfg.gated_selfplay,
                 "selfplay_source": selfplay_source,
+                "hof_fraction": iter_cfg.hof_fraction,
+                "hof_enabled": hof_stats["enabled"],
+                "hof_games": hof_stats["games"],
+                "hof_trainable_examples": hof_stats["trainable_examples"],
+                "hof_opponent": hof_stats["opponent"],
+                "hof_opponent_sha256": hof_stats["opponent_sha256"],
+                "hof_mean_diff": hof_stats["mean_diff"],
+                "hof_added": hof_added_entry is not None,
+                "hof_added_path": hof_added_entry.path if hof_added_entry else None,
                 "promotion_checked": promotion_result is not None,
                 "promotion_passed": (
                     promotion_result["passed"] if promotion_result else None),
@@ -3000,6 +3303,24 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                           if batched_stats else None),
                 "exact_fallback_count": (batched_stats.get("exact_fallback_count", 0)
                                          if batched_stats else None),
+                "exact_attempt_deck4_initial_count": (
+                    batched_stats.get("exact_attempt_deck4_initial_count", 0)
+                    if batched_stats else None),
+                "exact_attempt_deck4_retry_count": (
+                    batched_stats.get("exact_attempt_deck4_retry_count", 0)
+                    if batched_stats else None),
+                "exact_attempt_deck0_count": (
+                    batched_stats.get("exact_attempt_deck0_count", 0)
+                    if batched_stats else None),
+                "exact_fallback_deck4_initial_count": (
+                    batched_stats.get("exact_fallback_deck4_initial_count", 0)
+                    if batched_stats else None),
+                "exact_fallback_deck4_retry_count": (
+                    batched_stats.get("exact_fallback_deck4_retry_count", 0)
+                    if batched_stats else None),
+                "exact_fallback_deck0_count": (
+                    batched_stats.get("exact_fallback_deck0_count", 0)
+                    if batched_stats else None),
                 "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
                                       if batched_stats else None),
                 "playout_cap_randomization": iter_cfg.playout_cap_randomization,
@@ -3066,7 +3387,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             _log_row(log_path, row)
             if verbose:
                 print(_compact_summary(
-                    it, sp_games=iter_cfg.games_per_iteration, row=row,
+                    it, sp_games=played_games, row=row,
                     trained=trained, buf_n=buffer_size,
                     min_buf=iter_cfg.min_buffer_to_train))
 
@@ -3235,6 +3556,24 @@ if __name__ == "__main__":
     p.add_argument("--promotion_update_best", action="store_true",
                    help="if an in-run promotion passes, also copy the saved "
                         "checkpoint to --current_best_path")
+    p.add_argument("--hof_dir", default=str(DEFAULT_HOF_DIR),
+                   help="Hall-of-Fame checkpoint pool directory")
+    p.add_argument("--hof_fraction", type=float, default=0.0,
+                   help="fraction of games per iteration to play vs one HOF opponent")
+    p.add_argument("--hof_fraction_schedule", default="",
+                   help='schedule like "0:0.0,50:0.05,100:0.1"')
+    p.add_argument("--hof_start_iter", type=int, default=50)
+    p.add_argument("--hof_sample_weights", default="recency",
+                   choices=("recency", "uniform", "mixed", "latest"))
+    p.add_argument("--hof_sims", type=int, default=200,
+                   help="MCTS sims for deterministic HOF opponent moves")
+    p.add_argument("--hof_temp_moves", type=int, default=0,
+                   help="HOF move sampling temperature window; default 0 = best play")
+    p.add_argument("--hof_dirichlet_epsilon", type=float, default=0.0,
+                   help="HOF root noise; default 0.0 = no forced exploration")
+    p.add_argument("--hof_add_every", type=int, default=0,
+                   help="copy current_best_path into hof_dir every N iterations")
+    p.add_argument("--hof_add_tag", default="current_best")
     p.add_argument("--no_augment", action="store_true",
                    help="disable D4 augmentation (useful when debugging policy/mask)")
     p.add_argument("--device", default="cpu")
@@ -3396,6 +3735,16 @@ if __name__ == "__main__":
         promotion_fixed_suite_tolerance=a.promotion_fixed_suite_tolerance,
         promotion_skip_fixed_suite=a.promotion_skip_fixed_suite,
         promotion_update_best=a.promotion_update_best,
+        hof_dir=a.hof_dir,
+        hof_fraction=a.hof_fraction,
+        hof_fraction_schedule=a.hof_fraction_schedule,
+        hof_start_iter=a.hof_start_iter,
+        hof_sample_weights=a.hof_sample_weights,
+        hof_sims=a.hof_sims,
+        hof_temp_moves=a.hof_temp_moves,
+        hof_dirichlet_epsilon=a.hof_dirichlet_epsilon,
+        hof_add_every=a.hof_add_every,
+        hof_add_tag=a.hof_add_tag,
         device=a.device, seed=a.seed, warm_start_path=warm_start_path,
         checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,
         save_buffer=a.save_buffer, warm_buffer=a.warm_buffer,

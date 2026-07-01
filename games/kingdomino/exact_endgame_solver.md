@@ -85,11 +85,12 @@ special handling in the solver.
 **Current status update:** BatchedMCTS training is now wired into the exact
 solver. `BatchedMCTS::resolve_exact_slots` solves terminal-adjacent roots once,
 skips GPU/MCTS for those moves, emits exact child-value policy targets, and
-exposes `exact_solve_count` / `exact_fallback_count`. The routine self-play
-default is `exact_endgame_max_secs=3.0`, exposed as a CLI/run setting; `0.0`
-disables exact solving for ablation and higher values are available for
-quality-first/reanalysis runs. The focused suite is 27 tests passing, including
-BatchedMCTS integration tests.
+exposes `exact_solve_count` / `exact_fallback_count` plus split attempt/fallback
+counters for `deck4_initial`, `deck4_retry`, and `deck0`. The routine self-play
+default is `exact_endgame_max_secs=3.0`, exposed as a CLI/run setting and shared
+by all three solve entry points; `0.0` disables exact solving for ablation and
+higher values are available for quality-first/reanalysis runs. The focused suite
+is 38 tests passing, including BatchedMCTS integration tests.
 
 1600-sim smoke result over 32 games, 48x6 CUDA: `off=0.0742 games/s`,
 `500k=0.0816`, `2M=0.0769`, `5M=0.0760`. 500k gave the best throughput in that
@@ -316,15 +317,15 @@ Current Rust `BatchedMCTS` behavior:
 
 Both paths avoid re-attempting an expensive solve that has already timed out:
 
-- **Rust `BatchedMCTS` — per-game sentinel.** When `solve_exact_plan` exceeds the
-  per-position `exact_endgame_max_secs` budget, the slot sets an `exact_unsolvable`
-  flag and falls back to MCTS. `finalize_move` then refuses to re-enter
-  `ExactSolving` for the rest of that game — without this, the next root (still
-  deck∈{0,4}, since the deck only shrinks) would just re-solve the same hard
-  endgame and time out again, once per remaining move. The flag is reset in
-  `new_for_game`, so each new game gets a fresh attempt. Net effect:
-  `exact_fallback_count` is at most one per game instead of one per remaining
-  endgame move.
+- **Rust `BatchedMCTS` — bounded retry sentinel.** When `solve_exact_plan`
+  exceeds the per-position `exact_endgame_max_secs` budget, the slot sets an
+  `exact_unsolvable` flag and falls back to MCTS. `finalize_move` then refuses
+  to re-enter `ExactSolving` for the same full deck=4 root, but it still allows
+  cheap `deck=0` exact solving and one later deck=4 retry after the current row
+  has progressed to two or fewer remaining claims. A 20-position sample showed
+  deck=4 after two random moves was ~15x faster at the median than the first
+  deck=4 root. The flag is reset in `new_for_game`, so each new game gets a
+  fresh initial attempt.
 
 - **Python `OpenLoopMCTS` — three-state node cache.** `OpenLoopNode.exact_value`
   is one of three states: `None` (Unsolved), a `float` (Solved — returned in O(1),
@@ -619,6 +620,10 @@ Diagnostics exposed through `self_play.py`:
 - `exact_tree_solve_count`: expensive exact continuation plans built;
 - `exact_cache_hit_count`: later deterministic continuation moves served from the plan;
 - `exact_fallback_count`: exact attempts that exceeded budget and fell back to MCTS.
+- `exact_attempt_deck4_initial_count`, `exact_attempt_deck4_retry_count`, and
+  `exact_attempt_deck0_count`: attempts by solve entry point;
+- `exact_fallback_deck4_initial_count`, `exact_fallback_deck4_retry_count`, and
+  `exact_fallback_deck0_count`: fallbacks by solve entry point.
 
 1600-sim, 32-game smoke result with 48x6 CUDA:
 
@@ -936,8 +941,9 @@ File: `games/kingdomino/test_endgame_exact.py`
 | `test_solves_deck4_within_budget` | OPT-4b: median deck=4 solve time fits the wall-clock budget | ✅ |
 | `test_oversample_increases_endgame_fraction` | Change 4: weight 2.0 lifts endgame fraction 20%→~33% | ✅ |
 | `test_oversample_weight_cache_invalidates_on_add` | Change 4: cached weights rebuilt after `add()` | ✅ |
-| `test_exact_stats_in_log_row` | Change 3: all four exact-solver keys present in every JSONL row | ✅ |
+| `test_exact_stats_in_log_row` | Change 3: aggregate and split exact-solver keys present in every JSONL row | ✅ |
 | `test_disabled_solver_returns_unsolved` | `max_secs<=0` disables solving (returns 0.0, unsolved) | ✅ |
+| Rust `exact_retry_tests::deck4_timeout_allows_one_after_two_moves_retry_and_deck0` | BatchedMCTS retry policy: no same-root retry, one deck=4 retry after two moves, deck=0 still allowed | ✅ |
 | `test_undo_redo_equivalent` | OPT-5: undo/redo solver gives same values as cloning solver | ⏳ pending |
 
 ---
@@ -971,7 +977,7 @@ File: `games/kingdomino/test_endgame_exact.py`
 | `games/kingdomino/kingdomino_rust/src/lib.rs` | Rust exact solver and integration: `solve_endgame_ab`, `solve_endgame_ab_parallel`, `exact_solve_no_chance` reference path, `exact_count_no_chance_bounded`, `is_no_chance_endgame_state`, `terminal_search_value`, `placement_score_delta`, `pick_order_score`, `order_legal_for_solver`, `exact_policy_target`, `ExactSolveResult`, exact continuation plan support, `BatchedMCTS::resolve_exact_slots`, `RustGameState.from_parts`, and PyO3 exports |
 | `games/kingdomino/endgame_solver.py` | Python bridge: `exact_endgame_value`, `_python_state_to_rust`, and Python fallback for deck-empty/reference cases |
 | `games/kingdomino/mcts_az.py` | Python `OpenLoopMCTS` exact hook: `exact_endgame_enabled`, `exact_endgame_max_hidden_tiles`, `exact_endgame_max_secs`, `_should_exact_solve`, solve counters (`_exact_solve_count`/`_exact_cache_hits`/`_exact_fallback_count`), root gate, and the three-state `OpenLoopNode.exact_value` cache (`None`/float/`_EXACT_UNSOLVABLE`) with give-up-on-timeout |
-| `games/kingdomino/self_play.py` | Batched training wiring: `SelfPlayConfig.exact_endgame_max_secs`, CLI `--exact_endgame_max_secs`, pass-through into Rust `BatchedMCTS`; exact-solver stats (`exact_solve_count`/`exact_tree_solve_count`/`exact_cache_hit_count`/`exact_fallback_count`) in the JSONL log row + `_compact_summary`; endgame oversampling (`ReplayBuffer.sample_batch(endgame_oversample_weight=...)` with cached weights, `SelfPlayConfig.endgame_oversample`, CLI `--endgame_oversample`, `n_endgame_in_batch` diagnostic) |
+| `games/kingdomino/self_play.py` | Batched training wiring: `SelfPlayConfig.exact_endgame_max_secs`, CLI `--exact_endgame_max_secs`, pass-through into Rust `BatchedMCTS`; exact-solver aggregate stats and split attempt/fallback stats in the JSONL log row + `_compact_summary`; endgame oversampling (`ReplayBuffer.sample_batch(endgame_oversample_weight=...)` with cached weights, `SelfPlayConfig.endgame_oversample`, CLI `--endgame_oversample`, `n_endgame_in_batch` diagnostic) |
 | `games/kingdomino/test_endgame_exact.py` | Exact solver test suite, currently 21 tests including Rust deck=0/deck=4 agreement, alpha-beta correctness, solve-once cache, BatchedMCTS integration, policy validity, fallback counters, and value sanity checks |
 | `games/kingdomino/print_model_contract.py` | Milestone 0 contract checker; adjacent project artifact, not part of exact solving |
 

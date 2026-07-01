@@ -1629,6 +1629,72 @@ fn exact_solve_no_chance(
     Ok(best)
 }
 
+fn board_total_score(board: &RustBoard, harmony: bool, middle_kingdom: bool) -> i32 {
+    let (territory, harmony_bonus, middle_bonus) = board.score(harmony, middle_kingdom);
+    territory + harmony_bonus + middle_bonus
+}
+
+fn max_board_score_after_dominoes(
+    board: &RustBoard,
+    dominoes: &[u16],
+    harmony: bool,
+    middle_kingdom: bool,
+) -> PyResult<i32> {
+    if dominoes.is_empty() {
+        return Ok(board_total_score(board, harmony, middle_kingdom));
+    }
+
+    let (ta, ca, tb, cb) = dom(dominoes[0]);
+    let placements = board.legal_placements(ta, ca, tb, cb);
+    if placements.is_empty() {
+        return max_board_score_after_dominoes(board, &dominoes[1..], harmony, middle_kingdom);
+    }
+
+    let mut best = i32::MIN;
+    for (x1, y1, x2, y2, flipped) in placements {
+        let mut next = board.copy();
+        next.place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+        let score = max_board_score_after_dominoes(
+            &next,
+            &dominoes[1..],
+            harmony,
+            middle_kingdom,
+        )?;
+        if score > best {
+            best = score;
+        }
+    }
+    Ok(best)
+}
+
+fn solve_deck0_final_placement_separable_raw_margin(state: &RustGameState) -> PyResult<Option<i32>> {
+    if state.phase == GAME_OVER {
+        let (s0, s1) = state.scores();
+        return Ok(Some(s0 - s1));
+    }
+    if state.phase != FINAL_PLACEMENT || !state.deck.is_empty() {
+        return Ok(None);
+    }
+
+    let mut remaining: [Vec<u16>; 2] = [Vec::new(), Vec::new()];
+    for &(player, domino_id) in state.pending_claims.iter().skip(state.actor_index) {
+        remaining[player as usize].push(domino_id);
+    }
+    let p0 = max_board_score_after_dominoes(
+        &state.boards[0],
+        &remaining[0],
+        state.harmony,
+        state.middle_kingdom,
+    )?;
+    let p1 = max_board_score_after_dominoes(
+        &state.boards[1],
+        &remaining[1],
+        state.harmony,
+        state.middle_kingdom,
+    )?;
+    Ok(Some(p0 - p1))
+}
+
 /// Flood one connected same-terrain region from (sx, sy), marking `visited`,
 /// returning (area, crowns).  Scoped helper for `placement_score_delta`.
 fn bfs_region(board: &RustBoard, sx: i8, sy: i8, t: u8, visited: &mut [bool; CELLS]) -> (i32, i32) {
@@ -2839,6 +2905,25 @@ fn ol_add_missing_children(
     added
 }
 
+fn ol_expand_uniform(arena: &mut Vec<OLNode>, node_id: u32, state: &RustGameState) -> PyResult<()> {
+    let legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Ok(());
+    }
+    let priors = vec![1.0 / legal.len() as f64; legal.len()];
+    if arena[node_id as usize].is_expanded {
+        ol_add_missing_children(arena, node_id, &legal, &priors);
+    } else {
+        for (i, &(idx, placement, pick)) in legal.iter().enumerate() {
+            let cid = arena.len() as u32;
+            arena.push(OLNode::new(priors[i], (placement, pick)));
+            arena[node_id as usize].children.push((idx, cid));
+        }
+        arena[node_id as usize].is_expanded = true;
+    }
+    Ok(())
+}
+
 /// Apply (sign=+1) / remove (sign=-1) virtual loss along an open-loop path.
 /// Mirrors apply_virtual_loss but takes the per-node actor explicitly (nodes are
 /// stateless): non-root node path[i] nudged by vl_value0 = -1 if its chooser
@@ -3163,6 +3248,55 @@ struct EndgameKey {
     board1_crowns: [u8; CELLS],
 }
 
+fn deck4_remaining_current_claims(state: &RustGameState) -> usize {
+    state
+        .pending_claims
+        .len()
+        .saturating_sub(state.actor_index)
+}
+
+fn should_enter_exact_solving(exact_enabled: bool, slot: &SearchSlot) -> bool {
+    if !exact_enabled || !is_no_chance_endgame_state(&slot.real_state) {
+        return false;
+    }
+    if !slot.exact_unsolvable {
+        return true;
+    }
+    if slot.real_state.deck.is_empty() {
+        return true;
+    }
+    slot.real_state.deck.len() == 4
+        && !slot.exact_deck4_after_two_retry_used
+        && deck4_remaining_current_claims(&slot.real_state) <= 2
+}
+
+fn mark_exact_timeout(slot: &mut SearchSlot) {
+    if slot.exact_unsolvable
+        && slot.real_state.deck.len() == 4
+        && deck4_remaining_current_claims(&slot.real_state) <= 2
+    {
+        slot.exact_deck4_after_two_retry_used = true;
+    }
+    slot.exact_unsolvable = true;
+}
+
+#[derive(Copy, Clone)]
+enum ExactAttemptKind {
+    Deck4Initial,
+    Deck4Retry,
+    Deck0,
+}
+
+fn exact_attempt_kind(slot: &SearchSlot) -> ExactAttemptKind {
+    if slot.real_state.deck.is_empty() {
+        ExactAttemptKind::Deck0
+    } else if slot.exact_unsolvable {
+        ExactAttemptKind::Deck4Retry
+    } else {
+        ExactAttemptKind::Deck4Initial
+    }
+}
+
 /// One game's search tree + real state.  Per-tick the slot runs exactly one
 /// `simulate_batch` chunk; root handling mirrors `RustMCTS::search`.
 struct SearchSlot {
@@ -3180,11 +3314,12 @@ struct SearchSlot {
     missing_child_count: u32, // open-loop: descents stopped to add newly-legal children (diagnostic)
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
     exact_plan: Vec<ExactPlanItem>, // chosen-line plan for the deterministic endgame
-    // Set once the exact solver times out on this game's endgame: the position is
-    // too hard to solve within budget, so fall through to MCTS for ALL remaining
-    // moves of this game instead of re-attempting the (still-failing) solve every
-    // move. Reset to false when the slot starts a new game (new_for_game).
+    // Set once the exact solver times out on this game's deck=4 endgame. This
+    // suppresses retrying the same expensive full-row root, but deck=0 remains
+    // eligible and one deck=4 retry is allowed after the current row has shrunk
+    // to two remaining decisions. Reset when the slot starts a new game.
     exact_unsolvable: bool,
+    exact_deck4_after_two_retry_used: bool,
     fast_move_count: u32,
     full_move_count: u32,
     recorded_fast_move_count: u32,
@@ -3230,6 +3365,7 @@ impl SearchSlot {
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
+            exact_deck4_after_two_retry_used: false,
             fast_move_count: 0,
             full_move_count: 0,
             recorded_fast_move_count: 0,
@@ -3257,6 +3393,7 @@ impl SearchSlot {
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
+            exact_deck4_after_two_retry_used: false,
             fast_move_count: 0,
             full_move_count: 0,
             recorded_fast_move_count: 0,
@@ -3520,10 +3657,7 @@ impl SearchSlot {
             // stays there until GAME_OVER — resolve_exact_slots cascades the whole
             // endgame with zero forwards. When disabled (budget 0), endgames go
             // through normal MCTS.
-            self.state = if exact_enabled
-                && !self.exact_unsolvable
-                && is_no_chance_endgame_state(&self.real_state)
-            {
+            self.state = if should_enter_exact_solving(exact_enabled, self) {
                 SlotState::ExactSolving
             } else {
                 SlotState::NeedsRootEval
@@ -3730,6 +3864,7 @@ fn solve_root_exact_cached(
 /// slot's game. Sent to the background solver thread; the slot keeps its own copy.
 struct SolveJob {
     slot_idx: usize,
+    kind: ExactAttemptKind,
     state: RustGameState,
     records: Vec<MoveRecord>,
     game_seed: u64,
@@ -3745,6 +3880,7 @@ enum SolveResult {
 /// Result of one background solve, harvested by the main thread on the next step().
 struct SolveOutcome {
     slot_idx: usize,
+    kind: ExactAttemptKind,
     result: SolveResult,
     n_solved: u64, // plan length (for counters); 0 on fallback
     solve_secs: f64,
@@ -3769,6 +3905,7 @@ fn spawn_endgame_solver(
         while let Ok(job) = job_rx.recv() {
             let SolveJob {
                 slot_idx,
+                kind,
                 state,
                 records,
                 game_seed,
@@ -3793,6 +3930,7 @@ fn spawn_endgame_solver(
             });
             let outcome = SolveOutcome {
                 slot_idx,
+                kind,
                 result,
                 n_solved,
                 solve_secs: t0.elapsed().as_secs_f64(),
@@ -3978,6 +4116,42 @@ mod exact_policy_tests {
 /// Pick a root child by visit count.  τ=0 → argmax (ties → lowest joint index,
 /// since children are ascending), matching the Python greedy select; τ>0 →
 /// sample ∝ visit^(1/τ) using the slot RNG.
+#[cfg(test)]
+mod exact_retry_tests {
+    use super::*;
+
+    fn deck4_slot(actor_index: usize) -> SearchSlot {
+        let mut state = new_game(0, true, true);
+        state.phase = PLACE_AND_SELECT;
+        state.deck = vec![41, 42, 43, 44];
+        state.current_row = vec![1, 2, 3, 4];
+        state.pending_claims = vec![(0, 5), (1, 6), (0, 7), (1, 8)];
+        state.next_claims.clear();
+        state.actor_index = actor_index;
+        SearchSlot::new_for_game(state, 0, true)
+    }
+
+    #[test]
+    fn deck4_timeout_allows_one_after_two_moves_retry_and_deck0() {
+        let mut slot = deck4_slot(0);
+        assert!(should_enter_exact_solving(true, &slot));
+
+        mark_exact_timeout(&mut slot);
+        assert!(!should_enter_exact_solving(true, &slot));
+
+        slot.real_state.actor_index = 2;
+        assert!(should_enter_exact_solving(true, &slot));
+
+        mark_exact_timeout(&mut slot);
+        assert!(slot.exact_deck4_after_two_retry_used);
+        assert!(!should_enter_exact_solving(true, &slot));
+
+        slot.real_state.deck.clear();
+        slot.real_state.actor_index = 0;
+        assert!(should_enter_exact_solving(true, &slot));
+    }
+}
+
 fn select_from_visits(arena: &[Node], temp: f64, rng: &mut StdRng) -> u16 {
     let children = &arena[0].children;
     if temp <= 1e-6 {
@@ -4095,6 +4269,12 @@ struct BatchedMCTS {
     cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
     cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
     cum_exact_fallback_count: u64,   // budget exceeded → fell back to MCTS (≈0)
+    cum_exact_attempt_deck4_initial_count: u64,
+    cum_exact_attempt_deck4_retry_count: u64,
+    cum_exact_attempt_deck0_count: u64,
+    cum_exact_fallback_deck4_initial_count: u64,
+    cum_exact_fallback_deck4_retry_count: u64,
+    cum_exact_fallback_deck0_count: u64,
     cum_exact_solver_secs: f64,      // wall time spent in resolve_exact_slots (solve + finalize)
     cum_fast_move_count: u64,
     cum_full_move_count: u64,
@@ -4117,6 +4297,35 @@ struct BatchedMCTS {
 }
 
 impl BatchedMCTS {
+    fn note_exact_attempt(&mut self, kind: ExactAttemptKind) {
+        match kind {
+            ExactAttemptKind::Deck4Initial => {
+                self.cum_exact_attempt_deck4_initial_count += 1;
+            }
+            ExactAttemptKind::Deck4Retry => {
+                self.cum_exact_attempt_deck4_retry_count += 1;
+            }
+            ExactAttemptKind::Deck0 => {
+                self.cum_exact_attempt_deck0_count += 1;
+            }
+        }
+    }
+
+    fn note_exact_fallback(&mut self, kind: ExactAttemptKind) {
+        self.cum_exact_fallback_count += 1;
+        match kind {
+            ExactAttemptKind::Deck4Initial => {
+                self.cum_exact_fallback_deck4_initial_count += 1;
+            }
+            ExactAttemptKind::Deck4Retry => {
+                self.cum_exact_fallback_deck4_retry_count += 1;
+            }
+            ExactAttemptKind::Deck0 => {
+                self.cum_exact_fallback_deck0_count += 1;
+            }
+        }
+    }
+
     fn absorb_slot_move_counts(&mut self, si: usize) {
         self.cum_fast_move_count += self.slots[si].fast_move_count as u64;
         self.cum_full_move_count += self.slots[si].full_move_count as u64;
@@ -4145,6 +4354,7 @@ impl BatchedMCTS {
         self.inflight_solves = self.inflight_solves.saturating_sub(1);
         self.cum_exact_solver_secs += outcome.solve_secs;
         let open_loop = self.open_loop;
+        self.note_exact_attempt(outcome.kind);
         match outcome.result {
             SolveResult::Finished(fg) => {
                 self.cum_exact_tree_solve_count += 1;
@@ -4184,9 +4394,9 @@ impl BatchedMCTS {
                 }
             }
             SolveResult::Fallback => {
-                self.cum_exact_fallback_count += 1;
+                self.note_exact_fallback(outcome.kind);
                 let slot = &mut self.slots[si];
-                slot.exact_unsolvable = true;
+                mark_exact_timeout(slot);
                 slot.exact_result = None;
                 slot.exact_plan.clear();
                 slot.state = SlotState::NeedsRootEval;
@@ -4213,6 +4423,7 @@ impl BatchedMCTS {
             if self.slots[si].state == SlotState::ExactSolving {
                 let job = SolveJob {
                     slot_idx: si,
+                    kind: exact_attempt_kind(&self.slots[si]),
                     state: self.slots[si].real_state.cloned(),
                     records: self.slots[si].records.clone(),
                     game_seed: self.slots[si].game_seed,
@@ -4393,6 +4604,12 @@ impl BatchedMCTS {
             cum_exact_tree_solve_count: 0,
             cum_exact_cache_hit_count: 0,
             cum_exact_fallback_count: 0,
+            cum_exact_attempt_deck4_initial_count: 0,
+            cum_exact_attempt_deck4_retry_count: 0,
+            cum_exact_attempt_deck0_count: 0,
+            cum_exact_fallback_deck4_initial_count: 0,
+            cum_exact_fallback_deck4_retry_count: 0,
+            cum_exact_fallback_deck0_count: 0,
             cum_exact_solver_secs: 0.0,
             cum_fast_move_count: 0,
             cum_full_move_count: 0,
@@ -4442,6 +4659,36 @@ impl BatchedMCTS {
     #[getter]
     fn exact_fallback_count(&self) -> u64 {
         self.cum_exact_fallback_count
+    }
+
+    #[getter]
+    fn exact_attempt_deck4_initial_count(&self) -> u64 {
+        self.cum_exact_attempt_deck4_initial_count
+    }
+
+    #[getter]
+    fn exact_attempt_deck4_retry_count(&self) -> u64 {
+        self.cum_exact_attempt_deck4_retry_count
+    }
+
+    #[getter]
+    fn exact_attempt_deck0_count(&self) -> u64 {
+        self.cum_exact_attempt_deck0_count
+    }
+
+    #[getter]
+    fn exact_fallback_deck4_initial_count(&self) -> u64 {
+        self.cum_exact_fallback_deck4_initial_count
+    }
+
+    #[getter]
+    fn exact_fallback_deck4_retry_count(&self) -> u64 {
+        self.cum_exact_fallback_deck4_retry_count
+    }
+
+    #[getter]
+    fn exact_fallback_deck0_count(&self) -> u64 {
+        self.cum_exact_fallback_deck0_count
     }
 
     /// Diagnostic: non-exact moves searched with the fast per-move sim cap.
@@ -4544,6 +4791,8 @@ impl BatchedMCTS {
             if self.slots[si].state != SlotState::ExactSolving {
                 continue;
             }
+            let attempt_kind = exact_attempt_kind(&self.slots[si]);
+            self.note_exact_attempt(attempt_kind);
             match solve_exact_plan(
                 &self.slots[si].real_state,
                 max_secs,
@@ -4568,11 +4817,12 @@ impl BatchedMCTS {
                     finished.push((si, fg));
                 }
                 _ => {
-                    // Deadline exceeded (or degenerate): too hard within budget.
-                    // Mark Unsolvable so the rest of THIS game falls back to MCTS
-                    // (cleared when the slot is recycled in new_for_game).
-                    self.cum_exact_fallback_count += 1;
-                    self.slots[si].exact_unsolvable = true;
+                    // Deadline exceeded (or degenerate): suppress retrying the
+                    // same full deck=4 root, but allow the cheap deck=0 solve
+                    // and one later deck=4 retry once two current-row decisions
+                    // have been fixed.
+                    self.note_exact_fallback(attempt_kind);
+                    mark_exact_timeout(&mut self.slots[si]);
                     self.slots[si].exact_result = None;
                     self.slots[si].exact_plan.clear();
                     self.slots[si].state = SlotState::NeedsRootEval;
@@ -6122,5 +6372,184 @@ mod kingdomino_rust {
             }
             None => Ok((0.0, false, start.elapsed().as_secs_f64())),
         }
+    }
+
+    /// Exact deck=0 FINAL_PLACEMENT value via independent per-player board
+    /// maximization. Returns solved=false for PLACE_AND_SELECT deck=0 because
+    /// final-row picks are still interactive there.
+    #[pyfunction]
+    #[pyo3(signature = (state, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    fn exact_deck0_final_value_separable(
+        state: &RustGameState,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(f64, bool)> {
+        match super::solve_deck0_final_placement_separable_raw_margin(state)? {
+            Some(raw_margin) => Ok((
+                super::margin_to_training_value(raw_margin as f64, score_scale, margin_gain, alpha),
+                true,
+            )),
+            None => Ok((0.0, false)),
+        }
+    }
+
+    /// Benchmark-only probe: run open-loop MCTS from `state` with uniform priors
+    /// and value-zero nonterminal leaves, optionally replacing deck=0 leaf values
+    /// with exact minimax solves. This does not affect production training.
+    #[pyfunction]
+    #[pyo3(signature = (
+        state,
+        n_sims=1600,
+        exact_deck0=false,
+        leaf_max_secs=0.25,
+        final_only=false,
+        fpu=-0.2,
+        cpuct=1.5,
+        seed=0,
+        score_scale=160.0,
+        margin_gain=2.0,
+        alpha=0.8,
+        ordering="lookahead2_clustered",
+        parallel=true
+    ))]
+    fn bench_open_loop_deck0_leaf_exact(
+        state: &RustGameState,
+        n_sims: usize,
+        exact_deck0: bool,
+        leaf_max_secs: f64,
+        final_only: bool,
+        fpu: f64,
+        cpuct: f64,
+        seed: u64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+        ordering: &str,
+        parallel: bool,
+    ) -> PyResult<(f64, u64, u64, u64, u64, u64, f64, u64, u64, u64)> {
+        let mode = super::SolverOrderMode::from_str(ordering)?;
+        let start = std::time::Instant::now();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
+        super::ol_expand_uniform(&mut arena, 0, state)?;
+        arena[0].visit_count = 1;
+
+        let mut exact_cache: HashMap<EndgameKey, Option<f64>> = HashMap::new();
+        let mut deck0_leaf_hits: u64 = 0;
+        let mut deck0_unique_solves: u64 = 0;
+        let mut deck0_cache_hits: u64 = 0;
+        let mut deck0_timeouts: u64 = 0;
+        let mut exact_solve_secs = 0.0;
+        let mut terminal_leaf_hits: u64 = 0;
+        let mut network_leaf_evals: u64 = 0;
+        let mut fallback_count: u32 = 0;
+        let mut missing_child_count: u32 = 0;
+
+        for _ in 0..n_sims {
+            let det = state.redeterminize(Some(rng.r#gen::<u64>()));
+            let (path, _actors, leaf_state) = super::ol_descend(
+                &arena,
+                0,
+                det,
+                fpu,
+                cpuct,
+                &mut fallback_count,
+                &mut missing_child_count,
+            )?;
+            let leaf = *path.last().unwrap();
+
+            let v0 = if leaf_state.phase == GAME_OVER {
+                terminal_leaf_hits += 1;
+                super::terminal_search_value(&leaf_state, score_scale, margin_gain, alpha)
+            } else if leaf_state.deck.is_empty()
+                && (leaf_state.phase == PLACE_AND_SELECT || leaf_state.phase == FINAL_PLACEMENT)
+            {
+                deck0_leaf_hits += 1;
+                if exact_deck0 && (!final_only || leaf_state.phase == FINAL_PLACEMENT) {
+                    let key = super::endgame_key(&leaf_state);
+                    if let Some(cached) = exact_cache.get(&key) {
+                        deck0_cache_hits += 1;
+                        if let Some(raw_margin) = cached {
+                            super::margin_to_training_value(
+                                *raw_margin,
+                                score_scale,
+                                margin_gain,
+                                alpha,
+                            )
+                        } else {
+                            network_leaf_evals += 1;
+                            super::ol_expand_uniform(&mut arena, leaf, &leaf_state)?;
+                            0.0
+                        }
+                    } else {
+                        deck0_unique_solves += 1;
+                        let solve_start = std::time::Instant::now();
+                        let raw = if let Some(raw_margin) =
+                            super::solve_deck0_final_placement_separable_raw_margin(&leaf_state)?
+                        {
+                            Some(raw_margin as f64)
+                        } else {
+                            let deadline = solve_start
+                                + std::time::Duration::from_secs_f64(leaf_max_secs);
+                            if parallel {
+                                super::solve_endgame_ab_parallel(&leaf_state, deadline, mode)?
+                            } else {
+                                super::solve_endgame_ab(
+                                    &leaf_state,
+                                    deadline,
+                                    super::MARGIN_LO,
+                                    super::MARGIN_HI,
+                                    mode,
+                                    0,
+                                )?
+                            }
+                        };
+                        exact_solve_secs += solve_start.elapsed().as_secs_f64();
+                        exact_cache.insert(key, raw);
+                        if let Some(raw_margin) = raw {
+                            super::margin_to_training_value(
+                                raw_margin,
+                                score_scale,
+                                margin_gain,
+                                alpha,
+                            )
+                        } else {
+                            deck0_timeouts += 1;
+                            network_leaf_evals += 1;
+                            super::ol_expand_uniform(&mut arena, leaf, &leaf_state)?;
+                            0.0
+                        }
+                    }
+                } else {
+                    network_leaf_evals += 1;
+                    super::ol_expand_uniform(&mut arena, leaf, &leaf_state)?;
+                    0.0
+                }
+            } else {
+                network_leaf_evals += 1;
+                super::ol_expand_uniform(&mut arena, leaf, &leaf_state)?;
+                0.0
+            };
+
+            for &n in &path {
+                let node = &mut arena[n as usize];
+                node.visit_count += 1;
+                node.value_sum += v0;
+            }
+        }
+
+        Ok((
+            start.elapsed().as_secs_f64(),
+            deck0_leaf_hits,
+            deck0_unique_solves,
+            deck0_cache_hits,
+            deck0_timeouts,
+            terminal_leaf_hits,
+            exact_solve_secs,
+            network_leaf_evals,
+            fallback_count as u64,
+            arena.len() as u64,
+        ))
     }
 }

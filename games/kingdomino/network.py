@@ -133,6 +133,7 @@ class KingdominoNet(nn.Module):
     ):
         super().__init__()
         self.channels = channels
+        self.blocks = blocks
         self.bilinear_dim = D = bilinear_dim
         # Divisor mapping a raw board score to the normalized target the score
         # heads predict (raw_score / score_scale).  Stored for callers that

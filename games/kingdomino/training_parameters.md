@@ -279,6 +279,20 @@ change settings mid-iteration. For example, `--sims_schedule "0:800,20:1600"`
 means iterations 1-20 use 800 full-search sims, and iteration 21 onward uses
 1600 until another schedule key overrides it.
 
+Avoid changing `lr`, `alpha`, and `sims` all at one hard cliff unless the run is
+explicitly testing that regime change. A sudden target/search change can make
+loss curves look like a regression even when the final checkpoint is stronger.
+For production learning runs, prefer small stair steps every ~8-12 iterations:
+
+```powershell
+--sims_schedule "0:800,8:1000,16:1200,28:1400,40:1600" `
+--alpha_schedule "0:0.8,8:0.65,16:0.5,28:0.35,40:0.25" `
+--lr_schedule "0:3e-4,16:2e-4,32:1.25e-4,44:1e-4"
+```
+
+This keeps early training cheap and exploratory, then gradually increases target
+quality while reducing the optimizer step size.
+
 ---
 
 #### `--fast_game_fraction`, `--fast_game_sims`
@@ -340,6 +354,40 @@ Additional knobs:
 
 When `--playout_cap_randomization` is enabled, the training loop bypasses the
 legacy `--fast_game_fraction` split so the two modes do not stack.
+
+`--full_search_fraction` is a throughput/learning optimum, not a
+"higher is always better" knob. The useful rate is approximately:
+
+```text
+useful_training_positions_per_hour
+  = games/sec
+    * moves_per_game
+    * full_search_fraction
+    * target_quality_factor
+    * diversity_factor
+```
+
+Low values generate more unique games and trajectories per hour, but record few
+training positions per game and can leave the replay buffer underfilled. High
+values record more full-search positions per game, but reduce games/sec and add
+more correlated positions from the same games. Run9 used `0.25`; it finished 50
+iterations with only `165941 / 300000` buffer examples, so that setting was
+probably too low for the 48x6 overnight regime.
+
+Recommended sweep values:
+
+```text
+0.25 baseline
+0.33
+0.40
+0.50
+```
+
+Compare `recorded_full_move_count / wall_time`, `buffer_size` growth,
+`games_per_sec`, `exact_solver_secs`, policy KL, win Brier, and final Elo. For
+the current 48x6 laptop setup, start around `0.35`; move toward `0.40` only if
+throughput remains acceptable. Leave `--record_fast_moves` off unless explicitly
+testing lower-quality fast-search policy targets.
 
 ---
 
@@ -407,11 +455,13 @@ exact endgame solving for ablation. This replaced the old node-count budget
 (`--exact_endgame_max_nodes`): wall-clock is what bounds throughput, and a node
 budget timed out at a roughly fixed wall-clock cost regardless of complexity.
 
-When a solve exceeds the budget, the slot sets a per-game `exact_unsolvable`
-sentinel and falls back to MCTS for **all** remaining moves of that game (the next
-root is usually still deck∈{0,4} and would just time out again). The flag resets
-when the slot starts a new game, so `exact_fallback_count` is at most ~one per
-game instead of one per remaining endgame move.
+When a deck=4 solve exceeds the budget, the slot sets a per-game
+`exact_unsolvable` sentinel and falls back to MCTS rather than retrying the same
+full-row root every move. The retry policy is intentionally narrow: always allow
+cheap `deck=0` exact solving later, and allow one additional `deck=4` attempt
+once the current round has progressed to two or fewer remaining claims. A small
+sample of real deck=4 positions showed this "after two moves" state was ~15x
+faster at the median, so it often recovers exact labels without a retry storm.
 
 The exact solver applies when the game has no remaining chance branching:
 
@@ -446,6 +496,13 @@ Interpretation:
 - `0.0` is useful for measuring whether exact solving is helping a particular run.
 - Advisor/reanalysis use cases should prefer larger budgets and more aggressive
   solver work; training should optimize the throughput/label-quality tradeoff.
+
+Run9 used `10.0s` and averaged roughly 637 solver-seconds per iteration while
+GPU fill was low. For learning-speed runs, return to `3.0s` or at most `5.0s`
+before increasing search parallelism. Watch `exact_fallback_count` plus the
+split attempt/fallback counters for `deck4_initial`, `deck4_retry`, and `deck0`;
+a small fallback increase is acceptable if examples/hour and games/hour improve.
+All three solve entry points share the single `exact_endgame_max_secs` cap.
 
 Exact policy targets are soft expert targets, not one-hot best-move labels. The
 solver converts exact child values into an advantage-weighted softmax with
@@ -1027,6 +1084,62 @@ This allows the model to keep learning without letting a transient regression
 poison future self-play data. Add `--promotion_update_best` only when you want
 an in-run passed promotion to also overwrite `current_best.pt` on disk.
 
+Validation status: targeted tests cover Wilson LCB behavior, fixed-suite
+regression blocking, audit-file/backup writes, and a one-iteration gated
+self-play smoke. Before using gated self-play for a long run, do one short CUDA
+smoke with `--gated_selfplay --promotion_every 1 --promotion_games 20
+--promotion_sims 50 --benchmark_every 0 --elo_every 0` and confirm
+`promotion_checked`, `promotion_passed`, and `selfplay_source` appear as expected
+in `training_log.jsonl`. For production, use larger promotion games
+(`400-800`) and keep `--promotion_update_best` off until the dry-run decision
+JSONs look sane.
+
+#### Hall-of-Fame Opponent Mixing
+**Values:** off by default
+
+Seed the HOF pool from a promoted/manual checkpoint:
+
+```
+.\.venv\Scripts\python.exe .\scripts\seed_hof.py `
+  --source runs\kingdomino\best_checkpoint\current_best.pt `
+  --hof_dir runs\kingdomino\best_checkpoint\hof `
+  --tag current_best_seed
+```
+
+Enable a small HOF block during training:
+
+```
+--hof_dir runs\kingdomino\best_checkpoint\hof
+--hof_fraction_schedule "0:0.0,50:0.05,100:0.1"
+--hof_start_iter 50
+--hof_sample_weights recency
+--hof_sims 200
+--hof_temp_moves 0
+--hof_dirichlet_epsilon 0.0
+```
+
+The first-pass M7 implementation samples one HOF opponent per iteration and
+runs HOF games as a separate mixed-model open-loop block. This keeps the main
+batched self-play path unchanged while we measure the training value and
+throughput cost.
+
+HOF opponents are deterministic by default: no Dirichlet noise and no
+temperature exploration. Only the current model's turns are stored as trainable
+examples; HOF-owned decisions are not used as policy targets.
+
+Use `--hof_add_every N` to copy `--current_best_path` into the HOF pool every
+N iterations. This should usually be paired with promotion gating so HOF entries
+come only from promoted checkpoints.
+
+Validation status: targeted tests cover HOF index metadata, loading each HOF
+checkpoint with its own architecture, latest/recency sampling, trainable-example
+filtering, and a one-iteration mixed self-play smoke. The remaining validation is
+operational: run a short CUDA smoke with a seeded HOF pool and `hof_fraction`
+around `0.05-0.10`, then check `hof_games`, `hof_trainable_examples`,
+`hof_opponent_sha256`, and loss/Elo stability. Do not jump straight to the
+original 30% HOF target; ramp only after the small-fraction run shows no loss
+spikes or throughput surprises.
+
 #### `--checkpoint_dir`
 **Values:** directory path
 
@@ -1127,6 +1240,11 @@ elo_rating_time ≈ (anchors × games_per_anchor × 2) / 0.72 games/s
 
 buffer_coverage (iters) = buffer / (games_per_iter × ~80 positions/game)
 
+with playout-cap randomization and fast moves not recorded:
+recorded_positions_per_iter ~= games_per_iter * ~80 * full_search_fraction
+useful_positions/hour depends on both games/sec and full_search_fraction;
+run short sweeps at 0.25/0.33/0.40/0.50 rather than assuming max is best
+
 target_quality driven by: sims (dominant), batch_slots×leaf_batch (fill ratio)
 
 train_steps should scale with games_per_iter: ~4× games_per_iter
@@ -1142,6 +1260,7 @@ Elo ±CI ≈ 400 / (log(10) × √(total_elo_games × p × (1-p)))
 | Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors; exact off (`--exact_endgame_max_secs 0`) |
 | Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams; exact 3.0s |
 | Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config; exact 3.0s + `--async_solve --solver_cpus 6` |
+| 48x6 replay-width run | scheduled 800-1600 | 224 | 600 | 300000 | 0-10 | `--playout_cap_randomization --full_search_fraction 0.35`, exact 3.0s, smooth lr/alpha/sims schedules |
 | Cloud overnight | 1600 | 300 | 1200 | 500000 | 10 | ~3× throughput; `--async_solve --solver_cpus <vcpus−2>` |
 | Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates; exact 3.0s + `--async_solve` |
 

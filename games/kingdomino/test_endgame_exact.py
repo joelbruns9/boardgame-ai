@@ -1022,7 +1022,17 @@ def test_exact_stats_in_log_row(tmp_path):
     lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
     assert len(lines) == 2
     for row in lines:
-        for key in ("exact_solve_count", "exact_tree_solve_count",
-                    "exact_cache_hit_count", "exact_fallback_count"):
+        for key in (
+            "exact_solve_count",
+            "exact_tree_solve_count",
+            "exact_cache_hit_count",
+            "exact_fallback_count",
+            "exact_attempt_deck4_initial_count",
+            "exact_attempt_deck4_retry_count",
+            "exact_attempt_deck0_count",
+            "exact_fallback_deck4_initial_count",
+            "exact_fallback_deck4_retry_count",
+            "exact_fallback_deck0_count",
+        ):
             assert key in row, f"missing {key} in log row"
             assert row[key] is not None  # batched engine populates real ints

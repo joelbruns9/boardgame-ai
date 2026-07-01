@@ -555,8 +555,16 @@ Implementation phases:
 ## Milestone 7 — Hall-of-Fame Opponent Sampling + Sample Ownership
 **Gate: HOF mixing does not destabilize losses; Elo continues improving**
 
+Status: first-pass infrastructure implemented. HOF is opt-in, samples one HOF
+opponent per iteration, and runs HOF games as a separate mixed-model open-loop
+block to avoid disturbing the high-throughput batched self-play path.
+
 ### Mechanism
-HOF pool seeded/grown from `current_best`. Each iteration: ~70% self-play, HOF fraction per schedule (ramping to 30%). HOF sampling weighted toward recent entries with diversity across the full pool.
+HOF pool seeded/grown from `current_best`. Each iteration: normal self-play
+consumes the non-HOF game budget, then a small HOF block plays against one
+sampled HOF opponent. Start with low fractions (5-10%) before considering the
+original 30% target. HOF sampling is weighted toward recent entries with
+diversity across the full pool.
 
 ### Sample ownership rules (written before implementation)
 
@@ -580,12 +588,18 @@ trainable = True | False
 ```
 --hof_dir             best_checkpoint/hof/
 --hof_fraction        0.3
+--hof_fraction_schedule "0:0.0,50:0.05,100:0.1"
 --hof_start_iter      50
 --hof_sample_weights  "recency"
+--hof_sims            200
+--hof_temp_moves      0
+--hof_dirichlet_epsilon 0.0
+--hof_add_every       50
 ```
 
 ### Where
-`games/kingdomino/self_play.py`, `parallel_self_play.py`
+`games/kingdomino/self_play.py`, `games/kingdomino/hof.py`,
+`scripts/seed_hof.py`. `parallel_self_play.py` remains deferred.
 
 ---
 
