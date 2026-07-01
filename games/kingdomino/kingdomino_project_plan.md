@@ -499,14 +499,21 @@ scrollback or a separate notebook.
 ## Milestone 6 — Promotion Gating + Checkpoint Role Separation
 **Gate: regression never propagates to advisor or HOF pool**
 
+Status: implemented, pending review. `current_best.pt` is also the advisor
+default; no separate `advisor_default.pt` is maintained.
+
 ### Checkpoint roles
 
 | Role | Path | Updated when |
 |---|---|---|
 | `latest` | `runs/.../iter_NNNN.pt` | Every iteration |
+| `candidate` | any `iter_NNNN.pt` under review | Never copied automatically |
 | `current_best` | `best_checkpoint/current_best.pt` | Passes statistical promotion gate |
 | `hof/` | `best_checkpoint/hof/iter_NNNN.pt` | Every 50 iters, only from `current_best` |
-| `advisor_default` | `best_checkpoint/advisor_default.pt` | Manual promotion + human review |
+
+The BGA advisor loads `current_best.pt` directly. This avoids a second manual
+promotion path and keeps "best model for training", "best model for advisor",
+and "source for future HOF entries" aligned.
 
 ### Statistical promotion gate
 
@@ -529,6 +536,19 @@ HOF is fed only from `current_best` — one bad promotion contaminates the HOF p
 
 ### Where
 `games/kingdomino/self_play.py`, `scripts/promote_checkpoint.py` (with confirmation prompt)
+
+Implementation phases:
+
+1. **M6a standalone promotion gate**: `scripts/promote_checkpoint.py` evaluates a
+   candidate against `current_best.pt`, writes audit metadata, and updates
+   `current_best.pt` only with explicit `--confirm`.
+2. **M6b training convention**: new runs should normally warm-start from
+   `runs/kingdomino/best_checkpoint/current_best.pt` via
+   `--warm_start_current_best`, not from arbitrary final checkpoints.
+3. **M6c gated self-play**: optional `--gated_selfplay` decouples the learner
+   from the data generator. Self-play comes from `current_best.pt`; the learner
+   updates every iteration but replaces the generator only after an in-run
+   promotion gate passes.
 
 ---
 
