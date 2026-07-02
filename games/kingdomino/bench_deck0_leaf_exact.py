@@ -5,7 +5,7 @@ This is measurement-only. It does not change training behavior.
 Example:
     python -m games.kingdomino.bench_deck0_leaf_exact \
       --positions runs/kingdomino/benchmarks/network_positions_50.pkl \
-      --sims 1600 --leaf-max-secs 0.25
+      --sims 1600 --leaf-max-secs 0.01 --draft-k 2
 """
 
 from __future__ import annotations
@@ -32,6 +32,10 @@ FIELDS = (
     "network_leaf_evals",
     "fallback_count",
     "arena_nodes",
+    "dp_nodes",
+    "dp_cache_hits",
+    "dp_final_cutoffs",
+    "dp_deadline_hits",
 )
 
 
@@ -50,6 +54,7 @@ def _run_one(state, *, exact: bool, args, seed: int) -> dict:
         exact_deck0=exact,
         leaf_max_secs=args.leaf_max_secs,
         final_only=args.final_only,
+        draft_k=args.draft_k,
         fpu=args.fpu,
         cpuct=args.cpuct,
         seed=seed,
@@ -72,6 +77,10 @@ def _summarize(label: str, rows: list[dict]) -> None:
     timeouts = sum(int(r["deck0_timeouts"]) for r in rows)
     solve_secs = sum(float(r["exact_solve_secs"]) for r in rows)
     net_evals = sum(int(r["network_leaf_evals"]) for r in rows)
+    dp_nodes = sum(int(r["dp_nodes"]) for r in rows)
+    dp_cache_hits = sum(int(r["dp_cache_hits"]) for r in rows)
+    dp_final_cutoffs = sum(int(r["dp_final_cutoffs"]) for r in rows)
+    dp_deadline_hits = sum(int(r["dp_deadline_hits"]) for r in rows)
     print(f"\n=== {label} ===")
     print(
         f"wall: total={sum(elapsed):.3f}s "
@@ -84,6 +93,12 @@ def _summarize(label: str, rows: list[dict]) -> None:
         f"cache_hits={cache_hits} timeouts={timeouts} "
         f"exact_solve_secs={solve_secs:.3f}s network_leaf_evals={net_evals}"
     )
+    if dp_nodes or dp_cache_hits or dp_final_cutoffs or dp_deadline_hits:
+        print(
+            f"dp_nodes={dp_nodes} dp_cache_hits={dp_cache_hits} "
+            f"dp_final_cutoffs={dp_final_cutoffs} "
+            f"dp_deadline_hits={dp_deadline_hits}"
+        )
 
 
 def main() -> None:
@@ -95,6 +110,10 @@ def main() -> None:
     ap.add_argument("--final-only", action="store_true",
                     help="only exact-solve deck=0 FINAL_PLACEMENT leaves; "
                          "PLACE_AND_SELECT deck=0 leaves use the ordinary leaf evaluator")
+    ap.add_argument("--draft-k", type=int, default=-1,
+                    help="enable memoized deck=0 PLACE_AND_SELECT draft DP for "
+                         "current_row length <= K; 0 is final-placement only; "
+                         "-1 keeps the older joint-solver behavior")
     ap.add_argument("--fpu", type=float, default=-0.2)
     ap.add_argument("--cpuct", type=float, default=1.5)
     ap.add_argument("--seed", type=int, default=0)
@@ -111,6 +130,7 @@ def main() -> None:
         f"Loaded {len(positions)} positions; sims={args.sims}, "
         f"leaf_max_secs={args.leaf_max_secs:g}, "
         f"final_only={args.final_only}, "
+        f"draft_k={args.draft_k}, "
         f"solver={'serial' if args.serial else 'parallel'}"
     )
 
@@ -129,7 +149,8 @@ def main() -> None:
             f"exact={exact['elapsed_secs']*1000:.1f}ms "
             f"deck0_hits={exact['deck0_leaf_hits']} "
             f"unique={exact['deck0_unique_solves']} "
-            f"solve={exact['exact_solve_secs']*1000:.1f}ms",
+            f"solve={exact['exact_solve_secs']*1000:.1f}ms "
+            f"dp_nodes={exact['dp_nodes']}",
             flush=True,
         )
 

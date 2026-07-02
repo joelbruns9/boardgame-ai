@@ -9,15 +9,14 @@
 #   3. Python deps — cu128 torch FIRST, then the rest of requirements.txt
 #   4. build the kingdomino_rust crate with maturin
 #   5. HARD-FAIL GPU verification gate (wrong wheel/driver dies in ~30s)
-#   6. print the exact benchmark + training commands to run next
+#   6. run the bootstrap calibration benchmark sequence and save logs
 #
 # Design notes:
 #   * Idempotent: safe to re-run after a partial failure. Rust install, clone,
 #     and the crate build all detect prior state.
 #   * No credentials baked in. Clones public over HTTPS; if the repo is private
 #     and a TTY is present, prompts for a GitHub token.
-#   * The GPU gate runs BEFORE any benchmark; benchmarks run BEFORE any training
-#     (this script stops at the gate and only PRINTS the next commands).
+#   * The GPU gate runs BEFORE any benchmark; benchmarks run BEFORE any training.
 #
 # Usage (fresh box):
 #   curl -fsSL https://raw.githubusercontent.com/joelbruns9/boardgame-ai/main/setup_cloud.sh -o setup_cloud.sh
@@ -32,6 +31,13 @@ REPO_DIR="${REPO_DIR:-$HOME/boardgame-ai}"
 CRATE_DIR_REL="games/kingdomino/kingdomino_rust"
 CU128_INDEX="https://download.pytorch.org/whl/cu128"
 MIN_DRIVER=570
+RUN_CALIBRATION="${RUN_CALIBRATION:-1}"
+CALIBRATION_DIR_REL="${CALIBRATION_DIR_REL:-runs/kingdomino/cloud_calibration}"
+CALIBRATION_CHANNELS="${CALIBRATION_CHANNELS:-80,96}"
+CALIBRATION_PRIMARY_CHANNELS="${CALIBRATION_PRIMARY_CHANNELS:-80}"
+CALIBRATION_BATCHES="${CALIBRATION_BATCHES:-64,96,128,160,192,224,256,320,384,512}"
+CALIBRATION_GAMES="${CALIBRATION_GAMES:-30}"
+CALIBRATION_SIMS="${CALIBRATION_SIMS:-200}"
 
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -57,6 +63,21 @@ fi
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 command -v cargo >/dev/null 2>&1 || die "cargo still not on PATH after rustup."
+if ! command -v rustup >/dev/null 2>&1; then
+  warn "cargo exists but rustup is missing; installing rustup so Rust can be updated."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  # shellcheck disable=SC1091
+  [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+fi
+RUST_VERSION="$(rustc --version | awk '{print $2}')"
+if [ "$(printf '%s\n' "1.85.0" "$RUST_VERSION" | sort -V | head -n1)" != "1.85.0" ]; then
+  warn "rustc $RUST_VERSION is older than 1.85.0; updating stable via rustup."
+  rustup default stable
+  rustup update stable
+fi
+RUST_VERSION="$(rustc --version | awk '{print $2}')"
+[ "$(printf '%s\n' "1.85.0" "$RUST_VERSION" | sort -V | head -n1)" = "1.85.0" ] \
+  || die "rustc $RUST_VERSION is still older than required 1.85.0."
 ok "$(rustc --version)"
 stage_done 1
 
@@ -237,35 +258,43 @@ else
   exit 1
 fi
 
-# ── STAGE 6: Next steps (benchmarks BEFORE training) ─────────────────────────
-stage 6 "Next steps — run these IN ORDER (benchmarks before training)"
+# ── STAGE 6: Hand off to the Python calibration runner ───────────────────────
+stage 6 "Calibration benchmarks (Phase 3 runner)"
+cd "$REPO_DIR"
+CALIBRATION_DIR="$REPO_DIR/$CALIBRATION_DIR_REL"
+mkdir -p "$CALIBRATION_DIR"
+
+if [ "$RUN_CALIBRATION" != "1" ]; then
+  warn "RUN_CALIBRATION=$RUN_CALIBRATION; skipping Phase 3 benchmark launch."
+  warn "Run this before training:"
+  warn "  $PY -m games.kingdomino.cloud_calibration --preset bootstrap --out \"$CALIBRATION_DIR\""
+  stage_done 6
+  ok "Setup complete."
+  exit 0
+fi
+
+"$PY" -m games.kingdomino.cloud_calibration \
+  --preset bootstrap \
+  --out "$CALIBRATION_DIR" \
+  --device cuda \
+  --channels "$CALIBRATION_CHANNELS" \
+  --primary_channels "$CALIBRATION_PRIMARY_CHANNELS" \
+  --blocks 6 \
+  --forward_batches "$CALIBRATION_BATCHES" \
+  --sims "$CALIBRATION_SIMS" \
+  --selfplay_games "$CALIBRATION_GAMES"
+
 cat <<EOF
 
-  Repo:   $REPO_DIR
-  Python: $($PY --version 2>&1)
+Calibration output written to:
+  $CALIBRATION_DIR
 
-  1) torch.compile A/B  (decides whether to pass --compile)
-       cd "$REPO_DIR"
-       python -m games.kingdomino.bench_compile --device cuda --sims 200 --games 20
-     -> read the final 'USE --compile' / 'DO NOT USE --compile' verdict.
+Review:
+  $CALIBRATION_DIR/summary.md
+  $CALIBRATION_DIR/results.csv
 
-  2) double-buffer A/B  (decides whether to pass --double_buffer)
-       python -m games.kingdomino.bench_doublebuffer --device cuda --sims 200 --games 50 --channels 80 --blocks 6
-     -> read the final 'USE --double_buffer' / 'DO NOT USE --double_buffer' verdict.
-
-  3) batch_slots sweep  (pick the best N for the 5090; keep leaf_batch=6 fixed)
-       for N in 32 48 64 96; do
-         echo "=== batch_slots=\$N ==="
-         python -m games.kingdomino.self_play --engine batched_open_loop --device cuda \\
-           --channels 80 --blocks 6 --leaf_batch 6 --batch_slots \$N \\
-           --iterations 1 --games_per_iter 30 --benchmark_every 0 --elo_every 0
-       done
-     -> pick the N with the highest games/s.
-
-  4) CHECK the three outputs above, THEN launch the 80ch/6b cold-start training
-     run (see games/kingdomino/CLOUD_RUN.md Phase 4). Add --compile (and
-     --compile_dynamic on) / --double_buffer ONLY if steps 1-2 said USE, and
-     --batch_slots <N> from step 3. Do not skip the benchmarks.
+Run the full Phase 3 sweep later with:
+  $PY -m games.kingdomino.cloud_calibration --preset full --out "$CALIBRATION_DIR/full"
 
 EOF
 stage_done 6

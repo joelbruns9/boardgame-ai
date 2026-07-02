@@ -5,11 +5,13 @@ use numpy::{
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+mod deck0_draft_dp;
 
 // Terrain constants matching Python's Terrain IntEnum
 const EMPTY: u8 = 0;
@@ -1629,72 +1631,6 @@ fn exact_solve_no_chance(
     Ok(best)
 }
 
-fn board_total_score(board: &RustBoard, harmony: bool, middle_kingdom: bool) -> i32 {
-    let (territory, harmony_bonus, middle_bonus) = board.score(harmony, middle_kingdom);
-    territory + harmony_bonus + middle_bonus
-}
-
-fn max_board_score_after_dominoes(
-    board: &RustBoard,
-    dominoes: &[u16],
-    harmony: bool,
-    middle_kingdom: bool,
-) -> PyResult<i32> {
-    if dominoes.is_empty() {
-        return Ok(board_total_score(board, harmony, middle_kingdom));
-    }
-
-    let (ta, ca, tb, cb) = dom(dominoes[0]);
-    let placements = board.legal_placements(ta, ca, tb, cb);
-    if placements.is_empty() {
-        return max_board_score_after_dominoes(board, &dominoes[1..], harmony, middle_kingdom);
-    }
-
-    let mut best = i32::MIN;
-    for (x1, y1, x2, y2, flipped) in placements {
-        let mut next = board.copy();
-        next.place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
-        let score = max_board_score_after_dominoes(
-            &next,
-            &dominoes[1..],
-            harmony,
-            middle_kingdom,
-        )?;
-        if score > best {
-            best = score;
-        }
-    }
-    Ok(best)
-}
-
-fn solve_deck0_final_placement_separable_raw_margin(state: &RustGameState) -> PyResult<Option<i32>> {
-    if state.phase == GAME_OVER {
-        let (s0, s1) = state.scores();
-        return Ok(Some(s0 - s1));
-    }
-    if state.phase != FINAL_PLACEMENT || !state.deck.is_empty() {
-        return Ok(None);
-    }
-
-    let mut remaining: [Vec<u16>; 2] = [Vec::new(), Vec::new()];
-    for &(player, domino_id) in state.pending_claims.iter().skip(state.actor_index) {
-        remaining[player as usize].push(domino_id);
-    }
-    let p0 = max_board_score_after_dominoes(
-        &state.boards[0],
-        &remaining[0],
-        state.harmony,
-        state.middle_kingdom,
-    )?;
-    let p1 = max_board_score_after_dominoes(
-        &state.boards[1],
-        &remaining[1],
-        state.harmony,
-        state.middle_kingdom,
-    )?;
-    Ok(Some(p0 - p1))
-}
-
 /// Flood one connected same-terrain region from (sx, sy), marking `visited`,
 /// returning (area, crowns).  Scoped helper for `placement_score_delta`.
 fn bfs_region(board: &RustBoard, sx: i8, sy: i8, t: u8, visited: &mut [bool; CELLS]) -> (i32, i32) {
@@ -1952,14 +1888,7 @@ fn order_legal_for_solver(
         None
     };
     legal.sort_by_cached_key(|&(idx_key, p, pk)| {
-        let score = cheap_order_score_for_solver(
-            board,
-            halves,
-            &tc,
-            opp_tc.as_ref(),
-            p,
-            pk,
-        );
+        let score = cheap_order_score_for_solver(board, halves, &tc, opp_tc.as_ref(), p, pk);
         // Negate so the natural ascending sort yields descending benefit;
         // (score, idx) lexicographic with idx as the stable tiebreaker.
         (-score, idx_key)
@@ -1989,14 +1918,7 @@ fn cheap_scores_clustered_for_solver(
     let mut best = i32::MIN;
     let mut scores = Vec::with_capacity(legal.len());
     for &(_idx_key, p, pk) in legal {
-        let score = cheap_order_score_for_solver(
-            board,
-            halves,
-            &tc,
-            opp_tc.as_ref(),
-            p,
-            pk,
-        );
+        let score = cheap_order_score_for_solver(board, halves, &tc, opp_tc.as_ref(), p, pk);
         best = best.max(score);
         scores.push(score);
     }
@@ -2069,9 +1991,11 @@ fn order_legal_for_solver_at_depth(
         SolverOrderMode::Lookahead1Clustered => depth == 1,
         _ => false,
     };
-    let clustered = clustered_depth
-        && cheap_scores_clustered_for_solver(state, legal, mode);
-    if mode.uses_lookahead_at_depth(depth) || mode.uses_adaptive_lookahead(depth, legal.len()) || clustered {
+    let clustered = clustered_depth && cheap_scores_clustered_for_solver(state, legal, mode);
+    if mode.uses_lookahead_at_depth(depth)
+        || mode.uses_adaptive_lookahead(depth, legal.len())
+        || clustered
+    {
         order_legal_for_solver_lookahead(state, legal, mode)
     } else {
         order_legal_for_solver(state, legal, mode);
@@ -3249,10 +3173,7 @@ struct EndgameKey {
 }
 
 fn deck4_remaining_current_claims(state: &RustGameState) -> usize {
-    state
-        .pending_claims
-        .len()
-        .saturating_sub(state.actor_index)
+    state.pending_claims.len().saturating_sub(state.actor_index)
 }
 
 fn should_enter_exact_solving(exact_enabled: bool, slot: &SearchSlot) -> bool {
@@ -3285,6 +3206,14 @@ enum ExactAttemptKind {
     Deck4Initial,
     Deck4Retry,
     Deck0,
+}
+
+fn exact_attempt_kind_label(kind: ExactAttemptKind) -> &'static str {
+    match kind {
+        ExactAttemptKind::Deck4Initial => "deck4_initial",
+        ExactAttemptKind::Deck4Retry => "deck4_retry",
+        ExactAttemptKind::Deck0 => "deck0",
+    }
 }
 
 fn exact_attempt_kind(slot: &SearchSlot) -> ExactAttemptKind {
@@ -3837,16 +3766,18 @@ fn solve_root_exact_cached(
     let _ = &value_cache; // intentionally unused by the parallel per-child solves
     let child_results: Vec<PyResult<Option<(u16, f64)>>> = legal
         .par_iter()
-        .map(|&(joint_idx, placement, pick)| -> PyResult<Option<(u16, f64)>> {
-            let next = state.step(placement, pick)?;
-            match solve_endgame_ab(&next, deadline, MARGIN_LO, MARGIN_HI, mode, 0)? {
-                Some(raw_margin) => Ok(Some((
-                    joint_idx,
-                    margin_to_training_value(raw_margin, score_scale, margin_gain, alpha_param),
-                ))),
-                None => Ok(None),
-            }
-        })
+        .map(
+            |&(joint_idx, placement, pick)| -> PyResult<Option<(u16, f64)>> {
+                let next = state.step(placement, pick)?;
+                match solve_endgame_ab(&next, deadline, MARGIN_LO, MARGIN_HI, mode, 0)? {
+                    Some(raw_margin) => Ok(Some((
+                        joint_idx,
+                        margin_to_training_value(raw_margin, score_scale, margin_gain, alpha_param),
+                    ))),
+                    None => Ok(None),
+                }
+            },
+        )
         .collect();
     let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
     for r in child_results {
@@ -3868,6 +3799,7 @@ struct SolveJob {
     state: RustGameState,
     records: Vec<MoveRecord>,
     game_seed: u64,
+    move_num: usize,
 }
 
 enum SolveResult {
@@ -3884,6 +3816,9 @@ struct SolveOutcome {
     result: SolveResult,
     n_solved: u64, // plan length (for counters); 0 on fallback
     solve_secs: f64,
+    fallback_state: Option<RustGameState>,
+    game_seed: u64,
+    move_num: usize,
 }
 
 /// Spawn the single background solver thread (concurrency 1, so each solve keeps
@@ -3909,8 +3844,10 @@ fn spawn_endgame_solver(
                 state,
                 records,
                 game_seed,
+                move_num,
             } = job;
             let t0 = std::time::Instant::now();
+            let state_for_fallback = state.cloned();
             // Confine the within-solve YBW par_iter to the DEDICATED solver pool so
             // its long, non-preemptible subtree-solves never head-of-line-block the
             // GLOBAL pool that step()/update() use to feed the GPU. The pool's thread
@@ -3928,12 +3865,20 @@ fn spawn_endgame_solver(
                     _ => (SolveResult::Fallback, 0),
                 }
             });
+            let is_fallback = matches!(&result, SolveResult::Fallback);
             let outcome = SolveOutcome {
                 slot_idx,
                 kind,
+                fallback_state: if is_fallback {
+                    Some(state_for_fallback)
+                } else {
+                    None
+                },
                 result,
                 n_solved,
                 solve_secs: t0.elapsed().as_secs_f64(),
+                game_seed,
+                move_num,
             };
             if out_tx.send(outcome).is_err() {
                 break; // main side dropped the receiver
@@ -4275,7 +4220,8 @@ struct BatchedMCTS {
     cum_exact_fallback_deck4_initial_count: u64,
     cum_exact_fallback_deck4_retry_count: u64,
     cum_exact_fallback_deck0_count: u64,
-    cum_exact_solver_secs: f64,      // wall time spent in resolve_exact_slots (solve + finalize)
+    cum_exact_solver_secs: f64, // wall time spent in resolve_exact_slots (solve + finalize)
+    exact_fallback_records: Vec<ExactFallbackRecord>,
     cum_fast_move_count: u64,
     cum_full_move_count: u64,
     cum_recorded_fast_move_count: u64,
@@ -4294,6 +4240,15 @@ struct BatchedMCTS {
     job_tx: std::sync::Mutex<std::sync::mpsc::Sender<SolveJob>>,
     out_rx: std::sync::Mutex<std::sync::mpsc::Receiver<SolveOutcome>>,
     _solver_handle: std::thread::JoinHandle<()>,
+}
+
+struct ExactFallbackRecord {
+    kind: ExactAttemptKind,
+    game_seed: u64,
+    move_num: usize,
+    max_secs: f64,
+    solve_secs: f64,
+    state: RustGameState,
 }
 
 impl BatchedMCTS {
@@ -4326,6 +4281,24 @@ impl BatchedMCTS {
         }
     }
 
+    fn record_exact_fallback(
+        &mut self,
+        kind: ExactAttemptKind,
+        state: RustGameState,
+        game_seed: u64,
+        move_num: usize,
+        solve_secs: f64,
+    ) {
+        self.exact_fallback_records.push(ExactFallbackRecord {
+            kind,
+            game_seed,
+            move_num,
+            max_secs: self.exact_endgame_max_secs,
+            solve_secs,
+            state,
+        });
+    }
+
     fn absorb_slot_move_counts(&mut self, si: usize) {
         self.cum_fast_move_count += self.slots[si].fast_move_count as u64;
         self.cum_full_move_count += self.slots[si].full_move_count as u64;
@@ -4352,7 +4325,11 @@ impl BatchedMCTS {
     fn apply_outcome(&mut self, outcome: SolveOutcome) {
         let si = outcome.slot_idx;
         self.inflight_solves = self.inflight_solves.saturating_sub(1);
-        self.cum_exact_solver_secs += outcome.solve_secs;
+        let solve_secs = outcome.solve_secs;
+        let fallback_state = outcome.fallback_state;
+        let game_seed = outcome.game_seed;
+        let move_num = outcome.move_num;
+        self.cum_exact_solver_secs += solve_secs;
         let open_loop = self.open_loop;
         self.note_exact_attempt(outcome.kind);
         match outcome.result {
@@ -4395,6 +4372,15 @@ impl BatchedMCTS {
             }
             SolveResult::Fallback => {
                 self.note_exact_fallback(outcome.kind);
+                if let Some(state) = fallback_state {
+                    self.record_exact_fallback(
+                        outcome.kind,
+                        state,
+                        game_seed,
+                        move_num,
+                        solve_secs,
+                    );
+                }
                 let slot = &mut self.slots[si];
                 mark_exact_timeout(slot);
                 slot.exact_result = None;
@@ -4427,6 +4413,7 @@ impl BatchedMCTS {
                     state: self.slots[si].real_state.cloned(),
                     records: self.slots[si].records.clone(),
                     game_seed: self.slots[si].game_seed,
+                    move_num: self.slots[si].move_num,
                 };
                 self.slots[si].state = SlotState::SolvingInBackground;
                 self.inflight_solves += 1;
@@ -4442,9 +4429,10 @@ impl BatchedMCTS {
         self.harvest_solves();
         self.dispatch_solves();
         while self.inflight_solves > 0
-            && !self.slots.iter().any(|s| {
-                matches!(s.state, SlotState::Searching | SlotState::NeedsRootEval)
-            })
+            && !self
+                .slots
+                .iter()
+                .any(|s| matches!(s.state, SlotState::Searching | SlotState::NeedsRootEval))
         {
             let outcome = match self.out_rx.lock().unwrap().recv() {
                 Ok(o) => o,
@@ -4611,6 +4599,7 @@ impl BatchedMCTS {
             cum_exact_fallback_deck4_retry_count: 0,
             cum_exact_fallback_deck0_count: 0,
             cum_exact_solver_secs: 0.0,
+            exact_fallback_records: Vec::new(),
             cum_fast_move_count: 0,
             cum_full_move_count: 0,
             cum_recorded_fast_move_count: 0,
@@ -4689,6 +4678,50 @@ impl BatchedMCTS {
     #[getter]
     fn exact_fallback_deck0_count(&self) -> u64 {
         self.cum_exact_fallback_deck0_count
+    }
+
+    /// Diagnostic: exact-solver fallback roots buffered for optional sidecar
+    /// logging. These are not replay examples and are drained by Python after
+    /// each self-play generation block.
+    #[getter]
+    fn exact_fallback_record_count(&self) -> usize {
+        self.exact_fallback_records.len()
+    }
+
+    fn drain_exact_fallback_records(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let mut out = Vec::with_capacity(self.exact_fallback_records.len());
+        for rec in self.exact_fallback_records.drain(..) {
+            let state = rec.state;
+            let dict = PyDict::new(py);
+            dict.set_item("kind", exact_attempt_kind_label(rec.kind))?;
+            dict.set_item("game_seed", rec.game_seed)?;
+            dict.set_item("move_num", rec.move_num)?;
+            dict.set_item("max_secs", rec.max_secs)?;
+            dict.set_item("solve_secs", rec.solve_secs)?;
+            dict.set_item("deck_len", state.deck.len())?;
+            dict.set_item(
+                "remaining_current_claims",
+                deck4_remaining_current_claims(&state),
+            )?;
+            dict.set_item("phase", state.phase)?;
+            dict.set_item("actor_index", state.actor_index)?;
+            dict.set_item("initial_pick_count", state.initial_pick_count)?;
+            dict.set_item("start_player", state.start_player)?;
+            dict.set_item("harmony", state.harmony)?;
+            dict.set_item("middle_kingdom", state.middle_kingdom)?;
+            dict.set_item("deck", state.deck)?;
+            dict.set_item("current_row", state.current_row)?;
+            dict.set_item("pending_claims", state.pending_claims)?;
+            dict.set_item("next_claims", state.next_claims)?;
+            dict.set_item("board0_terrain", state.boards[0].terrain.to_vec())?;
+            dict.set_item("board0_crowns", state.boards[0].crowns.to_vec())?;
+            dict.set_item("board1_terrain", state.boards[1].terrain.to_vec())?;
+            dict.set_item("board1_crowns", state.boards[1].crowns.to_vec())?;
+            dict.set_item("castle_x", state.boards[0].castle_x)?;
+            dict.set_item("castle_y", state.boards[0].castle_y)?;
+            out.push(dict.into_any().unbind());
+        }
+        Ok(out)
     }
 
     /// Diagnostic: non-exact moves searched with the fast per-move sim cap.
@@ -4793,6 +4826,7 @@ impl BatchedMCTS {
             }
             let attempt_kind = exact_attempt_kind(&self.slots[si]);
             self.note_exact_attempt(attempt_kind);
+            let solve_t0 = std::time::Instant::now();
             match solve_exact_plan(
                 &self.slots[si].real_state,
                 max_secs,
@@ -4821,7 +4855,15 @@ impl BatchedMCTS {
                     // same full deck=4 root, but allow the cheap deck=0 solve
                     // and one later deck=4 retry once two current-row decisions
                     // have been fixed.
+                    let solve_secs = solve_t0.elapsed().as_secs_f64();
                     self.note_exact_fallback(attempt_kind);
+                    self.record_exact_fallback(
+                        attempt_kind,
+                        self.slots[si].real_state.cloned(),
+                        self.slots[si].game_seed,
+                        self.slots[si].move_num,
+                        solve_secs,
+                    );
                     mark_exact_timeout(&mut self.slots[si]);
                     self.slots[si].exact_result = None;
                     self.slots[si].exact_plan.clear();
@@ -4831,9 +4873,10 @@ impl BatchedMCTS {
                         self.slots[si].ol_arena.clear();
                         self.slots[si].ol_arena.push(OLNode::new(1.0, (None, None)));
                     } else {
-                        let root_state = self.slots[si].real_state.redeterminize(Some(
-                            det_seed(self.slots[si].game_seed, self.slots[si].move_num),
-                        ));
+                        let root_state = self.slots[si].real_state.redeterminize(Some(det_seed(
+                            self.slots[si].game_seed,
+                            self.slots[si].move_num,
+                        )));
                         self.slots[si].arena.clear();
                         self.slots[si].arena.push(Node::new(1.0, (None, None)));
                         self.slots[si].arena[0].state = Some(root_state);
@@ -5059,7 +5102,9 @@ impl BatchedMCTS {
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
                         SlotState::ExactSolving | SlotState::SolvingInBackground => {
-                            unreachable!("ExactSolving/SolvingInBackground filtered before the batch")
+                            unreachable!(
+                                "ExactSolving/SolvingInBackground filtered before the batch"
+                            )
                         }
                         SlotState::NeedsRootEval => {
                             // Root is evaluated from the PUBLIC real_state (its
@@ -5101,8 +5146,8 @@ impl BatchedMCTS {
                             }
                         }
                         SlotState::Searching => {
-                            let chunk = leaf_batch
-                                .min(slot.move_profile.target_sims - slot.sims_done);
+                            let chunk =
+                                leaf_batch.min(slot.move_profile.target_sims - slot.sims_done);
                             let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
                             let mut ol_actors: Vec<Vec<u8>> = Vec::with_capacity(chunk);
                             let mut ol_leaf_states: Vec<RustGameState> = Vec::with_capacity(chunk);
@@ -5218,7 +5263,9 @@ impl BatchedMCTS {
                     match slot.state {
                         SlotState::Idle => unreachable!("idle slots were filtered"),
                         SlotState::ExactSolving | SlotState::SolvingInBackground => {
-                            unreachable!("ExactSolving/SolvingInBackground filtered before the batch")
+                            unreachable!(
+                                "ExactSolving/SolvingInBackground filtered before the batch"
+                            )
                         }
                         SlotState::NeedsRootEval => {
                             let ev = push_leaf(
@@ -5241,8 +5288,8 @@ impl BatchedMCTS {
                             }
                         }
                         SlotState::Searching => {
-                            let chunk = leaf_batch
-                                .min(slot.move_profile.target_sims - slot.sims_done);
+                            let chunk =
+                                leaf_batch.min(slot.move_profile.target_sims - slot.sims_done);
                             let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
                             for _ in 0..chunk {
                                 let path = descend(&mut slot.arena, 0, fpu, cpuct)?;
@@ -6325,10 +6372,7 @@ mod kingdomino_rust {
 
     #[pyfunction]
     #[pyo3(signature = (state, ordering="combined"))]
-    fn debug_ordered_legal_indices(
-        state: &RustGameState,
-        ordering: &str,
-    ) -> PyResult<Vec<u16>> {
+    fn debug_ordered_legal_indices(state: &RustGameState, ordering: &str) -> PyResult<Vec<u16>> {
         let mode = super::SolverOrderMode::from_str(ordering)?;
         let mut legal = state.legal_actions_indexed();
         super::order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
@@ -6385,12 +6429,64 @@ mod kingdomino_rust {
         margin_gain: f64,
         alpha: f64,
     ) -> PyResult<(f64, bool)> {
-        match super::solve_deck0_final_placement_separable_raw_margin(state)? {
+        match super::deck0_draft_dp::solve_deck0_final_placement_separable_raw_margin(state)? {
             Some(raw_margin) => Ok((
                 super::margin_to_training_value(raw_margin as f64, score_scale, margin_gain, alpha),
                 true,
             )),
             None => Ok((0.0, false)),
+        }
+    }
+
+    /// Exact deck=0 PLACE_AND_SELECT/FINAL_PLACEMENT value using a memoized
+    /// draft DP with final-placement cutoff into independent board maximizers.
+    /// `max_current_row_len=0` effectively means final-placement only.
+    #[pyfunction]
+    #[pyo3(signature = (
+        state,
+        max_current_row_len=4,
+        max_secs=1.0,
+        score_scale=160.0,
+        margin_gain=2.0,
+        alpha=0.8
+    ))]
+    fn exact_deck0_draft_value_dp(
+        state: &RustGameState,
+        max_current_row_len: usize,
+        max_secs: f64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(f64, bool, f64, u64, u64, u64, u64)> {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs_f64(max_secs);
+        let mut cache: HashMap<EndgameKey, Option<f64>> = HashMap::new();
+        let mut stats = super::deck0_draft_dp::Deck0DraftDpStats::default();
+        match super::deck0_draft_dp::solve_deck0_draft_dp_raw_margin(
+            state,
+            max_current_row_len,
+            deadline,
+            &mut cache,
+            &mut stats,
+        )? {
+            Some(raw_margin) => Ok((
+                super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha),
+                true,
+                start.elapsed().as_secs_f64(),
+                stats.nodes,
+                stats.cache_hits,
+                stats.final_cutoffs,
+                stats.deadline_hits,
+            )),
+            None => Ok((
+                0.0,
+                false,
+                start.elapsed().as_secs_f64(),
+                stats.nodes,
+                stats.cache_hits,
+                stats.final_cutoffs,
+                stats.deadline_hits,
+            )),
         }
     }
 
@@ -6404,6 +6500,7 @@ mod kingdomino_rust {
         exact_deck0=false,
         leaf_max_secs=0.25,
         final_only=false,
+        draft_k=-1,
         fpu=-0.2,
         cpuct=1.5,
         seed=0,
@@ -6419,6 +6516,7 @@ mod kingdomino_rust {
         exact_deck0: bool,
         leaf_max_secs: f64,
         final_only: bool,
+        draft_k: i32,
         fpu: f64,
         cpuct: f64,
         seed: u64,
@@ -6427,7 +6525,7 @@ mod kingdomino_rust {
         alpha: f64,
         ordering: &str,
         parallel: bool,
-    ) -> PyResult<(f64, u64, u64, u64, u64, u64, f64, u64, u64, u64)> {
+    ) -> PyResult<Vec<f64>> {
         let mode = super::SolverOrderMode::from_str(ordering)?;
         let start = std::time::Instant::now();
         let mut rng = StdRng::seed_from_u64(seed);
@@ -6445,6 +6543,7 @@ mod kingdomino_rust {
         let mut network_leaf_evals: u64 = 0;
         let mut fallback_count: u32 = 0;
         let mut missing_child_count: u32 = 0;
+        let mut dp_stats_total = super::deck0_draft_dp::Deck0DraftDpStats::default();
 
         for _ in 0..n_sims {
             let det = state.redeterminize(Some(rng.r#gen::<u64>()));
@@ -6466,7 +6565,14 @@ mod kingdomino_rust {
                 && (leaf_state.phase == PLACE_AND_SELECT || leaf_state.phase == FINAL_PLACEMENT)
             {
                 deck0_leaf_hits += 1;
-                if exact_deck0 && (!final_only || leaf_state.phase == FINAL_PLACEMENT) {
+                let dp_enabled = draft_k >= 0;
+                let dp_eligible = dp_enabled
+                    && (leaf_state.phase == FINAL_PLACEMENT
+                        || (leaf_state.phase == PLACE_AND_SELECT
+                            && leaf_state.current_row.len() <= draft_k as usize));
+                let old_eligible =
+                    !dp_enabled && (!final_only || leaf_state.phase == FINAL_PLACEMENT);
+                if exact_deck0 && (dp_eligible || old_eligible) {
                     let key = super::endgame_key(&leaf_state);
                     if let Some(cached) = exact_cache.get(&key) {
                         deck0_cache_hits += 1;
@@ -6485,28 +6591,48 @@ mod kingdomino_rust {
                     } else {
                         deck0_unique_solves += 1;
                         let solve_start = std::time::Instant::now();
-                        let raw = if let Some(raw_margin) =
-                            super::solve_deck0_final_placement_separable_raw_margin(&leaf_state)?
-                        {
-                            Some(raw_margin as f64)
+                        let raw = if dp_enabled {
+                            let deadline =
+                                solve_start + std::time::Duration::from_secs_f64(leaf_max_secs);
+                            let mut dp_stats = super::deck0_draft_dp::Deck0DraftDpStats::default();
+                            let result = super::deck0_draft_dp::solve_deck0_draft_dp_raw_margin(
+                                &leaf_state,
+                                draft_k.max(0) as usize,
+                                deadline,
+                                &mut exact_cache,
+                                &mut dp_stats,
+                            )?;
+                            dp_stats_total.nodes += dp_stats.nodes;
+                            dp_stats_total.cache_hits += dp_stats.cache_hits;
+                            dp_stats_total.final_cutoffs += dp_stats.final_cutoffs;
+                            dp_stats_total.deadline_hits += dp_stats.deadline_hits;
+                            result
                         } else {
-                            let deadline = solve_start
-                                + std::time::Duration::from_secs_f64(leaf_max_secs);
-                            if parallel {
-                                super::solve_endgame_ab_parallel(&leaf_state, deadline, mode)?
+                            if let Some(raw_margin) =
+                                super::deck0_draft_dp::solve_deck0_final_placement_separable_raw_margin(&leaf_state)?
+                            {
+                                Some(raw_margin as f64)
                             } else {
-                                super::solve_endgame_ab(
-                                    &leaf_state,
-                                    deadline,
-                                    super::MARGIN_LO,
-                                    super::MARGIN_HI,
-                                    mode,
-                                    0,
-                                )?
+                                let deadline = solve_start
+                                    + std::time::Duration::from_secs_f64(leaf_max_secs);
+                                if parallel {
+                                    super::solve_endgame_ab_parallel(&leaf_state, deadline, mode)?
+                                } else {
+                                    super::solve_endgame_ab(
+                                        &leaf_state,
+                                        deadline,
+                                        super::MARGIN_LO,
+                                        super::MARGIN_HI,
+                                        mode,
+                                        0,
+                                    )?
+                                }
                             }
                         };
                         exact_solve_secs += solve_start.elapsed().as_secs_f64();
-                        exact_cache.insert(key, raw);
+                        if !dp_enabled {
+                            exact_cache.insert(key, raw);
+                        }
                         if let Some(raw_margin) = raw {
                             super::margin_to_training_value(
                                 raw_margin,
@@ -6539,17 +6665,21 @@ mod kingdomino_rust {
             }
         }
 
-        Ok((
+        Ok(vec![
             start.elapsed().as_secs_f64(),
-            deck0_leaf_hits,
-            deck0_unique_solves,
-            deck0_cache_hits,
-            deck0_timeouts,
-            terminal_leaf_hits,
+            deck0_leaf_hits as f64,
+            deck0_unique_solves as f64,
+            deck0_cache_hits as f64,
+            deck0_timeouts as f64,
+            terminal_leaf_hits as f64,
             exact_solve_secs,
-            network_leaf_evals,
-            fallback_count as u64,
-            arena.len() as u64,
-        ))
+            network_leaf_evals as f64,
+            fallback_count as f64,
+            arena.len() as f64,
+            dp_stats_total.nodes as f64,
+            dp_stats_total.cache_hits as f64,
+            dp_stats_total.final_cutoffs as f64,
+            dp_stats_total.deadline_hits as f64,
+        ])
     }
 }
