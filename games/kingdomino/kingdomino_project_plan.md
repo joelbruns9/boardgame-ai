@@ -193,7 +193,10 @@ Runs as a precondition before training, advisor startup, reanalysis, and promoti
 
 **Training path (higher leverage):** when a self-play game reaches a terminal-adjacent position, the MCTS leaf evaluation switches from the network value head to exact scoring using `board.score()`. The simulation plays out remaining moves exhaustively using the public-consistent bag and backs up the true terminal value. Policy and value targets recorded for those positions are grounded in exact outcomes rather than network estimates. This compounds across every future self-play game — the online fix is more valuable than the offline reanalysis fix.
 
-Additionally, stored terminal-adjacent positions in the buffer can be retroactively relabeled via reanalysis (Milestone 9 — offline fix).
+Additionally, exact-solver fallback roots can be saved to a sidecar file for
+offline diagnosis (Milestone 9). Broad replay-buffer reanalysis is deferred:
+the hot replay buffer intentionally stores encoded examples rather than full
+engine states, so it remains compact and hidden-order-leak safe.
 
 ### Budgeted public-information-safe solver
 
@@ -499,8 +502,11 @@ scrollback or a separate notebook.
 ## Milestone 6 — Promotion Gating + Checkpoint Role Separation
 **Gate: regression never propagates to advisor or HOF pool**
 
-Status: implemented, pending review. `current_best.pt` is also the advisor
-default; no separate `advisor_default.pt` is maintained.
+Status: implemented. `current_best.pt` is also the advisor default; no separate
+`advisor_default.pt` is maintained. After run10 Elo sampling, the recommended
+training pattern is soft-gated self-play: let the latest learner generate
+frontier positions, but only rewrite `current_best.pt` after the promotion gate
+passes.
 
 ### Checkpoint roles
 
@@ -545,10 +551,13 @@ Implementation phases:
 2. **M6b training convention**: new runs should normally warm-start from
    `runs/kingdomino/best_checkpoint/current_best.pt` via
    `--warm_start_current_best`, not from arbitrary final checkpoints.
-3. **M6c gated self-play**: optional `--gated_selfplay` decouples the learner
-   from the data generator. Self-play comes from `current_best.pt`; the learner
-   updates every iteration but replaces the generator only after an in-run
-   promotion gate passes.
+3. **M6c generator modes**: `--selfplay_generator_mode soft_gate` is the
+   preferred long-run mode. Latest generates self-play unless it clearly loses
+   to `current_best.pt`; near-equal checkpoints stay probationary, and strong
+   checkpoints promote to `current_best.pt` after the statistical gate passes.
+   `--gated_selfplay` remains as the legacy strict-gate compatibility mode.
+4. **M6d smart Elo**: use `--smart_elo --smart_elo_on_promote --elo_every 0`
+   when routine training should only Elo-rate newly promoted best models.
 
 ---
 
@@ -625,55 +634,89 @@ Final 2–4 tiles, high-crown tile still unseen, harmony almost complete, middle
 
 ---
 
-## Milestone 9 — Replay Reanalysis Infrastructure
-**Gate: data format supports reanalysis before first reanalysis run**
+## Milestone 9 — Exact-Solver Fallback Capture
+**Status: concluded for now; broad replay reanalysis deferred**
 
-Re-label stored positions with stronger search targets from the current model. Allows improving label quality without generating new games — critical given ~16 min/iter generation cost at sims=1600.
+### Decision
 
-### Data format (design now, use later)
-```python
-{
-  "position_id": str,
-  "ruleset_hash": str,
-  "public_state": dict,        # FULL engine state — not just encoded tensors.
-                               # Reanalysis must reconstruct legal actions,
-                               # chance futures, and scoring.
-  "legal_mask": list,
-  "policy_target": list,
-  "value_target": float,
-  "owner": str,                # current | hof | self
-  "trainable": bool,
-  "search_metadata": {
-    "sims": int,
-    "checkpoint_iter": int,
-    "alpha": float,
-    "exact": bool,
-    "search_type": str         # selfplay|pimc|open_loop|exact_endgame|reanalyze
-  },
-  "checkpoint_provenance": str,
-  "reanalysis_count": int
-}
+Do **not** build broad replay-buffer reanalysis now. The current replay buffer is
+intentionally compact and leak-safe: it stores encoded tensors, sparse policy
+targets, legal indices, scalar targets, and provenance, but not a reconstructable
+`GameState` / full public state. That design is correct for training throughput
+and hidden-order safety.
+
+Broad "interesting position" logging is also not useful until there is a
+concrete consumer. A saved position only matters if it becomes:
+
+- a relabeled training dataset,
+- a frozen hard-position evaluation suite, or
+- a focused debugging/regression case.
+
+For the current training phase, only the third case is clearly valuable.
+
+### Implemented Scope
+
+Exact-solver fallback roots can be saved to an optional JSONL sidecar:
+
+```
+--exact_fallback_positions runs\kingdomino\<run>\exact_fallback_positions.jsonl
 ```
 
-### Staged reanalysis plan
+Each record is a reconstructable diagnostic snapshot of the failed exact-solver
+root, including:
 
-| Stage | Type | Sims | When |
-|---|---|---|---|
-| Early | Endgame/terminal-adjacent | Exact | After Milestone 1 |
-| Mid | Hard-position suite | 1600–3200 | After Milestone 8 |
-| Later | HOF/replay refresh | 3200 | After HOF pool matures |
-| Polish | Top-loss / high-disagreement | 3200+ | Final stages |
+- fallback kind: `deck4_initial`, `deck4_retry`, or `deck0`
+- `game_seed`, `move_num`, `max_secs`, and observed `solve_secs`
+- phase, actor indices, deck/current-row/claim lists
+- both boards' terrain and crown arrays
+- rules flags such as harmony and middle kingdom
 
-### New flags
+The sidecar is outside the replay buffer and is append-only. Training examples
+remain unchanged.
+
+### Expected Cost And Volume
+
+Throughput impact should be negligible. The extra work happens only after a
+solver timeout has already consumed seconds of wall-clock time; saving one compact
+JSONL record is tiny compared with the failed solve.
+
+Run9 at `exact_endgame_max_secs=10.0` produced 1,085 fallbacks over 8,000 games,
+which normalizes to about 2,700 saved positions over a 100-iteration, 200-game
+run. Lower caps will save more positions. Rough planning estimates:
+
+| cap | saved positions over 20,000 games |
+|---|---:|
+| `3s` | ~8k-9k |
+| `5s` | ~5k-6k |
+| `8s` | ~3k-4k |
+| `10s` | ~2.7k observed-normalized |
+
+### How To Use The Saved Positions
+
+Use them as solver diagnostics and regression tests, not as a primary training
+dataset. Replay them offline with a larger budget to determine whether fallbacks
+are true hard cases or solver-pathology cases. If patterns emerge, improve move
+ordering/pruning and rerun the same sidecar positions as a regression suite.
+
+Only revisit full reanalysis after the main training loop is stable, HOF/gating
+is active, and there is a clear plan to mix relabeled positions into training.
+
+### Deferred Work
+
+The original reanalysis flags are intentionally deferred:
+
 ```
---reanalyze_every      25
---reanalyze_positions  50000
---reanalyze_sims       3200
---reanalyze_source     "endgame|hard|hof|mixed"
+--reanalyze_every
+--reanalyze_positions
+--reanalyze_sims
+--reanalyze_source
 ```
+
+Do not add these to the main training loop until a relabeled-position training
+pipeline is explicitly planned.
 
 ### Where
-`games/kingdomino/self_play.py`, `games/kingdomino/replay_buffer.py`
+`games/kingdomino/self_play.py`, `games/kingdomino/kingdomino_rust/src/lib.rs`
 
 ---
 
@@ -746,10 +789,13 @@ Alpha transitions triggered empirically by win_brier_by_phase when available; it
 **Throughput caveat:** 1.35 games/s will not hold uniformly as sims rise 800→1600→3200. Rerun `bench_compile.py` and `bench_doublebuffer.py` on the actual RTX 5090 / Ryzen 9600X before committing to long runs. Use phase-specific measured rates for cost estimates, not flat extrapolation.
 
 ### Checkpoint strategy
-- Promote to `current_best` every 10 iters if gate passes (LCB > 50%)
-- Add to HOF every 50 iters from `current_best`
-- Commit `elo_db.json` and `elo_games.jsonl` to repo after run
-- Update `advisor_default` only after human review of advisor quality
+- Check promotion every 5-10 iters with soft gate.
+- Promote to `current_best` only if win rate >= 55%, LCB > 50%, and fixed suite
+  passes.
+- Add the previous `current_best` to HOF before overwriting it.
+- Run smart Elo on promoted checkpoints; keep `--elo_every 0` unless scheduled
+  diagnostics are needed.
+- Commit `elo_db.json` and `elo_games.jsonl` to repo after run.
 
 ### Hardware
 RTX 5090, Ryzen 9600X, ~$0.42/hr on-demand.

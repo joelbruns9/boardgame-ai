@@ -148,9 +148,9 @@ cd ../../..
 
 ## Training
 
-### Canonical training command (laptop overnight, ~9 hours)
+### Canonical training command (soft-gated laptop overnight)
 ```powershell
-python -m games.kingdomino.self_play --engine batched_open_loop --device cuda --warm_start games\kingdomino\best_checkpoint\best_32x4.pt --warm_buffer checkpoints_ol_local_cont3\buffer_final.pkl --iterations 55 --games_per_iter 150 --train_steps 600 --sims 1600 --channels 32 --blocks 4 --batch_slots 32 --leaf_batch 6 --lr 3e-4 --buffer 300000 --lambda_score 0.5 --lambda_w 0.25 --score_scale 160 --margin_gain 2.0 --alpha 0.8 --fpu -0.2 --c_puct 1.5 --benchmark_every 10 --benchmark_sims 50 --benchmark_seeds 20 --checkpoint_dir checkpoints_ol_local_cont4 --save_buffer checkpoints_ol_local_cont4\buffer_final.pkl --elo_every 10 --elo_sims 400 --elo_games_per_anchor 40 --elo_db elo_db.json --elo_games_log elo_games.jsonl --seed 0
+.\.venv\Scripts\python.exe -m games.kingdomino.self_play --engine batched_open_loop --device cuda --warm_start_current_best --selfplay_generator_mode soft_gate --promotion_every 5 --promotion_games 384 --promotion_sims 100 --smart_elo --smart_elo_on_promote --smart_elo_games_per_anchor 32 --iterations 60 --games_per_iter 160 --train_steps 600 --sims 1600 --channels 48 --blocks 6 --batch_slots 32 --leaf_batch 6 --lr 1e-4 --buffer 300000 --lambda_score 0.5 --lambda_w 0.25 --score_scale 160 --margin_gain 2.0 --alpha 0.2 --fpu -0.2 --c_puct 1.5 --benchmark_every 10 --benchmark_sims 50 --benchmark_seeds 20 --checkpoint_dir runs\kingdomino\local_48x6_softgate --save_buffer runs\kingdomino\local_48x6_softgate\buffer_final.pkl --elo_every 0 --elo_sims 400 --elo_games_per_anchor 32 --elo_db elo_db.json --elo_games_log elo_games.jsonl --seed 0
 ```
 
 See `training_parameters.md` for full parameter documentation.
@@ -174,7 +174,7 @@ python -m games.kingdomino.elo_rating --leaderboard
 
 ### Rate a new checkpoint
 ```bash
-python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --sims 400 --games_per_anchor 32 --device cuda --verbose
 ```
 
 ### Re-solve global ladder from full game log
@@ -184,7 +184,7 @@ python -m games.kingdomino.elo_rating --resolve --verbose
 
 ### Re-bootstrap anchor pool (after adding a new anchor)
 ```bash
-python -m games.kingdomino.elo_rating --reanchor --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --reanchor --sims 400 --games_per_anchor 32 --device cuda --verbose
 ```
 
 ## Cloud Training (Vast.ai)

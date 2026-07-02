@@ -65,7 +65,7 @@ class EloConfig:
     anchors_csv: str = "games/kingdomino/elo_anchors.csv"
     db_path: str = "elo_db.json"
     games_path: str = "elo_games.jsonl"
-    games_per_anchor: int = 20          # paired seeds → 2x this many games per anchor
+    games_per_anchor: int = 32          # paired seeds → 2x this many games per anchor
     sims: int = 400
     device: str = "cuda"
     n_slots: int = 32
@@ -816,7 +816,7 @@ def main() -> None:
     p.add_argument("--anchors", default="games/kingdomino/elo_anchors.csv")
     p.add_argument("--db", default="elo_db.json")
     p.add_argument("--games_log", default="elo_games.jsonl")
-    p.add_argument("--games_per_anchor", type=int, default=20)
+    p.add_argument("--games_per_anchor", type=int, default=32)
     p.add_argument("--sims", type=int, default=400)
     p.add_argument("--device", default="cuda")
     p.add_argument("--n_slots", type=int, default=32)

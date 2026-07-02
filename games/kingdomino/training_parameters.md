@@ -7,7 +7,7 @@ python -m games.kingdomino.self_play `
   --engine batched_open_loop `
   --device cuda `
   --async_solve `
-  --solver_cpus 6 `
+  --game_cpus 2 `
   --warm_start runs\kingdomino\local_48x6_run6\iter_0050.pt `
   --warm_buffer runs\kingdomino\local_48x6_run6\buffer_final.pkl `
   --warm_buffer_max_staleness 200 `
@@ -41,9 +41,18 @@ python -m games.kingdomino.self_play `
   --benchmark_seeds 20 `
   --checkpoint_dir runs\kingdomino\local_48x6_run7 `
   --save_buffer runs\kingdomino\local_48x6_run7\buffer_final.pkl `
-  --elo_every 10 `
+  --warm_start_current_best `
+  --selfplay_generator_mode soft_gate `
+  --promotion_every 5 `
+  --promotion_games 384 `
+  --promotion_sims 100 `
+  --soft_gate_revert_win_rate 0.48 `
+  --smart_elo `
+  --smart_elo_on_promote `
+  --smart_elo_games_per_anchor 32 `
+  --elo_every 0 `
   --elo_sims 400 `
-  --elo_games_per_anchor 40 `
+  --elo_games_per_anchor 32 `
   --elo_db elo_db.json `
   --elo_games_log elo_games.jsonl `
   --seed 0
@@ -52,13 +61,15 @@ python -m games.kingdomino.self_play `
 > Note: PowerShell requires single-line commands (no backslash continuation).
 > The above uses backtick line continuation for readability only.
 
-> **Throughput-optimal solver settings (`--async_solve --solver_cpus N`):** these
+> **Throughput-optimal solver settings (`--async_solve --game_cpus N`):** these
 > make the exact endgame solver effectively *free* on throughput. Without them the
 > solver runs on the synchronous critical path and costs ~13% games/s; with them it
 > overlaps the GPU eval on a dedicated thread pool and recovers to the solver-off
 > rate (~0.14 vs ~0.12 games/s on the 8-core laptop) while still emitting exact
-> endgame targets. Set `--solver_cpus` to roughly `physical_cores − 2` (6 here),
-> re-tuning per machine. See the two parameters below for details. `--channels 48
+> endgame targets. Set `--game_cpus` to the number of logical CPUs to reserve for
+> game generation; the solver gets all remaining CPUs by default. Use
+> `--solver_cpus` only as an explicit override. See the parameters below for
+> details. `--channels 48
 > --blocks 6` reflects the current production architecture (32ch/4b is saturated).
 
 ---
@@ -527,7 +538,7 @@ diagnostic iterations (≈33% at weight 2.0 on a ~20%-endgame buffer).
 
 #### `--async_solve`
 **Values:** flag (off by default)
-**Recommended:** on (paired with `--solver_cpus`)
+**Recommended:** on (paired with `--game_cpus`)
 
 Run the exact endgame solver on a dedicated **background thread** so it overlaps
 the GPU eval instead of blocking the synchronous `step()` critical path. When a
@@ -539,26 +550,38 @@ games rejoin on the next harvest.
 - **Default (off):** the solver runs synchronously inside `step()` and costs ~13%
   games/s (it is otherwise free in CPU-scheduling terms — the cost is just that it
   sits on the critical path).
-- **On (with `--solver_cpus N`):** the solver becomes throughput-free. On the
+- **On (with `--game_cpus N`):** the solver becomes throughput-free. On the
   8-core laptop it recovers to ~0.14 games/s (== solver-off) vs ~0.12 sync, while
   still emitting exact endgame targets.
 - **Correctness is identical** — deterministic, bit-for-bit the same per-seed
   games and finished results as the sync path (verified).
 
 Off by default so the simpler sync path stays the baseline. Turn it on for routine
-solver-on training. Its real payoff grows on the cloud 5090 (more spare cores).
+solver-on training. Its real payoff grows on larger cloud boxes (more spare cores).
+
+#### `--game_cpus`
+**Values:** 1 - logical CPU count, integer
+**Default:** 2
+**Recommended:** start with `2`, then sweep on new hardware
+
+Preferred CPU split for async exact solving. `--game_cpus` reserves that many
+logical CPUs for game generation (MCTS descent/backup + Python orchestration);
+the exact-solver pool gets all remaining CPUs. This scales naturally from the
+8-core laptop (`--game_cpus 2` gives the solver 6 CPUs) to larger cloud boxes
+without manually calculating `solver_cpus`.
 
 #### `--solver_cpus`
-**Values:** 0 (auto) – physical core count, integer
-**Default:** 0 (auto = half of available threads)
-**Recommended:** `physical_cores − 2` (e.g. 6 on an 8-core box)
+**Values:** 0 (derive from `total_cpus - game_cpus`) or explicit integer
+**Default:** 0
+**Recommended:** leave at `0`; use only as an override
 
-Size of the dedicated Rayon thread pool that runs the within-solve (YBW) endgame
-parallelism when `--async_solve` is on. Game generation (MCTS descent + backup)
-gets the remaining cores via the global pool. Confining the solver to its own pool
-is what makes the overlap pay off — a single shared pool lets the solver's long,
+Explicit size of the dedicated Rayon thread pool that runs the within-solve
+(YBW) endgame parallelism when `--async_solve` is on. If positive, this overrides
+`--game_cpus`; otherwise it is derived automatically. Game generation gets the
+remaining cores via the global pool. Confining the solver to its own pool is what
+makes the overlap pay off: a single shared pool lets the solver's long,
 non-preemptible subtree-solves head-of-line-block the latency-critical work that
-feeds the GPU, which *inflates* eval/update and makes async slower than sync.
+feeds the GPU, which inflates eval/update and makes async slower than sync.
 
 **Sweep (8-core laptop, `--async_solve`, batch_slots=32):**
 
@@ -568,10 +591,10 @@ feeds the GPU, which *inflates* eval/update and makes async slower than sync.
 | **6** | **0.139** | **59** |
 | 7 | 0.141 | 59 |
 
-Throughput is flat across 5–7 (GPU-bound, solver fully hidden); solve-success
-peaks at 6 then plateaus. So `physical_cores − 2` is the knee — give the solver
-everything except ~2 cores reserved for generation. Re-tune per machine; the cloud
-5090 (16–32 vCPUs) has far more headroom. Only has effect with `--async_solve`.
+Throughput is flat across 5-7 (GPU-bound, solver fully hidden); solve-success
+peaks at 6 then plateaus. This is equivalent to `--game_cpus 2` on the 8-core
+laptop. Re-tune per machine; larger cloud machines may need more than 2 game CPUs
+if generation/update becomes the bottleneck. Only has effect with `--async_solve`.
 
 ---
 
@@ -852,7 +875,7 @@ The canonical rating agent is α=0.0, c_puct=1.5, sims=400.
 
 #### `--benchmark_every`
 **Values:** 1 – 20, or 0 to disable
-**Current:** 10
+**Current:** 0 for soft-gated production runs; 10 for scheduled Elo diagnostics
 
 Run a benchmark vs GreedyBot every N iterations.
 
@@ -918,14 +941,14 @@ always rates the final checkpoint in the finally block (on clean exit
 or Ctrl+C). After the final rating, automatically runs `--resolve` to
 re-solve the global ladder from the full game log.
 
-- 0: Elo disabled entirely
+- 0: scheduled Elo disabled; promotion-triggered smart Elo can still run
 - 5: more granular training curve, ~5.6 min overhead per 10 iters
-- 10: recommended — ~2.8 min overhead per 10 iters, good granularity
+- 10: recommended — ~4.4 min overhead per 10 iters, good granularity
 - 20: minimal overhead but coarse training curve
 
 At 0.72 games/s (two-network batched open-loop, sims=400):
-3 anchors × 80 games = 240 games ≈ **5.5 minutes per rating session**
-at elo_games_per_anchor=40.
+3 anchors × 64 games = 192 games ≈ **4.4 minutes per rating session**
+at elo_games_per_anchor=32.
 
 #### `--elo_sims`
 **Values:** 50 – 800
@@ -941,7 +964,7 @@ the ladder to be comparable. Canonical value: 400.
 
 #### `--elo_games_per_anchor`
 **Values:** 10 – 80
-**Current:** 40
+**Current:** 32
 
 Paired seeds per anchor (total games = 2 × this per anchor). With 3
 active anchors and MLE fit across all games:
@@ -950,13 +973,21 @@ active anchors and MLE fit across all games:
 |-----------------|-------------|----------------|----------------------|
 | 10 | 60 | ±92 | ~1.4 min |
 | 20 | 120 | ±65 | ~2.8 min |
+| 32 | 192 | ±51 | ~4.4 min |
 | 40 | 240 | ±46 | ~5.5 min |
 | 60 | 360 | ±37 | ~8.3 min |
 | 80 | 480 | ±32 | ~11 min |
 
-40 is the recommended default — ±46 Elo is sufficient to detect
-meaningful improvement between runs while keeping rating sessions under
-6 minutes. The `--resolve` post-run re-solve tightens this further
+For throughput-sensitive Elo runs, choose `elo_games_per_anchor` as a
+multiple of `--n_slots`. Elo runs each orientation separately with
+`elo_games_per_anchor` concurrent-game opportunities; matching the paired seed
+count to the slot count avoids a partially filled tail batch. Examples:
+`--n_slots 32 --elo_games_per_anchor 32`, `--n_slots 48
+--elo_games_per_anchor 48`, or `--n_slots 64 --elo_games_per_anchor 64`.
+
+32 is the recommended default: it fills the default 32 concurrent game slots
+without a tail batch while keeping rating sessions under 5 minutes. The
+`--resolve` post-run re-solve tightens this further
 by combining all sessions' game data jointly.
 
 #### `--elo_db`
@@ -989,7 +1020,7 @@ score_opponent, winner, sims, engine, routing, timestamp.
 
 **Rate a checkpoint:**
 ```
-python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --alpha 0.0 --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name> --alpha 0.0 --sims 400 --games_per_anchor 32 --device cuda --verbose
 ```
 
 **Re-solve global ladder from game log:**
@@ -999,7 +1030,7 @@ python -m games.kingdomino.elo_rating --resolve --verbose
 
 **Re-bootstrap anchor pool (e.g. after adding a new anchor):**
 ```
-python -m games.kingdomino.elo_rating --reanchor --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --reanchor --sims 400 --games_per_anchor 32 --device cuda --verbose
 ```
 
 **View current leaderboard:**
@@ -1009,10 +1040,29 @@ python -m games.kingdomino.elo_rating --leaderboard
 
 **Search parameter sweep (α or c_puct):**
 ```
-python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha00 --alpha 0.0 --c_puct 1.5 --sims 400 --games_per_anchor 40 --device cuda --verbose
-python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha08 --alpha 0.8 --c_puct 1.5 --sims 400 --games_per_anchor 40 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha00 --alpha 0.0 --c_puct 1.5 --sims 400 --games_per_anchor 32 --device cuda --verbose
+python -m games.kingdomino.elo_rating --checkpoint <path> --name <name>_alpha08 --alpha 0.8 --c_puct 1.5 --sims 400 --games_per_anchor 32 --device cuda --verbose
 ```
 Then run `--resolve` to get globally consistent ratings across all configurations.
+
+#### `--smart_elo`, `--smart_elo_on_promote`
+**Values:** flags, off by default
+
+Event-driven Elo for promoted checkpoints. This is independent of
+`--elo_every`: keep `--elo_every 0` when you only want ratings after a model
+becomes the new `current_best.pt`.
+
+Recommended soft-gate settings:
+
+```
+--smart_elo
+--smart_elo_on_promote
+--smart_elo_games_per_anchor 32
+--smart_elo_sims 400
+```
+
+Smart Elo checks `elo_db.json` first and skips rating if the promoted checkpoint
+name is already present.
 
 ---
 
@@ -1069,30 +1119,60 @@ This loads `--current_best_path` (default:
 `runs/kingdomino/best_checkpoint/current_best.pt`) and avoids accidentally
 starting from a regressed final checkpoint.
 
+#### `--selfplay_generator_mode`
+**Values:** `latest` | `current_best` | `strict_gate` | `soft_gate`
+**Current recommendation:** `soft_gate`
+
+Controls which model generates self-play data:
+
+- `latest`: normal AlphaZero loop; the learner always generates new data.
+- `current_best`: always generate from `--current_best_path`.
+- `strict_gate`: legacy `--gated_selfplay`; generate from `current_best.pt`
+  until a promotion passes.
+- `soft_gate`: generate from the latest learner, but compare it against
+  `current_best.pt` every `--promotion_every` iterations.
+
+Soft gate is the recommended long-run mode because it keeps frontier self-play
+while protecting `current_best.pt` and the HOF pool:
+
+```
+--warm_start_current_best
+--selfplay_generator_mode soft_gate
+--promotion_every 5
+--promotion_games 384
+--promotion_sims 100
+--soft_gate_revert_win_rate 0.48
+--smart_elo
+--smart_elo_on_promote
+--smart_elo_games_per_anchor 32
+--elo_every 0
+```
+
+Soft-gate actions:
+
+- `< 48%` raw win rate vs current best: revert generator to `current_best.pt`.
+- `48-55%` or promotion LCB/fixed-suite miss: keep latest as probationary
+  generator, but do not overwrite `current_best.pt`.
+- `>= 55%`, LCB > 50%, fixed suite passes: copy old `current_best.pt` into HOF,
+  promote latest to `current_best.pt`, and run smart Elo if enabled.
+
+First CUDA smoke:
+
+```
+--selfplay_generator_mode soft_gate --warm_start_current_best
+--promotion_every 1 --promotion_games 32 --promotion_sims 50
+--smart_elo --smart_elo_on_promote --smart_elo_games_per_anchor 32
+--benchmark_every 0 --elo_every 0
+```
+
+Confirm `generator_source`, `promotion_action`, `smart_elo_triggered`, and
+`selfplay_source` appear as expected in `training_log.jsonl`.
+
 #### `--gated_selfplay`
 **Values:** flag, off by default
 
-Decouple the learner from the data-generating model. With this flag:
-
-1. self-play is generated by `--current_best_path`;
-2. the learner still trains every iteration;
-3. every `--promotion_every` iterations, the learner is evaluated against the
-   self-play generator;
-4. only a passed promotion gate updates the in-memory self-play generator.
-
-This allows the model to keep learning without letting a transient regression
-poison future self-play data. Add `--promotion_update_best` only when you want
-an in-run passed promotion to also overwrite `current_best.pt` on disk.
-
-Validation status: targeted tests cover Wilson LCB behavior, fixed-suite
-regression blocking, audit-file/backup writes, and a one-iteration gated
-self-play smoke. Before using gated self-play for a long run, do one short CUDA
-smoke with `--gated_selfplay --promotion_every 1 --promotion_games 20
---promotion_sims 50 --benchmark_every 0 --elo_every 0` and confirm
-`promotion_checked`, `promotion_passed`, and `selfplay_source` appear as expected
-in `training_log.jsonl`. For production, use larger promotion games
-(`400-800`) and keep `--promotion_update_best` off until the dry-run decision
-JSONs look sane.
+Backward-compatible alias for the legacy strict gate. Prefer
+`--selfplay_generator_mode soft_gate` for new training runs.
 
 #### Hall-of-Fame Opponent Mixing
 **Values:** off by default
@@ -1233,10 +1313,10 @@ total_wall_time ≈ iterations × (games_per_iter/throughput + train_steps×0.1s
                 + (iterations/elo_every) × elo_rating_time
 
 throughput (games/s) driven by: sims, batch_slots, leaf_batch, channels, blocks,
-exact_endgame_max_secs (cost hidden by --async_solve --solver_cpus)
+exact_endgame_max_secs (cost hidden by --async_solve --game_cpus)
 
 elo_rating_time ≈ (anchors × games_per_anchor × 2) / 0.72 games/s
-  e.g. 3 anchors × 40 games = 240 games ÷ 0.72 = ~5.5 min per rating session
+  e.g. 3 anchors × 32 paired seeds × 2 games = 192 games ÷ 0.72 = ~4.4 min per rating session
 
 buffer_coverage (iters) = buffer / (games_per_iter × ~80 positions/game)
 
@@ -1259,10 +1339,10 @@ Elo ±CI ≈ 400 / (log(10) × √(total_elo_games × p × (1-p)))
 |----------|------|------------|-------------|--------|-----------|-------|
 | Smoke test | 200 | 10 | 50 | 10000 | 0 | verify no errors; exact off (`--exact_endgame_max_secs 0`) |
 | Fast iteration | 800 | 50 | 200 | 100000 | 0 | explore hyperparams; exact 3.0s |
-| Laptop overnight | 1600 | 150 | 600 | 300000 | 10 | current config; exact 3.0s + `--async_solve --solver_cpus 6` |
-| 48x6 replay-width run | scheduled 800-1600 | 224 | 600 | 300000 | 0-10 | `--playout_cap_randomization --full_search_fraction 0.35`, exact 3.0s, smooth lr/alpha/sims schedules |
-| Cloud overnight | 1600 | 300 | 1200 | 500000 | 10 | ~3× throughput; `--async_solve --solver_cpus <vcpus−2>` |
-| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 10 | after 32ch/4b saturates; exact 3.0s + `--async_solve` |
+| Laptop overnight | 1600 | 150 | 600 | 300000 | 0 | soft gate + smart Elo on promote; exact 3.0s + `--async_solve --game_cpus 2` |
+| 48x6 replay-width run | scheduled 800-1600 | 224 | 600 | 300000 | 0 | `--selfplay_generator_mode soft_gate --smart_elo_on_promote`, playout-cap randomization, exact 3.0s |
+| Cloud overnight | 1600 | 300 | 1200 | 500000 | 0 | soft gate + smart Elo; `--async_solve --game_cpus 2`, then sweep |
+| Scale up (48ch/6b) | 1600 | 200 | 800 | 400000 | 0 | after 32ch/4b saturates; soft gate, exact 3.0s + `--async_solve` |
 
 ## Elo Anchor Pool Maintenance
 
@@ -1286,5 +1366,5 @@ The 400 Elo gap between the bottom two anchors means checkpoints in
 the 600-800 range will have wider confidence intervals. Add a mid anchor
 when a suitable checkpoint from that range is available.
 
-**After adding an anchor:** run `--reanchor --sims 400 --games_per_anchor 40`
+**After adding an anchor:** run `--reanchor --sims 400 --games_per_anchor 32`
 to re-bootstrap the pool with the new anchor included.
