@@ -17,17 +17,18 @@ edge visit count, and Q(a) the mean action value.
 VALUE PERSPECTIVE — fixed player-0 frame
 Every value stored in the tree is expressed from player 0's perspective.
   - Network leaf value is from state.current_actor's view → negate if actor==1.
-  - Leaf value comes from the network's three value-relevant outputs:
+  - Leaf value is the WIN-GATED mix of the network's three value-relevant outputs
+    (KataGo-style — fight for margin only once the win is nearly decided):
         margin_value = tanh((own_norm − opp_norm) × MARGIN_GAIN)
-        win_value    = 2 × win_prob − 1
-        leaf_value   = ALPHA × margin_value + (1 − ALPHA) × win_value
-    Both components are in the encoded player's frame; _postprocess flips to
-    player-0 frame.
+        win_value    = 2 × win_prob − 1                     (in [-1, 1])
+        win_gate     = win_value ** 4                        (n=4 certainty gate)
+        leaf_value   = (1 − B) × win_value + B × win_gate × margin_value
+    B is the `alpha` param (reserved margin band).  Both components are in the
+    encoded player's frame; _postprocess flips to player-0 frame.
   - Terminal value = terminal_search_value(state, player=0, ...) using the SAME
-    mixed formula as non-terminal leaves:
-        alpha * tanh((own-opp)/score_scale * margin_gain) + (1-alpha) * win_value,
-    where win_value is ±1/0 from final scores.  (Replaces compute_target_z, whose
-    tanh(margin/30) scale was inconsistent with the non-terminal estimates.)
+    win-gated formula as non-terminal leaves, where win_value is ±1/0 from final
+    scores (so win_gate is 1 for a decided game, 0 for a draw).  (Replaces
+    compute_target_z, whose tanh(margin/30) scale was inconsistent.)
   - Backup adds the player-0 value to every node on the path; NO sign flips.
   - At selection, a node maximises from ITS actor's view: q = child.Q if
     actor==0 else -child.Q.
@@ -54,7 +55,7 @@ EVALUATOR SEAM
     - mb, ob    (9,13,13) float32 board arrays
     - flat       (FLAT_SIZE,) float32 flat features
     - idxs       (n,)     int64  legal joint-action indices (encode_action order)
-    - value      float    in (-1,1), leaf_value = α·margin + (1-α)·win,
+    - value      float    in (-1,1), leaf_value = (1-B)·win + B·win⁴·margin,
                           from the ENCODED player's perspective
     - logits     (n,)     float32  network logits gathered at idxs, in idxs order
   MCTS softmaxes over legal actions only.  The evaluator need never materialise
@@ -110,16 +111,24 @@ from games.kingdomino.action_codec import (
 )
 
 
-# Leaf-value combination hyperparameters.  leaf_value mixes a dense score-margin
-# signal with the win-probability signal:
+# Leaf-value combination hyperparameters.  leaf_value is the WIN-GATED mix of a
+# dense score-margin signal with the win-probability signal (KataGo-style):
 #     margin_value = tanh((own_norm − opp_norm) × MARGIN_GAIN)
-#     win_value    = 2 × win_prob − 1
-#     leaf_value   = ALPHA × margin_value + (1 − ALPHA) × win_value
+#     win_value    = 2 × win_prob − 1                       (in [-1, 1])
+#     win_gate     = win_value ** 4                          (n=4 certainty gate)
+#     leaf_value   = (1 − B) × win_value + B × win_gate × margin_value
+# The even-power gate suppresses margin in close positions (win_gate → 0 as
+# win_prob → 0.5) and opens it fully in DECIDED positions — symmetric for wins
+# AND losses (win_prob → 1 or → 0 both give win_gate → 1).  So the net tracks the
+# win in uncertain positions and fights for margin (extend a lead / minimize a
+# deficit) once the result is nearly settled.  B is the reserved margin band; it
+# is the module `ALPHA` / `alpha` param (name kept for plumbing compatibility).
 # own/opp are already normalized by score_scale (the network head outputs
 # normalized scores directly), so MARGIN_GAIN operates on normalized scores
 # (typically in [-1, 1]).  MARGIN_GAIN=2.0 puts a 0.1 normalized-score difference
 # (= 10 points at score_scale=100) through tanh(0.2) ≈ 0.197 — a meaningful but
-# non-saturating signal.
+# non-saturating signal.  win_gate is computed as (w*w)*(w*w) so Python and Rust
+# terminal values stay bit-identical (same f64 op order as .powi(4)).
 #
 # MARGIN_GAIN and ALPHA are module-level DEFAULTS ONLY.  They are bound into
 # AlphaZeroMCTS/OpenLoopMCTS at construction (margin_gain/alpha params) and into
@@ -129,7 +138,7 @@ from games.kingdomino.action_codec import (
 # make_serial_evaluator / make_mcts / make_open_loop_mcts — the old
 # `mcts_az.MARGIN_GAIN = cfg.margin_gain` global-override pattern is removed.
 MARGIN_GAIN: float = 2.0
-ALPHA: float = 0.8         # weight on margin_value; (1-ALPHA) on win_value
+ALPHA: float = 0.5         # B: reserved margin band; (1-B) on win, B·win⁴ on margin
 
 
 def terminal_search_value(
@@ -140,7 +149,7 @@ def terminal_search_value(
     margin_gain: float,
     alpha: float,
 ) -> float:
-    """Terminal backup value in PLAYER-0 frame, using the SAME mixed formula as
+    """Terminal backup value in PLAYER-0 frame, using the SAME win-gated formula as
     non-terminal leaves (replaces compute_target_z inside MCTS, whose tanh(margin/30)
     scale was inconsistent with the non-terminal estimates it is compared against).
 
@@ -148,7 +157,8 @@ def terminal_search_value(
       opp_norm  = score1 / score_scale
       margin    = tanh((own_norm - opp_norm) * margin_gain)
       win_value = +1.0 win / 0.0 draw / -1.0 loss   (exact, from final scores)
-      result    = alpha * margin + (1 - alpha) * win_value
+      win_gate  = win_value ** 4  (= 1 for a decided game, 0 for a draw)
+      result    = (1 - alpha) * win_value + alpha * win_gate * margin
 
     win_value uses the score-only cascade (same limitation as Rust finalize_move
     — no territory/crowns tiebreaker); a score tie → 0.0.  Always returns the
@@ -167,7 +177,9 @@ def terminal_search_value(
         win_value = -1.0
     else:
         win_value = 0.0        # score tie → neutral (no tiebreaker cascade)
-    return alpha * margin_value + (1.0 - alpha) * win_value
+    win_gate = win_value * win_value
+    win_gate = win_gate * win_gate          # win_value**4 (n=4 win-certainty gate)
+    return (1.0 - alpha) * win_value + alpha * win_gate * margin_value
 
 
 class Node:
@@ -301,14 +313,15 @@ def make_serial_evaluator(
             ob_t = torch.from_numpy(ob).unsqueeze(0).to(device)
             flat_t = torch.from_numpy(flat).unsqueeze(0).to(device)
             own, opp, win_prob, logits = network(mb_t, ob_t, flat_t)
-            # Full leaf_value: convex mix of score-margin and win signals, in the
-            # encoded player's frame (own/opp/win_prob all from that player's view).
-            # _postprocess flips to the player-0 frame.
+            # Win-gated leaf_value in the encoded player's frame (own/opp/win_prob
+            # all from that player's view).  _postprocess flips to player-0 frame.
             own_n = own.item()
             opp_n = opp.item()
             margin_value = math.tanh((own_n - opp_n) * mg)
             win_value = 2.0 * float(win_prob.item()) - 1.0
-            leaf_value = al * margin_value + (1.0 - al) * win_value
+            win_gate = win_value * win_value
+            win_gate = win_gate * win_gate      # win_value**4 (n=4 certainty gate)
+            leaf_value = (1.0 - al) * win_value + al * win_gate * margin_value
             # GPU-side gather (Fix 3): transfer only the legal logits, not all 3390.
             idx_t = torch.as_tensor(idxs, device=device, dtype=torch.long)
             gathered = logits[0].index_select(0, idx_t).detach().cpu().numpy()
@@ -344,14 +357,16 @@ def make_batched_evaluator(
             ob_t = torch.from_numpy(np.ascontiguousarray(obs)).to(device)
             flat_t = torch.from_numpy(np.ascontiguousarray(flats)).to(device)
             own, opp, win_prob, logits = network(mb_t, ob_t, flat_t)
-            # Full leaf_value (vectorized): convex mix of score-margin and win
-            # signals, per leaf, in each encoded player's frame.
+            # Win-gated leaf_value (vectorized), per leaf, in each encoded
+            # player's frame.
             own_n = own.reshape(-1).detach().cpu().numpy()       # (K,)
             opp_n = opp.reshape(-1).detach().cpu().numpy()       # (K,)
             win_p = win_prob.reshape(-1).detach().cpu().numpy()  # (K,)
             margin_values = np.tanh((own_n - opp_n) * mg)
             win_values = 2.0 * win_p - 1.0
-            values = al * margin_values + (1.0 - al) * win_values  # (K,)
+            win_gate = win_values * win_values
+            win_gate = win_gate * win_gate                       # win_values**4 (n=4)
+            values = (1.0 - al) * win_values + al * win_gate * margin_values  # (K,)
             # GPU-side gather (Fix 3): per leaf, transfer only its legal logits.
             gathered = []
             for i in range(len(idxs_list)):

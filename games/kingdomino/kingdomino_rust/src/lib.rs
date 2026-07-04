@@ -1648,7 +1648,7 @@ impl RustGameState {
     /// deadline was hit.
     ///
     /// Uses the SAME solver (alpha-beta + move ordering) as production, so timings
-    /// reflect production pruning behavior. `alpha` defaults to 0.8 (the training
+    /// reflect production pruning behavior. `alpha` defaults to 0.5 (the training
     /// frame): alpha-beta cutoffs depend on leaf values, so pruning — and
     /// therefore solve time — can vary with alpha. Measure at the alpha training
     /// actually uses.
@@ -1656,7 +1656,7 @@ impl RustGameState {
     /// `parallel=True` (default) uses the YBW parallel solver
     /// (`solve_endgame_ab_parallel`) to measure wall-clock; `parallel=False` uses
     /// the serial solver — use that to compare single-core solve times.
-    #[pyo3(signature = (max_secs=60.0, score_scale=160.0, margin_gain=2.0, alpha=0.8, parallel=true, ordering="lookahead2_clustered"))]
+    #[pyo3(signature = (max_secs=60.0, score_scale=160.0, margin_gain=2.0, alpha=0.5, parallel=true, ordering="lookahead2_clustered"))]
     fn measure_endgame_tree(
         &self,
         max_secs: f64,
@@ -1739,13 +1739,18 @@ impl Node {
     }
 }
 
-/// Terminal backup value in player-0 frame, using the SAME mixed formula as
+/// Terminal backup value in player-0 frame, using the SAME win-gated formula as
 /// non-terminal leaf values (Fix 1).  Replaces mcts_compute_target_z (whose
 /// tanh(margin/30) scale was inconsistent with the non-terminal estimates).
 ///
-/// score_scale / margin_gain / alpha must match the Python config values
-/// (SCORE_SCALE=160.0, MARGIN_GAIN=2.0, ALPHA=0.8 by default) so the Rust and
-/// Python terminal values are bit-identical for the same terminal state.
+///     win_value  = +1 win / 0 draw / -1 loss   (from final scores)
+///     win_gate   = win_value^4  (= 1 for a decided game, 0 for a draw)
+///     value      = (1 - alpha) * win_value + alpha * win_gate * margin_value
+///
+/// alpha is the reserved margin band B.  win_gate is computed as (w*w)*(w*w) so
+/// the f64 op order matches Python's, keeping Rust and Python terminal values
+/// bit-identical for the same terminal state.  score_scale / margin_gain / alpha
+/// must match the Python config (SCORE_SCALE=160.0, MARGIN_GAIN=2.0, ALPHA=0.5).
 fn terminal_search_value(
     state: &RustGameState,
     score_scale: f64,
@@ -1763,7 +1768,9 @@ fn terminal_search_value(
     } else {
         0.0
     };
-    alpha * margin_value + (1.0 - alpha) * win_value
+    let win_gate = win_value * win_value;
+    let win_gate = win_gate * win_gate; // win_value^4 (n=4 win-certainty gate)
+    (1.0 - alpha) * win_value + alpha * win_gate * margin_value
 }
 
 /// Convert a raw score margin (s0 - s1, player-0 frame) into the training value.
@@ -1780,7 +1787,9 @@ fn margin_to_training_value(margin: f64, score_scale: f64, margin_gain: f64, alp
         0.0
     };
     let margin_value = (margin / score_scale * margin_gain).tanh();
-    alpha * margin_value + (1.0 - alpha) * win_value
+    let win_gate = win_value * win_value;
+    let win_gate = win_gate * win_gate; // win_value^4 (n=4 win-certainty gate)
+    (1.0 - alpha) * win_value + alpha * win_gate * margin_value
 }
 
 /// Full-window sentinel for the raw-margin solver. Margins live in ~[-80, 80], so
@@ -3238,7 +3247,7 @@ impl RustMCTS {
     ///   (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,FLAT_SIZE) f32, idxs_list)
     ///     -> (values (K,) f64, [gathered_logits_i (n_i,) f64])
     /// Serial search calls it with K=1.  `seed` only affects Dirichlet noise.
-    #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0, fpu=0.0, cpuct=1.5, seed=None, leaf_batch=1, virtual_loss=1, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0, fpu=0.0, cpuct=1.5, seed=None, leaf_batch=1, virtual_loss=1, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn search<'py>(
         &self,
         py: Python<'py>,
@@ -4691,7 +4700,7 @@ impl BatchedMCTS {
                         virtual_loss=1, cpuct=1.5, fpu=0.0, dirichlet_alpha=0.3,
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
-                        score_scale=160.0, margin_gain=2.0, alpha=0.8,
+                        score_scale=160.0, margin_gain=2.0, alpha=0.5,
                         exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0,
                         playout_cap_randomization=false, full_search_fraction=0.25,
                         fast_move_sims=100, record_fast_moves=false,
@@ -6502,7 +6511,7 @@ mod kingdomino_rust {
     /// Convert a raw score margin (s0 - s1) to the training value formula. Exposed
     /// for tests: the raw-margin alpha-beta solver applies this AFTER the solve.
     #[pyfunction]
-    #[pyo3(signature = (margin, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (margin, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn margin_to_training_value(
         margin: f64,
         score_scale: f64,
@@ -6520,7 +6529,7 @@ mod kingdomino_rust {
     /// if the state still has chance branching or the per-position wall-clock
     /// budget `max_secs` is exceeded.
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn exact_endgame_value_no_chance(
         state: &RustGameState,
         max_secs: f64,
@@ -6576,7 +6585,7 @@ mod kingdomino_rust {
     /// accepts deck length 4, because that is likewise no-chance: all four
     /// hidden tiles form the next row.
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn exact_endgame_value_deck_empty(
         state: &RustGameState,
         max_secs: f64,
@@ -6621,7 +6630,7 @@ mod kingdomino_rust {
     }
 
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8, ordering="combined", parallel=true))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.5, ordering="combined", parallel=true))]
     fn exact_endgame_value_no_chance_ordered(
         state: &RustGameState,
         max_secs: f64,
@@ -6663,7 +6672,7 @@ mod kingdomino_rust {
     /// maximization. Returns solved=false for PLACE_AND_SELECT deck=0 because
     /// final-row picks are still interactive there.
     #[pyfunction]
-    #[pyo3(signature = (state, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn exact_deck0_final_value_separable(
         state: &RustGameState,
         score_scale: f64,
@@ -6689,7 +6698,7 @@ mod kingdomino_rust {
         max_secs=1.0,
         score_scale=160.0,
         margin_gain=2.0,
-        alpha=0.8
+        alpha=0.5
     ))]
     fn exact_deck0_draft_value_dp(
         state: &RustGameState,
@@ -6747,7 +6756,7 @@ mod kingdomino_rust {
         seed=0,
         score_scale=160.0,
         margin_gain=2.0,
-        alpha=0.8,
+        alpha=0.5,
         ordering="lookahead2_clustered",
         parallel=true
     ))]

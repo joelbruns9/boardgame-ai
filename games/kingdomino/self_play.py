@@ -121,7 +121,7 @@ class SelfPlayConfig:
         latency-bound, so the fp16 cast overhead exceeds any compute saving.
       - leaf-eval D2H readback is f32 (make_rust_evaluator .float(), Rust widens
         to f64 on entry): halves the K×3390 logit transfer; tree math stays f64.
-      - alpha=0.8: margin-dominant leaf value (plan §1.4).
+      - alpha=0.5: reserved margin band B in the win-gated leaf value.
       - lambda_score=0.5, lambda_w=0.25: start low; policy is the core signal.
       - buffer_capacity=100_000: 50 iters × 50 games × ~80 positions ≈ 200k
         total; the 100k cap holds roughly the most recent ~25 iterations.
@@ -171,14 +171,16 @@ class SelfPlayConfig:
     score_scale: float = 160.0    # normalization divisor for score heads
     grad_clip: float = 1.0        # max global grad norm; <=0 disables clipping
     augment: bool = True
-    # Leaf-value mix (open-loop / batched_open_loop): leaf_value =
-    #   alpha * tanh((own_norm - opp_norm) * margin_gain) + (1-alpha)*(2*win-1).
-    # These override the module-level mcts_az.MARGIN_GAIN / mcts_az.ALPHA at the
-    # top of run_self_play_training, and are saved in the checkpoint config so an
-    # old checkpoint's leaf-value formula is recoverable.  alpha=0.8 is the
-    # margin-dominant cloud setting (plan §1.4); mcts_az's own default is 0.5.
+    # Win-gated leaf value (open-loop / batched_open_loop): with w = 2*win-1,
+    #   win_gate  = w**4
+    #   leaf_value = (1-alpha)*w + alpha*win_gate*tanh((own_norm-opp_norm)*margin_gain).
+    # alpha is the reserved margin band B: margin is suppressed in close positions
+    # and fully active in DECIDED ones (symmetric wins/losses).  These override the
+    # module-level mcts_az.MARGIN_GAIN / mcts_az.ALPHA at the top of
+    # run_self_play_training, and are saved in the checkpoint config so an old
+    # checkpoint's leaf-value formula is recoverable.  alpha=0.5 matches mcts_az.
     margin_gain: float = 2.0
-    alpha: float = 0.8
+    alpha: float = 0.5
     # Exact endgame solver budget for the batched engines. When a self-play root
     # reaches a terminal-adjacent position (deck∈{0,4}), it is solved exactly
     # (minimax) instead of MCTS — perfect value/policy targets, no GPU forwards.
@@ -1331,15 +1333,17 @@ def make_rust_evaluator(
             _sync()
             timing["forward"] += time.perf_counter() - t1
         t2 = time.perf_counter() if profile_timing else 0.0
-        # Full leaf value formula.  This evaluator is IN-PROCESS and is the one the
+        # Win-gated leaf value.  This evaluator is IN-PROCESS and is the one the
         # batched / batched_open_loop engines use; mg/al are bound at construction
         # (Fix 2) from cfg.margin_gain / cfg.alpha — no module-global reads.
         margin_val = torch.tanh((own - opp) * mg)
         win_val = 2.0 * win_prob - 1.0
+        win_gate = win_val * win_val
+        win_gate = win_gate * win_gate                 # win_val**4 (n=4 certainty gate)
         # f32 readback (was .double()): halves D2H bytes for values and the
         # K×3390 logits.  .float() is a no-op for an already-f32 forward and
         # promotes f16 (AMP) up to f32; the Rust tree casts to f64 on entry.
-        values = (al * margin_val + (1.0 - al) * win_val).reshape(-1)[:n].float().cpu().numpy()
+        values = ((1.0 - al) * win_val + al * win_gate * margin_val).reshape(-1)[:n].float().cpu().numpy()
         full = logits[:n].float().cpu().numpy()
         if profile_timing:
             timing["readback"] += time.perf_counter() - t2
@@ -1404,7 +1408,7 @@ def play_selfplay_game_rust(
     c_puct: float, dirichlet_alpha: float, dirichlet_epsilon: float,
     leaf_batch: int, virtual_loss: int, seed: int,
     py_rng: random.Random, np_rng: np.random.Generator,
-    score_scale: float = 160.0, margin_gain: float = 2.0, alpha: float = 0.8,
+    score_scale: float = 160.0, margin_gain: float = 2.0, alpha: float = 0.5,
     iteration: int = 0,
     playout_cfg: Optional[SelfPlayConfig] = None,
 ) -> Tuple[List[Example], Tuple[int, int]]:
@@ -3883,9 +3887,9 @@ if __name__ == "__main__":
     p.add_argument("--margin_gain", type=float, default=2.0,
                    help="leaf value: scales (own_norm-opp_norm) before tanh "
                         "(overrides mcts_az.MARGIN_GAIN)")
-    p.add_argument("--alpha", type=float, default=0.8,
-                   help="leaf value: weight on margin vs win term "
-                        "(overrides mcts_az.ALPHA; 0.8 = margin-dominant)")
+    p.add_argument("--alpha", type=float, default=0.5,
+                   help="win-gated leaf value: reserved margin band B "
+                        "(overrides mcts_az.ALPHA; (1-B)·win + B·win⁴·margin)")
     p.add_argument("--benchmark_every", type=int, default=1,
                    help="benchmark vs GreedyBot every N iterations")
     p.add_argument("--benchmark_sims", type=int, default=50,
