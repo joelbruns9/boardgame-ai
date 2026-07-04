@@ -84,7 +84,7 @@ def load_hof_net(path: str | Path, device: str = "cpu") -> KingdominoNet:
         channels=int(cfg.get("channels", 96)),
         blocks=int(cfg.get("blocks", 8)),
         bilinear_dim=int(cfg.get("bilinear_dim", 64)),
-        score_scale=float(cfg.get("score_scale", 100.0)),
+        score_scale=float(cfg.get("score_scale", 160.0)),
     )
     net.load_state_dict(checkpoint_state_dict(ckpt))
     net.to(device)

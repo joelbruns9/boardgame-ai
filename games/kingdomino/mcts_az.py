@@ -375,7 +375,7 @@ class AlphaZeroMCTS:
         dirichlet_epsilon: float = 0.25,
         fpu: float = 0.0,
         virtual_loss: int = 1,
-        score_scale: float = 100.0,
+        score_scale: float = 160.0,
         margin_gain: float = 2.0,
         alpha: float = 0.8,
     ):
@@ -785,7 +785,7 @@ class OpenLoopMCTS:
         dirichlet_epsilon: float = 0.25,
         fpu: float = 0.0,
         virtual_loss: int = 1,
-        score_scale: float = 100.0,
+        score_scale: float = 160.0,
         margin_gain: float = 2.0,
         alpha: float = 0.8,
         exact_endgame_max_secs: float = 3.0,

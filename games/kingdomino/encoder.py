@@ -81,7 +81,10 @@ ROW_SLOT_SIZE = TILE_FEAT_SIZE + 1                  # + present flag = 15
 CLAIM_SLOT_SIZE = TILE_FEAT_SIZE + 2                # + is_mine flag + status flag = 16
 PENDING_SUMMARY_SIZE = TILE_FEAT_SIZE + 4           # + present + turn_distance + active + remaining_count
 BOARD_SUMMARY_SIZE = 25
-SCORE_SCALE = 100.0
+# Normaliser for the board-summary score features.  MUST match the training
+# score_scale (self_play/network) so the summary inputs and the score-head
+# targets live on the same scale, and high scores (~160) don't saturate.
+SCORE_SCALE = 160.0
 MAX_BOARD_CELLS = 48.0
 MAX_TOTAL_CROWNS = 24.0
 MAX_LEGAL_PLACEMENTS = 64.0

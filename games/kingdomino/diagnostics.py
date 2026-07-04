@@ -172,7 +172,7 @@ def win_brier_by_phase(examples: List["Example"], net, device: str,
 # ─── Metric 2: margin MAE by phase ─────────────────────────────────────────
 def margin_mae_by_phase(examples: List["Example"], net, device: str,
                         batch_size: int = 512,
-                        score_scale: float = 100.0) -> dict:
+                        score_scale: float = 160.0) -> dict:
     """MAE of the own_score head vs actual own_score (in raw score points)."""
     own_pred, _, _ = _forward_heads(examples, net, device, batch_size)
     own_score = np.array([float(ex.own_score) for ex in examples],
@@ -356,7 +356,7 @@ def build_diag_batch(examples: List["Example"], n: int = 1024,
 
 # ─── main entry point ──────────────────────────────────────────────────────
 def compute_all_diagnostics(examples: List["Example"], net, device: str,
-                            score_scale: float = 100.0,
+                            score_scale: float = 160.0,
                             margin_gain: float = 2.0,
                             alpha: float = 0.8,
                             diag_n: int = 1024,

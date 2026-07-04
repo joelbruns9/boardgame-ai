@@ -30,7 +30,7 @@ SCORE HEADS (own_score_head, opponent_score_head)
 Average+max pool each board's trunk features → (B, C) each, concatenate
 with the flat vector, MLP → linear scalar (no final activation).
 Output is the predicted NORMALIZED score: raw_score / score_scale.
-score_scale defaults to 100.0. The two heads share the same MLP structure
+score_scale defaults to 160.0. The two heads share the same MLP structure
 but have independent weights.
 
 WIN HEAD
@@ -129,7 +129,7 @@ class KingdominoNet(nn.Module):
         pick_hidden: int = 128,
         flat_policy_hidden: int = 256,
         norm: str = "group",
-        score_scale: float = 100.0,
+        score_scale: float = 160.0,
     ):
         super().__init__()
         self.channels = channels

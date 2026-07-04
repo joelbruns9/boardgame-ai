@@ -155,7 +155,7 @@ def _net_from_checkpoint(path: str | Path, device: str) -> KingdominoNet:
         channels=int(cfg.get("channels", 96)),
         blocks=int(cfg.get("blocks", 8)),
         bilinear_dim=int(cfg.get("bilinear_dim", 64)),
-        score_scale=float(cfg.get("score_scale", 100.0)),
+        score_scale=float(cfg.get("score_scale", 160.0)),
     )
     net.load_state_dict(checkpoint_state_dict(ckpt))
     net.to(device)
@@ -207,7 +207,7 @@ def fixed_suite_summary_for_net(
 
     records = load_suite(Path(suite))
     net = net.to(device).eval()
-    score_scale = float(getattr(net, "score_scale", 100.0) or 100.0)
+    score_scale = float(getattr(net, "score_scale", 160.0) or 160.0)
     rows = [evaluate_record(rec, net, device, score_scale) for rec in records]
     return summarize(rows, Path(suite), checkpoint_label)
 

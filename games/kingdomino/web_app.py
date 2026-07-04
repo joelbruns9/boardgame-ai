@@ -711,7 +711,7 @@ def _recommend_exact(
         raise HTTPException(status_code=400, detail=detail)
 
     thread_meta = _exact_thread_meta(req.exact_threads)
-    score_scale = 100.0
+    score_scale = 160.0
     margin_gain = 2.0
     win_alpha = 0.0
     rank_alpha = 0.8

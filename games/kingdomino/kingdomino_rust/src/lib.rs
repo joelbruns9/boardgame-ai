@@ -542,7 +542,7 @@ const CLAIM_SLOT: usize = 16; // TILE_FEAT + is_mine + status
 const PENDING_SUMMARY: usize = 18; // TILE_FEAT + present + turn_distance + active + remaining_count
 const BOARD_SUMMARY: usize = 25;
 const FLAT_SIZE: usize = 333;
-const SCORE_SCALE: f32 = 100.0;
+const SCORE_SCALE: f32 = 160.0; // must match encoder.SCORE_SCALE / training score_scale
 const MAX_BOARD_CELLS: f32 = 48.0;
 const MAX_TOTAL_CROWNS: f32 = 24.0;
 const MAX_LEGAL_PLACEMENTS: f32 = 64.0;
@@ -1656,7 +1656,7 @@ impl RustGameState {
     /// `parallel=True` (default) uses the YBW parallel solver
     /// (`solve_endgame_ab_parallel`) to measure wall-clock; `parallel=False` uses
     /// the serial solver — use that to compare single-core solve times.
-    #[pyo3(signature = (max_secs=60.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, parallel=true, ordering="lookahead2_clustered"))]
+    #[pyo3(signature = (max_secs=60.0, score_scale=160.0, margin_gain=2.0, alpha=0.8, parallel=true, ordering="lookahead2_clustered"))]
     fn measure_endgame_tree(
         &self,
         max_secs: f64,
@@ -1744,7 +1744,7 @@ impl Node {
 /// tanh(margin/30) scale was inconsistent with the non-terminal estimates).
 ///
 /// score_scale / margin_gain / alpha must match the Python config values
-/// (SCORE_SCALE=100.0, MARGIN_GAIN=2.0, ALPHA=0.8 by default) so the Rust and
+/// (SCORE_SCALE=160.0, MARGIN_GAIN=2.0, ALPHA=0.8 by default) so the Rust and
 /// Python terminal values are bit-identical for the same terminal state.
 fn terminal_search_value(
     state: &RustGameState,
@@ -3238,7 +3238,7 @@ impl RustMCTS {
     ///   (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,FLAT_SIZE) f32, idxs_list)
     ///     -> (values (K,) f64, [gathered_logits_i (n_i,) f64])
     /// Serial search calls it with K=1.  `seed` only affects Dirichlet noise.
-    #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0, fpu=0.0, cpuct=1.5, seed=None, leaf_batch=1, virtual_loss=1, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0, fpu=0.0, cpuct=1.5, seed=None, leaf_batch=1, virtual_loss=1, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
     fn search<'py>(
         &self,
         py: Python<'py>,
@@ -4691,7 +4691,7 @@ impl BatchedMCTS {
                         virtual_loss=1, cpuct=1.5, fpu=0.0, dirichlet_alpha=0.3,
                         dirichlet_eps=0.25, temp_moves=20, harmony=true,
                         middle_kingdom=true, open_loop=false,
-                        score_scale=100.0, margin_gain=2.0, alpha=0.8,
+                        score_scale=160.0, margin_gain=2.0, alpha=0.8,
                         exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0,
                         playout_cap_randomization=false, full_search_fraction=0.25,
                         fast_move_sims=100, record_fast_moves=false,
@@ -6520,7 +6520,7 @@ mod kingdomino_rust {
     /// if the state still has chance branching or the per-position wall-clock
     /// budget `max_secs` is exceeded.
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
     fn exact_endgame_value_no_chance(
         state: &RustGameState,
         max_secs: f64,
@@ -6576,7 +6576,7 @@ mod kingdomino_rust {
     /// accepts deck length 4, because that is likewise no-chance: all four
     /// hidden tiles form the next row.
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8))]
     fn exact_endgame_value_deck_empty(
         state: &RustGameState,
         max_secs: f64,
@@ -6621,7 +6621,7 @@ mod kingdomino_rust {
     }
 
     #[pyfunction]
-    #[pyo3(signature = (state, max_secs=3.0, score_scale=100.0, margin_gain=2.0, alpha=0.8, ordering="combined", parallel=true))]
+    #[pyo3(signature = (state, max_secs=3.0, score_scale=160.0, margin_gain=2.0, alpha=0.8, ordering="combined", parallel=true))]
     fn exact_endgame_value_no_chance_ordered(
         state: &RustGameState,
         max_secs: f64,

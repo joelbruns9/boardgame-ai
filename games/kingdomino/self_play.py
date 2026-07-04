@@ -168,7 +168,7 @@ class SelfPlayConfig:
     policy_weight: float = 1.0
     lambda_score: float = 0.5     # weight on own + opp score MSE losses
     lambda_w: float = 0.25        # weight on win BCE loss
-    score_scale: float = 100.0    # normalization divisor for score heads
+    score_scale: float = 160.0    # normalization divisor for score heads
     grad_clip: float = 1.0        # max global grad norm; <=0 disables clipping
     augment: bool = True
     # Leaf-value mix (open-loop / batched_open_loop): leaf_value =
@@ -1404,7 +1404,7 @@ def play_selfplay_game_rust(
     c_puct: float, dirichlet_alpha: float, dirichlet_epsilon: float,
     leaf_batch: int, virtual_loss: int, seed: int,
     py_rng: random.Random, np_rng: np.random.Generator,
-    score_scale: float = 100.0, margin_gain: float = 2.0, alpha: float = 0.8,
+    score_scale: float = 160.0, margin_gain: float = 2.0, alpha: float = 0.8,
     iteration: int = 0,
     playout_cfg: Optional[SelfPlayConfig] = None,
 ) -> Tuple[List[Example], Tuple[int, int]]:
@@ -2125,7 +2125,7 @@ def _new_history() -> dict:
 def train_step(
     net: KingdominoNet, batch, optimizer, *,
     policy_weight: float = 1.0, lambda_score: float = 0.5,
-    lambda_w: float = 0.25, score_scale: float = 100.0,
+    lambda_w: float = 0.25, score_scale: float = 160.0,
     grad_clip: float = 1.0,
 ) -> Tuple[float, float, float, float, float, float]:
     """One optimiser step on a batch.  Returns (policy_loss, own_loss, opp_loss,
@@ -3869,7 +3869,7 @@ if __name__ == "__main__":
                    help="weight on own+opp score MSE losses")
     p.add_argument("--lambda_w", type=float, default=0.25,
                    help="weight on win BCE loss")
-    p.add_argument("--score_scale", type=float, default=100.0,
+    p.add_argument("--score_scale", type=float, default=160.0,
                    help="normalization divisor for the score heads")
     p.add_argument("--grad_clip", type=float, default=1.0,
                    help="max global grad norm; <=0 disables clipping")
