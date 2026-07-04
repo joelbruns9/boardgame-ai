@@ -12,13 +12,103 @@ caveats worked out in discussion. Work top to bottom: everything in
 > `--warm_start` from `best_32x4.pt` — the tensor shapes don't match
 > (32→80/96 channels, 4→6 blocks), so weight transfer is impossible. We
 > start from random weights.
-> The prior buffer can still *optionally* seed self-play (samples are
-> architecture-independent), but they come from a weaker policy — see Phase 4.
+>
+> **This is also the first run on the new 333-flat encoder + win-gated value
+> (2026-07).** Every prior checkpoint AND replay buffer is **261-flat** and is
+> therefore INCOMPATIBLE — there is no warm-start weight *and* no buffer seed
+> available. This run is genuinely from scratch: random weights, empty buffer.
+> Two config consequences (details in Phase 4): use a **fixed `--alpha 0.5`**
+> (the win-gated margin band B; the old `--alpha_schedule` no longer applies),
+> and do **not** pass `--warm_buffer`.
 >
 > Depth decision: **6 blocks is the default.** Six blocks gives full-board
 > receptive-field coverage on the encoded Kingdomino board. Test 8 blocks only
 > if the 6-block model later shows clear underfitting; it taxes every MCTS
 > inference call.
+
+---
+
+## First cloud run? Plain-English walkthrough (never run a `.sh` before)
+
+This is the whole run in eight concrete steps. It reuses the Phases below — those
+have the detail and the reasoning; this is "what do I literally type." You rent a
+remote computer with a GPU by the hour, set it up with **one script**, start
+training, check on it, copy the results back, and shut it down.
+
+> A `.sh` file is just a plain text file containing shell commands. You don't
+> double-click it — you hand it to the `bash` program, which runs the lines in
+> order. `bash setup_cloud.sh` always works; you never need to "install" it.
+
+**Step 1 — Rent a GPU box (Vast.ai website, in your browser).**
+- Make a Vast.ai account and add a little credit.
+- Search/filter for: GPU **RTX 5090**, host **driver ≥ 570** (CUDA ≥ 12.8), and a
+  template image with **CUDA 12.8+** (e.g. a `pytorch/pytorch ...cuda12.8...`
+  image). See Phase 1.
+- **Set a max spend / max duration before you click rent** — this is your money
+  guardrail.
+- Rent it. Vast shows you an **SSH command** to connect, like
+  `ssh -p 12345 root@203.0.113.7`. Copy it.
+
+**Step 2 — Connect to the box (from your Windows laptop).**
+- Open **Git Bash** (you already have it) — or PowerShell.
+- Paste the SSH command from Vast and press Enter. The first time it asks
+  "are you sure you want to continue connecting?" → type `yes`.
+- Your prompt is now *on the remote box*. Every command from here runs there, not
+  on your laptop, until you type `exit`.
+
+**Step 3 — Set the box up with one script (this is "running a `.sh`").**
+```bash
+curl -fsSL https://raw.githubusercontent.com/joelbruns9/boardgame-ai/main/setup_cloud.sh -o setup_cloud.sh
+bash setup_cloud.sh
+```
+This installs Rust, clones the repo, installs the correct PyTorch (cu128 for the
+5090), builds the Rust engine, runs a **GPU self-check**, then runs the
+calibration benchmark. It takes ~15–40 min. Watch for the green `=== STAGE N
+COMPLETE ===` banners.
+- If it prints **`INSTANCE FAILED VERIFICATION`**, the box's GPU/driver is wrong.
+  **Destroy it (Step 8) and rent a different one** — don't try to fix it.
+- If it prints **`ALL CHECKS PASSED`** and finishes calibration, you're good.
+
+**Step 4 — Read the calibration result and note your settings.**
+```bash
+cat ~/boardgame-ai/runs/kingdomino/cloud_calibration/summary.md
+```
+Write down the recommended `channels` (80 or 96), `batch_slots`, `game_cpus`,
+`exact_endgame_max_secs`, and `full_search_fraction` (Phase 3).
+
+**Step 5 — Start training inside `tmux` (so it survives a dropped connection).**
+If your SSH drops, anything running normally dies with it. `tmux` keeps it alive.
+```bash
+tmux new -s train                 # opens a persistent session
+cd ~/boardgame-ai
+# paste the Phase 4 training command, with your Step-4 numbers filled in.
+# (fixed --alpha 0.5, NO --warm_start, NO --warm_buffer — see Phase 4.)
+```
+Then **detach** (leave it running): press `Ctrl+b`, release, then press `d`.
+Reattach anytime with `tmux attach -t train`.
+
+**Step 6 — Watch it (optional).**
+```bash
+tail -f ~/boardgame-ai/runs/kingdomino/cloud_<channels>x6_run1/training_log.jsonl
+nvidia-smi        # GPU utilization
+```
+`Ctrl+c` stops *watching*, not the training.
+
+**Step 7 — Copy results back to your laptop every ~10 iters (run on your LAPTOP,
+not the box).** Open a *second* Git Bash window:
+```bash
+rsync -avz -e "ssh -p <port>" \
+  root@<ip>:~/boardgame-ai/runs/kingdomino/cloud_<channels>x6_run1/ \
+  runs/kingdomino/cloud_<channels>x6_run1/
+```
+(If `rsync` isn't available, use
+`scp -P <port> -r root@<ip>:~/boardgame-ai/runs/kingdomino/cloud_<channels>x6_run1 .`.)
+The box is ephemeral — if it dies with no off-box copy, the run is gone (Phase 5).
+
+**Step 8 — Stop paying: DESTROY the instance.**
+When training is done and you've copied results back, go to the Vast.ai web UI and
+**Destroy** the instance. *Stopping* is not enough — billing continues until it's
+destroyed. Then finish with Phase 6 (merge Elo, save the checkpoint, commit).
 
 ---
 
@@ -68,8 +158,9 @@ Markdown or JSON summary with the recommended settings.
 - `best_checkpoint/`, `elo_db.json`, `elo_games.jsonl` are **committed** →
   arrive automatically with `git clone`. No scp needed for the Elo ladder.
 - For a cold start we need **no weights**.
-- **Optional:** `runs/kingdomino/<prev_run>/buffer_final.pkl` (gitignored,
-  `*.pkl`) — scp it over only if seeding the buffer (Phase 4).
+- **Buffer seeding is NOT available for this run.** Prior `buffer_final.pkl` files
+  hold **261-flat** encoded examples; the current encoder is **333-flat**, so they
+  cannot train the new net. Start with an empty buffer (no `--warm_buffer`).
 
 ---
 
@@ -256,7 +347,7 @@ python -m games.kingdomino.self_play \
   --buffer 500000 \
   --lambda_score 0.5 --lambda_w 0.25 --score_scale 160.0 \
   --policy_weight 1.0 --grad_clip 1.0 --margin_gain 2.0 \
-  --alpha_schedule "0:0.8,20:0.5,40:0.2" \
+  --alpha 0.5 \
   --c_puct 1.5 --temp_moves 20 --fpu -0.2 \
   --playout_cap_randomization \
   --full_search_fraction <full_search_fraction> \
@@ -274,8 +365,14 @@ python -m games.kingdomino.self_play \
 Notes that differ from a warm-start laptop run:
 
 - **No `--warm_start`** (cold start — random weights at 80x6 or 96x6).
-- **Use schedules instead of cliffs.** The sample command ramps sims and decays
-  LR/alpha in stages so training is not jolted by one abrupt change.
+- **`alpha` is fixed at `0.5`, not scheduled (2026-07 win-gated value).** `alpha`
+  is now the reserved margin band **B** in `(1-B)*win + B*win^4*margin`, not the
+  old convex-blend weight. The old `--alpha_schedule "0:0.8,20:0.5,40:0.2"` ramps B
+  *down*, which shrinks margin-fighting exactly when the net is strong enough to
+  use it — the opposite of what we want. Use `--alpha 0.5`. If you ever schedule
+  B, ramp it **up** (score head is miscalibrated early), never down.
+- **Use schedules for sims and LR.** The sample command ramps sims and decays LR
+  in stages so training is not jolted by one abrupt change.
 - **Tune `--game_cpus` on the target box.** The exact-solver pool gets all
   remaining logical CPUs by default. Use `--solver_cpus` only as an explicit
   override.
@@ -283,10 +380,9 @@ Notes that differ from a warm-start laptop run:
   only a calibration ceiling unless Elo later says otherwise.
 - **Add `--compile`, AMP inference, or `--double_buffer` only if Phase 3
   confirmed them.**
-- **Optional buffer seed:** add `--warm_buffer runs/kingdomino/<prev_run>/buffer_final.pkl`
-  to skip the empty-buffer cold period. Samples are architecture-independent,
-  but come from a weaker 32x4 policy — acceptable as early filler, not as
-  long-term signal.
+- **No buffer seed (this run).** Old buffers are **261-flat** encoded examples,
+  incompatible with the **333-flat** encoder — do **not** pass `--warm_buffer`.
+  The buffer fills from scratch over the first few iterations.
 
 For same-architecture continuation runs where
 `runs/kingdomino/best_checkpoint/current_best.pt` matches `<channels>x6`, prefer
