@@ -227,8 +227,8 @@ def augment(
     if flat.shape != (FLAT_SIZE,):
         raise ValueError(
             f"bad flat shape: {flat.shape}, expected ({FLAT_SIZE},). "
-            f"Note: FLAT_SIZE is now {FLAT_SIZE} (was 259 before the Phase 0.2 "
-            f"pick_pos feature, 261 after the encoder fix)."
+            f"Note: FLAT_SIZE is now {FLAT_SIZE} after the symmetric pending "
+            "encoder migration."
         )
 
     # Fix 3: four-head scalar targets are required — fail loudly rather than

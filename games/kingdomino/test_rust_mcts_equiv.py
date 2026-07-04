@@ -81,7 +81,7 @@ def mock_single(mb, ob, flat, idxs):
 
 def mock_batched(mb, ob, flat, idxs_list):
     """Batched evaluator for the Rust tree's leaf callback:
-    (mb (K,9,13,13), ob (K,9,13,13), flat (K,261), idxs_list) ->
+    (mb (K,9,13,13), ob (K,9,13,13), flat (K,FLAT_SIZE), idxs_list) ->
     (values (K,) f32, [gathered_i f32]).  Identical math to mock_single.
     Returns f32 — the Rust tree casts to f64 on entry (halved-D2H contract)."""
     k = mb.shape[0]

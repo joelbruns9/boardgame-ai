@@ -78,7 +78,7 @@ class _CountingMock:
 
 
 class _CountingMockBatched:
-    """Batched evaluator seam for the RUST engine: (mb (K,...), ob, flat (K,261),
+    """Batched evaluator seam for the RUST engine: (mb (K,...), ob, flat (K,FLAT_SIZE),
     idxs_list) -> (values (K,) f64, [zeros f64]).  Counts total leaves (sum of K)
     so the counter is an exact leaf count, matching _CountingMock's semantics."""
     __slots__ = ("n",)
@@ -176,7 +176,6 @@ _HOT = {
     "encode_state": "encode_state (total)",
     "_encode_board_spatial": "  board spatial encode",
     "_compute_bag": "  compute_bag",
-    "_domino_in_hand": "  domino_in_hand",
     "legal_placements": "legal_placements",
     "is_legal_placement": "is_legal_placement",
     "legal_actions": "legal_actions",

@@ -52,6 +52,21 @@ async function postJson(url, payload) {
   return data;
 }
 
+async function downloadJson(filename, data) {
+  if (!browserAPI.downloads || !browserAPI.downloads.download) {
+    throw new Error("downloads API is not available; reload the extension after adding the downloads permission");
+  }
+  const text = JSON.stringify(data, null, 2);
+  const url = "data:application/json;charset=utf-8," + encodeURIComponent(text);
+  const downloadId = await browserAPI.downloads.download({
+    url,
+    filename,
+    saveAs: false,
+    conflictAction: "uniquify",
+  });
+  return downloadId;
+}
+
 // Runs the content script's page-reader function in the page's MAIN world via
 // chrome.scripting. This is NOT subject to the page's Content Security Policy
 // (which blocks inline <script> injection), so it works on BGA where the old
@@ -81,13 +96,44 @@ async function readPageStateInTab(tabId, fnSource) {
 
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       world: "MAIN",
       func: runner,
       args: [fnSource],
     });
-    const result = results && results[0] && results[0].result;
-    return result || { ok: false, error: "no result returned from executeScript" };
+    if (!results || !results.length) {
+      return { ok: false, error: "executeScript returned no result rows" };
+    }
+
+    const rows = results.map((row) => ({
+      frameId: row.frameId,
+      result: Object.prototype.hasOwnProperty.call(row, "result") ? row.result : undefined,
+    }));
+    const okRow = rows.find((row) => row.result && row.result.ok);
+    if (okRow) {
+      return okRow.result;
+    }
+
+    const usefulError = rows.find((row) => row.result && row.result.error);
+    if (usefulError) {
+      return {
+        ...usefulError.result,
+        frame_debug: rows.map((row) => ({
+          frameId: row.frameId,
+          ok: Boolean(row.result && row.result.ok),
+          error: row.result && row.result.error ? row.result.error : row.result === undefined ? "undefined result" : null,
+        })),
+      };
+    }
+
+    return {
+      ok: false,
+      error: "reader returned no usable result from executeScript frames",
+      frame_debug: rows.map((row) => ({
+        frameId: row.frameId,
+        resultType: row.result === undefined ? "undefined" : typeof row.result,
+      })),
+    };
   } catch (e) {
     return { ok: false, error: "executeScript failed: " + String((e && e.message) || e) };
   }
@@ -115,6 +161,20 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender.tab && sender.tab.id;
     readPageStateInTab(tabId, message.fnSource)
       .then((result) => sendResponse(result))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  if (message.action === "downloadProbe") {
+    downloadJson(message.filename, message.probe)
+      .then((downloadId) => sendResponse({ ok: true, downloadId }))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  if (message.action === "saveProbe") {
+    postJson(message.url, { filename: message.filename, probe: message.probe })
+      .then((data) => sendResponse({ ok: true, data }))
       .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
     return true;
   }

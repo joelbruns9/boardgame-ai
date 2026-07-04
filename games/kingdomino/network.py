@@ -6,7 +6,7 @@ ARCHITECTURE OVERVIEW
 Inputs (from encoder.py):
     my_board   (B, 9, 13, 13)   current player's board, castle-centred
     opp_board  (B, 9, 13, 13)   opponent's board, same frame
-    flat       (B, 261)         non-spatial features
+    flat       (B, FLAT_SIZE)   non-spatial features
 
 Outputs:
     own_score  (B,)             predicted NORMALIZED own final score
@@ -116,9 +116,9 @@ class ResBlock(nn.Module):
 
 class KingdominoNet(nn.Module):
     # Architecture version stamped into checkpoints so the loader (in
-    # self_play.py) can detect migrations.  Bumped to 2 for the four-head
-    # rewrite (single tanh value head → own/opp score + win heads).
-    checkpoint_version: int = 2
+    # self_play.py) can detect migrations.  Bumped to 3 for the symmetric
+    # pending-tile encoder migration.
+    checkpoint_version: int = 3
 
     def __init__(
         self,
@@ -175,9 +175,9 @@ class KingdominoNet(nn.Module):
 
         # ── Policy: flat → D context, injected into BOTH placement and pick
         # representations.  This is what lets the placement head condition on
-        # the tile in hand (domino_in_hand lives in `flat`); without it the
-        # placement logits depend only on board geometry, not on which terrain/
-        # crown tile is actually being placed.
+        # the next pending tile; without it the placement logits depend only on
+        # board geometry, not on which terrain/crown tile is actually being
+        # placed.
         self.flat_policy_mlp = nn.Sequential(
             nn.Linear(FLAT_SIZE, flat_policy_hidden),
             nn.ReLU(inplace=True),
@@ -259,7 +259,7 @@ class KingdominoNet(nn.Module):
     def forward(self, my_board, opp_board, flat):
         """
         my_board, opp_board: (B, 9, 13, 13)
-        flat:                (B, 261)
+        flat:                (B, FLAT_SIZE)
         returns: own_score (B,), opp_score (B,), win_prob (B,),
                  policy_logits (B, 3390)
         own_score/opp_score are normalized scores (no activation); win_prob is
@@ -276,7 +276,7 @@ class KingdominoNet(nn.Module):
         opp_score = self.opponent_score_mlp(head_in).squeeze(-1)       # (B,)
         win_prob = torch.sigmoid(self.win_mlp(head_in).squeeze(-1))    # (B,) in (0,1)
 
-        # ── Flat policy context (carries domino_in_hand etc. into the heads) ──
+        # ── Flat policy context (carries pending-tile context into the heads) ──
         flat_ctx = self.flat_policy_mlp(flat)                    # (B, D)
 
         # ── Placement representation P (B, 678, D) ──

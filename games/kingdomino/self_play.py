@@ -52,7 +52,7 @@ import torch.nn.functional as F
 
 from games.kingdomino.game import GameState, Phase, determine_winner
 from games.kingdomino.encoder import (
-    encode_state, compute_target_z, FLAT_LAYOUT,
+    encode_state, compute_target_z, FLAT_LAYOUT, FLAT_SIZE,
     compute_target_own_score, compute_target_opponent_score, compute_target_win,
 )
 from games.kingdomino.action_codec import encode_action, decode_action, NUM_JOINT_ACTIONS
@@ -354,7 +354,7 @@ class Example:
     than their dense 3390-wide form."""
     my_board: np.ndarray    # float16 (9, 13, 13)
     opp_board: np.ndarray   # float16 (9, 13, 13)
-    flat: np.ndarray        # float16 (261,)
+    flat: np.ndarray        # float16 (FLAT_SIZE,)
     policy_idx: np.ndarray  # int32 — non-zero policy indices
     policy_val: np.ndarray  # float32 — corresponding visit-proportional mass
     legal_idx: np.ndarray   # int32 — all legal joint indices (⊇ policy_idx)
@@ -379,6 +379,17 @@ class Example:
     # construction site that misses the kwarg yields a (stale) age reading
     # rather than crashing.
     iteration: int = 0
+
+
+def _validate_example_schema(ex: Example, *, context: str) -> None:
+    """Fail loudly when replay data was produced by an older encoder schema."""
+    flat_shape = tuple(getattr(ex.flat, "shape", ()))
+    if flat_shape != (FLAT_SIZE,):
+        raise ValueError(
+            f"{context}: replay example flat shape {flat_shape} does not match "
+            f"current FLAT_SIZE ({FLAT_SIZE},). Start a fresh replay buffer after "
+            "encoder/checkpoint_version migrations."
+        )
 
 
 def configure_torch_performance(cfg: SelfPlayConfig) -> None:
@@ -481,6 +492,11 @@ class ReplayBuffer:
         # Respect current buffer capacity — truncate if saved buffer was larger
         if len(examples) > self.capacity:
             examples = examples[-self.capacity:]
+        for i, ex in enumerate(examples):
+            _validate_example_schema(
+                ex,
+                context=f"ReplayBuffer.load({path}) example {i}",
+            )
         self.data = list(examples)
         self._pos = payload.get('pos', 0) % max(1, len(self.data))
         print(f"Buffer loaded: {len(self.data)} examples from {path}")
@@ -490,6 +506,7 @@ class ReplayBuffer:
         for ex in examples:
             if not getattr(ex, "trainable", True):
                 continue
+            _validate_example_schema(ex, context="ReplayBuffer.add")
             if len(self.data) < self.capacity:
                 self.data.append(ex)
             else:
@@ -1235,7 +1252,7 @@ def make_rust_evaluator(
 ):
     """In-process batched leaf evaluator for RustMCTS.search / BatchedMCTS.update.
     Contract:
-    (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,261) f32, idxs_list)
+    (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,FLAT_SIZE) f32, idxs_list)
       -> (values (K,) f32, [gathered_logits_i f32]).
     Returns f32 to HALVE the D2H transfer volume (logits are K×3390); the Rust
     tree casts to f64 on entry and keeps its internal accumulation in f64.

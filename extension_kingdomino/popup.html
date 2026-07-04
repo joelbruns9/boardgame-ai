@@ -55,7 +55,9 @@
 
     <label for="engine">Engine</label>
     <select id="engine">
+      <option value="auto">Auto endgame</option>
       <option value="nn">NN/MCTS</option>
+      <option value="exact">Exact solver</option>
       <option value="greedy">Greedy debug</option>
       <option value="random">Random debug</option>
     </select>
@@ -66,8 +68,15 @@
     <label for="checkpoint">Checkpoint path</label>
     <input id="checkpoint" type="text" placeholder="blank uses server default">
 
+    <label for="exactMaxSecs">Exact max seconds</label>
+    <input id="exactMaxSecs" type="number" min="0" max="3600" step="10">
+
+    <label for="exactThreads">Exact CPU threads</label>
+    <input id="exactThreads" type="number" min="0" max="128" step="1" placeholder="0 = all logical CPUs">
+
     <button id="captureBtn">Capture and Recommend</button>
     <button id="debugBtn" class="secondary">Capture Debug Only</button>
+    <button id="probeBtn" class="secondary">Save Last Probe</button>
     <div id="status"></div>
 
     <script src="popup.js"></script>

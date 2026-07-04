@@ -79,6 +79,12 @@ NUM_BOARD_CHANNELS = 9
 TILE_FEAT_SIZE = 2 * (NUM_PLACEABLE_TERRAINS + 1)  # 14
 ROW_SLOT_SIZE = TILE_FEAT_SIZE + 1                  # + present flag = 15
 CLAIM_SLOT_SIZE = TILE_FEAT_SIZE + 2                # + is_mine flag + status flag = 16
+PENDING_SUMMARY_SIZE = TILE_FEAT_SIZE + 4           # + present + turn_distance + active + remaining_count
+BOARD_SUMMARY_SIZE = 25
+SCORE_SCALE = 100.0
+MAX_BOARD_CELLS = 48.0
+MAX_TOTAL_CROWNS = 24.0
+MAX_LEGAL_PLACEMENTS = 64.0
 
 
 # ─── flat-vector layout ───────────────────────────────────────────────────
@@ -94,7 +100,10 @@ def _build_flat_layout() -> Tuple[dict, int]:
     (1,3) vs (2,4)) is strategically distinct.  See _pick_positions.
     """
     sizes = [
-        ('domino_in_hand', TILE_FEAT_SIZE),                          # 14
+        ('my_next_pending',  PENDING_SUMMARY_SIZE),                  # 18
+        ('opp_next_pending', PENDING_SUMMARY_SIZE),                  # 18
+        ('my_board_summary',  BOARD_SUMMARY_SIZE),                   # 25
+        ('opp_board_summary', BOARD_SUMMARY_SIZE),                   # 25
         ('current_row',    ROW_SLOT_SIZE   * MAX_PHASE_SLOTS),       # 60
         ('pending_claims', CLAIM_SLOT_SIZE * MAX_PHASE_SLOTS),       # 64
         ('next_claims',    CLAIM_SLOT_SIZE * MAX_PHASE_SLOTS),       # 64
@@ -117,7 +126,7 @@ def _build_flat_layout() -> Tuple[dict, int]:
 
 
 FLAT_LAYOUT, FLAT_SIZE = _build_flat_layout()
-# FLAT_SIZE = 261 with current constants
+# FLAT_SIZE = 333 with current constants
 
 
 # ─── primitives ───────────────────────────────────────────────────────────
@@ -151,6 +160,185 @@ def _encode_claim_slot(claim, current_player: int, status_flag: float) -> np.nda
     out[:TILE_FEAT_SIZE] = _encode_tile(claim.domino_id)
     out[TILE_FEAT_SIZE] = 1.0 if claim.player == current_player else 0.0
     out[TILE_FEAT_SIZE + 1] = status_flag
+    return out
+
+
+def _next_pending_summary(state: GameState, owner: int) -> tuple[Optional[int], int, int]:
+    """Return (domino_id, distance, remaining_count) for owner's next claim.
+
+    Current-round unresolved pending_claims take priority. If owner has no
+    unresolved current-round claim, fall forward to their earliest next_claims
+    commitment so claimed-but-unplaced tiles stay visible across round
+    boundaries.
+
+    distance is measured in placement-order slots from the current actor_index:
+      0 = this owner is placing now
+      1 = after one more pending placement
+      ...
+    remaining_count counts owner's claims remaining in the chosen claim source.
+    """
+    current_remaining = []
+    if state.phase in (Phase.PLACE_AND_SELECT, Phase.FINAL_PLACEMENT):
+        current_remaining = [
+            (idx, claim)
+            for idx, claim in enumerate(state.pending_claims)
+            if idx >= state.actor_index
+        ]
+        own_current = [(idx, claim) for idx, claim in current_remaining
+                       if claim.player == owner]
+        if own_current:
+            idx, claim = own_current[0]
+            return claim.domino_id, idx - state.actor_index, len(own_current)
+
+    if state.phase in (Phase.INITIAL_SELECTION, Phase.PLACE_AND_SELECT):
+        next_order = sorted(state.next_claims, key=lambda c: c.domino_id)
+        own_next = [(idx, claim) for idx, claim in enumerate(next_order)
+                    if claim.player == owner]
+        if own_next:
+            idx, claim = own_next[0]
+            return claim.domino_id, len(current_remaining) + idx, len(own_next)
+
+    return None, 0, 0
+
+
+def _encode_pending_summary(state: GameState, owner: int) -> np.ndarray:
+    out = np.zeros(PENDING_SUMMARY_SIZE, dtype=np.float32)
+    domino_id, distance, remaining_count = _next_pending_summary(state, owner)
+    if domino_id is None:
+        return out
+    out[:TILE_FEAT_SIZE] = _encode_tile(domino_id)
+    out[TILE_FEAT_SIZE] = 1.0
+    out[TILE_FEAT_SIZE + 1] = min(float(distance), 3.0) / 3.0
+    out[TILE_FEAT_SIZE + 2] = 1.0 if distance == 0 else 0.0
+    out[TILE_FEAT_SIZE + 3] = min(float(remaining_count), 2.0) / 2.0
+    return out
+
+
+def _board_component_facts(board) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return (score_by_terrain, largest_by_terrain, total_crowns)."""
+    score_by = np.zeros(NUM_PLACEABLE_TERRAINS, dtype=np.float32)
+    largest_by = np.zeros(NUM_PLACEABLE_TERRAINS, dtype=np.float32)
+    total_crowns = 0
+    visited = np.zeros_like(board.terrain, dtype=bool)
+    bbox = board.occupied_bbox()
+    if bbox is None:
+        return score_by, largest_by, total_crowns
+    min_x, min_y, max_x, max_y = bbox
+    for y in range(min_y, max_y + 1):
+        for x in range(min_x, max_x + 1):
+            t = int(board.terrain[y, x])
+            if visited[y, x] or t in (int(Terrain.EMPTY), int(Terrain.CASTLE)):
+                continue
+            terrain_idx = t - TERRAIN_INDEX_OFFSET
+            stack = [(x, y)]
+            visited[y, x] = True
+            area = 0
+            crowns = 0
+            while stack:
+                cx, cy = stack.pop()
+                area += 1
+                crowns += int(board.crowns[cy, cx])
+                for nx, ny in board.adjacent_coords(cx, cy):
+                    if not visited[ny, nx] and int(board.terrain[ny, nx]) == t:
+                        visited[ny, nx] = True
+                        stack.append((nx, ny))
+            score_by[terrain_idx] += float(area * crowns)
+            largest_by[terrain_idx] = max(largest_by[terrain_idx], float(area))
+            total_crowns += crowns
+    return score_by, largest_by, total_crowns
+
+
+def _bonus_state_features(state: GameState, board, owner: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return factual bonus states for harmony and middle kingdom.
+
+    Layout per bonus: [currently_awarded, still_possible, impossible].  Both
+    tests are EXACT in the safe direction — they never mark a truly-possible
+    position impossible.
+
+    Harmony needs occupied == 49 (a full 7×7), i.e. all 24 dominoes placed →
+    zero discards.  So harmony is impossible the instant this player discards
+    (a forced discard permanently caps the board below 49 cells).
+
+    Middle kingdom needs the castle centred in a 7×7 bbox at game end; it does
+    NOT require a full fill, so discards are irrelevant.  It becomes impossible
+    once the bbox extends outside the castle-centred 7×7 target (it can then
+    never end as a castle-centred 7×7).
+    """
+    occupied = len(board.occupied_cells())
+    bbox = board.occupied_bbox()
+    if bbox is None:
+        min_x = max_x = board.castle_pos[0]
+        min_y = max_y = board.castle_pos[1]
+    else:
+        min_x, min_y, max_x, max_y = bbox
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+
+    harmony = np.zeros(3, dtype=np.float32)
+    if state.config.harmony:
+        awarded = width == 7 and height == 7 and occupied == 49
+        impossible = state.discards[owner] > 0
+        if awarded:
+            harmony[0] = 1.0
+        elif impossible:
+            harmony[2] = 1.0
+        else:
+            harmony[1] = 1.0
+
+    middle = np.zeros(3, dtype=np.float32)
+    if state.config.middle_kingdom:
+        cx, cy = board.castle_pos
+        awarded = (
+            width == 7 and height == 7
+            and (cx, cy) == (min_x + 3, min_y + 3)
+        )
+        outside_target = (
+            min_x < cx - 3 or max_x > cx + 3
+            or min_y < cy - 3 or max_y > cy + 3
+        )
+        if awarded:
+            middle[0] = 1.0
+        elif outside_target:
+            middle[2] = 1.0
+        else:
+            middle[1] = 1.0
+    return harmony, middle
+
+
+def _encode_board_summary(state: GameState, player: int) -> np.ndarray:
+    board = state.boards[player]
+    out = np.zeros(BOARD_SUMMARY_SIZE, dtype=np.float32)
+    score = board.score(state.config.harmony, state.config.middle_kingdom)
+    score_by, largest_by, total_crowns = _board_component_facts(board)
+    harmony, middle = _bonus_state_features(state, board, player)
+    bbox = board.occupied_bbox()
+    if bbox is None:
+        width = height = 1
+        occupied = 1
+    else:
+        min_x, min_y, max_x, max_y = bbox
+        width = max_x - min_x + 1
+        height = max_y - min_y + 1
+        occupied = len(board.occupied_cells())
+    next_domino, _, _ = _next_pending_summary(state, player)
+    legal_count = 0
+    if next_domino is not None:
+        legal_count = len(board.legal_placements(DOMINOES[next_domino]))
+
+    off = 0
+    out[off] = min(float(score.total), SCORE_SCALE) / SCORE_SCALE; off += 1
+    out[off:off + NUM_PLACEABLE_TERRAINS] = np.minimum(score_by, SCORE_SCALE) / SCORE_SCALE
+    off += NUM_PLACEABLE_TERRAINS
+    out[off:off + NUM_PLACEABLE_TERRAINS] = np.minimum(largest_by, MAX_BOARD_CELLS) / MAX_BOARD_CELLS
+    off += NUM_PLACEABLE_TERRAINS
+    out[off] = min(float(total_crowns), MAX_TOTAL_CROWNS) / MAX_TOTAL_CROWNS; off += 1
+    out[off:off + 3] = harmony; off += 3
+    out[off:off + 3] = middle; off += 3
+    out[off] = min(float(width), 7.0) / 7.0; off += 1
+    out[off] = min(float(height), 7.0) / 7.0; off += 1
+    out[off] = min(float(max(0, 49 - occupied)), MAX_BOARD_CELLS) / MAX_BOARD_CELLS; off += 1
+    out[off] = min(float(legal_count), MAX_LEGAL_PLACEMENTS) / MAX_LEGAL_PLACEMENTS; off += 1
+    out[off] = 1.0 if next_domino is not None and legal_count == 0 else 0.0
     return out
 
 
@@ -259,20 +447,6 @@ def _compute_bag(state: GameState) -> np.ndarray:
     return out
 
 
-def _domino_in_hand(state: GameState, player: int) -> Optional[int]:
-    """Return domino_id the given player is currently placing, if any."""
-    if state.phase not in (Phase.PLACE_AND_SELECT, Phase.FINAL_PLACEMENT):
-        return None
-    if not state.pending_claims:
-        return None
-    if state.actor_index >= len(state.pending_claims):
-        return None
-    claim = state.pending_claims[state.actor_index]
-    if claim.player != player:
-        return None
-    return claim.domino_id
-
-
 def _pick_positions(state: GameState, player: int) -> np.ndarray:
     """Compute next-round pick position features for the encoded player.
 
@@ -359,10 +533,16 @@ def encode_state(state: GameState, player: int) -> Tuple[np.ndarray, np.ndarray,
     # ── Flat encoding ──
     flat = np.zeros(FLAT_SIZE, dtype=np.float32)
 
-    # 1. Domino in hand — only meaningful when it's *this* player's turn to place.
-    in_hand = _domino_in_hand(state, player)
-    if in_hand is not None:
-        flat[FLAT_LAYOUT['domino_in_hand']] = _encode_tile(in_hand)
+    # 1. Symmetric pending-placement summaries expose each side's next claimed
+    # but unplaced tile, even before that side is the current actor.
+    flat[FLAT_LAYOUT['my_next_pending']] = _encode_pending_summary(state, player)
+    flat[FLAT_LAYOUT['opp_next_pending']] = _encode_pending_summary(state, opponent)
+
+    # 1b. Rule-derived board summaries.  These are mirrored my/opp facts:
+    # scoring components, conservative bonus feasibility, geometry, remaining
+    # placement opportunities, and neutral legality for the next pending tile.
+    flat[FLAT_LAYOUT['my_board_summary']] = _encode_board_summary(state, player)
+    flat[FLAT_LAYOUT['opp_board_summary']] = _encode_board_summary(state, opponent)
 
     # 2. Current row (visible dominoes available for next-round drafting).
     row_buf = np.zeros(ROW_SLOT_SIZE * MAX_PHASE_SLOTS, dtype=np.float32)

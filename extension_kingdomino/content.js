@@ -2,6 +2,7 @@ const browserAPI = typeof browser !== "undefined" ? browser : chrome;
 const usesPromiseAPI = typeof browser !== "undefined" && browserAPI === browser;
 
 const ADVISOR_URL = "http://127.0.0.1:8000/api/recommend";
+const PROBE_SAVE_URL = "http://127.0.0.1:8000/api/advisor-probe/save";
 const RESULT_EVENT = "kingdomino-advisor-state";
 const OVERLAY_ID = "kingdomino-advisor-overlay";
 
@@ -10,11 +11,13 @@ const OVERLAY_ID = "kingdomino-advisor-overlay";
 // values from the checkpoint's own config. The extension only sends a checkpoint
 // path (or nothing, to use the server's autodiscovered current_best.pt).
 const DEFAULT_OPTIONS = {
-  engine: "nn",
+  engine: "auto",
   sims: 800,
   topK: 8,
   checkpoint: "",
   device: "cuda",
+  exactMaxSecs: 300,
+  exactThreads: 0,
 };
 
 const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200];
@@ -62,15 +65,21 @@ async function loadOptions() {
     "kingdomino_checkpoint",
     "kingdomino_top_k",
     "kingdomino_device",
+    "kingdomino_exact_max_secs",
+    "kingdomino_exact_threads",
   ]);
   const sims = Number(stored.kingdomino_sims);
   const topK = Number(stored.kingdomino_top_k);
+  const exactMaxSecs = Number(stored.kingdomino_exact_max_secs);
+  const exactThreads = Number(stored.kingdomino_exact_threads);
   return {
     engine: stored.kingdomino_engine || DEFAULT_OPTIONS.engine,
     sims: Number.isFinite(sims) && sims > 0 ? Math.round(sims) : DEFAULT_OPTIONS.sims,
     topK: Number.isFinite(topK) && topK > 0 ? Math.round(topK) : DEFAULT_OPTIONS.topK,
     checkpoint: stored.kingdomino_checkpoint || DEFAULT_OPTIONS.checkpoint,
     device: stored.kingdomino_device || DEFAULT_OPTIONS.device,
+    exactMaxSecs: Number.isFinite(exactMaxSecs) && exactMaxSecs >= 0 ? exactMaxSecs : DEFAULT_OPTIONS.exactMaxSecs,
+    exactThreads: Number.isFinite(exactThreads) && exactThreads >= 0 ? Math.round(exactThreads) : DEFAULT_OPTIONS.exactThreads,
   };
 }
 
@@ -81,7 +90,114 @@ async function saveOptionPatch(patch) {
   if (patch.checkpoint !== undefined) out.kingdomino_checkpoint = patch.checkpoint;
   if (patch.topK !== undefined) out.kingdomino_top_k = patch.topK;
   if (patch.device !== undefined) out.kingdomino_device = patch.device;
+  if (patch.exactMaxSecs !== undefined) out.kingdomino_exact_max_secs = patch.exactMaxSecs;
+  if (patch.exactThreads !== undefined) out.kingdomino_exact_threads = patch.exactThreads;
   await setStorage(out);
+}
+
+function timestampSlug(value) {
+  const d = value ? new Date(value) : new Date();
+  const iso = Number.isFinite(d.getTime()) ? d.toISOString() : new Date().toISOString();
+  return iso.replace(/[:.]/g, "-");
+}
+
+function buildAdvisorProbe({ capture, payload = null, response = null, options = null, transport = null, reason = null, error = null }) {
+  const capturedAt = (capture && capture.capturedAt) || new Date().toISOString();
+  return {
+    schema: "kingdomino-advisor-probe/v1",
+    created_at: new Date().toISOString(),
+    captured_at: capturedAt,
+    url: (capture && capture.url) || location.href,
+    table_id: capture && capture.tableId !== undefined ? capture.tableId : null,
+    reason,
+    options,
+    transport,
+    error,
+    capture,
+    advisor_payload: payload,
+    advisor_response: response,
+  };
+}
+
+function downloadProbe(probe) {
+  const table = probe && probe.table_id ? `table-${probe.table_id}` : "table-unknown";
+  const filename = `kingdomino-advisor-probe-${table}-${timestampSlug(probe && probe.captured_at)}.json`;
+  return new Promise((resolve) => {
+    try {
+      const message = { action: "saveProbe", url: PROBE_SAVE_URL, filename, probe };
+      if (usesPromiseAPI) {
+        browserAPI.runtime.sendMessage(message).then(
+          (response) => {
+            if (response && response.ok) {
+              resolve({ ...response, mode: "server-save", filename });
+              return;
+            }
+            browserAPI.runtime.sendMessage({ action: "downloadProbe", filename, probe }).then(
+              (fallback) => resolve(fallback && fallback.ok
+                ? { ...fallback, mode: "browser-download", filename }
+                : { ok: false, error: (response && response.error) || (fallback && fallback.error) || "probe save/download failed" }),
+              (err) => resolve({ ok: false, error: String((err && err.message) || err) })
+            );
+          },
+          (err) => resolve({ ok: false, error: String((err && err.message) || err) })
+        );
+        return;
+      }
+      const result = browserAPI.runtime.sendMessage(message, (response) => {
+        if (browserAPI.runtime.lastError) {
+          resolve({ ok: false, error: browserAPI.runtime.lastError.message });
+        } else if (response && response.ok) {
+          resolve({ ...response, mode: "server-save", filename });
+        } else {
+          browserAPI.runtime.sendMessage({ action: "downloadProbe", filename, probe }, (fallback) => {
+            if (browserAPI.runtime.lastError) {
+              resolve({ ok: false, error: (response && response.error) || browserAPI.runtime.lastError.message });
+            } else {
+              resolve(fallback && fallback.ok
+                ? { ...fallback, mode: "browser-download", filename }
+                : { ok: false, error: (response && response.error) || (fallback && fallback.error) || "probe save/download failed" });
+            }
+          });
+        }
+      });
+      if (result && typeof result.then === "function") {
+        result.then(
+          (response) => resolve(response && response.ok
+            ? { ...response, mode: "server-save", filename }
+            : { ok: false, error: (response && response.error) || "probe save failed" }),
+          (err) => resolve({ ok: false, error: String((err && err.message) || err) })
+        );
+      }
+    } catch (e) {
+      resolve({ ok: false, error: String((e && e.message) || e) });
+    }
+  });
+}
+
+function exactEligibleState(state) {
+  if (!state || typeof state !== "object") return false;
+  const phase = state.phase;
+  const debugDeck = state.debug && Array.isArray(state.debug.deck) ? state.debug.deck : null;
+  const deckCount = Number.isFinite(state.deck_count)
+    ? state.deck_count
+    : debugDeck
+      ? debugDeck.length
+      : null;
+  if (phase === "GAME_OVER") return true;
+  if (phase === "FINAL_PLACEMENT") return deckCount === 0;
+  if (phase === "PLACE_AND_SELECT") {
+    if (deckCount === 0) return true;
+    return deckCount === 4 && debugDeck && debugDeck.length === 4;
+  }
+  return false;
+}
+
+function advisorEngineForState(state, requestedEngine) {
+  const requested = String(requestedEngine || DEFAULT_OPTIONS.engine).toLowerCase();
+  if (requested === "auto") {
+    return exactEligibleState(state) ? "exact" : "nn";
+  }
+  return requestedEngine;
 }
 
 function pageReadKingdominoState() {
@@ -144,6 +260,31 @@ function pageReadKingdominoState() {
     if (value === null || value === undefined || value === "") return fallback;
     const n = Number(value);
     return Number.isFinite(n) ? Math.trunc(n) : fallback;
+  }
+
+  const pageGlobal = typeof window !== "undefined" ? window : null;
+  const authoritativeBoardCache = pageGlobal
+    ? (pageGlobal.__kingdominoAdvisorBoardCache = pageGlobal.__kingdominoAdvisorBoardCache || {})
+    : {};
+
+  function cloneBoard(board) {
+    if (!board || !Array.isArray(board.cells)) return null;
+    return {
+      canvas_size: board.canvas_size,
+      castle_pos: Array.isArray(board.castle_pos) ? board.castle_pos.slice() : board.castle_pos,
+      cells: board.cells.map((c) => ({ ...c })),
+    };
+  }
+
+  function readDisplayedDeckCount() {
+    try {
+      const el = document.getElementById("dominoes_remaining");
+      const text = el && el.textContent ? el.textContent.trim() : "";
+      const match = text.match(/(\d+)\s+domino(?:es)?\s+remaining/i);
+      return match ? asInt(match[1], null) : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   function sortedDominoIds(dominoes, predicate) {
@@ -279,24 +420,30 @@ function pageReadKingdominoState() {
     // a STRUCTURAL lookup: BGA nests the opponent kingdom(s) inside the stable
     // container #other_players_kingdoms (the active player's own kingdom is NOT
     // in there). In a 2-player game there is exactly one kingdom div inside it.
-    let container = document.getElementById("kingdom_" + bgaPlayerId);
-    const directHit = !!container;
-    if (!container) {
-      const others = document.getElementById("other_players_kingdoms");
-      if (others) {
-        const kings = others.querySelectorAll("[id^='kingdom_']");
-        // Prefer the one whose id matches bgaPlayerId (n-player safe); else, in
-        // a 2-player game there is only one, so take it as a last resort.
-        let match = null;
-        for (const k of kings) {
-          if (k.id === "kingdom_" + bgaPlayerId) { match = k; break; }
-        }
-        if (!match && kings.length === 1) match = kings[0];
+    let container = null;
+    let source = "none";
+    const others = document.getElementById("other_players_kingdoms");
+    if (others) {
+      const kings = others.querySelectorAll("[id^='kingdom_']");
+      // For hidden/opponent boards, prefer the stable opponent-board container.
+      // In BGA hot-seat, a direct #kingdom_<playerId> can exist while actually
+      // containing the active player's rendered tiles after the view flips.
+      let match = null;
+      for (const k of kings) {
+        if (k.id === "kingdom_" + bgaPlayerId) { match = k; break; }
+      }
+      if (!match && kings.length === 1) match = kings[0];
+      if (match) {
         container = match;
+        source = "other_players_kingdoms";
       }
     }
+    if (!container) {
+      container = document.getElementById("kingdom_" + bgaPlayerId);
+      if (container) source = "direct id";
+    }
     console.log('[advisor] buildBoardFromDom: resolved opponent kingdom via',
-      directHit ? 'direct id' : 'other_players_kingdoms fallback',
+      source,
       '-> container id:', container ? container.id : 'NONE');
     if (!container) return null;
 
@@ -658,6 +805,23 @@ function pageReadKingdominoState() {
     const dominoesDescription = gd.dominoesDescription || {};
     const boardSize = asInt(gd.gridSize, 7);
     const canvasSize = 15;
+    const tableId = gd.table_id || gd.tableId || "unknown";
+    const cacheKeyForPlayer = (playerIndex) => `${tableId}:${playerorder[playerIndex] || playerIndex}`;
+    const cachedBoardForPlayer = (playerIndex) => {
+      const entry = authoritativeBoardCache[cacheKeyForPlayer(playerIndex)];
+      return entry && entry.board ? cloneBoard(entry.board) : null;
+    };
+    const cacheAuthoritativeBoard = (playerIndex, board, expectedCells) => {
+      if (!board || !Array.isArray(board.cells) || board.cells.length < expectedCells) return;
+      authoritativeBoardCache[cacheKeyForPlayer(playerIndex)] = {
+        board: cloneBoard(board),
+        cell_count: board.cells.length,
+        updated_at: Date.now(),
+      };
+    };
+    const cachedBoardHasExpectedCells = (board, expectedCells) => {
+      return !!(board && Array.isArray(board.cells) && board.cells.length >= expectedCells);
+    };
 
     // Count dominoes on each player's board, by player index. Used to validate
     // the DOM-reconstructed opponent board: each placed domino occupies 2 cells,
@@ -667,13 +831,22 @@ function pageReadKingdominoState() {
     // "PLACED" here counted 0 for every player, so expectedCells was always 1
     // (castle only) and the board_reconstruction_warning never fired.
     const placedCountByPlayer = {};
+    const kingdomIdsByPlayer = {};
     Object.keys(dominoes).forEach((k) => {
       const d = dominoes[k];
       if (String(d.location || "").toUpperCase() !== "KINGDOM") return;
       const pi = playerToIndex[String(d.owner_player)];
       if (Number.isFinite(pi)) {
         placedCountByPlayer[pi] = (placedCountByPlayer[pi] || 0) + 1;
+        const dominoId = asInt(d.number, asInt(d.id, asInt(k, null)));
+        if (Number.isFinite(dominoId)) {
+          if (!kingdomIdsByPlayer[pi]) kingdomIdsByPlayer[pi] = [];
+          kingdomIdsByPlayer[pi].push(dominoId);
+        }
       }
+    });
+    Object.keys(kingdomIdsByPlayer).forEach((pi) => {
+      kingdomIdsByPlayer[pi].sort((a, b) => a - b);
     });
 
     const allClaims = Object.keys(dominoes)
@@ -718,9 +891,14 @@ function pageReadKingdominoState() {
       : Array.from({ length: 48 }, (_, i) => i + 1);
     const visibleSet = {};
     visibleDominoIds.forEach((n) => { visibleSet[n] = true; });
-    const hiddenDeck = allDominoIds
+    const displayedDeckCount = readDisplayedDeckCount();
+    const inferredHiddenDeck = allDominoIds
       .filter((n) => !visibleSet[n])
       .sort((a, b) => a - b);
+    let hiddenDeck = inferredHiddenDeck;
+    if (Number.isFinite(displayedDeckCount) && displayedDeckCount >= 0 && displayedDeckCount < inferredHiddenDeck.length) {
+      hiddenDeck = inferredHiddenDeck.slice(0, displayedDeckCount);
+    }
 
     const debug = {
       source: "bga.gameui.gamedatas",
@@ -739,6 +917,9 @@ function pageReadKingdominoState() {
       }, {}),
       bga_current_domino: activeDomino,
       bga_current_position: gd.gamestate && gd.gamestate.args ? gd.gamestate.args.currentPosition : null,
+      bga_turns_left: asInt(gd.turnsLeft, null),
+      displayed_deck_count: displayedDeckCount,
+      inferred_hidden_deck: inferredHiddenDeck,
       kingdom_summary: summarizeKingdom(gd.gamestate && gd.gamestate.args && gd.gamestate.args.kingdom),
       deck: hiddenDeck,
       notes: [],
@@ -746,6 +927,9 @@ function pageReadKingdominoState() {
 
     if (activeIndex === undefined) {
       debug.notes.push("active BGA player is not in playerorder; defaulting start/current player to 0");
+    }
+    if (Number.isFinite(displayedDeckCount) && displayedDeckCount >= 0 && displayedDeckCount < inferredHiddenDeck.length) {
+      debug.notes.push(`Clamped hidden deck from inferred ${inferredHiddenDeck.length} tile(s) to displayed ${displayedDeckCount}; omitted IDs: ${inferredHiddenDeck.slice(displayedDeckCount).join(", ") || "none"}.`);
     }
 
     let phase = null;
@@ -776,6 +960,7 @@ function pageReadKingdominoState() {
       const grid = resolveKingdomForPlayer(gd, p, playerorder, activeIndex);
       if (grid) {
         boardBuild.boards[p] = buildBoardFromKingdomArg(grid, canvasSize);
+        cacheAuthoritativeBoard(p, boardBuild.boards[p], 1 + ((placedCountByPlayer[p] || 0) * 2));
         debug.notes.push(`Player ${p} board built from authoritative BGA kingdom grid.`);
         console.log('[advisor] board', p, 'built via: authoritative-grid',
           JSON.stringify(boardBuild.boards[p].cells.map(c => [c.x, c.y])));
@@ -787,6 +972,23 @@ function pageReadKingdominoState() {
         domBoard === null ? 'null' : (domBoard.cells.length + ' cell(s)'),
         domBoard ? JSON.stringify(domBoard.cells.map(c => [c.x, c.y])) : '');
       if (domBoard && domBoard.cells.length > 1) {
+        const expectedIds = kingdomIdsByPlayer[p] || [];
+        const reconstructedIds = Array.from(new Set(
+          domBoard.cells
+            .map((c) => asInt(c.domino_id, null))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        )).sort((a, b) => a - b);
+        const foreignIds = reconstructedIds.filter((id) => expectedIds.indexOf(id) < 0);
+        if (expectedIds.length && foreignIds.length) {
+          debug.notes.push(`Player ${p} DOM reconstruction rejected: expected KINGDOM domino IDs ${expectedIds.join(", ")}, but DOM board contained foreign IDs ${foreignIds.join(", ")}.`);
+          const expectedCells = 1 + ((placedCountByPlayer[p] || 0) * 2);
+          const cachedBoard = cachedBoardForPlayer(p);
+          if (cachedBoardHasExpectedCells(cachedBoard, expectedCells)) {
+            boardBuild.boards[p] = cachedBoard;
+            debug.notes.push(`Player ${p} board restored from hot-seat authoritative cache after rejecting foreign DOM tiles.`);
+            continue;
+          }
+        } else {
         boardBuild.boards[p] = domBoard;
         debug.notes.push(`Player ${p} board built from DOM reconstruction (${domBoard.cells.length - 1} placed cell(s) from rendered tiles).`);
         console.log('[advisor] board', p, 'built via: DOM');
@@ -797,23 +999,64 @@ function pageReadKingdominoState() {
         const expectedCells = 1 + ((placedCountByPlayer[p] || 0) * 2);
         const actualCells = domBoard.cells.length;
         const boardIncomplete = actualCells < expectedCells;
-        const skippedIds = domBoard.skipped_dominoes ? domBoard.skipped_dominoes : [];
+        const expectedIds = kingdomIdsByPlayer[p] || [];
+        const reconstructedIds = Array.from(new Set(
+          domBoard.cells
+            .map((c) => asInt(c.domino_id, null))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        )).sort((a, b) => a - b);
+        const missingIds = expectedIds.filter((id) => reconstructedIds.indexOf(id) < 0);
+        const skippedIds = domBoard.skipped_dominoes && domBoard.skipped_dominoes.length
+          ? domBoard.skipped_dominoes
+          : missingIds;
         if (boardIncomplete) {
           debug.notes.push(`Player ${p} board INCOMPLETE: expected ${expectedCells} cells (${placedCountByPlayer[p] || 0} placed dominoes × 2 + castle), got ${actualCells}. Skipped domino IDs: ${skippedIds.join(", ") || "unknown (out-of-bounds)"}.`);
           boardReconstructionWarning = {
             player: p,
             expected_cells: expectedCells,
             actual_cells: actualCells,
+            expected_domino_ids: expectedIds,
+            reconstructed_domino_ids: reconstructedIds,
+            missing_domino_ids: missingIds,
             skipped_domino_ids: skippedIds,
             message: `Opponent board missing ${expectedCells - actualCells} cell(s) — advisor recommendations may be unreliable.`,
           };
         }
         continue;
+        }
       }
       debug.notes.push(`Player ${p} board uses APPROXIMATE dominoes reconstruction / castle-only (no authoritative kingdom grid and no DOM-placed tiles found${p === activeIndex ? "" : "; BGA exposes the kingdom grid for the active player only"}).`);
       console.log('[advisor] board', p, 'built via:',
         boardBuild.boards[p].cells.length > 1 ? 'approx' : 'castle-only',
         JSON.stringify(boardBuild.boards[p].cells.map(c => [c.x, c.y])));
+      const expectedCells = 1 + ((placedCountByPlayer[p] || 0) * 2);
+      const actualCells = boardBuild.boards[p].cells.length;
+      if (actualCells < expectedCells) {
+        const cachedBoard = cachedBoardForPlayer(p);
+        if (cachedBoardHasExpectedCells(cachedBoard, expectedCells)) {
+          boardBuild.boards[p] = cachedBoard;
+          debug.notes.push(`Player ${p} board restored from hot-seat authoritative cache (${cachedBoard.cells.length} cached cell(s), expected ${expectedCells}).`);
+          continue;
+        }
+        const expectedIds = kingdomIdsByPlayer[p] || [];
+        const reconstructedIds = Array.from(new Set(
+          boardBuild.boards[p].cells
+            .map((c) => asInt(c.domino_id, null))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        )).sort((a, b) => a - b);
+        const missingIds = expectedIds.filter((id) => reconstructedIds.indexOf(id) < 0);
+        boardReconstructionWarning = {
+          player: p,
+          expected_cells: expectedCells,
+          actual_cells: actualCells,
+          expected_domino_ids: expectedIds,
+          reconstructed_domino_ids: reconstructedIds,
+          missing_domino_ids: missingIds,
+          skipped_domino_ids: missingIds,
+          message: `Opponent board missing ${expectedCells - actualCells} cell(s) - advisor recommendations may be unreliable.`,
+        };
+        debug.notes.push(`Player ${p} approximate board incomplete: expected IDs ${expectedIds.join(", ") || "none"}, reconstructed IDs ${reconstructedIds.join(", ") || "none"}, missing IDs ${missingIds.join(", ") || "none"}.`);
+      }
     }
 
     if (gameStateName === "chooseDomino") {
@@ -969,7 +1212,7 @@ function pageReadKingdominoState() {
   try {
     if (typeof gameui === "undefined" || !gameui.gamedatas) {
       emit({ ok: false, error: "gameui.gamedatas is not available. Open an active BGA Kingdomino table first." });
-      return;
+      return __result;
     }
 
     const gd = gameui.gamedatas;
@@ -1060,6 +1303,11 @@ function firstNumber(obj, keys) {
     if (typeof v === "number" && Number.isFinite(v)) return v;
   }
   return null;
+}
+
+function isExactResponse(response, payload) {
+  const engine = String((response && response.engine) || (payload && payload.engine) || "").toLowerCase();
+  return engine.startsWith("exact") || Boolean(response && response.exact && response.exact.solved);
 }
 
 function actionText(rec) {
@@ -1381,6 +1629,7 @@ async function renderDebugOverlay(capture, message) {
     candidateSource: capture.candidateSource,
     gamedatasKeys: capture.gamedatasKeys,
     domSamples: capture.domSamples,
+    frame_debug: capture.frame_debug,
     error: capture.error,
   }, null, 2);
   box.appendChild(meta);
@@ -1396,12 +1645,22 @@ async function renderDebugOverlay(capture, message) {
     copy.textContent = "Copied";
   });
 
+  const download = document.createElement("button");
+  download.textContent = "Download probe";
+  download.style.cssText = "flex:1;background:#166534;color:white;border:0;border-radius:6px;padding:7px;cursor:pointer;";
+  download.addEventListener("click", async () => {
+    const result = await downloadProbe(buildAdvisorProbe({ capture, reason: "debug" }));
+    download.textContent = result.ok ? "Saved" : "Save failed";
+    if (!result.ok) download.title = result.error || "download failed";
+  });
+
   const refresh = document.createElement("button");
   refresh.textContent = "Refresh";
   refresh.style.cssText = "flex:1;background:#475569;color:white;border:0;border-radius:6px;padding:7px;cursor:pointer;";
   refresh.addEventListener("click", () => captureDebugOnly());
 
   controls.appendChild(copy);
+  controls.appendChild(download);
   controls.appendChild(refresh);
   box.appendChild(controls);
   document.body.appendChild(box);
@@ -1416,7 +1675,7 @@ function renderErrorOverlay(message) {
   document.body.appendChild(box);
 }
 
-function renderRecommendations(response, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells) {
+function renderRecommendations(response, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells, capture) {
   const box = makeOverlayBase("Kingdomino Advisor");
 
   // Loud failure: an incomplete opponent board reconstruction means the model
@@ -1466,9 +1725,27 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   refresh.style.cssText = "background:rgba(51,65,85,0.9);color:#e2e8f0;border:1px solid rgba(100,116,139,0.9);border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
   refresh.addEventListener("click", () => triggerRecommend({ force: true, reason: "manual-refresh" }));
 
+  const probe = document.createElement("button");
+  probe.textContent = "Download probe";
+  probe.title = "Download a JSON debug bundle for local advisor replay";
+  probe.style.cssText = "background:rgba(37,99,235,0.9);color:#dbeafe;border:1px solid rgba(96,165,250,0.8);border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
+  probe.addEventListener("click", async () => {
+    const result = await downloadProbe(buildAdvisorProbe({
+      capture,
+      payload,
+      response,
+      options,
+      transport,
+      reason: "overlay-download",
+    }));
+    probe.textContent = result.ok ? "Saved" : "Save failed";
+    if (!result.ok) probe.title = result.error || "download failed";
+  });
+
   controls.appendChild(simSelect);
   controls.appendChild(deeper);
   controls.appendChild(refresh);
+  controls.appendChild(probe);
   box.appendChild(controls);
 
   const meta = document.createElement("div");
@@ -1476,13 +1753,23 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   const valueText = typeof response.value === "number" ? formatValue(response.value) : "-";
   const searchMs = response.search_ms !== undefined ? `${response.search_ms}ms` : "-";
   const sims = response.num_simulations !== undefined ? response.num_simulations : options.sims;
-  // Prefer the network's win probability (root_inference) over response.value:
-  // for NN, response.value is the root Q in [-1,1] actor frame, less readable.
   const ri = response.root_inference;
-  const valueLine = (ri && typeof ri.win_prob === "number")
-    ? `Win prob: <b style="color:#f8fafc">${formatPct(ri.win_prob)}</b>`
-    : `Value: <b style="color:#f8fafc">${valueText}</b>`;
+  const exactResponse = isExactResponse(response, payload);
+  const rootWinProb = exactResponse && typeof response.root_win_prob === "number"
+    ? response.root_win_prob
+    : null;
+  const valueLine = rootWinProb !== null
+    ? `Exact win: <b style="color:#f8fafc">${formatPct(rootWinProb)}</b>`
+    : `NN edge: <b style="color:#f8fafc">${valueText}</b>`;
   meta.innerHTML = `${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
+  if (response.exact && response.exact.solved) {
+    const exact = document.createElement("div");
+    exact.style.cssText = "font-size:11px;color:#86efac;margin-top:3px;";
+    const hits = Number.isFinite(response.exact.cache_hits) ? response.exact.cache_hits : 0;
+    const misses = Number.isFinite(response.exact.cache_misses) ? response.exact.cache_misses : 0;
+    exact.textContent = `Exact solved - deck ${response.exact.deck_count} - cache ${hits}/${hits + misses} hits`;
+    meta.appendChild(exact);
+  }
   if (response.checkpoint_path) {
     const ck = document.createElement("div");
     ck.style.cssText = "font-size:11px;color:#94a3b8;margin-top:3px;word-break:break-all;";
@@ -1520,7 +1807,7 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     const marginText = (margin >= 0 ? "+" : "") + Math.round(margin);
     panel.appendChild(stat("Margin: ", bold(marginText, margin >= 0 ? "#4ade80" : "#f87171")));
 
-    panel.appendChild(stat("Win: ", bold(formatPct(ri.win_prob), ri.win_prob >= 0.5 ? "#4ade80" : "#f87171")));
+    panel.appendChild(stat("Raw win head: ", bold(formatPct(ri.win_prob), ri.win_prob >= 0.5 ? "#4ade80" : "#f87171")));
 
     const note = document.createElement("span");
     note.textContent = "(pre-search estimates)";
@@ -1557,7 +1844,9 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
 
     const visit = firstNumber(rec, ["visit_frac", "visit_share", "prob"]);
     const prior = firstNumber(rec, ["prior", "policy_prior", "nn_prior"]);
-    const qWinProb = firstNumber(rec, ["q_win_prob", "q_value", "q", "Q"]);
+    const qWinProb = firstNumber(rec, ["q_win_prob"]);
+    const qRankValue = firstNumber(rec, ["q_rank_value"]);
+    const qEdge = qWinProb !== null ? (qWinProb * 2.0) - 1.0 : null;
 
     const rowFlex = document.createElement("div");
     rowFlex.style.cssText = "display:flex;align-items:center;gap:10px;";
@@ -1647,7 +1936,9 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     // → win% (win probability if this move is played).
     if (visit !== null) chips.appendChild(metricChip("visit", formatPct(visit), "MCTS visit share"));
     if (prior !== null) chips.appendChild(metricChip("prior", formatPct(prior), "Network prior (pre-search)"));
-    if (qWinProb !== null) chips.appendChild(metricChip("win%", formatPct(qWinProb), "Search win probability (MCTS-updated)"));
+    if (qWinProb !== null && exactResponse) chips.appendChild(metricChip("win%", formatPct(qWinProb), "Exact win probability after this move"));
+    if (qEdge !== null && !exactResponse) chips.appendChild(metricChip("edge", formatValue(qEdge), "Uncalibrated NN/MCTS value edge after this move"));
+    if (qRankValue !== null) chips.appendChild(metricChip("rank", formatValue(qRankValue), "Exact margin-aware tie-break value"));
     if (chips.children.length) row.appendChild(chips);
 
     list.appendChild(row);
@@ -1660,15 +1951,19 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
 function buildRecommendPayload(state, options) {
   // Note: no channels/blocks/bilinear_dim here. The server reads the model
   // architecture from the checkpoint config, so the extension never sends it.
+  const resolvedEngine = advisorEngineForState(state, options.engine);
   const payload = {
     state,
-    engine: options.engine,
+    engine: resolvedEngine,
+    requested_engine: options.engine,
     num_simulations: options.sims,
     nn_sims: options.sims,
     top_k: options.topK,
     determinizations: 1,
     temperature: 0.0,
     device: options.device,
+    exact_max_secs: options.exactMaxSecs,
+    exact_threads: options.exactThreads,
   };
   if (options.checkpoint && options.checkpoint.trim()) {
     payload.checkpoint_path = options.checkpoint.trim();
@@ -1716,7 +2011,11 @@ async function postRecommend(payload) {
 
 async function captureDebugOnly() {
   const capture = await readPageState();
-  await setStorage({ kingdomino_last_capture: capture });
+  const probe = buildAdvisorProbe({ capture, reason: "debug" });
+  await setStorage({
+    kingdomino_last_capture: capture,
+    kingdomino_last_probe: probe,
+  });
   await renderDebugOverlay(capture);
   return { ok: Boolean(capture.ok), capture };
 }
@@ -1764,13 +2063,22 @@ async function triggerRecommend({ force = false, reason = "manual" } = {}) {
     lastPayloadKey = key;
 
     const { data, transport } = await postRecommend(payload);
+    const probe = buildAdvisorProbe({
+      capture,
+      payload,
+      response: data,
+      options,
+      transport,
+      reason,
+    });
     await setStorage({
       kingdomino_last_payload: payload,
       kingdomino_last_recommendation: data,
       kingdomino_last_transport: transport,
       kingdomino_last_recommendation_at: new Date().toISOString(),
+      kingdomino_last_probe: probe,
     });
-    renderRecommendations(data, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells);
+    renderRecommendations(data, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells, capture);
     return { ok: true, transport, capture, payload, response: data, reason };
   } catch (e) {
     const error = String((e && e.message) || e);
@@ -1788,6 +2096,17 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message && message.action === "debugCapture") {
     captureDebugOnly().then(sendResponse);
+    return true;
+  }
+  if (message && message.action === "downloadLastProbe") {
+    getStorage(["kingdomino_last_probe"]).then((stored) => {
+      const probe = stored.kingdomino_last_probe;
+      if (!probe) {
+        sendResponse({ ok: false, error: "no advisor probe has been captured yet" });
+        return;
+      }
+      downloadProbe(probe).then(sendResponse);
+    }, (err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
   return false;

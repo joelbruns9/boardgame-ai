@@ -26,6 +26,7 @@ from kingdomino_rust import d4_augment
 from games.kingdomino.game import GameState, Phase, PickAction, TurnAction
 from games.kingdomino.augmentation import augment, NUM_D4_TRANSFORMS
 from games.kingdomino.action_codec import legal_mask as py_legal_mask
+from games.kingdomino.encoder import FLAT_SIZE
 
 
 # ─── A. d4_augment byte-identical to augment() ──────────────────────────────
@@ -33,7 +34,7 @@ def test_rust_augment_matches_python() -> bool:
     """d4_augment (Rust) byte-identical to augment (Python) for all 8 transforms."""
     my_board = np.random.default_rng(0).random((9, 13, 13), dtype=np.float32)
     opp_board = np.random.default_rng(1).random((9, 13, 13), dtype=np.float32)
-    flat = np.random.default_rng(2).random((261,), dtype=np.float32)
+    flat = np.random.default_rng(2).random((FLAT_SIZE,), dtype=np.float32)
     policy = np.random.default_rng(3).random((3390,), dtype=np.float32)
 
     ok = True

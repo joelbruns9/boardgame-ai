@@ -539,25 +539,34 @@ const CH_OCCUPIED: usize = 8;
 const TILE_FEAT: usize = 14; // a-terrain(6)+a-crowns(1)+b-terrain(6)+b-crowns(1)
 const ROW_SLOT: usize = 15; // TILE_FEAT + present flag
 const CLAIM_SLOT: usize = 16; // TILE_FEAT + is_mine + status
-const FLAT_SIZE: usize = 261;
+const PENDING_SUMMARY: usize = 18; // TILE_FEAT + present + turn_distance + active + remaining_count
+const BOARD_SUMMARY: usize = 25;
+const FLAT_SIZE: usize = 333;
+const SCORE_SCALE: f32 = 100.0;
+const MAX_BOARD_CELLS: f32 = 48.0;
+const MAX_TOTAL_CROWNS: f32 = 24.0;
+const MAX_LEGAL_PLACEMENTS: f32 = 64.0;
 
 // Flat-vector field offsets (see encoder.FLAT_LAYOUT).
-const OFF_DOMINO_IN_HAND: usize = 0;
-const OFF_CURRENT_ROW: usize = 14;
-const OFF_PENDING: usize = 74;
-const OFF_NEXT: usize = 138;
-const OFF_BAG: usize = 202;
-const OFF_PHASE: usize = 250;
-const OFF_GAME_PROGRESS: usize = 253;
-const OFF_MY_FILL: usize = 254;
-const OFF_OPP_FILL: usize = 255;
-const OFF_ACTOR_FLAG: usize = 256;
-// Pick position features (4 scalars, FLAT_SIZE 259 → 261).
+const OFF_MY_NEXT_PENDING: usize = 0;
+const OFF_OPP_NEXT_PENDING: usize = 18;
+const OFF_MY_BOARD_SUMMARY: usize = 36;
+const OFF_OPP_BOARD_SUMMARY: usize = 61;
+const OFF_CURRENT_ROW: usize = 86;
+const OFF_PENDING: usize = 146;
+const OFF_NEXT: usize = 210;
+const OFF_BAG: usize = 274;
+const OFF_PHASE: usize = 322;
+const OFF_GAME_PROGRESS: usize = 325;
+const OFF_MY_FILL: usize = 326;
+const OFF_OPP_FILL: usize = 327;
+const OFF_ACTOR_FLAG: usize = 328;
+// Pick position features (4 scalars).
 // Replaces OFF_MY_PICK_RANK / OFF_OPP_PICK_RANK (2 scalars).
-const OFF_PICK_POS_0: usize = 257;
-const OFF_PICK_POS_1: usize = 258;
-const OFF_PICK_POS_2: usize = 259;
-const OFF_PICK_POS_3: usize = 260;
+const OFF_PICK_POS_0: usize = 329;
+const OFF_PICK_POS_1: usize = 330;
+const OFF_PICK_POS_2: usize = 331;
+const OFF_PICK_POS_3: usize = 332;
 
 /// Write a domino's 14-float tile features at `off`.  Layout:
 /// [a-terrain one-hot(6), a-crowns/3, b-terrain one-hot(6), b-crowns/3].
@@ -593,6 +602,23 @@ fn write_claim_slot(
         write_tile(buf, off, did);
         buf[off + TILE_FEAT] = if cp == player { 1.0 } else { 0.0 };
         buf[off + TILE_FEAT + 1] = status;
+    }
+}
+
+/// Pending summary (18): tile + present + turn_distance + active + remaining.
+#[inline]
+fn write_pending_summary(
+    buf: &mut [f32],
+    off: usize,
+    summary: Option<(u16, usize, usize)>,
+) {
+    debug_assert!(off + PENDING_SUMMARY <= buf.len());
+    if let Some((did, distance, remaining)) = summary {
+        write_tile(buf, off, did);
+        buf[off + TILE_FEAT] = 1.0;
+        buf[off + TILE_FEAT + 1] = (distance.min(3) as f64 / 3.0) as f32;
+        buf[off + TILE_FEAT + 2] = if distance == 0 { 1.0 } else { 0.0 };
+        buf[off + TILE_FEAT + 3] = (remaining.min(2) as f64 / 2.0) as f32;
     }
 }
 
@@ -648,6 +674,153 @@ fn fill_ratio(board: &RustBoard) -> f32 {
 // Mirrors games/kingdomino/action_codec.py.  Joint index = placement_idx *
 // PICK_AXIS_SIZE + pick_idx over a 3390-action space.  Spatial placement index =
 // direction * 169 + out_y * 13 + out_x in the 13×13 castle-centred frame.
+fn board_component_facts(board: &RustBoard) -> ([f32; 6], [f32; 6], i32) {
+    let mut visited = [false; CELLS];
+    let mut score_by = [0.0f32; 6];
+    let mut largest_by = [0.0f32; 6];
+    let mut total_crowns: i32 = 0;
+
+    for sy in board.min_y..=board.max_y {
+        for sx in board.min_x..=board.max_x {
+            let si = idx(sx, sy);
+            let t = board.terrain[si];
+            if visited[si] || t == EMPTY || t == CASTLE {
+                continue;
+            }
+            let terrain_idx = (t - 2) as usize;
+            let mut stack: Vec<(i8, i8)> = Vec::with_capacity(49);
+            stack.push((sx, sy));
+            visited[si] = true;
+            let mut area: i32 = 0;
+            let mut crowns: i32 = 0;
+            while let Some((cx, cy)) = stack.pop() {
+                area += 1;
+                crowns += board.crowns[idx(cx, cy)] as i32;
+                for (dx, dy) in DIRS {
+                    let nx = cx + dx;
+                    let ny = cy + dy;
+                    if in_bounds(nx, ny) {
+                        let ni = idx(nx, ny);
+                        if !visited[ni] && board.terrain[ni] == t {
+                            visited[ni] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+            }
+            score_by[terrain_idx] += (area * crowns) as f32;
+            largest_by[terrain_idx] = largest_by[terrain_idx].max(area as f32);
+            total_crowns += crowns;
+        }
+    }
+
+    (score_by, largest_by, total_crowns)
+}
+
+/// Factual bonus states for harmony and middle kingdom (mirrors encoder.py
+/// _bonus_state_features).  Layout per bonus: [awarded, still_possible,
+/// impossible].  Harmony needs a full 7×7 (occupied == 49 → all 24 placed →
+/// zero discards), so it is impossible the instant this player discards.
+/// Middle kingdom needs a castle-centred 7×7 bbox (not a full fill), so it is
+/// impossible once the bbox extends outside the castle-centred 7×7 target.
+fn bonus_state_features(
+    state: &RustGameState,
+    board: &RustBoard,
+    owner: u8,
+) -> ([f32; 3], [f32; 3]) {
+    let width = (board.max_x - board.min_x + 1) as i32;
+    let height = (board.max_y - board.min_y + 1) as i32;
+    let occupied = board.occupied as i32;
+
+    let mut harmony = [0.0f32; 3];
+    if state.harmony {
+        let awarded = width == 7 && height == 7 && occupied == 49;
+        let impossible = state.discards[owner as usize] > 0;
+        if awarded {
+            harmony[0] = 1.0;
+        } else if impossible {
+            harmony[2] = 1.0;
+        } else {
+            harmony[1] = 1.0;
+        }
+    }
+
+    let mut middle = [0.0f32; 3];
+    if state.middle_kingdom {
+        let awarded = width == 7
+            && height == 7
+            && board.castle_x == board.min_x + 3
+            && board.castle_y == board.min_y + 3;
+        let outside_target = board.min_x < board.castle_x - 3
+            || board.max_x > board.castle_x + 3
+            || board.min_y < board.castle_y - 3
+            || board.max_y > board.castle_y + 3;
+        if awarded {
+            middle[0] = 1.0;
+        } else if outside_target {
+            middle[2] = 1.0;
+        } else {
+            middle[1] = 1.0;
+        }
+    }
+
+    (harmony, middle)
+}
+
+fn write_board_summary(buf: &mut [f32], off: usize, state: &RustGameState, player: u8) {
+    debug_assert!(off + BOARD_SUMMARY <= buf.len());
+    let board = &state.boards[player as usize];
+    let (territory, harmony_bonus, middle_bonus) =
+        board.score(state.harmony, state.middle_kingdom);
+    let total_score = territory + harmony_bonus + middle_bonus;
+    let (score_by, largest_by, total_crowns) = board_component_facts(board);
+    let (harmony, middle) = bonus_state_features(state, board, player);
+    let width = (board.max_x - board.min_x + 1) as f32;
+    let height = (board.max_y - board.min_y + 1) as f32;
+    let empty_remaining = (49i32 - board.occupied as i32).max(0) as f32;
+    let next_summary = state.next_pending_summary(player);
+    let mut legal_count = 0usize;
+    if let Some((did, _, _)) = next_summary {
+        let (ta, ca, tb, cb) = dom(did);
+        legal_count = board.legal_placements(ta, ca, tb, cb).len();
+    }
+
+    let mut i = off;
+    buf[i] = (total_score as f32).min(SCORE_SCALE) / SCORE_SCALE;
+    i += 1;
+    for v in score_by {
+        buf[i] = v.min(SCORE_SCALE) / SCORE_SCALE;
+        i += 1;
+    }
+    for v in largest_by {
+        buf[i] = v.min(MAX_BOARD_CELLS) / MAX_BOARD_CELLS;
+        i += 1;
+    }
+    buf[i] = (total_crowns as f32).min(MAX_TOTAL_CROWNS) / MAX_TOTAL_CROWNS;
+    i += 1;
+    for v in harmony {
+        buf[i] = v;
+        i += 1;
+    }
+    for v in middle {
+        buf[i] = v;
+        i += 1;
+    }
+    buf[i] = width.min(7.0) / 7.0;
+    i += 1;
+    buf[i] = height.min(7.0) / 7.0;
+    i += 1;
+    buf[i] = empty_remaining.min(MAX_BOARD_CELLS) / MAX_BOARD_CELLS;
+    i += 1;
+    buf[i] = (legal_count as f32).min(MAX_LEGAL_PLACEMENTS) / MAX_LEGAL_PLACEMENTS;
+    i += 1;
+    buf[i] = if legal_count == 0 && next_summary.is_some() {
+        1.0
+    } else {
+        0.0
+    };
+}
+
 const CODEC_CELLS: u16 = 169; // 13×13 castle-centred cells (NUM_CELLS)
 const DISCARD_PLACEMENT_IDX: u16 = 676; // = NUM_SPATIAL_PLACEMENTS
 const NO_PLACEMENT_IDX: u16 = 677;
@@ -679,6 +852,9 @@ struct RustGameState {
     start_player: u8,
     harmony: bool,
     middle_kingdom: bool,
+    // Per-player forced-discard count (mirrors game.py GameState.discards).  A
+    // discard permanently forfeits Harmony for that player (needs a full 7×7).
+    discards: [u32; 2],
 }
 
 /// Compute next-round pick position features. Mirrors encoder.py
@@ -728,6 +904,7 @@ impl RustGameState {
             start_player: self.start_player,
             harmony: self.harmony,
             middle_kingdom: self.middle_kingdom,
+            discards: self.discards,
         }
     }
 
@@ -783,15 +960,60 @@ impl RustGameState {
         }
     }
 
-    /// Domino the given player is currently placing, if any (mirrors
-    /// encoder._domino_in_hand): only during a turn phase, only when the
-    /// pending claim at actor_index belongs to `player`.
+    /// Domino the given player is currently placing, if any: only during a turn
+    /// phase, only when the pending claim at actor_index belongs to `player`.
     fn domino_in_hand(&self, player: u8) -> Option<u16> {
         if self.phase != PLACE_AND_SELECT && self.phase != FINAL_PLACEMENT {
             return None;
         }
         let (cp, did) = *self.pending_claims.get(self.actor_index)?;
         if cp != player { None } else { Some(did) }
+    }
+
+    fn next_pending_summary(&self, owner: u8) -> Option<(u16, usize, usize)> {
+        let mut current_remaining: Vec<(usize, u8, u16)> = Vec::new();
+        if self.phase == PLACE_AND_SELECT || self.phase == FINAL_PLACEMENT {
+            for (idx, &(claim_owner, did)) in self.pending_claims.iter().enumerate() {
+                if idx >= self.actor_index {
+                    current_remaining.push((idx, claim_owner, did));
+                }
+            }
+            let mut first: Option<(u16, usize)> = None;
+            let mut remaining: usize = 0;
+            for &(idx, claim_owner, did) in &current_remaining {
+                if claim_owner != owner {
+                    continue;
+                }
+                remaining += 1;
+                if first.is_none() {
+                    first = Some((did, idx - self.actor_index));
+                }
+            }
+            if let Some((did, distance)) = first {
+                return Some((did, distance, remaining));
+            }
+        }
+
+        if self.phase == INITIAL_SELECTION || self.phase == PLACE_AND_SELECT {
+            let mut next_order = self.next_claims.clone();
+            next_order.sort_by_key(|c| c.1);
+            let mut first: Option<(u16, usize)> = None;
+            let mut remaining: usize = 0;
+            for (idx, &(claim_owner, did)) in next_order.iter().enumerate() {
+                if claim_owner != owner {
+                    continue;
+                }
+                remaining += 1;
+                if first.is_none() {
+                    first = Some((did, current_remaining.len() + idx));
+                }
+            }
+            if let Some((did, distance)) = first {
+                return Some((did, distance, remaining));
+            }
+        }
+
+        None
     }
 
     /// Spatial placement index (mirrors action_codec._encode_placement): anchor =
@@ -949,7 +1171,7 @@ impl RustGameState {
     /// Python/numpy objects).  Mirrors encoder.encode_state exactly; the `encode`
     /// pymethod and the in-process MCTS leaf evaluation both go through this so
     /// they cannot drift.
-    /// Core encoder: writes the (9,13,13) my/opp board planes and the (261,) flat
+    /// Core encoder: writes the (9,13,13) my/opp board planes and the flat
     /// vector directly into the provided slices (each exactly one example wide).
     /// Zeroes all three first, so callers may pass reused buffers.  Both the
     /// allocating `encode_arrays` and the batch-buffer `encode_arrays_into` go
@@ -976,10 +1198,20 @@ impl RustGameState {
 
         flat.fill(0.0);
 
-        // 1. Domino in hand (only when it's this player's turn to place).
-        if let Some(d) = self.domino_in_hand(player) {
-            write_tile(flat, OFF_DOMINO_IN_HAND, d);
-        }
+        // 1. Symmetric pending-placement summaries for both sides.
+        write_pending_summary(
+            flat,
+            OFF_MY_NEXT_PENDING,
+            self.next_pending_summary(player),
+        );
+        write_pending_summary(
+            flat,
+            OFF_OPP_NEXT_PENDING,
+            self.next_pending_summary(opp),
+        );
+        // 1b. Rule-derived board summaries for both sides.
+        write_board_summary(flat, OFF_MY_BOARD_SUMMARY, self, player);
+        write_board_summary(flat, OFF_OPP_BOARD_SUMMARY, self, opp);
         // 2. Current row (up to 4 slots).
         for i in 0..4 {
             write_row_slot(
@@ -1025,7 +1257,7 @@ impl RustGameState {
         flat[OFF_OPP_FILL] = fill_ratio(&self.boards[opp as usize]);
         // 9. Actor flag: is the encoded player the one about to act?
         flat[OFF_ACTOR_FLAG] = if self.actor()? == player { 1.0 } else { 0.0 };
-        // 10. Next-round pick positions (full interleaving, FLAT_SIZE 259→261).
+        // 10. Next-round pick positions (full interleaving).
         //     +1 = encoded player acts here, -1 = opponent, 0 = unknown/no round.
         let pos = pick_positions(self, player);
         flat[OFF_PICK_POS_0] = pos[0];
@@ -1036,7 +1268,7 @@ impl RustGameState {
         Ok(())
     }
 
-    /// Allocating encoder: (my_board (9,13,13), opp_board (9,13,13), flat (261,)).
+    /// Allocating encoder: (my_board (9,13,13), opp_board (9,13,13), flat).
     /// Thin wrapper over encode_into_slices (which holds the canonical logic).
     fn encode_arrays(&self, player: u8) -> PyResult<(Array3<f32>, Array3<f32>, Array1<f32>)> {
         let mut mb = vec![0f32; N_BOARD_CH * OUT_N * OUT_N];
@@ -1052,7 +1284,7 @@ impl RustGameState {
 
     /// Encode directly into pre-allocated batch buffers at row `row`, avoiding the
     /// intermediate Array3/Array1 allocation + copy that encode_arrays incurs.
-    /// `mb_data`/`ob_data` are (rows, 9, 13, 13) flat; `flat_data` is (rows, 261)
+    /// `mb_data`/`ob_data` are (rows, 9, 13, 13) flat; `flat_data` is (rows, FLAT_SIZE)
     /// flat.  Each row's region is written (and zeroed) by encode_into_slices.
     fn encode_arrays_into(
         &self,
@@ -1100,6 +1332,7 @@ impl RustGameState {
             start_player,
             harmony,
             middle_kingdom,
+            discards: [0, 0],
         }
     }
 
@@ -1122,7 +1355,8 @@ impl RustGameState {
         harmony=true,
         middle_kingdom=true,
         castle_x=7,
-        castle_y=7
+        castle_y=7,
+        discards=(0, 0)
     ))]
     fn from_parts(
         deck: Vec<u16>,
@@ -1141,6 +1375,7 @@ impl RustGameState {
         middle_kingdom: bool,
         castle_x: i8,
         castle_y: i8,
+        discards: (u32, u32),
     ) -> PyResult<Self> {
         if phase > GAME_OVER {
             return Err(PyValueError::new_err(format!("invalid phase {phase}")));
@@ -1179,6 +1414,7 @@ impl RustGameState {
             start_player,
             harmony,
             middle_kingdom,
+            discards: [discards.0, discards.1],
         })
     }
 
@@ -1227,6 +1463,9 @@ impl RustGameState {
                 if let Some((x1, y1, x2, y2, flipped)) = placement {
                     let (ta, ca, tb, cb) = dom(domino_id);
                     s.boards[player as usize].place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                } else {
+                    // Forced discard: the claimed tile had no legal placement.
+                    s.discards[player as usize] += 1;
                 }
                 if s.phase == PLACE_AND_SELECT {
                     let pick = pick_domino_id
@@ -1306,7 +1545,7 @@ impl RustGameState {
 
     /// Encode this state from `player`'s perspective, mirroring
     /// encoder.encode_state.  Returns (my_board, opp_board, flat) as numpy
-    /// arrays: two (9, 13, 13) float32 plane stacks and a (261,) float32 vector.
+    /// arrays: two (9, 13, 13) float32 plane stacks and a flat float32 vector.
     /// Errors on a terminal state (matches Python).
     fn encode<'py>(
         &self,
@@ -2257,7 +2496,7 @@ fn expand(arena: &mut Vec<Node>, node_id: u32, ev: &Py<PyAny>) -> PyResult<f64> 
     let (value, gathered) = Python::attach(|py| -> PyResult<(f64, Vec<f64>)> {
         let mb_py = my.insert_axis(Axis(0)).into_pyarray(py); // (1,9,13,13)
         let ob_py = opp.insert_axis(Axis(0)).into_pyarray(py);
-        let flat_py = flat.insert_axis(Axis(0)).into_pyarray(py); // (1,261)
+        let flat_py = flat.insert_axis(Axis(0)).into_pyarray(py);
         let idxs_py = idxs.into_pyarray(py); // (n,) int64
         let idxs_list = PyList::new(py, [idxs_py])?;
         let result = ev.bind(py).call1((mb_py, ob_py, flat_py, idxs_list))?;
@@ -2410,7 +2649,7 @@ fn apply_virtual_loss(arena: &mut [Node], path: &[u32], sign: i32, n_vl: i32) {
 /// Evaluate K leaves in ONE batched call to the Python evaluator.  Returns, per
 /// leaf: value (network frame), gathered legal logits, the acting player, and
 /// the indexed legal actions (for expansion).  mb/ob/flat are stacked to
-/// (K,9,13,13)/(K,9,13,13)/(K,261); idxs are passed as a list of K int arrays.
+/// (K,9,13,13)/(K,9,13,13)/(K,FLAT_SIZE); idxs are passed as a list of K int arrays.
 fn evaluate_batch(
     arena: &Vec<Node>,
     leaves: &[u32],
@@ -2977,6 +3216,7 @@ fn new_game(seed: u64, harmony: bool, middle_kingdom: bool) -> RustGameState {
         start_player,
         harmony,
         middle_kingdom,
+        discards: [0, 0],
     }
 }
 
@@ -2995,7 +3235,7 @@ impl RustMCTS {
     /// counts as (joint_index, visit_count) pairs in ascending-index order.
     ///
     /// `evaluator` is a Python callable with the BatchedEvaluator contract:
-    ///   (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,261) f32, idxs_list)
+    ///   (mb (K,9,13,13) f32, ob (K,9,13,13) f32, flat (K,FLAT_SIZE) f32, idxs_list)
     ///     -> (values (K,) f64, [gathered_logits_i (n_i,) f64])
     /// Serial search calls it with K=1.  `seed` only affects Dirichlet noise.
     #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0, fpu=0.0, cpuct=1.5, seed=None, leaf_batch=1, virtual_loss=1, score_scale=100.0, margin_gain=2.0, alpha=0.8))]
@@ -5049,7 +5289,7 @@ impl BatchedMCTS {
 
     /// Phase 1 of a tick: descend every active slot, stack all non-terminal
     /// unique leaves into one batch, stash per-slot bookkeeping for update().
-    /// Returns (mb (B,9,13,13), ob (B,9,13,13), flat (B,261), idxs_list[B]).
+    /// Returns (mb (B,9,13,13), ob (B,9,13,13), flat (B,FLAT_SIZE), idxs_list[B]).
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -5842,7 +6082,7 @@ fn transform_policy(src: &[f32], k: u8, flip: bool, dir_perm: &[usize; 4]) -> Ve
 /// Arguments:
 ///   my_board    : (9, 13, 13) f32 array, C-contiguous
 ///   opp_board   : (9, 13, 13) f32 array, C-contiguous
-///   flat        : (261,) f32 array — invariant, copied unchanged
+///   flat        : flat f32 array — invariant, copied unchanged
 ///   policy      : (3390,) f32 array
 ///   transform_id: int in [0, 8)
 ///
@@ -6171,6 +6411,7 @@ mod pick_pos_tests {
             start_player: 0,
             harmony: true,
             middle_kingdom: true,
+            discards: [0, 0],
         }
     }
 

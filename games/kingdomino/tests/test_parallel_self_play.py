@@ -103,7 +103,7 @@ def _dummy_example(iteration: int = 0, *, pidx=(0,), pval=(1.0,), lidx=(0,)) -> 
 class TestExampleSchema(unittest.TestCase):
 
     def test_flat_size(self):
-        self.assertEqual(FLAT_SIZE, 261)
+        self.assertEqual(FLAT_SIZE, 333)
 
     def test_example_fields(self):
         """Example carries training fields, optional root stats, and iteration."""
@@ -113,6 +113,7 @@ class TestExampleSchema(unittest.TestCase):
             "policy_idx", "policy_val", "legal_idx",
             "z", "own_score", "opp_score", "win_target",
             "root_prior_idx", "root_prior_val", "root_visit_count",
+            "owner", "trainable", "game_type", "opponent_source",
             "iteration",
         ])
 

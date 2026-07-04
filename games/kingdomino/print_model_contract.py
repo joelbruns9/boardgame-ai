@@ -14,8 +14,8 @@ from games.kingdomino.dominoes import DOMINOES
 from games.kingdomino.network import KingdominoNet
 
 
-EXPECTED_CHECKPOINT_VERSION = 2
-EXPECTED_FLAT_SIZE = 261
+EXPECTED_CHECKPOINT_VERSION = 3
+EXPECTED_FLAT_SIZE = encoder.FLAT_SIZE
 EXPECTED_BOARD_SHAPE = (9, 13, 13)
 EXPECTED_CHANNELS = 48
 EXPECTED_BLOCKS = 6

@@ -24,7 +24,7 @@ Four-head residual network:
 Inputs:
 - `my_board` (9, 13, 13) — own kingdom, castle-centered on 13×13 canvas
 - `opp_board` (9, 13, 13) — opponent kingdom
-- `flat` (261,) — global features (pick positions, game phase, round, etc.)
+- `flat` (333,) — global features (pending tiles, score/bonus summaries, pick positions, game phase, round, etc.)
 
 ### Search (lib.rs — Rust)
 Open-loop BatchedMCTS: runs 32 game slots simultaneously, resampling
@@ -33,8 +33,8 @@ determinized future. This is architecturally necessary for Kingdomino
 because the future tile reveal order is hidden information.
 
 Key constants:
-- `FLAT_SIZE = 261` — flat encoder dimension (pick_pos_0..3 encoding)
-- `checkpoint_version = 2` — four-head network format
+- `FLAT_SIZE = 333` — flat encoder dimension (symmetric pending-tile + board-fact summaries + pick_pos_0..3 encoding)
+- `checkpoint_version = 3` — symmetric pending-tile encoder format
 
 ### Training (self_play.py)
 AlphaZero self-play loop:
@@ -68,7 +68,7 @@ Anchor pool (sims=400, fpu=-0.2):
 games/kingdomino/
 ├── self_play.py          # Main training loop — start here
 ├── network.py            # KingdominoNet (four-head ResNet)
-├── encoder.py            # Board → tensor encoding (FLAT_SIZE=261)
+├── encoder.py            # Board → tensor encoding (FLAT_SIZE=333)
 ├── mcts_az.py            # Python open-loop MCTS (reference/testing)
 ├── round_robin_eval.py   # Head-to-head checkpoint evaluation
 ├── elo_rating.py         # Automated Elo rating system
@@ -157,8 +157,8 @@ See `training_parameters.md` for full parameter documentation.
 
 ### Key invariants
 These must be preserved across all runs:
-- `FLAT_SIZE = 261` (pick_pos_0..3 encoder fix)
-- `checkpoint_version = 2` (four-head network)
+- `FLAT_SIZE = 333` (symmetric pending-tile + board-fact encoder)
+- `checkpoint_version = 3` (symmetric pending-tile encoder)
 - Open-loop MCTS is required — closed-loop (det=1) trains on a
   non-existent game with revealed future draws
 - `terminal_search_value()` is the single source for terminal backup

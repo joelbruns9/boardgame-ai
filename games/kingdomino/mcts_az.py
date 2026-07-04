@@ -52,7 +52,7 @@ never leaks into what the network evaluates.
 EVALUATOR SEAM
   Evaluator: (mb, ob, flat, idxs) -> (value, gathered_legal_logits)
     - mb, ob    (9,13,13) float32 board arrays
-    - flat       (261,)   float32 flat features
+    - flat       (FLAT_SIZE,) float32 flat features
     - idxs       (n,)     int64  legal joint-action indices (encode_action order)
     - value      float    in (-1,1), leaf_value = α·margin + (1-α)·win,
                           from the ENCODED player's perspective
@@ -269,7 +269,7 @@ Evaluator = Callable[
 ]
 
 # BatchedEvaluator: stacked inputs + per-leaf legal indices → (values, gathered).
-#     (mbs (K,9,13,13), obs (K,9,13,13), flats (K,261), idxs_list[K])
+#     (mbs (K,9,13,13), obs (K,9,13,13), flats (K,FLAT_SIZE), idxs_list[K])
 #       -> (values (K,), [gathered_legal_logits])  (each (n_legal_i,))
 # Mirrors the single Evaluator's 4-arg/gathered contract, just batched.  Returning
 # gathered (not full) logits keeps the IPC response small; the in-process backend

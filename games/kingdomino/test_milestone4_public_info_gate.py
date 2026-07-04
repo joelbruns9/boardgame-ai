@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from games.kingdomino.action_codec import encode_action
-from games.kingdomino.encoder import encode_state, redeterminize
+from games.kingdomino.encoder import FLAT_SIZE, encode_state, redeterminize
 from games.kingdomino.game import GameState, Phase
 from games.kingdomino.self_play import Example, ReplayBuffer
 from games.kingdomino.web_app import state_from_debug_json, state_to_public_json
@@ -68,7 +68,7 @@ def test_example_and_replay_buffer_schema_cannot_store_true_deck_order():
     ex = Example(
         my_board=np.zeros((9, 13, 13), dtype=np.float16),
         opp_board=np.zeros((9, 13, 13), dtype=np.float16),
-        flat=np.zeros(261, dtype=np.float16),
+        flat=np.zeros(FLAT_SIZE, dtype=np.float16),
         policy_idx=np.array([0], dtype=np.int32),
         policy_val=np.array([1.0], dtype=np.float32),
         legal_idx=np.array([0, 1], dtype=np.int32),

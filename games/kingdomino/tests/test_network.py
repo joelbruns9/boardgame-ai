@@ -61,9 +61,9 @@ check("policy logits finite", bool(torch.isfinite(p).all()))
 
 
 # ──────────────────────────────────────────────────────────────────────────
-print("\n=== TEST 1b: checkpoint_version is 2 (four-head architecture) ===")
-check("KingdominoNet.checkpoint_version == 2",
-      KingdominoNet.checkpoint_version == 2,
+print("\n=== TEST 1b: checkpoint_version is 3 (symmetric pending encoder) ===")
+check("KingdominoNet.checkpoint_version == 3",
+      KingdominoNet.checkpoint_version == 3,
       f"got {KingdominoNet.checkpoint_version}")
 
 

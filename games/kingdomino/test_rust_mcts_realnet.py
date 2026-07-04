@@ -31,11 +31,9 @@ from games.kingdomino.test_rust_mcts_equiv import _collect_states
 
 import kingdomino_rust
 
-# Pre-261 (four-head, FLAT_SIZE=257-era pick_rank) checkpoint.  NOTE: after the
-# pick_pos feature change (FLAT_SIZE 259 → 261) this Phase 4b checkpoint's flat
-# input layer (259-wide) no longer load_state_dict's into the current 261-wide
-# KingdominoNet — this diagnostic needs a fresh checkpoint from a post-261
-# training run.  Not in the required gate; left as-is until the cloud run
+# Pre-current-encoder checkpoint. Its flat input layer no longer load_state_dict's
+# into checkpoint_version=3 / FLAT_SIZE=335 KingdominoNet; this diagnostic needs a
+# fresh training run. Not in the required gate; left as-is until the cloud run
 # produces a current-architecture net.
 CKPT = "checkpoints_ol_4b/iter_0005.pt"
 N_SIMS = 200

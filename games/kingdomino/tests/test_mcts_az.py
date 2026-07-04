@@ -80,7 +80,7 @@ class Node:
 
 # An Evaluator isolates the ONLY part of MCTS that touches the network: a
 # single forward pass.  It maps one encoded position to (value, policy_logits):
-#     (my_board (9,13,13), opp_board (9,13,13), flat (261,))
+#     (my_board (9,13,13), opp_board (9,13,13), flat (FLAT_SIZE,))
 #       -> (value  in [-1,1] from the ENCODED player's perspective,
 #           logits (NUM_JOINT_ACTIONS,) over the full joint action space)
 # MCTS owns encoding and legal-action prior extraction; the evaluator owns the

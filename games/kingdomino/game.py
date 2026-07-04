@@ -57,6 +57,11 @@ class GameState:
     initial_pick_count: int = 0
     start_player: int = 0
     history: list[object] = field(default_factory=list)
+    # Per-player count of dominoes discarded (forced when a claimed tile has no
+    # legal placement).  A discard permanently forfeits the Harmony bonus for
+    # that player (Harmony needs all 24 dominoes placed → a full 7×7).  Tracked
+    # explicitly because it cannot be reconstructed from board/claim state alone.
+    discards: list[int] = field(default_factory=lambda: [0, 0])
 
     @classmethod
     def new(cls, seed: int | None = None, config: GameConfig | None = None, start_player: int | None = None) -> "GameState":
@@ -102,6 +107,7 @@ class GameState:
             initial_pick_count=self.initial_pick_count,
             start_player=self.start_player,
             history=list(self.history),
+            discards=list(self.discards),
         )
 
     def legal_actions(self) -> list[PickAction | TurnAction]:
@@ -159,6 +165,9 @@ class GameState:
         claim = s.pending_claims[s.actor_index]
         if action.placement is not None:
             s.boards[claim.player].place(DOMINOES[claim.domino_id], action.placement)
+        else:
+            # Forced discard: the claimed tile had no legal placement.
+            s.discards[claim.player] += 1
 
         if s.phase == Phase.PLACE_AND_SELECT:
             if action.pick_domino_id not in s.current_row:

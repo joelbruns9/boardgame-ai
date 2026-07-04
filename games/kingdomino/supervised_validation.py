@@ -64,7 +64,7 @@ class Position:
     """One labelled training example."""
     my_board: np.ndarray   # (9, 13, 13) float32
     opp_board: np.ndarray  # (9, 13, 13) float32
-    flat: np.ndarray       # (261,) float32
+    flat: np.ndarray       # (FLAT_SIZE,) float32
     z_target: float        # in [-1, 1], from the current actor's perspective
 
 

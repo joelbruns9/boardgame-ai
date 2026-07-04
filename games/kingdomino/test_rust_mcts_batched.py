@@ -146,13 +146,13 @@ def run(seeds=(0, 1, 2), verbose: bool = False) -> bool:
     # perturbs selection and cosine dips below the gate.  The only four-head
     # checkpoint available is the Phase 4b open-loop net at iteration 5 — too
     # weakly trained (measured cosine 0.9487, just under the 0.95 gate) AND now
-    # pre-261 (its 259-wide flat layer no longer loads into the current 261-wide
-    # net after the pick_pos feature change).  The pre-milestone strong
-    # checkpoints are the old single-value_mlp architecture and no longer load.
-    # Re-enable Part B once the cloud run produces a stronger checkpoint_version=2
-    # net.  Part A (the rigorous port-correctness gate) still runs and gates.
+    # pre-current-encoder (its flat layer no longer loads into checkpoint_version=3
+    # / FLAT_SIZE=335).  The pre-milestone strong checkpoints are the old
+    # single-value_mlp architecture and no longer load. Re-enable Part B once the
+    # cloud run produces a stronger current-architecture net. Part A (the rigorous
+    # port-correctness gate) still runs and gates.
     warnings.warn(
-        "test_rust_mcts_batched Part B skipped: no strong checkpoint_version=2 "
+        "test_rust_mcts_batched Part B skipped: no strong checkpoint_version=3 "
         "net available (Phase 4b iter-5 scores cosine 0.9487 < 0.95 gate). "
         "Part A still gates.")
     print("--- B. approximation quality (real net) — SKIPPED "

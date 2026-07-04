@@ -11,6 +11,7 @@ from games.kingdomino.hof import (
     read_hof_index,
     sample_hof_entry,
 )
+from games.kingdomino.encoder import FLAT_SIZE
 from games.kingdomino.network import KingdominoNet
 from games.kingdomino.self_play import (
     Example,
@@ -25,7 +26,7 @@ def _tiny_example(*, trainable: bool, owner: str = "current") -> Example:
     return Example(
         np.zeros((9, 13, 13), dtype=np.float16),
         np.zeros((9, 13, 13), dtype=np.float16),
-        np.zeros((261,), dtype=np.float16),
+        np.zeros((FLAT_SIZE,), dtype=np.float16),
         np.array([0], dtype=np.int32),
         np.array([1.0], dtype=np.float32),
         np.array([0], dtype=np.int32),

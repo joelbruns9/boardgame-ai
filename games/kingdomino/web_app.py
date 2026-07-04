@@ -46,9 +46,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
+import json
+import os
 import random
 import glob
 import re
+import sys
 
 try:
     from fastapi import FastAPI, HTTPException, Query
@@ -99,6 +102,8 @@ _SESSIONS: dict[str, GameState] = {}
 _SESSION_TIMELINES: dict[str, list[GameState]] = {}
 
 _NN_EVALUATOR_CACHE: dict[tuple[str, str, int, int, int], Any] = {}
+_EXACT_ADVISOR_VALUE_CACHE: dict[tuple[str, float, float, float], float] = {}
+_EXACT_ADVISOR_CACHE_MAX = 200_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,10 +144,16 @@ class ImportStateRequest(BaseModel):
     state: dict[str, Any]
 
 
+class AdvisorProbeSaveRequest(BaseModel):
+    filename: Optional[str] = None
+    probe: dict[str, Any]
+
+
 class RecommendRequest(BaseModel):
     session_id: Optional[str] = None
     state: Optional[dict[str, Any]] = None
-    engine: str = Field(default="greedy", description="greedy/heuristic, random, or nn")
+    engine: str = Field(default="greedy", description="greedy/heuristic, random, nn, exact, or auto")
+    requested_engine: Optional[str] = None
     num_simulations: int = Field(default=50, ge=0, le=5000)
     top_k: int = Field(default=8, ge=1, le=100)
     checkpoint_path: Optional[str] = None
@@ -159,6 +170,11 @@ class RecommendRequest(BaseModel):
     blocks: Optional[int] = None
     bilinear_dim: Optional[int] = None
     seed: int = 0
+    # Exact endgame advisor. exact_threads=0 leaves Rayon on its default global
+    # pool size, which is all logical CPUs unless RAYON_NUM_THREADS was set
+    # before the Rust extension initialized.
+    exact_max_secs: float = Field(default=300.0, ge=0.0, le=3600.0)
+    exact_threads: int = Field(default=0, ge=0, le=128)
 
 
 class BotActionRequest(BaseModel):
@@ -580,6 +596,262 @@ def _choose_greedy_action(state: GameState):
     return action, {"engine": "greedy-placeholder", "score": float(score), "debug": parts}
 
 
+def _exact_thread_meta(requested_threads: int) -> dict[str, Any]:
+    requested = int(requested_threads or 0)
+    rust_already_loaded = "kingdomino_rust" in sys.modules
+    if requested > 0 and not rust_already_loaded:
+        os.environ["RAYON_NUM_THREADS"] = str(requested)
+    env_threads = os.environ.get("RAYON_NUM_THREADS")
+    return {
+        "threads_requested": requested,
+        "threads_effective": requested if requested > 0 else int(os.cpu_count() or 1),
+        "rayon_num_threads_env": env_threads,
+        "thread_pool_already_initialized": bool(rust_already_loaded),
+        "thread_note": (
+            "exact_threads only changes Rayon before the Rust extension initializes"
+            if requested > 0 and rust_already_loaded
+            else None
+        ),
+    }
+
+
+def _exact_state_key(state: GameState) -> str:
+    data = state_to_debug_json(state)
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _exact_supported_detail(state: GameState, request_state: Optional[dict[str, Any]]) -> Optional[str]:
+    if request_state is not None:
+        deck_count = request_state.get("deck_count")
+        debug_deck = request_state.get("debug", {}).get("deck") if isinstance(request_state.get("debug"), dict) else None
+        if deck_count == 4 and not debug_deck:
+            return (
+                "Exact deck=4 solving requires the hidden deck identities in state.debug.deck. "
+                "The BGA capture reported deck_count=4 but did not include debug.deck."
+            )
+
+    if state.phase == Phase.GAME_OVER:
+        return None
+    if state.phase == Phase.PLACE_AND_SELECT and len(state.deck) in (0, 4):
+        return None
+    if state.phase == Phase.FINAL_PLACEMENT and len(state.deck) == 0:
+        return None
+    return (
+        "Exact advisor is only available for PLACE_AND_SELECT with deck length 4 or 0, "
+        "FINAL_PLACEMENT with deck length 0, or GAME_OVER. "
+        f"Current phase={state.phase.name}, deck length={len(state.deck)}."
+    )
+
+
+def _cached_exact_value(
+    state: GameState,
+    *,
+    max_secs: float,
+    score_scale: float,
+    margin_gain: float,
+    alpha: float,
+    seed: int,
+) -> tuple[float, bool, bool]:
+    key = (_exact_state_key(state), float(score_scale), float(margin_gain), float(alpha))
+    cached = _EXACT_ADVISOR_VALUE_CACHE.get(key)
+    if cached is not None:
+        return float(cached), True, True
+
+    from games.kingdomino.endgame_solver import exact_endgame_value
+
+    value0, solved = exact_endgame_value(
+        state,
+        max_secs=float(max_secs),
+        rng=random.Random(int(seed)),
+        score_scale=float(score_scale),
+        margin_gain=float(margin_gain),
+        alpha=float(alpha),
+    )
+    if not solved:
+        return float(value0), False, False
+    if len(_EXACT_ADVISOR_VALUE_CACHE) >= _EXACT_ADVISOR_CACHE_MAX:
+        _EXACT_ADVISOR_VALUE_CACHE.clear()
+    _EXACT_ADVISOR_VALUE_CACHE[key] = float(value0)
+    return float(value0), False, True
+
+
+def _exact_cache_stats_for(
+    state: GameState,
+    *,
+    max_secs: float,
+    score_scale: float,
+    margin_gain: float,
+    alpha: float,
+    seed: int,
+) -> tuple[float, int, int]:
+    value, hit, solved = _cached_exact_value(
+        state,
+        max_secs=max_secs,
+        score_scale=score_scale,
+        margin_gain=margin_gain,
+        alpha=alpha,
+        seed=seed,
+    )
+    if not solved:
+        raise HTTPException(status_code=504, detail="Exact solver did not finish within exact_max_secs.")
+    return value, int(hit), int(not hit)
+
+
+def _recommend_exact(
+    state: GameState,
+    req: RecommendRequest,
+    *,
+    request_state: Optional[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    import time
+
+    detail = _exact_supported_detail(state, request_state)
+    if detail is not None:
+        raise HTTPException(status_code=400, detail=detail)
+
+    thread_meta = _exact_thread_meta(req.exact_threads)
+    score_scale = 100.0
+    margin_gain = 2.0
+    win_alpha = 0.0
+    rank_alpha = 0.8
+    root_value0, root_hit, root_solved = _cached_exact_value(
+        state,
+        max_secs=float(req.exact_max_secs),
+        score_scale=score_scale,
+        margin_gain=margin_gain,
+        alpha=win_alpha,
+        seed=int(req.seed),
+    )
+    if not root_solved:
+        raise HTTPException(status_code=504, detail="Exact solver did not finish the root position within exact_max_secs.")
+    if state.phase == Phase.GAME_OVER:
+        return {
+            "ok": True,
+            "engine": "exact",
+            "value": None,
+            "root_value_player0": float(root_value0),
+            "search_ms": int(round((time.perf_counter() - started_at) * 1000)),
+            "num_simulations": 0,
+            "exact": {
+                "solved": True,
+                "label": "exact",
+                "deck_count": int(len(state.deck)),
+                "cache_hits": int(root_hit),
+                "cache_misses": int(not root_hit),
+                "cache_size": int(len(_EXACT_ADVISOR_VALUE_CACHE)),
+                "max_secs": float(req.exact_max_secs),
+                **thread_meta,
+            },
+            "recommendations": [],
+        }
+
+    actor = int(state.current_actor)
+    rows = []
+    cache_hits = int(root_hit)
+    cache_misses = int(not root_hit)
+    root_rank_value0, rank_hit, rank_miss = _exact_cache_stats_for(
+        state,
+        max_secs=float(req.exact_max_secs),
+        score_scale=score_scale,
+        margin_gain=margin_gain,
+        alpha=rank_alpha,
+        seed=int(req.seed),
+    )
+    cache_hits += rank_hit
+    cache_misses += rank_miss
+    actions = state.legal_actions()
+    id_to_index = {
+        action_to_json(state, action, i)["action_id"]: i
+        for i, action in enumerate(actions)
+    }
+    for action in actions:
+        child = state.step(action)
+        value0, hit, solved = _cached_exact_value(
+            child,
+            max_secs=float(req.exact_max_secs),
+            score_scale=score_scale,
+            margin_gain=margin_gain,
+            alpha=win_alpha,
+            seed=int(req.seed),
+        )
+        if not solved:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Exact solver did not finish legal action {action_to_json(state, action, -1).get('action_id')} within exact_max_secs.",
+            )
+        cache_hits += int(hit)
+        cache_misses += int(not hit)
+        rank_value0, rank_hit, rank_miss = _exact_cache_stats_for(
+            child,
+            max_secs=float(req.exact_max_secs),
+            score_scale=score_scale,
+            margin_gain=margin_gain,
+            alpha=rank_alpha,
+            seed=int(req.seed),
+        )
+        cache_hits += rank_hit
+        cache_misses += rank_miss
+        value_actor = float(value0 if actor == 0 else -value0)
+        rank_value_actor = float(rank_value0 if actor == 0 else -rank_value0)
+        q_win_prob = max(0.0, min(1.0, (value_actor + 1.0) / 2.0))
+        aj = action_to_json(state, action, -1)
+        idx = id_to_index.get(aj["action_id"], -1)
+        if idx >= 0:
+            aj = action_to_json(state, actions[idx], idx)
+        rows.append((value_actor, rank_value_actor, q_win_prob, idx, aj, value0, rank_value0, hit))
+
+    rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    recs = []
+    for rank, (value_actor, rank_value_actor, q_win_prob, idx, aj, value0, rank_value0, hit) in enumerate(rows[: max(1, int(req.top_k))], start=1):
+        recs.append({
+            "rank": rank,
+            **aj,
+            "prior": None,
+            "visit_frac": None,
+            "q_win_prob": float(q_win_prob),
+            "q_value": float(value_actor),
+            "q_rank_value": float(rank_value_actor),
+            "is_legal": idx >= 0,
+            "debug": {
+                "engine": "exact",
+                "label": "exact",
+                "legal_index_resolved": idx,
+                "value_player0": float(value0),
+                "rank_value_player0": float(rank_value0),
+                "cache_hit": bool(hit),
+            },
+        })
+
+    value_actor = float(root_value0 if actor == 0 else -root_value0)
+    rank_value_actor = float(root_rank_value0 if actor == 0 else -root_rank_value0)
+    return {
+        "ok": True,
+        "engine": "exact",
+        "value": value_actor,
+        "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
+        "root_rank_value": rank_value_actor,
+        "root_value_player0": float(root_value0),
+        "search_ms": int(round((time.perf_counter() - started_at) * 1000)),
+        "num_simulations": 0,
+        "exact": {
+            "solved": True,
+            "label": "exact",
+            "deck_count": int(len(state.deck)),
+            "cache_hits": int(cache_hits),
+            "cache_misses": int(cache_misses),
+            "cache_size": int(len(_EXACT_ADVISOR_VALUE_CACHE)),
+            "max_secs": float(req.exact_max_secs),
+            "score_scale": score_scale,
+            "margin_gain": margin_gain,
+            "alpha": win_alpha,
+            "rank_alpha": rank_alpha,
+            **thread_meta,
+        },
+        "recommendations": recs,
+    }
+
+
 def _newest_checkpoint_path() -> Optional[str]:
     # 1) Canonical best model for the BGA advisor.  Copy the promoted checkpoint
     #    here as current_best.pt; the server loads it automatically when no
@@ -972,6 +1244,36 @@ def render_state(req: ImportStateRequest) -> dict[str, Any]:
     return {"ok": True, "state": state_to_public_json(state), "legal_actions": legal_actions_json(state)}
 
 
+def _safe_probe_filename(name: Optional[str]) -> str:
+    raw = (name or f"kingdomino-advisor-probe-{uuid4().hex}.json").replace("\\", "/").split("/")[-1]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    if not safe:
+        safe = f"kingdomino-advisor-probe-{uuid4().hex}.json"
+    if not safe.lower().endswith(".json"):
+        safe += ".json"
+    return safe
+
+
+@app.post("/api/advisor-probe/save")
+def save_advisor_probe(req: AdvisorProbeSaveRequest) -> dict[str, Any]:
+    out_dir = Path("runs/kingdomino/advisor_probes")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = _safe_probe_filename(req.filename)
+    path = out_dir / filename
+    if path.exists():
+        stem = path.stem
+        suffix = path.suffix
+        for i in range(1, 10000):
+            candidate = out_dir / f"{stem}-{i}{suffix}"
+            if not candidate.exists():
+                path = candidate
+                break
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(req.probe, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return {"ok": True, "path": str(path), "filename": path.name}
+
+
 @app.post("/api/recommend")
 def recommend(req: RecommendRequest) -> dict[str, Any]:
     """Return advisor recommendations in the shared UI/BGA protocol shape.
@@ -980,6 +1282,8 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
       - greedy / heuristic: fast deterministic model-free scoring
       - random: useful sanity check for UI rendering
       - nn / mcts / alphazero: OpenLoopMCTS (deck resampled per simulation) using a checkpoint
+      - exact / solver: exhaustive no-chance endgame solve for deck=4 or deck=0 states
+      - auto: exact when eligible, otherwise NN/MCTS
 
     The local web UI and the future BGA extension should both consume this
     endpoint.  Bot-play helpers may apply a move; /api/recommend only reports.
@@ -993,6 +1297,14 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
     else:
         raise HTTPException(status_code=400, detail="Provide session_id or state")
 
+    mode = req.engine.strip().lower()
+    if mode in ("exact", "solver", "exact-solver"):
+        return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+    if mode in ("auto", "exact-auto", "auto-endgame"):
+        if _exact_supported_detail(state, req.state) is None:
+            return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+        mode = "nn"
+
     actions = state.legal_actions()
     if not actions:
         return {
@@ -1004,7 +1316,6 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             "recommendations": [],
         }
 
-    mode = req.engine.strip().lower()
     top_k = max(1, int(req.top_k))
 
     # ── Random advisor: exposes protocol with a deliberately uninformative rank.
@@ -1144,6 +1455,7 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             "engine": "nn-mcts",
             "checkpoint_path": checkpoint_path,
             "value": value_actor,
+            "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
             "root_value_player0": float(value0),
             # Network's pre-search trajectory readout (own/opp/win_prob); a single
             # root forward pass, not search-averaged.  See _root_trajectory.
@@ -1156,7 +1468,7 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
 
     # ── Greedy/heuristic advisor: fast default and current placeholder behavior.
     if mode not in ("greedy", "heuristic", "heuristic-placeholder"):
-        raise HTTPException(status_code=400, detail=f"Unknown advisor engine {req.engine!r}; expected greedy, random, or nn.")
+        raise HTTPException(status_code=400, detail=f"Unknown advisor engine {req.engine!r}; expected greedy, random, nn, exact, or auto.")
 
     scored = []
     for i, action in enumerate(actions):

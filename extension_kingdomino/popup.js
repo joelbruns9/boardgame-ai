@@ -2,17 +2,22 @@ const browserAPI = typeof browser !== "undefined" ? browser : chrome;
 const usesPromiseAPI = typeof browser !== "undefined" && browserAPI === browser;
 
 const DEFAULTS = {
-  engine: "nn",
+  engine: "auto",
   sims: 800,
   checkpoint: "",
+  exactMaxSecs: 300,
+  exactThreads: 0,
 };
 
 const statusEl = document.getElementById("status");
 const captureBtn = document.getElementById("captureBtn");
 const debugBtn = document.getElementById("debugBtn");
+const probeBtn = document.getElementById("probeBtn");
 const engineEl = document.getElementById("engine");
 const simsEl = document.getElementById("sims");
 const checkpointEl = document.getElementById("checkpoint");
+const exactMaxSecsEl = document.getElementById("exactMaxSecs");
+const exactThreadsEl = document.getElementById("exactThreads");
 
 function getStorage(keys) {
   return new Promise((resolve, reject) => {
@@ -45,18 +50,30 @@ function setStorage(values) {
 }
 
 async function loadOptions() {
-  const stored = await getStorage(["kingdomino_engine", "kingdomino_sims", "kingdomino_checkpoint"]);
+  const stored = await getStorage([
+    "kingdomino_engine",
+    "kingdomino_sims",
+    "kingdomino_checkpoint",
+    "kingdomino_exact_max_secs",
+    "kingdomino_exact_threads",
+  ]);
   engineEl.value = stored.kingdomino_engine || DEFAULTS.engine;
   simsEl.value = String(stored.kingdomino_sims || DEFAULTS.sims);
   checkpointEl.value = stored.kingdomino_checkpoint || DEFAULTS.checkpoint;
+  exactMaxSecsEl.value = String(stored.kingdomino_exact_max_secs ?? DEFAULTS.exactMaxSecs);
+  exactThreadsEl.value = String(stored.kingdomino_exact_threads ?? DEFAULTS.exactThreads);
 }
 
 async function saveOptions() {
   const sims = Number(simsEl.value);
+  const exactMaxSecs = Number(exactMaxSecsEl.value);
+  const exactThreads = Number(exactThreadsEl.value);
   await setStorage({
     kingdomino_engine: engineEl.value || DEFAULTS.engine,
     kingdomino_sims: Number.isFinite(sims) && sims > 0 ? Math.round(sims) : DEFAULTS.sims,
     kingdomino_checkpoint: checkpointEl.value.trim(),
+    kingdomino_exact_max_secs: Number.isFinite(exactMaxSecs) && exactMaxSecs >= 0 ? exactMaxSecs : DEFAULTS.exactMaxSecs,
+    kingdomino_exact_threads: Number.isFinite(exactThreads) && exactThreads >= 0 ? Math.round(exactThreads) : DEFAULTS.exactThreads,
   });
 }
 
@@ -137,6 +154,13 @@ async function capture(mode) {
 
 captureBtn.addEventListener("click", () => capture("recommend"));
 debugBtn.addEventListener("click", () => capture("debug"));
+probeBtn.addEventListener("click", async () => {
+  statusEl.textContent = "Saving last probe...";
+  const response = await sendToActiveTab({ action: "downloadLastProbe" });
+  statusEl.textContent = response.ok
+    ? "Probe saved."
+    : `Error: ${response.error || "no probe available"}`;
+});
 loadOptions().catch((e) => {
   statusEl.textContent = String((e && e.message) || e);
 });

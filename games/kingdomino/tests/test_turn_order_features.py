@@ -20,6 +20,8 @@ from games.kingdomino.encoder import (
     redeterminize,
     FLAT_LAYOUT,
     FLAT_SIZE,
+    PENDING_SUMMARY_SIZE,
+    BOARD_SUMMARY_SIZE,
 )
 
 
@@ -54,12 +56,28 @@ def play_random_to_phase(state, target_phase, rng, max_steps=200):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-print("\n=== TEST 1: FLAT_SIZE is 261 ===")
-check("FLAT_SIZE == 261", FLAT_SIZE == 261, f"got {FLAT_SIZE}")
+print("\n=== TEST 1: FLAT_SIZE is 333 ===")
+check("FLAT_SIZE == 333", FLAT_SIZE == 333, f"got {FLAT_SIZE}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
 print("\n=== TEST 2: pick_pos_0..3 feature slots exist with correct size ===")
+for key in ("my_next_pending", "opp_next_pending"):
+    present = key in FLAT_LAYOUT
+    check(f"FLAT_LAYOUT contains {key}", present)
+    if present:
+        sl = FLAT_LAYOUT[key]
+        check(f"{key} size is PENDING_SUMMARY_SIZE",
+              (sl.stop - sl.start) == PENDING_SUMMARY_SIZE,
+              f"got {sl.stop - sl.start}")
+for key in ("my_board_summary", "opp_board_summary"):
+    present = key in FLAT_LAYOUT
+    check(f"FLAT_LAYOUT contains {key}", present)
+    if present:
+        sl = FLAT_LAYOUT[key]
+        check(f"{key} size is BOARD_SUMMARY_SIZE",
+              (sl.stop - sl.start) == BOARD_SUMMARY_SIZE,
+              f"got {sl.stop - sl.start}")
 for k in range(4):
     key = f"pick_pos_{k}"
     present = key in FLAT_LAYOUT
@@ -160,7 +178,7 @@ state = GameState.new(seed=1)
 mb, ob, flat = encode_state(state, player=0)
 check("my_board shape (9,13,13)", mb.shape == (9, 13, 13), f"got {mb.shape}")
 check("opp_board shape (9,13,13)", ob.shape == (9, 13, 13), f"got {ob.shape}")
-check("flat shape (261,)", flat.shape == (261,), f"got {flat.shape}")
+check(f"flat shape ({FLAT_SIZE},)", flat.shape == (FLAT_SIZE,), f"got {flat.shape}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
