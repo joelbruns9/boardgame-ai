@@ -8,6 +8,84 @@ project. Update as results come in.
 
 ---
 
+## Status Update — 2026-07 (win-gated value + tail-diagnosis tooling)
+
+Three changes since the last revision, plus the agreed next-step plan:
+
+1. **Value definition is now win-gated (KataGo-style).** `terminal_search_value`
+   and `margin_to_training_value` changed from the convex blend
+   `alpha*margin + (1-alpha)*win` to `(1-B)*win + B*win^4*margin` (B = the `alpha`
+   param, default **0.5**; n=4 certainty gate). **This does NOT change any
+   exact-solve value or ranking:** at a decided terminal `win_value ∈ {-1,0,+1}`,
+   so the gate `win^4 ∈ {1,0,1}` is 1 whenever a margin exists and 0 only on a
+   draw — identical to the old blend. The solver, its pruning, and all
+   value-equivalence tests are unaffected; only continuous-win-prob *neural leaves*
+   (outside the solver) change. `win_gate` is computed as `(w*w)*(w*w)` so Python
+   and Rust stay bit-identical.
+
+2. **`score_scale` unified to 160.0** everywhere (was 100.0 in some paths). The raw
+   integer-margin alpha-beta search is scale-independent; `score_scale` only enters
+   the post-solve monotone value transform, so pruning/values/rankings are
+   unchanged. Historical benchmark tables below were measured at `score_scale=100`,
+   `alpha=0.8`; current defaults are `score_scale=160`, `alpha(B)=0.5`.
+
+3. **New tail-diagnosis harness:** `games/kingdomino/endgame_solver_harness.py`
+   (`generate` / `analyze`). It snapshots no-chance endgame roots, measures each
+   (pruned solve time + solved/timeout via `measure_endgame_tree`; unpruned tree
+   size via `count_endgame_nodes_no_chance`), and persists them in the
+   `from_parts` / fallback-sidecar field set so harness- and run-produced positions
+   are interchangeable and re-analyzable. `analyze` reports the tail distribution,
+   timeout rate at several budgets, and a **placement-axis vs draft/selection-axis**
+   hardness split (decoded from joint indices), plus an optional two-ordering
+   value-equivalence guard. Supersedes ad-hoc `bench_endgame_tail.py` runs for tail
+   work.
+
+### Where the solver work goes next
+
+**Goal (clarified).** With within-search *leaf* solving abandoned (the
+`solve_endgame_ab_value_cached` leaf cache is dead code, and the deck-0 draft DP in
+`deck0_draft_dp.rs` is an experimental benchmark, not on the training path), the
+ONLY channel from the solver to a midgame (deck ≥ 6) evaluation is **training-data
+generalization**: the solver labels deck ∈ {0,4} roots → the value head trains on
+them → the NN gives better values at deck ≥ 4 leaves in future searches. So making
+the solver "more impactful on midgame" reduces to **producing more/better exact
+endgame targets = shrinking the ~20% deck=4 timeout tail** observed at a 5–6 s
+budget (a timeout costs double: the wasted budget *and* the lost exact signal on a
+hard, high-value position).
+
+**Full deck=4 separability is rejected.** Extending the deck=0 independent-board
+factorization to deck=4 does not work: at deck=4 a selection (draft) round remains,
+and selection is the irreducible adversarial coupling (e.g. hand the opponent a
+15-point tile to win the margin). Splitting the two players' trees would discard
+exactly that. A narrower hybrid — use the fast deck=0 separable solver as the *leaf
+evaluator* beneath the deck=4 draft minimax — is parked as a smaller later
+optimization, not a reopening of separability.
+
+**Diagnosis-first plan:**
+1. Characterize the tail with the harness — is the exploding branching the
+   placement axis or the draft/selection axis? (Early greedy-corpus hint: hardness
+   tracked `n_picks`, i.e. the draft axis — needs confirmation on faithful
+   positions, and the greedy corpus showed 0% timeouts because those positions are
+   easy.)
+2. Pick the lever accordingly, from: **policy-prior move ordering** (the one untried
+   ordering signal — all existing orderings are hand-crafted heuristics), a
+   within-*single*-solve **transposition table** (distinct from the dead leaf
+   cache), or **aspiration / iterative-deepening** on the raw margin. Guard every
+   change with the value-equivalence check (bit-identical solved values).
+3. Validate on the FAITHFUL tail, not a proxy.
+
+**Position sourcing.** There is no competent net compatible with the current
+encoder (all checkpoints are 261-flat; current encoder is 333-flat), and recent
+runs did not save their tail (`--exact_fallback_positions` was off). So faithful
+competent positions come from **enabling `--exact_fallback_positions` in the
+from-scratch run** — captured in reloadable `from_parts` form, they drop straight
+into `analyze` — available once the run has a few competent iterations (~iter 10).
+The harness's random/greedy corpus is for building tooling, validating value
+propagation, and measuring *relative* speedups only; competent-play endgames differ
+structurally from random/greedy ones, so absolute-tail conclusions need the sidecar.
+
+---
+
 ## Why This Exists
 
 AlphaZero MCTS never plays to terminal nodes — it stops at leaves and uses the
@@ -603,11 +681,20 @@ this is ~30% speedup. If it's 5%, not worth building.
 
 ---
 
-### SKIP: Transposition table
-**Reason:** Low expected hit rate. The (board0, board1, current_row, pending_claims,
-actor_index) state tuple is nearly always unique — two paths producing the same
-board layout requires the same tiles placed in the same cells in the same order,
-which is rare. Implementation cost is high (hashing two 225-cell boards). Skip.
+### SKIP → RECONSIDER (pending diagnosis): Transposition table
+**Original reason to skip:** Low expected hit rate. The (board0, board1,
+current_row, pending_claims, actor_index) state tuple is nearly always unique — two
+paths producing the same board layout requires the same tiles placed in the same
+cells in the same order, which is rare. Implementation cost is high (hashing two
+225-cell boards).
+
+**2026-07 update:** *leaf-level* memoization across the MCTS tree was tried and
+abandoned — `solve_endgame_ab_value_cached` is dead code, and `deck0_draft_dp.rs`
+(with an `EndgameKey`→value cache) is an experimental deck-0 benchmark only, not on
+the training path. A *within-single-root-solve* transposition table is a different
+question and is on the candidate-lever list, but only if tail diagnosis
+(`endgame_solver_harness.py`) shows meaningful in-solve transposition; otherwise it
+stays skipped.
 
 ### DONE: Rust-side BatchedMCTS hook (solver called from `BatchedMCTS` tick)
 **Status:** Done
@@ -650,12 +737,23 @@ The original implementation-order section served its purpose and is now historic
 | OPT-6 root-only Rayon/YBW | Reduced worst-case wall-clock but inflated nodes on some pruning-dependent positions | Done; mixed result |
 | Rust BatchedMCTS hook | Wired exact solving into the batched open-loop training path | Done |
 
-Remaining forward-looking items:
+Remaining forward-looking items (see the 2026-07 Status Update at the top for the
+current tail-reduction plan and its position-sourcing constraints):
 
+- **Tail diagnosis (active next step):** use `endgame_solver_harness.py` to
+  characterize the draft-axis vs placement-axis split of the timeout tail on
+  faithful `--exact_fallback_positions` positions, then pick a lever below.
+- **Policy-prior move ordering:** the one untried ordering signal (all existing
+  orderings are hand-crafted). Strongest candidate if the tail is ordering-bound
+  rather than raw-branching-bound; couples the solver to the net, so only worth it
+  if diagnosis says ordering is the bottleneck.
+- **Within-single-solve transposition table:** reconsider the SKIP below *for one
+  root solve* (not the abandoned leaf-level `solve_endgame_ab_value_cached`).
+- **Aspiration / iterative-deepening** on the raw margin: cheap, ordering-agnostic.
 - **OPT-5 undo/redo state mutation:** likely allocation/time reduction, but higher correctness risk; build only with strong equivalence tests.
 - **OPT-7 incremental score tracking:** profile first; only worth building if terminal `board.score()` is a meaningful share of solver time.
 - **Recursive-depth YBW / deeper parallelism:** candidate for advisor p99 latency; root-only YBW was not enough for sub-second p99.
-- **Fallback diagnostics / hard-position reanalysis:** log high-budget fallbacks and replay offline to distinguish true complexity from pruning failures.
+- **Fallback diagnostics / hard-position reanalysis:** enable `--exact_fallback_positions` to persist high-budget fallbacks, then `endgame_solver_harness.py analyze` them offline to distinguish true complexity from pruning failures.
 
 ---
 
@@ -836,21 +934,28 @@ labels are most reliable.
   iterations to confirm the oversampling is taking effect (≈33% at weight 2.0 on a
   20%-endgame buffer).
 
-All exact values use `terminal_search_value` — the single source of truth:
+All exact values use `terminal_search_value` — the single source of truth
+(win-gated form, 2026-07):
 
 ```
 own_norm  = score_p0 / score_scale
 opp_norm  = score_p1 / score_scale
 margin    = tanh((own_norm - opp_norm) * margin_gain)
 win_value = +1.0 / -1.0 / 0.0
-result    = alpha * margin + (1 - alpha) * win_value
+win_gate  = win_value^4                       # (w*w)*(w*w); = 1 decided, 0 draw
+result    = (1 - alpha) * win_value + alpha * win_gate * margin
 ```
+
+At a terminal, `win_value ∈ {-1,0,+1}` so `win_gate` is 1 exactly when a margin
+exists — the result is therefore **numerically identical to the old
+`alpha*margin + (1-alpha)*win` blend** for any decided position, and 0 for a draw.
+Exact-solve values, minimax rankings, and alpha-beta pruning are unchanged.
 
 **Always returns player-0 frame.** Caller negates if needed for player-1 context.
 
-Config values: `score_scale=100.0`, `margin_gain=2.0`  
-Training: `alpha=0.8` (margin-dominant, matches training leaf value)  
-Eval/advisor: `alpha=0.0` (pure win probability, matches eval sweep winner)
+Config values: `score_scale=160.0`, `margin_gain=2.0`  
+Training: `alpha=0.5` (B: reserved margin band in the win-gated value)  
+Eval/advisor: `alpha=0.0` (pure win value; also prunes ~2× better — see tail notes)
 
 The Rust `terminal_search_value` is verified bit-identical to the Python version.
 
@@ -979,6 +1084,8 @@ File: `games/kingdomino/test_endgame_exact.py`
 | `games/kingdomino/mcts_az.py` | Python `OpenLoopMCTS` exact hook: `exact_endgame_enabled`, `exact_endgame_max_hidden_tiles`, `exact_endgame_max_secs`, `_should_exact_solve`, solve counters (`_exact_solve_count`/`_exact_cache_hits`/`_exact_fallback_count`), root gate, and the three-state `OpenLoopNode.exact_value` cache (`None`/float/`_EXACT_UNSOLVABLE`) with give-up-on-timeout |
 | `games/kingdomino/self_play.py` | Batched training wiring: `SelfPlayConfig.exact_endgame_max_secs`, CLI `--exact_endgame_max_secs`, pass-through into Rust `BatchedMCTS`; exact-solver aggregate stats and split attempt/fallback stats in the JSONL log row + `_compact_summary`; endgame oversampling (`ReplayBuffer.sample_batch(endgame_oversample_weight=...)` with cached weights, `SelfPlayConfig.endgame_oversample`, CLI `--endgame_oversample`, `n_endgame_in_batch` diagnostic) |
 | `games/kingdomino/test_endgame_exact.py` | Exact solver test suite, currently 21 tests including Rust deck=0/deck=4 agreement, alpha-beta correctness, solve-once cache, BatchedMCTS integration, policy validity, fallback counters, and value sanity checks |
+| `games/kingdomino/endgame_solver_harness.py` | **(2026-07)** Tail-diagnosis harness. `generate` snapshots + measures no-chance endgame roots into a JSONL corpus (from_parts / fallback-sidecar format); `analyze` reports the tail distribution, timeout rate by budget, placement-axis vs draft-axis hardness split, and a two-ordering value-equivalence guard. Reads run-produced `--exact_fallback_positions` files too |
+| `games/kingdomino/kingdomino_rust/src/deck0_draft_dp.rs` | **(experimental, not training path)** deck-0 separable / DP leaf-solving benchmark; preserves the K-sweep prototype |
 | `games/kingdomino/print_model_contract.py` | Milestone 0 contract checker; adjacent project artifact, not part of exact solving |
 
 
