@@ -2442,6 +2442,355 @@ fn solve_endgame_ab_parallel(
     Ok(Some(best_val))
 }
 
+// ─── Solver-state hashing + transposition diagnostics ───────────────────────
+//
+// State identity for the solver mirrors `EndgameKey`: boards (terrain+crowns),
+// phase, actor_index, sorted deck, current_row, pending_claims, next_claims.
+// `discards` is deliberately excluded — it feeds encoder features only, never
+// scores or legal actions, so two states differing only in discards are
+// solver-identical. harmony/middle_kingdom/castle are constant within a game
+// and every hash consumer is scoped to a single game's solve.
+
+/// Serialize the solver-relevant state into `buf` (cleared first). Length
+/// prefixes guard against aliasing across the variable-length sections.
+fn solver_state_bytes(state: &RustGameState, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.push(state.phase);
+    buf.push(state.actor_index as u8);
+    let mut deck = state.deck.clone();
+    deck.sort_unstable();
+    buf.push(deck.len() as u8);
+    for d in &deck {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    buf.push(state.current_row.len() as u8);
+    for d in &state.current_row {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    buf.push(state.pending_claims.len() as u8);
+    for &(p, d) in &state.pending_claims {
+        buf.push(p);
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    buf.push(state.next_claims.len() as u8);
+    for &(p, d) in &state.next_claims {
+        buf.push(p);
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    for b in &state.boards {
+        buf.extend_from_slice(&b.terrain);
+        buf.extend_from_slice(&b.crowns);
+    }
+}
+
+/// 128-bit xxh3 hash of the solver-relevant state. At the scale of one root
+/// solve (≤ tens of millions of distinct states) the collision probability of a
+/// 128-bit hash is negligible, which is what lets the TT / diagnostics compare
+/// hashes instead of full 1KB `EndgameKey`s.
+fn solver_state_hash128(state: &RustGameState, buf: &mut Vec<u8>) -> u128 {
+    solver_state_bytes(state, buf);
+    xxhash_rust::xxh3::xxh3_128(buf)
+}
+
+// ─── Within-single-solve transposition table ────────────────────────────────
+//
+// The endgame solver always searches to GAME_OVER, so a stored EXACT value is
+// the true minimax value of the state — valid on every re-visit regardless of
+// path or remaining depth (no depth field needed, unlike depth-limited chess
+// TTs). LOWER/UPPER entries are fail-soft bounds produced by window cutoffs.
+//
+// Scope: ONE root solve (all children of one root share a table; the plan
+// cascade reuses it across the endgame's successive roots). Never persisted
+// across games. Diagnosis on the real fallback corpus measured 62-86% of
+// interior visits re-entering already-seen states (pick-order permutations
+// collapse 4x per selection round via advance_round's next_claims sort), which
+// is what justifies the probe/insert cost.
+
+/// TT value classification. For the mover-agnostic player-0-frame margin value:
+/// Exact = true minimax value; Lower = value >= stored (fail high);
+/// Upper = value <= stored (fail low).
+#[derive(Clone, Copy, PartialEq)]
+enum TTFlag {
+    Exact,
+    Lower,
+    Upper,
+}
+
+/// Sharded transposition table, safe for concurrent use by parallel sibling
+/// solves (rayon). 64 mutex shards keep contention negligible against the
+/// ~1µs/node solve work. Inserts stop at `cap` entries (probes continue), so
+/// one pathological solve cannot grow memory unboundedly.
+struct TranspositionTable {
+    shards: Vec<std::sync::Mutex<HashMap<u128, (f64, TTFlag)>>>,
+    cap_per_shard: usize,
+}
+
+const TT_SHARDS: usize = 64;
+/// ~4M entries total ≈ 130MB worst case ((16+8+1+pad)*4M + HashMap overhead) —
+/// bounded and short-lived (freed when the root solve returns).
+const TT_CAP_TOTAL: usize = 4_000_000;
+
+impl TranspositionTable {
+    fn new() -> Self {
+        TranspositionTable {
+            shards: (0..TT_SHARDS)
+                .map(|_| std::sync::Mutex::new(HashMap::new()))
+                .collect(),
+            cap_per_shard: TT_CAP_TOTAL / TT_SHARDS,
+        }
+    }
+
+    #[inline]
+    fn shard(&self, key: u128) -> &std::sync::Mutex<HashMap<u128, (f64, TTFlag)>> {
+        &self.shards[(key as usize) & (TT_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn probe(&self, key: u128) -> Option<(f64, TTFlag)> {
+        self.shard(key).lock().unwrap().get(&key).copied()
+    }
+
+    #[inline]
+    fn store(&self, key: u128, value: f64, flag: TTFlag) {
+        let mut m = self.shard(key).lock().unwrap();
+        if let Some(slot) = m.get_mut(&key) {
+            // Never let a bound clobber an Exact entry (parallel siblings can
+            // finish the same state with different windows); among bounds of
+            // the same kind keep the tighter one.
+            let keep = match (slot.1, flag) {
+                (TTFlag::Exact, _) => true,
+                (_, TTFlag::Exact) => false,
+                (TTFlag::Lower, TTFlag::Lower) => slot.0 >= value,
+                (TTFlag::Upper, TTFlag::Upper) => slot.0 <= value,
+                _ => true, // mixed bounds: keep the incumbent (either is valid)
+            };
+            if !keep {
+                *slot = (value, flag);
+            }
+        } else if m.len() < self.cap_per_shard {
+            m.insert(key, (value, flag));
+        }
+    }
+}
+
+/// `solve_endgame_ab` + transposition table. Traversal, ordering, deadline and
+/// fail-soft window semantics are identical; the TT adds:
+///   probe — Exact hit returns immediately; Lower/Upper hits tighten the
+///   window (standard TT window narrowing) and may cut off;
+///   store — the returned best is classified against the ORIGINAL window:
+///   fail-low (best <= alpha_in) → Upper, fail-high (best >= beta) → Lower,
+///   else Exact.
+/// Correctness contract (weaker than bit-identical traversal, sufficient for
+/// every caller): the returned value is a valid fail-soft alpha-beta result
+/// for the caller's window — in particular a FULL-window call returns the
+/// true minimax value, identical to the untabled solver. Interior fail-high/
+/// fail-low returns may differ from the untabled search's fail-soft values
+/// (a TT bound hit returns the stored bound), which alpha-beta treats
+/// equivalently. States never repeat within a game (tiles only accumulate),
+/// so there is no graph-history/path-dependence hazard.
+#[allow(clippy::too_many_arguments)]
+fn solve_endgame_ab_tt(
+    state: &RustGameState,
+    deadline: std::time::Instant,
+    mut alpha: f64,
+    mut beta: f64,
+    mode: SolverOrderMode,
+    depth: u32,
+    tt: &TranspositionTable,
+    buf: &mut Vec<u8>,
+) -> PyResult<Option<f64>> {
+    if state.phase == GAME_OVER {
+        let (s0, s1) = state.scores();
+        return Ok(Some((s0 - s1) as f64));
+    }
+    if std::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+
+    let key = solver_state_hash128(state, buf);
+    if let Some((v, flag)) = tt.probe(key) {
+        match flag {
+            TTFlag::Exact => return Ok(Some(v)),
+            TTFlag::Lower => {
+                if v >= beta {
+                    return Ok(Some(v));
+                }
+                if v > alpha {
+                    alpha = v;
+                }
+            }
+            TTFlag::Upper => {
+                if v <= alpha {
+                    return Ok(Some(v));
+                }
+                if v < beta {
+                    beta = v;
+                }
+            }
+        }
+    }
+
+    let actor = state.actor()?;
+    let mut legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "non-terminal state has no legal actions (phase={})",
+            state.phase
+        )));
+    }
+    order_legal_for_solver_at_depth(state, &mut legal, mode, depth)?;
+
+    // Fail-soft classification must use the window the search actually ran
+    // with — INCLUDING any TT probe tightening above — or a fail-low against
+    // a probe-raised alpha would be mis-stored as Exact.
+    let alpha_in = alpha;
+    let beta_in = beta;
+    let best = if actor == 0 {
+        let mut best = f64::NEG_INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab_tt(&child, deadline, alpha, beta, mode, depth + 1, tt, buf)? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v > best {
+                        best = v;
+                    }
+                    if best > alpha {
+                        alpha = best;
+                    }
+                    if alpha >= beta {
+                        break;
+                    }
+                }
+            }
+        }
+        best
+    } else {
+        let mut best = f64::INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab_tt(&child, deadline, alpha, beta, mode, depth + 1, tt, buf)? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v < best {
+                        best = v;
+                    }
+                    if best < beta {
+                        beta = best;
+                    }
+                    if beta <= alpha {
+                        break;
+                    }
+                }
+            }
+        }
+        best
+    };
+
+    let flag = if best <= alpha_in {
+        TTFlag::Upper
+    } else if best >= beta_in {
+        TTFlag::Lower
+    } else {
+        TTFlag::Exact
+    };
+    tt.store(key, best, flag);
+    Ok(Some(best))
+}
+
+/// Counters for `solve_endgame_ab_transpo`.
+#[derive(Default)]
+struct TranspoStats {
+    interior: u64,      // interior (non-terminal) nodes visited
+    terminals: u64,     // terminal leaves visited
+    dup_visits: u64,    // interior visits whose state was already seen
+    seen: HashSet<u128>,
+}
+
+/// Instrumented copy of `solve_endgame_ab`: identical traversal and value, plus
+/// per-interior-node state hashing into `stats.seen`. `dup_visits / interior`
+/// is the fraction of pruned-search work re-entering an already-visited state —
+/// the first-order estimate of what an EXACT-hit transposition table would skip
+/// (an underestimate of nothing: every node inside a re-entered subtree also
+/// counts as a duplicate). Diagnostic only; not on any hot path.
+#[allow(clippy::too_many_arguments)]
+fn solve_endgame_ab_transpo(
+    state: &RustGameState,
+    deadline: std::time::Instant,
+    mut alpha: f64,
+    mut beta: f64,
+    mode: SolverOrderMode,
+    depth: u32,
+    stats: &mut TranspoStats,
+    buf: &mut Vec<u8>,
+) -> PyResult<Option<f64>> {
+    if state.phase == GAME_OVER {
+        stats.terminals += 1;
+        let (s0, s1) = state.scores();
+        return Ok(Some((s0 - s1) as f64));
+    }
+    if std::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+    stats.interior += 1;
+    let h = solver_state_hash128(state, buf);
+    if !stats.seen.insert(h) {
+        stats.dup_visits += 1;
+    }
+
+    let actor = state.actor()?;
+    let mut legal = state.legal_actions_indexed();
+    if legal.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "non-terminal state has no legal actions (phase={})",
+            state.phase
+        )));
+    }
+    order_legal_for_solver_at_depth(state, &mut legal, mode, depth)?;
+
+    if actor == 0 {
+        let mut best = f64::NEG_INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab_transpo(&child, deadline, alpha, beta, mode, depth + 1, stats, buf)? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v > best {
+                        best = v;
+                    }
+                    if best > alpha {
+                        alpha = best;
+                    }
+                    if alpha >= beta {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Some(best))
+    } else {
+        let mut best = f64::INFINITY;
+        for &(_idx, p, pk) in &legal {
+            let child = state.step(p, pk)?;
+            match solve_endgame_ab_transpo(&child, deadline, alpha, beta, mode, depth + 1, stats, buf)? {
+                None => return Ok(None),
+                Some(v) => {
+                    if v < best {
+                        best = v;
+                    }
+                    if best < beta {
+                        beta = best;
+                    }
+                    if beta <= alpha {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Some(best))
+    }
+}
+
 /// Stable softmax over legal logits, matching encoder/mcts `_postprocess`
 /// (subtract max, exp, normalise) in f64.
 fn softmax_f64(logits: &[f64]) -> Vec<f64> {
@@ -3397,10 +3746,71 @@ enum SlotState {
 /// minimax-optimal move. own/opp/win and the value target `z` are NOT taken from
 /// here — the game plays out to GAME_OVER under exact-optimal moves, so they are
 /// filled from the real terminal scores at game end, exactly as for MCTS moves.
+/// How the exact root solve prices non-best children for the POLICY target.
+/// The root VALUE and the chosen (minimax-best) MOVE are exact in every mode —
+/// modes only trade per-child value precision for solve cost:
+///
+/// - `Exact`: every child solved full-window (the historical behavior). The
+///   policy label is the advantage-weighted softmax over exact child values.
+/// - `SoftClamp`: children within `clamp_delta` raw points of the best are
+///   solved exactly; the rest are only PROVEN at least `clamp_delta` worse
+///   (cheap fail-low search) and recorded at the clamp value `best ∓ delta`.
+///   Since the clamp can only raise a bad child's value, the label error is
+///   one-sided (dominated moves slightly overweighted) and bounded by the
+///   softmax weight at delta (~e^-3 relative when delta spans the range).
+/// - `ArgmaxTies`: integer margins let a 1-point window prove exact ties with
+///   the best; the label is uniform over the tied-best children, zero
+///   elsewhere. Cheapest mode (ablation arm for the label-shape question).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactPolicyMode {
+    Exact,
+    SoftClamp,
+    ArgmaxTies,
+}
+
+impl ExactPolicyMode {
+    fn from_str(s: &str) -> PyResult<Self> {
+        match s {
+            "exact" => Ok(Self::Exact),
+            "soft_clamp" => Ok(Self::SoftClamp),
+            "argmax_ties" => Ok(Self::ArgmaxTies),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown exact_policy_mode '{s}' (expected exact, soft_clamp, argmax_ties)"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ExactSolveResult {
-    /// (joint_index, minimax value player-0 frame) for ALL legal root actions.
+    /// (joint_index, value player-0 frame, training-value space) for ALL legal
+    /// root actions. Exact for the best child always; under SoftClamp/ArgmaxTies
+    /// dominated children hold their clamp value (an upper bound on how good
+    /// they are, from the mover's perspective).
     child_values: Vec<(u16, f64)>,
+    /// Label mode this result was solved under (drives `policy_target`).
+    policy_mode: ExactPolicyMode,
+    /// Children recorded at the clamp value instead of an exact value.
+    n_clamped: u16,
+}
+
+impl ExactSolveResult {
+    /// Build the policy training target for this solved root.
+    ///
+    /// Exact / SoftClamp use the advantage-weighted softmax
+    /// (`exact_policy_target`); ArgmaxTies is uniform over the proven-tied-best
+    /// children. SoftClamp label semantics: with the range compressed to the
+    /// clamp distance, the softmax temperature anchors to Δ instead of the
+    /// true (unsolved) range — near-best discrimination is Δ-scaled ("3 points
+    /// worse" always means the same weight ratio), whereas the Exact label's
+    /// sharpness varies with how bad the worst legal move happens to be. All
+    /// clamped children collapse to the recorded worst and share one weight.
+    fn policy_target(&self, actor: u8) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+        match self.policy_mode {
+            ExactPolicyMode::ArgmaxTies => exact_policy_target_ties(&self.child_values, actor),
+            _ => exact_policy_target(&self.child_values, actor),
+        }
+    }
 }
 
 struct ExactPlanItem {
@@ -3647,8 +4057,7 @@ impl SearchSlot {
             chosen,
         ) = if let Some(exact) = exact {
             // ── Exact endgame path: policy + move from minimax child values ──
-            let (policy_idx, policy_val, legal_idx) =
-                exact_policy_target(&exact.child_values, actor);
+            let (policy_idx, policy_val, legal_idx) = exact.policy_target(actor);
             // The optimal move is unambiguous; always play the minimax-best child
             // (temperature does not apply — there is a single correct answer).
             let best = if actor == 0 {
@@ -3912,6 +4321,37 @@ fn exact_policy_target(child_values: &[(u16, f64)], actor: u8) -> (Vec<i32>, Vec
     (policy_idx, policy_val, legal_idx)
 }
 
+/// ArgmaxTies policy target: uniform over the children whose value exactly
+/// equals the best, zero elsewhere. Exact f64 equality is sound here because
+/// tied children share the same integer raw margin, and
+/// `margin_to_training_value` maps identical inputs to identical bits.
+fn exact_policy_target_ties(
+    child_values: &[(u16, f64)],
+    actor: u8,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let legal_idx: Vec<i32> = child_values.iter().map(|&(idx, _)| idx as i32).collect();
+    let v_best = if actor == 0 {
+        child_values
+            .iter()
+            .map(|&(_, v)| v)
+            .fold(f64::NEG_INFINITY, f64::max)
+    } else {
+        child_values
+            .iter()
+            .map(|&(_, v)| v)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let ties: Vec<u16> = child_values
+        .iter()
+        .filter(|&&(_, v)| v == v_best)
+        .map(|&(idx, _)| idx)
+        .collect();
+    let w = 1.0f32 / ties.len() as f32;
+    let policy_idx: Vec<i32> = ties.iter().map(|&idx| idx as i32).collect();
+    let policy_val: Vec<f32> = vec![w; ties.len()];
+    (policy_idx, policy_val, legal_idx)
+}
+
 fn endgame_key(state: &RustGameState) -> EndgameKey {
     let mut deck = state.deck.clone();
     deck.sort_unstable();
@@ -3985,59 +4425,188 @@ fn solve_root_exact_cached(
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
-    value_cache: &mut HashMap<EndgameKey, f64>,
+    policy_mode: ExactPolicyMode,
+    clamp_delta: f64,
     result_cache: &mut HashMap<EndgameKey, ExactSolveResult>,
 ) -> PyResult<Option<ExactSolveResult>> {
     let key = endgame_key(state);
     if let Some(result) = result_cache.get(&key) {
         return Ok(Some(result.clone()));
     }
+    match solve_root_exact(
+        state,
+        deadline,
+        score_scale,
+        margin_gain,
+        alpha_param,
+        SolverOrderMode::Lookahead2Clustered,
+        policy_mode,
+        clamp_delta,
+    )? {
+        Some(result) => {
+            result_cache.insert(key, result.clone());
+            Ok(Some(result))
+        }
+        None => Ok(None),
+    }
+}
 
+/// Solve one exact root under `policy_mode` (see `ExactPolicyMode`).
+///
+/// - `Exact`: every child solved with a full window IN PARALLEL — verbatim the
+///   historical behavior (bit-identical child values and policy labels).
+/// - `SoftClamp` / `ArgmaxTies`: the first (best-ordered) child is solved
+///   full-window serially to establish the bound `b0`, then the remaining
+///   children are solved in parallel with the one-sided window
+///   `(b0 - delta, +inf)` (mover-maximising frame; mirrored for the minimiser).
+///   Fail-soft: a sibling whose true value lies inside the window returns it
+///   exactly (including any that BEAT b0 — the final best is exact in every
+///   case); one outside fails cheaply and is recorded at the clamp value
+///   `best_final ∓ delta`, a valid upper bound on its worth to the mover.
+///
+/// The root value (best child) and minimax move are exact in all modes; the
+/// deadline is shared across all children, `Ok(None)` = budget exceeded.
+#[allow(clippy::too_many_arguments)]
+fn solve_root_exact(
+    state: &RustGameState,
+    deadline: std::time::Instant,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+    order_mode: SolverOrderMode,
+    policy_mode: ExactPolicyMode,
+    clamp_delta: f64,
+) -> PyResult<Option<ExactSolveResult>> {
     let mut legal = state.legal_actions_indexed();
     if legal.is_empty() {
         return Ok(None); // not GAME_OVER but no actions — fall back defensively
     }
-    let mode = SolverOrderMode::Lookahead2Clustered;
-    order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
+    order_legal_for_solver_at_depth(state, &mut legal, order_mode, 0)?;
 
     if std::time::Instant::now() >= deadline {
         return Ok(None);
     }
-    // Solve each root child with a full window (the exact per-child value is needed
-    // for the policy target) IN PARALLEL across cores. This is the YBW-style
-    // within-solve parallelism (mirrors solve_endgame_ab_parallel) that lets ONE
-    // endgame use the whole machine and finish within budget — the axis that
-    // actually matters for the per-solve wall-clock deadline. Children are
-    // independent (each owns its `next` state), so the shared value_cache is not
-    // threaded through here; cross-move reuse via `result_cache` below is
-    // unaffected. The solver returns the exact RAW margin per child; convert to the
-    // (monotone) training value so argmax/argmin over children is unchanged.
-    let _ = &value_cache; // intentionally unused by the parallel per-child solves
-    let child_results: Vec<PyResult<Option<(u16, f64)>>> = legal
+    let ttv = |raw: f64| margin_to_training_value(raw, score_scale, margin_gain, alpha_param);
+    // One transposition table for the WHOLE root solve: sibling subtrees
+    // overlap heavily (62-86% duplicate interior visits measured on the real
+    // fallback corpus), so sharing it across children attacks the same
+    // redundancy that made per-child solving ~11x a value-only solve.
+    let tt = TranspositionTable::new();
+
+    if policy_mode == ExactPolicyMode::Exact || legal.len() == 1 {
+        // Historical path: every child full-window, all in parallel.
+        let child_results: Vec<PyResult<Option<(u16, f64)>>> = legal
+            .par_iter()
+            .map(
+                |&(joint_idx, placement, pick)| -> PyResult<Option<(u16, f64)>> {
+                    let next = state.step(placement, pick)?;
+                    let mut buf = Vec::with_capacity(1024);
+                    match solve_endgame_ab_tt(
+                        &next, deadline, MARGIN_LO, MARGIN_HI, order_mode, 0, &tt, &mut buf,
+                    )? {
+                        Some(raw_margin) => Ok(Some((joint_idx, ttv(raw_margin)))),
+                        None => Ok(None),
+                    }
+                },
+            )
+            .collect();
+        let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
+        for r in child_results {
+            match r? {
+                Some(cv) => child_values.push(cv),
+                None => return Ok(None), // a child hit the deadline → whole solve fails
+            }
+        }
+        return Ok(Some(ExactSolveResult {
+            child_values,
+            policy_mode,
+            n_clamped: 0,
+        }));
+    }
+
+    let actor = state.actor()?;
+    let delta = if policy_mode == ExactPolicyMode::ArgmaxTies {
+        // Integer raw margins: a 1-point window separates exact ties from
+        // strictly-worse children.
+        1.0
+    } else {
+        clamp_delta
+    };
+
+    // First (best-ordered) child: serial, full window → exact bound b0.
+    let (_i0, p0, pk0) = legal[0];
+    let first = state.step(p0, pk0)?;
+    let mut buf0 = Vec::with_capacity(1024);
+    let Some(v0) = solve_endgame_ab_tt(
+        &first, deadline, MARGIN_LO, MARGIN_HI, order_mode, 0, &tt, &mut buf0,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // Siblings: parallel, one-sided window `delta` beyond b0 on the mover's
+    // losing side. Fail-soft classification below distinguishes exact returns
+    // from bound returns.
+    let (w_lo, w_hi) = if actor == 0 {
+        ((v0 - delta).max(MARGIN_LO), MARGIN_HI)
+    } else {
+        (MARGIN_LO, (v0 + delta).min(MARGIN_HI))
+    };
+    let sibling_results: Vec<PyResult<Option<(u16, f64)>>> = legal[1..]
         .par_iter()
         .map(
             |&(joint_idx, placement, pick)| -> PyResult<Option<(u16, f64)>> {
                 let next = state.step(placement, pick)?;
-                match solve_endgame_ab(&next, deadline, MARGIN_LO, MARGIN_HI, mode, 0)? {
-                    Some(raw_margin) => Ok(Some((
-                        joint_idx,
-                        margin_to_training_value(raw_margin, score_scale, margin_gain, alpha_param),
-                    ))),
-                    None => Ok(None),
-                }
+                let mut buf = Vec::with_capacity(1024);
+                Ok(
+                    solve_endgame_ab_tt(&next, deadline, w_lo, w_hi, order_mode, 0, &tt, &mut buf)?
+                        .map(|raw| (joint_idx, raw)),
+                )
             },
         )
         .collect();
-    let mut child_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
-    for r in child_results {
+    let mut raw_values: Vec<(u16, f64)> = Vec::with_capacity(legal.len());
+    raw_values.push((legal[0].0, v0));
+    for r in sibling_results {
         match r? {
-            Some(cv) => child_values.push(cv),
-            None => return Ok(None), // a child hit the deadline → whole solve fails
+            Some(rv) => raw_values.push(rv),
+            None => return Ok(None),
         }
     }
-    let result = ExactSolveResult { child_values };
-    result_cache.insert(key, result.clone());
-    Ok(Some(result))
+
+    // Fail-soft: exact iff the return lies strictly inside the window on the
+    // mover's losing side (the winning side is unbounded, so any improvement
+    // over b0 — including the final best — is exact).
+    let is_exact = |r: f64| if actor == 0 { r > w_lo } else { r < w_hi };
+    let b_final = raw_values
+        .iter()
+        .filter(|&&(_, r)| is_exact(r))
+        .map(|&(_, r)| r)
+        .fold(if actor == 0 { f64::NEG_INFINITY } else { f64::INFINITY }, |acc, r| {
+            if actor == 0 { acc.max(r) } else { acc.min(r) }
+        });
+    let clamp_raw = if actor == 0 {
+        b_final - delta
+    } else {
+        b_final + delta
+    };
+    let mut n_clamped: u16 = 0;
+    let child_values: Vec<(u16, f64)> = raw_values
+        .iter()
+        .map(|&(idx, r)| {
+            if is_exact(r) {
+                (idx, ttv(r))
+            } else {
+                n_clamped += 1;
+                (idx, ttv(clamp_raw))
+            }
+        })
+        .collect();
+    Ok(Some(ExactSolveResult {
+        child_values,
+        policy_mode,
+        n_clamped,
+    }))
 }
 
 /// A dispatched endgame solve (Step 1.5 async path): an owned snapshot of the
@@ -4083,6 +4652,8 @@ fn spawn_endgame_solver(
     score_scale: f64,
     margin_gain: f64,
     alpha: f64,
+    policy_mode: ExactPolicyMode,
+    clamp_delta: f64,
     solver_pool: rayon::ThreadPool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -4103,7 +4674,15 @@ fn spawn_endgame_solver(
             // count is the gen/solver core split (solver_cpus); generation gets the
             // rest via the global pool.
             let (result, n_solved) = solver_pool.install(move || {
-                match solve_exact_plan(&state, max_secs, score_scale, margin_gain, alpha) {
+                match solve_exact_plan(
+                    &state,
+                    max_secs,
+                    score_scale,
+                    margin_gain,
+                    alpha,
+                    policy_mode,
+                    clamp_delta,
+                ) {
                     Ok(Some(plan)) if !plan.is_empty() => {
                         let n = plan.len() as u64;
                         match play_out_exact_endgame(state, records, game_seed, plan) {
@@ -4153,7 +4732,7 @@ fn play_out_exact_endgame(
         let exact = item.result;
         let actor = state.actor()?;
         let (my, opp, flat) = state.encode_arrays(actor)?;
-        let (policy_idx, policy_val, legal_idx) = exact_policy_target(&exact.child_values, actor);
+        let (policy_idx, policy_val, legal_idx) = exact.policy_target(actor);
         // Optimal move is unambiguous: minimax-best child (no temperature).
         let best = if actor == 0 {
             exact
@@ -4219,13 +4798,14 @@ fn solve_exact_plan(
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
+    policy_mode: ExactPolicyMode,
+    clamp_delta: f64,
 ) -> PyResult<Option<Vec<ExactPlanItem>>> {
     let mut cur = state.cloned();
     // One shared deadline for the whole endgame cascade from this root. The plan
     // is built once and reused (cache hits) for the deterministic continuation,
     // so this bounds the once-per-game expensive solve, not each move.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(max_secs);
-    let mut value_cache: HashMap<EndgameKey, f64> = HashMap::new();
     let mut result_cache: HashMap<EndgameKey, ExactSolveResult> = HashMap::new();
     let mut plan = Vec::new();
 
@@ -4239,7 +4819,8 @@ fn solve_exact_plan(
             score_scale,
             margin_gain,
             alpha_param,
-            &mut value_cache,
+            policy_mode,
+            clamp_delta,
             &mut result_cache,
         )? {
             Some(r) => r,
@@ -4258,6 +4839,220 @@ fn solve_exact_plan(
         cur = cur.step(placement, pick)?;
     }
     Ok(Some(plan))
+}
+
+#[cfg(test)]
+mod solver_restructure_tests {
+    use super::*;
+
+    /// Play a random game to its first no-chance endgame root (deck ∈ {0,4}).
+    fn first_endgame_root(seed: u64) -> Option<RustGameState> {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xE17D);
+        let mut state = new_game(seed, true, true);
+        for _ in 0..200 {
+            if state.phase == GAME_OVER {
+                return None;
+            }
+            if is_no_chance_endgame_state(&state) && state.legal_actions_indexed().len() >= 2 {
+                return Some(state);
+            }
+            let legal = state.legal_actions_indexed();
+            let &(_i, p, pk) = legal.choose(&mut rng)?;
+            state = state.step(p, pk).ok()?;
+        }
+        None
+    }
+
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    /// TT solver == plain solver on full-window solves (true minimax value).
+    #[test]
+    fn tt_solver_matches_plain_full_window() -> PyResult<()> {
+        let mode = SolverOrderMode::Lookahead2Clustered;
+        let mut checked = 0;
+        for seed in 0..24u64 {
+            let Some(root) = first_endgame_root(seed) else {
+                continue;
+            };
+            let plain = solve_endgame_ab(&root, far_deadline(), MARGIN_LO, MARGIN_HI, mode, 0)?
+                .expect("plain solve");
+            let tt = TranspositionTable::new();
+            let mut buf = Vec::new();
+            let tabled = solve_endgame_ab_tt(
+                &root,
+                far_deadline(),
+                MARGIN_LO,
+                MARGIN_HI,
+                mode,
+                0,
+                &tt,
+                &mut buf,
+            )?
+            .expect("tt solve");
+            assert_eq!(plain, tabled, "seed {seed}: TT value diverged");
+            checked += 1;
+        }
+        assert!(checked >= 5, "too few endgame roots reached ({checked})");
+        Ok(())
+    }
+
+    /// All three policy modes agree on the root value and the minimax-best
+    /// child set; soft_clamp only ever RAISES dominated children's values.
+    #[test]
+    fn policy_modes_agree_on_value_and_move() -> PyResult<()> {
+        let mode = SolverOrderMode::Lookahead2Clustered;
+        let mut checked = 0;
+        for seed in 0..24u64 {
+            let Some(root) = first_endgame_root(seed) else {
+                continue;
+            };
+            let actor = root.actor()?;
+            let best_of = |r: &ExactSolveResult| -> f64 {
+                r.child_values
+                    .iter()
+                    .map(|&(_, v)| v)
+                    .fold(if actor == 0 { f64::NEG_INFINITY } else { f64::INFINITY }, |a, v| {
+                        if actor == 0 { a.max(v) } else { a.min(v) }
+                    })
+            };
+            let solve = |pm: ExactPolicyMode| -> PyResult<ExactSolveResult> {
+                Ok(solve_root_exact(
+                    &root,
+                    far_deadline(),
+                    160.0,
+                    2.0,
+                    0.5,
+                    mode,
+                    pm,
+                    10.0,
+                )?
+                .expect("root solve"))
+            };
+            let exact = solve(ExactPolicyMode::Exact)?;
+            let clamp = solve(ExactPolicyMode::SoftClamp)?;
+            let ties = solve(ExactPolicyMode::ArgmaxTies)?;
+            let (vb_e, vb_c, vb_t) = (best_of(&exact), best_of(&clamp), best_of(&ties));
+            assert_eq!(vb_e, vb_c, "seed {seed}: soft_clamp root value diverged");
+            assert_eq!(vb_e, vb_t, "seed {seed}: argmax_ties root value diverged");
+            // Same tied-best child set in every mode.
+            let bestset = |r: &ExactSolveResult, vb: f64| -> Vec<u16> {
+                let mut v: Vec<u16> = r
+                    .child_values
+                    .iter()
+                    .filter(|&&(_, cv)| cv == vb)
+                    .map(|&(i, _)| i)
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(bestset(&exact, vb_e), bestset(&clamp, vb_c), "seed {seed}");
+            assert_eq!(bestset(&exact, vb_e), bestset(&ties, vb_t), "seed {seed}");
+            // Clamp error is one-sided: recorded >= exact for the maximiser's
+            // dominated children (mirrored for the minimiser).
+            let exact_map: HashMap<u16, f64> = exact.child_values.iter().copied().collect();
+            for &(idx, v) in &clamp.child_values {
+                let ev = exact_map[&idx];
+                if actor == 0 {
+                    assert!(v >= ev - 1e-12, "seed {seed}: clamp lowered child {idx}");
+                } else {
+                    assert!(v <= ev + 1e-12, "seed {seed}: clamp lowered child {idx}");
+                }
+            }
+            // ArgmaxTies label: uniform over ties, nothing else.
+            let (pidx, pval, _legal) = ties.policy_target(actor);
+            let nb = bestset(&ties, vb_t).len();
+            assert_eq!(pidx.len(), nb, "seed {seed}: ties label size");
+            for &w in &pval {
+                assert!((w - 1.0 / nb as f32).abs() < 1e-6, "seed {seed}: not uniform");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "too few endgame roots reached ({checked})");
+        Ok(())
+    }
+
+    /// SoftClamp label guarantees: same argmax move as the Exact label; all
+    /// clamped children collapse to one shared weight that never exceeds any
+    /// exact-band child's weight.
+    #[test]
+    fn soft_clamp_label_argmax_and_tail_shape() -> PyResult<()> {
+        let mode = SolverOrderMode::Lookahead2Clustered;
+        let mut checked_with_clamp = 0;
+        for seed in 0..24u64 {
+            let Some(root) = first_endgame_root(seed) else {
+                continue;
+            };
+            let actor = root.actor()?;
+            let solve = |pm: ExactPolicyMode| -> PyResult<ExactSolveResult> {
+                Ok(
+                    solve_root_exact(&root, far_deadline(), 160.0, 2.0, 0.5, mode, pm, 10.0)?
+                        .expect("root solve"),
+                )
+            };
+            let clamp = solve(ExactPolicyMode::SoftClamp)?;
+            if clamp.n_clamped == 0 {
+                continue;
+            }
+            checked_with_clamp += 1;
+            let exact = solve(ExactPolicyMode::Exact)?;
+            let (ci, cv, _) = clamp.policy_target(actor);
+            let (ei, ev, _) = exact.policy_target(actor);
+            let argmax = |idx: &[i32], val: &[f32]| -> i32 {
+                idx.iter()
+                    .zip(val)
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(&i, _)| i)
+                    .unwrap()
+            };
+            assert_eq!(
+                argmax(&ci, &cv),
+                argmax(&ei, &ev),
+                "seed {seed}: clamped label argmax diverged from exact"
+            );
+            // Clamped children all sit at the recorded worst → equal weights,
+            // and no clamped child outweighs the best move.
+            let exact_map: HashMap<u16, f64> = exact.child_values.iter().copied().collect();
+            let clamp_map: HashMap<u16, f64> = clamp.child_values.iter().copied().collect();
+            // Children whose recorded value differs from the exact one are
+            // necessarily clamped; the converse can fail (a fail-low child
+            // whose true value happens to EQUAL the clamp value is counted in
+            // n_clamped but invisible here), so subset — not equality.
+            let clamped_ids: Vec<u16> = clamp
+                .child_values
+                .iter()
+                .filter(|&&(idx, v)| v != exact_map[&idx])
+                .map(|&(idx, _)| idx)
+                .collect();
+            assert!(
+                clamped_ids.len() <= clamp.n_clamped as usize,
+                "seed {seed}: {} value-diffs > n_clamped {}",
+                clamped_ids.len(),
+                clamp.n_clamped
+            );
+            let cw_map: HashMap<i32, f32> = ci.iter().copied().zip(cv.iter().copied()).collect();
+            let max_w = cv.iter().cloned().fold(f32::MIN, f32::max);
+            let mut clamped_w: Option<f32> = None;
+            for &cid in &clamped_ids {
+                // All clamped children share one recorded value → one weight.
+                let w = cw_map.get(&(cid as i32)).copied().unwrap_or(0.0);
+                if let Some(prev) = clamped_w {
+                    assert!((w - prev).abs() < 1e-6, "seed {seed}: clamped weights differ");
+                } else {
+                    clamped_w = Some(w);
+                }
+                assert!(w <= max_w + 1e-6, "seed {seed}: clamped child outweighs best");
+                let same_val = clamp_map[&cid];
+                let _ = same_val;
+            }
+        }
+        assert!(
+            checked_with_clamp >= 2,
+            "too few clamped roots exercised ({checked_with_clamp})"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -4459,6 +5254,12 @@ struct BatchedMCTS {
     // Exact endgame solver (deck ∈ {0,4} roots). Per-position wall-clock budget
     // in seconds; <= 0.0 disables it (ablation).
     exact_endgame_max_secs: f64,
+    // How exact roots price dominated children for the policy label (see
+    // ExactPolicyMode). Root value + chosen move are exact in every mode.
+    exact_policy_mode: ExactPolicyMode,
+    // SoftClamp threshold in raw margin points: children proven at least this
+    // far below the best are recorded at the clamp value instead of solved.
+    exact_clamp_delta: f64,
     cum_exact_solve_count: u64,      // root moves solved exactly
     cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
     cum_exact_cache_hit_count: u64,  // exact moves served from a precomputed plan
@@ -4704,7 +5505,8 @@ impl BatchedMCTS {
                         exact_endgame_max_secs=3.0, async_solve=false, solver_cpus=0,
                         playout_cap_randomization=false, full_search_fraction=0.25,
                         fast_move_sims=100, record_fast_moves=false,
-                        fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0))]
+                        fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0,
+                        exact_policy_mode="soft_clamp", exact_clamp_delta=10.0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -4732,7 +5534,16 @@ impl BatchedMCTS {
         record_fast_moves: bool,
         fast_move_dirichlet_eps: f64,
         fast_move_temp_moves: usize,
+        exact_policy_mode: &str,
+        exact_clamp_delta: f64,
     ) -> Self {
+        let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
+            .expect("BatchedMCTS: invalid exact_policy_mode");
+        assert!(
+            exact_clamp_delta > 0.0,
+            "BatchedMCTS: exact_clamp_delta must be > 0, got {}",
+            exact_clamp_delta
+        );
         // Misconfigured callers: cheap one-time hard checks (assert!, not
         // debug_assert!) at construction so a bad config fails loudly up front
         // rather than producing degenerate searches or div-by-zero later.
@@ -4806,6 +5617,8 @@ impl BatchedMCTS {
             score_scale,
             margin_gain,
             alpha,
+            exact_policy_mode,
+            exact_clamp_delta,
             solver_pool,
         );
         BatchedMCTS {
@@ -4837,6 +5650,8 @@ impl BatchedMCTS {
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
             exact_endgame_max_secs,
+            exact_policy_mode,
+            exact_clamp_delta,
             cum_exact_solve_count: 0,
             cum_exact_tree_solve_count: 0,
             cum_exact_cache_hit_count: 0,
@@ -5082,6 +5897,8 @@ impl BatchedMCTS {
                 score_scale,
                 margin_gain,
                 val_alpha,
+                self.exact_policy_mode,
+                self.exact_clamp_delta,
             )? {
                 Some(plan) if !plan.is_empty() => {
                     // Accounting matches the old per-move loop: one tree solve per
@@ -6564,6 +7381,151 @@ mod kingdomino_rust {
                 Ok((value, true, start.elapsed().as_secs_f64()))
             }
             None => Ok((0.0, false, start.elapsed().as_secs_f64())),
+        }
+    }
+
+    /// Transposition-rate diagnostic for a no-chance endgame root.
+    ///
+    /// Runs the SAME alpha-beta traversal as the production solver while
+    /// hashing every interior state, and reports how much of the pruned
+    /// search re-enters already-visited states — the evidence base for a
+    /// within-solve transposition table.
+    ///
+    /// `per_child_full_window=True` mirrors the production training-path root
+    /// solve (`solve_root_exact_cached`): every root child is solved with a
+    /// full window, sharing ONE seen-set, so cross-child state reuse counts as
+    /// duplicates. `False` measures a single serial full-window root solve.
+    ///
+    /// Returns (interior_nodes, terminal_nodes, distinct_states, dup_visits,
+    /// completed). On deadline the partial counts are still returned with
+    /// completed=False (dup shares of a partial traversal remain meaningful).
+    #[pyfunction]
+    #[pyo3(signature = (state, max_secs=10.0, ordering="lookahead2_clustered", per_child_full_window=true))]
+    fn measure_endgame_transpositions(
+        state: &RustGameState,
+        max_secs: f64,
+        ordering: &str,
+        per_child_full_window: bool,
+    ) -> PyResult<(u64, u64, u64, u64, bool)> {
+        if state.phase == GAME_OVER || !super::is_no_chance_endgame_state(state) {
+            return Err(PyValueError::new_err(
+                "requires a non-terminal no-chance endgame state (deck in {0,4})",
+            ));
+        }
+        let mode = super::SolverOrderMode::from_str(ordering)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(max_secs);
+        let mut stats = super::TranspoStats::default();
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        let completed = if per_child_full_window {
+            let mut legal = state.legal_actions_indexed();
+            super::order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
+            let mut done = true;
+            for &(_idx, p, pk) in &legal {
+                let child = state.step(p, pk)?;
+                if super::solve_endgame_ab_transpo(
+                    &child,
+                    deadline,
+                    super::MARGIN_LO,
+                    super::MARGIN_HI,
+                    mode,
+                    0,
+                    &mut stats,
+                    &mut buf,
+                )?
+                .is_none()
+                {
+                    done = false;
+                    break;
+                }
+            }
+            done
+        } else {
+            super::solve_endgame_ab_transpo(
+                state,
+                deadline,
+                super::MARGIN_LO,
+                super::MARGIN_HI,
+                mode,
+                0,
+                &mut stats,
+                &mut buf,
+            )?
+            .is_some()
+        };
+        Ok((
+            stats.interior,
+            stats.terminals,
+            stats.seen.len() as u64,
+            stats.dup_visits,
+            completed,
+        ))
+    }
+
+    /// Benchmark the PRODUCTION root solve (`solve_root_exact`) under a given
+    /// policy-label mode. Unlike `measure_endgame_tree` (value-only YBW solve),
+    /// this measures the training path: per-child solves for policy targets.
+    ///
+    /// Returns (root_value_training_frame, solved, elapsed_secs, n_children,
+    /// n_clamped). `n_clamped` is 0 for mode="exact"; for "soft_clamp" /
+    /// "argmax_ties" it is the number of children priced at the clamp value
+    /// instead of solved exactly.
+    #[pyfunction]
+    #[pyo3(signature = (state, max_secs=10.0, score_scale=160.0, margin_gain=2.0, alpha=0.5,
+                        ordering="lookahead2_clustered", policy_mode="soft_clamp", clamp_delta=10.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn measure_root_exact(
+        state: &RustGameState,
+        max_secs: f64,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+        ordering: &str,
+        policy_mode: &str,
+        clamp_delta: f64,
+    ) -> PyResult<(f64, bool, f64, u32, u32)> {
+        if state.phase == GAME_OVER || !super::is_no_chance_endgame_state(state) {
+            return Err(PyValueError::new_err(
+                "requires a non-terminal no-chance endgame state (deck in {0,4})",
+            ));
+        }
+        let order_mode = super::SolverOrderMode::from_str(ordering)?;
+        let pmode = super::ExactPolicyMode::from_str(policy_mode)?;
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs_f64(max_secs);
+        match super::solve_root_exact(
+            state,
+            deadline,
+            score_scale,
+            margin_gain,
+            alpha,
+            order_mode,
+            pmode,
+            clamp_delta,
+        )? {
+            Some(result) => {
+                let actor = state.actor()?;
+                let root_value = if actor == 0 {
+                    result
+                        .child_values
+                        .iter()
+                        .map(|&(_, v)| v)
+                        .fold(f64::NEG_INFINITY, f64::max)
+                } else {
+                    result
+                        .child_values
+                        .iter()
+                        .map(|&(_, v)| v)
+                        .fold(f64::INFINITY, f64::min)
+                };
+                Ok((
+                    root_value,
+                    true,
+                    start.elapsed().as_secs_f64(),
+                    result.child_values.len() as u32,
+                    result.n_clamped as u32,
+                ))
+            }
+            None => Ok((0.0, false, start.elapsed().as_secs_f64(), 0, 0)),
         }
     }
 
