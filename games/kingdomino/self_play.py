@@ -318,6 +318,7 @@ class SelfPlayConfig:
     lr_schedule: str = ""
     alpha_schedule: str = ""
     sims_schedule: str = ""
+    exact_endgame_max_secs_schedule: str = ""
     games_per_iter_schedule: str = ""
     c_puct_schedule: str = ""
     dirichlet_epsilon_schedule: str = ""
@@ -680,6 +681,8 @@ def _compiled_schedules(cfg: SelfPlayConfig) -> dict:
         "lr": _parse_schedule(cfg.lr_schedule, cast=float),
         "alpha": _parse_schedule(cfg.alpha_schedule, cast=float),
         "n_simulations": _parse_schedule(cfg.sims_schedule, cast=int),
+        "exact_endgame_max_secs": _parse_schedule(
+            cfg.exact_endgame_max_secs_schedule, cast=float),
         "games_per_iteration": _parse_schedule(cfg.games_per_iter_schedule, cast=int),
         "c_puct": _parse_schedule(cfg.c_puct_schedule, cast=float),
         "dirichlet_epsilon": _parse_schedule(cfg.dirichlet_epsilon_schedule, cast=float),
@@ -3847,6 +3850,11 @@ if __name__ == "__main__":
                    help="piecewise schedule for value blend alpha")
     p.add_argument("--sims_schedule", default="",
                    help="piecewise schedule for full self-play MCTS simulations")
+    p.add_argument("--exact_endgame_max_secs_schedule", default="",
+                   help="piecewise schedule for the exact-endgame-solver wall-clock "
+                        "budget, e.g. '0:1.0,10:2.0,25:3.0' (light early while the "
+                        "net/game distribution is still weak, ramped up once "
+                        "self-play reaches more representative endgames)")
     p.add_argument("--games_per_iter_schedule", default="",
                    help="piecewise schedule for self-play games per iteration")
     p.add_argument("--c_puct_schedule", default="",
@@ -4102,6 +4110,7 @@ if __name__ == "__main__":
         batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
         lr_schedule=a.lr_schedule, alpha_schedule=a.alpha_schedule,
         sims_schedule=a.sims_schedule,
+        exact_endgame_max_secs_schedule=a.exact_endgame_max_secs_schedule,
         games_per_iter_schedule=a.games_per_iter_schedule,
         c_puct_schedule=a.c_puct_schedule,
         dirichlet_epsilon_schedule=a.dirichlet_epsilon_schedule,
