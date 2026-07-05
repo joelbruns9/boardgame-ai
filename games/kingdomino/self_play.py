@@ -1553,6 +1553,12 @@ def _write_exact_fallback_records(path: str, records: list, *, iteration: int,
     with out.open("a", encoding="utf-8") as f:
         for rec in records:
             row = dict(rec)
+            # PyO3 returns Vec<u8> fields (board terrain/crowns) as Python `bytes`,
+            # which json.dumps cannot serialize; coerce to a list of ints (matches
+            # what endgame_solver_harness.py / RustGameState.from_parts expect).
+            for k, v in row.items():
+                if isinstance(v, (bytes, bytearray)):
+                    row[k] = list(v)
             row.update({
                 "iteration": int(iteration),
                 "engine": engine,
