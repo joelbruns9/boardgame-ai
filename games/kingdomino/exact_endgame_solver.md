@@ -8,6 +8,112 @@ project. Update as results come in.
 
 ---
 
+## Status Update — 2026-07b (root-solve restructure: policy modes + windowed children + TT)
+
+Diagnosis-first plan (below) executed against the REAL fallback corpus
+(`runs/kingdomino/cloud_80x6_run1/exact_fallback_positions.jsonl`, 2,819
+positions from the first competent-play run: net beating GreedyBot 100%,
+fallback rate risen to ~12%, solver wall-clock ≈ 500s of a ~515s generation
+wall per iteration). Findings, in order of importance:
+
+1. **The training path never ran the solver the benchmarks measured.** All tail
+   numbers in this doc measure `solve_endgame_ab`/`solve_endgame_ab_parallel` —
+   a single-value root solve with alpha-beta bound sharing. The training path
+   (`solve_root_exact_cached`) solves EVERY root child with a full window for
+   exact per-child policy targets. Measured on 16 real fallback positions:
+   median **11×** (range 4–51×) the work of the value-only YBW solve; cost
+   spread across all children (top-3 of ~24–52 children hold only ~23%);
+   max single-child serial time 3–6s — the parallel critical path alone can
+   bust the 3s budget.
+2. **The hand-crafted ordering family is saturated on the real tail.** 48-position
+   sweep at 10s: all 5 orderings within noise (25–31/48 solved; `baseline`
+   27/48 vs production `lookahead2_clustered` 28/48). But orderings are
+   complementary per-position (best/worst spread median 1.5×, p90 4.3×; 11 of
+   20 production-ordering timeouts solved by some other ordering) — ordering
+   headroom exists, just not inside this family. Policy-prior ordering stays
+   deferred.
+3. **Transpositions are systematic, not rare.** `advance_round` sorts
+   `next_claims`, so pick-order permutations provably collapse ~4× per
+   selection round (path enumeration on real positions: 4.00–4.38×). The
+   instrumented production traversal (`measure_endgame_transpositions`) showed
+   **62–86% of interior visits re-enter already-seen states** — the original
+   "low expected hit rate" TT skip rationale considered coincidental board
+   collisions and missed this structural collapse.
+4. The real competent-play tail is genuinely harder than the greedy/random
+   proxy: 42% of first-attempt fallbacks still time out a local 10s value-only
+   YBW re-solve (proxy p99 was ~3–4s). The retry+deck0 net still recovers
+   ~99.75% (only 7 retry-stage failures across 66 iterations); every game's
+   ending was exact-solved (`exact_tree_solve_count` = 400/400 every iteration).
+
+**What shipped (this revision):**
+
+- **`ExactPolicyMode`** (`--exact_policy_mode`, default `soft_clamp`;
+  `--exact_clamp_delta`, default 10.0 raw margin points):
+  - `exact` — historical behavior, bit-identical labels (ablation reference).
+  - `soft_clamp` — best-ordered child solved full-window serially; siblings
+    get a one-sided window `delta` beyond that bound; fail-lows are recorded
+    at the clamp value `best ∓ delta`. Root value + minimax move remain exact;
+    label error is one-sided (dominated moves slightly overweighted, each
+    clamped child ≈ e⁻³ relative weight). Label semantics note: the softmax
+    temperature anchors to Δ instead of the true range, so near-best
+    discrimination is Δ-scaled rather than scaled by how bad the worst legal
+    move happens to be.
+  - `argmax_ties` — 1-point window proves exact ties; uniform-over-ties
+    one-hot label. Cheapest; the label-shape ablation arm.
+- **Within-single-root-solve transposition table** (`solve_endgame_ab_tt`):
+  128-bit xxh3 keys over the solver-relevant state (`discards` excluded — it
+  never affects scores/legality), EXACT/LOWER/UPPER flags with fail-soft
+  classification against the post-probe-tightening window, **no depth field**
+  (the solver always searches to terminal, so stored values are true minimax
+  values), 64 mutex shards (parallel siblings share one table), 4M-entry cap,
+  scoped to one root solve + its plan cascade. Never persisted across games.
+  Correctness contract: full-window calls return the true minimax value,
+  identical to the untabled solver (equivalence-tested); interior fail-soft
+  bound returns may differ, which alpha-beta treats equivalently. No
+  graph-history hazard: states never repeat within a game.
+- **Diagnostics:** `measure_endgame_transpositions` (dup-visit share under the
+  production traversal), `measure_root_exact` (per-mode production root-solve
+  benchmark — measures the training path, unlike `measure_endgame_tree`).
+- Tests: `tt_solver_matches_plain_full_window`,
+  `policy_modes_agree_on_value_and_move`,
+  `soft_clamp_label_argmax_and_tail_shape` (Rust); full focused Python suite
+  passes. (`test_exact_vs_sampled_convergence` fails identically on unmodified
+  main — pre-existing, unrelated.)
+
+**Measured impact — A/B on 96 real fallback positions** (every one a REAL 3s
+production timeout under the old solver on the 22-CPU cloud runner; re-measured
+locally on 16 threads, `measure_root_exact`, value guard: 0 mismatches across
+all modes and budgets):
+
+| mode | solved @3s | median | solved @10s | median |
+|---|---|---|---|---|
+| old production (exact, no TT) | 0% (by construction) | — | ~14% (3/22 paired sample) | — |
+| `exact` + TT | 23% | 2.23s | 64% | 3.47s |
+| `soft_clamp` + TT (default) | **33%** | 1.96s | **72%** | 2.95s |
+| `argmax_ties` + TT | 51% | 1.49s | 85% | 2.51s |
+
+Paired no-TT vs TT on the same 22 positions: the TT alone is the dominant
+factor (median **3.4×** wall-clock on both-solved positions; exact@10s
+3/22 → 18/22), with the windowed modes stacking on top. `soft_clamp` clamps a
+mean 23% of children. Notably `exact`+TT (the full per-child production solve)
+now beats the *value-only* no-TT YBW solve on this corpus (64% vs 58% @10s) —
+the per-child policy-target tax is effectively paid for by the TT. These are
+positions from the hardest ~12% tail; the same mechanisms cut cost on the
+other ~88% of endgame roots too, which is where the self-play throughput
+recovery comes from.
+
+**Still open / follow-ups:**
+- Value-only rescue on timeout (emit exact value target + minimax move with
+  the MCTS visit policy when even the windowed per-child solve can't finish):
+  recovers the more-important half of the training signal on residual
+  fallbacks. Needs a small decision on how to mark such records.
+- `argmax_ties` vs `soft_clamp` label-shape ablation in a real training run
+  (bench win rate / Elo / policy_kl are already logged per iteration).
+- Racing two complementary orderings on split cores (measured complementarity
+  above) if a residual tail remains after the TT.
+
+---
+
 ## Status Update — 2026-07 (win-gated value + tail-diagnosis tooling)
 
 Three changes since the last revision, plus the agreed next-step plan:
