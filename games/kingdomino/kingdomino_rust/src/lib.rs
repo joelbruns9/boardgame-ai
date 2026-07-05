@@ -2388,10 +2388,28 @@ fn solve_endgame_ab_parallel(
     }
     order_legal_for_solver_at_depth(state, &mut legal, mode, 0)?;
 
+    // One transposition table shared by the serial first child and all
+    // parallel siblings (same rationale + correctness contract as
+    // solve_root_exact: 62-86% duplicate interior visits measured on the real
+    // fallback corpus; full-window root value unchanged). This is the advisor/
+    // value-only path's share of the TT win — paired corpus measurement showed
+    // ~3.4x median wall-clock.
+    let tt = TranspositionTable::new();
+
     // Step 1: solve the first (best-ordered) child serially to establish a bound.
     let (_i0, p0, pk0) = legal[0];
     let first_next = state.step(p0, pk0)?;
-    let first_val = match solve_endgame_ab(&first_next, deadline, MARGIN_LO, MARGIN_HI, mode, 1)? {
+    let mut buf0 = Vec::with_capacity(1024);
+    let first_val = match solve_endgame_ab_tt(
+        &first_next,
+        deadline,
+        MARGIN_LO,
+        MARGIN_HI,
+        mode,
+        1,
+        &tt,
+        &mut buf0,
+    )? {
         Some(v) => v,
         None => return Ok(None),
     };
@@ -2420,7 +2438,17 @@ fn solve_endgame_ab_parallel(
         .par_iter()
         .map(|&(_idx, p, pk)| -> PyResult<Option<f64>> {
             let next = state.step(p, pk)?;
-            solve_endgame_ab(&next, deadline, captured_alpha, captured_beta, mode, 1)
+            let mut buf = Vec::with_capacity(1024);
+            solve_endgame_ab_tt(
+                &next,
+                deadline,
+                captured_alpha,
+                captured_beta,
+                mode,
+                1,
+                &tt,
+                &mut buf,
+            )
         })
         .collect();
 
@@ -4892,6 +4920,27 @@ mod solver_restructure_tests {
             )?
             .expect("tt solve");
             assert_eq!(plain, tabled, "seed {seed}: TT value diverged");
+            checked += 1;
+        }
+        assert!(checked >= 5, "too few endgame roots reached ({checked})");
+        Ok(())
+    }
+
+    /// Advisor/value path: YBW parallel solver WITH the shared TT matches the
+    /// untabled serial solver's root value on real endgame roots.
+    #[test]
+    fn parallel_tt_matches_serial_plain() -> PyResult<()> {
+        let mode = SolverOrderMode::Lookahead2Clustered;
+        let mut checked = 0;
+        for seed in 0..24u64 {
+            let Some(root) = first_endgame_root(seed) else {
+                continue;
+            };
+            let serial = solve_endgame_ab(&root, far_deadline(), MARGIN_LO, MARGIN_HI, mode, 0)?
+                .expect("serial solve");
+            let parallel = solve_endgame_ab_parallel(&root, far_deadline(), mode)?
+                .expect("parallel TT solve");
+            assert_eq!(serial, parallel, "seed {seed}: parallel+TT value diverged");
             checked += 1;
         }
         assert!(checked >= 5, "too few endgame roots reached ({checked})");
