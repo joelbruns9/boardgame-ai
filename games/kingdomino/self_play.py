@@ -187,6 +187,18 @@ class SelfPlayConfig:
     # Per-position wall-clock limit in seconds; <= 0.0 disables it (ablation).
     # Higher budgets reduce fallbacks but spend more CPU on the hardest endgames.
     exact_endgame_max_secs: float = 3.0
+    # How exact roots price dominated children for the POLICY label (the root
+    # value and chosen move are exact in every mode):
+    #   "exact"       — every child solved full-window (historical; ~11x the
+    #                   work of a value-only solve on the real fallback tail);
+    #   "soft_clamp"  — children within exact_clamp_delta raw points of the
+    #                   best are exact, the rest only PROVEN >= delta worse and
+    #                   recorded at the clamp value (default; near-value-solve
+    #                   cost, label error one-sided and bounded);
+    #   "argmax_ties" — uniform over proven-tied-best children (cheapest; the
+    #                   label-shape ablation arm).
+    exact_policy_mode: str = "soft_clamp"
+    exact_clamp_delta: float = 10.0
     # Optional JSONL sidecar for exact-solver fallback root states. Kept outside
     # the replay buffer so normal training examples remain compact and leak-safe.
     exact_fallback_positions: str = ""
@@ -1808,6 +1820,8 @@ def play_selfplay_games_batched(
             margin_gain=float(cfg.margin_gain),
             alpha=float(cfg.alpha),
             exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
+            exact_policy_mode=str(cfg.exact_policy_mode),
+            exact_clamp_delta=float(cfg.exact_clamp_delta),
             async_solve=bool(cfg.async_solve),
             solver_cpus=int(effective_solver_cpus),
             playout_cap_randomization=bool(cfg.playout_cap_randomization),
@@ -3728,6 +3742,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     batched_stats.get("exact_recorded_move_count", 0)
                     if batched_stats else None),
                 "endgame_oversample": iter_cfg.endgame_oversample,
+                "exact_policy_mode": iter_cfg.exact_policy_mode,
+                "exact_clamp_delta": iter_cfg.exact_clamp_delta,
                 "n_endgame_in_batch": n_endgame_in_batch,
                 "lr": iter_cfg.lr,
                 "alpha": iter_cfg.alpha,
@@ -4088,6 +4104,18 @@ if __name__ == "__main__":
                    help="Per-position wall-clock time limit for the exact endgame "
                         "solver (seconds). 0.0 disables exact endgame solving; "
                         "higher values reduce fallbacks on the hardest endgames.")
+    p.add_argument("--exact_policy_mode", default="soft_clamp",
+                   choices=["exact", "soft_clamp", "argmax_ties"],
+                   help="How exact roots price dominated children for the policy "
+                        "label. exact = historical full-window per child; "
+                        "soft_clamp = exact within --exact_clamp_delta of best, "
+                        "clamp the rest (default); argmax_ties = uniform over "
+                        "proven-tied-best (ablation arm). Root value and chosen "
+                        "move are exact in every mode.")
+    p.add_argument("--exact_clamp_delta", type=float, default=10.0,
+                   help="soft_clamp threshold in raw margin points: children "
+                        "proven at least this far below the best child are "
+                        "recorded at the clamp value instead of solved exactly.")
     p.add_argument("--exact_fallback_positions", default="",
                    help="Optional JSONL sidecar path for exact-solver fallback "
                         "root states. Empty disables saving.")
@@ -4194,6 +4222,8 @@ if __name__ == "__main__":
         forced_playout_k=a.forced_playout_k,
         profile_eval_timing=a.profile_eval_timing,
         exact_endgame_max_secs=a.exact_endgame_max_secs,
+        exact_policy_mode=a.exact_policy_mode,
+        exact_clamp_delta=a.exact_clamp_delta,
         exact_fallback_positions=a.exact_fallback_positions,
         endgame_oversample=a.endgame_oversample,
     )
