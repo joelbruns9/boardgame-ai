@@ -102,13 +102,34 @@ positions from the hardest ~12% tail; the same mechanisms cut cost on the
 other ~88% of endgame roots too, which is where the self-play throughput
 recovery comes from.
 
+**Label-shape ablation result (2026-07-05, local).** Two 24-iteration runs
+(48x4, 400 sims, 128 games/iter, seed 777, 3s budget) identical except
+`--exact_policy_mode`, then a 400-game paired seat-swapped head-to-head
+between the final checkpoints (`promotion.evaluate_checkpoint_match`; Elo
+anchors NOT used — they are old-encoder):
+
+- **argmax_ties beat soft_clamp 231–162–7** (soft_clamp win rate 41.4%,
+  95% CI excludes 50%; mean margin −5.7). One-hot-over-proven-ties labels
+  produced a STRONGER net at equal iterations, despite soft_clamp showing
+  better mid/endgame win-brier calibration curves during training — label
+  sharpness apparently matters more for playing strength than the graded
+  tail information at this scale. (Echoes the Azul-NNUE thesis finding that
+  bare game-result labels sufficed.)
+- argmax_ties was also ~17% cheaper in solver time (1,690s vs 2,027s total),
+  consistent with the corpus A/B (51% vs 33% solved @3s).
+- Caveats: small scale (48x4, 24 iters, single seed, nets only 75–80% vs
+  GreedyBot), so confirm at cloud scale before treating as settled.
+- Production-path readout from the arms: first-attempt deck4 fallback ran
+  2–7% at 3s with the new solver (cloud run2 with the OLD solver at a 1s
+  budget: 43%).
+
 **Still open / follow-ups:**
+- Whether to flip the production default from `soft_clamp` to `argmax_ties`
+  (ablation says yes at small scale; user decision + cloud-scale confirmation).
 - Value-only rescue on timeout (emit exact value target + minimax move with
   the MCTS visit policy when even the windowed per-child solve can't finish):
   recovers the more-important half of the training signal on residual
   fallbacks. Needs a small decision on how to mark such records.
-- `argmax_ties` vs `soft_clamp` label-shape ablation in a real training run
-  (bench win rate / Elo / policy_kl are already logged per iteration).
 - Racing two complementary orderings on split cores (measured complementarity
   above) if a residual tail remains after the TT.
 
