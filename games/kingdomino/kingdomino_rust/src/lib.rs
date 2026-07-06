@@ -3788,7 +3788,9 @@ enum SlotState {
 ///   softmax weight at delta (~e^-3 relative when delta spans the range).
 /// - `ArgmaxTies`: integer margins let a 1-point window prove exact ties with
 ///   the best; the label is uniform over the tied-best children, zero
-///   elsewhere. Cheapest mode (ablation arm for the label-shape question).
+///   elsewhere. Cheapest mode — and the PRODUCTION DEFAULT since the
+///   2026-07-05 label-shape ablation, where it beat soft_clamp 231-162-7 in a
+///   400-game head-to-head between matched training runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExactPolicyMode {
     Exact,
@@ -5555,7 +5557,7 @@ impl BatchedMCTS {
                         playout_cap_randomization=false, full_search_fraction=0.25,
                         fast_move_sims=100, record_fast_moves=false,
                         fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0,
-                        exact_policy_mode="soft_clamp", exact_clamp_delta=10.0))]
+                        exact_policy_mode="argmax_ties", exact_clamp_delta=10.0))]
     fn new(
         n_slots: usize,
         n_games: usize,

@@ -1,0 +1,69 @@
+{
+  "checkpoints": {
+    "run1_iter_0010": {
+      "rating": 950.04,
+      "rating_stderr": 88.0387480308933,
+      "n_games": 192,
+      "sims": 400,
+      "path": "runs/kingdomino/cloud_80x6_run1/iter_0010.pt",
+      "channels": 80,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-07-06T02:57:26.792804+00:00",
+      "is_anchor": true,
+      "fixed_rating": 950.04
+    },
+    "run1_iter_0040": {
+      "rating": 1523.28,
+      "rating_stderr": 102.73271004194545,
+      "n_games": 64,
+      "sims": 400,
+      "path": "runs/kingdomino/cloud_80x6_run1/iter_0040.pt",
+      "channels": 80,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-07-06T02:44:17.694816+00:00",
+      "is_anchor": true,
+      "fixed_rating": 1523.28
+    },
+    "run1_iter_0066": {
+      "rating": 1647.79,
+      "rating_stderr": 44.01820703318472,
+      "n_games": 128,
+      "sims": 400,
+      "path": "runs/kingdomino/cloud_80x6_run1/iter_0066.pt",
+      "channels": 80,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-07-06T02:47:25.655811+00:00",
+      "is_anchor": true,
+      "fixed_rating": 1647.79
+    },
+    "run2_iter_0050": {
+      "rating": 1762.38,
+      "rating_stderr": 34.43166620537293,
+      "n_games": 192,
+      "sims": 400,
+      "path": "runs/kingdomino/cloud_80x6_run2/iter_0050.pt",
+      "channels": 80,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-07-06T02:52:41.789564+00:00",
+      "is_anchor": true,
+      "fixed_rating": 1762.38
+    },
+    "run1_iter_0020": {
+      "rating": 1267.34,
+      "rating_stderr": 33.77582633063138,
+      "n_games": 256,
+      "sims": 400,
+      "path": "runs/kingdomino/cloud_80x6_run1/iter_0020.pt",
+      "channels": 80,
+      "blocks": 6,
+      "bilinear_dim": 64,
+      "timestamp": "2026-07-06T03:41:29.524175+00:00",
+      "is_anchor": true,
+      "fixed_rating": 1267.34
+    }
+  }
+}

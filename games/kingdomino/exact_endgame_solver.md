@@ -47,7 +47,8 @@ wall per iteration). Findings, in order of importance:
 
 **What shipped (this revision):**
 
-- **`ExactPolicyMode`** (`--exact_policy_mode`, default `soft_clamp`;
+- **`ExactPolicyMode`** (`--exact_policy_mode`, default `argmax_ties` since the
+  2026-07-05 ablation below — was `soft_clamp` pre-ablation;
   `--exact_clamp_delta`, default 10.0 raw margin points):
   - `exact` — historical behavior, bit-identical labels (ablation reference).
   - `soft_clamp` — best-ordered child solved full-window serially; siblings
@@ -123,9 +124,23 @@ anchors NOT used — they are old-encoder):
   2–7% at 3s with the new solver (cloud run2 with the OLD solver at a 1s
   budget: 43%).
 
+**Elo for new-encoder checkpoints (2026-07-05).** The legacy
+`elo_anchors.csv` / `elo_db.json` pool is OLD-ENCODER (261-flat) and must not
+be used with current checkpoints. A fresh 80x6 pool now exists —
+`games/kingdomino/elo_anchors_80x6.csv` (5 active anchors spanning
+950–1762: run1 iters 10/20/40/66 + run2 iter 50) with
+`elo_db_80x6.json` / `elo_games_80x6.jsonl` at the repo root. Its scale is
+independent of the legacy db; only within-pool differences are meaningful.
+Next cloud run: rate periodically with
+`--elo_every 20 --elo_anchors games/kingdomino/elo_anchors_80x6.csv
+--elo_db elo_db_80x6.json --elo_games_log elo_games_80x6.jsonl`
+(the anchor CHECKPOINT .pt files under `runs/kingdomino/cloud_80x6_run{1,2}/`
+must be present on the cloud machine at those relative paths).
+
 **Still open / follow-ups:**
-- Whether to flip the production default from `soft_clamp` to `argmax_ties`
-  (ablation says yes at small scale; user decision + cloud-scale confirmation).
+- Production default flipped to `argmax_ties` (2026-07-05, user-approved after
+  the ablation). `soft_clamp` remains available; watch the usual phase-brier /
+  bench / Elo diagnostics on the first cloud run for at-scale confirmation.
 - Value-only rescue on timeout (emit exact value target + minimax move with
   the MCTS visit policy when even the windowed per-child solve can't finish):
   recovers the more-important half of the training signal on residual

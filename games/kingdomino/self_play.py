@@ -193,11 +193,13 @@ class SelfPlayConfig:
     #                   work of a value-only solve on the real fallback tail);
     #   "soft_clamp"  — children within exact_clamp_delta raw points of the
     #                   best are exact, the rest only PROVEN >= delta worse and
-    #                   recorded at the clamp value (default; near-value-solve
-    #                   cost, label error one-sided and bounded);
-    #   "argmax_ties" — uniform over proven-tied-best children (cheapest; the
-    #                   label-shape ablation arm).
-    exact_policy_mode: str = "soft_clamp"
+    #                   recorded at the clamp value (label error one-sided and
+    #                   bounded);
+    #   "argmax_ties" — uniform over proven-tied-best children (DEFAULT: won
+    #                   the 2026-07-05 label-shape ablation 231-162-7 vs
+    #                   soft_clamp head-to-head AND is the cheapest mode; see
+    #                   exact_endgame_solver.md).
+    exact_policy_mode: str = "argmax_ties"
     exact_clamp_delta: float = 10.0
     # Optional JSONL sidecar for exact-solver fallback root states. Kept outside
     # the replay buffer so normal training examples remain compact and leak-safe.
@@ -4104,13 +4106,14 @@ if __name__ == "__main__":
                    help="Per-position wall-clock time limit for the exact endgame "
                         "solver (seconds). 0.0 disables exact endgame solving; "
                         "higher values reduce fallbacks on the hardest endgames.")
-    p.add_argument("--exact_policy_mode", default="soft_clamp",
+    p.add_argument("--exact_policy_mode", default="argmax_ties",
                    choices=["exact", "soft_clamp", "argmax_ties"],
                    help="How exact roots price dominated children for the policy "
-                        "label. exact = historical full-window per child; "
-                        "soft_clamp = exact within --exact_clamp_delta of best, "
-                        "clamp the rest (default); argmax_ties = uniform over "
-                        "proven-tied-best (ablation arm). Root value and chosen "
+                        "label. argmax_ties = uniform over proven-tied-best "
+                        "(default; won the label-shape ablation and is the "
+                        "cheapest mode); soft_clamp = exact within "
+                        "--exact_clamp_delta of best, clamp the rest; exact = "
+                        "historical full-window per child. Root value and chosen "
                         "move are exact in every mode.")
     p.add_argument("--exact_clamp_delta", type=float, default=10.0,
                    help="soft_clamp threshold in raw margin points: children "

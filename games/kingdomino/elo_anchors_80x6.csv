@@ -1,0 +1,6 @@
+name,path,channels,blocks,bilinear_dim,fixed_rating,is_anchor,is_active
+run1_iter_0010,runs/kingdomino/cloud_80x6_run1/iter_0010.pt,80,6,64,950.04,True,True
+run1_iter_0040,runs/kingdomino/cloud_80x6_run1/iter_0040.pt,80,6,64,1523.28,True,True
+run1_iter_0066,runs/kingdomino/cloud_80x6_run1/iter_0066.pt,80,6,64,1647.79,True,True
+run2_iter_0050,runs/kingdomino/cloud_80x6_run2/iter_0050.pt,80,6,64,1762.38,True,True
+run1_iter_0020,runs/kingdomino/cloud_80x6_run1/iter_0020.pt,80,6,64,1267.34,True,True

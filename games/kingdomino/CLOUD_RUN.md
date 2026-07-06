@@ -357,8 +357,9 @@ python -m games.kingdomino.self_play \
   --checkpoint_dir runs/kingdomino/cloud_<channels>x6_run1 \
   --save_buffer runs/kingdomino/cloud_<channels>x6_run1/buffer_final.pkl \
   --exact_fallback_positions runs/kingdomino/cloud_<channels>x6_run1/exact_fallback_positions.jsonl \
-  --elo_every 10 --elo_sims 400 --elo_games_per_anchor 32 \
-  --elo_db elo_db.json --elo_games_log elo_games.jsonl \
+  --elo_every 20 --elo_sims 400 --elo_games_per_anchor 32 \
+  --elo_anchors games/kingdomino/elo_anchors_80x6.csv \
+  --elo_db elo_db_80x6.json --elo_games_log elo_games_80x6.jsonl \
   --seed 0
 ```
 
@@ -383,6 +384,21 @@ Notes that differ from a warm-start laptop run:
 - **No buffer seed (this run).** Old buffers are **261-flat** encoded examples,
   incompatible with the **333-flat** encoder — do **not** pass `--warm_buffer`.
   The buffer fills from scratch over the first few iterations.
+- **Elo: use the 80x6 pool, never the legacy one (2026-07-05).** The legacy
+  `games/kingdomino/elo_anchors.csv` / `elo_db.json` anchors are OLD-ENCODER
+  (261-flat) checkpoints — they cannot evaluate against current nets. The
+  command above points at `elo_anchors_80x6.csv` (5 bootstrapped anchors from
+  run1/run2, ratings 950–1762) with its own db/games log; `--elo_every 20`
+  keeps the rating cost to ~3 sessions per 60-iteration run. The anchor
+  checkpoint files (`runs/kingdomino/cloud_80x6_run1/iter_00{10,20,40,66}.pt`,
+  `runs/kingdomino/cloud_80x6_run2/iter_0050.pt`) must exist on the cloud box
+  at those relative paths — sync them before launch.
+- **Exact-solver defaults (2026-07-05 restructure).** `--exact_policy_mode`
+  defaults to `argmax_ties` (won the label-shape ablation 231-162-7 and is the
+  cheapest mode; `soft_clamp` / `exact` remain available for ablation). With
+  the within-solve transposition table, the local ablation arms saw 2-7%
+  first-attempt deck4 fallback at `--exact_endgame_max_secs 3.0` (old solver:
+  12% at 3.0s, 43% at 1.0s) — prefer 3.0s over run2's 1.0s squeeze.
 
 For same-architecture continuation runs where
 `runs/kingdomino/best_checkpoint/current_best.pt` matches `<channels>x6`, prefer
