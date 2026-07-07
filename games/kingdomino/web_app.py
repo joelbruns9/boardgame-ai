@@ -953,6 +953,69 @@ def _load_nn_evaluator(req: BotActionRequest):
     return evaluator, net, path
 
 
+_RUST_ADVISOR_EVAL_CACHE: dict[Any, Any] = {}
+# Wave size for the Rust advisor search's leaf batching (virtual loss). 8 keeps
+# VL distortion negligible at advisor sim counts while giving the GPU real
+# batches instead of the serial path's batch-of-1 forwards.
+_RUST_ADVISOR_LEAF_BATCH = 8
+
+
+def _rust_open_loop_search(state: GameState, net, req_key, device: str,
+                           sims: int, seed: int):
+    """Rust-engine advisor search. Returns (visit_counts, value0, action_info)
+    where visit_counts maps Python action -> visits, value0 is the search-mean
+    root value (player-0 frame), and action_info maps action -> (prior,
+    q_win_prob | None). Raises on any failure — callers fall back to the
+    Python OpenLoopMCTS path.
+
+    Only called for deck > 4 roots: terminal-adjacent roots stay on the Python
+    path, whose exact-endgame hook solves them perfectly (the Rust search has
+    no exact hook by design — see advisor_open_loop_search's docstring).
+    """
+    import kingdomino_rust as kr
+    from games.kingdomino.action_codec import encode_action
+    from games.kingdomino.endgame_solver import _rust_state_from_python
+
+    ev = _RUST_ADVISOR_EVAL_CACHE.get(req_key)
+    if ev is None:
+        from games.kingdomino.self_play import make_rust_evaluator
+        # Advisor searches with alpha=0.0 (pure win probability) — same
+        # rationale as the serial evaluator above.
+        ev = make_rust_evaluator(net, device=device, alpha=0.0)
+        if len(_RUST_ADVISOR_EVAL_CACHE) >= 4:
+            _RUST_ADVISOR_EVAL_CACHE.clear()
+        _RUST_ADVISOR_EVAL_CACHE[req_key] = ev
+
+    rs = _rust_state_from_python(state)
+    children, value0 = kr.advisor_open_loop_search(
+        rs, ev, int(sims),
+        dirichlet_eps=0.0,
+        cpuct=1.5,
+        seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
+        leaf_batch=_RUST_ADVISOR_LEAF_BATCH,
+        alpha=0.0,
+    )
+    actor = int(state.current_actor)
+    idx_to_action = {int(encode_action(a, state)): a for a in state.legal_actions()}
+    visit_counts: dict[Any, float] = {}
+    action_info: dict[Any, tuple[float, Optional[float]]] = {}
+    for idx, visits, value_sum, prior in children:
+        action = idx_to_action.get(int(idx))
+        if action is None:
+            continue  # root child from a stale index — impossible at the root, defensive
+        visit_counts[action] = float(visits)
+        if visits > 0:
+            q0 = value_sum / visits
+            q_actor = q0 if actor == 0 else -q0
+            q_win_prob = (q_actor + 1.0) / 2.0
+        else:
+            q_win_prob = None
+        action_info[action] = (float(prior), q_win_prob)
+    if not visit_counts:
+        raise RuntimeError("rust advisor search returned no legal root children")
+    return visit_counts, float(value0), action_info
+
+
 def _root_trajectory(net, state: GameState, device: str) -> dict[str, Any]:
     """One forward pass on the root state — the network's pre-search trajectory
     estimate (projected final scores + win probability).
@@ -988,41 +1051,56 @@ def _choose_nn_action(state: GameState, req: BotActionRequest):
     if state.phase == Phase.GAME_OVER:
         raise HTTPException(status_code=400, detail="Game is already over.")
     # Bot-action path ignores the net (no trajectory/prior readout needed here).
-    evaluator, _net, checkpoint_path = _load_nn_evaluator(req)
+    evaluator, net, checkpoint_path = _load_nn_evaluator(req)
     try:
         import numpy as np
         from games.kingdomino.mcts_az import OpenLoopMCTS, run_pimc_open_loop, select_move
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not import MCTS dependencies: {exc}") from exc
 
-    # Open-loop MCTS resamples the deck on every simulation, averaging over deck
-    # uncertainty — the correct search for a live advisory context.  (Closed-loop
-    # PIMC with n_determinizations=1 would just deepen one fixed hypothetical
-    # future, so raising sim counts barely changes the visit distribution.)
-    mcts = OpenLoopMCTS(
-        evaluator,
-        c_puct=1.5,
-        n_simulations=int(req.nn_sims),
-        dirichlet_alpha=0.3,
-        dirichlet_epsilon=0.25,
-        # Advisor policy: always solve reachable endgames exactly. 3600s is a
-        # hung-request safeguard, not a budget — with the within-solve TT the
-        # worst measured real position solves in well under a minute.
-        exact_endgame_max_secs=3600.0,
-    )
     np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
-    visit_counts, value0, _root = run_pimc_open_loop(
-        mcts,
-        state,
-        add_noise=False,
-        rng=np_rng,
-    )
+    engine_name = "nn-mcts"
+    visit_counts = value0 = None
+    # Rust open-loop search for deck > 4 roots: same search semantics
+    # (per-simulation deck redeterminization), Rust tree ops + batched leaf
+    # evals instead of Python batch-1 forwards. Terminal-adjacent roots stay on
+    # the Python engine, whose exact-endgame hook solves them perfectly.
+    if len(state.deck) > 4:
+        try:
+            key = (checkpoint_path, req.device)
+            visit_counts, value0, _info = _rust_open_loop_search(
+                state, net, key, req.device, int(req.nn_sims),
+                int(req.seed) + 104729 * (len(state.history) + 1))
+            engine_name = "nn-mcts-rust"
+        except Exception as exc:  # any failure → Python path (never a 500)
+            print(f"[advisor] rust search unavailable ({exc!r}); using Python engine")
+            visit_counts = None
+    if visit_counts is None:
+        # Open-loop MCTS resamples the deck on every simulation, averaging over
+        # deck uncertainty — the correct search for a live advisory context.
+        mcts = OpenLoopMCTS(
+            evaluator,
+            c_puct=1.5,
+            n_simulations=int(req.nn_sims),
+            dirichlet_alpha=0.3,
+            dirichlet_epsilon=0.25,
+            # Advisor policy: always solve reachable endgames exactly. 3600s is a
+            # hung-request safeguard, not a budget — with the within-solve TT the
+            # worst measured real position solves in well under a minute.
+            exact_endgame_max_secs=3600.0,
+        )
+        visit_counts, value0, _root = run_pimc_open_loop(
+            mcts,
+            state,
+            add_noise=False,
+            rng=np_rng,
+        )
     action = select_move(visit_counts, temperature=float(req.temperature), rng=np_rng)
     total_visits = sum(float(v) for v in visit_counts.values()) or 1.0
     chosen_visits = float(visit_counts.get(action, 0.0))
     value_actor = float(value0 if state.current_actor == 0 else -value0)
     return action, {
-        "engine": "nn-mcts",
+        "engine": engine_name,
         "checkpoint_path": checkpoint_path,
         "nn_sims": int(req.nn_sims),
         "temperature": float(req.temperature),
@@ -1382,40 +1460,55 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
         root_traj = _root_trajectory(net, state, req.device)
 
         sims = int(bot_req.nn_sims)
-        # Open-loop MCTS resamples the deck per simulation, so raising sim counts
-        # genuinely explores varied futures rather than deepening one fixed deck.
-        mcts = OpenLoopMCTS(
-            evaluator,
-            c_puct=1.5,
-            n_simulations=sims,
-            dirichlet_alpha=0.3,
-            dirichlet_epsilon=0.25,
-            # Advisor policy: always solve reachable endgames exactly (see
-            # _choose_nn_action for rationale).
-            exact_endgame_max_secs=3600.0,
-        )
         np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
-        try:
-            visit_counts, value0, root = run_pimc_open_loop(
-                mcts,
-                state,
-                add_noise=False,
-                rng=np_rng,
+        engine_name = "nn-mcts"
+        visit_counts = value0 = root = rust_info = None
+        # Rust open-loop search for deck > 4 roots (see _choose_nn_action).
+        if len(state.deck) > 4:
+            try:
+                key = (checkpoint_path, req.device)
+                visit_counts, value0, rust_info = _rust_open_loop_search(
+                    state, net, key, req.device, sims,
+                    int(req.seed) + 104729 * (len(state.history) + 1))
+                engine_name = "nn-mcts-rust"
+            except Exception as exc:
+                print(f"[advisor] rust search unavailable ({exc!r}); using Python engine")
+                visit_counts = rust_info = None
+        if visit_counts is None:
+            # Open-loop MCTS resamples the deck per simulation, so raising sim
+            # counts genuinely explores varied futures rather than deepening one
+            # fixed deck.
+            mcts = OpenLoopMCTS(
+                evaluator,
+                c_puct=1.5,
+                n_simulations=sims,
+                dirichlet_alpha=0.3,
+                dirichlet_epsilon=0.25,
+                # Advisor policy: always solve reachable endgames exactly (see
+                # _choose_nn_action for rationale).
+                exact_endgame_max_secs=3600.0,
             )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": str(exc),
-                    "phase": state.phase.name,
-                    "current_actor": None if state.phase == Phase.GAME_OVER else int(state.current_actor),
-                    "current_row": [int(d) for d in state.current_row],
-                    "pending_claims": [_claim_to_json(c) for c in state.pending_claims],
-                    "next_claims": [_claim_to_json(c) for c in state.next_claims],
-                    "deck_count": int(len(state.deck)),
-                    "legal_action_count": int(len(actions)),
-                },
-            ) from exc
+            try:
+                visit_counts, value0, root = run_pimc_open_loop(
+                    mcts,
+                    state,
+                    add_noise=False,
+                    rng=np_rng,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": str(exc),
+                        "phase": state.phase.name,
+                        "current_actor": None if state.phase == Phase.GAME_OVER else int(state.current_actor),
+                        "current_row": [int(d) for d in state.current_row],
+                        "pending_claims": [_claim_to_json(c) for c in state.pending_claims],
+                        "next_claims": [_claim_to_json(c) for c in state.next_claims],
+                        "deck_count": int(len(state.deck)),
+                        "legal_action_count": int(len(actions)),
+                    },
+                ) from exc
         total_visits = sum(float(v) for v in visit_counts.values()) or 1.0
         # Map actions to their current legal-index by stable action_id, because
         # determinization can produce equivalent action objects that do not share
@@ -1431,18 +1524,24 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             idx = id_to_index.get(aj["action_id"], -1)
             if idx >= 0:
                 aj = action_to_json(state, actions[idx], idx)
-            # Open-loop root children are keyed by slot-relative joint index, not
-            # action objects, so re-encode the action to find its child node.
-            child = root.children.get(encode_action(action, state))
-            prior = float(child.prior) if child is not None else None
-            # child.value is player-0 frame; flip to the acting player's frame,
-            # then map the [-1, 1] value to a [0, 1] win probability.  Under the
-            # advisor's alpha=0.0 search, this Q is search-updated win prob.
-            if child is not None and child.visit_count > 0:
-                q_actor = child.value if actor == 0 else -child.value
-                q_win_prob = (q_actor + 1.0) / 2.0
+            if rust_info is not None:
+                # Rust path: per-action (prior, q_win_prob) computed in
+                # _rust_open_loop_search from the OL root children.
+                prior, q_win_prob = rust_info.get(action, (None, None))
             else:
-                q_win_prob = None
+                # Open-loop root children are keyed by slot-relative joint index,
+                # not action objects, so re-encode the action to find its child.
+                child = root.children.get(encode_action(action, state))
+                prior = float(child.prior) if child is not None else None
+                # child.value is player-0 frame; flip to the acting player's
+                # frame, then map the [-1, 1] value to a [0, 1] win probability.
+                # Under the advisor's alpha=0.0 search, this Q is search-updated
+                # win prob.
+                if child is not None and child.visit_count > 0:
+                    q_actor = child.value if actor == 0 else -child.value
+                    q_win_prob = (q_actor + 1.0) / 2.0
+                else:
+                    q_win_prob = None
             rows.append((float(count), idx, aj, prior, q_win_prob))
         rows.sort(key=lambda x: x[0], reverse=True)
         recs = []
@@ -1455,12 +1554,12 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                 "q_win_prob": q_win_prob,
                 "q_value": None,
                 "is_legal": idx >= 0,
-                "debug": {"engine": "nn-mcts", "legal_index_resolved": idx},
+                "debug": {"engine": engine_name, "legal_index_resolved": idx},
             })
         value_actor = float(value0 if state.current_actor == 0 else -value0)
         return {
             "ok": True,
-            "engine": "nn-mcts",
+            "engine": engine_name,
             "checkpoint_path": checkpoint_path,
             "value": value_actor,
             "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),

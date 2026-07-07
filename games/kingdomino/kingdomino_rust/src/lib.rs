@@ -3562,6 +3562,260 @@ fn ol_select_from_visits(arena: &[OLNode], temp: f64, rng: &mut StdRng) -> u16 {
     }
 }
 
+// ─── Advisor open-loop single-root search ───────────────────────────────────
+// Rust port of the advisor's OpenLoopMCTS search loop (web_app._choose_nn_action):
+// one root, per-simulation deck redeterminization, network leaf evaluation via
+// the BatchedEvaluator callback contract, leaf-parallel waves with virtual loss.
+// Exists because the Python OL engine drives batch-1 GPU forwards from Python
+// (~1.7k leaves/s locally) while this path runs Rust tree ops + K-row eval
+// batches — the advisor's sims/latency budget, not training throughput.
+//
+// Exact endgames are NOT hooked here: the advisor routes terminal-adjacent
+// ROOTS (deck <= 4) to the exact per-child solver in web_app before searching,
+// and interior deck<=4 nodes under a deck>=8 root are determinization-dependent
+// (the same correctness gate as training — see OPT-1 notes).
+
+/// Expand an OLNode with evaluator priors; returns the leaf value in the
+/// player-0 frame. OL analogue of `expand` (closed-loop): stateless node, so
+/// the caller passes the concrete `leaf_state`; an already-expanded node gets
+/// only its missing children added (Issue 2 semantics).
+fn ol_expand_with_evaluator(
+    arena: &mut Vec<OLNode>,
+    node_id: u32,
+    leaf_state: &RustGameState,
+    ev: &Py<PyAny>,
+) -> PyResult<f64> {
+    let actor = leaf_state.actor()?;
+    let legal = leaf_state.legal_actions_indexed();
+    let (my, opp, flat) = leaf_state.encode_arrays(actor)?;
+    let idxs: Vec<i64> = legal.iter().map(|t| t.0 as i64).collect();
+
+    let (value, gathered) = Python::attach(|py| -> PyResult<(f64, Vec<f64>)> {
+        let mb_py = my.insert_axis(Axis(0)).into_pyarray(py);
+        let ob_py = opp.insert_axis(Axis(0)).into_pyarray(py);
+        let flat_py = flat.insert_axis(Axis(0)).into_pyarray(py);
+        let idxs_py = idxs.into_pyarray(py);
+        let idxs_list = PyList::new(py, [idxs_py])?;
+        let result = ev.bind(py).call1((mb_py, ob_py, flat_py, idxs_list))?;
+        let tuple = result.downcast::<PyTuple>()?;
+        let value = {
+            let arr = tuple.get_item(0)?;
+            let arr = arr.downcast::<PyArray1<f32>>()?;
+            arr.readonly().as_slice()?[0] as f64
+        };
+        let gathered = {
+            let list = tuple.get_item(1)?;
+            let list = list.downcast::<PyList>()?;
+            let g0 = list.get_item(0)?;
+            let arr = g0.downcast::<PyArray1<f32>>()?;
+            arr.readonly()
+                .as_slice()?
+                .iter()
+                .map(|&x| x as f64)
+                .collect()
+        };
+        Ok((value, gathered))
+    })?;
+
+    let priors = softmax_f64(&gathered);
+    let value0 = if actor == 0 { value } else { -value };
+    if arena[node_id as usize].is_expanded {
+        ol_add_missing_children(arena, node_id, &legal, &priors);
+    } else {
+        for (i, &(idx, placement, pick)) in legal.iter().enumerate() {
+            let cid = arena.len() as u32;
+            arena.push(OLNode::new(priors[i], (placement, pick)));
+            arena[node_id as usize].children.push((idx, cid));
+        }
+        arena[node_id as usize].is_expanded = true;
+    }
+    Ok(value0)
+}
+
+/// One wave's pending network evaluation: the path that produced it and the
+/// concrete leaf state that will be evaluated/expanded.
+struct AdvisorPendingEval {
+    path_idx: usize,
+    leaf: u32,
+    actor: u8,
+    legal: Vec<(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>,
+    my: Array3<f32>,
+    opp: Array3<f32>,
+    flat: Array1<f32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advisor_open_loop_search_impl(
+    root_state: &RustGameState,
+    ev: &Py<PyAny>,
+    n_sims: usize,
+    dirichlet_alpha: f64,
+    dirichlet_eps: f64,
+    fpu: f64,
+    cpuct: f64,
+    seed: u64,
+    leaf_batch: usize,
+    virtual_loss: i32,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
+    let mut fallback_count = 0u32;
+    let mut missing_child_count = 0u32;
+
+    // Root: expand on the REAL state — the root's public information (boards,
+    // row, claims) is determinization-independent; only the deck order below
+    // it varies per simulation.
+    let root_v0 = ol_expand_with_evaluator(&mut arena, 0, root_state, ev)?;
+    arena[0].visit_count = 1;
+    arena[0].value_sum = root_v0;
+    if dirichlet_eps > 0.0 {
+        ol_add_dirichlet_noise(&mut arena, 0, dirichlet_alpha, dirichlet_eps, Some(seed));
+    }
+
+    let wave_cap = leaf_batch.max(1);
+    let vl = virtual_loss.max(0);
+    let mut sims_done = 0usize;
+    while sims_done < n_sims {
+        let wave = wave_cap.min(n_sims - sims_done);
+        let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
+        let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
+        let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
+        let mut evals: Vec<AdvisorPendingEval> = Vec::new();
+
+        for _ in 0..wave {
+            let det = root_state.redeterminize(Some(rng.r#gen::<u64>()));
+            let (path, actors, leaf_state) = ol_descend(
+                &arena,
+                0,
+                det,
+                fpu,
+                cpuct,
+                &mut fallback_count,
+                &mut missing_child_count,
+            )?;
+            ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
+            let leaf = *path.last().unwrap();
+            if leaf_state.phase != GAME_OVER {
+                let actor = leaf_state.actor()?;
+                let legal = leaf_state.legal_actions_indexed();
+                let (my, opp, flat) = leaf_state.encode_arrays(actor)?;
+                evals.push(AdvisorPendingEval {
+                    path_idx: paths.len(),
+                    leaf,
+                    actor,
+                    legal,
+                    my,
+                    opp,
+                    flat,
+                });
+            }
+            paths.push(path);
+            path_actors.push(actors);
+            leaf_states.push(leaf_state);
+        }
+
+        // One evaluator call for the whole wave's non-terminal leaves.
+        let mut path_v0: Vec<Option<f64>> = vec![None; paths.len()];
+        if !evals.is_empty() {
+            let idxs_per: Vec<Vec<i64>> = evals
+                .iter()
+                .map(|e| e.legal.iter().map(|t| t.0 as i64).collect())
+                .collect();
+            let (vals, gvecs) = Python::attach(|py| -> PyResult<(Vec<f64>, Vec<Vec<f64>>)> {
+                let mb_views: Vec<_> = evals.iter().map(|e| e.my.view()).collect();
+                let ob_views: Vec<_> = evals.iter().map(|e| e.opp.view()).collect();
+                let flat_views: Vec<_> = evals.iter().map(|e| e.flat.view()).collect();
+                let mb = numpy::ndarray::stack(Axis(0), &mb_views)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let ob = numpy::ndarray::stack(Axis(0), &ob_views)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let flat = numpy::ndarray::stack(Axis(0), &flat_views)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let mb_py = mb.into_pyarray(py);
+                let ob_py = ob.into_pyarray(py);
+                let flat_py = flat.into_pyarray(py);
+                let idx_arrays: Vec<_> = idxs_per
+                    .iter()
+                    .map(|v| v.clone().into_pyarray(py))
+                    .collect();
+                let idxs_list = PyList::new(py, idx_arrays)?;
+                let result = ev.bind(py).call1((mb_py, ob_py, flat_py, idxs_list))?;
+                let tuple = result.downcast::<PyTuple>()?;
+                let vals: Vec<f64> = {
+                    let arr = tuple.get_item(0)?;
+                    let arr = arr.downcast::<PyArray1<f32>>()?;
+                    arr.readonly().as_slice()?.iter().map(|&x| x as f64).collect()
+                };
+                let gvecs: Vec<Vec<f64>> = {
+                    let list = tuple.get_item(1)?;
+                    let list = list.downcast::<PyList>()?;
+                    let mut out = Vec::with_capacity(list.len());
+                    for item in list.iter() {
+                        let arr = item.downcast::<PyArray1<f32>>()?;
+                        out.push(
+                            arr.readonly()
+                                .as_slice()?
+                                .iter()
+                                .map(|&x| x as f64)
+                                .collect(),
+                        );
+                    }
+                    out
+                };
+                Ok((vals, gvecs))
+            })?;
+            for (row, e) in evals.iter().enumerate() {
+                let priors = softmax_f64(&gvecs[row]);
+                let value0 = if e.actor == 0 { vals[row] } else { -vals[row] };
+                if arena[e.leaf as usize].is_expanded {
+                    ol_add_missing_children(&mut arena, e.leaf, &e.legal, &priors);
+                } else {
+                    for (i, &(idx, placement, pick)) in e.legal.iter().enumerate() {
+                        let cid = arena.len() as u32;
+                        arena.push(OLNode::new(priors[i], (placement, pick)));
+                        arena[e.leaf as usize].children.push((idx, cid));
+                    }
+                    arena[e.leaf as usize].is_expanded = true;
+                }
+                path_v0[e.path_idx] = Some(value0);
+            }
+        }
+
+        // Remove VL, then back up each path's own value (terminal leaves take
+        // their concrete state's terminal value — deck-dependent by design).
+        for (pi, path) in paths.iter().enumerate() {
+            ol_apply_virtual_loss(&mut arena, path, &path_actors[pi], -1, vl);
+        }
+        for (pi, path) in paths.iter().enumerate() {
+            let v0 = if leaf_states[pi].phase == GAME_OVER {
+                terminal_search_value(&leaf_states[pi], score_scale, margin_gain, alpha_param)
+            } else {
+                path_v0[pi].expect("non-terminal path must have an eval value")
+            };
+            for &n in path {
+                let node = &mut arena[n as usize];
+                node.visit_count += 1;
+                node.value_sum += v0;
+            }
+        }
+        sims_done += paths.len();
+    }
+
+    let root_value0 = arena[0].value_sum / arena[0].visit_count.max(1) as f64;
+    let children: Vec<(u16, i32, f64, f64)> = arena[0]
+        .children
+        .iter()
+        .map(|&(idx, cid)| {
+            let c = &arena[cid as usize];
+            (idx, c.visit_count, c.value_sum, c.prior)
+        })
+        .collect();
+    Ok((children, root_value0))
+}
+
 // ─── Batched MCTS (N games, synchronized ticks, one GPU forward per tick) ─────
 // Drives N independent search trees ("slots") in lockstep: every tick each slot
 // descends to its leaves (pure Rust), ALL N×leaf_batch leaves are stacked into
@@ -7578,6 +7832,62 @@ mod kingdomino_rust {
             }
             None => Ok((0.0, false, start.elapsed().as_secs_f64(), 0, 0)),
         }
+    }
+
+    /// Advisor open-loop single-root search (Rust port of the web advisor's
+    /// OpenLoopMCTS loop). Runs `n_sims` simulations from `state` with a fresh
+    /// deck redeterminization per simulation, evaluating leaves through the
+    /// BatchedEvaluator-contract callable in `leaf_batch`-sized waves (virtual
+    /// loss). Returns (children, root_value_player0) where children is
+    /// [(joint_index, visit_count, value_sum_player0, prior)] for every root
+    /// child, ascending by joint index.
+    ///
+    /// No exact-endgame hook: route terminal-adjacent ROOTS (deck <= 4) to the
+    /// exact solver before calling this (interior deck<=4 nodes under a deeper
+    /// root are determinization-dependent — same gate as training).
+    #[pyfunction]
+    #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0,
+                        fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
+                        score_scale=160.0, margin_gain=2.0, alpha=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn advisor_open_loop_search<'py>(
+        py: Python<'py>,
+        state: &RustGameState,
+        evaluator: Bound<'py, PyAny>,
+        n_sims: usize,
+        dirichlet_alpha: f64,
+        dirichlet_eps: f64,
+        fpu: f64,
+        cpuct: f64,
+        seed: u64,
+        leaf_batch: usize,
+        virtual_loss: i32,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+        if state.phase == GAME_OVER {
+            return Err(PyValueError::new_err("Cannot search from a terminal state"));
+        }
+        let root_state = state.cloned();
+        let ev: Py<PyAny> = evaluator.unbind();
+        py.detach(move || {
+            super::advisor_open_loop_search_impl(
+                &root_state,
+                &ev,
+                n_sims,
+                dirichlet_alpha,
+                dirichlet_eps,
+                fpu,
+                cpuct,
+                seed,
+                leaf_batch,
+                virtual_loss,
+                score_scale,
+                margin_gain,
+                alpha,
+            )
+        })
     }
 
     /// Count exact minimax nodes for a no-chance endgame, with the same
