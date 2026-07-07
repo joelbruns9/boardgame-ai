@@ -13,6 +13,7 @@ insertion order does not affect sampling; added in chain order anyway.
 Local-only: writes runs/kingdomino/hof_run6/ (pool + hof_index.jsonl). Sync this
 dir to the box alongside the run6 launch and point --hof_dir at it.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,23 @@ from games.kingdomino.hof import add_hof_entry, read_hof_index
 
 REPO = Path(r"C:\Users\joeld\projects\boardgame-ai")
 HOF_DIR = REPO / "runs" / "kingdomino" / "hof_run6"
+
+
+def relativize_index(hof_dir: Path, repo: Path) -> None:
+    """add_hof_entry records absolute paths; rewrite path/source to repo-relative
+    POSIX so the pool is portable across machines (e.g. uploaded to the box and
+    loaded with cwd=repo root). Without this, load_hof_net fails on the box with
+    the laptop's C:\\... paths."""
+    index = hof_dir / "hof_index.jsonl"
+    rows = [json.loads(x) for x in index.read_text(encoding="utf-8").splitlines() if x.strip()]
+    for r in rows:
+        for key in ("path", "source"):
+            if r.get(key):
+                rel = Path(r[key].replace("\\", "/")).resolve().relative_to(repo.resolve())
+                r[key] = rel.as_posix()
+    with index.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
 
 SEEDS = [
     (REPO / "runs/kingdomino/cloud_80x6_run1/iter_0066.pt", "run1_iter66", 66),
@@ -35,6 +53,8 @@ for src, tag, iteration in SEEDS:
     )
     print(f"  + {tag:20s} <- {src.name}  "
           f"[{entry.channels}x{entry.blocks}]  sha256={entry.sha256[:12]}")
+
+relativize_index(HOF_DIR, REPO)
 
 print(f"\nHOF pool: {HOF_DIR}")
 for e in read_hof_index(HOF_DIR):
