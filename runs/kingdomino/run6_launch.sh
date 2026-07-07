@@ -51,7 +51,9 @@ nohup python games/kingdomino/self_play.py \
   \
   --hof_dir runs/kingdomino/hof_run6 \
   --hof_fraction 0.2 --hof_start_iter 1 --hof_sample_weights uniform \
-  --hof_sims 200 --hof_current_sims 200 --hof_temp_moves 8 --hof_add_every 10 \
+  --hof_sims 400 --hof_temp_moves 8 --hof_add_every 10 \
+  `# HOF games now run on the Rust batched engine (fast); --hof_sims drives` \
+  `# BOTH seats. --hof_current_sims is obsolete here (serial path only).` \
   \
   --selfplay_generator_mode soft_gate \
   --promotion_every 5 --promotion_games 1032 --promotion_sims 100 \
