@@ -6754,8 +6754,10 @@ impl BatchedMCTS {
 
     /// Phase 2 of a tick: scatter forward results, expand + back up every slot,
     /// advance state machines, recycle finished games.  Returns finished games as
-    /// [(game_seed, [(mb,ob,flat,pidx,pval,lidx,z,own_score,opp_score,win_target)],
-    ///  (score0,score1))].
+    /// [(game_seed,
+    ///   [(mb,ob,flat,pidx,pval,lidx,root_stats,z,own_score,opp_score,win_target,actor)],
+    ///  (score0,score1))].  `actor` (0/1) is the seat that made the move; used by
+    /// the two-net HOF self-play path to keep only the learner-searched moves.
     fn update<'py>(
         &mut self,
         py: Python<'py>,
@@ -7070,6 +7072,7 @@ impl BatchedMCTS {
                     r.root_prior_val.into_pyarray(py),
                     r.root_visit_count.into_pyarray(py),
                 );
+                let actor = r.actor;
                 let tup = (
                     r.my.into_pyarray(py),
                     r.opp.into_pyarray(py),
@@ -7082,6 +7085,7 @@ impl BatchedMCTS {
                     r.own_score,
                     r.opp_score,
                     r.win_target,
+                    actor,
                 );
                 examples.append(tup)?;
             }

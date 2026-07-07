@@ -1235,6 +1235,144 @@ def play_current_vs_hof_game(
     }
 
 
+def _run_hof_orientation(batched, eval_seat0, eval_seat1):
+    """Drive one learner-vs-HOF BatchedMCTS to completion, routing each leaf to
+    the net of the seat whose search produced it (searcher-owns-network, via
+    row_search_actors — the same mechanism elo_rating uses for two-net matches).
+    Returns [(seed, raw_example_tuples, (s0, s1))] carrying ALL moves' examples;
+    the caller keeps only the learner's seat (each tuple's trailing actor field)."""
+    results: List[Tuple[int, list, Tuple[int, int]]] = []
+    ticks = 0
+    while not batched.done():
+        mb, ob, flat, idxs_list = batched.step()
+        mb = np.asarray(mb); ob = np.asarray(ob); flat = np.asarray(flat)
+        search_actors = np.asarray(batched.row_search_actors(), dtype=np.int64)
+        n = mb.shape[0]
+        values = np.zeros(n, dtype=np.float32)
+        gathered: List[Optional[np.ndarray]] = [None] * n
+        for actor_id, evaluator in ((0, eval_seat0), (1, eval_seat1)):
+            rows = np.flatnonzero(search_actors == actor_id)
+            if rows.size == 0:
+                continue
+            sub_idxs = [idxs_list[int(r)] for r in rows]
+            v, g = evaluator(mb[rows], ob[rows], flat[rows], sub_idxs)
+            values[rows] = np.asarray(v, dtype=np.float32)
+            for i, r in enumerate(rows):
+                gathered[int(r)] = np.asarray(g[i], dtype=np.float32)
+        for r in range(n):
+            if gathered[r] is None:
+                gathered[r] = np.zeros(len(idxs_list[r]), dtype=np.float32)
+        for seed, examples, scores in batched.update(values, gathered):
+            results.append((int(seed), examples, (int(scores[0]), int(scores[1]))))
+        ticks += 1
+        if ticks > 2_000_000:
+            raise RuntimeError("HOF BatchedMCTS exceeded tick guard")
+    return results
+
+
+def play_hof_games_batched(
+    learner_net: KingdominoNet,
+    hof_net: KingdominoNet,
+    cfg: SelfPlayConfig,
+    *,
+    n_games: int,
+    game_seed_start: int,
+    iteration: int = 0,
+    opponent_source: str = "",
+) -> Tuple[List[List[Example]], List[Tuple[int, int]], dict]:
+    """Rust-batched learner-vs-HOF self-play — the fast replacement for the serial
+    play_current_vs_hof_game loop under the batched engines.
+
+    Both seats are searched by their own net inside ONE open-loop BatchedMCTS
+    (leaves routed by row_search_actors), so HOF games run at the same
+    GPU-batched throughput as normal self-play instead of the ~28x-slower serial
+    Python MCTS.  Only the LEARNER's moves become training examples — the HOF
+    net's search policy is never a training target — using each example tuple's
+    trailing actor field to keep the learner's seat.  The learner plays half the
+    games in seat 0 and half in seat 1 for seat balance.
+
+    Search config is a single instance shared by both seats (the batched engine
+    has no per-seat knobs): sims=--hof_sims, temp_moves=--hof_temp_moves,
+    dirichlet_eps=--hof_dirichlet_epsilon, playout-cap OFF.  The learner's heavy
+    exploration lives in the main self-play; HOF games favour honest play against
+    the frozen opponent.  (--hof_current_sims applies only to the legacy serial
+    path and is ignored here.)
+
+    Returns (per_game_learner_examples, per_game_scores_seat0_frame, stats) where
+    stats has trainable_examples and mean_diff (learner-frame score margin)."""
+    import kingdomino_rust
+
+    effective_solver_cpus, _game_cpus, _total = _resolve_async_solver_cpus(cfg)
+
+    def _mk_eval(net: KingdominoNet):
+        return make_rust_evaluator(
+            net, device=cfg.device, amp=cfg.inference_amp,
+            margin_gain=cfg.margin_gain, alpha=cfg.alpha)
+
+    eval_learner = _mk_eval(learner_net)
+    eval_hof = _mk_eval(hof_net)
+    hof_sims = max(1, int(cfg.hof_sims))
+
+    def _make(n: int, seed0: int):
+        return kingdomino_rust.BatchedMCTS(
+            max(1, int(cfg.batch_slots)), int(n), int(seed0), hof_sims,
+            leaf_batch=max(1, int(cfg.leaf_batch)),
+            virtual_loss=int(cfg.virtual_loss),
+            cpuct=float(cfg.c_puct), fpu=float(cfg.fpu),
+            dirichlet_alpha=float(cfg.dirichlet_alpha),
+            dirichlet_eps=float(cfg.hof_dirichlet_epsilon),
+            temp_moves=int(cfg.hof_temp_moves),
+            open_loop=(cfg.engine == "batched_open_loop"),
+            score_scale=float(cfg.score_scale),
+            margin_gain=float(cfg.margin_gain), alpha=float(cfg.alpha),
+            exact_endgame_max_secs=float(cfg.exact_endgame_max_secs),
+            exact_policy_mode=str(cfg.exact_policy_mode),
+            exact_clamp_delta=float(cfg.exact_clamp_delta),
+            async_solve=bool(cfg.async_solve),
+            solver_cpus=int(effective_solver_cpus),
+            playout_cap_randomization=False,
+            full_search_fraction=1.0,
+            fast_move_sims=hof_sims,
+            record_fast_moves=False,
+            fast_move_dirichlet_eps=0.0,
+            fast_move_temp_moves=0,
+        )
+
+    all_examples: List[List[Example]] = []
+    all_scores: List[Tuple[int, int]] = []
+    learner_diffs: List[int] = []
+    n0 = int(n_games) // 2                    # orientation 0: learner in seat 0
+    n1 = int(n_games) - n0                    # orientation 1: learner in seat 1
+    for n_or, learner_seat, seed0 in ((n0, 0, int(game_seed_start)),
+                                      (n1, 1, int(game_seed_start) + n0)):
+        if n_or <= 0:
+            continue
+        eval0 = eval_learner if learner_seat == 0 else eval_hof
+        eval1 = eval_hof if learner_seat == 0 else eval_learner
+        game_type = "current_vs_hof" if learner_seat == 0 else "hof_vs_current"
+        for seed, raw_examples, (s0, s1) in _run_hof_orientation(
+                _make(n_or, seed0), eval0, eval1):
+            keep: List[Example] = []
+            for tup in raw_examples:
+                if int(tup[-1]) != learner_seat:  # keep only learner-searched moves
+                    continue
+                ex = _example_from_rust_tuple(tup, iteration=iteration)
+                ex.owner = "current"
+                ex.trainable = True
+                ex.game_type = game_type
+                ex.opponent_source = opponent_source
+                keep.append(ex)
+            all_examples.append(keep)
+            all_scores.append((s0, s1))
+            learner_diffs.append((s0 - s1) if learner_seat == 0 else (s1 - s0))
+
+    stats = {
+        "trainable_examples": int(sum(len(e) for e in all_examples)),
+        "mean_diff": float(np.mean(learner_diffs)) if learner_diffs else 0.0,
+    }
+    return all_examples, all_scores, stats
+
+
 # ─── 3b. Rust-engine self-play generation ──────────────────────────────────
 # The Rust engine (--engine rust) plays the ENTIRE game inside a RustGameState
 # and runs RustMCTS.search in place of AlphaZeroMCTS+PIMC.  It produces the same
@@ -1527,7 +1665,13 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
     Rust, matching play_selfplay_game_rust's documented limitation).  The Rust
     tuple carries no iteration field, so the caller passes it in.
     """
-    if len(tup) == 11:
+    if len(tup) == 12:
+        # Current format: root_stats + trailing actor (0/1). The actor is only
+        # needed by the two-net HOF path (_hof_actor_from_rust_tuple); ignored here.
+        (mb, ob, flat, pidx, pval, lidx, root_stats,
+         z, own_score, opp_score, win_target, _actor) = tup
+        root_prior_idx, root_prior_val, root_visit_count = root_stats
+    elif len(tup) == 11:
         mb, ob, flat, pidx, pval, lidx, root_stats, z, own_score, opp_score, win_target = tup
         root_prior_idx, root_prior_val, root_visit_count = root_stats
     elif len(tup) == 10:
@@ -3089,60 +3233,83 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     game_seed += 1
             if hof_games and hof_entry is not None:
                 hof_net = load_hof_net(hof_entry.path, device=iter_cfg.device)
-                # HOF games run on the serial Python MCTS (make_open_loop_mcts),
-                # not the Rust batched engine, so the full n_simulations is
-                # prohibitively slow here. Cap the learner side at
-                # hof_current_sims when set (>0); 0 keeps the old full-sims
-                # behaviour (only viable when --sims is itself small).
-                current_hof_sims = (int(iter_cfg.hof_current_sims)
-                                    if int(iter_cfg.hof_current_sims) > 0
-                                    else int(iter_cfg.n_simulations))
-                current_hof_mcts = make_open_loop_mcts(
-                    generation_net, iter_cfg, max(1, current_hof_sims))
-                hof_cfg = replace(
-                    iter_cfg,
-                    n_simulations=max(1, int(iter_cfg.hof_sims)),
-                    temp_moves=int(iter_cfg.hof_temp_moves),
-                    dirichlet_epsilon=float(iter_cfg.hof_dirichlet_epsilon),
-                    playout_cap_randomization=False,
-                )
-                hof_mcts = make_open_loop_mcts(
-                    hof_net, hof_cfg, int(hof_cfg.n_simulations))
-                hof_diffs = []
-                for h in range(hof_games):
-                    _, g_np_rng = _game_rngs(game_seed)
-                    current_player = h % 2
-                    examples, scores, mixed_stats = play_current_vs_hof_game(
-                        current_hof_mcts,
-                        hof_mcts,
-                        current_player=current_player,
-                        current_cfg=iter_cfg,
-                        seed=game_seed,
-                        np_rng=g_np_rng,
-                        iteration=it,
-                        opponent_source=hof_entry.path,
-                    )
+                if iter_cfg.engine in ("batched", "batched_open_loop"):
+                    # Fast path: learner-vs-HOF games on the Rust BatchedMCTS
+                    # (two-net, searcher-owns-network). Only learner moves become
+                    # examples; both seats searched via GPU-batched leaves.
+                    hof_ex, hof_sc, hstats = play_hof_games_batched(
+                        generation_net, hof_net, iter_cfg,
+                        n_games=hof_games, game_seed_start=game_seed,
+                        iteration=it, opponent_source=hof_entry.path)
                     if (iter_cfg.policy_target_pruning
                             or iter_cfg.forced_playout_subtraction):
-                        wrapped = [examples]
                         ps = _prune_examples_policy_targets(
-                            wrapped, total_visits=max(1, int(iter_cfg.n_simulations)),
+                            hof_ex, total_visits=max(1, int(iter_cfg.hof_sims)),
                             skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
                             one_visit_pruning=iter_cfg.policy_target_pruning,
                             forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
                             forced_playout_k=iter_cfg.forced_playout_k)
                         for k, v in ps.items():
                             policy_prune_stats[k] += v
-                    buffer.add(examples)
-                    diff = scores[0] - scores[1]
-                    diffs.append(diff)
-                    hof_diffs.append(diff if current_player == 0 else -diff)
-                    hof_stats["trainable_examples"] += int(
-                        mixed_stats["current_records"])
-                    game_seed += 1
-                if hof_diffs:
-                    hof_stats["mean_diff"] = float(
-                        np.asarray(hof_diffs, dtype=np.float32).mean())
+                    for examples, (s0, s1) in zip(hof_ex, hof_sc):
+                        buffer.add(examples)
+                        diffs.append(s0 - s1)
+                    hof_stats["trainable_examples"] += int(hstats["trainable_examples"])
+                    hof_stats["mean_diff"] = float(hstats["mean_diff"])
+                    game_seed += hof_games
+                else:
+                    # Legacy serial path (Python OpenLoopMCTS). --hof_current_sims
+                    # caps the learner side (the full n_simulations is far too slow
+                    # serially); 0 keeps the old full-sims behaviour.
+                    current_hof_sims = (int(iter_cfg.hof_current_sims)
+                                        if int(iter_cfg.hof_current_sims) > 0
+                                        else int(iter_cfg.n_simulations))
+                    current_hof_mcts = make_open_loop_mcts(
+                        generation_net, iter_cfg, max(1, current_hof_sims))
+                    hof_cfg = replace(
+                        iter_cfg,
+                        n_simulations=max(1, int(iter_cfg.hof_sims)),
+                        temp_moves=int(iter_cfg.hof_temp_moves),
+                        dirichlet_epsilon=float(iter_cfg.hof_dirichlet_epsilon),
+                        playout_cap_randomization=False,
+                    )
+                    hof_mcts = make_open_loop_mcts(
+                        hof_net, hof_cfg, int(hof_cfg.n_simulations))
+                    hof_diffs = []
+                    for h in range(hof_games):
+                        _, g_np_rng = _game_rngs(game_seed)
+                        current_player = h % 2
+                        examples, scores, mixed_stats = play_current_vs_hof_game(
+                            current_hof_mcts,
+                            hof_mcts,
+                            current_player=current_player,
+                            current_cfg=iter_cfg,
+                            seed=game_seed,
+                            np_rng=g_np_rng,
+                            iteration=it,
+                            opponent_source=hof_entry.path,
+                        )
+                        if (iter_cfg.policy_target_pruning
+                                or iter_cfg.forced_playout_subtraction):
+                            wrapped = [examples]
+                            ps = _prune_examples_policy_targets(
+                                wrapped, total_visits=max(1, int(iter_cfg.n_simulations)),
+                                skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
+                                one_visit_pruning=iter_cfg.policy_target_pruning,
+                                forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
+                                forced_playout_k=iter_cfg.forced_playout_k)
+                            for k, v in ps.items():
+                                policy_prune_stats[k] += v
+                        buffer.add(examples)
+                        diff = scores[0] - scores[1]
+                        diffs.append(diff)
+                        hof_diffs.append(diff if current_player == 0 else -diff)
+                        hof_stats["trainable_examples"] += int(
+                            mixed_stats["current_records"])
+                        game_seed += 1
+                    if hof_diffs:
+                        hof_stats["mean_diff"] = float(
+                            np.asarray(hof_diffs, dtype=np.float32).mean())
                 hof_net.to("cpu")
                 if str(iter_cfg.device).startswith("cuda"):
                     torch.cuda.empty_cache()
@@ -4002,10 +4169,11 @@ if __name__ == "__main__":
     p.add_argument("--hof_sims", type=int, default=200,
                    help="MCTS sims for deterministic HOF opponent moves")
     p.add_argument("--hof_current_sims", type=int, default=0,
-                   help="MCTS sims for the LEARNER side in HOF games. HOF games "
-                        "run on the serial Python MCTS (not the Rust batched "
-                        "engine), so the full --sims is unusably slow here; set "
-                        "this to ~100-400. 0 = use --sims (only sane at low sims).")
+                   help="LEGACY serial HOF path only (engine not in batched/"
+                        "batched_open_loop): sims for the learner side, since the "
+                        "full --sims is unusably slow on the serial Python MCTS; "
+                        "set ~100-400, 0 = use --sims. Ignored by the batched HOF "
+                        "path, which searches both seats at --hof_sims.")
     p.add_argument("--hof_temp_moves", type=int, default=0,
                    help="HOF move sampling temperature window; default 0 = best play")
     p.add_argument("--hof_dirichlet_epsilon", type=float, default=0.0,
