@@ -265,6 +265,7 @@ class SelfPlayConfig:
     hof_start_iter: int = 50
     hof_sample_weights: str = "recency"
     hof_sims: int = 200
+    hof_current_sims: int = 0  # learner-side sims in HOF games; 0 = full n_simulations
     hof_temp_moves: int = 0
     hof_dirichlet_epsilon: float = 0.0
     hof_add_every: int = 0
@@ -3088,8 +3089,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     game_seed += 1
             if hof_games and hof_entry is not None:
                 hof_net = load_hof_net(hof_entry.path, device=iter_cfg.device)
+                # HOF games run on the serial Python MCTS (make_open_loop_mcts),
+                # not the Rust batched engine, so the full n_simulations is
+                # prohibitively slow here. Cap the learner side at
+                # hof_current_sims when set (>0); 0 keeps the old full-sims
+                # behaviour (only viable when --sims is itself small).
+                current_hof_sims = (int(iter_cfg.hof_current_sims)
+                                    if int(iter_cfg.hof_current_sims) > 0
+                                    else int(iter_cfg.n_simulations))
                 current_hof_mcts = make_open_loop_mcts(
-                    generation_net, iter_cfg, int(iter_cfg.n_simulations))
+                    generation_net, iter_cfg, max(1, current_hof_sims))
                 hof_cfg = replace(
                     iter_cfg,
                     n_simulations=max(1, int(iter_cfg.hof_sims)),
@@ -3992,6 +4001,11 @@ if __name__ == "__main__":
                    choices=("recency", "uniform", "mixed", "latest"))
     p.add_argument("--hof_sims", type=int, default=200,
                    help="MCTS sims for deterministic HOF opponent moves")
+    p.add_argument("--hof_current_sims", type=int, default=0,
+                   help="MCTS sims for the LEARNER side in HOF games. HOF games "
+                        "run on the serial Python MCTS (not the Rust batched "
+                        "engine), so the full --sims is unusably slow here; set "
+                        "this to ~100-400. 0 = use --sims (only sane at low sims).")
     p.add_argument("--hof_temp_moves", type=int, default=0,
                    help="HOF move sampling temperature window; default 0 = best play")
     p.add_argument("--hof_dirichlet_epsilon", type=float, default=0.0,
@@ -4193,6 +4207,7 @@ if __name__ == "__main__":
         hof_start_iter=a.hof_start_iter,
         hof_sample_weights=a.hof_sample_weights,
         hof_sims=a.hof_sims,
+        hof_current_sims=a.hof_current_sims,
         hof_temp_moves=a.hof_temp_moves,
         hof_dirichlet_epsilon=a.hof_dirichlet_epsilon,
         hof_add_every=a.hof_add_every,
