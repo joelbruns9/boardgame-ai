@@ -173,7 +173,8 @@ class RecommendRequest(BaseModel):
     # Exact endgame advisor. exact_threads=0 leaves Rayon on its default global
     # pool size, which is all logical CPUs unless RAYON_NUM_THREADS was set
     # before the Rust extension initialized.
-    exact_max_secs: float = Field(default=300.0, ge=0.0, le=3600.0)
+    # Advisor policy: always solve — default to the ceiling; requests may lower it.
+    exact_max_secs: float = Field(default=3600.0, ge=0.0, le=3600.0)
     exact_threads: int = Field(default=0, ge=0, le=128)
 
 
@@ -1004,6 +1005,10 @@ def _choose_nn_action(state: GameState, req: BotActionRequest):
         n_simulations=int(req.nn_sims),
         dirichlet_alpha=0.3,
         dirichlet_epsilon=0.25,
+        # Advisor policy: always solve reachable endgames exactly. 3600s is a
+        # hung-request safeguard, not a budget — with the within-solve TT the
+        # worst measured real position solves in well under a minute.
+        exact_endgame_max_secs=3600.0,
     )
     np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
     visit_counts, value0, _root = run_pimc_open_loop(
@@ -1385,6 +1390,9 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             n_simulations=sims,
             dirichlet_alpha=0.3,
             dirichlet_epsilon=0.25,
+            # Advisor policy: always solve reachable endgames exactly (see
+            # _choose_nn_action for rationale).
+            exact_endgame_max_secs=3600.0,
         )
         np_rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
         try:
