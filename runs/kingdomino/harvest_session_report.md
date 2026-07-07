@@ -9,7 +9,10 @@ its gate still owns its own `current_best.pt`.
 the flat gate checks; hypothesis (B) self-play data exhaustion for this net is
 confirmed. Recommended next step: run6 = diversity package (option b).
 Sims sweep: no knee up to 12800 — residual flips are near-tie reshuffles; advisor
-should default to a flat 3200 sims (current web default of 50 is far too low).**
+should default to a flat 3200 sims (current web default of 50 is far too low).
+Final 5e-5 verdict (sync through iter 115): checks tighten (sd 2.7→1.0) but mean
+stays ~48% and brier_diag keeps rising at the 1e-4 rate — variance reduction
+only, no strength; run6 recommendation unchanged.**
 
 ---
 
@@ -141,6 +144,37 @@ Gate-check series (516 games @ 100 sims vs current_best; from nohup.log):
 Preliminary read: 5e-5 has plausibly stopped the value-head drift (ii) but shows
 no strength signal yet (i, iii). Re-run this section against nohup.log after the
 next sync covering checks 100–110.
+
+### UPDATE (sync through iter 115, received 2026-07-07) — final verdict
+
+The next sync arrived same-day (iters 90–115 pasted from the box's log; checks
+at 100/105/110/115). Pre-registered criteria, final scoring:
+
+Post-drop checks: 95: 46.6% (revert) · 100: 47.9% (revert) · 105: 46.9%
+(revert) · 110: 48.7% (probation) · 115: 48.9% (probation).
+
+- **(i) checks tighten into 47–51 — MARGINAL.** The five post-drop checks span
+  46.6–48.9 (sd 1.03) vs the 1e-4 era's 43.4–52.9 (sd 2.66). The tightening is
+  real-looking but not conclusive (P(sd ≤ 1.03 from pure 2.2% sampling noise,
+  n=5) ≈ 0.07), two of five checks sit below the band's 47 floor, and the mean
+  did not move: 47.8% post-drop vs 48.3% before. Tighter, not stronger.
+- **(ii) brier_diag stops rising — FAILS.** With all 25 post-drop iterations,
+  the OLS slope over iters 91–115 is **+0.00053/iter — the same as the late
+  1e-4 rate**. Window means: 0.207 (91–96) → 0.208 (97–102) → 0.216 (103–108)
+  → 0.215 (109–115). The 10× flattening reported above from iters 91–96 alone
+  was noise. Train-side value metrics agree: win loss drifts 0.244 → ~0.256
+  and train brier 0.073 → 0.078 over the same span — the value head keeps
+  churning at half the lr.
+- **(iii) any check ≥ 53% — FAILS.** Max post-drop check is 48.9%.
+
+**Verdict: the lr drop reduced the amplitude of the wander (smaller steps ⇒
+smaller noise ball) but changed nothing else — drift continues at the same
+rate and strength is flat at ~48%.** This closes the loop with the H2H tie:
+neither averaging the noise ball (§2) nor shrinking it (this section) yields
+strength, so the plateau is not an optimizer artifact at either scale. The
+data-exhaustion diagnosis and the run6 recommendation (§5) stand unchanged,
+including starting run6 at 1e-4: 5e-5 demonstrably buys variance reduction
+only, which is not what a fresh data distribution needs early.
 
 ## 5. Recommended next step
 
