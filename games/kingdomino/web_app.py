@@ -715,7 +715,10 @@ def _recommend_exact(
     score_scale = 160.0
     margin_gain = 2.0
     win_alpha = 0.0
-    rank_alpha = 0.8
+    # Ranking frame matches training (win-gated B=0.5; was the pre-win-gate
+    # 0.8). Rankings are identical for any alpha>0 — the value is a monotone
+    # transform of the raw margin — so this is consistency, not behavior.
+    rank_alpha = 0.5
     root_value0, root_hit, root_solved = _cached_exact_value(
         state,
         max_secs=float(req.exact_max_secs),
@@ -939,13 +942,17 @@ def _load_nn_evaluator(req: BotActionRequest):
         ).to(req.device)
         net.load_state_dict(sd)
         net.eval()
-        # The advisor deliberately searches with alpha=0.0 — a PURE win-probability
-        # objective — rather than the training-time alpha=0.8 (80% win / 20%
-        # score-margin blend).  This makes backed-up Q values map cleanly to win
-        # probability via (Q + 1) / 2, and matches the known-best eval config
-        # (alpha=0.0, c_puct=1.5).  margin_gain is left at its default; with
-        # alpha=0.0 the margin term is multiplied by zero, so it has no effect.
-        evaluator = make_serial_evaluator(net, device=req.device, alpha=0.0)
+        # The advisor searches with the TRAINING value frame: the win-gated form
+        # (1-B)*win + B*win^4*margin at B=alpha=0.5 (2026-07-06 change; was
+        # alpha=0.0 pure win probability).  The win^4 gate means margin only
+        # influences the search once the win is essentially decided — fixing the
+        # observed "sloppy play above 95% win prob" without ever trading win
+        # probability for points in contested positions.  Q values are therefore
+        # the win-gated search value, not a calibrated win probability; (Q+1)/2
+        # is still surfaced as a [0,1] score (margin-tinted only when decided),
+        # and the net's own win head (root_inference.win_prob) is the calibrated
+        # probability readout.
+        evaluator = make_serial_evaluator(net, device=req.device, alpha=0.5)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to load NN checkpoint {path}: {exc}") from exc
 
@@ -979,9 +986,9 @@ def _rust_open_loop_search(state: GameState, net, req_key, device: str,
     ev = _RUST_ADVISOR_EVAL_CACHE.get(req_key)
     if ev is None:
         from games.kingdomino.self_play import make_rust_evaluator
-        # Advisor searches with alpha=0.0 (pure win probability) — same
-        # rationale as the serial evaluator above.
-        ev = make_rust_evaluator(net, device=device, alpha=0.0)
+        # Training value frame (win-gated, B=0.5) — same rationale as the
+        # serial evaluator in _load_nn_evaluator.
+        ev = make_rust_evaluator(net, device=device, alpha=0.5)
         if len(_RUST_ADVISOR_EVAL_CACHE) >= 4:
             _RUST_ADVISOR_EVAL_CACHE.clear()
         _RUST_ADVISOR_EVAL_CACHE[req_key] = ev
@@ -993,7 +1000,7 @@ def _rust_open_loop_search(state: GameState, net, req_key, device: str,
         cpuct=1.5,
         seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
         leaf_batch=_RUST_ADVISOR_LEAF_BATCH,
-        alpha=0.0,
+        alpha=0.5,
     )
     actor = int(state.current_actor)
     idx_to_action = {int(encode_action(a, state)): a for a in state.legal_actions()}
@@ -1023,7 +1030,8 @@ def _root_trajectory(net, state: GameState, device: str) -> dict[str, Any]:
     This is a SINGLE root forward pass, NOT search-averaged: it reflects the
     network's prior belief before any tree exploration.  (The per-action Q
     values in the recommendations ARE search-updated, and are win probabilities
-    under the advisor's alpha=0.0 search.)  Surfacing the un-searched root
+    under the advisor's win-gated B=0.5 search — margin-tinted only in
+    decided positions.)  Surfacing the un-searched root
     readout is a known, accepted limitation.
 
     The own/opp heads are normalized by score_scale=100 and are from the CURRENT
@@ -1084,6 +1092,11 @@ def _choose_nn_action(state: GameState, req: BotActionRequest):
             n_simulations=int(req.nn_sims),
             dirichlet_alpha=0.3,
             dirichlet_epsilon=0.25,
+            # Training value frame for terminal/exact backups (win-gated B=0.5;
+            # the class default 0.8 is the pre-win-gate training value).
+            score_scale=160.0,
+            margin_gain=2.0,
+            alpha=0.5,
             # Advisor policy: always solve reachable endgames exactly. 3600s is a
             # hung-request safeguard, not a budget — with the within-solve TT the
             # worst measured real position solves in well under a minute.
@@ -1484,6 +1497,10 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                 n_simulations=sims,
                 dirichlet_alpha=0.3,
                 dirichlet_epsilon=0.25,
+                # Training value frame (win-gated B=0.5); see _choose_nn_action.
+                score_scale=160.0,
+                margin_gain=2.0,
+                alpha=0.5,
                 # Advisor policy: always solve reachable endgames exactly (see
                 # _choose_nn_action for rationale).
                 exact_endgame_max_secs=3600.0,
@@ -1535,8 +1552,9 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                 prior = float(child.prior) if child is not None else None
                 # child.value is player-0 frame; flip to the acting player's
                 # frame, then map the [-1, 1] value to a [0, 1] win probability.
-                # Under the advisor's alpha=0.0 search, this Q is search-updated
-                # win prob.
+                # Under the win-gated B=0.5 search this Q is the search value
+                # (margin-tinted only when decided), squashed to [0,1];
+                # root_inference.win_prob is the calibrated probability.
                 if child is not None and child.visit_count > 0:
                     q_actor = child.value if actor == 0 else -child.value
                     q_win_prob = (q_actor + 1.0) / 2.0
