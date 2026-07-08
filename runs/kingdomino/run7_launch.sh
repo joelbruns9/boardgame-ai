@@ -12,9 +12,11 @@
 #      as normal self-play); --hof_sims caps ONLY the frozen opponent seat
 #      (engine hof_opponent_seat override). Pool curated to near-peers
 #      (hof_run7: run3_iter80 + run5_avg + pre_run7 if Item 1 banked).
-#   3. Promotion ratchet: promote iff confidently >51% — LCB 0.51 on 2500 games
-#      @ 300 sims (was WR wall 0.53 / LCB 0.50 on 1032 @ 100). This unlocks
-#      banking of real micro-gains; it does not by itself create strength.
+#   3. Promotion ratchet: promote iff confidently better — LCB > 0.50 on 2500
+#      games @ 300 sims (was WR wall 0.53 on 1032 @ 100). At this power the LCB
+#      is the binding check (needs observed WR >= ~0.520); min_win_rate 0.51 is
+#      redundant but kept. Banks real micro-gains; does not itself create
+#      strength.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd /root/boardgame-ai
@@ -66,7 +68,7 @@ nohup python games/kingdomino/self_play.py \
   \
   --selfplay_generator_mode soft_gate \
   --promotion_every 5 --promotion_games 2500 --promotion_sims 300 \
-  --promotion_min_win_rate 0.51 --promotion_min_lcb 0.51 \
+  --promotion_min_win_rate 0.51 --promotion_min_lcb 0.50 \
   --soft_gate_revert_win_rate 0.48 \
   \
   --benchmark_every 0 --elo_every 0 \

@@ -115,14 +115,22 @@ power/thresholds in the launch flags:
 | flag | run6 | run7 |
 |---|---|---|
 | `--promotion_min_win_rate` | 0.53 | 0.51 |
-| `--promotion_min_lcb` | 0.50 | 0.51 |
+| `--promotion_min_lcb` | 0.50 | 0.50 |
 | `--promotion_games` | 1032 | 2500 |
 | `--promotion_sims` | 100 | 300 |
+
+User decision (2026-07-08): min_lcb stays 0.50 rather than the originally
+planned 0.51 — promote anything *confidently better than equal*, not only
+confidently-≥1%-better, to allow more banking of real micro-gains. At 2500
+games the LCB is the binding check regardless (LCB > 0.50 needs observed
+WR ≥ ~0.520, so min_win_rate 0.51 is redundant). Known trade-off: across ~24
+gate checks per run there is a ~40% chance one truly-equal net false-passes
+(cheap — it is equal — but adds baseline churn).
 
 Fixed-suite guard and `--soft_gate_revert_win_rate 0.48` unchanged. **Honest
 caveat**: this unlocks the ratchet so real micro-gains get banked — it does
 not by itself create strength. If the learner never truly exceeds
-current_best by >51%, run7 will (correctly) bank nothing.
+current_best, run7 will (correctly) bank nothing.
 
 ## Item 4 — Launch
 
