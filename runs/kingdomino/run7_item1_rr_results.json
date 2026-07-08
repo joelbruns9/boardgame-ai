@@ -1,0 +1,58 @@
+{
+  "protocol": "round_robin_3way_no_incumbent",
+  "games_per_pairing": 2500,
+  "sims": 300,
+  "note": "Pasted back from the cloud box log (2026-07-08). Pairing iter_0020 vs iter_0025 detail rows were clipped in the paste; its a_points/a_win_rate are reconstructed exactly from the aggregate table (1247.5 = 2500 + 1323.0 - 2575.5); its W/L/D split was not recovered. The other two pairings are verbatim.",
+  "pairings": [
+    {
+      "a": "iter_0020",
+      "b": "iter_0025",
+      "games": 2500,
+      "sims": 300,
+      "seed": 20260708,
+      "a_points": 1247.5,
+      "a_win_rate": 0.499,
+      "a_lcb": null,
+      "wins": null,
+      "losses": null,
+      "draws": null,
+      "a_mean_margin": null,
+      "reconstructed": true
+    },
+    {
+      "a": "iter_0020",
+      "b": "iter_0040",
+      "games": 2500,
+      "sims": 300,
+      "seed": 20260709,
+      "a_points": 1310.5,
+      "a_win_rate": 0.5242,
+      "wins": 1264,
+      "losses": 1143,
+      "draws": 93,
+      "a_mean_margin": 0.868,
+      "elapsed_min": 28.655941220124564
+    },
+    {
+      "a": "iter_0025",
+      "b": "iter_0040",
+      "games": 2500,
+      "sims": 300,
+      "seed": 20260710,
+      "a_points": 1323.0,
+      "a_win_rate": 0.5292,
+      "a_lcb": 0.5096036157273608,
+      "wins": 1288,
+      "losses": 1142,
+      "draws": 70,
+      "a_mean_margin": 1.2864,
+      "elapsed_min": 27.828986287117004
+    }
+  ],
+  "aggregate": [
+    {"candidate": "iter_0025", "win_rate": 0.5151, "points": 2575.5, "games": 5000},
+    {"candidate": "iter_0020", "win_rate": 0.5116, "points": 2558.0, "games": 5000},
+    {"candidate": "iter_0040", "win_rate": 0.4733, "points": 2366.5, "games": 5000}
+  ],
+  "winner": "iter_0025"
+}

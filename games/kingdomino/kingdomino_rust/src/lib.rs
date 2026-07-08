@@ -4010,6 +4010,19 @@ impl MoveSearchProfile {
     }
 }
 
+/// Two-net asymmetric self-play (HOF diversity games): the override seat — the
+/// frozen HOF opponent — always searches a fixed shallow budget with its own
+/// noise/temperature settings and NEVER records training examples.  The other
+/// seat (the learner) gets the normal move profile, including playout-cap
+/// randomization, so its recorded targets are full-strength searches.
+#[derive(Clone, Copy)]
+struct SeatSearchOverride {
+    seat: u8,
+    sims: usize,
+    dirichlet_eps: f64,
+    temp_moves: usize,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SlotState {
     NeedsRootEval, // root set but unexpanded; contributes the root as 1 leaf
@@ -4286,7 +4299,23 @@ impl SearchSlot {
         fast_move_dirichlet_eps: f64,
         temp_moves: usize,
         fast_move_temp_moves: usize,
+        seat_override: Option<SeatSearchOverride>,
     ) {
+        // Asymmetric two-net games: the override seat (frozen HOF opponent) is
+        // pinned to its own shallow profile and records nothing; every other
+        // parameter below applies to the learner seat only.
+        if let Some(o) = seat_override {
+            if self.real_state.actor().map(|a| a == o.seat).unwrap_or(false) {
+                self.move_profile = MoveSearchProfile {
+                    target_sims: o.sims.max(1),
+                    record_example: false,
+                    is_full_search: false,
+                    dirichlet_eps: o.dirichlet_eps,
+                    temp_moves: o.temp_moves,
+                };
+                return;
+            }
+        }
         if !playout_cap_randomization {
             self.move_profile = MoveSearchProfile::full(n_sims, dirichlet_eps, temp_moves);
             return;
@@ -4322,6 +4351,7 @@ impl SearchSlot {
         fast_move_dirichlet_eps: f64,
         temp_moves: usize,
         fast_move_temp_moves: usize,
+        seat_override: Option<SeatSearchOverride>,
     ) -> PyResult<Option<(u64, Vec<MoveRecord>, (i32, i32))>> {
         // Training record: encode the REAL (public) state + policy target.
         let actor = self.real_state.actor()?;
@@ -4521,6 +4551,7 @@ impl SearchSlot {
                 fast_move_dirichlet_eps,
                 temp_moves,
                 fast_move_temp_moves,
+                seat_override,
             );
             // If the solver is enabled and the new root is terminal-adjacent
             // (deck ∈ {0,4}), hand it to the exact solver instead of GPU-backed
@@ -5540,6 +5571,8 @@ struct BatchedMCTS {
     record_fast_moves: bool,
     fast_move_dirichlet_eps: f64,
     fast_move_temp_moves: usize,
+    // Asymmetric two-net (HOF) games: shallow no-record profile for one seat.
+    seat_override: Option<SeatSearchOverride>,
     // Terminal-value formula params (Fix 1): GAME_OVER backup uses
     // terminal_search_value with these, matching the non-terminal leaf scale.
     score_scale: f64,
@@ -5717,6 +5750,7 @@ impl BatchedMCTS {
                         self.fast_move_dirichlet_eps,
                         self.temp_moves,
                         self.fast_move_temp_moves,
+                        self.seat_override,
                     );
                     self.slots[si] = slot;
                 } else {
@@ -5811,7 +5845,9 @@ impl BatchedMCTS {
                         playout_cap_randomization=false, full_search_fraction=0.25,
                         fast_move_sims=100, record_fast_moves=false,
                         fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0,
-                        exact_policy_mode="argmax_ties", exact_clamp_delta=10.0))]
+                        exact_policy_mode="argmax_ties", exact_clamp_delta=10.0,
+                        hof_opponent_seat=-1, hof_opponent_sims=0,
+                        hof_opponent_dirichlet_eps=0.0, hof_opponent_temp_moves=0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -5841,9 +5877,35 @@ impl BatchedMCTS {
         fast_move_temp_moves: usize,
         exact_policy_mode: &str,
         exact_clamp_delta: f64,
+        hof_opponent_seat: i64,
+        hof_opponent_sims: usize,
+        hof_opponent_dirichlet_eps: f64,
+        hof_opponent_temp_moves: usize,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
+        // Asymmetric two-net games: seat >= 0 pins that seat (the frozen HOF
+        // opponent) to a fixed shallow search that records no examples, while
+        // the other seat keeps the full profile above (incl. playout cap).
+        assert!(
+            hof_opponent_seat < 2,
+            "BatchedMCTS: hof_opponent_seat must be -1 (off), 0, or 1, got {}",
+            hof_opponent_seat
+        );
+        let seat_override = if hof_opponent_seat >= 0 {
+            Some(SeatSearchOverride {
+                seat: hof_opponent_seat as u8,
+                sims: if hof_opponent_sims > 0 {
+                    hof_opponent_sims
+                } else {
+                    n_sims
+                },
+                dirichlet_eps: hof_opponent_dirichlet_eps,
+                temp_moves: hof_opponent_temp_moves,
+            })
+        } else {
+            None
+        };
         assert!(
             exact_clamp_delta > 0.0,
             "BatchedMCTS: exact_clamp_delta must be > 0, got {}",
@@ -5887,6 +5949,7 @@ impl BatchedMCTS {
                     fast_move_dirichlet_eps,
                     temp_moves,
                     fast_move_temp_moves,
+                    seat_override,
                 );
                 slots.push(slot);
                 games_started += 1;
@@ -5942,6 +6005,7 @@ impl BatchedMCTS {
             record_fast_moves,
             fast_move_dirichlet_eps,
             fast_move_temp_moves,
+            seat_override,
             score_scale,
             margin_gain,
             alpha,
@@ -6281,6 +6345,7 @@ impl BatchedMCTS {
                     self.fast_move_dirichlet_eps,
                     self.temp_moves,
                     self.fast_move_temp_moves,
+                    self.seat_override,
                 );
                 self.slots[si] = slot;
             } else {
@@ -6779,6 +6844,7 @@ impl BatchedMCTS {
             record_fast_moves,
             fast_move_dirichlet_eps,
             fast_move_temp_moves,
+            seat_override,
         ) = (
             self.n_sims,
             self.virtual_loss,
@@ -6794,6 +6860,7 @@ impl BatchedMCTS {
             self.record_fast_moves,
             self.fast_move_dirichlet_eps,
             self.fast_move_temp_moves,
+            self.seat_override,
         );
         // Terminal-value formula params (Fix 1).  `alpha` above is the DIRICHLET
         // alpha; the value-formula weight is `val_alpha`.  Copied to locals so the
@@ -7011,6 +7078,7 @@ impl BatchedMCTS {
                             fast_move_dirichlet_eps,
                             temp_moves,
                             fast_move_temp_moves,
+                            seat_override,
                         )?
                     } else {
                         None
@@ -7050,6 +7118,7 @@ impl BatchedMCTS {
                         fast_move_dirichlet_eps,
                         temp_moves,
                         fast_move_temp_moves,
+                        seat_override,
                     );
                     self.slots[si] = slot;
                 } else {

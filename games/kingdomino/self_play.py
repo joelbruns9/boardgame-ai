@@ -1291,12 +1291,15 @@ def play_hof_games_batched(
     trailing actor field to keep the learner's seat.  The learner plays half the
     games in seat 0 and half in seat 1 for seat balance.
 
-    Search config is a single instance shared by both seats (the batched engine
-    has no per-seat knobs): sims=--hof_sims, temp_moves=--hof_temp_moves,
-    dirichlet_eps=--hof_dirichlet_epsilon, playout-cap OFF.  The learner's heavy
-    exploration lives in the main self-play; HOF games favour honest play against
-    the frozen opponent.  (--hof_current_sims applies only to the legacy serial
-    path and is ignored here.)
+    ASYMMETRIC DEEP TARGETS (run7): the learner seat searches EXACTLY like
+    normal self-play — sims=--sims with playout-cap randomization and
+    full_search_fraction, recording only full-search moves — so the policy
+    targets harvested from HOF games are full-strength.  The frozen HOF
+    opponent seat is pinned via the engine's hof_opponent_seat override to a
+    shallow no-record profile: sims=--hof_sims, temp_moves=--hof_temp_moves,
+    dirichlet_eps=--hof_dirichlet_epsilon.  Its role is steering the learner
+    into diverse positions, not labelling them.  (--hof_current_sims applies
+    only to the legacy serial path and is ignored here.)
 
     Returns (per_game_learner_examples, per_game_scores_seat0_frame, stats) where
     stats has trainable_examples and mean_diff (learner-frame score margin)."""
@@ -1313,15 +1316,16 @@ def play_hof_games_batched(
     eval_hof = _mk_eval(hof_net)
     hof_sims = max(1, int(cfg.hof_sims))
 
-    def _make(n: int, seed0: int):
+    def _make(n: int, seed0: int, hof_seat: int):
         return kingdomino_rust.BatchedMCTS(
-            max(1, int(cfg.batch_slots)), int(n), int(seed0), hof_sims,
+            max(1, int(cfg.batch_slots)), int(n), int(seed0),
+            max(1, int(cfg.n_simulations)),
             leaf_batch=max(1, int(cfg.leaf_batch)),
             virtual_loss=int(cfg.virtual_loss),
             cpuct=float(cfg.c_puct), fpu=float(cfg.fpu),
             dirichlet_alpha=float(cfg.dirichlet_alpha),
-            dirichlet_eps=float(cfg.hof_dirichlet_epsilon),
-            temp_moves=int(cfg.hof_temp_moves),
+            dirichlet_eps=float(cfg.dirichlet_epsilon),
+            temp_moves=int(cfg.temp_moves),
             open_loop=(cfg.engine == "batched_open_loop"),
             score_scale=float(cfg.score_scale),
             margin_gain=float(cfg.margin_gain), alpha=float(cfg.alpha),
@@ -1330,12 +1334,16 @@ def play_hof_games_batched(
             exact_clamp_delta=float(cfg.exact_clamp_delta),
             async_solve=bool(cfg.async_solve),
             solver_cpus=int(effective_solver_cpus),
-            playout_cap_randomization=False,
-            full_search_fraction=1.0,
-            fast_move_sims=hof_sims,
+            playout_cap_randomization=bool(cfg.playout_cap_randomization),
+            full_search_fraction=float(cfg.full_search_fraction),
+            fast_move_sims=max(1, int(cfg.fast_move_sims)),
             record_fast_moves=False,
-            fast_move_dirichlet_eps=0.0,
-            fast_move_temp_moves=0,
+            fast_move_dirichlet_eps=float(cfg.fast_move_dirichlet_epsilon),
+            fast_move_temp_moves=int(cfg.fast_move_temp_moves),
+            hof_opponent_seat=int(hof_seat),
+            hof_opponent_sims=hof_sims,
+            hof_opponent_dirichlet_eps=float(cfg.hof_dirichlet_epsilon),
+            hof_opponent_temp_moves=int(cfg.hof_temp_moves),
         )
 
     all_examples: List[List[Example]] = []
@@ -1351,7 +1359,7 @@ def play_hof_games_batched(
         eval1 = eval_hof if learner_seat == 0 else eval_learner
         game_type = "current_vs_hof" if learner_seat == 0 else "hof_vs_current"
         for seed, raw_examples, (s0, s1) in _run_hof_orientation(
-                _make(n_or, seed0), eval0, eval1):
+                _make(n_or, seed0, 1 - learner_seat), eval0, eval1):
             keep: List[Example] = []
             for tup in raw_examples:
                 if int(tup[-1]) != learner_seat:  # keep only learner-searched moves
@@ -3243,8 +3251,12 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         iteration=it, opponent_source=hof_entry.path)
                     if (iter_cfg.policy_target_pruning
                             or iter_cfg.forced_playout_subtraction):
+                        # Recorded HOF-game moves are LEARNER full searches at
+                        # n_simulations (the shallow hof_sims profile belongs to
+                        # the never-recorded opponent seat), so prune against
+                        # the frontier budget, not hof_sims.
                         ps = _prune_examples_policy_targets(
-                            hof_ex, total_visits=max(1, int(iter_cfg.hof_sims)),
+                            hof_ex, total_visits=max(1, int(iter_cfg.n_simulations)),
                             skip_exact=iter_cfg.exact_endgame_max_secs > 0.0,
                             one_visit_pruning=iter_cfg.policy_target_pruning,
                             forced_playout_subtraction=iter_cfg.forced_playout_subtraction,
