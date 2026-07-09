@@ -3,6 +3,7 @@ const usesPromiseAPI = typeof browser !== "undefined" && browserAPI === browser;
 
 const ADVISOR_URL = "http://127.0.0.1:8000/api/recommend";
 const PROBE_SAVE_URL = "http://127.0.0.1:8000/api/advisor-probe/save";
+const GAME_LOG_URL = "http://127.0.0.1:8000/api/game-log/append";
 const RESULT_EVENT = "kingdomino-advisor-state";
 const OVERLAY_ID = "kingdomino-advisor-overlay";
 
@@ -19,6 +20,7 @@ const DEFAULT_OPTIONS = {
   exactMaxSecs: 300,
   exactThreads: 0,
   autoRefresh: true,
+  gameLog: true,
 };
 
 const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
@@ -69,6 +71,7 @@ async function loadOptions() {
     "kingdomino_exact_max_secs",
     "kingdomino_exact_threads",
     "kingdomino_auto_refresh",
+    "kingdomino_game_log",
   ]);
   const sims = Number(stored.kingdomino_sims);
   const topK = Number(stored.kingdomino_top_k);
@@ -85,6 +88,9 @@ async function loadOptions() {
     autoRefresh: stored.kingdomino_auto_refresh === undefined
       ? DEFAULT_OPTIONS.autoRefresh
       : Boolean(stored.kingdomino_auto_refresh),
+    gameLog: stored.kingdomino_game_log === undefined
+      ? DEFAULT_OPTIONS.gameLog
+      : Boolean(stored.kingdomino_game_log),
   };
 }
 
@@ -98,6 +104,7 @@ async function saveOptionPatch(patch) {
   if (patch.exactMaxSecs !== undefined) out.kingdomino_exact_max_secs = patch.exactMaxSecs;
   if (patch.exactThreads !== undefined) out.kingdomino_exact_threads = patch.exactThreads;
   if (patch.autoRefresh !== undefined) out.kingdomino_auto_refresh = Boolean(patch.autoRefresh);
+  if (patch.gameLog !== undefined) out.kingdomino_game_log = Boolean(patch.gameLog);
   await setStorage(out);
 }
 
@@ -1802,11 +1809,24 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   autoWrap.appendChild(autoBox);
   autoWrap.appendChild(document.createTextNode("auto"));
 
+  const logWrap = document.createElement("label");
+  logWrap.title = "Passively log every decision state + final result of this game to the local server (runs/kingdomino/bga_game_log/)";
+  logWrap.style.cssText = "display:flex;align-items:center;gap:4px;color:#cbd5e1;font-size:11px;cursor:pointer;user-select:none;";
+  const logBox = document.createElement("input");
+  logBox.type = "checkbox";
+  logBox.checked = Boolean(options.gameLog);
+  logBox.addEventListener("change", async () => {
+    await saveOptionPatch({ gameLog: logBox.checked });
+  });
+  logWrap.appendChild(logBox);
+  logWrap.appendChild(document.createTextNode("log"));
+
   controls.appendChild(simSelect);
   controls.appendChild(deeper);
   controls.appendChild(refresh);
   controls.appendChild(probe);
   controls.appendChild(autoWrap);
+  controls.appendChild(logWrap);
   box.appendChild(controls);
 
   const meta = document.createElement("div");
@@ -2189,23 +2209,97 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-// ── Auto-refresh: run the advisor automatically when it becomes your turn ──
-// Polls the page every AUTO_POLL_MS. Fires only when (a) the "auto" toggle is
-// on, (b) the VIEWER is the active player, (c) a normalized state was
-// captured, and (d) that state has been stable for two consecutive polls —
-// BGA's tile animations produce transitional captures, so acting on the first
-// sighting risks analyzing a half-updated board. Repeat ticks on an
-// already-analyzed state are dropped by triggerRecommend's payload-key dedupe.
+// ── Poller: auto-refresh on your turn + passive game logging ────────────────
+// One capture per tick serves both features. Both use a two-poll stability
+// rule before acting — BGA's tile animations produce transitional captures,
+// so acting on the first sighting risks a half-updated board.
 const AUTO_POLL_MS = 2500;
 let lastAutoStateKey = null;
+let lastLoggedKey = null;
+let pendingLogKey = null;
 
-async function autoRefreshTick() {
+function postGameLog(tableId, record) {
+  // Fire-and-forget through the background worker's JSON-POST proxy; logging
+  // must never break the page or the advisor.
+  const message = {
+    action: "recommend",
+    url: GAME_LOG_URL,
+    payload: { table_id: tableId == null ? null : String(tableId), record },
+  };
+  try {
+    if (usesPromiseAPI) {
+      browserAPI.runtime.sendMessage(message).catch(() => {});
+      return;
+    }
+    browserAPI.runtime.sendMessage(message, () => {
+      void browserAPI.runtime.lastError;
+    });
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function extractFinalResult(capture) {
+  const gd = capture && capture.gamedatas;
+  if (!gd || !gd.players) return null;
+  const players = {};
+  Object.keys(gd.players).forEach((id) => {
+    const p = gd.players[id] || {};
+    players[String(id)] = {
+      name: p.name != null ? String(p.name) : null,
+      score: p.score != null ? Number(p.score) : null,
+    };
+  });
+  if (!Object.keys(players).length) return null;
+  return {
+    players,
+    playerorder: Array.isArray(gd.playerorder) ? gd.playerorder.map(String) : null,
+  };
+}
+
+function gameLogTick(capture) {
+  // Decision states: every NEW normalized state (either player's turn).
+  // Final results: once, when BGA reaches its end-of-game state (the scraper
+  // reports those as unsupported gamestates, but the raw scores are present).
+  const meta = {
+    schema: "kingdomino-bga-gamelog/v1",
+    captured_at: capture.capturedAt || new Date().toISOString(),
+    url: capture.url || location.href,
+    table_id: capture.tableId != null ? String(capture.tableId) : null,
+    gamestate_name: capture.gamestateName != null ? String(capture.gamestateName) : null,
+    active_player: capture.activePlayer != null ? String(capture.activePlayer) : null,
+    viewer_id: capture.viewerId != null ? String(capture.viewerId) : null,
+  };
+  let key = null;
+  let record = null;
+  if (capture.state) {
+    key = "state:" + stableStringify(capture.state);
+    record = { ...meta, kind: "decision", state: capture.state };
+  } else if (/gameEnd|endGame|gameResult|finalScoring|end$/i.test(String(capture.gamestateName || ""))) {
+    const final = extractFinalResult(capture);
+    if (final) {
+      key = "final:" + stableStringify(final);
+      record = { ...meta, kind: "final", final };
+    }
+  }
+  if (!record || key === lastLoggedKey) return;
+  if (key !== pendingLogKey) {
+    pendingLogKey = key; // first sighting — wait one poll for stability
+    return;
+  }
+  lastLoggedKey = key;
+  postGameLog(meta.table_id, record);
+}
+
+async function pollTick() {
   try {
     if (inFlightRecommend) return;
     const options = await loadOptions();
-    if (!options.autoRefresh) return;
+    if (!options.autoRefresh && !options.gameLog) return;
     const capture = await readPageState();
-    if (!capture || !capture.ok || !capture.state) return;
+    if (!capture || !capture.ok) return;
+    if (options.gameLog) gameLogTick(capture);
+    if (!options.autoRefresh || !capture.state) return;
     const viewerId = capture.viewerId != null ? String(capture.viewerId) : null;
     const active = capture.activePlayer != null ? String(capture.activePlayer) : null;
     if (!viewerId || !active || viewerId !== active) return;
@@ -2217,7 +2311,7 @@ async function autoRefreshTick() {
     await triggerRecommend({ reason: "auto-turn" });
   } catch (e) {
     // The poller must never take down the content script.
-    console.warn("[kingdomino-advisor] auto-refresh tick failed:", e);
+    console.warn("[kingdomino-advisor] poll tick failed:", e);
   }
 }
-setInterval(autoRefreshTick, AUTO_POLL_MS);
+setInterval(pollTick, AUTO_POLL_MS);

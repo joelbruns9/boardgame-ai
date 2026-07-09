@@ -1399,6 +1399,47 @@ def save_advisor_probe(req: AdvisorProbeSaveRequest) -> dict[str, Any]:
     return {"ok": True, "path": str(path), "filename": path.name}
 
 
+class GameLogAppendRequest(BaseModel):
+    table_id: Optional[str] = None
+    record: dict[str, Any]
+
+
+# Per-table hash of the last appended record's CORE (state/final only — the
+# captured_at timestamp would defeat dedupe) so extension reload / page reload
+# can't append the same position twice in a row.
+_GAME_LOG_LAST_KEY: dict[str, str] = {}
+
+
+@app.post("/api/game-log/append")
+def append_game_log(req: GameLogAppendRequest) -> dict[str, Any]:
+    """Append one passively-captured BGA game record (a decision state or the
+    final result) to a per-table JSONL under runs/kingdomino/bga_game_log/.
+
+    Purpose: an off-distribution eval suite now (value/policy calibration on
+    human games), and a seed pool for position-seeded self-play later. Human
+    MOVES are deliberately not training targets — see the run7 post-mortem
+    discussion; positions and outcomes are what's worth keeping."""
+    import hashlib
+
+    table = "".join(
+        c for c in str(req.table_id or "unknown") if c.isalnum() or c in "-_"
+    ) or "unknown"
+    core = {k: req.record.get(k)
+            for k in ("kind", "state", "final", "gamestate_name", "active_player")}
+    key = hashlib.sha256(
+        json.dumps(core, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if _GAME_LOG_LAST_KEY.get(table) == key:
+        return {"ok": True, "appended": False, "reason": "duplicate"}
+    out_dir = Path("runs/kingdomino/bga_game_log")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"table_{table}.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(req.record, sort_keys=True, ensure_ascii=False) + "\n")
+    _GAME_LOG_LAST_KEY[table] = key
+    return {"ok": True, "appended": True, "path": str(path)}
+
+
 @app.post("/api/recommend")
 def recommend(req: RecommendRequest) -> dict[str, Any]:
     """Return advisor recommendations in the shared UI/BGA protocol shape.
