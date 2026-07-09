@@ -3612,10 +3612,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                 run_manifest=run_manifest)
                 record_checkpoint(cfg.checkpoint_dir, checkpoint_path, it)
 
+            # Skip gate checks while training hasn't started YET (buffer still
+            # warming): the learner is byte-identical to its warm start, so
+            # the match is a guaranteed ~50% self-match. Does NOT apply when
+            # training is explicitly disabled (train_steps=0) — there the
+            # operator is gating a fixed learner on purpose.
             if (generator_state.mode in ("strict_gate", "soft_gate")
                     and iter_cfg.promotion_every
                     and it % int(iter_cfg.promotion_every) == 0
-                    and not has_trained_ever):
+                    and not has_trained_ever
+                    and iter_cfg.train_steps_per_iteration > 0):
                 if verbose:
                     print("  promotion: skipped (no training has run yet - "
                           "learner is still the warm start)")
