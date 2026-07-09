@@ -154,10 +154,10 @@ class RecommendRequest(BaseModel):
     state: Optional[dict[str, Any]] = None
     engine: str = Field(default="greedy", description="greedy/heuristic, random, nn, exact, or auto")
     requested_engine: Optional[str] = None
-    num_simulations: int = Field(default=50, ge=0, le=5000)
+    num_simulations: int = Field(default=50, ge=0, le=20000)
     top_k: int = Field(default=8, ge=1, le=100)
     checkpoint_path: Optional[str] = None
-    nn_sims: int = Field(default=50, ge=1, le=5000)
+    nn_sims: int = Field(default=50, ge=1, le=20000)
     # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
     # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
@@ -185,7 +185,7 @@ class BotActionRequest(BaseModel):
     # NN/MCTS options.  If checkpoint_path is omitted, the newest common
     # Kingdomino iter_*.pt checkpoint is used when available.
     checkpoint_path: Optional[str] = None
-    nn_sims: int = Field(default=50, ge=1, le=5000)
+    nn_sims: int = Field(default=50, ge=1, le=20000)
     # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
     # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
@@ -719,6 +719,23 @@ def _recommend_exact(
     # 0.8). Rankings are identical for any alpha>0 — the value is a monotone
     # transform of the raw margin — so this is consistency, not behavior.
     rank_alpha = 0.5
+    # Margin probe: with alpha=1 the exact leaf is win_gate*tanh(g*m/scale); a
+    # tiny gain keeps tanh in its linear region (|x| <= ~0.008 for |m| <= 120),
+    # so the chance-node EXPECTATION divides back out to expected margin in
+    # actual points: E[m] ~= value * scale / g. The win gate only zeroes exact
+    # draws, where m = 0 anyway.
+    margin_probe_gain = 0.01
+
+    def _exact_margin_pts(child_state) -> tuple[float, int, int]:
+        value0, hit, miss = _exact_cache_stats_for(
+            child_state,
+            max_secs=float(req.exact_max_secs),
+            score_scale=score_scale,
+            margin_gain=margin_probe_gain,
+            alpha=1.0,
+            seed=int(req.seed),
+        )
+        return float(value0) * score_scale / margin_probe_gain, hit, miss
     root_value0, root_hit, root_solved = _cached_exact_value(
         state,
         max_secs=float(req.exact_max_secs),
@@ -796,18 +813,25 @@ def _recommend_exact(
         )
         cache_hits += rank_hit
         cache_misses += rank_miss
+        margin0_pts, margin_hit, margin_miss = _exact_margin_pts(child)
+        cache_hits += margin_hit
+        cache_misses += margin_miss
         value_actor = float(value0 if actor == 0 else -value0)
         rank_value_actor = float(rank_value0 if actor == 0 else -rank_value0)
+        margin_actor_pts = float(margin0_pts if actor == 0 else -margin0_pts)
         q_win_prob = max(0.0, min(1.0, (value_actor + 1.0) / 2.0))
         aj = action_to_json(state, action, -1)
         idx = id_to_index.get(aj["action_id"], -1)
         if idx >= 0:
             aj = action_to_json(state, actions[idx], idx)
-        rows.append((value_actor, rank_value_actor, q_win_prob, idx, aj, value0, rank_value0, hit))
+        rows.append((value_actor, rank_value_actor, q_win_prob, idx, aj, value0,
+                     rank_value0, hit, margin_actor_pts))
 
     rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
     recs = []
-    for rank, (value_actor, rank_value_actor, q_win_prob, idx, aj, value0, rank_value0, hit) in enumerate(rows[: max(1, int(req.top_k))], start=1):
+    for rank, (value_actor, rank_value_actor, q_win_prob, idx, aj, value0,
+               rank_value0, hit, margin_actor_pts) in enumerate(
+            rows[: max(1, int(req.top_k))], start=1):
         recs.append({
             "rank": rank,
             **aj,
@@ -816,6 +840,7 @@ def _recommend_exact(
             "q_win_prob": float(q_win_prob),
             "q_value": float(value_actor),
             "q_rank_value": float(rank_value_actor),
+            "exact_margin_pts": float(margin_actor_pts),
             "is_legal": idx >= 0,
             "debug": {
                 "engine": "exact",
@@ -827,6 +852,9 @@ def _recommend_exact(
             },
         })
 
+    root_margin0_pts, margin_hit, margin_miss = _exact_margin_pts(state)
+    cache_hits += margin_hit
+    cache_misses += margin_miss
     value_actor = float(root_value0 if actor == 0 else -root_value0)
     rank_value_actor = float(root_rank_value0 if actor == 0 else -root_rank_value0)
     return {
@@ -835,6 +863,7 @@ def _recommend_exact(
         "value": value_actor,
         "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
         "root_rank_value": rank_value_actor,
+        "root_margin_pts": float(root_margin0_pts if actor == 0 else -root_margin0_pts),
         "root_value_player0": float(root_value0),
         "search_ms": int(round((time.perf_counter() - started_at) * 1000)),
         "num_simulations": 0,

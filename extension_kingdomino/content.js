@@ -18,9 +18,10 @@ const DEFAULT_OPTIONS = {
   device: "cuda",
   exactMaxSecs: 300,
   exactThreads: 0,
+  autoRefresh: true,
 };
 
-const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200];
+const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
 
 let inFlightRecommend = false;
 let lastPayloadKey = null;
@@ -67,6 +68,7 @@ async function loadOptions() {
     "kingdomino_device",
     "kingdomino_exact_max_secs",
     "kingdomino_exact_threads",
+    "kingdomino_auto_refresh",
   ]);
   const sims = Number(stored.kingdomino_sims);
   const topK = Number(stored.kingdomino_top_k);
@@ -80,6 +82,9 @@ async function loadOptions() {
     device: stored.kingdomino_device || DEFAULT_OPTIONS.device,
     exactMaxSecs: Number.isFinite(exactMaxSecs) && exactMaxSecs >= 0 ? exactMaxSecs : DEFAULT_OPTIONS.exactMaxSecs,
     exactThreads: Number.isFinite(exactThreads) && exactThreads >= 0 ? Math.round(exactThreads) : DEFAULT_OPTIONS.exactThreads,
+    autoRefresh: stored.kingdomino_auto_refresh === undefined
+      ? DEFAULT_OPTIONS.autoRefresh
+      : Boolean(stored.kingdomino_auto_refresh),
   };
 }
 
@@ -92,6 +97,7 @@ async function saveOptionPatch(patch) {
   if (patch.device !== undefined) out.kingdomino_device = patch.device;
   if (patch.exactMaxSecs !== undefined) out.kingdomino_exact_max_secs = patch.exactMaxSecs;
   if (patch.exactThreads !== undefined) out.kingdomino_exact_threads = patch.exactThreads;
+  if (patch.autoRefresh !== undefined) out.kingdomino_auto_refresh = Boolean(patch.autoRefresh);
   await setStorage(out);
 }
 
@@ -263,9 +269,35 @@ function pageReadKingdominoState() {
   }
 
   const pageGlobal = typeof window !== "undefined" ? window : null;
-  const authoritativeBoardCache = pageGlobal
-    ? (pageGlobal.__kingdominoAdvisorBoardCache = pageGlobal.__kingdominoAdvisorBoardCache || {})
-    : {};
+  // The authoritative-board cache must survive a page reload (F5 during the
+  // opponent's turn was the classic tiles-missing failure: BGA only exposes
+  // the kingdom grid for the ACTIVE player, and a reload wiped the in-memory
+  // copy of YOUR board). Mirror it in sessionStorage: per-tab, survives
+  // reloads, and the tableId-scoped keys keep tables separate.
+  const CACHE_SS_KEY = "__kingdominoAdvisorBoardCacheV1";
+  let authoritativeBoardCache = {};
+  if (pageGlobal) {
+    if (!pageGlobal.__kingdominoAdvisorBoardCache) {
+      try {
+        const stored = pageGlobal.sessionStorage &&
+          pageGlobal.sessionStorage.getItem(CACHE_SS_KEY);
+        pageGlobal.__kingdominoAdvisorBoardCache = stored ? JSON.parse(stored) : {};
+      } catch (e) {
+        pageGlobal.__kingdominoAdvisorBoardCache = {};
+      }
+    }
+    authoritativeBoardCache = pageGlobal.__kingdominoAdvisorBoardCache;
+  }
+
+  function persistBoardCache() {
+    if (!pageGlobal || !pageGlobal.sessionStorage) return;
+    try {
+      pageGlobal.sessionStorage.setItem(
+        CACHE_SS_KEY, JSON.stringify(authoritativeBoardCache));
+    } catch (e) {
+      /* quota/serialization failures: cache stays in-memory only */
+    }
+  }
 
   function cloneBoard(board) {
     if (!board || !Array.isArray(board.cells)) return null;
@@ -818,6 +850,7 @@ function pageReadKingdominoState() {
         cell_count: board.cells.length,
         updated_at: Date.now(),
       };
+      persistBoardCache();
     };
     const cachedBoardHasExpectedCells = (board, expectedCells) => {
       return !!(board && Array.isArray(board.cells) && board.cells.length >= expectedCells);
@@ -1010,6 +1043,16 @@ function pageReadKingdominoState() {
           ? domBoard.skipped_dominoes
           : missingIds;
         if (boardIncomplete) {
+          // Try the authoritative cache BEFORE settling for a partial board —
+          // this fallback existed on the foreign-ID and approximate paths but
+          // was missing here, so a short DOM reconstruction shadowed a
+          // complete cached board.
+          const cachedBoard = cachedBoardForPlayer(p);
+          if (cachedBoardHasExpectedCells(cachedBoard, expectedCells)) {
+            boardBuild.boards[p] = cachedBoard;
+            debug.notes.push(`Player ${p} board restored from authoritative cache (${cachedBoard.cells.length} cell(s)) after incomplete DOM reconstruction (${actualCells}/${expectedCells}).`);
+            continue;
+          }
           debug.notes.push(`Player ${p} board INCOMPLETE: expected ${expectedCells} cells (${placedCountByPlayer[p] || 0} placed dominoes × 2 + castle), got ${actualCells}. Skipped domino IDs: ${skippedIds.join(", ") || "unknown (out-of-bounds)"}.`);
           boardReconstructionWarning = {
             player: p,
@@ -1229,6 +1272,11 @@ function pageReadKingdominoState() {
       game: gd.game_name || gd.gamename || gd.game || "unknown",
       tableId: gd.table_id || gd.tableId || null,
       activePlayer: gd.gamestate && gd.gamestate.active_player,
+      // The VIEWING player's BGA id — lets the overlay distinguish "my turn"
+      // (auto-refresh trigger) from "analyzing the opponent's move".
+      viewerId: (typeof gameui.player_id !== "undefined" && gameui.player_id !== null)
+        ? String(gameui.player_id)
+        : null,
       gamestateName: gd.gamestate && (gd.gamestate.name || gd.gamestate.descriptionmyturn),
       candidateSource: normalized.source || candidate.source,
       state: normalized.state || null,
@@ -1742,10 +1790,23 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     if (!result.ok) probe.title = result.error || "download failed";
   });
 
+  const autoWrap = document.createElement("label");
+  autoWrap.title = "Automatically run the advisor when it becomes your turn";
+  autoWrap.style.cssText = "display:flex;align-items:center;gap:4px;color:#cbd5e1;font-size:11px;cursor:pointer;user-select:none;";
+  const autoBox = document.createElement("input");
+  autoBox.type = "checkbox";
+  autoBox.checked = Boolean(options.autoRefresh);
+  autoBox.addEventListener("change", async () => {
+    await saveOptionPatch({ autoRefresh: autoBox.checked });
+  });
+  autoWrap.appendChild(autoBox);
+  autoWrap.appendChild(document.createTextNode("auto"));
+
   controls.appendChild(simSelect);
   controls.appendChild(deeper);
   controls.appendChild(refresh);
   controls.appendChild(probe);
+  controls.appendChild(autoWrap);
   box.appendChild(controls);
 
   const meta = document.createElement("div");
@@ -1758,10 +1819,24 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   const rootWinProb = exactResponse && typeof response.root_win_prob === "number"
     ? response.root_win_prob
     : null;
+  const rootMarginPts = exactResponse && typeof response.root_margin_pts === "number"
+    ? response.root_margin_pts
+    : null;
+  const marginText = rootMarginPts === null
+    ? ""
+    : ` · margin <b style="color:${rootMarginPts >= 0 ? "#4ade80" : "#f87171"}">${(rootMarginPts >= 0 ? "+" : "") + rootMarginPts.toFixed(1)}</b>`;
   const valueLine = rootWinProb !== null
-    ? `Exact win: <b style="color:#f8fafc">${formatPct(rootWinProb)}</b>`
+    ? `Exact win: <b style="color:#f8fafc">${formatPct(rootWinProb)}</b>${marginText}`
     : `NN edge: <b style="color:#f8fafc">${valueText}</b>`;
-  meta.innerHTML = `${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
+  // Flag analyses of the opponent's decision loudly — same engine, same
+  // output, just a different actor (state.current_actor is the ACTIVE player).
+  const viewerId = capture && capture.viewerId != null ? String(capture.viewerId) : null;
+  const capturedActive = capture && capture.activePlayer != null ? String(capture.activePlayer) : null;
+  const opponentTurn = viewerId !== null && capturedActive !== null && viewerId !== capturedActive;
+  const turnLine = opponentTurn
+    ? `<div style="color:#fbbf24;font-weight:600;margin-bottom:3px;">Analyzing OPPONENT's move</div>`
+    : "";
+  meta.innerHTML = `${turnLine}${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
   if (response.exact && response.exact.solved) {
     const exact = document.createElement("div");
     exact.style.cssText = "font-size:11px;color:#86efac;margin-top:3px;";
@@ -1846,6 +1921,7 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     const prior = firstNumber(rec, ["prior", "policy_prior", "nn_prior"]);
     const qWinProb = firstNumber(rec, ["q_win_prob"]);
     const qRankValue = firstNumber(rec, ["q_rank_value"]);
+    const marginPts = firstNumber(rec, ["exact_margin_pts"]);
     const qEdge = qWinProb !== null ? (qWinProb * 2.0) - 1.0 : null;
 
     const rowFlex = document.createElement("div");
@@ -1937,8 +2013,9 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     if (visit !== null) chips.appendChild(metricChip("visit", formatPct(visit), "MCTS visit share"));
     if (prior !== null) chips.appendChild(metricChip("prior", formatPct(prior), "Network prior (pre-search)"));
     if (qWinProb !== null && exactResponse) chips.appendChild(metricChip("win%", formatPct(qWinProb), "Exact win probability after this move"));
+    if (marginPts !== null) chips.appendChild(metricChip("margin", (marginPts >= 0 ? "+" : "") + marginPts.toFixed(1), "Exact expected final-score margin (points) after this move"));
     if (qEdge !== null && !exactResponse) chips.appendChild(metricChip("edge", formatValue(qEdge), "Uncalibrated NN/MCTS value edge after this move"));
-    if (qRankValue !== null) chips.appendChild(metricChip("rank", formatValue(qRankValue), "Exact margin-aware tie-break value"));
+    if (qRankValue !== null && marginPts === null) chips.appendChild(metricChip("rank", formatValue(qRankValue), "Exact margin-aware tie-break value"));
     if (chips.children.length) row.appendChild(chips);
 
     list.appendChild(row);
@@ -2111,3 +2188,36 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   return false;
 });
+
+// ── Auto-refresh: run the advisor automatically when it becomes your turn ──
+// Polls the page every AUTO_POLL_MS. Fires only when (a) the "auto" toggle is
+// on, (b) the VIEWER is the active player, (c) a normalized state was
+// captured, and (d) that state has been stable for two consecutive polls —
+// BGA's tile animations produce transitional captures, so acting on the first
+// sighting risks analyzing a half-updated board. Repeat ticks on an
+// already-analyzed state are dropped by triggerRecommend's payload-key dedupe.
+const AUTO_POLL_MS = 2500;
+let lastAutoStateKey = null;
+
+async function autoRefreshTick() {
+  try {
+    if (inFlightRecommend) return;
+    const options = await loadOptions();
+    if (!options.autoRefresh) return;
+    const capture = await readPageState();
+    if (!capture || !capture.ok || !capture.state) return;
+    const viewerId = capture.viewerId != null ? String(capture.viewerId) : null;
+    const active = capture.activePlayer != null ? String(capture.activePlayer) : null;
+    if (!viewerId || !active || viewerId !== active) return;
+    const key = stableStringify(capture.state);
+    if (key !== lastAutoStateKey) {
+      lastAutoStateKey = key; // first sighting — wait one poll for stability
+      return;
+    }
+    await triggerRecommend({ reason: "auto-turn" });
+  } catch (e) {
+    // The poller must never take down the content script.
+    console.warn("[kingdomino-advisor] auto-refresh tick failed:", e);
+  }
+}
+setInterval(autoRefreshTick, AUTO_POLL_MS);
