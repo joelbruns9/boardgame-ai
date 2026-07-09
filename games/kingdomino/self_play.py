@@ -3017,6 +3017,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     selfplay_source = generator_state.source
     # Run8: count CONSECUTIVE gate reverts for --revert_reset_after.
     consecutive_reverts = 0
+    # Skip promotion checks until the first real training pass: during buffer
+    # warmup the learner is byte-identical to its warm start, so a gate match
+    # is a guaranteed ~50% self-match (~25-30 min of GPU each at run8 power).
+    has_trained_ever = False
 
     buffer = ReplayBuffer(cfg.buffer_capacity, n_sample_workers=cfg.sample_workers)
     # Pre-load a previously saved replay buffer (warm start of the DATA, not just
@@ -3459,6 +3463,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     print("  train: train_steps_per_iteration=0; skipping training")
             else:
                 trained = True
+                has_trained_ever = True
                 net.train()
                 p_sum = o_sum = q_sum = w_sum = 0.0
                 brier_sum = baseline_sum = 0.0
@@ -3608,6 +3613,13 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 record_checkpoint(cfg.checkpoint_dir, checkpoint_path, it)
 
             if (generator_state.mode in ("strict_gate", "soft_gate")
+                    and iter_cfg.promotion_every
+                    and it % int(iter_cfg.promotion_every) == 0
+                    and not has_trained_ever):
+                if verbose:
+                    print("  promotion: skipped (no training has run yet - "
+                          "learner is still the warm start)")
+            elif (generator_state.mode in ("strict_gate", "soft_gate")
                     and iter_cfg.promotion_every
                     and it % int(iter_cfg.promotion_every) == 0):
                 # Run8: the gate CANDIDATE is a rolling average of the last K
