@@ -255,6 +255,20 @@ class SelfPlayConfig:
     promotion_fixed_suite_tolerance: float = 0.05
     promotion_skip_fixed_suite: bool = False
     promotion_update_best: bool = False
+    # Run8: gate a rolling average of the last K iteration checkpoints instead
+    # of the raw learner snapshot. Snapshots are noisy samples off the
+    # trajectory mean (run7: individual checkpoints measured 43-44% vs the
+    # peak while their 10-iter average measured 48.9%); gating the average
+    # removes the winner's-curse on promotions and banks reproducible
+    # strength. 0/1 = gate the raw learner (old behavior).
+    promotion_average_k: int = 0
+    # Run8: after this many CONSECUTIVE failed-below-revert gate checks, reset
+    # the LEARNER's weights (and optimizer moments) to current_best. One
+    # revert only swaps the generator and gives the learner 5+ iterations of
+    # baseline-quality data to recover (protects a mid-breakthrough learner);
+    # run7 showed a diverged learner never recovers unaided (9 straight
+    # reverts). 0 = never reset (old behavior).
+    revert_reset_after: int = 0
     # Milestone 7 Hall-of-Fame opponent mixing. Default off. The first
     # implementation samples one HOF opponent per iteration and runs HOF games
     # as a separate mixed-model open-loop block to keep the high-throughput
@@ -2933,6 +2947,37 @@ def _run_smart_elo_rating(
     return result
 
 
+def _rolling_average_state(checkpoint_dir: str, it: int, k: int):
+    """Average the model_state of the last k iteration checkpoints
+    (iter_{it-k+1:04d}.pt .. iter_{it:04d}.pt; missing files skipped).
+
+    Returns (state_dict_f32, n_averaged). n_averaged < 2 means there was
+    nothing to average — caller falls back to the raw learner. Same running
+    float64 mean as average_checkpoints.py; GroupNorm nets average cleanly
+    (no BatchNorm running stats). CPU-only and light (~6MB per checkpoint)."""
+    mean_state: dict = {}
+    n = 0
+    for j in range(max(1, it - k + 1), it + 1):
+        cp = Path(checkpoint_dir) / f"iter_{j:04d}.pt"
+        if not cp.exists():
+            continue
+        # Same-run checkpoints (save_checkpoint) always carry "model_state".
+        sd = torch.load(cp, map_location="cpu")["model_state"]
+        n += 1
+        if n == 1:
+            for key, v in sd.items():
+                mean_state[key] = v.double() if v.is_floating_point() else v.clone()
+        else:
+            for key, v in sd.items():
+                if v.is_floating_point():
+                    mean_state[key] += (v.double() - mean_state[key]) / n
+                else:
+                    mean_state[key] = v.clone()
+    out = {key: (v.float() if v.is_floating_point() else v)
+           for key, v in mean_state.items()}
+    return out, n
+
+
 def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     """Run the serial self-play loop.  Returns the trained net and history."""
     configure_torch_performance(cfg)
@@ -2970,6 +3015,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     generator_state = _init_generator_state(cfg, net, verbose=verbose)
     selfplay_net = generator_state.net
     selfplay_source = generator_state.source
+    # Run8: count CONSECUTIVE gate reverts for --revert_reset_after.
+    consecutive_reverts = 0
 
     buffer = ReplayBuffer(cfg.buffer_capacity, n_sample_workers=cfg.sample_workers)
     # Pre-load a previously saved replay buffer (warm start of the DATA, not just
@@ -3563,15 +3610,43 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             if (generator_state.mode in ("strict_gate", "soft_gate")
                     and iter_cfg.promotion_every
                     and it % int(iter_cfg.promotion_every) == 0):
+                # Run8: the gate CANDIDATE is a rolling average of the last K
+                # iteration checkpoints when promotion_average_k > 1 — the raw
+                # learner keeps training/generating either way; only what gets
+                # measured, promoted, and banked changes.
+                candidate_net = net
+                candidate_ckpt_path = checkpoint_path
+                avg_k_used = 0
+                if int(iter_cfg.promotion_average_k) > 1 and cfg.checkpoint_dir:
+                    avg_state, avg_k_used = _rolling_average_state(
+                        cfg.checkpoint_dir, it, int(iter_cfg.promotion_average_k))
+                    if avg_k_used >= 2:
+                        candidate_net = KingdominoNet(
+                            channels=iter_cfg.channels,
+                            blocks=iter_cfg.blocks,
+                            bilinear_dim=iter_cfg.bilinear_dim,
+                            score_scale=iter_cfg.score_scale,
+                        )
+                        candidate_net.load_state_dict(avg_state)
+                        candidate_net.to(iter_cfg.device)
+                        candidate_ckpt_path = os.path.join(
+                            cfg.checkpoint_dir, f"avg_iter_{it:04d}_k{avg_k_used}.pt")
+                        save_checkpoint(candidate_ckpt_path, candidate_net,
+                                        iter_cfg, it, history,
+                                        run_manifest=run_manifest)
+                    else:
+                        candidate_net = net
                 if verbose:
-                    print(f"  promotion: evaluating learner vs current best "
+                    cand_desc = (f"avg of last {avg_k_used} checkpoints"
+                                 if avg_k_used >= 2 else "learner")
+                    print(f"  promotion: evaluating {cand_desc} vs current best "
                           f"({iter_cfg.promotion_games} games, "
                           f"{iter_cfg.promotion_sims} sims)")
-                net.eval()
+                candidate_net.eval()
                 baseline_net = generator_state.baseline_net or generator_state.net
                 baseline_net.eval()
                 match = evaluate_network_match(
-                    net, baseline_net,
+                    candidate_net, baseline_net,
                     games=iter_cfg.promotion_games,
                     sims=iter_cfg.promotion_sims,
                     device=iter_cfg.device,
@@ -3591,7 +3666,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         tolerance=iter_cfg.promotion_fixed_suite_tolerance)
                 else:
                     cand_fixed = fixed_suite_summary_for_net(
-                        net,
+                        candidate_net,
                         suite=iter_cfg.promotion_fixed_suite,
                         device=iter_cfg.device,
                         checkpoint_label=f"learner_iter_{it:04d}",
@@ -3645,7 +3720,28 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     generator_state.action = "revert"
                     selfplay_net = generator_state.net
                     selfplay_source = generator_state.source
+                    consecutive_reverts += 1
+                    # Run8: a diverged learner never recovers unaided (run7:
+                    # nine straight reverts). After N CONSECUTIVE reverts,
+                    # reset the learner's weights to the baseline and clear
+                    # the optimizer moments (stale Adam state would drag it
+                    # straight back into the diverged basin). One revert alone
+                    # never resets — a mid-breakthrough learner gets 5+
+                    # iterations of baseline-generated data to recover first.
+                    if (int(iter_cfg.revert_reset_after) > 0
+                            and consecutive_reverts >= int(iter_cfg.revert_reset_after)):
+                        net.load_state_dict(baseline_net.state_dict())
+                        net.to(iter_cfg.device)
+                        net.train()
+                        optimizer.state.clear()
+                        generator_state.action = "revert_reset"
+                        if verbose:
+                            print(f"  promotion: LEARNER RESET to baseline after "
+                                  f"{consecutive_reverts} consecutive reverts "
+                                  f"(optimizer moments cleared)")
+                        consecutive_reverts = 0
                 elif promotion_result["action"] == "probation":
+                    consecutive_reverts = 0
                     generator_state.net = net
                     generator_state.source = f"learner_iter_{it:04d}"
                     generator_state.checkpoint_path = checkpoint_path
@@ -3655,8 +3751,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     selfplay_net = generator_state.net
                     selfplay_source = generator_state.source
                 elif promotion_result["action"] == "promote":
+                    consecutive_reverts = 0
                     if generator_state.mode == "strict_gate":
-                        selfplay_net.load_state_dict(net.state_dict())
+                        # The PROMOTED artifact (possibly the rolling average)
+                        # becomes the generator in strict_gate.
+                        selfplay_net.load_state_dict(candidate_net.state_dict())
                         selfplay_net.eval()
                     selfplay_source = f"learner_iter_{it:04d}"
                     generator_state.net = net if generator_state.mode == "soft_gate" else selfplay_net
@@ -3670,7 +3769,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         or iter_cfg.promotion_update_best
                     )
                     if should_update_best:
-                        if checkpoint_path is None:
+                        if candidate_ckpt_path is None:
                             print("WARNING: promotion update requested but no "
                                   "checkpoint_path exists; current_best.pt unchanged")
                         else:
@@ -3686,11 +3785,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                     metadata={
                                         "source": "self_play.soft_gate_pre_promote",
                                         "checkpoint_dir": cfg.checkpoint_dir,
-                                        "candidate": checkpoint_path,
+                                        "candidate": candidate_ckpt_path,
                                     },
                                 )
                             payload = promotion_payload(
-                                candidate=checkpoint_path,
+                                candidate=candidate_ckpt_path,
                                 current_best=iter_cfg.current_best_path,
                                 decision=decision,
                                 candidate_fixed_summary=cand_fixed,
@@ -3699,13 +3798,14 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                     "source": f"self_play.{generator_state.mode}",
                                     "iteration": it,
                                     "run_checkpoint_dir": cfg.checkpoint_dir,
+                                    "promotion_average_k": int(avg_k_used),
                                     "hof_previous_current_best": (
                                         hof_entry_before_promote.path
                                         if hof_entry_before_promote else None),
                                 },
                             )
                             promote_current_best(
-                                checkpoint_path,
+                                candidate_ckpt_path,
                                 best_dir=Path(iter_cfg.current_best_path).parent,
                                 current_best=iter_cfg.current_best_path,
                                 payload=payload,
@@ -3731,13 +3831,13 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             generator_state.baseline_sha256 = sha256_file(promoted_path)
                             selfplay_net = generator_state.net
                     if (iter_cfg.smart_elo and iter_cfg.smart_elo_on_promote
-                            and checkpoint_path is not None):
+                            and candidate_ckpt_path is not None):
                         run_id = Path(cfg.checkpoint_dir).name if cfg.checkpoint_dir else "run"
                         smart_elo_triggered = True
                         smart_elo_reason = "promote"
                         smart_elo_name = f"{run_id}_iter_{it:04d}_promoted"
                         smart_elo_result = _run_smart_elo_rating(
-                            checkpoint_path=checkpoint_path,
+                            checkpoint_path=candidate_ckpt_path,
                             checkpoint_name=smart_elo_name,
                             cfg=iter_cfg,
                             reason=smart_elo_reason,
@@ -4166,6 +4266,14 @@ if __name__ == "__main__":
     p.add_argument("--promotion_fixed_suite", default=str(DEFAULT_FIXED_SUITE))
     p.add_argument("--promotion_fixed_suite_tolerance", type=float, default=0.05)
     p.add_argument("--promotion_skip_fixed_suite", action="store_true")
+    p.add_argument("--promotion_average_k", type=int, default=0,
+                   help="gate a rolling average of the last K iteration "
+                        "checkpoints instead of the raw learner (0/1 = off); "
+                        "removes snapshot noise / winner's curse from the gate")
+    p.add_argument("--revert_reset_after", type=int, default=0,
+                   help="reset the LEARNER weights (and optimizer moments) to "
+                        "current_best after this many CONSECUTIVE gate reverts "
+                        "(0 = never)")
     p.add_argument("--promotion_update_best", action="store_true",
                    help="if an in-run promotion passes, also copy the saved "
                         "checkpoint to --current_best_path")
@@ -4380,6 +4488,8 @@ if __name__ == "__main__":
         promotion_fixed_suite=a.promotion_fixed_suite,
         promotion_fixed_suite_tolerance=a.promotion_fixed_suite_tolerance,
         promotion_skip_fixed_suite=a.promotion_skip_fixed_suite,
+        promotion_average_k=a.promotion_average_k,
+        revert_reset_after=a.revert_reset_after,
         promotion_update_best=a.promotion_update_best,
         hof_dir=a.hof_dir,
         hof_fraction=a.hof_fraction,
