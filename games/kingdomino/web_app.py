@@ -182,6 +182,14 @@ class RecommendRequest(BaseModel):
     # (run whenever the root is not winning); True/False force on/off.
     swindle: Optional[bool] = None
     swindle_budget_secs: float = Field(default=60.0, ge=0.0, le=600.0)
+    # Draft matrix (NN engine): group the actor's candidates by PICK (the only
+    # interactive dimension — boards are disjoint) and, for each pick, evaluate
+    # the opponent's pick responses with rooted mini-searches. Exposes moves
+    # whose headline value depends on the opponent NOT taking a specific tile
+    # (prior-starvation blindness). None = auto (on when >= 2 picks exist).
+    draft_matrix: Optional[bool] = None
+    draft_search_sims: int = Field(default=800, ge=50, le=20000)
+    draft_budget_secs: float = Field(default=20.0, ge=0.0, le=300.0)
 
 
 class BotActionRequest(BaseModel):
@@ -846,6 +854,195 @@ def _swindle_for_move(
         "expected_points_weighted": (pts_weighted_sum if priors is not None else None),
         "trap_payoff_pts": best_payoff,
     }
+
+
+def _pick_key_of(aj: dict[str, Any]) -> Optional[int]:
+    """The PICK a joint action commits to: pick_domino_id in PLACE_AND_SELECT,
+    the picked domino itself in INITIAL_SELECTION, None when the action has no
+    pick (FINAL_PLACEMENT)."""
+    if aj.get("pick_domino_id") is not None:
+        return int(aj["pick_domino_id"])
+    if aj.get("placement") is None and aj.get("domino_id") is not None:
+        return int(aj["domino_id"])
+    return None
+
+
+def _draft_matrix(
+    state: GameState,
+    req: RecommendRequest,
+    *,
+    net,
+    checkpoint_path: str,
+    actions: list,
+    visit_counts: dict,
+    priors_by_action: dict,
+) -> Optional[dict[str, Any]]:
+    """Pick-grouped danger analysis (the 'draft matrix').
+
+    In 2p Kingdomino the boards are disjoint: placements never interact, so
+    ALL player interaction flows through picks (tile denial + turn order).
+    The prior-guided search can silently starve an opponent's off-prior pick
+    (measured: a game-losing reply at 4.7%% prior received 0.6%% of 3200
+    sims). This analysis restores breadth exactly there:
+
+      for each of YOUR pick options p (representative = the group's most
+      visited action): step it, descend your own consecutive moves, then at
+      the opponent's node branch over THEIR pick options — each branch gets a
+      ROOTED mini-search with its own full budget (rooting is what defeats
+      starvation), with the opponent's placement chosen by net value (their
+      placement is a private optimization the net models well; top-1 is an
+      optimistic-for-you approximation, flagged in the docstring on purpose).
+
+    Per your-pick row: headline (main-search edge), per-their-pick response
+    values (your frame), robust (worst response), realistic (policy-prior-
+    weighted response), fragility (headline - robust). Budget-capped; rows
+    analyzed in main-search order; 'partial' set if the budget ran out.
+    """
+    import time as _time
+
+    if state.phase == Phase.GAME_OVER:
+        return None
+    actor = int(state.current_actor)
+    key = (checkpoint_path, req.device)
+    deadline = _time.perf_counter() + float(req.draft_budget_secs)
+    seed0 = int(req.seed) + 777_000
+
+    def mini_search(st: GameState, seed: int) -> Optional[float]:
+        """Rooted search value, PLAYER-0 frame. None on failure/timeout."""
+        if _time.perf_counter() > deadline:
+            return None
+        try:
+            _vc, v0, _info = _rust_open_loop_search(
+                st, net, key, req.device, int(req.draft_search_sims), seed)
+            return float(v0)
+        except Exception:
+            return None
+
+    # Action objects don't reliably hash across legal_actions() calls, so key
+    # everything by the stable action_id.
+    visits_by_id = {action_to_json(state, a, -1)["action_id"]: float(v)
+                    for a, v in visit_counts.items()}
+    info_by_id = {action_to_json(state, a, -1)["action_id"]: v
+                  for a, v in (priors_by_action or {}).items()}
+
+    # Group YOUR actions by pick; representative = most-visited in group.
+    groups: dict[int, list] = {}
+    for a in actions:
+        aj = action_to_json(state, a, -1)
+        pk = _pick_key_of(aj)
+        if pk is None:
+            return None  # no picks this phase — nothing interactive to map
+        groups.setdefault(pk, []).append((a, aj))
+
+    def _v(aj):
+        return visits_by_id.get(aj["action_id"], 0.0)
+
+    def group_rep(items):
+        return max(items, key=lambda p: (
+            _v(p[1]),
+            float((info_by_id.get(p[1]["action_id"]) or (0.0,))[0] or 0.0)))
+
+    # Order rows by main-search preference (most visited group first).
+    ordered = sorted(groups.items(),
+                     key=lambda kv: -sum(_v(aj) for _, aj in kv[1]))
+    total_visits = sum(visits_by_id.values()) or 1.0
+    rows_out = []
+    partial = False
+    for pick, items_in_group in ordered:
+        if _time.perf_counter() > deadline:
+            partial = True
+            break
+        rep, rep_aj = group_rep(items_in_group)
+        rep_q = None
+        info = info_by_id.get(rep_aj["action_id"])
+        if info is not None and info[1] is not None:
+            rep_q = 2.0 * float(info[1]) - 1.0  # actor-frame edge
+        # Step the representative; descend own consecutive moves by mini-search.
+        node = state.step(rep)
+        guard = 0
+        dead = False
+        while (node.phase != Phase.GAME_OVER
+               and int(node.current_actor) == actor and guard < 8):
+            if _time.perf_counter() > deadline:
+                dead = True
+                break
+            try:
+                vc, _v0, _i = _rust_open_loop_search(
+                    node, net, key, req.device, int(req.draft_search_sims),
+                    seed0 + guard)
+                best = max(vc.items(), key=lambda kv: kv[1])[0]
+                node = node.step(best)
+            except Exception:
+                dead = True
+                break
+            guard += 1
+        if dead:
+            partial = True
+            break
+        row = {
+            "pick_domino_id": int(pick),
+            "action": rep_aj,
+            "group_visit_frac": sum(_v(aj) for _, aj in items_in_group) / total_visits,
+            "headline_edge": rep_q,
+            "responses": [],
+            "robust_edge": None,
+            "realistic_edge": None,
+            "fragility": None,
+        }
+        if node.phase == Phase.GAME_OVER:
+            rows_out.append(row)
+            continue
+        # Opponent's node: group THEIR actions by pick; prior mass per group.
+        opp_priors = _opponent_policy_priors(req, node)  # index -> prior
+        opp_actions = node.legal_actions()
+        their: dict[int, list] = {}
+        for i, a in enumerate(opp_actions):
+            aj = action_to_json(node, a, -1)
+            pk = _pick_key_of(aj)
+            pk = -1 if pk is None else pk  # FINAL_PLACEMENT replies: one group
+            their.setdefault(pk, []).append((i, a))
+        responses = []
+        for tp, items in their.items():
+            if _time.perf_counter() > deadline:
+                partial = True
+                break
+            mass = (sum(opp_priors.get(i, 0.0) for i, _ in items)
+                    if opp_priors else len(items) / max(1, len(opp_actions)))
+            # Their placement is a private optimization: search the top-2
+            # prior placements in the group and let them take the better one
+            # (top-1 alone proved optimistic-for-you on the ground-truth game).
+            if opp_priors:
+                cands = sorted(items, key=lambda ia: -opp_priors.get(ia[0], 0.0))[:2]
+            else:
+                cands = items[:2]
+            v_you = None
+            for _bi, ba in cands:
+                g = node.step(ba)
+                v0 = mini_search(g, seed0 + 100 + int(tp))
+                if v0 is None:
+                    break
+                cand_you = float(v0 if actor == 0 else -v0)
+                v_you = cand_you if v_you is None else min(v_you, cand_you)
+            if v_you is None:
+                partial = True
+                continue
+            responses.append({"pick_domino_id": int(tp), "prior_mass": mass,
+                              "edge_you": v_you})
+        if responses:
+            responses.sort(key=lambda r: r["edge_you"])
+            row["responses"] = responses
+            row["robust_edge"] = responses[0]["edge_you"]
+            tot = sum(r["prior_mass"] for r in responses) or 1.0
+            row["realistic_edge"] = sum(
+                r["edge_you"] * r["prior_mass"] for r in responses) / tot
+            if rep_q is not None:
+                row["fragility"] = rep_q - row["robust_edge"]
+        rows_out.append(row)
+
+    if not rows_out:
+        return None
+    return {"rows": rows_out, "partial": partial,
+            "search_sims": int(req.draft_search_sims)}
 
 
 def _recommend_exact(
@@ -1850,6 +2047,25 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                 "debug": {"engine": engine_name, "legal_index_resolved": idx},
             })
         value_actor = float(value0 if state.current_actor == 0 else -value0)
+        # Draft matrix: pick-grouped opponent-response analysis. Auto-on when
+        # the actor has >= 2 pick options and the fast Rust search ran (the
+        # mini-searches reuse it); request can force on/off.
+        draft = None
+        want_matrix = (req.draft_matrix is True
+                       or (req.draft_matrix is None
+                           and req.draft_budget_secs > 0))
+        if want_matrix and rust_info is not None:
+            pick_keys = {_pick_key_of(action_to_json(state, a, -1))
+                         for a in actions}
+            pick_keys.discard(None)
+            if len(pick_keys) >= 2:
+                try:
+                    draft = _draft_matrix(
+                        state, req, net=net, checkpoint_path=checkpoint_path,
+                        actions=actions, visit_counts=visit_counts,
+                        priors_by_action=rust_info)
+                except Exception as exc:
+                    print(f"[advisor] draft matrix failed: {exc!r}")
         return {
             "ok": True,
             "engine": engine_name,
@@ -1863,6 +2079,7 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
             "search_ms": int(round((time.perf_counter() - t0) * 1000)),
             "num_simulations": sims,
             "total_visits": total_visits,
+            "draft_matrix": draft,
             "recommendations": recs,
         }
 

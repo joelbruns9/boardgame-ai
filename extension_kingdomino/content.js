@@ -1919,6 +1919,40 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     box.appendChild(panel);
   }
 
+  // ── Draft matrix: pick-grouped robustness vs the opponent's pick responses.
+  // headline = what the main search believes; robust = worst opponent pick;
+  // realistic = policy-weighted. Big headline-robust gap = the move's value
+  // depends on the opponent NOT taking a specific tile.
+  const matrix = response.draft_matrix;
+  if (matrix && Array.isArray(matrix.rows) && matrix.rows.length) {
+    const panel = document.createElement("div");
+    panel.style.cssText = "background:rgba(15,23,42,0.9);border:1px solid rgba(71,85,105,0.6);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:12px;";
+    const head = document.createElement("div");
+    head.style.cssText = "color:#94a3b8;margin-bottom:4px;font-weight:600;";
+    head.textContent = "Draft matrix (your pick vs their response)"
+      + (matrix.partial ? " — partial, budget hit" : "");
+    panel.appendChild(head);
+    const fmt = (x) => (typeof x === "number" && Number.isFinite(x))
+      ? (x >= 0 ? "+" : "") + x.toFixed(2) : "—";
+    matrix.rows.forEach((r) => {
+      const fragile = typeof r.fragility === "number" && r.fragility >= 0.15;
+      const line = document.createElement("div");
+      line.style.cssText = "display:flex;gap:10px;align-items:baseline;"
+        + (fragile ? "color:#fca5a5;" : "color:#cbd5e1;");
+      const worst = (r.responses && r.responses[0])
+        ? ` (they take d${r.responses[0].pick_domino_id})` : "";
+      line.innerHTML = `<b style="min-width:70px;">pick d${r.pick_domino_id}</b>`
+        + `<span>Q ${fmt(r.headline_edge)}</span>`
+        + `<span title="worst opponent pick response${worst}">robust ${fmt(r.robust_edge)}${worst}</span>`
+        + `<span title="opponent responses weighted by their policy prior">real ${fmt(r.realistic_edge)}</span>`
+        + (fragile ? `<span style="font-weight:700;">⚠ fragile ${fmt(r.fragility)}</span>` : "");
+      line.title = (r.responses || []).map((x) =>
+        `they take d${x.pick_domino_id}: ${fmt(x.edge_you)} (${Math.round((x.prior_mass || 0) * 100)}% likely)`).join("\n");
+      panel.appendChild(line);
+    });
+    box.appendChild(panel);
+  }
+
   const recs = Array.isArray(response.recommendations) ? response.recommendations : [];
   const list = document.createElement("div");
   list.style.cssText = "display:flex;flex-direction:column;gap:7px;";
@@ -2217,6 +2251,13 @@ async function triggerRecommend({ force = false, reason = "manual" } = {}) {
           root_win_prob: typeof data.root_win_prob === "number" ? data.root_win_prob : null,
           root_margin_pts: typeof data.root_margin_pts === "number" ? data.root_margin_pts : null,
           swindle_mode: Boolean(data.swindle_mode),
+          draft_matrix: (data.draft_matrix && Array.isArray(data.draft_matrix.rows))
+            ? data.draft_matrix.rows.map((r) => ({
+                pick: r.pick_domino_id, headline: r.headline_edge,
+                robust: r.robust_edge, realistic: r.realistic_edge,
+                fragility: r.fragility,
+              }))
+            : null,
           top: recs.slice(0, 3).map((r) => ({
             domino_id: r.domino_id, placement: r.placement || null,
             pick_domino_id: r.pick_domino_id,
