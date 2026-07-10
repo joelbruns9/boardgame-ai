@@ -1856,7 +1856,10 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   const turnLine = opponentTurn
     ? `<div style="color:#fbbf24;font-weight:600;margin-bottom:3px;">Analyzing OPPONENT's move</div>`
     : "";
-  meta.innerHTML = `${turnLine}${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
+  const swindleLine = response.swindle_mode
+    ? `<div style="color:#f472b6;font-weight:600;margin-bottom:3px;" title="You are not winning with perfect play. Ranking favors moves that maximize the chance your opponent errs (traps), not minimal losing margin.">SWINDLE MODE${response.swindle_truncated ? " (partial — budget hit)" : ""}</div>`
+    : "";
+  meta.innerHTML = `${turnLine}${swindleLine}${valueLine}<br>Search: <b style="color:#f8fafc">${searchMs}</b> / <b style="color:#f8fafc">${sims}</b> sims<br>Engine: <b style="color:#f8fafc">${response.engine || payload.engine}</b> · ${transport} · ${new Date().toLocaleTimeString()}`;
   if (response.exact && response.exact.solved) {
     const exact = document.createElement("div");
     exact.style.cssText = "font-size:11px;color:#86efac;margin-top:3px;";
@@ -2034,6 +2037,20 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     if (prior !== null) chips.appendChild(metricChip("prior", formatPct(prior), "Network prior (pre-search)"));
     if (qWinProb !== null && exactResponse) chips.appendChild(metricChip("win%", formatPct(qWinProb), "Exact win probability after this move"));
     if (marginPts !== null) chips.appendChild(metricChip("margin", (marginPts >= 0 ? "+" : "") + marginPts.toFixed(1), "Exact expected final-score margin (points) after this move"));
+    const sw = rec.swindle;
+    if (sw && sw.replies > 0) {
+      const flips = (sw.flips_win || 0) + (sw.flips_draw || 0);
+      chips.appendChild(metricChip("traps", `${flips}/${sw.replies}`,
+        `Opponent replies that improve YOUR outcome: ${sw.flips_win || 0} flip to a win, ${sw.flips_draw || 0} to a draw (of ${sw.replies} legal replies)`));
+      if (typeof sw.weighted_rate === "number") {
+        chips.appendChild(metricChip("w", formatPct(sw.weighted_rate),
+          "Trap probability weighted by the network's policy for the opponent — how likely a natural-looking reply walks into a trap"));
+      }
+      if (typeof sw.trap_payoff_pts === "number") {
+        chips.appendChild(metricChip("if err", (sw.trap_payoff_pts >= 0 ? "+" : "") + sw.trap_payoff_pts.toFixed(1),
+          "Your best final-score margin among the opponent's mistaken replies"));
+      }
+    }
     if (qEdge !== null && !exactResponse) chips.appendChild(metricChip("edge", formatValue(qEdge), "Uncalibrated NN/MCTS value edge after this move"));
     if (qRankValue !== null && marginPts === null) chips.appendChild(metricChip("rank", formatValue(qRankValue), "Exact margin-aware tie-break value"));
     if (chips.children.length) row.appendChild(chips);

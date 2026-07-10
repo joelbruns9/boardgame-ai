@@ -176,6 +176,12 @@ class RecommendRequest(BaseModel):
     # Advisor policy: always solve — default to the ceiling; requests may lower it.
     exact_max_secs: float = Field(default=3600.0, ge=0.0, le=3600.0)
     exact_threads: int = Field(default=0, ge=0, le=128)
+    # Swindle analysis (exact engine, losing/drawn roots): enumerate opponent
+    # replies to the top candidate moves and exact-solve each, identifying
+    # moves that maximize the chance an imperfect opponent errs. None = auto
+    # (run whenever the root is not winning); True/False force on/off.
+    swindle: Optional[bool] = None
+    swindle_budget_secs: float = Field(default=60.0, ge=0.0, le=600.0)
 
 
 class BotActionRequest(BaseModel):
@@ -698,6 +704,120 @@ def _exact_cache_stats_for(
     return value, int(hit), int(not hit)
 
 
+def _opponent_policy_priors(req: RecommendRequest, child: GameState) -> Optional[dict]:
+    """NN policy priors over the OPPONENT's legal replies in `child` (their
+    turn). Used to weight swindle traps by how likely a strong-but-imperfect
+    opponent is to walk into them. Returns None when no checkpoint resolves —
+    swindle then falls back to uniform weighting."""
+    try:
+        import torch
+        from games.kingdomino.encoder import encode_state
+
+        _evaluator, net, _path = _load_nn_evaluator(req)
+        acts = child.legal_actions()
+        mb, ob, flat = encode_state(child, child.current_actor)
+        device = next(net.parameters()).device
+        with torch.inference_mode():
+            _own, _opp, _win, logits = net(
+                torch.from_numpy(mb).unsqueeze(0).to(device),
+                torch.from_numpy(ob).unsqueeze(0).to(device),
+                torch.from_numpy(flat).unsqueeze(0).to(device),
+            )
+        idxs = torch.tensor([int(encode_action(a, child)) for a in acts],
+                            dtype=torch.long, device=logits.device)
+        legal_logits = logits[0, idxs]
+        priors = torch.softmax(legal_logits, dim=0).cpu().numpy()
+        return {i: float(p) for i, p in enumerate(priors)}
+    except Exception:
+        return None
+
+
+def _swindle_for_move(
+    child: GameState,
+    child_value_actor: float,
+    actor: int,
+    req: RecommendRequest,
+    *,
+    score_scale: float,
+    margin_gain: float,
+    margin_probe_gain: float,
+    deadline: float,
+) -> Optional[dict[str, Any]]:
+    """One-ply trap analysis of `child` (opponent to move) from the ACTOR's
+    perspective. Exact-solves every opponent reply and reports how many of
+    them improve the actor's game-theoretic outcome — i.e. are mistakes.
+
+    Correctness invariant (deck <= 4 is chance-free: the final-row reveal is
+    deterministic): the opponent's BEST reply must reproduce the child's own
+    minimax value. A violation means solver/state inconsistency; the move's
+    swindle stats are dropped and a warning logged rather than shown wrong.
+
+    Returns None when the deadline is hit before finishing (partial results
+    are never shown) or when the child is terminal."""
+    import time as _time
+
+    if child.phase == Phase.GAME_OVER:
+        return {"replies": 0, "flips_win": 0, "flips_draw": 0,
+                "uniform_rate": 0.0, "weighted_rate": None,
+                "expected_points_uniform": None, "expected_points_weighted": None,
+                "trap_payoff_pts": None, "note": "terminal after this move"}
+
+    replies = child.legal_actions()
+    priors = _opponent_policy_priors(req, child)
+    flips_win = flips_draw = 0
+    weighted_improving = 0.0
+    pts_uniform_sum = 0.0
+    pts_weighted_sum = 0.0
+    best_payoff: Optional[float] = None
+    min_reply_value = None
+    for ri, r in enumerate(replies):
+        if _time.perf_counter() > deadline:
+            return None
+        g = child.step(r)
+        v0, _hit, solved = _cached_exact_value(
+            g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
+            margin_gain=margin_gain, alpha=0.0, seed=int(req.seed))
+        if not solved:
+            return None
+        v_act = float(v0 if actor == 0 else -v0)
+        min_reply_value = v_act if min_reply_value is None else min(min_reply_value, v_act)
+        pts = 1.0 if v_act > 1e-9 else (0.5 if v_act > -1e-9 else 0.0)
+        w = priors.get(ri, 0.0) if priors is not None else 1.0 / len(replies)
+        pts_uniform_sum += pts / len(replies)
+        pts_weighted_sum += pts * w
+        if v_act > child_value_actor + 1e-9:
+            if v_act > 1e-9:
+                flips_win += 1
+            else:
+                flips_draw += 1
+            weighted_improving += w
+            m0, _mh, m_solved = _cached_exact_value(
+                g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
+                margin_gain=margin_probe_gain, alpha=1.0, seed=int(req.seed))
+            if m_solved:
+                payoff = float(m0 if actor == 0 else -m0) * score_scale / margin_probe_gain
+                best_payoff = payoff if best_payoff is None else max(best_payoff, payoff)
+
+    # Invariant: opponent's best reply == child's minimax value.
+    if min_reply_value is None or abs(min_reply_value - child_value_actor) > 1e-6:
+        print(f"WARNING: swindle invariant violated: min reply value "
+              f"{min_reply_value} != child value {child_value_actor}; "
+              f"dropping swindle stats for this move")
+        return None
+
+    improving = flips_win + flips_draw
+    return {
+        "replies": len(replies),
+        "flips_win": flips_win,
+        "flips_draw": flips_draw,
+        "uniform_rate": improving / len(replies),
+        "weighted_rate": (float(weighted_improving) if priors is not None else None),
+        "expected_points_uniform": pts_uniform_sum,
+        "expected_points_weighted": (pts_weighted_sum if priors is not None else None),
+        "trap_payoff_pts": best_payoff,
+    }
+
+
 def _recommend_exact(
     state: GameState,
     req: RecommendRequest,
@@ -825,14 +945,63 @@ def _recommend_exact(
         if idx >= 0:
             aj = action_to_json(state, actions[idx], idx)
         rows.append((value_actor, rank_value_actor, q_win_prob, idx, aj, value0,
-                     rank_value0, hit, margin_actor_pts))
+                     rank_value0, hit, margin_actor_pts, child))
 
     rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    # ── Swindle analysis (losing/drawn roots): identify moves that maximize
+    # the chance an imperfect opponent errs. One-ply: exact-solve every
+    # opponent reply to the top candidates, in rank order, under a time
+    # budget. Among equally-valued moves the ranking then prefers high trap
+    # rates over minimal losing margins — a simplifying "least bad" move that
+    # leaves the opponent nothing to get wrong is worth less against a human
+    # than a slightly worse move with a trap their natural reply walks into.
+    root_value_actor = float(root_value0 if actor == 0 else -root_value0)
+    swindle_mode = (req.swindle is True
+                    or (req.swindle is None and root_value_actor <= 1e-9))
+    swindle_truncated = False
+    swindle_results: list[Optional[dict[str, Any]]] = [None] * len(rows)
+    if swindle_mode and rows:
+        deadline = time.perf_counter() + float(req.swindle_budget_secs)
+        analyze_n = min(len(rows), max(int(req.top_k), 8))
+        for pos in range(analyze_n):
+            if time.perf_counter() > deadline:
+                swindle_truncated = True
+                break
+            row = rows[pos]
+            res = _swindle_for_move(
+                row[9], row[0], actor, req,
+                score_scale=score_scale, margin_gain=margin_gain,
+                margin_probe_gain=margin_probe_gain, deadline=deadline)
+            if res is None:
+                if time.perf_counter() > deadline:
+                    swindle_truncated = True
+                    break
+                continue  # invariant violation — stats dropped for this move
+            swindle_results[pos] = res
+        # Re-rank the ANALYZED head among itself: (game value, trap score,
+        # margin). Unanalyzed tail keeps its original order below.
+        analyzed = [(rows[i], swindle_results[i]) for i in range(analyze_n)]
+        tail = [(rows[i], None) for i in range(analyze_n, len(rows))]
+
+        def _trap_score(s: Optional[dict[str, Any]]) -> float:
+            if not s:
+                return -1.0
+            if s.get("weighted_rate") is not None:
+                return float(s["weighted_rate"])
+            return float(s.get("uniform_rate") or 0.0)
+
+        analyzed.sort(key=lambda rs: (rs[0][0], _trap_score(rs[1]), rs[0][1]),
+                      reverse=True)
+        paired = analyzed + tail
+    else:
+        paired = [(row, None) for row in rows]
+
     recs = []
-    for rank, (value_actor, rank_value_actor, q_win_prob, idx, aj, value0,
-               rank_value0, hit, margin_actor_pts) in enumerate(
-            rows[: max(1, int(req.top_k))], start=1):
-        recs.append({
+    for rank, ((value_actor, rank_value_actor, q_win_prob, idx, aj, value0,
+                rank_value0, hit, margin_actor_pts, _child), swindle) in enumerate(
+            paired[: max(1, int(req.top_k))], start=1):
+        rec = {
             "rank": rank,
             **aj,
             "prior": None,
@@ -850,12 +1019,15 @@ def _recommend_exact(
                 "rank_value_player0": float(rank_value0),
                 "cache_hit": bool(hit),
             },
-        })
+        }
+        if swindle is not None:
+            rec["swindle"] = swindle
+        recs.append(rec)
 
     root_margin0_pts, margin_hit, margin_miss = _exact_margin_pts(state)
     cache_hits += margin_hit
     cache_misses += margin_miss
-    value_actor = float(root_value0 if actor == 0 else -root_value0)
+    value_actor = root_value_actor
     rank_value_actor = float(root_rank_value0 if actor == 0 else -root_rank_value0)
     return {
         "ok": True,
@@ -864,6 +1036,8 @@ def _recommend_exact(
         "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
         "root_rank_value": rank_value_actor,
         "root_margin_pts": float(root_margin0_pts if actor == 0 else -root_margin0_pts),
+        "swindle_mode": bool(swindle_mode),
+        "swindle_truncated": bool(swindle_truncated),
         "root_value_player0": float(root_value0),
         "search_ms": int(round((time.perf_counter() - started_at) * 1000)),
         "num_simulations": 0,
