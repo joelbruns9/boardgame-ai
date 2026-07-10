@@ -284,6 +284,13 @@ class SelfPlayConfig:
     hof_dirichlet_epsilon: float = 0.0
     hof_add_every: int = 0
     hof_add_tag: str = "current_best"
+    # Run9 diversity: comma-separated win-vs-margin blend values; each HOF
+    # opponent draw also draws one alpha for the OPPONENT's leaf evaluator
+    # (alpha=0 pure win-maximizer, alpha=1 pure score-maximizer). Same nets,
+    # distinct styles. Empty = opponent uses cfg.alpha (old behavior). Applies
+    # to the batched HOF path; leaf-eval blend only (the engine's shared
+    # terminal-value alpha stays cfg.alpha).
+    hof_alpha_choices: str = ""
     # io / misc
     device: str = "cpu"
     seed: int = 0
@@ -367,6 +374,15 @@ class SelfPlayConfig:
     # KataGo-style move-level playout-cap randomization. When enabled, each
     # move independently chooses a full or fast search. Fast moves default to
     # strong cheap play: no root noise, greedy selection, and no policy record.
+    # Run9 diversity: fraction of batched self-play games that open with
+    # k ~ Uniform[min, max] uniformly-random UNRECORDED plies before normal
+    # search play. Diversifies the midgame position distribution (the worst-fit
+    # phase per the capacity bake-off) without touching target quality. Early
+    # plies are mostly picks + low-stakes placements, so k <= 8 perturbs
+    # without ruining boards. Batched engines only; HOF games unaffected.
+    random_opening_fraction: float = 0.0
+    random_opening_plies_min: int = 0
+    random_opening_plies_max: int = 0
     playout_cap_randomization: bool = False
     full_search_fraction: float = 0.25
     fast_move_sims: int = 100
@@ -1297,6 +1313,7 @@ def play_hof_games_batched(
     game_seed_start: int,
     iteration: int = 0,
     opponent_source: str = "",
+    hof_value_alpha: Optional[float] = None,
 ) -> Tuple[List[List[Example]], List[Tuple[int, int]], dict]:
     """Rust-batched learner-vs-HOF self-play — the fast replacement for the serial
     play_current_vs_hof_game loop under the batched engines.
@@ -1325,13 +1342,18 @@ def play_hof_games_batched(
 
     effective_solver_cpus, _game_cpus, _total = _resolve_async_solver_cpus(cfg)
 
-    def _mk_eval(net: KingdominoNet):
+    def _mk_eval(net: KingdominoNet, value_alpha: float):
         return make_rust_evaluator(
             net, device=cfg.device, amp=cfg.inference_amp,
-            margin_gain=cfg.margin_gain, alpha=cfg.alpha)
+            margin_gain=cfg.margin_gain, alpha=value_alpha)
 
-    eval_learner = _mk_eval(learner_net)
-    eval_hof = _mk_eval(hof_net)
+    eval_learner = _mk_eval(learner_net, float(cfg.alpha))
+    # Run9 value-personalities: the OPPONENT's leaf evaluator may blend
+    # win-vs-margin differently (alpha 0 = win-maximizer, 1 = score-maximizer)
+    # so the same net plays a distinct style. The learner always uses
+    # cfg.alpha, and so does the engine's shared terminal-value formula.
+    opp_alpha = float(cfg.alpha if hof_value_alpha is None else hof_value_alpha)
+    eval_hof = _mk_eval(hof_net, opp_alpha)
     hof_sims = max(1, int(cfg.hof_sims))
 
     def _make(n: int, seed0: int, hof_seat: int):
@@ -2003,6 +2025,9 @@ def play_selfplay_games_batched(
             record_fast_moves=bool(cfg.record_fast_moves),
             fast_move_dirichlet_eps=float(cfg.fast_move_dirichlet_epsilon),
             fast_move_temp_moves=int(cfg.fast_move_temp_moves),
+            random_opening_fraction=float(cfg.random_opening_fraction),
+            random_opening_plies_min=int(cfg.random_opening_plies_min),
+            random_opening_plies_max=int(cfg.random_opening_plies_max),
         )
 
     use_db = bool(double_buffer)
@@ -3185,6 +3210,14 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         hof_stats["games"] = hof_games
                         hof_stats["opponent"] = hof_entry.path
                         hof_stats["opponent_sha256"] = hof_entry.sha256
+                        # Run9 value-personalities: one alpha per opponent draw.
+                        if str(iter_cfg.hof_alpha_choices).strip():
+                            choices = [float(x) for x in
+                                       str(iter_cfg.hof_alpha_choices).split(",")
+                                       if x.strip()]
+                            hof_stats["opponent_alpha"] = hof_rng.choice(choices)
+                        else:
+                            hof_stats["opponent_alpha"] = None
             normal_games = total_games - hof_games
             if iter_cfg.playout_cap_randomization:
                 fast_games = 0
@@ -3314,7 +3347,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     hof_ex, hof_sc, hstats = play_hof_games_batched(
                         generation_net, hof_net, iter_cfg,
                         n_games=hof_games, game_seed_start=game_seed,
-                        iteration=it, opponent_source=hof_entry.path)
+                        iteration=it, opponent_source=hof_entry.path,
+                        hof_value_alpha=hof_stats.get("opponent_alpha"))
                     if (iter_cfg.policy_target_pruning
                             or iter_cfg.forced_playout_subtraction):
                         # Recorded HOF-game moves are LEARNER full searches at
@@ -3408,8 +3442,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 print(f"  self-play: {played_games} games "
                       f"({sp_rate:.2f} games/sec), buffer={buffer_size}")
                 if hof_games:
+                    alpha_note = ("" if hof_stats.get("opponent_alpha") is None
+                                  else f" alpha={hof_stats['opponent_alpha']:g},")
                     print(f"  HOF: {hof_games}/{played_games} games, "
-                          f"opponent={Path(str(hof_stats['opponent'])).name}, "
+                          f"opponent={Path(str(hof_stats['opponent'])).name},"
+                          f"{alpha_note} "
                           f"trainable_examples={hof_stats['trainable_examples']}, "
                           f"current_mean_diff={hof_stats['mean_diff']:+.1f}")
                 if fast_games:
@@ -4341,6 +4378,15 @@ if __name__ == "__main__":
                    help="HOF move sampling temperature window; default 0 = best play")
     p.add_argument("--hof_dirichlet_epsilon", type=float, default=0.0,
                    help="HOF root noise; default 0.0 = no forced exploration")
+    p.add_argument("--hof_alpha_choices", default="",
+                   help="comma-separated alphas; each HOF opponent draw also "
+                        "draws one for ITS leaf evaluator (0=win-maximizer, "
+                        "1=score-maximizer). Empty = opponent uses --alpha")
+    p.add_argument("--random_opening_fraction", type=float, default=0.0,
+                   help="fraction of batched self-play games opening with "
+                        "uniformly-random UNRECORDED plies (diversity)")
+    p.add_argument("--random_opening_plies_min", type=int, default=0)
+    p.add_argument("--random_opening_plies_max", type=int, default=0)
     p.add_argument("--hof_add_every", type=int, default=0,
                    help="copy current_best_path into hof_dir every N iterations")
     p.add_argument("--hof_add_tag", default="current_best")
@@ -4547,6 +4593,10 @@ if __name__ == "__main__":
         hof_temp_moves=a.hof_temp_moves,
         hof_dirichlet_epsilon=a.hof_dirichlet_epsilon,
         hof_add_every=a.hof_add_every,
+        hof_alpha_choices=a.hof_alpha_choices,
+        random_opening_fraction=a.random_opening_fraction,
+        random_opening_plies_min=a.random_opening_plies_min,
+        random_opening_plies_max=a.random_opening_plies_max,
         hof_add_tag=a.hof_add_tag,
         device=a.device, seed=a.seed, warm_start_path=warm_start_path,
         checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,

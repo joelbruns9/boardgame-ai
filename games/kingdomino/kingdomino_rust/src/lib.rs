@@ -4212,17 +4212,62 @@ struct SearchSlot {
     exact_recorded_move_count: u32,
 }
 
+/// Random-opening diversification (run9): with probability `fraction`, a new
+/// game starts with k ~ Uniform[min_plies, max_plies] uniformly-random plies
+/// played out BEFORE the first search. The plies are never recorded (they
+/// happen before any MoveRecord exists), so target quality is untouched;
+/// their purpose is stretching the position distribution the searched game
+/// then explores. Early Kingdomino plies are mostly picks plus low-stakes
+/// placements on a near-empty board, so k <= 8 perturbs without ruining.
+#[derive(Clone, Copy)]
+struct RandomOpening {
+    fraction: f64,
+    min_plies: usize,
+    max_plies: usize,
+}
+
 impl SearchSlot {
     /// Start a fresh game in this slot: real state + a redeterminized root,
     /// ready for its root evaluation on the next tick.
-    fn new_for_game(real_state: RustGameState, game_seed: u64, open_loop: bool) -> SearchSlot {
+    fn new_for_game(
+        mut real_state: RustGameState,
+        game_seed: u64,
+        open_loop: bool,
+        opening: Option<RandomOpening>,
+    ) -> SearchSlot {
+        let mut rng = StdRng::seed_from_u64(game_seed);
+        let mut move_num = 0usize;
+        if let Some(o) = opening {
+            if o.fraction > 0.0 && rng.r#gen::<f64>() < o.fraction {
+                let k = if o.max_plies > o.min_plies {
+                    rng.gen_range(o.min_plies..=o.max_plies)
+                } else {
+                    o.min_plies
+                };
+                for _ in 0..k {
+                    if real_state.phase == GAME_OVER {
+                        break;
+                    }
+                    let acts = real_state.legal_actions_indexed();
+                    if acts.is_empty() {
+                        break;
+                    }
+                    let (_, placement, pick) = acts[rng.gen_range(0..acts.len())];
+                    match real_state.step(placement, pick) {
+                        Ok(next) => real_state = next,
+                        Err(_) => break, // defensive: keep the pre-step state
+                    }
+                    move_num += 1;
+                }
+            }
+        }
         // Closed-loop stores a redeterminized root state in arena[0]; open-loop
         // is stateless and evaluates its root from the public real_state, so it
         // only needs a bare ol_arena root.
         let (arena, ol_arena) = if open_loop {
             (Vec::new(), vec![OLNode::new(1.0, (None, None))])
         } else {
-            let root_state = real_state.redeterminize(Some(det_seed(game_seed, 0)));
+            let root_state = real_state.redeterminize(Some(det_seed(game_seed, move_num)));
             let mut arena = vec![Node::new(1.0, (None, None))];
             arena[0].state = Some(root_state);
             (arena, Vec::new())
@@ -4240,10 +4285,10 @@ impl SearchSlot {
             ol_arena,
             real_state,
             sims_done: 0,
-            move_num: 0,
+            move_num,
             move_profile: MoveSearchProfile::full(1, 0.0, 0),
             game_seed,
-            rng: StdRng::seed_from_u64(game_seed),
+            rng,
             records: Vec::new(),
             fallback_count: 0,
             missing_child_count: 0,
@@ -5453,7 +5498,7 @@ mod exact_retry_tests {
         state.pending_claims = vec![(0, 5), (1, 6), (0, 7), (1, 8)];
         state.next_claims.clear();
         state.actor_index = actor_index;
-        SearchSlot::new_for_game(state, 0, true)
+        SearchSlot::new_for_game(state, 0, true, None)
     }
 
     #[test]
@@ -5573,6 +5618,9 @@ struct BatchedMCTS {
     fast_move_temp_moves: usize,
     // Asymmetric two-net (HOF) games: shallow no-record profile for one seat.
     seat_override: Option<SeatSearchOverride>,
+    // Run9 diversity: uniformly-random unrecorded opening plies (see
+    // RandomOpening). None = every game starts from the standard deal.
+    random_opening: Option<RandomOpening>,
     // Terminal-value formula params (Fix 1): GAME_OVER backup uses
     // terminal_search_value with these, matching the non-terminal leaf scale.
     score_scale: f64,
@@ -5739,6 +5787,7 @@ impl BatchedMCTS {
                         new_game(ns, self.harmony, self.middle_kingdom),
                         ns,
                         open_loop,
+                        self.random_opening,
                     );
                     slot.choose_move_profile(
                         self.playout_cap_randomization,
@@ -5847,7 +5896,9 @@ impl BatchedMCTS {
                         fast_move_dirichlet_eps=0.0, fast_move_temp_moves=0,
                         exact_policy_mode="argmax_ties", exact_clamp_delta=10.0,
                         hof_opponent_seat=-1, hof_opponent_sims=0,
-                        hof_opponent_dirichlet_eps=0.0, hof_opponent_temp_moves=0))]
+                        hof_opponent_dirichlet_eps=0.0, hof_opponent_temp_moves=0,
+                        random_opening_fraction=0.0, random_opening_plies_min=0,
+                        random_opening_plies_max=0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -5881,6 +5932,9 @@ impl BatchedMCTS {
         hof_opponent_sims: usize,
         hof_opponent_dirichlet_eps: f64,
         hof_opponent_temp_moves: usize,
+        random_opening_fraction: f64,
+        random_opening_plies_min: usize,
+        random_opening_plies_max: usize,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -5902,6 +5956,26 @@ impl BatchedMCTS {
                 },
                 dirichlet_eps: hof_opponent_dirichlet_eps,
                 temp_moves: hof_opponent_temp_moves,
+            })
+        } else {
+            None
+        };
+        assert!(
+            (0.0..=1.0).contains(&random_opening_fraction),
+            "BatchedMCTS: random_opening_fraction must be in [0, 1], got {}",
+            random_opening_fraction
+        );
+        assert!(
+            random_opening_plies_min <= random_opening_plies_max,
+            "BatchedMCTS: random_opening_plies_min {} > max {}",
+            random_opening_plies_min,
+            random_opening_plies_max
+        );
+        let random_opening = if random_opening_fraction > 0.0 && random_opening_plies_max > 0 {
+            Some(RandomOpening {
+                fraction: random_opening_fraction,
+                min_plies: random_opening_plies_min,
+                max_plies: random_opening_plies_max,
             })
         } else {
             None
@@ -5938,6 +6012,7 @@ impl BatchedMCTS {
                     new_game(seed, harmony, middle_kingdom),
                     seed,
                     open_loop,
+                    random_opening,
                 );
                 slot.choose_move_profile(
                     playout_cap_randomization,
@@ -6006,6 +6081,7 @@ impl BatchedMCTS {
             fast_move_dirichlet_eps,
             fast_move_temp_moves,
             seat_override,
+            random_opening,
             score_scale,
             margin_gain,
             alpha,
@@ -6334,6 +6410,7 @@ impl BatchedMCTS {
                     new_game(ns, self.harmony, self.middle_kingdom),
                     ns,
                     self.open_loop,
+                    self.random_opening,
                 );
                 slot.choose_move_profile(
                     self.playout_cap_randomization,
@@ -6845,6 +6922,7 @@ impl BatchedMCTS {
             fast_move_dirichlet_eps,
             fast_move_temp_moves,
             seat_override,
+            random_opening,
         ) = (
             self.n_sims,
             self.virtual_loss,
@@ -6861,6 +6939,7 @@ impl BatchedMCTS {
             self.fast_move_dirichlet_eps,
             self.fast_move_temp_moves,
             self.seat_override,
+            self.random_opening,
         );
         // Terminal-value formula params (Fix 1).  `alpha` above is the DIRICHLET
         // alpha; the value-formula weight is `val_alpha`.  Copied to locals so the
@@ -7107,7 +7186,7 @@ impl BatchedMCTS {
                     self.next_seed += 1;
                     self.games_started += 1;
                     let mut slot =
-                        SearchSlot::new_for_game(new_game(ns, harmony, mk), ns, open_loop);
+                        SearchSlot::new_for_game(new_game(ns, harmony, mk), ns, open_loop, random_opening);
                     slot.choose_move_profile(
                         playout_cap_randomization,
                         full_search_fraction,
