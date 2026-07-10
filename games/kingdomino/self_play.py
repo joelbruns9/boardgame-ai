@@ -291,6 +291,10 @@ class SelfPlayConfig:
     checkpoint_dir: Optional[str] = None
     # Replay-buffer persistence (see ReplayBuffer.save / .load).
     save_buffer: str = ""
+    # Autosave the buffer to save_buffer every N iterations (0 = only on exit).
+    # Bounds buffer loss on HARD kills (credit cutoff, kill -9) to N iterations;
+    # the atomic tmp+rename write means a kill mid-save can't corrupt the file.
+    buffer_autosave_every: int = 0
     # Path to save the final replay buffer after training completes (also saved
     # on KeyboardInterrupt).  Empty string = don't save.  Not auto-derived from
     # checkpoint_dir — must be requested explicitly so a multi-GB pickle is never
@@ -3079,8 +3083,19 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     has_active_schedules = any(bool(schedule) for schedule in schedules.values())
 
     it = 0   # defined before the loop so the finally block's final-rating is safe
+    # Graceful stop that does NOT depend on signal delivery: `touch <dir>/STOP`
+    # ends the run at the next iteration boundary and the finally block saves
+    # the buffer. SIGINT is unreliable here — the main thread lives inside
+    # GIL-released Rust calls (and can block on the async-solver channel), so
+    # KeyboardInterrupt delivery can lag by many minutes.
+    stop_file = (Path(cfg.checkpoint_dir) / "STOP") if cfg.checkpoint_dir else None
     try:
         for it in range(1, cfg.n_iterations + 1):
+            if stop_file is not None and stop_file.exists():
+                stop_file.unlink()  # consume it so the next launch doesn't insta-stop
+                print(f"STOP file detected ({stop_file}); ending run cleanly "
+                      f"before iteration {it}. Buffer will be saved on exit.")
+                break
             iter_cfg = _active_config_for_iteration(cfg, schedules, it)
             _apply_optimizer_schedule(optimizer, iter_cfg.lr)
             _apply_buffer_capacity(buffer, iter_cfg.buffer_capacity)
@@ -4100,6 +4115,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     trained=trained, buf_n=buffer_size,
                     min_buf=iter_cfg.min_buffer_to_train))
 
+            # Periodic buffer autosave: bounds buffer loss on HARD kills to
+            # buffer_autosave_every iterations. Atomic write — a kill mid-save
+            # leaves the previous autosave intact, never a corrupt file.
+            if (cfg.save_buffer and int(cfg.buffer_autosave_every) > 0
+                    and it % int(cfg.buffer_autosave_every) == 0):
+                try:
+                    buffer.save(cfg.save_buffer)
+                except Exception as e:
+                    print(f"WARNING: buffer autosave failed: {e}")
+
     finally:
         # Save the buffer on EXIT — clean completion AND KeyboardInterrupt — so a
         # long run that the user Ctrl+C's still yields its replay buffer.  Guarded
@@ -4348,6 +4373,9 @@ if __name__ == "__main__":
     p.add_argument("--save_buffer", default="",
                    help="path to save the final replay buffer when training ends "
                         "(also saved on Ctrl+C); empty = don't save")
+    p.add_argument("--buffer_autosave_every", type=int, default=0,
+                   help="also save the buffer to --save_buffer every N iterations "
+                        "(0 = only on exit); bounds loss on hard kills")
     p.add_argument("--warm_buffer", default="",
                    help="path to a previously saved buffer to load before iter 1 "
                         "(use with --warm_start); empty = start empty")
@@ -4523,6 +4551,7 @@ if __name__ == "__main__":
         device=a.device, seed=a.seed, warm_start_path=warm_start_path,
         checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,
         save_buffer=a.save_buffer, warm_buffer=a.warm_buffer,
+        buffer_autosave_every=a.buffer_autosave_every,
         warm_buffer_max_staleness=a.warm_buffer_max_staleness,
         min_buffer_to_train=min_buf,
         engine=a.engine, allow_tf32=not a.no_tf32,
