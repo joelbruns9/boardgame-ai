@@ -756,12 +756,42 @@ def _swindle_for_move(
     are never shown) or when the child is terminal."""
     import time as _time
 
-    if child.phase == Phase.GAME_OVER:
+    # Kingdomino does NOT strictly alternate: pick order can give the same
+    # player consecutive moves. Descend through the ACTOR's own follow-up
+    # moves along the exact-optimal line (value-preserving, so the invariant
+    # below still checks against child_value_actor) until it is genuinely the
+    # opponent's decision — that is where traps live.
+    node = child
+    guard = 0
+    while node.phase != Phase.GAME_OVER and int(node.current_actor) == int(actor):
+        best_v = None
+        best_g = None
+        for a in node.legal_actions():
+            if _time.perf_counter() > deadline:
+                return None
+            g = node.step(a)
+            v0, _hit, solved = _cached_exact_value(
+                g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
+                margin_gain=margin_gain, alpha=0.0, seed=int(req.seed))
+            if not solved:
+                return None
+            v_act = float(v0 if actor == 0 else -v0)
+            if best_v is None or v_act > best_v:
+                best_v, best_g = v_act, g
+        if best_g is None:
+            return None
+        node = best_g
+        guard += 1
+        if guard > 8:
+            return None  # defensive: no legal Kingdomino line has this many consecutive moves
+
+    if node.phase == Phase.GAME_OVER:
         return {"replies": 0, "flips_win": 0, "flips_draw": 0,
                 "uniform_rate": 0.0, "weighted_rate": None,
                 "expected_points_uniform": None, "expected_points_weighted": None,
                 "trap_payoff_pts": None, "note": "terminal after this move"}
 
+    child = node
     replies = child.legal_actions()
     priors = _opponent_policy_priors(req, child)
     flips_win = flips_draw = 0
