@@ -1629,7 +1629,8 @@ def append_game_log(req: GameLogAppendRequest) -> dict[str, Any]:
         c for c in str(req.table_id or "unknown") if c.isalnum() or c in "-_"
     ) or "unknown"
     core = {k: req.record.get(k)
-            for k in ("kind", "state", "final", "gamestate_name", "active_player")}
+            for k in ("kind", "state", "final", "gamestate_name",
+                      "active_player", "advisor")}
     key = hashlib.sha256(
         json.dumps(core, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()

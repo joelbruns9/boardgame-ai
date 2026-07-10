@@ -1277,7 +1277,11 @@ function pageReadKingdominoState() {
         ? gameui.gamedatas.dominoesDescription
         : null,
       game: gd.game_name || gd.gamename || gd.game || "unknown",
-      tableId: gd.table_id || gd.tableId || null,
+      // gamedatas table id is unreliable on some tables (null) — fall back to
+      // the URL (?table=NNN appears on live tables and replays alike), so
+      // per-table log files actually separate games.
+      tableId: gd.table_id || gd.tableId
+        || (location.href.match(/[?&]table=(\d+)/) || [null, null])[1] || null,
       activePlayer: gd.gamestate && gd.gamestate.active_player,
       // The VIEWING player's BGA id — lets the overlay distinguish "my turn"
       // (auto-refresh trigger) from "analyzing the opponent's move".
@@ -2192,6 +2196,36 @@ async function triggerRecommend({ force = false, reason = "manual" } = {}) {
       kingdomino_last_recommendation_at: new Date().toISOString(),
       kingdomino_last_probe: probe,
     });
+    // Log a compact summary of what the user was SHOWN, so post-mortems can
+    // compare in-game advice against later recomputation (different nets,
+    // sims, seeds otherwise make that impossible to reconstruct).
+    if (options.gameLog) {
+      const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+      postGameLog(capture.tableId, {
+        schema: "kingdomino-bga-gamelog/v1",
+        kind: "advisor",
+        captured_at: capture.capturedAt || new Date().toISOString(),
+        table_id: capture.tableId != null ? String(capture.tableId) : null,
+        gamestate_name: capture.gamestateName != null ? String(capture.gamestateName) : null,
+        active_player: capture.activePlayer != null ? String(capture.activePlayer) : null,
+        viewer_id: capture.viewerId != null ? String(capture.viewerId) : null,
+        advisor: {
+          engine: data.engine || payload.engine,
+          sims: data.num_simulations,
+          checkpoint: data.checkpoint_path || null,
+          value: typeof data.value === "number" ? data.value : null,
+          root_win_prob: typeof data.root_win_prob === "number" ? data.root_win_prob : null,
+          root_margin_pts: typeof data.root_margin_pts === "number" ? data.root_margin_pts : null,
+          swindle_mode: Boolean(data.swindle_mode),
+          top: recs.slice(0, 3).map((r) => ({
+            domino_id: r.domino_id, placement: r.placement || null,
+            pick_domino_id: r.pick_domino_id,
+            q_win_prob: r.q_win_prob, visit_frac: r.visit_frac,
+            exact_margin_pts: r.exact_margin_pts,
+          })),
+        },
+      });
+    }
     renderRecommendations(data, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells, capture);
     return { ok: true, transport, capture, payload, response: data, reason };
   } catch (e) {
