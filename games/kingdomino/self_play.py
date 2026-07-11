@@ -40,6 +40,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -395,6 +396,14 @@ class SelfPlayConfig:
     # and gate searches are untouched.
     pick_floor_frac: float = 0.0
     pick_floor_depth: int = 2
+    # Run11a exploiter mode (PSRO-lite): the gate baseline is FROZEN — gates
+    # become measurement-only (the WR curve = the exploitability metric),
+    # promotion never overwrites current_best_path, the learner is never
+    # reverted/reset (divergence from the baseline is the objective), and the
+    # best candidate by gate win rate is banked to checkpoint_dir/
+    # exploiter_best.pt. Use with hof_fraction=1.0 and a pool containing only
+    # the frozen net, so every game is learner-vs-frozen.
+    exploiter_frozen_baseline: bool = False
     playout_cap_randomization: bool = False
     full_search_fraction: float = 0.25
     fast_move_sims: int = 100
@@ -3088,6 +3097,31 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     selfplay_source = generator_state.source
     # Run8: count CONSECUTIVE gate reverts for --revert_reset_after.
     consecutive_reverts = 0
+    # Run11a exploiter mode: best gate win rate banked so far. Resumes from
+    # exploiter_best.json so a restarted run never overwrites a better bank.
+    exploiter_best_wr = float("-inf")
+    if bool(cfg.exploiter_frozen_baseline) and cfg.checkpoint_dir:
+        _ebj = Path(cfg.checkpoint_dir) / "exploiter_best.json"
+        if _ebj.exists():
+            try:
+                exploiter_best_wr = float(
+                    json.loads(_ebj.read_text(encoding="utf-8"))["win_rate"])
+                if verbose:
+                    print(f"exploiter mode: resuming, best banked WR "
+                          f"{exploiter_best_wr:.1%}")
+            except Exception:
+                pass
+    if bool(cfg.exploiter_frozen_baseline) and verbose:
+        print("exploiter mode: gate baseline FROZEN (measurement-only gates; "
+              "no promote/revert/reset)")
+        if float(cfg.hof_fraction) < 1.0:
+            print(f"WARNING: exploiter mode with hof_fraction="
+                  f"{cfg.hof_fraction} < 1.0 — the non-HOF fraction is "
+                  f"learner-vs-learner mirror play, which dilutes the "
+                  f"best-response objective")
+        if int(cfg.hof_add_every or 0) > 0:
+            print("WARNING: exploiter mode with hof_add_every > 0 — the pool "
+                  "should contain ONLY the frozen net; set --hof_add_every 0")
     # Skip promotion checks until the first real training pass: during buffer
     # warmup the learner is byte-identical to its warm start, so a gate match
     # is a guaranteed ~50% self-match (~25-30 min of GPU each at run8 power).
@@ -3867,6 +3901,40 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                           f"action={promotion_result['action']}")
                     for reason in decision.reasons:
                         print(f"    - {reason}")
+                if bool(iter_cfg.exploiter_frozen_baseline):
+                    # Run11a: the gate is a MEASUREMENT vs the frozen baseline,
+                    # not a ratchet. Force probation (learner continues) so the
+                    # revert/reset/promote branches below never fire — the
+                    # baseline must stay byte-identical for the whole run and
+                    # a low gate is information, not a failure. Bank the best
+                    # candidate by raw win rate for run11b's HOF pool.
+                    promotion_result["action"] = "probation"
+                    promotion_result["exploiter_mode"] = True
+                    promotion_result["exploiter_best_wr"] = max(
+                        exploiter_best_wr, float(match.win_rate))
+                    if (candidate_ckpt_path is not None
+                            and cfg.checkpoint_dir
+                            and float(match.win_rate) > exploiter_best_wr):
+                        exploiter_best_wr = float(match.win_rate)
+                        dst = Path(cfg.checkpoint_dir) / "exploiter_best.pt"
+                        shutil.copy2(candidate_ckpt_path, dst)
+                        (Path(cfg.checkpoint_dir) / "exploiter_best.json").write_text(
+                            json.dumps({
+                                "win_rate": float(match.win_rate),
+                                "lcb": float(match.lower_confidence_bound),
+                                "wins": match.wins,
+                                "losses": match.losses,
+                                "draws": match.draws,
+                                "iteration": it,
+                                "source": str(candidate_ckpt_path),
+                                "baseline": str(iter_cfg.current_best_path),
+                            }, indent=2), encoding="utf-8")
+                        if verbose:
+                            print(f"  exploiter: NEW BEST banked at "
+                                  f"{match.win_rate:.1%} -> {dst}")
+                    elif verbose:
+                        print(f"  exploiter: baseline frozen; best so far "
+                              f"{max(exploiter_best_wr, 0.0):.1%}")
                 if promotion_result["action"] == "revert":
                     generator_state.net = baseline_net
                     generator_state.source = generator_state.baseline_source or str(iter_cfg.current_best_path)
@@ -4487,6 +4555,11 @@ if __name__ == "__main__":
     p.add_argument("--pick_floor_depth", type=int, default=2,
                    help="deepest node depth the pick floor applies at (root "
                         "excluded; default 2)")
+    p.add_argument("--exploiter_frozen_baseline", action="store_true",
+                   help="run11a exploiter mode: gate baseline frozen, gates "
+                        "measurement-only (WR curve = exploitability), best "
+                        "candidate banked to checkpoint_dir/exploiter_best.pt; "
+                        "use with --hof_fraction 1.0 and a single-net pool")
     p.add_argument("--hof_add_every", type=int, default=0,
                    help="copy current_best_path into hof_dir every N iterations")
     p.add_argument("--hof_add_tag", default="current_best")
@@ -4700,6 +4773,7 @@ if __name__ == "__main__":
         random_opening_plies_max=a.random_opening_plies_max,
         pick_floor_frac=a.pick_floor_frac,
         pick_floor_depth=a.pick_floor_depth,
+        exploiter_frozen_baseline=a.exploiter_frozen_baseline,
         hof_add_tag=a.hof_add_tag,
         device=a.device, seed=a.seed, warm_start_path=warm_start_path,
         checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,
