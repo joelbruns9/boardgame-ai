@@ -3274,6 +3274,23 @@ impl OLNode {
 /// child's id plus the action DECODED against this state; None (a counted
 /// dead-end) when no child is legal here, which stops the descent.  Actor comes
 /// from the concrete state, not the (stateless) node.
+/// Run10 pick-group visit floors: at shallow non-root nodes, guarantee every
+/// PICK-GROUP (joint_idx % 5 — the codec is placement*5 + pick, and picks are
+/// the only interactive dimension in 2p Kingdomino) a minimum visit share.
+/// Prior-guided PUCT compounds starvation with depth (measured: a game-losing
+/// opponent reply at 4.7% prior received 0.6% of 3200 sims); the floor gives
+/// each pick branch enough visits to reveal its value, after which normal
+/// PUCT takes over on merit. Applied at node depths 1..=max_depth, NEVER the
+/// root (root pick-groups are never starved at training sim counts, and the
+/// root heals itself once child Q values are accurate — so policy targets
+/// need no forced-visit subtraction).
+#[derive(Clone, Copy)]
+struct PickFloor {
+    frac: f64,
+    max_depth: usize,
+    min_visits: i32, // don't force below this node visit count (too noisy)
+}
+
 fn ol_select_child(
     arena: &[OLNode],
     node_id: u32,
@@ -3282,6 +3299,7 @@ fn ol_select_child(
     cpuct: f64,
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
+    pick_filter: Option<u16>,
 ) -> Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)> {
     let node = &arena[node_id as usize];
     // Both lists are sorted ascending by joint index — legal_actions_indexed()
@@ -3316,6 +3334,15 @@ fn ol_select_child(
             ci += 1;
         }
         if ci < children.len() && children[ci].0 == legal_idx {
+            // Pick-floor restriction: only actions in the forced pick-group are
+            // candidates.  The merge still walks EVERY legal action so that
+            // has_missing stays a global property of the node — a missing child
+            // outside the group must still halt the descent for expansion.
+            if let Some(pf) = pick_filter {
+                if legal_idx % 5 != pf {
+                    continue;
+                }
+            }
             // This legal action has a stored child — score it.  Scoring order is
             // ascending by joint index (same as the old children-order loop), so
             // the strict-`>` tie-break selects the SAME child: bit-identical.
@@ -3358,10 +3385,14 @@ fn ol_select_child(
             Some((cid, placement, pick))
         }
         None => {
-            // No legal action had a stored child at all.  After the Issue 2 fix
-            // this is effectively unreachable (missing children are added), but
-            // keep it as a counted defensive dead-end.
-            *fallback_count += 1;
+            // With a pick_filter this just means the forced group has no legal
+            // action under THIS determinization (open-loop legality varies per
+            // det) — an expected miss, not a dead-end: the caller retries
+            // unfiltered.  Without a filter it is the Issue-2-era defensive
+            // dead-end, kept counted.
+            if pick_filter.is_none() {
+                *fallback_count += 1;
+            }
             None
         }
     }
@@ -3371,6 +3402,42 @@ fn ol_select_child(
 /// simulation state forward with each selected action.  No lazy state storage —
 /// the concrete state is threaded as a local.  Returns (path of node ids, the
 /// actor at each NON-leaf node on the path [for VL framing], leaf concrete state).
+/// If `node_id` (at an eligible depth) has a pick-group whose visit share is
+/// below the floor, return the MOST-deficient group's pick index (idx % 5).
+/// Groups are computed over stored children (the union of legalities seen so
+/// far) — per-det legality is handled by the caller's unfiltered retry.
+fn ol_pick_floor_group(arena: &[OLNode], node_id: u32, floor: &PickFloor) -> Option<u16> {
+    let node = &arena[node_id as usize];
+    if node.visit_count < floor.min_visits {
+        return None;
+    }
+    let mut group_visits = [0i64; 5];
+    let mut group_present = [false; 5];
+    for &(idx, cid) in &node.children {
+        let g = (idx % 5) as usize;
+        group_present[g] = true;
+        group_visits[g] += arena[cid as usize].visit_count as i64;
+    }
+    let total: i64 = group_visits.iter().sum();
+    if total <= 0 || group_present.iter().filter(|&&p| p).count() < 2 {
+        return None; // single pick-group (or nothing visited yet): floor is moot
+    }
+    let mut best_g: Option<u16> = None;
+    let mut best_deficit = 0.0f64;
+    for g in 0..5 {
+        if !group_present[g] {
+            continue;
+        }
+        let share = group_visits[g] as f64 / total as f64;
+        let deficit = floor.frac - share;
+        if deficit > best_deficit {
+            best_deficit = deficit;
+            best_g = Some(g as u16);
+        }
+    }
+    best_g
+}
+
 fn ol_descend(
     arena: &[OLNode],
     root_id: u32,
@@ -3379,6 +3446,7 @@ fn ol_descend(
     cpuct: f64,
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
+    pick_floor: Option<PickFloor>,
 ) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
@@ -3392,15 +3460,51 @@ fn ol_descend(
             break;
         }
         let actor = state.actor()?;
-        match ol_select_child(
-            arena,
-            node_id,
-            &state,
-            fpu,
-            cpuct,
-            fallback_count,
-            missing_child_count,
-        ) {
+        // Pick-group visit floor: at node depths 1..=max_depth (NEVER the root:
+        // path.len()-1 == 0 there), if a pick-group is starved below its floor
+        // share, restrict this selection to that group (best child within it
+        // still chosen by PUCT).  If the forced group has no legal action under
+        // this determinization, fall through to normal unfiltered selection.
+        let depth = path.len() - 1;
+        let mut selected: Option<Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>> =
+            None;
+        if let Some(pf) = &pick_floor {
+            if depth >= 1 && depth <= pf.max_depth {
+                if let Some(g) = ol_pick_floor_group(arena, node_id, pf) {
+                    let missing_before = *missing_child_count;
+                    let r = ol_select_child(
+                        arena,
+                        node_id,
+                        &state,
+                        fpu,
+                        cpuct,
+                        fallback_count,
+                        missing_child_count,
+                        Some(g),
+                    );
+                    if r.is_some() || *missing_child_count > missing_before {
+                        // Either a forced-group child was selected, or the node
+                        // has missing children (a GLOBAL stop — must expand).
+                        selected = Some(r);
+                    }
+                    // else: group det-illegal here — retry unfiltered below.
+                }
+            }
+        }
+        let step = match selected {
+            Some(r) => r,
+            None => ol_select_child(
+                arena,
+                node_id,
+                &state,
+                fpu,
+                cpuct,
+                fallback_count,
+                missing_child_count,
+                None,
+            ),
+        };
+        match step {
             None => break, // dead-end / missing children: re-evaluate this node as the leaf
             Some((child_id, placement, pick)) => {
                 actors.push(actor);
@@ -3695,6 +3799,7 @@ fn advisor_open_loop_search_impl(
                 cpuct,
                 &mut fallback_count,
                 &mut missing_child_count,
+                None, // pick floors are a TRAINING device; the advisor stays pure PUCT
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -4210,6 +4315,13 @@ struct SearchSlot {
     recorded_fast_move_count: u32,
     recorded_full_move_count: u32,
     exact_recorded_move_count: u32,
+    // Pick-floor diagnostic: at each full-search finalize, the minimum
+    // pick-group visit share at the most-visited root CHILD (a depth-1 node,
+    // where the floor acts). sum/count → mean min-share per iteration; with
+    // floors off this is the starvation baseline, with floors on it should
+    // sit at ≈ pick_floor_frac.
+    pf_minshare_sum: f64,
+    pf_minshare_count: u32,
 }
 
 /// Random-opening diversification (run9): with probability `fraction`, a new
@@ -4301,6 +4413,8 @@ impl SearchSlot {
             recorded_fast_move_count: 0,
             recorded_full_move_count: 0,
             exact_recorded_move_count: 0,
+            pf_minshare_sum: 0.0,
+            pf_minshare_count: 0,
         }
     }
 
@@ -4329,6 +4443,8 @@ impl SearchSlot {
             recorded_fast_move_count: 0,
             recorded_full_move_count: 0,
             exact_recorded_move_count: 0,
+            pf_minshare_sum: 0.0,
+            pf_minshare_count: 0,
         }
     }
 
@@ -4461,6 +4577,37 @@ impl SearchSlot {
                     })
                     .collect()
             };
+            // Pick-floor diagnostic: min pick-group visit share at the
+            // most-visited root child (a depth-1 node — where the floor acts).
+            if open_loop {
+                let best_child = self.ol_arena[0]
+                    .children
+                    .iter()
+                    .max_by_key(|&&(_, c)| self.ol_arena[c as usize].visit_count)
+                    .map(|&(_, c)| c);
+                if let Some(cid) = best_child {
+                    let node = &self.ol_arena[cid as usize];
+                    if node.visit_count >= 64 {
+                        let mut gv = [0i64; 5];
+                        let mut gp = [false; 5];
+                        for &(idx, c) in &node.children {
+                            let g = (idx % 5) as usize;
+                            gp[g] = true;
+                            gv[g] += self.ol_arena[c as usize].visit_count as i64;
+                        }
+                        let gtotal: i64 = gv.iter().sum();
+                        let n_groups = gp.iter().filter(|&&p| p).count();
+                        if gtotal > 0 && n_groups >= 2 {
+                            let min_share = (0..5)
+                                .filter(|&g| gp[g])
+                                .map(|g| gv[g] as f64 / gtotal as f64)
+                                .fold(f64::INFINITY, f64::min);
+                            self.pf_minshare_sum += min_share;
+                            self.pf_minshare_count += 1;
+                        }
+                    }
+                }
+            }
             let total: i32 = root_children.iter().map(|&(_, vc, _)| vc).sum();
             let mut policy_idx = Vec::new();
             let mut policy_val = Vec::new();
@@ -5621,6 +5768,8 @@ struct BatchedMCTS {
     // Run9 diversity: uniformly-random unrecorded opening plies (see
     // RandomOpening). None = every game starts from the standard deal.
     random_opening: Option<RandomOpening>,
+    // Run10: pick-group visit floors at shallow non-root nodes (see PickFloor).
+    pick_floor: Option<PickFloor>,
     // Terminal-value formula params (Fix 1): GAME_OVER backup uses
     // terminal_search_value with these, matching the non-terminal leaf scale.
     score_scale: f64,
@@ -5637,6 +5786,9 @@ struct BatchedMCTS {
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
     cum_missing_child_count: u64,
+    // Pick-floor diagnostic accumulators (see SearchSlot::pf_minshare_*).
+    cum_pf_minshare_sum: f64,
+    cum_pf_minshare_count: u64,
     // Exact endgame solver (deck ∈ {0,4} roots). Per-position wall-clock budget
     // in seconds; <= 0.0 disables it (ablation).
     exact_endgame_max_secs: f64,
@@ -5741,6 +5893,8 @@ impl BatchedMCTS {
         self.cum_recorded_fast_move_count += self.slots[si].recorded_fast_move_count as u64;
         self.cum_recorded_full_move_count += self.slots[si].recorded_full_move_count as u64;
         self.cum_exact_recorded_move_count += self.slots[si].exact_recorded_move_count as u64;
+        self.cum_pf_minshare_sum += self.slots[si].pf_minshare_sum;
+        self.cum_pf_minshare_count += self.slots[si].pf_minshare_count as u64;
     }
 
     /// Async path (Step 1.5): drain every completed background solve and apply it.
@@ -5898,7 +6052,8 @@ impl BatchedMCTS {
                         hof_opponent_seat=-1, hof_opponent_sims=0,
                         hof_opponent_dirichlet_eps=0.0, hof_opponent_temp_moves=0,
                         random_opening_fraction=0.0, random_opening_plies_min=0,
-                        random_opening_plies_max=0))]
+                        random_opening_plies_max=0,
+                        pick_floor_frac=0.0, pick_floor_depth=2))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -5935,6 +6090,8 @@ impl BatchedMCTS {
         random_opening_fraction: f64,
         random_opening_plies_min: usize,
         random_opening_plies_max: usize,
+        pick_floor_frac: f64,
+        pick_floor_depth: usize,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -5976,6 +6133,22 @@ impl BatchedMCTS {
                 fraction: random_opening_fraction,
                 min_plies: random_opening_plies_min,
                 max_plies: random_opening_plies_max,
+            })
+        } else {
+            None
+        };
+        // A floor of 0.2+ per group with 5 groups would force uniform picks;
+        // stay well under 1/5 so PUCT retains most of the budget on merit.
+        assert!(
+            (0.0..0.2).contains(&pick_floor_frac),
+            "BatchedMCTS: pick_floor_frac must be in [0, 0.2), got {}",
+            pick_floor_frac
+        );
+        let pick_floor = if pick_floor_frac > 0.0 && pick_floor_depth > 0 {
+            Some(PickFloor {
+                frac: pick_floor_frac,
+                max_depth: pick_floor_depth,
+                min_visits: 16,
             })
         } else {
             None
@@ -6082,6 +6255,7 @@ impl BatchedMCTS {
             fast_move_temp_moves,
             seat_override,
             random_opening,
+            pick_floor,
             score_scale,
             margin_gain,
             alpha,
@@ -6094,6 +6268,8 @@ impl BatchedMCTS {
             open_loop,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
+            cum_pf_minshare_sum: 0.0,
+            cum_pf_minshare_count: 0,
             exact_endgame_max_secs,
             exact_policy_mode,
             exact_clamp_delta,
@@ -6460,6 +6636,38 @@ impl BatchedMCTS {
                 .sum::<u64>()
     }
 
+    /// Pick-floor diagnostic: mean of the minimum pick-group visit share at the
+    /// most-visited root child, over all full-search finalized moves so far.
+    /// Baseline (floors off) shows starvation depth; with floors on it should
+    /// approach pick_floor_frac. NaN-free: returns 0.0 before any sample.
+    #[getter]
+    fn pick_floor_min_share_mean(&self) -> f64 {
+        let sum: f64 = self.cum_pf_minshare_sum
+            + self.slots.iter().map(|s| s.pf_minshare_sum).sum::<f64>();
+        let count: u64 = self.cum_pf_minshare_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.pf_minshare_count as u64)
+                .sum::<u64>();
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f64
+        }
+    }
+
+    /// Sample count behind pick_floor_min_share_mean.
+    #[getter]
+    fn pick_floor_min_share_count(&self) -> u64 {
+        self.cum_pf_minshare_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.pf_minshare_count as u64)
+                .sum::<u64>()
+    }
+
     /// True once every game is finished and all slots are Idle.
     fn done(&self) -> bool {
         self.slots.iter().all(|s| s.state == SlotState::Idle)
@@ -6583,12 +6791,13 @@ impl BatchedMCTS {
             self.resolve_exact_slots(py)?;
         }
 
-        let (fpu, cpuct, leaf_batch, vl, open_loop) = (
+        let (fpu, cpuct, leaf_batch, vl, open_loop, pick_floor) = (
             self.fpu,
             self.cpuct,
             self.leaf_batch,
             self.virtual_loss,
             self.open_loop,
+            self.pick_floor,
         );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
@@ -6683,6 +6892,7 @@ impl BatchedMCTS {
                                     cpuct, // det moved in (no clone)
                                     &mut slot.fallback_count,
                                     &mut slot.missing_child_count,
+                                    pick_floor,
                                 )?;
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
                                 paths.push(path);
@@ -8280,6 +8490,7 @@ mod kingdomino_rust {
                 cpuct,
                 &mut fallback_count,
                 &mut missing_child_count,
+                None,
             )?;
             let leaf = *path.last().unwrap();
 

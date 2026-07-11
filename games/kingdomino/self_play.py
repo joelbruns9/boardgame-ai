@@ -390,6 +390,11 @@ class SelfPlayConfig:
     random_opening_fraction: float = 0.0
     random_opening_plies_min: int = 0
     random_opening_plies_max: int = 0
+    # Run10: pick-group visit floors at tree depths 1..pick_floor_depth (never
+    # the root). 0.0 = off. Training-only: self-play + HOF games; the advisor
+    # and gate searches are untouched.
+    pick_floor_frac: float = 0.0
+    pick_floor_depth: int = 2
     playout_cap_randomization: bool = False
     full_search_fraction: float = 0.25
     fast_move_sims: int = 100
@@ -1013,6 +1018,13 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
             int(s.get("exact_fallback_deck4_retry_count", 0)) for s in stats_list),
         "exact_fallback_deck0_count": sum(
             int(s.get("exact_fallback_deck0_count", 0)) for s in stats_list),
+        "pf_minshare_mean": (
+            sum(float(s.get("pf_minshare_mean", 0.0))
+                * int(s.get("pf_minshare_count", 0)) for s in stats_list)
+            / max(1, sum(int(s.get("pf_minshare_count", 0)) for s in stats_list))
+        ),
+        "pf_minshare_count": sum(
+            int(s.get("pf_minshare_count", 0)) for s in stats_list),
         "exact_solver_secs": sum(float(s.get("exact_solver_secs", 0.0)) for s in stats_list),
         "exact_fallback_positions_saved": sum(
             int(s.get("exact_fallback_positions_saved", 0)) for s in stats_list),
@@ -1396,6 +1408,8 @@ def play_hof_games_batched(
             hof_opponent_sims=hof_sims,
             hof_opponent_dirichlet_eps=float(cfg.hof_dirichlet_epsilon),
             hof_opponent_temp_moves=int(cfg.hof_temp_moves),
+            pick_floor_frac=float(cfg.pick_floor_frac),
+            pick_floor_depth=int(cfg.pick_floor_depth),
         )
 
     all_examples: List[List[Example]] = []
@@ -1952,6 +1966,12 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
     exact_fallback_records = (
         list(A.drain_exact_fallback_records())
         + list(B.drain_exact_fallback_records()))
+    # Pick-floor diagnostic: recombine the two instances' means by weight.
+    pf_n = int(A.pick_floor_min_share_count) + int(B.pick_floor_min_share_count)
+    pf_mean = 0.0 if pf_n == 0 else (
+        float(A.pick_floor_min_share_mean) * int(A.pick_floor_min_share_count)
+        + float(B.pick_floor_min_share_mean) * int(B.pick_floor_min_share_count)
+    ) / pf_n
     return (finished, batch_sizes, ticks,
             exact_solve_count, exact_tree_solve_count, exact_cache_hit_count,
             exact_fallback_count, exact_solver_secs,
@@ -1962,6 +1982,8 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
                 "exact_fallback_deck4_initial_count": exact_fallback_deck4_initial_count,
                 "exact_fallback_deck4_retry_count": exact_fallback_deck4_retry_count,
                 "exact_fallback_deck0_count": exact_fallback_deck0_count,
+                "pf_minshare_mean": pf_mean,
+                "pf_minshare_count": pf_n,
             },
             fast_move_count, full_move_count,
             recorded_fast_move_count, recorded_full_move_count,
@@ -2040,6 +2062,8 @@ def play_selfplay_games_batched(
             random_opening_fraction=float(cfg.random_opening_fraction),
             random_opening_plies_min=int(cfg.random_opening_plies_min),
             random_opening_plies_max=int(cfg.random_opening_plies_max),
+            pick_floor_frac=float(cfg.pick_floor_frac),
+            pick_floor_depth=int(cfg.pick_floor_depth),
         )
 
     use_db = bool(double_buffer)
@@ -2108,6 +2132,8 @@ def play_selfplay_games_batched(
             "exact_fallback_deck4_retry_count": int(
                 batched.exact_fallback_deck4_retry_count),
             "exact_fallback_deck0_count": int(batched.exact_fallback_deck0_count),
+            "pf_minshare_mean": float(batched.pick_floor_min_share_mean),
+            "pf_minshare_count": int(batched.pick_floor_min_share_count),
         }
         exact_solver_secs = float(batched.exact_solver_secs)
         fast_move_count = int(batched.fast_move_count)
@@ -2316,6 +2342,10 @@ def _compact_summary(it: int, *, sp_games: int, row: dict, trained: bool,
         if row.get("exact_solver_secs") is not None:
             exact_part += f" solver={row['exact_solver_secs']:.1f}s"
         parts.append(exact_part)
+    if row.get("pf_minshare_count"):
+        parts.append(
+            f"pf: minshare={row['pf_minshare_mean']:.4f} "
+            f"(n={row['pf_minshare_count']})")
     return " | ".join(parts)
 
 
@@ -3544,6 +3574,13 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             f"recorded_fast={batched_stats.get('recorded_fast_move_count', 0)} "
                             f"exact_recorded={batched_stats.get('exact_recorded_move_count', 0)}"
                         )
+                    if batched_stats.get("pf_minshare_count", 0):
+                        print(
+                            f"  pick floor: min_share_mean="
+                            f"{batched_stats.get('pf_minshare_mean', 0.0):.4f} "
+                            f"(n={batched_stats.get('pf_minshare_count', 0)}, "
+                            f"floor={iter_cfg.pick_floor_frac})"
+                        )
 
             # ── 2. Train ──
             if len(buffer) < iter_cfg.min_buffer_to_train:
@@ -4118,6 +4155,10 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     if batched_stats else None),
                 "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
                                       if batched_stats else None),
+                "pf_minshare_mean": (batched_stats.get("pf_minshare_mean", 0.0)
+                                     if batched_stats else None),
+                "pf_minshare_count": (batched_stats.get("pf_minshare_count", 0)
+                                      if batched_stats else None),
                 "exact_fallback_positions_saved": (
                     batched_stats.get("exact_fallback_positions_saved", 0)
                     if batched_stats else None),
@@ -4439,6 +4480,13 @@ if __name__ == "__main__":
                         "uniformly-random UNRECORDED plies (diversity)")
     p.add_argument("--random_opening_plies_min", type=int, default=0)
     p.add_argument("--random_opening_plies_max", type=int, default=0)
+    p.add_argument("--pick_floor_frac", type=float, default=0.0,
+                   help="run10: min visit share per PICK-GROUP (joint_idx %% 5) "
+                        "at tree depths 1..pick_floor_depth in batched training "
+                        "searches (~0.08). 0 = off. Advisor/gates unaffected")
+    p.add_argument("--pick_floor_depth", type=int, default=2,
+                   help="deepest node depth the pick floor applies at (root "
+                        "excluded; default 2)")
     p.add_argument("--hof_add_every", type=int, default=0,
                    help="copy current_best_path into hof_dir every N iterations")
     p.add_argument("--hof_add_tag", default="current_best")
@@ -4650,6 +4698,8 @@ if __name__ == "__main__":
         random_opening_fraction=a.random_opening_fraction,
         random_opening_plies_min=a.random_opening_plies_min,
         random_opening_plies_max=a.random_opening_plies_max,
+        pick_floor_frac=a.pick_floor_frac,
+        pick_floor_depth=a.pick_floor_depth,
         hof_add_tag=a.hof_add_tag,
         device=a.device, seed=a.seed, warm_start_path=warm_start_path,
         checkpoint_dir=a.checkpoint_dir, log_path=a.log_path,
