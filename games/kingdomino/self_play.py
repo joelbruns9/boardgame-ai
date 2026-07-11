@@ -291,6 +291,13 @@ class SelfPlayConfig:
     # to the batched HOF path; leaf-eval blend only (the engine's shared
     # terminal-value alpha stays cfg.alpha).
     hof_alpha_choices: str = ""
+    # Run10 generalization (supersedes hof_alpha_choices when set): styles are
+    # "alpha:margin_gain" pairs, e.g. "0:2.0,1:2.0,1:0.2". The 1:0.2 entry is
+    # the SPITE personality: alpha=1 with a small gain keeps tanh in its
+    # linear region, making the opponent a point-DIFFERENTIAL maximizer for
+    # whom denying the learner 8 points equals gaining 8 — the drafting
+    # adversary the equilibrium never produces (see RUN10_PLAN.md).
+    hof_style_choices: str = ""
     # io / misc
     device: str = "cpu"
     seed: int = 0
@@ -1314,6 +1321,7 @@ def play_hof_games_batched(
     iteration: int = 0,
     opponent_source: str = "",
     hof_value_alpha: Optional[float] = None,
+    hof_value_margin_gain: Optional[float] = None,
 ) -> Tuple[List[List[Example]], List[Tuple[int, int]], dict]:
     """Rust-batched learner-vs-HOF self-play — the fast replacement for the serial
     play_current_vs_hof_game loop under the batched engines.
@@ -1342,18 +1350,22 @@ def play_hof_games_batched(
 
     effective_solver_cpus, _game_cpus, _total = _resolve_async_solver_cpus(cfg)
 
-    def _mk_eval(net: KingdominoNet, value_alpha: float):
+    def _mk_eval(net: KingdominoNet, value_alpha: float, value_gain: float):
         return make_rust_evaluator(
             net, device=cfg.device, amp=cfg.inference_amp,
-            margin_gain=cfg.margin_gain, alpha=value_alpha)
+            margin_gain=value_gain, alpha=value_alpha)
 
-    eval_learner = _mk_eval(learner_net, float(cfg.alpha))
-    # Run9 value-personalities: the OPPONENT's leaf evaluator may blend
-    # win-vs-margin differently (alpha 0 = win-maximizer, 1 = score-maximizer)
-    # so the same net plays a distinct style. The learner always uses
-    # cfg.alpha, and so does the engine's shared terminal-value formula.
+    eval_learner = _mk_eval(learner_net, float(cfg.alpha), float(cfg.margin_gain))
+    # Run9/10 value-personalities: the OPPONENT's leaf evaluator may blend
+    # win-vs-margin differently — alpha 0 = win-maximizer, alpha 1 with the
+    # standard gain = score-maximizer, and alpha 1 with a SMALL gain (linear
+    # tanh region) = the run10 SPITE style: a point-differential maximizer for
+    # whom denial equals gain. The learner always uses cfg.alpha/margin_gain,
+    # and so does the engine's shared terminal-value formula.
     opp_alpha = float(cfg.alpha if hof_value_alpha is None else hof_value_alpha)
-    eval_hof = _mk_eval(hof_net, opp_alpha)
+    opp_gain = float(cfg.margin_gain if hof_value_margin_gain is None
+                     else hof_value_margin_gain)
+    eval_hof = _mk_eval(hof_net, opp_alpha, opp_gain)
     hof_sims = max(1, int(cfg.hof_sims))
 
     def _make(n: int, seed0: int, hof_seat: int):
@@ -3114,12 +3126,23 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     # GIL-released Rust calls (and can block on the async-solver channel), so
     # KeyboardInterrupt delivery can lag by many minutes.
     stop_file = (Path(cfg.checkpoint_dir) / "STOP") if cfg.checkpoint_dir else None
+
+    def _stop_requested(where: str) -> bool:
+        """Consume the STOP file if present. Checked at the iteration boundary
+        AND between phases (after self-play, before the gate) so a stop lands
+        within ~one phase (~8 min) instead of a full gate-bearing iteration
+        (~35 min) — the run9 shutdown lesson."""
+        if stop_file is not None and stop_file.exists():
+            stop_file.unlink()  # consume so the next launch doesn't insta-stop
+            print(f"STOP file detected ({stop_file}) {where}; ending run "
+                  f"cleanly. Buffer will be saved on exit.")
+            return True
+        return False
+
+    stop_now = False
     try:
         for it in range(1, cfg.n_iterations + 1):
-            if stop_file is not None and stop_file.exists():
-                stop_file.unlink()  # consume it so the next launch doesn't insta-stop
-                print(f"STOP file detected ({stop_file}); ending run cleanly "
-                      f"before iteration {it}. Buffer will be saved on exit.")
+            if stop_now or _stop_requested(f"before iteration {it}"):
                 break
             iter_cfg = _active_config_for_iteration(cfg, schedules, it)
             _apply_optimizer_schedule(optimizer, iter_cfg.lr)
@@ -3210,14 +3233,27 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         hof_stats["games"] = hof_games
                         hof_stats["opponent"] = hof_entry.path
                         hof_stats["opponent_sha256"] = hof_entry.sha256
-                        # Run9 value-personalities: one alpha per opponent draw.
-                        if str(iter_cfg.hof_alpha_choices).strip():
+                        # Run9/10 value-personalities: one style per opponent
+                        # draw. hof_style_choices ("alpha:gain,...") supersedes
+                        # the run9 hof_alpha_choices ("alpha,...") when set.
+                        hof_stats["opponent_alpha"] = None
+                        hof_stats["opponent_margin_gain"] = None
+                        if str(iter_cfg.hof_style_choices).strip():
+                            styles = []
+                            for part in str(iter_cfg.hof_style_choices).split(","):
+                                part = part.strip()
+                                if not part:
+                                    continue
+                                a, _, g = part.partition(":")
+                                styles.append((float(a), float(g) if g else None))
+                            a, g = hof_rng.choice(styles)
+                            hof_stats["opponent_alpha"] = a
+                            hof_stats["opponent_margin_gain"] = g
+                        elif str(iter_cfg.hof_alpha_choices).strip():
                             choices = [float(x) for x in
                                        str(iter_cfg.hof_alpha_choices).split(",")
                                        if x.strip()]
                             hof_stats["opponent_alpha"] = hof_rng.choice(choices)
-                        else:
-                            hof_stats["opponent_alpha"] = None
             normal_games = total_games - hof_games
             if iter_cfg.playout_cap_randomization:
                 fast_games = 0
@@ -3348,7 +3384,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         generation_net, hof_net, iter_cfg,
                         n_games=hof_games, game_seed_start=game_seed,
                         iteration=it, opponent_source=hof_entry.path,
-                        hof_value_alpha=hof_stats.get("opponent_alpha"))
+                        hof_value_alpha=hof_stats.get("opponent_alpha"),
+                        hof_value_margin_gain=hof_stats.get("opponent_margin_gain"))
                     if (iter_cfg.policy_target_pruning
                             or iter_cfg.forced_playout_subtraction):
                         # Recorded HOF-game moves are LEARNER full searches at
@@ -3444,6 +3481,9 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 if hof_games:
                     alpha_note = ("" if hof_stats.get("opponent_alpha") is None
                                   else f" alpha={hof_stats['opponent_alpha']:g},")
+                    if hof_stats.get("opponent_margin_gain") is not None:
+                        alpha_note = (f" style={hof_stats['opponent_alpha']:g}"
+                                      f":{hof_stats['opponent_margin_gain']:g},")
                     print(f"  HOF: {hof_games}/{played_games} games, "
                           f"opponent={Path(str(hof_stats['opponent'])).name},"
                           f"{alpha_note} "
@@ -3664,12 +3704,20 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                 run_manifest=run_manifest)
                 record_checkpoint(cfg.checkpoint_dir, checkpoint_path, it)
 
+            # Mid-iteration STOP check before the EXPENSIVE phase: a gate match
+            # costs ~30 min; honoring a stop here caps shutdown latency at one
+            # self-play+train phase.
+            if not stop_now and _stop_requested(f"before iteration {it}'s gate"):
+                stop_now = True
+
             # Skip gate checks while training hasn't started YET (buffer still
             # warming): the learner is byte-identical to its warm start, so
             # the match is a guaranteed ~50% self-match. Does NOT apply when
             # training is explicitly disabled (train_steps=0) — there the
             # operator is gating a fixed learner on purpose.
-            if (generator_state.mode in ("strict_gate", "soft_gate")
+            if stop_now:
+                pass  # stopping: skip promotion; loop exits at the next boundary
+            elif (generator_state.mode in ("strict_gate", "soft_gate")
                     and iter_cfg.promotion_every
                     and it % int(iter_cfg.promotion_every) == 0
                     and not has_trained_ever
@@ -4382,6 +4430,10 @@ if __name__ == "__main__":
                    help="comma-separated alphas; each HOF opponent draw also "
                         "draws one for ITS leaf evaluator (0=win-maximizer, "
                         "1=score-maximizer). Empty = opponent uses --alpha")
+    p.add_argument("--hof_style_choices", default="",
+                   help="run10: 'alpha:margin_gain' pairs (e.g. "
+                        "'0:2.0,1:2.0,1:0.2'; 1:0.2 = linear-margin SPITE "
+                        "style). Supersedes --hof_alpha_choices when set")
     p.add_argument("--random_opening_fraction", type=float, default=0.0,
                    help="fraction of batched self-play games opening with "
                         "uniformly-random UNRECORDED plies (diversity)")
@@ -4594,6 +4646,7 @@ if __name__ == "__main__":
         hof_dirichlet_epsilon=a.hof_dirichlet_epsilon,
         hof_add_every=a.hof_add_every,
         hof_alpha_choices=a.hof_alpha_choices,
+        hof_style_choices=a.hof_style_choices,
         random_opening_fraction=a.random_opening_fraction,
         random_opening_plies_min=a.random_opening_plies_min,
         random_opening_plies_max=a.random_opening_plies_max,
