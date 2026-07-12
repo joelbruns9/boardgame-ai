@@ -1269,8 +1269,29 @@ function pageReadKingdominoState() {
     const candidate = findCandidateState(gd);
     const normalized = candidate.state ? { ok: true, state: candidate.state, source: candidate.source } : normalizeBgaState(gd);
     const sprite = harvestSpriteMap();
+    // Player ELO/rank badges from the player panels (gamedatas usually lacks
+    // them). Best-effort: null when no badge is rendered (replays, themes).
+    // Purpose: seed-pool tooling filters logged games by opponent strength —
+    // squeeze-shaped positions only come from strong opponents.
+    const playerElos = {};
+    try {
+      for (const pid of Object.keys((gd && gd.players) || {})) {
+        let elo = null;
+        for (const scopeId of ["overall_player_board_" + pid, "player_board_" + pid]) {
+          const scope = document.getElementById(scopeId);
+          if (!scope || elo !== null) continue;
+          const el = scope.querySelector(".gamerank_value, .player_elo, [id^='player_elo']");
+          if (el) {
+            const digits = String(el.textContent || "").replace(/[^0-9]/g, "");
+            if (digits) elo = parseInt(digits, 10);
+          }
+        }
+        playerElos[String(pid)] = elo;
+      }
+    } catch (e) { /* best-effort only */ }
     emit({
       ok: true,
+      playerElos,
       spriteUrl: sprite.spriteUrl,
       dominoSpriteMap: sprite.map,
       dominoesDescription: (typeof gameui !== "undefined" && gameui.gamedatas)
@@ -2361,6 +2382,9 @@ function gameLogTick(capture) {
     gamestate_name: capture.gamestateName != null ? String(capture.gamestateName) : null,
     active_player: capture.activePlayer != null ? String(capture.activePlayer) : null,
     viewer_id: capture.viewerId != null ? String(capture.viewerId) : null,
+    // Scraped rank badges keyed by player id (null when not rendered).
+    // Outside the dedupe core hash, so identical states still dedupe.
+    player_elos: capture.playerElos || null,
   };
   let key = null;
   let record = null;
