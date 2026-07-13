@@ -1894,8 +1894,9 @@ impl search::Game for Kingdomino {
     }
 
     /// Mirrors `rust_expectiminimax.RustExpectiminimax._deals`: the last mover of a
-    /// round triggers the next deal (a chance node).
-    fn is_stochastic(s: &RustGameState) -> bool {
+    /// round triggers the next deal (a chance node). In Kingdomino the deal is
+    /// independent of which placement/pick the mover chose, so `_a` is ignored.
+    fn is_stochastic(s: &RustGameState, _a: Self::Action) -> bool {
         match s.phase {
             INITIAL_SELECTION => s.initial_pick_count == 3,
             PLACE_AND_SELECT => s.deck.len() >= 4 && s.actor_index + 1 == s.pending_claims.len(),
@@ -1905,8 +1906,13 @@ impl search::Game for Kingdomino {
 
     /// (row, weight) pairs for the pending deal: enumerated in lexicographic order
     /// over the sorted deck when C(n,4) <= enum_cap (matching itertools.combinations),
-    /// else Monte-Carlo sampled with SplitMix64. Weights sum to 1.
-    fn chance_children(s: &RustGameState, cfg: &search::SearchConfig) -> Vec<(Vec<u16>, f64)> {
+    /// else Monte-Carlo sampled with SplitMix64. Weights sum to 1. The deal does not
+    /// depend on the action taken, so `_a` is ignored.
+    fn chance_children(
+        s: &RustGameState,
+        _a: Self::Action,
+        cfg: &search::SearchConfig,
+    ) -> Vec<(Vec<u16>, f64)> {
         let mut deck = s.deck.clone();
         deck.sort_unstable();
         let n = deck.len();

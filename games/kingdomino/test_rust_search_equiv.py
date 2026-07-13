@@ -6,11 +6,11 @@ over one mutable state) must return a search value NUMERICALLY IDENTICAL (within
 differences; in practice the values usually agree bit-for-bit.)
 
 This is the same discipline as the make/unmake and encode_state milestones: a new
-faster path is proven byte-identical to the known-good reference under real search
-recursion, not just unit-tested in isolation. Wide (sampled) chance is validated
-separately (reproducibility + it converges to the enumerated exact value as the
-sample count grows), since sampled mode uses its own RNG and is a Monte-Carlo
-estimate rather than a byte-for-byte match of CPython's Mersenne Twister.
+faster path is proven numerically equivalent (within 1e-9) to the known-good
+reference under real search recursion, not just unit-tested in isolation. Wide
+(sampled) chance is validated separately (reproducibility + it converges to the
+enumerated exact value as the sample count grows), since sampled mode uses its own
+RNG and is a Monte-Carlo estimate rather than a match of CPython's Mersenne Twister.
 """
 from __future__ import annotations
 
