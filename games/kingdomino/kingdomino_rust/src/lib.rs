@@ -1777,8 +1777,9 @@ impl SearchEngine {
 // module's logic EXACTLY — same SCORE_SCALE (40), same eval formulas, same
 // `_deals` predicate, same enumerate-else-sample chance handling, same
 // alpha-beta on decision layers, same expected-outcome terminals — so that, with
-// every in-horizon chance node enumerated (deterministic), it returns
-// byte-identical search VALUES to `RustExpectiminimax` / `ExpectiminimaxBot`.
+// every in-horizon chance node enumerated (deterministic), it returns search
+// VALUES numerically identical (within 1e-9) to `RustExpectiminimax` /
+// `ExpectiminimaxBot`.
 // See `test_rust_search_equiv.py`. Sampled (wide) chance uses its own reproducible
 // RNG and is NOT gated on Python byte-identity — a Monte-Carlo estimate of the
 // same expectiminimax value, validated by the enumerated core plus convergence.
@@ -2063,6 +2064,12 @@ impl RustSearch {
                 "depth, chance_samples, enum_cap must all be >= 1",
             ));
         }
+        // A non-finite margin_weight makes every terminal blend NaN, so no action
+        // score compares greater than the initial -inf best → the best-action
+        // vector stays empty → choose_action panics on index. Reject up front.
+        if !margin_weight.is_finite() {
+            return Err(PyValueError::new_err("margin_weight must be finite"));
+        }
         let eval = match eval.as_str() {
             "pick_blind" | "tanh_margin" => EmmEval::PickBlind,
             "pick_aware" => EmmEval::PickAware,
@@ -2124,6 +2131,7 @@ impl RustSearch {
             ));
         }
         if actions.len() == 1 {
+            self.nodes = 0; // no search performed — don't leave a prior count stale
             return Ok(actions[0]);
         }
         let actor = s.actor()?;

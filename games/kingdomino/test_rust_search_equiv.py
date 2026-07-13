@@ -1,7 +1,9 @@
 """Step 3 equivalence gate: the Rust-HOSTED `kr.RustSearch` (recursion in Rust
-over one mutable state) must return the SAME search value as the Python-hosted
-`RustExpectiminimax` — and hence the pure-Python `ExpectiminimaxBot` — whenever
-every in-horizon chance node is enumerated (deterministic).
+over one mutable state) must return a search value NUMERICALLY IDENTICAL (within
+1e-9) to the Python-hosted `RustExpectiminimax` — and hence the pure-Python
+`ExpectiminimaxBot` — whenever every in-horizon chance node is enumerated
+(deterministic). (The tolerance guards against last-ULP float summation-order
+differences; in practice the values usually agree bit-for-bit.)
 
 This is the same discipline as the make/unmake and encode_state milestones: a new
 faster path is proven byte-identical to the known-good reference under real search
@@ -176,3 +178,8 @@ def test_constructor_validation():
             kr.RustSearch(**bad)
     with pytest.raises(ValueError):
         kr.RustSearch(eval="nonsense")
+    # A non-finite margin_weight would make terminal blends NaN and could leave
+    # choose_action's best-action vector empty → an index panic. Reject at ctor.
+    for bad_mw in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            kr.RustSearch(margin_weight=bad_mw)
