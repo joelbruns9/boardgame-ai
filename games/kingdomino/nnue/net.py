@@ -8,9 +8,16 @@ Architecture (the NNUE shape — bigness is incidental, sparse+incrementally-upd
         -> [tail]         Linear(acc_width, tail_hidden) -> ReLU
                           Linear(tail_hidden, tail_hidden) -> ReLU
         -> two heads:
-             outcome_logit  (sigmoid -> win probability in (0,1)), trained on
-                            win_target (1 win / 0.5 draw / 0 loss), ACTOR frame
-             margin         normalized final score margin (own - opp), ACTOR frame
+             outcome_logit  trained on win_target (1 win / 0.5 draw / 0 loss),
+                            ACTOR frame. NOTE sigmoid(outcome_logit) estimates the
+                            EXPECTED MATCH SCORE  P(win) + 0.5*P(draw)  in [0,1] —
+                            NOT literal P(win). The searcher converts it to a
+                            player-0-frame value in [-1,1] via  2*sigmoid - 1  then
+                            a sign flip when the actor is not P0 (done in the eval
+                            wrapper, not here).
+             margin         normalized final score margin (own - opp), ACTOR frame.
+                            A SEPARATE auxiliary output — never silently blended
+                            into the outcome value (the plan warns against that).
 
 The first Linear is the "accumulator" that Step 3 will make incrementally
 updatable over a SPARSE feature set; the rest of the architecture is unchanged, so
@@ -55,7 +62,9 @@ class TwoHeadNNUE(nn.Module):
 
     @torch.no_grad()
     def evaluate(self, x: torch.Tensor):
-        """Inference convenience: (win_prob in (0,1), margin_pred normalized)."""
+        """Inference convenience: (expected_score in (0,1), margin_pred normalized).
+        expected_score = sigmoid(outcome_logit) = P(win)+0.5*P(draw), ACTOR frame;
+        convert to a P0-frame value via 2*expected_score-1 (+ sign flip) downstream."""
         logit, margin = self.forward(x)
         return torch.sigmoid(logit), margin
 

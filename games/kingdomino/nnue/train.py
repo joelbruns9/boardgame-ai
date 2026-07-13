@@ -1,10 +1,19 @@
 """Train the two-head NNUE eval on the Kingdomino self-play buffer (Step 2a).
 
-Game-agnostic training loop + validation; the only Kingdomino-specific part is the
-`data` import. Two heads, two separate labels (the plan is explicit these are NOT
-interchangeable): outcome <- win_target (log-loss / Brier), margin <- own-opp
+This is the Kingdomino training ENTRYPOINT. The net (`net.py`) and the training
+*math* here (loss, loop, metrics) are game-agnostic in principle, but this CLI is
+coupled to Kingdomino via the `data` loader import and the KD-specific input-layout
+metadata it saves; a second game would swap the loader (and could factor the loop
+into a shared trainer). Two heads, two separate labels (the plan is explicit these
+are NOT interchangeable): outcome <- win_target (log-loss / Brier), margin <- own-opp
 (MAE). Split is game-honest (whole held-out iterations). Reports both heads against
 trivial baselines so "did a dense net learn Kingdomino value?" is answerable.
+
+NOTE: the outcome sigmoid estimates EXPECTED MATCH SCORE (P(win)+0.5*P(draw)), not
+literal P(win); the searcher converts via 2*sigmoid-1 + a P0-frame sign flip.
+Run10's labels are score-only (no official tiebreaker cascade) -> a small benign
+label noise on the ~2% of near-draw positions; fix at the Rust source before any
+strength-focused retraining, not here.
 
 Example:
     PYTHONPATH=. python -m games.kingdomino.nnue.train \
@@ -25,6 +34,24 @@ from games.kingdomino.nnue import data as kd_data
 from games.kingdomino.nnue.net import TwoHeadNNUE, config_of
 
 
+def _avg_rank(a):
+    """Average (fractional) ranks, so tied values share the mean of their positions."""
+    n = len(a)
+    order = np.argsort(a, kind="mergesort")
+    sa = a[order]
+    avg = np.empty(n, dtype=np.float64)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sa[j] == sa[i]:
+            j += 1
+        avg[i:j] = (i + j - 1) / 2.0
+        i = j
+    out = np.empty(n, dtype=np.float64)
+    out[order] = avg
+    return out
+
+
 def _metrics(net, X, outcome, margin_raw, margin_scale, device, batch=8192):
     """Validation metrics for both heads (numpy in, dict out)."""
     net.eval()
@@ -43,10 +70,12 @@ def _metrics(net, X, outcome, margin_raw, margin_scale, device, batch=8192):
     decisive = outcome != 0.5
     acc = float(np.mean((probs[decisive] > 0.5) == (outcome[decisive] > 0.5)))
     mae = float(np.mean(np.abs(mpred - margin_raw)))
-    # Ranking: does predicted margin order positions like the true margin?
+    # Ranking: does predicted margin order positions like the true margin? Spearman
+    # over AVERAGE ranks — Kingdomino margins are discrete and heavily tied, so
+    # average-rank (not arbitrary distinct ranks) is the correct tie handling.
     if len(margin_raw) > 2:
-        spearman = float(np.corrcoef(
-            np.argsort(np.argsort(mpred)), np.argsort(np.argsort(margin_raw)))[0, 1])
+        rp, rt = _avg_rank(mpred), _avg_rank(margin_raw)
+        spearman = float(np.corrcoef(rp, rt)[0, 1])
     else:
         spearman = float("nan")
     return {"brier": brier, "logloss": logloss, "acc": acc,
@@ -91,13 +120,14 @@ def main():
     print(f"  split: {tr.sum():,} train / {va.sum():,} val "
           f"(held-out iterations {held})")
 
-    # Trivial baselines on the val set (what the net must beat).
+    # Trivial baselines on the val set (what the net must beat). The MAE-optimal
+    # constant is the training MEDIAN (not mean); Brier's is the base rate.
     base_rate = float(outcome[tr].mean())
     base_brier = float(np.mean((base_rate - outcome[va]) ** 2))
-    mean_margin = float(margin[tr].mean())
-    base_mae = float(np.mean(np.abs(mean_margin - margin[va])))
+    median_margin = float(np.median(margin[tr]))
+    base_mae = float(np.mean(np.abs(median_margin - margin[va])))
     print(f"  baselines (val): outcome base-rate {base_rate:.3f} -> Brier {base_brier:.4f}; "
-          f"margin predict-mean -> MAE {base_mae:.2f} pts")
+          f"margin predict-median -> MAE {base_mae:.2f} pts")
 
     net = TwoHeadNNUE(X.shape[1], args.acc_width, args.tail_hidden).to(device)
     n_params = sum(p.numel() for p in net.parameters())

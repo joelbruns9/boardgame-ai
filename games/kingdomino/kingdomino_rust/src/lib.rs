@@ -1794,6 +1794,7 @@ const EMM_CROWN_WEIGHT: f64 = 4.0; // must match rust_expectiminimax.pick_aware
 enum EmmEval {
     PickBlind, // tanh(margin / scale)
     PickAware, // tanh((margin + w*(claimed_crowns0 - claimed_crowns1)) / scale)
+    Nnue,      // trained dense net (weights held in RustSearch.nnue)
 }
 
 /// C(n, 4) as a u64 (0 for n < 4).
@@ -1998,6 +1999,206 @@ impl RustGameState {
     }
 }
 
+// ── NNUE dense evaluator (Step 2b) ───────────────────────────────────────────
+// Loads a `.knnue` export (see nnue/export.py) and runs the trained two-head net
+// as a leaf `Eval<Kingdomino>`: encode the state actor-relative (the ported
+// bit-exact encoder) -> forward -> convert the actor-frame EXPECTED SCORE to a
+// player-0-frame value via 2*sigmoid-1, sign-flipped when the actor is not P0.
+// Dense (non-incremental) forward — Step 3's accumulator makes the first layer
+// fast; this is correctness + integration, not speed.
+
+const KNNUE_MAGIC: u32 = 0x4B4E_4E55; // "KNNU"
+
+struct NnueWeights {
+    input_dim: usize,
+    acc_width: usize,
+    tail_hidden: usize,
+    margin_scale: f32,
+    acc_w: Vec<f32>, // (acc_width, input_dim) row-major
+    acc_b: Vec<f32>,
+    t0_w: Vec<f32>, // (tail_hidden, acc_width)
+    t0_b: Vec<f32>,
+    t1_w: Vec<f32>, // (tail_hidden, tail_hidden)
+    t1_b: Vec<f32>,
+    out_w: Vec<f32>, // (1, tail_hidden)
+    out_b: f32,
+    mgn_w: Vec<f32>, // (1, tail_hidden)
+    mgn_b: f32,
+}
+
+impl NnueWeights {
+    fn load(path: &str) -> PyResult<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| PyValueError::new_err(format!("nnue load '{path}': {e}")))?;
+        if bytes.len() < 32 {
+            return Err(PyValueError::new_err("nnue: file too small for the 32-byte header"));
+        }
+        let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        if u(0) != KNNUE_MAGIC {
+            return Err(PyValueError::new_err("nnue: bad magic (not a .knnue file)"));
+        }
+        if u(4) != 1 {
+            return Err(PyValueError::new_err(format!(
+                "nnue: unsupported format version {}",
+                u(4)
+            )));
+        }
+        let input_dim = u(8) as usize;
+        let acc_width = u(12) as usize;
+        let tail_hidden = u(16) as usize;
+        let board_size = u(20) as usize;
+        let flat_size = u(24) as usize;
+        let margin_scale =
+            f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        // Encoder-layout guard: the export must match THIS crate's encoder, else the
+        // net would be fed differently-laid-out features (silent garbage).
+        let want_board = N_BOARD_CH * OUT_N * OUT_N;
+        if board_size != want_board
+            || flat_size != FLAT_SIZE
+            || input_dim != 2 * board_size + flat_size
+        {
+            return Err(PyValueError::new_err(format!(
+                "nnue: encoder layout mismatch (file board={board_size} flat={flat_size} \
+                 input={input_dim}; crate board={want_board} flat={FLAT_SIZE})"
+            )));
+        }
+        let mut off = 32usize;
+        let read = |off: &mut usize, n: usize| -> PyResult<Vec<f32>> {
+            let need = n * 4;
+            if *off + need > bytes.len() {
+                return Err(PyValueError::new_err("nnue: truncated tensor data"));
+            }
+            let v = bytes[*off..*off + need]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            *off += need;
+            Ok(v)
+        };
+        let acc_w = read(&mut off, acc_width * input_dim)?;
+        let acc_b = read(&mut off, acc_width)?;
+        let t0_w = read(&mut off, tail_hidden * acc_width)?;
+        let t0_b = read(&mut off, tail_hidden)?;
+        let t1_w = read(&mut off, tail_hidden * tail_hidden)?;
+        let t1_b = read(&mut off, tail_hidden)?;
+        let out_w = read(&mut off, tail_hidden)?;
+        let out_b = read(&mut off, 1)?[0];
+        let mgn_w = read(&mut off, tail_hidden)?;
+        let mgn_b = read(&mut off, 1)?[0];
+        if off != bytes.len() {
+            return Err(PyValueError::new_err("nnue: trailing bytes after tensors"));
+        }
+        Ok(NnueWeights {
+            input_dim,
+            acc_width,
+            tail_hidden,
+            margin_scale,
+            acc_w,
+            acc_b,
+            t0_w,
+            t0_b,
+            t1_w,
+            t1_b,
+            out_w,
+            out_b,
+            mgn_w,
+            mgn_b,
+        })
+    }
+
+    /// Forward from feature vector `x` (len input_dim) -> (expected_score in [0,1],
+    /// margin_normalized). Plain (non-clipped) ReLU on accumulator + tail — matches
+    /// training. PyTorch Linear is y = x @ W^T + b with W row-major (out, in).
+    fn forward(&self, x: &[f32]) -> (f32, f32) {
+        let relu_layer = |w: &[f32], b: &[f32], inp: &[f32], n_out: usize, n_in: usize| {
+            let mut out = vec![0f32; n_out];
+            for o in 0..n_out {
+                let row = &w[o * n_in..(o + 1) * n_in];
+                let mut s = b[o];
+                for i in 0..n_in {
+                    s += row[i] * inp[i];
+                }
+                out[o] = s.max(0.0);
+            }
+            out
+        };
+        let a = relu_layer(&self.acc_w, &self.acc_b, x, self.acc_width, self.input_dim);
+        let h0 = relu_layer(&self.t0_w, &self.t0_b, &a, self.tail_hidden, self.acc_width);
+        let h1 = relu_layer(&self.t1_w, &self.t1_b, &h0, self.tail_hidden, self.tail_hidden);
+        let mut logit = self.out_b;
+        let mut margin = self.mgn_b;
+        for i in 0..self.tail_hidden {
+            logit += self.out_w[i] * h1[i];
+            margin += self.mgn_w[i] * h1[i];
+        }
+        let expected = 1.0 / (1.0 + (-logit).exp());
+        (expected, margin)
+    }
+}
+
+/// A leaf `Eval<Kingdomino>` backed by the trained dense net.
+struct NnueEval {
+    w: NnueWeights,
+}
+
+impl NnueEval {
+    fn features(&self, s: &RustGameState, actor: u8) -> PyResult<Vec<f32>> {
+        let board = N_BOARD_CH * OUT_N * OUT_N;
+        let mut x = vec![0f32; 2 * board + FLAT_SIZE];
+        let (mb, rest) = x.split_at_mut(board);
+        let (ob, flat) = rest.split_at_mut(board);
+        s.encode_into_slices(actor, mb, ob, flat)?;
+        Ok(x)
+    }
+
+    /// (p0_value in [-1,1], expected_score in [0,1], margin_points). Actor is read
+    /// from the state (valid at any non-terminal — where the searcher calls eval).
+    fn value_and_aux(&self, s: &RustGameState) -> PyResult<(f64, f32, f32)> {
+        let actor = s.actor()?;
+        let x = self.features(s, actor)?;
+        let (expected, margin_norm) = self.w.forward(&x);
+        let actor_value = 2.0 * expected - 1.0; // expected score [0,1] -> [-1,1]
+        let p0 = if actor == 0 { actor_value } else { -actor_value };
+        Ok((p0 as f64, expected, margin_norm * self.w.margin_scale))
+    }
+}
+
+impl search::Eval<Kingdomino> for NnueEval {
+    fn eval(&self, s: &RustGameState) -> f64 {
+        // Only called at non-terminal leaves, so actor()/encode succeed; a failure
+        // is a real bug, surfaced as a panic at the FFI boundary.
+        self.value_and_aux(s)
+            .map(|(p0, _, _)| p0)
+            .expect("NnueEval: encode/forward failed at a search leaf")
+    }
+}
+
+/// Standalone Python handle for the dense NNUE eval — construct from a `.knnue`
+/// export and evaluate a state. Used by the PyTorch-equivalence test and shared
+/// with `RustSearch` when `eval="nnue"`.
+#[pyclass]
+struct NnueEvaluator {
+    inner: NnueEval,
+}
+
+#[pymethods]
+impl NnueEvaluator {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        Ok(NnueEvaluator {
+            inner: NnueEval {
+                w: NnueWeights::load(path)?,
+            },
+        })
+    }
+
+    /// (p0_value, expected_score, margin_points) for `state`.
+    fn evaluate(&self, state: &RustGameState) -> PyResult<(f64, f64, f64)> {
+        let (p0, exp, mgn) = self.inner.value_and_aux(state)?;
+        Ok((p0, exp as f64, mgn as f64))
+    }
+}
+
 /// Rust-hosted depth-limited expectiminimax searcher for Kingdomino (make/unmake,
 /// no per-node FFI). A thin Python-facing wrapper over the generic `search`
 /// module: it holds a `SearchConfig` + a Kingdomino leaf eval selector and
@@ -2006,6 +2207,7 @@ impl RustGameState {
 struct RustSearch {
     cfg: search::SearchConfig,
     eval: EmmEval,
+    nnue: Option<NnueEval>, // Some iff eval == Nnue
     #[pyo3(get)]
     nodes: u64,
 }
@@ -2013,7 +2215,7 @@ struct RustSearch {
 #[pymethods]
 impl RustSearch {
     #[new]
-    #[pyo3(signature = (depth=4, chance_samples=16, enum_cap=128, eval="pick_blind".to_string(), margin_weight=0.0, seed=0))]
+    #[pyo3(signature = (depth=4, chance_samples=16, enum_cap=128, eval="pick_blind".to_string(), margin_weight=0.0, seed=0, nnue_path=None))]
     fn new(
         depth: u32,
         chance_samples: usize,
@@ -2021,6 +2223,7 @@ impl RustSearch {
         eval: String,
         margin_weight: f64,
         seed: u64,
+        nnue_path: Option<String>,
     ) -> PyResult<Self> {
         if depth < 1 || chance_samples < 1 || enum_cap < 1 {
             return Err(PyValueError::new_err(
@@ -2036,12 +2239,25 @@ impl RustSearch {
         let eval = match eval.as_str() {
             "pick_blind" | "tanh_margin" => EmmEval::PickBlind,
             "pick_aware" => EmmEval::PickAware,
+            "nnue" => EmmEval::Nnue,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown eval '{}' (expected 'pick_blind' or 'pick_aware')",
+                    "unknown eval '{}' (expected 'pick_blind', 'pick_aware', or 'nnue')",
                     other
                 )))
             }
+        };
+        let nnue = match (eval, nnue_path) {
+            (EmmEval::Nnue, Some(p)) => Some(NnueEval {
+                w: NnueWeights::load(&p)?,
+            }),
+            (EmmEval::Nnue, None) => {
+                return Err(PyValueError::new_err("eval='nnue' requires nnue_path"))
+            }
+            (_, Some(_)) => {
+                return Err(PyValueError::new_err("nnue_path given but eval is not 'nnue'"))
+            }
+            (_, None) => None,
         };
         Ok(RustSearch {
             cfg: search::SearchConfig {
@@ -2052,6 +2268,7 @@ impl RustSearch {
                 seed,
             },
             eval,
+            nnue,
             nodes: 0,
         })
     }
@@ -2070,6 +2287,10 @@ impl RustSearch {
             }
             EmmEval::PickAware => {
                 search::value::<Kingdomino, _>(&mut s, d, a, b, &PickAwareEval, &self.cfg, &mut nodes)?
+            }
+            EmmEval::Nnue => {
+                let e = self.nnue.as_ref().expect("nnue eval without weights");
+                search::value::<Kingdomino, _>(&mut s, d, a, b, e, &self.cfg, &mut nodes)?
             }
         };
         self.nodes = nodes;
@@ -2095,6 +2316,10 @@ impl RustSearch {
             }
             EmmEval::PickAware => {
                 search::choose_action::<Kingdomino, _>(&mut s, &PickAwareEval, &self.cfg, seed, &mut nodes)?
+            }
+            EmmEval::Nnue => {
+                let e = self.nnue.as_ref().expect("nnue eval without weights");
+                search::choose_action::<Kingdomino, _>(&mut s, e, &self.cfg, seed, &mut nodes)?
             }
         };
         self.nodes = nodes;
@@ -9011,6 +9236,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::RustSearch;
+
+    #[pymodule_export]
+    use super::NnueEvaluator;
 
     #[pymodule_export]
     use super::RustMCTS;
