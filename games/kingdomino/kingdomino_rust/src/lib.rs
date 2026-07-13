@@ -1306,6 +1306,469 @@ impl RustGameState {
     }
 }
 
+// ─── Make / unmake: mutable, reversible engine for deep search ───────────────
+//
+// The NNUE searcher walks ONE `RustGameState` down and back up the tree instead
+// of cloning per node (the functional `step` clones two 225-cell boards every
+// call — the measured bottleneck).  `make` applies an action in place and returns
+// an `UndoRecord`; `unmake` replays it in reverse to the byte-identical prior
+// state.  `step` is retained unchanged as the correctness oracle (see the
+// differential tests in `make_unmake_tests`).
+//
+// Reversibility notes (verified against `place` / `advance_round`):
+//   * `place` writes 2 cells + `occupied += 2` and updates the bounding box
+//     MONOTONICALLY, so the bbox cannot be recomputed on undo — `PlaceUndo`
+//     snapshots the pre-move bbox and restores it verbatim.  This is the one
+//     spot a naive "clear the two cells" undo would silently corrupt scoring.
+//   * `current_row.remove(pos)` shifts the tail → undo re-inserts at `pos`.
+//   * `next_claims.push` → undo `pop` (the current actor's claim is always last).
+//   * Round boundaries (`deal_row` / `advance_round`, and the 4th-initial-pick
+//     promotion) rewrite deck / row / claim vectors wholesale.  Rather than
+//     invert the deal, `RoundSnapshot` captures the six mutated vectors/scalars
+//     just before the transform and restores them.  These vecs are tiny and the
+//     boundary fires ~12×/game-line, not per node.
+
+/// Undo payload for a single board placement.
+struct PlaceUndo {
+    i1: usize,
+    i2: usize,
+    /// Pre-placement (min_x, min_y, max_x, max_y).
+    bbox: (i8, i8, i8, i8),
+}
+
+/// Snapshot of every field a round-boundary transform rewrites, captured at the
+/// instant AFTER the per-move mutations but BEFORE the boundary transform.
+struct RoundSnapshot {
+    deck: Vec<u16>,
+    current_row: Vec<u16>,
+    pending_claims: Vec<(u8, u16)>,
+    next_claims: Vec<(u8, u16)>,
+    actor_index: usize,
+    phase: u8,
+}
+
+impl RoundSnapshot {
+    fn capture(s: &RustGameState) -> Self {
+        RoundSnapshot {
+            deck: s.deck.clone(),
+            current_row: s.current_row.clone(),
+            pending_claims: s.pending_claims.clone(),
+            next_claims: s.next_claims.clone(),
+            actor_index: s.actor_index,
+            phase: s.phase,
+        }
+    }
+    fn restore(self, s: &mut RustGameState) {
+        s.deck = self.deck;
+        s.current_row = self.current_row;
+        s.pending_claims = self.pending_claims;
+        s.next_claims = self.next_claims;
+        s.actor_index = self.actor_index;
+        s.phase = self.phase;
+    }
+}
+
+/// Everything needed to reverse one `make`.
+enum UndoRecord {
+    InitialPick {
+        removed_pos: usize,
+        domino_id: u16,
+        boundary: Option<RoundSnapshot>,
+    },
+    Move {
+        player: u8,
+        /// `Some` for a placement, `None` for a forced discard.
+        place: Option<PlaceUndo>,
+        /// `(pos, pick_id)` in PLACE_AND_SELECT; `None` in FINAL_PLACEMENT.
+        pick: Option<(usize, u16)>,
+        boundary: Option<RoundSnapshot>,
+    },
+}
+
+impl RustGameState {
+    /// Apply `action` in place, returning the record needed to reverse it.
+    /// Mirrors `step`'s branches exactly but mutates `self`.  Atomic on any legal
+    /// action: all fallible lookups run before any mutation, and `place` is itself
+    /// atomic, so an error leaves `self` unchanged.
+    fn make(
+        &mut self,
+        placement: Option<(i8, i8, i8, i8, bool)>,
+        pick_domino_id: Option<u16>,
+    ) -> PyResult<UndoRecord> {
+        match self.phase {
+            INITIAL_SELECTION => {
+                if placement.is_some() {
+                    return Err(PyValueError::new_err(
+                        "INITIAL_SELECTION takes a pick only, no placement",
+                    ));
+                }
+                let d = pick_domino_id
+                    .ok_or_else(|| PyValueError::new_err("INITIAL_SELECTION requires a pick"))?;
+                let pos = self
+                    .current_row
+                    .iter()
+                    .position(|&x| x == d)
+                    .ok_or_else(|| PyValueError::new_err("Picked domino not available"))?;
+                let actor = self.actor()?; // attributed before the count increments
+                // --- mutate ---
+                self.current_row.remove(pos);
+                self.next_claims.push((actor, d));
+                self.initial_pick_count += 1;
+                let boundary = if self.initial_pick_count == 4 {
+                    let snap = RoundSnapshot::capture(self);
+                    self.next_claims.sort_by_key(|c| c.1);
+                    self.pending_claims = std::mem::take(&mut self.next_claims);
+                    self.deal_row();
+                    self.actor_index = 0;
+                    self.phase = PLACE_AND_SELECT;
+                    Some(snap)
+                } else {
+                    None
+                };
+                Ok(UndoRecord::InitialPick {
+                    removed_pos: pos,
+                    domino_id: d,
+                    boundary,
+                })
+            }
+            PLACE_AND_SELECT | FINAL_PLACEMENT => {
+                let (player, domino_id) = self.pending_claims[self.actor_index];
+                // Resolve the fallible pick lookup BEFORE mutating so `make` stays
+                // atomic (PLACE_AND_SELECT only; FINAL_PLACEMENT has no pick).
+                let pick_undo = if self.phase == PLACE_AND_SELECT {
+                    let pk = pick_domino_id.ok_or_else(|| {
+                        PyValueError::new_err("PLACE_AND_SELECT requires a pick")
+                    })?;
+                    let pos = self
+                        .current_row
+                        .iter()
+                        .position(|&x| x == pk)
+                        .ok_or_else(|| PyValueError::new_err("Picked domino not available"))?;
+                    Some((pos, pk))
+                } else {
+                    None
+                };
+                // --- placement / discard (place is atomic on error) ---
+                let place_undo = if let Some((x1, y1, x2, y2, flipped)) = placement {
+                    let (ta, ca, tb, cb) = dom(domino_id);
+                    let b = &self.boards[player as usize];
+                    let bbox = (b.min_x, b.min_y, b.max_x, b.max_y);
+                    self.boards[player as usize]
+                        .place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                    Some(PlaceUndo {
+                        i1: idx(x1, y1),
+                        i2: idx(x2, y2),
+                        bbox,
+                    })
+                } else {
+                    self.discards[player as usize] += 1;
+                    None
+                };
+                // --- pick apply ---
+                if let Some((pos, pk)) = pick_undo {
+                    self.current_row.remove(pos);
+                    self.next_claims.push((player, pk));
+                }
+                self.actor_index += 1;
+                let boundary = if self.actor_index >= self.pending_claims.len() {
+                    let snap = RoundSnapshot::capture(self);
+                    if self.phase == FINAL_PLACEMENT {
+                        self.phase = GAME_OVER;
+                    } else {
+                        self.advance_round();
+                    }
+                    Some(snap)
+                } else {
+                    None
+                };
+                Ok(UndoRecord::Move {
+                    player,
+                    place: place_undo,
+                    pick: pick_undo,
+                    boundary,
+                })
+            }
+            _ => Err(PyValueError::new_err("Cannot step a terminal state")),
+        }
+    }
+
+    /// Reverse a `make`, restoring the exact prior state.  Undo the boundary
+    /// (if any) first, then the per-move mutations in reverse.
+    fn unmake(&mut self, record: UndoRecord) {
+        match record {
+            UndoRecord::InitialPick {
+                removed_pos,
+                domino_id,
+                boundary,
+            } => {
+                if let Some(snap) = boundary {
+                    snap.restore(self);
+                }
+                self.initial_pick_count -= 1;
+                self.next_claims.pop();
+                self.current_row.insert(removed_pos, domino_id);
+            }
+            UndoRecord::Move {
+                player,
+                place,
+                pick,
+                boundary,
+            } => {
+                if let Some(snap) = boundary {
+                    snap.restore(self);
+                }
+                self.actor_index -= 1;
+                if let Some((pos, pk)) = pick {
+                    self.next_claims.pop();
+                    self.current_row.insert(pos, pk);
+                }
+                if let Some(pu) = place {
+                    let b = &mut self.boards[player as usize];
+                    b.terrain[pu.i1] = EMPTY;
+                    b.crowns[pu.i1] = 0;
+                    b.terrain[pu.i2] = EMPTY;
+                    b.crowns[pu.i2] = 0;
+                    b.occupied -= 2;
+                    b.min_x = pu.bbox.0;
+                    b.min_y = pu.bbox.1;
+                    b.max_x = pu.bbox.2;
+                    b.max_y = pu.bbox.3;
+                } else {
+                    self.discards[player as usize] -= 1;
+                }
+            }
+        }
+    }
+
+    /// Official outcome in player-0 frame: +1 (P0 wins), -1 (P1 wins), 0 (draw).
+    /// Mirrors game.py `determine_winner`'s cascade — meaningful only at a
+    /// terminal state (it scores the current boards directly).
+    fn official_outcome_i8(&self) -> i8 {
+        let k0 = self.boards[0].cascade_key(self.harmony, self.middle_kingdom);
+        let k1 = self.boards[1].cascade_key(self.harmony, self.middle_kingdom);
+        // Rust tuple comparison is lexicographic, matching Python's key tuples.
+        if k0 > k1 {
+            1
+        } else if k1 > k0 {
+            -1
+        } else {
+            0
+        }
+    }
+}
+
+impl RustBoard {
+    /// Official tiebreak key `(total, largest_single_territory_size, total_crowns)`
+    /// — the per-board key `determine_winner` compares.  The largest-territory and
+    /// crown terms reuse the exact same-terrain flood fill as `score`.
+    fn cascade_key(&self, harmony: bool, middle_kingdom: bool) -> (i32, i32, i32) {
+        let (territory, hb, mb) = self.score(harmony, middle_kingdom);
+        let total = territory + hb + mb;
+        let mut visited = [false; CELLS];
+        let mut largest: i32 = 0;
+        for sy in self.min_y..=self.max_y {
+            for sx in self.min_x..=self.max_x {
+                let si = idx(sx, sy);
+                let t = self.terrain[si];
+                if visited[si] || t == EMPTY || t == CASTLE {
+                    continue;
+                }
+                let mut stack: Vec<(i8, i8)> = Vec::with_capacity(49);
+                stack.push((sx, sy));
+                visited[si] = true;
+                let mut area: i32 = 0;
+                while let Some((cx, cy)) = stack.pop() {
+                    area += 1;
+                    for (dx, dy) in DIRS {
+                        let nx = cx + dx;
+                        let ny = cy + dy;
+                        if in_bounds(nx, ny) {
+                            let ni = idx(nx, ny);
+                            if !visited[ni] && self.terrain[ni] == t {
+                                visited[ni] = true;
+                                stack.push((nx, ny));
+                            }
+                        }
+                    }
+                }
+                if area > largest {
+                    largest = area;
+                }
+            }
+        }
+        let total_crowns: i32 = self.crowns.iter().map(|&c| c as i32).sum();
+        (total, largest, total_crowns)
+    }
+}
+
+/// A mutable search driver over one `RustGameState`: walks the state via
+/// `make`/`unmake` with an internal undo stack, so a Python-hosted expectiminimax
+/// never clones per node.  Chance children are produced with `make_with_row`,
+/// which installs a specified drawn row (the enumerated/sampled future) instead
+/// of the hidden actual deck order.  The functional `RustGameState::step` remains
+/// the oracle; `make`/`unmake` were byte-exact validated against it (see
+/// `make_unmake_tests`).
+#[pyclass]
+struct SearchEngine {
+    state: RustGameState,
+    undo: Vec<UndoRecord>,
+}
+
+#[pymethods]
+impl SearchEngine {
+    #[new]
+    fn new(state: &RustGameState) -> Self {
+        SearchEngine {
+            state: state.cloned(),
+            undo: Vec::new(),
+        }
+    }
+
+    /// Apply an action, following the ACTUAL deck order on a deal.  Use for
+    /// deterministic moves and for a straight (non-search) playout.
+    fn make(
+        &mut self,
+        placement: Option<(i8, i8, i8, i8, bool)>,
+        pick: Option<u16>,
+    ) -> PyResult<()> {
+        let rec = self.state.make(placement, pick)?;
+        self.undo.push(rec);
+        Ok(())
+    }
+
+    /// Apply an action; if it triggers a deal, install `row` (a 4-tile subset of
+    /// the pre-deal bag) as the new current row instead of the actual deck order.
+    /// This is the chance-child expansion: `deck` becomes the pre-deal bag minus
+    /// `row`, both sorted (hidden order carries no information).  `unmake` reverses
+    /// it via the boundary snapshot exactly as for a plain `make`.
+    fn make_with_row(
+        &mut self,
+        placement: Option<(i8, i8, i8, i8, bool)>,
+        pick: Option<u16>,
+        row: Vec<u16>,
+    ) -> PyResult<()> {
+        // Validate the chosen row against the PRE-deal bag BEFORE mutating, so an
+        // invalid request errors with the engine and undo depth untouched.  A
+        // silently-accepted bad row (wrong length, dups, alien/absent tiles, or an
+        // empty row that preserves the hidden actual deal) would corrupt the state
+        // or reintroduce clairvoyance — this is foundational infra, so it is strict.
+        if row.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "make_with_row: row must have exactly 4 tiles, got {}",
+                row.len()
+            )));
+        }
+        let pre_deck = self.state.deck.clone();
+        let mut sorted_row = row;
+        sorted_row.sort_unstable();
+        for w in sorted_row.windows(2) {
+            if w[0] == w[1] {
+                return Err(PyValueError::new_err(format!(
+                    "make_with_row: row has a duplicate tile ({})",
+                    w[0]
+                )));
+            }
+        }
+        for r in &sorted_row {
+            if !pre_deck.contains(r) {
+                return Err(PyValueError::new_err(format!(
+                    "make_with_row: tile {} is not in the pre-deal bag",
+                    r
+                )));
+            }
+        }
+        // Apply, then require that this action actually deals a new row.
+        let rec = self.state.make(placement, pick)?;
+        let dealt = matches!(
+            &rec,
+            UndoRecord::InitialPick { boundary: Some(_), .. }
+                | UndoRecord::Move { boundary: Some(_), .. }
+        ) && !self.state.current_row.is_empty();
+        if !dealt {
+            // A row was supplied for an action that does not deal — reverse and
+            // reject rather than silently keep the actual (hidden-order) row.
+            self.state.unmake(rec);
+            return Err(PyValueError::new_err(
+                "make_with_row: action does not reveal a new row (not a chance node)",
+            ));
+        }
+        // Install the validated chosen row; deck = pre-deal bag minus row (sorted).
+        // Every tile is validated present-and-distinct, so each removal succeeds.
+        let mut remaining = pre_deck;
+        for r in &sorted_row {
+            if let Some(pos) = remaining.iter().position(|x| x == r) {
+                remaining.remove(pos);
+            }
+        }
+        remaining.sort_unstable();
+        self.state.current_row = sorted_row;
+        self.state.deck = remaining;
+        self.undo.push(rec);
+        Ok(())
+    }
+
+    /// Reverse the most recent make.  Errors on an empty stack.
+    fn unmake(&mut self) -> PyResult<()> {
+        let rec = self
+            .undo
+            .pop()
+            .ok_or_else(|| PyValueError::new_err("unmake called with empty undo stack"))?;
+        self.state.unmake(rec);
+        Ok(())
+    }
+
+    /// Number of un-reversed makes on the stack (search ply depth).
+    fn depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    // ── read delegates for the search + eval ────────────────────────────────
+    #[getter]
+    fn phase(&self) -> u8 {
+        self.state.phase
+    }
+    fn current_actor(&self) -> PyResult<u8> {
+        self.state.actor()
+    }
+    #[getter]
+    fn actor_index(&self) -> usize {
+        self.state.actor_index
+    }
+    #[getter]
+    fn initial_pick_count(&self) -> usize {
+        self.state.initial_pick_count
+    }
+    fn legal_actions(&self) -> Vec<(Option<(i8, i8, i8, i8, bool)>, Option<u16>)> {
+        self.state.legal_actions()
+    }
+    fn deck(&self) -> Vec<u16> {
+        self.state.deck.clone()
+    }
+    fn current_row(&self) -> Vec<u16> {
+        self.state.current_row.clone()
+    }
+    fn pending_claims(&self) -> Vec<(u8, u16)> {
+        self.state.pending_claims.clone()
+    }
+    fn next_claims(&self) -> Vec<(u8, u16)> {
+        self.state.next_claims.clone()
+    }
+    /// Board totals (territory + harmony + middle) for (player0, player1).
+    fn scores(&self) -> (i32, i32) {
+        let a = self.state.boards[0].score(self.state.harmony, self.state.middle_kingdom);
+        let b = self.state.boards[1].score(self.state.harmony, self.state.middle_kingdom);
+        (a.0 + a.1 + a.2, b.0 + b.1 + b.2)
+    }
+    /// Official outcome, player-0 frame: +1 (P0), -1 (P1), 0 (draw).
+    fn official_outcome(&self) -> i8 {
+        self.state.official_outcome_i8()
+    }
+    /// Deep copy of the current underlying state.
+    fn snapshot(&self) -> RustGameState {
+        self.state.cloned()
+    }
+}
+
 #[pymethods]
 impl RustGameState {
     /// Build a fresh INITIAL_SELECTION state.  `deck` and `current_row` are the
@@ -1595,6 +2058,11 @@ impl RustGameState {
 
     fn deck(&self) -> Vec<u16> {
         self.deck.clone()
+    }
+
+    /// Per-player forced-discard counts (player0, player1).
+    fn discards(&self) -> (u32, u32) {
+        (self.discards[0], self.discards[1])
     }
 
     fn pending_claims(&self) -> Vec<(u8, u16)> {
@@ -5349,6 +5817,244 @@ fn solve_exact_plan(
 }
 
 #[cfg(test)]
+mod make_unmake_tests {
+    //! Differential gate for the mutable make/unmake engine.  The functional
+    //! `step` is the oracle: `make` must reproduce `step` byte-for-byte, and
+    //! `make` + `unmake` must round-trip to the exact prior state.  `fingerprint`
+    //! serializes EVERY field — including the board bounding box, `occupied`, and
+    //! the deck in ORDER — so the bbox-restore hazard and any deck-order leak are
+    //! caught, not masked (`solver_state_bytes` sorts the deck and omits the bbox,
+    //! so it is deliberately NOT reused here).
+    use super::*;
+
+    /// Full structural fingerprint of a state (all fields, deck in order).
+    fn fingerprint(s: &RustGameState) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.push(s.phase);
+        b.extend_from_slice(&(s.actor_index as u64).to_le_bytes());
+        b.extend_from_slice(&(s.initial_pick_count as u64).to_le_bytes());
+        b.push(s.start_player);
+        b.push(s.harmony as u8);
+        b.push(s.middle_kingdom as u8);
+        b.extend_from_slice(&s.discards[0].to_le_bytes());
+        b.extend_from_slice(&s.discards[1].to_le_bytes());
+        for &d in &s.deck {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.push(0xFF); // section separator (deck len is variable)
+        for &d in &s.current_row {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.push(0xFF);
+        for &(p, d) in &s.pending_claims {
+            b.push(p);
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.push(0xFF);
+        for &(p, d) in &s.next_claims {
+            b.push(p);
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.push(0xFF);
+        for brd in &s.boards {
+            b.extend_from_slice(&brd.terrain);
+            b.extend_from_slice(&brd.crowns);
+            b.extend_from_slice(&[
+                brd.castle_x as u8,
+                brd.castle_y as u8,
+                brd.min_x as u8,
+                brd.max_x as u8,
+                brd.min_y as u8,
+                brd.max_y as u8,
+                brd.occupied,
+            ]);
+        }
+        b
+    }
+
+    /// At every ply of many random games: (1) `make` on a clone reproduces `step`
+    /// byte-for-byte; (2) `make` then `unmake` round-trips to the prior state.
+    /// Random play naturally covers all phases, forced discards, round
+    /// boundaries, and the terminal transition.
+    #[test]
+    fn make_matches_step_and_round_trips() -> PyResult<()> {
+        let mut games = 0;
+        let mut plies = 0;
+        let mut discards_seen = 0;
+        let mut boundaries_seen = 0;
+        for seed in 0..200u64 {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x5A17);
+            let mut state = new_game(seed, true, true);
+            games += 1;
+            for _ in 0..400 {
+                if state.phase == GAME_OVER {
+                    break;
+                }
+                let legal = state.legal_actions();
+                let &(p, pk) = legal.choose(&mut rng).expect("nonempty legal actions");
+                // A forced discard is a placement-PHASE move with no placement.
+                // INITIAL_SELECTION picks also carry placement=None, so they must
+                // be excluded or the coverage assertion is a false positive.
+                if state.phase != INITIAL_SELECTION && p.is_none() {
+                    discards_seen += 1;
+                }
+
+                // (1) make == step
+                let stepped = state.step(p, pk)?;
+                let mut m = state.cloned();
+                let _ = m.make(p, pk)?;
+                assert_eq!(
+                    fingerprint(&m),
+                    fingerprint(&stepped),
+                    "seed {seed} ply {plies}: make diverged from step"
+                );
+
+                // (2) round-trip
+                let before = fingerprint(&state);
+                let mut r = state.cloned();
+                let rec = r.make(p, pk)?;
+                if matches!(
+                    rec,
+                    UndoRecord::InitialPick { boundary: Some(_), .. }
+                        | UndoRecord::Move { boundary: Some(_), .. }
+                ) {
+                    boundaries_seen += 1;
+                }
+                r.unmake(rec);
+                assert_eq!(
+                    fingerprint(&r),
+                    before,
+                    "seed {seed} ply {plies}: unmake did not restore prior state"
+                );
+
+                state = stepped;
+                plies += 1;
+            }
+        }
+        // Guard the test actually exercised the interesting transitions.
+        assert!(games >= 100, "too few games ({games})");
+        assert!(discards_seen >= 1, "no forced discards exercised");
+        assert!(boundaries_seen >= 50, "too few round boundaries ({boundaries_seen})");
+        Ok(())
+    }
+
+    /// A single mutable state, walked to game over via `make` (records pushed on a
+    /// stack) and then fully unwound via `unmake`, must return byte-identical to
+    /// the start — the real search-walk discipline, not just isolated plies.
+    #[test]
+    fn full_playout_unwinds_to_start() -> PyResult<()> {
+        for seed in 0..60u64 {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0xB00C);
+            let mut state = new_game(seed, true, true);
+            let start = fingerprint(&state);
+            let mut stack: Vec<UndoRecord> = Vec::new();
+            // Parallel functional reference advanced by `step`.
+            let mut reference = state.cloned();
+            for _ in 0..400 {
+                if state.phase == GAME_OVER {
+                    break;
+                }
+                let legal = state.legal_actions();
+                let &(p, pk) = legal.choose(&mut rng).expect("nonempty legal actions");
+                let rec = state.make(p, pk)?;
+                reference = reference.step(p, pk)?;
+                assert_eq!(
+                    fingerprint(&state),
+                    fingerprint(&reference),
+                    "seed {seed}: running make state diverged from step"
+                );
+                stack.push(rec);
+            }
+            assert_eq!(
+                state.phase, GAME_OVER,
+                "seed {seed}: game did not reach GAME_OVER within 400 plies — \
+                 the 'walked to game over' property was not actually exercised"
+            );
+            assert!(!stack.is_empty(), "seed {seed}: game produced no moves");
+            while let Some(rec) = stack.pop() {
+                state.unmake(rec);
+            }
+            assert_eq!(
+                fingerprint(&state),
+                start,
+                "seed {seed}: unwinding the full game did not restore the start"
+            );
+        }
+        Ok(())
+    }
+
+    /// Atomicity: an illegal action must return `Err` and leave the state
+    /// byte-identical (the documented guarantee that fallible lookups run before
+    /// any mutation and `place` validates before writing). Covers all four paths:
+    /// invalid opening pick, placement supplied in INITIAL_SELECTION, invalid pick
+    /// with a legal placement, illegal placement with a valid pick, and `make` on
+    /// a terminal state.
+    #[test]
+    fn make_rejects_illegal_actions_without_mutating() -> PyResult<()> {
+        const BAD_ID: u16 = 9999;
+
+        // --- INITIAL_SELECTION ---
+        let mut s0 = new_game(1, true, true);
+        assert_eq!(s0.phase, INITIAL_SELECTION);
+        let fp0 = fingerprint(&s0);
+        assert!(s0.make(None, Some(BAD_ID)).is_err(), "invalid opening pick");
+        assert_eq!(fingerprint(&s0), fp0, "errored opening pick mutated state");
+        assert!(
+            s0.make(Some((7, 7, 7, 8, false)), Some(0)).is_err(),
+            "placement in INITIAL_SELECTION must be rejected"
+        );
+        assert_eq!(fingerprint(&s0), fp0, "errored initial placement mutated state");
+
+        // --- PLACE_AND_SELECT with a real placement action available ---
+        let mut rng = StdRng::seed_from_u64(0xA704);
+        let mut s = new_game(2, true, true);
+        let mut found: Option<(RustGameState, Option<(i8, i8, i8, i8, bool)>, Option<u16>)> = None;
+        for _ in 0..400 {
+            if s.phase == GAME_OVER {
+                break;
+            }
+            if s.phase == PLACE_AND_SELECT {
+                if let Some(&(p, pk)) = s.legal_actions().iter().find(|(p, _)| p.is_some()) {
+                    found = Some((s.cloned(), p, pk));
+                    break;
+                }
+            }
+            let legal = s.legal_actions();
+            let &(p, pk) = legal.choose(&mut rng).expect("nonempty legal actions");
+            s = s.step(p, pk)?;
+        }
+        let (mut sp, p, pk) = found.expect("no PLACE_AND_SELECT placement action found");
+        let fpp = fingerprint(&sp);
+        // Invalid pick + legal placement: pick is resolved before placement, so it
+        // errors with the board untouched.
+        assert!(sp.make(p, Some(BAD_ID)).is_err(), "invalid pick should error");
+        assert_eq!(fingerprint(&sp), fpp, "errored invalid pick mutated state");
+        // Illegal placement + valid pick: `place` validates before writing, so it
+        // errors with no pick mutation applied.
+        let illegal = Some((0i8, 0i8, 0i8, 1i8, false)); // far from castle -> illegal
+        assert!(sp.make(illegal, pk).is_err(), "illegal placement should error");
+        assert_eq!(fingerprint(&sp), fpp, "errored illegal placement mutated state");
+
+        // --- terminal ---
+        let mut t = new_game(3, true, true);
+        let mut rng2 = StdRng::seed_from_u64(0xDEAD);
+        for _ in 0..400 {
+            if t.phase == GAME_OVER {
+                break;
+            }
+            let legal = t.legal_actions();
+            let &(p, pk) = legal.choose(&mut rng2).expect("nonempty legal actions");
+            t = t.step(p, pk)?;
+        }
+        assert_eq!(t.phase, GAME_OVER);
+        let fpt = fingerprint(&t);
+        assert!(t.make(None, None).is_err(), "make on terminal should error");
+        assert_eq!(fingerprint(&t), fpt, "errored terminal make mutated state");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod solver_restructure_tests {
     use super::*;
 
@@ -7964,6 +8670,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::RustGameState;
+
+    #[pymodule_export]
+    use super::SearchEngine;
 
     #[pymodule_export]
     use super::RustMCTS;
