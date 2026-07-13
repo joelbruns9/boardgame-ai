@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 mod deck0_draft_dp;
+mod search;
 
 // Terrain constants matching Python's Terrain IntEnum
 const EMPTY: u8 = 0;
@@ -1769,20 +1770,22 @@ impl SearchEngine {
     }
 }
 
-// ── Step 3: Rust-HOSTED depth-limited expectiminimax ─────────────────────────
+// ── Kingdomino as the first `search::Game` implementation ────────────────────
 //
-// This hosts the whole search recursion in Rust over a single mutable
-// `RustGameState` (make/unmake), removing the per-node FFI hop that capped the
-// Python-hosted `RustExpectiminimax` (rust_expectiminimax.py). It mirrors that
-// module's logic EXACTLY — same SCORE_SCALE (40), same eval formulas, same
-// `_deals` predicate, same enumerate-else-sample chance handling, same
-// alpha-beta on decision layers, same expected-outcome terminals — so that, with
-// every in-horizon chance node enumerated (deterministic), it returns search
-// VALUES numerically identical (within 1e-9) to `RustExpectiminimax` /
-// `ExpectiminimaxBot`.
-// See `test_rust_search_equiv.py`. Sampled (wide) chance uses its own reproducible
-// RNG and is NOT gated on Python byte-identity — a Monte-Carlo estimate of the
-// same expectiminimax value, validated by the enumerated core plus convergence.
+// The depth-limited expectiminimax recursion now lives in the game-agnostic
+// `search` module; this section is the KINGDOMINO-SPECIFIC glue that plugs into
+// it: the `Game` trait impl (rules/chance) + `Eval` impls (leaf value) + the
+// `RustSearch` pyclass (Python entry point). The search walks one mutable
+// `RustGameState` via make/unmake (no per-node FFI), and — with every in-horizon
+// chance node enumerated (deterministic) — returns search VALUES numerically
+// identical (within 1e-9) to the Python-hosted `RustExpectiminimax` /
+// `ExpectiminimaxBot`. See `test_rust_search_equiv.py`. Sampled (wide) chance uses
+// its own reproducible SplitMix64 RNG — a Monte-Carlo estimate of the same
+// expectiminimax value, validated by the enumerated core plus convergence.
+//
+// The trait boundary (search::Game / search::Eval) is what a SECOND game would
+// implement; `search` is written to be extractable to a standalone crate at that
+// point ("build one, extract at two"). Constants/evals below are Kingdomino-only.
 
 const EMM_SCORE_SCALE: f64 = 40.0; // must match rust_expectiminimax.SCORE_SCALE
 const EMM_CROWN_WEIGHT: f64 = 4.0; // must match rust_expectiminimax.pick_aware
@@ -1791,25 +1794,6 @@ const EMM_CROWN_WEIGHT: f64 = 4.0; // must match rust_expectiminimax.pick_aware
 enum EmmEval {
     PickBlind, // tanh(margin / scale)
     PickAware, // tanh((margin + w*(claimed_crowns0 - claimed_crowns1)) / scale)
-}
-
-#[derive(Clone)]
-struct EmmConfig {
-    depth: u32,
-    chance_samples: usize,
-    enum_cap: u64,
-    eval: EmmEval,
-    margin_weight: f64,
-    seed: u64,
-}
-
-/// SplitMix64 — a tiny reproducible PRNG for sampled (wide) chance nodes only.
-fn emm_splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// C(n, 4) as a u64 (0 for n < 4).
@@ -1857,157 +1841,127 @@ fn emm_pick_aware(s: &RustGameState) -> f64 {
     ((emm_margin(s) + pot) / EMM_SCORE_SCALE).tanh()
 }
 
-fn emm_leaf_eval(s: &RustGameState, cfg: &EmmConfig) -> f64 {
-    match cfg.eval {
-        EmmEval::PickBlind => emm_tanh_margin(s),
-        EmmEval::PickAware => emm_pick_aware(s),
+/// Player-0-frame leaf evals for Kingdomino, plugged into the generic searcher.
+struct PickBlindEval; // tanh(margin / scale)
+struct PickAwareEval; // + claimed-domino crown potential
+
+impl search::Eval<Kingdomino> for PickBlindEval {
+    fn eval(&self, s: &RustGameState) -> f64 {
+        emm_tanh_margin(s)
     }
 }
 
-/// Expected-outcome terminal value: official result {+1,0,-1} plus an optional
-/// bounded margin proxy (so proven results always dominate the blend).
-fn emm_terminal(s: &RustGameState, cfg: &EmmConfig) -> f64 {
-    let mut v = s.official_outcome_i8() as f64;
-    if cfg.margin_weight != 0.0 {
-        v += cfg.margin_weight * emm_tanh_margin(s);
-    }
-    v
-}
-
-/// Does the next applied action reveal a new row (a chance node)?  Mirrors
-/// rust_expectiminimax.RustExpectiminimax._deals.
-fn emm_deals(s: &RustGameState) -> bool {
-    match s.phase {
-        INITIAL_SELECTION => s.initial_pick_count == 3,
-        PLACE_AND_SELECT => s.deck.len() >= 4 && s.actor_index + 1 == s.pending_claims.len(),
-        _ => false,
+impl search::Eval<Kingdomino> for PickAwareEval {
+    fn eval(&self, s: &RustGameState) -> f64 {
+        emm_pick_aware(s)
     }
 }
 
-/// (row, weight) pairs for the pending deal: enumerated in lexicographic order
-/// over the sorted deck when C(n,4) <= enum_cap (matching itertools.combinations),
-/// else Monte-Carlo sampled with SplitMix64.  Weights sum to 1.
-fn emm_chance_rows(s: &RustGameState, cfg: &EmmConfig) -> Vec<(Vec<u16>, f64)> {
-    let mut deck = s.deck.clone();
-    deck.sort_unstable();
-    let n = deck.len();
-    let n_rows = emm_comb4(n);
-    if n_rows <= cfg.enum_cap {
-        let p = 1.0 / n_rows as f64;
-        let mut out = Vec::with_capacity(n_rows as usize);
-        for i in 0..n {
-            for j in (i + 1)..n {
-                for k in (j + 1)..n {
-                    for l in (k + 1)..n {
-                        out.push((vec![deck[i], deck[j], deck[k], deck[l]], p));
+/// Kingdomino as an implementation of the generic `search::Game` trait (impl #1).
+/// A zero-sized type used only as a type-level namespace; all state lives in the
+/// `RustGameState` passed to each method.
+struct Kingdomino;
+
+impl search::Game for Kingdomino {
+    type State = RustGameState;
+    type Action = (Option<(i8, i8, i8, i8, bool)>, Option<u16>);
+    type Chance = Vec<u16>;
+    type Undo = UndoRecord;
+
+    fn to_move(s: &RustGameState) -> PyResult<search::Turn> {
+        Ok(if s.actor()? == 0 {
+            search::Turn::P0
+        } else {
+            search::Turn::P1
+        })
+    }
+
+    fn is_terminal(s: &RustGameState) -> bool {
+        s.phase == GAME_OVER
+    }
+
+    /// Official outcome, player-0 frame: +1 / 0 / -1 (the determine_winner cascade).
+    fn terminal_value_p0(s: &RustGameState) -> f64 {
+        s.official_outcome_i8() as f64
+    }
+
+    fn bounded_margin(s: &RustGameState) -> f64 {
+        emm_tanh_margin(s)
+    }
+
+    fn legal_actions(s: &RustGameState, out: &mut Vec<Self::Action>) {
+        out.extend(s.legal_actions());
+    }
+
+    /// Mirrors `rust_expectiminimax.RustExpectiminimax._deals`: the last mover of a
+    /// round triggers the next deal (a chance node).
+    fn is_stochastic(s: &RustGameState) -> bool {
+        match s.phase {
+            INITIAL_SELECTION => s.initial_pick_count == 3,
+            PLACE_AND_SELECT => s.deck.len() >= 4 && s.actor_index + 1 == s.pending_claims.len(),
+            _ => false,
+        }
+    }
+
+    /// (row, weight) pairs for the pending deal: enumerated in lexicographic order
+    /// over the sorted deck when C(n,4) <= enum_cap (matching itertools.combinations),
+    /// else Monte-Carlo sampled with SplitMix64. Weights sum to 1.
+    fn chance_children(s: &RustGameState, cfg: &search::SearchConfig) -> Vec<(Vec<u16>, f64)> {
+        let mut deck = s.deck.clone();
+        deck.sort_unstable();
+        let n = deck.len();
+        let n_rows = emm_comb4(n);
+        if n_rows <= cfg.enum_cap {
+            let p = 1.0 / n_rows as f64;
+            let mut out = Vec::with_capacity(n_rows as usize);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    for k in (j + 1)..n {
+                        for l in (k + 1)..n {
+                            out.push((vec![deck[i], deck[j], deck[k], deck[l]], p));
+                        }
                     }
                 }
             }
+            out
+        } else {
+            // Reproducible per-node seed from the config seed folded with the sorted
+            // bag, so a given position always samples the same rows.
+            let mut rng = cfg.seed ^ 0x1234_5678_9ABC_DEF0;
+            for &d in &deck {
+                rng = rng.wrapping_mul(0x0100_0000_01B3) ^ d as u64;
+            }
+            let w = 1.0 / cfg.chance_samples as f64;
+            (0..cfg.chance_samples)
+                .map(|_| {
+                    // partial Fisher-Yates over indices → 4 distinct tiles, then sort.
+                    let mut idx: Vec<usize> = (0..n).collect();
+                    for i in 0..4 {
+                        let j = i + (search::splitmix64(&mut rng) as usize) % (n - i);
+                        idx.swap(i, j);
+                    }
+                    let mut row: Vec<u16> = idx[..4].iter().map(|&i| deck[i]).collect();
+                    row.sort_unstable();
+                    (row, w)
+                })
+                .collect()
         }
-        out
-    } else {
-        // Reproducible per-node seed from the config seed folded with the sorted
-        // bag, so a given position always samples the same rows.
-        let mut rng = cfg.seed ^ 0x1234_5678_9ABC_DEF0;
-        for &d in &deck {
-            rng = rng.wrapping_mul(0x0100_0000_01B3) ^ d as u64;
-        }
-        let w = 1.0 / cfg.chance_samples as f64;
-        (0..cfg.chance_samples)
-            .map(|_| {
-                // partial Fisher-Yates over indices → 4 distinct tiles, then sort.
-                let mut idx: Vec<usize> = (0..n).collect();
-                for i in 0..4 {
-                    let j = i + (emm_splitmix64(&mut rng) as usize) % (n - i);
-                    idx.swap(i, j);
-                }
-                let mut row: Vec<u16> = idx[..4].iter().map(|&i| deck[i]).collect();
-                row.sort_unstable();
-                (row, w)
-            })
-            .collect()
     }
-}
 
-/// Value of applying `(placement, pick)` then searching one ply deeper.  At a
-/// chance node it probability-weights the child values over the drawn rows (fresh
-/// window per child — no pruning across chance).  Always unmakes, even on error.
-#[allow(clippy::too_many_arguments)]
-fn emm_action_value(
-    s: &mut RustGameState,
-    placement: Option<(i8, i8, i8, i8, bool)>,
-    pick: Option<u16>,
-    depth: i32,
-    alpha: f64,
-    beta: f64,
-    cfg: &EmmConfig,
-    nodes: &mut u64,
-) -> PyResult<f64> {
-    if !emm_deals(s) {
-        let rec = s.make(placement, pick)?;
-        let r = emm_value(s, depth - 1, alpha, beta, cfg, nodes);
-        s.unmake(rec);
-        return r;
+    fn make(s: &mut RustGameState, a: Self::Action) -> PyResult<UndoRecord> {
+        s.make(a.0, a.1)
     }
-    let mut expected = 0.0;
-    for (row, w) in emm_chance_rows(s, cfg) {
-        let rec = s.make_with_row_core(placement, pick, &row)?;
-        let r = emm_value(s, depth - 1, f64::NEG_INFINITY, f64::INFINITY, cfg, nodes);
-        s.unmake(rec);
-        expected += w * r?;
-    }
-    Ok(expected)
-}
 
-/// Depth-limited expectiminimax value in the player-0 frame.  Alpha-beta on the
-/// decision layers; player 0 maximizes, player 1 minimizes.
-fn emm_value(
-    s: &mut RustGameState,
-    depth: i32,
-    mut alpha: f64,
-    mut beta: f64,
-    cfg: &EmmConfig,
-    nodes: &mut u64,
-) -> PyResult<f64> {
-    *nodes += 1;
-    if s.phase == GAME_OVER {
-        return Ok(emm_terminal(s, cfg));
+    fn make_with_chance(
+        s: &mut RustGameState,
+        a: Self::Action,
+        c: &Self::Chance,
+    ) -> PyResult<UndoRecord> {
+        s.make_with_row_core(a.0, a.1, c)
     }
-    if depth <= 0 {
-        return Ok(emm_leaf_eval(s, cfg));
-    }
-    let actor = s.actor()?;
-    let actions = s.legal_actions();
-    if actor == 0 {
-        let mut v = f64::NEG_INFINITY;
-        for (p, pk) in actions {
-            let av = emm_action_value(s, p, pk, depth, alpha, beta, cfg, nodes)?;
-            if av > v {
-                v = av;
-            }
-            if v > alpha {
-                alpha = v;
-            }
-            if alpha >= beta {
-                break; // beta cutoff
-            }
-        }
-        Ok(v)
-    } else {
-        let mut v = f64::INFINITY;
-        for (p, pk) in actions {
-            let av = emm_action_value(s, p, pk, depth, alpha, beta, cfg, nodes)?;
-            if av < v {
-                v = av;
-            }
-            if v < beta {
-                beta = v;
-            }
-            if beta <= alpha {
-                break; // alpha cutoff
-            }
-        }
-        Ok(v)
+
+    fn unmake(s: &mut RustGameState, u: UndoRecord) {
+        s.unmake(u);
     }
 }
 
@@ -2038,11 +1992,14 @@ impl RustGameState {
     }
 }
 
-/// Rust-hosted depth-limited expectiminimax searcher (make/unmake, no per-node
-/// FFI).  Config mirrors `rust_expectiminimax.RustExpectiminimax`.
+/// Rust-hosted depth-limited expectiminimax searcher for Kingdomino (make/unmake,
+/// no per-node FFI). A thin Python-facing wrapper over the generic `search`
+/// module: it holds a `SearchConfig` + a Kingdomino leaf eval selector and
+/// dispatches into `search::value` / `search::choose_action`.
 #[pyclass]
 struct RustSearch {
-    cfg: EmmConfig,
+    cfg: search::SearchConfig,
+    eval: EmmEval,
     #[pyo3(get)]
     nodes: u64,
 }
@@ -2081,14 +2038,14 @@ impl RustSearch {
             }
         };
         Ok(RustSearch {
-            cfg: EmmConfig {
+            cfg: search::SearchConfig {
                 depth,
                 chance_samples,
                 enum_cap,
-                eval,
                 margin_weight,
                 seed,
             },
+            eval,
             nodes: 0,
         })
     }
@@ -2100,23 +2057,24 @@ impl RustSearch {
         let mut s = state.cloned();
         let d = depth.unwrap_or(self.cfg.depth as i32);
         let mut nodes = 0u64;
-        let v = emm_value(
-            &mut s,
-            d,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            &self.cfg,
-            &mut nodes,
-        )?;
+        let (a, b) = (f64::NEG_INFINITY, f64::INFINITY);
+        let v = match self.eval {
+            EmmEval::PickBlind => {
+                search::value::<Kingdomino, _>(&mut s, d, a, b, &PickBlindEval, &self.cfg, &mut nodes)?
+            }
+            EmmEval::PickAware => {
+                search::value::<Kingdomino, _>(&mut s, d, a, b, &PickAwareEval, &self.cfg, &mut nodes)?
+            }
+        };
         self.nodes = nodes;
         Ok(v)
     }
 
     /// Best action for the side to move (player 0 maximizes the value, player 1
     /// minimizes it), searched at the configured depth.  Each root child gets a
-    /// full (-inf, inf) window (no root-sibling pruning) — matching
-    /// RustExpectiminimax.choose_action.  Ties broken by `seed` (deterministic
-    /// first-best when `seed` is None).
+    /// full (-inf, inf) window (no root-sibling pruning).  Ties broken by `seed`
+    /// (deterministic first-best when `seed` is None).  `self.nodes` is set to the
+    /// node count (0 for a forced single-action move — no search performed).
     #[pyo3(signature = (state, seed=None))]
     fn choose_action(
         &mut self,
@@ -2124,49 +2082,19 @@ impl RustSearch {
         seed: Option<u64>,
     ) -> PyResult<(Option<(i8, i8, i8, i8, bool)>, Option<u16>)> {
         let mut s = state.cloned();
-        let actions = s.legal_actions();
-        if actions.is_empty() {
-            return Err(PyValueError::new_err(
-                "choose_action on a state with no legal actions",
-            ));
-        }
-        if actions.len() == 1 {
-            self.nodes = 0; // no search performed — don't leave a prior count stale
-            return Ok(actions[0]);
-        }
-        let actor = s.actor()?;
         let mut nodes = 0u64;
-        let mut best_score = f64::NEG_INFINITY;
-        let mut best: Vec<(Option<(i8, i8, i8, i8, bool)>, Option<u16>)> = Vec::new();
-        for (p, pk) in actions {
-            let av = emm_action_value(
-                &mut s,
-                p,
-                pk,
-                self.cfg.depth as i32,
-                f64::NEG_INFINITY,
-                f64::INFINITY,
-                &self.cfg,
-                &mut nodes,
-            )?;
-            let score = if actor == 0 { av } else { -av };
-            if score > best_score {
-                best_score = score;
-                best.clear();
-                best.push((p, pk));
-            } else if score == best_score {
-                best.push((p, pk));
+        let chosen = match self.eval {
+            EmmEval::PickBlind => {
+                search::choose_action::<Kingdomino, _>(&mut s, &PickBlindEval, &self.cfg, seed, &mut nodes)?
             }
-        }
-        self.nodes = nodes;
-        let choice = match seed {
-            Some(sd) if best.len() > 1 => {
-                let mut rng = sd ^ nodes;
-                (emm_splitmix64(&mut rng) as usize) % best.len()
+            EmmEval::PickAware => {
+                search::choose_action::<Kingdomino, _>(&mut s, &PickAwareEval, &self.cfg, seed, &mut nodes)?
             }
-            _ => 0,
         };
-        Ok(best[choice])
+        self.nodes = nodes;
+        chosen.ok_or_else(|| {
+            PyValueError::new_err("choose_action on a state with no legal actions")
+        })
     }
 }
 
