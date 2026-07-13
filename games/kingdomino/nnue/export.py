@@ -1,10 +1,12 @@
 """Export a trained TwoHeadNNUE to a neutral, versioned format the Rust searcher
 reads (Step 2b). Produces two files next to the checkpoint:
 
-  <name>.knnue          compact binary: a fixed 32-byte little-endian header
-                        (magic, format version, dims, margin_scale) followed by the
-                        weight tensors as raw little-endian f32 in a FIXED order.
-                        Rust reads this directly — no JSON/serde dependency.
+  <name>.knnue          compact binary: a fixed 40-byte little-endian header
+                        (magic bytes "KNNU", format version, dims, margin_scale,
+                        encoder signature) followed by the weight tensors as raw
+                        little-endian f32 in a FIXED order. Rust reads this directly
+                        — no JSON/serde dependency — and ENFORCES the magic, version,
+                        encoder signature, dims, and tensor finiteness.
   <name>.manifest.json  human-readable contract: format version, tensor
                         names/shapes/dtype/order, activation + output semantics,
                         margin scale, encoder layout + signature, and provenance.
@@ -31,10 +33,14 @@ import torch
 
 from games.kingdomino.encoder import (
     FLAT_SIZE, FLAT_LAYOUT, NUM_BOARD_CHANNELS, CANVAS_SIZE,
+    CH_TERRAIN_START, CH_TERRAIN_END, CH_CROWNS, CH_CASTLE, CH_OCCUPIED,
 )
+from games.kingdomino.network import KingdominoNet
 
-KNNUE_MAGIC = 0x4B4E4E55  # "KNNU"
-FORMAT_VERSION = 1
+KNNUE_MAGIC = b"KNNU"       # exact on-disk bytes (header[0:4])
+FORMAT_VERSION = 2
+HEADER_FMT = "<4sIIIIIIfQ"  # magic, version, input_dim, acc_width, tail_hidden,
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # board_size, flat_size, margin_scale, sig(u64) = 44
 
 # Tensor order in the binary blob (PyTorch Linear weight is (out, in), row-major).
 TENSOR_ORDER = [
@@ -46,62 +52,73 @@ TENSOR_ORDER = [
 ]
 
 
-def _encoder_signature() -> str:
-    """Stable hash of the encoder layout, so a Rust/Python encoder mismatch is
-    caught rather than silently feeding the net garbage features."""
-    layout = f"{NUM_BOARD_CHANNELS}x{CANVAS_SIZE}x{CANVAS_SIZE}+flat{FLAT_SIZE};"
-    layout += ";".join(f"{k}:{v.start}:{v.stop}" for k, v in sorted(FLAT_LAYOUT.items()))
-    return hashlib.sha256(layout.encode()).hexdigest()[:16]
+def encoder_signature() -> int:
+    """64-bit hash of the encoder CONTRACT the net was trained against: board
+    dimensions, the semantic board-channel ordering (CH_* boundaries), the flat
+    layout (names + slice bounds), and the checkpoint/encoder migration version.
+    Embedded in the .knnue header and enforced by Rust — so a reordered flat block,
+    a remapped board channel, or an encoder migration all invalidate stale exports
+    loudly instead of silently feeding the net wrong features. (It cannot catch a
+    change that alters channel *meaning* while preserving all of the above; bump
+    KingdominoNet.checkpoint_version for those.)"""
+    parts = [
+        f"board={NUM_BOARD_CHANNELS}x{CANVAS_SIZE}x{CANVAS_SIZE}",
+        f"chan=terrain:{CH_TERRAIN_START}:{CH_TERRAIN_END},crowns:{CH_CROWNS},"
+        f"castle:{CH_CASTLE},occupied:{CH_OCCUPIED}",
+        f"flat={FLAT_SIZE}:" + ";".join(
+            f"{k}:{v.start}:{v.stop}" for k, v in sorted(FLAT_LAYOUT.items())),
+        f"ckpt_version={KingdominoNet.checkpoint_version}",
+    ]
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    return int(digest, 16)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="games/kingdomino/nnue/checkpoints/dense_v1.pt")
-    ap.add_argument("--out", default=None, help="output basename (default: alongside ckpt)")
-    args = ap.parse_args()
-
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    sd = ckpt["state_dict"]
-    cfg = ckpt["config"]
-    margin_scale = float(ckpt["margin_scale"])
+def export_state(state_dict, config, margin_scale, out_base, provenance=None):
+    """Write <out_base>.knnue + .manifest.json from raw weights. Returns the two
+    paths. Rejects non-finite / non-positive metadata and non-finite tensors here,
+    so a bad checkpoint never becomes a bad artifact."""
+    margin_scale = float(margin_scale)
+    if not np.isfinite(margin_scale) or margin_scale <= 0:
+        raise ValueError(f"margin_scale must be finite and positive, got {margin_scale}")
     board_size = NUM_BOARD_CHANNELS * CANVAS_SIZE * CANVAS_SIZE
-    assert cfg["input_dim"] == 2 * board_size + FLAT_SIZE, "input_dim / encoder mismatch"
+    if config["input_dim"] != 2 * board_size + FLAT_SIZE:
+        raise ValueError("config input_dim does not match the encoder layout")
 
-    base = Path(args.out) if args.out else Path(args.ckpt).with_suffix("")
-    bin_path = base.with_suffix(".knnue")
-    man_path = base.with_suffix(".manifest.json")
+    out_base = Path(out_base)
+    bin_path = out_base.with_suffix(".knnue")
+    man_path = out_base.with_suffix(".manifest.json")
+    sig = encoder_signature()
 
-    # ── binary: header + tensors ──
     header = struct.pack(
-        "<IIIIIIIf",
-        KNNUE_MAGIC, FORMAT_VERSION,
-        cfg["input_dim"], cfg["acc_width"], cfg["tail_hidden"],
-        board_size, FLAT_SIZE, margin_scale,
+        HEADER_FMT, KNNUE_MAGIC, FORMAT_VERSION,
+        config["input_dim"], config["acc_width"], config["tail_hidden"],
+        board_size, FLAT_SIZE, margin_scale, sig,
     )
-    tensors = {}
-    blob = bytearray()
+    tensors, blob = {}, bytearray()
     for name in TENSOR_ORDER:
-        t = sd[name].detach().cpu().numpy().astype("<f4")  # little-endian f32
+        t = state_dict[name].detach().cpu().numpy().astype("<f4")
+        if not np.isfinite(t).all():
+            raise ValueError(f"tensor {name} contains non-finite values")
         tensors[name] = list(t.shape)
         blob += t.reshape(-1).tobytes()
-    bin_path.write_bytes(bytes(header) + bytes(blob))
+    bin_path.write_bytes(header + bytes(blob))
 
-    # ── manifest: the human/tooling-readable contract ──
     manifest = {
         "format": "knnue",
         "format_version": FORMAT_VERSION,
-        "magic": KNNUE_MAGIC,
+        "magic": KNNUE_MAGIC.decode(),
         "header": {
-            "fields": ["magic:u32", "version:u32", "input_dim:u32", "acc_width:u32",
+            "struct": HEADER_FMT,
+            "fields": ["magic:4s", "version:u32", "input_dim:u32", "acc_width:u32",
                        "tail_hidden:u32", "board_size:u32", "flat_size:u32",
-                       "margin_scale:f32"],
+                       "margin_scale:f32", "encoder_sig:u64"],
             "byte_order": "little-endian",
-            "size_bytes": len(header),
+            "size_bytes": HEADER_SIZE,
         },
         "dtype": "f32-le",
         "tensor_order": TENSOR_ORDER,
         "tensor_shapes": tensors,  # PyTorch Linear weight = (out, in), row-major
-        "config": cfg,
+        "config": config,
         "activation": "relu(accumulator) -> relu(tail0) -> relu(tail1); "
                       "sigmoid(outcome_head) = expected_score; identity(margin_head)",
         "output_semantics": {
@@ -114,24 +131,43 @@ def main():
             "board_channels": NUM_BOARD_CHANNELS,
             "canvas": CANVAS_SIZE,
             "flat_size": FLAT_SIZE,
+            "channel_order": {"terrain": [CH_TERRAIN_START, CH_TERRAIN_END],
+                              "crowns": CH_CROWNS, "castle": CH_CASTLE,
+                              "occupied": CH_OCCUPIED},
             "feature_order": "[my_board | opp_board | flat], each board C-order (9,13,13)",
-            "signature": _encoder_signature(),
+            "checkpoint_version": KingdominoNet.checkpoint_version,
+            "signature_u64": sig,
         },
-        "provenance": {
-            "checkpoint": str(args.ckpt),
-            "val_metrics": ckpt.get("val_metrics"),
-            "baselines": ckpt.get("baselines"),
-            "train_args": ckpt.get("args"),
-        },
+        "provenance": provenance or {},
     }
     man_path.write_text(json.dumps(manifest, indent=2))
+    return bin_path, man_path
 
-    n_floats = (len(blob)) // 4
+
+def export_checkpoint(ckpt_path, out_base=None):
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    base = Path(out_base) if out_base else Path(ckpt_path).with_suffix("")
+    return export_state(
+        ck["state_dict"], ck["config"], ck["margin_scale"], base,
+        provenance={
+            "checkpoint": str(ckpt_path),
+            "val_metrics": ck.get("val_metrics"),
+            "baselines": ck.get("baselines"),
+            "train_args": ck.get("args"),
+        },
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default="games/kingdomino/nnue/checkpoints/dense_v1.pt")
+    ap.add_argument("--out", default=None, help="output basename (default: alongside ckpt)")
+    args = ap.parse_args()
+    bin_path, man_path = export_checkpoint(args.ckpt, args.out)
+    n_floats = (bin_path.stat().st_size - HEADER_SIZE) // 4
     print(f"wrote {bin_path} ({bin_path.stat().st_size:,} bytes, {n_floats:,} f32) "
           f"+ {man_path.name}")
-    print(f"  input_dim={cfg['input_dim']} acc_width={cfg['acc_width']} "
-          f"tail_hidden={cfg['tail_hidden']} margin_scale={margin_scale} "
-          f"encoder_sig={manifest['encoder']['signature']}")
+    print(f"  format v{FORMAT_VERSION}, encoder_sig=0x{encoder_signature():016x}")
 
 
 if __name__ == "__main__":

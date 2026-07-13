@@ -11,8 +11,9 @@ trivial baselines so "did a dense net learn Kingdomino value?" is answerable.
 
 NOTE: the outcome sigmoid estimates EXPECTED MATCH SCORE (P(win)+0.5*P(draw)), not
 literal P(win); the searcher converts via 2*sigmoid-1 + a P0-frame sign flip.
-Run10's labels are score-only (no official tiebreaker cascade) -> a small benign
-label noise on the ~2% of near-draw positions; fix at the Rust source before any
+Run10's labels are score-only (no official tiebreaker cascade) -> a small, KNOWN
+label noise on the ~2% of near-draw positions (which are exactly the close games
+where tiebreakers/calibration matter most); fix at the Rust source before any
 strength-focused retraining, not here.
 
 Example:

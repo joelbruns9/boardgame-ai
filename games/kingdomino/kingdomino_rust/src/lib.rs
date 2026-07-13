@@ -2007,7 +2007,17 @@ impl RustGameState {
 // Dense (non-incremental) forward — Step 3's accumulator makes the first layer
 // fast; this is correctness + integration, not speed.
 
-const KNNUE_MAGIC: u32 = 0x4B4E_4E55; // "KNNU"
+const KNNUE_MAGIC: &[u8; 4] = b"KNNU"; // exact header[0..4] bytes
+const KNNUE_FORMAT_VERSION: u32 = 2;
+const KNNUE_HEADER_SIZE: usize = 40;
+// Encoder-contract signature this build expects (encoder_signature() in
+// nnue/export.py: board dims + channel ordering + flat layout + checkpoint_version).
+// Bump BOTH sides together whenever the encoder contract changes — a stale export
+// then fails to load loudly instead of feeding the net mislaid-out features.
+const KNNUE_EXPECTED_ENCODER_SIG: u64 = 0x0320_d99b_a270_0657;
+// Sanity bounds on advertised dimensions (guard against absurd allocations from a
+// corrupt header).
+const KNNUE_MAX_DIM: usize = 1 << 24;
 
 struct NnueWeights {
     input_dim: usize,
@@ -2030,16 +2040,18 @@ impl NnueWeights {
     fn load(path: &str) -> PyResult<Self> {
         let bytes = std::fs::read(path)
             .map_err(|e| PyValueError::new_err(format!("nnue load '{path}': {e}")))?;
-        if bytes.len() < 32 {
-            return Err(PyValueError::new_err("nnue: file too small for the 32-byte header"));
+        if bytes.len() < KNNUE_HEADER_SIZE {
+            return Err(PyValueError::new_err(format!(
+                "nnue: file too small for the {KNNUE_HEADER_SIZE}-byte header"
+            )));
         }
-        let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-        if u(0) != KNNUE_MAGIC {
+        if &bytes[0..4] != KNNUE_MAGIC {
             return Err(PyValueError::new_err("nnue: bad magic (not a .knnue file)"));
         }
-        if u(4) != 1 {
+        let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        if u(4) != KNNUE_FORMAT_VERSION {
             return Err(PyValueError::new_err(format!(
-                "nnue: unsupported format version {}",
+                "nnue: unsupported format version {} (expected {KNNUE_FORMAT_VERSION})",
                 u(4)
             )));
         }
@@ -2050,9 +2062,27 @@ impl NnueWeights {
         let flat_size = u(24) as usize;
         let margin_scale =
             f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
-        // Encoder-layout guard: the export must match THIS crate's encoder, else the
-        // net would be fed differently-laid-out features (silent garbage).
+        let encoder_sig = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        // Encoder-contract guard: the export must have been built against the same
+        // encoder this crate expects, else the net is fed mislaid-out features
+        // (silent garbage). The signature covers dims + channel order + flat layout
+        // + checkpoint_version (see nnue/export.encoder_signature).
+        if encoder_sig != KNNUE_EXPECTED_ENCODER_SIG {
+            return Err(PyValueError::new_err(format!(
+                "nnue: encoder signature mismatch (file 0x{encoder_sig:016x}, \
+                 crate expects 0x{KNNUE_EXPECTED_ENCODER_SIG:016x}); re-export against \
+                 the current encoder"
+            )));
+        }
+        // Dimension sanity: reject zero/absurd dims and any encoder-layout drift the
+        // signature somehow missed, before allocating anything.
         let want_board = N_BOARD_CH * OUT_N * OUT_N;
+        if acc_width == 0 || acc_width > KNNUE_MAX_DIM
+            || tail_hidden == 0 || tail_hidden > KNNUE_MAX_DIM
+            || input_dim == 0 || input_dim > KNNUE_MAX_DIM
+        {
+            return Err(PyValueError::new_err("nnue: dimension out of range"));
+        }
         if board_size != want_board
             || flat_size != FLAT_SIZE
             || input_dim != 2 * board_size + flat_size
@@ -2062,7 +2092,12 @@ impl NnueWeights {
                  input={input_dim}; crate board={want_board} flat={FLAT_SIZE})"
             )));
         }
-        let mut off = 32usize;
+        if !(margin_scale.is_finite() && margin_scale > 0.0) {
+            return Err(PyValueError::new_err(format!(
+                "nnue: margin_scale must be finite and positive, got {margin_scale}"
+            )));
+        }
+        let mut off = KNNUE_HEADER_SIZE;
         let read = |off: &mut usize, n: usize| -> PyResult<Vec<f32>> {
             let need = n * 4;
             if *off + need > bytes.len() {
@@ -2087,6 +2122,16 @@ impl NnueWeights {
         let mgn_b = read(&mut off, 1)?[0];
         if off != bytes.len() {
             return Err(PyValueError::new_err("nnue: trailing bytes after tensors"));
+        }
+        // Non-finite weights poison the forward pass (NaN value -> the searcher's
+        // choose_action finds no best move). Reject at load, not mid-search.
+        let all_finite = [&acc_w, &acc_b, &t0_w, &t0_b, &t1_w, &t1_b, &out_w, &mgn_w]
+            .iter()
+            .all(|v| v.iter().all(|f| f.is_finite()))
+            && out_b.is_finite()
+            && mgn_b.is_finite();
+        if !all_finite {
+            return Err(PyValueError::new_err("nnue: non-finite weight/bias value"));
         }
         Ok(NnueWeights {
             input_dim,
