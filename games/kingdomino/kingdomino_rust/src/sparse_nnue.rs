@@ -15,6 +15,8 @@ const HEADER_SIZE: usize = 44;
 const EXPECTED_CORE_HASH: u64 = 0xf4a6_81bf_7fa8_950c;
 const EXPECTED_SUMMARY_HASH: u64 = 0x0eca_00b1_9211_1097;
 const MAX_DIM: usize = 1 << 24;
+const MAX_ACTIVE_FEATURES: usize = 112;
+const SUMMARY_QUANT_SCALE: f32 = 32767.0;
 
 pub(super) struct SparseNnueWeights {
     summary_size: usize,
@@ -235,6 +237,381 @@ fn scaled_add(dst: &mut [f32], weights: &[f32], value: f32) {
     for (out, &weight) in dst.iter_mut().zip(weights) {
         *out += weight * value;
     }
+}
+
+/// Post-training dynamic quantization of the frozen v3 float artifact.  The
+/// sparse accumulator is int16; every dense-tail weight is int8 with a
+/// per-output scale; accumulator/summary/tail activations are int16.  Biases and
+/// the short dequantization steps remain float32.
+pub(super) struct QuantizedSparseWeights {
+    summary_size: usize,
+    acc_width: usize,
+    tail_hidden: usize,
+    margin_scale: f32,
+    acc_scale: Vec<f32>, // integer units per real unit, one per accumulator channel
+    acc_bound: i32,
+    acc_w: Vec<i16>,
+    acc_b: Vec<i16>,
+    // Dense rows remain output-major: the AVX2 kernel dots across contiguous inputs.
+    t0_w: Vec<i8>,
+    t0_scale: Vec<f32>, // accumulator-group + summary-group scale per output
+    t0_b: Vec<f32>,
+    t1_w: Vec<i8>,
+    t1_scale: Vec<f32>,
+    t1_b: Vec<f32>,
+    out_w: Vec<i8>,
+    out_scale: f32,
+    out_b: f32,
+    margin_w: Vec<i8>,
+    margin_weight_scale: f32,
+    margin_b: f32,
+}
+
+impl QuantizedSparseWeights {
+    pub(super) fn load(path: &str) -> PyResult<Self> {
+        let float = SparseNnueWeights::load(path)?;
+        Self::from_float(&float).map_err(PyValueError::new_err)
+    }
+
+    fn from_float(float: &SparseNnueWeights) -> Result<Self, String> {
+        let acc_scale = choose_accumulator_scales(float)?;
+        let mut acc_w = Vec::with_capacity(float.acc_w.len());
+        for row in float.acc_w.chunks_exact(float.acc_width) {
+            acc_w.extend(
+                row.iter()
+                    .zip(&acc_scale)
+                    .map(|(&v, &scale)| quantize_i16(v, scale)),
+            );
+        }
+        let acc_b: Vec<i16> = float
+            .acc_b
+            .iter()
+            .zip(&acc_scale)
+            .map(|(&v, &scale)| quantize_i16(v, scale))
+            .collect();
+        let acc_bound = exact_accumulator_bound(&acc_w, &acc_b, float.acc_width);
+        if acc_bound > i16::MAX as i32 {
+            return Err(format!(
+                "quantized accumulator bound {acc_bound} exceeds int16"
+            ));
+        }
+
+        let tail_input = float.acc_width + float.summary_size;
+        let mut t0_effective =
+            output_major_from_input_major(&float.t0_w_by_input, float.tail_hidden, tail_input);
+        let t1_float = output_major_from_input_major(
+            &float.t1_w_by_input,
+            float.tail_hidden,
+            float.tail_hidden,
+        );
+        // Fold each input's activation scale into tail0 before int8
+        // quantization. The integer dot then directly approximates the real
+        // contribution even though accumulator channels use different scales.
+        for row in t0_effective.chunks_exact_mut(tail_input) {
+            for (i, weight) in row.iter_mut().enumerate() {
+                *weight /= if i < float.acc_width {
+                    acc_scale[i]
+                } else {
+                    SUMMARY_QUANT_SCALE
+                };
+            }
+        }
+        let (t0_w, t0_scale) = quantize_i8_rows_two_groups(
+            &t0_effective,
+            float.tail_hidden,
+            tail_input,
+            float.acc_width,
+        );
+        let (t1_w, t1_scale) = quantize_i8_rows(&t1_float, float.tail_hidden, float.tail_hidden);
+        let (out_w, out_scale) = quantize_i8_vector(&float.out_w);
+        let (margin_w, margin_weight_scale) = quantize_i8_vector(&float.margin_w);
+        Ok(Self {
+            summary_size: float.summary_size,
+            acc_width: float.acc_width,
+            tail_hidden: float.tail_hidden,
+            margin_scale: float.margin_scale,
+            acc_scale,
+            acc_bound,
+            acc_w,
+            acc_b,
+            t0_w,
+            t0_scale,
+            t0_b: float.t0_b.clone(),
+            t1_w,
+            t1_scale,
+            t1_b: float.t1_b.clone(),
+            out_w,
+            out_scale,
+            out_b: float.out_b,
+            margin_w,
+            margin_weight_scale,
+            margin_b: float.margin_b,
+        })
+    }
+
+    fn accumulator(&self, active: &[i32]) -> Result<Vec<i16>, String> {
+        if active.len() > MAX_ACTIVE_FEATURES {
+            return Err(format!(
+                "{} active NNUE features exceeds quantized bound {MAX_ACTIVE_FEATURES}",
+                active.len()
+            ));
+        }
+        let mut sums: Vec<i32> = self.acc_b.iter().map(|&v| v as i32).collect();
+        for &feature in active {
+            let start = feature as usize * self.acc_width;
+            for (dst, &src) in sums
+                .iter_mut()
+                .zip(&self.acc_w[start..start + self.acc_width])
+            {
+                *dst += src as i32;
+            }
+        }
+        sums.into_iter()
+            .map(|v| i16::try_from(v).map_err(|_| format!("quantized accumulator overflow: {v}")))
+            .collect()
+    }
+
+    fn add_feature(&self, z: &mut [i16], feature: i32, sign: i32) {
+        let start = feature as usize * self.acc_width;
+        for (dst, &src) in z.iter_mut().zip(&self.acc_w[start..start + self.acc_width]) {
+            let value = *dst as i32 + sign * src as i32;
+            debug_assert!((i16::MIN as i32..=i16::MAX as i32).contains(&value));
+            *dst = value as i16;
+        }
+    }
+
+    fn forward_from_z(&self, z: &[i16], summary: &[f32]) -> (f32, f32) {
+        debug_assert_eq!(z.len(), self.acc_width);
+        debug_assert_eq!(summary.len(), self.summary_size);
+        let summary_q: Vec<i16> = summary
+            .iter()
+            .map(|&v| quantize_i16(v.clamp(-1.0, 1.0), SUMMARY_QUANT_SCALE))
+            .collect();
+        let tail_input = self.acc_width + self.summary_size;
+        let mut tail_q = Vec::with_capacity(tail_input);
+        tail_q.extend(z.iter().map(|&value| value.max(0)));
+        tail_q.extend_from_slice(&summary_q);
+        let mut h0 = vec![0.0f32; self.tail_hidden];
+        for (o, out) in h0.iter_mut().enumerate() {
+            let row = &self.t0_w[o * tail_input..(o + 1) * tail_input];
+            let value = self.t0_b[o]
+                + dot_i16_i8(&tail_q[..self.acc_width], &row[..self.acc_width]) as f32
+                    * self.t0_scale[o * 2]
+                + dot_i16_i8(&tail_q[self.acc_width..], &row[self.acc_width..]) as f32
+                    * self.t0_scale[o * 2 + 1];
+            *out = value.max(0.0);
+        }
+        let (h0_q, h0_scale) = dynamic_quantize_nonnegative(&h0);
+
+        let mut h1 = vec![0.0f32; self.tail_hidden];
+        for (o, out) in h1.iter_mut().enumerate() {
+            let row = &self.t1_w[o * self.tail_hidden..(o + 1) * self.tail_hidden];
+            let value = self.t1_b[o] + dot_i16_i8(&h0_q, row) as f32 * self.t1_scale[o] / h0_scale;
+            *out = value.max(0.0);
+        }
+        let (h1_q, h1_scale) = dynamic_quantize_nonnegative(&h1);
+        let logit = self.out_b + dot_i16_i8(&h1_q, &self.out_w) as f32 * self.out_scale / h1_scale;
+        let margin = self.margin_b
+            + dot_i16_i8(&h1_q, &self.margin_w) as f32 * self.margin_weight_scale / h1_scale;
+        (1.0 / (1.0 + (-logit).exp()), margin)
+    }
+
+    fn value_from_state(&self, state: &RustGameState) -> Result<(f64, f32, f32), String> {
+        let actor = state.actor().map_err(|e| e.to_string())?;
+        let active = nnue_features::sparse_indices(state, actor)?;
+        let summary = nnue_features::summary(state, actor)?;
+        let z = self.accumulator(&active)?;
+        let (expected, margin) = self.forward_from_z(&z, &summary);
+        let actor_value = 2.0 * expected - 1.0;
+        let p0 = if actor == 0 {
+            actor_value
+        } else {
+            -actor_value
+        };
+        Ok((p0 as f64, expected, margin * self.margin_scale))
+    }
+}
+
+fn choose_accumulator_scales(float: &SparseNnueWeights) -> Result<Vec<f32>, String> {
+    let mut scales = Vec::with_capacity(float.acc_width);
+    let mut values = Vec::with_capacity(nnue_features::CORE_SIZE);
+    for dim in 0..float.acc_width {
+        values.clear();
+        values.extend(
+            (0..nnue_features::CORE_SIZE)
+                .map(|feature| float.acc_w[feature * float.acc_width + dim].abs()),
+        );
+        values.sort_unstable_by(|a, b| b.total_cmp(a));
+        let bound = float.acc_b[dim].abs()
+            + values
+                .iter()
+                .take(MAX_ACTIVE_FEATURES)
+                .copied()
+                .sum::<f32>();
+        if !bound.is_finite() || bound <= 0.0 {
+            return Err(format!("invalid float accumulator bound in channel {dim}"));
+        }
+        // Rounding each selected row can add at most 0.5 integer units.
+        let rounding_guard = 0.5 * (MAX_ACTIVE_FEATURES + 1) as f32;
+        let safe = (i16::MAX as f32 - rounding_guard) / bound;
+        let mut scale = 1.0f32;
+        while scale * 2.0 <= safe && scale < 4096.0 {
+            scale *= 2.0;
+        }
+        if scale < 1.0 {
+            return Err(format!(
+                "float accumulator channel {dim} bound {bound} cannot fit int16"
+            ));
+        }
+        scales.push(scale);
+    }
+    Ok(scales)
+}
+
+fn exact_accumulator_bound(weights: &[i16], bias: &[i16], width: usize) -> i32 {
+    let mut max_bound = 0i32;
+    let mut values = Vec::with_capacity(nnue_features::CORE_SIZE);
+    for dim in 0..width {
+        values.clear();
+        values.extend(
+            (0..nnue_features::CORE_SIZE)
+                .map(|feature| (weights[feature * width + dim] as i32).unsigned_abs() as i32),
+        );
+        values.sort_unstable_by(|a, b| b.cmp(a));
+        let bound = (bias[dim] as i32).unsigned_abs() as i32
+            + values.iter().take(MAX_ACTIVE_FEATURES).sum::<i32>();
+        max_bound = max_bound.max(bound);
+    }
+    max_bound
+}
+
+#[inline]
+fn quantize_i16(value: f32, units_per_real: f32) -> i16 {
+    (value * units_per_real)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+fn quantize_i8_rows(values: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut out = Vec::with_capacity(values.len());
+    let mut scales = Vec::with_capacity(rows);
+    for row in values.chunks_exact(cols) {
+        let (q, scale) = quantize_i8_vector(row);
+        out.extend(q);
+        scales.push(scale);
+    }
+    (out, scales)
+}
+
+fn quantize_i8_rows_two_groups(
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+    split: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    debug_assert!(split > 0 && split < cols);
+    let mut out = Vec::with_capacity(values.len());
+    let mut scales = Vec::with_capacity(rows * 2);
+    for row in values.chunks_exact(cols) {
+        let (left, left_scale) = quantize_i8_vector(&row[..split]);
+        let (right, right_scale) = quantize_i8_vector(&row[split..]);
+        out.extend(left);
+        out.extend(right);
+        scales.extend([left_scale, right_scale]);
+    }
+    (out, scales)
+}
+
+fn quantize_i8_vector(values: &[f32]) -> (Vec<i8>, f32) {
+    let max_abs = values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let real_per_integer = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+    let out = values
+        .iter()
+        .map(|&v| (v / real_per_integer).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (out, real_per_integer)
+}
+
+fn output_major_from_input_major(values: &[f32], outputs: usize, inputs: usize) -> Vec<f32> {
+    let mut out = vec![0.0; values.len()];
+    for input in 0..inputs {
+        for output in 0..outputs {
+            out[output * inputs + input] = values[input * outputs + output];
+        }
+    }
+    out
+}
+
+fn dynamic_quantize_nonnegative(values: &[f32]) -> (Vec<i16>, f32) {
+    let max = values.iter().copied().fold(0.0f32, f32::max);
+    let units_per_real = if max > 0.0 {
+        i16::MAX as f32 / max
+    } else {
+        1.0
+    };
+    let quantized = values
+        .iter()
+        .map(|&v| quantize_i16(v.max(0.0), units_per_real))
+        .collect();
+    (quantized, units_per_real)
+}
+
+#[inline]
+fn dot_i16_i8(a: &[i16], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by runtime AVX2 detection; the implementation uses
+        // unaligned loads and remains within both slices.
+        return unsafe { dot_i16_i8_avx2(a, b) };
+    }
+    a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i16_i8_avx2(a: &[i16], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 16 <= a.len() {
+        let va = unsafe { _mm256_loadu_si256(a.as_ptr().add(i).cast::<__m256i>()) };
+        let vb8 = unsafe { _mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()) };
+        let vb = _mm256_cvtepi8_epi16(vb8);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+        i += 16;
+    }
+    let mut lanes = [0i32; 8];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), acc) };
+    let mut sum: i32 = lanes.into_iter().sum();
+    while i < a.len() {
+        sum += a[i] as i32 * b[i] as i32;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i16_i8_avx2(a: &[i16], b: &[i8]) -> i32 {
+    use std::arch::x86::*;
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 16 <= a.len() {
+        let va = unsafe { _mm256_loadu_si256(a.as_ptr().add(i).cast::<__m256i>()) };
+        let vb8 = unsafe { _mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()) };
+        let vb = _mm256_cvtepi8_epi16(vb8);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+        i += 16;
+    }
+    let mut lanes = [0i32; 8];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), acc) };
+    let mut sum: i32 = lanes.into_iter().sum();
+    while i < a.len() {
+        sum += a[i] as i32 * b[i] as i32;
+        i += 1;
+    }
+    sum
 }
 
 #[derive(Clone)]
@@ -474,6 +851,246 @@ impl Eval<SparseKingdomino> for SparseIncrementalEval {
     }
 }
 
+#[derive(Clone)]
+struct QuantizedAccumulatorSnapshot {
+    active: [Vec<i32>; 2],
+    z: [Vec<i16>; 2],
+}
+
+#[derive(Clone)]
+struct QuantizedDualAccumulator {
+    active: [Vec<i32>; 2],
+    z: [Vec<i16>; 2],
+}
+
+impl QuantizedDualAccumulator {
+    fn refresh(state: &RustGameState, weights: &QuantizedSparseWeights) -> Result<Self, String> {
+        let a0 = nnue_features::sparse_indices(state, 0)?;
+        let a1 = nnue_features::sparse_indices(state, 1)?;
+        let z0 = weights.accumulator(&a0)?;
+        let z1 = weights.accumulator(&a1)?;
+        Ok(Self {
+            active: [a0, a1],
+            z: [z0, z1],
+        })
+    }
+
+    fn restore(&mut self, snapshot: QuantizedAccumulatorSnapshot) {
+        self.active = snapshot.active;
+        self.z = snapshot.z;
+    }
+
+    fn transition_to(
+        &mut self,
+        next: [Vec<i32>; 2],
+        weights: &QuantizedSparseWeights,
+    ) -> Result<QuantizedAccumulatorSnapshot, String> {
+        if next.iter().any(|active| active.len() > MAX_ACTIVE_FEATURES) {
+            return Err(format!(
+                "quantized transition exceeds {MAX_ACTIVE_FEATURES} active features"
+            ));
+        }
+        let old_z = self.z.clone();
+        for perspective in 0..2 {
+            let old = &self.active[perspective];
+            let new = &next[perspective];
+            // Removals first, then additions. Every intermediate is therefore a
+            // subset of old or new and remains covered by the top-K int16 proof.
+            let mut i = 0;
+            let mut j = 0;
+            while i < old.len() {
+                while j < new.len() && new[j] < old[i] {
+                    j += 1;
+                }
+                if j == new.len() || old[i] < new[j] {
+                    weights.add_feature(&mut self.z[perspective], old[i], -1);
+                }
+                i += 1;
+            }
+            i = 0;
+            j = 0;
+            while j < new.len() {
+                while i < old.len() && old[i] < new[j] {
+                    i += 1;
+                }
+                if i == old.len() || new[j] < old[i] {
+                    weights.add_feature(&mut self.z[perspective], new[j], 1);
+                }
+                j += 1;
+            }
+        }
+        let old_active = std::mem::replace(&mut self.active, next);
+        Ok(QuantizedAccumulatorSnapshot {
+            active: old_active,
+            z: old_z,
+        })
+    }
+}
+
+pub(super) struct QuantizedSparseSearchState {
+    pub(super) game: RustGameState,
+    weights: Arc<QuantizedSparseWeights>,
+    accumulator: QuantizedDualAccumulator,
+}
+
+impl QuantizedSparseSearchState {
+    pub(super) fn new(game: RustGameState, weights: Arc<QuantizedSparseWeights>) -> PyResult<Self> {
+        let accumulator =
+            QuantizedDualAccumulator::refresh(&game, &weights).map_err(PyValueError::new_err)?;
+        Ok(Self {
+            game,
+            weights,
+            accumulator,
+        })
+    }
+}
+
+pub(super) struct QuantizedSparseUndo {
+    game: UndoRecord,
+    accumulator: QuantizedAccumulatorSnapshot,
+}
+
+pub(super) struct QuantizedSparseKingdomino;
+
+impl Game for QuantizedSparseKingdomino {
+    type State = QuantizedSparseSearchState;
+    type Action = <Kingdomino as Game>::Action;
+    type Chance = <Kingdomino as Game>::Chance;
+    type Undo = QuantizedSparseUndo;
+
+    fn to_move(s: &Self::State) -> PyResult<search::Turn> {
+        <Kingdomino as Game>::to_move(&s.game)
+    }
+    fn is_terminal(s: &Self::State) -> bool {
+        <Kingdomino as Game>::is_terminal(&s.game)
+    }
+    fn terminal_value_p0(s: &Self::State) -> f64 {
+        <Kingdomino as Game>::terminal_value_p0(&s.game)
+    }
+    fn bounded_margin(s: &Self::State) -> f64 {
+        <Kingdomino as Game>::bounded_margin(&s.game)
+    }
+    fn legal_actions(s: &Self::State, out: &mut Vec<Self::Action>) {
+        <Kingdomino as Game>::legal_actions(&s.game, out)
+    }
+    fn is_stochastic(s: &Self::State, a: Self::Action) -> bool {
+        <Kingdomino as Game>::is_stochastic(&s.game, a)
+    }
+    fn chance_children(
+        s: &Self::State,
+        a: Self::Action,
+        cfg: &search::SearchConfig,
+    ) -> Vec<(Self::Chance, f64)> {
+        <Kingdomino as Game>::chance_children(&s.game, a, cfg)
+    }
+    fn make(s: &mut Self::State, a: Self::Action) -> PyResult<Self::Undo> {
+        let game = <Kingdomino as Game>::make(&mut s.game, a)?;
+        let next = match DualAccumulator::derive_next(&s.game, &game, &s.accumulator.active) {
+            Ok(next) => next,
+            Err(err) => {
+                <Kingdomino as Game>::unmake(&mut s.game, game);
+                return Err(PyValueError::new_err(err));
+            }
+        };
+        let accumulator = match s.accumulator.transition_to(next, &s.weights) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                <Kingdomino as Game>::unmake(&mut s.game, game);
+                return Err(PyValueError::new_err(err));
+            }
+        };
+        Ok(QuantizedSparseUndo { game, accumulator })
+    }
+    fn make_with_chance(
+        s: &mut Self::State,
+        a: Self::Action,
+        c: &Self::Chance,
+    ) -> PyResult<Self::Undo> {
+        let game = <Kingdomino as Game>::make_with_chance(&mut s.game, a, c)?;
+        let next = match DualAccumulator::derive_next(&s.game, &game, &s.accumulator.active) {
+            Ok(next) => next,
+            Err(err) => {
+                <Kingdomino as Game>::unmake(&mut s.game, game);
+                return Err(PyValueError::new_err(err));
+            }
+        };
+        let accumulator = match s.accumulator.transition_to(next, &s.weights) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                <Kingdomino as Game>::unmake(&mut s.game, game);
+                return Err(PyValueError::new_err(err));
+            }
+        };
+        Ok(QuantizedSparseUndo { game, accumulator })
+    }
+    fn unmake(s: &mut Self::State, undo: Self::Undo) {
+        <Kingdomino as Game>::unmake(&mut s.game, undo.game);
+        s.accumulator.restore(undo.accumulator);
+    }
+}
+
+pub(super) struct QuantizedSparseEval;
+
+impl Eval<QuantizedSparseKingdomino> for QuantizedSparseEval {
+    fn eval(&self, state: &QuantizedSparseSearchState) -> f64 {
+        let actor = state.game.actor().expect("quantized eval on terminal");
+        let summary = nnue_features::summary(&state.game, actor)
+            .expect("quantized sparse NNUE summary failed");
+        let (expected, _) = state
+            .weights
+            .forward_from_z(&state.accumulator.z[actor as usize], &summary);
+        let actor_value = 2.0 * expected - 1.0;
+        if actor == 0 {
+            actor_value as f64
+        } else {
+            -actor_value as f64
+        }
+    }
+}
+
+#[pyclass]
+pub(super) struct QuantizedSparseNnueEvaluator {
+    weights: Arc<QuantizedSparseWeights>,
+}
+
+#[pymethods]
+impl QuantizedSparseNnueEvaluator {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        Ok(Self {
+            weights: Arc::new(QuantizedSparseWeights::load(path)?),
+        })
+    }
+
+    fn evaluate(&self, state: &RustGameState) -> PyResult<(f64, f64, f64)> {
+        let (p0, expected, margin) = self
+            .weights
+            .value_from_state(state)
+            .map_err(PyValueError::new_err)?;
+        Ok((p0, expected as f64, margin as f64))
+    }
+
+    /// `(min_acc_scale, max_acc_scale, conservative_abs_bound,
+    /// max_active_features, avx2)`.
+    fn quantization_info(&self) -> (f64, f64, i32, usize, bool) {
+        (
+            self.weights
+                .acc_scale
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min) as f64,
+            self.weights
+                .acc_scale
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max) as f64,
+            self.weights.acc_bound,
+            MAX_ACTIVE_FEATURES,
+            std::arch::is_x86_feature_detected!("avx2"),
+        )
+    }
+}
+
 #[pyclass]
 pub(super) struct SparseNnueEvaluator {
     weights: Arc<SparseNnueWeights>,
@@ -580,6 +1197,67 @@ mod tests {
             .zip(fresh.z.iter().flatten())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max)
+    }
+
+    fn quantized_weights() -> Arc<QuantizedSparseWeights> {
+        Arc::new(QuantizedSparseWeights::from_float(&weights()).unwrap())
+    }
+
+    #[test]
+    fn quantized_dot_matches_scalar_and_bound_is_safe() {
+        for len in 0..96usize {
+            let a: Vec<i16> = (0..len)
+                .map(|i| ((i * 7919 + 17) % 65535) as i32 - 32767)
+                .map(|v| v as i16)
+                .collect();
+            let b: Vec<i8> = (0..len)
+                .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
+                .collect();
+            let scalar: i32 = a.iter().zip(&b).map(|(&x, &y)| x as i32 * y as i32).sum();
+            assert_eq!(dot_i16_i8(&a, &b), scalar, "length {len}");
+        }
+        let q = quantized_weights();
+        assert!(q.acc_bound <= i16::MAX as i32);
+        assert_eq!(q.acc_scale.len(), q.acc_width);
+    }
+
+    #[test]
+    fn quantized_incremental_full_playout_and_unwind() -> PyResult<()> {
+        let weights = quantized_weights();
+        let mut s = QuantizedSparseSearchState::new(new_game(29, true, true), weights.clone())?;
+        let root_acc = s.accumulator.clone();
+        let mut root_bytes = Vec::new();
+        solver_state_bytes(&s.game, &mut root_bytes);
+        let mut stack = Vec::new();
+        let mut seed = 41u64;
+        while !<QuantizedSparseKingdomino as Game>::is_terminal(&s) {
+            let mut actions = Vec::new();
+            <QuantizedSparseKingdomino as Game>::legal_actions(&s, &mut actions);
+            let pick = search::splitmix64(&mut seed) as usize % actions.len();
+            let undo = <QuantizedSparseKingdomino as Game>::make(&mut s, actions[pick])?;
+            for perspective in 0..2 {
+                assert_eq!(
+                    s.accumulator.active[perspective],
+                    nnue_features::sparse_indices(&s.game, perspective as u8).unwrap()
+                );
+                assert_eq!(
+                    s.accumulator.z[perspective],
+                    weights
+                        .accumulator(&s.accumulator.active[perspective])
+                        .unwrap()
+                );
+            }
+            stack.push(undo);
+        }
+        while let Some(undo) = stack.pop() {
+            <QuantizedSparseKingdomino as Game>::unmake(&mut s, undo);
+        }
+        let mut end_bytes = Vec::new();
+        solver_state_bytes(&s.game, &mut end_bytes);
+        assert_eq!(root_bytes, end_bytes);
+        assert_eq!(root_acc.active, s.accumulator.active);
+        assert_eq!(root_acc.z, s.accumulator.z);
+        Ok(())
     }
 
     #[test]

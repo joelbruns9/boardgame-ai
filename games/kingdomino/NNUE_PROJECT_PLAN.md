@@ -22,10 +22,19 @@ six-position depth-3 `choose_action` gate, incremental throughput rose from **33
 94.3k nodes/s (2.81×)**; the stateless oracle reaches 87.1k. Per-eval profiling fell
 from roughly 3.8/10.5/14.2 µs to **2.58 µs sparse derive+sum, 3.60 µs summary, and
 1.21 µs float tail**. The accumulator itself is now a modest 1.08× over stateless;
-rollback union-find remains unjustified. The next planned milestone is v3.2
-quantization/SIMD, with overflow analysis before any integer conversion. The original
-phase descriptions below remain planning history; these measurements supersede their
-bottleneck predictions.
+rollback union-find remains unjustified.
+
+v3.2 is also complete. `sparse_nnue_q` derives an int16 accumulator + int8 tail from
+the unchanged v3 float artifact at load time, retains the float path as its oracle, and
+uses an AVX2 integer-dot kernel with a scalar fallback. A top-112-feature proof bounds
+the pilot accumulator at **19,958 < 32,767**. Across 100 real positions, quantized vs
+float expected-score MAE/max are **0.0028/0.0109** and margin MAE/max are
+**0.13/0.43 points**. Root actions agree 20/20 at depth 2 and 6/6 at depth 3. The fixed
+six-position depth-3 gate reaches **102.3k nodes/s** vs 98.8k float (**1.04×**) while
+roughly halving inference-weight storage. The next milestone is the operational fast
+searcher: deadlines, iterative deepening, root/PV ordering, aspiration windows, and
+safe search telemetry. The original phase descriptions below remain planning history;
+these measurements supersede their bottleneck predictions.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data

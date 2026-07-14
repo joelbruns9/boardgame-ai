@@ -112,6 +112,40 @@ def test_incremental_search_matches_stateless_including_chance(artifact):
     assert checks == 6
 
 
+def test_quantized_forward_is_bounded_and_close_to_float(artifact):
+    float_eval = kr.SparseNnueEvaluator(artifact["binary"])
+    quant_eval = kr.QuantizedSparseNnueEvaluator(artifact["binary"])
+    errors = []
+    for state in _states(24):
+        f = np.asarray(float_eval.evaluate(state))
+        q = np.asarray(quant_eval.evaluate(state))
+        assert np.isfinite(q).all()
+        errors.append(np.abs(f - q))
+    errors = np.asarray(errors)
+    assert errors[:, 1].max() < 0.02       # actor expected score
+    assert errors[:, 0].max() < 0.04       # player-0 value is 2x expected error
+    assert errors[:, 2].max() < 1.0        # margin points
+
+    min_scale, max_scale, bound, max_active, avx2 = quant_eval.quantization_info()
+    assert 1 <= min_scale <= max_scale
+    assert bound <= np.iinfo(np.int16).max
+    assert max_active >= 100
+    assert isinstance(avx2, bool)
+
+
+def test_quantized_search_stays_close_to_float(artifact):
+    for state in _states(6):
+        f = kr.RustSearch(
+            depth=2, enum_cap=1, chance_samples=8, seed=31,
+            eval="sparse_nnue", nnue_path=artifact["binary"],
+        )
+        q = kr.RustSearch(
+            depth=2, enum_cap=1, chance_samples=8, seed=31,
+            eval="sparse_nnue_q", nnue_path=artifact["binary"],
+        )
+        assert abs(f.value(state, 2) - q.value(state, 2)) < 0.04
+
+
 def test_sparse_export_omits_aux_heads_and_documents_layout(artifact):
     import json
 
@@ -154,3 +188,5 @@ def test_sparse_constructor_validation(artifact):
         kr.RustSearch(eval="sparse_nnue")
     with pytest.raises(ValueError):
         kr.RustSearch(eval="pick_aware", nnue_path=artifact["binary"])
+    with pytest.raises(ValueError):
+        kr.RustSearch(eval="sparse_nnue_q")

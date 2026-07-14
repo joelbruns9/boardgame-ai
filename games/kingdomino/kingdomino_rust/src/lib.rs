@@ -1804,6 +1804,7 @@ enum EmmEval {
     Nnue,      // trained dense net (weights held in RustSearch.nnue)
     SparseNnueRef, // Step-3 sparse net, stateless full accumulator rebuild
     SparseNnue, // Step-3 sparse net, reversible dual accumulators
+    QuantizedSparseNnue, // v3.2 guarded int16/int8 incremental inference
 }
 
 /// C(n, 4) as a u64 (0 for n < 4).
@@ -2263,6 +2264,7 @@ struct RustSearch {
     eval: EmmEval,
     nnue: Option<NnueEval>, // Some iff eval == Nnue
     sparse_nnue: Option<Arc<sparse_nnue::SparseNnueWeights>>,
+    quantized_sparse_nnue: Option<Arc<sparse_nnue::QuantizedSparseWeights>>,
     #[pyo3(get)]
     nodes: u64,
 }
@@ -2297,10 +2299,11 @@ impl RustSearch {
             "nnue" => EmmEval::Nnue,
             "sparse_nnue_ref" => EmmEval::SparseNnueRef,
             "sparse_nnue" => EmmEval::SparseNnue,
+            "sparse_nnue_q" => EmmEval::QuantizedSparseNnue,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown eval '{}' (expected 'pick_blind', 'pick_aware', 'nnue', \
-                     'sparse_nnue_ref', or 'sparse_nnue')",
+                     'sparse_nnue_ref', 'sparse_nnue', or 'sparse_nnue_q')",
                     other
                 )))
             }
@@ -2324,13 +2327,24 @@ impl RustSearch {
                     "sparse NNUE eval requires nnue_path",
                 ))
             }
-            (EmmEval::Nnue, _) => None,
+            (EmmEval::Nnue | EmmEval::QuantizedSparseNnue, _) => None,
             (_, Some(_)) => {
                 return Err(PyValueError::new_err(
                     "nnue_path given but eval is not an NNUE evaluator",
                 ))
             }
             (_, None) => None,
+        };
+        let quantized_sparse_nnue = match (eval, nnue_path.as_ref()) {
+            (EmmEval::QuantizedSparseNnue, Some(p)) => {
+                Some(Arc::new(sparse_nnue::QuantizedSparseWeights::load(p)?))
+            }
+            (EmmEval::QuantizedSparseNnue, None) => {
+                return Err(PyValueError::new_err(
+                    "quantized sparse NNUE eval requires nnue_path",
+                ))
+            }
+            _ => None,
         };
         Ok(RustSearch {
             cfg: search::SearchConfig {
@@ -2343,6 +2357,7 @@ impl RustSearch {
             eval,
             nnue,
             sparse_nnue,
+            quantized_sparse_nnue,
             nodes: 0,
         })
     }
@@ -2385,6 +2400,23 @@ impl RustSearch {
                     a,
                     b,
                     &sparse_nnue::SparseIncrementalEval,
+                    &self.cfg,
+                    &mut nodes,
+                )?
+            }
+            EmmEval::QuantizedSparseNnue => {
+                let weights = Arc::clone(
+                    self.quantized_sparse_nnue
+                        .as_ref()
+                        .expect("quantized sparse nnue without weights"),
+                );
+                let mut state = sparse_nnue::QuantizedSparseSearchState::new(s, weights)?;
+                search::value::<sparse_nnue::QuantizedSparseKingdomino, _>(
+                    &mut state,
+                    d,
+                    a,
+                    b,
+                    &sparse_nnue::QuantizedSparseEval,
                     &self.cfg,
                     &mut nodes,
                 )?
@@ -2440,6 +2472,21 @@ impl RustSearch {
                 search::choose_action::<sparse_nnue::SparseKingdomino, _>(
                     &mut state,
                     &sparse_nnue::SparseIncrementalEval,
+                    &self.cfg,
+                    seed,
+                    &mut nodes,
+                )?
+            }
+            EmmEval::QuantizedSparseNnue => {
+                let weights = Arc::clone(
+                    self.quantized_sparse_nnue
+                        .as_ref()
+                        .expect("quantized sparse nnue without weights"),
+                );
+                let mut state = sparse_nnue::QuantizedSparseSearchState::new(s, weights)?;
+                search::choose_action::<sparse_nnue::QuantizedSparseKingdomino, _>(
+                    &mut state,
+                    &sparse_nnue::QuantizedSparseEval,
                     &self.cfg,
                     seed,
                     &mut nodes,
@@ -9456,6 +9503,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::sparse_nnue::SparseNnueEvaluator;
+
+    #[pymodule_export]
+    use super::sparse_nnue::QuantizedSparseNnueEvaluator;
 
     #[pymodule_export]
     use super::RustMCTS;

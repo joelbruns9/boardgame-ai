@@ -72,6 +72,16 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       float tail**, down from 3.8/10.5/14.2 µs. Python/Rust feature and forward parity,
       stateless/incremental values/actions/node counts, sampled chance, and unwind gates
       remain green.
+- [x] **v3.2 guarded quantization + SIMD** — `sparse_nnue_q` quantizes the unchanged v3
+      float artifact at load: per-channel power-of-two int16 accumulator scales, int8
+      tail weights (separate accumulator/summary scales in tail0), dynamic int16 tail
+      activations, float biases/dequantization, and AVX2 integer dot with scalar parity.
+      The conservation-derived 112-active-feature guard gives a conservative pilot bound
+      of **19,958 < 32,767**; transition removals precede additions so every intermediate
+      remains a bounded subset. On 100 real positions, expected-score MAE/max are
+      **0.0028/0.0109** and margin MAE/max **0.13/0.43 points**. Search action agreement
+      is 20/20 at depth 2 and 6/6 at depth 3. The six-position depth-3 gate is **102.3k
+      nodes/s** vs 98.8k float (**1.04×**) with roughly half the inference-weight memory.
 
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.
@@ -436,8 +446,12 @@ older/diverse data and measure each generation against **fixed** opponents.
 - **v3.1 — COMPLETE: profile-driven float inference.** Input-major tail weights plus
   fused/allocation-light summary derivation delivered 2.81× end-to-end throughput on the
   fixed depth-3 gate. Same schema and artifact → **no retrain**.
-- **v3.2 — NEXT: quantization + SIMD** (int16 acc, int8 tail), plain ReLU. **Overflow
-  test first** (Azul lesson). Retain the float implementation as the correctness oracle.
+- **v3.2 — COMPLETE: guarded quantization + SIMD.** Int16 accumulator, int8 tail,
+  explicit AVX2/scalar-parity kernel, conservative overflow proof, float-oracle numeric
+  gates, and search-level action/performance gates. Same artifact; no retrain.
+- **Operational search — NEXT.** Deadline-safe iterative deepening, root/PV ordering,
+  aspiration windows, reuse where stochastic semantics allow it, and completed-depth /
+  timeout telemetry.
 
 ## Verification discipline (float-aware; the completeness gate is redesigned)
 
