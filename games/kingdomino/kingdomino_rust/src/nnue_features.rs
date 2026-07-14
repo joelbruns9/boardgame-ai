@@ -5,12 +5,10 @@
 //! that Rust derives exactly the same 5,710 sparse indices and 171-value summary
 //! as the frozen Python schema, then optimize updates without changing meaning.
 
-use std::collections::HashSet;
-
 use super::{
-    dom, idx, write_board_summary, RustBoard, RustGameState, BOARD_SUMMARY, CASTLE, CELLS, DIRS,
-    EMPTY, FINAL_PLACEMENT, GAME_OVER, INITIAL_SELECTION, MAX_LEGAL_PLACEMENTS, N,
-    PLACE_AND_SELECT,
+    BOARD_SUMMARY, CASTLE, CELLS, DIRS, EMPTY, FINAL_PLACEMENT, GAME_OVER, INITIAL_SELECTION,
+    MAX_BOARD_CELLS, MAX_LEGAL_PLACEMENTS, MAX_TOTAL_CROWNS, N, PLACE_AND_SELECT, RustBoard,
+    RustGameState, SCORE_SCALE, bonus_state_features, dom, idx,
 };
 
 pub(super) const CORE_SCHEMA_HASH: &str = "f4a681bf7fa8950c";
@@ -21,6 +19,7 @@ const NUM_HALF: usize = 16;
 const NUM_TERRAINS: usize = 6;
 const CELL_SIDE: usize = 13;
 const NUM_CELLS: usize = CELL_SIDE * CELL_SIDE;
+const FRONTIER_WORDS: usize = CELLS.div_ceil(64);
 const CASTLE_COORD: i8 = 7;
 const MIN_CELL: i8 = 1;
 const MAX_CELL: i8 = 13;
@@ -292,6 +291,7 @@ pub(super) fn board_feature_index(
 struct BoardFacts {
     cell_count: [i32; NUM_TERRAINS],
     crown_count: [i32; NUM_TERRAINS],
+    score_by: [i32; NUM_TERRAINS],
     largest_size: [i32; NUM_TERRAINS],
     largest_crowns: [i32; NUM_TERRAINS],
     largest_crownless: [i32; NUM_TERRAINS],
@@ -307,6 +307,7 @@ struct BoardFacts {
 fn board_facts(board: &RustBoard) -> BoardFacts {
     let mut facts = BoardFacts::default();
     let mut visited = [false; CELLS];
+    let mut stack = Vec::with_capacity(49);
 
     for sy in board.min_y..=board.max_y {
         for sx in board.min_x..=board.max_x {
@@ -316,7 +317,7 @@ fn board_facts(board: &RustBoard) -> BoardFacts {
                 continue;
             }
             let ti = (terrain - 2) as usize;
-            let mut stack = Vec::with_capacity(49);
+            stack.clear();
             stack.push((sx, sy));
             visited[si] = true;
             let mut size = 0i32;
@@ -339,6 +340,7 @@ fn board_facts(board: &RustBoard) -> BoardFacts {
             }
             facts.cell_count[ti] += size;
             facts.crown_count[ti] += crowns;
+            facts.score_by[ti] += size * crowns;
             facts.global_largest = facts.global_largest.max(size);
             if size > facts.largest_size[ti]
                 || (size == facts.largest_size[ti] && crowns > facts.largest_crowns[ti])
@@ -356,7 +358,10 @@ fn board_facts(board: &RustBoard) -> BoardFacts {
         }
     }
 
-    let mut frontier: [HashSet<usize>; NUM_TERRAINS] = std::array::from_fn(|_| HashSet::new());
+    // A board has only 225 backing cells.  Fixed bitsets avoid allocating six
+    // HashSets at every leaf while retaining the exact per-terrain uniqueness
+    // semantics (one frontier cell may still count for multiple terrains).
+    let mut frontier = [[0u64; FRONTIER_WORDS]; NUM_TERRAINS];
     for y in board.min_y..=board.max_y {
         for x in board.min_x..=board.max_x {
             let terrain = board.terrain[idx(x, y)];
@@ -375,13 +380,14 @@ fn board_facts(board: &RustBoard) -> BoardFacts {
                 let width = board.max_x.max(nx) - board.min_x.min(nx) + 1;
                 let height = board.max_y.max(ny) - board.min_y.min(ny) + 1;
                 if width <= 7 && height <= 7 {
-                    frontier[(terrain - 2) as usize].insert(idx(nx, ny));
+                    let cell = idx(nx, ny);
+                    frontier[(terrain - 2) as usize][cell / 64] |= 1u64 << (cell % 64);
                 }
             }
         }
     }
-    for (ti, cells) in frontier.iter().enumerate() {
-        facts.open_frontier[ti] = cells.len() as i32;
+    for (ti, words) in frontier.iter().enumerate() {
+        facts.open_frontier[ti] = words.iter().map(|word| word.count_ones() as i32).sum();
     }
 
     for y in board.min_y..=board.max_y {
@@ -413,8 +419,7 @@ fn normalized(value: i32, denominator: f64) -> f32 {
     (value as f64 / denominator) as f32
 }
 
-fn append_extension(out: &mut Vec<f32>, board: &RustBoard) {
-    let f = board_facts(board);
+fn append_extension(out: &mut Vec<f32>, f: &BoardFacts) {
     out.extend(f.cell_count.iter().map(|&v| normalized(v, 48.0)));
     out.extend(
         f.crown_count
@@ -436,6 +441,78 @@ fn append_extension(out: &mut Vec<f32>, board: &RustBoard) {
     out.push(normalized(f.gaps, 48.0));
     out.extend(f.castle_extent.iter().map(|&v| normalized(v, 6.0)));
     out.extend(f.largest_crownless.iter().map(|&v| normalized(v, 48.0)));
+}
+
+/// Write the frozen 25-value base board block from the same region facts used
+/// by the 39-value extension.  The old path called `board.score`,
+/// `board_component_facts`, and `board_facts` independently, which performed
+/// three equivalent flood fills per board at every leaf.
+fn write_base(
+    out: &mut [f32],
+    off: usize,
+    state: &RustGameState,
+    player: u8,
+    f: &BoardFacts,
+    claim_facts: &[ClaimFact],
+) {
+    debug_assert!(off + BOARD_SUMMARY <= out.len());
+    let board = &state.boards[player as usize];
+    let (harmony, middle) = bonus_state_features(state, board, player);
+    let territory: i32 = f.score_by.iter().sum();
+    let total_score =
+        territory + if harmony[0] == 1.0 { 5 } else { 0 } + if middle[0] == 1.0 { 10 } else { 0 };
+    let total_crowns: i32 = f.crown_count.iter().sum();
+    let width = (board.max_x - board.min_x + 1) as f32;
+    let height = (board.max_y - board.min_y + 1) as f32;
+    let empty_remaining = (49i32 - board.occupied as i32).max(0) as f32;
+    let next_summary = state.next_pending_summary(player);
+    let legal_count = if let Some((did, _, _)) = next_summary {
+        claim_facts
+            .iter()
+            .find(|fact| fact.owner == player && fact.did == did)
+            .map(|fact| fact.legal)
+            .unwrap_or_else(|| {
+                let (ta, ca, tb, cb) = dom(did);
+                board.legal_placements(ta, ca, tb, cb).len()
+            })
+    } else {
+        0
+    };
+
+    let mut i = off;
+    out[i] = (total_score as f32).min(SCORE_SCALE) / SCORE_SCALE;
+    i += 1;
+    for &v in &f.score_by {
+        out[i] = (v as f32).min(SCORE_SCALE) / SCORE_SCALE;
+        i += 1;
+    }
+    for &v in &f.largest_size {
+        out[i] = (v as f32).min(MAX_BOARD_CELLS) / MAX_BOARD_CELLS;
+        i += 1;
+    }
+    out[i] = (total_crowns as f32).min(MAX_TOTAL_CROWNS) / MAX_TOTAL_CROWNS;
+    i += 1;
+    for v in harmony {
+        out[i] = v;
+        i += 1;
+    }
+    for v in middle {
+        out[i] = v;
+        i += 1;
+    }
+    out[i] = width.min(7.0) / 7.0;
+    i += 1;
+    out[i] = height.min(7.0) / 7.0;
+    i += 1;
+    out[i] = empty_remaining.min(MAX_BOARD_CELLS) / MAX_BOARD_CELLS;
+    i += 1;
+    out[i] = (legal_count as f32).min(MAX_LEGAL_PLACEMENTS) / MAX_LEGAL_PLACEMENTS;
+    i += 1;
+    out[i] = if legal_count == 0 && next_summary.is_some() {
+        1.0
+    } else {
+        0.0
+    };
 }
 
 fn append_bag(out: &mut Vec<f32>, state: &RustGameState) {
@@ -463,23 +540,36 @@ fn append_bag(out: &mut Vec<f32>, state: &RustGameState) {
     );
 }
 
-fn append_claims(out: &mut Vec<f32>, state: &RustGameState, perspective: u8) {
-    let start = out.len();
-    out.resize(start + 24, 0.0);
+#[derive(Clone, Copy)]
+struct ClaimFact {
+    owner: u8,
+    did: u16,
+    legal: usize,
+}
+
+fn unresolved_claim_facts(state: &RustGameState) -> Vec<ClaimFact> {
     if !matches!(state.phase, PLACE_AND_SELECT | FINAL_PLACEMENT) {
-        return;
+        return Vec::new();
     }
-    for (k, &(owner, did)) in state
+    state
         .pending_claims
         .iter()
         .skip(state.actor_index)
         .take(4)
-        .enumerate()
-    {
-        let (ta, ca, tb, cb) = dom(did);
-        let legal = state.boards[owner as usize]
-            .legal_placements(ta, ca, tb, cb)
-            .len();
+        .map(|&(owner, did)| {
+            let (ta, ca, tb, cb) = dom(did);
+            let legal = state.boards[owner as usize]
+                .legal_placements(ta, ca, tb, cb)
+                .len();
+            ClaimFact { owner, did, legal }
+        })
+        .collect()
+}
+
+fn append_claims(out: &mut Vec<f32>, claim_facts: &[ClaimFact], perspective: u8) {
+    let start = out.len();
+    out.resize(start + 24, 0.0);
+    for (k, &ClaimFact { owner, did, legal }) in claim_facts.iter().enumerate() {
         let base = start + k * 6;
         out[base] = 1.0;
         out[base + 1] =
@@ -526,13 +616,23 @@ fn append_progress_and_fill(out: &mut Vec<f32>, state: &RustGameState, perspecti
 pub(super) fn summary(state: &RustGameState, perspective: u8) -> Result<Vec<f32>, String> {
     validate_state(state, perspective)?;
     let opponent = 1 - perspective;
+    let my_facts = board_facts(&state.boards[perspective as usize]);
+    let opp_facts = board_facts(&state.boards[opponent as usize]);
+    let claim_facts = unresolved_claim_facts(state);
     let mut out = vec![0.0f32; BASE_SIZE];
-    write_board_summary(&mut out, 0, state, perspective);
-    write_board_summary(&mut out, BOARD_SUMMARY, state, opponent);
-    append_extension(&mut out, &state.boards[perspective as usize]);
-    append_extension(&mut out, &state.boards[opponent as usize]);
+    write_base(&mut out, 0, state, perspective, &my_facts, &claim_facts);
+    write_base(
+        &mut out,
+        BOARD_SUMMARY,
+        state,
+        opponent,
+        &opp_facts,
+        &claim_facts,
+    );
+    append_extension(&mut out, &my_facts);
+    append_extension(&mut out, &opp_facts);
     append_bag(&mut out, state);
-    append_claims(&mut out, state, perspective);
+    append_claims(&mut out, &claim_facts, perspective);
     append_pick_positions(&mut out, state, perspective);
     append_progress_and_fill(&mut out, state, perspective);
     if out.len() != SUMMARY_SIZE {

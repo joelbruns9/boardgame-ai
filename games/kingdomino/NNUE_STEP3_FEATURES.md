@@ -60,13 +60,18 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       Semantic placement additions come from the move undo; compact dynamic banks are
       re-derived after each move/chance result, so sampled rows and round promotion cannot
       drift from the frozen reference encoder.
-- [ ] **Profile-driven inference follow-up** ← **NEXT DECISION**. Real `choose_action`
-      profiling found no material deep-search gain from the float accumulator: on a
-      six-position depth-3 repeat, stateless was **31.8k nodes/s** and incremental
-      **32.3k nodes/s (1.02×)**; shallow trees can be slower from setup/rollback overhead.
-      Component cost is approximately **3.8 µs sparse derive+sum, 10.5 µs summary,
-      14.2 µs float tail** per eval. The sparse first layer is no longer dominant;
-      optimize/quantize the tail and summary before investing further in deltas.
+- [x] **v3.1 profile-driven float inference** — same v3 artifact and frozen schemas; no
+      retraining. The loader transposes dense-tail weights to input-major layout once,
+      making each scalar input an SIMD-friendly update across contiguous outputs and
+      skipping zero activations. Summary construction now derives base + extension from
+      one region traversal per board, reuses its flood stack, uses fixed frontier bitsets,
+      and shares unresolved-claim legal counts. On the same six-position depth-3
+      `choose_action` gate, incremental throughput rose from **33.5k to 94.3k nodes/s
+      (2.81×)**; stateless reaches **87.1k** and the accumulator adds **1.08×**. Component
+      cost is now approximately **2.58 µs sparse derive+sum, 3.60 µs summary, 1.21 µs
+      float tail**, down from 3.8/10.5/14.2 µs. Python/Rust feature and forward parity,
+      stateless/incremental values/actions/node counts, sampled chance, and unwind gates
+      remain green.
 
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.
@@ -428,12 +433,11 @@ older/diverse data and measure each generation against **fixed** opponents.
   oracle, reversible dual accumulator, chance/error cleanup gates, and profiling landed.
   The composite state provides atomic game+accumulator unwind without a separate mutable
   evaluator stack.
-- **v3.1 — profile-driven float inference.** The measured bottlenecks are tail first,
-  summary second; the active-row accumulator rebuild is only ~13% of leaf cost. Improve
-  tail layout/vectorization and eliminate duplicate summary traversal before considering
-  rollback union-find. Same schema → **no retrain**.
-- **v3.2 — quantization + SIMD** (int16 acc, int8 tail), plain ReLU. **Overflow test
-  first** (Azul lesson).
+- **v3.1 — COMPLETE: profile-driven float inference.** Input-major tail weights plus
+  fused/allocation-light summary derivation delivered 2.81× end-to-end throughput on the
+  fixed depth-3 gate. Same schema and artifact → **no retrain**.
+- **v3.2 — NEXT: quantization + SIMD** (int16 acc, int8 tail), plain ReLU. **Overflow
+  test first** (Azul lesson). Retain the float implementation as the correctness oracle.
 
 ## Verification discipline (float-aware; the completeness gate is redesigned)
 

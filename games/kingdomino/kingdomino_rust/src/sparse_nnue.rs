@@ -24,9 +24,12 @@ pub(super) struct SparseNnueWeights {
     // Feature-major EmbeddingBag layout: each feature row is contiguous.
     acc_w: Vec<f32>,
     acc_b: Vec<f32>,
-    t0_w: Vec<f32>,
+    // Dense tail weights are transposed once at load time to input-major
+    // layout.  For each scalar input, all output weights are contiguous, so
+    // the hot loop is an SIMD-friendly AXPY across independent outputs.
+    t0_w_by_input: Vec<f32>,
     t0_b: Vec<f32>,
-    t1_w: Vec<f32>,
+    t1_w_by_input: Vec<f32>,
     t1_b: Vec<f32>,
     out_w: Vec<f32>,
     out_b: f32,
@@ -121,6 +124,8 @@ impl SparseNnueWeights {
                 "sparse nnue: non-finite weight or bias",
             ));
         }
+        let t0_w_by_input = transpose_output_major(&t0_w, tail_hidden, tail_input);
+        let t1_w_by_input = transpose_output_major(&t1_w, tail_hidden, tail_hidden);
         Ok(Self {
             summary_size,
             acc_width,
@@ -128,9 +133,9 @@ impl SparseNnueWeights {
             margin_scale,
             acc_w,
             acc_b,
-            t0_w,
+            t0_w_by_input,
             t0_b,
-            t1_w,
+            t1_w_by_input,
             t1_b,
             out_w,
             out_b,
@@ -162,28 +167,32 @@ impl SparseNnueWeights {
     fn forward_from_z(&self, z: &[f32], summary: &[f32]) -> (f32, f32) {
         debug_assert_eq!(z.len(), self.acc_width);
         debug_assert_eq!(summary.len(), self.summary_size);
-        let tail_input = self.acc_width + self.summary_size;
-        let mut h0 = vec![0.0f32; self.tail_hidden];
-        for (o, out) in h0.iter_mut().enumerate() {
-            let row = &self.t0_w[o * tail_input..(o + 1) * tail_input];
-            let mut sum = self.t0_b[o];
-            for i in 0..self.acc_width {
-                sum += row[i] * z[i].max(0.0);
+        let mut h0 = self.t0_b.clone();
+        for (i, &value) in z.iter().enumerate() {
+            let value = value.max(0.0);
+            if value != 0.0 {
+                let row = &self.t0_w_by_input[i * self.tail_hidden..(i + 1) * self.tail_hidden];
+                scaled_add(&mut h0, row, value);
             }
-            for i in 0..self.summary_size {
-                sum += row[self.acc_width + i] * summary[i];
-            }
-            *out = sum.max(0.0);
         }
-        let mut h1 = vec![0.0f32; self.tail_hidden];
-        for (o, out) in h1.iter_mut().enumerate() {
-            let row = &self.t1_w[o * self.tail_hidden..(o + 1) * self.tail_hidden];
-            let mut sum = self.t1_b[o];
-            for i in 0..self.tail_hidden {
-                sum += row[i] * h0[i];
+        for (i, &value) in summary.iter().enumerate() {
+            if value != 0.0 {
+                let input = self.acc_width + i;
+                let row =
+                    &self.t0_w_by_input[input * self.tail_hidden..(input + 1) * self.tail_hidden];
+                scaled_add(&mut h0, row, value);
             }
-            *out = sum.max(0.0);
         }
+        h0.iter_mut().for_each(|v| *v = v.max(0.0));
+
+        let mut h1 = self.t1_b.clone();
+        for (i, &value) in h0.iter().enumerate() {
+            if value != 0.0 {
+                let row = &self.t1_w_by_input[i * self.tail_hidden..(i + 1) * self.tail_hidden];
+                scaled_add(&mut h1, row, value);
+            }
+        }
+        h1.iter_mut().for_each(|v| *v = v.max(0.0));
         let mut logit = self.out_b;
         let mut margin = self.margin_b;
         for i in 0..self.tail_hidden {
@@ -206,6 +215,25 @@ impl SparseNnueWeights {
             -actor_value
         };
         Ok((p0 as f64, expected, margin * self.margin_scale))
+    }
+}
+
+fn transpose_output_major(weights: &[f32], outputs: usize, inputs: usize) -> Vec<f32> {
+    debug_assert_eq!(weights.len(), outputs * inputs);
+    let mut transposed = vec![0.0; weights.len()];
+    for output in 0..outputs {
+        for input in 0..inputs {
+            transposed[input * outputs + output] = weights[output * inputs + input];
+        }
+    }
+    transposed
+}
+
+#[inline(always)]
+fn scaled_add(dst: &mut [f32], weights: &[f32], value: f32) {
+    debug_assert_eq!(dst.len(), weights.len());
+    for (out, &weight) in dst.iter_mut().zip(weights) {
+        *out += weight * value;
     }
 }
 
@@ -528,9 +556,13 @@ mod tests {
             margin_scale: 40.0,
             acc_w: patterned(nnue_features::CORE_SIZE * aw, 0.0002),
             acc_b: patterned(aw, 0.001),
-            t0_w: patterned(th * (aw + nnue_features::SUMMARY_SIZE), 0.0005),
+            t0_w_by_input: transpose_output_major(
+                &patterned(th * (aw + nnue_features::SUMMARY_SIZE), 0.0005),
+                th,
+                aw + nnue_features::SUMMARY_SIZE,
+            ),
             t0_b: patterned(th, 0.001),
-            t1_w: patterned(th * th, 0.001),
+            t1_w_by_input: transpose_output_major(&patterned(th * th, 0.001), th, th),
             t1_b: patterned(th, 0.001),
             out_w: patterned(th, 0.002),
             out_b: 0.03,

@@ -14,15 +14,18 @@ v3 sparse export, stateless Rust forward, and reversible dual accumulators are c
 The 50k pilot learned above baseline (validation Brier 0.2115 vs 0.2500; margin MAE
 16.62 vs 17.81), with the reserved test split still unopened.
 
-The main Phase-2 performance hypothesis has now been measured. Sparse stateless search
-already sums only active feature rows, so the float accumulator is correct but provides
-no material overall bot-path gain (six-position depth-3 repeat: 31.8k stateless vs 32.3k
-incremental nodes/s, 1.02×). Per-eval profiling is ~3.8 µs sparse derive+sum, ~10.5 µs
-summary, and ~14.2 µs float tail. The next decision is therefore tail
-layout/vectorization/quantization plus duplicate-summary-work removal—not more
-first-layer delta complexity. The original phase descriptions below are retained as the
-planning history; where they predict the accumulator or flood-fill will dominate, these
-measurements supersede that prediction.
+The v3.1 float-inference pass is complete without changing the schema, artifact, or
+trained weights. Dense-tail weights are transposed to input-major layout once at load
+for SIMD-friendly output updates; summary construction now shares one region traversal
+per board, fixed frontier bitsets, and cached legal-placement counts. On the same
+six-position depth-3 `choose_action` gate, incremental throughput rose from **33.5k to
+94.3k nodes/s (2.81×)**; the stateless oracle reaches 87.1k. Per-eval profiling fell
+from roughly 3.8/10.5/14.2 µs to **2.58 µs sparse derive+sum, 3.60 µs summary, and
+1.21 µs float tail**. The accumulator itself is now a modest 1.08× over stateless;
+rollback union-find remains unjustified. The next planned milestone is v3.2
+quantization/SIMD, with overflow analysis before any integer conversion. The original
+phase descriptions below remain planning history; these measurements supersede their
+bottleneck predictions.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data
