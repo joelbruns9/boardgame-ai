@@ -4,6 +4,43 @@
 the step that makes the eval *fast*. Grounded in `encoder.py`, `board.py` scoring
 (exact), `dominoes.py` (verified counts), and the `search::Game`/`Eval` boundary.
 
+## Build status (2026-07-14)
+
+At-a-glance progress; commits carry the granular history. Both encoders are
+frozen-ready — the schema hashes (`core_schema_hash`, `summary_schema_hash`) must be
+stored in every derived-feature artifact / `.knnue` / trained model.
+
+- [x] **D4 augmentation bug fix** — flat `width`/`height` swap under 90°/270° (numpy
+      `_transform_flat` + Rust `transform_flat`); had mis-augmented even the dense net.
+- [x] **Official-outcome cascade labels + conservation** — self-play `win_target`
+      routes through `official_outcome_i8` (score→largest territory→total crowns);
+      genuine draws stay 0.5. 48-domino conservation ledger as an engine gate.
+- [x] **Data harness** `nnue/datagen.py` — GPU-free CPU self-play → replayable-source
+      buffer (features DERIVED by replay, no encoder-lock). Strict loader hard-fails on
+      engine/format/catalog/rules mismatch. 50k pilot clean (0 replay failures).
+- [x] **Sparse core encoder (5,710)** `nnue/sparse_encoder.py` — lossless perspective-
+      relative Markov core. Frozen. Gated: seat-swap, lossless decode, completeness,
+      inventory, hidden-deck-order, boundary, RAW golden fixtures, semantic schema hash.
+- [x] **Summary encoder (171)** `nnue/summary_encoder.py` (commit `1f4093a`) — base 50 +
+      extension 78 + global 43. Hardened: all extension/global norms are TRUE
+      combinatorial bounds → provably 0 clip; only base `score/160` & claim `legal/64`
+      saturate by design (measured max 94/160, 38/64, 0 clips on random play — re-audit
+      on stronger-play corpora). Semantic schema hash; golden fixtures. Frozen.
+- [x] **D4 `transform_state` + augmentation-identity gate** `nnue/d4.py` (commit
+      `d611810`) — `encode(transform(s)) == Dmap(encode(s))` over 25 trajectories × 8 D4
+      elements for BOTH sparse and summary. `coord_fwd` drives the state transform and
+      the index perms (no drift). Sparse/summary augmentation now unblocked.
+- [ ] **Rust derivation from `RustGameState` + Python/Rust parity** (random trajectories
+      + golden) ← **NEXT**; the gate before generating the full CPU training set.
+- [ ] Fixed-weight network-output seat-swap.
+- [ ] Two-head + aux net, train on pilot (aux heads need per-game final `ScoreBreakdown`:
+      total, territory_score, largest_territory_size, total_crowns, harmony_bonus,
+      middle_kingdom_bonus — derivable on replay).
+- [ ] Rust pre-activation accumulator + IncrementalEval + RAII.
+
+**Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
+`terminal_search_value` with the official cascade before AZ/hybrid data.
+
 ## The one principle everything follows
 
 NNUE is **sparse binary features + a big first layer, updated incrementally**, where the
