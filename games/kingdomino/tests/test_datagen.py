@@ -100,5 +100,36 @@ def test_manifest_integrity(batch):
     man = batch["manifest"]
     assert man["catalog_hash"] == dg.catalog_hash()
     assert man["engine_version"] == dg.ENGINE_VERSION
+    assert man["format_version"] == dg.FORMAT_VERSION
+    assert "git_commit" in man and "git_dirty" in man
     assert man["total_positions"] == sum(r["n_positions"]
                                          for recs in batch["recs"].values() for r in recs)
+
+
+def test_loader_accepts_fresh_buffer(batch):
+    recs = dg.load_records(str(batch["out"]), strict=True)
+    assert len(recs) == 60
+    # provenance stamped onto every record
+    assert all("git_commit" in r and "format_version" in r for r in recs)
+
+
+def test_loader_rejects_stale_buffers(tmp_path, batch):
+    good = batch["recs"]["train"][0]
+    for field, bad in [("engine_version", 999), ("format_version", 999),
+                       ("catalog_hash", "deadbeef")]:
+        rec = dict(good)
+        rec[field] = bad
+        p = tmp_path / f"stale_{field}.jsonl"
+        p.write_text(json.dumps(rec) + "\n")
+        with pytest.raises(dg.StaleBufferError):
+            dg.load_records(str(p), strict=True)
+
+
+def test_loader_rejects_mixed_rules(tmp_path, batch):
+    a = dict(batch["recs"]["train"][0])
+    b = dict(batch["recs"]["train"][1])
+    b["harmony"] = not b["harmony"]
+    p = tmp_path / "mixed_rules.jsonl"
+    p.write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
+    with pytest.raises(dg.StaleBufferError):
+        dg.load_records(str(p), strict=True)

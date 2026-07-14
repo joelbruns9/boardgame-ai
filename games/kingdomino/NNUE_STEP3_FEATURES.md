@@ -120,8 +120,11 @@ never a dense `N × 5,710` matrix** — a 500k-row dense input is ~11.4 GB and p
 
 This block **requires retraining if changed**, so it is pinned exactly here. Definitions
 are chosen to be computable in the **single** connected-component traversal that already
-computes score (`board.score`). The definitional choices flagged **⚠** are the ones to
-confirm before we freeze (tie rule, hole/frontier definitions, normalizations).
+computes score (`board.score`). **All definitions below are APPROVED/frozen** (2026-07-13).
+**Normalization rule (approved):** every denominator is a **fixed schema constant** derived
+from the catalog/rules — *never* computed from the pilot data — and is **included in the
+feature-schema hash**. Add explicit range assertions on each raw value and **measure clip
+frequency** (a clipped feature silently collapses distinct states).
 
 **Perspective-relative — hard contract.** The summary is `summary(state,
 perspective=actor)`, **not** `summary(state)`. Every per-player block is ordered
@@ -145,12 +148,12 @@ absolute P0/P1.
 |---|---|---|---|
 | terrain_cell_count | 6 | placed cells of each placeable terrain | /48 |
 | terrain_crown_count | 6 | Σ crowns on each terrain | /MAX_TOTAL_CROWNS |
-| largest_region_crowns | 6 | crowns in the largest-area region of each terrain; **⚠ tie rule:** among that terrain's maximal-area regions, take the max crown count | /MAX_TOTAL_CROWNS |
+| largest_region_crowns | 6 | crowns in the largest-area region of each terrain; **tie rule (approved):** among that terrain's *maximal-area* regions, take the maximum crown count | /MAX_TOTAL_CROWNS |
 | global_largest_territory | 1 | `ScoreBreakdown.largest_territory_size` (terrain-agnostic official tiebreaker) | /48 |
 | crownless_region_count | 1 | # connected same-terrain regions with 0 crowns | /24 |
 | stranded_crowns | 1 | Σ crowns in area-1 regions (isolated crowned tiles) | /MAX_TOTAL_CROWNS |
-| open_frontier | 6 | **⚠** per terrain, # empty legal-expansion cells (in-bounds, keeps bbox ≤7×7) orthogonally adjacent to ≥1 placed cell of that terrain | /24 |
-| enclosed_holes | 1 | **⚠** empty cells inside bbox with all 4 orthogonal neighbors occupied (permanently unfillable → kills harmony) | /48 |
+| open_frontier | 6 | **(approved)** per terrain, # of **unique empty cells** that are empty + in-bounds + **bbox-admissible** (keeps bbox ≤7×7) AND orthogonally adjacent to ≥1 placed cell of that terrain. "Legal expansion" means bbox-admissible, **not** that a whole domino can be placed there. A cell may count for two terrains (e.g. Wheat *and* Forest) if adjacent to both — counted once per terrain | /24 |
+| enclosed_single_holes | 1 | **(approved, renamed to avoid overclaiming)** # of empty cells inside bbox with **all 4** orthogonal neighbors occupied — detects fully-enclosed **single-cell** holes only, *not* every possible unfillable cavity | /48 |
 | gaps | 1 | bbox_area − occupied (empty cells inside the bounding rectangle) | /48 |
 | castle_extent L/R/U/D | 4 | `castle_x−min_x`, `max_x−castle_x`, `castle_y−min_y`, `max_y−castle_y` — how far the kingdom reaches past the castle each way (all four = 3 ⇒ Middle-Kingdom geometry). **Replaces** the redundant `bbox_room` (which collapsed to `7−width`/`7−height`). **D4:** permutes/swaps like directions | /6 |
 | largest_crownless_region | 6 | per terrain, size of the **largest 0-crown** connected region (dormant potential a single crown would activate — distinct from `largest_region` which may be crowned). ⚠ **first ablation candidate** (see §Ablation) | /48 |
@@ -164,7 +167,7 @@ absolute P0/P1.
 | bag_terrain_crowns | 6 | Σ crowns of each terrain remaining in the bag | /max |
 | unresolved claims, **self-identifying** (fixed action order, ≤4) | 24 | per claim (6 each): presence, `legal_placement_count`(/max), `forced_discard` flag, `owner_role` (+1 my / −1 opp / 0 absent), `draft_priority_rank` (domino id /47 — a **tempo** signal, *not* content: id→tile is non-monotonic), `turn_distance` (actions until it resolves, /3). Makes each slot a self-contained unit so the tail needn't re-bind a summed accumulator to the right legal-count. **D4-invariant** | — |
 | next-round draft order `pick_pos[4]` | 4 | sort `next_claims` by domino id; element k = owner of next-round pick k (+1 my / −1 opp / 0 unassigned). Exposes tempo / consecutive turns / first-vs-last choice — a *sort* an EmbeddingBag sum cannot reconstruct. **D4-invariant** | — |
-| game_progress, fill_ratio my/opp | 3 | **⚠ redefine** `game_progress = (placed_dominoes + discarded_dominoes)/48` (reaches 1.0 at terminal even with discards; the current `placed_cells/96` does not and duplicates fill_ratio) | — |
+| game_progress, fill_ratio my/opp | 3 | **(approved)** `game_progress = ((occupied_non_castle_cells / 2) + total_discards) / 48` (reaches 1.0 at terminal even with discards; the old `placed_cells/96` did not and duplicated fill_ratio) | — |
 
 **v3.0 summary total = 50 (base) + 78 (2×39 ext) + 43 (global) = 171.**
 
@@ -275,8 +278,14 @@ to *this* encoder, the same trap. Store **replayable source**; derive everything
 
 Per-position canonical state and cached active indices are **derived conveniences**
 (regenerable by replay). This guarantees a future v4 feature schema needs **no new
-self-play** — just re-derive from the stored trajectories. Gate loading on the
-schema/catalog hash so stale buffers fail loudly.
+self-play** — just re-derive from the stored trajectories.
+
+**Stale-buffer rejection (IMPLEMENTED — `datagen.load_records`).** The loader hard-fails
+(`StaleBufferError`) on any mismatch of **engine_version**, **format_version**, or
+**catalog_hash** vs the current code, on a buffer that **mixes rules configs**, or (if an
+expected config is passed) on a rules mismatch. Records also carry **git commit +
+dirty-state/diff hash** so the exact producing engine is identifiable even if
+`ENGINE_VERSION` was not bumped. So no incompatible buffer can silently train a model.
 
 ## Data generation plan — enhanced Option A (CPU, no GPU)
 
@@ -310,7 +319,16 @@ in" — it sharpens it):
 - **Genuine** ties, still tied after the full cascade, stay **0.5** and **remain in the
   dataset**.
 
-*[Pending your confirmation.]*
+*[Confirmed: exact-tiebreak labels; genuine post-cascade draws stay 0.5 and remain in the
+data.]*
+
+> **AZ terminal alignment (deferred to before AZ/hybrid data).** The buffer labels are now
+> official, and the CPU `RustSearch` teacher's terminal value already uses the official
+> cascade (`terminal_value_p0`). But the legacy AZ MCTS leaf `terminal_search_value`
+> (lib.rs) still treats a raw-score tie as a draw. That is internally consistent for *this*
+> CPU pilot, but before generating AZ/hybrid data its terminal value must be aligned with
+> the cascade, or the AZ search could call a tiebreak win neutral while the labels call it
+> decisive. (Left as-is now: it is under a documented bit-identical-to-Python contract.)
 
 **Actor attribution (Priority 2).** Kingdomino does **not** alternate seats reliably (a
 player can take consecutive turns). Labels must use the **recorded actor**, never ply
@@ -402,6 +420,15 @@ hits an accidental omission. Replace it with:
 - **refresh vs make/unmake fuzz.** Over large random walks, delta-maintained active set
   = `refresh` **exactly** (set equality); pre-activation `z` within tight numeric
   tolerance (float add-order ULPs — *not* byte-for-byte).
+- **Independent Python-oracle replay (deferred; closes the source contract).** Current
+  replay verification is *self-consistent* (generation and replay both use Rust
+  `step`/official outcome — proves the serialized source reproduces under the same engine,
+  which the pilot passed on all 1000 games). To fully verify the trajectory matches the
+  Python rules oracle, replay the whole pilot through Python `GameState`, checking actor,
+  legal action, phase, public-state fingerprint, final scores, and official outcome at
+  every ply. Needs a Rust→Python action mapping; existing Rust/Python differential tests
+  (search-equiv, encoder bit-exactness, `official_outcome` parity) cover the risk, so this
+  is not encoder-blocking — but it closes the loop.
 - **Bounded exhaustion.** Fully enumerate small late-game subsets where tractable.
 - **Snapshot restore: exact.** After `push` then `pop`, `z` restores bit-for-bit.
 - **RAII balance test.** Inject mid-search errors; assert undo/accumulator stacks balanced.
@@ -430,9 +457,11 @@ hits an accidental omission. Replace it with:
 
 ## Open decisions to pin (recommended defaults in bold)
 
-- **⚠ Summary definitions** (largest-region-crowns tie rule; open-frontier = unique empty
-  cells; enclosed-holes; `game_progress = (placed+discarded)/48`; per-feature
-  normalizations from the catalog) — confirm before freeze (retraining-locked).
+- **Summary definitions — APPROVED/frozen** (2026-07-13): largest-region-crowns tie rule
+  (max crowns among maximal-area regions); open-frontier = unique bbox-admissible empty
+  cells per terrain; `enclosed_single_holes` (renamed); `game_progress =
+  ((occupied_non_castle/2)+discards)/48`; normalizations are fixed catalog/rules constants
+  in the schema hash, with range assertions + clip-frequency measurement.
 - Board feature join: **joint `(cell, half_type)`** vs separate `(cell,terrain)+(cell,crowns)`.
 - Accumulator width: **256** (sweep 128–512).
 - Frame: **two shared-weight perspective accumulators**.

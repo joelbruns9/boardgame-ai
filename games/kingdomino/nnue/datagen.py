@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import random
+import subprocess
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Optional
@@ -37,7 +38,33 @@ from games.kingdomino.dominoes import DOMINOES
 # Bump if any rules/engine change alters how a (deck, actions) trajectory unfolds,
 # so replay of an old buffer against a new engine fails the hash check loudly.
 ENGINE_VERSION = 1
+# Bump if the on-disk record schema / action serialization changes.
+FORMAT_VERSION = 1
 GAME_OVER = 3  # RustGameState phase code
+
+
+def git_provenance() -> dict:
+    """Git commit + dirty-state/diff hash of the tree that produced a buffer, so a
+    future buffer's exact engine is identifiable even if someone forgets to bump
+    ENGINE_VERSION. Best-effort (empty strings if git is unavailable)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def _run(args):
+        try:
+            return subprocess.run(["git", *args], cwd=here, capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+        except Exception:
+            return ""
+
+    commit = _run(["rev-parse", "HEAD"])
+    dirty_files = _run(["status", "--porcelain"])
+    dirty = bool(dirty_files)
+    diff = _run(["diff", "HEAD"]) if dirty else ""
+    return {
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "git_diff_sha": hashlib.sha256(diff.encode()).hexdigest()[:16] if dirty else "",
+    }
 
 
 def catalog_hash() -> str:
@@ -135,6 +162,7 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
                        "explore_plies": cfg.explore_plies,
                        "random_opening": cfg.random_opening, "seed": seed},
         "engine_version": ENGINE_VERSION,
+        "format_version": FORMAT_VERSION,
         "catalog_hash": catalog_hash(),
     }
 
@@ -154,6 +182,57 @@ def replay(rec: dict) -> tuple[int, int, int]:
         rs = rs.step(placement, pick)
     s0, s1 = rs.scores()
     return int(s0), int(s1), int(kr.SearchEngine(rs).official_outcome())
+
+
+class StaleBufferError(ValueError):
+    """A record was produced by a different engine/catalog/format than this code."""
+
+
+def load_records(path: str, *, strict: bool = True, expect_rules: Optional[dict] = None):
+    """Load game records from a .jsonl file or a run directory, hard-failing on any
+    stale-buffer signal so an incompatible buffer can never silently train a model.
+
+    Validated per record (strict): engine_version, format_version, and catalog_hash
+    must match THIS code; the whole buffer must share one rules config; if
+    expect_rules is given, that config must match too. Returns list[dict].
+    """
+    if os.path.isdir(path):
+        files = [os.path.join(path, f"{s}.jsonl") for s in ("train", "val", "test")]
+        files = [f for f in files if os.path.exists(f)]
+    else:
+        files = [path]
+
+    cat = catalog_hash()
+    recs, rules_seen = [], set()
+    for fp in files:
+        with open(fp) as f:
+            for ln, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if strict:
+                    if rec.get("engine_version") != ENGINE_VERSION:
+                        raise StaleBufferError(
+                            f"{fp}:{ln}: engine_version {rec.get('engine_version')} "
+                            f"!= {ENGINE_VERSION}")
+                    if rec.get("format_version") != FORMAT_VERSION:
+                        raise StaleBufferError(
+                            f"{fp}:{ln}: format_version {rec.get('format_version')} "
+                            f"!= {FORMAT_VERSION}")
+                    if rec.get("catalog_hash") != cat:
+                        raise StaleBufferError(
+                            f"{fp}:{ln}: catalog_hash {rec.get('catalog_hash')} != {cat}")
+                rules = (bool(rec["harmony"]), bool(rec["middle_kingdom"]))
+                rules_seen.add(rules)
+                if expect_rules is not None:
+                    want = (bool(expect_rules["harmony"]), bool(expect_rules["middle_kingdom"]))
+                    if rules != want:
+                        raise StaleBufferError(f"{fp}:{ln}: rules {rules} != expected {want}")
+                recs.append(rec)
+    if strict and len(rules_seen) > 1:
+        raise StaleBufferError(f"buffer mixes rules configs: {rules_seen}")
+    return recs
 
 
 def _split_of(seed: int, cfg: GenConfig) -> str:
@@ -184,11 +263,13 @@ def generate(n_games: int, out_dir: str, cfg: GenConfig, workers: int = 1,
     else:
         records = [play_one_game(s, cfg) for s in seeds]
 
+    prov = git_provenance()  # constant for the run; stamped onto every record
     files = {k: open(os.path.join(out_dir, f"{k}.jsonl"), "w") for k in ("train", "val", "test")}
     counts = {"train": 0, "val": 0, "test": 0}
     pos = {"train": 0, "val": 0, "test": 0}
     n_verify_fail = 0
     for rec in records:
+        rec.update(prov)
         if verify:
             s0, s1, oc = replay(rec)
             if [s0, s1] != rec["final_scores"] or oc != rec["outcome_p0"]:
@@ -205,8 +286,9 @@ def generate(n_games: int, out_dir: str, cfg: GenConfig, workers: int = 1,
         "n_games": n_games, "seed_start": seed_start, "counts": counts,
         "positions": pos, "total_positions": sum(pos.values()),
         "config": asdict(cfg), "engine_version": ENGINE_VERSION,
-        "catalog_hash": catalog_hash(), "verify_failures": n_verify_fail,
-        "wall_seconds": round(dt, 1), "workers": workers,
+        "format_version": FORMAT_VERSION, "catalog_hash": catalog_hash(),
+        "verify_failures": n_verify_fail, "wall_seconds": round(dt, 1),
+        "workers": workers, **prov,
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
