@@ -30,9 +30,16 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       `d611810`) — `encode(transform(s)) == Dmap(encode(s))` over 25 trajectories × 8 D4
       elements for BOTH sparse and summary. `coord_fwd` drives the state transform and
       the index perms (no drift). Sparse/summary augmentation now unblocked.
-- [ ] **Rust derivation from `RustGameState` + Python/Rust parity** (random trajectories
-      + golden) ← **NEXT**; the gate before generating the full CPU training set.
-- [ ] Fixed-weight network-output seat-swap.
+- [x] **Rust reference derivation from `RustGameState` + Python/Rust parity** — isolated
+      `kingdomino_rust/src/nnue_features.rs`; `RustGameState.nnue_features` returns the
+      sorted 5,710-core indices + 171-value summary, including terminals. Exact sparse
+      and bit-identical float32 summary parity hold at every ply, both perspectives,
+      forced discards, all four rules configurations, golden-derived states, and all D4
+      transforms. Rust exposes and gates both frozen schema hashes. The shared
+      Python→Rust converter now preserves discard counts (previously defaulted them to
+      zero, which would corrupt Harmony/progress features after a forced discard).
+- [ ] **Fixed-weight network-output seat-swap** ← **NEXT**; lands with the sparse
+      `EmbeddingBag` network/training-pilot scaffold.
 - [ ] Two-head + aux net, train on pilot (aux heads need per-game final `ScoreBreakdown`:
       total, territory_score, largest_territory_size, total_crowns, harmony_bonus,
       middle_kingdom_bonus — derivable on replay).

@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 mod deck0_draft_dp;
+mod nnue_features;
 mod search;
 
 // Terrain constants matching Python's Terrain IntEnum
@@ -2633,6 +2634,30 @@ impl RustGameState {
             my_board.into_pyarray(py),
             opp_board.into_pyarray(py),
             flat.into_pyarray(py),
+        ))
+    }
+
+    /// Frozen Step-3 NNUE reference features for this state and perspective.
+    ///
+    /// Returns `(sparse_indices, summary)`: sorted unique int32 indices in the
+    /// 5,710-feature public-state core plus the 171-value float32 summary.  This
+    /// stateless path is the correctness oracle for the later incremental
+    /// accumulator and is intentionally defined for terminal states too.
+    fn nnue_features<'py>(
+        &self,
+        py: Python<'py>,
+        player: u8,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<i32>>,
+        Bound<'py, PyArray1<f32>>,
+    )> {
+        let sparse = nnue_features::sparse_indices(self, player)
+            .map_err(PyValueError::new_err)?;
+        let summary = nnue_features::summary(self, player)
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            Array1::from_vec(sparse).into_pyarray(py),
+            Array1::from_vec(summary).into_pyarray(py),
         ))
     }
 
@@ -9339,6 +9364,18 @@ mod kingdomino_rust {
     #[pyfunction]
     fn domino_halves(id: u16) -> (u8, u8, u8, u8) {
         super::dom(id)
+    }
+
+    /// Frozen NNUE feature schema identifiers shared with the Python reference.
+    /// Derived-feature artifacts and exported models persist both hashes.
+    #[pyfunction]
+    fn nnue_schema_info() -> (usize, usize, &'static str, &'static str) {
+        (
+            super::nnue_features::CORE_SIZE,
+            super::nnue_features::SUMMARY_SIZE,
+            super::nnue_features::CORE_SCHEMA_HASH,
+            super::nnue_features::SUMMARY_SCHEMA_HASH,
+        )
     }
 
     /// Deterministic redeterminization seed used by BatchedMCTS for a move.

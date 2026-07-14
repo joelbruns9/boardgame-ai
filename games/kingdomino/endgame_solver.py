@@ -105,6 +105,7 @@ def _rust_state_from_python(state: GameState):
             bool(state.config.middle_kingdom),
             int(castle_x),
             int(castle_y),
+            (int(state.discards[0]), int(state.discards[1])),
         )
     except Exception:
         return None
