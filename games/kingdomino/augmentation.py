@@ -16,8 +16,14 @@ Spatial (transforms):
                                                 permuted (see direction
                                                 permutations below).
 
+Mostly-invariant (only the bbox dims transform):
+    flat                 shape (FLAT_SIZE,)     tile encodings, bag, phase, etc.
+                                                are orientation-invariant, BUT the
+                                                per-player bbox (width, height)
+                                                SWAP under 90°/270° rotations —
+                                                see _transform_flat.
+
 Invariant (unchanged):
-    flat                 shape (FLAT_SIZE,)     tile encodings, bag, phase
     policy[676*5:678*5]                         DISCARD and NO_PLACEMENT —
                                                 non-spatial actions
     policy pick axis (5 entries within each     pick slot index is unrelated
@@ -42,8 +48,10 @@ CORRECTNESS CONTRACTS (all verified by tests)
 1. augment(inverse_of(t), augment(t, x)) == x          (byte-identical)
 2. Castle remains at (CASTLE_CENTER, CASTLE_CENTER) under every transform.
 3. Terrain channels remain one-hot at every occupied non-castle cell.
-4. flat (shape (FLAT_SIZE,)), z, own_score, opp_score, and win_target are
-   byte-identical across all 8 transforms.
+4. z, own_score, opp_score, and win_target are byte-identical across all 8
+   transforms. The flat vector is byte-identical EXCEPT its per-player bbox
+   (width, height), which swap under the four odd-rotation transforms
+   (ROT90, ROT270, ROT90+H, ROT270+H); all other flat fields are invariant.
 5. A policy with mass exclusively on a single legal action remains exactly
    one-hot after transform (proving the spatial+direction transformation is
    consistent with the action codec's indexing).
@@ -66,7 +74,9 @@ from typing import List, Tuple
 
 import numpy as np
 
-from games.kingdomino.encoder import CANVAS_SIZE, NUM_BOARD_CHANNELS, FLAT_SIZE
+from games.kingdomino.encoder import (
+    CANVAS_SIZE, NUM_BOARD_CHANNELS, FLAT_SIZE, FLAT_LAYOUT,
+)
 from games.kingdomino.action_codec import (
     NUM_DIRECTIONS, NUM_JOINT_ACTIONS, NUM_SPATIAL_PLACEMENTS,
     PICK_AXIS_SIZE, PLACEMENT_AXIS_SIZE,
@@ -132,6 +142,35 @@ def _transform_spatial(arr: np.ndarray, k: int, flip: bool) -> np.ndarray:
     if flip:
         out = out[:, :, ::-1]
     return np.ascontiguousarray(out)
+
+
+# Absolute flat indices of (width, height) for each board summary. `width` sits
+# at local offset 20 within a 25-wide board_summary block (see
+# encoder._encode_board_summary / Rust write_board_summary); `height` follows.
+# Derived from FLAT_LAYOUT so it tracks any layout change. Kept in sync with the
+# Rust BS_WIDTH_LOCAL constant.
+_BS_WIDTH_LOCAL = 20
+_FLAT_WH_PAIRS: Tuple[Tuple[int, int], ...] = tuple(
+    (FLAT_LAYOUT[name].start + _BS_WIDTH_LOCAL,
+     FLAT_LAYOUT[name].start + _BS_WIDTH_LOCAL + 1)
+    for name in ("my_board_summary", "opp_board_summary")
+)
+
+
+def _transform_flat(flat: np.ndarray, k: int) -> np.ndarray:
+    """Apply the D4 flat-vector transform.
+
+    Every flat feature is orientation-invariant EXCEPT the per-player bounding
+    box (width, height): a rotation by an odd number of quarter-turns exchanges
+    the x and y extents. 180° rotations and pure reflections preserve both, so
+    the swap depends only on `k` parity, not `flip`. Bit-identical to Rust
+    `transform_flat`.
+    """
+    out = flat.copy()
+    if k % 2 == 1:
+        for wi, hi in _FLAT_WH_PAIRS:
+            out[wi], out[hi] = out[hi], out[wi]
+    return out
 
 
 def _transform_policy(
@@ -209,9 +248,9 @@ def augment(
 
     Returns a new tuple with spatial components transformed consistently:
     the boards rotate, the spatial portion of the policy rotates and its
-    direction channels permute.  flat, z, own_score, opp_score, and
-    win_target are unchanged (rotation-invariant scalars passed through
-    byte-identically).
+    direction channels permute.  In flat, the per-player bbox width/height swap
+    under odd (90°/270°) rotations; all other flat fields, plus z, own_score,
+    opp_score, and win_target, are rotation-invariant and passed through.
     """
     if not 0 <= transform_id < NUM_D4_TRANSFORMS:
         raise ValueError(
@@ -264,7 +303,7 @@ def augment(
         k, flip, dir_perm = _D4_ELEMENTS[transform_id]
         mb_t = _transform_spatial(my_board, k, flip)
         ob_t = _transform_spatial(opp_board, k, flip)
-        fl_t = flat.copy()  # invariant, but copy to avoid downstream aliasing
+        fl_t = _transform_flat(flat, k)  # width/height swap under odd rotations
         pol_t = _transform_policy(policy, k, flip, dir_perm)
 
     return (

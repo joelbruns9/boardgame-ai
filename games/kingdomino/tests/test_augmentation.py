@@ -29,7 +29,7 @@ from games.kingdomino import augmentation
 from games.kingdomino.augmentation import (
     NUM_D4_TRANSFORMS, augment, augment_all, inverse_transform_id,
     augment_mask, _D4_ELEMENTS, _INVERSE_TRANSFORM,
-    _transform_spatial, _transform_policy,
+    _transform_spatial, _transform_policy, _transform_flat, _FLAT_WH_PAIRS,
 )
 
 # Diagnostic scalar-target placeholders.  augment() now REQUIRES own_score /
@@ -90,14 +90,23 @@ check("identity preserves z",        z_t == z)
 
 
 # ──────────────────────────────────────────────────────────────────────────
-print("\n=== TEST 3: flat and z are byte-identical under all transforms ===")
+print("\n=== TEST 3: z invariant; flat invariant except width/height swap on odd rot ===")
+# All flat fields are orientation-invariant EXCEPT the per-player bbox
+# (width, height), which swap under the four odd-rotation transforms. z is a
+# pure scalar and stays invariant across all 8.
+_wh_idx = {i for pair in _FLAT_WH_PAIRS for i in pair}
+_non_wh = [i for i in range(flat.shape[0]) if i not in _wh_idx]
 violations = 0
 for t in range(NUM_D4_TRANSFORMS):
     _, _, flat_t, _, z_t, *_ = augment(mb, ob, flat, policy, z, t, **_S)
-    if not np.array_equal(flat_t, flat): violations += 1
+    k, _flip, _perm = _D4_ELEMENTS[t]
+    # everything OUTSIDE width/height must be byte-identical under every transform
+    if not np.array_equal(flat_t[_non_wh], flat[_non_wh]): violations += 1
+    # the full flat must match the reference transform (swap iff k odd)
+    if not np.array_equal(flat_t, _transform_flat(flat, k)): violations += 1
     if z_t != z: violations += 1
-check("flat and z invariant across all 8 transforms", violations == 0,
-      f"violations={violations}")
+check("z invariant and flat matches width/height-swap reference across all 8",
+      violations == 0, f"violations={violations}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

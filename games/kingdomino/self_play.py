@@ -59,7 +59,7 @@ from games.kingdomino.encoder import (
 from games.kingdomino.action_codec import encode_action, decode_action, NUM_JOINT_ACTIONS
 from games.kingdomino.augmentation import (
     augment, augment_mask, NUM_D4_TRANSFORMS,
-    _D4_ELEMENTS, _transform_spatial, _transform_policy,
+    _D4_ELEMENTS, _transform_spatial, _transform_policy, _transform_flat,
 )
 from games.kingdomino.network import KingdominoNet, masked_log_softmax
 from games.kingdomino.mcts_az import (
@@ -489,7 +489,7 @@ def _apply_augment(mb: np.ndarray, ob: np.ndarray, flat: np.ndarray,
         k, flip, dp = _D4_ELEMENTS[t_id]
         return (_transform_spatial(mb, k, flip),
                 _transform_spatial(ob, k, flip),
-                flat.copy(),
+                _transform_flat(flat, k),  # width/height swap under odd rotations
                 _transform_policy(policy, k, flip, dp))
 
 

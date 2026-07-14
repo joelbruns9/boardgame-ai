@@ -553,6 +553,10 @@ const OFF_MY_NEXT_PENDING: usize = 0;
 const OFF_OPP_NEXT_PENDING: usize = 18;
 const OFF_MY_BOARD_SUMMARY: usize = 36;
 const OFF_OPP_BOARD_SUMMARY: usize = 61;
+// Local offset of `width` within a board-summary block; `height` is the next
+// slot (see write_board_summary). These two exchange under D4 rotations by an
+// odd number of quarter-turns — see transform_flat.
+const BS_WIDTH_LOCAL: usize = 20;
 const OFF_CURRENT_ROW: usize = 86;
 const OFF_PENDING: usize = 146;
 const OFF_NEXT: usize = 210;
@@ -8881,12 +8885,28 @@ fn transform_policy(src: &[f32], k: u8, flip: bool, dir_perm: &[usize; 4]) -> Ve
     out
 }
 
+/// Flat-vector D4 transform. Every flat feature is orientation-invariant EXCEPT
+/// the per-player bounding-box (width, height): a rotation by an odd number of
+/// quarter-turns exchanges the x and y extents. 180° rotations and pure
+/// reflections (h-flip) preserve both, so the swap depends only on `k` parity,
+/// not `flip`. Keep bit-identical to augmentation._transform_flat.
+fn transform_flat(src: &[f32], k: u8) -> Vec<f32> {
+    let mut out = src.to_vec();
+    if k % 2 == 1 {
+        for off in [OFF_MY_BOARD_SUMMARY, OFF_OPP_BOARD_SUMMARY] {
+            out.swap(off + BS_WIDTH_LOCAL, off + BS_WIDTH_LOCAL + 1);
+        }
+    }
+    out
+}
+
 /// Apply one of the 8 D4 transforms to a Kingdomino training tuple.
 ///
 /// Arguments:
 ///   my_board    : (9, 13, 13) f32 array, C-contiguous
 ///   opp_board   : (9, 13, 13) f32 array, C-contiguous
-///   flat        : flat f32 array — invariant, copied unchanged
+///   flat        : flat f32 array — width/height swap under odd rotations,
+///                 all other fields orientation-invariant (see transform_flat)
 ///   policy      : (3390,) f32 array
 ///   transform_id: int in [0, 8)
 ///
@@ -8921,9 +8941,31 @@ fn d4_augment<'py>(
     let fl_sl = flat.as_slice()?;
     let pol_sl = policy.as_slice()?;
 
+    // Validate lengths up front so malformed direct callers get a ValueError
+    // instead of an out-of-bounds panic (transform_flat/spatial index by fixed
+    // offsets). Normal callers validate upstream; this hardens the public entry.
+    let board_len = N_BOARD_CH_AUG * CANVAS * CANVAS;
+    if mb_sl.len() != board_len || ob_sl.len() != board_len {
+        return Err(PyValueError::new_err(format!(
+            "board must have {board_len} elements ({N_BOARD_CH_AUG}x{CANVAS}x{CANVAS})"
+        )));
+    }
+    if fl_sl.len() != FLAT_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "flat must have {FLAT_SIZE} elements; got {}",
+            fl_sl.len()
+        )));
+    }
+    if pol_sl.len() != POLICY_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "policy must have {POLICY_SIZE} elements; got {}",
+            pol_sl.len()
+        )));
+    }
+
     let mb_t = transform_spatial(mb_sl, N_BOARD_CH_AUG, k, flip);
     let ob_t = transform_spatial(ob_sl, N_BOARD_CH_AUG, k, flip);
-    let fl_cp = fl_sl.to_vec();
+    let fl_cp = transform_flat(fl_sl, k);
     let pol_t = transform_policy(pol_sl, k, flip, &dir_perm);
 
     Ok((
