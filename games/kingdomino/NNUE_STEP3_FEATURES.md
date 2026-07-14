@@ -38,12 +38,21 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       transforms. Rust exposes and gates both frozen schema hashes. The shared
       Python→Rust converter now preserves discard counts (previously defaulted them to
       zero, which would corrupt Harmony/progress features after a forced discard).
-- [ ] **Fixed-weight network-output seat-swap** ← **NEXT**; lands with the sparse
-      `EmbeddingBag` network/training-pilot scaffold.
-- [ ] Two-head + aux net, train on pilot (aux heads need per-game final `ScoreBreakdown`:
-      total, territory_score, largest_territory_size, total_crowns, harmony_bonus,
-      middle_kingdom_bonus — derivable on replay).
-- [ ] Rust pre-activation accumulator + IncrementalEval + RAII.
+- [x] **Fixed-weight network-output seat-swap** — the full sparse+summary network
+      preserves actor-frame outcome/margin exactly under a seat swap and negates both
+      after conversion to the P0 frame. This is an untrained, fixed-weight structural
+      gate, so training cannot hide a frame error.
+- [x] **Packed sparse trainer + two-head/aux pilot** — `nnue/sparse_data.py` replays
+      source games into CSR active-index lists + summaries and stamps both frozen schema
+      hashes; D4 is applied by feature permutation at batch time. `nnue/sparse_net.py`
+      uses `EmbeddingBag(sum)` for the exact accumulator column sum; auxiliary targets
+      are final per-player territory/largest/crowns + Harmony/Middle, derived from the
+      terminal Rust state. On the validation split (41,340 train / 4,940 val), the 50k
+      pilot reached best Brier **0.2115** vs **0.2500** base rate and margin MAE **16.62**
+      vs **17.81** points at epoch 8; later epochs overfit. The reserved 5,720-position
+      test split remains unopened.
+- [ ] **Rust pre-activation accumulator + sparse export/loader + IncrementalEval + RAII**
+      ← **NEXT**.
 
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.
@@ -249,10 +258,11 @@ are already in the buffer):
 
 Temper the two bonus heads: Harmony/Middle occur in a small fraction of games, so they are
 class-imbalanced and low-signal — keep their loss weight modest; their value is
-representation-shaping, not accuracy. **Data dependency:** the buffer must store each
-game's final `ScoreBreakdown` per player (territory, largest-territory, total-crowns,
-`harmony_bonus>0`, `middle_bonus>0`) so these targets are computable — fold into the Rev 3
-data plan's "outcome + tiebreak components".
+representation-shaping, not accuracy. **Data dependency:** each derived training artifact
+must carry the game's final `ScoreBreakdown` targets per player (territory,
+largest-territory, total-crowns, `harmony_bonus>0`, `middle_bonus>0`). The replayable
+source is sufficient: these are now derived from the terminal Rust state while features
+are materialized, so the existing pilot does not need regeneration or a format bump.
 
 ### Ablation (pre-registered, on a reserved untouched split)
 

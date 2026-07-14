@@ -1,9 +1,7 @@
 """NNUE evaluation pipeline for the alpha-beta searcher.
 
-Generalization note (see games/kingdomino/NNUE_PROJECT_PLAN.md): the *net* and
-*trainer* here are game-agnostic — they consume a flat feature matrix + two label
-vectors (official outcome, score margin) and know nothing about Kingdomino. Only
-the data loader (`data.py`) is game-specific (it reads the Kingdomino self-play
-buffer). When a second game arrives, it supplies its own loader and reuses `net.py`
-+ the training loop unchanged.
+The dense Step-2 path remains in ``net.py``/``data.py``/``train.py``. Step 3 adds
+the generic sparse network in ``sparse_net.py`` and Kingdomino-specific replay,
+feature, and target adapters in ``sparse_data.py``. A second game can reuse the
+sparse architecture and training math while supplying its own packed-data adapter.
 """

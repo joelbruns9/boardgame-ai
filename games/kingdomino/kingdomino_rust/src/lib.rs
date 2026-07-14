@@ -2730,6 +2730,34 @@ impl RustGameState {
         (a.0 + a.1 + a.2, b.0 + b.1 + b.2)
     }
 
+    /// Final-score components for auxiliary NNUE training targets.
+    ///
+    /// Each player tuple is `(total, territory_score, largest_territory_size,
+    /// total_crowns, harmony_bonus, middle_kingdom_bonus)`.  This is valid for
+    /// any state, although the replay dataset calls it only after game-over.
+    fn score_breakdowns(
+        &self,
+    ) -> (
+        (i32, i32, i32, i32, i32, i32),
+        (i32, i32, i32, i32, i32, i32),
+    ) {
+        let one = |board: &RustBoard| {
+            let (territory, harmony_bonus, middle_bonus) =
+                board.score(self.harmony, self.middle_kingdom);
+            let (total, largest, total_crowns) =
+                board.cascade_key(self.harmony, self.middle_kingdom);
+            (
+                total,
+                territory,
+                largest,
+                total_crowns,
+                harmony_bonus,
+                middle_bonus,
+            )
+        };
+        (one(&self.boards[0]), one(&self.boards[1]))
+    }
+
     /// Flat 225-cell terrain map (idx = y*15 + x) for one player's board.
     fn board_terrain(&self, player: usize) -> Vec<u8> {
         self.boards[player].terrain.to_vec()
