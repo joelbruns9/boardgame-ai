@@ -12,8 +12,8 @@ Design contracts enforced by tests (test_sparse_encoder.py):
   * inventory: row/pending/next/bag banks agree with the 48-ID conservation ledger
 
 Reads a Python GameState (rich accessors, easy to construct/swap for the gates).
-A RustGameState path (for replay-time feature derivation in training) mirrors the
-same banks and is validated to match.
+A RustGameState path (for replay-time feature derivation in training), and the
+Rust accumulator that must match this encoder, are still to come (not yet built).
 """
 from __future__ import annotations
 
@@ -87,9 +87,19 @@ def _turn_slot(state) -> int:
     return 0  # terminal
 
 
+def _check_id(did: int, what: str) -> int:
+    if not (1 <= int(did) <= NUM_DOMINOES):
+        raise ValueError(f"{what}: domino id {did} outside 1..{NUM_DOMINOES}")
+    return int(did)
+
+
 def encode_core(state, perspective: int) -> np.ndarray:
     """Active sparse feature indices for `state` from `perspective`'s frame,
-    returned sorted and unique (int32)."""
+    returned sorted and unique (int32). Malformed public data (bad perspective,
+    domino id, or claim owner) fails here rather than silently crossing bank
+    offsets."""
+    if perspective not in (0, 1):
+        raise ValueError(f"perspective must be 0 or 1, got {perspective}")
     opp = 1 - perspective
     idx: list[int] = []
 
@@ -100,21 +110,25 @@ def encode_core(state, perspective: int) -> np.ndarray:
 
     # Current-row ID membership.
     for did in state.current_row:
-        idx.append(ROW_OFF + (did - 1))
+        idx.append(ROW_OFF + (_check_id(did, "current_row") - 1))
 
     # Pending claims: UNRESOLVED tail only ([actor_index:]); resolved ones are placed.
     for claim in state.pending_claims[state.actor_index:]:
+        if claim.player not in (0, 1):
+            raise ValueError(f"pending claim owner {claim.player} not in {{0,1}}")
         role = 0 if claim.player == perspective else 1
-        idx.append(PENDING_OFF + role * NUM_DOMINOES + (claim.domino_id - 1))
+        idx.append(PENDING_OFF + role * NUM_DOMINOES + (_check_id(claim.domino_id, "pending") - 1))
 
     # Next-round claims (owner x ID).
     for claim in state.next_claims:
+        if claim.player not in (0, 1):
+            raise ValueError(f"next claim owner {claim.player} not in {{0,1}}")
         role = 0 if claim.player == perspective else 1
-        idx.append(NEXT_OFF + role * NUM_DOMINOES + (claim.domino_id - 1))
+        idx.append(NEXT_OFF + role * NUM_DOMINOES + (_check_id(claim.domino_id, "next") - 1))
 
     # Bag (hidden deck) membership -- the SET is public, only order is hidden.
     for did in state.deck:
-        idx.append(BAG_OFF + (did - 1))
+        idx.append(BAG_OFF + (_check_id(did, "deck") - 1))
 
     # Phase one-hot (incl. terminal).
     idx.append(PHASE_OFF + int(state.phase))
@@ -238,10 +252,34 @@ def swap_players(state):
     return s
 
 
+# Bump whenever the MEANING of any bank changes even if dimensions/offsets do not
+# (e.g. pending switched from unresolved-tail to full list, coord order, slot rule).
+# Every entry in _SEMANTICS is a canonical descriptor of a rule the layout alone
+# does not capture; changing behavior without updating these + the version is a bug.
+SEMANTIC_VERSION = 1
+_SEMANTICS = {
+    "version": SEMANTIC_VERSION,
+    "role_order": ["role0=my=perspective", "role1=opp=other"],
+    "board_coords": "castle_relative_row_major; cell=(y-castle+6)*13+(x-castle+6); x,y are Board grid coords; castle cell excluded",
+    "half_type_order": "ascending sorted (terrain, crowns) over the 16 occurring half-types",
+    "row_bank": "current_row domino-id membership",
+    "pending_bank": "UNRESOLVED tail pending_claims[actor_index:] only, (owner_role x id)",
+    "next_bank": "all next_claims, (owner_role x id)",
+    "bag_bank": "deck (hidden) domino-id membership; set is public, order hidden",
+    "phase_order": ["INITIAL=0", "PLACE=1", "FINAL=2", "TERMINAL=3"],
+    "actor_bank": "one-hot [my_to_move=0, opp_to_move=1]; OMITTED at terminal",
+    "turn_slot": "INITIAL: initial_pick_count; PLACE/FINAL: actor_index; clamped 0..3",
+    "discard_bank": "per role, flag = discards[player] > 0 (count thresholded to a bit)",
+    "rules_order": ["harmony_enabled=0", "middle_kingdom_enabled=1"],
+}
+
+
 def core_schema_hash() -> str:
-    """Stable hash of the frozen CORE feature layout. Included in the buffer/schema
-    contract so a layout change invalidates trained artifacts loudly."""
+    """Stable hash of the frozen CORE feature layout AND its semantics. Included in
+    the buffer/schema contract so a layout OR meaning change invalidates trained
+    artifacts loudly (dimensions alone are not enough -- see _SEMANTICS)."""
     spec = {
+        "semantics": _SEMANTICS,
         "half_types": HALF_TYPES, "num_half": NUM_HALF, "cell_side": CELL_SIDE,
         "num_cells": NUM_CELLS, "castle": CASTLE, "num_dominoes": NUM_DOMINOES,
         "offsets": {"board": BOARD_OFF, "row": ROW_OFF, "pending": PENDING_OFF,
