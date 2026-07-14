@@ -36,7 +36,10 @@ CASTLE = 7                           # board grid coord of the castle on each ax
 _MIN, _MAX = CASTLE - 6, CASTLE + 6  # reachable board indices 1..13
 BBOX_MAX = 7                         # 7x7 kingdom
 
-# Catalog-derived fixed normalization maxima (true upper bounds -> no clipping).
+# Catalog-derived fixed normalization maxima. These are TRUE combinatorial upper
+# bounds (a player cannot hold more terrain-t crowns/halves than the catalog has),
+# so the features that use them provably never clip (verified in test_summary_encoder
+# by auditing RAW pre-normalization values, not post-clip outputs).
 MAX_CROWNS_PER_TERRAIN = [0] * NT
 MAX_HALVES_PER_TERRAIN = [0] * NT
 for _d in DOMINOES.values():
@@ -44,10 +47,18 @@ for _d in DOMINOES.values():
         _ti = int(_h.terrain) - TOFF
         MAX_CROWNS_PER_TERRAIN[_ti] += int(_h.crowns)
         MAX_HALVES_PER_TERRAIN[_ti] += 1
-# Rules-derived caps (generous true maxima; clip frequency asserted 0 in tests).
-CAP_REGION_COUNT = 24.0
-CAP_FRONTIER = 24.0
+TOTAL_CATALOG_CROWNS = float(sum(MAX_CROWNS_PER_TERRAIN))   # 39: true bound for stranded crowns
 MAX_TURN_DISTANCE = 3.0
+
+# Region counts and frontier cells are bounded by the placeable-cell count (<=48):
+# a region needs >=1 cell, and a frontier is a subset of empty in-bbox cells. Using
+# MAX_BOARD_CELLS here is a genuine bound (not an empirical one), so no clipping.
+# NOTE ON CLIPPING (accepted, measured): the reused base block AND the unresolved-
+# claim legal_count normalize by the TRAINING scales SCORE_SCALE=160 and
+# MAX_LEGAL_PLACEMENTS=64. Those are NOT rules maxima (score can exceed 160, a
+# near-empty board can exceed 64 placements), so those two features DO saturate.
+# This is deliberate (match the score head's scale / a "many options" signal); the
+# clip frequency is measured and asserted small in test_summary_encoder.
 
 BASE_SIZE = 50
 EXT_PER = 39
@@ -163,9 +174,9 @@ def _extension_vec(board) -> np.ndarray:
     out += [r["crown_count"][t] / MAX_CROWNS_PER_TERRAIN[t] for t in range(NT)]  # 6
     out += [r["largest_crowns"][t] / MAX_CROWNS_PER_TERRAIN[t] for t in range(NT)]  # 6
     out.append(r["global_largest"] / MAX_BOARD_CELLS)                          # 1
-    out.append(r["crownless_region_count"] / CAP_REGION_COUNT)                 # 1
-    out.append(r["stranded_crowns"] / MAX_TOTAL_CROWNS)                        # 1
-    out += [f / CAP_FRONTIER for f in r["open_frontier"]]                      # 6
+    out.append(r["crownless_region_count"] / MAX_BOARD_CELLS)                  # 1 (<=48 regions)
+    out.append(r["stranded_crowns"] / TOTAL_CATALOG_CROWNS)                    # 1 (<=39)
+    out += [f / MAX_BOARD_CELLS for f in r["open_frontier"]]                   # 6 (<=48 empty cells)
     out.append(r["holes"] / MAX_BOARD_CELLS)                                   # 1
     out.append(r["gaps"] / MAX_BOARD_CELLS)                                    # 1
     out += [e / 6.0 for e in r["castle_extent"]]                              # 4
@@ -256,15 +267,37 @@ def encode_summary(state, perspective: int) -> np.ndarray:
     return v
 
 
+# Bump when the MEANING of any summary feature changes even if dims/constants do
+# not. Descriptors pin the semantics the layout+constants alone do not capture.
+SUMMARY_SEMANTIC_VERSION = 1
+_SUMMARY_SEMANTICS = {
+    "version": SUMMARY_SEMANTIC_VERSION,
+    "block_order": "base[my,opp](25 each) | ext[my,opp](39 each) | bag(12) | claims(24) | pick_pos(4) | progress_fill(3)",
+    "base": "encoder._encode_board_summary(state, player) verbatim, [my=perspective, opp]",
+    "ext_order": "cell_count[6] crown_count[6] largest_region_crowns[6] global_largest crownless_region_count stranded_crowns open_frontier[6] enclosed_single_holes gaps castle_extent[L,R,U,D] largest_crownless[6]",
+    "largest_region_crowns": "crowns of the MAX-AREA region per terrain; tie -> MAX crowns among maximal-area regions",
+    "open_frontier": "unique empty cells that are in-bounds(1..13) + bbox-admissible(<=7x7) + orthogonally adjacent to >=1 placed cell of the terrain; may count once per terrain",
+    "enclosed_single_holes": "empty cells inside bbox with all 4 orthogonal neighbors non-empty (single-cell holes only)",
+    "gaps": "bbox_area - occupied_cells(incl castle)",
+    "castle_extent": "[castle_x-min_x, max_x-castle_x, castle_y-min_y, max_y-castle_y] (L,R,U,D)",
+    "fill_ratio": "placed_non_castle_halves / bbox_area (castle EXCLUDED from numerator, included in bbox area)",
+    "game_progress": "((sum placed non-castle halves both players)/2 + sum discards) / 48",
+    "claims": "unresolved pending_claims[actor_index:] up to 4, fixed action order; per claim [presence, legal_count/64, forced_discard, owner(+1 my/-1 opp), draft_rank=(id-1)/47, turn_distance=min(k,3)/3]",
+    "pick_pos": "next_claims sorted by domino_id, first 4; owner +1 my / -1 opp / 0 absent",
+    "norm_terrain_crowns": "per-terrain catalog crown maxima (NOT MAX_TOTAL_CROWNS)",
+    "clipping": "base score /SCORE_SCALE=160 and legal_count /MAX_LEGAL_PLACEMENTS=64 saturate by design; all other features use true combinatorial bounds",
+}
+
+
 def summary_schema_hash() -> str:
     spec = {
+        "semantics": _SUMMARY_SEMANTICS,
         "size": SUMMARY_SIZE, "base": BASE_SIZE, "ext_per": EXT_PER, "global": GLOBAL_SIZE,
         "score_scale": SCORE_SCALE, "max_board_cells": MAX_BOARD_CELLS,
         "max_total_crowns": MAX_TOTAL_CROWNS, "max_legal": MAX_LEGAL_PLACEMENTS,
         "max_crowns_per_terrain": MAX_CROWNS_PER_TERRAIN,
         "max_halves_per_terrain": MAX_HALVES_PER_TERRAIN,
-        "cap_region_count": CAP_REGION_COUNT, "cap_frontier": CAP_FRONTIER,
+        "total_catalog_crowns": TOTAL_CATALOG_CROWNS,
         "max_turn_distance": MAX_TURN_DISTANCE, "bbox_max": BBOX_MAX,
-        "order": "base[my,opp] ext[my,opp] bag claims pick_pos progress_fill",
     }
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]

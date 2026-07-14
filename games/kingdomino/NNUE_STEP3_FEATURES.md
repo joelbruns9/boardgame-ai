@@ -147,12 +147,12 @@ absolute P0/P1.
 | Feature | Dim | Definition | Norm |
 |---|---|---|---|
 | terrain_cell_count | 6 | placed cells of each placeable terrain | /48 |
-| terrain_crown_count | 6 | Σ crowns on each terrain | /MAX_TOTAL_CROWNS |
-| largest_region_crowns | 6 | crowns in the largest-area region of each terrain; **tie rule (approved):** among that terrain's *maximal-area* regions, take the maximum crown count | /MAX_TOTAL_CROWNS |
+| terrain_crown_count | 6 | Σ crowns on each terrain | **/ per-terrain catalog crown max** (`MAX_CROWNS_PER_TERRAIN[t]`, NOT MAX_TOTAL_CROWNS — each terrain saturates on its own ceiling) |
+| largest_region_crowns | 6 | crowns in the largest-area region of each terrain; **tie rule (approved):** among that terrain's *maximal-area* regions, take the maximum crown count | **/ `MAX_CROWNS_PER_TERRAIN[t]`** |
 | global_largest_territory | 1 | `ScoreBreakdown.largest_territory_size` (terrain-agnostic official tiebreaker) | /48 |
-| crownless_region_count | 1 | # connected same-terrain regions with 0 crowns | /24 |
-| stranded_crowns | 1 | Σ crowns in area-1 regions (isolated crowned tiles) | /MAX_TOTAL_CROWNS |
-| open_frontier | 6 | **(approved)** per terrain, # of **unique empty cells** that are empty + in-bounds + **bbox-admissible** (keeps bbox ≤7×7) AND orthogonally adjacent to ≥1 placed cell of that terrain. "Legal expansion" means bbox-admissible, **not** that a whole domino can be placed there. A cell may count for two terrains (e.g. Wheat *and* Forest) if adjacent to both — counted once per terrain | /24 |
+| crownless_region_count | 1 | # connected same-terrain regions with 0 crowns | **/48** (`MAX_BOARD_CELLS`; ≤ one region per cell — a genuine bound, not the old empirical /24) |
+| stranded_crowns | 1 | Σ crowns in area-1 regions (isolated crowned tiles) | **/39** (`TOTAL_CATALOG_CROWNS` = Σ all catalog crowns — true bound) |
+| open_frontier | 6 | **(approved)** per terrain, # of **unique empty cells** that are empty + in-bounds + **bbox-admissible** (keeps bbox ≤7×7) AND orthogonally adjacent to ≥1 placed cell of that terrain. "Legal expansion" means bbox-admissible, **not** that a whole domino can be placed there. A cell may count for two terrains (e.g. Wheat *and* Forest) if adjacent to both — counted once per terrain | **/48** (`MAX_BOARD_CELLS`; frontier ⊆ empty in-bbox cells — a genuine bound, not the old empirical /24) |
 | enclosed_single_holes | 1 | **(approved, renamed to avoid overclaiming)** # of empty cells inside bbox with **all 4** orthogonal neighbors occupied — detects fully-enclosed **single-cell** holes only, *not* every possible unfillable cavity | /48 |
 | gaps | 1 | bbox_area − occupied (empty cells inside the bounding rectangle) | /48 |
 | castle_extent L/R/U/D | 4 | `castle_x−min_x`, `max_x−castle_x`, `castle_y−min_y`, `max_y−castle_y` — how far the kingdom reaches past the castle each way (all four = 3 ⇒ Middle-Kingdom geometry). **Replaces** the redundant `bbox_room` (which collapsed to `7−width`/`7−height`). **D4:** permutes/swaps like directions | /6 |
@@ -163,13 +163,24 @@ absolute P0/P1.
 
 | Feature | Dim | Definition | Norm |
 |---|---|---|---|
-| bag_terrain_halfcount | 6 | # remaining half-tiles of each terrain in the bag | /max |
-| bag_terrain_crowns | 6 | Σ crowns of each terrain remaining in the bag | /max |
-| unresolved claims, **self-identifying** (fixed action order, ≤4) | 24 | per claim (6 each): presence, `legal_placement_count`(/max), `forced_discard` flag, `owner_role` (+1 my / −1 opp / 0 absent), `draft_priority_rank` (domino id /47 — a **tempo** signal, *not* content: id→tile is non-monotonic), `turn_distance` (actions until it resolves, /3). Makes each slot a self-contained unit so the tail needn't re-bind a summed accumulator to the right legal-count. **D4-invariant** | — |
+| bag_terrain_halfcount | 6 | # remaining half-tiles of each terrain in the bag | **/ `MAX_HALVES_PER_TERRAIN[t]`** (per-terrain catalog half-count) |
+| bag_terrain_crowns | 6 | Σ crowns of each terrain remaining in the bag | **/ `MAX_CROWNS_PER_TERRAIN[t]`** (per-terrain catalog crown max) |
+| unresolved claims, **self-identifying** (fixed action order, ≤4) | 24 | per claim (6 each): presence, `legal_placement_count`(/64 = `MAX_LEGAL_PLACEMENTS`, a saturating scale — see clip note), `forced_discard` flag, `owner_role` (+1 my / −1 opp / 0 absent), `draft_priority_rank` = **`(domino_id − 1) / 47`** (zero-based tempo signal, *not* content: id→tile is non-monotonic), `turn_distance` = **`min(k, 3) / 3`** where k = slot offset from the actor (actions until it resolves). Makes each slot a self-contained unit so the tail needn't re-bind a summed accumulator to the right legal-count. **D4-invariant** | — |
 | next-round draft order `pick_pos[4]` | 4 | sort `next_claims` by domino id; element k = owner of next-round pick k (+1 my / −1 opp / 0 unassigned). Exposes tempo / consecutive turns / first-vs-last choice — a *sort* an EmbeddingBag sum cannot reconstruct. **D4-invariant** | — |
-| game_progress, fill_ratio my/opp | 3 | **(approved)** `game_progress = ((occupied_non_castle_cells / 2) + total_discards) / 48` (reaches 1.0 at terminal even with discards; the old `placed_cells/96` did not and duplicated fill_ratio) | — |
+| game_progress, fill_ratio my/opp | 3 | **(approved)** `game_progress = ((occupied_non_castle_cells / 2) + total_discards) / 48` (reaches 1.0 at terminal even with discards; the old `placed_cells/96` did not and duplicated fill_ratio). **`fill_ratio` (per role) = placed_non-castle_halves / bbox_area** — castle **excluded** from the numerator but **included** in bbox_area (occupied density of the reachable rectangle) | — |
 
 **v3.0 summary total = 50 (base) + 78 (2×39 ext) + 43 (global) = 171.**
+
+> **Clip audit (recorded 2026-07-13, `test_summary_encoder.py`).** Every extension +
+> global feature is now normalized by a **true combinatorial/catalog bound** (`/48`,
+> `MAX_CROWNS_PER_TERRAIN`, `TOTAL_CATALOG_CROWNS=39`, per-terrain half/crown maxima),
+> so their raw values *cannot* exceed the denominator — **provably 0 clips** (asserted
+> over 30 random games + a dense fill-out board). The only two saturating features are
+> **inherited from the base block / claims**: `score.total /160` and
+> `legal_placement_count /64` — these are training *scales*, not rules maxima. Measured
+> over random self-play: score max **94/160**, legal max **38/64**, **0 clips observed**.
+> Saturation is therefore accepted by design; a stronger-play corpus must be re-audited
+> (the test prints the live max + clip counts so this stays visible).
 
 Tail: `[a (width) | s (171)] → 32 → 32 → {outcome_logit, margin, + auxiliary heads}`
 (auxiliary heads below; still small vs the 256-wide accumulator).
