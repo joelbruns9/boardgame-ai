@@ -5768,16 +5768,17 @@ impl SearchSlot {
 
         if self.real_state.phase == GAME_OVER {
             let (s0, s1) = self.real_state.scores();
-            // Fill the per-move targets now that final scores are known.  No
-            // tiebreaker cascade in Rust (RustGameState lacks determine_winner);
-            // score-only win, matching play_selfplay_game_rust's documented
-            // limitation.  Draw → 0.5 for both (1.0 - 0.5 = 0.5).
-            let win0: f32 = if s0 > s1 {
-                1.0
-            } else if s1 > s0 {
-                0.0
-            } else {
-                0.5
+            // Fill the per-move targets now that the game is over.  win_target
+            // uses the OFFICIAL outcome cascade (total score → largest single
+            // territory → total crowns); score-ties resolved by the cascade are
+            // decisive, and only a genuine tie through all levels stays 0.5.
+            // (own_score/opp_score below remain the raw scores for the margin
+            // head.)  actor attribution uses the recorded rec.actor, not ply
+            // parity — Kingdomino does not alternate seats reliably.
+            let win0: f32 = match self.real_state.official_outcome_i8() {
+                1 => 1.0,
+                -1 => 0.0,
+                _ => 0.5,
             };
             for rec in &mut self.records {
                 let (own_s, opp_s, win_t) = if rec.actor == 0 {
@@ -6353,15 +6354,14 @@ fn play_out_exact_endgame(
             .ok_or_else(|| PyValueError::new_err("exact endgame: selected index not legal"))?;
         state = state.step(placement, pick)?;
     }
-    // Plan plays to GAME_OVER; fill per-move targets from the final scores
-    // (score-only win, draw -> 0.5, matching finalize_move).
+    // Plan plays to GAME_OVER; fill per-move targets. win_target uses the
+    // OFFICIAL outcome cascade (matching finalize_move); own_score/opp_score
+    // stay raw for the margin head; actor attribution uses recorded rec.actor.
     let (s0, s1) = state.scores();
-    let win0: f32 = if s0 > s1 {
-        1.0
-    } else if s1 > s0 {
-        0.0
-    } else {
-        0.5
+    let win0: f32 = match state.official_outcome_i8() {
+        1 => 1.0,
+        -1 => 0.0,
+        _ => 0.5,
     };
     for rec in &mut records {
         let (own_s, opp_s, win_t) = if rec.actor == 0 {

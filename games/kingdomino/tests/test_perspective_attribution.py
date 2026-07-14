@@ -77,8 +77,14 @@ def test_perspective_attribution_end_to_end():
             else:
                 pytest.fail(f"(own,opp)=({own},{opp}) matches neither ({s0},{s1})")
 
-            # C. win_target matches the score-only rule in this frame
-            assert abs(wt - _score_rule_win(own, opp)) < 1e-6
+            # C. win_target is consistent with the official outcome in this frame.
+            # When the two final scores differ, the official cascade agrees with the
+            # raw-score rule; on a score TIE the cascade (largest territory -> total
+            # crowns) decides, so win_target may be a decisive 0.0/1.0, not 0.5.
+            if own != opp:
+                assert abs(wt - _score_rule_win(own, opp)) < 1e-6
+            else:
+                assert wt in (0.0, 0.5, 1.0)
             # D. z shares the frame: z == tanh((own-opp)/30)
             assert abs(z - math.tanh((own - opp) / 30.0)) < 1e-4
 

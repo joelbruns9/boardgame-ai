@@ -725,8 +725,9 @@ def test_win_target_perspective():
     correct per-actor perspective flip.
 
     For a finished game with scores (s0, s1): every example has own+opp == s0+s1,
-    win is consistent with own vs opp (>:1.0, <:0.0, ==:0.5), and on a decisive
-    game BOTH perspectives appear with complementary win targets.
+    win is consistent with own vs opp (>:1.0, <:0.0; on a score TIE the official
+    tiebreak cascade decides, so 0.0/0.5/1.0), and on a score-decisive game BOTH
+    perspectives appear with complementary win targets.
     """
     import kingdomino_rust as kr
 
@@ -757,7 +758,9 @@ def test_win_target_perspective():
             elif own < opp:
                 assert win == 0.0, f"own<opp but win={win}"
             else:
-                assert win == 0.5, f"own==opp but win={win}"
+                # score tie: the official cascade (largest territory -> total
+                # crowns) decides, so win may be a decisive 0.0/1.0, not 0.5.
+                assert win in (0.0, 0.5, 1.0), f"own==opp but win={win}"
             owns.add(own)
         if s0 != s1:
             # Decisive game: both perspectives must be present with complementary
