@@ -206,6 +206,9 @@ def test_operational_search_matches_fixed_depth_on_real_chance_tree():
     assert report.value is not None
     assert report.nodes == operational.nodes
     assert report.elapsed_secs > 0
+    assert not report.selective
+    assert report.selective_pruned == 0
+    assert report.ordering_evals == 0
 
 
 def test_operational_node_budget_returns_legal_fallback_and_telemetry():
@@ -232,9 +235,36 @@ def test_operational_argument_validation():
         {"max_depth": 0},
         {"aspiration_window": 0.0},
         {"max_nodes": 0},
+        {"selective_width": 0},
+        {"selective_root_width": 1},
+        {"selective_width": 2, "selective_root_width": 0},
+        {"selective_min_depth": 0},
     ):
         with pytest.raises(ValueError):
             search.choose_action_timed(rs, **kwargs)
+
+
+def test_selective_search_is_explicit_and_returns_legal_action():
+    st = _wide_boundary_state(min_deck=12)
+    rs = _rust_state_from_python(st)
+    search = kr.RustSearch(
+        depth=8, enum_cap=1, chance_samples=8, eval="pick_aware", seed=17
+    )
+    report = search.choose_action_timed(
+        rs,
+        max_secs=30.0,
+        max_depth=8,
+        max_nodes=200_000,
+        selective_width=2,
+        selective_min_depth=2,
+    )
+    assert report.selective
+    assert report.selective_width == 2
+    assert report.selective_root_width is None
+    assert report.selective_min_depth == 2
+    assert report.selective_pruned > 0
+    assert report.ordering_evals > 0
+    assert report.action in rs.legal_actions()
 
 
 def test_operational_bot_adapter_returns_python_action():

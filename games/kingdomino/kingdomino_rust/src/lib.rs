@@ -1904,6 +1904,39 @@ impl search::Game for Kingdomino {
         out.extend(s.legal_actions());
     }
 
+    fn action_order_score(s: &RustGameState, a: Self::Action) -> f64 {
+        let Ok(actor) = s.actor() else {
+            return 0.0;
+        };
+        let mut score = 0i32;
+        if let Some((x1, y1, x2, y2, flipped)) = a.0 {
+            if let Some(&(_, domino_id)) = s.pending_claims.get(s.actor_index) {
+                let (ta, ca, tb, cb) = dom(domino_id);
+                let (t1, c1, t2, c2) = if flipped {
+                    (tb, cb, ta, ca)
+                } else {
+                    (ta, ca, tb, cb)
+                };
+                score += 8 * placement_score_delta(
+                    &s.boards[actor as usize], t1, c1, x1, y1, t2, c2, x2, y2,
+                );
+            }
+        }
+        if let Some(domino_id) = a.1 {
+            let mine = terrain_counts(&s.boards[actor as usize]);
+            let theirs = terrain_counts(&s.boards[1 - actor as usize]);
+            let (_, ca, _, cb) = dom(domino_id);
+            score += 6 * (ca + cb) as i32;
+            score += 2 * pick_order_score(domino_id, &mine);
+            score += opponent_denial_score(domino_id, &theirs);
+        }
+        if actor == 0 {
+            score as f64
+        } else {
+            -(score as f64)
+        }
+    }
+
     /// Mirrors `rust_expectiminimax.RustExpectiminimax._deals`: the last mover of a
     /// round triggers the next deal (a chance node). In Kingdomino the deal is
     /// independent of which placement/pick the mover chose, so `_a` is ignored.
@@ -2337,6 +2370,18 @@ struct OperationalSearchReport {
     tt_cutoffs: u64,
     #[pyo3(get)]
     last_iteration_nodes: u64,
+    #[pyo3(get)]
+    ordering_evals: u64,
+    #[pyo3(get)]
+    selective_pruned: u64,
+    #[pyo3(get)]
+    selective: bool,
+    #[pyo3(get)]
+    selective_width: Option<usize>,
+    #[pyo3(get)]
+    selective_root_width: Option<usize>,
+    #[pyo3(get)]
+    selective_min_depth: u32,
 }
 
 #[pymethods]
@@ -2573,7 +2618,7 @@ impl RustSearch {
     /// Root/PV-first ordering, root-sibling alpha/beta reuse, aspiration windows,
     /// bounded Star1 chance pruning, and deterministic exact-tail extensions are
     /// all enabled. On timeout the last fully completed depth is returned.
-    #[pyo3(signature = (state, max_secs=1.0, max_depth=None, aspiration_window=0.25, max_nodes=None))]
+    #[pyo3(signature = (state, max_secs=1.0, max_depth=None, aspiration_window=0.25, max_nodes=None, selective_width=None, selective_root_width=None, selective_min_depth=4))]
     fn choose_action_timed(
         &mut self,
         state: &RustGameState,
@@ -2581,6 +2626,9 @@ impl RustSearch {
         max_depth: Option<u32>,
         aspiration_window: f64,
         max_nodes: Option<u64>,
+        selective_width: Option<usize>,
+        selective_root_width: Option<usize>,
+        selective_min_depth: u32,
     ) -> PyResult<OperationalSearchReport> {
         if !max_secs.is_finite() || max_secs <= 0.0 {
             return Err(PyValueError::new_err("max_secs must be finite and > 0"));
@@ -2597,6 +2645,24 @@ impl RustSearch {
         if max_nodes == Some(0) {
             return Err(PyValueError::new_err("max_nodes must be >= 1"));
         }
+        if selective_width == Some(0) {
+            return Err(PyValueError::new_err("selective_width must be >= 1"));
+        }
+        if selective_root_width == Some(0) {
+            return Err(PyValueError::new_err(
+                "selective_root_width must be >= 1",
+            ));
+        }
+        if selective_root_width.is_some() && selective_width.is_none() {
+            return Err(PyValueError::new_err(
+                "selective_root_width requires selective_width",
+            ));
+        }
+        if selective_min_depth < 1 {
+            return Err(PyValueError::new_err(
+                "selective_min_depth must be >= 1",
+            ));
+        }
 
         let start = std::time::Instant::now();
         let limits = search::OperationalLimits {
@@ -2605,6 +2671,9 @@ impl RustSearch {
             aspiration_window,
             node_limit: max_nodes,
             value_bound: 1.0 + self.cfg.margin_weight.abs(),
+            selective_width,
+            selective_root_width,
+            selective_min_depth,
         };
         let result = match self.eval {
             EmmEval::PickBlind => {
@@ -2694,6 +2763,12 @@ impl RustSearch {
             tt_hits: result.tt_hits,
             tt_cutoffs: result.tt_cutoffs,
             last_iteration_nodes: result.last_iteration_nodes,
+            ordering_evals: result.ordering_evals,
+            selective_pruned: result.selective_pruned,
+            selective: result.selective,
+            selective_width,
+            selective_root_width,
+            selective_min_depth,
         })
     }
 }
@@ -7142,6 +7217,9 @@ mod make_unmake_tests {
                 aspiration_window: 0.25,
                 node_limit: None,
                 value_bound: 1.0,
+                selective_width: None,
+                selective_root_width: None,
+                selective_min_depth: 4,
             },
         )?
         .expect("operational search action");

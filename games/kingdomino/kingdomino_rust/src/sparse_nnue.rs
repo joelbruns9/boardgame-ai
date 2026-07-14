@@ -782,6 +782,9 @@ impl Game for SparseKingdomino {
     fn legal_actions(s: &Self::State, out: &mut Vec<Self::Action>) {
         <Kingdomino as Game>::legal_actions(&s.game, out)
     }
+    fn action_order_score(s: &Self::State, a: Self::Action) -> f64 {
+        <Kingdomino as Game>::action_order_score(&s.game, a)
+    }
     fn is_stochastic(s: &Self::State, a: Self::Action) -> bool {
         <Kingdomino as Game>::is_stochastic(&s.game, a)
     }
@@ -980,6 +983,9 @@ impl Game for QuantizedSparseKingdomino {
     }
     fn legal_actions(s: &Self::State, out: &mut Vec<Self::Action>) {
         <Kingdomino as Game>::legal_actions(&s.game, out)
+    }
+    fn action_order_score(s: &Self::State, a: Self::Action) -> f64 {
+        <Kingdomino as Game>::action_order_score(&s.game, a)
     }
     fn is_stochastic(s: &Self::State, a: Self::Action) -> bool {
         <Kingdomino as Game>::is_stochastic(&s.game, a)

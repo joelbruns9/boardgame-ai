@@ -83,6 +83,9 @@ def run_generation(args) -> dict:
         "selfplay_move_secs": args.selfplay_move_secs,
         "max_depth": args.max_depth,
         "chance_samples": args.chance_samples,
+        "selective_width": args.selective_width,
+        "selective_root_width": args.selective_root_width,
+        "selective_min_depth": args.selective_min_depth,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
@@ -141,6 +144,11 @@ def run_generation(args) -> dict:
             "--move-secs", str(args.selfplay_move_secs),
             "--max-depth", str(args.max_depth),
         ]
+        if args.selective_width is not None:
+            command += ["--selective-width", str(args.selective_width),
+                        "--selective-min-depth", str(args.selective_min_depth)]
+            if args.selective_root_width is not None:
+                command += ["--selective-root-width", str(args.selective_root_width)]
         _run(command, generation / "01_datagen.log")
     data_manifest = json.loads((data_dir / "manifest.json").read_text())
     if data_manifest.get("verify_failures"):
@@ -189,7 +197,7 @@ def run_generation(args) -> dict:
 
     match_path = generation / "promotion_match.json"
     if not match_path.exists():
-        _run([
+        command = [
             sys.executable, "-m", "games.kingdomino.nnue.match", "nnue",
             "--candidate", str(candidate_base.with_suffix(".knnue")),
             "--incumbent", str(incumbent_knnue),
@@ -199,7 +207,13 @@ def run_generation(args) -> dict:
             "--paired-seeds", str(args.paired_seeds),
             "--seed-start", str(args.gate_seed_start),
             "--out", str(match_path),
-        ], generation / "04_match.log")
+        ]
+        if args.selective_width is not None:
+            command += ["--selective-width", str(args.selective_width),
+                        "--selective-min-depth", str(args.selective_min_depth)]
+            if args.selective_root_width is not None:
+                command += ["--selective-root-width", str(args.selective_root_width)]
+        _run(command, generation / "04_match.log")
     match = json.loads(match_path.read_text())
     pair = match["pair"]
     passed = (
@@ -244,6 +258,9 @@ def main():
     ap.add_argument("--selfplay-move-secs", type=float, default=0.1)
     ap.add_argument("--max-depth", type=int, default=12)
     ap.add_argument("--chance-samples", type=int, default=16)
+    ap.add_argument("--selective-width", type=int, default=None)
+    ap.add_argument("--selective-root-width", type=int, default=None)
+    ap.add_argument("--selective-min-depth", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=2e-4)

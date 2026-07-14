@@ -215,12 +215,22 @@ class OperationalRustSearchBot:
         margin_weight: float = 0.0,
         seed: int = 0,
         aspiration_window: float = 0.25,
+        selective_width: int | None = None,
+        selective_root_width: int | None = None,
+        selective_min_depth: int = 4,
     ):
-        if max_secs <= 0 or max_depth < 1 or aspiration_window <= 0:
-            raise ValueError("max_secs, max_depth, and aspiration_window must be positive")
+        if (max_secs <= 0 or max_depth < 1 or aspiration_window <= 0
+                or (selective_width is not None and selective_width < 1)
+                or (selective_root_width is not None and selective_root_width < 1)
+                or (selective_root_width is not None and selective_width is None)
+                or selective_min_depth < 1):
+            raise ValueError("search limits and optional selective width must be positive")
         self.max_secs = float(max_secs)
         self.max_depth = int(max_depth)
         self.aspiration_window = float(aspiration_window)
+        self.selective_width = selective_width
+        self.selective_root_width = selective_root_width
+        self.selective_min_depth = int(selective_min_depth)
         self.search = kr.RustSearch(
             depth=self.max_depth,
             chance_samples=chance_samples,
@@ -260,6 +270,9 @@ class OperationalRustSearchBot:
             max_secs=self.max_secs,
             max_depth=self.max_depth,
             aspiration_window=self.aspiration_window,
+            selective_width=self.selective_width,
+            selective_root_width=self.selective_root_width,
+            selective_min_depth=self.selective_min_depth,
         )
         self.last_report = report
         self.nodes = int(report.nodes)

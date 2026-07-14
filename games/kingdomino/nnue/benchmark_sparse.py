@@ -48,6 +48,11 @@ def main():
         help="if >0, also run deadline-safe sparse_nnue_q searches at this per-move budget",
     )
     ap.add_argument("--max-depth", type=int, default=8)
+    ap.add_argument("--selective-widths", default="",
+                    help="comma-separated upper-tree beam widths for timed sweeps")
+    ap.add_argument("--selective-min-depth", type=int, default=4)
+    ap.add_argument("--selective-root-width", type=int, default=None,
+                    help="optional explicit root cap; default keeps every root action")
     ap.add_argument(
         "--evals",
         default="sparse_nnue_ref,sparse_nnue,sparse_nnue_q",
@@ -95,41 +100,59 @@ def main():
             )
 
     if args.timed_secs > 0:
-        reports = []
-        wall_start = time.perf_counter()
-        for state in states:
-            search = kr.RustSearch(
-                depth=args.max_depth,
-                enum_cap=1,
-                chance_samples=args.chance_samples,
-                seed=23,
-                eval="sparse_nnue_q",
-                nnue_path=args.model,
-            )
-            reports.append(
-                search.choose_action_timed(
-                    state,
-                    max_secs=args.timed_secs,
-                    max_depth=args.max_depth,
-                    aspiration_window=0.25,
+        widths = [None] + [
+            int(x) for x in args.selective_widths.split(",") if x.strip()
+        ]
+        full_actions = None
+        for width in widths:
+            reports = []
+            wall_start = time.perf_counter()
+            for state in states:
+                search = kr.RustSearch(
+                    depth=args.max_depth,
+                    enum_cap=1,
+                    chance_samples=args.chance_samples,
+                    seed=23,
+                    eval="sparse_nnue_q",
+                    nnue_path=args.model,
                 )
+                reports.append(
+                    search.choose_action_timed(
+                        state,
+                        max_secs=args.timed_secs,
+                        max_depth=args.max_depth,
+                        aspiration_window=0.25,
+                        selective_width=width,
+                        selective_root_width=(args.selective_root_width
+                                              if width is not None else None),
+                        selective_min_depth=args.selective_min_depth,
+                    )
+                )
+            wall = time.perf_counter() - wall_start
+            depths = Counter(r.completed_depth for r in reports)
+            total_nodes = sum(r.nodes for r in reports)
+            final_nodes = sum(r.last_iteration_nodes for r in reports)
+            label = "full" if width is None else f"selective-{width}"
+            actions = [r.action for r in reports]
+            if width is None:
+                full_actions = actions
+            print(
+                f"timed {label}: {len(reports)} positions x {args.timed_secs:.3f}s, "
+                f"wall {wall:.3f}s, completed depths {dict(sorted(depths.items()))}"
             )
-        wall = time.perf_counter() - wall_start
-        depths = Counter(r.completed_depth for r in reports)
-        total_nodes = sum(r.nodes for r in reports)
-        final_nodes = sum(r.last_iteration_nodes for r in reports)
-        print(
-            f"timed sparse_nnue_q: {len(reports)} positions x {args.timed_secs:.3f}s, "
-            f"wall {wall:.3f}s, completed depths {dict(sorted(depths.items()))}"
-        )
-        print(
-            f"  timeouts {sum(r.timed_out for r in reports)}/{len(reports)}, "
-            f"nodes {total_nodes:,} ({total_nodes / wall:,.0f} n/s), "
-            f"last-complete iteration nodes {final_nodes:,}, "
-            f"Star cutoffs {sum(r.star_cutoffs for r in reports):,}, "
-            f"TT cutoffs {sum(r.tt_cutoffs for r in reports):,}, "
-            f"exact extensions {sum(r.exact_extensions for r in reports):,}"
-        )
+            print(
+                f"  timeouts {sum(r.timed_out for r in reports)}/{len(reports)}, "
+                f"nodes {total_nodes:,} ({total_nodes / wall:,.0f} n/s), "
+                f"last-complete iteration nodes {final_nodes:,}, "
+                f"ordering evals {sum(r.ordering_evals for r in reports):,}, "
+                f"selective pruned {sum(r.selective_pruned for r in reports):,}, "
+                f"Star cutoffs {sum(r.star_cutoffs for r in reports):,}, "
+                f"TT cutoffs {sum(r.tt_cutoffs for r in reports):,}, "
+                f"exact extensions {sum(r.exact_extensions for r in reports):,}"
+            )
+            if full_actions is not None and width is not None:
+                agreement = sum(a == b for a, b in zip(actions, full_actions))
+                print(f"  root action agreement with full-width: {agreement}/{len(actions)}")
 
 
 if __name__ == "__main__":

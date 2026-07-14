@@ -69,10 +69,22 @@ candidate gating, restart guards, and atomic run-local promotion. It never opens
 reserved test split. A 256-game pilot improved held-out Brier **0.2115 -> 0.2091** and
 margin MAE **16.62 -> 16.31**, but lost **5-11** to its incumbent at equal 0.1s clocks;
 the gate correctly rejected it. The result is important: static validation loss is not
-a promotion proxy, and scaling shallow self-imitation is not the next move. Next:
-selective/deeper search plus stronger teacher targets, then rerun the loop. The original
-phase descriptions below remain planning history; these measurements supersede their
-bottleneck predictions.
+a promotion proxy, and scaling shallow self-imitation is not the next move.
+
+An opt-in selective-search experiment is now implemented and explicitly labeled in
+telemetry. It keeps the root full-width by default, NNUE-orders deterministic upper-tree
+actions, caps only eligible non-exact subtrees, keeps the tactical bottom full-width,
+and never prunes exact deterministic tails. At a 1s clock, internal width 2 / bottom
+one ply full completed **depth 4-6** versus full-width **depth 3-4**; an explicit top-8
+root cap completed **depth 5-7**. Root widths 1-2 can display depth 8-12, but those are
+principal-line/beam rollouts, not comparable to full-width alpha-beta. More importantly,
+the honest same-net strength confirmation rejected the first full-root width-2 policy:
+after an initial 11-5 result, it lost the disjoint 32-game confirmation 11-21; combined
+**22-26 (45.8%, -2.9 average margin)** at identical 0.1s clocks. Selective mode therefore
+remains a research/data-diversity knob, not the gameplay or training default. Next:
+less brittle deep-search selection/verification plus stronger teacher targets, then
+rerun the loop. The original phase descriptions below remain planning history; these
+measurements supersede their bottleneck predictions.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data
@@ -333,8 +345,12 @@ deck-multiset-seeded CRN (explicit stable hash). Plugs into `bot_match.run_match
 - **Deliverable:** re-measured ELO; ideally > the AZ checkpoint at matched wall-clock.
 
 **STATUS (2026-07-14): operational search machinery complete and gated.** The
-remaining Phase-3 deliverable is experimental, not engine construction: play the
-paired matched-clock NNUE-vs-AZ bar and re-measure strength.
+matched-clock AZ floor and first selective-search sweep are complete. The pilot NNUE
+lost 0-8 to AZ at a matched clock. Selective beam search can expose longer nominal
+horizons, but the first credible full-root width-2 configuration did not beat the
+full-width incumbent over 48 paired-seat games. Do not report selective completed depth
+as full-width depth; telemetry exposes `selective`, widths, ordering probes, and pruned
+actions specifically to prevent that mistake.
 
 ### Phase 4 — Training loop (self-generated data)  (ongoing)
 - Azul methodology: searcher self-plays → positions labeled with deep-search

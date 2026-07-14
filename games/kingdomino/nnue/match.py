@@ -71,6 +71,9 @@ def nnue_participant(
     max_depth: int = 12,
     chance_samples: int = 16,
     eval_kind: str = "sparse_nnue_q",
+    selective_width: int | None = None,
+    selective_root_width: int | None = None,
+    selective_min_depth: int = 4,
 ) -> Participant:
     artifact = str(Path(artifact).resolve())
 
@@ -81,6 +84,9 @@ def nnue_participant(
             chance_samples=chance_samples,
             eval=eval_kind,
             nnue_path=artifact,
+            selective_width=selective_width,
+            selective_root_width=selective_root_width,
+            selective_min_depth=selective_min_depth,
         )
 
     return Participant(name=name, make_bot=make_bot, kind=eval_kind, source=artifact)
@@ -137,10 +143,24 @@ def write_report(report: dict, path: str | Path) -> Path:
 
 
 def _main_nnue(args) -> dict:
+    candidate_width = (args.candidate_selective_width
+                       if args.candidate_selective_width is not None
+                       else args.selective_width)
+    incumbent_width = (args.incumbent_selective_width
+                       if args.incumbent_selective_width is not None
+                       else args.selective_width)
+    candidate_root_width = args.selective_root_width if candidate_width is not None else None
+    incumbent_root_width = args.selective_root_width if incumbent_width is not None else None
     a = nnue_participant("candidate", args.candidate, move_secs=args.move_secs,
-                         max_depth=args.max_depth, chance_samples=args.chance_samples)
+                         max_depth=args.max_depth, chance_samples=args.chance_samples,
+                         selective_width=candidate_width,
+                         selective_root_width=candidate_root_width,
+                         selective_min_depth=args.selective_min_depth)
     b = nnue_participant("incumbent", args.incumbent, move_secs=args.move_secs,
-                         max_depth=args.max_depth, chance_samples=args.chance_samples)
+                         max_depth=args.max_depth, chance_samples=args.chance_samples,
+                         selective_width=incumbent_width,
+                         selective_root_width=incumbent_root_width,
+                         selective_min_depth=args.selective_min_depth)
     return run_paired(
         a, b, seed_start=args.seed_start, paired_seeds=args.paired_seeds,
         settings={
@@ -152,6 +172,11 @@ def _main_nnue(args) -> dict:
             "move_secs": args.move_secs,
             "max_depth": args.max_depth,
             "chance_samples": args.chance_samples,
+            "selective_width": args.selective_width,
+            "candidate_selective_width": candidate_width,
+            "incumbent_selective_width": incumbent_width,
+            "selective_root_width": args.selective_root_width,
+            "selective_min_depth": args.selective_min_depth,
         },
     )
 
@@ -159,7 +184,10 @@ def _main_nnue(args) -> dict:
 def _main_az(args) -> dict:
     nnue = nnue_participant("NNUE", args.nnue, move_secs=args.nnue_move_secs,
                             max_depth=args.max_depth,
-                            chance_samples=args.chance_samples)
+                            chance_samples=args.chance_samples,
+                            selective_width=args.selective_width,
+                            selective_root_width=args.selective_root_width,
+                            selective_min_depth=args.selective_min_depth)
     az = build_open_loop_checkpoint_participant(
         args.az_checkpoint,
         name="AlphaZero",
@@ -184,6 +212,9 @@ def _main_az(args) -> dict:
             "device": args.device,
             "max_depth": args.max_depth,
             "chance_samples": args.chance_samples,
+            "selective_width": args.selective_width,
+            "selective_root_width": args.selective_root_width,
+            "selective_min_depth": args.selective_min_depth,
         },
     )
 
@@ -198,6 +229,11 @@ def main():
     p.add_argument("--move-secs", type=float, default=0.5)
     p.add_argument("--max-depth", type=int, default=12)
     p.add_argument("--chance-samples", type=int, default=16)
+    p.add_argument("--selective-width", type=int, default=None)
+    p.add_argument("--selective-root-width", type=int, default=None)
+    p.add_argument("--candidate-selective-width", type=int, default=None)
+    p.add_argument("--incumbent-selective-width", type=int, default=None)
+    p.add_argument("--selective-min-depth", type=int, default=4)
     p.add_argument("--paired-seeds", type=int, default=32)
     p.add_argument("--seed-start", type=int, default=20260714)
     p.add_argument("--out", required=True)
@@ -211,6 +247,9 @@ def main():
     p.add_argument("--c-puct", type=float, default=1.5)
     p.add_argument("--max-depth", type=int, default=12)
     p.add_argument("--chance-samples", type=int, default=16)
+    p.add_argument("--selective-width", type=int, default=None)
+    p.add_argument("--selective-root-width", type=int, default=None)
+    p.add_argument("--selective-min-depth", type=int, default=4)
     p.add_argument("--paired-seeds", type=int, default=8)
     p.add_argument("--seed-start", type=int, default=20260714)
     p.add_argument("--out", required=True)

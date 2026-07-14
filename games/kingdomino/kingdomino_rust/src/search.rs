@@ -83,6 +83,13 @@ pub(crate) trait Game {
     /// (max/min is order-independent); it only affects alpha-beta cutoff timing.
     fn legal_actions(s: &Self::State, out: &mut Vec<Self::Action>);
 
+    /// Cheap player-0-frame fallback ordering score for stochastic actions,
+    /// whose unresolved chance outcome prevents a direct one-ply eval probe.
+    /// Deterministic actions are ordered by making the child and calling `Eval`.
+    fn action_order_score(_s: &Self::State, _a: Self::Action) -> f64 {
+        0.0
+    }
+
     /// Does applying `a` at `s` resolve hidden randomness? When true, the searcher
     /// expands [`chance_children`] for this action instead of a single child.
     fn is_stochastic(s: &Self::State, a: Self::Action) -> bool;
@@ -143,6 +150,12 @@ pub(crate) struct OperationalLimits {
     /// Symmetric absolute bound on every leaf and terminal value. This enables
     /// safe Star1 chance pruning. Use infinity to disable chance pruning.
     pub value_bound: f64,
+    /// Approximate beam width for the upper tree. `None` preserves the exact
+    /// full-width operational path. When enabled, all moves are still retained
+    /// below `selective_min_depth` so the horizon remains tactically wider.
+    pub selective_width: Option<usize>,
+    pub selective_root_width: Option<usize>,
+    pub selective_min_depth: u32,
 }
 
 /// A move from the last fully completed iteration. Partial iterations never
@@ -159,6 +172,9 @@ pub(crate) struct OperationalResult<A> {
     pub tt_hits: u64,
     pub tt_cutoffs: u64,
     pub last_iteration_nodes: u64,
+    pub ordering_evals: u64,
+    pub selective_pruned: u64,
+    pub selective: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -184,8 +200,91 @@ struct OperationalControl<A: Copy> {
     exact_extensions: u64,
     tt_hits: u64,
     tt_cutoffs: u64,
+    ordering_evals: u64,
+    selective_pruned: u64,
+    selective_width: Option<usize>,
+    selective_root_width: Option<usize>,
+    selective_min_depth: u32,
     tt: HashMap<u128, TtEntry<A>>,
     hash_scratch: Vec<u8>,
+}
+
+/// Prepare an operational node's move order. Full-width mode only promotes the
+/// hash/PV move and is behavior-preserving. Selective mode orders deterministic
+/// actions by a one-ply leaf probe, stochastic actions by the game's cheap
+/// public-state heuristic, then caps the upper tree to `selective_width`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_operational_actions<G: Game, E: Eval<G>>(
+    s: &mut G::State,
+    actions: &mut Vec<G::Action>,
+    hash_move: Option<G::Action>,
+    maximizing: bool,
+    depth: i32,
+    allow_prune: bool,
+    prune_width: Option<usize>,
+    eval: &E,
+    control: &mut OperationalControl<G::Action>,
+) -> PyResult<bool> {
+    let Some(_) = control.selective_width else {
+        if let Some(best) = hash_move {
+            if let Some(index) = actions.iter().position(|action| *action == best) {
+                actions.swap(0, index);
+            }
+        }
+        return Ok(true);
+    };
+    if !allow_prune || depth < control.selective_min_depth as i32 {
+        if let Some(best) = hash_move {
+            if let Some(index) = actions.iter().position(|action| *action == best) {
+                actions.swap(0, index);
+            }
+        }
+        return Ok(true);
+    }
+
+    let mut scored = Vec::with_capacity(actions.len());
+    for &action in actions.iter() {
+        if control.expired() {
+            return Ok(false);
+        }
+        let score = if G::is_stochastic(s, action) {
+            G::action_order_score(s, action)
+        } else {
+            let undo = G::make(s, action)?;
+            let score = if G::is_terminal(s) {
+                G::terminal_value_p0(s)
+            } else {
+                eval.eval(s)
+            };
+            G::unmake(s, undo);
+            control.ordering_evals += 1;
+            score
+        };
+        if !score.is_finite() {
+            return Err(PyValueError::new_err(
+                "selective move ordering produced a non-finite value",
+            ));
+        }
+        scored.push((action, score));
+    }
+    scored.sort_by(|a, b| {
+        if maximizing {
+            b.1.total_cmp(&a.1)
+        } else {
+            a.1.total_cmp(&b.1)
+        }
+    });
+    *actions = scored.into_iter().map(|(action, _)| action).collect();
+    if let Some(best) = hash_move {
+        if let Some(index) = actions.iter().position(|action| *action == best) {
+            actions.swap(0, index);
+        }
+    }
+    if let Some(width) = prune_width.filter(|width| actions.len() > *width) {
+        control.selective_pruned += (actions.len() - width) as u64;
+        actions.truncate(width);
+    }
+    Ok(true)
 }
 
 impl<A: Copy> OperationalControl<A> {
@@ -543,12 +642,22 @@ fn operational_value<G: Game, E: Eval<G>>(
             "non-terminal state has no legal actions (model a forced move as a pass)",
         ));
     }
-    if let Some(best) = hash_move {
-        if let Some(index) = actions.iter().position(|action| *action == best) {
-            actions.swap(0, index);
-        }
-    }
     let maximizing = matches!(G::to_move(s)?, Turn::P0);
+    let allow_selective_prune = G::exact_remaining_plies(s).is_none();
+    let prune_width = control.selective_width;
+    if !prepare_operational_actions::<G, E>(
+        s,
+        &mut actions,
+        hash_move,
+        maximizing,
+        depth,
+        allow_selective_prune,
+        prune_width,
+        eval,
+        control,
+    )? {
+        return Ok(None);
+    }
     let mut best_action = actions[0];
     let value = if maximizing {
         let mut value = f64::NEG_INFINITY;
@@ -634,12 +743,22 @@ fn operational_root_iteration<G: Game, E: Eval<G>>(
 ) -> PyResult<Option<RootIteration<G::Action>>> {
     let mut actions = Vec::new();
     G::legal_actions(s, &mut actions);
-    if let Some(best) = previous_best {
-        if let Some(index) = actions.iter().position(|action| *action == best) {
-            actions.swap(0, index);
-        }
-    }
     let maximizing = matches!(G::to_move(s)?, Turn::P0);
+    let allow_selective_prune = G::exact_remaining_plies(s).is_none();
+    let prune_width = control.selective_root_width;
+    if !prepare_operational_actions::<G, E>(
+        s,
+        &mut actions,
+        previous_best,
+        maximizing,
+        depth as i32,
+        allow_selective_prune,
+        prune_width,
+        eval,
+        control,
+    )? {
+        return Ok(None);
+    }
     let mut best_action = None;
     let mut best_value = if maximizing {
         f64::NEG_INFINITY
@@ -714,6 +833,9 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
             tt_hits: 0,
             tt_cutoffs: 0,
             last_iteration_nodes: 0,
+            ordering_evals: 0,
+            selective_pruned: 0,
+            selective: limits.selective_width.is_some(),
         }));
     }
 
@@ -725,6 +847,11 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         exact_extensions: 0,
         tt_hits: 0,
         tt_cutoffs: 0,
+        ordering_evals: 0,
+        selective_pruned: 0,
+        selective_width: limits.selective_width,
+        selective_root_width: limits.selective_root_width,
+        selective_min_depth: limits.selective_min_depth,
         tt: HashMap::new(),
         hash_scratch: Vec::with_capacity(1024),
     };
@@ -737,6 +864,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
 
     for depth in 1..=limits.max_depth {
         let iteration_start_nodes = control.nodes;
+        let previous_best = if completed_depth > 0 { Some(action) } else { None };
         let aspiration = value.map(|center| {
             (
                 center - limits.aspiration_window,
@@ -749,7 +877,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
             eval,
             cfg,
             depth,
-            Some(action),
+            previous_best,
             alpha,
             beta,
             &mut control,
@@ -798,6 +926,9 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         tt_hits: control.tt_hits,
         tt_cutoffs: control.tt_cutoffs,
         last_iteration_nodes,
+        ordering_evals: control.ordering_evals,
+        selective_pruned: control.selective_pruned,
+        selective: limits.selective_width.is_some(),
     }))
 }
 
@@ -916,6 +1047,16 @@ mod tests {
             f64::NAN
         }
     }
+    struct NodeEval;
+    impl Eval<Toy> for NodeEval {
+        fn eval(&self, s: &ToyState) -> f64 {
+            match s.node {
+                1 => -0.8,
+                2 => 0.8,
+                _ => 0.0,
+            }
+        }
+    }
 
     fn cfg() -> SearchConfig {
         SearchConfig {
@@ -944,6 +1085,9 @@ mod tests {
             aspiration_window,
             node_limit,
             value_bound: 1.0,
+            selective_width: None,
+            selective_root_width: None,
+            selective_min_depth: 4,
         }
     }
 
@@ -1088,6 +1232,34 @@ mod tests {
         assert_eq!(result.completed_depth, 3);
         assert!(!result.timed_out);
         assert_eq!(s.node, 0, "operational search must unwind to root");
+    }
+
+    #[test]
+    fn selective_mode_orders_then_caps_upper_tree() {
+        // The root remains full-width. Each child is a minimizing node whose
+        // two actions are reduced to the better one by width-1 ordering.
+        let tree = vec![
+            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
+            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
+            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Terminal(-1.0),
+            Node::Terminal(-0.9),
+            Node::Terminal(0.7),
+            Node::Terminal(0.9),
+        ];
+        let mut limits = operational_limits(2, None, 0.25);
+        limits.selective_width = Some(1);
+        limits.selective_min_depth = 1;
+        let mut s = st(tree);
+        let result = choose_action_operational::<Toy, _>(&mut s, &NodeEval, &cfg(), &limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.action, 1);
+        assert_eq!(result.completed_depth, 2);
+        assert!(result.selective);
+        assert!(result.selective_pruned >= 2);
+        assert!(result.ordering_evals >= 2);
+        assert_eq!(s.node, 0);
     }
 
     #[test]
