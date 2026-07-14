@@ -29,7 +29,8 @@ import os
 import random
 import subprocess
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Optional
 
 from games.kingdomino.game import GameState
@@ -82,6 +83,10 @@ def catalog_hash() -> str:
 @dataclass
 class GenConfig:
     eval: str = "pick_aware"          # RustSearch heuristic (GPU-free teacher)
+    nnue_path: Optional[str] = None    # required for an NNUE-backed eval
+    nnue_sha256: str = ""              # filled once by generate(), not per game
+    move_secs: float = 0.0             # >0 selects operational iterative deepening
+    max_depth: int = 8                 # operational cap; depth_choices for fixed search
     depth_choices: tuple = (2, 3)     # per-game varied depth for diversity
     depth_weights: tuple = (0.85, 0.15)  # depth-3 is ~27x depth-2; keep it a minority
     chance_samples: int = 16
@@ -127,8 +132,13 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
 
     rng = random.Random((seed * 2654435761) & 0xFFFFFFFFFFFF)
     depth = rng.choices(list(cfg.depth_choices), weights=list(cfg.depth_weights))[0]
-    search = kr.RustSearch(depth=depth, chance_samples=cfg.chance_samples,
-                           eval=cfg.eval, seed=seed)
+    search = kr.RustSearch(
+        depth=(cfg.max_depth if cfg.move_secs > 0 else depth),
+        chance_samples=cfg.chance_samples,
+        eval=cfg.eval,
+        seed=seed,
+        nnue_path=cfg.nnue_path,
+    )
 
     actions = []
     move_i = 0
@@ -139,7 +149,14 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
         elif move_i < cfg.random_opening or rng.random() < _epsilon(move_i, cfg):
             a = legal[rng.randrange(len(legal))]
         else:
-            a = search.choose_action(rs, (seed ^ (move_i * 0x9E3779B1)) & 0xFFFFFFFFFFFF)
+            if cfg.move_secs > 0:
+                a = search.choose_action_timed(
+                    rs, max_secs=cfg.move_secs, max_depth=cfg.max_depth
+                ).action
+            else:
+                a = search.choose_action(
+                    rs, (seed ^ (move_i * 0x9E3779B1)) & 0xFFFFFFFFFFFF
+                )
         actions.append(_ser_action(a))
         rs = rs.step(a[0], a[1])
         move_i += 1
@@ -158,6 +175,9 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
         "outcome_p0": outcome,
         "n_positions": len(actions),
         "provenance": {"policy": f"rust_search:{cfg.eval}", "depth": depth,
+                       "search_mode": ("operational" if cfg.move_secs > 0 else "fixed_depth"),
+                       "move_secs": cfg.move_secs, "max_depth": cfg.max_depth,
+                       "nnue_path": cfg.nnue_path, "nnue_sha256": cfg.nnue_sha256,
                        "chance_samples": cfg.chance_samples,
                        "epsilon_open": cfg.epsilon_open, "epsilon_tail": cfg.epsilon_tail,
                        "explore_plies": cfg.explore_plies,
@@ -253,6 +273,18 @@ def _worker(args):
 
 def generate(n_games: int, out_dir: str, cfg: GenConfig, workers: int = 1,
              seed_start: int = 0, verify: bool = True) -> dict:
+    if cfg.eval in {"nnue", "sparse_nnue_ref", "sparse_nnue", "sparse_nnue_q"}:
+        if not cfg.nnue_path:
+            raise ValueError(f"eval={cfg.eval!r} requires nnue_path")
+        artifact = Path(cfg.nnue_path).resolve()
+        if not artifact.is_file():
+            raise FileNotFoundError(f"NNUE artifact not found: {artifact}")
+        cfg.nnue_path = str(artifact)
+        cfg.nnue_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    elif cfg.nnue_path:
+        raise ValueError("nnue_path is only valid with an NNUE-backed eval")
+    if cfg.move_secs < 0 or cfg.max_depth < 1:
+        raise ValueError("move_secs must be >= 0 and max_depth must be >= 1")
     os.makedirs(out_dir, exist_ok=True)
     seeds = list(range(seed_start, seed_start + n_games))
     t0 = time.time()
@@ -303,10 +335,15 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--seed-start", type=int, default=0)
     ap.add_argument("--eval", default="pick_aware")
+    ap.add_argument("--nnue-path", default=None)
+    ap.add_argument("--move-secs", type=float, default=0.0,
+                    help="per-move operational-search budget; 0 uses fixed depth")
+    ap.add_argument("--max-depth", type=int, default=8)
     ap.add_argument("--no-verify", action="store_true", help="skip replay verification")
     args = ap.parse_args()
 
-    cfg = GenConfig(eval=args.eval)
+    cfg = GenConfig(eval=args.eval, nnue_path=args.nnue_path,
+                    move_secs=args.move_secs, max_depth=args.max_depth)
     print(f"generating {args.games} games -> {args.out} ({args.workers} workers) ...")
     man = generate(args.games, args.out, cfg, workers=args.workers,
                    seed_start=args.seed_start, verify=not args.no_verify)

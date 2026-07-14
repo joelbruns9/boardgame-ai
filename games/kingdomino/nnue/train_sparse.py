@@ -19,6 +19,7 @@ from .sparse_data import (
     AUX_SCORE_NAMES,
     MARGIN_SCALE,
     TARGET_SCHEMA,
+    concatenate_packed,
     derive_split,
     load_packed,
 )
@@ -46,6 +47,14 @@ def _load_or_derive(source: str, cache_dir: str, split: str, max_games: int):
         f"{len(data.indices):,} active indices in {time.time() - t0:.1f}s -> {path}"
     )
     return data
+
+
+def _load_sources(sources: list[str], cache_dir: str, split: str, max_games: int):
+    parts = []
+    for i, source in enumerate(sources):
+        shard_cache = str(Path(cache_dir) / f"source_{i:03d}")
+        parts.append(_load_or_derive(source, shard_cache, split, max_games))
+    return parts[0] if len(parts) == 1 else concatenate_packed(parts)
 
 
 def validation_metrics(net, data, device, batch_size=4096):
@@ -113,7 +122,10 @@ def train_epoch(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="runs/kingdomino/nnue_data/pilot_50k")
+    ap.add_argument("--source", action="append", default=None,
+                    help="replay source directory; repeat to mix immutable shards")
+    ap.add_argument("--val-source", action="append", default=None,
+                    help="validation source(s); defaults to --source. Use a frozen source in loops")
     ap.add_argument("--cache-dir", default="runs/kingdomino/nnue_data/packed_v3")
     ap.add_argument("--max-games", type=int, default=0,
                     help="whole games per split for a smoke run (0 = all)")
@@ -128,16 +140,22 @@ def main():
     ap.add_argument("--aux-bonus-loss-weight", type=float, default=0.05)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--init-ckpt", default=None,
+                    help="warm-start from a schema-compatible sparse checkpoint")
     ap.add_argument("--out", default="games/kingdomino/nnue/checkpoints/sparse_v3_pilot.pt")
     args = ap.parse_args()
+    sources = args.source or ["runs/kingdomino/nnue_data/pilot_50k"]
+    val_sources = args.val_source or sources
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)
 
-    train = _load_or_derive(args.source, args.cache_dir, "train", args.max_games)
-    val = _load_or_derive(args.source, args.cache_dir, "val", args.max_games)
+    train = _load_sources(sources, str(Path(args.cache_dir) / "train"),
+                          "train", args.max_games)
+    val = _load_sources(val_sources, str(Path(args.cache_dir) / "val"),
+                        "val", args.max_games)
     base_rate = float(train.outcome.mean())
     base_brier = float(np.mean((val.outcome - base_rate) ** 2))
     median_margin = float(np.median(train.margin))
@@ -148,6 +166,18 @@ def main():
     )
 
     net = SparseNNUE(CORE_SIZE, SUMMARY_SIZE, args.acc_width, args.tail_hidden).to(device)
+    if args.init_ckpt:
+        init = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
+        if init.get("core_schema_hash") != core_schema_hash():
+            raise ValueError("init checkpoint core schema does not match")
+        if init.get("summary_schema_hash") != summary_schema_hash():
+            raise ValueError("init checkpoint summary schema does not match")
+        if init.get("config") != sparse_config_of(net):
+            raise ValueError(
+                f"init checkpoint config {init.get('config')} != requested {sparse_config_of(net)}"
+            )
+        net.load_state_dict(init["state_dict"])
+        print(f"warm-started from {args.init_ckpt}")
     print(f"net parameters: {sum(p.numel() for p in net.parameters()):,}")
     optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best = None
@@ -187,7 +217,7 @@ def main():
             "data_provenance": {"train": train.metadata, "val": val.metadata},
             "val_metrics": {k: v for k, v in best.items() if k != "state"},
             "baselines": {"outcome_brier": base_brier, "margin_mae": base_margin_mae},
-            "args": vars(args),
+            "args": {**vars(args), "source": sources, "val_source": val_sources},
         },
         out,
     )

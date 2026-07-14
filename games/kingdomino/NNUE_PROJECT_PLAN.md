@@ -55,8 +55,23 @@ The live web-server extension was not replaced. On six representative positions 
 quantized timed path sustained roughly **101k-126k nodes/s**: every 0.5s move completed
 depth 3; at 1.0s, five completed depth 3 and one depth 4; at 2.0s, three completed depth
 3 and three depth 4. All intentionally timed out while returning the last complete
-iteration. Next: matched-clock NNUE-vs-AZ strength measurement. The original phase
-descriptions below remain planning history; these measurements supersede their
+iteration.
+
+The first clock-matched strength floor is now frozen: four paired seeds / both seats,
+pilot NNUE at a 0.1s deadline versus the current AZ checkpoint at 13 simulations.
+Actual non-forced decision means were **85.0ms NNUE vs 83.5ms AZ**. The pilot NNUE
+lost **0-8**, average margin **-88.4**. This is a small baseline, not a strength CI,
+but the gap is too large to explain by clock mismatch.
+
+The Phase-4 MVP loop is also operational: incumbent-guided replayable self-play,
+immutable shard mixing, warm-start training, frozen validation, export, paired
+candidate gating, restart guards, and atomic run-local promotion. It never opens the
+reserved test split. A 256-game pilot improved held-out Brier **0.2115 -> 0.2091** and
+margin MAE **16.62 -> 16.31**, but lost **5-11** to its incumbent at equal 0.1s clocks;
+the gate correctly rejected it. The result is important: static validation loss is not
+a promotion proxy, and scaling shallow self-imitation is not the next move. Next:
+selective/deeper search plus stronger teacher targets, then rerun the loop. The original
+phase descriptions below remain planning history; these measurements supersede their
 bottleneck predictions.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
@@ -328,6 +343,14 @@ paired matched-clock NNUE-vs-AZ bar and re-measure strength.
   thousand correlated trajectories on one policy's support; alpha-beta walks
   off-distribution where a static-buffer eval is blind).
 - Reuse existing self-play orchestration + gating.
+
+**STATUS (2026-07-14): MVP complete and first candidate rejected.**
+`nnue/generation_loop.py` runs one restartable generation; `nnue/match.py` provides
+the shared paired, seat-swapped clock-accounted gate. `train_sparse.py` can mix
+immutable replay shards while keeping validation frozen and warm-starting from the
+incumbent. Bootstrap targets are still honest final outcomes, not yet deep-search
+values. The 256-game result above says to improve the teacher/search before producing
+a large corpus. Promotion remains game-strength-gated; Brier selects an epoch only.
 
 ### Phase 5 — Combine with AlphaZero (the payoff)
 - **TRAIN (highest strategic value):** relabel/augment AZ training targets with

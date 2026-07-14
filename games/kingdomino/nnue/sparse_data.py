@@ -352,6 +352,73 @@ def load_packed(path) -> PackedSparseData:
         )
 
 
+def concatenate_packed(parts: Iterable[PackedSparseData]) -> PackedSparseData:
+    """Join independently derived shards without weakening schema validation.
+
+    Replay JSONL remains the source of truth.  This only combines disposable
+    packed caches, preserving each component's source hash in the aggregate
+    metadata and making game indices unique across shards.
+    """
+    parts = list(parts)
+    if not parts:
+        raise ValueError("at least one packed shard is required")
+    rules = {
+        (bool(p.metadata["rules"]["harmony"]),
+         bool(p.metadata["rules"]["middle_kingdom"]))
+        for p in parts
+    }
+    if len(rules) != 1:
+        raise ValueError(f"packed shards mix rules configurations: {rules}")
+
+    offsets = [0]
+    indices: list[np.ndarray] = []
+    game_indices: list[np.ndarray] = []
+    game_base = 0
+    for part in parts:
+        indices.append(part.indices)
+        offsets.extend((part.offsets[1:] + offsets[-1]).tolist())
+        game_indices.append(part.game_index.astype(np.int64) + game_base)
+        game_base += int(part.metadata["game_count"])
+
+    component_hashes = [p.metadata["source_records_sha256"] for p in parts]
+    aggregate_hash = hashlib.sha256("\n".join(component_hashes).encode()).hexdigest()
+    metadata = {
+        "artifact": "kingdomino_sparse_nnue_csr",
+        "artifact_version": ARTIFACT_VERSION,
+        "core_size": CORE_SIZE,
+        "summary_size": SUMMARY_SIZE,
+        "core_schema_hash": core_schema_hash(),
+        "summary_schema_hash": summary_schema_hash(),
+        "datagen_engine_version": datagen.ENGINE_VERSION,
+        "datagen_format_version": datagen.FORMAT_VERSION,
+        "catalog_hash": datagen.catalog_hash(),
+        "rules": {"harmony": next(iter(rules))[0],
+                  "middle_kingdom": next(iter(rules))[1]},
+        "game_count": game_base,
+        "position_count": sum(len(p) for p in parts),
+        "source_records_sha256": aggregate_hash,
+        "source_components": [p.metadata for p in parts],
+        "source_git_commits": sorted({
+            commit for p in parts for commit in p.metadata.get("source_git_commits", [])
+        }),
+        "source_git_dirty": any(p.metadata.get("source_git_dirty", False) for p in parts),
+        "target_schema": TARGET_SCHEMA,
+        "d4": "base orientation stored; one of 8 frozen permutations applied at batch time",
+    }
+    return PackedSparseData(
+        indices=np.concatenate(indices).astype(np.int32, copy=False),
+        offsets=np.asarray(offsets, dtype=np.int64),
+        summaries=np.concatenate([p.summaries for p in parts]),
+        outcome=np.concatenate([p.outcome for p in parts]),
+        margin=np.concatenate([p.margin for p in parts]),
+        aux_scores=np.concatenate([p.aux_scores for p in parts]),
+        aux_bonus=np.concatenate([p.aux_bonus for p in parts]),
+        actors=np.concatenate([p.actors for p in parts]),
+        game_index=np.concatenate(game_indices).astype(np.int32),
+        metadata=metadata,
+    )
+
+
 def derive_split(source_dir, split: str, out_path=None, *, max_games: int = 0):
     """Strict-load and derive one whole-game split; optionally cache it."""
     if split not in ("train", "val", "test"):
