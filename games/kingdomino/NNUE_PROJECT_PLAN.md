@@ -35,8 +35,9 @@ roughly halving inference-weight storage.
 
 The native operational searcher is now implemented. `RustSearch.choose_action_timed`
 uses one shared wall-clock deadline, iterative deepening, last-complete-depth fallback,
-root/PV-first ordering, root-sibling windows, aspiration re-search, a depth-aware
-bound/exact TT at Kingdomino's canonical round roots, bounded Star1 chance pruning,
+full-width cheap heuristic ordering with root/PV promotion, root-sibling windows,
+aspiration re-search, a depth-aware bound/exact TT at Kingdomino's canonical round
+roots, bounded Star1 chance pruning,
 and exact horizon extension through deterministic deck-in-{0,4}/final tails. The tail
 extension searches the generic official-outcome objective to GAME_OVER rather than
 calling the legacy raw-margin solver, so score ties retain the largest-territory/crowns
@@ -44,18 +45,33 @@ cascade. Telemetry reports completed depth, timeout, total/final-iteration nodes
 Star cutoffs, TT hits/cutoffs, aspiration re-searches, and exact extensions. A bot_match
 adapter (`OperationalRustSearchBot`) makes this the playable path.
 
-Native release gates are green (**45/45 Rust tests**): deterministic node-budget
+Native release gates are green (**47/47 Rust tests**): deterministic node-budget
 timeout/unwind, aspiration failure re-search, Star1, TT reuse, exact-tail ply counts on
 real games, and fixed-vs-operational move equivalence. On the real sampled-chance gate
 at depth 5, operational search used **8.79M total nodes / 9.321s** (including depths
 1-4) vs fixed depth-5's **9.79M / 10.115s**; its final iteration was 8.55M nodes
-(14% below fixed). The isolated release-wheel Python gate now passes **26/26** tests,
-including the bot adapter and a timed `sparse_nnue_q` move matched to fixed-depth.
+(14% below fixed). The isolated release-wheel operational/sparse/generation gate now
+passes **32/32 Python tests**, including the bot adapter and a timed `sparse_nnue_q`
+move matched to fixed-depth.
 The live web-server extension was not replaced. On six representative positions the
 quantized timed path sustained roughly **101k-126k nodes/s**: every 0.5s move completed
 depth 3; at 1.0s, five completed depth 3 and one depth 4; at 2.0s, three completed depth
 3 and three depth 4. All intentionally timed out while returning the last complete
 iteration.
+
+Full-width move ordering is now the NNUE operational default and remains completely
+separate from selective pruning: every legal action is retained, ordering uses only the
+game's cheap public-state heuristic, and telemetry distinguishes scored actions from
+actual eval probes or pruned actions. On 20 representative positions at completed
+depth 3, ordered and unordered search produced identical values **20/20** while ordering
+reduced nodes **588,834 -> 496,342 (15.7%)** and wall time **6.506s -> 5.758s
+(11.5%)**. Root actions agreed 19/20; the lone difference had exactly the same root
+value and was an equal-valued traversal tie. The same-artifact, equal-0.1s-clock,
+seat-swapped gameplay gate finished **32-32 over 64 games**, with ordered search at
+**+7.14 average score margin** and effectively identical decision timing. The lower-
+level Rust API still defaults to unordered search so it remains an explicit oracle and
+benchmark baseline; the NNUE bot, match, and operational data-generation entry points
+default to full-width ordering and record the choice in provenance.
 
 The first clock-matched strength floor is now frozen: four paired seeds / both seats,
 pilot NNUE at a 0.1s deadline versus the current AZ checkpoint at 13 simulations.

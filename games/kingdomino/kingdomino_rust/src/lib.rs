@@ -2373,6 +2373,10 @@ struct OperationalSearchReport {
     #[pyo3(get)]
     ordering_evals: u64,
     #[pyo3(get)]
+    ordering_actions: u64,
+    #[pyo3(get)]
+    full_width_ordering: bool,
+    #[pyo3(get)]
     selective_pruned: u64,
     #[pyo3(get)]
     selective: bool,
@@ -2618,7 +2622,7 @@ impl RustSearch {
     /// Root/PV-first ordering, root-sibling alpha/beta reuse, aspiration windows,
     /// bounded Star1 chance pruning, and deterministic exact-tail extensions are
     /// all enabled. On timeout the last fully completed depth is returned.
-    #[pyo3(signature = (state, max_secs=1.0, max_depth=None, aspiration_window=0.25, max_nodes=None, selective_width=None, selective_root_width=None, selective_min_depth=4))]
+    #[pyo3(signature = (state, max_secs=1.0, max_depth=None, aspiration_window=0.25, max_nodes=None, full_width_ordering=false, selective_width=None, selective_root_width=None, selective_min_depth=4))]
     fn choose_action_timed(
         &mut self,
         state: &RustGameState,
@@ -2626,6 +2630,7 @@ impl RustSearch {
         max_depth: Option<u32>,
         aspiration_window: f64,
         max_nodes: Option<u64>,
+        full_width_ordering: bool,
         selective_width: Option<usize>,
         selective_root_width: Option<usize>,
         selective_min_depth: u32,
@@ -2671,6 +2676,7 @@ impl RustSearch {
             aspiration_window,
             node_limit: max_nodes,
             value_bound: 1.0 + self.cfg.margin_weight.abs(),
+            full_width_ordering,
             selective_width,
             selective_root_width,
             selective_min_depth,
@@ -2764,6 +2770,8 @@ impl RustSearch {
             tt_cutoffs: result.tt_cutoffs,
             last_iteration_nodes: result.last_iteration_nodes,
             ordering_evals: result.ordering_evals,
+            ordering_actions: result.ordering_actions,
+            full_width_ordering,
             selective_pruned: result.selective_pruned,
             selective: result.selective,
             selective_width,
@@ -7217,6 +7225,7 @@ mod make_unmake_tests {
                 aspiration_window: 0.25,
                 node_limit: None,
                 value_bound: 1.0,
+                full_width_ordering: false,
                 selective_width: None,
                 selective_root_width: None,
                 selective_min_depth: 4,

@@ -83,9 +83,11 @@ pub(crate) trait Game {
     /// (max/min is order-independent); it only affects alpha-beta cutoff timing.
     fn legal_actions(s: &Self::State, out: &mut Vec<Self::Action>);
 
-    /// Cheap player-0-frame fallback ordering score for stochastic actions,
-    /// whose unresolved chance outcome prevents a direct one-ply eval probe.
-    /// Deterministic actions are ordered by making the child and calling `Eval`.
+    /// Cheap player-0-frame action-ordering score. Full-width heuristic ordering
+    /// uses this for every action without dropping any action. Selective mode uses
+    /// it only for stochastic actions, whose unresolved chance outcome prevents a
+    /// direct one-ply eval probe; deterministic selective actions are ordered by
+    /// making the child and calling `Eval`.
     fn action_order_score(_s: &Self::State, _a: Self::Action) -> f64 {
         0.0
     }
@@ -150,6 +152,9 @@ pub(crate) struct OperationalLimits {
     /// Symmetric absolute bound on every leaf and terminal value. This enables
     /// safe Star1 chance pruning. Use infinity to disable chance pruning.
     pub value_bound: f64,
+    /// Cheaply order the complete action list while preserving full-width search.
+    /// This is independent of selective pruning and never truncates actions.
+    pub full_width_ordering: bool,
     /// Approximate beam width for the upper tree. `None` preserves the exact
     /// full-width operational path. When enabled, all moves are still retained
     /// below `selective_min_depth` so the horizon remains tactically wider.
@@ -173,6 +178,7 @@ pub(crate) struct OperationalResult<A> {
     pub tt_cutoffs: u64,
     pub last_iteration_nodes: u64,
     pub ordering_evals: u64,
+    pub ordering_actions: u64,
     pub selective_pruned: u64,
     pub selective: bool,
 }
@@ -201,6 +207,8 @@ struct OperationalControl<A: Copy> {
     tt_hits: u64,
     tt_cutoffs: u64,
     ordering_evals: u64,
+    ordering_actions: u64,
+    full_width_ordering: bool,
     selective_pruned: u64,
     selective_width: Option<usize>,
     selective_root_width: Option<usize>,
@@ -209,10 +217,10 @@ struct OperationalControl<A: Copy> {
     hash_scratch: Vec<u8>,
 }
 
-/// Prepare an operational node's move order. Full-width mode only promotes the
-/// hash/PV move and is behavior-preserving. Selective mode orders deterministic
-/// actions by a one-ply leaf probe, stochastic actions by the game's cheap
-/// public-state heuristic, then caps the upper tree to `selective_width`.
+/// Prepare an operational node's move order. The default full-width mode only
+/// promotes the hash/PV move. Optional full-width heuristic ordering cheaply
+/// scores every action but retains all of them. Selective mode keeps its existing
+/// stronger probes and may cap the upper tree to `selective_width`.
 #[allow(clippy::too_many_arguments)]
 fn prepare_operational_actions<G: Game, E: Eval<G>>(
     s: &mut G::State,
@@ -225,15 +233,10 @@ fn prepare_operational_actions<G: Game, E: Eval<G>>(
     eval: &E,
     control: &mut OperationalControl<G::Action>,
 ) -> PyResult<bool> {
-    let Some(_) = control.selective_width else {
-        if let Some(best) = hash_move {
-            if let Some(index) = actions.iter().position(|action| *action == best) {
-                actions.swap(0, index);
-            }
-        }
-        return Ok(true);
-    };
-    if !allow_prune || depth < control.selective_min_depth as i32 {
+    let selective_active = control.selective_width.is_some()
+        && allow_prune
+        && depth >= control.selective_min_depth as i32;
+    if !selective_active && !control.full_width_ordering {
         if let Some(best) = hash_move {
             if let Some(index) = actions.iter().position(|action| *action == best) {
                 actions.swap(0, index);
@@ -247,7 +250,9 @@ fn prepare_operational_actions<G: Game, E: Eval<G>>(
         if control.expired() {
             return Ok(false);
         }
-        let score = if G::is_stochastic(s, action) {
+        let score = if control.full_width_ordering && !selective_active {
+            G::action_order_score(s, action)
+        } else if G::is_stochastic(s, action) {
             G::action_order_score(s, action)
         } else {
             let undo = G::make(s, action)?;
@@ -267,6 +272,7 @@ fn prepare_operational_actions<G: Game, E: Eval<G>>(
         }
         scored.push((action, score));
     }
+    control.ordering_actions += scored.len() as u64;
     scored.sort_by(|a, b| {
         if maximizing {
             b.1.total_cmp(&a.1)
@@ -280,9 +286,11 @@ fn prepare_operational_actions<G: Game, E: Eval<G>>(
             actions.swap(0, index);
         }
     }
-    if let Some(width) = prune_width.filter(|width| actions.len() > *width) {
-        control.selective_pruned += (actions.len() - width) as u64;
-        actions.truncate(width);
+    if selective_active {
+        if let Some(width) = prune_width.filter(|width| actions.len() > *width) {
+            control.selective_pruned += (actions.len() - width) as u64;
+            actions.truncate(width);
+        }
     }
     Ok(true)
 }
@@ -834,6 +842,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
             tt_cutoffs: 0,
             last_iteration_nodes: 0,
             ordering_evals: 0,
+            ordering_actions: 0,
             selective_pruned: 0,
             selective: limits.selective_width.is_some(),
         }));
@@ -848,6 +857,8 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         tt_hits: 0,
         tt_cutoffs: 0,
         ordering_evals: 0,
+        ordering_actions: 0,
+        full_width_ordering: limits.full_width_ordering,
         selective_pruned: 0,
         selective_width: limits.selective_width,
         selective_root_width: limits.selective_root_width,
@@ -927,6 +938,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         tt_cutoffs: control.tt_cutoffs,
         last_iteration_nodes,
         ordering_evals: control.ordering_evals,
+        ordering_actions: control.ordering_actions,
         selective_pruned: control.selective_pruned,
         selective: limits.selective_width.is_some(),
     }))
@@ -994,6 +1006,18 @@ mod tests {
         fn legal_actions(s: &ToyState, out: &mut Vec<usize>) {
             if let Node::Decision { edges, .. } = &s.tree[s.node] {
                 out.extend(0..edges.len());
+            }
+        }
+        fn action_order_score(s: &ToyState, a: usize) -> f64 {
+            // Purpose-built ordering values for the full-width pruning test.
+            // All other tests leave full_width_ordering disabled.
+            match (s.node, a) {
+                (0, 1) => 1.0,
+                (1, 0) => -1.0,
+                (1, 1) => -0.9,
+                (2, 0) => 0.7,
+                (2, 1) => 0.9,
+                _ => 0.0,
             }
         }
         fn is_stochastic(s: &ToyState, a: usize) -> bool {
@@ -1085,6 +1109,7 @@ mod tests {
             aspiration_window,
             node_limit,
             value_bound: 1.0,
+            full_width_ordering: false,
             selective_width: None,
             selective_root_width: None,
             selective_min_depth: 4,
@@ -1260,6 +1285,54 @@ mod tests {
         assert!(result.selective_pruned >= 2);
         assert!(result.ordering_evals >= 2);
         assert_eq!(s.node, 0);
+    }
+
+    #[test]
+    fn full_width_ordering_preserves_value_and_reduces_nodes() {
+        // Ordered search visits the winning root action first. Its 0.7 alpha then
+        // lets the losing sibling's first -1.0 reply cut off, but no action is
+        // truncated: the final minimax value/action match the unordered oracle.
+        let tree = vec![
+            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
+            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
+            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Terminal(-1.0),
+            Node::Terminal(-0.9),
+            Node::Terminal(0.7),
+            Node::Terminal(0.9),
+        ];
+        let mut unordered_state = st(tree.clone());
+        let unordered = choose_action_operational::<Toy, _>(
+            &mut unordered_state,
+            &ZeroEval,
+            &cfg(),
+            &operational_limits(2, None, 0.25),
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut limits = operational_limits(2, None, 0.25);
+        limits.full_width_ordering = true;
+        let mut ordered_state = st(tree);
+        let ordered = choose_action_operational::<Toy, _>(
+            &mut ordered_state,
+            &ZeroEval,
+            &cfg(),
+            &limits,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(ordered.action, unordered.action);
+        assert_eq!(ordered.value, unordered.value);
+        assert_eq!(ordered.completed_depth, unordered.completed_depth);
+        assert!(!ordered.selective);
+        assert_eq!(ordered.selective_pruned, 0);
+        assert_eq!(ordered.ordering_evals, 0);
+        assert!(ordered.ordering_actions >= 6);
+        assert!(ordered.nodes < unordered.nodes,
+            "ordering should reduce nodes: {} vs {}", ordered.nodes, unordered.nodes);
+        assert_eq!(ordered_state.node, 0);
     }
 
     #[test]

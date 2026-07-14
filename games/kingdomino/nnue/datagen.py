@@ -87,6 +87,7 @@ class GenConfig:
     nnue_sha256: str = ""              # filled once by generate(), not per game
     move_secs: float = 0.0             # >0 selects operational iterative deepening
     max_depth: int = 8                 # operational cap; depth_choices for fixed search
+    full_width_ordering: bool = True   # complete action set; cheap alpha-beta ordering
     selective_width: Optional[int] = None
     selective_root_width: Optional[int] = None
     selective_min_depth: int = 4
@@ -155,6 +156,7 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
             if cfg.move_secs > 0:
                 a = search.choose_action_timed(
                     rs, max_secs=cfg.move_secs, max_depth=cfg.max_depth,
+                    full_width_ordering=cfg.full_width_ordering,
                     selective_width=cfg.selective_width,
                     selective_root_width=cfg.selective_root_width,
                     selective_min_depth=cfg.selective_min_depth,
@@ -183,6 +185,9 @@ def play_one_game(seed: int, cfg: GenConfig) -> dict:
         "provenance": {"policy": f"rust_search:{cfg.eval}", "depth": depth,
                        "search_mode": ("operational" if cfg.move_secs > 0 else "fixed_depth"),
                        "move_secs": cfg.move_secs, "max_depth": cfg.max_depth,
+                       "full_width_ordering": bool(
+                           cfg.full_width_ordering and cfg.move_secs > 0
+                       ),
                        "selective_width": cfg.selective_width,
                        "selective_root_width": cfg.selective_root_width,
                        "selective_min_depth": cfg.selective_min_depth,
@@ -351,6 +356,11 @@ def main():
     ap.add_argument("--move-secs", type=float, default=0.0,
                     help="per-move operational-search budget; 0 uses fixed depth")
     ap.add_argument("--max-depth", type=int, default=8)
+    ap.add_argument(
+        "--full-width-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     ap.add_argument("--selective-width", type=int, default=None)
     ap.add_argument("--selective-root-width", type=int, default=None)
     ap.add_argument("--selective-min-depth", type=int, default=4)
@@ -359,6 +369,7 @@ def main():
 
     cfg = GenConfig(eval=args.eval, nnue_path=args.nnue_path,
                     move_secs=args.move_secs, max_depth=args.max_depth,
+                    full_width_ordering=args.full_width_ordering,
                     selective_width=args.selective_width,
                     selective_root_width=args.selective_root_width,
                     selective_min_depth=args.selective_min_depth)

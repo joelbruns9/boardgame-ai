@@ -84,20 +84,28 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       nodes/s** vs 98.8k float (**1.04×**) with roughly half the inference-weight memory.
 
 - [x] **Native operational fast search** — `choose_action_timed` adds deadline-safe
-      iterative deepening with last-complete-depth fallback, root/PV-first ordering,
-      root window reuse, aspiration re-search, depth-aware TT reuse at canonical round
-      roots, bounded Star1 chance pruning, and exact official-outcome extensions through
-      deterministic tails. Timeout/error paths unmake both game and accumulator.
+      iterative deepening with last-complete-depth fallback, full-width cheap heuristic
+      ordering with root/PV promotion, root window reuse, aspiration re-search,
+      depth-aware TT reuse at canonical round roots, bounded Star1 chance pruning, and
+      exact official-outcome extensions through deterministic tails. Timeout/error
+      paths unmake both game and accumulator.
       Telemetry exposes completed depth, timeout, total/final-iteration nodes, Star/TT
-      cutoffs, re-searches, and exact extensions. Native release suite: 45/45. On one
+      cutoffs, re-searches, and exact extensions. Native release suite: 47/47. On one
       real sampled-chance depth-5 gate, the whole iterative search was **9.321s / 8.79M
       nodes** vs fixed-depth **10.115s / 9.79M**; final-iteration nodes fell 14%.
 
-The isolated release-wheel operational/sparse Python suite passes **26/26**, including
-the bot adapter and timed quantized path, without replacing the extension loaded by the
-web server. Six-position `sparse_nnue_q` timed gates completed depth 3 on every 0.5s
-move, depth 3/4 in a 5/1 split at 1.0s, and depth 3/4 in a 3/3 split at 2.0s, at
-approximately 101k-126k nodes/s.
+The isolated release-wheel operational/sparse/generation Python suite passes
+**32/32**, including the bot adapter and timed quantized path, without replacing the
+extension loaded by the web server. Six-position `sparse_nnue_q` timed gates completed
+depth 3 on every 0.5s move, depth 3/4 in a 5/1 split at 1.0s, and depth 3/4 in a 3/3
+split at 2.0s, at approximately 101k-126k nodes/s.
+
+Full-width ordering is independently gated from selective pruning and is now the NNUE
+operational default. It never truncates the action list. At completed depth 3 over 20
+positions it preserved root values 20/20 while reducing nodes 15.7% and wall time
+11.5%. A same-artifact, equal-clock, paired-seat gate was neutral on outcomes (32-32
+over 64 games), positive on average score margin (+7.14), and timing-balanced. The
+underlying Rust API retains an unordered default for explicit oracle comparisons.
 
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.

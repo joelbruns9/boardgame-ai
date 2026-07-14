@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from games.kingdomino.nnue.datagen import GenConfig, generate
-from games.kingdomino.nnue.match import TimedBot
+from games.kingdomino.nnue.match import TimedBot, nnue_participant
 from games.kingdomino.nnue.sparse_data import (
     ARTIFACT_VERSION,
     TARGET_SCHEMA,
@@ -90,3 +90,22 @@ def test_timed_bot_separates_forced_and_decision_calls():
     assert summary["forced_count"] == 1
     assert summary["decision_count"] == 1
     assert summary["decision_total_seconds"] >= 0.0
+
+
+def test_nnue_participant_defaults_to_full_width_ordering(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeSearchBot:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "games.kingdomino.nnue.match.OperationalRustSearchBot", FakeSearchBot
+    )
+    participant = nnue_participant(
+        "ordered",
+        tmp_path / "model.knnue",
+        move_secs=0.1,
+    )
+    participant.make_bot()
+    assert captured["full_width_ordering"] is True

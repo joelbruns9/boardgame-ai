@@ -207,8 +207,35 @@ def test_operational_search_matches_fixed_depth_on_real_chance_tree():
     assert report.nodes == operational.nodes
     assert report.elapsed_secs > 0
     assert not report.selective
+    assert not report.full_width_ordering
     assert report.selective_pruned == 0
     assert report.ordering_evals == 0
+    assert report.ordering_actions == 0
+
+
+def test_full_width_ordering_matches_unordered_without_pruning():
+    """Cheap ordering may change traversal, never the completed sampled tree."""
+    st = _wide_boundary_state(min_deck=12)
+    rs = _rust_state_from_python(st)
+    kwargs = dict(depth=2, enum_cap=1, chance_samples=8, eval="pick_aware", seed=17)
+    unordered = kr.RustSearch(**kwargs).choose_action_timed(
+        rs, max_secs=30.0, max_depth=2, aspiration_window=0.25
+    )
+    ordered = kr.RustSearch(**kwargs).choose_action_timed(
+        rs,
+        max_secs=30.0,
+        max_depth=2,
+        aspiration_window=0.25,
+        full_width_ordering=True,
+    )
+    assert ordered.completed_depth == unordered.completed_depth == 2
+    assert ordered.action == unordered.action
+    assert ordered.value == pytest.approx(unordered.value, abs=1e-12)
+    assert ordered.full_width_ordering
+    assert not ordered.selective
+    assert ordered.selective_pruned == 0
+    assert ordered.ordering_evals == 0
+    assert ordered.ordering_actions > 0
 
 
 def test_operational_node_budget_returns_legal_fallback_and_telemetry():
@@ -280,4 +307,5 @@ def test_operational_bot_adapter_returns_python_action():
     action = bot.choose_action(state, state.legal_actions())
     assert action in state.legal_actions()
     assert bot.last_report.completed_depth == 2
+    assert bot.last_report.full_width_ordering
     assert bot.nodes == bot.last_report.nodes

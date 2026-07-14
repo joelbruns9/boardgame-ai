@@ -48,6 +48,8 @@ def main():
         help="if >0, also run deadline-safe sparse_nnue_q searches at this per-move budget",
     )
     ap.add_argument("--max-depth", type=int, default=8)
+    ap.add_argument("--compare-ordering", action="store_true",
+                    help="also time full-width cheap heuristic ordering (no pruning)")
     ap.add_argument("--selective-widths", default="",
                     help="comma-separated upper-tree beam widths for timed sweeps")
     ap.add_argument("--selective-min-depth", type=int, default=4)
@@ -100,11 +102,16 @@ def main():
             )
 
     if args.timed_secs > 0:
-        widths = [None] + [
-            int(x) for x in args.selective_widths.split(",") if x.strip()
-        ]
+        modes = [("full", None, False)]
+        if args.compare_ordering:
+            modes.append(("full-ordered", None, True))
+        modes.extend(
+            (f"selective-{width}", width, False)
+            for width in [int(x) for x in args.selective_widths.split(",") if x.strip()]
+        )
         full_actions = None
-        for width in widths:
+        full_reports = None
+        for label, width, full_width_ordering in modes:
             reports = []
             wall_start = time.perf_counter()
             for state in states:
@@ -122,6 +129,7 @@ def main():
                         max_secs=args.timed_secs,
                         max_depth=args.max_depth,
                         aspiration_window=0.25,
+                        full_width_ordering=full_width_ordering,
                         selective_width=width,
                         selective_root_width=(args.selective_root_width
                                               if width is not None else None),
@@ -132,10 +140,10 @@ def main():
             depths = Counter(r.completed_depth for r in reports)
             total_nodes = sum(r.nodes for r in reports)
             final_nodes = sum(r.last_iteration_nodes for r in reports)
-            label = "full" if width is None else f"selective-{width}"
             actions = [r.action for r in reports]
-            if width is None:
+            if label == "full":
                 full_actions = actions
+                full_reports = reports
             print(
                 f"timed {label}: {len(reports)} positions x {args.timed_secs:.3f}s, "
                 f"wall {wall:.3f}s, completed depths {dict(sorted(depths.items()))}"
@@ -145,14 +153,38 @@ def main():
                 f"nodes {total_nodes:,} ({total_nodes / wall:,.0f} n/s), "
                 f"last-complete iteration nodes {final_nodes:,}, "
                 f"ordering evals {sum(r.ordering_evals for r in reports):,}, "
+                f"ordering actions {sum(r.ordering_actions for r in reports):,}, "
                 f"selective pruned {sum(r.selective_pruned for r in reports):,}, "
                 f"Star cutoffs {sum(r.star_cutoffs for r in reports):,}, "
                 f"TT cutoffs {sum(r.tt_cutoffs for r in reports):,}, "
                 f"exact extensions {sum(r.exact_extensions for r in reports):,}"
             )
-            if full_actions is not None and width is not None:
+            if full_actions is not None and label != "full":
                 agreement = sum(a == b for a, b in zip(actions, full_actions))
                 print(f"  root action agreement with full-width: {agreement}/{len(actions)}")
+                same_depth = [
+                    (base, current)
+                    for base, current in zip(full_reports, reports)
+                    if base.completed_depth == current.completed_depth
+                    and base.value is not None and current.value is not None
+                ]
+                if same_depth:
+                    max_delta = max(abs(a.value - b.value) for a, b in same_depth)
+                    print(
+                        f"  same-depth value pairs {len(same_depth)}/{len(reports)}, "
+                        f"max |value delta| {max_delta:.3e}"
+                    )
+                mismatches = [
+                    (i, base, current)
+                    for i, (base, current) in enumerate(zip(full_reports, reports))
+                    if base.action != current.action
+                ]
+                for i, base, current in mismatches:
+                    print(
+                        f"    mismatch position {i}: depths "
+                        f"{base.completed_depth}/{current.completed_depth}, "
+                        f"values {base.value}/{current.value}"
+                    )
 
 
 if __name__ == "__main__":

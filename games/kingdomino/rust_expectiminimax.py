@@ -215,6 +215,7 @@ class OperationalRustSearchBot:
         margin_weight: float = 0.0,
         seed: int = 0,
         aspiration_window: float = 0.25,
+        full_width_ordering: bool = True,
         selective_width: int | None = None,
         selective_root_width: int | None = None,
         selective_min_depth: int = 4,
@@ -228,6 +229,7 @@ class OperationalRustSearchBot:
         self.max_secs = float(max_secs)
         self.max_depth = int(max_depth)
         self.aspiration_window = float(aspiration_window)
+        self.full_width_ordering = bool(full_width_ordering)
         self.selective_width = selective_width
         self.selective_root_width = selective_root_width
         self.selective_min_depth = int(selective_min_depth)
@@ -265,15 +267,19 @@ class OperationalRustSearchBot:
         rust_state = _rust_state_from_python(state)
         if rust_state is None:
             raise RuntimeError("could not convert GameState to RustGameState")
-        report = self.search.choose_action_timed(
-            rust_state,
-            max_secs=self.max_secs,
-            max_depth=self.max_depth,
-            aspiration_window=self.aspiration_window,
-            selective_width=self.selective_width,
-            selective_root_width=self.selective_root_width,
-            selective_min_depth=self.selective_min_depth,
-        )
+        search_kwargs = {
+            "max_secs": self.max_secs,
+            "max_depth": self.max_depth,
+            "aspiration_window": self.aspiration_window,
+            "selective_width": self.selective_width,
+            "selective_root_width": self.selective_root_width,
+            "selective_min_depth": self.selective_min_depth,
+        }
+        # Omit the new keyword on the disabled path so older installed Rust
+        # extensions remain usable until they are deliberately rebuilt.
+        if self.full_width_ordering:
+            search_kwargs["full_width_ordering"] = True
+        report = self.search.choose_action_timed(rust_state, **search_kwargs)
         self.last_report = report
         self.nodes = int(report.nodes)
         legal = state.legal_actions() if actions is None else actions

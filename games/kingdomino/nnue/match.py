@@ -71,6 +71,7 @@ def nnue_participant(
     max_depth: int = 12,
     chance_samples: int = 16,
     eval_kind: str = "sparse_nnue_q",
+    full_width_ordering: bool = True,
     selective_width: int | None = None,
     selective_root_width: int | None = None,
     selective_min_depth: int = 4,
@@ -84,6 +85,7 @@ def nnue_participant(
             chance_samples=chance_samples,
             eval=eval_kind,
             nnue_path=artifact,
+            full_width_ordering=full_width_ordering,
             selective_width=selective_width,
             selective_root_width=selective_root_width,
             selective_min_depth=selective_min_depth,
@@ -153,11 +155,13 @@ def _main_nnue(args) -> dict:
     incumbent_root_width = args.selective_root_width if incumbent_width is not None else None
     a = nnue_participant("candidate", args.candidate, move_secs=args.move_secs,
                          max_depth=args.max_depth, chance_samples=args.chance_samples,
+                         full_width_ordering=args.candidate_full_width_ordering,
                          selective_width=candidate_width,
                          selective_root_width=candidate_root_width,
                          selective_min_depth=args.selective_min_depth)
     b = nnue_participant("incumbent", args.incumbent, move_secs=args.move_secs,
                          max_depth=args.max_depth, chance_samples=args.chance_samples,
+                         full_width_ordering=args.incumbent_full_width_ordering,
                          selective_width=incumbent_width,
                          selective_root_width=incumbent_root_width,
                          selective_min_depth=args.selective_min_depth)
@@ -172,6 +176,8 @@ def _main_nnue(args) -> dict:
             "move_secs": args.move_secs,
             "max_depth": args.max_depth,
             "chance_samples": args.chance_samples,
+            "candidate_full_width_ordering": args.candidate_full_width_ordering,
+            "incumbent_full_width_ordering": args.incumbent_full_width_ordering,
             "selective_width": args.selective_width,
             "candidate_selective_width": candidate_width,
             "incumbent_selective_width": incumbent_width,
@@ -185,6 +191,7 @@ def _main_az(args) -> dict:
     nnue = nnue_participant("NNUE", args.nnue, move_secs=args.nnue_move_secs,
                             max_depth=args.max_depth,
                             chance_samples=args.chance_samples,
+                            full_width_ordering=args.full_width_ordering,
                             selective_width=args.selective_width,
                             selective_root_width=args.selective_root_width,
                             selective_min_depth=args.selective_min_depth)
@@ -212,6 +219,7 @@ def _main_az(args) -> dict:
             "device": args.device,
             "max_depth": args.max_depth,
             "chance_samples": args.chance_samples,
+            "full_width_ordering": args.full_width_ordering,
             "selective_width": args.selective_width,
             "selective_root_width": args.selective_root_width,
             "selective_min_depth": args.selective_min_depth,
@@ -229,6 +237,16 @@ def main():
     p.add_argument("--move-secs", type=float, default=0.5)
     p.add_argument("--max-depth", type=int, default=12)
     p.add_argument("--chance-samples", type=int, default=16)
+    p.add_argument(
+        "--candidate-full-width-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument(
+        "--incumbent-full-width-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--selective-width", type=int, default=None)
     p.add_argument("--selective-root-width", type=int, default=None)
     p.add_argument("--candidate-selective-width", type=int, default=None)
@@ -247,6 +265,11 @@ def main():
     p.add_argument("--c-puct", type=float, default=1.5)
     p.add_argument("--max-depth", type=int, default=12)
     p.add_argument("--chance-samples", type=int, default=16)
+    p.add_argument(
+        "--full-width-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--selective-width", type=int, default=None)
     p.add_argument("--selective-root-width", type=int, default=None)
     p.add_argument("--selective-min-depth", type=int, default=4)
