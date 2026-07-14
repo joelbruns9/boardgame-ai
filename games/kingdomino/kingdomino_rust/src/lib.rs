@@ -10,10 +10,12 @@ use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 mod deck0_draft_dp;
 mod nnue_features;
 mod search;
+mod sparse_nnue;
 
 // Terrain constants matching Python's Terrain IntEnum
 const EMPTY: u8 = 0;
@@ -1800,6 +1802,8 @@ enum EmmEval {
     PickBlind, // tanh(margin / scale)
     PickAware, // tanh((margin + w*(claimed_crowns0 - claimed_crowns1)) / scale)
     Nnue,      // trained dense net (weights held in RustSearch.nnue)
+    SparseNnueRef, // Step-3 sparse net, stateless full accumulator rebuild
+    SparseNnue, // Step-3 sparse net, reversible dual accumulators
 }
 
 /// C(n, 4) as a u64 (0 for n < 4).
@@ -2258,6 +2262,7 @@ struct RustSearch {
     cfg: search::SearchConfig,
     eval: EmmEval,
     nnue: Option<NnueEval>, // Some iff eval == Nnue
+    sparse_nnue: Option<Arc<sparse_nnue::SparseNnueWeights>>,
     #[pyo3(get)]
     nodes: u64,
 }
@@ -2290,22 +2295,40 @@ impl RustSearch {
             "pick_blind" | "tanh_margin" => EmmEval::PickBlind,
             "pick_aware" => EmmEval::PickAware,
             "nnue" => EmmEval::Nnue,
+            "sparse_nnue_ref" => EmmEval::SparseNnueRef,
+            "sparse_nnue" => EmmEval::SparseNnue,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown eval '{}' (expected 'pick_blind', 'pick_aware', or 'nnue')",
+                    "unknown eval '{}' (expected 'pick_blind', 'pick_aware', 'nnue', \
+                     'sparse_nnue_ref', or 'sparse_nnue')",
                     other
                 )))
             }
         };
-        let nnue = match (eval, nnue_path) {
+        let nnue = match (eval, nnue_path.as_ref()) {
             (EmmEval::Nnue, Some(p)) => Some(NnueEval {
-                w: NnueWeights::load(&p)?,
+                w: NnueWeights::load(p)?,
             }),
             (EmmEval::Nnue, None) => {
                 return Err(PyValueError::new_err("eval='nnue' requires nnue_path"))
             }
+            (_, None) => None,
+            (_, Some(_)) => None,
+        };
+        let sparse_nnue = match (eval, nnue_path.as_ref()) {
+            (EmmEval::SparseNnue | EmmEval::SparseNnueRef, Some(p)) => {
+                Some(Arc::new(sparse_nnue::SparseNnueWeights::load(p)?))
+            }
+            (EmmEval::SparseNnue | EmmEval::SparseNnueRef, None) => {
+                return Err(PyValueError::new_err(
+                    "sparse NNUE eval requires nnue_path",
+                ))
+            }
+            (EmmEval::Nnue, _) => None,
             (_, Some(_)) => {
-                return Err(PyValueError::new_err("nnue_path given but eval is not 'nnue'"))
+                return Err(PyValueError::new_err(
+                    "nnue_path given but eval is not an NNUE evaluator",
+                ))
             }
             (_, None) => None,
         };
@@ -2319,6 +2342,7 @@ impl RustSearch {
             },
             eval,
             nnue,
+            sparse_nnue,
             nodes: 0,
         })
     }
@@ -2341,6 +2365,29 @@ impl RustSearch {
             EmmEval::Nnue => {
                 let e = self.nnue.as_ref().expect("nnue eval without weights");
                 search::value::<Kingdomino, _>(&mut s, d, a, b, e, &self.cfg, &mut nodes)?
+            }
+            EmmEval::SparseNnueRef => {
+                let e = sparse_nnue::SparseStatelessEval {
+                    weights: Arc::clone(
+                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    ),
+                };
+                search::value::<Kingdomino, _>(&mut s, d, a, b, &e, &self.cfg, &mut nodes)?
+            }
+            EmmEval::SparseNnue => {
+                let weights = Arc::clone(
+                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                );
+                let mut state = sparse_nnue::SparseSearchState::new(s, weights)?;
+                search::value::<sparse_nnue::SparseKingdomino, _>(
+                    &mut state,
+                    d,
+                    a,
+                    b,
+                    &sparse_nnue::SparseIncrementalEval,
+                    &self.cfg,
+                    &mut nodes,
+                )?
             }
         };
         self.nodes = nodes;
@@ -2370,6 +2417,33 @@ impl RustSearch {
             EmmEval::Nnue => {
                 let e = self.nnue.as_ref().expect("nnue eval without weights");
                 search::choose_action::<Kingdomino, _>(&mut s, e, &self.cfg, seed, &mut nodes)?
+            }
+            EmmEval::SparseNnueRef => {
+                let e = sparse_nnue::SparseStatelessEval {
+                    weights: Arc::clone(
+                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    ),
+                };
+                search::choose_action::<Kingdomino, _>(
+                    &mut s,
+                    &e,
+                    &self.cfg,
+                    seed,
+                    &mut nodes,
+                )?
+            }
+            EmmEval::SparseNnue => {
+                let weights = Arc::clone(
+                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                );
+                let mut state = sparse_nnue::SparseSearchState::new(s, weights)?;
+                search::choose_action::<sparse_nnue::SparseKingdomino, _>(
+                    &mut state,
+                    &sparse_nnue::SparseIncrementalEval,
+                    &self.cfg,
+                    seed,
+                    &mut nodes,
+                )?
             }
         };
         self.nodes = nodes;
@@ -9379,6 +9453,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::NnueEvaluator;
+
+    #[pymodule_export]
+    use super::sparse_nnue::SparseNnueEvaluator;
 
     #[pymodule_export]
     use super::RustMCTS;

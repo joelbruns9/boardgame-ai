@@ -28,6 +28,7 @@ const MAX_CELL: i8 = 13;
 const BOARD_OFF: usize = 0;
 const BOARD_SIZE: usize = 2 * NUM_CELLS * NUM_HALF;
 const ROW_OFF: usize = BOARD_OFF + BOARD_SIZE;
+pub(super) const BOARD_FEATURE_END: i32 = ROW_OFF as i32;
 const PENDING_OFF: usize = ROW_OFF + NUM_DOMINOES;
 const NEXT_OFF: usize = PENDING_OFF + 2 * NUM_DOMINOES;
 const BAG_OFF: usize = NEXT_OFF + 2 * NUM_DOMINOES;
@@ -207,6 +208,30 @@ pub(super) fn sparse_indices(state: &RustGameState, perspective: u8) -> Result<V
         }
     }
 
+    active.extend(non_board_indices(state, perspective)?);
+
+    active.sort_unstable();
+    if active.windows(2).any(|w| w[0] == w[1]) {
+        return Err("duplicate active NNUE feature index".to_owned());
+    }
+    if active.iter().any(|&i| i < 0 || i as usize >= CORE_SIZE) {
+        return Err("NNUE feature index outside frozen core schema".to_owned());
+    }
+    Ok(active)
+}
+
+/// All sparse banks except board cells. Used by the incremental transition path:
+/// board additions come directly from the placement undo, while dynamic row/
+/// claim/bag/scalar banks are cheaply re-derived after every move/chance result.
+pub(super) fn non_board_indices(
+    state: &RustGameState,
+    perspective: u8,
+) -> Result<Vec<i32>, String> {
+    if perspective >= 2 {
+        return Err(format!("perspective must be 0 or 1, got {perspective}"));
+    }
+    let opponent = 1 - perspective;
+    let mut active = Vec::with_capacity(64);
     for &did in &state.current_row {
         active.push((ROW_OFF + checked_domino_id(did, "current_row")?) as i32);
     }
@@ -242,13 +267,25 @@ pub(super) fn sparse_indices(state: &RustGameState, perspective: u8) -> Result<V
     }
 
     active.sort_unstable();
-    if active.windows(2).any(|w| w[0] == w[1]) {
-        return Err("duplicate active NNUE feature index".to_owned());
-    }
-    if active.iter().any(|&i| i < 0 || i as usize >= CORE_SIZE) {
-        return Err("NNUE feature index outside frozen core schema".to_owned());
-    }
     Ok(active)
+}
+
+pub(super) fn board_feature_index(
+    perspective: u8,
+    owner: u8,
+    x: i8,
+    y: i8,
+    terrain: u8,
+    crowns: u8,
+) -> Result<i32, String> {
+    if perspective >= 2 || owner >= 2 {
+        return Err("invalid perspective/owner for board feature".to_owned());
+    }
+    let role = usize::from(owner != perspective);
+    let cell = cell_index(x, y)?;
+    let half = half_type_index(terrain, crowns)
+        .ok_or_else(|| format!("invalid half type ({terrain},{crowns})"))?;
+    Ok((BOARD_OFF + (role * NUM_CELLS + cell) * NUM_HALF + half) as i32)
 }
 
 #[derive(Default)]

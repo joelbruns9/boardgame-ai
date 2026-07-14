@@ -51,8 +51,22 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       pilot reached best Brier **0.2115** vs **0.2500** base rate and margin MAE **16.62**
       vs **17.81** points at epoch 8; later epochs overfit. The reserved 5,720-position
       test split remains unopened.
-- [ ] **Rust pre-activation accumulator + sparse export/loader + IncrementalEval + RAII**
-      ← **NEXT**.
+- [x] **Sparse v3 export/loader + Rust oracle + reversible dual accumulators** — the
+      `KNSP` v3 artifact is feature-major and omits training-only auxiliary heads.
+      Stateless Rust forward matches PyTorch; incremental search matches stateless
+      values/actions and node counts across deterministic and sampled-chance trees.
+      The composite search state makes game undo + accumulator rollback one indivisible
+      operation; full playout/unwind and injected-error cleanup restore both exactly.
+      Semantic placement additions come from the move undo; compact dynamic banks are
+      re-derived after each move/chance result, so sampled rows and round promotion cannot
+      drift from the frozen reference encoder.
+- [ ] **Profile-driven inference follow-up** ← **NEXT DECISION**. Real `choose_action`
+      profiling found no material deep-search gain from the float accumulator: on a
+      six-position depth-3 repeat, stateless was **31.8k nodes/s** and incremental
+      **32.3k nodes/s (1.02×)**; shallow trees can be slower from setup/rollback overhead.
+      Component cost is approximately **3.8 µs sparse derive+sum, 10.5 µs summary,
+      14.2 µs float tail** per eval. The sparse first layer is no longer dominant;
+      optimize/quantize the tail and summary before investing further in deltas.
 
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.
@@ -72,10 +86,12 @@ value:
 ReLU is nonlinear, so `a' = a + added − removed` is **wrong**. Column add/subtract is
 valid only on the *linear* pre-activation. A move that flips a handful of features
 updates `z` by a few column adds — O(flips × width) instead of recomputing the
-`~5.7k × width` layer. That removes the **dominant** per-node cost. It does *not* by
-itself guarantee hundreds of k nodes/s: the per-leaf summary flood-fill and the tail
-still run every node. Net throughput is a **profiling question after v3.0**, not a
-prediction (§Phasing).
+`~5.7k × width` layer. That was the design hypothesis for removing the **dominant**
+per-node cost. v3.0 profiling answered it more precisely: once the stateless evaluator
+also sums only the ~110 *active* rows, sparse derive+sum is ~3.8 µs while summary is
+~10.5 µs and the float tail ~14.2 µs. The accumulator is correct but only neutral-to-
+modestly faster in deep search; hundreds of k nodes/s requires work on the tail/summary,
+not more first-layer delta engineering (§Phasing).
 
 So the feature set is designed around one question: **does each move flip only a few
 features?** Everything below is chosen so the answer is yes.
@@ -407,12 +423,15 @@ older/diverse data and measure each generation against **fixed** opponents.
 
 ## Phasing (retire the fiddliest engineering last)
 
-- **v3.0 — float accumulator, recomputed rich summary, no union-find.** Design schema,
-  generate enhanced-Option-A data, build Python sparse (EmbeddingBag) encoder + retrain,
-  build Rust pre-activation accumulator + semantic chance-aware deltas + cloneable
-  `IncrementalEval` + RAII cleanup, verify. **Profile here.**
-- **v3.1 — incremental region features via rollback union-find**, only if profiling shows
-  flood-fill dominates. Same schema → **no retrain**.
+- **v3.0 — COMPLETE: float accumulator, recomputed rich summary, no union-find.** Schema,
+  enhanced-Option-A pilot, packed `EmbeddingBag` training, v3 export, stateless Rust
+  oracle, reversible dual accumulator, chance/error cleanup gates, and profiling landed.
+  The composite state provides atomic game+accumulator unwind without a separate mutable
+  evaluator stack.
+- **v3.1 — profile-driven float inference.** The measured bottlenecks are tail first,
+  summary second; the active-row accumulator rebuild is only ~13% of leaf cost. Improve
+  tail layout/vectorization and eliminate duplicate summary traversal before considering
+  rollback union-find. Same schema → **no retrain**.
 - **v3.2 — quantization + SIMD** (int16 acc, int8 tail), plain ReLU. **Overflow test
   first** (Azul lesson).
 

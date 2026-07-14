@@ -5,6 +5,25 @@ Goal: build a CPU-only NNUE evaluation + alpha-beta/expectiminimax searcher for
 higher-quality / independent targets, (b) **combine** it into the HOF gauntlet as
 an architecturally-independent exploiter, and (c) **help** as an analysis tool.
 
+## Current status (2026-07-14)
+
+The authoritative frozen encoder/inference detail is in `NNUE_STEP3_FEATURES.md`.
+Phase 0 search, mutable Rust make/unmake, generic search traits, dense representability,
+the 5,710+171 sparse encoder, replayable data harness, packed `EmbeddingBag` training,
+v3 sparse export, stateless Rust forward, and reversible dual accumulators are complete.
+The 50k pilot learned above baseline (validation Brier 0.2115 vs 0.2500; margin MAE
+16.62 vs 17.81), with the reserved test split still unopened.
+
+The main Phase-2 performance hypothesis has now been measured. Sparse stateless search
+already sums only active feature rows, so the float accumulator is correct but provides
+no material overall bot-path gain (six-position depth-3 repeat: 31.8k stateless vs 32.3k
+incremental nodes/s, 1.02×). Per-eval profiling is ~3.8 µs sparse derive+sum, ~10.5 µs
+summary, and ~14.2 µs float tail. The next decision is therefore tail
+layout/vectorization/quantization plus duplicate-summary-work removal—not more
+first-layer delta complexity. The original phase descriptions below are retained as the
+planning history; where they predict the accumulator or flood-fill will dominate, these
+measurements supersede that prediction.
+
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data
 exhaustion + a monoculture of AlphaZero-lineage agents. An NNUE searcher attacks
@@ -85,7 +104,7 @@ So "we haven't built the encoder or Rust yet" is BY DESIGN, not an omission.
 | Can we do CORRECT expectiminimax over Kingdomino's chance structure without clairvoyance? (the thesis's flagged bottleneck) | **Phase 0** (done) | days, pure Python |
 | Where does strength come from — eval content vs raw depth? | **Phase 0 probe** (done: eval dominates at feasible depth) | free (a control run) |
 | Can a small STATIC learned eval represent Kingdomino value well enough? (connectivity scoring, pick value) | **Phase 1** — dense MLP on run10 buffer, dropped into the Phase-0 harness | hours, pure PyTorch, NO Rust |
-| Can the incremental accumulator be made bit-exact AND fast? | **Phase 2** — gated on Phase 1 passing | weeks, Rust |
+| Can the incremental accumulator be made bit-exact AND fast? | **Phase 2 complete** — correct; only ~1.02× at depth 3 because tail/summary dominate | weeks, Rust |
 | Does the whole thing beat / complement AZ? | Phases 4–5 | ongoing |
 
 **Phase 0 is NOT a feasibility test of the NNUE representation or performance.** It
