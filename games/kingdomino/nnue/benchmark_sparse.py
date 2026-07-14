@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import random
 import time
 
@@ -40,6 +41,13 @@ def main():
     ap.add_argument("--depths", default="2,3")
     ap.add_argument("--positions", type=int, default=4)
     ap.add_argument("--chance-samples", type=int, default=8)
+    ap.add_argument(
+        "--timed-secs",
+        type=float,
+        default=0.0,
+        help="if >0, also run deadline-safe sparse_nnue_q searches at this per-move budget",
+    )
+    ap.add_argument("--max-depth", type=int, default=8)
     ap.add_argument(
         "--evals",
         default="sparse_nnue_ref,sparse_nnue,sparse_nnue_q",
@@ -85,6 +93,43 @@ def main():
                 f"  quantized action agreement {agreement}/{len(states)}; "
                 f"speedup {result['sparse_nnue'][0] / result['sparse_nnue_q'][0]:.2f}x"
             )
+
+    if args.timed_secs > 0:
+        reports = []
+        wall_start = time.perf_counter()
+        for state in states:
+            search = kr.RustSearch(
+                depth=args.max_depth,
+                enum_cap=1,
+                chance_samples=args.chance_samples,
+                seed=23,
+                eval="sparse_nnue_q",
+                nnue_path=args.model,
+            )
+            reports.append(
+                search.choose_action_timed(
+                    state,
+                    max_secs=args.timed_secs,
+                    max_depth=args.max_depth,
+                    aspiration_window=0.25,
+                )
+            )
+        wall = time.perf_counter() - wall_start
+        depths = Counter(r.completed_depth for r in reports)
+        total_nodes = sum(r.nodes for r in reports)
+        final_nodes = sum(r.last_iteration_nodes for r in reports)
+        print(
+            f"timed sparse_nnue_q: {len(reports)} positions x {args.timed_secs:.3f}s, "
+            f"wall {wall:.3f}s, completed depths {dict(sorted(depths.items()))}"
+        )
+        print(
+            f"  timeouts {sum(r.timed_out for r in reports)}/{len(reports)}, "
+            f"nodes {total_nodes:,} ({total_nodes / wall:,.0f} n/s), "
+            f"last-complete iteration nodes {final_nodes:,}, "
+            f"Star cutoffs {sum(r.star_cutoffs for r in reports):,}, "
+            f"TT cutoffs {sum(r.tt_cutoffs for r in reports):,}, "
+            f"exact extensions {sum(r.exact_extensions for r in reports):,}"
+        )
 
 
 if __name__ == "__main__":

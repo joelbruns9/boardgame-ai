@@ -18,10 +18,12 @@ import random
 from math import inf
 
 import kingdomino_rust as kr
+import pytest
 
 from games.kingdomino.game import GameState, Phase
 from games.kingdomino.endgame_solver import _rust_state_from_python
 from games.kingdomino.rust_expectiminimax import (
+    OperationalRustSearchBot,
     RustExpectiminimax,
     tanh_margin as r_tanh_margin,
     pick_aware as r_pick_aware,
@@ -183,3 +185,69 @@ def test_constructor_validation():
     for bad_mw in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError):
             kr.RustSearch(margin_weight=bad_mw)
+
+
+def test_operational_search_matches_fixed_depth_on_real_chance_tree():
+    """The timed path may prune/order differently, but a fully completed depth
+    must choose the same optimum as the fixed-depth oracle on a real sampled
+    chance tree."""
+    st = _wide_boundary_state(min_deck=12)
+    rs = _rust_state_from_python(st)
+    kwargs = dict(depth=2, enum_cap=1, chance_samples=8, eval="pick_aware", seed=17)
+    fixed = kr.RustSearch(**kwargs)
+    expected = fixed.choose_action(rs)
+    operational = kr.RustSearch(**kwargs)
+    report = operational.choose_action_timed(
+        rs, max_secs=30.0, max_depth=2, aspiration_window=0.25
+    )
+    assert report.completed_depth == 2
+    assert not report.timed_out
+    assert report.action == expected
+    assert report.value is not None
+    assert report.nodes == operational.nodes
+    assert report.elapsed_secs > 0
+
+
+def test_operational_node_budget_returns_legal_fallback_and_telemetry():
+    st = _wide_boundary_state(min_deck=12)
+    rs = _rust_state_from_python(st)
+    search = kr.RustSearch(
+        depth=4, enum_cap=1, chance_samples=8, eval="pick_aware", seed=17
+    )
+    report = search.choose_action_timed(rs, max_secs=30.0, max_depth=4, max_nodes=1)
+    assert report.timed_out
+    assert report.completed_depth == 0
+    assert report.value is None
+    assert report.nodes == 1
+    assert report.action in rs.legal_actions()
+
+
+def test_operational_argument_validation():
+    st = _wide_boundary_state(min_deck=12)
+    rs = _rust_state_from_python(st)
+    search = kr.RustSearch()
+    for kwargs in (
+        {"max_secs": 0.0},
+        {"max_secs": float("nan")},
+        {"max_depth": 0},
+        {"aspiration_window": 0.0},
+        {"max_nodes": 0},
+    ):
+        with pytest.raises(ValueError):
+            search.choose_action_timed(rs, **kwargs)
+
+
+def test_operational_bot_adapter_returns_python_action():
+    state = _wide_boundary_state(min_deck=12)
+    bot = OperationalRustSearchBot(
+        max_secs=10.0,
+        max_depth=2,
+        chance_samples=8,
+        enum_cap=1,
+        eval="pick_aware",
+        seed=17,
+    )
+    action = bot.choose_action(state, state.legal_actions())
+    assert action in state.legal_actions()
+    assert bot.last_report.completed_depth == 2
+    assert bot.nodes == bot.last_report.nodes

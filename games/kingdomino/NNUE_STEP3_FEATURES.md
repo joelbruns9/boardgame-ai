@@ -83,6 +83,22 @@ stored in every derived-feature artifact / `.knnue` / trained model.
       is 20/20 at depth 2 and 6/6 at depth 3. The six-position depth-3 gate is **102.3k
       nodes/s** vs 98.8k float (**1.04×**) with roughly half the inference-weight memory.
 
+- [x] **Native operational fast search** — `choose_action_timed` adds deadline-safe
+      iterative deepening with last-complete-depth fallback, root/PV-first ordering,
+      root window reuse, aspiration re-search, depth-aware TT reuse at canonical round
+      roots, bounded Star1 chance pruning, and exact official-outcome extensions through
+      deterministic tails. Timeout/error paths unmake both game and accumulator.
+      Telemetry exposes completed depth, timeout, total/final-iteration nodes, Star/TT
+      cutoffs, re-searches, and exact extensions. Native release suite: 45/45. On one
+      real sampled-chance depth-5 gate, the whole iterative search was **9.321s / 8.79M
+      nodes** vs fixed-depth **10.115s / 9.79M**; final-iteration nodes fell 14%.
+
+The isolated release-wheel operational/sparse Python suite passes **26/26**, including
+the bot adapter and timed quantized path, without replacing the extension loaded by the
+web server. Six-position `sparse_nnue_q` timed gates completed depth 3 on every 0.5s
+move, depth 3/4 in a 5/1 split at 1.0s, and depth 3/4 in a 3/3 split at 2.0s, at
+approximately 101k-126k nodes/s.
+
 **Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
 `terminal_search_value` with the official cascade before AZ/hybrid data.
 
@@ -449,9 +465,11 @@ older/diverse data and measure each generation against **fixed** opponents.
 - **v3.2 — COMPLETE: guarded quantization + SIMD.** Int16 accumulator, int8 tail,
   explicit AVX2/scalar-parity kernel, conservative overflow proof, float-oracle numeric
   gates, and search-level action/performance gates. Same artifact; no retrain.
-- **Operational search — NEXT.** Deadline-safe iterative deepening, root/PV ordering,
-  aspiration windows, reuse where stochastic semantics allow it, and completed-depth /
-  timeout telemetry.
+- **Operational search — NATIVE COMPLETE.** Deadline-safe iterative deepening,
+  root/PV/TT ordering and reuse, aspiration windows, bounded Star1 chance pruning,
+  deterministic-tail exact extension, and completed-depth/timeout telemetry. Native
+  and isolated-wheel Python gates are complete; matched-clock strength measurement
+  remains.
 
 ## Verification discipline (float-aware; the completeness gate is redesigned)
 

@@ -47,6 +47,16 @@
 > (added `make_with_row` negative tests, sampled-row equivalence, evaluator-
 > exception unwind). Next: Step 3.
 
+> **STATUS — Step 3 + operational path DONE natively (2026-07-14).** The generic
+> recursion is Rust-hosted and the playable `RustSearch.choose_action_timed` path now
+> adds deadline-safe iterative deepening, last-complete-depth fallback, root/PV/TT
+> ordering and window reuse, aspiration re-search, bounded Star1 chance pruning, exact
+> official-outcome deterministic-tail extension, and full telemetry. A depth-5 real
+> sampled-chance gate matched the fixed oracle's move while using 8.79M total nodes /
+> 9.321s versus 9.79M / 10.115s fixed. Rust release suite is 45/45 and the isolated-
+> wheel Python operational/sparse suite is 26/26, including the bot adapter and timed
+> quantized path. The live web-server extension was deliberately not overwritten.
+
 
 **Goal.** Give the expectiminimax searcher a mutable, reversible engine so a single
 search walks one `RustGameState` down and back up the tree instead of cloning a

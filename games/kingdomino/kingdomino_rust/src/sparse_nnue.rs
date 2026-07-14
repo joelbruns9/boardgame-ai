@@ -830,6 +830,14 @@ impl Game for SparseKingdomino {
         <Kingdomino as Game>::unmake(&mut s.game, undo.game);
         s.accumulator.restore(undo.accumulator);
     }
+
+    fn exact_remaining_plies(s: &Self::State) -> Option<u32> {
+        <Kingdomino as Game>::exact_remaining_plies(&s.game)
+    }
+
+    fn position_key(s: &Self::State, scratch: &mut Vec<u8>) -> Option<u128> {
+        <Kingdomino as Game>::position_key(&s.game, scratch)
+    }
 }
 
 pub(super) struct SparseIncrementalEval;
@@ -1026,6 +1034,14 @@ impl Game for QuantizedSparseKingdomino {
     fn unmake(s: &mut Self::State, undo: Self::Undo) {
         <Kingdomino as Game>::unmake(&mut s.game, undo.game);
         s.accumulator.restore(undo.accumulator);
+    }
+
+    fn exact_remaining_plies(s: &Self::State) -> Option<u32> {
+        <Kingdomino as Game>::exact_remaining_plies(&s.game)
+    }
+
+    fn position_key(s: &Self::State, scratch: &mut Vec<u8>) -> Option<u128> {
+        <Kingdomino as Game>::position_key(&s.game, scratch)
     }
 }
 

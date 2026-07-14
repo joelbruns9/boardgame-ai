@@ -31,10 +31,33 @@ the pilot accumulator at **19,958 < 32,767**. Across 100 real positions, quantiz
 float expected-score MAE/max are **0.0028/0.0109** and margin MAE/max are
 **0.13/0.43 points**. Root actions agree 20/20 at depth 2 and 6/6 at depth 3. The fixed
 six-position depth-3 gate reaches **102.3k nodes/s** vs 98.8k float (**1.04×**) while
-roughly halving inference-weight storage. The next milestone is the operational fast
-searcher: deadlines, iterative deepening, root/PV ordering, aspiration windows, and
-safe search telemetry. The original phase descriptions below remain planning history;
-these measurements supersede their bottleneck predictions.
+roughly halving inference-weight storage.
+
+The native operational searcher is now implemented. `RustSearch.choose_action_timed`
+uses one shared wall-clock deadline, iterative deepening, last-complete-depth fallback,
+root/PV-first ordering, root-sibling windows, aspiration re-search, a depth-aware
+bound/exact TT at Kingdomino's canonical round roots, bounded Star1 chance pruning,
+and exact horizon extension through deterministic deck-in-{0,4}/final tails. The tail
+extension searches the generic official-outcome objective to GAME_OVER rather than
+calling the legacy raw-margin solver, so score ties retain the largest-territory/crowns
+cascade. Telemetry reports completed depth, timeout, total/final-iteration nodes,
+Star cutoffs, TT hits/cutoffs, aspiration re-searches, and exact extensions. A bot_match
+adapter (`OperationalRustSearchBot`) makes this the playable path.
+
+Native release gates are green (**45/45 Rust tests**): deterministic node-budget
+timeout/unwind, aspiration failure re-search, Star1, TT reuse, exact-tail ply counts on
+real games, and fixed-vs-operational move equivalence. On the real sampled-chance gate
+at depth 5, operational search used **8.79M total nodes / 9.321s** (including depths
+1-4) vs fixed depth-5's **9.79M / 10.115s**; its final iteration was 8.55M nodes
+(14% below fixed). The isolated release-wheel Python gate now passes **26/26** tests,
+including the bot adapter and a timed `sparse_nnue_q` move matched to fixed-depth.
+The live web-server extension was not replaced. On six representative positions the
+quantized timed path sustained roughly **101k-126k nodes/s**: every 0.5s move completed
+depth 3; at 1.0s, five completed depth 3 and one depth 4; at 2.0s, three completed depth
+3 and three depth 4. All intentionally timed out while returning the last complete
+iteration. Next: matched-clock NNUE-vs-AZ strength measurement. The original phase
+descriptions below remain planning history; these measurements supersede their
+bottleneck predictions.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data
@@ -293,6 +316,10 @@ deck-multiset-seeded CRN (explicit stable hash). Plugs into `bot_match.run_match
   rounds. The eval extends *approximate* search; it never *certifies* an earlier
   exact frontier.
 - **Deliverable:** re-measured ELO; ideally > the AZ checkpoint at matched wall-clock.
+
+**STATUS (2026-07-14): operational search machinery complete and gated.** The
+remaining Phase-3 deliverable is experimental, not engine construction: play the
+paired matched-clock NNUE-vs-AZ bar and re-measure strength.
 
 ### Phase 4 — Training loop (self-generated data)  (ongoing)
 - Azul methodology: searcher self-plays → positions labeled with deep-search

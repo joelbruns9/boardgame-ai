@@ -1980,6 +1980,45 @@ impl search::Game for Kingdomino {
     fn unmake(s: &mut RustGameState, u: UndoRecord) {
         s.unmake(u);
     }
+
+    fn exact_remaining_plies(s: &RustGameState) -> Option<u32> {
+        match s.phase {
+            FINAL_PLACEMENT if s.deck.is_empty() => {
+                Some((s.pending_claims.len() - s.actor_index) as u32)
+            }
+            PLACE_AND_SELECT if s.deck.is_empty() || s.deck.len() == 4 => {
+                let current = (s.pending_claims.len() - s.actor_index) as u32;
+                // Every current action claims one domino for the next round.
+                // With an empty deck that next round is four final placements;
+                // with one row left it is four place-and-select moves followed
+                // by four final placements. No hidden draw remains in either case.
+                Some(current + if s.deck.is_empty() { 4 } else { 8 })
+            }
+            _ => None,
+        }
+    }
+
+    fn position_key(s: &RustGameState, scratch: &mut Vec<u8>) -> Option<u128> {
+        // Kingdomino's measured re-entry comes from pick-order permutations
+        // collapsing when a round is promoted/sorted. Hash those canonical
+        // round roots; hashing every interior placement node costs more than it
+        // saves and those states rarely transpose.
+        if s.phase == INITIAL_SELECTION || s.actor_index != 0 {
+            return None;
+        }
+        solver_state_bytes(s, scratch);
+        // The legacy exact-endgame key intentionally omits fields that cannot
+        // affect future rules. A depth-limited NNUE TT must additionally retain
+        // every field visible to the evaluator, especially discard history, and
+        // opening actor identity before actor_index becomes meaningful.
+        scratch.extend_from_slice(&(s.initial_pick_count as u64).to_le_bytes());
+        scratch.push(s.start_player);
+        scratch.push(s.harmony as u8);
+        scratch.push(s.middle_kingdom as u8);
+        scratch.extend_from_slice(&s.discards[0].to_le_bytes());
+        scratch.extend_from_slice(&s.discards[1].to_le_bytes());
+        Some(xxhash_rust::xxh3::xxh3_128(scratch))
+    }
 }
 
 impl RustGameState {
@@ -2269,6 +2308,37 @@ struct RustSearch {
     nodes: u64,
 }
 
+/// Telemetry for one deadline-safe iterative-deepening move. `action` always
+/// contains a legal fallback; `value` is absent only when no depth completed
+/// (or the move was forced and therefore required no search).
+#[pyclass]
+struct OperationalSearchReport {
+    #[pyo3(get)]
+    action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
+    #[pyo3(get)]
+    value: Option<f64>,
+    #[pyo3(get)]
+    completed_depth: u32,
+    #[pyo3(get)]
+    timed_out: bool,
+    #[pyo3(get)]
+    elapsed_secs: f64,
+    #[pyo3(get)]
+    nodes: u64,
+    #[pyo3(get)]
+    aspiration_researches: u32,
+    #[pyo3(get)]
+    star_cutoffs: u64,
+    #[pyo3(get)]
+    exact_extensions: u64,
+    #[pyo3(get)]
+    tt_hits: u64,
+    #[pyo3(get)]
+    tt_cutoffs: u64,
+    #[pyo3(get)]
+    last_iteration_nodes: u64,
+}
+
 #[pymethods]
 impl RustSearch {
     #[new]
@@ -2496,6 +2566,134 @@ impl RustSearch {
         self.nodes = nodes;
         chosen.ok_or_else(|| {
             PyValueError::new_err("choose_action on a state with no legal actions")
+        })
+    }
+
+    /// Operational bot path: iterative deepening under one shared deadline.
+    /// Root/PV-first ordering, root-sibling alpha/beta reuse, aspiration windows,
+    /// bounded Star1 chance pruning, and deterministic exact-tail extensions are
+    /// all enabled. On timeout the last fully completed depth is returned.
+    #[pyo3(signature = (state, max_secs=1.0, max_depth=None, aspiration_window=0.25, max_nodes=None))]
+    fn choose_action_timed(
+        &mut self,
+        state: &RustGameState,
+        max_secs: f64,
+        max_depth: Option<u32>,
+        aspiration_window: f64,
+        max_nodes: Option<u64>,
+    ) -> PyResult<OperationalSearchReport> {
+        if !max_secs.is_finite() || max_secs <= 0.0 {
+            return Err(PyValueError::new_err("max_secs must be finite and > 0"));
+        }
+        let max_depth = max_depth.unwrap_or(self.cfg.depth);
+        if max_depth < 1 {
+            return Err(PyValueError::new_err("max_depth must be >= 1"));
+        }
+        if !aspiration_window.is_finite() || aspiration_window <= 0.0 {
+            return Err(PyValueError::new_err(
+                "aspiration_window must be finite and > 0",
+            ));
+        }
+        if max_nodes == Some(0) {
+            return Err(PyValueError::new_err("max_nodes must be >= 1"));
+        }
+
+        let start = std::time::Instant::now();
+        let limits = search::OperationalLimits {
+            max_depth,
+            deadline: start + std::time::Duration::from_secs_f64(max_secs),
+            aspiration_window,
+            node_limit: max_nodes,
+            value_bound: 1.0 + self.cfg.margin_weight.abs(),
+        };
+        let result = match self.eval {
+            EmmEval::PickBlind => {
+                let mut s = state.cloned();
+                search::choose_action_operational::<Kingdomino, _>(
+                    &mut s,
+                    &PickBlindEval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+            EmmEval::PickAware => {
+                let mut s = state.cloned();
+                search::choose_action_operational::<Kingdomino, _>(
+                    &mut s,
+                    &PickAwareEval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+            EmmEval::Nnue => {
+                let mut s = state.cloned();
+                let eval = self.nnue.as_ref().expect("nnue eval without weights");
+                search::choose_action_operational::<Kingdomino, _>(
+                    &mut s,
+                    eval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+            EmmEval::SparseNnueRef => {
+                let mut s = state.cloned();
+                let eval = sparse_nnue::SparseStatelessEval {
+                    weights: Arc::clone(
+                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    ),
+                };
+                search::choose_action_operational::<Kingdomino, _>(
+                    &mut s,
+                    &eval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+            EmmEval::SparseNnue => {
+                let weights = Arc::clone(
+                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                );
+                let mut s = sparse_nnue::SparseSearchState::new(state.cloned(), weights)?;
+                search::choose_action_operational::<sparse_nnue::SparseKingdomino, _>(
+                    &mut s,
+                    &sparse_nnue::SparseIncrementalEval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+            EmmEval::QuantizedSparseNnue => {
+                let weights = Arc::clone(
+                    self.quantized_sparse_nnue
+                        .as_ref()
+                        .expect("quantized sparse nnue without weights"),
+                );
+                let mut s =
+                    sparse_nnue::QuantizedSparseSearchState::new(state.cloned(), weights)?;
+                search::choose_action_operational::<sparse_nnue::QuantizedSparseKingdomino, _>(
+                    &mut s,
+                    &sparse_nnue::QuantizedSparseEval,
+                    &self.cfg,
+                    &limits,
+                )?
+            }
+        }
+        .ok_or_else(|| {
+            PyValueError::new_err("choose_action_timed on a state with no legal actions")
+        })?;
+        self.nodes = result.nodes;
+        Ok(OperationalSearchReport {
+            action: result.action,
+            value: result.value,
+            completed_depth: result.completed_depth,
+            timed_out: result.timed_out,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+            nodes: result.nodes,
+            aspiration_researches: result.aspiration_researches,
+            star_cutoffs: result.star_cutoffs,
+            exact_extensions: result.exact_extensions,
+            tt_hits: result.tt_hits,
+            tt_cutoffs: result.tt_cutoffs,
+            last_iteration_nodes: result.last_iteration_nodes,
         })
     }
 }
@@ -6835,6 +7033,143 @@ mod make_unmake_tests {
         assert_eq!(fingerprint(&t), fpt, "errored terminal make mutated state");
         Ok(())
     }
+
+    /// The operational search may extend a horizon only when the game reports an
+    /// exact deterministic distance to GAME_OVER. Prove that Kingdomino's count
+    /// is exact on every tail state encountered across random full games.
+    #[test]
+    fn operational_exact_tail_count_is_exact() -> PyResult<()> {
+        let mut checked = 0usize;
+        let mut saw_deck4 = false;
+        let mut saw_deck0 = false;
+        let mut saw_final = false;
+        for seed in 0..40u64 {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x0EAC_7A11);
+            let mut state = new_game(seed, true, true);
+            while state.phase != GAME_OVER {
+                if let Some(predicted) =
+                    <Kingdomino as search::Game>::exact_remaining_plies(&state)
+                {
+                    saw_deck4 |= state.phase == PLACE_AND_SELECT && state.deck.len() == 4;
+                    saw_deck0 |= state.phase == PLACE_AND_SELECT && state.deck.is_empty();
+                    saw_final |= state.phase == FINAL_PLACEMENT;
+                    let mut tail = state.cloned();
+                    let mut actual = 0u32;
+                    while tail.phase != GAME_OVER {
+                        let legal = tail.legal_actions();
+                        let &(placement, pick) = legal
+                            .choose(&mut rng)
+                            .expect("deterministic tail must expose an action");
+                        tail = tail.step(placement, pick)?;
+                        actual += 1;
+                    }
+                    assert_eq!(
+                        predicted, actual,
+                        "seed {seed}: exact tail count wrong at phase {} deck {} actor {}/{}",
+                        state.phase, state.deck.len(), state.actor_index,
+                        state.pending_claims.len()
+                    );
+                    checked += 1;
+                }
+                let legal = state.legal_actions();
+                let &(placement, pick) = legal.choose(&mut rng).expect("nonempty legal actions");
+                state = state.step(placement, pick)?;
+            }
+        }
+        assert!(checked >= 100, "too few exact-tail states checked ({checked})");
+        assert!(saw_deck4 && saw_deck0 && saw_final, "tail phase coverage incomplete");
+        Ok(())
+    }
+
+    /// Real Kingdomino sampled-chance gate: the operational path must select the
+    /// fixed-depth oracle's move, restore the mutable state, and recover enough
+    /// pruning to pay for its shallower iterative-deepening passes.
+    #[test]
+    fn operational_real_tree_matches_fixed_and_reduces_nodes() -> PyResult<()> {
+        let mut root = None;
+        for seed in 0..80u64 {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x0F45_7B0A);
+            let mut state = new_game(seed, true, true);
+            while state.phase != GAME_OVER {
+                if state.phase == PLACE_AND_SELECT
+                    && state.deck.len() >= 12
+                    && state.actor_index + 1 == state.pending_claims.len()
+                    && state.legal_actions().len() >= 2
+                {
+                    root = Some(state);
+                    break;
+                }
+                let legal = state.legal_actions();
+                let &(placement, pick) = legal.choose(&mut rng).expect("nonempty legal actions");
+                state = state.step(placement, pick)?;
+            }
+            if root.is_some() {
+                break;
+            }
+        }
+        let root = root.expect("no sampled-chance operational fixture found");
+        let before = fingerprint(&root);
+        let cfg = search::SearchConfig {
+            depth: 4,
+            chance_samples: 8,
+            enum_cap: 1,
+            margin_weight: 0.0,
+            seed: 17,
+        };
+
+        let mut fixed_state = root.cloned();
+        let mut fixed_nodes = 0u64;
+        let fixed_start = std::time::Instant::now();
+        let fixed = search::choose_action::<Kingdomino, _>(
+            &mut fixed_state,
+            &PickAwareEval,
+            &cfg,
+            None,
+            &mut fixed_nodes,
+        )?
+        .expect("fixed search action");
+        let fixed_secs = fixed_start.elapsed().as_secs_f64();
+
+        let mut operational_state = root.cloned();
+        let operational_start = std::time::Instant::now();
+        let result = search::choose_action_operational::<Kingdomino, _>(
+            &mut operational_state,
+            &PickAwareEval,
+            &cfg,
+            &search::OperationalLimits {
+                max_depth: 4,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                aspiration_window: 0.25,
+                node_limit: None,
+                value_bound: 1.0,
+            },
+        )?
+        .expect("operational search action");
+        let operational_secs = operational_start.elapsed().as_secs_f64();
+        assert_eq!(result.completed_depth, 4);
+        assert!(!result.timed_out);
+        assert_eq!(result.action, fixed);
+        assert_eq!(fingerprint(&operational_state), before, "search did not unwind root");
+        eprintln!(
+            "operational depth4: {:.3}s, {} total / {} final-iteration nodes vs fixed {:.3}s / {} nodes ({:.2}x final ratio), star cutoffs {}, aspiration re-searches {}, TT hits {}, TT cutoffs {}",
+            operational_secs,
+            result.nodes,
+            result.last_iteration_nodes,
+            fixed_secs,
+            fixed_nodes,
+            fixed_nodes as f64 / result.last_iteration_nodes as f64,
+            result.star_cutoffs,
+            result.aspiration_researches,
+            result.tt_hits,
+            result.tt_cutoffs,
+        );
+        assert!(
+            result.last_iteration_nodes <= fixed_nodes,
+            "operational final iteration regressed: {} vs fixed {} nodes",
+            result.last_iteration_nodes, fixed_nodes
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -9497,6 +9832,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::RustSearch;
+
+    #[pymodule_export]
+    use super::OperationalSearchReport;
 
     #[pymodule_export]
     use super::NnueEvaluator;

@@ -193,3 +193,97 @@ class RustExpectiminimax:
             elif score == best_score:
                 best_actions.append(a)
         return (rng or random).choice(best_actions)
+
+
+class OperationalRustSearchBot:
+    """Bot adapter for RustSearch's deadline-safe operational path.
+
+    The Rust search owns the clock, iterative deepening, TT/PV ordering, chance
+    pruning, and exact deterministic-tail extension. The adapter only converts
+    the public Python GameState/action objects at the bot_match boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_secs: float = 1.0,
+        max_depth: int = 8,
+        chance_samples: int = 16,
+        enum_cap: int = 128,
+        eval: str = "pick_aware",
+        nnue_path: str | None = None,
+        margin_weight: float = 0.0,
+        seed: int = 0,
+        aspiration_window: float = 0.25,
+    ):
+        if max_secs <= 0 or max_depth < 1 or aspiration_window <= 0:
+            raise ValueError("max_secs, max_depth, and aspiration_window must be positive")
+        self.max_secs = float(max_secs)
+        self.max_depth = int(max_depth)
+        self.aspiration_window = float(aspiration_window)
+        self.search = kr.RustSearch(
+            depth=self.max_depth,
+            chance_samples=chance_samples,
+            enum_cap=enum_cap,
+            eval=eval,
+            margin_weight=margin_weight,
+            seed=seed,
+            nnue_path=nnue_path,
+        )
+        self.last_report = None
+        self.nodes = 0
+
+    @staticmethod
+    def _placement_key(placement, domino_id):
+        """Physical placement identity, independent of endpoint/flip spelling."""
+        from games.kingdomino.dominoes import DOMINOES
+
+        if placement is None:
+            return None
+        x1, y1, x2, y2, flipped = placement
+        domino = DOMINOES[domino_id]
+        h1, h2 = (domino.b, domino.a) if flipped else (domino.a, domino.b)
+        cells = (
+            (x1, y1, int(h1.terrain), int(h1.crowns)),
+            (x2, y2, int(h2.terrain), int(h2.crowns)),
+        )
+        return tuple(sorted(cells))
+
+    def choose_action(self, state, actions=None, rng=None):
+        from games.kingdomino.endgame_solver import _rust_state_from_python
+
+        rust_state = _rust_state_from_python(state)
+        if rust_state is None:
+            raise RuntimeError("could not convert GameState to RustGameState")
+        report = self.search.choose_action_timed(
+            rust_state,
+            max_secs=self.max_secs,
+            max_depth=self.max_depth,
+            aspiration_window=self.aspiration_window,
+        )
+        self.last_report = report
+        self.nodes = int(report.nodes)
+        legal = state.legal_actions() if actions is None else actions
+        rust_placement, rust_pick = report.action
+        if state.phase == _INITIAL:
+            for action in legal:
+                if getattr(action, "domino_id", None) == rust_pick:
+                    return action
+        else:
+            domino_id = state.pending_claims[state.actor_index].domino_id
+            rust_key = self._placement_key(rust_placement, domino_id)
+            for action in legal:
+                placement = action.placement
+                py_tuple = None if placement is None else (
+                    placement.x1,
+                    placement.y1,
+                    placement.x2,
+                    placement.y2,
+                    placement.flipped,
+                )
+                if (
+                    action.pick_domino_id == rust_pick
+                    and self._placement_key(py_tuple, domino_id) == rust_key
+                ):
+                    return action
+        raise RuntimeError(f"Rust operational search returned illegal action {report.action!r}")

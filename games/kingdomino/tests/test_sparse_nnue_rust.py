@@ -146,6 +146,30 @@ def test_quantized_search_stays_close_to_float(artifact):
         assert abs(f.value(state, 2) - q.value(state, 2)) < 0.04
 
 
+def test_quantized_operational_search_completes_and_matches_fixed(artifact):
+    state = next(s for s in _states(12) if len(s.legal_actions()) > 1)
+    kwargs = dict(
+        depth=2,
+        enum_cap=1,
+        chance_samples=8,
+        seed=23,
+        eval="sparse_nnue_q",
+        nnue_path=artifact["binary"],
+    )
+    fixed = kr.RustSearch(**kwargs)
+    expected = fixed.choose_action(state)
+    operational = kr.RustSearch(**kwargs)
+    report = operational.choose_action_timed(
+        state, max_secs=30.0, max_depth=2, aspiration_window=0.25
+    )
+    assert report.completed_depth == 2
+    assert not report.timed_out
+    assert report.action == expected
+    assert report.value is not None and np.isfinite(report.value)
+    assert report.nodes == operational.nodes
+    assert report.last_iteration_nodes <= report.nodes
+
+
 def test_sparse_export_omits_aux_heads_and_documents_layout(artifact):
     import json
 
