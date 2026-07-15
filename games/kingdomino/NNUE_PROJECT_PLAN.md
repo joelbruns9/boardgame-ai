@@ -36,6 +36,19 @@ float expected-score MAE/max are **0.0028/0.0109** and margin MAE/max are
 six-position depth-3 gate reaches **102.3k nodes/s** vs 98.8k float (**1.04×**) while
 roughly halving inference-weight storage.
 
+Quantized overflow safety is already **per artifact**, not a one-time pilot assumption:
+`QuantizedSparseWeights::from_float` chooses per-channel power-of-two scales, recomputes
+the conservative top-112 active-feature bound from that artifact's weights/biases, and
+rejects a bound above `i16::MAX`; runtime construction also rejects too many active
+features and checked full-refresh overflow. The **19,958** figure is the pilot's reported
+instance, not a permanent constant. Every promoted artifact must instantiate
+`sparse_nnue_q`, record `quantization_info`, and pass float-vs-quantized parity before
+gameplay. Track headroom, but do not impose an arbitrary 20% rejection margin: the
+dynamic scale is designed to use safe int16 range, and exact bound enforcement—not raw
+weight magnitude—is the correctness condition. Score scalars live in the separately
+bounded summary block, so higher game scores do not directly enlarge the sparse binary
+accumulator.
+
 The native operational searcher is now implemented. `RustSearch.choose_action_timed`
 uses one shared wall-clock deadline, iterative deepening, last-complete-depth fallback,
 full-width cheap heuristic ordering with root/PV promotion, root-sibling windows,
@@ -101,9 +114,10 @@ the honest same-net strength confirmation rejected the first full-root width-2 p
 after an initial 11-5 result, it lost the disjoint 32-game confirmation 11-21; combined
 **22-26 (45.8%, -2.9 average margin)** at identical 0.1s clocks. Selective mode therefore
 remains a research/data-diversity knob, not the gameplay or training default. Next:
-run work package A's stochastic-search probe, then build the source-separated teacher
-pilot and controlled candidates in work packages B/C. The original phase descriptions
-below remain planning history; these measurements supersede their bottleneck predictions.
+run the matched-clock scaling curve and the primary-goal disagreement/curriculum pilot
+described below. Defer the larger stochastic-search and NNUE-training packages until
+those cheap gates report. The original phase descriptions below remain planning
+history; these measurements supersede their bottleneck predictions.
 
 ## Approved direction after the search/training review (2026-07-14)
 
@@ -138,7 +152,79 @@ open-loop MCTS. Conversely, our pilot is far too small to prove that NNUE cannot
 The relevant experiment is our mature AZ against a fairly trained NNUE under
 Kingdomino-safe chance handling—not paper labels or nominal depth comparisons.
 
-### Next work package A — stochastic search without a fictitious "average row"
+### Risk ranking after implementation evidence
+
+Separate **chance correctness** from **chance efficiency**:
+
+- Chance correctness is implemented and gated: the encoder is hidden-order-blind;
+  sampled rows come from the sorted bag with a bag-keyed seed; sibling decisions with
+  the same remaining bag see the same sampled rows; chance outcomes are averaged inside
+  one public-state expectiminimax tree; and late rows/exact tails are enumerated when
+  feasible. Do not rebuild this as a belief-state or independent-determinization system.
+- Chance efficiency remains measurable: sample count, variance, and where the horizon
+  falls can still consume depth. Treat scenario tries and boundary evaluation as
+  compute-allocation experiments, not correctness repairs.
+- The **joint pick × placement branching factor is now the leading structural risk for
+  standalone strength**. The current full-width ceiling (usually depth 3-4 at practical
+  clocks), weak narrow-deep confirmation, and strong AZ policy prior all point here.
+  Measure legal-action distributions and effective alpha-beta branching by phase rather
+  than relying on a rough `100^4` estimate, which ignores legality contraction,
+  ordering, transpositions, and pruning.
+
+The selective result (22-26, -2.9 margin) is negative evidence for that one width-2
+policy, not a proof that every selective or learned-ordering design fails. The 0-8 AZ
+floor is likewise a directional small-sample result, not evidence that the gap must
+widen with time. A clock-scaling curve is the correct cheap discriminator.
+
+### Immediate work package P0 — validate the primary AZ-curriculum bet first
+
+This package moves ahead of the standalone-oriented A/B/C packages. It uses the pilot
+NNUE as a **disagreement hypothesis generator**, not as an authoritative teacher.
+
+1. **Clock-scaling characterization.** Run matched practical clocks at
+   `0.1 / 0.5 / 2 / 10s` for NNUE and AZ, with paired seeds/both seats and actual
+   decision-time telemetry. Use a small screening set at all clocks, then a disjoint
+   confirmation only where the trend could change a decision. Report NNUE completed
+   depth/nodes/chance share and AZ simulations, plus win rate and margin. The question
+   is whether the gap narrows, stays flat, or widens—not which agent wins one tiny set.
+2. **Competence floor for generation.** At a generous offline NNUE budget, benchmark
+   the pilot against Greedy, pick-aware search, and a mid-strength AZ checkpoint. Also
+   report illegal/replay failures, score/discard distributions, and phase coverage.
+   Whole-game superiority to current AZ is not required; positions must be legal,
+   coherent, and nontrivial.
+3. **Collect fresh replayable AZ trajectories.** The old run10-style encoded buffers
+   cannot seed this miner: they have no move trajectories and lose exact domino ID
+   information (33 compositions for 48 unique tiles). Extend/reuse the replayable-source
+   harness to record AZ games as initial deck/row + actions + model/search provenance.
+   Do not attempt lossy reconstruction of the million-position legacy buffers.
+4. **Mine disagreements on AZ-supported states.** Replay fresh AZ trajectories and run
+   offline NNUE full-width search at selected positions. Rank candidates by action
+   disagreement, NNUE-estimated improvement over AZ's most-visited move, AZ entropy,
+   value swing, novelty, phase, and exact-tail availability. Calling these candidates
+   "refutations" is provisional: NNUE disagreement nominates a hypothesis; it does not
+   prove the AZ move is wrong.
+5. **Reanalyze both actions fairly.** On the top candidates, run high-budget AZ MCTS
+   and exact search where feasible. A normal AZ rerun can reproduce policy starvation,
+   so guarantee the NNUE candidate and AZ candidate adequate root-child evaluation
+   (forced first-action searches, a temporary root prior floor, or equivalent explicit
+   child-value probes). Keep ordinary high-budget AZ visits separate from forced-probe
+   evidence in provenance. Reject candidates whose apparent edge disappears.
+6. **Freeze 1-2k validated disagreement examples.** Split by whole source game/seed.
+   Keep a frozen disagreement/exact probe subset out of training. Store the public state,
+   both candidate actions, original and reanalysis visits/values, realized official
+   outcome, exact status, and all teacher hashes/budgets.
+7. **Run the falsifiable AZ curriculum experiment.** Fine-tune two AZ candidates with
+   identical initialization, examples, updates, optimizer settings, and compute:
+   control = ordinary replay replacement; treatment = the tagged 75/10/10/5 mixture
+   below. Compare HOF/gauntlet strength, frozen disagreement/exact error, and closure of
+   repeatable exploits. Lower loss alone is not success.
+
+If the treatment helps, the project has delivered its primary practical goal and earns
+scaling investment even if NNUE remains weaker head-to-head. If it does not, inspect
+whether the failure is generator competence, disagreement precision, reanalysis label
+quality, or replay mixing before producing the 5k-game teacher corpus.
+
+### Standalone work package A — stochastic allocation (after P0)
 
 The Azul result does not justify selecting one permanent representative four-domino
 draw in Kingdomino. Azul tiles are exchangeable within colors and a refill can be
@@ -159,29 +245,32 @@ Required invariants for every experimental mode:
 - Scenario seeds, draw probabilities, completed depth, sample count, and aggregation
   method are recorded in telemetry and training provenance.
 
-Sweep these modes before generating a large new corpus:
+Evaluate in this implementation order after P0; do not build every mode up front:
 
-1. **Current sampled expectiminimax baseline.** Independently sample/enumerate chance
-   children inside the public-state tree (`chance_samples=8` today). This is the
-   correctness baseline, not automatically the best clock allocation.
-2. **K=1 representative future — diagnostic only.** Use one legal sampled future to
+1. **Current sampled expectiminimax + existing late exact baseline.** Independently
+   sample/enumerate chance children inside the public-state tree (`chance_samples=8`
+   today), retaining the already-built switch to full row enumeration and official-
+   outcome exact tails when feasible. Audit and measure this path; late exact is not a
+   new subsystem to rebuild.
+2. **Current-round search plus boundary evaluation.** Fully search the visible round
+   and stop before the next unknown row, using an order-blind boundary value trained to
+   integrate over the remaining bag. This sacrifices concrete next-round tactics but
+   never invents a representative unique-domino row. This is the first material search
+   experiment because it can change the depth/accuracy trade. The engine currently
+   fuses dealing into the round transition, so scope an explicit pre-deal boundary/eval
+   state, make/unmake behavior, hashing rule, and parity tests before implementation;
+   do not install an arbitrary row and pretend it is unknown.
+3. **K=1 representative future — diagnostic only.** Use one legal sampled future to
    measure the maximum possible depth gain and instability. Do not promote it to a
    gameplay or data-generation default merely because it reaches a larger nominal
    depth.
-3. **K={2,4,8} sampled scenario tree.** Pre-sample complete remaining-deck scenarios,
+4. **K={2,4,8} sampled scenario tree — deferred unless modes 1/2 expose a measured
+   gap.** Pre-sample complete remaining-deck scenarios,
    organize them as a trie of revealed row sequences, and branch only when a row becomes
    public. Scenarios sharing a public history must share the same decision node. This
    preserves non-anticipativity while avoiding an independent K-way resample at every
    later round. It may still be too broad when sampled rows rarely share prefixes; that
    is a measurement question. K=4 is the leading candidate, not a predetermined winner.
-4. **Current-round search plus boundary evaluation.** Fully search the visible round
-   and stop before the next unknown row, using an order-blind boundary value trained to
-   integrate over the remaining bag. This sacrifices concrete next-round tactics but
-   never invents a representative unique-domino row. The engine currently fuses dealing
-   into the round transition, so this mode requires an explicit pre-deal boundary/eval
-   contract rather than installing an arbitrary row and pretending it is unknown.
-5. **Late exact mode.** Continue switching to full row enumeration and official-outcome
-   exact tails when the remaining combinations fit the budget.
 
 The first gate is an offline stochastic-search probe, stratified by opening, middle,
 late, placement-heavy, denial-heavy, and forced-discard positions. Build a high-sample
@@ -198,10 +287,12 @@ reference (`K=64` or `K=128`, and exact enumeration wherever feasible), then mea
 No stochastic approximation becomes the default unless it improves matched-clock play
 on a disjoint confirmation set. A displayed depth increase alone is insufficient.
 
-### Next work package B — stronger, source-separated teacher data
+### Scale-up work package B — stronger, source-separated teacher data (conditional)
 
-Do not scale the rejected shallow self-imitation recipe. Generate positions cheaply,
-then spend teacher compute only on a stratified subset. Initial pilot target:
+Run this after P0 shows useful curriculum signal, or when standalone work specifically
+needs broader labels. Do not scale the rejected shallow self-imitation recipe. Generate
+positions cheaply, then spend teacher compute only on a stratified subset. Scale-up
+target:
 
 - roughly 5,000 replayable games from a mixture of full-width NNUE, pick-aware search,
   randomized openings, NNUE-vs-AZ games, and the best gated stochastic-search mode;
@@ -217,8 +308,9 @@ Store **separate targets**, never an undocumented blend:
 - honest official final outcome and actor-relative margin from the realized game;
 - exact official outcome/action/value when the endgame solver finishes;
 - high-budget AlphaZero MCTS root value and visit distribution on selected positions;
-- deep NNUE-search value plus sparse root child values only when the iteration completed
-  and its stochastic quality gate is known;
+- deep NNUE-search value plus sparse root child values only for exact/late/tactical
+  positions, or after a frozen probe proves lower error than the available AZ teacher.
+  Do not use weak opening/midgame NNUE values merely because they are available;
 - training-only score/territory/crowns/bonus auxiliaries already supported.
 
 Every label carries: teacher type and artifact hash, search algorithm, clock/node/sim
@@ -227,7 +319,7 @@ official-cascade version, and source trajectory ID. Exact and high-confidence la
 may receive greater training weight, but source targets remain independently auditable.
 The reserved test split stays unopened.
 
-### Next work package C — controlled NNUE training experiment
+### Standalone work package C — controlled NNUE training experiment (conditional)
 
 Train at least three same-architecture candidates with matched examples/optimizer
 budget so the source of improvement is identifiable:
@@ -235,9 +327,12 @@ budget so the source of improvement is identifiable:
 1. **Outcome control:** final outcome + margin + current auxiliaries only.
 2. **Reanalysis value:** control targets plus exact/deep/AZ value supervision, with
    confidence-aware weighting.
-3. **Value + ordering:** candidate 2 plus a small CPU ordering/ranking head distilled
+3. **Value + ordering — standalone-only, deferred:** candidate 2 plus a small CPU
+   ordering/ranking head distilled
    from exact root actions, deep child values, or AZ visits. The head orders the complete
-   legal set and does not authorize pruning.
+   legal set and does not authorize pruning. Do not build it for the primary curriculum
+   pilot; require evidence that ordering, rather than evaluation/width, is the next
+   standalone bottleneck.
 
 The ordering experiment must reuse the frozen state features or live in a separately
 versioned action-ranking artifact. It does not silently reopen the v3 state encoder.
@@ -586,11 +681,15 @@ immutable replay shards while keeping validation frozen and warm-starting from t
 incumbent. Bootstrap targets are still honest final outcomes, not yet deep-search
 values. The 256-game result above says to improve the teacher/search before producing
 a large corpus. Promotion remains game-strength-gated; Brier selects an epoch only.
-The next Phase-4 action is work package A (stochastic search probe), followed by the
-5k-game / 25k-40k-position source-separated teacher pilot in work package B. Do not
-launch a 500k-position homogeneous self-imitation run first.
+The next action is immediate package P0: clock scaling, competence floor, fresh
+replayable AZ trajectories, disagreement mining/reanalysis, and the equal-compute AZ
+curriculum control. Work package A follows only for standalone chance-allocation work;
+the 5k-game / 25k-40k-position package B is conditional on P0 or a demonstrated
+standalone label need. Do not launch a 500k-position homogeneous self-imitation run.
 
 ### Phase 5 — Combine with AlphaZero (the payoff)
+- **SEQUENCING UPDATE:** the small disagreement/curriculum falsification pilot is now
+  immediate package P0, ahead of standalone A/B/C. Full-scale mixing remains Phase 5.
 - **TRAIN (highest strategic value):** use NNUE as a position/curriculum generator,
   then relabel selected positions with high-budget AZ MCTS, exact official-outcome
   search, or demonstrably higher-confidence NNUE search. NNUE search values are not
@@ -751,10 +850,11 @@ learned directly.** Three requirements:
    penalties" idea; our run11 exploiter machinery) to force denial into the buffer.
 
 **Honest prediction (asked directly):** likely does NOT surpass the mature AZ net
-as a *solo* player initially — Kingdomino's high joint branching + heavy chance
-layer blunt alpha-beta's depth edge exactly in the opening/midgame where most of
-the game is decided, and the eval it falls back on there is trained on the same
-data as AZ's value head (no inherent edge). It WILL be stronger in the endgame
+as a *solo* player initially — Kingdomino's high joint pick×placement branching is
+the leading structural limiter on alpha-beta depth; sampled chance cost compounds it
+but is not a correctness gap. This matters in the opening/midgame where most of the
+game is decided, and the eval it falls back on there is trained on the same data as
+AZ's value head (no inherent edge). It WILL be stronger in the endgame
 (exact) and will surface lines AZ is blind to. ~1-in-3 it eventually overtakes
 outright with the full loop (Azul precedent — tempered: their MCTS was an
 afterthought, ours is mature). **Solo dominance is the ideal bar, but not the only
@@ -816,10 +916,19 @@ checkpoint)**, matched wall-clock AND deployment; report completed depth, nodes/
 eval share, chance-node share, and AZ-assisted-ordering effect.
 
 ## Risks / decision points
-- **Chance-node handling** is the biggest search-design risk — the thesis flagged
-  draw simulation as a bottleneck, while Kingdomino's unique dominoes make a single
-  representative row especially risky. Sweep public-tree scenario count, variance
-  reduction, Star1/Star2, boundary evaluation, and late exact enumeration.
+- **Joint pick×placement branching** is the leading standalone-search risk. The
+  3390-wide action encoding is only a ceiling, not the effective branching factor,
+  so record legal actions, searched children, cutoffs, and completed depth by phase
+  before choosing an intervention. Use the matched-clock curve to distinguish an
+  ordering/engineering problem from a structural depth ceiling. Keep NNUE-only
+  ordering as the independence baseline; any AZ-assisted or distilled ordering is a
+  separately reported standalone enhancement and must never silently prune moves.
+- **Chance efficiency, not chance correctness** remains a secondary search risk.
+  The current engine already samples public rows from the sorted remaining bag,
+  reuses a bag-keyed scenario set, expands chance inside the tree, and enumerates
+  late chance exactly. Kingdomino's unique dominoes still make K=1 unsafe as a
+  strength method. Audit the existing baseline, then test current-round boundary
+  evaluation before paying for a K-scenario trie; retain K=1 only as a diagnostic.
 - **Strategy fusion / hidden-order leakage** — a hard correctness failure, not a
   strength trade. Reject independent full-deck solves, order-dependent encoding, and
   future-revealed training targets with structural tests.
@@ -835,9 +944,10 @@ eval share, chance-node share, and AZ-assisted-ordering effect.
   equal-compute AZ ablations for decisions.
 - **Connectivity nonlinearity** — the frozen encoder includes exact region/score and
   expansion summaries, but training must still prove they support long-horizon value.
-- **Branching factor** — the joint pick+place space is large (3390-wide policy);
-  alpha-beta depth depends on ordering. Preserve NNUE-only ordering for independence;
-  separately test AZ-assisted/distilled ordering without silent pruning.
+- **Quantized-artifact safety** — every promoted checkpoint must instantiate the
+  existing Rust quantized path, record its selected scales and accumulator bound,
+  and pass float/quantized parity. Do not replace the exact per-artifact overflow
+  rejection with a fixed heuristic margin.
 - **Compute allocation** — CPU trajectory generation is cheap; high-budget AZ/exact
   reanalysis is not. Stratify and filter positions first, then spend teacher compute.
 - **Frozen-schema discipline** — trajectories remain the source of truth. Do not add
