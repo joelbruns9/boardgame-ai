@@ -656,6 +656,44 @@ full-width incumbent over 48 paired-seat games. Do not report selective complete
 as full-width depth; telemetry exposes `selective`, widths, ordering probes, and pruned
 actions specifically to prevent that mistake.
 
+#### Conditional Phase-3 experiment — Middle-Kingdom-aware late-move reductions
+
+The strongest game-specific branch-reduction hypothesis is the castle-centred target,
+not a generic top-K beam. Precisely: Middle Kingdom requires the final occupied bbox to
+be the **7×7 square centred on the castle** (coordinates no farther than three cells
+from it). Because the bbox grows monotonically, placing either half outside that square
+irreversibly forfeits the 10-point bonus. The mature AZ policy's strong preference for
+preserving this bonus makes these actions plausible *late moves*, but does not prove
+they are dominated: an outside placement can connect a crown-rich region worth more
+than 10, avoid losing a domino, or carry a strategically critical next-row pick/denial.
+
+Therefore do **not** alter `legal_actions` or make centred-only play the default. Test a
+Kingdomino-specific late-move-reduction (LMR) policy inside operational search:
+
+1. When Middle Kingdom is enabled and still possible, order all actions that preserve
+   the centred 7×7 target before actions that make it impossible.
+2. Search preserving actions at full requested depth. Search target-breaking actions
+   later with a narrow alpha-beta scout window and initially one fewer decision ply.
+3. If a reduced target-breaking action challenges the current bound/best value,
+   re-search it at full depth before accepting or rejecting it. Count the re-search.
+4. Disable the reduction when Middle Kingdom is already impossible, for forced/sole
+   actions, when no target-preserving placement is available, and throughout exact
+   deterministic tails. Never invent a discard or remove every legal realization of a
+   valuable pick merely because its placement breaks the bonus.
+5. Keep hard centred-only pruning as a measurement diagnostic only. Full-width search
+   remains the correctness oracle and the default source for disagreement/reanalysis
+   labels; any label produced with LMR records the reduction/re-search telemetry and is
+   verified full-width when selected as a high-value training example.
+
+Before promotion, measure on phase-stratified AZ and NNUE positions: legal actions and
+pick groups split by preserve/break; how often mature AZ, high-budget full-width NNUE,
+and exact tails choose a target-breaking move; full-width value regret when they do;
+node reduction, completed depth, re-search rate, and timeout behavior. Compare four
+matched-clock modes—full width, centred-first ordering only, LMR+re-search, and hard
+centred-only diagnostic—then require paired-seat gameplay confirmation on disjoint
+seeds. The intended win is more completed **verified** depth without repeating the
+width-2 policy's blind pruning; nominal depth alone is not a promotion signal.
+
 ### Phase 4 — Training loop (self-generated data)  (ongoing)
 - Searcher self-plays → replayable trajectories → stratified position selection →
   source-separated outcome/exact/reanalysis targets → retrain → select if stronger →
@@ -923,6 +961,11 @@ eval share, chance-node share, and AZ-assisted-ordering effect.
   ordering/engineering problem from a structural depth ceiling. Keep NNUE-only
   ordering as the independence baseline; any AZ-assisted or distilled ordering is a
   separately reported standalone enhancement and must never silently prune moves.
+- **Middle-Kingdom pruning can erase rare high-value exceptions.** Treat breaking the
+  centred 7×7 target as an LMR/order signal with full-depth re-search, not as illegality
+  or proven dominance. Preserve exact/full-width verification for promoted labels and
+  measure results by pick group as well as placement so the coupled draft decision is
+  not accidentally pruned.
 - **Chance efficiency, not chance correctness** remains a secondary search risk.
   The current engine already samples public rows from the sorted remaining bag,
   reuses a bag-keyed scenario set, expands chance inside the tree, and enumerates
