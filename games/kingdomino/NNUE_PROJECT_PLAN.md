@@ -1,9 +1,12 @@
 # Kingdomino NNUE — Project Plan
 
 Goal: build a CPU-only NNUE evaluation + alpha-beta/expectiminimax searcher for
-2-player Kingdomino, then use it to (a) **train** the AlphaZero net with
-higher-quality / independent targets, (b) **combine** it into the HOF gauntlet as
-an architecturally-independent exploiter, and (c) **help** as an analysis tool.
+2-player Kingdomino. The **ideal / stretch outcome** is a standalone NNUE search
+agent stronger than the trained AlphaZero agent at an honestly matched clock. The
+**practical primary outcome** is a competent, strategically different agent that
+generates adversarial and underrepresented positions which, after high-quality
+reanalysis, improve AlphaZero. Independent HOF exploitation, exact endgame labels,
+and analysis tooling remain valuable supporting outcomes.
 
 ## Current status (2026-07-14)
 
@@ -98,9 +101,199 @@ the honest same-net strength confirmation rejected the first full-root width-2 p
 after an initial 11-5 result, it lost the disjoint 32-game confirmation 11-21; combined
 **22-26 (45.8%, -2.9 average margin)** at identical 0.1s clocks. Selective mode therefore
 remains a research/data-diversity knob, not the gameplay or training default. Next:
-less brittle deep-search selection/verification plus stronger teacher targets, then
-rerun the loop. The original phase descriptions below remain planning history; these
-measurements supersede their bottleneck predictions.
+run work package A's stochastic-search probe, then build the source-separated teacher
+pilot and controlled candidates in work packages B/C. The original phase descriptions
+below remain planning history; these measurements supersede their bottleneck predictions.
+
+## Approved direction after the search/training review (2026-07-14)
+
+The project now has **two connected tracks**, not an all-or-nothing bet on standalone
+strength. Engineering and data artifacts should serve both tracks so that a negative
+standalone result does not strand the work.
+
+### Outcome hierarchy
+
+1. **Stretch success — standalone superiority.** NNUE plus its CPU search defeats the
+   current AlphaZero/open-loop-MCTS agent, then holds up against the full HOF, at paired
+   seeds, both seats, and matched practical clocks. This remains the ideal result.
+2. **Primary practical success — AlphaZero curriculum.** NNUE is competent and
+   strategically divergent enough to generate realistic positions that AlphaZero
+   self-play rarely reaches. Those positions are reanalyzed before use; AlphaZero is
+   never asked to imitate a weaker NNUE action blindly.
+3. **Independent success — exactness and exploitation.** NNUE supplies exact or
+   higher-confidence endgame labels, a non-AZ-lineage HOF opponent, disagreement
+   probes, puzzles, and analysis even if its whole-game Elo remains below AlphaZero.
+
+The 0-8 pilot result does **not** decide feasibility. It compares a mature AlphaZero
+agent with a 50k-position pilot NNUE before a serious self-play/reanalysis ratchet. A
+fair standalone verdict requires both (a) a Kingdomino-appropriate stochastic-search
+sweep and (b) at least two promotion-capable training iterations using materially
+stronger and broader targets than the rejected 256-game self-imitation shard.
+
+The Azul result is motivation, not a direct algorithm verdict. Its final strength came
+from a fast integer/AVX2 evaluator, a heavily optimized alpha-beta engine, million-scale
+datasets, many candidate models and duels, and repeated training rounds. Its abandoned
+MCTS baseline used random rollouts, not a trained AlphaZero policy/value network with
+open-loop MCTS. Conversely, our pilot is far too small to prove that NNUE cannot work.
+The relevant experiment is our mature AZ against a fairly trained NNUE under
+Kingdomino-safe chance handling—not paper labels or nominal depth comparisons.
+
+### Next work package A — stochastic search without a fictitious "average row"
+
+The Azul result does not justify selecting one permanent representative four-domino
+draw in Kingdomino. Azul tiles are exchangeable within colors and a refill can be
+summarized by color quantities. Kingdomino dominoes are mostly unique; ID determines
+draft order, and terrain/crowns/placement feasibility can make two superficially
+similar rows strategically opposite. Our earlier deterministic-deck AlphaZero failure
+is direct evidence that collapsing the future distribution can teach brittle policy.
+
+Required invariants for every experimental mode:
+
+- The encoder remains blind to hidden deck order.
+- Every root action is compared against the same sampled public futures (common random
+  numbers), so sampling noise is not mistaken for action quality.
+- Decisions at identical public information states are shared. Never solve complete
+  deck orders independently and average their clairvoyant root values; that is PIMC
+  strategy fusion even when many deck orders are used.
+- Samples respect without-replacement draws and the sorted four-domino row rule.
+- Scenario seeds, draw probabilities, completed depth, sample count, and aggregation
+  method are recorded in telemetry and training provenance.
+
+Sweep these modes before generating a large new corpus:
+
+1. **Current sampled expectiminimax baseline.** Independently sample/enumerate chance
+   children inside the public-state tree (`chance_samples=8` today). This is the
+   correctness baseline, not automatically the best clock allocation.
+2. **K=1 representative future — diagnostic only.** Use one legal sampled future to
+   measure the maximum possible depth gain and instability. Do not promote it to a
+   gameplay or data-generation default merely because it reaches a larger nominal
+   depth.
+3. **K={2,4,8} sampled scenario tree.** Pre-sample complete remaining-deck scenarios,
+   organize them as a trie of revealed row sequences, and branch only when a row becomes
+   public. Scenarios sharing a public history must share the same decision node. This
+   preserves non-anticipativity while avoiding an independent K-way resample at every
+   later round. It may still be too broad when sampled rows rarely share prefixes; that
+   is a measurement question. K=4 is the leading candidate, not a predetermined winner.
+4. **Current-round search plus boundary evaluation.** Fully search the visible round
+   and stop before the next unknown row, using an order-blind boundary value trained to
+   integrate over the remaining bag. This sacrifices concrete next-round tactics but
+   never invents a representative unique-domino row. The engine currently fuses dealing
+   into the round transition, so this mode requires an explicit pre-deal boundary/eval
+   contract rather than installing an arbitrary row and pretending it is unknown.
+5. **Late exact mode.** Continue switching to full row enumeration and official-outcome
+   exact tails when the remaining combinations fit the budget.
+
+The first gate is an offline stochastic-search probe, stratified by opening, middle,
+late, placement-heavy, denial-heavy, and forced-discard positions. Build a high-sample
+reference (`K=64` or `K=128`, and exact enumeration wherever feasible), then measure:
+
+- root-action agreement and expected-score error;
+- **regret**, defined as reference-best value minus the reference value of the selected
+  action (more informative than action agreement when several moves tie);
+- action entropy and value variance across scenario seeds;
+- completed full-width depth, nodes, chance nodes, and wall time;
+- stability of ordering and TT reuse;
+- paired same-net playing strength against the current `chance_samples=8` baseline.
+
+No stochastic approximation becomes the default unless it improves matched-clock play
+on a disjoint confirmation set. A displayed depth increase alone is insufficient.
+
+### Next work package B — stronger, source-separated teacher data
+
+Do not scale the rejected shallow self-imitation recipe. Generate positions cheaply,
+then spend teacher compute only on a stratified subset. Initial pilot target:
+
+- roughly 5,000 replayable games from a mixture of full-width NNUE, pick-aware search,
+  randomized openings, NNUE-vs-AZ games, and the best gated stochastic-search mode;
+- sample approximately 4-8 positions per game across rounds/phases rather than labeling
+  all correlated plies equally;
+- emphasize NNUE/AZ disagreements, high AZ policy entropy, rare board geometry, unusual
+  draft rows, forced discards, value swings, and exact-solvable tails;
+- retain ordinary positions as a control so the selector does not create only exotic
+  outliers.
+
+Store **separate targets**, never an undocumented blend:
+
+- honest official final outcome and actor-relative margin from the realized game;
+- exact official outcome/action/value when the endgame solver finishes;
+- high-budget AlphaZero MCTS root value and visit distribution on selected positions;
+- deep NNUE-search value plus sparse root child values only when the iteration completed
+  and its stochastic quality gate is known;
+- training-only score/territory/crowns/bonus auxiliaries already supported.
+
+Every label carries: teacher type and artifact hash, search algorithm, clock/node/sim
+budget, completed depth, chance method and K, exact/complete/timeout status, actor frame,
+official-cascade version, and source trajectory ID. Exact and high-confidence labels
+may receive greater training weight, but source targets remain independently auditable.
+The reserved test split stays unopened.
+
+### Next work package C — controlled NNUE training experiment
+
+Train at least three same-architecture candidates with matched examples/optimizer
+budget so the source of improvement is identifiable:
+
+1. **Outcome control:** final outcome + margin + current auxiliaries only.
+2. **Reanalysis value:** control targets plus exact/deep/AZ value supervision, with
+   confidence-aware weighting.
+3. **Value + ordering:** candidate 2 plus a small CPU ordering/ranking head distilled
+   from exact root actions, deep child values, or AZ visits. The head orders the complete
+   legal set and does not authorize pruning.
+
+The ordering experiment must reuse the frozen state features or live in a separately
+versioned action-ranking artifact. It does not silently reopen the v3 state encoder.
+
+Model selection remains two-stage: frozen validation chooses epochs; paired gameplay
+chooses promotions. Each promoted candidate must be tested against the incumbent NNUE,
+the current AZ checkpoint, the HOF subset, and the frozen stochastic/exact probe suites.
+Report results by phase and label source, not only an aggregate win rate.
+
+### Standalone continuation and pivot rule
+
+Continue optimizing the standalone agent while candidates show repeatable promotion,
+the AZ gap narrows, or added clock produces a meaningful strength curve. After the
+stochastic sweep and at least two materially stronger training iterations, treat
+standalone superiority as unlikely **for the current design** if all are true:
+
+- no candidate earns a statistically credible promotion over the NNUE incumbent;
+- matched-clock results remain decisively below AZ with no narrowing trend;
+- deeper/longer search mainly increases stochastic variance or nominal depth rather
+  than reference regret and playing strength;
+- the best chance allocation cannot cross useful horizons without unsafe selective or
+  clairvoyant approximations.
+
+That is a design pivot, not project failure. Freeze the strongest competent NNUE and
+make the AlphaZero curriculum/exploiter track primary. Revisit standalone dominance
+only when a material change arrives (better labels, learned ordering, new chance model,
+or a substantially faster engine).
+
+### AlphaZero curriculum deliverable
+
+NNUE-generated positions are **off-policy curriculum**, not NNUE policy labels. The
+safe pipeline is:
+
+```
+NNUE / NNUE-vs-AZ trajectory
+    -> novelty + disagreement + decision-importance filter
+    -> high-budget AZ MCTS and/or exact reanalysis
+    -> AZ policy target + official/exact value target
+    -> source-tagged replay mixture
+    -> controlled AZ training and HOF evaluation
+```
+
+On AZ turns, existing MCTS visits are usable if their budget meets the quality bar. On
+NNUE turns, re-run AZ MCTS after the game; never encode the NNUE's selected action as
+the AlphaZero policy target by default. A weaker NNUE can therefore generate valuable
+positions without teaching weaker moves. Replay the stored source trajectories through
+the current AZ encoder to create dense AZ inputs; do not add another encoded-only
+buffer. Split and deduplicate by whole trajectory/source seed so related positions do
+not leak across train/validation or dominate the mixture.
+
+Start the AZ experiment with a conservative tagged mix (subject to ablation): **75%
+normal AZ self-play, 10% NNUE-generated/AZ-reanalyzed positions, 10% NNUE-vs-AZ
+disagreement positions, and 5% exact/near-exact endgames**. Compare with an
+equal-example, equal-update control. Success means improved HOF/gauntlet strength,
+reduced error on frozen exact/disagreement suites, or closure of repeatable NNUE
+exploits—not merely lower aggregate training loss.
 
 Motivated by: the Rzepecki 2025 Azul MSc thesis (alpha-beta + tiny NNUE beat MCTS
 and reached superhuman 2p play) and our own run5/run10/run11 verdict — data
@@ -369,12 +562,22 @@ as full-width depth; telemetry exposes `selective`, widths, ordering probes, and
 actions specifically to prevent that mistake.
 
 ### Phase 4 — Training loop (self-generated data)  (ongoing)
-- Azul methodology: searcher self-plays → positions labeled with deep-search
-  values → retrain → select if stronger → repeat.
+- Searcher self-plays → replayable trajectories → stratified position selection →
+  source-separated outcome/exact/reanalysis targets → retrain → select if stronger →
+  repeat.
 - **This is what breaks past run10's coverage ceiling** (200k ≈ only a few
   thousand correlated trajectories on one policy's support; alpha-beta walks
   off-distribution where a static-buffer eval is blind).
-- Reuse existing self-play orchestration + gating.
+- Mix policies and opponents deliberately: incumbent NNUE, pick-aware search, the best
+  gated stochastic mode, randomized openings, and NNUE-vs-AZ games. A training round
+  should cover new public states, not merely repeat the incumbent's principal lines.
+- Keep final outcome/margin, exact labels, deep NNUE values, and AZ MCTS reanalysis as
+  distinct target channels with provenance and confidence. Never silently replace an
+  honest outcome with a bootstrapped estimate.
+- Train outcome-control, reanalysis-value, and value+ordering candidates under matched
+  data/optimizer budgets. Validation selects epochs; gameplay selects promotions.
+- Reuse existing self-play orchestration + gating, extending artifacts rather than
+  creating encoder-locked buffers.
 
 **STATUS (2026-07-14): MVP complete and first candidate rejected.**
 `nnue/generation_loop.py` runs one restartable generation; `nnue/match.py` provides
@@ -383,11 +586,24 @@ immutable replay shards while keeping validation frozen and warm-starting from t
 incumbent. Bootstrap targets are still honest final outcomes, not yet deep-search
 values. The 256-game result above says to improve the teacher/search before producing
 a large corpus. Promotion remains game-strength-gated; Brier selects an epoch only.
+The next Phase-4 action is work package A (stochastic search probe), followed by the
+5k-game / 25k-40k-position source-separated teacher pilot in work package B. Do not
+launch a 500k-position homogeneous self-imitation run first.
 
 ### Phase 5 — Combine with AlphaZero (the payoff)
-- **TRAIN (highest strategic value):** relabel/augment AZ training targets with
-  deep NNUE-alphabeta search values — higher quality than 800-sim MCTS *and* from
-  a different search process → genuinely new signal into an exhausted pipeline.
+- **TRAIN (highest strategic value):** use NNUE as a position/curriculum generator,
+  then relabel selected positions with high-budget AZ MCTS, exact official-outcome
+  search, or demonstrably higher-confidence NNUE search. NNUE search values are not
+  presumed better than 800-sim MCTS; prove label quality on exact/high-sample probes.
+- **POLICY SAFETY:** a weaker NNUE action is not an AZ policy target. On NNUE turns,
+  reanalyze the state and train the AZ policy head from AZ visits or exact/deep child
+  values. The realized official outcome remains a valid value sample.
+- **SELECT:** prioritize AZ/NNUE action disagreements, high AZ entropy, AZ losses,
+  large value swings, rare geometries/rows, forced discards, and exact-solvable tails.
+  Retain ordinary controls so filtering does not create an exotic-only distribution.
+- **MIX + ABLATE:** begin with a conservative tagged fraction of NNUE-derived data and
+  compare against an equal-example/equal-update AZ control. Promote only on HOF,
+  exact-suite, disagreement-suite, and repeatable-exploit improvement.
 - **COMBINE:** enter NNUE-alphabeta as an independent HOF/exploiter agent. run11a
   said "locally unexploitable, but all attackers share AZ lineage." An
   independent searcher is the honest exploiter the monoculture lacked — holes
@@ -399,12 +615,38 @@ a large corpus. Promotion remains game-strength-gated; Brier selects an epoch on
 
 ---
 
-## Chance handling — what the Azul thesis actually did (directly transferable)
-Azul faced our exact problem (known bag composition, unknown future dispersement).
+## Chance handling — what transfers from Azul and what does not
+
+**Kingdomino-specific correction (2026-07-14): do not assume a representative
+four-domino row exists.** The Azul thesis found that, under its clock, a branching
+factor of one often beat spending the same time on several refill samples; its final
+agent also benefited from a semirandom refill whose color quantities were near their
+expectation. That is evidence for sweeping accuracy versus depth, not permission to
+hard-code one Kingdomino future. Azul has repeated, exchangeable colors. Kingdomino
+has mostly unique domino IDs whose rank, crowns, terrains, placement feasibility, and
+removal from later rounds jointly determine value. A row that is average on one axis
+can be an extreme tactical draw on another.
+
+Our deterministic-deck AlphaZero experiment already showed the failure mode: when the
+environment/search collapses hidden order, the learner can specialize to artificial
+future regularities and fail to generalize. Therefore:
+
+- K=1 is a depth/variance diagnostic, not an approved default.
+- There is no hand-designed "median ID/crowns/terrain" row in the plan.
+- A fixed `state_hash -> representative row` mapping is forbidden for training data.
+- Any reduced-sample method must be compared with a high-sample/exact reference for
+  regret and seed stability, then beat the current method in disjoint paired games.
+- The preferred reduced-cost design is one sampled **public scenario tree/trie** with
+  K complete without-replacement scenarios, not K independent full-information solves.
+- Current-round search plus an order-blind boundary value is the conservative fallback
+  if unique-domino scenario variance remains too high.
+
+Azul faced a related problem (known bag composition, unknown future dispersement),
+but repeated colors make its refill distribution more compressible than Kingdomino's.
 It did NOT do exact expectiminimax. At each chance node its `branching`
 enhancement:
-- **Pre-generates** `branchingFactor` sampled draws *before* the search → the tree
-  is deterministic and TT-consistent, and sibling moves are compared against the
+- **Pre-generates** the sampled draws used when round refills are reached, avoiding
+  traversal-order-dependent RNG and allowing sibling moves to be compared against the
   *same* futures (= common random numbers, free variance reduction).
 - Aggregates child values with `branchingMethod`: `arithmeticMean` (unbiased E),
   or `median`/`truncatedMean`/`winsorizedMean` (robust, lower-variance, slightly
@@ -416,7 +658,7 @@ enhancement:
   latter two cut variance hard by sampling *near the bag's mean* instead of freely.
 
 They flagged this as their **suspected bottleneck** (future work). We can beat it:
-our chance branching C(remaining,4) *collapses* (10626→…→70→1) so we get **exact
+our chance branching C(remaining,4) *collapses* (135751→…→70→1) so we get **exact
 expectiminimax in the endgame** (Azul's 20-from-big-bag couldn't), sample +
 variance-reduce early, and add **Star2 pruning** they never tried.
 
@@ -432,10 +674,10 @@ Three separable safeguards, all required:
    there. Sampling must be *chance nodes inside one public-state tree*, with
    identical info-states sharing one decision. Solving K complete sampled deck
    orders separately and averaging root values is PIMC and fuses strategies for ANY
-   K (2 or 200). Azul is safe because its `branchingFactor` samples are consumed AT
-   the chance nodes of one expectiminimax tree, not as K full-info solves. K>1 +
-   common random numbers is good variance reduction, but the tree structure is what
-   prevents fusion.
+   K (2 or 200). Our required design consumes sampled rows AT chance nodes in one
+   public-state tree (or a scenario trie with shared public histories), not as K
+   full-information solves. K>1 + common random numbers is good variance reduction,
+   but the tree structure is what prevents fusion.
 3. **Targets = honest outcome samples or expectiminimax values, NEVER a
    future-revealed solve.** *Where you average matters*: at chance nodes inside one
    tree = correct info-set value; at the root over fully-solved deterministic
@@ -448,12 +690,12 @@ Three separable safeguards, all required:
   confidence): a *correctness* bug, fixed by order-blind encoder + averaging at
   chance nodes. SOLVED by the guardrail above.
 - **(b) Azul's "draw simulation is the bottleneck"**: a *variance/efficiency*
-  ceiling. Their final system already did correct sampled in-tree expectiminimax
-  (variance-reduced draws, pre-generation) — it wasn't miscalibrated; it was that
-  covering a huge draw space with few samples is noisy/expensive, and robust means
-  are a biased band-aid. Being calibrated does NOT solve (b).
-- **Our methodology ≈ Azul's for the general case.** What softens (b) for
-  Kingdomino is *game structure*, not a cleverer algorithm: C(remaining,4)
+  ceiling. It used pre-generated draws and tuned refill policies, often favoring a
+  branching factor of one under a fixed clock. Covering a huge draw space with few
+  samples is noisy; using a representative draw or robust mean reduces variance by
+  accepting bias. Being calibrated does NOT solve (b).
+- **Our current methodology is more expectation-oriented than Azul's default.** What
+  softens (b) for Kingdomino is *late-game structure*: C(remaining,4)
   collapses → exact enumeration late + exact endgame (Azul's 20-from-big-bag
   never could); draws are 4-tile objects (lower per-node variance); + Star2 chance
   pruning they likely lacked; + delegating draw-averaging to the learned eval. The
@@ -464,6 +706,11 @@ Three separable safeguards, all required:
   depth) measured on the round-robin — suspicion → knob.
 
 ## References
+- **Mateusz Rzepecki, "Implementing superhuman AI for Azul board game with a
+  variation of NNUE" (2025)** — primary comparison for the search/training loop,
+  branching-factor experiments, refill simulation, integer/AVX2 inference, and
+  million-scale iterative training:
+  https://jakubkowalski.tech/Supervising/Rzepecki2025ImplementingSuperhuman.pdf
 - **Yu Nasu, "NNUE" (2018)** — original Shogi paper; the foundational text.
 - **Stockfish `nnue-pytorch` + `docs/nnue.md`** — canonical trainer + the clearest
   written spec of accumulator/quantization: github.com/official-stockfish/nnue-pytorch
@@ -510,7 +757,8 @@ the game is decided, and the eval it falls back on there is trained on the same
 data as AZ's value head (no inherent edge). It WILL be stronger in the endgame
 (exact) and will surface lines AZ is blind to. ~1-in-3 it eventually overtakes
 outright with the full loop (Azul precedent — tempered: their MCTS was an
-afterthought, ours is mature). **Solo dominance is the wrong bar anyway.**
+afterthought, ours is mature). **Solo dominance is the ideal bar, but not the only
+bar that determines whether the project creates strategic value.**
 
 **Generator bar (how strong is "useful"?) — much lower than "stronger than AZ":**
 - **Endgame relabeler (near-free):** exact endgame values beat AZ approximations at
@@ -520,8 +768,10 @@ afterthought, ours is mature). **Solo dominance is the wrong bar anyway.**
   game strength (measure vs deep-solve ground truth on a probe set). Achievable
   well below AZ's playing strength.
 - **Diversity generator / exploiter:** useful once it plays *competently* (positions
-  realistic, ~within a couple hundred Elo) AND *diverges* from AZ's policy (covers
-  under-visited lines) OR finds one repeatable exploit. Difference > dominance.
+  are realistic) AND diverges from AZ's policy, reaches under-visited lines, or finds
+  one repeatable exploit. The generated positions are reanalyzed; NNUE need not be
+  within a fixed Elo distance or provide the final AZ policy label. Difference plus
+  label quality matters more than dominance.
 All three are directly measurable on the existing round-robin + run11 exploiter
 harness (Elo gap, exploit win-rate, value-error vs ground truth).
 
@@ -546,9 +796,10 @@ variant (may be strongest). If AZ ordering helps, distill it into a tiny CPU
 move-orderer rather than calling the GPU net in the search loop.
 
 **Phase 5 — value relabeling alone will NOT fix policy-prior starvation** (the
-denial blind spot is a POLICY problem). Alpha-beta must ALSO emit **sparse root
-policy targets** from searched child values, with explicit tie / incomplete-search
-/ uncertainty / temperature handling. Reuse the `ExactPolicyMode` machinery.
+denial blind spot is a POLICY problem). Selected NNUE positions must ALSO receive a
+credible policy target: high-budget AZ visits, exact root actions, or sparse root
+targets from completed deep child values, with explicit tie / incomplete-search /
+uncertainty / temperature handling. Reuse the `ExactPolicyMode` machinery.
 **Teacher labels carry provenance + quality** — {exact official-outcome solve |
 complete sampled expectiminimax | depth-limited | static NNUE} + (chance samples,
 completed depth) — and training weights exact/high-confidence labels higher.
@@ -566,12 +817,28 @@ eval share, chance-node share, and AZ-assisted-ordering effect.
 
 ## Risks / decision points
 - **Chance-node handling** is the biggest search-design risk — the thesis flagged
-  its own naive chance handling as *the* bottleneck. Budget iteration
-  (determinization count, variance reduction, Star2).
-- **Connectivity nonlinearity** — mitigate with union-find features; measure
-  whether the net needs them or learns around them.
+  draw simulation as a bottleneck, while Kingdomino's unique dominoes make a single
+  representative row especially risky. Sweep public-tree scenario count, variance
+  reduction, Star1/Star2, boundary evaluation, and late exact enumeration.
+- **Strategy fusion / hidden-order leakage** — a hard correctness failure, not a
+  strength trade. Reject independent full-deck solves, order-dependent encoding, and
+  future-revealed training targets with structural tests.
+- **Teacher circularity** — deeper NNUE labels can distill its own mistakes. Keep
+  outcome, exact, AZ, and NNUE targets separate; use exact/high-sample probes and
+  gameplay to establish confidence before weighting them heavily.
+- **Weak-generator policy contamination** — NNUE-generated states are useful, but
+  its chosen action is not automatically an AZ target. Reanalyze NNUE turns.
+- **Novelty filter bias** — selecting only disagreements can create an exotic replay
+  distribution. Retain ordinary controls, source tags, and phase/geometry coverage.
+- **Statistical power** — early 8- or 16-game results are directional only. Use
+  paired seeds/both seats, disjoint confirmation sets, confidence intervals, and
+  equal-compute AZ ablations for decisions.
+- **Connectivity nonlinearity** — the frozen encoder includes exact region/score and
+  expansion summaries, but training must still prove they support long-horizon value.
 - **Branching factor** — the joint pick+place space is large (3390-wide policy);
-  alpha-beta depth depends on good ordering → lean on the AZ policy head.
-- **Encoding bridge** — buffer stores AZ dense planes `(9,13,13)+flat(333)`, not
-  the sparse NNUE layout. Convertible (planes → one-hot deltas), but Phase 1 can
-  train on the dense tensors directly while Phase 2 designs the sparse set.
+  alpha-beta depth depends on ordering. Preserve NNUE-only ordering for independence;
+  separately test AZ-assisted/distilled ordering without silent pruning.
+- **Compute allocation** — CPU trajectory generation is cheap; high-budget AZ/exact
+  reanalysis is not. Stratify and filter positions first, then spend teacher compute.
+- **Frozen-schema discipline** — trajectories remain the source of truth. Do not add
+  encoder-locked buffers or reopen the reserved test split during tuning.
