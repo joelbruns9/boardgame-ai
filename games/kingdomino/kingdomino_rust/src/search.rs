@@ -171,6 +171,10 @@ pub(crate) struct OperationalResult<A> {
     pub completed_depth: u32,
     pub timed_out: bool,
     pub nodes: u64,
+    /// Explicit stochastic layers expanded by the operational search. `nodes`
+    /// counts the decision/terminal states below those layers, so callers can
+    /// report both components without changing the established node metric.
+    pub chance_nodes: u64,
     pub aspiration_researches: u32,
     pub star_cutoffs: u64,
     pub exact_extensions: u64,
@@ -202,6 +206,7 @@ struct OperationalControl<A: Copy> {
     deadline: Instant,
     node_limit: Option<u64>,
     nodes: u64,
+    chance_nodes: u64,
     star_cutoffs: u64,
     exact_extensions: u64,
     tt_hits: u64,
@@ -516,6 +521,13 @@ fn operational_action_value<G: Game, E: Eval<G>>(
         return Err(PyValueError::new_err(
             "stochastic action produced no chance children",
         ));
+    }
+    // Count a live explicit chance layer once, independent of how many sampled
+    // or enumerated row outcomes it expands. Kingdomino's deck-length-4 tail
+    // uses this plumbing for its sole forced row, but that deterministic layer
+    // is intentionally not a chance node.
+    if children.len() > 1 {
+        control.chance_nodes += 1;
     }
     let weight_sum: f64 = children.iter().map(|(_, w)| *w).sum();
     if children.iter().any(|(_, w)| !w.is_finite() || *w <= 0.0)
@@ -835,6 +847,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
             completed_depth: 0,
             timed_out: false,
             nodes: 0,
+            chance_nodes: 0,
             aspiration_researches: 0,
             star_cutoffs: 0,
             exact_extensions: 0,
@@ -852,6 +865,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         deadline: limits.deadline,
         node_limit: limits.node_limit,
         nodes: 0,
+        chance_nodes: 0,
         star_cutoffs: 0,
         exact_extensions: 0,
         tt_hits: 0,
@@ -931,6 +945,7 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
         completed_depth,
         timed_out,
         nodes: control.nodes,
+        chance_nodes: control.chance_nodes,
         aspiration_researches,
         star_cutoffs: control.star_cutoffs,
         exact_extensions: control.exact_extensions,
@@ -1256,6 +1271,7 @@ mod tests {
         assert_eq!(result.value, Some(0.8));
         assert_eq!(result.completed_depth, 3);
         assert!(!result.timed_out);
+        assert_eq!(result.chance_nodes, 0);
         assert_eq!(s.node, 0, "operational search must unwind to root");
     }
 
@@ -1426,6 +1442,7 @@ mod tests {
         assert_eq!(result.action, 0);
         assert_eq!(result.value, Some(0.8));
         assert!(result.star_cutoffs >= 1);
+        assert!(result.chance_nodes >= 1);
         assert_eq!(s.node, 0);
     }
 

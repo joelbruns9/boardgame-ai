@@ -2359,6 +2359,8 @@ struct OperationalSearchReport {
     #[pyo3(get)]
     nodes: u64,
     #[pyo3(get)]
+    chance_nodes: u64,
+    #[pyo3(get)]
     aspiration_researches: u32,
     #[pyo3(get)]
     star_cutoffs: u64,
@@ -2763,6 +2765,7 @@ impl RustSearch {
             timed_out: result.timed_out,
             elapsed_secs: start.elapsed().as_secs_f64(),
             nodes: result.nodes,
+            chance_nodes: result.chance_nodes,
             aspiration_researches: result.aspiration_researches,
             star_cutoffs: result.star_cutoffs,
             exact_extensions: result.exact_extensions,
@@ -5453,6 +5456,226 @@ fn advisor_open_loop_search_impl(
     Ok((children, root_value0))
 }
 
+/// Hash one advisor information-set state. Hidden deck order is canonicalized;
+/// all revealed/public fields remain exact.
+fn advisor_public_signature(state: &RustGameState) -> u128 {
+    let mut buf = Vec::with_capacity(2 * CELLS * 2 + 160);
+    for board in &state.boards {
+        buf.extend_from_slice(&board.terrain);
+        buf.extend_from_slice(&board.crowns);
+        buf.extend_from_slice(&[board.castle_x as u8, board.castle_y as u8,
+            board.min_x as u8, board.max_x as u8, board.min_y as u8,
+            board.max_y as u8, board.occupied]);
+    }
+    let mut bag = state.deck.clone();
+    bag.sort_unstable();
+    for value in bag { buf.extend_from_slice(&value.to_le_bytes()); }
+    buf.push(0xff);
+    for &value in &state.current_row { buf.extend_from_slice(&value.to_le_bytes()); }
+    buf.push(0xfe);
+    for &(player, value) in &state.pending_claims {
+        buf.push(player); buf.extend_from_slice(&value.to_le_bytes());
+    }
+    buf.push(0xfd);
+    for &(player, value) in &state.next_claims {
+        buf.push(player); buf.extend_from_slice(&value.to_le_bytes());
+    }
+    buf.extend_from_slice(&[state.phase, state.actor_index as u8,
+        state.initial_pick_count as u8, state.start_player,
+        state.harmony as u8, state.middle_kingdom as u8]);
+    buf.extend_from_slice(&state.discards[0].to_le_bytes());
+    buf.extend_from_slice(&state.discards[1].to_le_bytes());
+    xxhash_rust::xxh3::xxh3_128(&buf)
+}
+
+fn advisor_link_children(
+    arena: &mut Vec<OLNode>, tt: &mut HashMap<u128, u32>, node_id: u32,
+    leaf_state: &RustGameState,
+    legal: &[(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
+    priors: &[f64],
+) -> PyResult<()> {
+    for (i, &(idx, placement, pick)) in legal.iter().enumerate() {
+        if arena[node_id as usize].children.iter().any(|&(old, _)| old == idx) { continue; }
+        let child_state = leaf_state.step(placement, pick)?;
+        let signature = advisor_public_signature(&child_state);
+        let cid = if let Some(&existing) = tt.get(&signature) { existing } else {
+            let fresh = arena.len() as u32;
+            arena.push(OLNode::new(priors[i], (placement, pick)));
+            tt.insert(signature, fresh);
+            fresh
+        };
+        arena[node_id as usize].children.push((idx, cid));
+    }
+    arena[node_id as usize].children.sort_unstable_by_key(|&(idx, _)| idx);
+    arena[node_id as usize].is_expanded = true;
+    Ok(())
+}
+
+/// Persistent main-root advisor tree. Never reused across requests or by the
+/// independent draft-matrix mini-searches.
+#[pyclass]
+struct AdvisorSearchHandle {
+    root_state: RustGameState,
+    ev: Py<PyAny>,
+    rng: StdRng,
+    arena: Vec<OLNode>,
+    tt: HashMap<u128, u32>,
+    fallback_count: u32,
+    missing_child_count: u32,
+    fpu: f64,
+    cpuct: f64,
+    leaf_batch: usize,
+    virtual_loss: i32,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha_param: f64,
+    sims_done: usize,
+}
+
+impl AdvisorSearchHandle {
+    fn snapshot_inner(&self) -> (Vec<(u16, i32, f64, f64)>, f64) {
+        let root = &self.arena[0];
+        let value0 = root.value_sum / root.visit_count.max(1) as f64;
+        let children = root.children.iter().map(|&(idx, cid)| {
+            let child = &self.arena[cid as usize];
+            (idx, child.visit_count, child.value_sum, child.prior)
+        }).collect();
+        (children, value0)
+    }
+
+    fn advance_inner(&mut self, n_sims: usize) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+        let wave_cap = self.leaf_batch.max(1);
+        let vl = self.virtual_loss.max(0);
+        let mut advanced = 0usize;
+        while advanced < n_sims {
+            let wave = wave_cap.min(n_sims - advanced);
+            let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
+            let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
+            let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
+            let mut evals: Vec<AdvisorPendingEval> = Vec::new();
+            for _ in 0..wave {
+                let det = self.root_state.redeterminize(Some(self.rng.r#gen::<u64>()));
+                let (path, actors, leaf_state) = ol_descend(
+                    &self.arena, 0, det, self.fpu, self.cpuct,
+                    &mut self.fallback_count, &mut self.missing_child_count, None,
+                )?;
+                ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
+                let leaf = *path.last().unwrap();
+                if leaf_state.phase != GAME_OVER {
+                    let actor = leaf_state.actor()?;
+                    let legal = leaf_state.legal_actions_indexed();
+                    let (my, opp, flat) = leaf_state.encode_arrays(actor)?;
+                    evals.push(AdvisorPendingEval {
+                        path_idx: paths.len(), leaf, actor, legal, my, opp, flat,
+                    });
+                }
+                paths.push(path); path_actors.push(actors); leaf_states.push(leaf_state);
+            }
+            let mut path_v0: Vec<Option<f64>> = vec![None; paths.len()];
+            if !evals.is_empty() {
+                let idxs_per: Vec<Vec<i64>> = evals.iter()
+                    .map(|e| e.legal.iter().map(|t| t.0 as i64).collect()).collect();
+                let (vals, gvecs) = Python::attach(|py| -> PyResult<(Vec<f64>, Vec<Vec<f64>>)> {
+                    let mb_views: Vec<_> = evals.iter().map(|e| e.my.view()).collect();
+                    let ob_views: Vec<_> = evals.iter().map(|e| e.opp.view()).collect();
+                    let flat_views: Vec<_> = evals.iter().map(|e| e.flat.view()).collect();
+                    let mb = numpy::ndarray::stack(Axis(0), &mb_views)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let ob = numpy::ndarray::stack(Axis(0), &ob_views)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let flat = numpy::ndarray::stack(Axis(0), &flat_views)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let idx_arrays: Vec<_> = idxs_per.iter().map(|v| v.clone().into_pyarray(py)).collect();
+                    let result = self.ev.bind(py).call1((mb.into_pyarray(py), ob.into_pyarray(py),
+                        flat.into_pyarray(py), PyList::new(py, idx_arrays)?))?;
+                    let tuple = result.downcast::<PyTuple>()?;
+                    let vals = tuple.get_item(0)?.downcast::<PyArray1<f32>>()?.readonly()
+                        .as_slice()?.iter().map(|&x| x as f64).collect();
+                    let list_item = tuple.get_item(1)?;
+                    let list = list_item.downcast::<PyList>()?;
+                    let mut gvecs = Vec::with_capacity(list.len());
+                    for item in list.iter() {
+                        gvecs.push(item.downcast::<PyArray1<f32>>()?.readonly().as_slice()?
+                            .iter().map(|&x| x as f64).collect());
+                    }
+                    Ok((vals, gvecs))
+                })?;
+                for (row, eval) in evals.iter().enumerate() {
+                    let priors = softmax_f64(&gvecs[row]);
+                    let value0 = if eval.actor == 0 { vals[row] } else { -vals[row] };
+                    advisor_link_children(&mut self.arena, &mut self.tt, eval.leaf,
+                        &leaf_states[eval.path_idx], &eval.legal, &priors)?;
+                    path_v0[eval.path_idx] = Some(value0);
+                }
+            }
+            for (pi, path) in paths.iter().enumerate() {
+                ol_apply_virtual_loss(&mut self.arena, path, &path_actors[pi], -1, vl);
+            }
+            for (pi, path) in paths.iter().enumerate() {
+                let value0 = if leaf_states[pi].phase == GAME_OVER {
+                    terminal_search_value(&leaf_states[pi], self.score_scale,
+                        self.margin_gain, self.alpha_param)
+                } else { path_v0[pi].expect("non-terminal path must have an eval value") };
+                for &node_id in path {
+                    let node = &mut self.arena[node_id as usize];
+                    node.visit_count += 1; node.value_sum += value0;
+                }
+            }
+            advanced += paths.len(); self.sims_done += paths.len();
+        }
+        Ok(self.snapshot_inner())
+    }
+}
+
+#[pymethods]
+impl AdvisorSearchHandle {
+    #[new]
+    #[pyo3(signature = (state, evaluator, dirichlet_alpha=0.3, dirichlet_eps=0.0,
+                        fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
+                        score_scale=160.0, margin_gain=2.0, alpha=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(py: Python<'_>, state: &RustGameState, evaluator: Bound<'_, PyAny>,
+        dirichlet_alpha: f64, dirichlet_eps: f64, fpu: f64, cpuct: f64,
+        seed: u64, leaf_batch: usize, virtual_loss: i32,
+        score_scale: f64, margin_gain: f64, alpha: f64) -> PyResult<Self> {
+        if state.phase == GAME_OVER {
+            return Err(PyValueError::new_err("Cannot search from a terminal state"));
+        }
+        let root_state = state.cloned();
+        let ev = evaluator.unbind();
+        py.detach(move || {
+            let mut arena = vec![OLNode::new(1.0, (None, None))];
+            let root_v0 = ol_expand_with_evaluator(&mut arena, 0, &root_state, &ev)?;
+            arena[0].visit_count = 1; arena[0].value_sum = root_v0;
+            if dirichlet_eps > 0.0 {
+                ol_add_dirichlet_noise(&mut arena, 0, dirichlet_alpha, dirichlet_eps, Some(seed));
+            }
+            let mut tt = HashMap::new();
+            tt.insert(advisor_public_signature(&root_state), 0);
+            for &(idx, placement, pick) in &root_state.legal_actions_indexed() {
+                if let Some(&(_, cid)) = arena[0].children.iter().find(|&&(old, _)| old == idx) {
+                    let child = root_state.step(placement, pick)?;
+                    tt.insert(advisor_public_signature(&child), cid);
+                }
+            }
+            Ok(AdvisorSearchHandle { root_state, ev, rng: StdRng::seed_from_u64(seed),
+                arena, tt, fallback_count: 0, missing_child_count: 0, fpu, cpuct,
+                leaf_batch, virtual_loss, score_scale, margin_gain,
+                alpha_param: alpha, sims_done: 0 })
+        })
+    }
+
+    fn advance(&mut self, py: Python<'_>, n_sims: usize)
+        -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+        py.detach(|| self.advance_inner(n_sims))
+    }
+    fn snapshot(&self) -> (Vec<(u16, i32, f64, f64)>, f64) { self.snapshot_inner() }
+    #[getter]
+    fn sims_done(&self) -> usize { self.sims_done }
+    #[getter]
+    fn transpositions(&self) -> usize { self.tt.len() }
+}
+
 // ─── Batched MCTS (N games, synchronized ticks, one GPU forward per tick) ─────
 // Drives N independent search trees ("slots") in lockstep: every tick each slot
 // descends to its leaves (pure Rust), ALL N×leaf_batch leaves are stacked into
@@ -7235,6 +7458,7 @@ mod make_unmake_tests {
         let operational_secs = operational_start.elapsed().as_secs_f64();
         assert_eq!(result.completed_depth, 4);
         assert!(!result.timed_out);
+        assert!(result.chance_nodes > 0, "live deal node was not counted");
         assert_eq!(result.action, fixed);
         assert_eq!(fingerprint(&operational_state), before, "search did not unwind root");
         eprintln!(
@@ -7255,6 +7479,58 @@ mod make_unmake_tests {
             "operational final iteration regressed: {} vs fixed {} nodes",
             result.last_iteration_nodes, fixed_nodes
         );
+        Ok(())
+    }
+
+    /// The public-state operational counter records explicit deal layers only:
+    /// a live sampled deal must be non-zero, while a deck-in-{0,4} exact tail
+    /// must never invent a chance node even when the search is node-limited.
+    #[test]
+    fn operational_chance_nodes_live_vs_no_chance_endgame() -> PyResult<()> {
+        let cfg = search::SearchConfig {
+            depth: 4,
+            chance_samples: 2,
+            enum_cap: 1,
+            margin_weight: 0.0,
+            seed: 23,
+        };
+        let limits = |max_depth, node_limit| search::OperationalLimits {
+            max_depth,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            aspiration_window: 0.25,
+            node_limit,
+            value_bound: 1.0,
+            full_width_ordering: true,
+            selective_width: None,
+            selective_root_width: None,
+            selective_min_depth: 4,
+        };
+
+        let mut live = new_game(101, true, true);
+        let live_result = search::choose_action_operational::<Kingdomino, _>(
+            &mut live,
+            &PickAwareEval,
+            &cfg,
+            &limits(4, Some(50_000)),
+        )?
+        .expect("live-chance search action");
+        assert!(live_result.chance_nodes > 0, "opening deal layer was not counted");
+
+        let mut rng = StdRng::seed_from_u64(0xC11A_CE00);
+        let mut tail = new_game(102, true, true);
+        while !is_no_chance_endgame_state(&tail) || tail.legal_actions().len() < 2 {
+            let legal = tail.legal_actions();
+            let &(placement, pick) = legal.choose(&mut rng).expect("nonempty legal actions");
+            tail = tail.step(placement, pick)?;
+        }
+        let tail_result = search::choose_action_operational::<Kingdomino, _>(
+            &mut tail,
+            &PickAwareEval,
+            &cfg,
+            &limits(1, Some(200)),
+        )?
+        .expect("no-chance tail search action");
+        assert_eq!(tail_result.chance_nodes, 0);
         Ok(())
     }
 }
@@ -9913,6 +10189,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::RustGameState;
+
+    #[pymodule_export]
+    use super::AdvisorSearchHandle;
 
     #[pymodule_export]
     use super::SearchEngine;

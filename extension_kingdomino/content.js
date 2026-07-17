@@ -2,6 +2,9 @@ const browserAPI = typeof browser !== "undefined" ? browser : chrome;
 const usesPromiseAPI = typeof browser !== "undefined" && browserAPI === browser;
 
 const ADVISOR_URL = "http://127.0.0.1:8000/api/recommend";
+const ADVISOR_START_URL = `${ADVISOR_URL}/start`;
+const ADVISOR_POLL_URL = `${ADVISOR_URL}/poll`;
+const ADVISOR_STOP_URL = `${ADVISOR_URL}/stop`;
 const PROBE_SAVE_URL = "http://127.0.0.1:8000/api/advisor-probe/save";
 const GAME_LOG_URL = "http://127.0.0.1:8000/api/game-log/append";
 const RESULT_EVENT = "kingdomino-advisor-state";
@@ -17,10 +20,15 @@ const DEFAULT_OPTIONS = {
   topK: 8,
   checkpoint: "",
   device: "cuda",
-  exactMaxSecs: 300,
+  exactMaxSecs: 30,
   exactThreads: 0,
   autoRefresh: true,
   gameLog: true,
+  streaming: true,
+  maxSims: 3200,
+  refreshMs: 1000,
+  fragilityAtSims: 1000,
+  fragilitySims: 800,
 };
 
 const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
@@ -28,6 +36,7 @@ const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
 let inFlightRecommend = false;
 let lastPayloadKey = null;
 let lastStartedAt = 0;
+let activeStreamingJob = null;
 
 console.log("[kingdomino-advisor] content.js loaded");
 
@@ -72,11 +81,20 @@ async function loadOptions() {
     "kingdomino_exact_threads",
     "kingdomino_auto_refresh",
     "kingdomino_game_log",
+    "kingdomino_streaming",
+    "kingdomino_max_sims",
+    "kingdomino_refresh_ms",
+    "kingdomino_fragility_at_sims",
+    "kingdomino_fragility_sims",
   ]);
   const sims = Number(stored.kingdomino_sims);
   const topK = Number(stored.kingdomino_top_k);
   const exactMaxSecs = Number(stored.kingdomino_exact_max_secs);
   const exactThreads = Number(stored.kingdomino_exact_threads);
+  const maxSims = Number(stored.kingdomino_max_sims);
+  const refreshMs = Number(stored.kingdomino_refresh_ms);
+  const fragilityAtSims = Number(stored.kingdomino_fragility_at_sims);
+  const fragilitySims = Number(stored.kingdomino_fragility_sims);
   return {
     engine: stored.kingdomino_engine || DEFAULT_OPTIONS.engine,
     sims: Number.isFinite(sims) && sims > 0 ? Math.round(sims) : DEFAULT_OPTIONS.sims,
@@ -91,6 +109,14 @@ async function loadOptions() {
     gameLog: stored.kingdomino_game_log === undefined
       ? DEFAULT_OPTIONS.gameLog
       : Boolean(stored.kingdomino_game_log),
+    streaming: stored.kingdomino_streaming === undefined
+      ? DEFAULT_OPTIONS.streaming : Boolean(stored.kingdomino_streaming),
+    maxSims: Number.isFinite(maxSims) && maxSims > 0 ? Math.round(maxSims) : DEFAULT_OPTIONS.maxSims,
+    refreshMs: Number.isFinite(refreshMs) && refreshMs >= 100 ? Math.round(refreshMs) : DEFAULT_OPTIONS.refreshMs,
+    fragilityAtSims: Number.isFinite(fragilityAtSims) && fragilityAtSims >= 0
+      ? Math.round(fragilityAtSims) : DEFAULT_OPTIONS.fragilityAtSims,
+    fragilitySims: Number.isFinite(fragilitySims) && fragilitySims >= 50
+      ? Math.round(fragilitySims) : DEFAULT_OPTIONS.fragilitySims,
   };
 }
 
@@ -105,6 +131,11 @@ async function saveOptionPatch(patch) {
   if (patch.exactThreads !== undefined) out.kingdomino_exact_threads = patch.exactThreads;
   if (patch.autoRefresh !== undefined) out.kingdomino_auto_refresh = Boolean(patch.autoRefresh);
   if (patch.gameLog !== undefined) out.kingdomino_game_log = Boolean(patch.gameLog);
+  if (patch.streaming !== undefined) out.kingdomino_streaming = Boolean(patch.streaming);
+  if (patch.maxSims !== undefined) out.kingdomino_max_sims = patch.maxSims;
+  if (patch.refreshMs !== undefined) out.kingdomino_refresh_ms = patch.refreshMs;
+  if (patch.fragilityAtSims !== undefined) out.kingdomino_fragility_at_sims = patch.fragilityAtSims;
+  if (patch.fragilitySims !== undefined) out.kingdomino_fragility_sims = patch.fragilitySims;
   await setStorage(out);
 }
 
@@ -1755,6 +1786,34 @@ function renderErrorOverlay(message) {
   document.body.appendChild(box);
 }
 
+function renderPendingStreamingJob(job, data, transport) {
+  const box = makeOverlayBase("Kingdomino Advisor");
+  const status = String((data && data.status) || "solving_exact");
+  const elapsed = Math.max(0, (Date.now() - job.startedAt) / 1000);
+  const progress = document.createElement("div");
+  progress.style.cssText = "color:#93c5fd;background:rgba(30,58,138,0.28);border:1px solid rgba(96,165,250,.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:12px;";
+  progress.textContent = status === "solving_exact"
+    ? `Solving exact endgame... ${elapsed.toFixed(1)}s`
+    : status === "cancelled" ? "Stopped."
+    : status === "error" ? "Advisor job failed."
+    : `Starting NN fallback... ${elapsed.toFixed(1)}s`;
+  box.appendChild(progress);
+
+  const meta = document.createElement("div");
+  meta.style.cssText = "color:#94a3b8;font-size:11px;margin-bottom:8px;";
+  meta.textContent = `Engine: ${job.payload.engine} · ${transport}`;
+  box.appendChild(meta);
+
+  if (!["done", "error", "cancelled"].includes(status)) {
+    const stop = document.createElement("button");
+    stop.textContent = "Stop";
+    stop.style.cssText = "background:#b45309;color:#fff7ed;border:1px solid #fb923c;border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
+    stop.addEventListener("click", () => stopActiveStreamingJob("good-enough"));
+    box.appendChild(stop);
+  }
+  document.body.appendChild(box);
+}
+
 function renderRecommendations(response, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells, capture) {
   const box = makeOverlayBase("Kingdomino Advisor");
 
@@ -1777,15 +1836,17 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   const simSelect = document.createElement("select");
   simSelect.title = "MCTS simulations";
   simSelect.style.cssText = "background:rgba(51,65,85,0.9);color:#e2e8f0;border:1px solid rgba(100,116,139,0.9);border-radius:6px;font-size:12px;cursor:pointer;padding:3px 5px;";
-  Array.from(new Set([...SIM_OPTIONS, options.sims])).sort((a, b) => a - b).forEach((n) => {
+  const configuredSims = options.streaming ? options.maxSims : options.sims;
+  Array.from(new Set([...SIM_OPTIONS, configuredSims])).sort((a, b) => a - b).forEach((n) => {
     const opt = document.createElement("option");
     opt.value = String(n);
     opt.textContent = `${n} sims`;
-    opt.selected = n === options.sims;
+    opt.selected = n === configuredSims;
     simSelect.appendChild(opt);
   });
   simSelect.addEventListener("change", async () => {
-    await saveOptionPatch({ sims: Number(simSelect.value) });
+    const value = Number(simSelect.value);
+    await saveOptionPatch(options.streaming ? { maxSims: value } : { sims: value });
     triggerRecommend({ force: true, reason: "sim-change" });
   });
 
@@ -1794,8 +1855,8 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   deeper.title = "Increase simulations and recompute";
   deeper.style.cssText = "background:rgba(22,101,52,0.9);color:#dcfce7;border:1px solid rgba(74,222,128,0.75);border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
   deeper.addEventListener("click", async () => {
-    const next = SIM_OPTIONS.find((n) => n > options.sims) || options.sims * 2;
-    await saveOptionPatch({ sims: next });
+    const next = SIM_OPTIONS.find((n) => n > configuredSims) || configuredSims * 2;
+    await saveOptionPatch(options.streaming ? { maxSims: next } : { sims: next });
     triggerRecommend({ force: true, reason: "think-deeper" });
   });
 
@@ -1852,7 +1913,36 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   controls.appendChild(probe);
   controls.appendChild(autoWrap);
   controls.appendChild(logWrap);
+  if (activeStreamingJob && ["running", "testing_fragility", "solving_exact"].includes(response.status)) {
+    const stop = document.createElement("button");
+    stop.textContent = "Stop / Good enough";
+    stop.title = "Stop searching and keep the current best recommendation";
+    stop.style.cssText = "background:#b45309;color:#fff7ed;border:1px solid #fb923c;border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
+    stop.addEventListener("click", () => stopActiveStreamingJob("good-enough"));
+    controls.appendChild(stop);
+  }
   box.appendChild(controls);
+
+  if (response.status && !isExactResponse(response, payload)) {
+    const progress = document.createElement("div");
+    const done = Number(response.sims_done || response.num_simulations || 0);
+    const target = Number(response.sims_target || options.maxSims || done);
+    const elapsed = activeStreamingJob ? Math.max(0, (Date.now() - activeStreamingJob.startedAt) / 1000) : null;
+    const label = response.status === "testing_fragility" ? "testing fragility..."
+      : response.status === "done" ? "converged"
+      : response.status === "cancelled" ? "stopped" : "searching...";
+    progress.style.cssText = "color:#93c5fd;background:rgba(30,58,138,0.28);border:1px solid rgba(96,165,250,.45);border-radius:6px;padding:5px 8px;margin-bottom:8px;font-size:12px;";
+    progress.textContent = `${done} / ${target} sims${elapsed === null ? "" : ` - ${elapsed.toFixed(1)}s`} - ${label}`
+      + (response.stable_hint ? " - stable - safe to move" : "");
+    box.appendChild(progress);
+  }
+
+  if (response.exact_fallback) {
+    const fallback = document.createElement("div");
+    fallback.style.cssText = "color:#fde68a;background:rgba(120,53,15,.35);border:1px solid rgba(251,191,36,.45);border-radius:6px;padding:5px 8px;margin-bottom:8px;font-size:11px;";
+    fallback.textContent = `Exact solve timed out; continued with NN${response.reason ? ` — ${response.reason}` : "."}`;
+    box.appendChild(fallback);
+  }
 
   const meta = document.createElement("div");
   meta.style.cssText = "color:#cbd5e1;margin-bottom:10px;";
@@ -1952,6 +2042,7 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     head.style.cssText = "color:#94a3b8;margin-bottom:4px;font-weight:600;";
     head.textContent = "Draft matrix (your pick vs their response)"
       + (matrix.partial ? " — partial, budget hit" : "");
+    if (matrix.computed_at_sims != null) head.textContent += ` @ ${matrix.computed_at_sims} sims`;
     panel.appendChild(head);
     const fmt = (x) => (typeof x === "number" && Number.isFinite(x))
       ? (x >= 0 ? "+" : "") + x.toFixed(2) : "—";
@@ -1967,6 +2058,12 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
         + `<span title="worst opponent pick response${worst}">robust ${fmt(r.robust_edge)}${worst}</span>`
         + `<span title="opponent responses weighted by their policy prior">real ${fmt(r.realistic_edge)}</span>`
         + (fragile ? `<span style="font-weight:700;">⚠ fragile ${fmt(r.fragility)}</span>` : "");
+      if (r.robust_stale) {
+        const stale = document.createElement("span");
+        stale.textContent = " robust stale";
+        stale.style.cssText = "font-weight:700;color:#fbbf24;";
+        line.appendChild(stale);
+      }
       line.title = (r.responses || []).map((x) =>
         `they take d${x.pick_domino_id}: ${fmt(x.edge_you)} (${Math.round((x.prior_mass || 0) * 100)}% likely)`).join("\n");
       panel.appendChild(line);
@@ -2137,6 +2234,8 @@ function buildRecommendPayload(state, options) {
     device: options.device,
     exact_max_secs: options.exactMaxSecs,
     exact_threads: options.exactThreads,
+    fragility_at_sims: options.fragilityAtSims,
+    draft_search_sims: options.fragilitySims,
   };
   if (options.checkpoint && options.checkpoint.trim()) {
     payload.checkpoint_path = options.checkpoint.trim();
@@ -2145,41 +2244,168 @@ function buildRecommendPayload(state, options) {
 }
 
 async function postRecommend(payload) {
+  return advisorRequest(ADVISOR_URL, { method: "POST", payload });
+}
+
+async function advisorRequest(url, { method = "GET", payload = null } = {}) {
   try {
-    const response = await fetch(ADVISOR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const init = { method, headers: { "Content-Type": "application/json" } };
+    if (payload !== null) init.body = JSON.stringify(payload);
+    const response = await fetch(url, init);
     const data = await response.json();
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
     return { data, transport: "direct" };
   } catch (directError) {
-    console.warn("[kingdomino-advisor] direct fetch failed; trying background fallback:", directError);
     const wrapped = await new Promise((resolve) => {
+      const message = { action: "advisorRequest", url, method, payload };
       try {
         if (usesPromiseAPI) {
-          browserAPI.runtime.sendMessage({ action: "recommend", url: ADVISOR_URL, payload }).then(
-            resolve,
-            (err) => resolve({ ok: false, error: String((err && err.message) || err) })
-          );
+          browserAPI.runtime.sendMessage(message).then(resolve, (err) => resolve({ ok: false, error: String(err) }));
           return;
         }
-        const result = browserAPI.runtime.sendMessage({ action: "recommend", url: ADVISOR_URL, payload }, resolve);
-        if (result && typeof result.then === "function") {
-          result.then(resolve, (err) => resolve({ ok: false, error: String((err && err.message) || err) }));
-        }
-      } catch (e) {
-        resolve({ ok: false, error: String((e && e.message) || e) });
-      }
+        const result = browserAPI.runtime.sendMessage(message, resolve);
+        if (result && typeof result.then === "function") result.then(resolve, (err) => resolve({ ok: false, error: String(err) }));
+      } catch (e) { resolve({ ok: false, error: String(e) }); }
     });
-    console.log("[advisor] background response:", JSON.stringify(wrapped));
     if (!wrapped || !wrapped.ok) {
-      console.error("[advisor] background fetch failed:", wrapped && wrapped.error);
-      throw new Error((wrapped && wrapped.error) || String((directError && directError.message) || directError));
+      throw new Error((wrapped && wrapped.error) || String(directError));
     }
     return { data: wrapped.data, transport: "background" };
   }
+}
+
+function streamingEligible(payload, options) {
+  const mode = String(payload && payload.engine || "").toLowerCase();
+  return Boolean(
+    options.streaming
+    && payload
+    && [
+      "nn", "model", "az", "alphazero", "mcts", "nn-mcts",
+      "exact", "solver", "exact-solver",
+      "auto", "exact-auto", "auto-endgame",
+    ].includes(mode)
+  );
+}
+
+function streamingStableHint(job, data) {
+  const top = data && Array.isArray(data.recommendations) ? data.recommendations[0] : null;
+  const sims = Number(data && (data.sims_done ?? data.num_simulations));
+  if (!top || !top.action_id || typeof top.visit_frac !== "number" || !Number.isFinite(sims)) {
+    return job.stableHint;
+  }
+  if (sims <= job.lastStabilitySims) return job.stableHint;
+  job.lastStabilitySims = sims;
+  job.topHistory.push({ actionId: top.action_id, visitFrac: top.visit_frac });
+  if (job.topHistory.length > 3) job.topHistory.shift();
+  job.stableHint = job.topHistory.length === 3
+    && job.topHistory.every((item) => item.actionId === top.action_id)
+    && Math.max(...job.topHistory.map((item) => item.visitFrac))
+       - Math.min(...job.topHistory.map((item) => item.visitFrac)) <= 0.03;
+  return job.stableHint;
+}
+
+async function stopActiveStreamingJob(reason = "user") {
+  const job = activeStreamingJob;
+  if (!job) return { ok: true, skipped: true };
+  activeStreamingJob = null;
+  if (job.timer !== null) clearTimeout(job.timer);
+  try {
+    const result = await advisorRequest(ADVISOR_STOP_URL, {
+      method: "POST", payload: { job_id: job.jobId },
+    });
+    const data = result.data || {};
+    data.stop_reason = reason;
+    if (job.lastResponse) {
+      renderRecommendations(
+        { ...job.lastResponse, status: data.status || "cancelled" },
+        job.payload, job.options, result.transport, job.spriteUrl, job.spriteMap,
+        job.dominoDesc, job.activeBoardCells, job.capture,
+      );
+    } else {
+      renderPendingStreamingJob(job, data, result.transport);
+    }
+    return { ok: true, response: data };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+async function pollStreamingJob(job) {
+  if (activeStreamingJob !== job) return;
+  try {
+    const url = `${ADVISOR_POLL_URL}?job_id=${encodeURIComponent(job.jobId)}&since_version=${job.version}`;
+    const { data, transport } = await advisorRequest(url);
+    if (activeStreamingJob !== job) return;
+    job.version = Number.isFinite(data.version) ? data.version : job.version;
+    if (data.changed && Array.isArray(data.recommendations)) {
+      data.stable_hint = streamingStableHint(job, data);
+      job.lastResponse = data;
+      await setStorage({
+        kingdomino_last_payload: job.payload,
+        kingdomino_last_recommendation: data,
+        kingdomino_last_transport: transport,
+        kingdomino_last_recommendation_at: new Date().toISOString(),
+      });
+      renderRecommendations(
+        data, job.payload, job.options, transport, job.spriteUrl, job.spriteMap,
+        job.dominoDesc, job.activeBoardCells, job.capture,
+      );
+    } else if (data.changed && ["solving_exact", "running"].includes(data.status)) {
+      renderPendingStreamingJob(job, data, transport);
+    }
+    if (["done", "error", "cancelled"].includes(data.status)) {
+      activeStreamingJob = null;
+      if (data.status === "error") renderErrorOverlay(data.error || "Streaming search failed");
+      return;
+    }
+  } catch (e) {
+    if (activeStreamingJob === job) {
+      activeStreamingJob = null;
+      renderErrorOverlay(String((e && e.message) || e));
+    }
+    return;
+  }
+  job.timer = setTimeout(() => pollStreamingJob(job), job.options.refreshMs);
+}
+
+async function startStreamingRecommend(capture, payload, options, reason) {
+  const stateKey = stableStringify(capture.state);
+  const startPayload = {
+    ...payload,
+    max_sims: options.maxSims,
+    chunk_sims: Math.min(200, options.maxSims),
+  };
+  const requestKey = stableStringify(startPayload);
+  if (activeStreamingJob && activeStreamingJob.requestKey === requestKey) {
+    return { ok: true, attached: true, job_id: activeStreamingJob.jobId };
+  }
+  if (activeStreamingJob) {
+    const stopReason = activeStreamingJob.stateKey === stateKey
+      ? "parameters-change" : "position-change";
+    await stopActiveStreamingJob(stopReason);
+  }
+  const { data, transport } = await advisorRequest(ADVISOR_START_URL, {
+    method: "POST", payload: startPayload,
+  });
+  const activeBoardCells = capture.state && Array.isArray(capture.state.boards)
+    && capture.state.boards[capture.state.current_actor]
+    ? capture.state.boards[capture.state.current_actor].cells || [] : [];
+  const job = {
+    jobId: data.job_id, stateKey, requestKey, version: -1, timer: null, topHistory: [],
+    lastStabilitySims: -1, stableHint: false,
+    startedAt: Date.now(), lastResponse: null, payload, options, capture, transport,
+    spriteUrl: capture.spriteUrl || null,
+    spriteMap: capture.dominoSpriteMap || null,
+    dominoDesc: capture.dominoesDescription || null,
+    activeBoardCells,
+  };
+  activeStreamingJob = job;
+  lastPayloadKey = stableStringify(payload);
+  if (data.status === "solving_exact") {
+    renderPendingStreamingJob(job, data, transport);
+  }
+  pollStreamingJob(job);
+  return { ok: true, transport, capture, payload, response: data, reason, job_id: data.job_id };
 }
 
 async function captureDebugOnly() {
@@ -2193,7 +2419,24 @@ async function captureDebugOnly() {
   return { ok: Boolean(capture.ok), capture };
 }
 
-async function triggerRecommend({ force = false, reason = "manual" } = {}) {
+async function triggerRecommend({ force = false, reason = "manual", captureOverride = null } = {}) {
+  const options = await loadOptions();
+  if (options.streaming) {
+    const capture = captureOverride || await readPageState();
+    if (!capture || !capture.ok || !capture.state) {
+      return { ok: false, skipped: true, error: (capture && capture.error) || "capture failed", capture };
+    }
+    const payload = buildRecommendPayload(capture.state, options);
+    if (streamingEligible(payload, options)) {
+      return startStreamingRecommend(capture, payload, options, reason);
+    }
+    return {
+      ok: false,
+      skipped: true,
+      error: `Engine ${payload.engine} is not available through streaming; turn streaming off to use the legacy endpoint.`,
+      capture,
+    };
+  }
   if (inFlightRecommend) return { ok: false, skipped: true, error: "recommendation already in flight" };
   const now = Date.now();
   if (!force && now - lastStartedAt < 1000) return { ok: false, skipped: true, error: "throttled" };
@@ -2201,8 +2444,7 @@ async function triggerRecommend({ force = false, reason = "manual" } = {}) {
   inFlightRecommend = true;
   lastStartedAt = now;
   try {
-    const options = await loadOptions();
-    const capture = await readPageState();
+    const capture = captureOverride || await readPageState();
     await setStorage({ kingdomino_last_capture: capture });
 
     const spriteUrl = capture.spriteUrl || null;
@@ -2323,13 +2565,51 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ── Poller: auto-refresh on your turn + passive game logging ────────────────
-// One capture per tick serves both features. Both use a two-poll stability
-// rule before acting — BGA's tile animations produce transitional captures,
-// so acting on the first sighting risks a half-updated board.
+// BGA's tile animations produce transitional captures, so recommendations still
+// require two identical reads. DOM changes wake the poller promptly; after the
+// first candidate read, a short inner loop confirms stability without waiting
+// for another 2.5-second backstop tick.
 const AUTO_POLL_MS = 2500;
+const AUTO_SETTLE_READ_MS = 175;
+const AUTO_SETTLE_MAX_MS = 2500;
+const AUTO_MUTATION_DEBOUNCE_MS = 40;
 let lastAutoStateKey = null;
 let lastLoggedKey = null;
 let pendingLogKey = null;
+let pollTickRunning = false;
+let mutationPollTimer = null;
+
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function autoCaptureKey(capture) {
+  if (!capture || !capture.ok || !capture.state) return null;
+  const viewerId = capture.viewerId != null ? String(capture.viewerId) : null;
+  const active = capture.activePlayer != null ? String(capture.activePlayer) : null;
+  if (!viewerId || !active || viewerId !== active) return null;
+  return stableStringify(capture.state);
+}
+
+async function settleAutoCapture(initialCapture, options) {
+  let previousKey = autoCaptureKey(initialCapture);
+  if (previousKey === null) return null;
+  const deadline = Date.now() + AUTO_SETTLE_MAX_MS;
+
+  while (Date.now() < deadline) {
+    await delayMs(AUTO_SETTLE_READ_MS);
+    if (inFlightRecommend) return null;
+    const capture = await readPageState();
+    if (!capture || !capture.ok) {
+      previousKey = null;
+      continue;
+    }
+    const key = autoCaptureKey(capture);
+    if (key !== null && key === previousKey) return { capture, key };
+    previousKey = key;
+  }
+  return null;
+}
 
 function postGameLog(tableId, record) {
   // Fire-and-forget through the background worker's JSON-POST proxy; logging
@@ -2408,6 +2688,8 @@ function gameLogTick(capture) {
 }
 
 async function pollTick() {
+  if (pollTickRunning) return;
+  pollTickRunning = true;
   try {
     if (inFlightRecommend) return;
     const options = await loadOptions();
@@ -2416,18 +2698,52 @@ async function pollTick() {
     if (!capture || !capture.ok) return;
     if (options.gameLog) gameLogTick(capture);
     if (!options.autoRefresh || !capture.state) return;
-    const viewerId = capture.viewerId != null ? String(capture.viewerId) : null;
-    const active = capture.activePlayer != null ? String(capture.activePlayer) : null;
-    if (!viewerId || !active || viewerId !== active) return;
-    const key = stableStringify(capture.state);
-    if (key !== lastAutoStateKey) {
-      lastAutoStateKey = key; // first sighting — wait one poll for stability
-      return;
-    }
-    await triggerRecommend({ reason: "auto-turn" });
+    const firstKey = autoCaptureKey(capture);
+    if (firstKey === null || firstKey === lastAutoStateKey) return;
+    const settled = await settleAutoCapture(capture, options);
+    if (!settled) return;
+    lastAutoStateKey = settled.key;
+    await triggerRecommend({ reason: "auto-turn", captureOverride: settled.capture });
   } catch (e) {
     // The poller must never take down the content script.
     console.warn("[kingdomino-advisor] poll tick failed:", e);
+  } finally {
+    pollTickRunning = false;
   }
 }
+
+function mutationTouchesOnlyOverlay(mutation) {
+  const target = mutation && mutation.target;
+  const targetEl = target && (target.nodeType === 1 ? target : target.parentElement);
+  if (targetEl && targetEl.closest && targetEl.closest(`#${OVERLAY_ID}`)) return true;
+  const changedNodes = [
+    ...Array.from((mutation && mutation.addedNodes) || []),
+    ...Array.from((mutation && mutation.removedNodes) || []),
+  ];
+  return changedNodes.length > 0 && changedNodes.every((node) => {
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    return Boolean(el && (el.id === OVERLAY_ID || (el.closest && el.closest(`#${OVERLAY_ID}`))));
+  });
+}
+
+function scheduleMutationPoll(mutations = []) {
+  if (mutations.length && mutations.every(mutationTouchesOnlyOverlay)) return;
+  if (mutationPollTimer !== null) clearTimeout(mutationPollTimer);
+  mutationPollTimer = setTimeout(() => {
+    mutationPollTimer = null;
+    pollTick();
+  }, AUTO_MUTATION_DEBOUNCE_MS);
+}
+
+if (typeof MutationObserver !== "undefined" &&
+    typeof document !== "undefined" && document.documentElement) {
+  const autoPollObserver = new MutationObserver(scheduleMutationPoll);
+  autoPollObserver.observe(document.documentElement, {
+    attributes: true,
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+}
 setInterval(pollTick, AUTO_POLL_MS);
+pollTick();

@@ -342,3 +342,13 @@ inside the same deck window) comes back high, **and** in practice you routinely
 act on the first refresh before the fresh search converges. Short of that
 evidence, do not build it. Items 1–2 attack the real bottleneck (draft-matrix
 budget exhaustion) with bigger, safer wins.
+
+**Measured 2026-07-17:** `measure_reveal_recurrence.py` read the current
+`runs/kingdomino/bga_game_log` corpus: 44 games, 1,092 own decisions, and 526
+reveal windows. Consecutive own decisions recurred within the same window
+566/1,048 times (**54.0%**), with 2.08 decisions/window. Median/mean gaps were
+30.0/35.6 s across all consecutive own decisions and 27.5/33.1 s for same-window
+pairs. This clears the script's deliberately simple 50% recurrence gate, but it
+does **not** satisfy the second reopen criterion: the logs do not show that play
+routinely commits before the fresh search's first 1 s refresh converges. Item 3
+therefore remains **DEFERRED**; no cross-move reuse machinery was built.

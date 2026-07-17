@@ -30,25 +30,22 @@ fetch("http://127.0.0.1:8000/api/recommend", {
     e.name, e.message));
 
 async function postJson(url, payload) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: timeoutSignal(120000),
-  });
+  return requestJson(url, "POST", payload);
+}
 
+async function requestJson(url, method, payload) {
+  const init = {
+    method: method || "GET",
+    headers: { "Content-Type": "application/json" },
+    signal: timeoutSignal(120000),
+  };
+  if (payload !== undefined && payload !== null) init.body = JSON.stringify(payload);
+  const response = await fetch(url, init);
   const text = await response.text();
   let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch (e) {
-    throw new Error(`Advisor returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  if (!response.ok) {
-    throw new Error(`Advisor HTTP ${response.status}: ${JSON.stringify(data)}`);
-  }
-
+  try { data = text ? JSON.parse(text) : null; }
+  catch (e) { throw new Error(`Advisor returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`); }
+  if (!response.ok) throw new Error(`Advisor HTTP ${response.status}: ${JSON.stringify(data)}`);
   return data;
 }
 
@@ -161,6 +158,14 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender.tab && sender.tab.id;
     readPageStateInTab(tabId, message.fnSource)
       .then((result) => sendResponse(result))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+
+  if (message.action === "advisorRequest") {
+    requestJson(message.url, message.method, message.payload)
+      .then((data) => sendResponse({ ok: true, data }))
       .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
     return true;
   }

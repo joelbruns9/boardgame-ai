@@ -46,12 +46,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
+import copy
+import hashlib
 import json
 import os
 import random
 import glob
+import math
 import re
 import sys
+import threading
+import time
 
 try:
     from fastapi import FastAPI, HTTPException, Query
@@ -103,7 +108,16 @@ _SESSION_TIMELINES: dict[str, list[GameState]] = {}
 
 _NN_EVALUATOR_CACHE: dict[tuple[str, str, int, int, int], Any] = {}
 _EXACT_ADVISOR_VALUE_CACHE: dict[tuple[str, float, float, float], float] = {}
+_EXACT_ADVISOR_MARGIN_CACHE: dict[str, int] = {}
 _EXACT_ADVISOR_CACHE_MAX = 200_000
+
+
+class ExactTimeout(RuntimeError):
+    """Signal that the interactive exact-advisor budget was exhausted."""
+
+
+class SearchCancelled(RuntimeError):
+    """Cooperative cancellation observed between bounded search operations."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,8 +187,8 @@ class RecommendRequest(BaseModel):
     # Exact endgame advisor. exact_threads=0 leaves Rayon on its default global
     # pool size, which is all logical CPUs unless RAYON_NUM_THREADS was set
     # before the Rust extension initialized.
-    # Advisor policy: always solve — default to the ceiling; requests may lower it.
-    exact_max_secs: float = Field(default=3600.0, ge=0.0, le=3600.0)
+    # Interactive requests default to a bounded solve; power users may raise it.
+    exact_max_secs: float = Field(default=30.0, ge=0.0, le=3600.0)
     exact_threads: int = Field(default=0, ge=0, le=128)
     # Swindle analysis (exact engine, losing/drawn roots): enumerate opponent
     # replies to the top candidate moves and exact-solve each, identifying
@@ -190,6 +204,49 @@ class RecommendRequest(BaseModel):
     draft_matrix: Optional[bool] = None
     draft_search_sims: int = Field(default=800, ge=50, le=20000)
     draft_budget_secs: float = Field(default=20.0, ge=0.0, le=300.0)
+    # Streaming-only milestone for the one-time static draft/fragility pass.
+    # Kept on the shared request model so the legacy endpoint remains forwards
+    # compatible with extension options; zero disables the streaming pass.
+    fragility_at_sims: int = Field(default=1000, ge=0, le=20000)
+
+
+class RecommendStartRequest(RecommendRequest):
+    max_sims: int = Field(default=3200, ge=1, le=20000)
+    chunk_sims: int = Field(default=200, ge=1, le=5000)
+
+
+class RecommendStopRequest(BaseModel):
+    job_id: str
+
+
+@dataclass
+class SearchJob:
+    job_id: str
+    state_key: str
+    params_key: str
+    status: str
+    version: int
+    sims_done: int
+    sims_target: int
+    snapshot: Optional[dict[str, Any]]
+    error: Optional[str]
+    started_at: float
+    updated_at: float
+    _stop: threading.Event
+    _thread: Optional[threading.Thread] = None
+    # The remaining fields are worker-owned. They intentionally never escape
+    # through the API and are discarded by the finished-job reaper.
+    _req: Optional[RecommendStartRequest] = None
+    _state: Optional[GameState] = None
+    _fragility_static: Optional[dict[str, Any]] = None
+    _handle: Any = None
+
+
+_SEARCH_JOBS: dict[str, SearchJob] = {}
+_STATE_TO_JOB: dict[tuple[str, str], str] = {}
+_SEARCH_JOBS_LOCK = threading.RLock()
+_SEARCH_JOB_TTL_SECS = 60.0
+_ACTIVE_SEARCH_STATUSES = ("running", "testing_fragility", "solving_exact")
 
 
 class BotActionRequest(BaseModel):
@@ -690,26 +747,61 @@ def _cached_exact_value(
     return float(value0), False, True
 
 
-def _exact_cache_stats_for(
+def _margin_to_training_value(
+    margin: int,
+    *,
+    score_scale: float,
+    margin_gain: float,
+    alpha: float,
+) -> float:
+    """Apply the solver's post-search value transform to an integer margin."""
+    try:
+        import kingdomino_rust
+
+        return float(kingdomino_rust.margin_to_training_value(
+            float(margin), float(score_scale), float(margin_gain), float(alpha)
+        ))
+    except Exception:
+        win_value = 1.0 if margin > 0 else (-1.0 if margin < 0 else 0.0)
+        margin_value = math.tanh(float(margin) / float(score_scale) * float(margin_gain))
+        win_gate = win_value ** 4
+        return float((1.0 - float(alpha)) * win_value + float(alpha) * win_gate * margin_value)
+
+
+def _cached_exact_margin(
     state: GameState,
     *,
     max_secs: float,
     score_scale: float,
-    margin_gain: float,
-    alpha: float,
     seed: int,
-) -> tuple[float, int, int]:
-    value, hit, solved = _cached_exact_value(
+) -> tuple[int, bool, bool]:
+    """Solve once, recover the raw integer margin, and cache it by state."""
+    key = _exact_state_key(state)
+    cached = _EXACT_ADVISOR_MARGIN_CACHE.get(key)
+    if cached is not None:
+        return int(cached), True, True
+
+    # alpha=1 exposes tanh(margin / scale); invert it and round because the
+    # underlying Rust alpha-beta search operates on integer score margins.
+    probe_gain = 1.0
+    from games.kingdomino.endgame_solver import exact_endgame_value
+
+    probe_value, solved = exact_endgame_value(
         state,
-        max_secs=max_secs,
-        score_scale=score_scale,
-        margin_gain=margin_gain,
-        alpha=alpha,
-        seed=seed,
+        max_secs=float(max_secs),
+        rng=random.Random(int(seed)),
+        score_scale=float(score_scale),
+        margin_gain=probe_gain,
+        alpha=1.0,
     )
     if not solved:
-        raise HTTPException(status_code=504, detail="Exact solver did not finish within exact_max_secs.")
-    return value, int(hit), int(not hit)
+        return 0, False, False
+    clipped = max(-1.0 + 1e-15, min(1.0 - 1e-15, float(probe_value)))
+    margin = int(round(math.atanh(clipped) * float(score_scale) / probe_gain))
+    if len(_EXACT_ADVISOR_MARGIN_CACHE) >= _EXACT_ADVISOR_CACHE_MAX:
+        _EXACT_ADVISOR_MARGIN_CACHE.clear()
+    _EXACT_ADVISOR_MARGIN_CACHE[key] = margin
+    return margin, False, True
 
 
 def _opponent_policy_priors(req: RecommendRequest, child: GameState) -> Optional[dict]:
@@ -740,6 +832,13 @@ def _opponent_policy_priors(req: RecommendRequest, child: GameState) -> Optional
         return None
 
 
+def _raise_if_cancelled(stop_event: Optional[threading.Event]) -> None:
+    # Exact solving is atomic inside Rust. Checks around every root/child/reply
+    # solve therefore bound cancellation latency to roughly one such solve.
+    if stop_event is not None and stop_event.is_set():
+        raise SearchCancelled("Search job was cancelled")
+
+
 def _swindle_for_move(
     child: GameState,
     child_value_actor: float,
@@ -750,6 +849,7 @@ def _swindle_for_move(
     margin_gain: float,
     margin_probe_gain: float,
     deadline: float,
+    stop_event: Optional[threading.Event] = None,
 ) -> Optional[dict[str, Any]]:
     """One-ply trap analysis of `child` (opponent to move) from the ACTOR's
     perspective. Exact-solves every opponent reply and reports how many of
@@ -763,6 +863,30 @@ def _swindle_for_move(
     Returns None when the deadline is hit before finishing (partial results
     are never shown) or when the child is terminal."""
     import time as _time
+    cache_hits = 0
+    cache_misses = 0
+
+    def exact_value(st: GameState) -> Optional[tuple[float, int]]:
+        nonlocal cache_hits, cache_misses
+        _raise_if_cancelled(stop_event)
+        margin, hit, solved = _cached_exact_margin(
+            st,
+            max_secs=max(0.0, deadline - _time.perf_counter()),
+            score_scale=score_scale,
+            seed=int(req.seed),
+        )
+        _raise_if_cancelled(stop_event)
+        if not solved:
+            return None
+        cache_hits += int(hit)
+        cache_misses += int(not hit)
+        value0 = _margin_to_training_value(
+            margin,
+            score_scale=score_scale,
+            margin_gain=margin_gain,
+            alpha=0.0,
+        )
+        return value0, margin
 
     # Kingdomino does NOT strictly alternate: pick order can give the same
     # player consecutive moves. Descend through the ACTOR's own follow-up
@@ -775,14 +899,14 @@ def _swindle_for_move(
         best_v = None
         best_g = None
         for a in node.legal_actions():
+            _raise_if_cancelled(stop_event)
             if _time.perf_counter() > deadline:
                 return None
             g = node.step(a)
-            v0, _hit, solved = _cached_exact_value(
-                g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
-                margin_gain=margin_gain, alpha=0.0, seed=int(req.seed))
-            if not solved:
+            solved_value = exact_value(g)
+            if solved_value is None:
                 return None
+            v0, _margin = solved_value
             v_act = float(v0 if actor == 0 else -v0)
             if best_v is None or v_act > best_v:
                 best_v, best_g = v_act, g
@@ -809,14 +933,14 @@ def _swindle_for_move(
     best_payoff: Optional[float] = None
     min_reply_value = None
     for ri, r in enumerate(replies):
+        _raise_if_cancelled(stop_event)
         if _time.perf_counter() > deadline:
             return None
         g = child.step(r)
-        v0, _hit, solved = _cached_exact_value(
-            g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
-            margin_gain=margin_gain, alpha=0.0, seed=int(req.seed))
-        if not solved:
+        solved_value = exact_value(g)
+        if solved_value is None:
             return None
+        v0, raw_margin = solved_value
         v_act = float(v0 if actor == 0 else -v0)
         min_reply_value = v_act if min_reply_value is None else min(min_reply_value, v_act)
         pts = 1.0 if v_act > 1e-9 else (0.5 if v_act > -1e-9 else 0.0)
@@ -829,12 +953,8 @@ def _swindle_for_move(
             else:
                 flips_draw += 1
             weighted_improving += w
-            m0, _mh, m_solved = _cached_exact_value(
-                g, max_secs=float(req.exact_max_secs), score_scale=score_scale,
-                margin_gain=margin_probe_gain, alpha=1.0, seed=int(req.seed))
-            if m_solved:
-                payoff = float(m0 if actor == 0 else -m0) * score_scale / margin_probe_gain
-                best_payoff = payoff if best_payoff is None else max(best_payoff, payoff)
+            payoff = float(raw_margin if actor == 0 else -raw_margin)
+            best_payoff = payoff if best_payoff is None else max(best_payoff, payoff)
 
     # Invariant: opponent's best reply == child's minimax value.
     if min_reply_value is None or abs(min_reply_value - child_value_actor) > 1e-6:
@@ -853,6 +973,8 @@ def _swindle_for_move(
         "expected_points_uniform": pts_uniform_sum,
         "expected_points_weighted": (pts_weighted_sum if priors is not None else None),
         "trap_payoff_pts": best_payoff,
+        "_cache_hits": cache_hits,
+        "_cache_misses": cache_misses,
     }
 
 
@@ -876,6 +998,7 @@ def _draft_matrix(
     actions: list,
     visit_counts: dict,
     priors_by_action: dict,
+    stop_event: Optional[threading.Event] = None,
 ) -> Optional[dict[str, Any]]:
     """Pick-grouped danger analysis (the 'draft matrix').
 
@@ -909,7 +1032,7 @@ def _draft_matrix(
 
     def mini_search(st: GameState, seed: int) -> Optional[float]:
         """Rooted search value, PLAYER-0 frame. None on failure/timeout."""
-        if _time.perf_counter() > deadline:
+        if (stop_event is not None and stop_event.is_set()) or _time.perf_counter() > deadline:
             return None
         try:
             _vc, v0, _info = _rust_open_loop_search(
@@ -949,7 +1072,7 @@ def _draft_matrix(
     rows_out = []
     partial = False
     for pick, items_in_group in ordered:
-        if _time.perf_counter() > deadline:
+        if (stop_event is not None and stop_event.is_set()) or _time.perf_counter() > deadline:
             partial = True
             break
         rep, rep_aj = group_rep(items_in_group)
@@ -1003,7 +1126,7 @@ def _draft_matrix(
             their.setdefault(pk, []).append((i, a))
         responses = []
         for tp, items in their.items():
-            if _time.perf_counter() > deadline:
+            if (stop_event is not None and stop_event.is_set()) or _time.perf_counter() > deadline:
                 partial = True
                 break
             mass = (sum(opp_priors.get(i, 0.0) for i, _ in items)
@@ -1051,6 +1174,7 @@ def _recommend_exact(
     *,
     request_state: Optional[dict[str, Any]],
     started_at: float,
+    stop_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
     import time
 
@@ -1066,33 +1190,40 @@ def _recommend_exact(
     # 0.8). Rankings are identical for any alpha>0 — the value is a monotone
     # transform of the raw margin — so this is consistency, not behavior.
     rank_alpha = 0.5
-    # Margin probe: with alpha=1 the exact leaf is win_gate*tanh(g*m/scale); a
-    # tiny gain keeps tanh in its linear region (|x| <= ~0.008 for |m| <= 120),
-    # so the chance-node EXPECTATION divides back out to expected margin in
-    # actual points: E[m] ~= value * scale / g. The win gate only zeroes exact
-    # draws, where m = 0 anyway.
+    # The swindle helper still uses a near-linear margin probe. The primary
+    # recommendation fields below come from the single recovered raw margin.
     margin_probe_gain = 0.01
+    exact_deadline = started_at + float(req.exact_max_secs)
 
-    def _exact_margin_pts(child_state) -> tuple[float, int, int]:
-        value0, hit, miss = _exact_cache_stats_for(
+    def _solve_values(child_state: GameState) -> tuple[int, float, float, bool, bool]:
+        _raise_if_cancelled(stop_event)
+        remaining = max(0.0, exact_deadline - time.perf_counter())
+        raw_margin, hit, solved = _cached_exact_margin(
             child_state,
-            max_secs=float(req.exact_max_secs),
+            max_secs=remaining,
             score_scale=score_scale,
-            margin_gain=margin_probe_gain,
-            alpha=1.0,
             seed=int(req.seed),
         )
-        return float(value0) * score_scale / margin_probe_gain, hit, miss
-    root_value0, root_hit, root_solved = _cached_exact_value(
-        state,
-        max_secs=float(req.exact_max_secs),
-        score_scale=score_scale,
-        margin_gain=margin_gain,
-        alpha=win_alpha,
-        seed=int(req.seed),
-    )
+        _raise_if_cancelled(stop_event)
+        value0 = _margin_to_training_value(
+            raw_margin,
+            score_scale=score_scale,
+            margin_gain=margin_gain,
+            alpha=win_alpha,
+        )
+        rank_value0 = _margin_to_training_value(
+            raw_margin,
+            score_scale=score_scale,
+            margin_gain=margin_gain,
+            alpha=rank_alpha,
+        )
+        return raw_margin, value0, rank_value0, hit, solved
+
+    root_margin0_pts, root_value0, root_rank_value0, root_hit, root_solved = _solve_values(state)
     if not root_solved:
-        raise HTTPException(status_code=504, detail="Exact solver did not finish the root position within exact_max_secs.")
+        raise ExactTimeout(
+            f"Exact solver did not finish the root within the {float(req.exact_max_secs):g} s budget."
+        )
     if state.phase == Phase.GAME_OVER:
         return {
             "ok": True,
@@ -1107,7 +1238,7 @@ def _recommend_exact(
                 "deck_count": int(len(state.deck)),
                 "cache_hits": int(root_hit),
                 "cache_misses": int(not root_hit),
-                "cache_size": int(len(_EXACT_ADVISOR_VALUE_CACHE)),
+                "cache_size": int(len(_EXACT_ADVISOR_MARGIN_CACHE)),
                 "max_secs": float(req.exact_max_secs),
                 **thread_meta,
             },
@@ -1118,51 +1249,23 @@ def _recommend_exact(
     rows = []
     cache_hits = int(root_hit)
     cache_misses = int(not root_hit)
-    root_rank_value0, rank_hit, rank_miss = _exact_cache_stats_for(
-        state,
-        max_secs=float(req.exact_max_secs),
-        score_scale=score_scale,
-        margin_gain=margin_gain,
-        alpha=rank_alpha,
-        seed=int(req.seed),
-    )
-    cache_hits += rank_hit
-    cache_misses += rank_miss
     actions = state.legal_actions()
     id_to_index = {
         action_to_json(state, action, i)["action_id"]: i
         for i, action in enumerate(actions)
     }
     for action in actions:
+        _raise_if_cancelled(stop_event)
         child = state.step(action)
-        value0, hit, solved = _cached_exact_value(
-            child,
-            max_secs=float(req.exact_max_secs),
-            score_scale=score_scale,
-            margin_gain=margin_gain,
-            alpha=win_alpha,
-            seed=int(req.seed),
-        )
+        margin0_pts, value0, rank_value0, hit, solved = _solve_values(child)
         if not solved:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Exact solver did not finish legal action {action_to_json(state, action, -1).get('action_id')} within exact_max_secs.",
+            action_id = action_to_json(state, action, -1).get("action_id")
+            raise ExactTimeout(
+                f"Exact solver did not finish legal action {action_id} within the "
+                f"{float(req.exact_max_secs):g} s budget."
             )
         cache_hits += int(hit)
         cache_misses += int(not hit)
-        rank_value0, rank_hit, rank_miss = _exact_cache_stats_for(
-            child,
-            max_secs=float(req.exact_max_secs),
-            score_scale=score_scale,
-            margin_gain=margin_gain,
-            alpha=rank_alpha,
-            seed=int(req.seed),
-        )
-        cache_hits += rank_hit
-        cache_misses += rank_miss
-        margin0_pts, margin_hit, margin_miss = _exact_margin_pts(child)
-        cache_hits += margin_hit
-        cache_misses += margin_miss
         value_actor = float(value0 if actor == 0 else -value0)
         rank_value_actor = float(rank_value0 if actor == 0 else -rank_value0)
         margin_actor_pts = float(margin0_pts if actor == 0 else -margin0_pts)
@@ -1192,6 +1295,7 @@ def _recommend_exact(
         deadline = time.perf_counter() + float(req.swindle_budget_secs)
         analyze_n = min(len(rows), max(int(req.top_k), 8))
         for pos in range(analyze_n):
+            _raise_if_cancelled(stop_event)
             if time.perf_counter() > deadline:
                 swindle_truncated = True
                 break
@@ -1199,12 +1303,15 @@ def _recommend_exact(
             res = _swindle_for_move(
                 row[9], row[0], actor, req,
                 score_scale=score_scale, margin_gain=margin_gain,
-                margin_probe_gain=margin_probe_gain, deadline=deadline)
+                margin_probe_gain=margin_probe_gain, deadline=deadline,
+                stop_event=stop_event)
             if res is None:
                 if time.perf_counter() > deadline:
                     swindle_truncated = True
                     break
                 continue  # invariant violation — stats dropped for this move
+            cache_hits += int(res.pop("_cache_hits", 0))
+            cache_misses += int(res.pop("_cache_misses", 0))
             swindle_results[pos] = res
         # Re-rank the ANALYZED head among itself: (game value, trap score,
         # margin). Unanalyzed tail keeps its original order below.
@@ -1251,9 +1358,6 @@ def _recommend_exact(
             rec["swindle"] = swindle
         recs.append(rec)
 
-    root_margin0_pts, margin_hit, margin_miss = _exact_margin_pts(state)
-    cache_hits += margin_hit
-    cache_misses += margin_miss
     value_actor = root_value_actor
     rank_value_actor = float(root_rank_value0 if actor == 0 else -root_rank_value0)
     return {
@@ -1274,7 +1378,7 @@ def _recommend_exact(
             "deck_count": int(len(state.deck)),
             "cache_hits": int(cache_hits),
             "cache_misses": int(cache_misses),
-            "cache_size": int(len(_EXACT_ADVISOR_VALUE_CACHE)),
+            "cache_size": int(len(_EXACT_ADVISOR_MARGIN_CACHE)),
             "max_secs": float(req.exact_max_secs),
             "score_scale": score_scale,
             "margin_gain": margin_gain,
@@ -1397,6 +1501,38 @@ _RUST_ADVISOR_EVAL_CACHE: dict[Any, Any] = {}
 _RUST_ADVISOR_LEAF_BATCH = 8
 
 
+def _rust_advisor_evaluator(net, req_key, device: str):
+    ev = _RUST_ADVISOR_EVAL_CACHE.get(req_key)
+    if ev is None:
+        from games.kingdomino.self_play import make_rust_evaluator
+        ev = make_rust_evaluator(net, device=device, alpha=0.5)
+        if len(_RUST_ADVISOR_EVAL_CACHE) >= 4:
+            _RUST_ADVISOR_EVAL_CACHE.clear()
+        _RUST_ADVISOR_EVAL_CACHE[req_key] = ev
+    return ev
+
+
+def _decode_rust_advisor_snapshot(state: GameState, children, value0: float):
+    actor = int(state.current_actor)
+    idx_to_action = {int(encode_action(a, state)): a for a in state.legal_actions()}
+    visit_counts = {}
+    action_info = {}
+    for idx, visits, value_sum, prior in children:
+        action = idx_to_action.get(int(idx))
+        if action is None:
+            continue
+        visit_counts[action] = float(visits)
+        q_win_prob = None
+        if visits > 0:
+            q0 = value_sum / visits
+            q_actor = q0 if actor == 0 else -q0
+            q_win_prob = (q_actor + 1.0) / 2.0
+        action_info[action] = (float(prior), q_win_prob)
+    if not visit_counts:
+        raise RuntimeError("rust advisor search returned no legal root children")
+    return visit_counts, float(value0), action_info
+
+
 def _rust_open_loop_search(state: GameState, net, req_key, device: str,
                            sims: int, seed: int):
     """Rust-engine advisor search. Returns (visit_counts, value0, action_info)
@@ -1410,18 +1546,9 @@ def _rust_open_loop_search(state: GameState, net, req_key, device: str,
     no exact hook by design — see advisor_open_loop_search's docstring).
     """
     import kingdomino_rust as kr
-    from games.kingdomino.action_codec import encode_action
     from games.kingdomino.endgame_solver import _rust_state_from_python
 
-    ev = _RUST_ADVISOR_EVAL_CACHE.get(req_key)
-    if ev is None:
-        from games.kingdomino.self_play import make_rust_evaluator
-        # Training value frame (win-gated, B=0.5) — same rationale as the
-        # serial evaluator in _load_nn_evaluator.
-        ev = make_rust_evaluator(net, device=device, alpha=0.5)
-        if len(_RUST_ADVISOR_EVAL_CACHE) >= 4:
-            _RUST_ADVISOR_EVAL_CACHE.clear()
-        _RUST_ADVISOR_EVAL_CACHE[req_key] = ev
+    ev = _rust_advisor_evaluator(net, req_key, device)
 
     rs = _rust_state_from_python(state)
     children, value0 = kr.advisor_open_loop_search(
@@ -1432,25 +1559,26 @@ def _rust_open_loop_search(state: GameState, net, req_key, device: str,
         leaf_batch=_RUST_ADVISOR_LEAF_BATCH,
         alpha=0.5,
     )
-    actor = int(state.current_actor)
-    idx_to_action = {int(encode_action(a, state)): a for a in state.legal_actions()}
-    visit_counts: dict[Any, float] = {}
-    action_info: dict[Any, tuple[float, Optional[float]]] = {}
-    for idx, visits, value_sum, prior in children:
-        action = idx_to_action.get(int(idx))
-        if action is None:
-            continue  # root child from a stale index — impossible at the root, defensive
-        visit_counts[action] = float(visits)
-        if visits > 0:
-            q0 = value_sum / visits
-            q_actor = q0 if actor == 0 else -q0
-            q_win_prob = (q_actor + 1.0) / 2.0
-        else:
-            q_win_prob = None
-        action_info[action] = (float(prior), q_win_prob)
-    if not visit_counts:
-        raise RuntimeError("rust advisor search returned no legal root children")
-    return visit_counts, float(value0), action_info
+    return _decode_rust_advisor_snapshot(state, children, value0)
+
+
+def _rust_open_loop_handle(state: GameState, net, req_key, device: str, seed: int):
+    """Construct the persistent main-search handle when the rebuilt module has it."""
+    import kingdomino_rust as kr
+    from games.kingdomino.endgame_solver import _rust_state_from_python
+
+    handle_type = getattr(kr, "AdvisorSearchHandle", None)
+    if handle_type is None:
+        return None
+    return handle_type(
+        _rust_state_from_python(state),
+        _rust_advisor_evaluator(net, req_key, device),
+        dirichlet_eps=0.0,
+        cpuct=1.5,
+        seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
+        leaf_batch=_RUST_ADVISOR_LEAF_BATCH,
+        alpha=0.5,
+    )
 
 
 def _root_trajectory(net, state: GameState, device: str) -> dict[str, Any]:
@@ -1592,6 +1720,403 @@ def _heuristic_action_score(state: GameState, action) -> tuple[float, dict[str, 
     discard_penalty = -20.0 if isinstance(action, TurnAction) and action.placement is None else 0.0
     total = score_delta + pick_bonus + discard_penalty
     return total, {"score_delta": score_delta, "pick_bonus": pick_bonus, "discard_penalty": discard_penalty}
+
+
+def _python_action_info(state: GameState, root, actions: list) -> dict:
+    """Convert Python OpenLoopMCTS root children to the Rust-path info shape."""
+    from games.kingdomino.action_codec import encode_action
+
+    actor = int(state.current_actor)
+    out = {}
+    for action in actions:
+        child = root.children.get(encode_action(action, state))
+        prior = float(child.prior) if child is not None else None
+        q_win_prob = None
+        if child is not None and child.visit_count > 0:
+            q_actor = child.value if actor == 0 else -child.value
+            q_win_prob = (float(q_actor) + 1.0) / 2.0
+        out[action] = (prior, q_win_prob)
+    return out
+
+
+def _nn_recommendations_from_search(
+    state: GameState,
+    req: RecommendRequest,
+    *,
+    visit_counts: dict,
+    value0: float,
+    action_info: dict,
+    root_traj: dict[str, Any],
+    checkpoint_path: str,
+    engine_name: str = "nn-mcts-rust",
+    started_at: Optional[float] = None,
+    num_simulations: Optional[int] = None,
+) -> dict[str, Any]:
+    """Assemble the common NN advisor response from a completed snapshot.
+
+    Draft/fragility analysis is deliberately excluded: the synchronous route
+    adds it inline exactly as before, while streaming schedules it once at its
+    configured milestone and cheaply merges live headline values afterwards.
+    """
+    actions = state.legal_actions()
+    total_visits = sum(float(v) for v in visit_counts.values()) or 1.0
+    id_to_index = {
+        action_to_json(state, action, i)["action_id"]: i
+        for i, action in enumerate(actions)
+    }
+    rows = []
+    for action, count in visit_counts.items():
+        aj = action_to_json(state, action, -1)
+        idx = id_to_index.get(aj["action_id"], -1)
+        if idx >= 0:
+            aj = action_to_json(state, actions[idx], idx)
+        prior, q_win_prob = action_info.get(action, (None, None))
+        rows.append((float(count), idx, aj, prior, q_win_prob))
+    rows.sort(key=lambda item: item[0], reverse=True)
+    recs = []
+    for rank, (count, idx, aj, prior, q_win_prob) in enumerate(
+        rows[:max(1, int(req.top_k))], start=1
+    ):
+        recs.append({
+            "rank": rank,
+            **aj,
+            "prior": prior,
+            "visit_frac": count / total_visits,
+            "q_win_prob": q_win_prob,
+            "q_value": None,
+            "is_legal": idx >= 0,
+            "debug": {"engine": engine_name, "legal_index_resolved": idx},
+        })
+    value_actor = float(value0 if state.current_actor == 0 else -value0)
+    sims = int(num_simulations if num_simulations is not None else req.nn_sims)
+    elapsed_ms = int(round((time.perf_counter() - (started_at or time.perf_counter())) * 1000))
+    return {
+        "ok": True,
+        "engine": engine_name,
+        "checkpoint_path": checkpoint_path,
+        "value": value_actor,
+        "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
+        "root_value_player0": float(value0),
+        "root_inference": root_traj,
+        "search_ms": elapsed_ms,
+        "num_simulations": sims,
+        "total_visits": total_visits,
+        "draft_matrix": None,
+        "recommendations": recs,
+    }
+
+
+def _live_fragility_matrix(
+    state: GameState,
+    static_matrix: Optional[dict[str, Any]],
+    visit_counts: dict,
+    action_info: dict,
+) -> Optional[dict[str, Any]]:
+    """Merge live representative Q values into the one-time static matrix."""
+    if not static_matrix:
+        return None
+    visits_by_id = {
+        action_to_json(state, action, -1)["action_id"]: float(visits)
+        for action, visits in visit_counts.items()
+    }
+    info_by_id = {
+        action_to_json(state, action, -1)["action_id"]: info
+        for action, info in action_info.items()
+    }
+    actions_by_pick: dict[int, list[tuple[str, float]]] = {}
+    for action in state.legal_actions():
+        aj = action_to_json(state, action, -1)
+        pick = _pick_key_of(aj)
+        if pick is not None:
+            actions_by_pick.setdefault(pick, []).append(
+                (aj["action_id"], visits_by_id.get(aj["action_id"], 0.0))
+            )
+    merged = copy.deepcopy(static_matrix)
+    for row in merged.get("rows", []):
+        candidates = actions_by_pick.get(int(row["pick_domino_id"]), [])
+        live_rep = max(candidates, key=lambda pair: pair[1])[0] if candidates else None
+        stored_rep = row.get("representative_action") or (row.get("action") or {}).get("action_id")
+        row["representative_action"] = stored_rep
+        row["robust_stale"] = live_rep is not None and live_rep != stored_rep
+        info = info_by_id.get(stored_rep)
+        headline = None if not info or info[1] is None else 2.0 * float(info[1]) - 1.0
+        row["headline_edge"] = headline
+        robust = row.get("robust_edge")
+        row["fragility"] = None if headline is None or robust is None else headline - float(robust)
+    return merged
+
+
+def _model_dump(model: BaseModel) -> dict[str, Any]:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+def _stream_request_state(req: RecommendRequest) -> GameState:
+    if req.session_id:
+        return _get_state(req.session_id)
+    if req.state is not None:
+        return state_from_debug_json(req.state)
+    raise HTTPException(status_code=400, detail="Provide session_id or state")
+
+
+def _search_params_key(req: RecommendStartRequest) -> str:
+    data = _model_dump(req)
+    data.pop("state", None)
+    data.pop("session_id", None)
+    return hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _reap_search_jobs(now: float) -> None:
+    stale = [
+        job_id for job_id, job in _SEARCH_JOBS.items()
+        if job.status in ("done", "error", "cancelled")
+        and now - job.updated_at >= _SEARCH_JOB_TTL_SECS
+    ]
+    for job_id in stale:
+        job = _SEARCH_JOBS.pop(job_id)
+        key = (job.state_key, job.params_key)
+        if _STATE_TO_JOB.get(key) == job_id:
+            _STATE_TO_JOB.pop(key, None)
+
+
+def _set_job_status(
+    job: SearchJob,
+    status: str,
+    *,
+    bump: bool = False,
+    error: Optional[str] = None,
+) -> None:
+    with _SEARCH_JOBS_LOCK:
+        if job.status == "cancelled" and status != "cancelled":
+            return
+        job.status = status
+        if error is not None:
+            job.error = error
+        job.updated_at = time.time()
+        if bump:
+            job.version += 1
+
+
+def _publish_job_snapshot(
+    job: SearchJob,
+    snapshot: dict[str, Any],
+    sims_done: int,
+    *,
+    status: str = "running",
+) -> None:
+    with _SEARCH_JOBS_LOCK:
+        if job._stop.is_set() or job.status == "cancelled":
+            return
+        job.snapshot = snapshot
+        job.sims_done = int(sims_done)
+        job.status = status
+        job.version += 1
+        job.updated_at = time.time()
+
+
+def _python_stream_search(
+    state: GameState,
+    evaluator,
+    req: RecommendStartRequest,
+    sims: int,
+    *,
+    disable_exact_endgame: bool = False,
+):
+    import numpy as np
+    from games.kingdomino.mcts_az import OpenLoopMCTS, run_pimc_open_loop
+
+    mcts = OpenLoopMCTS(
+        evaluator,
+        c_puct=1.5,
+        n_simulations=int(sims),
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        score_scale=160.0,
+        margin_gain=2.0,
+        alpha=0.5,
+        exact_endgame_enabled=not disable_exact_endgame,
+        exact_endgame_max_secs=0.0 if disable_exact_endgame else 3600.0,
+    )
+    rng = np.random.default_rng(int(req.seed) + 104729 * (len(state.history) + 1))
+    visits, value0, root = run_pimc_open_loop(mcts, state, add_noise=False, rng=rng)
+    return visits, value0, _python_action_info(state, root, list(visits))
+
+
+def _run_search_job(job: SearchJob) -> None:
+    req = job._req
+    state = job._state
+    assert req is not None and state is not None
+    try:
+        exact_fallback_reason: Optional[str] = None
+        if _exact_supported_detail(state, req.state) is None:
+            _set_job_status(job, "solving_exact")
+            try:
+                exact_snapshot = _recommend_exact(
+                    state,
+                    req,
+                    request_state=req.state,
+                    started_at=job.started_at,
+                    stop_event=job._stop,
+                )
+                _raise_if_cancelled(job._stop)
+                _publish_job_snapshot(
+                    job,
+                    exact_snapshot,
+                    0,
+                    status="done",
+                )
+                return
+            except ExactTimeout as exc:
+                exact_fallback_reason = str(exc)
+                _raise_if_cancelled(job._stop)
+                _set_job_status(job, "running", bump=True)
+
+        bot_req = BotActionRequest(
+            session_id=req.session_id or "",
+            mode="nn",
+            apply=False,
+            checkpoint_path=req.checkpoint_path,
+            nn_sims=int(req.max_sims),
+            determinizations=int(req.determinizations),
+            temperature=float(req.temperature),
+            device=req.device,
+            channels=req.channels,
+            blocks=req.blocks,
+            bilinear_dim=req.bilinear_dim,
+            seed=int(req.seed),
+        )
+        evaluator, net, checkpoint_path = _load_nn_evaluator(bot_req)
+        root_traj = _root_trajectory(net, state, req.device)
+        search_key = (checkpoint_path, req.device)
+        search_seed = int(req.seed) + 104729 * (len(state.history) + 1)
+        allow_rust = len(state.deck) > 4
+        if allow_rust:
+            try:
+                job._handle = _rust_open_loop_handle(
+                    state, net, search_key, req.device, search_seed
+                )
+            except Exception as exc:
+                print(f"[advisor] resumable handle unavailable ({exc!r}); using chunk restarts")
+                job._handle = None
+        else:
+            job._handle = None
+
+        sims_done = 0
+        while sims_done < job.sims_target and not job._stop.is_set():
+            step = min(int(req.chunk_sims), job.sims_target - sims_done)
+            target = sims_done + step
+            engine_name = "nn-mcts-rust"
+            if job._handle is not None:
+                children, value0 = job._handle.advance(step)
+                visits, value0, action_info = _decode_rust_advisor_snapshot(
+                    state, children, value0
+                )
+            elif allow_rust:
+                try:
+                    visits, value0, action_info = _rust_open_loop_search(
+                        state, net, search_key, req.device, target, search_seed
+                    )
+                except Exception as exc:
+                    print(f"[advisor] rust streaming search unavailable ({exc!r}); using Python engine")
+                    visits, value0, action_info = _python_stream_search(
+                        state,
+                        evaluator,
+                        req,
+                        target,
+                        disable_exact_endgame=exact_fallback_reason is not None,
+                    )
+                    engine_name = "nn-mcts"
+            else:
+                visits, value0, action_info = _python_stream_search(
+                    state,
+                    evaluator,
+                    req,
+                    target,
+                    disable_exact_endgame=exact_fallback_reason is not None,
+                )
+                engine_name = "nn-mcts"
+            sims_done = target
+            snapshot = _nn_recommendations_from_search(
+                state, req,
+                visit_counts=visits,
+                value0=value0,
+                action_info=action_info,
+                root_traj=root_traj,
+                checkpoint_path=checkpoint_path,
+                engine_name=engine_name,
+                started_at=job.started_at,
+                num_simulations=sims_done,
+            )
+            if job._fragility_static is not None:
+                snapshot["draft_matrix"] = _live_fragility_matrix(
+                    state, job._fragility_static, visits, action_info
+                )
+            if exact_fallback_reason is not None:
+                snapshot.update(
+                    exact_fallback=True,
+                    reason=exact_fallback_reason,
+                )
+            _publish_job_snapshot(job, snapshot, sims_done)
+            if job._stop.is_set():
+                break
+
+            milestone = int(req.fragility_at_sims)
+            if milestone > 0 and sims_done >= milestone and job._fragility_static is None:
+                _set_job_status(job, "testing_fragility", bump=True)
+                static_matrix = _draft_matrix(
+                    state, req,
+                    net=net,
+                    checkpoint_path=checkpoint_path,
+                    actions=state.legal_actions(),
+                    visit_counts=visits,
+                    priors_by_action=action_info,
+                    stop_event=job._stop,
+                )
+                if job._stop.is_set():
+                    break
+                if static_matrix is not None:
+                    static_matrix["computed_at_sims"] = sims_done
+                    job._fragility_static = static_matrix
+                    snapshot["draft_matrix"] = _live_fragility_matrix(
+                        state, static_matrix, visits, action_info
+                    )
+                    _publish_job_snapshot(job, snapshot, sims_done)
+
+        if job._stop.is_set():
+            _set_job_status(job, "cancelled")
+        else:
+            _set_job_status(job, "done", bump=True)
+    except SearchCancelled:
+        _set_job_status(job, "cancelled")
+    except Exception as exc:
+        _set_job_status(
+            job,
+            "error",
+            bump=True,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        print(f"[advisor] streaming job {job.job_id} failed: {exc!r}")
+
+
+def _job_poll_body(job: SearchJob, since_version: int) -> dict[str, Any]:
+    base = {
+        "job_id": job.job_id,
+        "status": job.status,
+        "sims_done": job.sims_done,
+        "sims_target": job.sims_target,
+        "version": job.version,
+        "updated_at": job.updated_at,
+    }
+    if job.error:
+        base["error"] = job.error
+    if int(since_version) == job.version:
+        base["changed"] = False
+        return base
+    base["changed"] = True
+    if job.snapshot:
+        base.update(copy.deepcopy(job.snapshot))
+    return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1842,6 +2367,103 @@ def append_game_log(req: GameLogAppendRequest) -> dict[str, Any]:
     return {"ok": True, "appended": True, "path": str(path)}
 
 
+@app.post("/api/recommend/start")
+def recommend_start(req: RecommendStartRequest) -> dict[str, Any]:
+    """Start or attach to one exact-first/NN streaming advisor job."""
+    state = _stream_request_state(req)
+    mode = req.engine.strip().lower()
+    if mode not in (
+        "nn", "model", "az", "alphazero", "mcts", "nn-mcts",
+        "exact", "solver", "exact-solver",
+        "auto", "exact-auto", "auto-endgame",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Streaming is available only for NN, exact, and auto advisor modes.",
+        )
+    exact_job = _exact_supported_detail(state, req.state) is None
+    if not exact_job and not state.legal_actions():
+        raise HTTPException(status_code=400, detail="Cannot stream a terminal state")
+
+    now = time.time()
+    state_key = _exact_state_key(state)
+    params_key = _search_params_key(req)
+    dedupe_key = (state_key, params_key)
+    with _SEARCH_JOBS_LOCK:
+        _reap_search_jobs(now)
+        existing_id = _STATE_TO_JOB.get(dedupe_key)
+        existing = _SEARCH_JOBS.get(existing_id or "")
+        if existing is not None and existing.status in _ACTIVE_SEARCH_STATUSES:
+            return {
+                "job_id": existing.job_id,
+                "status": existing.status,
+                "state_key": existing.state_key,
+                "version": existing.version,
+            }
+
+        # Deliberately global: one advisor search at a time because all tabs
+        # contend for the same GPU evaluator in this single-worker dev server.
+        for other in _SEARCH_JOBS.values():
+            if other.status in _ACTIVE_SEARCH_STATUSES:
+                other._stop.set()
+                _set_job_status(other, "cancelled", bump=True)
+
+        job_id = str(uuid4())
+        job = SearchJob(
+            job_id=job_id,
+            state_key=state_key,
+            params_key=params_key,
+            status="solving_exact" if exact_job else "running",
+            version=0,
+            sims_done=0,
+            sims_target=int(req.max_sims),
+            snapshot=None,
+            error=None,
+            started_at=time.perf_counter(),
+            updated_at=now,
+            _stop=threading.Event(),
+            _req=req,
+            _state=state,
+        )
+        thread = threading.Thread(
+            target=_run_search_job,
+            args=(job,),
+            name=f"kingdomino-advisor-{job_id[:8]}",
+            daemon=True,
+        )
+        job._thread = thread
+        _SEARCH_JOBS[job_id] = job
+        _STATE_TO_JOB[dedupe_key] = job_id
+        thread.start()
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "state_key": state_key,
+        "version": job.version,
+    }
+
+
+@app.get("/api/recommend/poll")
+def recommend_poll(job_id: str = Query(...), since_version: int = Query(default=-1)) -> dict[str, Any]:
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Unknown or expired search job")
+        return _job_poll_body(job, since_version)
+
+
+@app.post("/api/recommend/stop")
+def recommend_stop(req: RecommendStopRequest) -> dict[str, Any]:
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(req.job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Unknown or expired search job")
+        job._stop.set()
+        if job.status not in ("done", "error", "cancelled"):
+            _set_job_status(job, "cancelled", bump=True)
+        return _job_poll_body(job, -1)
+
+
 @app.post("/api/recommend")
 def recommend(req: RecommendRequest) -> dict[str, Any]:
     """Return advisor recommendations in the shared UI/BGA protocol shape.
@@ -1866,23 +2488,34 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Provide session_id or state")
 
     mode = req.engine.strip().lower()
+    exact_fallback_reason: Optional[str] = None
     if mode in ("exact", "solver", "exact-solver"):
-        return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+        try:
+            return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+        except ExactTimeout as exc:
+            exact_fallback_reason = str(exc)
+            mode = "nn"
     if mode in ("auto", "exact-auto", "auto-endgame"):
         if _exact_supported_detail(state, req.state) is None:
-            return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+            try:
+                return _recommend_exact(state, req, request_state=req.state, started_at=t0)
+            except ExactTimeout as exc:
+                exact_fallback_reason = str(exc)
         mode = "nn"
 
     actions = state.legal_actions()
     if not actions:
-        return {
+        response = {
             "ok": True,
-            "engine": req.engine,
+            "engine": "nn-mcts" if exact_fallback_reason is not None else req.engine,
             "value": None,
             "search_ms": int(round((time.perf_counter() - t0) * 1000)),
             "num_simulations": 0,
             "recommendations": [],
         }
+        if exact_fallback_reason is not None:
+            response.update(exact_fallback=True, reason=exact_fallback_reason)
+        return response
 
     top_k = max(1, int(req.top_k))
 
@@ -1975,7 +2608,10 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                 alpha=0.5,
                 # Advisor policy: always solve reachable endgames exactly (see
                 # _choose_nn_action for rationale).
-                exact_endgame_max_secs=3600.0,
+                # A timed-out exact request must not immediately re-enter the
+                # same solver from MCTS's leaf hook.
+                exact_endgame_max_secs=0.0 if exact_fallback_reason is not None else 3600.0,
+                exact_endgame_enabled=exact_fallback_reason is None,
             )
             try:
                 visit_counts, value0, root = run_pimc_open_loop(
@@ -1998,55 +2634,8 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                         "legal_action_count": int(len(actions)),
                     },
                 ) from exc
-        total_visits = sum(float(v) for v in visit_counts.values()) or 1.0
-        # Map actions to their current legal-index by stable action_id, because
-        # determinization can produce equivalent action objects that do not share
-        # identity with the public state's legal_actions() list.
-        id_to_index = {
-            action_to_json(state, a, i)["action_id"]: i
-            for i, a in enumerate(actions)
-        }
-        actor = int(state.current_actor)
-        rows = []
-        for action, count in visit_counts.items():
-            aj = action_to_json(state, action, -1)
-            idx = id_to_index.get(aj["action_id"], -1)
-            if idx >= 0:
-                aj = action_to_json(state, actions[idx], idx)
-            if rust_info is not None:
-                # Rust path: per-action (prior, q_win_prob) computed in
-                # _rust_open_loop_search from the OL root children.
-                prior, q_win_prob = rust_info.get(action, (None, None))
-            else:
-                # Open-loop root children are keyed by slot-relative joint index,
-                # not action objects, so re-encode the action to find its child.
-                child = root.children.get(encode_action(action, state))
-                prior = float(child.prior) if child is not None else None
-                # child.value is player-0 frame; flip to the acting player's
-                # frame, then map the [-1, 1] value to a [0, 1] win probability.
-                # Under the win-gated B=0.5 search this Q is the search value
-                # (margin-tinted only when decided), squashed to [0,1];
-                # root_inference.win_prob is the calibrated probability.
-                if child is not None and child.visit_count > 0:
-                    q_actor = child.value if actor == 0 else -child.value
-                    q_win_prob = (q_actor + 1.0) / 2.0
-                else:
-                    q_win_prob = None
-            rows.append((float(count), idx, aj, prior, q_win_prob))
-        rows.sort(key=lambda x: x[0], reverse=True)
-        recs = []
-        for rank, (count, idx, aj, prior, q_win_prob) in enumerate(rows[:top_k], start=1):
-            recs.append({
-                "rank": rank,
-                **aj,
-                "prior": prior,
-                "visit_frac": count / total_visits,
-                "q_win_prob": q_win_prob,
-                "q_value": None,
-                "is_legal": idx >= 0,
-                "debug": {"engine": engine_name, "legal_index_resolved": idx},
-            })
-        value_actor = float(value0 if state.current_actor == 0 else -value0)
+        action_info = (rust_info if rust_info is not None
+                       else _python_action_info(state, root, list(visit_counts)))
         # Draft matrix: pick-grouped opponent-response analysis. Auto-on when
         # the actor has >= 2 pick options and the fast Rust search ran (the
         # mini-searches reuse it); request can force on/off.
@@ -2063,25 +2652,24 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
                     draft = _draft_matrix(
                         state, req, net=net, checkpoint_path=checkpoint_path,
                         actions=actions, visit_counts=visit_counts,
-                        priors_by_action=rust_info)
+                        priors_by_action=action_info)
                 except Exception as exc:
                     print(f"[advisor] draft matrix failed: {exc!r}")
-        return {
-            "ok": True,
-            "engine": engine_name,
-            "checkpoint_path": checkpoint_path,
-            "value": value_actor,
-            "root_win_prob": max(0.0, min(1.0, (value_actor + 1.0) / 2.0)),
-            "root_value_player0": float(value0),
-            # Network's pre-search trajectory readout (own/opp/win_prob); a single
-            # root forward pass, not search-averaged.  See _root_trajectory.
-            "root_inference": root_traj,
-            "search_ms": int(round((time.perf_counter() - t0) * 1000)),
-            "num_simulations": sims,
-            "total_visits": total_visits,
-            "draft_matrix": draft,
-            "recommendations": recs,
-        }
+        response = _nn_recommendations_from_search(
+            state, req,
+            visit_counts=visit_counts,
+            value0=value0,
+            action_info=action_info,
+            root_traj=root_traj,
+            checkpoint_path=checkpoint_path,
+            engine_name=engine_name,
+            started_at=t0,
+            num_simulations=sims,
+        )
+        response["draft_matrix"] = draft
+        if exact_fallback_reason is not None:
+            response.update(exact_fallback=True, reason=exact_fallback_reason)
+        return response
 
     # ── Greedy/heuristic advisor: fast default and current placeholder behavior.
     if mode not in ("greedy", "heuristic", "heuristic-placeholder"):

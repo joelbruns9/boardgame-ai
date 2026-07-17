@@ -5,8 +5,13 @@ const DEFAULTS = {
   engine: "auto",
   sims: 800,
   checkpoint: "",
-  exactMaxSecs: 300,
+  exactMaxSecs: 30,
   exactThreads: 0,
+  streaming: true,
+  maxSims: 3200,
+  refreshMs: 1000,
+  fragilityAtSims: 1000,
+  fragilitySims: 800,
 };
 
 const statusEl = document.getElementById("status");
@@ -18,6 +23,11 @@ const simsEl = document.getElementById("sims");
 const checkpointEl = document.getElementById("checkpoint");
 const exactMaxSecsEl = document.getElementById("exactMaxSecs");
 const exactThreadsEl = document.getElementById("exactThreads");
+const streamingEl = document.getElementById("streaming");
+const maxSimsEl = document.getElementById("maxSims");
+const refreshMsEl = document.getElementById("refreshMs");
+const fragilityAtSimsEl = document.getElementById("fragilityAtSims");
+const fragilitySimsEl = document.getElementById("fragilitySims");
 
 function getStorage(keys) {
   return new Promise((resolve, reject) => {
@@ -56,24 +66,44 @@ async function loadOptions() {
     "kingdomino_checkpoint",
     "kingdomino_exact_max_secs",
     "kingdomino_exact_threads",
+    "kingdomino_streaming",
+    "kingdomino_max_sims",
+    "kingdomino_refresh_ms",
+    "kingdomino_fragility_at_sims",
+    "kingdomino_fragility_sims",
   ]);
   engineEl.value = stored.kingdomino_engine || DEFAULTS.engine;
   simsEl.value = String(stored.kingdomino_sims || DEFAULTS.sims);
   checkpointEl.value = stored.kingdomino_checkpoint || DEFAULTS.checkpoint;
   exactMaxSecsEl.value = String(stored.kingdomino_exact_max_secs ?? DEFAULTS.exactMaxSecs);
   exactThreadsEl.value = String(stored.kingdomino_exact_threads ?? DEFAULTS.exactThreads);
+  streamingEl.checked = stored.kingdomino_streaming === undefined
+    ? DEFAULTS.streaming : Boolean(stored.kingdomino_streaming);
+  maxSimsEl.value = String(stored.kingdomino_max_sims ?? DEFAULTS.maxSims);
+  refreshMsEl.value = String(stored.kingdomino_refresh_ms ?? DEFAULTS.refreshMs);
+  fragilityAtSimsEl.value = String(stored.kingdomino_fragility_at_sims ?? DEFAULTS.fragilityAtSims);
+  fragilitySimsEl.value = String(stored.kingdomino_fragility_sims ?? DEFAULTS.fragilitySims);
 }
 
 async function saveOptions() {
   const sims = Number(simsEl.value);
   const exactMaxSecs = Number(exactMaxSecsEl.value);
   const exactThreads = Number(exactThreadsEl.value);
+  const maxSims = Number(maxSimsEl.value);
+  const refreshMs = Number(refreshMsEl.value);
+  const fragilityAtSims = Number(fragilityAtSimsEl.value);
+  const fragilitySims = Number(fragilitySimsEl.value);
   await setStorage({
     kingdomino_engine: engineEl.value || DEFAULTS.engine,
     kingdomino_sims: Number.isFinite(sims) && sims > 0 ? Math.round(sims) : DEFAULTS.sims,
     kingdomino_checkpoint: checkpointEl.value.trim(),
     kingdomino_exact_max_secs: Number.isFinite(exactMaxSecs) && exactMaxSecs >= 0 ? exactMaxSecs : DEFAULTS.exactMaxSecs,
     kingdomino_exact_threads: Number.isFinite(exactThreads) && exactThreads >= 0 ? Math.round(exactThreads) : DEFAULTS.exactThreads,
+    kingdomino_streaming: streamingEl.checked,
+    kingdomino_max_sims: Number.isFinite(maxSims) && maxSims > 0 ? Math.round(maxSims) : DEFAULTS.maxSims,
+    kingdomino_refresh_ms: Number.isFinite(refreshMs) && refreshMs >= 100 ? Math.round(refreshMs) : DEFAULTS.refreshMs,
+    kingdomino_fragility_at_sims: Number.isFinite(fragilityAtSims) && fragilityAtSims >= 0 ? Math.round(fragilityAtSims) : DEFAULTS.fragilityAtSims,
+    kingdomino_fragility_sims: Number.isFinite(fragilitySims) && fragilitySims >= 50 ? Math.round(fragilitySims) : DEFAULTS.fragilitySims,
   });
 }
 

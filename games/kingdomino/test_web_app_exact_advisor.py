@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from fastapi import HTTPException
@@ -60,6 +62,11 @@ def _forced_discard_deck4_state() -> GameState:
 
 def setup_function() -> None:
     web_app._EXACT_ADVISOR_VALUE_CACHE.clear()
+    web_app._EXACT_ADVISOR_MARGIN_CACHE.clear()
+
+
+def test_exact_advisor_interactive_budget_defaults_to_30_seconds():
+    assert web_app.RecommendRequest().exact_max_secs == 30.0
 
 
 def test_exact_advisor_returns_solved_recommendations_for_deck0_final():
@@ -119,6 +126,92 @@ def test_auto_advisor_uses_exact_for_eligible_deck4_state():
     assert response["engine"] == "exact"
     assert response["exact"]["solved"] is True
     assert response["exact"]["deck_count"] == 4
+
+
+def test_exact_advisor_solves_each_node_once_and_derives_all_outputs(monkeypatch):
+    rust = pytest.importorskip("kingdomino_rust")
+    import games.kingdomino.endgame_solver as endgame_solver
+
+    state = _forced_discard_deck4_state()
+    original = endgame_solver.exact_endgame_value
+    calls = []
+
+    def counted(state_arg, **kwargs):
+        calls.append((web_app._exact_state_key(state_arg), kwargs.copy()))
+        return original(state_arg, **kwargs)
+
+    monkeypatch.setattr(endgame_solver, "exact_endgame_value", counted)
+    req = web_app.RecommendRequest(
+        engine="exact",
+        state=web_app.state_to_debug_json(state),
+        top_k=100,
+        exact_max_secs=3.0,
+        swindle=False,
+    )
+
+    response = web_app.recommend(req)
+
+    expected_states = {web_app._exact_state_key(state)}
+    expected_states.update(web_app._exact_state_key(state.step(a)) for a in state.legal_actions())
+    assert len(calls) == len(expected_states)
+    assert {key for key, _kwargs in calls} == expected_states
+    assert all(kwargs["alpha"] == 1.0 and kwargs["margin_gain"] == 1.0
+               for _key, kwargs in calls)
+
+    root_margin = int(response["root_margin_pts"])
+    assert response["root_margin_pts"] == float(root_margin)
+    assert response["root_value_player0"] == pytest.approx(
+        rust.margin_to_training_value(root_margin, 160.0, 2.0, 0.0), abs=0.0
+    )
+    assert response["root_rank_value"] == pytest.approx(
+        rust.margin_to_training_value(root_margin, 160.0, 2.0, 0.5), abs=0.0
+    )
+    assert all(rec["exact_margin_pts"].is_integer() for rec in response["recommendations"])
+
+
+@pytest.mark.parametrize("engine", ["auto", "exact"])
+def test_exact_timeout_falls_back_to_nn_mcts(monkeypatch, engine):
+    from games.kingdomino.action_codec import encode_action
+    import games.kingdomino.mcts_az as mcts_az
+
+    state = _forced_discard_deck4_state()
+    action = state.legal_actions()[0]
+    child = SimpleNamespace(prior=0.6, visit_count=1, value=0.2)
+    root = SimpleNamespace(children={encode_action(action, state): child})
+    mcts_kwargs = {}
+
+    def force_timeout(*_args, **_kwargs):
+        raise web_app.ExactTimeout("Exact solver did not finish the root within the 30 s budget.")
+
+    class FakeMCTS:
+        def __init__(self, *_args, **kwargs):
+            mcts_kwargs.update(kwargs)
+
+    monkeypatch.setattr(web_app, "_recommend_exact", force_timeout)
+    monkeypatch.setattr(web_app, "_load_nn_evaluator", lambda _req: (object(), object(), "fake.pt"))
+    monkeypatch.setattr(web_app, "_root_trajectory", lambda *_args: {})
+    monkeypatch.setattr(mcts_az, "OpenLoopMCTS", FakeMCTS)
+    monkeypatch.setattr(
+        mcts_az,
+        "run_pimc_open_loop",
+        lambda *_args, **_kwargs: ({action: 1.0}, 0.1, root),
+    )
+    req = web_app.RecommendRequest(
+        engine=engine,
+        state=web_app.state_to_debug_json(state),
+        nn_sims=1,
+        swindle=False,
+        draft_matrix=False,
+    )
+
+    response = web_app.recommend(req)
+
+    assert response["engine"] == "nn-mcts"
+    assert response["exact_fallback"] is True
+    assert "30 s budget" in response["reason"]
+    assert response["recommendations"]
+    assert mcts_kwargs["exact_endgame_enabled"] is False
+    assert mcts_kwargs["exact_endgame_max_secs"] == 0.0
 
 
 def test_exact_advisor_rejects_non_endgame_state():
