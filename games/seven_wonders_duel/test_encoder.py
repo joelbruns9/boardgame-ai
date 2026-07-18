@@ -4,6 +4,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import random
 
 from games.seven_wonders_duel.data import BackType
@@ -15,6 +16,7 @@ from games.seven_wonders_duel.encoder import (
     TokenType,
     encode,
 )
+from games.seven_wonders_duel.codec import legal_action_indices
 from games.seven_wonders_duel.engine import Action, ActionUse, apply_action, legal_actions
 from games.seven_wonders_duel.game import Phase, new_game
 from games.seven_wonders_duel.pool import resample_hidden
@@ -110,18 +112,26 @@ def test_encoding_is_pure_under_hidden_reassignment():
 
 
 def test_mirror_states_encode_identically_across_trajectories():
-    for seed in (3, 8):
+    # CI default: 2 games sampled every 8th move. The full spec §2 gate (≥1k
+    # states) is the same test at SWD_MIRROR_GAMES=16 (checks every move).
+    n_games = int(os.environ.get("SWD_MIRROR_GAMES", "2"))
+    step = 8 if n_games <= 2 else 1
+    for seed in range(3, 3 + n_games):
         game = new_game(seed, first_player=seed % 2)
         rng = random.Random(seed)
         move = 0
         while game.phase is not Phase.COMPLETE:
-            if move % 8 == 0:
+            if move % step == 0:
                 # The net-facing tokens must match exactly; Encoding.actor is
                 # absolute-seat bookkeeping and flips by construction.
+                mirror = _mirrored(game)
                 assert (
                     encode(game.observation(0)).tokens
-                    == encode(_mirrored(game).observation(0)).tokens
+                    == encode(mirror.observation(0)).tokens
                 )
+                # Identity-indexed masks are seat-free, so the mirrored state
+                # must expose the exact same legal index set (spec §2 gate).
+                assert legal_action_indices(game) == legal_action_indices(mirror)
             apply_action(game, rng.choice(legal_actions(game)))
             move += 1
 
@@ -237,6 +247,71 @@ def test_draft_phase_has_offer_and_wonder_pool_tokens():
     assert _global_value(encoding, "decision_wonder_draft") == 1
 
 
+def _force_into_unused(game, token_names):
+    """Ensure the given progress tokens are off-board (in unused), swapping
+    with board tokens as needed while keeping the 5/5 split consistent."""
+
+    available = list(game.available_progress_tokens)
+    unused = list(game.unused_progress_tokens)
+    for name in token_names:
+        if name in available:
+            swap = next(t for t in unused if t not in token_names)
+            available[available.index(name)] = swap
+            unused[unused.index(swap)] = name
+    game.available_progress_tokens = tuple(available)
+    game.unused_progress_tokens = tuple(unused)
+
+
+def test_great_library_candidates_count_toward_race_clocks():
+    base = _playing_game(400)
+    _give_wonder(base, 0, "The Great Library")
+    base.cities[0].coins = 100
+    _force_into_unused(base, ["Law", "Strategy"])
+    others = [
+        t for t in base.unused_progress_tokens if t not in ("Law", "Strategy")
+    ]
+    slot = base.tableau.accessible_slot_ids()[0]
+
+    def build_with(drawn):
+        clone = base.clone()
+        apply_action(
+            clone,
+            Action(slot, ActionUse.CONSTRUCT_WONDER, "The Great Library"),
+            chance_outcomes=[tuple(drawn)],
+        )
+        return encode(clone.observation(0))
+
+    without = build_with(others[:3])
+    with_law = build_with(["Law", *others[:2]])
+    with_strategy = build_with(["Strategy", *others[:2]])
+
+    # Law among the drawn candidates is one pick away: it must count as an
+    # obtainable missing symbol for the pending player.
+    assert (
+        _global_value(with_law, "my_sci_missing_obtainable")
+        == _global_value(without, "my_sci_missing_obtainable") + 1
+    )
+    # Strategy among the candidates unlocks the +1/red headroom in the bound.
+    assert _global_value(with_strategy, "my_mil_shields_obtainable") > _global_value(
+        without, "my_mil_shields_obtainable"
+    )
+
+
+def test_new_global_fields_token_flags_and_guild_score():
+    game = _playing_game(30)
+    encoding = encode(game.observation(0))
+    assert _global_value(encoding, "my_token_2coin_remaining") == 1
+    assert _global_value(encoding, "my_token_5coin_remaining") == 1
+    assert _global_value(encoding, "opp_token_2coin_remaining") == 1
+    assert _global_value(encoding, "my_score_guild") == 0
+    actor = game.active_player
+    del game.military_tokens_remaining[4 if actor == 0 else -4]
+    encoding = encode(game.observation(0))
+    assert _global_value(encoding, "my_token_2coin_remaining") == 0
+    assert _global_value(encoding, "my_next_token_dist") == 7
+    assert _global_value(encoding, "my_next_token_penalty") == 5
+
+
 # --- signature + golden -----------------------------------------------------
 
 
@@ -244,7 +319,7 @@ def test_encoder_signature_is_pinned():
     # Bump ENCODER_VERSION and this pin together on any schema change (§5.8).
     assert (
         ENCODER_SIGNATURE
-        == "76268a5f53f3ea0c3a18142ea3189df9b7f46e8e7d8117623720b989353054f5"
+        == "7d68ff20f280700f0c7a04d2411cded734c51b3e312a80578824d7dbb0098be2"
     )
 
 
@@ -252,5 +327,25 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "9d75df0d87a4d9725c2d4eb9e217b8bd6d2ac86d4cd4553535baac203ed4be60"
+        == "3dc18d90782fac2a906eecaa3bf6d8118beee76909f8b1a13b1111ac24772e60"
+    )
+
+
+def test_golden_digests_cover_draft_and_pending_states():
+    draft = new_game(9)
+    apply_action(draft, legal_actions(draft)[0])
+    assert (
+        _digest(encode(draft.observation(0)))
+        == "12c235e52cc19f80430a55ede7f4ec9c3b4a0922d7a031955ad424442bd190c1"
+    )
+
+    library = _playing_game(400)
+    _give_wonder(library, 0, "The Great Library")
+    library.cities[0].coins = 100
+    slot = library.tableau.accessible_slot_ids()[0]
+    apply_action(library, Action(slot, ActionUse.CONSTRUCT_WONDER, "The Great Library"))
+    assert library.pending_choice is not None
+    assert (
+        _digest(encode(library.observation(0)))
+        == "13d9638d8f1720232eba47c8d9e8987a15fe5f2de45b87c3fb9ed65c50ba4e99"
     )

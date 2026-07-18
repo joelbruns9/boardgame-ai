@@ -68,12 +68,13 @@ class Payment:
 @dataclass(frozen=True, slots=True)
 class ScoreBreakdown:
     military: int
-    buildings: int
+    buildings: int  # all card VP including guilds
     wonders: int
     progress: int
     treasury: int
     total: int
     blue_buildings: int
+    guild: int = 0  # guild-card VP alone (subset of buildings)
 
 
 _RESOURCES = tuple(Resource)
@@ -321,13 +322,19 @@ def _override_reveal(game: GameState, slot_id: SlotId, new_name: str) -> None:
     raise ValueError(f"reveal outcome is not in the unseen pool: {new_name}")
 
 
-def _process_reveals(ctx: _ChanceCtx, newly_revealed: tuple[SlotId, ...]) -> None:
+def _process_reveals(ctx: _ChanceCtx, newly_accessible: tuple[SlotId, ...]) -> None:
+    """Resolve reveals sequentially (spec §4.2). Each slot stays unrevealed
+    until its own event fires, so a supplied outcome can swap with a card
+    locked in a sibling slot exposed by the same take, and a barrier violation
+    raises before any hidden identity is marked visible."""
+
     game = ctx.game
-    for slot_id in newly_revealed:
+    for slot_id in newly_accessible:
         back = back_type_of(game.tableau.cards[slot_id].card_name)
         supplied = ctx.draw(ChanceKind.CARD_REVEAL)
         if supplied is not None:
             _override_reveal(game, slot_id, supplied)
+        game.tableau.reveal(slot_id)
         ctx.events.append(
             ResolvedChance(
                 kind=ChanceKind.CARD_REVEAL,
@@ -584,6 +591,19 @@ def apply_action(
                     outcome=tuple(sorted(game.wonder_offer, key=WONDER_IDS.__getitem__)),
                 )
             )
+        if game.phase is Phase.PLAY_AGE:
+            # The eighth pick ends the draft and makes the Age I structure
+            # observable for the first time — an AGE_DEAL chance event
+            # (spec §4.2: "start_next_age and the initial Age I deal").
+            supplied = ctx.draw(ChanceKind.AGE_DEAL)
+            if supplied is not None:
+                deal = _validated_age_deal(game, supplied)
+                game.tableau = TableauState.from_deck(1, deal)
+            else:
+                deal = game.age_decks[1]
+            ctx.events.append(
+                ResolvedChance(kind=ChanceKind.AGE_DEAL, context=(1,), outcome=tuple(deal))
+            )
         return ctx.result()
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
         if action.choice is None:
@@ -757,7 +777,8 @@ def score_player(game: GameState, player: int) -> ScoreBreakdown:
     city = game.cities[player]
     cards = [CARDS_BY_NAME[name] for name in city.buildings]
     military = _military_victory_points(game, player)
-    buildings = sum(card.victory_points for card in cards) + _guild_victory_points(game, player)
+    guild = _guild_victory_points(game, player)
+    buildings = sum(card.victory_points for card in cards) + guild
     wonders = sum(WONDERS_BY_NAME[name].victory_points for name in city.built_wonders)
     progress = sum(PROGRESS_BY_NAME[name].victory_points for name in city.progress_tokens)
     for token_name in city.progress_tokens:
@@ -777,6 +798,7 @@ def score_player(game: GameState, player: int) -> ScoreBreakdown:
         treasury=treasury,
         total=total,
         blue_buildings=blue_buildings,
+        guild=guild,
     )
 
 

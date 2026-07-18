@@ -171,10 +171,14 @@ class TableauState:
         return tuple(slot_id for slot_id in self.cards if self.is_accessible(slot_id))
 
     def take_accessible(self, slot_id: SlotId) -> tuple[str, tuple[SlotId, ...]]:
-        """Remove one accessible card; reveal and report newly accessible cards.
+        """Remove one accessible card; report newly accessible face-down slots.
 
-        Newly revealed slots are returned in canonical (row, x) ascending order —
-        the CODEC_SPEC.md §4.2 sequential chance-node order.
+        Newly accessible cards are NOT revealed here: revelation is a chance
+        event owned by ``engine._process_reveals``, which resolves the returned
+        slots sequentially in the canonical (row, x) ascending order of
+        CODEC_SPEC.md §4.2 and calls :meth:`reveal` on each. Keeping siblings
+        unrevealed until their own event fires is what lets a supplied outcome
+        swap with a card locked in a simultaneously exposed slot.
         """
 
         if not self.is_accessible(slot_id):
@@ -183,12 +187,22 @@ class TableauState:
         if not card.revealed:
             raise AssertionError("an accessible card must have been revealed")
         card.present = False
-        newly_revealed: list[SlotId] = []
-        for candidate in self.cards.values():
-            if candidate.present and not candidate.revealed and self.is_accessible(candidate.slot_id):
-                candidate.revealed = True
-                newly_revealed.append(candidate.slot_id)
-        return card.card_name, tuple(sorted(newly_revealed))
+        newly_accessible = tuple(
+            sorted(
+                candidate.slot_id
+                for candidate in self.cards.values()
+                if candidate.present
+                and not candidate.revealed
+                and self.is_accessible(candidate.slot_id)
+            )
+        )
+        return card.card_name, newly_accessible
+
+    def reveal(self, slot_id: SlotId) -> None:
+        card = self.cards[slot_id]
+        if not card.present:
+            raise ValueError(f"cannot reveal an absent card: {slot_id}")
+        card.revealed = True
 
     def public_cards(self) -> tuple[PublicTableauCard, ...]:
         return tuple(

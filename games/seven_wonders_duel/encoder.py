@@ -57,7 +57,7 @@ from .game import (
 from .pool import BACK_UNIVERSES, UnseenPool, unseen_pool
 from .rules import Resource, discard_income
 
-ENCODER_VERSION = "7wd-encoder-1"
+ENCODER_VERSION = "7wd-encoder-2"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)
@@ -139,11 +139,14 @@ def _per_player_names(prefix: str) -> tuple[str, ...]:
         f"{prefix}discard_income",
         f"{prefix}score_military",
         f"{prefix}score_buildings",
+        f"{prefix}score_guild",
         f"{prefix}score_wonders",
         f"{prefix}score_progress",
         f"{prefix}score_treasury",
         f"{prefix}score_total",
         f"{prefix}score_blue",
+        f"{prefix}token_2coin_remaining",
+        f"{prefix}token_5coin_remaining",
         f"{prefix}mil_shields_obtainable",
         f"{prefix}mil_win_feasible",
         f"{prefix}sci_missing_obtainable",
@@ -394,9 +397,21 @@ class _Derived:
             else -self.obs.conflict_position
         )
 
+    def tokens_remaining(self, seat: int) -> tuple[float, float]:
+        """(2-coin, 5-coin) flags: which coin-loss tokens in ``seat``'s advance
+        direction are still in play (spec §5.2 per-side token state)."""
+
+        remaining = dict(self.obs.military_tokens_remaining)
+        sign = 1 if seat == 0 else -1
+        return (
+            1.0 if sign * 4 in remaining else 0.0,
+            1.0 if sign * 7 in remaining else 0.0,
+        )
+
     def next_token(self, seat: int) -> tuple[int, int]:
         """(distance, penalty) to the next unclaimed token ahead of ``seat``'s
-        advance; (18, 0) when none remain in that direction."""
+        advance; sentinel (18, 0) when none remain in that direction — the
+        ``token_*_remaining`` flags disambiguate the sentinel."""
 
         position = self.rel_position(seat)
         best: tuple[int, int] | None = None
@@ -409,6 +424,14 @@ class _Derived:
         return best if best is not None else (18, 0)
 
     def progress_obtainable(self, seat: int, token_name: str) -> bool:
+        pending = self.obs.pending_choice
+        if (
+            pending is not None
+            and pending.kind is PendingChoiceKind.CHOOSE_UNUSED_PROGRESS
+            and pending.player == seat
+            and token_name in pending.options
+        ):
+            return True  # a drawn Great Library candidate is one pick away
         if token_name in self.obs.available_progress_tokens:
             return True
         if token_name in self.obs.cities[seat].progress_tokens:
@@ -511,11 +534,13 @@ def _per_player_values(derived: _Derived, seat: int) -> list[float]:
         discard_income(color_counts[CardColor.YELLOW]),
         score.military,
         score.buildings,
+        score.guild,
         score.wonders,
         score.progress,
         score.treasury,
         score.total,
         score.blue_buildings,
+        *derived.tokens_remaining(seat),
         mil_bound,
         1.0 if mil_bound >= dist_win else 0.0,
         sci_missing,

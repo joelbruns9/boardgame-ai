@@ -4,6 +4,7 @@ The in-repo gate runs a reduced game count for CI speed; the full ≥10k-game
 Phase A sweep uses the same checks via a longer seed range.
 """
 
+import os
 import random
 
 import pytest
@@ -32,7 +33,9 @@ from games.seven_wonders_duel.engine import (
 )
 from games.seven_wonders_duel.game import PendingChoiceKind, Phase, new_game
 
-N_GAMES = 150
+# CI default 150 games (≥10k states); the full spec §3.3 gate is the same test
+# at SWD_GATE_GAMES=10000.
+N_GAMES = int(os.environ.get("SWD_GATE_GAMES", "150"))
 
 
 def _playing_game(seed=1):

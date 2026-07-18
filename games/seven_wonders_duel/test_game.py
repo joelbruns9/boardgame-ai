@@ -69,7 +69,7 @@ def test_play_observation_redacts_face_down_and_setup_removed_cards():
     assert all(name not in repr(observation) for name in game.removed_age_cards[1])
 
 
-def test_only_accessible_card_can_be_taken_and_newly_uncovered_card_reveals():
+def test_only_accessible_card_can_be_taken_and_uncovered_card_is_reported():
     game = new_game(30)
     _finish_wonder_draft(game)
     tableau = game.tableau
@@ -78,10 +78,15 @@ def test_only_accessible_card_can_be_taken_and_newly_uncovered_card_reveals():
         tableau.take_accessible((0, 5))
 
     # Removing both cards that cover row 3 / x=2 exposes that face-down card.
+    # Revelation itself is a chance event owned by the engine: take_accessible
+    # only reports the newly accessible slots, and reveal() flips them.
     assert tableau.cards[(3, 2)].revealed is False
-    tableau.take_accessible((4, 1))
+    _, newly = tableau.take_accessible((4, 1))
+    assert newly == ()
+    _, newly = tableau.take_accessible((4, 3))
+    assert newly == ((3, 2),)
     assert tableau.cards[(3, 2)].revealed is False
-    tableau.take_accessible((4, 3))
+    tableau.reveal((3, 2))
     assert tableau.cards[(3, 2)].revealed is True
     assert tableau.is_accessible((3, 2))
 

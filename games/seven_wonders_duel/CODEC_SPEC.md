@@ -276,10 +276,11 @@ encode the same observation under ≥10 different consistent hidden assignments
   next-age-starter, complete.
 - Age one-hot (3); cards remaining in current age; face-down count remaining.
 - Actor-relative military position `m` (signed, §2); distance-to-military-win pair
-  `(9 − m, 9 + m)`; per-side military coin-loss tokens still in play (from
-  `military_tokens_remaining`, folded to actor frame); per side, shields from the
-  pawn to the next unclaimed token in that direction and that token's coin penalty
-  (0/absent when none remain); pending shields.
+  `(9 − m, 9 + m)`; per side, which coin-loss tokens remain in that side's advance
+  direction (2-coin and 5-coin flags, folded to actor frame); per side, shields
+  from the pawn to the next unclaimed token in that direction and that token's
+  coin penalty — sentinel `(18, 0)` when none remain (a 0 distance would read as
+  "crossing now"; the remaining flags disambiguate the sentinel); pending shields.
 - Extra-turn pending flag.
 - Per-player (actor first, opponent second — identical sub-layout):
   coins; distinct science-symbol count and `6 − count`; per-symbol have-flags (7);
@@ -287,8 +288,9 @@ encode the same observation under ≥10 different consistent hidden assignments
   fixed-production vector (5); choice-producer count per resource (5);
   trade price per resource (5, from `minimum_payment` internals: 1 with reserve,
   else 2 + opponent fixed production); discard income (2 + yellow count);
-  current score breakdown from `score_player` (blue VP, guild VP, wonder VP,
-  progress VP, military VP, coin VP, total).
+  current score breakdown from `score_player` — the engine `ScoreBreakdown`
+  fields verbatim, with guild VP broken out separately (military, buildings,
+  guild, wonders, progress, treasury, total, blue).
 - Per-player **moonshot clocks** (actor then opponent — the threat/feasibility
   layer; all from public sets, loose upper bounds by design):
   - military: upper-bound additional shields still obtainable = shields on
@@ -344,9 +346,16 @@ One per **present** card. Features:
 
 ### 5.6 Unseen-pool summary tokens (per back type with a non-empty pool)
 
-Count + pooled embedding (mean of unseen card-id embeddings) per back type with a
-non-empty pool; same for the unseen wonder pool during draft round 0. Fed from
-`UnseenPool` (§4.1) — the same structure the chance layer uses.
+One token per back type with a non-empty pool; same for the unseen wonder pool
+during draft round 0. Fed from `UnseenPool` (§4.1) — the same structure the
+chance layer uses.
+
+**Encoder-side realization**: the token carries the pool *count* plus a 0/1
+membership vector over card ids (12-dim wonder ids for the wonder pool). The
+"pooled embedding (mean of unseen card-id embeddings)" is computed net-side as
+`(membership / count) @ embedding_table` — embeddings are learned parameters
+and cannot appear in encoder output. The membership vector IS the Python/Rust
+compatibility contract for this token.
 
 **Future ages are included**: during Age I the AGE_II, AGE_III, and GUILD pools are
 full (23 / 20-of-unknown-3-removed / 7-of-unknown-selection) and get summary tokens
@@ -447,6 +456,11 @@ relabeling, trap harvesting).
   order. It is *redundant* given the seed (the simulator RNG is deterministic) and
   that redundancy is the point: the replay gate cross-checks it, so any change to
   engine RNG consumption is caught instead of silently corrupting old buffers.
+- Two digests: `final_digest` = canonical hash of the complete final state
+  (public + hidden deal + draft counters + an RNG-state hash), and
+  `trajectory_digest` = chained hash over the pre-move state digest of every
+  decision plus the final state — intermediate divergence that leaves masks,
+  chance outcomes, and the final state unchanged still fails replay.
 - Seeded/bot games used for buffer seeding use the same schema with
   `sims: 0, visits: {}` and a `"policy_excluded": true` flag after iteration ~10
   (plan §6 seeding rules).
@@ -486,18 +500,25 @@ Items 1–5 SHIPPED (see `test_chance.py`); item 6 SHIPPED with `codec.py`
 
 ## 8. Gate checklist (Phase A exit)
 
-- [x] Codec round-trip (§3.3.1) — `test_codec.py`: 10k+ states / 150 games in
-  CI; the full ≥10k-game sweep is the same check over a longer seed range
-- [x] Mask exactness on ≥10k states (§3.3.2) — `test_codec.py`
-- [x] Mirror gates: encoding (§2) — `test_encoder.py` (token-exact across
-  trajectories + crafted asymmetric/pending states); mask mirroring follows
-  from identity indexing + the pinned NEXT_AGE test
+CI runs reduced scales on every test run; the full-scale sweeps below were
+executed 2026-07-18 (post review-fix round) and pass.
+
+- [x] Codec round-trip + mask exactness (§3.3) — `test_codec.py`; full sweep:
+  **10,000 games** (`SWD_GATE_GAMES=10000`, ~9.5 min) with round-trip,
+  injectivity, and mask agreement at every decision state
+- [x] Mirror gates: encoding + mask (§2) — `test_encoder.py`; full sweep:
+  **16 games, every move (1k+ states)** (`SWD_MIRROR_GAMES=16`), token-exact
+  encodings AND identical legal-index sets on every mirrored pair; plus
+  crafted asymmetric/pending states and the pinned NEXT_AGE test
 - [x] Encoder purity under re-dealt hidden assignments (§5.1) — `test_encoder.py`
-- [x] Encoder determinism + golden digest + pinned signature hash (§5.8)
-- [~] Chance marginals (§4.4) — light coverage check in `test_chance.py`
-  (all 11 reveal outcomes reached); full chi-squared sweep still to run
-- [x] Great Library: 10 outcomes, event-driven, canonical order (§4.4)
-- [x] Search barrier raises on unresolved chance (§4.4) — `test_chance.py`
-- [x] Buffer replay: masks, chance log, full-state digest (§6) — `buffer.py` /
-  `test_buffer.py` (bit-exact replay incl. hidden deal; tamper detection;
-  byte-stable JSONL round-trip)
+- [x] Encoder determinism + pinned signature + 3 golden digests covering main
+  play, draft, and a Great Library pending (§5.8)
+- [x] Chance marginals (§4.4) — `phase_a_gates.py`: determinizer single-slot
+  marginal chi2=4.8 (df=10, 100k samples), conditioned double-reveal joint
+  marginal over 110 ordered pairs chi2=117.4 (df=109, 100k samples)
+- [x] Great Library: 10 outcomes, event-driven, canonical order (§4.4);
+  empirical uniformity chi2=4.6 (df=9, 20k simulator draws)
+- [x] Search barrier raises on unresolved chance — including the final draft
+  pick (initial AGE_DEAL) and multi-card uncovers, before any reveal mutation
+- [x] Buffer replay: masks, chance log, full-state digest incl. RNG stream and
+  draft counters, chained trajectory digest (§6) — `test_buffer.py`

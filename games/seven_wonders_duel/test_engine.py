@@ -188,6 +188,42 @@ def test_seventh_built_wonder_retires_the_only_remaining_wonder():
     assert target in game.cities[0].built_wonders
 
 
+def test_theology_extra_turn_survives_a_pending_choice():
+    game = _playing_game(700)
+    _give_wonder(game, 0, "Circus Maximus")  # destroy-grey pending, no PLAY_AGAIN
+    game.cities[0].coins = 100
+    game.cities[0].progress_tokens = ["Theology"]
+    game.cities[1].buildings = ["Glassworks"]
+    slot = game.tableau.accessible_slot_ids()[0]
+    apply_action(game, Action(slot, ActionUse.CONSTRUCT_WONDER, "Circus Maximus"))
+    assert game.pending_choice is not None
+    assert game.pending_extra_turn is True
+    resolve_pending_choice(game, "Glassworks")
+    assert game.active_player == 0  # Theology's extra turn survived the pending
+
+
+def test_mausoleum_revival_can_chain_into_a_science_pair_pending():
+    game = _playing_game(400)
+    _give_wonder(game, 1, "The Mausoleum")
+    game.cities[1].coins = 100
+    game.cities[1].buildings = ["Workshop"]  # set square
+    discard_slot = _put_in_accessible_slot(game, "Laboratory")  # second set square
+    apply_action(game, Action(discard_slot, ActionUse.DISCARD_FOR_COINS))
+    assert game.active_player == 1
+    build_slot = game.tableau.accessible_slot_ids()[0]
+    apply_action(game, Action(build_slot, ActionUse.CONSTRUCT_WONDER, "The Mausoleum"))
+    assert game.pending_choice is not None
+    assert game.pending_choice.kind is PendingChoiceKind.BUILD_FROM_DISCARD_FREE
+    resolve_pending_choice(game, "Laboratory")
+    # The free build formed a science pair: a second pending must chain.
+    chained = game.pending_choice
+    assert chained is not None
+    assert chained.kind is PendingChoiceKind.CHOOSE_AVAILABLE_PROGRESS
+    assert chained.player == 1
+    resolve_pending_choice(game, chained.options[0])
+    assert game.pending_choice is None
+
+
 def test_illegal_or_malformed_action_does_not_mutate_tableau():
     game = _playing_game()
     before = tuple(card.present for card in game.tableau.cards.values())

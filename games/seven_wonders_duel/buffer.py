@@ -48,6 +48,10 @@ class GameRecord:
     chance_log: tuple[tuple[str, str | tuple[str, ...]], ...]
     moves: tuple[MoveRecord, ...]
     final_digest: str
+    trajectory_digest: str
+    """Chained sha256 over the pre-move state digest of every decision plus the
+    final state — catches intermediate divergence that leaves the legal mask,
+    the chance outcomes, and the final state unchanged."""
     schema: int = SCHEMA_VERSION
     spec_version: str = SPEC_VERSION
 
@@ -62,8 +66,10 @@ def mask_hash(game: GameState) -> str:
 
 
 def state_digest(game: GameState) -> str:
-    """Canonical digest of the complete state (public and hidden), so replay
-    divergence anywhere — including the locked deal — is caught."""
+    """Canonical digest of the complete state — public, hidden deal, draft
+    counters, and the RNG stream — so replay divergence anywhere is caught,
+    including a change in engine RNG consumption that happens to produce the
+    same visible outcomes."""
 
     cities = tuple(
         (
@@ -82,8 +88,11 @@ def state_digest(game: GameState) -> str:
     )
     payload = (
         game.phase.value,
+        game.first_player,
         game.active_player,
         game.age,
+        game.wonder_round,
+        game.wonder_pick_index,
         cities,
         game.available_progress_tokens,
         game.unused_progress_tokens,
@@ -116,6 +125,7 @@ def state_digest(game: GameState) -> str:
         game.winner,
         game.victory_type.value if game.victory_type is not None else None,
         game.final_scores,
+        hashlib.sha256(str(game.rng.getstate()).encode()).hexdigest()[:16],
     )
     return "sha256:" + hashlib.sha256(json.dumps(payload).encode()).hexdigest()
 
@@ -138,6 +148,7 @@ class GameRecorder:
         self.game = new_game(seed, first_player=first_player)
         self._moves: list[MoveRecord] = []
         self._chance_log: list[tuple[str, str | tuple[str, ...]]] = []
+        self._trajectory = hashlib.sha256()
 
     def play(
         self,
@@ -156,6 +167,7 @@ class GameRecorder:
             if game.pending_choice is not None
             else game.active_player
         )
+        self._trajectory.update(state_digest(game).encode())
         move = MoveRecord(
             i=len(self._moves),
             actor=actor,
@@ -176,6 +188,8 @@ class GameRecorder:
         game = self.game
         if game.phase is not Phase.COMPLETE:
             raise ValueError("cannot finish a record before the game is complete")
+        final_digest = state_digest(game)
+        self._trajectory.update(final_digest.encode())
         return GameRecord(
             seed=self.seed,
             first_player=self.first_player,
@@ -185,7 +199,8 @@ class GameRecorder:
             scores=game.final_scores,
             chance_log=tuple(self._chance_log),
             moves=tuple(self._moves),
-            final_digest=state_digest(game),
+            final_digest=final_digest,
+            trajectory_digest="sha256:" + self._trajectory.hexdigest(),
         )
 
 
@@ -195,7 +210,9 @@ def replay(record: GameRecord) -> GameState:
 
     game = new_game(record.seed, first_player=record.first_player)
     log_position = 0
+    trajectory = hashlib.sha256()
     for move in record.moves:
+        trajectory.update(state_digest(game).encode())
         current_hash = mask_hash(game)
         if current_hash != move.mask_hash:
             raise ReplayMismatchError(
@@ -230,6 +247,13 @@ def replay(record: GameRecord) -> GameState:
     if digest != record.final_digest:
         raise ReplayMismatchError(
             f"final digest {digest} != recorded {record.final_digest}"
+        )
+    trajectory.update(digest.encode())
+    trajectory_digest = "sha256:" + trajectory.hexdigest()
+    if trajectory_digest != record.trajectory_digest:
+        raise ReplayMismatchError(
+            f"trajectory digest {trajectory_digest} != recorded "
+            f"{record.trajectory_digest}"
         )
     return game
 
@@ -270,6 +294,7 @@ def to_json_line(record: GameRecord) -> str:
             for move in record.moves
         ],
         "final_digest": record.final_digest,
+        "trajectory_digest": record.trajectory_digest,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -315,6 +340,7 @@ def from_json_line(line: str) -> GameRecord:
             for move in payload["moves"]
         ),
         final_digest=payload["final_digest"],
+        trajectory_digest=payload["trajectory_digest"],
     )
 
 

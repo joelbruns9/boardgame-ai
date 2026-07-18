@@ -265,6 +265,109 @@ def test_age_transition_emits_age_deal_and_respects_barrier():
     assert len(deals) == 1 and len(deals[0].outcome) == 20
 
 
+def test_final_draft_pick_emits_initial_age_deal():
+    game = new_game(9)
+    result = None
+    for _ in range(8):
+        result = apply_action(game, legal_actions(game)[0])
+    assert game.phase is Phase.PLAY_AGE
+    deals = [e for e in result.events if e.kind is ChanceKind.AGE_DEAL]
+    assert len(deals) == 1
+    assert deals[0].context == (1,)
+    assert deals[0].outcome == game.age_decks[1]
+    assert len(deals[0].outcome) == 20
+
+
+def test_final_draft_pick_respects_barrier_and_supplied_deal():
+    from games.seven_wonders_duel.data import AGE_I_CARDS
+
+    game = new_game(9)
+    for _ in range(7):
+        apply_action(game, legal_actions(game)[0])
+
+    barred = game.clone()
+    barred.search_barrier = True
+    with pytest.raises(HiddenInformationError):
+        apply_action(barred, legal_actions(barred)[0])
+
+    supplied = game.clone()
+    supplied.search_barrier = True
+    deal = tuple(card.name for card in AGE_I_CARDS[:20])
+    apply_action(supplied, legal_actions(supplied)[0], chance_outcomes=[deal])
+    assert supplied.phase is Phase.PLAY_AGE
+    dealt = {c.card_name for c in supplied.tableau.cards.values()}
+    assert dealt == set(deal)
+    assert set(supplied.removed_age_cards[1]) == {c.name for c in AGE_I_CARDS[20:]}
+
+
+def _double_uncover_state(seed=30):
+    """Discard (4,1) and (4,5) so that taking (4,3) exposes (3,2) and (3,4)
+    simultaneously — the sequential-chance-node scenario."""
+
+    game = _playing_game(seed)
+    apply_action(game, Action((4, 1), ActionUse.DISCARD_FOR_COINS))
+    apply_action(game, Action((4, 5), ActionUse.DISCARD_FOR_COINS))
+    return game
+
+
+def test_double_uncover_emits_two_ordered_reveal_events():
+    game = _double_uncover_state()
+    result = apply_action(game, Action((4, 3), ActionUse.DISCARD_FOR_COINS))
+    reveals = [e for e in result.events if e.kind is ChanceKind.CARD_REVEAL]
+    assert [e.context[0] for e in reveals] == [(3, 2), (3, 4)]
+    assert reveals[0].outcome == game.tableau.cards[(3, 2)].card_name
+    assert reveals[1].outcome == game.tableau.cards[(3, 4)].card_name
+
+
+def test_supplied_outcome_can_be_the_card_locked_in_a_sibling_slot():
+    game = _double_uncover_state()
+    clone = game.clone()
+    clone.search_barrier = True
+    card_a = clone.tableau.cards[(3, 2)].card_name
+    card_b = clone.tableau.cards[(3, 4)].card_name
+    # First reveal outcome = the card currently locked in the OTHER slot the
+    # same take exposes: legal (uniform over the whole pool) and must swap.
+    result = apply_action(
+        clone,
+        Action((4, 3), ActionUse.DISCARD_FOR_COINS),
+        chance_outcomes=[card_b, card_a],
+    )
+    reveals = [e for e in result.events if e.kind is ChanceKind.CARD_REVEAL]
+    assert [e.outcome for e in reveals] == [card_b, card_a]
+    assert clone.tableau.cards[(3, 2)].card_name == card_b
+    assert clone.tableau.cards[(3, 4)].card_name == card_a
+
+
+def test_supplying_the_true_outcomes_reproduces_the_simulator_state():
+    from games.seven_wonders_duel.buffer import state_digest
+
+    game = _double_uncover_state()
+    simulator = game.clone()
+    result = apply_action(simulator, Action((4, 3), ActionUse.DISCARD_FOR_COINS))
+    true_outcomes = [
+        e.outcome for e in result.events if e.kind is ChanceKind.CARD_REVEAL
+    ]
+    barred = game.clone()
+    barred.search_barrier = True
+    apply_action(
+        barred,
+        Action((4, 3), ActionUse.DISCARD_FOR_COINS),
+        chance_outcomes=true_outcomes,
+    )
+    barred.search_barrier = False
+    assert state_digest(barred) == state_digest(simulator)
+
+
+def test_barrier_on_multi_uncover_raises_before_any_reveal():
+    game = _double_uncover_state()
+    clone = game.clone()
+    clone.search_barrier = True
+    with pytest.raises(HiddenInformationError):
+        apply_action(clone, Action((4, 3), ActionUse.DISCARD_FOR_COINS))
+    assert clone.tableau.cards[(3, 2)].revealed is False
+    assert clone.tableau.cards[(3, 4)].revealed is False
+
+
 # --- §7.5 UnseenPool + resample_hidden --------------------------------------
 
 
