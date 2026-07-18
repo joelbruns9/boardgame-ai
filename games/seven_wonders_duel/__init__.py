@@ -9,6 +9,7 @@ from .codec import (
     legal_action_mask,
 )
 from .data import BackType, back_type_of
+from .encoder import ENCODER_SIGNATURE, Encoding, Token, TokenType, encode
 from .engine import (
     Action,
     ActionUse,
@@ -41,6 +42,8 @@ __all__ = [
     "ActionUse",
     "BackType",
     "ChanceKind",
+    "ENCODER_SIGNATURE",
+    "Encoding",
     "GameState",
     "GreedyBot",
     "HiddenInformationError",
@@ -48,11 +51,14 @@ __all__ = [
     "RandomBot",
     "ResolvedChance",
     "StepResult",
+    "Token",
+    "TokenType",
     "UnseenPool",
     "VictoryType",
     "apply_action",
     "back_type_of",
     "decode_action",
+    "encode",
     "encode_action",
     "legal_action_indices",
     "legal_action_mask",

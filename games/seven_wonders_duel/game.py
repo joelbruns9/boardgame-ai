@@ -219,6 +219,8 @@ class PlayerObservation:
     wonder_burials: tuple[tuple[str, str], ...]
     retired_wonders: frozenset[str]
     pending_choice: PendingChoice | None
+    pending_extra_turn: bool
+    pending_shields: int
     conflict_position: int
     military_tokens_remaining: tuple[tuple[int, int], ...]
     winner: int | None
@@ -404,6 +406,8 @@ class GameState:
             wonder_burials=tuple(sorted(self.wonder_burials.items())),
             retired_wonders=frozenset(self.retired_wonders),
             pending_choice=self.pending_choice,
+            pending_extra_turn=self.pending_extra_turn,
+            pending_shields=self.pending_shields,
             conflict_position=self.conflict_position,
             military_tokens_remaining=tuple(sorted(self.military_tokens_remaining.items())),
             winner=self.winner,

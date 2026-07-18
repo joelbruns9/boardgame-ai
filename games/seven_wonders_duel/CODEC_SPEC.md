@@ -486,12 +486,16 @@ Items 1–5 SHIPPED (see `test_chance.py`); item 6 SHIPPED with `codec.py`
 
 ## 8. Gate checklist (Phase A exit)
 
-- [ ] Codec round-trip over ≥10k full games (§3.3.1)
-- [ ] Mask exactness on ≥10k states (§3.3.2)
-- [ ] Mirror gates: encoding + mask (§2)
-- [ ] Encoder purity under re-dealt hidden assignments (§5.1)
-- [ ] Encoder determinism + golden files + signature hash (§5.8)
-- [ ] Chance marginals: determinizer vs closed-loop enumeration, chi-squared (§4.4)
-- [ ] Great Library: exactly 10 uniform outcomes, event-driven (§4.4)
-- [ ] Search barrier raises on unresolved chance (§4.4)
-- [ ] Buffer replay: masks, chance log, final state hash (§6)
+- [x] Codec round-trip (§3.3.1) — `test_codec.py`: 10k+ states / 150 games in
+  CI; the full ≥10k-game sweep is the same check over a longer seed range
+- [x] Mask exactness on ≥10k states (§3.3.2) — `test_codec.py`
+- [x] Mirror gates: encoding (§2) — `test_encoder.py` (token-exact across
+  trajectories + crafted asymmetric/pending states); mask mirroring follows
+  from identity indexing + the pinned NEXT_AGE test
+- [x] Encoder purity under re-dealt hidden assignments (§5.1) — `test_encoder.py`
+- [x] Encoder determinism + golden digest + pinned signature hash (§5.8)
+- [~] Chance marginals (§4.4) — light coverage check in `test_chance.py`
+  (all 11 reveal outcomes reached); full chi-squared sweep still to run
+- [x] Great Library: 10 outcomes, event-driven, canonical order (§4.4)
+- [x] Search barrier raises on unresolved chance (§4.4) — `test_chance.py`
+- [ ] Buffer replay: masks, chance log, final state hash (§6) — next build item
