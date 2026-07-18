@@ -22,11 +22,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .buffer import GameRecord
-from .codec import NUM_ACTIONS, decode_action, legal_action_indices
+from .buffer import GameRecord, replay
+from .codec import NUM_ACTIONS, legal_action_indices
 from .encoder import _FEATURE_COUNTS, _SCHEMA, Encoding, TokenType, encode
-from .engine import apply_action, _science_symbols
-from .game import Phase, VictoryType, new_game
+from .engine import _science_symbols
+from .game import VictoryType
 
 TOKEN_TYPES = tuple(TokenType)
 TYPE_IDS = {token_type: index for index, token_type in enumerate(TOKEN_TYPES)}
@@ -57,7 +57,9 @@ class Example:
     type_ids: np.ndarray  # [T] int8
     entity_ids: np.ndarray  # [T] int16
     aux_ids: np.ndarray  # [T] int16 (0 = none, else card_id + 1)
-    features: np.ndarray  # [T, MAX_FEATURES] float32, zero-padded per type
+    features: np.ndarray  # [T, MAX_FEATURES] float16 (exact for the integer-
+    # valued raw features < 2048; halves the materialized footprint. True
+    # streaming replaces eager materialization in the Phase D loop extraction.)
     legal: np.ndarray  # [L] int16 legal action indices
     policy_target: np.ndarray  # [L] float32 distribution over legal (sums to 1)
     has_policy: bool
@@ -69,6 +71,7 @@ class Example:
     sci_final_my: float
     sci_final_opp: float
     game_key: int  # for game-honest splits
+    iteration: int | None  # for iteration-honest splits (Phase D)
 
 
 def vectorize(encoding: Encoding) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -76,7 +79,7 @@ def vectorize(encoding: Encoding) -> tuple[np.ndarray, np.ndarray, np.ndarray, n
     type_ids = np.empty(count, dtype=np.int8)
     entity_ids = np.empty(count, dtype=np.int16)
     aux_ids = np.empty(count, dtype=np.int16)
-    features = np.zeros((count, MAX_FEATURES), dtype=np.float32)
+    features = np.zeros((count, MAX_FEATURES), dtype=np.float16)
     for row, token in enumerate(encoding.tokens):
         type_ids[row] = TYPE_IDS[token.type]
         entity_ids[row] = token.entity_id
@@ -102,11 +105,14 @@ def _joint7_class(winner: int | None, victory: VictoryType | None, actor: int) -
 
 
 def examples_from_record(record: GameRecord) -> list[Example]:
-    """Replay one game and emit an example per recorded decision."""
+    """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
+    actors, chance log, trajectory and final digests all checked) and emit an
+    example per recorded decision. A stale or tampered buffer raises
+    ReplayMismatchError instead of silently training on regenerated states."""
 
-    game = new_game(record.seed, first_player=record.first_player)
     staged: list[tuple[Example, int]] = []  # (example, actor)
-    for move in record.moves:
+
+    def featurize(game, move):
         actor = (
             game.pending_choice.player
             if game.pending_choice is not None
@@ -116,14 +122,19 @@ def examples_from_record(record: GameRecord) -> list[Example]:
         if encoding.actor != actor:
             raise AssertionError("encoder actor disagrees with replay actor")
         legal = np.asarray(legal_action_indices(game), dtype=np.int16)
+        policy = np.zeros(len(legal), dtype=np.float32)
         if move.visits:
-            policy = np.zeros(len(legal), dtype=np.float32)
             total = float(sum(move.visits.values()))
+            if total <= 0:
+                raise ValueError(f"move {move.i}: visit counts sum to zero")
             index_of = {int(a): i for i, a in enumerate(legal)}
             for action, visits in move.visits.items():
+                if int(action) not in index_of:
+                    raise ValueError(
+                        f"move {move.i}: visit on illegal action {action}"
+                    )
                 policy[index_of[int(action)]] = visits / total
         else:
-            policy = np.zeros(len(legal), dtype=np.float32)
             policy[int(np.searchsorted(legal, move.action))] = 1.0
         type_ids, entity_ids, aux_ids, features = vectorize(encoding)
         staged.append(
@@ -144,14 +155,13 @@ def examples_from_record(record: GameRecord) -> list[Example]:
                     sci_final_my=0.0,
                     sci_final_opp=0.0,
                     game_key=record.seed,
+                    iteration=record.iteration,
                 ),
                 actor,
             )
         )
-        apply_action(game, decode_action(game, move.action))
 
-    if game.phase is not Phase.COMPLETE:
-        raise ValueError("record did not replay to a finished game")
+    game = replay(record, on_state=featurize)
     final_position = game.conflict_position
     sci_counts = (len(_science_symbols(game, 0)), len(_science_symbols(game, 1)))
     for example, actor in staged:
@@ -173,6 +183,46 @@ def examples_from_records(records) -> list[Example]:
     for record in records:
         out.extend(examples_from_record(record))
     return out
+
+
+def collate_inputs(
+    vectorized: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    legal_lists: list,
+    device: str = "cpu",
+) -> dict[str, torch.Tensor]:
+    """Inputs-only collate for inference: same input keys as :func:`collate`
+    (type_ids, entity_ids, aux_ids, features, pad_mask, legal_mask), no
+    targets. ``vectorized`` entries come from :func:`vectorize`."""
+
+    size = len(vectorized)
+    max_tokens = max(len(v[0]) for v in vectorized)
+    type_ids = torch.zeros(size, max_tokens, dtype=torch.long)
+    entity_ids = torch.zeros(size, max_tokens, dtype=torch.long)
+    aux_ids = torch.zeros(size, max_tokens, dtype=torch.long)
+    features = torch.zeros(size, max_tokens, MAX_FEATURES)
+    pad_mask = torch.ones(size, max_tokens, dtype=torch.bool)
+    legal_mask = torch.zeros(size, NUM_ACTIONS, dtype=torch.bool)
+    for row, ((types, entities, auxes, feats), legal) in enumerate(
+        zip(vectorized, legal_lists)
+    ):
+        count = len(types)
+        type_ids[row, :count] = torch.from_numpy(types.astype(np.int64))
+        entity_ids[row, :count] = torch.from_numpy(entities.astype(np.int64))
+        aux_ids[row, :count] = torch.from_numpy(auxes.astype(np.int64))
+        features[row, :count] = torch.from_numpy(feats.astype(np.float32))
+        pad_mask[row, :count] = False
+        legal_mask[row, torch.as_tensor(list(legal), dtype=torch.long)] = True
+    tensors = {
+        "type_ids": type_ids,
+        "entity_ids": entity_ids,
+        "aux_ids": aux_ids,
+        "features": features,
+        "pad_mask": pad_mask,
+        "legal_mask": legal_mask,
+    }
+    if device != "cpu":
+        tensors = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
+    return tensors
 
 
 def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor]:
@@ -203,7 +253,7 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         type_ids[row, :count] = torch.from_numpy(example.type_ids.astype(np.int64))
         entity_ids[row, :count] = torch.from_numpy(example.entity_ids.astype(np.int64))
         aux_ids[row, :count] = torch.from_numpy(example.aux_ids.astype(np.int64))
-        features[row, :count] = torch.from_numpy(example.features)
+        features[row, :count] = torch.from_numpy(example.features.astype(np.float32))
         pad_mask[row, :count] = False
         legal_indices = torch.from_numpy(example.legal.astype(np.int64))
         legal_mask[row, legal_indices] = True

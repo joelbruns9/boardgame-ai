@@ -10,12 +10,19 @@ Steps:
 3. Overfit gate: transformer on all states — policy CE and value CE must fall
    below thresholds that only full memorization reaches.
 4. Generalization check: fresh transformer + MLP control on a game-honest
-   split — value/joint7 accuracy must beat the majority-class base rate.
+   split — ALL heads must beat their trivial baselines: value and joint7
+   accuracy above majority-class rate, margin/military/science MAE below the
+   predict-the-mean baseline.
+
+The buffer must match the requested game count, and the featurized cache is
+validated against the encoder signature and buffer file hash — a stale cache
+is re-featurized, never silently reused.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,10 +32,44 @@ from .bots import GreedyBot, RandomBot
 from .buffer import GameRecorder, append_records, read_records
 from .codec import encode_action
 from .dataset import examples_from_records
+from .encoder import ENCODER_SIGNATURE
 from .game import Phase
 from .train import baselines, build_model, evaluate, game_honest_split, train_loop
 
 RUNS = Path(__file__).parent / "runs"
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_examples(buffer_path: Path, cache_path: Path):
+    """Featurize with a validated cache: reuse only when the encoder signature
+    AND the buffer file hash both match; anything else re-featurizes."""
+
+    buffer_sha = _file_sha256(buffer_path)
+    if cache_path.exists():
+        cached = torch.load(cache_path, weights_only=False)
+        if (
+            isinstance(cached, dict)
+            and cached.get("encoder_signature") == ENCODER_SIGNATURE
+            and cached.get("buffer_sha256") == buffer_sha
+        ):
+            print(f"featurized cache valid: {len(cached['examples'])} states")
+            return cached["examples"]
+        print("featurized cache stale (encoder or buffer changed); rebuilding")
+    print("featurizing (verified replay)...")
+    examples = examples_from_records(read_records(buffer_path))
+    torch.save(
+        {
+            "encoder_signature": ENCODER_SIGNATURE,
+            "buffer_sha256": buffer_sha,
+            "examples": examples,
+        },
+        cache_path,
+    )
+    print(f"featurized {len(examples)} states -> {cache_path}")
+    return examples
 
 
 def generate_buffer(path: Path, games: int) -> None:
@@ -75,16 +116,13 @@ def main(argv=None) -> int:
     if not buffer_path.exists():
         generate_buffer(buffer_path, args.games)
     records = read_records(buffer_path)
+    if len(records) != args.games:
+        raise SystemExit(
+            f"buffer {buffer_path} holds {len(records)} games but --games is "
+            f"{args.games}; delete the buffer to regenerate at the new size"
+        )
     print(f"buffer: {len(records)} games")
-
-    if cache_path.exists():
-        examples = torch.load(cache_path, weights_only=False)
-        print(f"featurized cache: {len(examples)} states")
-    else:
-        print("featurizing (one-time)...")
-        examples = examples_from_records(records)
-        torch.save(examples, cache_path)
-        print(f"featurized {len(examples)} states -> {cache_path}")
+    examples = load_examples(buffer_path, cache_path)
 
     base = baselines(examples)
     print(f"baselines: {json.dumps({k: round(v, 4) for k, v in base.items()})}")
@@ -112,10 +150,12 @@ def main(argv=None) -> int:
         f"{'PASS' if overfit_pass else 'FAIL'}"
     )
 
-    # --- Gate 2: aux heads beat base rates on held-out games ----------------
-    print("\n[gate 2] generalization vs base rates (game-honest split)")
+    # --- Gate 2: every head beats its baseline on held-out games ------------
+    print("\n[gate 2] generalization: all six heads vs baselines (game-honest split)")
     train_examples, val_examples = game_honest_split(list(examples), 0.15)
+    val_base = baselines(val_examples)
     gate2 = {}
+    head_checks = {}
     for name in ("transformer", "mlp"):
         fresh = build_model(name, 128, 4)
         train_loop(
@@ -128,19 +168,31 @@ def main(argv=None) -> int:
         )
         metrics = evaluate(fresh, val_examples, args.device)
         gate2[name] = metrics
+        checks = {
+            "value": metrics["value_acc"] > val_base["value_base_rate"],
+            "joint7": metrics["joint7_acc"] > val_base["joint7_base_rate"],
+            "policy": metrics["policy"] < val_base["policy_uniform_loss"],
+            "margin": metrics["margin_mae"] < val_base["margin_mae"],
+            "military": metrics["military_mae"] < val_base["military_mae"],
+            "science": metrics["science_mae"] < val_base["science_mae"],
+        }
+        head_checks[name] = checks
         print(
-            f"  {name}: value_acc {metrics['value_acc']:.3f} "
-            f"(base {base['value_base_rate']:.3f}) "
-            f"joint7_acc {metrics['joint7_acc']:.3f} "
-            f"(base {base['joint7_base_rate']:.3f})"
+            f"  {name}: value_acc {metrics['value_acc']:.3f}/{val_base['value_base_rate']:.3f} "
+            f"joint7_acc {metrics['joint7_acc']:.3f}/{val_base['joint7_base_rate']:.3f} "
+            f"policy {metrics['policy']:.3f}/{val_base['policy_uniform_loss']:.3f}"
+        )
+        print(
+            f"    margin_mae {metrics['margin_mae']:.4f}/{val_base['margin_mae']:.4f} "
+            f"military_mae {metrics['military_mae']:.4f}/{val_base['military_mae']:.4f} "
+            f"science_mae {metrics['science_mae']:.4f}/{val_base['science_mae']:.4f} "
+            f"-> {'all heads PASS' if all(checks.values()) else 'FAIL: ' + str([k for k, v in checks.items() if not v])}"
         )
     results["generalization"] = gate2
-    aux_pass = all(
-        gate2[m]["value_acc"] > base["value_base_rate"]
-        and gate2[m]["joint7_acc"] > base["joint7_base_rate"]
-        for m in gate2
-    )
-    print(f"  aux-vs-baseline: {'PASS' if aux_pass else 'FAIL'}")
+    results["val_baselines"] = val_base
+    results["head_checks"] = head_checks
+    aux_pass = all(all(checks.values()) for checks in head_checks.values())
+    print(f"  all-heads-vs-baselines: {'PASS' if aux_pass else 'FAIL'}")
 
     (RUNS / "phase_b_gate.json").write_text(json.dumps(results, indent=2, default=float))
     print(f"\nresults -> {RUNS / 'phase_b_gate.json'}")

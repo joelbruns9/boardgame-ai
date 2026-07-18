@@ -75,16 +75,24 @@ def compute_losses(
 
 
 @torch.no_grad()
-def evaluate(model, examples: list[Example], device: str, batch_size: int = 512):
+def evaluate(
+    model,
+    examples: list[Example],
+    device: str,
+    batch_size: int = 512,
+    aux_weight: float = AUX_WEIGHT_DEFAULT,
+):
     model.eval()
     sums: dict[str, float] = {}
     correct = {"value": 0, "joint7": 0, "policy_top1": 0}
+    abs_err = {"margin": 0.0, "military": 0.0, "science": 0.0}
+    margin_rows = 0
     policy_rows = 0
     count = 0
     for start in range(0, len(examples), batch_size):
         batch = collate(examples[start : start + batch_size], device)
         outputs = model(batch)
-        _, parts = compute_losses(outputs, batch)
+        _, parts = compute_losses(outputs, batch, aux_weight)
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
             sums[key] = sums.get(key, 0.0) + value * rows
@@ -99,16 +107,33 @@ def evaluate(model, examples: list[Example], device: str, batch_size: int = 512)
         has = batch["has_policy"]
         correct["policy_top1"] += int((top1[has] == target_top[has]).sum())
         policy_rows += int(has.sum())
+        valid = batch["margin_valid"]
+        if valid.any():
+            abs_err["margin"] += float(
+                (outputs["margin"][valid] - batch["margin"][valid]).abs().sum()
+            )
+            margin_rows += int(valid.sum())
+        abs_err["military"] += float(
+            (outputs["military"] - batch["military_final"]).abs().sum()
+        )
+        abs_err["science"] += float(
+            (outputs["science"] - batch["sci_final"]).abs().mean(dim=-1).sum()
+        )
     metrics = {key: value / count for key, value in sums.items()}
     metrics["value_acc"] = correct["value"] / count
     metrics["joint7_acc"] = correct["joint7"] / count
     metrics["policy_top1"] = correct["policy_top1"] / max(policy_rows, 1)
+    metrics["margin_mae"] = abs_err["margin"] / max(margin_rows, 1)
+    metrics["military_mae"] = abs_err["military"] / count
+    metrics["science_mae"] = abs_err["science"] / count
     model.train()
     return metrics
 
 
 def baselines(examples: list[Example]) -> dict[str, float]:
-    """What the heads must beat: majority-class rates and uniform policy."""
+    """What each head must beat: majority-class rates for the classifiers,
+    predict-the-mean MAE for the regressions, uniform policy cross-entropy
+    (mean of log(n_legal) over policy-bearing examples)."""
 
     def base_rate(values):
         counts: dict[int, int] = {}
@@ -116,15 +141,53 @@ def baselines(examples: list[Example]) -> dict[str, float]:
             counts[v] = counts.get(v, 0) + 1
         return max(counts.values()) / len(values)
 
-    mean_legal = sum(len(e.legal) for e in examples) / len(examples)
+    def mean_mae(values):
+        if not values:
+            return 0.0
+        mean = sum(values) / len(values)
+        return sum(abs(v - mean) for v in values) / len(values)
+
+    policy_examples = [e for e in examples if e.has_policy]
+    margins = [e.margin for e in examples if e.margin_valid]
+    sci = [e.sci_final_my for e in examples] + [e.sci_final_opp for e in examples]
     return {
         "value_base_rate": base_rate([e.value_class for e in examples]),
         "joint7_base_rate": base_rate([e.joint7_class for e in examples]),
-        "policy_uniform_loss": math.log(mean_legal),
+        "policy_uniform_loss": sum(math.log(len(e.legal)) for e in policy_examples)
+        / max(len(policy_examples), 1),
+        "margin_mae": mean_mae(margins),
+        "military_mae": mean_mae([e.military_final for e in examples]),
+        "science_mae": mean_mae(sci),
     }
 
 
 def game_honest_split(examples: list[Example], val_frac: float, seed: int = 0):
+    """Held-out validation that never shares a game with training.
+
+    When examples carry iteration labels (Phase D self-play), whole recent
+    iterations are held out — the KD `iteration_split` discipline, so val
+    measures generalization across agent generations, not just across games.
+    Unlabeled buffers (bot games) fall back to a by-game split.
+    """
+
+    iterations = {e.iteration for e in examples}
+    if len(iterations) > 1 and None not in iterations:
+        ordered = sorted(iterations)
+        total = len(examples)
+        by_iteration = {
+            it: sum(1 for e in examples if e.iteration == it) for it in ordered
+        }
+        val_iterations: set[int] = set()
+        held = 0
+        for it in reversed(ordered):
+            if held >= total * val_frac:
+                break
+            val_iterations.add(it)
+            held += by_iteration[it]
+        train = [e for e in examples if e.iteration not in val_iterations]
+        val = [e for e in examples if e.iteration in val_iterations]
+        return train, val
+
     keys = sorted({e.game_key for e in examples})
     rng = random.Random(seed)
     rng.shuffle(keys)
@@ -135,6 +198,7 @@ def game_honest_split(examples: list[Example], val_frac: float, seed: int = 0):
 
 
 def make_checkpoint(model, config: dict) -> dict:
+    model = getattr(model, "_orig_mod", model)  # unwrap torch.compile
     return {
         "model_state": model.state_dict(),
         "config": config,
@@ -142,13 +206,53 @@ def make_checkpoint(model, config: dict) -> dict:
     }
 
 
-def load_checkpoint(path, model) -> dict:
+def migrate_state_dict(old_state: dict, model) -> dict:
+    """Additive-schema warm start (spec §5.8a): load every parameter that still
+    matches, zero-initialize parameters with no counterpart (new token types'
+    entity embeddings and feature projections), and zero-pad grown embedding
+    tables (the type-embedding table when a type is appended).
+
+    Zero-init makes the new tokens' pre-activation contribution exactly zero.
+    Note the honest caveat (also in the spec): zero-VALUE tokens still
+    participate in attention normalization, so switch-on is near-neutral, not
+    bit-neutral — exact bit-neutrality requires masking the new type until
+    enabled. Returns a report of what was loaded / grown / zero-initialized.
+    """
+
+    new_state = model.state_dict()
+    report = {"loaded": [], "grown": [], "zeroed": []}
+    for key, tensor in new_state.items():
+        if key in old_state and old_state[key].shape == tensor.shape:
+            new_state[key] = old_state[key]
+            report["loaded"].append(key)
+        elif (
+            key in old_state
+            and old_state[key].ndim == tensor.ndim
+            and old_state[key].shape[1:] == tensor.shape[1:]
+            and old_state[key].shape[0] < tensor.shape[0]
+        ):
+            grown = torch.zeros_like(tensor)
+            grown[: old_state[key].shape[0]] = old_state[key]
+            new_state[key] = grown
+            report["grown"].append(key)
+        else:
+            new_state[key] = torch.zeros_like(tensor)
+            report["zeroed"].append(key)
+    model.load_state_dict(new_state)
+    return report
+
+
+def load_checkpoint(path, model, *, migrate: bool = False) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint["encoder_signature"] != ENCODER_SIGNATURE:
-        raise ValueError(
-            "checkpoint encoder signature does not match the live encoder — "
-            "the encoding schema changed since this model was trained"
-        )
+        if not migrate:
+            raise ValueError(
+                "checkpoint encoder signature does not match the live encoder — "
+                "the encoding schema changed since this model was trained "
+                "(pass migrate=True for an additive-schema warm start)"
+            )
+        checkpoint["migration"] = migrate_state_dict(checkpoint["model_state"], model)
+        return checkpoint
     model.load_state_dict(checkpoint["model_state"])
     return checkpoint
 
@@ -203,7 +307,7 @@ def train_loop(
         train_parts = {k: v / batches for k, v in running.items()}
         row = {"epoch": epoch, "train": train_parts, "secs": time.time() - start_time}
         if val_examples:
-            val_metrics = evaluate(model, val_examples, device, batch_size)
+            val_metrics = evaluate(model, val_examples, device, batch_size, aux_weight)
             row["val"] = val_metrics
             log(
                 f"epoch {epoch}: train total {train_parts['total']:.4f} "
@@ -251,6 +355,12 @@ def main(argv=None) -> int:
     parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT_DEFAULT)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--overfit", action="store_true", help="no split, no early stop")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model (falls back with a warning if the "
+        "backend is unavailable on this platform)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
@@ -271,6 +381,19 @@ def main(argv=None) -> int:
     model = build_model(args.model, args.d_model, args.layers)
     params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {params:,} params on {args.device}")
+    if args.compile:
+        # Compilation errors surface lazily at the first forward, so probe a
+        # trivial compiled function on the target device before committing.
+        # (Verified on this project's Windows box: triton is unavailable there
+        # and the probe correctly falls back to eager; compile pays off on the
+        # Linux training boxes.)
+        try:
+            probe = torch.compile(lambda x: x * 2 + 1)
+            probe(torch.zeros(4, device=args.device))
+            model = torch.compile(model)
+            print("torch.compile enabled")
+        except Exception as error:  # backend availability varies by platform
+            print(f"torch.compile unavailable, running eager: {type(error).__name__}")
     history = train_loop(
         model,
         train_examples,
@@ -281,7 +404,13 @@ def main(argv=None) -> int:
         lr=args.lr,
         aux_weight=args.aux_weight,
     )
-    final = evaluate(model, val_examples or train_examples, args.device, args.batch_size)
+    final = evaluate(
+        model,
+        val_examples or train_examples,
+        args.device,
+        args.batch_size,
+        args.aux_weight,
+    )
     print(f"final: {json.dumps({k: round(v, 4) for k, v in final.items()})}")
 
     if args.out:

@@ -42,6 +42,7 @@ class GameRecord:
     seed: int
     first_player: int
     agents: dict[str, str]
+    iteration: int | None
     winner: int | None
     victory_type: str | None
     scores: tuple[int, int] | None
@@ -141,10 +142,17 @@ class GameRecorder:
     until ``game.phase is COMPLETE``, then ``finish()``.
     """
 
-    def __init__(self, seed: int, first_player: int = 0, agents: dict[str, str] | None = None):
+    def __init__(
+        self,
+        seed: int,
+        first_player: int = 0,
+        agents: dict[str, str] | None = None,
+        iteration: int | None = None,
+    ):
         self.seed = seed
         self.first_player = first_player
         self.agents = dict(agents) if agents is not None else {}
+        self.iteration = iteration
         self.game = new_game(seed, first_player=first_player)
         self._moves: list[MoveRecord] = []
         self._chance_log: list[tuple[str, str | tuple[str, ...]]] = []
@@ -194,6 +202,7 @@ class GameRecorder:
             seed=self.seed,
             first_player=self.first_player,
             agents=self.agents,
+            iteration=self.iteration,
             winner=game.winner,
             victory_type=game.victory_type.value if game.victory_type else None,
             scores=game.final_scores,
@@ -204,9 +213,15 @@ class GameRecorder:
         )
 
 
-def replay(record: GameRecord) -> GameState:
+def replay(record: GameRecord, on_state=None) -> GameState:
     """Re-run the game from (seed, actions), verifying masks, chance log, and
-    the final digest. Raises ReplayMismatchError on any divergence."""
+    the final digest. Raises ReplayMismatchError on any divergence.
+
+    ``on_state(game, move)`` is invoked at every decision AFTER that move's
+    integrity checks pass and BEFORE the move is applied — the hook consumers
+    (featurization, reanalyze) use so they can never read from an unverified
+    replay.
+    """
 
     game = new_game(record.seed, first_player=record.first_player)
     log_position = 0
@@ -227,6 +242,8 @@ def replay(record: GameRecord) -> GameState:
             raise ReplayMismatchError(
                 f"move {move.i}: actor {actor} != recorded {move.actor}"
             )
+        if on_state is not None:
+            on_state(game, move)
         result = apply_action(game, decode_action(game, move.action))
         for event in result.events:
             if log_position >= len(record.chance_log):
@@ -267,6 +284,7 @@ def to_json_line(record: GameRecord) -> str:
         "spec_version": record.spec_version,
         "setup": {"seed": record.seed, "first_player": record.first_player},
         "agents": record.agents,
+        "iteration": record.iteration,
         "result": {
             "winner": record.winner,
             "victory_type": record.victory_type,
@@ -310,6 +328,7 @@ def from_json_line(line: str) -> GameRecord:
         seed=payload["setup"]["seed"],
         first_player=payload["setup"]["first_player"],
         agents=dict(payload["agents"]),
+        iteration=payload.get("iteration"),
         winner=result["winner"],
         victory_type=result["victory_type"],
         scores=tuple(result["scores"]) if result["scores"] is not None else None,

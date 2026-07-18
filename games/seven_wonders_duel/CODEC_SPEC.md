@@ -389,11 +389,15 @@ v2 items (prospect tokens especially) must be addable to a live run without a
 restart. Two requirements make that true and are REQUIRED in v1:
 
 1. **Extensible token typing**: every token carries a token-type embedding, and
-   each type gets its own input projection. Adding a type later = one new type
-   embedding + one new projection, **zero-initialized** so the net's output is
-   bit-unchanged at switch-on (warm start from the current checkpoint, no strength
-   cliff, SPRT-gated like any change). No other weight changes shape — the set
-   transformer is length-agnostic.
+   each type gets its own input projection (per-type modules keyed by type NAME
+   so checkpoint keys stay stable). Adding a type later = one new type embedding
+   + one new projection, **zero-initialized** (`train.migrate_state_dict`) so
+   the new parameters' pre-activation contribution is exactly zero at switch-on
+   (warm start from the current checkpoint, SPRT-gated like any change).
+   Honest caveat: zero-valued tokens still enter attention normalization, so
+   switch-on is *near*-neutral, not bit-neutral — exact bit-neutrality requires
+   additionally pad-masking the new type until enabled. No other weight changes
+   shape — the set transformer is length-agnostic.
 2. **Buffer stores no encodings** (already the A4 rule): training re-encodes
    replayed states, so the whole existing buffer is available in the new schema
    immediately — no migration, no mixed-format examples.

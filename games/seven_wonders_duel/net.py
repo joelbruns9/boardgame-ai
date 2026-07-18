@@ -24,30 +24,44 @@ from .dataset import ENTITY_SPACES, FEATURE_COUNTS, NUM_AUX_CARDS, TOKEN_TYPES
 
 
 class TokenEmbedder(nn.Module):
-    """Shared by the transformer and the MLP control model."""
+    """Shared by the transformer and the MLP control model.
+
+    Per-type modules are keyed by token-type NAME (ModuleDict), so state-dict
+    keys stay stable when a new token type is appended — the §5.8a additive-
+    migration hook (`train.migrate_state_dict` zero-initializes exactly the
+    keys that have no counterpart in an older checkpoint).
+    """
 
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
-        self.entity = nn.ModuleList(
-            nn.Embedding(space, d_model) for space in ENTITY_SPACES
+        self.entity = nn.ModuleDict(
+            {
+                token_type.value: nn.Embedding(space, d_model)
+                for token_type, space in zip(TOKEN_TYPES, ENTITY_SPACES)
+            }
         )
-        self.feature = nn.ModuleList(
-            nn.Linear(count, d_model) for count in FEATURE_COUNTS
+        self.feature = nn.ModuleDict(
+            {
+                token_type.value: nn.Linear(count, d_model)
+                for token_type, count in zip(TOKEN_TYPES, FEATURE_COUNTS)
+            }
         )
         self.type_embedding = nn.Embedding(len(TOKEN_TYPES), d_model)
-        self.aux = nn.Embedding(NUM_AUX_CARDS, d_model)
-        with torch.no_grad():
-            self.aux.weight[0].zero_()  # "no aux entity" contributes nothing
+        # padding_idx keeps the "no aux entity" row at zero permanently —
+        # it receives no gradient, so real tokens never drift it.
+        self.aux = nn.Embedding(NUM_AUX_CARDS, d_model, padding_idx=0)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         type_ids = batch["type_ids"]
         out = self.type_embedding(type_ids) + self.aux(batch["aux_ids"])
         per_type = torch.zeros_like(out)
-        for type_index, (entity, feature) in enumerate(zip(self.entity, self.feature)):
+        for type_index, token_type in enumerate(TOKEN_TYPES):
             mask = type_ids == type_index
             if not mask.any():
                 continue
+            entity = self.entity[token_type.value]
+            feature = self.feature[token_type.value]
             rows = entity(batch["entity_ids"][mask])
             rows = rows + feature(batch["features"][mask][:, : feature.in_features])
             per_type[mask] = rows
