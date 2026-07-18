@@ -498,4 +498,6 @@ Items 1–5 SHIPPED (see `test_chance.py`); item 6 SHIPPED with `codec.py`
   (all 11 reveal outcomes reached); full chi-squared sweep still to run
 - [x] Great Library: 10 outcomes, event-driven, canonical order (§4.4)
 - [x] Search barrier raises on unresolved chance (§4.4) — `test_chance.py`
-- [ ] Buffer replay: masks, chance log, final state hash (§6) — next build item
+- [x] Buffer replay: masks, chance log, full-state digest (§6) — `buffer.py` /
+  `test_buffer.py` (bit-exact replay incl. hidden deal; tamper detection;
+  byte-stable JSONL round-trip)
