@@ -1,6 +1,15 @@
 """7 Wonders Duel rules engine and AI project."""
 
-from .bots import GreedyBot, RandomBot, play_game, play_series
+from .bots import (
+    GreedyBot,
+    MilitaryAggressiveBot,
+    MilitaryEconomyBot,
+    RandomBot,
+    ScienceAggressiveBot,
+    ScienceEconomyBot,
+    play_game,
+    play_series,
+)
 from .buffer import (
     GameRecord,
     GameRecorder,
@@ -61,10 +70,14 @@ __all__ = [
     "GreedyBot",
     "HiddenInformationError",
     "MoveRecord",
+    "MilitaryAggressiveBot",
+    "MilitaryEconomyBot",
     "NUM_ACTIONS",
     "RandomBot",
     "ReplayMismatchError",
     "ResolvedChance",
+    "ScienceAggressiveBot",
+    "ScienceEconomyBot",
     "StepResult",
     "Token",
     "TokenType",
