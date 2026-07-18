@@ -459,7 +459,8 @@ state hash; `chance_log` matches; a record survives JSON round-trip byte-stably.
 ## 7. Engine contract additions (implementation checklist)
 
 Gaps found auditing `game.py` / `engine.py` against this spec, in build order.
-Items 1–5 SHIPPED (see `test_chance.py`); item 6 lands with `codec.py`.
+Items 1–5 SHIPPED (see `test_chance.py`); item 6 SHIPPED with `codec.py`
+(`test_codec.py::test_next_age_starter_is_actor_relative`).
 
 1. ✅ `PublicTableauCard.back: BackType` — expose the (public) back type of
    present cards (§1.4). `BackType` + `back_type_of` live in `data.py`, along
@@ -477,8 +478,9 @@ Items 1–5 SHIPPED (see `test_chance.py`); item 6 lands with `codec.py`.
 5. ✅ `pool.py`: `UnseenPool` from observation only, `enumerate_card_reveal` /
    `enumerate_great_library` / `enumerate_wonder_flip` in canonical order, and
    `resample_hidden(state, rng)` (§4.1, §4.3).
-6. ⬜ NEXT_AGE_STARTER stays engine-side as absolute player ids; actor-relative
-   conversion is codec-only (§3.2) — no engine change, just a pinned test.
+6. ✅ NEXT_AGE_STARTER stays engine-side as absolute player ids; actor-relative
+   conversion is codec-only (§3.2) — no engine change, pinned test in
+   `test_codec.py`.
 
 ---
 

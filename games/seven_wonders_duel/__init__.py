@@ -1,6 +1,13 @@
 """7 Wonders Duel rules engine and AI project."""
 
 from .bots import GreedyBot, RandomBot, play_game, play_series
+from .codec import (
+    NUM_ACTIONS,
+    decode_action,
+    encode_action,
+    legal_action_indices,
+    legal_action_mask,
+)
 from .data import BackType, back_type_of
 from .engine import (
     Action,
@@ -37,6 +44,7 @@ __all__ = [
     "GameState",
     "GreedyBot",
     "HiddenInformationError",
+    "NUM_ACTIONS",
     "RandomBot",
     "ResolvedChance",
     "StepResult",
@@ -44,6 +52,10 @@ __all__ = [
     "VictoryType",
     "apply_action",
     "back_type_of",
+    "decode_action",
+    "encode_action",
+    "legal_action_indices",
+    "legal_action_mask",
     "enumerate_card_reveal",
     "enumerate_great_library",
     "enumerate_wonder_flip",
