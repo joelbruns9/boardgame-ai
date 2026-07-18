@@ -30,6 +30,9 @@ class MoveRecord:
     action: int
     mask_hash: str
     visits: dict[int, int] = field(default_factory=dict)
+    policy_target: dict[int, float] | None = None
+    """Improved (completed-Q) policy from Gumbel search — the preferred
+    training target; visits are kept as raw search evidence for reanalyze."""
     root_value: float | None = None
     sims: int = 0
     mode: str = "simulator"
@@ -163,6 +166,7 @@ class GameRecorder:
         action_index: int,
         *,
         visits: dict[int, int] | None = None,
+        policy_target: dict[int, float] | None = None,
         root_value: float | None = None,
         sims: int = 0,
         mode: str = "simulator",
@@ -182,6 +186,7 @@ class GameRecorder:
             action=action_index,
             mask_hash=mask_hash(game),
             visits=dict(visits) if visits is not None else {},
+            policy_target=dict(policy_target) if policy_target is not None else None,
             root_value=root_value,
             sims=sims,
             mode=mode,
@@ -301,6 +306,11 @@ def to_json_line(record: GameRecord) -> str:
                 "action": move.action,
                 "mask_hash": move.mask_hash,
                 "visits": {str(k): v for k, v in sorted(move.visits.items())},
+                "policy_target": (
+                    {str(k): v for k, v in sorted(move.policy_target.items())}
+                    if move.policy_target is not None
+                    else None
+                ),
                 "root_value": move.root_value,
                 "sims": move.sims,
                 "mode": move.mode,
@@ -348,6 +358,11 @@ def from_json_line(line: str) -> GameRecord:
                 action=move["action"],
                 mask_hash=move["mask_hash"],
                 visits={int(k): v for k, v in move["visits"].items()},
+                policy_target=(
+                    {int(k): v for k, v in move["policy_target"].items()}
+                    if move.get("policy_target") is not None
+                    else None
+                ),
                 root_value=move["root_value"],
                 sims=move["sims"],
                 mode=move["mode"],

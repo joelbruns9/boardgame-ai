@@ -23,6 +23,15 @@ Kingdomino's tree does not have:
 The actor sequence along a path is deterministic given the actions (reveals
 change identities, never who acts next), which is what makes path-keyed open
 nodes and closed-tree actors well-defined.
+
+Known divergence from the plan's architecture, kept deliberately: multi-event
+chance CHAINS are stored flattened per action edge (children keyed by the full
+outcome tuple with correct sequential-conditional probabilities) rather than
+as nested per-event chance nodes. Sampling and expectation are semantically
+identical; what is lost is prefix sharing across sibling outcomes, which
+matters for Star pruning — the Rust searcher (Phase F) implements first-class
+sequential chance layers per the shared-crate design, and this reference
+stays the simpler equivalent.
 """
 
 from __future__ import annotations
@@ -61,50 +70,67 @@ class ChanceSpec:
     context: tuple = ()
 
 
-def _newly_accessible_after_take(state: GameState, taken) -> list[tuple]:
-    """(slot_id, back) of face-down cards a take would expose — public info:
-    layout coverage is printed on the board and backs are visible."""
+def _newly_accessible_after_take(observation, taken) -> list[tuple]:
+    """(slot_id, back) of face-down cards a take would expose. Consumes ONLY
+    the observation: coverage topology from the printed layout and
+    `PublicTableauCard.back` — this function is the anti-leak foundation and
+    never touches hidden identities."""
 
-    tableau = state.tableau
-    layout = TABLEAU_LAYOUTS[tableau.age]
+    layout = {(slot.row, slot.x): slot for slot in TABLEAU_LAYOUTS[observation.age]}
+    cards = {card.slot_id: card for card in observation.tableau}
     present = {
-        slot_id
-        for slot_id, card in tableau.cards.items()
-        if card.present and slot_id != taken
+        slot_id for slot_id, card in cards.items() if card.present and slot_id != taken
     }
     exposed = []
-    for slot_id, card in tableau.cards.items():
+    for slot_id, card in cards.items():
         if slot_id == taken or not card.present or card.revealed:
             continue
-        coverers = covering_slots(layout, card.slot)
+        coverers = covering_slots(
+            tuple(layout.values()), layout[slot_id]
+        )
         if not any((c.row, c.x) in present for c in coverers):
-            exposed.append((slot_id, back_type_of(card.card_name)))
+            exposed.append((slot_id, card.back))
     return sorted(exposed)
 
 
 def chance_signature(state: GameState, action: Action) -> tuple[ChanceSpec, ...]:
+    """Predict the chance events an action fires, from public information only
+    (implemented against the observation; gated exactly vs engine events)."""
+
+    observation = state.observation(state_actor(state))
     if action.use is ActionUse.DRAFT_WONDER:
+        picked = sum(len(city.wonders) for city in observation.cities)
         specs = []
-        if state.wonder_round == 0 and state.wonder_pick_index == 3:
+        if picked == 3:
             specs.append(ChanceSpec(ChanceKind.WONDER_GROUP_REVEAL))
-        if state.wonder_round == 1 and state.wonder_pick_index == 3:
+        if picked == 7:
             specs.append(ChanceSpec(ChanceKind.AGE_DEAL, (1,)))
         return tuple(specs)
     if action.use is ActionUse.CHOOSE_NEXT_START_PLAYER:
-        return (ChanceSpec(ChanceKind.AGE_DEAL, (state.age + 1,)),)
+        return (ChanceSpec(ChanceKind.AGE_DEAL, (observation.age + 1,)),)
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
         return ()
     specs = [
         ChanceSpec(ChanceKind.CARD_REVEAL, (slot_id, back))
-        for slot_id, back in _newly_accessible_after_take(state, action.slot_id)
+        for slot_id, back in _newly_accessible_after_take(observation, action.slot_id)
     ]
-    if (
-        action.use is ActionUse.CONSTRUCT_WONDER
-        and action.wonder_name == "The Great Library"
-        and state.unused_progress_tokens
-    ):
-        specs.append(ChanceSpec(ChanceKind.GREAT_LIBRARY_DRAW))
+    if action.use is ActionUse.CONSTRUCT_WONDER and action.wonder_name == "The Great Library":
+        offboard = unseen_pool(observation).offboard_progress
+        if offboard:
+            specs.append(ChanceSpec(ChanceKind.GREAT_LIBRARY_DRAW))
     return tuple(specs)
+
+
+def age_deal_key(age: int, deal) -> tuple:
+    """Observable signature of an Age deal (spec §4.2): face-up identities plus
+    the public back pattern, in layout order. Two hidden arrangements with the
+    same signature are the same chance child."""
+
+    layout = TABLEAU_LAYOUTS[age]
+    return tuple(
+        name if slot.face_up else back_type_of(name)
+        for slot, name in zip(layout, deal, strict=True)
+    )
 
 
 def sample_outcomes(
@@ -158,11 +184,15 @@ def sample_outcomes(
             probability = None  # sample-only event (spec §4.2)
         else:  # pragma: no cover
             raise AssertionError(spec.kind)
-    key = tuple(
-        outcome if isinstance(outcome, (str, tuple)) else tuple(outcome)
-        for outcome in outcomes
-    )
-    return outcomes, probability, key
+    key_parts = []
+    for spec, outcome in zip(specs, outcomes):
+        if spec.kind is ChanceKind.AGE_DEAL:
+            # Children keyed by OBSERVABLE signature (spec §4.2): equivalent
+            # hidden arrangements coalesce into one node.
+            key_parts.append(age_deal_key(spec.context[0], outcome))
+        else:
+            key_parts.append(outcome if isinstance(outcome, (str, tuple)) else tuple(outcome))
+    return outcomes, probability, tuple(key_parts)
 
 
 # --------------------------------------------------------------------------
@@ -240,8 +270,9 @@ class SearchResult:
     action_index: int
     root_value: float  # root-actor perspective
     visits: dict  # action_index -> visit count
-    policy_target: dict  # action_index -> improved-policy probability
-    sims: int
+    policy_target: dict  # action_index -> improved (completed-Q) probability
+    gumbel_topk: tuple  # the initial Gumbel top-k candidate set (buffer field)
+    sims: int  # always <= config.sims
     mode: str
 
 
@@ -254,6 +285,10 @@ class SearchConfig:
     c_visit: float = 50.0
     c_scale: float = 1.0
     seed: int = 0
+    force_expand_root_chance: bool = False
+    """Closed mode: exhaustively materialize and evaluate every enumerable
+    chance child of the root's edges before searching (plan §5 catastrophe
+    coverage; AGE_DEAL edges stay sampled)."""
 
 
 class GumbelMCTS:
@@ -298,39 +333,47 @@ class GumbelMCTS:
         perspective) and visit count."""
 
         config = self.config
+        if config.sims < 1 or config.top_k < 1:
+            raise ValueError("sims and top_k must be positive")
         log_prior = {a: math.log(max(priors.get(a, 1e-12), 1e-12)) for a in legal}
         gumbel = {a: self.rng.gammavariate(1.0, 1.0) for a in legal}
         gumbel = {a: -math.log(max(g, 1e-12)) for a, g in gumbel.items()}
         candidates = sorted(
             legal, key=lambda a: gumbel[a] + log_prior[a], reverse=True
         )[: min(config.top_k, len(legal))]
+        topk = tuple(candidates)
 
+        budget = config.sims
         sims_used = 0
-        rounds = max(1, math.ceil(math.log2(max(len(candidates), 2))))
+        rounds_total = max(1, math.ceil(math.log2(max(len(candidates), 2))))
+        round_index = 0
         q_hat: dict = {}
         visits: dict = {a: 0 for a in legal}
-        while True:
+        while sims_used < budget:
+            rounds_remaining = max(1, rounds_total - round_index)
             per_action = max(
-                1, config.sims // max(1, rounds * len(candidates))
+                1, (budget - sims_used) // (rounds_remaining * len(candidates))
             )
             for action in candidates:
                 for _ in range(per_action):
-                    if sims_used >= config.sims and len(candidates) == 1:
+                    if sims_used >= budget:
                         break
                     q, n = simulate(action)
                     q_hat[action] = q
                     visits[action] = n
                     sims_used += 1
-            if len(candidates) == 1 or sims_used >= config.sims:
-                break
-            max_visits = max(visits.values()) if visits else 0
-            candidates = sorted(
-                candidates,
-                key=lambda a: gumbel[a]
-                + log_prior[a]
-                + self._sigma(q_hat.get(a, root_value), max_visits),
-                reverse=True,
-            )[: max(1, len(candidates) // 2)]
+                if sims_used >= budget:
+                    break
+            if len(candidates) > 1:
+                max_visits = max(visits.values()) if visits else 0
+                candidates = sorted(
+                    candidates,
+                    key=lambda a: gumbel[a]
+                    + log_prior[a]
+                    + self._sigma(q_hat.get(a, root_value), max_visits),
+                    reverse=True,
+                )[: max(1, len(candidates) // 2)]
+            round_index += 1
 
         max_visits = max(visits.values()) if visits else 0
         best = max(
@@ -351,7 +394,7 @@ class GumbelMCTS:
         weights = {a: math.exp(v - peak) for a, v in logits.items()}
         total = sum(weights.values())
         policy_target = {a: w / total for a, w in weights.items()}
-        return best, visits, policy_target, sims_used
+        return best, visits, policy_target, sims_used, topk
 
     # ---- closed mode ------------------------------------------------------
 
@@ -439,6 +482,32 @@ class GumbelMCTS:
         node.value_sum_p0 += value
         return value
 
+    def _force_expand_root(self, root: ClosedNode) -> None:
+        """Materialize + evaluate every enumerable chance child of the root's
+        edges (catastrophe coverage: rare instant-loss reveals are guaranteed
+        probability-weighted, never unsampled). AGE_DEAL edges stay sampled."""
+
+        for edge in root.edges:
+            if not edge.specs or any(
+                spec.kind is ChanceKind.AGE_DEAL for spec in edge.specs
+            ):
+                continue
+            for outcomes, probability, key in enumerate_chains(root.state, edge.specs):
+                if key in edge.children:
+                    continue
+                clone = root.state.clone()
+                clone.search_barrier = True
+                apply_action(
+                    clone,
+                    decode_action(clone, edge.action_index),
+                    chance_outcomes=outcomes,
+                )
+                child_node = self._make_closed_node(clone)
+                value_p0, _ = self._evaluate(clone)
+                child_node.visits = 1
+                child_node.value_sum_p0 = value_p0
+                edge.children[key] = _Child(probability=probability, node=child_node)
+
     def _search_closed(self, state: GameState) -> SearchResult:
         root_state = state.clone()
         root_state.search_barrier = True
@@ -446,6 +515,8 @@ class GumbelMCTS:
         root_value_p0 = self._expand_closed(root)
         root.visits += 1
         root.value_sum_p0 += root_value_p0
+        if self.config.force_expand_root_chance and not root.terminal:
+            self._force_expand_root(root)
         sign = 1.0 if root.actor == 0 else -1.0
         edges_by_action = {edge.action_index: edge for edge in root.edges}
         priors = {edge.action_index: edge.prior for edge in root.edges}
@@ -455,7 +526,7 @@ class GumbelMCTS:
             self._descend_closed(root, forced_edge=edge)
             return sign * edge.q_p0, edge.visits
 
-        best, visits, policy_target, sims = self._gumbel_root(
+        best, visits, policy_target, sims, topk = self._gumbel_root(
             root.legal, priors, simulate, sign * root_value_p0, root.actor
         )
         self._closed_root = root  # exposed for gates/inspection
@@ -464,6 +535,7 @@ class GumbelMCTS:
             root_value=sign * root.value_p0,
             visits=visits,
             policy_target=policy_target,
+            gumbel_topk=topk,
             sims=sims,
             mode="closed",
         )
@@ -539,7 +611,7 @@ class GumbelMCTS:
             q = sign * (root.edge_value_p0.get(action_index, 0.0) / n) if n else 0.0
             return q, n
 
-        best, visits, policy_target, sims = self._gumbel_root(
+        best, visits, policy_target, sims, topk = self._gumbel_root(
             legal, priors, simulate, sign * root_value_p0, root.actor
         )
         self._open_root = root
@@ -548,6 +620,7 @@ class GumbelMCTS:
             root_value=sign * root.value_p0,
             visits=visits,
             policy_target=policy_target,
+            gumbel_topk=topk,
             sims=sims,
             mode="open",
         )
@@ -592,15 +665,25 @@ def enumerate_chains(state: GameState, specs) -> list[tuple[list, float, tuple]]
     ]
 
 
-def expand_exhaustive(mcts: GumbelMCTS, node: ClosedNode) -> None:
-    """Fully expand a closed subtree to terminal, materializing every chance
-    outcome with exact probabilities. Gate/verifier utility for small
-    positions — raises on AGE_DEAL (sample-only)."""
+def expand_exhaustive(
+    mcts: GumbelMCTS, node: ClosedNode, depth: int | None = None
+) -> None:
+    """Fully expand a closed subtree, materializing every chance outcome with
+    exact probabilities. ``depth=None`` runs to terminal; a finite depth stops
+    there and evaluates the frontier with the net (the §5 net-leaves gate).
+    Gate/verifier utility for small positions — raises on AGE_DEAL."""
 
     if node.terminal:
         return
+    if depth is not None and depth <= 0:
+        if node.visits == 0:
+            value_p0, _ = mcts._evaluate(node.state)
+            node.visits = 1
+            node.value_sum_p0 = value_p0
+        return
     if not node.edges:
         mcts._expand_closed(node)
+    next_depth = None if depth is None else depth - 1
     for edge in node.edges:
         for outcomes, probability, key in enumerate_chains(node.state, edge.specs):
             if key not in edge.children:
@@ -615,7 +698,7 @@ def expand_exhaustive(mcts: GumbelMCTS, node: ClosedNode) -> None:
                     probability=probability, node=mcts._make_closed_node(clone)
                 )
         for child in edge.children.values():
-            expand_exhaustive(mcts, child.node)
+            expand_exhaustive(mcts, child.node, next_depth)
 
 
 # --------------------------------------------------------------------------
@@ -625,14 +708,17 @@ def expand_exhaustive(mcts: GumbelMCTS, node: ClosedNode) -> None:
 
 def closed_root_exact_value(node: ClosedNode) -> float:
     """Recursive exact value (p0 terms): max over edges at decision nodes,
-    probability-weighted expectation at chance edges. Requires every reachable
-    child to be expanded (true on small gate positions searched to
-    exhaustion); unexpanded regions raise."""
+    probability-weighted expectation at chance edges, net value at evaluated
+    frontier leaves (depth-limited trees). The contract is strict: enumerable
+    chance edges must carry their FULL probability mass — a partial tree
+    raises instead of silently returning a conditional value."""
 
     if node.terminal:
         return _terminal_value_p0(node.state)
     if not node.edges:
-        raise ValueError("exact value requires a fully expanded tree")
+        if node.visits:
+            return node.value_p0  # evaluated frontier leaf
+        raise ValueError("exact value reached an unexpanded, unevaluated node")
     sign = 1.0 if node.actor == 0 else -1.0
     best = -math.inf
     for edge in node.edges:
@@ -641,6 +727,8 @@ def closed_root_exact_value(node: ClosedNode) -> float:
         if any(child.probability is None for child in edge.children.values()):
             # Sample-only chance (AGE_DEAL): Monte Carlo mean over samples.
             weight = sum(child.samples for child in edge.children.values())
+            if weight == 0:
+                raise ValueError("sample-only edge has no sampled descents")
             value = (
                 sum(
                     child.samples * closed_root_exact_value(child.node)
@@ -650,12 +738,14 @@ def closed_root_exact_value(node: ClosedNode) -> float:
             )
         else:
             mass = sum(child.probability for child in edge.children.values())
-            value = (
-                sum(
-                    child.probability * closed_root_exact_value(child.node)
-                    for child in edge.children.values()
+            if abs(mass - 1.0) > 1e-9:
+                raise ValueError(
+                    f"chance edge holds probability mass {mass:.6f} != 1 — "
+                    "missing outcomes; expand exhaustively before exact_value"
                 )
-                / mass
+            value = sum(
+                child.probability * closed_root_exact_value(child.node)
+                for child in edge.children.values()
             )
         best = max(best, sign * value)
     return sign * best

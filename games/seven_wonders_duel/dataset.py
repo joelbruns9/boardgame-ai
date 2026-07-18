@@ -123,11 +123,26 @@ def examples_from_record(record: GameRecord) -> list[Example]:
             raise AssertionError("encoder actor disagrees with replay actor")
         legal = np.asarray(legal_action_indices(game), dtype=np.int16)
         policy = np.zeros(len(legal), dtype=np.float32)
-        if move.visits:
+        index_of = {int(a): i for i, a in enumerate(legal)}
+        if move.policy_target:
+            # Preferred: the improved completed-Q distribution from Gumbel
+            # search (visits stay as raw evidence for reanalyze).
+            for action, probability in move.policy_target.items():
+                if int(action) not in index_of:
+                    raise ValueError(
+                        f"move {move.i}: policy target on illegal action {action}"
+                    )
+                policy[index_of[int(action)]] = probability
+            total = float(policy.sum())
+            if not 0.999 <= total <= 1.001:
+                raise ValueError(
+                    f"move {move.i}: policy target sums to {total:.4f}"
+                )
+            policy /= total
+        elif move.visits:
             total = float(sum(move.visits.values()))
             if total <= 0:
                 raise ValueError(f"move {move.i}: visit counts sum to zero")
-            index_of = {int(a): i for i, a in enumerate(legal)}
             for action, visits in move.visits.items():
                 if int(action) not in index_of:
                     raise ValueError(
