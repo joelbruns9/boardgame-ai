@@ -53,7 +53,7 @@ runner. This plan is milestone 7 onward.
 | Wonder draft | In-policy from day 1, ZeusAI tier-list prior blended into draft-node priors, annealed to 0 | 8 high-impact decisions/game; prior is context-free so it must decay |
 | Chance handling | **Dual-mode interface, decided by experiment** (§4): closed-loop exact chance nodes vs open-loop per-descent determinization | User-validated A/B; Rust implements only the winner |
 | Exploration seeding | ScienceRushBot + MilitaryRushBot buffer seeding (annealed) + early opponent mixing | Deletes ZeusAI's 100k-game discovery tax; also teaches the denial side |
-| Value/aux heads | Win/draw/loss + aux: victory type (civ/sci/mil), final VP margin, final military-track position, final science-symbol counts | KataGo lesson: dense long-horizon signal |
+| Value/aux heads | Win/draw/loss + aux: joint winner × victory type (7-way: self/opp × civ/sci/mil, + draw — an explicit trained estimate of each moonshot threat), final VP margin, final military-track position, final science-symbol counts | KataGo lesson: dense long-horizon signal; W/D/L (never margin-blended) is what makes the agent risk-seeking when behind and blocking when ahead |
 | Control model | Flat MLP on same features | Fast baseline + architecturally independent sparring partner (run5/run10 monoculture lesson) |
 | Buffer schema | Replayable from day 1: seed + action sequence + per-move search stats | Reanalyze (Phase G) is a bolt-on, not a migration |
 | Gating | SPRT (fishtest-style), not fixed-N matches | ~3× cheaper gating on clear results |
@@ -188,7 +188,7 @@ harvesting free later.
 
 - `net.py`: set transformer (pre-LN, no positional encoding beyond structural
   features; masked mean-pool or global-token readout). Heads: policy (~1.2k logits,
-  legality-masked softmax), value (W/D/L 3-way), aux (victory type 3-way, VP margin
+  legality-masked softmax), value (W/D/L 3-way), aux (winner × victory type 7-way, VP margin
   regression, military-track final position, science-count finals).
 - `mlp.py`: control model on flattened features, same heads, same trainer.
 - `train.py`: reuse the Kingdomino two-head trainer skeleton (BCE/CE + MSE, val
@@ -308,6 +308,14 @@ Instrumentation from the first scaled run: victory-type mix per iteration (expec
 drift toward ~60/20/17 civ/sci/mil), science-win discovery iteration, draft pick-rate
 table vs ZeusAI tiers, trap-suite blunder rate per checkpoint, Elo ledger vs frozen
 anchors (greedy, rush bots, phase-D net, each HOF gate).
+
+Card/wonder analytics module (`buffer_stats.py`): offline over the replayable
+buffer — per-card build/discard/bury rates and conditional win rates split by
+victory type, wonder pick + win tables, pairing lift (P(win | both built) vs
+baseline), resource-cornering frequency. Analytics and health monitoring ONLY:
+these statistics are policy-generated and never become encoder features or
+training targets (circularity); the sole stats-into-training channels remain the
+annealed draft prior and buffer seeding (§2, §6).
 
 ## 10. Phase H — Exact layer (expectiminimax tail solver)
 
