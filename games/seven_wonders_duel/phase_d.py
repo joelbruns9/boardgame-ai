@@ -423,6 +423,76 @@ def _process_self_play_game(job: GameJob) -> GameRecord:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ModelAgentSpec:
+    """Picklable recipe for a SearchAgent; built parent- or child-side."""
+
+    name: str
+    model_state: dict[str, torch.Tensor]
+    d_model: int
+    layers: int
+    sims: int
+    mode: str
+    top_k: int
+
+
+@dataclass(frozen=True, slots=True)
+class BotAgentSpec:
+    bot: Any
+
+
+GateAgentSpec = ModelAgentSpec | BotAgentSpec
+
+
+def _spec_name(spec: GateAgentSpec) -> str:
+    return spec.bot.name if isinstance(spec, BotAgentSpec) else spec.name
+
+
+def _build_gate_agent(spec: GateAgentSpec, device: str, inference_batch: int):
+    if isinstance(spec, BotAgentSpec):
+        return BotAgent(spec.bot)
+    model = build_model("transformer", spec.d_model, spec.layers)
+    model.load_state_dict(spec.model_state)
+    return SearchAgent(
+        spec.name,
+        Evaluator(model, device, inference_batch),
+        sims=spec.sims,
+        mode=spec.mode,
+        top_k=spec.top_k,
+    )
+
+
+def _process_gate_init(
+    candidate_spec: GateAgentSpec,
+    opponent_spec: GateAgentSpec,
+    inference_batch: int,
+) -> None:
+    torch.set_num_threads(1)
+    _PROCESS_STATE["gate_adapter"] = SevenWondersDuelLoopAdapter()
+    _PROCESS_STATE["gate_candidate"] = _build_gate_agent(
+        candidate_spec, "cpu", inference_batch
+    )
+    _PROCESS_STATE["gate_opponent"] = _build_gate_agent(
+        opponent_spec, "cpu", inference_batch
+    )
+
+
+def _process_gate_game(job: GameJob):
+    candidate = _PROCESS_STATE["gate_candidate"]
+    opponent = _PROCESS_STATE["gate_opponent"]
+    agents = (
+        (candidate, opponent)
+        if job.payload["candidate_is_zero"]
+        else (opponent, candidate)
+    )
+    return play_match(
+        _PROCESS_STATE["gate_adapter"],
+        agents,
+        seed=job.seed,
+        first_player=job.payload["first_player"],
+    )
+
+
 def _search_move(
     game,
     evaluator,
@@ -756,10 +826,82 @@ class PhaseDLoop:
         torch.save(checkpoint, candidate)
         return candidate
 
+    def _model_agent_spec(self, path: str | Path, role: str) -> ModelAgentSpec:
+        model = self.load_model(path)
+        source = getattr(model, "_orig_mod", model)
+        return ModelAgentSpec(
+            name=self.checkpoint_agent_name(path, role),
+            model_state={
+                key: value.cpu() for key, value in source.state_dict().items()
+            },
+            d_model=self.config.d_model,
+            layers=self.config.layers,
+            sims=self.config.gate_sims,
+            mode=self.config.search_mode,
+            top_k=self.config.top_k,
+        )
+
+    def _gate_job(self, index: int, seed_offset: int) -> GameJob:
+        return GameJob(
+            index=index,
+            seed=self.config.seed + seed_offset + index // 2,
+            kind="gate",
+            payload={
+                "first_player": (index // 2) % 2,
+                "candidate_is_zero": index % 2 == 0,
+            },
+        )
+
+    def _play_gate_waves(
+        self,
+        candidate_spec: GateAgentSpec,
+        opponent_spec: GateAgentSpec,
+        test: SPRT,
+        seed_offset: int,
+    ) -> list:
+        """Speculative parallel SPRT: identical decision, ledger, and game
+        count to sequential play.
+
+        Game outcomes depend only on their seeds, never on the SPRT state, so
+        waves of whole seed-pairs run in parallel and their outcomes feed the
+        test in index order. The first paired boundary crossing truncates the
+        record exactly where the sequential loop would have stopped; games
+        already played past it are discarded, costing at most one wave of
+        wasted compute and zero statistical difference.
+        """
+
+        outcomes = []
+        workers = self.config.process_workers
+        wave_games = 2 * workers
+        index = 0
+        while index < self.config.gate_max_games:
+            count = min(wave_games, self.config.gate_max_games - index)
+            jobs = [
+                self._gate_job(index + offset, seed_offset)
+                for offset in range(count)
+            ]
+            wave = run_jobs_in_processes(
+                jobs,
+                _process_gate_game,
+                workers=min(workers, count),
+                initializer=_process_gate_init,
+                initargs=(candidate_spec, opponent_spec, self.config.inference_batch),
+            )
+            for offset, outcome in enumerate(wave):
+                game_index = index + offset
+                outcomes.append(outcome)
+                result = test.update(
+                    outcome.score_for(0 if game_index % 2 == 0 else 1)
+                )
+                if game_index % 2 == 1 and result.decision != "continue":
+                    return outcomes
+            index += count
+        return outcomes
+
     def _sprt_match(
         self,
-        candidate_agent,
-        opponent_agent,
+        candidate_spec: GateAgentSpec,
+        opponent_spec: GateAgentSpec,
         *,
         threshold: float,
         seed_offset: int,
@@ -771,32 +913,43 @@ class PhaseDLoop:
             alpha=self.config.gate_alpha,
             beta=self.config.gate_beta,
         )
-        outcomes = []
-        for index in range(self.config.gate_max_games):
-            candidate_is_zero = index % 2 == 0
-            agents = (
-                (candidate_agent, opponent_agent)
-                if candidate_is_zero
-                else (opponent_agent, candidate_agent)
+        if self.config.process_workers:
+            outcomes = self._play_gate_waves(
+                candidate_spec, opponent_spec, test, seed_offset
             )
-            outcome = play_match(
-                self.adapter,
-                agents,
-                seed=self.config.seed + seed_offset + index // 2,
-                first_player=(index // 2) % 2,
+        else:
+            candidate_agent = _build_gate_agent(
+                candidate_spec, self.config.device, self.config.inference_batch
             )
-            outcomes.append(outcome)
-            result = test.update(
-                outcome.score_for(0 if candidate_is_zero else 1)
+            opponent_agent = _build_gate_agent(
+                opponent_spec, self.config.device, self.config.inference_batch
             )
-            # Stop only after the paired seed has put the candidate in both
-            # seats.  A one-orientation boundary crossing is seat noise.
-            if index % 2 == 1 and result.decision != "continue":
-                break
+            outcomes = []
+            for index in range(self.config.gate_max_games):
+                candidate_is_zero = index % 2 == 0
+                agents = (
+                    (candidate_agent, opponent_agent)
+                    if candidate_is_zero
+                    else (opponent_agent, candidate_agent)
+                )
+                outcome = play_match(
+                    self.adapter,
+                    agents,
+                    seed=self.config.seed + seed_offset + index // 2,
+                    first_player=(index // 2) % 2,
+                )
+                outcomes.append(outcome)
+                result = test.update(
+                    outcome.score_for(0 if candidate_is_zero else 1)
+                )
+                # Stop only after the paired seed has put the candidate in both
+                # seats.  A one-orientation boundary crossing is seat noise.
+                if index % 2 == 1 and result.decision != "continue":
+                    break
         result = test.result()
         return (
             GateResult(
-                opponent=opponent_agent.name,
+                opponent=_spec_name(opponent_spec),
                 threshold=threshold,
                 decision=result.decision,
                 games=result.games,
@@ -806,31 +959,9 @@ class PhaseDLoop:
         )
 
     def promotion_gate(self, candidate: str | Path) -> GateResult:
-        candidate_eval = Evaluator(
-            self.load_model(candidate), self.config.device, self.config.inference_batch
-        )
-        best_eval = Evaluator(
-            self.load_model(self.current_best),
-            self.config.device,
-            self.config.inference_batch,
-        )
-        candidate_agent = SearchAgent(
-            self.checkpoint_agent_name(candidate, "candidate"),
-            candidate_eval,
-            sims=self.config.gate_sims,
-            mode=self.config.search_mode,
-            top_k=self.config.top_k,
-        )
-        opponent = SearchAgent(
-            self.checkpoint_agent_name(self.current_best, "best"),
-            best_eval,
-            sims=self.config.gate_sims,
-            mode=self.config.search_mode,
-            top_k=self.config.top_k,
-        )
         report, outcomes = self._sprt_match(
-            candidate_agent,
-            opponent,
+            self._model_agent_spec(candidate, "candidate"),
+            self._model_agent_spec(self.current_best, "best"),
             threshold=0.50,
             seed_offset=50_000_000,
         )
@@ -838,21 +969,10 @@ class PhaseDLoop:
         return report
 
     def anchor_gates(self, checkpoint: str | Path) -> list[GateResult]:
-        checkpoint_eval = Evaluator(
-            self.load_model(checkpoint),
-            self.config.device,
-            self.config.inference_batch,
-        )
-        checkpoint_agent = SearchAgent(
-            self.checkpoint_agent_name(checkpoint, "anchor_subject"),
-            checkpoint_eval,
-            sims=self.config.gate_sims,
-            mode=self.config.search_mode,
-            top_k=self.config.top_k,
-        )
+        checkpoint_agent = self._model_agent_spec(checkpoint, "anchor_subject")
         targets = [
-            (BotAgent(GreedyBot()), 0.65),
-            *[(BotAgent(bot_type()), 0.60) for bot_type in CURRICULUM_BOT_TYPES],
+            (BotAgentSpec(GreedyBot()), 0.65),
+            *[(BotAgentSpec(bot_type()), 0.60) for bot_type in CURRICULUM_BOT_TYPES],
         ]
         reports = []
         all_outcomes = []

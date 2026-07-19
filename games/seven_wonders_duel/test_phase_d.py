@@ -269,6 +269,38 @@ def test_process_generation_is_deterministic_and_replayable(tmp_path: Path):
         replay(record)
 
 
+def test_process_gate_is_bit_identical_to_sequential_gate(tmp_path: Path):
+    def build(name: str, process_workers: int) -> PhaseDLoop:
+        config = PhaseDConfig(
+            run_dir=str(tmp_path / name),
+            workers=1,
+            process_workers=process_workers,
+            inference_batch=8,
+            seed_games=0,
+            d_model=32,
+            layers=1,
+            top_k=2,
+            gate_sims=1,
+            gate_max_games=4,
+            device="cpu",
+        )
+        loop = PhaseDLoop(config)
+        loop.initialize()
+        return loop
+
+    sequential = build("sequential", 0)
+    parallel = build("parallel", 2)
+    # Identical seeds build identical initial weights, and gate games on CPU
+    # are deterministic per seed, so the speculative wave path must reproduce
+    # the sequential decision, game count, and score exactly.
+    result_seq = sequential.promotion_gate(sequential.current_best)
+    result_par = parallel.promotion_gate(parallel.current_best)
+    assert result_par == result_seq
+    ledger_seq = (sequential.run_dir / "elo" / "elo_games.jsonl").read_text()
+    ledger_par = (parallel.run_dir / "elo" / "elo_games.jsonl").read_text()
+    assert ledger_par == ledger_seq
+
+
 def test_anchor_failure_does_not_block_current_best_promotion(
     tmp_path: Path, monkeypatch
 ):

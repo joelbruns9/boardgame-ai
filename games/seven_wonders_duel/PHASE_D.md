@@ -28,6 +28,12 @@ because batched and unbatched forwards round differently). Prefer
 the threaded fallback and is ignored for generation when process workers are
 active.
 
+SPRT gates use the same knob: game outcomes depend only on their seeds, so
+waves of paired games run speculatively in parallel and feed the test in
+index order. The decision, reported game count, and Elo ledger are exactly
+the sequential ones (a CPU-device test asserts bit-identity); games played
+past the stopping boundary are discarded, wasting at most one wave.
+
 ## Curriculum and labels
 
 - `seed_games=5000` creates replayable Greedy-versus-rush games, cycling all four
