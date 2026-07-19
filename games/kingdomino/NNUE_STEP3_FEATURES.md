@@ -107,8 +107,12 @@ positions it preserved root values 20/20 while reducing nodes 15.7% and wall tim
 over 64 games), positive on average score margin (+7.14), and timing-balanced. The
 underlying Rust API retains an unordered default for explicit oracle comparisons.
 
-**Deferred (non-blocking):** independent Python-oracle full-replay gate; align legacy AZ
-`terminal_search_value` with the official cascade before AZ/hybrid data.
+**Deferred:** independent Python-oracle full-replay gate (non-blocking). Aligning legacy
+AZ `terminal_search_value` with the official cascade is **no longer non-blocking**: it is
+a prerequisite (step 0) of NNUE_PROJECT_PLAN.md's P0 package before any AZ-reanalysis or
+legacy-solver label is frozen — the score-only tie rule (tie → 0.0, no
+territory/crowns cascade) disagrees with `determine_winner` exactly on the tie-adjacent
+late/exact positions P0 mines.
 
 ## The one principle everything follows
 

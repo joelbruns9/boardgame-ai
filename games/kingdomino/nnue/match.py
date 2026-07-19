@@ -35,10 +35,29 @@ def _sha256(path: str | Path) -> str:
 
 
 class TimedBot:
+    _REPORT_FIELDS = (
+        "completed_depth",
+        "timed_out",
+        "elapsed_secs",
+        "nodes",
+        "last_iteration_nodes",
+        "chance_nodes",
+        "aspiration_researches",
+        "star_cutoffs",
+        "exact_extensions",
+        "tt_hits",
+        "tt_cutoffs",
+        "ordering_evals",
+        "ordering_actions",
+        "selective_pruned",
+        "selective",
+    )
+
     def __init__(self, bot):
         self.bot = bot
         self.decision_times: list[float] = []
         self.forced_times: list[float] = []
+        self.search_reports: list[dict] = []
 
     def choose_action(self, state, actions=None, rng=None):
         legal = state.legal_actions() if actions is None else actions
@@ -46,7 +65,66 @@ class TimedBot:
         action = self.bot.choose_action(state, legal, rng=rng)
         elapsed = time.perf_counter() - t0
         (self.forced_times if len(legal) == 1 else self.decision_times).append(elapsed)
+        if len(legal) != 1:
+            report = getattr(self.bot, "last_report", None)
+            if report is not None:
+                # Snapshot the PyO3 object immediately; OperationalRustSearchBot
+                # replaces `last_report` on every move.
+                self.search_reports.append({
+                    field: getattr(report, field, None) for field in self._REPORT_FIELDS
+                })
         return action
+
+    def _search_summary(self) -> dict | None:
+        if not self.search_reports:
+            return None
+
+        def values(field: str, dtype=np.float64) -> np.ndarray:
+            return np.asarray(
+                [report[field] for report in self.search_reports if report[field] is not None],
+                dtype=dtype,
+            )
+
+        depth = values("completed_depth")
+        nodes = values("nodes")
+        last_nodes = values("last_iteration_nodes")
+        timed_out = values("timed_out")
+        chance = values("chance_nodes")
+        chance_available = len(chance) == len(self.search_reports)
+        node_total = float(nodes.sum()) if len(nodes) else 0.0
+        chance_total = float(chance.sum()) if chance_available else None
+        denominator = node_total + (chance_total or 0.0)
+        chance_share = (
+            chance_total / denominator
+            if chance_total is not None and denominator > 0.0
+            else None
+        )
+        return {
+            "report_count": len(self.search_reports),
+            "completed_depth_mean": float(depth.mean()) if len(depth) else None,
+            "completed_depth_median": float(np.median(depth)) if len(depth) else None,
+            "completed_depth_min": int(depth.min()) if len(depth) else None,
+            "completed_depth_max": int(depth.max()) if len(depth) else None,
+            "completed_depth_histogram": (
+                {
+                    str(int(value)): int((depth == value).sum())
+                    for value in np.unique(depth)
+                }
+                if len(depth)
+                else {}
+            ),
+            "nodes_mean": float(nodes.mean()) if len(nodes) else None,
+            "nodes_total": int(nodes.sum()) if len(nodes) else None,
+            "last_iteration_nodes_mean": (
+                float(last_nodes.mean()) if len(last_nodes) else None
+            ),
+            "timeout_count": int(timed_out.sum()) if len(timed_out) else 0,
+            "timeout_rate": float(timed_out.mean()) if len(timed_out) else None,
+            "chance_nodes_mean": float(chance.mean()) if chance_available else None,
+            "chance_nodes_total": int(chance_total) if chance_total is not None else None,
+            "chance_share": chance_share,
+            "chance_share_denominator": "chance_nodes / (nodes + chance_nodes)",
+        }
 
     def summary(self) -> dict:
         values = np.asarray(self.decision_times, dtype=np.float64)
@@ -60,6 +138,7 @@ class TimedBot:
             "decision_max_seconds": float(values.max()) if len(values) else 0.0,
             "forced_count": int(len(forced)),
             "forced_total_seconds": float(forced.sum()) if len(forced) else 0.0,
+            "search": self._search_summary(),
         }
 
 
@@ -101,6 +180,8 @@ def run_paired(
     seed_start: int,
     paired_seeds: int,
     settings: dict | None = None,
+    observer=None,
+    continue_on_game_error: bool = False,
 ) -> dict:
     if paired_seeds < 1:
         raise ValueError("paired_seeds must be >= 1")
@@ -108,13 +189,39 @@ def run_paired(
     bot_b = TimedBot(b.make_bot())
     pair = PairResult(a=a.name, b=b.name)
     games = []
+    failed_games = []
     t0 = time.perf_counter()
     for i in range(paired_seeds):
         seed = seed_start + i
-        for result in (
-            play_game(a.name, bot_a, b.name, bot_b, seed=seed),
-            play_game(b.name, bot_b, a.name, bot_a, seed=seed),
-        ):
+        game_specs = (
+            (a.name, bot_a, b.name, bot_b),
+            (b.name, bot_b, a.name, bot_a),
+        )
+        for p0_name, p0_bot, p1_name, p1_bot in game_specs:
+            try:
+                result = play_game(
+                    p0_name,
+                    p0_bot,
+                    p1_name,
+                    p1_bot,
+                    seed=seed,
+                    observer=observer,
+                )
+            except Exception as exc:
+                if not continue_on_game_error:
+                    raise
+                failure = {
+                    "seed": seed,
+                    "p0": p0_name,
+                    "p1": p1_name,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                failed_games.append(failure)
+                callback = getattr(observer, "on_game_aborted", None)
+                if callback is not None:
+                    callback(seed, p0_name, p1_name, exc)
+                continue
             update_pair(pair, result, a.name, b.name)
             games.append(asdict(result))
     wall = time.perf_counter() - t0
@@ -125,12 +232,15 @@ def run_paired(
         "settings": settings or {},
         "pair": {
             **asdict(pair),
-            "a_points_rate": points / pair.games,
+            "a_points_rate": points / pair.games if pair.games else 0.0,
             "a_points_lcb_95": wilson_lower_bound(points, pair.games),
             "avg_margin_a": pair.avg_margin_a,
         },
         "timing": {a.name: bot_a.summary(), b.name: bot_b.summary()},
         "wall_seconds": wall,
+        "requested_games": paired_seeds * 2,
+        "completed_games": pair.games,
+        "failed_games": failed_games,
         "games": games,
     }
 

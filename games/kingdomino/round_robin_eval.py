@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 
+from games.kingdomino.action_codec import encode_action
 from games.kingdomino.bots import GreedyBot, RandomBot
 from games.kingdomino.game import (
     GameState, Phase, determine_winner, PickAction, TurnAction,
@@ -528,6 +529,14 @@ def build_participants(args: argparse.Namespace) -> List[Participant]:
 # Game / match logic
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _notify_observer(observer: Any, method: str, *args, **kwargs) -> None:
+    if observer is None:
+        return
+    callback = getattr(observer, method, None)
+    if callback is not None:
+        callback(*args, **kwargs)
+
+
 def play_game(
     p0_name: str,
     p0_bot: BotProtocol,
@@ -535,6 +544,7 @@ def play_game(
     p1_bot: BotProtocol,
     *,
     seed: int,
+    observer: Any = None,
 ) -> GameResult:
     state = GameState.new(seed=seed)
     # One per-game RNG object is passed to bots for tie breaks, PIMC shuffles, and
@@ -547,11 +557,45 @@ def play_game(
     n_placements = 0     # TurnActions (PLACE_AND_SELECT + FINAL_PLACEMENT)
     n_discards = 0       # TurnActions with placement=None
     pick_slot_counts: Dict[int, int] = {}
+    _notify_observer(observer, "on_game_start", seed, p0_name, p1_name, state)
 
     while state.phase != Phase.GAME_OVER:
         actor = state.current_actor
         actions = state.legal_actions()
-        action = bots[actor].choose_action(state, actions, rng=rng)
+        actor_name = (p0_name, p1_name)[actor]
+        _notify_observer(observer, "on_position", state, actor_name)
+        try:
+            action = bots[actor].choose_action(state, actions, rng=rng)
+        except Exception as exc:
+            _notify_observer(
+                observer, "on_failure", "action_selection", state, actor_name, exc
+            )
+            raise
+        if action not in actions:
+            # Action decoding canonicalises placements, so a physically legal
+            # action (notably from OpenLoopEvalBot) need not compare equal to the
+            # engine's representative object. Resolve it by the stable joint
+            # action index before declaring it illegal.
+            try:
+                target_index = encode_action(action, state)
+                action = next(
+                    legal for legal in actions
+                    if encode_action(legal, state) == target_index
+                )
+                _notify_observer(
+                    observer, "on_action_mapping", state, actor_name, target_index
+                )
+            except Exception as mapping_exc:
+                exc = ValueError(
+                    f"{actor_name} returned an action outside the legal set and "
+                    f"joint-index mapping failed: action={action!r}; "
+                    f"legal_count={len(actions)}; cause={mapping_exc}"
+                )
+                _notify_observer(
+                    observer, "on_failure", "illegal_action", state, actor_name, exc
+                )
+                raise exc from mapping_exc
+        _notify_observer(observer, "on_action", state, actor_name, action, actions)
 
         # ── degenerate diagnostics ──
         if isinstance(action, TurnAction):
@@ -567,7 +611,15 @@ def play_game(
             slot = state.current_row.index(picked)
             pick_slot_counts[slot] = pick_slot_counts.get(slot, 0) + 1
 
-        state = state.step(action)
+        try:
+            next_state = state.step(action)
+        except Exception as exc:
+            _notify_observer(
+                observer, "on_failure", "action_resolution", state, actor_name, exc
+            )
+            raise
+        _notify_observer(observer, "on_transition", state, next_state, actor_name, action)
+        state = next_state
 
     score0 = score_total(state.boards[0])
     score1 = score_total(state.boards[1])
@@ -595,7 +647,7 @@ def play_game(
               f"discard_rate={discard_rate:.2f} pick_slot_entropy={pick_slot_entropy:.3f}",
               flush=True)
 
-    return GameResult(
+    result = GameResult(
         seed=seed,
         p0=p0_name,
         p1=p1_name,
@@ -606,6 +658,8 @@ def play_game(
         discard_rate=discard_rate,
         pick_slot_entropy=pick_slot_entropy,
     )
+    _notify_observer(observer, "on_game_end", state, result)
+    return result
 
 
 def update_standings(standings: Dict[str, Standing], result: GameResult) -> None:

@@ -73,7 +73,11 @@ The live web-server extension was not replaced. On six representative positions 
 quantized timed path sustained roughly **101k-126k nodes/s**: every 0.5s move completed
 depth 3; at 1.0s, five completed depth 3 and one depth 4; at 2.0s, three completed depth
 3 and three depth 4. All intentionally timed out while returning the last complete
-iteration.
+iteration. Note that headline node rates are gate-specific: the depth-5 sampled-chance
+gate above works out to roughly 0.9M nodes/s while these eval-bound six-position gates
+run 101-126k, likely because exact-tail extensions visit many nodes that never call the
+NNUE eval. Use each experiment's own telemetry; do not transplant a single nodes/s
+figure across position mixes when projecting clock-scaling behavior.
 
 Full-width move ordering is now the NNUE operational default and remains completely
 separate from selective pruning: every legal action is retained, ordering uses only the
@@ -118,6 +122,156 @@ run the matched-clock scaling curve and the primary-goal disagreement/curriculum
 described below. Defer the larger stochastic-search and NNUE-training packages until
 those cheap gates report. The original phase descriptions below remain planning
 history; these measurements supersede their bottleneck predictions.
+
+## P0 results + eval-quality pivot (2026-07-15)
+
+P0 steps 1-2 are complete; both used the 50k `sparse_v3_pilot` artifact. Reports live under
+gitignored `runs/kingdomino/nnue_loop/`.
+
+- **Step 1 — matched-clock scaling (`clock_scaling_p0_step1.json`): the NNUE-vs-AZ gap is
+  FLAT.** The pilot lost every paired game at 0.1/0.5/2/10s; margin ~-80/-90; mean completed
+  depth rose only 1.93->3.27; fitted slope +0.28 pts/clock-decade (inside a +/-5-pt flat band).
+  Crucially `chance_share ~= 1.7%` — chance allocation (Work Package A) is NOT the bottleneck.
+  Samples are small (4-8 games) but 0/all is a clear directional flat call, not a strength CI.
+- **Step 2 — competence floor (`competence_floor_p0_step2.json`): the pilot is NOT
+  generation-ready.** Beats Random (100%) but FAILS the Greedy floor (39.6%), loses to
+  pick-aware operational search (25%) and mid-AZ iter20/400-sim (6.2%). Plumbing is perfect:
+  0 illegal actions, full phase/round coverage, forced discards 7.1% (endgame-concentrated).
+
+**Diagnosis: the failure is EVAL CONTENT, not search/chance/plumbing.** Under identical
+operational search, the pilot NNUE eval loses to the trivial `pick_aware` (margin +
+claimed-crown) eval — the net is worse than a hand-crafted heuristic, despite beating the
+0.25 static-Brier baseline on its training distribution (a textbook "static val loss != strength"
+gap). Leading hypothesis: off-distribution failure (alpha-beta walks off the 50k-position
+training support).
+
+### Sharpened conclusion — Kingdomino is EVAL-dominated, not DEPTH-dominated
+
+This refines the "joint pick x placement branching is the leading risk" note into a stronger
+structural claim, now backed by the two results:
+
+- The scoring horizon (end-game connectivity x crowns, middle-kingdom bonus, harmony) is far
+  longer than reachable search depth (~3 plies — not even crossing a round boundary, hence the
+  ~1.7% chance share). So the eval must carry nearly all the strategic load; the agent
+  degenerates toward "greedy over the eval," with no tactical depth to bail out a weak eval.
+- **Pruning-quality == eval-quality here.** Sound alpha-beta cutoffs come from bounds, not the
+  eval value; a heuristic eval helps only via move ordering (free depth, no answer change) or
+  forward/selective pruning (heuristic, unsound, depth-for-trust). Selective pruning already
+  backfired with a weak eval: the width-2 beam reached nominal depth 8-12 and LOST 22-26. You
+  cannot prune past a bad eval — pruning is a multiplier on eval quality, not a substitute.
+- **NNUE's normal self-teaching loop cannot bootstrap here.** Both AZ and chess-NNUE learn the
+  eval by regressing toward a search STRONGER than the eval (MCTS; deep alpha-beta). In
+  Kingdomino NNUE's own search is shallow, so it is a WEAK teacher — already shown by the
+  rejected 256-game self-imitation candidate. The teacher must be imported: AZ MCTS + the exact
+  endgame solver + honest outcomes, distilled OFFLINE into the cheap CPU eval. AZ never runs
+  inside the search (GPU per-node is fatal and reintroduces the exact problem NNUE exists to
+  escape); the NNUE eval IS the offline compression of AZ's judgment.
+
+**Consequence for the outcome hierarchy:** standalone depth-based superiority (outcome 1) is now
+the LEAST likely win for the current design; realistic value concentrates in a better EVAL,
+EXACT ENDGAMES (the one regime where the horizon collapses and search reaches the result), and
+the AZ CURRICULUM. This does not yet trigger the formal pivot rule (which requires the stochastic
+sweep + two promotion-capable training iterations), but it re-weights effort now.
+
+**UPDATE (2026-07-15, depth-conversion probe DONE — verdict `no_conversion`,
+`runs/kingdomino/nnue_loop/depth_conversion.json`):** the eval-dominance conclusion is now
+empirically confirmed, and more strongly than predicted — **feasible full-width depth is
+COUNTERPRODUCTIVE, not merely neutral.** Holding the decent `pick_aware` eval fixed (240 games,
+0 failures, every decision completing exactly d1/d2/d3, no timeouts, direct `RustExpectiminimax`
+recursion with no exact-tail confounding): d2-vs-d1 was ~even (52.1% [38.3, 65.5], +1.29) but
+**d3-vs-d1 LOST (33.3% [21.7, 47.5], -7.77)** and d3-vs-d2 lost (35.4%, -13.58) — Wilson upper
+bounds below 50%, i.e. directional. d3 closed NONE of the Step-1 AZ gap (0/‌13 vs AZ at 65 and
+260 sims, margin -84/-87; cross-seed margin vs AZ actually *worsened* 6.44/3.77 pts). This is the
+classic minimax-pathology signature: deeper full-width search over a heuristic (non-terminal)
+leaf propagates the eval's biases and degrades decisions. If useful depth begins only beyond the
+next hidden row, that depth is practically unreachable here — which is itself the negative result.
+
+**This effectively settles the DEPTH-based standalone thesis for the current design** (a
+structural finding independent of eval quality, stronger than the formal two-training-iteration
+pivot rule contemplated). Deprioritize retraining aimed at out-searching AZ. A better eval still
+matters — but for its STATIC / shallow roles: generator, relabeler, and AZ-curriculum, plus the
+already-valuable exact endgame (which is exact-to-terminal search, NOT heuristic minimax, and is
+unaffected by this pathology).
+
+### Re-sequenced critical path (supersedes the "next action" ordering in the Phase-4 status)
+
+P0 steps 3-7 (trajectory collection, disagreement mining, reanalysis, curriculum) are PAUSED:
+they need a competent generator, and the pilot fails the Greedy floor. Do not spend AZ teacher
+compute yet. Step 0 (AZ terminal cascade alignment) stays queued (it gates label-producing steps
+5-7, not the remediation). Work Package A stays deprioritized (chance is not the bottleneck).
+The critical path is now eval remediation **for the eval's static/generator/relabeler roles**
+(NOT for deep out-searching — the depth route is settled negative above):
+
+1. **Depth-conversion probe (fitness discriminator).** DONE 2026-07-15 — verdict
+   `no_conversion` (depth counterproductive; see the UPDATE block above).
+   Prompt: `NNUE_P0_DEPTH_CONVERSION_PROMPT.md`.
+2. **Eval-quality diagnosis (NEXT).** Localize why the pilot eval is below trivial (bug/scaling
+   vs undertraining vs off-distribution vs capacity): deployed quantized-vs-float parity, and
+   stratified STATIC value/ranking accuracy vs ground truth (on- vs off-distribution). Judge the
+   eval as a static / 1-ply evaluator — the role that now matters — not as a deep-search enabler.
+   Prompt: `NNUE_P0_EVAL_DIAGNOSIS_PROMPT.md`.
+3. **Retrain against a shallow-play gate.** Recipe chosen by the diagnosis (natural first try:
+   supervised distillation on the FULL ~1M AZ buffer, not just 50k, with whole-game splits). The
+   gate is now **clear the competence floor at SHALLOW play** — beat Greedy and be competitive
+   with `pick_aware` at d1-d2 (deep search no longer justified) — never lower validation loss
+   alone. Since a good eval loses value at d3, the eval is a static evaluator / generator, and
+   its downstream job is the AZ curriculum + relabeling, not out-searching AZ.
+
+**Parallel, eval-independent track (elevated by this result):** the **exact endgame relabeler**
+needs no eval at all — it produces ground-truth official-outcome labels where the horizon
+collapses, useful the moment the solver runs, and feeds both AZ curriculum and AZ endgame value.
+It is gated only on **Step 0 (cascade alignment)** (align the exact solver / AZ terminal to the
+official largest-territory/crowns cascade), which is therefore promoted from "queued" toward the
+near-term path. It can proceed independently of the eval diagnosis/retrain.
+
+Only after an eval clears that gate do P0 steps 3-7 (curriculum) resume.
+
+## Committed direction (2026-07-16): AZ pick-denial curriculum (NNUE eval demoted)
+
+Decision (user, agreed): the project pivots off the NNUE-eval track onto **distilling
+pick-denial into AlphaZero itself**, using the mechanic ALREADY prototyped in the web advisor's
+`_draft_matrix` (`web_app.py:911`). Key realization: in 2p Kingdomino **boards are disjoint —
+placements never interact, so ALL player interaction is pick / turn-order** (advisor docstring),
+which makes "delegate placement, search picks only" EXACT, not an approximation. The advisor
+already measured the blindspot (a game-losing reply at 4.7% prior received 0.6% of 3200 sims) and
+computes per-pick `fragility = headline - robust`. The user treats advisor experience as
+sufficient proof of value, so we **skip a separate materiality probe** and go straight to learning.
+
+Goal: **the deployed AZ net plays denial correctly WITHOUT any extra search** — train it so plain
+AZ-MCTS no longer starves denial picks and draft-matrix fragility on held-out positions drops.
+Deployment-time simplicity, not an advisor-time crutch.
+
+Design:
+- **Search = offline 8-ply pick-denial expectiminimax** at start-of-round positions. 8 pick-plies
+  = ~2 rounds = crossing exactly ONE chance node (the next-round draw): the tractable sweet spot
+  (~2k leaves at k=8, AZ leaf eval affordable), NOT the infeasible 12-ply/3-chance-node target.
+  Forced exploration of every opponent pick (rooted — defeats prior starvation), placement
+  delegated to AZ, AZ value at leaves, chance sampled with common random numbers, order-blind bag.
+- **Target band = midgame -> just before the exact frontier.** Chance branching collapses late, so
+  8-ply gets cheaper/more exact toward the endgame where the solver already owns the last ~2-3
+  rounds; denial matters most in the midgame band before that.
+- **Primary training target = POLICY, not value.** The blindspot is prior starvation, a POLICY
+  problem ("value relabeling alone will NOT fix policy-prior starvation"). The 8-ply search's
+  per-pick searched values become a denial-corrected POLICY target (tie/uncertainty/temperature
+  handling); corrected value is secondary. Apply the correction ONLY where fragility is materially
+  high (targeted, not blanket) so AZ's non-denial mistakes are not distilled.
+- **Iterate to grow denial depth.** One iteration teaches ~1-round denial; once the net stops
+  starving those picks, the next iteration's 8-ply search sees 2-round denial at its horizon, etc.
+  Multi-round denial is grown by the ratchet, so 8-ply per iteration suffices; turn-order denial is
+  the reliable cross-chance signal (specific next-round tile denial is only in expectation).
+- **Gate:** control vs treatment AZ at equal compute; success = fragility drop on a frozen probe
+  set + head-to-head strength + frozen disagreement/exact suites. Lower loss alone is not success.
+
+Main engineering risk: **offline throughput** — 8-ply x k-chance x many positions with AZ leaf
+evals needs batched leaf evaluation + TT reuse; the advisor's per-position ~20s path will not scale
+(see [[kingdomino_advisor_throughput_review]]). NNUE eval diagnosis/retrain is DEMOTED off the
+critical path (the draft-matrix search runs on AZ's net; no NNUE eval needed). The exact endgame
+relabeler (Step-0-gated) remains a parallel independent win.
+
+Next: build + validate the offline 8-ply pick-denial search & label emitter on a small set (labels
+sane, denial found, turn-order + chance-crossing correct, incremental value over the existing
+1-round draft matrix) BEFORE any retrain; then the small control/treatment curriculum experiment.
+Prompt: `NNUE_DENIAL_SEARCH_BUILD_PROMPT.md`.
 
 ## Approved direction after the search/training review (2026-07-14)
 
@@ -168,7 +322,8 @@ Separate **chance correctness** from **chance efficiency**:
   standalone strength**. The current full-width ceiling (usually depth 3-4 at practical
   clocks), weak narrow-deep confirmation, and strong AZ policy prior all point here.
   Measure legal-action distributions and effective alpha-beta branching by phase rather
-  than relying on a rough `100^4` estimate, which ignores legality contraction,
+  than relying on rough worst-case products (on the order of 100 joint pick×placement
+  actions per ply raised to the search depth), which ignore legality contraction,
   ordering, transpositions, and pruning.
 
 The selective result (22-26, -2.9 margin) is negative evidence for that one width-2
@@ -181,6 +336,25 @@ widen with time. A clock-scaling curve is the correct cheap discriminator.
 This package moves ahead of the standalone-oriented A/B/C packages. It uses the pilot
 NNUE as a **disagreement hypothesis generator**, not as an authoritative teacher.
 
+**STATUS UPDATE (2026-07-15): steps 1-2 done; steps 3-7 PAUSED pending eval remediation.**
+See "P0 results + eval-quality pivot (2026-07-15)" above. The pilot fails the Greedy floor,
+so it is not yet a usable generator; the critical path diverts to the depth-conversion probe,
+eval-quality diagnosis, and a retrain gated on beating `pick_aware` under matched search before
+steps 3-7 resume. The step descriptions below stand as-is for when generation restarts.
+
+0. **Label-correctness prerequisite — cascade-align the AZ-side terminal value before
+   freezing any reanalysis label.** `terminal_search_value` (`mcts_az.py`) still decides
+   the terminal win value by raw score comparison and returns 0.0 on a score tie — it
+   never applies the official largest-territory/crowns cascade — and the legacy
+   `solve_endgame_ab` optimizes raw margin. The NNUE operational searcher already uses
+   the official-outcome objective, so a high-budget AZ reanalysis teacher would disagree
+   with the game's own winner rule exactly on the tie-adjacent late/exact positions P0
+   prizes most. Either align the AZ terminal backup (and any legacy-solver labels) with
+   `determine_winner`'s cascade, or route every exact/late label through the
+   cascade-correct NNUE-side exact search; in all cases record which terminal rule
+   produced each label. NNUE_STEP3_FEATURES.md listed this as "deferred (non-blocking)";
+   it is **blocking for P0 steps 5-7** (label production), though not for the pure
+   gameplay measurements in steps 1-2.
 1. **Clock-scaling characterization.** Run matched practical clocks at
    `0.1 / 0.5 / 2 / 10s` for NNUE and AZ, with paired seeds/both seats and actual
    decision-time telemetry. Use a small screening set at all clocks, then a disjoint
@@ -208,7 +382,12 @@ NNUE as a **disagreement hypothesis generator**, not as an authoritative teacher
    so guarantee the NNUE candidate and AZ candidate adequate root-child evaluation
    (forced first-action searches, a temporary root prior floor, or equivalent explicit
    child-value probes). Keep ordinary high-budget AZ visits separate from forced-probe
-   evidence in provenance. Reject candidates whose apparent edge disappears.
+   evidence in provenance. Reject candidates whose apparent edge disappears. Run a
+   **precision checkpoint** before scaling: reanalyze only the top ~100 ranked
+   candidates and measure what fraction survive. Reanalysis is the expensive step, and
+   with a generator that lost 0-8 most disagreements will be NNUE mistakes; if survival
+   is very low (roughly under 10-20%), fix the ranking features or the generator before
+   spending teacher compute on thousands of candidates.
 6. **Freeze 1-2k validated disagreement examples.** Split by whole source game/seed.
    Keep a frozen disagreement/exact probe subset out of training. Store the public state,
    both candidate actions, original and reanalysis visits/values, realized official
@@ -216,13 +395,27 @@ NNUE as a **disagreement hypothesis generator**, not as an authoritative teacher
 7. **Run the falsifiable AZ curriculum experiment.** Fine-tune two AZ candidates with
    identical initialization, examples, updates, optimizer settings, and compute:
    control = ordinary replay replacement; treatment = the tagged 75/10/10/5 mixture
-   below. Compare HOF/gauntlet strength, frozen disagreement/exact error, and closure of
-   repeatable exploits. Lower loss alone is not success.
+   below. P0 itself must produce all three non-control slices at small scale — the
+   numbered steps above only explicitly produce the disagreement set. Source the 10%
+   NNUE-generated/AZ-reanalyzed slice from step-2 competence-floor and NNUE-vs-AZ games
+   pushed through the step-5 reanalysis machinery; the 10% disagreement slice from
+   step 6; and the 5% exact slice from exact tails encountered in steps 4-6 plus the
+   endgame solver on late positions of the fresh trajectories. If a slice cannot be
+   filled honestly at this scale, shrink it in both arms and record the actual mixture —
+   never pad with lower-quality data. Compare HOF/gauntlet strength, frozen
+   disagreement/exact error, and closure of repeatable exploits. Lower loss alone is
+   not success.
 
-If the treatment helps, the project has delivered its primary practical goal and earns
-scaling investment even if NNUE remains weaker head-to-head. If it does not, inspect
-whether the failure is generator competence, disagreement precision, reanalysis label
-quality, or replay mixing before producing the 5k-game teacher corpus.
+**Pre-register the decision metrics before training, and match them to the statistical
+power available.** At 1-2k curriculum examples the sensitive instruments are the frozen
+disagreement/exact suites and closure of specific repeatable exploits; any gauntlet Elo
+shift a mixture this small could cause is likely below the noise floor of an affordable
+match count. A null Elo result with clearly improved frozen-suite error is a scale-up
+signal, not a failure. If the treatment helps on the pre-registered metrics, the project
+has delivered its primary practical goal and earns scaling investment even if NNUE
+remains weaker head-to-head. If it is flat on all of them, inspect whether the failure
+is generator competence, disagreement precision, reanalysis label quality, or replay
+mixing before producing the 5k-game teacher corpus.
 
 ### Standalone work package A — stochastic allocation (after P0)
 
@@ -259,7 +452,16 @@ Evaluate in this implementation order after P0; do not build every mode up front
    experiment because it can change the depth/accuracy trade. The engine currently
    fuses dealing into the round transition, so scope an explicit pre-deal boundary/eval
    state, make/unmake behavior, hashing rule, and parity tests before implementation;
-   do not install an arbitrary row and pretend it is unknown.
+   do not install an arbitrary row and pretend it is unknown. The gap is training
+   distribution as much as plumbing: every position in the current corpus has a fully
+   dealt visible row, so the frozen net has never been asked to value a pre-deal state,
+   and its out-of-distribution output there is not a boundary value. Boundary evaluation
+   therefore also needs (a) a representability check that the frozen schema encodes
+   "row not yet dealt" unambiguously rather than aliasing an empty/consumed row, and
+   (b) labeled pre-deal training positions — every round boundary of every existing
+   replayable trajectory yields one for free — feeding a separately versioned
+   boundary-capable artifact or an auxiliary boundary head. Do not report mode-2
+   results obtained by pointing the current net at states it never trained on.
 3. **K=1 representative future — diagnostic only.** Use one legal sampled future to
    measure the maximum possible depth gain and instability. Do not promote it to a
    gameplay or data-generation default merely because it reaches a larger nominal
@@ -659,10 +861,17 @@ actions specifically to prevent that mistake.
 #### Conditional Phase-3 experiment — Middle-Kingdom-aware late-move reductions
 
 The strongest game-specific branch-reduction hypothesis is the castle-centred target,
-not a generic top-K beam. Precisely: Middle Kingdom requires the final occupied bbox to
-be the **7×7 square centred on the castle** (coordinates no farther than three cells
-from it). Because the bbox grows monotonically, placing either half outside that square
-irreversibly forfeits the 10-point bonus. The mature AZ policy's strong preference for
+not a generic top-K beam. Precisely, as this engine scores it (`board.py::score`): the
+bonus pays only when the final occupied bbox is **exactly 7×7 with the castle at its
+centre** (`width == height == 7`, castle at `(min_x+3, min_y+3)`). Two consequences
+follow. Because the bbox only grows, placing either half of a domino outside the 7×7
+window centred on the castle irreversibly forfeits the 10-point bonus — that is the
+irreversibility the reduction keys on. But staying inside the window is necessary, not
+sufficient: the kingdom must also grow to the full 7×7 extent, so "still possible"
+below means the window is intact **and** enough placements remain to reach width and
+height 7. Gate on the cheap window-intact check first; add an extent-reachability
+necessary-condition check if telemetry shows positions where the bonus is already
+unreachable are common late in the game. The mature AZ policy's strong preference for
 preserving this bonus makes these actions plausible *late moves*, but does not prove
 they are dominated: an outside placement can connect a crown-rich region worth more
 than 10, avoid losing a domino, or carry a strategically critical next-row pick/denial.
@@ -797,7 +1006,9 @@ enhancement:
 They flagged this as their **suspected bottleneck** (future work). We can beat it:
 our chance branching C(remaining,4) *collapses* (135751→…→70→1) so we get **exact
 expectiminimax in the endgame** (Azul's 20-from-big-bag couldn't), sample +
-variance-reduce early, and add **Star2 pruning** they never tried.
+variance-reduce early, and add **Star2 pruning** they never tried. (Status check: the
+operational Rust search implements **Star1 only** today; Star2 is an available upgrade
+enabled by our bounded eval, not an existing edge.)
 
 **Calibration guardrail (we already hit this): a deterministic WORLD is fine; a
 deterministic FUTURE inside the search is not.** The world (self-play game) must
@@ -834,9 +1045,10 @@ Three separable safeguards, all required:
 - **Our current methodology is more expectation-oriented than Azul's default.** What
   softens (b) for Kingdomino is *late-game structure*: C(remaining,4)
   collapses → exact enumeration late + exact endgame (Azul's 20-from-big-bag
-  never could); draws are 4-tile objects (lower per-node variance); + Star2 chance
-  pruning they likely lacked; + delegating draw-averaging to the learned eval. The
-  OPENING still samples → the bottleneck shrinks, doesn't vanish.
+  never could); draws are 4-tile objects (lower per-node variance); + Star1 chance
+  pruning today (Star2 an available upgrade) that they likely lacked; + delegating
+  draw-averaging to the learned eval. The OPENING still samples → the bottleneck
+  shrinks, doesn't vanish.
 - **Real edge = measurement.** They *suspected* draw handling was the bottleneck
   but didn't isolate it. We make draw-handling an explicit swept axis
   (branchingFactor, enum threshold, sampling scheme, Star2 on/off, eval-delegation
