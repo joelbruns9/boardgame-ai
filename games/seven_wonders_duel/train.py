@@ -170,10 +170,14 @@ def game_honest_split(examples: list[Example], val_frac: float, seed: int = 0):
     Unlabeled buffers (bot games) fall back to a by-game split.
     """
 
-    iterations = {e.iteration for e in examples}
-    if len(iterations) > 1 and None not in iterations:
+    # Curriculum seed games are intentionally unlabeled (iteration=None). They
+    # remain training-only and must not disable the honest recent-iteration
+    # holdout once at least two self-play generations exist.
+    iterations = {e.iteration for e in examples if e.iteration is not None}
+    if len(iterations) > 1:
         ordered = sorted(iterations)
-        total = len(examples)
+        labeled = [e for e in examples if e.iteration is not None]
+        total = len(labeled)
         by_iteration = {
             it: sum(1 for e in examples if e.iteration == it) for it in ordered
         }

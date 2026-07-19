@@ -241,6 +241,19 @@ batch 512, lr 2e-4 cosine, temperature 1 → 0.25 by move ~20.
 and the victory-type aux head predicts bot-game outcomes well above base rate.**
 This proves codec, encoder, masking, search, and loop end-to-end before any Rust.
 
+Implementation status (2026-07-18): the Phase D infrastructure is complete in
+`games.az_loop` and `games.seven_wonders_duel.phase_d`. It includes the shared
+`GameAdapter` boundary plus a Kingdomino regression adapter, deterministic worker
+orchestration, request-coalesced inference, 5k four-bot curriculum seeding,
+annealed bot mixing and draft priors, playout-cap randomization with policy-label
+exclusion, iteration-windowed replay, fresh-data game-honest validation, warm-start
+candidate training, paired current-best SPRT promotion, periodic Phase-exit anchor
+SPRTs against Greedy/all four rush variants, atomic promotion, HOF, Elo, and run
+manifests. The draft blend follows the locked ZeusAI Wonder tiers. `PHASE_D.md`
+documents operation and artifacts. Plumbing tests pass; the statistical phase gate
+above still requires a real toy training run and is deliberately not claimed by
+the infrastructure build.
+
 ## 7. Phase E — Open vs closed loop A/B (the decision experiment)
 
 Run after Phase D so priors "have opinions" (a flat-prior net understates the

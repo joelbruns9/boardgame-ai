@@ -226,6 +226,26 @@ def test_iteration_split_holds_out_whole_iterations(examples):
     assert max(val_iters) == 3  # most recent iterations held out
 
 
+def test_iteration_split_keeps_unlabeled_curriculum_in_training(examples):
+    labeled = [
+        dataclasses.replace(example, iteration=index % 3, game_key=index)
+        for index, example in enumerate(examples)
+    ]
+    curriculum = [
+        dataclasses.replace(example, iteration=None, game_key=10_000 + index)
+        for index, example in enumerate(examples[:3])
+    ]
+    train, val = game_honest_split(labeled + curriculum, 0.25)
+    assert {example.game_key for example in curriculum} <= {
+        example.game_key for example in train
+    }
+    assert all(example.iteration is not None for example in val)
+    assert not (
+        {e.iteration for e in train if e.iteration is not None}
+        & {e.iteration for e in val}
+    )
+
+
 def test_aux_padding_row_stays_zero_after_training(examples):
     model = SWDNet(32, 1, 2)
     batch = collate(examples[:16])
