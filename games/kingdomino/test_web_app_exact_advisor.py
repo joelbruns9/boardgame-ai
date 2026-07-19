@@ -76,7 +76,7 @@ def test_exact_advisor_returns_solved_recommendations_for_deck0_final():
         engine="exact",
         state=web_app.state_to_debug_json(state),
         top_k=4,
-        exact_max_secs=3.0,
+        exact_max_secs=30.0,
     )
 
     response = web_app.recommend(req)

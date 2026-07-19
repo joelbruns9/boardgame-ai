@@ -79,6 +79,77 @@ test("settleAutoCapture ignores positions where it is not the viewer's turn", as
   assert.equal(context.__reads.length, 1);
 });
 
+test("auto-turn trigger is rejected on the opponent's turn", async () => {
+  const context = loadContentContext();
+  context.__starts = 0;
+  vm.runInContext(`
+    loadOptions = async () => ({streaming:true});
+    startStreamingRecommend = async () => { __starts += 1; };
+    __opponentCapture = {ok:true,state:{turn:2},activePlayer:"p2",viewerId:"p1"};
+  `, context);
+
+  const result = await vm.runInContext(
+    `triggerRecommend({reason:"auto-turn",captureOverride:__opponentCapture})`,
+    context,
+  );
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.error, "automatic advice only runs on your turn");
+  assert.equal(context.__starts, 0);
+});
+
+test("opponent turn stops auto-started jobs but preserves manual refresh jobs", async () => {
+  const context = loadContentContext();
+  context.__stops = [];
+  vm.runInContext(`
+    loadOptions = async () => ({autoRefresh:true,gameLog:false});
+    readPageState = async () => ({ok:true,state:{turn:2},activePlayer:"p2",viewerId:"p1"});
+    stopActiveStreamingJob = async (reason) => { __stops.push(reason); activeStreamingJob = null; };
+    activeStreamingJob = {startedAutomatically:true};
+  `, context);
+  await vm.runInContext("pollTick()", context);
+  assert.deepEqual(context.__stops, ["opponent-turn"]);
+
+  vm.runInContext("activeStreamingJob = {startedAutomatically:false};", context);
+  await vm.runInContext("pollTick()", context);
+  assert.deepEqual(context.__stops, ["opponent-turn"]);
+});
+
+test("streaming simulation choices extend to 100,000", () => {
+  const context = loadContentContext();
+  assert.equal(vm.runInContext("SIM_OPTIONS.includes(100000)", context), true);
+  assert.equal(vm.runInContext("Math.max(...SIM_OPTIONS)", context), 100000);
+});
+
+test("overlay replacement preserves its scroll position", () => {
+  const context = loadContentContext();
+  vm.runInContext(`
+    __existingOverlay = {scrollTop:173,remove() {}};
+    __mountedOverlay = null;
+    __element = () => ({
+      style:{},children:[],scrollTop:0,
+      appendChild(child) { this.children.push(child); },
+      addEventListener() {},remove() {},
+    });
+    document = {
+      getElementById: () => __existingOverlay,
+      createElement: () => __element(),
+      body: {appendChild(box) { __mountedOverlay = box; }},
+    };
+    __replacementOverlay = makeOverlayBase("Advisor");
+    mountOverlay(__replacementOverlay);
+  `, context);
+
+  assert.equal(context.__mountedOverlay.scrollTop, 173);
+});
+
+test("draft matrix uses color assessment without status text", () => {
+  const context = loadContentContext();
+  assert.equal(vm.runInContext("draftMatrixAssessment({fragility:0.15})", context), "fragile");
+  assert.equal(vm.runInContext("draftMatrixAssessment({fragility:0.149})", context), "robust");
+  assert.equal(vm.runInContext("draftMatrixAssessment({fragility:null})", context), "unknown");
+});
+
 test("state or parameter change restarts streaming without duplicate start", async () => {
   const context = loadContentContext();
   context.__calls = [];
@@ -138,6 +209,60 @@ test("streaming controller accepts NN, exact, and auto endgames", () => {
   assert.equal(vm.runInContext("streamingEligible({...__payload, engine:'exact'}, {streaming:true})", context), true);
   assert.equal(vm.runInContext("streamingEligible({...__payload, engine:'auto'}, {streaming:true})", context), true);
   assert.equal(vm.runInContext("streamingEligible(__payload, {streaming:false})", context), false);
+});
+
+test("auto refresh keeps prior exact advice during an endgame pick-only split", async () => {
+  const context = loadContentContext();
+  context.__starts = 0;
+  vm.runInContext(`
+    loadOptions = async () => ({streaming:true});
+    startStreamingRecommend = async () => { __starts += 1; };
+    __pickCapture = {
+      ok:true,activePlayer:"p1",viewerId:"p1",
+      state:{phase:"INITIAL_SELECTION",deck_count:4,debug:{deck:[41,42,43,44]}},
+    };
+  `, context);
+
+  const result = await vm.runInContext(
+    `triggerRecommend({reason:"auto-turn",captureOverride:__pickCapture})`, context,
+  );
+  assert.equal(result.skipped, true);
+  assert.equal(result.error, "keeping prior exact advice during endgame pick");
+  assert.equal(context.__starts, 0);
+});
+
+test("opponent-turn cancellation removes a pending overlay", async () => {
+  const context = loadContentContext();
+  context.__removed = 0;
+  vm.runInContext(`
+    document = {getElementById: () => ({remove() { __removed += 1; }})};
+    advisorRequest = async () => ({data:{status:"cancelled"},transport:"test"});
+    activeStreamingJob = {
+      jobId:"auto-job",timer:null,lastResponse:null,startedAutomatically:true,
+    };
+  `, context);
+
+  await vm.runInContext(`stopActiveStreamingJob("opponent-turn")`, context);
+  assert.equal(context.__removed, 1);
+});
+
+test("streaming jobs append one terminal lifecycle record", () => {
+  const context = loadContentContext();
+  context.__logs = [];
+  vm.runInContext(`
+    postGameLog = (tableId, record) => { __logs.push({tableId,record}); };
+    __logJob = {
+      jobId:"job-42",terminalLogged:false,options:{gameLog:true},
+      payload:{engine:"exact"},capture:{tableId:"42",activePlayer:"p1",viewerId:"p1"},
+    };
+    __logData = {status:"done",engine:"exact",exact:{solved:true},recommendations:[]};
+    logStreamingAdvisorTerminal(__logJob,__logData);
+    logStreamingAdvisorTerminal(__logJob,__logData);
+  `, context);
+
+  assert.equal(context.__logs.length, 1);
+  assert.equal(context.__logs[0].record.advisor.status, "done");
+  assert.equal(context.__logs[0].record.advisor.exact_solved, true);
 });
 
 test("deck 5 to deck 4 remains on the streaming lifecycle", async () => {

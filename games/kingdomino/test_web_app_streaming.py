@@ -114,11 +114,24 @@ def test_dedupe_includes_complete_start_parameters(monkeypatch):
     first = web_app.recommend_start(_request(state))
     assert entered.wait(timeout=1)
     deeper = _request(state)
-    deeper.max_sims = 30
+    deeper.max_sims = 100_000
     second = web_app.recommend_start(deeper)
 
     assert second["job_id"] != first["job_id"]
     assert web_app.recommend_poll(first["job_id"], -1)["status"] == "cancelled"
+    assert web_app._SEARCH_JOBS[second["job_id"]].sims_target == 100_000
+
+
+def test_draft_matrix_requires_immediate_opponent_reply_before_reveal():
+    state = GameState.new(seed=7)
+    assert web_app._draft_matrix_has_immediate_reply(state, state.legal_actions()) is True
+
+    # Consume three of the four opening picks. The remaining action is the
+    # round's last pick and reveals a new row, so there is no same-row reply.
+    for _ in range(3):
+        state = state.step(state.legal_actions()[0])
+    assert len(state.legal_actions()) == 1
+    assert web_app._draft_matrix_has_immediate_reply(state, state.legal_actions()) is False
 
 
 def test_exact_eligible_job_publishes_one_solved_snapshot(monkeypatch):

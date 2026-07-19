@@ -13,6 +13,7 @@ const DEFAULTS = {
   fragilityAtSims: 1000,
   fragilitySims: 800,
 };
+const MAX_STREAMING_SIMS = 100000;
 
 const statusEl = document.getElementById("status");
 const captureBtn = document.getElementById("captureBtn");
@@ -100,7 +101,8 @@ async function saveOptions() {
     kingdomino_exact_max_secs: Number.isFinite(exactMaxSecs) && exactMaxSecs >= 0 ? exactMaxSecs : DEFAULTS.exactMaxSecs,
     kingdomino_exact_threads: Number.isFinite(exactThreads) && exactThreads >= 0 ? Math.round(exactThreads) : DEFAULTS.exactThreads,
     kingdomino_streaming: streamingEl.checked,
-    kingdomino_max_sims: Number.isFinite(maxSims) && maxSims > 0 ? Math.round(maxSims) : DEFAULTS.maxSims,
+    kingdomino_max_sims: Number.isFinite(maxSims) && maxSims > 0
+      ? Math.min(MAX_STREAMING_SIMS, Math.round(maxSims)) : DEFAULTS.maxSims,
     kingdomino_refresh_ms: Number.isFinite(refreshMs) && refreshMs >= 100 ? Math.round(refreshMs) : DEFAULTS.refreshMs,
     kingdomino_fragility_at_sims: Number.isFinite(fragilityAtSims) && fragilityAtSims >= 0 ? Math.round(fragilityAtSims) : DEFAULTS.fragilityAtSims,
     kingdomino_fragility_sims: Number.isFinite(fragilitySims) && fragilitySims >= 50 ? Math.round(fragilitySims) : DEFAULTS.fragilitySims,

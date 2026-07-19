@@ -168,10 +168,10 @@ class RecommendRequest(BaseModel):
     state: Optional[dict[str, Any]] = None
     engine: str = Field(default="greedy", description="greedy/heuristic, random, nn, exact, or auto")
     requested_engine: Optional[str] = None
-    num_simulations: int = Field(default=50, ge=0, le=20000)
+    num_simulations: int = Field(default=50, ge=0, le=100000)
     top_k: int = Field(default=8, ge=1, le=100)
     checkpoint_path: Optional[str] = None
-    nn_sims: int = Field(default=50, ge=1, le=20000)
+    nn_sims: int = Field(default=50, ge=1, le=100000)
     # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
     # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
@@ -211,7 +211,7 @@ class RecommendRequest(BaseModel):
 
 
 class RecommendStartRequest(RecommendRequest):
-    max_sims: int = Field(default=3200, ge=1, le=20000)
+    max_sims: int = Field(default=3200, ge=1, le=100000)
     chunk_sims: int = Field(default=200, ge=1, le=5000)
 
 
@@ -256,7 +256,7 @@ class BotActionRequest(BaseModel):
     # NN/MCTS options.  If checkpoint_path is omitted, the newest common
     # Kingdomino iter_*.pt checkpoint is used when available.
     checkpoint_path: Optional[str] = None
-    nn_sims: int = Field(default=50, ge=1, le=20000)
+    nn_sims: int = Field(default=50, ge=1, le=100000)
     # Unused by the open-loop NN path (OpenLoopMCTS averages over deck orders
     # internally, one search per request).  Kept to preserve the API surface.
     determinizations: int = Field(default=1, ge=1, le=16)
@@ -989,6 +989,21 @@ def _pick_key_of(aj: dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _draft_matrix_has_immediate_reply(state: GameState, actions: list) -> bool:
+    """True only when our action is immediately answered before a tile reveal."""
+    if state.phase == Phase.GAME_OVER:
+        return False
+    actor = int(state.current_actor)
+    deck_count = len(state.deck)
+    for action in actions:
+        child = state.step(action)
+        if (child.phase != Phase.GAME_OVER
+                and int(child.current_actor) != actor
+                and len(child.deck) == deck_count):
+            return True
+    return False
+
+
 def _draft_matrix(
     state: GameState,
     req: RecommendRequest,
@@ -1023,7 +1038,7 @@ def _draft_matrix(
     """
     import time as _time
 
-    if state.phase == Phase.GAME_OVER:
+    if not _draft_matrix_has_immediate_reply(state, actions):
         return None
     actor = int(state.current_actor)
     key = (checkpoint_path, req.device)
@@ -2002,6 +2017,10 @@ def _run_search_job(job: SearchJob) -> None:
         else:
             job._handle = None
 
+        matrix_relevant = (
+            int(req.fragility_at_sims) > 0
+            and _draft_matrix_has_immediate_reply(state, state.legal_actions())
+        )
         sims_done = 0
         while sims_done < job.sims_target and not job._stop.is_set():
             step = min(int(req.chunk_sims), job.sims_target - sims_done)
@@ -2062,7 +2081,8 @@ def _run_search_job(job: SearchJob) -> None:
                 break
 
             milestone = int(req.fragility_at_sims)
-            if milestone > 0 and sims_done >= milestone and job._fragility_static is None:
+            if (matrix_relevant and milestone > 0 and sims_done >= milestone
+                    and job._fragility_static is None):
                 _set_job_status(job, "testing_fragility", bump=True)
                 static_matrix = _draft_matrix(
                     state, req,
@@ -2643,7 +2663,8 @@ def recommend(req: RecommendRequest) -> dict[str, Any]:
         want_matrix = (req.draft_matrix is True
                        or (req.draft_matrix is None
                            and req.draft_budget_secs > 0))
-        if want_matrix and rust_info is not None:
+        if (want_matrix and rust_info is not None
+                and _draft_matrix_has_immediate_reply(state, actions)):
             pick_keys = {_pick_key_of(action_to_json(state, a, -1))
                          for a in actions}
             pick_keys.discard(None)

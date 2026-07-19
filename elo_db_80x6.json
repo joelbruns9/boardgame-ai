@@ -64,6 +64,84 @@
       "timestamp": "2026-07-06T03:41:29.524175+00:00",
       "is_anchor": true,
       "fixed_rating": 1267.34
+    },
+    "cloud_80x6_run3_iter_0020": {
+      "rating": 1771.44,
+      "rating_stderr": 26.24,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849534+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "cloud_80x6_run3_iter_0040": {
+      "rating": 1753.89,
+      "rating_stderr": 25.82,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849540+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "cloud_80x6_run3_iter_0060": {
+      "rating": 1787.56,
+      "rating_stderr": 26.67,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849543+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "cloud_80x6_run3_iter_0080": {
+      "rating": 1808.51,
+      "rating_stderr": 27.3,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849545+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "cloud_80x6_run3_iter_0100": {
+      "rating": 1773.43,
+      "rating_stderr": 26.29,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849548+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
+    },
+    "cloud_80x6_run3_iter_0100_final": {
+      "rating": 1773.43,
+      "rating_stderr": 26.29,
+      "n_games": 320,
+      "sims": 0,
+      "path": "",
+      "channels": 0,
+      "blocks": 0,
+      "bilinear_dim": 0,
+      "timestamp": "2026-07-06T13:39:10.849549+00:00",
+      "is_anchor": false,
+      "fixed_rating": null
     }
   }
 }

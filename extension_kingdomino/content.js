@@ -31,7 +31,11 @@ const DEFAULT_OPTIONS = {
   fragilitySims: 800,
 };
 
-const SIM_OPTIONS = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
+const MAX_STREAMING_SIMS = 100000;
+const SIM_OPTIONS = [
+  100, 200, 400, 800, 1600, 3200, 6400, 12800,
+  25600, 51200, 100000,
+];
 
 let inFlightRecommend = false;
 let lastPayloadKey = null;
@@ -111,7 +115,8 @@ async function loadOptions() {
       : Boolean(stored.kingdomino_game_log),
     streaming: stored.kingdomino_streaming === undefined
       ? DEFAULT_OPTIONS.streaming : Boolean(stored.kingdomino_streaming),
-    maxSims: Number.isFinite(maxSims) && maxSims > 0 ? Math.round(maxSims) : DEFAULT_OPTIONS.maxSims,
+    maxSims: Number.isFinite(maxSims) && maxSims > 0
+      ? Math.min(MAX_STREAMING_SIMS, Math.round(maxSims)) : DEFAULT_OPTIONS.maxSims,
     refreshMs: Number.isFinite(refreshMs) && refreshMs >= 100 ? Math.round(refreshMs) : DEFAULT_OPTIONS.refreshMs,
     fragilityAtSims: Number.isFinite(fragilityAtSims) && fragilityAtSims >= 0
       ? Math.round(fragilityAtSims) : DEFAULT_OPTIONS.fragilityAtSims,
@@ -132,7 +137,9 @@ async function saveOptionPatch(patch) {
   if (patch.autoRefresh !== undefined) out.kingdomino_auto_refresh = Boolean(patch.autoRefresh);
   if (patch.gameLog !== undefined) out.kingdomino_game_log = Boolean(patch.gameLog);
   if (patch.streaming !== undefined) out.kingdomino_streaming = Boolean(patch.streaming);
-  if (patch.maxSims !== undefined) out.kingdomino_max_sims = patch.maxSims;
+  if (patch.maxSims !== undefined) {
+    out.kingdomino_max_sims = Math.min(MAX_STREAMING_SIMS, Math.max(1, Math.round(patch.maxSims)));
+  }
   if (patch.refreshMs !== undefined) out.kingdomino_refresh_ms = patch.refreshMs;
   if (patch.fragilityAtSims !== undefined) out.kingdomino_fragility_at_sims = patch.fragilityAtSims;
   if (patch.fragilitySims !== undefined) out.kingdomino_fragility_sims = patch.fragilitySims;
@@ -234,6 +241,14 @@ function exactEligibleState(state) {
     return deckCount === 4 && debugDeck && debugDeck.length === 4;
   }
   return false;
+}
+
+function endgamePickOnlyState(state) {
+  if (!state || state.phase !== "INITIAL_SELECTION") return false;
+  const debugDeck = state.debug && Array.isArray(state.debug.deck) ? state.debug.deck : null;
+  const deckCount = Number.isFinite(state.deck_count)
+    ? state.deck_count : debugDeck ? debugDeck.length : null;
+  return deckCount === 0 || deckCount === 4;
 }
 
 function advisorEngineForState(state, requestedEngine) {
@@ -1682,6 +1697,7 @@ function placementToText(placement) {
 
 function makeOverlayBase(titleText) {
   const existing = document.getElementById(OVERLAY_ID);
+  const previousScrollTop = existing ? existing.scrollTop : 0;
   if (existing) existing.remove();
 
   const box = document.createElement("div");
@@ -1719,7 +1735,14 @@ function makeOverlayBase(titleText) {
   header.appendChild(title);
   header.appendChild(close);
   box.appendChild(header);
+  box.__advisorPreviousScrollTop = previousScrollTop;
   return box;
+}
+
+function mountOverlay(box) {
+  const previousScrollTop = Number(box.__advisorPreviousScrollTop || 0);
+  document.body.appendChild(box);
+  box.scrollTop = previousScrollTop;
 }
 
 async function renderDebugOverlay(capture, message) {
@@ -1774,7 +1797,7 @@ async function renderDebugOverlay(capture, message) {
   controls.appendChild(download);
   controls.appendChild(refresh);
   box.appendChild(controls);
-  document.body.appendChild(box);
+  mountOverlay(box);
 }
 
 function renderErrorOverlay(message) {
@@ -1783,7 +1806,7 @@ function renderErrorOverlay(message) {
   body.style.cssText = "color:#fecaca;background:rgba(127,29,29,0.55);border:1px solid rgba(248,113,113,0.5);border-radius:8px;padding:8px;";
   body.textContent = message;
   box.appendChild(body);
-  document.body.appendChild(box);
+  mountOverlay(box);
 }
 
 function renderPendingStreamingJob(job, data, transport) {
@@ -1811,7 +1834,7 @@ function renderPendingStreamingJob(job, data, transport) {
     stop.addEventListener("click", () => stopActiveStreamingJob("good-enough"));
     box.appendChild(stop);
   }
-  document.body.appendChild(box);
+  mountOverlay(box);
 }
 
 function renderRecommendations(response, payload, options, transport, spriteUrl, spriteMap, dominoDesc, activeBoardCells, capture) {
@@ -1855,7 +1878,8 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   deeper.title = "Increase simulations and recompute";
   deeper.style.cssText = "background:rgba(22,101,52,0.9);color:#dcfce7;border:1px solid rgba(74,222,128,0.75);border-radius:6px;font-size:12px;cursor:pointer;padding:3px 7px;";
   deeper.addEventListener("click", async () => {
-    const next = SIM_OPTIONS.find((n) => n > configuredSims) || configuredSims * 2;
+    const next = SIM_OPTIONS.find((n) => n > configuredSims)
+      || Math.min(MAX_STREAMING_SIMS, configuredSims * 2);
     await saveOptionPatch(options.streaming ? { maxSims: next } : { sims: next });
     triggerRecommend({ force: true, reason: "think-deeper" });
   });
@@ -2047,25 +2071,30 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
     const fmt = (x) => (typeof x === "number" && Number.isFinite(x))
       ? (x >= 0 ? "+" : "") + x.toFixed(2) : "—";
     matrix.rows.forEach((r) => {
-      const fragile = typeof r.fragility === "number" && r.fragility >= 0.15;
+      const assessmentTone = draftMatrixAssessment(r);
+      const fragile = assessmentTone === "fragile";
+      const robust = assessmentTone === "robust";
       const line = document.createElement("div");
-      line.style.cssText = "display:flex;gap:10px;align-items:baseline;"
-        + (fragile ? "color:#fca5a5;" : "color:#cbd5e1;");
+      line.style.cssText = "display:flex;flex-wrap:wrap;column-gap:10px;row-gap:2px;align-items:baseline;"
+        + (fragile ? "color:#fca5a5;" : robust ? "color:#86efac;" : "color:#cbd5e1;");
       const worst = (r.responses && r.responses[0])
         ? ` (they take d${r.responses[0].pick_domino_id})` : "";
-      line.innerHTML = `<b style="min-width:70px;">pick d${r.pick_domino_id}</b>`
+      line.innerHTML = `<b style="min-width:65px;">pick d${r.pick_domino_id}</b>`
         + `<span>Q ${fmt(r.headline_edge)}</span>`
-        + `<span title="worst opponent pick response${worst}">robust ${fmt(r.robust_edge)}${worst}</span>`
-        + `<span title="opponent responses weighted by their policy prior">real ${fmt(r.realistic_edge)}</span>`
-        + (fragile ? `<span style="font-weight:700;">⚠ fragile ${fmt(r.fragility)}</span>` : "");
+        + `<span title="worst opponent pick response${worst}">worst ${fmt(r.robust_edge)}${worst}</span>`
+        + `<span title="opponent responses weighted by their policy prior">real ${fmt(r.realistic_edge)}</span>`;
       if (r.robust_stale) {
         const stale = document.createElement("span");
-        stale.textContent = " robust stale";
+        stale.textContent = "⚠ stale";
         stale.style.cssText = "font-weight:700;color:#fbbf24;";
         line.appendChild(stale);
       }
-      line.title = (r.responses || []).map((x) =>
+      const assessment = fragile
+        ? `Fragile: Q-to-worst gap ${fmt(r.fragility)} (red)`
+        : robust ? `Robust: Q-to-worst gap ${fmt(r.fragility)} (green)` : "Robustness not available";
+      const responses = (r.responses || []).map((x) =>
         `they take d${x.pick_domino_id}: ${fmt(x.edge_you)} (${Math.round((x.prior_mass || 0) * 100)}% likely)`).join("\n");
+      line.title = responses ? `${assessment}\n${responses}` : assessment;
       panel.appendChild(line);
     });
     box.appendChild(panel);
@@ -2215,7 +2244,14 @@ function renderRecommendations(response, payload, options, transport, spriteUrl,
   });
 
   box.appendChild(list);
-  document.body.appendChild(box);
+  mountOverlay(box);
+}
+
+function draftMatrixAssessment(row) {
+  if (!row || typeof row.fragility !== "number" || !Number.isFinite(row.fragility)) {
+    return "unknown";
+  }
+  return row.fragility >= 0.15 ? "fragile" : "robust";
 }
 
 function buildRecommendPayload(state, options) {
@@ -2304,6 +2340,40 @@ function streamingStableHint(job, data) {
   return job.stableHint;
 }
 
+function logStreamingAdvisorTerminal(job, data) {
+  if (!job || !job.options || !job.options.gameLog || job.terminalLogged) return;
+  job.terminalLogged = true;
+  const capture = job.capture || {};
+  const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+  postGameLog(capture.tableId, {
+    schema: "kingdomino-bga-gamelog/v1",
+    kind: "advisor",
+    captured_at: new Date().toISOString(),
+    table_id: capture.tableId != null ? String(capture.tableId) : null,
+    gamestate_name: capture.gamestateName != null ? String(capture.gamestateName) : null,
+    active_player: capture.activePlayer != null ? String(capture.activePlayer) : null,
+    viewer_id: capture.viewerId != null ? String(capture.viewerId) : null,
+    advisor: {
+      job_id: job.jobId,
+      status: data.status || null,
+      engine: data.engine || job.payload.engine,
+      sims: data.sims_done ?? data.num_simulations ?? 0,
+      exact_solved: Boolean(data.exact && data.exact.solved),
+      exact_fallback: Boolean(data.exact_fallback),
+      reason: data.reason || null,
+      error: data.error || null,
+      top: recs.slice(0, 3).map((r) => ({
+        domino_id: r.domino_id,
+        placement: r.placement || null,
+        pick_domino_id: r.pick_domino_id,
+        q_win_prob: r.q_win_prob,
+        visit_frac: r.visit_frac,
+        exact_margin_pts: r.exact_margin_pts,
+      })),
+    },
+  });
+}
+
 async function stopActiveStreamingJob(reason = "user") {
   const job = activeStreamingJob;
   if (!job) return { ok: true, skipped: true };
@@ -2315,6 +2385,12 @@ async function stopActiveStreamingJob(reason = "user") {
     });
     const data = result.data || {};
     data.stop_reason = reason;
+    logStreamingAdvisorTerminal(job, data);
+    if (reason === "opponent-turn") {
+      const overlay = document.getElementById(OVERLAY_ID);
+      if (overlay) overlay.remove();
+      return { ok: true, response: data };
+    }
     if (job.lastResponse) {
       renderRecommendations(
         { ...job.lastResponse, status: data.status || "cancelled" },
@@ -2354,6 +2430,7 @@ async function pollStreamingJob(job) {
       renderPendingStreamingJob(job, data, transport);
     }
     if (["done", "error", "cancelled"].includes(data.status)) {
+      logStreamingAdvisorTerminal(job, data);
       activeStreamingJob = null;
       if (data.status === "error") renderErrorOverlay(data.error || "Streaming search failed");
       return;
@@ -2394,6 +2471,7 @@ async function startStreamingRecommend(capture, payload, options, reason) {
     jobId: data.job_id, stateKey, requestKey, version: -1, timer: null, topHistory: [],
     lastStabilitySims: -1, stableHint: false,
     startedAt: Date.now(), lastResponse: null, payload, options, capture, transport,
+    startedAutomatically: reason === "auto-turn",
     spriteUrl: capture.spriteUrl || null,
     spriteMap: capture.dominoSpriteMap || null,
     dominoDesc: capture.dominoesDescription || null,
@@ -2421,6 +2499,20 @@ async function captureDebugOnly() {
 
 async function triggerRecommend({ force = false, reason = "manual", captureOverride = null } = {}) {
   const options = await loadOptions();
+  if (reason === "auto-turn") {
+    const autoCapture = captureOverride || await readPageState();
+    if (!captureIsViewerTurn(autoCapture)) {
+      return { ok: false, skipped: true, error: "automatic advice only runs on your turn", capture: autoCapture };
+    }
+    // BGA splits a joint placement+pick into two UI states. In the endgame the
+    // pick-only normalization is not supported by the exact backend. Starting
+    // NN here would cancel/replace the exact job from the preceding joint
+    // state, so retain that exact result; manual Refresh can still request NN.
+    if (endgamePickOnlyState(autoCapture.state)) {
+      return { ok: false, skipped: true, error: "keeping prior exact advice during endgame pick", capture: autoCapture };
+    }
+    captureOverride = autoCapture;
+  }
   if (options.streaming) {
     const capture = captureOverride || await readPageState();
     if (!capture || !capture.ok || !capture.state) {
@@ -2585,10 +2677,15 @@ function delayMs(ms) {
 
 function autoCaptureKey(capture) {
   if (!capture || !capture.ok || !capture.state) return null;
+  if (!captureIsViewerTurn(capture)) return null;
+  return stableStringify(capture.state);
+}
+
+function captureIsViewerTurn(capture) {
+  if (!capture || !capture.ok || !capture.state) return false;
   const viewerId = capture.viewerId != null ? String(capture.viewerId) : null;
   const active = capture.activePlayer != null ? String(capture.activePlayer) : null;
-  if (!viewerId || !active || viewerId !== active) return null;
-  return stableStringify(capture.state);
+  return Boolean(viewerId && active && viewerId === active);
 }
 
 async function settleAutoCapture(initialCapture, options) {
@@ -2697,6 +2794,10 @@ async function pollTick() {
     const capture = await readPageState();
     if (!capture || !capture.ok) return;
     if (options.gameLog) gameLogTick(capture);
+    if (!captureIsViewerTurn(capture)
+        && activeStreamingJob && activeStreamingJob.startedAutomatically) {
+      await stopActiveStreamingJob("opponent-turn");
+    }
     if (!options.autoRefresh || !capture.state) return;
     const firstKey = autoCaptureKey(capture);
     if (firstKey === null || firstKey === lastAutoStateKey) return;
