@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import multiprocessing
 import random
 from typing import Any, Callable, Protocol, Sequence, TypeVar
 
@@ -89,6 +90,44 @@ def run_jobs(
             for future in as_completed(futures):
                 job = futures[future]
                 results[job.index] = future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return [results[job.index] for job in sorted(jobs, key=lambda item: item.index)]
+
+
+def run_jobs_in_processes(
+    jobs: Sequence[GameJob],
+    worker: Callable[[GameJob], T],
+    *,
+    workers: int = 1,
+    initializer: Callable[..., None] | None = None,
+    initargs: tuple = (),
+) -> list[T]:
+    """Process-pool variant of :func:`run_jobs` for GIL-bound workloads.
+
+    ``worker`` and ``initializer`` must be module-level callables and every
+    argument/result must pickle. The spawn start method is used on every
+    platform so a CUDA context in the parent process is never forked into a
+    child. Ordering and failure semantics match :func:`run_jobs`.
+    """
+
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    if len({job.index for job in jobs}) != len(jobs):
+        raise ValueError("job indices must be unique")
+    results: dict[int, T] = {}
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=initializer,
+        initargs=initargs,
+    ) as pool:
+        futures = {pool.submit(worker, job): job for job in jobs}
+        try:
+            for future in as_completed(futures):
+                results[futures[future].index] = future.result()
         except BaseException:
             for future in futures:
                 future.cancel()

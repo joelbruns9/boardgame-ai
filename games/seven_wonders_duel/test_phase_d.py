@@ -233,6 +233,42 @@ def test_real_model_coalesced_self_play_writes_replayable_iteration(tmp_path: Pa
         replay(record)
 
 
+def test_process_generation_is_deterministic_and_replayable(tmp_path: Path):
+    def build(name: str) -> PhaseDLoop:
+        config = PhaseDConfig(
+            run_dir=str(tmp_path / name),
+            workers=1,
+            process_workers=2,
+            inference_batch=8,
+            games_per_iteration=2,
+            seed_games=0,
+            opponent_fraction=0.0,
+            d_model=32,
+            layers=1,
+            cheap_sims_min=1,
+            cheap_sims_max=1,
+            full_sims_min=1,
+            full_sims_max=1,
+            full_search_fraction=1.0,
+            top_k=2,
+            device="cpu",
+        )
+        loop = PhaseDLoop(config)
+        loop.initialize()
+        return loop
+
+    first = build("run_a")
+    records_a = first.generate_iteration(first.load_model(first.current_best), 0)
+    assert first.last_generation_stats["mode"] == "process"
+    assert first.last_generation_stats["process_workers"] == 2
+    second = build("run_b")
+    records_b = second.generate_iteration(second.load_model(second.current_best), 0)
+    assert records_a == records_b
+    assert len(records_a) == 2
+    for record in records_a:
+        replay(record)
+
+
 def test_anchor_failure_does_not_block_current_best_promotion(
     tmp_path: Path, monkeypatch
 ):

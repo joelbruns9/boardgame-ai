@@ -31,6 +31,7 @@ from games.az_loop import (
     SPRT,
     play_match,
     run_jobs,
+    run_jobs_in_processes,
 )
 
 from .bots import (
@@ -90,6 +91,7 @@ class PhaseDConfig:
     seed: int = 20260718
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     workers: int = 8
+    process_workers: int = 0
     inference_batch: int = 64
     inference_wait_ms: float = 2.0
     iterations: int = 1
@@ -126,6 +128,8 @@ class PhaseDConfig:
     def validate(self) -> None:
         if self.workers <= 0 or self.games_per_iteration <= 0:
             raise ValueError("workers and games_per_iteration must be positive")
+        if self.process_workers < 0:
+            raise ValueError("process_workers must be non-negative")
         if self.seed_games < 0 or self.replay_window <= 0:
             raise ValueError(
                 "seed_games must be non-negative and replay_window positive"
@@ -364,6 +368,7 @@ def generate_seed_buffer(
     games: int,
     seed: int,
     workers: int,
+    process_workers: int = 0,
 ) -> list[GameRecord]:
     destination = Path(path)
     if destination.exists():
@@ -378,9 +383,44 @@ def generate_seed_buffer(
         GameJob(index=index, seed=seed + 10_000_000 + index, kind="curriculum_seed")
         for index in range(games)
     ]
-    records = run_jobs(jobs, _bot_seed_game, workers=workers)
+    if process_workers:
+        records = run_jobs_in_processes(
+            jobs, _bot_seed_game, workers=process_workers
+        )
+    else:
+        records = run_jobs(jobs, _bot_seed_game, workers=workers)
     _write_records(destination, records)
     return records
+
+
+# Per-process state for run_jobs_in_processes generation. The initializer runs
+# once per spawned worker; the dict never leaks between processes.
+_PROCESS_STATE: dict[str, Any] = {}
+
+
+def _process_generation_init(
+    model_state: dict[str, torch.Tensor], config: PhaseDConfig, iteration: int
+) -> None:
+    # One BLAS thread per process: generation scales by process count, and
+    # oversubscribing cores with intra-op threads slows every worker down.
+    torch.set_num_threads(1)
+    model = build_model("transformer", config.d_model, config.layers)
+    model.load_state_dict(model_state)
+    # CPU inference per process: at generation batch sizes the tiny network is
+    # a few ms on a core, while fanning every process into one GPU serializes
+    # on the CUDA context. The GPU stays free for training and gates.
+    _PROCESS_STATE["evaluator"] = Evaluator(model, "cpu", config.inference_batch)
+    _PROCESS_STATE["config"] = config
+    _PROCESS_STATE["iteration"] = iteration
+
+
+def _process_self_play_game(job: GameJob) -> GameRecord:
+    return _self_play_game(
+        job,
+        _PROCESS_STATE["evaluator"],
+        _PROCESS_STATE["config"],
+        _PROCESS_STATE["iteration"],
+    )
 
 
 def _search_move(
@@ -548,6 +588,7 @@ class PhaseDLoop:
                 games=self.config.seed_games,
                 seed=self.config.seed,
                 workers=self.config.workers,
+                process_workers=self.config.process_workers,
             )
 
     def load_model(self, path: str | Path):
@@ -572,6 +613,28 @@ class PhaseDLoop:
             )
             for index in range(self.config.games_per_iteration)
         ]
+        if self.config.process_workers:
+            source = getattr(model, "_orig_mod", model)
+            model_state = {
+                key: value.cpu() for key, value in source.state_dict().items()
+            }
+            started = time.monotonic()
+            records = run_jobs_in_processes(
+                jobs,
+                _process_self_play_game,
+                workers=self.config.process_workers,
+                initializer=_process_generation_init,
+                initargs=(model_state, self.config, iteration),
+            )
+            elapsed = time.monotonic() - started
+            self.last_generation_stats = {
+                "seconds": elapsed,
+                "games_per_second": len(records) / elapsed if elapsed else 0.0,
+                "mode": "process",
+                "process_workers": self.config.process_workers,
+            }
+            _write_records(destination, records)
+            return records
         base = Evaluator(model, self.config.device, self.config.inference_batch)
         started = time.monotonic()
         with CoalescingEvaluator(
@@ -588,6 +651,7 @@ class PhaseDLoop:
             self.last_generation_stats = {
                 "seconds": elapsed,
                 "games_per_second": len(records) / elapsed if elapsed else 0.0,
+                "mode": "thread",
                 "inference_batches": service.batches,
                 "inference_positions": service.positions,
                 "mean_inference_batch": (
@@ -889,6 +953,14 @@ def main(argv=None) -> int:
     parser.add_argument("--games-per-iteration", type=int, default=500)
     parser.add_argument("--seed-games", type=int, default=5_000)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--process-workers",
+        type=int,
+        default=0,
+        help="self-play generation processes (0 = threaded generation); "
+        "scales with CPU cores because each process owns an interpreter and "
+        "runs CPU inference on its own model copy",
+    )
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
@@ -905,6 +977,7 @@ def main(argv=None) -> int:
         games_per_iteration=args.games_per_iteration,
         seed_games=args.seed_games,
         workers=args.workers,
+        process_workers=args.process_workers,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
         device=args.device,
     )

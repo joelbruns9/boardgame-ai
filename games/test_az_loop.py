@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import operator
 from pathlib import Path
 import random
+
+import pytest
 
 from games.az_loop import (
     EloLedger,
@@ -13,6 +16,7 @@ from games.az_loop import (
     SPRT,
     play_match,
     run_jobs,
+    run_jobs_in_processes,
 )
 from games.kingdomino.loop_adapter import KingdominoLoopAdapter
 
@@ -28,6 +32,27 @@ class FirstLegalAgent:
 def test_run_jobs_is_ordered_independently_of_submission_order():
     jobs = [GameJob(index=i, seed=100 + i) for i in reversed(range(8))]
     assert run_jobs(jobs, lambda job: job.seed, workers=3) == list(range(100, 108))
+
+
+def _seed_or_raise(job: GameJob) -> int:
+    if job.kind == "poison":
+        raise ValueError(f"job {job.index} poisoned")
+    return job.seed
+
+
+def test_run_jobs_in_processes_matches_thread_ordering_semantics():
+    jobs = [GameJob(index=i, seed=100 + i) for i in reversed(range(6))]
+    getter = operator.attrgetter("seed")
+    assert run_jobs_in_processes(jobs, getter, workers=2) == list(range(100, 106))
+
+
+def test_run_jobs_in_processes_propagates_worker_failure():
+    jobs = [
+        GameJob(index=0, seed=1),
+        GameJob(index=1, seed=2, kind="poison"),
+    ]
+    with pytest.raises(ValueError, match="poisoned"):
+        run_jobs_in_processes(jobs, _seed_or_raise, workers=2)
 
 
 def test_linear_schedule_and_sprt_reach_expected_decisions():

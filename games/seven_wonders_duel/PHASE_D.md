@@ -14,6 +14,20 @@ deterministic job runner, paired-match runner, linear schedules, SPRT, HOF, Elo,
 and run manifests. `games.kingdomino.loop_adapter` is the regression client;
 `loop_adapter.py` is the 7WD client.
 
+## Generation parallelism
+
+Threaded generation (`--workers`) serializes all Python engine/search work on
+one core through the GIL; measured scaling saturates near 4x regardless of
+thread count. `--process-workers N` instead spawns N processes that each load
+the current-best weights and run single-threaded CPU inference on their own
+copy, so throughput scales with physical cores and the GPU stays free for
+training and gates. Job seeds fully determine each game, so results are
+deterministic under either executor (though not bit-identical across the two,
+because batched and unbatched forwards round differently). Prefer
+`--process-workers $(nproc)` on many-core boxes; `--workers` still controls
+the threaded fallback and is ignored for generation when process workers are
+active.
+
 ## Curriculum and labels
 
 - `seed_games=5000` creates replayable Greedy-versus-rush games, cycling all four

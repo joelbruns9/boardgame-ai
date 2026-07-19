@@ -7,6 +7,7 @@ from .core import (
     MatchOutcome,
     play_match,
     run_jobs,
+    run_jobs_in_processes,
 )
 from .elo import EloLedger
 from .hof import HOFEntry, HallOfFame
@@ -29,4 +30,5 @@ __all__ = [
     "SPRTResult",
     "play_match",
     "run_jobs",
+    "run_jobs_in_processes",
 ]

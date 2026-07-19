@@ -28,6 +28,8 @@
 #
 # Knobs (env vars):
 #   ITERATIONS=20 GAMES_PER_ITERATION=500 SEED_GAMES=5000 WORKERS=8
+#   PROCESS_WORKERS=$(nproc)  self-play processes; the throughput knob on
+#                             many-core boxes (set 0 for threaded generation)
 #   RUN_DIR_REL=runs/seven_wonders_duel/phase_d_toy
 #   LAUNCH_TOY=1     set 0 to stop after the smoke (setup/verify only)
 #   SKIP_SMOKE=0     set 1 to skip the CUDA plumbing smoke
@@ -42,6 +44,7 @@ ITERATIONS="${ITERATIONS:-20}"
 GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-500}"
 SEED_GAMES="${SEED_GAMES:-5000}"
 WORKERS="${WORKERS:-8}"
+PROCESS_WORKERS="${PROCESS_WORKERS:-$(nproc)}"
 LAUNCH_TOY="${LAUNCH_TOY:-1}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 
@@ -181,8 +184,10 @@ if [ "$SKIP_SMOKE" = "1" ]; then
 else
   # Fresh dir each invocation: smoke runs are throwaway and must not resume.
   SMOKE_DIR="runs/seven_wonders_duel/phase_d_smoke_$(date +%Y%m%dT%H%M%S)"
+  # --process-workers 2 exercises the spawn/process generation path the toy
+  # run will use, on top of the CUDA training/gate path.
   "$PY" -m games.seven_wonders_duel.phase_d \
-    --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke \
+    --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke --process-workers 2 \
     || die "CUDA plumbing smoke failed — do not launch the toy run."
   ok "Smoke completed: $SMOKE_DIR"
 fi
@@ -199,7 +204,7 @@ if [ "$LAUNCH_TOY" != "1" ]; then
   warn "  cd $REPO_DIR && nohup $PY -m games.seven_wonders_duel.phase_d \\"
   warn "    --run-dir $RUN_DIR_REL --device cuda --iterations $ITERATIONS \\"
   warn "    --games-per-iteration $GAMES_PER_ITERATION --seed-games $SEED_GAMES \\"
-  warn "    --workers $WORKERS >> $LOG_FILE 2>&1 &"
+  warn "    --workers $WORKERS --process-workers $PROCESS_WORKERS >> $LOG_FILE 2>&1 &"
   stage_done 5
   ok "Setup complete."
   exit 0
@@ -212,12 +217,13 @@ nohup "$PY" -m games.seven_wonders_duel.phase_d \
   --games-per-iteration "$GAMES_PER_ITERATION" \
   --seed-games "$SEED_GAMES" \
   --workers "$WORKERS" \
+  --process-workers "$PROCESS_WORKERS" \
   >> "$LOG_FILE" 2>&1 &
 TOY_PID=$!
 disown "$TOY_PID" 2>/dev/null || true
 sleep 5
 kill -0 "$TOY_PID" 2>/dev/null || die "Toy run died within 5s — check $LOG_FILE"
-ok "Toy run launched: pid=$TOY_PID iterations=$ITERATIONS games/iter=$GAMES_PER_ITERATION"
+ok "Toy run launched: pid=$TOY_PID iterations=$ITERATIONS games/iter=$GAMES_PER_ITERATION process_workers=$PROCESS_WORKERS"
 stage_done 5
 
 cat <<EOF
