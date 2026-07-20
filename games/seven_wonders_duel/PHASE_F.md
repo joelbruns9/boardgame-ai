@@ -140,7 +140,47 @@ arena/coalescing/`allow_threads` scaffolding.
   match the Python reference searcher on fixed seeds/positions under a mock
   evaluator, per KD M4. One gate for the closed searcher, run with the flag both
   off and on.
-- Status: mode scope resolved; still sequenced after F1/F2. F1 green, F2 next.
+- **Scope resolved 2026-07-20** (sources: `search.py` closed searcher +
+  `kingdomino_rust/src/search.rs` reuse audit).
+  - **Reuse map:** KD's `search.rs` is an *alpha-beta/expectiminimax solver*, not
+    a Gumbel MCTS — the algorithm is written **fresh**. Reused: `splitmix64`, the
+    arena pattern, leaf-coalescing, `allow_threads`/`py.detach`, and the `Game`
+    trait *boundary shape* (`make`/`unmake`/`is_stochastic`/`chance_children`/
+    `make_with_chance`). Engine `make`/`unmake` (F1) and encoder (F2) already
+    exist.
+  - **Two dominating prerequisites, both ahead of the searcher:**
+    1. **Chance-node engine extension** (the F1-deferred item): add
+       `make_with_chance` (action + resolved outcome) plus Rust
+       `chance_signature`/`enumerate_chains`/`sample_outcomes` over the four
+       chance kinds. Its own differential gate vs Python's chance layer.
+    2. **RNG parity — the bit-exact crux.** Python uses Mersenne
+       `gammavariate`/`shuffle`/`randrange`; Rust uses `splitmix64`. **Decision
+       (2026-07-20): refactor the Python reference to a portable splitmix64
+       stream** (Gumbel via `-log(-log(1-u))`, portable `randrange`/Fisher-Yates)
+       so the tree gate is genuinely bit-exact (KD precedent, 288/288). Changes
+       Python self-play noise going forward (harmless); re-verify Phase D/E after.
+  - **Crate split — decision (2026-07-20): build the searcher *in-crate* first
+    (`seven_wonders_rust`), extract the shared crate later** as a separate,
+    KD-regression-gated step once the truly-shared surface is concrete (little
+    shared *algorithm* code, so the trait boundary is clearer after the Gumbel
+    searcher exists). Supersedes the "split at F3" default in §8 / the crate-split
+    section below.
+- **Sub-sequence (each behind a gate):**
+  - **F3.0** — Python reference RNG → portable splitmix64 (Gumbel + chance
+    sampling); Phase D/E re-verified.
+  - **F3.1** — Rust chance engine: `make_with_chance` + chance
+    signature/enumerate/sample, gated vs Python (outcomes, probabilities, states).
+  - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
+    materialization; matches Python to 1e-6 under a mock eval on deterministic
+    positions (sampling off).
+  - **F3.3** — Gumbel root (top-k + sequential halving + completed-Q policy
+    target) + `force_expand_root_chance`; full `search()` matches Python
+    (visits/values/chosen action) under mock across seeds, flag off and on.
+  - **F3.4** — batched real-evaluator bridge across the pyo3 boundary (feeds F4).
+  - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
+  - Carries the F2 sign-off follow-up: hidden-resampling invariance test once
+    determinization lands (F3.1).
+- Status: **scoped 2026-07-20; not started.** F1 + F2 green.
 
 ### F4 — Batched inference bridge
 
@@ -165,6 +205,15 @@ searcher, so `seven_wonders_rust` is a standalone engine-only crate (`data` +
 `state` + `engine` + `codec` + pyo3 `lib`). Nothing KD-shaped is shared yet;
 F3 revisits the split when the Gumbel searcher and Star solver force the trait
 surface (open questions 1–4 below).
+
+**F3 scoping resolution (2026-07-20):** deferred *again* — build the 7WD Gumbel
+searcher **inside `seven_wonders_rust`** first (adapting KD's `splitmix64`/arena/
+coalescing patterns), then extract the shared crate as a separate step (F3.5,
+conditional) once the truly-shared surface is concrete. KD's search is an
+alpha-beta solver and 7WD's is a fresh Gumbel MCTS, so little *algorithm* code is
+shared; designing the trait boundary before the searcher exists risks churn and
+puts KD's regression gates at risk early. Open questions 1–4 are answered at
+extraction time, not up front.
 
 Open questions — resolve when F3 forces them, log answers below:
 
