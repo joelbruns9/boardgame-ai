@@ -229,9 +229,22 @@ class _Edge:
     children: dict = field(default_factory=dict)  # key -> _Child
     visits: int = 0
     value_sum_p0: float = 0.0  # visit-weighted running mean (selection Q)
+    probability_weighted: bool = False
+    """Use the current exact chance expectation for Q. Enabled only after
+    every enumerable child has been materialized (forced root expansion)."""
 
     @property
     def q_p0(self) -> float:
+        if self.probability_weighted:
+            mass = sum(child.probability or 0.0 for child in self.children.values())
+            if abs(mass - 1.0) > 1e-9:
+                raise ValueError(
+                    f"probability-weighted edge holds mass {mass:.6f} != 1"
+                )
+            return sum(
+                child.probability * child.node.value_p0
+                for child in self.children.values()
+            )
         return self.value_sum_p0 / self.visits if self.visits else 0.0
 
 
@@ -268,6 +281,7 @@ class OpenNode:
 @dataclass(frozen=True, slots=True)
 class SearchResult:
     action_index: int
+    action_value: float  # selected-action Q, root-actor perspective
     root_value: float  # root-actor perspective
     visits: dict  # action_index -> visit count
     policy_target: dict  # action_index -> improved (completed-Q) probability
@@ -327,7 +341,9 @@ class GumbelMCTS:
             return self._search_open(state)
         raise ValueError(f"unknown mode: {self.config.mode}")
 
-    def _gumbel_root(self, legal, priors, simulate, root_value, root_actor):
+    def _gumbel_root(
+        self, legal, priors, simulate, root_value, root_actor, initial_q=None
+    ):
         """Gumbel top-k + sequential halving. `simulate(action_index)` runs one
         descent through that root action and returns its running Q (root-actor
         perspective) and visit count."""
@@ -349,6 +365,11 @@ class GumbelMCTS:
         round_index = 0
         q_hat: dict = {}
         visits: dict = {a: 0 for a in legal}
+        initial_q = initial_q or {}
+
+        def completed_q(action):
+            return q_hat.get(action, initial_q.get(action, root_value))
+
         while sims_used < budget:
             rounds_remaining = max(1, rounds_total - round_index)
             per_action = max(
@@ -370,7 +391,7 @@ class GumbelMCTS:
                     candidates,
                     key=lambda a: gumbel[a]
                     + log_prior[a]
-                    + self._sigma(q_hat.get(a, root_value), max_visits),
+                    + self._sigma(completed_q(a), max_visits),
                     reverse=True,
                 )[: max(1, len(candidates) // 2)]
             round_index += 1
@@ -380,12 +401,13 @@ class GumbelMCTS:
             candidates,
             key=lambda a: gumbel[a]
             + log_prior[a]
-            + self._sigma(q_hat.get(a, root_value), max_visits),
+            + self._sigma(completed_q(a), max_visits),
         )
-        # Improved policy over ALL legal actions: completed Q (root value for
-        # unvisited actions) — the Gumbel policy target.
+        # Improved policy over ALL legal actions: completed Q (an exact forced
+        # chance expectation when available, otherwise the root value for an
+        # unvisited action) — the Gumbel policy target.
         completed = {
-            a: q_hat.get(a, root_value) for a in legal
+            a: completed_q(a) for a in legal
         }
         logits = {
             a: log_prior[a] + self._sigma(completed[a], max_visits) for a in legal
@@ -394,7 +416,7 @@ class GumbelMCTS:
         weights = {a: math.exp(v - peak) for a, v in logits.items()}
         total = sum(weights.values())
         policy_target = {a: w / total for a, w in weights.items()}
-        return best, visits, policy_target, sims_used, topk
+        return best, completed[best], visits, policy_target, sims_used, topk
 
     # ---- closed mode ------------------------------------------------------
 
@@ -507,6 +529,12 @@ class GumbelMCTS:
                 child_node.visits = 1
                 child_node.value_sum_p0 = value_p0
                 edge.children[key] = _Child(probability=probability, node=child_node)
+            mass = sum(child.probability for child in edge.children.values())
+            if abs(mass - 1.0) > 1e-9:
+                raise RuntimeError(
+                    f"forced root edge holds probability mass {mass:.6f} != 1"
+                )
+            edge.probability_weighted = True
 
     def _search_closed(self, state: GameState) -> SearchResult:
         root_state = state.clone()
@@ -526,12 +554,23 @@ class GumbelMCTS:
             self._descend_closed(root, forced_edge=edge)
             return sign * edge.q_p0, edge.visits
 
-        best, visits, policy_target, sims, topk = self._gumbel_root(
-            root.legal, priors, simulate, sign * root_value_p0, root.actor
+        forced_q = {
+            edge.action_index: sign * edge.q_p0
+            for edge in root.edges
+            if edge.probability_weighted
+        }
+        best, action_value, visits, policy_target, sims, topk = self._gumbel_root(
+            root.legal,
+            priors,
+            simulate,
+            sign * root_value_p0,
+            root.actor,
+            initial_q=forced_q,
         )
         self._closed_root = root  # exposed for gates/inspection
         return SearchResult(
             action_index=best,
+            action_value=action_value,
             root_value=sign * root.value_p0,
             visits=visits,
             policy_target=policy_target,
@@ -611,12 +650,13 @@ class GumbelMCTS:
             q = sign * (root.edge_value_p0.get(action_index, 0.0) / n) if n else 0.0
             return q, n
 
-        best, visits, policy_target, sims, topk = self._gumbel_root(
+        best, action_value, visits, policy_target, sims, topk = self._gumbel_root(
             legal, priors, simulate, sign * root_value_p0, root.actor
         )
         self._open_root = root
         return SearchResult(
             action_index=best,
+            action_value=action_value,
             root_value=sign * root.value_p0,
             visits=visits,
             policy_target=policy_target,

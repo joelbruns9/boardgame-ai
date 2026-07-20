@@ -267,20 +267,48 @@ stale-prior failure mode; re-check mid-training later).
 - **Tier 2 — head-to-head (weekend, if Tier 1 is close):** same net, both modes,
   alternating seats, SPRT stop. Report at BOTH equal-sims and equal-NN-evals /
   equal-wall-clock (closed does more evals at reveal layers; the compute-normalized
-  number is what matters for training throughput).
+  number is what matters for training throughput). Runs on the Rust searcher
+  (Phase F3), not Python: the equal-wall-clock number is only meaningful on the
+  implementation that will train, since the relative cost of closed's extra
+  reveal-layer evals depends on batching/eval overhead.
 - **Tier 3 — dual training runs: skipped** unless Tiers 1–2 are genuinely ambiguous.
 
-**Decision rule: Rust implements only the winning mode; Python keeps dual-mode as
-the slow reference implementation for equivalence gates.**
+**Decision rule: if Tier 1 is decisive, Rust implements only the winning mode;
+if Tier 1 is close, Rust ports both modes (~10–20% extra — the mode split is
+small next to the shared engine/encoder/search core) and Tier 2 on the Rust
+searcher settles it. Python keeps dual-mode as the slow reference implementation
+for equivalence gates either way.** Sequencing (2026-07-19): Tier 1 runs
+immediately after Phase D; Phase F steps 1–2 are mode-independent and start in
+parallel without waiting.
 Prediction on record: closed wins trap coverage at low sims; open may win
 equal-wall-clock strength. If results split along that line, prefer closed +
 force-expansion near root, with sims budget adjusted.
+
+**Tier 1 verdict (2026-07-20 — prediction confirmed; full log in `PHASE_F.md`).**
+Run `runs/phase_e_2026-07-19_fixed`: 120 harvested positions, but only **11 are
+consequential** (`trap_gap ≥ 0.25`; median gap 0.002 — read that segment only).
+Consequential trap-pick rate: **closed ~22% < closed_forced ~26% < open ~28%**,
+closed best at every sims budget. Decision: **Rust ports the closed searcher
+only, with force-expansion as a runtime toggle** (`closed_forced` is that flag,
+not a separate mode). **Open is not ported** — worst coverage plus the
+stale-prior signature (determinization masks specific reveals); Python open
+stays as reference. **Closed vs closed_forced is left open for Tier 2** at equal
+wall-clock on the Rust searcher — coverage tied within the 11-position noise,
+but forced is 3–4× slower, so strength must justify the extra reveal-layer evals
+(ZeusAI's use of force-expansion is a prior in its favor; our data doesn't yet
+confirm it). Caveat: trap rate is flat across 32→256 sims and one position
+(`35:63`, banked as a regression fixture) is a mode-independent 100% blunder —
+these are net blind spots, not search-depth problems, and 11 consequential
+positions is thin for the §9 "blunder rate ≈ 0" bar. Robustness is *not* yet
+cleared; raise consequential yield before any "world best" claim.
 
 ## 8. Phase F — Rust port (the Kingdomino discipline)
 
 Reuse `kingdomino_rust`'s generic `search::Game` trait — 7WD is impl #2, the
 "extract at two" moment. Physical crate split into a shared search/NN crate happens
 here, per the standing plan.
+
+Working doc: `PHASE_F.md` (gate definitions, crate-split decisions, running log).
 
 Order, each step behind a bit-exact/1e-6 equivalence gate vs the Python reference
 (the Kingdomino M1–M6 pattern):
@@ -290,7 +318,8 @@ Order, each step behind a bit-exact/1e-6 equivalence gate vs the Python referenc
    center — 7WD effect resolution (chains, pendings, supremacies, extra turns) is
    meaningfully more intricate than Kingdomino.
 2. **Encoder + codec in Rust**, bit-exact vs Python on ≥100k sampled states.
-3. **Searcher (winning mode only)** + Gumbel root — written fresh in the shared
+3. **Searcher (winning mode per §7's decision rule; both if Tier 1 was close)**
+   + Gumbel root — written fresh in the shared
    crate per the §2b decision, porting KD's arena/coalescing/`allow_threads`
    scaffolding; tree values match the Python reference searcher on fixed
    seeds/positions.
