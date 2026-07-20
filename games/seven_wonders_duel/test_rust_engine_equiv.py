@@ -621,6 +621,9 @@ def test_chance_signature_and_chains_equivalent():
 
     checked_sig = 0
     checked_chains = 0
+    seen_kinds = set()
+    seen_deal_ages = set()
+    multi_reveal_seen = False
     for seed in range(25):
         first_player, actions, library = random_game(seed, seed % 2)
         py = new_game(seed, first_player=first_player)
@@ -634,6 +637,14 @@ def test_chance_signature_and_chains_equivalent():
                     f"  python: {expected_sig}\n  rust:   {rust_sig}"
                 )
                 checked_sig += 1
+                seen_kinds.update(k for k, _ in expected_sig)
+                seen_deal_ages.update(
+                    ctx[0]
+                    for k, ctx in expected_sig
+                    if k == _CHANCE_KIND_ID[ChanceKind.AGE_DEAL]
+                )
+                if sum(1 for k, _ in expected_sig if k == 0) >= 2:
+                    multi_reveal_seen = True
                 if any(k == _CHANCE_KIND_ID[ChanceKind.AGE_DEAL] for k, _ in expected_sig):
                     with pytest.raises(ValueError):
                         rg.enumerate_chains(index)
@@ -652,6 +663,12 @@ def test_chance_signature_and_chains_equivalent():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked_sig > 1000 and checked_chains > 500
+    # Coverage guard (F1a/F2.3 lesson): the corpus must exercise every chance
+    # kind, all three age-deal ages (age-3 = the guild path), and a sequential
+    # multi-reveal — else a branch could be broken yet untested.
+    assert seen_kinds == {0, 1, 2, 3}, f"chance kinds not all covered: {seen_kinds}"
+    assert seen_deal_ages == {1, 2, 3}, f"age-deal ages not all covered: {seen_deal_ages}"
+    assert multi_reveal_seen, "no sequential multi-reveal action exercised"
 
 
 def test_sample_outcomes_equivalent():
@@ -659,6 +676,8 @@ def test_sample_outcomes_equivalent():
     shared seed (portable RNG parity), including AGE_DEAL's shuffle path."""
 
     checked = 0
+    sampled_kinds = set()
+    sampled_deal_ages = set()
     for seed in range(25):
         first_player, actions, library = random_game(seed, seed % 2)
         py = new_game(seed, first_player=first_player)
@@ -668,6 +687,10 @@ def test_sample_outcomes_equivalent():
                 specs = py_chance_signature(py, decode_action(py, index))
                 if not specs:
                     continue
+                sampled_kinds.update(_CHANCE_KIND_ID[s.kind] for s in specs)
+                sampled_deal_ages.update(
+                    s.context[0] for s in specs if s.kind is ChanceKind.AGE_DEAL
+                )
                 for rng_seed in (0, 1, 12345):
                     exp_outcomes, exp_prob = _expected_sample(py, index, rng_seed)
                     rust_outcomes, rust_prob = rg.sample_outcomes(index, rng_seed)
@@ -684,6 +707,9 @@ def test_sample_outcomes_equivalent():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked > 500
+    # AGE_DEAL age-3 exercises the guild-split triple-shuffle path specifically.
+    assert sampled_kinds == {0, 1, 2, 3}, f"sample kinds not all covered: {sampled_kinds}"
+    assert sampled_deal_ages == {1, 2, 3}, f"sample age-deal ages: {sampled_deal_ages}"
 
 
 def test_encoder_signature_matches():
