@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod deck0_draft_dp;
+mod denial_tree;
 mod nnue_features;
 mod search;
 mod sparse_nnue;
@@ -615,11 +616,7 @@ fn write_claim_slot(
 
 /// Pending summary (18): tile + present + turn_distance + active + remaining.
 #[inline]
-fn write_pending_summary(
-    buf: &mut [f32],
-    off: usize,
-    summary: Option<(u16, usize, usize)>,
-) {
+fn write_pending_summary(buf: &mut [f32], off: usize, summary: Option<(u16, usize, usize)>) {
     debug_assert!(off + PENDING_SUMMARY <= buf.len());
     if let Some((did, distance, remaining)) = summary {
         write_tile(buf, off, did);
@@ -778,8 +775,7 @@ fn bonus_state_features(
 fn write_board_summary(buf: &mut [f32], off: usize, state: &RustGameState, player: u8) {
     debug_assert!(off + BOARD_SUMMARY <= buf.len());
     let board = &state.boards[player as usize];
-    let (territory, harmony_bonus, middle_bonus) =
-        board.score(state.harmony, state.middle_kingdom);
+    let (territory, harmony_bonus, middle_bonus) = board.score(state.harmony, state.middle_kingdom);
     let total_score = territory + harmony_bonus + middle_bonus;
     let (score_by, largest_by, total_crowns) = board_component_facts(board);
     let (harmony, middle) = bonus_state_features(state, board, player);
@@ -1207,16 +1203,8 @@ impl RustGameState {
         flat.fill(0.0);
 
         // 1. Symmetric pending-placement summaries for both sides.
-        write_pending_summary(
-            flat,
-            OFF_MY_NEXT_PENDING,
-            self.next_pending_summary(player),
-        );
-        write_pending_summary(
-            flat,
-            OFF_OPP_NEXT_PENDING,
-            self.next_pending_summary(opp),
-        );
+        write_pending_summary(flat, OFF_MY_NEXT_PENDING, self.next_pending_summary(player));
+        write_pending_summary(flat, OFF_OPP_NEXT_PENDING, self.next_pending_summary(opp));
         // 1b. Rule-derived board summaries for both sides.
         write_board_summary(flat, OFF_MY_BOARD_SUMMARY, self, player);
         write_board_summary(flat, OFF_OPP_BOARD_SUMMARY, self, opp);
@@ -1444,9 +1432,8 @@ impl RustGameState {
                 // Resolve the fallible pick lookup BEFORE mutating so `make` stays
                 // atomic (PLACE_AND_SELECT only; FINAL_PLACEMENT has no pick).
                 let pick_undo = if self.phase == PLACE_AND_SELECT {
-                    let pk = pick_domino_id.ok_or_else(|| {
-                        PyValueError::new_err("PLACE_AND_SELECT requires a pick")
-                    })?;
+                    let pk = pick_domino_id
+                        .ok_or_else(|| PyValueError::new_err("PLACE_AND_SELECT requires a pick"))?;
                     let pos = self
                         .current_row
                         .iter()
@@ -1461,8 +1448,7 @@ impl RustGameState {
                     let (ta, ca, tb, cb) = dom(domino_id);
                     let b = &self.boards[player as usize];
                     let bbox = (b.min_x, b.min_y, b.max_x, b.max_y);
-                    self.boards[player as usize]
-                        .place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                    self.boards[player as usize].place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
                     Some(PlaceUndo {
                         i1: idx(x1, y1),
                         i2: idx(x2, y2),
@@ -1689,8 +1675,13 @@ impl SearchEngine {
         let rec = self.state.make(placement, pick)?;
         let dealt = matches!(
             &rec,
-            UndoRecord::InitialPick { boundary: Some(_), .. }
-                | UndoRecord::Move { boundary: Some(_), .. }
+            UndoRecord::InitialPick {
+                boundary: Some(_),
+                ..
+            } | UndoRecord::Move {
+                boundary: Some(_),
+                ..
+            }
         ) && !self.state.current_row.is_empty();
         if !dealt {
             // A row was supplied for an action that does not deal — reverse and
@@ -1799,11 +1790,11 @@ const EMM_CROWN_WEIGHT: f64 = 4.0; // must match rust_expectiminimax.pick_aware
 
 #[derive(Clone, Copy, PartialEq)]
 enum EmmEval {
-    PickBlind, // tanh(margin / scale)
-    PickAware, // tanh((margin + w*(claimed_crowns0 - claimed_crowns1)) / scale)
-    Nnue,      // trained dense net (weights held in RustSearch.nnue)
-    SparseNnueRef, // Step-3 sparse net, stateless full accumulator rebuild
-    SparseNnue, // Step-3 sparse net, reversible dual accumulators
+    PickBlind,           // tanh(margin / scale)
+    PickAware,           // tanh((margin + w*(claimed_crowns0 - claimed_crowns1)) / scale)
+    Nnue,                // trained dense net (weights held in RustSearch.nnue)
+    SparseNnueRef,       // Step-3 sparse net, stateless full accumulator rebuild
+    SparseNnue,          // Step-3 sparse net, reversible dual accumulators
     QuantizedSparseNnue, // v3.2 guarded int16/int8 incremental inference
 }
 
@@ -1918,7 +1909,15 @@ impl search::Game for Kingdomino {
                     (ta, ca, tb, cb)
                 };
                 score += 8 * placement_score_delta(
-                    &s.boards[actor as usize], t1, c1, x1, y1, t2, c2, x2, y2,
+                    &s.boards[actor as usize],
+                    t1,
+                    c1,
+                    x1,
+                    y1,
+                    t2,
+                    c2,
+                    x2,
+                    y2,
                 );
             }
         }
@@ -2142,8 +2141,7 @@ impl NnueWeights {
         let tail_hidden = u(16) as usize;
         let board_size = u(20) as usize;
         let flat_size = u(24) as usize;
-        let margin_scale =
-            f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let margin_scale = f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let encoder_sig = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
         // Encoder-contract guard: the export must have been built against the same
         // encoder this crate expects, else the net is fed mislaid-out features
@@ -2159,9 +2157,12 @@ impl NnueWeights {
         // Dimension sanity: reject zero/absurd dims and any encoder-layout drift the
         // signature somehow missed, before allocating anything.
         let want_board = N_BOARD_CH * OUT_N * OUT_N;
-        if acc_width == 0 || acc_width > KNNUE_MAX_DIM
-            || tail_hidden == 0 || tail_hidden > KNNUE_MAX_DIM
-            || input_dim == 0 || input_dim > KNNUE_MAX_DIM
+        if acc_width == 0
+            || acc_width > KNNUE_MAX_DIM
+            || tail_hidden == 0
+            || tail_hidden > KNNUE_MAX_DIM
+            || input_dim == 0
+            || input_dim > KNNUE_MAX_DIM
         {
             return Err(PyValueError::new_err("nnue: dimension out of range"));
         }
@@ -2251,7 +2252,13 @@ impl NnueWeights {
         };
         let a = relu_layer(&self.acc_w, &self.acc_b, x, self.acc_width, self.input_dim);
         let h0 = relu_layer(&self.t0_w, &self.t0_b, &a, self.tail_hidden, self.acc_width);
-        let h1 = relu_layer(&self.t1_w, &self.t1_b, &h0, self.tail_hidden, self.tail_hidden);
+        let h1 = relu_layer(
+            &self.t1_w,
+            &self.t1_b,
+            &h0,
+            self.tail_hidden,
+            self.tail_hidden,
+        );
         let mut logit = self.out_b;
         let mut margin = self.mgn_b;
         for i in 0..self.tail_hidden {
@@ -2285,7 +2292,11 @@ impl NnueEval {
         let x = self.features(s, actor)?;
         let (expected, margin_norm) = self.w.forward(&x);
         let actor_value = 2.0 * expected - 1.0; // expected score [0,1] -> [-1,1]
-        let p0 = if actor == 0 { actor_value } else { -actor_value };
+        let p0 = if actor == 0 {
+            actor_value
+        } else {
+            -actor_value
+        };
         Ok((p0 as f64, expected, margin_norm * self.w.margin_scale))
     }
 }
@@ -2426,7 +2437,7 @@ impl RustSearch {
                     "unknown eval '{}' (expected 'pick_blind', 'pick_aware', 'nnue', \
                      'sparse_nnue_ref', 'sparse_nnue', or 'sparse_nnue_q')",
                     other
-                )))
+                )));
             }
         };
         let nnue = match (eval, nnue_path.as_ref()) {
@@ -2434,7 +2445,7 @@ impl RustSearch {
                 w: NnueWeights::load(p)?,
             }),
             (EmmEval::Nnue, None) => {
-                return Err(PyValueError::new_err("eval='nnue' requires nnue_path"))
+                return Err(PyValueError::new_err("eval='nnue' requires nnue_path"));
             }
             (_, None) => None,
             (_, Some(_)) => None,
@@ -2444,15 +2455,13 @@ impl RustSearch {
                 Some(Arc::new(sparse_nnue::SparseNnueWeights::load(p)?))
             }
             (EmmEval::SparseNnue | EmmEval::SparseNnueRef, None) => {
-                return Err(PyValueError::new_err(
-                    "sparse NNUE eval requires nnue_path",
-                ))
+                return Err(PyValueError::new_err("sparse NNUE eval requires nnue_path"));
             }
             (EmmEval::Nnue | EmmEval::QuantizedSparseNnue, _) => None,
             (_, Some(_)) => {
                 return Err(PyValueError::new_err(
                     "nnue_path given but eval is not an NNUE evaluator",
-                ))
+                ));
             }
             (_, None) => None,
         };
@@ -2463,7 +2472,7 @@ impl RustSearch {
             (EmmEval::QuantizedSparseNnue, None) => {
                 return Err(PyValueError::new_err(
                     "quantized sparse NNUE eval requires nnue_path",
-                ))
+                ));
             }
             _ => None,
         };
@@ -2492,12 +2501,24 @@ impl RustSearch {
         let mut nodes = 0u64;
         let (a, b) = (f64::NEG_INFINITY, f64::INFINITY);
         let v = match self.eval {
-            EmmEval::PickBlind => {
-                search::value::<Kingdomino, _>(&mut s, d, a, b, &PickBlindEval, &self.cfg, &mut nodes)?
-            }
-            EmmEval::PickAware => {
-                search::value::<Kingdomino, _>(&mut s, d, a, b, &PickAwareEval, &self.cfg, &mut nodes)?
-            }
+            EmmEval::PickBlind => search::value::<Kingdomino, _>(
+                &mut s,
+                d,
+                a,
+                b,
+                &PickBlindEval,
+                &self.cfg,
+                &mut nodes,
+            )?,
+            EmmEval::PickAware => search::value::<Kingdomino, _>(
+                &mut s,
+                d,
+                a,
+                b,
+                &PickAwareEval,
+                &self.cfg,
+                &mut nodes,
+            )?,
             EmmEval::Nnue => {
                 let e = self.nnue.as_ref().expect("nnue eval without weights");
                 search::value::<Kingdomino, _>(&mut s, d, a, b, e, &self.cfg, &mut nodes)?
@@ -2505,14 +2526,18 @@ impl RustSearch {
             EmmEval::SparseNnueRef => {
                 let e = sparse_nnue::SparseStatelessEval {
                     weights: Arc::clone(
-                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                        self.sparse_nnue
+                            .as_ref()
+                            .expect("sparse nnue without weights"),
                     ),
                 };
                 search::value::<Kingdomino, _>(&mut s, d, a, b, &e, &self.cfg, &mut nodes)?
             }
             EmmEval::SparseNnue => {
                 let weights = Arc::clone(
-                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    self.sparse_nnue
+                        .as_ref()
+                        .expect("sparse nnue without weights"),
                 );
                 let mut state = sparse_nnue::SparseSearchState::new(s, weights)?;
                 search::value::<sparse_nnue::SparseKingdomino, _>(
@@ -2561,12 +2586,20 @@ impl RustSearch {
         let mut s = state.cloned();
         let mut nodes = 0u64;
         let chosen = match self.eval {
-            EmmEval::PickBlind => {
-                search::choose_action::<Kingdomino, _>(&mut s, &PickBlindEval, &self.cfg, seed, &mut nodes)?
-            }
-            EmmEval::PickAware => {
-                search::choose_action::<Kingdomino, _>(&mut s, &PickAwareEval, &self.cfg, seed, &mut nodes)?
-            }
+            EmmEval::PickBlind => search::choose_action::<Kingdomino, _>(
+                &mut s,
+                &PickBlindEval,
+                &self.cfg,
+                seed,
+                &mut nodes,
+            )?,
+            EmmEval::PickAware => search::choose_action::<Kingdomino, _>(
+                &mut s,
+                &PickAwareEval,
+                &self.cfg,
+                seed,
+                &mut nodes,
+            )?,
             EmmEval::Nnue => {
                 let e = self.nnue.as_ref().expect("nnue eval without weights");
                 search::choose_action::<Kingdomino, _>(&mut s, e, &self.cfg, seed, &mut nodes)?
@@ -2574,20 +2607,18 @@ impl RustSearch {
             EmmEval::SparseNnueRef => {
                 let e = sparse_nnue::SparseStatelessEval {
                     weights: Arc::clone(
-                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                        self.sparse_nnue
+                            .as_ref()
+                            .expect("sparse nnue without weights"),
                     ),
                 };
-                search::choose_action::<Kingdomino, _>(
-                    &mut s,
-                    &e,
-                    &self.cfg,
-                    seed,
-                    &mut nodes,
-                )?
+                search::choose_action::<Kingdomino, _>(&mut s, &e, &self.cfg, seed, &mut nodes)?
             }
             EmmEval::SparseNnue => {
                 let weights = Arc::clone(
-                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    self.sparse_nnue
+                        .as_ref()
+                        .expect("sparse nnue without weights"),
                 );
                 let mut state = sparse_nnue::SparseSearchState::new(s, weights)?;
                 search::choose_action::<sparse_nnue::SparseKingdomino, _>(
@@ -2615,9 +2646,8 @@ impl RustSearch {
             }
         };
         self.nodes = nodes;
-        chosen.ok_or_else(|| {
-            PyValueError::new_err("choose_action on a state with no legal actions")
-        })
+        chosen
+            .ok_or_else(|| PyValueError::new_err("choose_action on a state with no legal actions"))
     }
 
     /// Operational bot path: iterative deepening under one shared deadline.
@@ -2656,9 +2686,7 @@ impl RustSearch {
             return Err(PyValueError::new_err("selective_width must be >= 1"));
         }
         if selective_root_width == Some(0) {
-            return Err(PyValueError::new_err(
-                "selective_root_width must be >= 1",
-            ));
+            return Err(PyValueError::new_err("selective_root_width must be >= 1"));
         }
         if selective_root_width.is_some() && selective_width.is_none() {
             return Err(PyValueError::new_err(
@@ -2666,9 +2694,7 @@ impl RustSearch {
             ));
         }
         if selective_min_depth < 1 {
-            return Err(PyValueError::new_err(
-                "selective_min_depth must be >= 1",
-            ));
+            return Err(PyValueError::new_err("selective_min_depth must be >= 1"));
         }
 
         let start = std::time::Instant::now();
@@ -2706,29 +2732,27 @@ impl RustSearch {
                 let mut s = state.cloned();
                 let eval = self.nnue.as_ref().expect("nnue eval without weights");
                 search::choose_action_operational::<Kingdomino, _>(
-                    &mut s,
-                    eval,
-                    &self.cfg,
-                    &limits,
+                    &mut s, eval, &self.cfg, &limits,
                 )?
             }
             EmmEval::SparseNnueRef => {
                 let mut s = state.cloned();
                 let eval = sparse_nnue::SparseStatelessEval {
                     weights: Arc::clone(
-                        self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                        self.sparse_nnue
+                            .as_ref()
+                            .expect("sparse nnue without weights"),
                     ),
                 };
                 search::choose_action_operational::<Kingdomino, _>(
-                    &mut s,
-                    &eval,
-                    &self.cfg,
-                    &limits,
+                    &mut s, &eval, &self.cfg, &limits,
                 )?
             }
             EmmEval::SparseNnue => {
                 let weights = Arc::clone(
-                    self.sparse_nnue.as_ref().expect("sparse nnue without weights"),
+                    self.sparse_nnue
+                        .as_ref()
+                        .expect("sparse nnue without weights"),
                 );
                 let mut s = sparse_nnue::SparseSearchState::new(state.cloned(), weights)?;
                 search::choose_action_operational::<sparse_nnue::SparseKingdomino, _>(
@@ -2744,8 +2768,7 @@ impl RustSearch {
                         .as_ref()
                         .expect("quantized sparse nnue without weights"),
                 );
-                let mut s =
-                    sparse_nnue::QuantizedSparseSearchState::new(state.cloned(), weights)?;
+                let mut s = sparse_nnue::QuantizedSparseSearchState::new(state.cloned(), weights)?;
                 search::choose_action_operational::<sparse_nnue::QuantizedSparseKingdomino, _>(
                     &mut s,
                     &sparse_nnue::QuantizedSparseEval,
@@ -3052,14 +3075,9 @@ impl RustGameState {
         &self,
         py: Python<'py>,
         player: u8,
-    ) -> PyResult<(
-        Bound<'py, PyArray1<i32>>,
-        Bound<'py, PyArray1<f32>>,
-    )> {
-        let sparse = nnue_features::sparse_indices(self, player)
-            .map_err(PyValueError::new_err)?;
-        let summary = nnue_features::summary(self, player)
-            .map_err(PyValueError::new_err)?;
+    ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<f32>>)> {
+        let sparse = nnue_features::sparse_indices(self, player).map_err(PyValueError::new_err)?;
+        let summary = nnue_features::summary(self, player).map_err(PyValueError::new_err)?;
         Ok((
             Array1::from_vec(sparse).into_pyarray(py),
             Array1::from_vec(summary).into_pyarray(py),
@@ -4264,9 +4282,9 @@ fn solve_endgame_ab_tt(
 /// Counters for `solve_endgame_ab_transpo`.
 #[derive(Default)]
 struct TranspoStats {
-    interior: u64,      // interior (non-terminal) nodes visited
-    terminals: u64,     // terminal leaves visited
-    dup_visits: u64,    // interior visits whose state was already seen
+    interior: u64,   // interior (non-terminal) nodes visited
+    terminals: u64,  // terminal leaves visited
+    dup_visits: u64, // interior visits whose state was already seen
     seen: HashSet<u128>,
 }
 
@@ -4315,7 +4333,16 @@ fn solve_endgame_ab_transpo(
         let mut best = f64::NEG_INFINITY;
         for &(_idx, p, pk) in &legal {
             let child = state.step(p, pk)?;
-            match solve_endgame_ab_transpo(&child, deadline, alpha, beta, mode, depth + 1, stats, buf)? {
+            match solve_endgame_ab_transpo(
+                &child,
+                deadline,
+                alpha,
+                beta,
+                mode,
+                depth + 1,
+                stats,
+                buf,
+            )? {
                 None => return Ok(None),
                 Some(v) => {
                     if v > best {
@@ -4335,7 +4362,16 @@ fn solve_endgame_ab_transpo(
         let mut best = f64::INFINITY;
         for &(_idx, p, pk) in &legal {
             let child = state.step(p, pk)?;
-            match solve_endgame_ab_transpo(&child, deadline, alpha, beta, mode, depth + 1, stats, buf)? {
+            match solve_endgame_ab_transpo(
+                &child,
+                deadline,
+                alpha,
+                beta,
+                mode,
+                depth + 1,
+                stats,
+                buf,
+            )? {
                 None => return Ok(None),
                 Some(v) => {
                     if v < best {
@@ -5001,8 +5037,7 @@ fn ol_descend(
         // still chosen by PUCT).  If the forced group has no legal action under
         // this determinization, fall through to normal unfiltered selection.
         let depth = path.len() - 1;
-        let mut selected: Option<Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>> =
-            None;
+        let mut selected: Option<Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>> = None;
         if let Some(pf) = &pick_floor {
             if depth >= 1 && depth <= pf.max_depth {
                 if let Some(g) = ol_pick_floor_group(arena, node_id, pf) {
@@ -5387,7 +5422,11 @@ fn advisor_open_loop_search_impl(
                 let vals: Vec<f64> = {
                     let arr = tuple.get_item(0)?;
                     let arr = arr.downcast::<PyArray1<f32>>()?;
-                    arr.readonly().as_slice()?.iter().map(|&x| x as f64).collect()
+                    arr.readonly()
+                        .as_slice()?
+                        .iter()
+                        .map(|&x| x as f64)
+                        .collect()
                 };
                 let gvecs: Vec<Vec<f64>> = {
                     let list = tuple.get_item(1)?;
@@ -5463,42 +5502,69 @@ fn advisor_public_signature(state: &RustGameState) -> u128 {
     for board in &state.boards {
         buf.extend_from_slice(&board.terrain);
         buf.extend_from_slice(&board.crowns);
-        buf.extend_from_slice(&[board.castle_x as u8, board.castle_y as u8,
-            board.min_x as u8, board.max_x as u8, board.min_y as u8,
-            board.max_y as u8, board.occupied]);
+        buf.extend_from_slice(&[
+            board.castle_x as u8,
+            board.castle_y as u8,
+            board.min_x as u8,
+            board.max_x as u8,
+            board.min_y as u8,
+            board.max_y as u8,
+            board.occupied,
+        ]);
     }
     let mut bag = state.deck.clone();
     bag.sort_unstable();
-    for value in bag { buf.extend_from_slice(&value.to_le_bytes()); }
+    for value in bag {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
     buf.push(0xff);
-    for &value in &state.current_row { buf.extend_from_slice(&value.to_le_bytes()); }
+    for &value in &state.current_row {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
     buf.push(0xfe);
     for &(player, value) in &state.pending_claims {
-        buf.push(player); buf.extend_from_slice(&value.to_le_bytes());
+        buf.push(player);
+        buf.extend_from_slice(&value.to_le_bytes());
     }
     buf.push(0xfd);
     for &(player, value) in &state.next_claims {
-        buf.push(player); buf.extend_from_slice(&value.to_le_bytes());
+        buf.push(player);
+        buf.extend_from_slice(&value.to_le_bytes());
     }
-    buf.extend_from_slice(&[state.phase, state.actor_index as u8,
-        state.initial_pick_count as u8, state.start_player,
-        state.harmony as u8, state.middle_kingdom as u8]);
+    buf.extend_from_slice(&[
+        state.phase,
+        state.actor_index as u8,
+        state.initial_pick_count as u8,
+        state.start_player,
+        state.harmony as u8,
+        state.middle_kingdom as u8,
+    ]);
     buf.extend_from_slice(&state.discards[0].to_le_bytes());
     buf.extend_from_slice(&state.discards[1].to_le_bytes());
     xxhash_rust::xxh3::xxh3_128(&buf)
 }
 
 fn advisor_link_children(
-    arena: &mut Vec<OLNode>, tt: &mut HashMap<u128, u32>, node_id: u32,
+    arena: &mut Vec<OLNode>,
+    tt: &mut HashMap<u128, u32>,
+    node_id: u32,
     leaf_state: &RustGameState,
     legal: &[(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)],
     priors: &[f64],
 ) -> PyResult<()> {
     for (i, &(idx, placement, pick)) in legal.iter().enumerate() {
-        if arena[node_id as usize].children.iter().any(|&(old, _)| old == idx) { continue; }
+        if arena[node_id as usize]
+            .children
+            .iter()
+            .any(|&(old, _)| old == idx)
+        {
+            continue;
+        }
         let child_state = leaf_state.step(placement, pick)?;
         let signature = advisor_public_signature(&child_state);
-        let cid = if let Some(&existing) = tt.get(&signature) { existing } else {
+        let cid = if let Some(&existing) = tt.get(&signature) {
+            existing
+        } else {
             let fresh = arena.len() as u32;
             arena.push(OLNode::new(priors[i], (placement, pick)));
             tt.insert(signature, fresh);
@@ -5506,7 +5572,9 @@ fn advisor_link_children(
         };
         arena[node_id as usize].children.push((idx, cid));
     }
-    arena[node_id as usize].children.sort_unstable_by_key(|&(idx, _)| idx);
+    arena[node_id as usize]
+        .children
+        .sort_unstable_by_key(|&(idx, _)| idx);
     arena[node_id as usize].is_expanded = true;
     Ok(())
 }
@@ -5536,10 +5604,14 @@ impl AdvisorSearchHandle {
     fn snapshot_inner(&self) -> (Vec<(u16, i32, f64, f64)>, f64) {
         let root = &self.arena[0];
         let value0 = root.value_sum / root.visit_count.max(1) as f64;
-        let children = root.children.iter().map(|&(idx, cid)| {
-            let child = &self.arena[cid as usize];
-            (idx, child.visit_count, child.value_sum, child.prior)
-        }).collect();
+        let children = root
+            .children
+            .iter()
+            .map(|&(idx, cid)| {
+                let child = &self.arena[cid as usize];
+                (idx, child.visit_count, child.value_sum, child.prior)
+            })
+            .collect();
         (children, value0)
     }
 
@@ -5556,8 +5628,14 @@ impl AdvisorSearchHandle {
             for _ in 0..wave {
                 let det = self.root_state.redeterminize(Some(self.rng.r#gen::<u64>()));
                 let (path, actors, leaf_state) = ol_descend(
-                    &self.arena, 0, det, self.fpu, self.cpuct,
-                    &mut self.fallback_count, &mut self.missing_child_count, None,
+                    &self.arena,
+                    0,
+                    det,
+                    self.fpu,
+                    self.cpuct,
+                    &mut self.fallback_count,
+                    &mut self.missing_child_count,
+                    None,
                 )?;
                 ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
                 let leaf = *path.last().unwrap();
@@ -5566,15 +5644,25 @@ impl AdvisorSearchHandle {
                     let legal = leaf_state.legal_actions_indexed();
                     let (my, opp, flat) = leaf_state.encode_arrays(actor)?;
                     evals.push(AdvisorPendingEval {
-                        path_idx: paths.len(), leaf, actor, legal, my, opp, flat,
+                        path_idx: paths.len(),
+                        leaf,
+                        actor,
+                        legal,
+                        my,
+                        opp,
+                        flat,
                     });
                 }
-                paths.push(path); path_actors.push(actors); leaf_states.push(leaf_state);
+                paths.push(path);
+                path_actors.push(actors);
+                leaf_states.push(leaf_state);
             }
             let mut path_v0: Vec<Option<f64>> = vec![None; paths.len()];
             if !evals.is_empty() {
-                let idxs_per: Vec<Vec<i64>> = evals.iter()
-                    .map(|e| e.legal.iter().map(|t| t.0 as i64).collect()).collect();
+                let idxs_per: Vec<Vec<i64>> = evals
+                    .iter()
+                    .map(|e| e.legal.iter().map(|t| t.0 as i64).collect())
+                    .collect();
                 let (vals, gvecs) = Python::attach(|py| -> PyResult<(Vec<f64>, Vec<Vec<f64>>)> {
                     let mb_views: Vec<_> = evals.iter().map(|e| e.my.view()).collect();
                     let ob_views: Vec<_> = evals.iter().map(|e| e.opp.view()).collect();
@@ -5585,26 +5673,55 @@ impl AdvisorSearchHandle {
                         .map_err(|e| PyValueError::new_err(e.to_string()))?;
                     let flat = numpy::ndarray::stack(Axis(0), &flat_views)
                         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                    let idx_arrays: Vec<_> = idxs_per.iter().map(|v| v.clone().into_pyarray(py)).collect();
-                    let result = self.ev.bind(py).call1((mb.into_pyarray(py), ob.into_pyarray(py),
-                        flat.into_pyarray(py), PyList::new(py, idx_arrays)?))?;
+                    let idx_arrays: Vec<_> = idxs_per
+                        .iter()
+                        .map(|v| v.clone().into_pyarray(py))
+                        .collect();
+                    let result = self.ev.bind(py).call1((
+                        mb.into_pyarray(py),
+                        ob.into_pyarray(py),
+                        flat.into_pyarray(py),
+                        PyList::new(py, idx_arrays)?,
+                    ))?;
                     let tuple = result.downcast::<PyTuple>()?;
-                    let vals = tuple.get_item(0)?.downcast::<PyArray1<f32>>()?.readonly()
-                        .as_slice()?.iter().map(|&x| x as f64).collect();
+                    let vals = tuple
+                        .get_item(0)?
+                        .downcast::<PyArray1<f32>>()?
+                        .readonly()
+                        .as_slice()?
+                        .iter()
+                        .map(|&x| x as f64)
+                        .collect();
                     let list_item = tuple.get_item(1)?;
                     let list = list_item.downcast::<PyList>()?;
                     let mut gvecs = Vec::with_capacity(list.len());
                     for item in list.iter() {
-                        gvecs.push(item.downcast::<PyArray1<f32>>()?.readonly().as_slice()?
-                            .iter().map(|&x| x as f64).collect());
+                        gvecs.push(
+                            item.downcast::<PyArray1<f32>>()?
+                                .readonly()
+                                .as_slice()?
+                                .iter()
+                                .map(|&x| x as f64)
+                                .collect(),
+                        );
                     }
                     Ok((vals, gvecs))
                 })?;
                 for (row, eval) in evals.iter().enumerate() {
                     let priors = softmax_f64(&gvecs[row]);
-                    let value0 = if eval.actor == 0 { vals[row] } else { -vals[row] };
-                    advisor_link_children(&mut self.arena, &mut self.tt, eval.leaf,
-                        &leaf_states[eval.path_idx], &eval.legal, &priors)?;
+                    let value0 = if eval.actor == 0 {
+                        vals[row]
+                    } else {
+                        -vals[row]
+                    };
+                    advisor_link_children(
+                        &mut self.arena,
+                        &mut self.tt,
+                        eval.leaf,
+                        &leaf_states[eval.path_idx],
+                        &eval.legal,
+                        &priors,
+                    )?;
                     path_v0[eval.path_idx] = Some(value0);
                 }
             }
@@ -5613,15 +5730,23 @@ impl AdvisorSearchHandle {
             }
             for (pi, path) in paths.iter().enumerate() {
                 let value0 = if leaf_states[pi].phase == GAME_OVER {
-                    terminal_search_value(&leaf_states[pi], self.score_scale,
-                        self.margin_gain, self.alpha_param)
-                } else { path_v0[pi].expect("non-terminal path must have an eval value") };
+                    terminal_search_value(
+                        &leaf_states[pi],
+                        self.score_scale,
+                        self.margin_gain,
+                        self.alpha_param,
+                    )
+                } else {
+                    path_v0[pi].expect("non-terminal path must have an eval value")
+                };
                 for &node_id in path {
                     let node = &mut self.arena[node_id as usize];
-                    node.visit_count += 1; node.value_sum += value0;
+                    node.visit_count += 1;
+                    node.value_sum += value0;
                 }
             }
-            advanced += paths.len(); self.sims_done += paths.len();
+            advanced += paths.len();
+            self.sims_done += paths.len();
         }
         Ok(self.snapshot_inner())
     }
@@ -5634,10 +5759,21 @@ impl AdvisorSearchHandle {
                         fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
                         score_scale=160.0, margin_gain=2.0, alpha=0.0))]
     #[allow(clippy::too_many_arguments)]
-    fn new(py: Python<'_>, state: &RustGameState, evaluator: Bound<'_, PyAny>,
-        dirichlet_alpha: f64, dirichlet_eps: f64, fpu: f64, cpuct: f64,
-        seed: u64, leaf_batch: usize, virtual_loss: i32,
-        score_scale: f64, margin_gain: f64, alpha: f64) -> PyResult<Self> {
+    fn new(
+        py: Python<'_>,
+        state: &RustGameState,
+        evaluator: Bound<'_, PyAny>,
+        dirichlet_alpha: f64,
+        dirichlet_eps: f64,
+        fpu: f64,
+        cpuct: f64,
+        seed: u64,
+        leaf_batch: usize,
+        virtual_loss: i32,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<Self> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
         }
@@ -5646,7 +5782,8 @@ impl AdvisorSearchHandle {
         py.detach(move || {
             let mut arena = vec![OLNode::new(1.0, (None, None))];
             let root_v0 = ol_expand_with_evaluator(&mut arena, 0, &root_state, &ev)?;
-            arena[0].visit_count = 1; arena[0].value_sum = root_v0;
+            arena[0].visit_count = 1;
+            arena[0].value_sum = root_v0;
             if dirichlet_eps > 0.0 {
                 ol_add_dirichlet_noise(&mut arena, 0, dirichlet_alpha, dirichlet_eps, Some(seed));
             }
@@ -5658,22 +5795,44 @@ impl AdvisorSearchHandle {
                     tt.insert(advisor_public_signature(&child), cid);
                 }
             }
-            Ok(AdvisorSearchHandle { root_state, ev, rng: StdRng::seed_from_u64(seed),
-                arena, tt, fallback_count: 0, missing_child_count: 0, fpu, cpuct,
-                leaf_batch, virtual_loss, score_scale, margin_gain,
-                alpha_param: alpha, sims_done: 0 })
+            Ok(AdvisorSearchHandle {
+                root_state,
+                ev,
+                rng: StdRng::seed_from_u64(seed),
+                arena,
+                tt,
+                fallback_count: 0,
+                missing_child_count: 0,
+                fpu,
+                cpuct,
+                leaf_batch,
+                virtual_loss,
+                score_scale,
+                margin_gain,
+                alpha_param: alpha,
+                sims_done: 0,
+            })
         })
     }
 
-    fn advance(&mut self, py: Python<'_>, n_sims: usize)
-        -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+    fn advance(
+        &mut self,
+        py: Python<'_>,
+        n_sims: usize,
+    ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
         py.detach(|| self.advance_inner(n_sims))
     }
-    fn snapshot(&self) -> (Vec<(u16, i32, f64, f64)>, f64) { self.snapshot_inner() }
+    fn snapshot(&self) -> (Vec<(u16, i32, f64, f64)>, f64) {
+        self.snapshot_inner()
+    }
     #[getter]
-    fn sims_done(&self) -> usize { self.sims_done }
+    fn sims_done(&self) -> usize {
+        self.sims_done
+    }
     #[getter]
-    fn transpositions(&self) -> usize { self.tt.len() }
+    fn transpositions(&self) -> usize {
+        self.tt.len()
+    }
 }
 
 // ─── Batched MCTS (N games, synchronized ticks, one GPU forward per tick) ─────
@@ -6221,7 +6380,12 @@ impl SearchSlot {
         // pinned to its own shallow profile and records nothing; every other
         // parameter below applies to the learner seat only.
         if let Some(o) = seat_override {
-            if self.real_state.actor().map(|a| a == o.seat).unwrap_or(false) {
+            if self
+                .real_state
+                .actor()
+                .map(|a| a == o.seat)
+                .unwrap_or(false)
+            {
                 self.move_profile = MoveSearchProfile {
                     target_sims: o.sims.max(1),
                     record_example: false,
@@ -6845,9 +7009,16 @@ fn solve_root_exact(
         .iter()
         .filter(|&&(_, r)| is_exact(r))
         .map(|&(_, r)| r)
-        .fold(if actor == 0 { f64::NEG_INFINITY } else { f64::INFINITY }, |acc, r| {
-            if actor == 0 { acc.max(r) } else { acc.min(r) }
-        });
+        .fold(
+            if actor == 0 {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            },
+            |acc, r| {
+                if actor == 0 { acc.max(r) } else { acc.min(r) }
+            },
+        );
     let clamp_raw = if actor == 0 {
         b_final - delta
     } else {
@@ -7202,8 +7373,13 @@ mod make_unmake_tests {
                 let rec = r.make(p, pk)?;
                 if matches!(
                     rec,
-                    UndoRecord::InitialPick { boundary: Some(_), .. }
-                        | UndoRecord::Move { boundary: Some(_), .. }
+                    UndoRecord::InitialPick {
+                        boundary: Some(_),
+                        ..
+                    } | UndoRecord::Move {
+                        boundary: Some(_),
+                        ..
+                    }
                 ) {
                     boundaries_seen += 1;
                 }
@@ -7221,7 +7397,10 @@ mod make_unmake_tests {
         // Guard the test actually exercised the interesting transitions.
         assert!(games >= 100, "too few games ({games})");
         assert!(discards_seen >= 1, "no forced discards exercised");
-        assert!(boundaries_seen >= 50, "too few round boundaries ({boundaries_seen})");
+        assert!(
+            boundaries_seen >= 50,
+            "too few round boundaries ({boundaries_seen})"
+        );
         Ok(())
     }
 
@@ -7290,7 +7469,11 @@ mod make_unmake_tests {
             s0.make(Some((7, 7, 7, 8, false)), Some(0)).is_err(),
             "placement in INITIAL_SELECTION must be rejected"
         );
-        assert_eq!(fingerprint(&s0), fp0, "errored initial placement mutated state");
+        assert_eq!(
+            fingerprint(&s0),
+            fp0,
+            "errored initial placement mutated state"
+        );
 
         // --- PLACE_AND_SELECT with a real placement action available ---
         let mut rng = StdRng::seed_from_u64(0xA704);
@@ -7314,13 +7497,23 @@ mod make_unmake_tests {
         let fpp = fingerprint(&sp);
         // Invalid pick + legal placement: pick is resolved before placement, so it
         // errors with the board untouched.
-        assert!(sp.make(p, Some(BAD_ID)).is_err(), "invalid pick should error");
+        assert!(
+            sp.make(p, Some(BAD_ID)).is_err(),
+            "invalid pick should error"
+        );
         assert_eq!(fingerprint(&sp), fpp, "errored invalid pick mutated state");
         // Illegal placement + valid pick: `place` validates before writing, so it
         // errors with no pick mutation applied.
         let illegal = Some((0i8, 0i8, 0i8, 1i8, false)); // far from castle -> illegal
-        assert!(sp.make(illegal, pk).is_err(), "illegal placement should error");
-        assert_eq!(fingerprint(&sp), fpp, "errored illegal placement mutated state");
+        assert!(
+            sp.make(illegal, pk).is_err(),
+            "illegal placement should error"
+        );
+        assert_eq!(
+            fingerprint(&sp),
+            fpp,
+            "errored illegal placement mutated state"
+        );
 
         // --- terminal ---
         let mut t = new_game(3, true, true);
@@ -7353,8 +7546,7 @@ mod make_unmake_tests {
             let mut rng = StdRng::seed_from_u64(seed ^ 0x0EAC_7A11);
             let mut state = new_game(seed, true, true);
             while state.phase != GAME_OVER {
-                if let Some(predicted) =
-                    <Kingdomino as search::Game>::exact_remaining_plies(&state)
+                if let Some(predicted) = <Kingdomino as search::Game>::exact_remaining_plies(&state)
                 {
                     saw_deck4 |= state.phase == PLACE_AND_SELECT && state.deck.len() == 4;
                     saw_deck0 |= state.phase == PLACE_AND_SELECT && state.deck.is_empty();
@@ -7370,9 +7562,12 @@ mod make_unmake_tests {
                         actual += 1;
                     }
                     assert_eq!(
-                        predicted, actual,
+                        predicted,
+                        actual,
                         "seed {seed}: exact tail count wrong at phase {} deck {} actor {}/{}",
-                        state.phase, state.deck.len(), state.actor_index,
+                        state.phase,
+                        state.deck.len(),
+                        state.actor_index,
                         state.pending_claims.len()
                     );
                     checked += 1;
@@ -7382,8 +7577,14 @@ mod make_unmake_tests {
                 state = state.step(placement, pick)?;
             }
         }
-        assert!(checked >= 100, "too few exact-tail states checked ({checked})");
-        assert!(saw_deck4 && saw_deck0 && saw_final, "tail phase coverage incomplete");
+        assert!(
+            checked >= 100,
+            "too few exact-tail states checked ({checked})"
+        );
+        assert!(
+            saw_deck4 && saw_deck0 && saw_final,
+            "tail phase coverage incomplete"
+        );
         Ok(())
     }
 
@@ -7460,7 +7661,11 @@ mod make_unmake_tests {
         assert!(!result.timed_out);
         assert!(result.chance_nodes > 0, "live deal node was not counted");
         assert_eq!(result.action, fixed);
-        assert_eq!(fingerprint(&operational_state), before, "search did not unwind root");
+        assert_eq!(
+            fingerprint(&operational_state),
+            before,
+            "search did not unwind root"
+        );
         eprintln!(
             "operational depth4: {:.3}s, {} total / {} final-iteration nodes vs fixed {:.3}s / {} nodes ({:.2}x final ratio), star cutoffs {}, aspiration re-searches {}, TT hits {}, TT cutoffs {}",
             operational_secs,
@@ -7477,7 +7682,8 @@ mod make_unmake_tests {
         assert!(
             result.last_iteration_nodes <= fixed_nodes,
             "operational final iteration regressed: {} vs fixed {} nodes",
-            result.last_iteration_nodes, fixed_nodes
+            result.last_iteration_nodes,
+            fixed_nodes
         );
         Ok(())
     }
@@ -7514,7 +7720,10 @@ mod make_unmake_tests {
             &limits(4, Some(50_000)),
         )?
         .expect("live-chance search action");
-        assert!(live_result.chance_nodes > 0, "opening deal layer was not counted");
+        assert!(
+            live_result.chance_nodes > 0,
+            "opening deal layer was not counted"
+        );
 
         let mut rng = StdRng::seed_from_u64(0xC11A_CE00);
         let mut tail = new_game(102, true, true);
@@ -7604,8 +7813,8 @@ mod solver_restructure_tests {
             };
             let serial = solve_endgame_ab(&root, far_deadline(), MARGIN_LO, MARGIN_HI, mode, 0)?
                 .expect("serial solve");
-            let parallel = solve_endgame_ab_parallel(&root, far_deadline(), mode)?
-                .expect("parallel TT solve");
+            let parallel =
+                solve_endgame_ab_parallel(&root, far_deadline(), mode)?.expect("parallel TT solve");
             assert_eq!(serial, parallel, "seed {seed}: parallel+TT value diverged");
             checked += 1;
         }
@@ -7625,25 +7834,22 @@ mod solver_restructure_tests {
             };
             let actor = root.actor()?;
             let best_of = |r: &ExactSolveResult| -> f64 {
-                r.child_values
-                    .iter()
-                    .map(|&(_, v)| v)
-                    .fold(if actor == 0 { f64::NEG_INFINITY } else { f64::INFINITY }, |a, v| {
+                r.child_values.iter().map(|&(_, v)| v).fold(
+                    if actor == 0 {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    },
+                    |a, v| {
                         if actor == 0 { a.max(v) } else { a.min(v) }
-                    })
+                    },
+                )
             };
             let solve = |pm: ExactPolicyMode| -> PyResult<ExactSolveResult> {
-                Ok(solve_root_exact(
-                    &root,
-                    far_deadline(),
-                    160.0,
-                    2.0,
-                    0.5,
-                    mode,
-                    pm,
-                    10.0,
-                )?
-                .expect("root solve"))
+                Ok(
+                    solve_root_exact(&root, far_deadline(), 160.0, 2.0, 0.5, mode, pm, 10.0)?
+                        .expect("root solve"),
+                )
             };
             let exact = solve(ExactPolicyMode::Exact)?;
             let clamp = solve(ExactPolicyMode::SoftClamp)?;
@@ -7680,7 +7886,10 @@ mod solver_restructure_tests {
             let nb = bestset(&ties, vb_t).len();
             assert_eq!(pidx.len(), nb, "seed {seed}: ties label size");
             for &w in &pval {
-                assert!((w - 1.0 / nb as f32).abs() < 1e-6, "seed {seed}: not uniform");
+                assert!(
+                    (w - 1.0 / nb as f32).abs() < 1e-6,
+                    "seed {seed}: not uniform"
+                );
             }
             checked += 1;
         }
@@ -7753,11 +7962,17 @@ mod solver_restructure_tests {
                 // All clamped children share one recorded value → one weight.
                 let w = cw_map.get(&(cid as i32)).copied().unwrap_or(0.0);
                 if let Some(prev) = clamped_w {
-                    assert!((w - prev).abs() < 1e-6, "seed {seed}: clamped weights differ");
+                    assert!(
+                        (w - prev).abs() < 1e-6,
+                        "seed {seed}: clamped weights differ"
+                    );
                 } else {
                     clamped_w = Some(w);
                 }
-                assert!(w <= max_w + 1e-6, "seed {seed}: clamped child outweighs best");
+                assert!(
+                    w <= max_w + 1e-6,
+                    "seed {seed}: clamped child outweighs best"
+                );
                 let same_val = clamp_map[&cid];
                 let _ = same_val;
             }
@@ -8829,19 +9044,15 @@ impl BatchedMCTS {
     /// approach pick_floor_frac. NaN-free: returns 0.0 before any sample.
     #[getter]
     fn pick_floor_min_share_mean(&self) -> f64 {
-        let sum: f64 = self.cum_pf_minshare_sum
-            + self.slots.iter().map(|s| s.pf_minshare_sum).sum::<f64>();
+        let sum: f64 =
+            self.cum_pf_minshare_sum + self.slots.iter().map(|s| s.pf_minshare_sum).sum::<f64>();
         let count: u64 = self.cum_pf_minshare_count
             + self
                 .slots
                 .iter()
                 .map(|s| s.pf_minshare_count as u64)
                 .sum::<u64>();
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f64
-        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     /// Sample count behind pick_floor_min_share_mean.
@@ -9582,8 +9793,12 @@ impl BatchedMCTS {
                     let ns = self.next_seed;
                     self.next_seed += 1;
                     self.games_started += 1;
-                    let mut slot =
-                        SearchSlot::new_for_game(new_game(ns, harmony, mk), ns, open_loop, random_opening);
+                    let mut slot = SearchSlot::new_for_game(
+                        new_game(ns, harmony, mk),
+                        ns,
+                        open_loop,
+                        random_opening,
+                    );
                     slot.choose_move_profile(
                         playout_cap_randomization,
                         full_search_fraction,
@@ -10183,6 +10398,9 @@ mod kingdomino_rust {
 
     #[pymodule_export]
     use super::d4_inverse_transform_id;
+
+    #[pymodule_export]
+    use super::denial_tree::denial_forced_tree;
 
     #[pymodule_export]
     use super::RustBoard;

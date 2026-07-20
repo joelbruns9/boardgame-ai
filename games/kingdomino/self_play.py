@@ -549,8 +549,17 @@ class ReplayBuffer:
         This prevents loading very old examples from a much weaker policy.
         """
         import pickle
+
+        class _ReplayUnpickler(pickle.Unpickler):
+            """Map legacy ``python self_play.py`` Example pickles safely."""
+
+            def find_class(self, module, name):
+                if module == "__main__" and name == "Example":
+                    return Example
+                return super().find_class(module, name)
+
         with open(path, 'rb') as f:
-            payload = pickle.load(f)
+            payload = _ReplayUnpickler(f).load()
         examples = payload['data']
         if max_staleness is not None:
             before = len(examples)
@@ -642,7 +651,8 @@ class ReplayBuffer:
 
     def sample_batch(self, batch_size: int, rng: np.random.Generator,
                      device: str = "cpu", augment_d4: bool = True,
-                     endgame_oversample_weight: float = 1.0):
+                     endgame_oversample_weight: float = 1.0,
+                     return_metadata: bool = False):
         """Return a training batch as tensors:
         (my_board, opp_board, flat, policy, legal_mask, z,
          own_score, opp_score, win_target).
@@ -706,13 +716,20 @@ class ReplayBuffer:
         # torch / device transfers only here, in the main thread.
         to = lambda arr: torch.from_numpy(np.stack(arr)).to(device)
         f32 = lambda vals: torch.tensor(vals, dtype=torch.float32, device=device)
-        return (
+        batch = (
             to(mbs).float(), to(obs).float(), to(flats).float(),
             to(pols).float(),
             torch.from_numpy(np.stack(masks)).to(device),       # bool
             f32(zs),
             f32(own_ss), f32(opp_ss), f32(win_ts),
         )
+        if return_metadata:
+            return batch, {
+                "buffer_indices": [int(value) for value in idxs],
+                "d4_transform_ids": (
+                    None if t_ids is None else [int(value) for value in t_ids]),
+            }
+        return batch
 
 
 # ─── Milestone 5 schedules / target cleanup ─────────────────────────────────

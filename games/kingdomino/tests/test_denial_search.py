@@ -18,7 +18,7 @@ from games.kingdomino.denial_search import (
     denial_policy_target,
     public_state_key,
 )
-from games.kingdomino.game import GameState, Phase
+from games.kingdomino.game import Claim, GameState, Phase
 from games.kingdomino.denial_signal_sweep import (
     CELL_SPECS,
     STABILITY_NAMES,
@@ -108,6 +108,60 @@ def test_forced_pick_search_emits_single_legal_pick(tmp_path):
     assert label["legal_pick_ids"] == [state.current_row[0]]
     assert label["policy_target"] == [1.0]
     assert label["structure"]["completed"]
+
+
+def test_extract_reply_labels_are_grouped_complete_and_opponent_only(tmp_path):
+    state = next(
+        candidate for seed in range(100, 200)
+        if (
+            (candidate := _round_start(seed)).pending_claims[0].player
+            != candidate.pending_claims[1].player
+        )
+    )
+    checkpoint = tmp_path / "fixture.pt"
+    checkpoint.write_bytes(b"fixture")
+    search = DenialSearch(
+        _ConstantEvaluator(), checkpoint_path=str(checkpoint),
+        config=SearchConfig(pick_plies=2, chance_k=1, root_search_sims=0,
+                            placement_top_k=2),
+    )
+
+    root_label = search.search_position(state)
+    replies = search.extract_reply_labels(state, root_label=root_label)
+
+    assert len(replies) == len(root_label["legal_pick_ids"])
+    for reply in replies:
+        assert reply["actor"] != reply["root_actor"]
+        assert reply["schema_version"] == 1
+        assert reply["state_key"] == public_state_key(reply["_state"])
+        assert sum(reply["denial_policy_target"]) == pytest.approx(1.0)
+        assert len(reply["per_pick"]) == len(reply["legal_pick_ids"])
+        legal = reply["_state"].legal_actions()
+        assert [row["action_idx"] for row in reply["legal_actions"]] == sorted(
+            encode_action(action, reply["_state"]) for action in legal)
+        for pick_row in reply["per_pick"]:
+            conditional = pick_row["baseline_conditional_placements"]
+            assert conditional
+            assert sum(row["conditional_probability"] for row in conditional) == pytest.approx(1.0)
+
+
+def test_extract_reply_labels_skips_same_player_continuation(tmp_path):
+    state = _round_start(101)
+    first = state.pending_claims[0]
+    second = state.pending_claims[1]
+    state.pending_claims[1] = Claim(first.player, second.domino_id)
+    checkpoint = tmp_path / "fixture.pt"
+    checkpoint.write_bytes(b"fixture")
+    search = DenialSearch(
+        _ConstantEvaluator(), checkpoint_path=str(checkpoint),
+        config=SearchConfig(pick_plies=2, chance_k=1, root_search_sims=0,
+                            placement_top_k=1),
+    )
+    root_label = search.search_position(state)
+
+    assert search.extract_reply_labels(state, root_label=root_label) == []
+    assert search.extract_reply_labels(
+        state, root_label=root_label, opponent_only=False)
 
 
 def test_game_over_search_emits_outcome_without_policy(tmp_path):

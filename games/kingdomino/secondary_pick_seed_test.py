@@ -505,41 +505,71 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         missing = sorted(expected - set(ladder))
         raise ValueError(f"Phase 2 is incomplete; first missing cells: {missing[:5]}")
 
-    secondary = []
+    ranked_picks = []
     secondary_keys = set()
+    rank1_keys = set()
     for index, values in references.items():
         ranks = _competition_ranks(values)
         for pick, rank in ranks.items():
+            item = {"position_index": index, "pick_domino_id": pick,
+                    "searched_rank": rank, "searched_ref": values[pick]}
+            ranked_picks.append(item)
             if rank >= 2:
                 secondary_keys.add((index, pick))
-                secondary.append({"position_index": index, "pick_domino_id": pick,
-                                  "searched_rank": rank, "searched_ref": values[pick]})
+            else:
+                rank1_keys.add((index, pick))
 
-    fragility_by_sims: dict[int, list[float]] = {int(sims): [] for sims in args.sims}
-    root_sd_by_sims: dict[int, list[float]] = {int(sims): [] for sims in args.sims}
-    per_secondary = []
-    for item in secondary:
-        index, pick = item["position_index"], item["pick_domino_id"]
-        row = dict(item)
-        row["by_sims"] = {}
-        for sims in args.sims:
-            root_values = [ladder[(index, int(sims), seed)].get(pick) for seed in ROOT_SEEDS]
-            finite = [float(value) for value in root_values if value is not None]
-            fragilities = [value - references[index][pick] for value in finite]
-            fragility_by_sims[int(sims)].extend(fragilities)
-            sd = _population_sd(finite)
-            root_sd_by_sims[int(sims)].append(sd)
-            row["by_sims"][str(sims)] = {
-                "root_q_by_seed": dict(zip(ROOT_SEEDS, root_values)),
-                "root_q_seed_sd": sd,
-                "fragility_seed_median": (float(statistics.median(fragilities))
-                                            if fragilities else None),
-            }
-        low = row["by_sims"].get("3200", {}).get("fragility_seed_median")
-        high = row["by_sims"].get(str(args.sims[-1]), {}).get("fragility_seed_median")
-        row["slope_high_minus_3200"] = (None if low is None or high is None
-                                         else float(high - low))
-        per_secondary.append(row)
+    secondary = [item for item in ranked_picks
+                 if (item["position_index"], item["pick_domino_id"]) in secondary_keys]
+    rank1 = [item for item in ranked_picks
+             if (item["position_index"], item["pick_domino_id"]) in rank1_keys]
+
+    def collect_cohort(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        fragility_by_sims = {int(sims): [] for sims in args.sims}
+        root_q_by_sims = {int(sims): [] for sims in args.sims}
+        root_sd_by_sims = {int(sims): [] for sims in args.sims}
+        complete_picks_by_sims = {int(sims): 0 for sims in args.sims}
+        per_pick = []
+        for item in items:
+            index, pick = item["position_index"], item["pick_domino_id"]
+            row = dict(item)
+            row["by_sims"] = {}
+            for sims in args.sims:
+                root_values = [ladder[(index, int(sims), seed)].get(pick)
+                               for seed in ROOT_SEEDS]
+                finite = [float(value) for value in root_values if value is not None]
+                fragilities = [value - references[index][pick] for value in finite]
+                fragility_by_sims[int(sims)].extend(fragilities)
+                root_q_by_sims[int(sims)].extend(finite)
+                sd = _population_sd(finite)
+                root_sd_by_sims[int(sims)].append(sd)
+                complete_picks_by_sims[int(sims)] += len(finite) == len(ROOT_SEEDS)
+                row["by_sims"][str(sims)] = {
+                    "root_q_by_seed": dict(zip(ROOT_SEEDS, root_values)),
+                    "root_q_seed_sd": sd,
+                    "observed_seeds": len(finite),
+                    "fragility_seed_median": (float(statistics.median(fragilities))
+                                                if fragilities else None),
+                }
+            low = row["by_sims"].get("3200", {}).get("fragility_seed_median")
+            high = row["by_sims"].get(str(args.sims[-1]), {}).get("fragility_seed_median")
+            row["slope_high_minus_3200"] = (None if low is None or high is None
+                                             else float(high - low))
+            per_pick.append(row)
+        return {
+            "pick_count": len(items),
+            "fragility_by_sims": fragility_by_sims,
+            "root_q_by_sims": root_q_by_sims,
+            "root_sd_by_sims": root_sd_by_sims,
+            "complete_picks_by_sims": complete_picks_by_sims,
+            "per_pick": per_pick,
+        }
+
+    secondary_metrics = collect_cohort(secondary)
+    rank1_metrics = collect_cohort(rank1)
+    fragility_by_sims = secondary_metrics["fragility_by_sims"]
+    root_sd_by_sims = secondary_metrics["root_sd_by_sims"]
+    per_secondary = secondary_metrics["per_pick"]
 
     stability_by_key = {(row["position_index"], row["pick_domino_id"]): row
                         for row in searched_stability}
@@ -627,6 +657,49 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     fragility_table = {str(sims): distribution(fragility_by_sims[int(sims)])
                        for sims in args.sims}
+    rank1_fragility_table = {
+        str(sims): distribution(rank1_metrics["fragility_by_sims"][int(sims)])
+        for sims in args.sims
+    }
+    secondary_root_q_table = {
+        str(sims): distribution(secondary_metrics["root_q_by_sims"][int(sims)])
+        for sims in args.sims
+    }
+    rank1_root_q_table = {
+        str(sims): distribution(rank1_metrics["root_q_by_sims"][int(sims)])
+        for sims in args.sims
+    }
+    rank_specificity = {}
+    for sims in args.sims:
+        secondary_row = fragility_table[str(sims)]
+        rank1_row = rank1_fragility_table[str(sims)]
+        rank_specificity[str(sims)] = {
+            "secondary_minus_rank1_median_fragility": (
+                None if secondary_row["median"] is None or rank1_row["median"] is None
+                else float(secondary_row["median"] - rank1_row["median"])),
+            "secondary_minus_rank1_p90_fragility": (
+                None if secondary_row["p90"] is None or rank1_row["p90"] is None
+                else float(secondary_row["p90"] - rank1_row["p90"])),
+        }
+
+    def observation_composition(metrics: dict[str, Any], sims: int) -> dict[str, Any]:
+        rows = [row["by_sims"][str(sims)] for row in metrics["per_pick"]]
+        complete_sds = [row["root_q_seed_sd"] for row in rows
+                        if row["observed_seeds"] == len(ROOT_SEEDS)]
+        incomplete_sds = [row["root_q_seed_sd"] for row in rows
+                          if row["observed_seeds"] < len(ROOT_SEEDS)]
+        observed = sum(row["observed_seeds"] for row in rows)
+        expected = len(rows) * len(ROOT_SEEDS)
+        return {
+            "expected_pick_seed_cells": expected,
+            "observed_pick_seed_cells": observed,
+            "missing_pick_seed_cells": expected - observed,
+            "complete_picks": len(complete_sds),
+            "incomplete_picks": len(incomplete_sds),
+            "seed_sd_complete_picks": distribution(complete_sds),
+            "seed_sd_incomplete_picks": distribution(incomplete_sds),
+        }
+
     slope_values = [row["slope_high_minus_3200"] for row in per_secondary
                     if row["slope_high_minus_3200"] is not None]
     searched_sds = [row["searched_seed_sd"] for row in all_pick_stability]
@@ -711,7 +784,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Phase 0 artifact uses different inputs")
     tree_flat = [row for seed in TREE_SEEDS for row in tree_rows[seed].values()]
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": "diagnosis only; no retraining, label change, value-semantic change, or throughput change",
         "provenance": {
             "checkpoint_path": str(args.checkpoint),
@@ -744,7 +817,31 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "phase0_equivalence": phase0,
         "secondary_pick_definition": "competition rank >= 2 by median searched value; tied best picks remain rank 1",
         "secondary_pick_count": len(secondary),
+        "rank1_pick_count": len(rank1),
         "sim_ladder_fragility": fragility_table,
+        "rank_conditioned_fragility": {
+            "posthoc_existing_artifact_analysis": True,
+            "rank1": rank1_fragility_table,
+            "secondary": fragility_table,
+            "secondary_specificity": rank_specificity,
+            "interpretation": (
+                "Positive rank-1 fragility estimates the common root-Q versus forced-tree "
+                "method offset; secondary-minus-rank1 isolates rank-specific excess."),
+        },
+        "root_q_level": {
+            "rank1": rank1_root_q_table,
+            "secondary": secondary_root_q_table,
+        },
+        "root_q_observation_composition": {
+            "rank1": {str(sims): observation_composition(rank1_metrics, int(sims))
+                      for sims in args.sims},
+            "secondary": {str(sims): observation_composition(secondary_metrics, int(sims))
+                          for sims in args.sims},
+            "note": (
+                "Seed-SD distributions change composition as higher simulation rungs fill "
+                "previously missing pick/seed cells; compare complete-pick strata before "
+                "interpreting the raw SD trend."),
+        },
         "secondary_pick_slopes": {
             "definition": f"median_seed_fragility({high_sims}) - median_seed_fragility(3200)",
             "distribution": distribution(slope_values),

@@ -40,7 +40,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -685,6 +685,362 @@ class DenialSearch:
         }
         return output
 
+    def extract_reply_labels(
+        self,
+        state: GameState,
+        *,
+        root_label: Optional[dict[str, Any]] = None,
+        opponent_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Extract grouped-pick policy labels at backed ply-1 states.
+
+        ``search_position`` builds and backs the complete forced tree but its
+        public result historically retained only root summaries.  This method
+        exposes the already-computed depth-1 values without running another
+        search.  The target constrains pick-group mass only; all legal placement
+        actions and the baseline conditional distribution within each group are
+        retained for drift diagnostics.
+
+        Training roots are expected to be round starts whose next actor is the
+        opponent.  ``opponent_only`` enforces that contract and prevents a
+        same-player continuation from being mislabeled as an opponent reply.
+        """
+        if root_label is None:
+            root_label = self.search_position(state)
+        if root_label.get("status") != "ok":
+            return []
+
+        root_actor = int(state.current_actor)
+        root = self._node_tt.get(self._node_key(state, 0, 0, root_actor))
+        if root is None or root.value is None or not root.edges:
+            raise RuntimeError("backed root tree is unavailable for reply-label extraction")
+
+        parent_rows = {
+            (-1 if row["pick_domino_id"] is None else int(row["pick_domino_id"])): row
+            for row in root_label["per_pick"]
+        }
+        parent_actor_values = {
+            pick: float(row["searched_value_actor"])
+            for pick, row in parent_rows.items()
+        }
+        parent_ranks = {
+            pick: 1 + sum(other > value for other in parent_actor_values.values())
+            for pick, value in parent_actor_values.items()
+        }
+
+        # Match search_position's placement delegation at the root.
+        root_edges: dict[int, Edge] = {}
+        for edge in root.edges:
+            current = root_edges.get(edge.pick)
+            if current is None or (
+                edge.value > current.value if root_actor == 0 else edge.value < current.value
+            ):
+                root_edges[edge.pick] = edge
+
+        labels: list[dict[str, Any]] = []
+        for parent_pick in sorted(root_edges):
+            parent_edge = root_edges[parent_pick]
+            parent_row = parent_rows[parent_pick]
+            for chance_index, (reply_node, chance_weight) in enumerate(parent_edge.children):
+                if reply_node.state.phase == Phase.GAME_OVER or not reply_node.edges:
+                    continue
+                reply_actor = int(reply_node.state.current_actor)
+                if opponent_only and reply_actor == root_actor:
+                    continue
+
+                by_pick: dict[int, list[Edge]] = {}
+                for edge in reply_node.edges:
+                    by_pick.setdefault(edge.pick, []).append(edge)
+                selected: dict[int, Edge] = {}
+                for pick, candidates in by_pick.items():
+                    choose = max if reply_actor == 0 else min
+                    selected[pick] = choose(candidates, key=lambda edge: edge.value)
+                picks = sorted(selected)
+                if not picks:
+                    continue
+
+                p0_values = [float(selected[pick].value) for pick in picks]
+                actor_values = [value if reply_actor == 0 else -value for value in p0_values]
+                errors = [float(selected[pick].stderr) for pick in picks]
+                target = denial_policy_target(
+                    actor_values,
+                    errors,
+                    temperature=self.config.policy_temperature,
+                    tie_tolerance=self.config.tie_tolerance,
+                    uncertainty_z=self.config.uncertainty_z,
+                )
+
+                policy = self.evaluator.policy(reply_node.state)
+                legal_rows = []
+                group_probability: dict[int, float] = {pick: 0.0 for pick in picks}
+                group_actions: dict[int, list[tuple[int, float]]] = {pick: [] for pick in picks}
+                for action in reply_node.state.legal_actions():
+                    pick = _pick_key(action)
+                    key = -1 if pick is None else int(pick)
+                    idx = int(encode_action(action, reply_node.state))
+                    probability = float(policy.get(idx, 0.0))
+                    legal_rows.append({
+                        "action_idx": idx,
+                        "pick_domino_id": None if key == -1 else key,
+                    })
+                    if key in group_probability:
+                        group_probability[key] += probability
+                        group_actions[key].append((idx, probability))
+
+                pick_rows = []
+                for pick, p0_value, actor_value, stderr, probability in zip(
+                    picks, p0_values, actor_values, errors, target
+                ):
+                    total = group_probability[pick]
+                    conditional = [
+                        {
+                            "action_idx": idx,
+                            "conditional_probability": (value / total if total > 0.0 else 0.0),
+                        }
+                        for idx, value in group_actions[pick]
+                    ]
+                    entropy = -sum(
+                        row["conditional_probability"]
+                        * math.log(max(row["conditional_probability"], 1e-300))
+                        for row in conditional
+                        if row["conditional_probability"] > 0.0
+                    )
+                    pick_rows.append({
+                        "pick_domino_id": None if pick == -1 else int(pick),
+                        "searched_value_player0": p0_value,
+                        "searched_value_actor": actor_value,
+                        "mc_standard_error": stderr,
+                        "policy_target": float(probability),
+                        "baseline_pick_probability": float(total),
+                        "selected_placement_action_idx": int(
+                            selected[pick].action_record["action_idx"]),
+                        "baseline_conditional_placements": conditional,
+                        "baseline_within_group_entropy": float(entropy),
+                    })
+
+                sorted_values = sorted(actor_values, reverse=True)
+                top_margin = (
+                    float(sorted_values[0] - sorted_values[1])
+                    if len(sorted_values) > 1 else 2.0
+                )
+                target_entropy = -sum(
+                    probability * math.log(max(probability, 1e-300))
+                    for probability in target if probability > 0.0
+                )
+                # Only a tie for the best pick makes the target ambiguous.
+                # Equal values among dominated lower-ranked picks are harmless.
+                exact_tie = top_margin <= self.config.tie_tolerance
+                labels.append({
+                    "schema_version": 1,
+                    "state_key": public_state_key(reply_node.state),
+                    "actor": reply_actor,
+                    "root_actor": root_actor,
+                    "parent_pick_domino_id": (
+                        None if parent_pick == -1 else int(parent_pick)),
+                    "parent_representative": dict(parent_edge.action_record),
+                    "parent_raw_prior": float(parent_row["raw_prior"]),
+                    "parent_searched_rank": int(parent_ranks[parent_pick]),
+                    "parent_fragility": parent_row.get("fragility"),
+                    "chance_child_index": int(chance_index),
+                    "chance_weight": float(chance_weight),
+                    "legal_actions": sorted(legal_rows, key=lambda row: row["action_idx"]),
+                    "legal_pick_ids": [None if pick == -1 else int(pick) for pick in picks],
+                    "per_pick": pick_rows,
+                    "denial_policy_target": [float(value) for value in target],
+                    "quality": {
+                        "top_two_margin": top_margin,
+                        "max_mc_standard_error": max(errors, default=0.0),
+                        "target_entropy": float(target_entropy),
+                        "exact_or_near_tie": bool(exact_tie),
+                    },
+                    # Kept in-memory for the artifact writer/training adapter;
+                    # callers must remove this key before JSON serialization.
+                    "_state": reply_node.state,
+                })
+        return labels
+
+    def search_position_rust(
+        self,
+        state: GameState,
+        *,
+        root_result=None,
+        rayon_threads: int = 1,
+        rust_evaluator=None,
+    ) -> dict[str, Any]:
+        """Run the Rust/Rayon forced tree and return oracle-comparable rows.
+
+        Root representative selection and CRN chance rows deliberately remain
+        Python-owned.  Passing those frozen decisions into Rust avoids changing
+        either the validated root factoring or Python ``random`` sampling while
+        moving state expansion, transposition merging, and backup off the GIL.
+        """
+        import kingdomino_rust as kr
+        from games.kingdomino.endgame_solver import _rust_state_from_python
+        from games.kingdomino.self_play import make_rust_evaluator
+
+        if state.phase == Phase.GAME_OVER:
+            raise ValueError("cannot run a forced tree from a terminal state")
+        if root_result is None:
+            root_result = self._root_search(state)
+        root_candidates, root_metadata = self._root_candidates(state, root_result)
+        root_actions = []
+        for pick, actions in sorted(root_candidates.items()):
+            if len(actions) != 1:
+                raise RuntimeError("Rust root contract requires one representative per pick")
+            action = actions[0]
+            root_actions.append((int(pick), int(encode_action(action, state))))
+
+        rows, chance_mode = self._chance_rows(state.deck)
+        if rust_evaluator is None:
+            if self._rust_evaluator is None:
+                self._rust_evaluator = make_rust_evaluator(
+                    self.evaluator.net, device=self.evaluator.device,
+                    margin_gain=self.evaluator.margin_gain, alpha=self.evaluator.alpha)
+            rust_evaluator = self._rust_evaluator
+        else:
+            self._rust_evaluator = rust_evaluator
+        rust_state = _rust_state_from_python(state)
+        if rust_state is None:
+            raise RuntimeError("could not convert Python state to Rust")
+        root_output, reply_output, structure = kr.denial_forced_tree(
+            rust_state, rust_evaluator, root_actions,
+            [list(row) for row in rows], chance_mode == "sampled",
+            pick_plies=int(self.config.pick_plies),
+            placement_top_k=int(self.config.placement_top_k),
+            rayon_threads=max(1, int(rayon_threads)),
+            eval_batch_size=int(getattr(self.evaluator, "batch_size", 512)),
+        )
+        root_actor = int(state.current_actor)
+        root_per_pick = []
+        for pick, value_p0, stderr, action_idx in root_output:
+            metadata = root_metadata[int(pick)]
+            actor_value = float(value_p0) if root_actor == 0 else -float(value_p0)
+            root_per_pick.append({
+                "pick_domino_id": None if int(pick) == -1 else int(pick),
+                "searched_value_player0": float(value_p0),
+                "searched_value_actor": actor_value,
+                "mc_standard_error": float(stderr),
+                "representative_action_idx": int(action_idx),
+                "raw_prior": float(metadata["raw_prior"]),
+                "group_visits": float(metadata["group_visits"]),
+                "headline_edge": metadata["headline_edge"],
+                "fragility": (
+                    None if metadata["headline_edge"] is None
+                    else float(metadata["headline_edge"] - actor_value)),
+            })
+        root_actor_values = {
+            (-1 if row["pick_domino_id"] is None else int(row["pick_domino_id"])):
+            float(row["searched_value_actor"])
+            for row in root_per_pick
+        }
+        root_ranks = {
+            pick: 1 + sum(other > value for other in root_actor_values.values())
+            for pick, value in root_actor_values.items()
+        }
+        root_by_pick = {
+            -1 if row["pick_domino_id"] is None else int(row["pick_domino_id"]): row
+            for row in root_per_pick
+        }
+        replies = []
+        for parent_pick, reply_state, pick_rows in reply_output:
+            reply_actor = int(reply_state.current_actor())
+            per_pick = []
+            for pick, value_p0, stderr, action_idx in pick_rows:
+                per_pick.append({
+                    "pick_domino_id": None if int(pick) == -1 else int(pick),
+                    "searched_value_player0": float(value_p0),
+                    "searched_value_actor": (
+                        float(value_p0) if reply_actor == 0 else -float(value_p0)),
+                    "mc_standard_error": float(stderr),
+                    "selected_placement_action_idx": int(action_idx),
+                })
+            actor_values = [row["searched_value_actor"] for row in per_pick]
+            errors = [row["mc_standard_error"] for row in per_pick]
+            target = denial_policy_target(
+                actor_values, errors, temperature=self.config.policy_temperature,
+                tie_tolerance=self.config.tie_tolerance,
+                uncertainty_z=self.config.uncertainty_z)
+            for row, probability in zip(per_pick, target):
+                row["policy_target"] = float(probability)
+            replies.append({
+                "parent_pick_domino_id": (
+                    None if int(parent_pick) == -1 else int(parent_pick)),
+                "parent_raw_prior": float(root_by_pick[int(parent_pick)]["raw_prior"]),
+                "parent_searched_rank": int(root_ranks[int(parent_pick)]),
+                "parent_fragility": root_by_pick[int(parent_pick)]["fragility"],
+                "parent_representative_action_idx": int(
+                    root_by_pick[int(parent_pick)]["representative_action_idx"]),
+                "actor": reply_actor,
+                "per_pick": per_pick,
+                "denial_policy_target": target,
+                "_rust_state": reply_state,
+            })
+        return {
+            "status": "ok",
+            "engine": "rust-forced-denial-tree-v1",
+            "state_key": public_state_key(state),
+            "actor": root_actor,
+            "per_pick": root_per_pick,
+            "reply_labels": replies,
+            "structure": {
+                "nodes": int(structure[0]),
+                "edges": int(structure[1]),
+                "leaves": int(structure[2]),
+                "max_depth": int(structure[3]),
+                "chance_events": int(structure[4]),
+                "pre_reveal_horizon_leaves": int(structure[5]),
+                "rayon_threads": max(1, int(rayon_threads)),
+            },
+        }
+
+    def search_rust_reply_state(
+        self,
+        rust_state,
+        *,
+        seed: int,
+        rayon_threads: int = 1,
+        rust_evaluator=None,
+    ) -> list[dict[str, Any]]:
+        """Re-search one fixed reply state for a cross-seed quality check.
+
+        An empty Rust root-action override intentionally lets the reply actor
+        use the same top-``placement_top_k`` expansion it received at depth 1
+        of the parent tree.  With the parent seed this reproduces the embedded
+        reply rows; other seeds change only the CRN chance sample.
+        """
+        import kingdomino_rust as kr
+        from games.kingdomino.self_play import make_rust_evaluator
+
+        if rust_evaluator is None:
+            if self._rust_evaluator is None:
+                self._rust_evaluator = make_rust_evaluator(
+                    self.evaluator.net, device=self.evaluator.device,
+                    margin_gain=self.evaluator.margin_gain, alpha=self.evaluator.alpha)
+            rust_evaluator = self._rust_evaluator
+        rows, chance_mode = chance_rows(
+            list(rust_state.deck()), int(self.config.chance_k), seed=int(seed), drew=4)
+        actor = int(rust_state.current_actor())
+        # Preserve the original parent tree's placement-delegation frame: this
+        # fixed state belongs to the opponent of the parent root actor.
+        placement_root_actor = 1 - actor
+        root_output, _replies, _structure = kr.denial_forced_tree(
+            rust_state, rust_evaluator, [], [list(row) for row in rows],
+            chance_mode == "sampled",
+            pick_plies=max(1, int(self.config.pick_plies) - 1),
+            placement_top_k=int(self.config.placement_top_k),
+            rayon_threads=max(1, int(rayon_threads)),
+            eval_batch_size=int(getattr(self.evaluator, "batch_size", 512)),
+            placement_root_actor=placement_root_actor,
+        )
+        return [{
+            "pick_domino_id": None if int(pick) == -1 else int(pick),
+            "searched_value_player0": float(value_p0),
+            "searched_value_actor": (
+                float(value_p0) if actor == 0 else -float(value_p0)),
+            "mc_standard_error": float(stderr),
+            "selected_placement_action_idx": int(action_idx),
+        } for pick, value_p0, stderr, action_idx in root_output]
+
     def derive_four_ply_position(self, state: GameState, *, root_result=None) -> dict[str, Any]:
         """Read the exact four-ply cutoff from an already-built eight-ply tree.
 
@@ -916,6 +1272,7 @@ def generate_az_midgame_positions(
     seed: int,
     min_deck: int = 8,
     max_deck: int = 28,
+    position_filter: Optional[Callable[[GameState], bool]] = None,
 ) -> list[tuple[GameState, dict[str, Any]]]:
     """Generate real greedy AZ-MCTS trajectories and sample round starts."""
     out: list[tuple[GameState, dict[str, Any]]] = []
@@ -929,7 +1286,8 @@ def generate_az_midgame_positions(
             if len(state.deck) < min_deck:
                 break
             if (state.phase == Phase.PLACE_AND_SELECT and state.actor_index == 0
-                    and min_deck <= len(state.deck) <= max_deck):
+                    and min_deck <= len(state.deck) <= max_deck
+                    and (position_filter is None or position_filter(state))):
                 out.append((state.copy(), {"game_seed": game_seed, "trajectory_ply": ply,
                                            "deck_count": len(state.deck)}))
                 if len(out) >= count:

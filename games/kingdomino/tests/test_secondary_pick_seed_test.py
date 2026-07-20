@@ -4,6 +4,8 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from games.kingdomino.action_codec import encode_action
 from games.kingdomino.denial_search import DenialSearch, SearchConfig, public_state_key
 from games.kingdomino.denial_signal_sweep import load_frozen_positions, write_frozen_positions
@@ -203,5 +205,21 @@ def test_report_builds_from_complete_resumable_artifacts(tmp_path):
 
     assert output.exists()
     assert report["secondary_pick_count"] == len(picks) - 1
+    assert report["rank1_pick_count"] == 1
+    rank_conditioned = report["rank_conditioned_fragility"]
+    for sims in SIMS:
+        key = str(sims)
+        assert rank_conditioned["rank1"][key]["median"] == pytest.approx(fragility[sims])
+        assert rank_conditioned["secondary"][key]["median"] == pytest.approx(
+            fragility[sims])
+        assert (
+            rank_conditioned["secondary_specificity"][key]
+            ["secondary_minus_rank1_median_fragility"]
+            == pytest.approx(0.0)
+        )
+        rank1_composition = report["root_q_observation_composition"]["rank1"][key]
+        assert rank1_composition["expected_pick_seed_cells"] == len(ROOT_SEEDS)
+        assert rank1_composition["observed_pick_seed_cells"] == len(ROOT_SEEDS)
+        assert rank1_composition["missing_pick_seed_cells"] == 0
     assert report["routing"]["classification"] == "NOISE"
     assert len(report["searched_reference_stability"]["per_pick"]) == len(picks)

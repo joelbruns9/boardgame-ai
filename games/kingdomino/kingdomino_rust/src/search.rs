@@ -314,8 +314,7 @@ impl<A: Copy> OperationalControl<A> {
 
     #[inline]
     fn expired(&self) -> bool {
-        self.node_limit.is_some_and(|limit| self.nodes >= limit)
-            || Instant::now() >= self.deadline
+        self.node_limit.is_some_and(|limit| self.nodes >= limit) || Instant::now() >= self.deadline
     }
 }
 
@@ -351,7 +350,15 @@ fn action_value<G: Game, E: Eval<G>>(
     let mut expected = 0.0;
     for (c, w) in G::chance_children(s, a, cfg) {
         let u = G::make_with_chance(s, a, &c)?;
-        let r = value::<G, E>(s, depth - 1, f64::NEG_INFINITY, f64::INFINITY, eval, cfg, nodes);
+        let r = value::<G, E>(
+            s,
+            depth - 1,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            eval,
+            cfg,
+            nodes,
+        );
         G::unmake(s, u);
         expected += w * r?;
     }
@@ -502,16 +509,8 @@ fn operational_action_value<G: Game, E: Eval<G>>(
 ) -> PyResult<Option<f64>> {
     if !G::is_stochastic(s, a) {
         let u = G::make(s, a)?;
-        let result = operational_value::<G, E>(
-            s,
-            depth - 1,
-            alpha,
-            beta,
-            eval,
-            cfg,
-            control,
-            value_bound,
-        );
+        let result =
+            operational_value::<G, E>(s, depth - 1, alpha, beta, eval, cfg, control, value_bound);
         G::unmake(s, u);
         return result;
     }
@@ -683,8 +682,17 @@ fn operational_value<G: Game, E: Eval<G>>(
         let mut value = f64::NEG_INFINITY;
         for action in actions {
             let Some(action_value) = operational_action_value::<G, E>(
-                s, action, depth, alpha, beta, eval, cfg, control, value_bound,
-            )? else {
+                s,
+                action,
+                depth,
+                alpha,
+                beta,
+                eval,
+                cfg,
+                control,
+                value_bound,
+            )?
+            else {
                 return Ok(None);
             };
             if action_value > value {
@@ -701,8 +709,17 @@ fn operational_value<G: Game, E: Eval<G>>(
         let mut value = f64::INFINITY;
         for action in actions {
             let Some(action_value) = operational_action_value::<G, E>(
-                s, action, depth, alpha, beta, eval, cfg, control, value_bound,
-            )? else {
+                s,
+                action,
+                depth,
+                alpha,
+                beta,
+                eval,
+                cfg,
+                control,
+                value_bound,
+            )?
+            else {
                 return Ok(None);
             };
             if action_value < value {
@@ -725,7 +742,10 @@ fn operational_value<G: Game, E: Eval<G>>(
         } else {
             TtBound::Exact
         };
-        let replace = control.tt.get(&key).is_none_or(|entry| depth >= entry.depth);
+        let replace = control
+            .tt
+            .get(&key)
+            .is_none_or(|entry| depth >= entry.depth);
         if replace {
             control.tt.insert(
                 key,
@@ -796,7 +816,8 @@ fn operational_root_iteration<G: Game, E: Eval<G>>(
             cfg,
             control,
             value_bound,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         if best_action.is_none()
@@ -889,7 +910,11 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
 
     for depth in 1..=limits.max_depth {
         let iteration_start_nodes = control.nodes;
-        let previous_best = if completed_depth > 0 { Some(action) } else { None };
+        let previous_best = if completed_depth > 0 {
+            Some(action)
+        } else {
+            None
+        };
         let aspiration = value.map(|center| {
             (
                 center - limits.aspiration_window,
@@ -907,7 +932,8 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
             beta,
             &mut control,
             limits.value_bound,
-        )? else {
+        )?
+        else {
             timed_out = true;
             break;
         };
@@ -924,7 +950,8 @@ pub(crate) fn choose_action_operational<G: Game, E: Eval<G>>(
                 f64::INFINITY,
                 &mut control,
                 limits.value_bound,
-            )? else {
+            )?
+            else {
                 timed_out = true;
                 break;
             };
@@ -1000,9 +1027,7 @@ mod tests {
 
         fn to_move(s: &ToyState) -> PyResult<Turn> {
             match &s.tree[s.node] {
-                Node::Decision { player, .. } => {
-                    Ok(if *player == 0 { Turn::P0 } else { Turn::P1 })
-                }
+                Node::Decision { player, .. } => Ok(if *player == 0 { Turn::P0 } else { Turn::P1 }),
                 Node::Terminal(_) => Err(PyValueError::new_err("to_move on terminal")),
             }
         }
@@ -1107,11 +1132,22 @@ mod tests {
         }
     }
     fn st(tree: Vec<Node>) -> ToyState {
-        ToyState { tree: Rc::new(tree), node: 0 }
+        ToyState {
+            tree: Rc::new(tree),
+            node: 0,
+        }
     }
     fn deep_value(s: &mut ToyState, eval: &impl Eval<Toy>) -> PyResult<f64> {
         let mut nodes = 0u64;
-        value::<Toy, _>(s, 8, f64::NEG_INFINITY, f64::INFINITY, eval, &cfg(), &mut nodes)
+        value::<Toy, _>(
+            s,
+            8,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            eval,
+            &cfg(),
+            &mut nodes,
+        )
     }
     fn operational_limits(
         max_depth: u32,
@@ -1136,9 +1172,18 @@ mod tests {
         // 0:P0 -> {1, 2};  1:P1 -> min(5, -1) = -1;  2:P0(again) -> max(2, 8) = 8.
         // root = max(-1, 8) = 8, and the best action leads to node 2.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 0, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(5.0),
             Node::Terminal(-1.0),
             Node::Terminal(2.0),
@@ -1173,7 +1218,10 @@ mod tests {
     fn standalone_chance_node() {
         // A state whose only action is stochastic: 0.5*2 + 0.5*(-2) = 0.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Chance(vec![(1, 0.5), (2, 0.5)])] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Chance(vec![(1, 0.5), (2, 0.5)])],
+            },
             Node::Terminal(2.0),
             Node::Terminal(-2.0),
         ];
@@ -1185,7 +1233,10 @@ mod tests {
     fn nonterminal_without_actions_errors() {
         // value() must error (not silently return +-inf); choose_action returns None
         // (the pyclass wrapper turns that into an error).
-        let mut s = st(vec![Node::Decision { player: 0, edges: vec![] }]);
+        let mut s = st(vec![Node::Decision {
+            player: 0,
+            edges: vec![],
+        }]);
         assert!(deep_value(&mut s, &ZeroEval).is_err());
         let mut n = 0;
         let r = choose_action::<Toy, _>(&mut s, &ZeroEval, &cfg(), None, &mut n).unwrap();
@@ -1197,9 +1248,18 @@ mod tests {
         // depth 1 so the (non-terminal) children are scored by the NaN evaluator:
         // every root action scores NaN -> best stays empty -> error, not a panic.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 0, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(5.0),
             Node::Terminal(-1.0),
             Node::Terminal(2.0),
@@ -1216,12 +1276,21 @@ mod tests {
         // A make() that errors two plies deep must leave the cursor restored to the
         // root (action_value unmakes before propagating the error).
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1)] },
-            Node::Decision { player: 1, edges: vec![Edge::Err] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Err],
+            },
         ];
         let mut s = st(tree);
         assert!(deep_value(&mut s, &ZeroEval).is_err());
-        assert_eq!(s.node, 0, "cursor must be restored after a mid-search make error");
+        assert_eq!(
+            s.node, 0,
+            "cursor must be restored after a mid-search make error"
+        );
     }
 
     #[test]
@@ -1229,7 +1298,10 @@ mod tests {
         // Two equal-value actions. No seed -> first best; a fixed seed -> reproducible
         // (fresh node counter per call, as the pyclass wrapper does).
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
             Node::Terminal(5.0),
             Node::Terminal(5.0),
         ];
@@ -1250,9 +1322,18 @@ mod tests {
     #[test]
     fn operational_matches_fixed_and_restores() {
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 0, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(0.5),
             Node::Terminal(-0.1),
             Node::Terminal(0.2),
@@ -1280,9 +1361,18 @@ mod tests {
         // The root remains full-width. Each child is a minimizing node whose
         // two actions are reduced to the better one by width-1 ordering.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(-1.0),
             Node::Terminal(-0.9),
             Node::Terminal(0.7),
@@ -1309,9 +1399,18 @@ mod tests {
         // lets the losing sibling's first -1.0 reply cut off, but no action is
         // truncated: the final minimax value/action match the unordered oracle.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(-1.0),
             Node::Terminal(-0.9),
             Node::Terminal(0.7),
@@ -1330,14 +1429,10 @@ mod tests {
         let mut limits = operational_limits(2, None, 0.25);
         limits.full_width_ordering = true;
         let mut ordered_state = st(tree);
-        let ordered = choose_action_operational::<Toy, _>(
-            &mut ordered_state,
-            &ZeroEval,
-            &cfg(),
-            &limits,
-        )
-        .unwrap()
-        .unwrap();
+        let ordered =
+            choose_action_operational::<Toy, _>(&mut ordered_state, &ZeroEval, &cfg(), &limits)
+                .unwrap()
+                .unwrap();
 
         assert_eq!(ordered.action, unordered.action);
         assert_eq!(ordered.value, unordered.value);
@@ -1346,8 +1441,12 @@ mod tests {
         assert_eq!(ordered.selective_pruned, 0);
         assert_eq!(ordered.ordering_evals, 0);
         assert!(ordered.ordering_actions >= 6);
-        assert!(ordered.nodes < unordered.nodes,
-            "ordering should reduce nodes: {} vs {}", ordered.nodes, unordered.nodes);
+        assert!(
+            ordered.nodes < unordered.nodes,
+            "ordering should reduce nodes: {} vs {}",
+            ordered.nodes,
+            unordered.nodes
+        );
         assert_eq!(ordered_state.node, 0);
     }
 
@@ -1357,9 +1456,18 @@ mod tests {
         // discovers action 1 is better. Give the second run exactly enough nodes
         // to complete depth 1 and begin (but not finish) depth 2.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(-1.0),
             Node::Terminal(-0.5),
             Node::Terminal(0.5),
@@ -1395,9 +1503,18 @@ mod tests {
     #[test]
     fn aspiration_failure_researches_full_window() {
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(2)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(3), Edge::Det(4)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(5), Edge::Det(6)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(2)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(3), Edge::Det(4)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(5), Edge::Det(6)],
+            },
             Node::Terminal(-1.0),
             Node::Terminal(-0.5),
             Node::Terminal(0.5),
@@ -1451,8 +1568,14 @@ mod tests {
         // Both root actions reach the same decision node. The first search stores
         // it; the second must reuse the exact value without walking its children.
         let tree = vec![
-            Node::Decision { player: 0, edges: vec![Edge::Det(1), Edge::Det(1)] },
-            Node::Decision { player: 1, edges: vec![Edge::Det(2), Edge::Det(3)] },
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Det(1), Edge::Det(1)],
+            },
+            Node::Decision {
+                player: 1,
+                edges: vec![Edge::Det(2), Edge::Det(3)],
+            },
             Node::Terminal(-0.5),
             Node::Terminal(0.5),
         ];
