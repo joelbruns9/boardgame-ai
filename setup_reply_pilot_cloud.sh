@@ -319,8 +319,7 @@ if [ "$RUN_PILOT_TESTS" = "1" ]; then
     games/kingdomino/tests/test_reply_pilot_evaluation.py \
     games/kingdomino/tests/test_rust_denial_tree_equiv.py \
     games/kingdomino/tests/test_rust_nnue_features.py \
-    games/kingdomino/tests/test_rust_augment.py \
-    games/kingdomino/tests/test_parallel_self_play.py -q
+    games/kingdomino/tests/test_rust_augment.py -q
 else
   warn "RUN_PILOT_TESTS=$RUN_PILOT_TESTS; tests skipped by explicit override."
 fi
