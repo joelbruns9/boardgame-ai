@@ -180,6 +180,14 @@ fn num_actions() -> usize {
     codec::NUM_ACTIONS
 }
 
+/// The encoder schema signature this build produces (must equal Python's
+/// `ENCODER_SIGNATURE`). F4 uses it to reject checkpoints trained on a different
+/// feature schema.
+#[pyfunction]
+fn encoder_signature() -> &'static str {
+    encoder::ENCODER_SIGNATURE
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -187,6 +195,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::num_actions;
+
+    #[pymodule_export]
+    use super::encoder_signature;
 }
 
 #[cfg(test)]
@@ -231,6 +242,27 @@ mod tests {
         let g = GameState::from_setup(sample_setup(), VecDeque::new());
         assert_eq!(g.fingerprint(), g.fingerprint());
         assert!(g.clone() == g);
+    }
+
+    #[test]
+    fn encoder_feature_counts_match_schema() {
+        use crate::encoder::{encode, FEATURE_COUNTS};
+        let mut g = GameState::from_setup(sample_setup(), VecDeque::new());
+        let mut steps = 0;
+        while g.phase != Phase::Complete && steps < 14 {
+            for t in encode(&g) {
+                assert_eq!(
+                    t.features.len(),
+                    FEATURE_COUNTS[t.type_id],
+                    "token type {} feature count",
+                    t.type_id
+                );
+            }
+            let legal = codec::legal_action_indices(&g);
+            g.apply_action(&codec::decode_action(&g, legal[0]));
+            steps += 1;
+        }
+        assert!(steps > 8);
     }
 
     #[test]

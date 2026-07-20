@@ -85,10 +85,40 @@ more intricate than Kingdomino's.
     env-sized `SWR_F2_GAMES` like F1a; skips when buffers absent). Acceptance run
     `SWR_F2_GAMES=2000`: **113,726 states bit-exact in 312s**; routine `pytest`
     runs a 60-game subset. `SWR_F2_GAMES=0` sweeps the whole corpus.
-- Status: **GREEN 2026-07-20.** Codec covered by F1a; encoder ported and
-  bit-exact (pool + all nine token types) over 113k+ sampled states across all
-  phases. `cargo test` 3 / `pytest test_rust_engine_equiv.py` 7 green. Next: F3
-  (closed searcher + Gumbel root; mode scope resolved by E-Tier-1 above).
+- Status: **GREEN 2026-07-20** (incl. review-hardening below). Codec covered by
+  F1a; encoder ported and bit-exact (pool + all nine token types) over 139k+
+  sampled states across all phases. `cargo test` 4 / `pytest
+  test_rust_engine_equiv.py` 8 green. Next: F3 (closed searcher + Gumbel root;
+  mode scope resolved by E-Tier-1 above).
+- **F2 review-hardening (2026-07-20, external review — no logic divergence
+  found; all sign-offs approved):**
+  - **Acceptance gate now enforces its criteria** (was: a 1-game corpus would
+    pass). `iter_buffer_records` samples **round-robin across all buffer files**
+    (was a lexicographic prefix of `curriculum_seed.jsonl` — also fixes F1a
+    sampling); the gate asserts `games == requested` and, at acceptance scale
+    (`SWR_F2_GAMES` 0 or ≥2000), `states ≥ 100_000`. Acceptance run: **139,816
+    states / 2000 games / 367s**, multi-file.
+  - **Terminal + branch coverage** — the loop now also compares the terminal
+    `COMPLETE` encoding (decision 8 was previously never gated), and the gate
+    asserts all nine decision branches and all nine token types appear at
+    acceptance scale (guards against silent corpus drift).
+  - **Rust bound to `ENCODER_SIGNATURE`** — `encoder.rs` pins the signature +
+    per-type `FEATURE_COUNTS`; `encoder_signature()` is exposed and
+    `test_encoder_signature_matches` asserts equality with Python, so a schema
+    change fails until Rust is updated in lockstep. A `debug_assert` + Rust unit
+    test check per-token feature lengths.
+  - **Deferred to F3/F4 (throughput, benchmark-driven):** rework encoder pricing
+    to a per-seat `PaymentContext` (precompute fixed production / trade prices /
+    discounts / chain / rebate / flexible assignments once per encode, instead of
+    reconstructing them per `minimum_payment` call — `pool_tokens` alone does up
+    to ~146 calls in draft), keeping exact pool cost aggregates; and add an
+    `encode_into`-style reusable flat buffer feeding Rust-side batching (the
+    current `Vec`-per-token + Python-object return is gate scaffolding). Enforce
+    the encoder signature at the F4 checkpoint-load boundary.
+  - **Sign-off follow-ups for F3:** when F3 adds Rust determinization, add a
+    hidden-resampling invariance test (encoding unchanged under resampling of
+    hidden cards) to preserve the "real GameState instead of stub" and
+    "face-down back class from hidden id" guarantees.
 
 ### F3 — Searcher + Gumbel root (shared crate)
 

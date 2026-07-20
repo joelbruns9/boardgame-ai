@@ -361,19 +361,33 @@ F1A_DEEP_GAMES = 4  # games that additionally get the exhaustive depth-2 audit
 
 
 def iter_buffer_records(limit):
-    """Yield decoded records from every buffer .jsonl (sorted), up to `limit`
-    games total (`limit <= 0` means all)."""
+    """Yield `(index, record)` round-robin across the buffer files (one game per
+    file per pass), up to `limit` games total (`limit <= 0` = all). Round-robin
+    gives a stratified multi-file sample even for small limits, so a subset is
+    never just a lexicographic prefix of the first file."""
 
     paths = sorted(glob.glob(os.path.join(BUFFER_DIR, "*.jsonl")))
-    n = 0
-    for path in paths:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
+    handles = [open(p, "r", encoding="utf-8") for p in paths]
+    try:
+        n = 0
+        while True:
+            progressed = False
+            for fh in handles:
+                line = fh.readline()
+                while line and not line.strip():
+                    line = fh.readline()
+                if not line:
+                    continue
+                progressed = True
                 if limit > 0 and n >= limit:
                     return
-                if line.strip():
-                    yield n, from_json_line(line)
-                    n += 1
+                yield n, from_json_line(line)
+                n += 1
+            if not progressed:
+                return
+    finally:
+        for fh in handles:
+            fh.close()
 
 
 def _library_draws(record):
@@ -427,40 +441,57 @@ def test_buffer_games_equivalent():
         n += 1
     assert n > 0, "buffer corpus present but yielded no games"
     if F1A_GAMES > 0:
-        assert n == min(F1A_GAMES, n), "fewer games compared than requested"
+        assert n == F1A_GAMES, f"compared {n} games, requested {F1A_GAMES}"
 
 
 F2_GAMES = int(os.environ.get("SWR_F2_GAMES", "60"))
 # Default is a fast multi-file subset; the ≥100k-state acceptance gate is
-# `SWR_F2_GAMES=0 pytest -k encode_corpus` (0 = every buffer game). See PHASE_F.md.
+# `SWR_F2_GAMES=2000 pytest -k encode_corpus` (or 0 = every buffer game). At
+# acceptance scale the gate enforces the criteria below. See PHASE_F.md.
+F2_ACCEPT_GAMES = 2000
+F2_ACCEPT_MIN_STATES = 100_000
+_ALL_TOKEN_TYPES = frozenset(range(9))
+_ALL_DECISIONS = frozenset(range(9))
 
 
-def _compare_encodings(seed, first_player, action_indices, library_draws):
+def _compare_encodings(seed, first_player, action_indices, library_draws, coverage):
     """Lean encode-only equivalence driver (no fingerprint/mask/roundtrip): drive
-    both engines and assert bit-identical encodings at every decision. Returns
-    the number of states compared."""
+    both engines and assert bit-identical encodings at every decision *including
+    the terminal COMPLETE state*. Records decision- and token-type coverage into
+    `coverage`. Returns the number of states compared."""
 
     py = new_game(seed, first_player=first_player)
     setup = extract_setup(py)
     rg = swr.RustGame(library_draws=[list(d) for d in library_draws], **setup)
-    for i, idx in enumerate(action_indices):
+
+    def check(move):
+        expected = _expected_encoding(py)
         rust_enc = [(ti, eid, aid, tuple(feats)) for ti, eid, aid, feats in rg.encode()]
-        _assert_encoding_equal(seed, i, _expected_encoding(py), rust_enc)
+        _assert_encoding_equal(seed, move, expected, rust_enc)
+        coverage["token_types"].update(tok[0] for tok in expected)
+        # The GLOBAL token (always tokens[0]) carries the decision one-hot first.
+        coverage["decisions"].add(expected[0][3][:9].index(1.0))
+
+    for i, idx in enumerate(action_indices):
+        check(i)
         apply_action(py, decode_action(py, idx))
         rg.apply_index(idx)
-    return len(action_indices)
+    check(len(action_indices))  # terminal COMPLETE state (else decision 8 is untested)
+    return len(action_indices) + 1
 
 
 def test_encode_corpus_equivalent():
     """F2.3: bit-exact encoder over the buffer corpus. Skips when buffers are
-    absent; runs ``SWR_F2_GAMES`` games (default 60; 0 = full ≥100k acceptance
-    gate) and reports the state count compared."""
+    absent; runs ``SWR_F2_GAMES`` games round-robin across all files (default 60;
+    2000 or 0 = acceptance). At acceptance scale it enforces ≥100k states and
+    full decision/token-type coverage."""
 
     if not os.path.isdir(BUFFER_DIR) or not glob.glob(
         os.path.join(BUFFER_DIR, "*.jsonl")
     ):
         pytest.skip(f"no buffer corpus under {BUFFER_DIR} (F2.3 needs replay buffers)")
 
+    coverage = {"token_types": set(), "decisions": set()}
     games = 0
     states = 0
     for _index, record in iter_buffer_records(F2_GAMES):
@@ -469,10 +500,27 @@ def test_encode_corpus_equivalent():
             record.first_player,
             [m.action for m in record.moves],
             _library_draws(record),
+            coverage,
         )
         games += 1
     assert games > 0, "buffer corpus present but yielded no games"
-    print(f"F2.3 encode corpus: {states} states over {games} games")
+    if F2_GAMES > 0:
+        assert games == F2_GAMES, f"compared {games} games, requested {F2_GAMES}"
+    print(
+        f"F2.3 encode corpus: {states} states over {games} games; "
+        f"decisions={sorted(coverage['decisions'])} "
+        f"token_types={sorted(coverage['token_types'])}"
+    )
+    if F2_GAMES == 0 or F2_GAMES >= F2_ACCEPT_GAMES:
+        assert states >= F2_ACCEPT_MIN_STATES, (
+            f"acceptance run compared only {states} states (< {F2_ACCEPT_MIN_STATES})"
+        )
+        assert coverage["decisions"] == _ALL_DECISIONS, (
+            f"missing decision branches: {sorted(_ALL_DECISIONS - coverage['decisions'])}"
+        )
+        assert coverage["token_types"] == _ALL_TOKEN_TYPES, (
+            f"missing token types: {sorted(_ALL_TOKEN_TYPES - coverage['token_types'])}"
+        )
 
 
 def test_unseen_pool_equivalent():
@@ -487,6 +535,16 @@ def test_unseen_pool_equivalent():
             seed, first_player, actions, library, check_pool=True
         )
     assert total > 0
+
+
+def test_encoder_signature_matches():
+    """F2.3: the Rust build is bound to the Python encoder schema signature.
+    Diverging feature order/count/naming changes Python's ENCODER_SIGNATURE and
+    fails here until the Rust constant is updated in lockstep."""
+
+    from .encoder import ENCODER_SIGNATURE
+
+    assert swr.encoder_signature() == ENCODER_SIGNATURE
 
 
 def test_encode_equivalent():

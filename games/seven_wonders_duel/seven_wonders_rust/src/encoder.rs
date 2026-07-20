@@ -24,6 +24,18 @@ const NUM_SYMBOLS: usize = 7;
 const NUM_COLORS: usize = 7;
 const NUM_RESOURCES: usize = 5;
 
+/// Pinned encoder schema signature — must equal `encoder.py::ENCODER_SIGNATURE`
+/// (the F2 gate `test_encoder_signature_matches` asserts it). The F4 checkpoint
+/// boundary compares a checkpoint's stored signature against this to reject a
+/// net trained on a different feature schema.
+pub const ENCODER_SIGNATURE: &str =
+    "7d68ff20f280700f0c7a04d2411cded734c51b3e312a80578824d7dbb0098be2";
+
+/// Feature-vector length per token type, in `TokenType` order. The encoder
+/// asserts every emitted token matches (debug builds + `cargo test`); the
+/// bit-exact gate enforces it in release via the value comparison.
+pub const FEATURE_COUNTS: [usize; 9] = [130, 1, 26, 1, 8, 4, 1, 79, 14];
+
 // TokenType indices, in `encoder.py::TokenType` declaration order.
 const T_GLOBAL: usize = 0;
 const T_DRAFT_OFFER: usize = 1;
@@ -81,6 +93,10 @@ pub fn encode(g: &GameState) -> Vec<Token> {
     e.discard_tokens(&mut tokens);
     e.pool_tokens(&mut tokens);
     e.pool_wonder_token(&mut tokens);
+    debug_assert!(
+        tokens.iter().all(|t| t.features.len() == FEATURE_COUNTS[t.type_id]),
+        "encoder token feature count disagrees with FEATURE_COUNTS"
+    );
     tokens
 }
 
