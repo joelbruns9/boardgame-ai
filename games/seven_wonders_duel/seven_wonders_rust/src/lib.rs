@@ -8,6 +8,7 @@
 
 mod codec;
 mod data;
+mod encoder;
 mod engine;
 mod pool;
 mod rules;
@@ -150,6 +151,17 @@ impl RustGame {
         let p = pool::unseen_pool(&self.state);
         let [age1, age2, age3, guild] = p.cards;
         (age1, age2, age3, guild, p.wonders, p.offboard_progress)
+    }
+
+    /// F2.2: the actor-relative encoder token sequence. Each token is
+    /// `(type_id, entity_id, aux_id, features)` with `type_id` in `TokenType`
+    /// declaration order (GLOBAL=0 … POOL_WONDER=8). Actor-relative: derived
+    /// from the pending choice's player, else the active player.
+    fn encode(&self) -> Vec<(usize, i32, i32, Vec<f64>)> {
+        encoder::encode(&self.state)
+            .into_iter()
+            .map(|t| (t.type_id, t.entity_id, t.aux_id, t.features))
+            .collect()
     }
 
     fn is_complete(&self) -> bool {

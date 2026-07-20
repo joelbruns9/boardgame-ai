@@ -25,8 +25,49 @@ import random
 from .buffer import from_json_line
 from .codec import decode_action, legal_action_indices
 from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
+from .encoder import encode as py_encode, TokenType
 from .engine import apply_action
 from .pool import unseen_pool as py_unseen_pool
+
+_TOKEN_TYPE_INDEX = {token_type: index for index, token_type in enumerate(TokenType)}
+
+
+def _expected_encoding(game):
+    """Python encoding as `(type_id, entity_id, aux_id, features)` tuples, with
+    `type_id` in TokenType declaration order (the encoder ignores the viewer, so
+    seat 0 is arbitrary)."""
+
+    encoding = py_encode(game.observation(0))
+    return [
+        (_TOKEN_TYPE_INDEX[tok.type], tok.entity_id, tok.aux_id, tuple(tok.features))
+        for tok in encoding.tokens
+    ]
+
+
+def _assert_encoding_equal(seed, move, expected, actual):
+    if actual == expected:
+        return
+    assert len(actual) == len(expected), (
+        f"seed {seed} move {move}: token count {len(actual)} != {len(expected)}"
+    )
+    for i, (exp, act) in enumerate(zip(expected, actual)):
+        if exp == act:
+            continue
+        if exp[:3] != act[:3]:
+            raise AssertionError(
+                f"seed {seed} move {move} token {i}: header {act[:3]} != {exp[:3]} "
+                f"(type_id, entity_id, aux_id)"
+            )
+        for f, (ef, af) in enumerate(zip(exp[3], act[3])):
+            if ef != af:
+                raise AssertionError(
+                    f"seed {seed} move {move} token {i} (type {exp[0]}) feature "
+                    f"{f}: rust {af!r} != python {ef!r}"
+                )
+        raise AssertionError(
+            f"seed {seed} move {move} token {i}: feature count "
+            f"{len(act[3])} != {len(exp[3])}"
+        )
 from .game import (
     ChanceKind,
     Phase,
@@ -209,6 +250,7 @@ def compare_game(
     check_roundtrip=True,
     deep_every=None,
     check_pool=False,
+    check_encode=False,
 ):
     """Drive Python and Rust from the same action sequence; assert agreement.
 
@@ -225,11 +267,14 @@ def compare_game(
     py_fps: list[list[int]] = []
     py_masks: list[list[int]] = []
     py_pools: list[tuple] = []
+    py_encodings: list[list] = []
     for idx in action_indices:
         py_fps.append(logic_fingerprint(py))
         py_masks.append(list(legal_action_indices(py)))
         if check_pool:
             py_pools.append(_expected_pool(py))
+        if check_encode:
+            py_encodings.append(_expected_encoding(py))
         apply_action(py, decode_action(py, idx))
     assert py.phase is Phase.COMPLETE, f"seed {seed}: python game did not complete"
     py_final = logic_fingerprint(py)
@@ -258,6 +303,11 @@ def compare_game(
                 f"seed {seed} move {i}: unseen-pool mismatch (F2.1)\n"
                 f"  python: {py_pools[i]}\n  rust:   {rust_pool}"
             )
+        if check_encode:
+            rust_enc = [
+                (ti, eid, aid, tuple(feats)) for ti, eid, aid, feats in rg.encode()
+            ]
+            _assert_encoding_equal(seed, i, py_encodings[i], rust_enc)
         rg.apply_index(idx)
 
     rust_final = rg.fingerprint()
@@ -390,6 +440,19 @@ def test_unseen_pool_equivalent():
         first_player, actions, library = random_game(seed, seed % 2)
         total += compare_game(
             seed, first_player, actions, library, check_pool=True
+        )
+    assert total > 0
+
+
+def test_encode_equivalent():
+    """F2.2: Rust `encode` is bit-identical (token type/entity/aux/features) to
+    Python `encode(observation)` at every decision, across all phases."""
+
+    total = 0
+    for seed in range(40):
+        first_player, actions, library = random_game(seed, seed % 2)
+        total += compare_game(
+            seed, first_player, actions, library, check_encode=True
         )
     assert total > 0
 

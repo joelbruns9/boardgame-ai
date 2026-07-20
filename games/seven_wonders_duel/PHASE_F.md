@@ -71,12 +71,18 @@ more intricate than Kingdomino's.
     phase-specific visibility (e.g. the draft-hidden tableau) is applied in the
     token builders. Search-side pool helpers (`resample_hidden`/`enumerate_*`)
     deferred to F3.
-  - **F2.2** — port `encode()` token builders simplest-first (global,
-    draft_offer, city_card, wonder, progress, discard, pool, pool_wonder,
-    tableau), reusing `minimum_payment`/scoring already in `engine.rs`; lock the
-    per-type feature order to `_SCHEMA`.
+  - **F2.2** — port `encode()` token builders. **DONE 2026-07-20:** `encoder.rs`
+    ships all nine token types in f64, feature-for-feature in `encoder.py` order,
+    reusing `minimum_payment`/`fixed_production`/`choice_producers`/
+    `opponent_trade_production`/`trade_discounts` (made `pub(crate)`) and a new
+    `GameState::score_player` breakdown (`score_totals` now delegates to it). The
+    Python "stub state" is unnecessary — the real `GameState`'s public fields
+    equal the observation's. `RustGame.encode()` matches Python
+    `encode(observation)` bit-for-bit (token type/entity_id/aux_id/features) at
+    every decision across all phases (`test_encode_equivalent`, 40 random games).
   - **F2.3** — full `encode_state` bit-exact gate over ≥100k sampled states.
-- Status: **in progress** — codec covered; encoder foundation (F2.1) starting.
+- Status: **in progress** — codec covered; F2.1 + F2.2 done; F2.3 (≥100k gate)
+  remains.
 
 ### F3 — Searcher + Gumbel root (shared crate)
 

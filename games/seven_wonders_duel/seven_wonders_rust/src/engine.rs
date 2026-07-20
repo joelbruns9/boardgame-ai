@@ -74,10 +74,25 @@ impl Action {
 /// Result of a payment search: only the total and trade portions affect state
 /// (Economy rebate + Urbanism chain bonus); the purchase breakdown does not.
 #[derive(Clone, Copy)]
-struct Payment {
-    total_coins: i32,
-    trade_coins: i32,
-    used_chain: bool,
+pub(crate) struct Payment {
+    pub(crate) total_coins: i32,
+    pub(crate) trade_coins: i32,
+    pub(crate) used_chain: bool,
+}
+
+/// Per-category victory-point breakdown (mirrors `engine.py::ScoreBreakdown`).
+/// The encoder consumes every field; the endgame resolver needs only
+/// `total`/`blue_buildings`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoreBreakdown {
+    pub(crate) military: i32,
+    pub(crate) buildings: i32, // all card VP incl. guilds
+    pub(crate) guild: i32,     // guild-card VP alone (subset of buildings)
+    pub(crate) wonders: i32,
+    pub(crate) progress: i32,
+    pub(crate) treasury: i32,
+    pub(crate) total: i32,
+    pub(crate) blue_buildings: i32,
 }
 
 // --- production / cost helpers ------------------------------------------------
@@ -94,7 +109,7 @@ fn has_token(g: &GameState, player: usize, name: &str) -> bool {
     g.cities[player].progress_tokens.contains(&progress_id(name))
 }
 
-fn fixed_production(g: &GameState, player: usize) -> [i32; 5] {
+pub(crate) fn fixed_production(g: &GameState, player: usize) -> [i32; 5] {
     let mut out = [0i32; 5];
     for &cid in &g.cities[player].buildings {
         for &r in card(cid).fixed_production {
@@ -104,7 +119,7 @@ fn fixed_production(g: &GameState, player: usize) -> [i32; 5] {
     out
 }
 
-fn choice_producers(g: &GameState, player: usize) -> Vec<&'static [Resource]> {
+pub(crate) fn choice_producers(g: &GameState, player: usize) -> Vec<&'static [Resource]> {
     let mut out: Vec<&'static [Resource]> = Vec::new();
     for &cid in &g.cities[player].buildings {
         let cp = card(cid).choice_production;
@@ -121,7 +136,7 @@ fn choice_producers(g: &GameState, player: usize) -> Vec<&'static [Resource]> {
     out
 }
 
-fn opponent_trade_production(g: &GameState, player: usize) -> [i32; 5] {
+pub(crate) fn opponent_trade_production(g: &GameState, player: usize) -> [i32; 5] {
     let mut out = [0i32; 5];
     for &cid in &g.cities[1 - player].buildings {
         let c = card(cid);
@@ -134,7 +149,7 @@ fn opponent_trade_production(g: &GameState, player: usize) -> [i32; 5] {
     out
 }
 
-fn trade_discounts(g: &GameState, player: usize) -> [bool; 5] {
+pub(crate) fn trade_discounts(g: &GameState, player: usize) -> [bool; 5] {
     let mut out = [false; 5];
     for &cid in &g.cities[player].buildings {
         for &r in card(cid).trade_discount {
@@ -157,7 +172,7 @@ fn chain_is_free(g: &GameState, player: usize, c: &data::CardData) -> bool {
 /// Enumerate rebate allocations (per-resource reductions summing to ≤ rebate,
 /// each ≤ the cost's count) and, over each, the minimal trade cost across
 /// flexible producers. Returns (total_coins, trade_coins, used_chain).
-fn minimum_payment(
+pub(crate) fn minimum_payment(
     g: &GameState,
     player: usize,
     cost: &Cost,
@@ -819,8 +834,9 @@ impl GameState {
         points
     }
 
-    /// (total, blue_buildings) — the two quantities the civilian tiebreak needs.
-    fn score_totals(&self, player: usize) -> (i32, i32) {
+    /// Full per-category victory-point breakdown (mirrors
+    /// `engine.py::score_player`); the encoder consumes every field.
+    pub(crate) fn score_player(&self, player: usize) -> ScoreBreakdown {
         let city = &self.cities[player];
         let military = self.military_victory_points(player);
         let guild = self.guild_victory_points(player);
@@ -844,7 +860,22 @@ impl GameState {
             .map(|&c| card(c).victory_points)
             .sum();
         let total = military + buildings + wonders + progress_vp + treasury;
-        (total, blue)
+        ScoreBreakdown {
+            military,
+            buildings,
+            guild,
+            wonders,
+            progress: progress_vp,
+            treasury,
+            total,
+            blue_buildings: blue,
+        }
+    }
+
+    /// (total, blue_buildings) — the two quantities the civilian tiebreak needs.
+    fn score_totals(&self, player: usize) -> (i32, i32) {
+        let s = self.score_player(player);
+        (s.total, s.blue_buildings)
     }
 
     fn resolve_civilian_endgame(&mut self) {
