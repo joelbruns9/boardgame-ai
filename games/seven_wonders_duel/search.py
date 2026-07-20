@@ -37,7 +37,6 @@ stays the simpler equivalent.
 from __future__ import annotations
 
 import math
-import random
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -48,6 +47,7 @@ from .encoder import encode
 from .engine import Action, ActionUse, apply_action
 from .game import ChanceKind, GameState, Phase
 from .inference import Evaluator
+from .portable_rng import PortableRng
 from .pool import (
     enumerate_card_reveal,
     enumerate_great_library,
@@ -134,7 +134,7 @@ def age_deal_key(age: int, deal) -> tuple:
 
 
 def sample_outcomes(
-    state: GameState, specs, rng: random.Random
+    state: GameState, specs, rng
 ) -> tuple[list, float | None, tuple]:
     """Sample one outcome per spec. Returns (outcomes, joint probability or
     None when any event is sample-only, hashable child key). Sequential
@@ -312,7 +312,7 @@ class GumbelMCTS:
     def __init__(self, evaluator: Evaluator, config: SearchConfig | None = None):
         self.evaluator = evaluator
         self.config = config or SearchConfig()
-        self.rng = random.Random(self.config.seed)
+        self.rng = PortableRng(self.config.seed)
 
     # ---- shared -----------------------------------------------------------
 
@@ -352,8 +352,9 @@ class GumbelMCTS:
         if config.sims < 1 or config.top_k < 1:
             raise ValueError("sims and top_k must be positive")
         log_prior = {a: math.log(max(priors.get(a, 1e-12), 1e-12)) for a in legal}
-        gumbel = {a: self.rng.gammavariate(1.0, 1.0) for a in legal}
-        gumbel = {a: -math.log(max(g, 1e-12)) for a, g in gumbel.items()}
+        # Portable Gumbel keys (one per legal action, sorted order) so the Rust
+        # searcher reproduces the top-k and halving bit-for-bit — see portable_rng.
+        gumbel = {a: self.rng.gumbel() for a in legal}
         candidates = sorted(
             legal, key=lambda a: gumbel[a] + log_prior[a], reverse=True
         )[: min(config.top_k, len(legal))]

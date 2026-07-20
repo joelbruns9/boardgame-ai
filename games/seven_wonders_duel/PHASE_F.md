@@ -167,7 +167,13 @@ arena/coalescing/`allow_threads` scaffolding.
     section below.
 - **Sub-sequence (each behind a gate):**
   - **F3.0** — Python reference RNG → portable splitmix64 (Gumbel + chance
-    sampling); Phase D/E re-verified.
+    sampling); Phase D/E re-verified. **DONE 2026-07-20:** `portable_rng.py`
+    (`PortableRng`: `next_u64`/`next_float`/`gumbel`/`randrange`/Fisher-Yates
+    `shuffle`/`getrandbits`, KD splitmix64 constants; seed-0 first output is the
+    canonical `0xE220A8397B1DCDAF`). `search.py` now uses it for the Gumbel keys
+    and `sample_outcomes`; open-mode `resample_hidden` works unchanged (portable
+    `shuffle`/`getrandbits`). `test_portable_rng.py` pins the golden stream Rust
+    must reproduce. `test_search.py` (23) + Phase D/E (20) green.
   - **F3.1** — Rust chance engine: `make_with_chance` + chance
     signature/enumerate/sample, gated vs Python (outcomes, probabilities, states).
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
