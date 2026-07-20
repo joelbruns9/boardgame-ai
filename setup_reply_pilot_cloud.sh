@@ -148,8 +148,8 @@ if [ -f requirements.txt ]; then
 else
   "$PY" -m pip install "numpy>=1.24" "maturin>=1.5"
 fi
-"$PY" -m pip install "pytest>=8,<10"
-"$PY" -c "import pytest; print('pytest', pytest.__version__)"
+"$PY" -m pip install "pytest>=8,<10" fastapi uvicorn
+"$PY" -c "import fastapi, pytest, uvicorn; print('pytest', pytest.__version__); print('fastapi', fastapi.__version__); print('uvicorn', uvicorn.__version__)"
 stage_done 3
 
 stage 4 "Release build of kingdomino_rust"
