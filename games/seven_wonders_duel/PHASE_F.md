@@ -174,8 +174,19 @@ arena/coalescing/`allow_threads` scaffolding.
     and `sample_outcomes`; open-mode `resample_hidden` works unchanged (portable
     `shuffle`/`getrandbits`). `test_portable_rng.py` pins the golden stream Rust
     must reproduce. `test_search.py` (23) + Phase D/E (20) green.
-  - **F3.1** — Rust chance engine: `make_with_chance` + chance
-    signature/enumerate/sample, gated vs Python (outcomes, probabilities, states).
+  - **F3.1** — Rust chance engine, in two halves:
+    - **F3.1a DONE 2026-07-20:** `rng.rs` (SplitMix64 mirroring `portable_rng.py`;
+      golden Rust unit test) + `chance.rs` (`ChanceKind`, `chance_signature`,
+      `enumerate_chains` with a lexicographic `combinations` helper). Exposed as
+      `RustGame.chance_signature`/`enumerate_chains`; `coverers` made
+      `pub(crate)`. Gate `test_chance_signature_and_chains_equivalent`: specs +
+      chain outcomes/probabilities match Python at every legal action across 25
+      random games (all phases); AGE_DEAL refused by both.
+    - **F3.1b (remaining):** `sample_outcomes` (portable RNG) + `make_with_chance`
+      (the supplied-outcome SWAP — `_override_reveal`/`_override_wonder_flip`/
+      Great-Library draw/`_validated_age_deal`). Gate: sampled chains match Python
+      under a shared seed; resulting states match. Includes the F2
+      hidden-resampling invariance follow-up.
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
     materialization; matches Python to 1e-6 under a mock eval on deterministic
     positions (sampling off).

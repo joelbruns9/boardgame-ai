@@ -158,7 +158,7 @@ impl TableauState {
 
 /// Covering slots for `slot_i` in `age`: next-row slots whose x differs by 1.
 /// Cached per age.
-fn coverers(age: u8, slot_i: usize) -> &'static [usize] {
+pub(crate) fn coverers(age: u8, slot_i: usize) -> &'static [usize] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[Vec<Vec<usize>>; 4]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {

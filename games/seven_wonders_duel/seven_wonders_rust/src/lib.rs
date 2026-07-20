@@ -6,11 +6,13 @@
 //! indices. See `state.rs` for why no Python RNG is modelled and why the
 //! fingerprint is the equivalence surface.
 
+mod chance;
 mod codec;
 mod data;
 mod encoder;
 mod engine;
 mod pool;
+mod rng;
 mod rules;
 mod state;
 
@@ -162,6 +164,34 @@ impl RustGame {
             .into_iter()
             .map(|t| (t.type_id, t.entity_id, t.aux_id, t.features))
             .collect()
+    }
+
+    /// F3.1a: predicted chance events for action `index`, as
+    /// `(kind_id, context)` — kind_id in `ChanceKind` order (CardReveal=0 …
+    /// AgeDeal=3), context flattened (CardReveal `[row, x, back]`, AgeDeal
+    /// `[age]`, else `[]`).
+    fn chance_signature(&self, index: usize) -> Vec<(u8, Vec<i32>)> {
+        let action = codec::decode_action(&self.state, index);
+        chance::chance_signature(&self.state, &action)
+            .into_iter()
+            .map(|s| (s.kind as u8, s.context))
+            .collect()
+    }
+
+    /// F3.1a: all `(outcomes, probability)` chains for action `index`'s
+    /// enumerable chance specs. Each chain's `outcomes` is one id list per spec
+    /// (CardReveal `[card_id]`, GreatLibraryDraw `[p,p,p]`, WonderGroupReveal
+    /// `[w,w,w,w]`). Errors on AgeDeal (sample-only).
+    fn enumerate_chains(&self, index: usize) -> PyResult<Vec<(Vec<Vec<usize>>, f64)>> {
+        let action = codec::decode_action(&self.state, index);
+        let specs = chance::chance_signature(&self.state, &action);
+        if specs
+            .iter()
+            .any(|s| s.kind == chance::ChanceKind::AgeDeal)
+        {
+            return Err(PyValueError::new_err("cannot enumerate AGE_DEAL chains"));
+        }
+        Ok(chance::enumerate_chains(&self.state, &specs))
     }
 
     fn is_complete(&self) -> bool {

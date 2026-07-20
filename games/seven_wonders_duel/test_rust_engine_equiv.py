@@ -27,7 +27,63 @@ from .codec import decode_action, legal_action_indices
 from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
 from .encoder import encode as py_encode, TokenType
 from .engine import apply_action
+from .game import ChanceKind
 from .pool import unseen_pool as py_unseen_pool
+from .search import (
+    chance_signature as py_chance_signature,
+    enumerate_chains as py_enumerate_chains,
+)
+
+_CHANCE_KIND_ID = {
+    ChanceKind.CARD_REVEAL: 0,
+    ChanceKind.GREAT_LIBRARY_DRAW: 1,
+    ChanceKind.WONDER_GROUP_REVEAL: 2,
+    ChanceKind.AGE_DEAL: 3,
+}
+_BACK_ID = {
+    BackType.AGE_I: 0,
+    BackType.AGE_II: 1,
+    BackType.AGE_III: 2,
+    BackType.GUILD: 3,
+}
+_CHANCE_ID_MAP = {
+    ChanceKind.CARD_REVEAL: CARD_IDS,
+    ChanceKind.GREAT_LIBRARY_DRAW: PROGRESS_IDS,
+    ChanceKind.WONDER_GROUP_REVEAL: WONDER_IDS,
+}
+
+
+def _expected_signature(game, index):
+    """Python chance_signature as (kind_id, context) — the shape Rust returns."""
+
+    out = []
+    for spec in py_chance_signature(game, decode_action(game, index)):
+        if spec.kind is ChanceKind.CARD_REVEAL:
+            (row, x), back = spec.context
+            ctx = [row, x, _BACK_ID[back]]
+        elif spec.kind is ChanceKind.AGE_DEAL:
+            ctx = [spec.context[0]]
+        else:
+            ctx = []
+        out.append((_CHANCE_KIND_ID[spec.kind], ctx))
+    return out
+
+
+def _expected_chains_dict(game, index):
+    """Python enumerate_chains as {outcome-id-tuple: probability}."""
+
+    specs = py_chance_signature(game, decode_action(game, index))
+    result = {}
+    for outcomes, prob, _key in py_enumerate_chains(game, specs):
+        key = []
+        for spec, outcome in zip(specs, outcomes):
+            id_map = _CHANCE_ID_MAP[spec.kind]
+            if isinstance(outcome, str):
+                key.append((id_map[outcome],))
+            else:
+                key.append(tuple(id_map[name] for name in outcome))
+        result[tuple(key)] = prob
+    return result
 
 _TOKEN_TYPE_INDEX = {token_type: index for index, token_type in enumerate(TokenType)}
 
@@ -535,6 +591,47 @@ def test_unseen_pool_equivalent():
             seed, first_player, actions, library, check_pool=True
         )
     assert total > 0
+
+
+def test_chance_signature_and_chains_equivalent():
+    """F3.1a: Rust chance_signature and enumerate_chains match Python at every
+    legal action across all phases (random games span draft/reveals/Great
+    Library/age boundaries). AGE_DEAL specs are sample-only — both refuse to
+    enumerate them."""
+
+    checked_sig = 0
+    checked_chains = 0
+    for seed in range(25):
+        first_player, actions, library = random_game(seed, seed % 2)
+        py = new_game(seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for idx in actions:
+            for index in legal_action_indices(py):
+                expected_sig = _expected_signature(py, index)
+                rust_sig = [(k, list(ctx)) for k, ctx in rg.chance_signature(index)]
+                assert rust_sig == expected_sig, (
+                    f"seed {seed} action {index}: chance_signature mismatch\n"
+                    f"  python: {expected_sig}\n  rust:   {rust_sig}"
+                )
+                checked_sig += 1
+                if any(k == _CHANCE_KIND_ID[ChanceKind.AGE_DEAL] for k, _ in expected_sig):
+                    with pytest.raises(ValueError):
+                        rg.enumerate_chains(index)
+                    continue
+                expected = _expected_chains_dict(py, index)
+                rust = {
+                    tuple(tuple(o) for o in outcomes): prob
+                    for outcomes, prob in rg.enumerate_chains(index)
+                }
+                assert rust.keys() == expected.keys(), (
+                    f"seed {seed} action {index}: chain outcome set mismatch"
+                )
+                for key, prob in expected.items():
+                    assert rust[key] == pytest.approx(prob, abs=1e-12)
+                checked_chains += 1
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked_sig > 1000 and checked_chains > 500
 
 
 def test_encoder_signature_matches():
