@@ -9,6 +9,7 @@
 mod codec;
 mod data;
 mod engine;
+mod pool;
 mod rules;
 mod state;
 
@@ -139,6 +140,16 @@ impl RustGame {
     #[pyo3(signature = (depth=2))]
     fn roundtrip_all_ok(&self, depth: usize) -> bool {
         engine::make_unmake_audit(&self.state, depth).is_ok()
+    }
+
+    /// F2.1 foundation: the unseen-card pool read from the public projection.
+    /// Returns `(age1, age2, age3, guild, wonders, offboard_progress)`, each a
+    /// sorted id list — the encoder's hidden-structure inputs. Viewer-independent
+    /// (hidden info is symmetric).
+    fn unseen_pool(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+        let p = pool::unseen_pool(&self.state);
+        let [age1, age2, age3, guild] = p.cards;
+        (age1, age2, age3, guild, p.wonders, p.offboard_progress)
     }
 
     fn is_complete(&self) -> bool {

@@ -24,8 +24,9 @@ import random
 
 from .buffer import from_json_line
 from .codec import decode_action, legal_action_indices
-from .data import CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
+from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
 from .engine import apply_action
+from .pool import unseen_pool as py_unseen_pool
 from .game import (
     ChanceKind,
     Phase,
@@ -182,6 +183,23 @@ def extract_setup(game) -> dict:
     }
 
 
+_BACK_ORDER = (BackType.AGE_I, BackType.AGE_II, BackType.AGE_III, BackType.GUILD)
+
+
+def _expected_pool(game):
+    """Python `unseen_pool` mapped to the sorted id lists the Rust `unseen_pool`
+    returns: (age1, age2, age3, guild, wonders, offboard_progress)."""
+
+    up = py_unseen_pool(game.observation(game.active_player))
+    cards = tuple(
+        tuple(sorted(CARD_IDS[n] for n in up.cards[back])) for back in _BACK_ORDER
+    )
+    return cards + (
+        tuple(sorted(WONDER_IDS[n] for n in up.wonders)),
+        tuple(sorted(PROGRESS_IDS[n] for n in up.offboard_progress)),
+    )
+
+
 def compare_game(
     seed,
     first_player,
@@ -190,6 +208,7 @@ def compare_game(
     *,
     check_roundtrip=True,
     deep_every=None,
+    check_pool=False,
 ):
     """Drive Python and Rust from the same action sequence; assert agreement.
 
@@ -205,9 +224,12 @@ def compare_game(
 
     py_fps: list[list[int]] = []
     py_masks: list[list[int]] = []
+    py_pools: list[tuple] = []
     for idx in action_indices:
         py_fps.append(logic_fingerprint(py))
         py_masks.append(list(legal_action_indices(py)))
+        if check_pool:
+            py_pools.append(_expected_pool(py))
         apply_action(py, decode_action(py, idx))
     assert py.phase is Phase.COMPLETE, f"seed {seed}: python game did not complete"
     py_final = logic_fingerprint(py)
@@ -229,6 +251,12 @@ def compare_game(
         if deep_every and i % deep_every == 0:
             assert rg.roundtrip_all_ok(2), (
                 f"seed {seed} move {i}: exhaustive make/unmake audit failed (F1b)"
+            )
+        if check_pool:
+            rust_pool = tuple(tuple(lst) for lst in rg.unseen_pool())
+            assert rust_pool == py_pools[i], (
+                f"seed {seed} move {i}: unseen-pool mismatch (F2.1)\n"
+                f"  python: {py_pools[i]}\n  rust:   {rust_pool}"
             )
         rg.apply_index(idx)
 
@@ -350,6 +378,20 @@ def test_buffer_games_equivalent():
     assert n > 0, "buffer corpus present but yielded no games"
     if F1A_GAMES > 0:
         assert n == min(F1A_GAMES, n), "fewer games compared than requested"
+
+
+def test_unseen_pool_equivalent():
+    """F2.1: Rust `unseen_pool` (encoder foundation) matches Python's public
+    projection at every decision, across all phases (random games span draft →
+    all three ages → endgame)."""
+
+    total = 0
+    for seed in range(40):
+        first_player, actions, library = random_game(seed, seed % 2)
+        total += compare_game(
+            seed, first_player, actions, library, check_pool=True
+        )
+    assert total > 0
 
 
 def test_apply_index_rejects_illegal_action():

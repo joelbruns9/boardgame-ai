@@ -49,7 +49,34 @@ more intricate than Kingdomino's.
 - **Gate F2:** bit-exact `encode_state` and exact `encode_action`/decode
   (order and value) vs Python on ≥100k sampled states across all game phases,
   per `CODEC_SPEC.md` (codec-1, encoder signature enforced).
-- Status: not started.
+- **Codec half already satisfied by F1a (2026-07-20 scoping).** `codec.rs`
+  (`encode_action`/`decode_action`/`legal_action_indices`) shipped with F1, and
+  F1a asserts the Rust legal-action indices equal Python's at *every* decision —
+  i.e. `encode_action` order+value over every legal action across 664,991
+  decisions / 12,500 games, far exceeding the ≥100k-state bar, with `decode`
+  exercised by every apply. F2's remaining work is the **encoder**.
+- **Encoder foundation:** `encode()` consumes `PlayerObservation` + `UnseenPool`
+  (actor-relative, hidden-info-stripped), which the F1 crate does not yet model.
+  For the F4 in-Rust self-play path the encoder must run from `GameState` with no
+  Python hop, so `observation(viewer)` (game.py) and `UnseenPool` (pool.py) are
+  ported to Rust first. Features computed in **f64** (KD f32-broke-bit-identity
+  lesson) and compared bit-for-bit.
+- **Sub-sequence (KD M2 discipline, each behind its own gate):**
+  - **F2.1** — port `UnseenPool` + `observation()`; gate derived pool/obs fields
+    vs Python over sampled states. **DONE 2026-07-20:** `pool.rs` (read-side
+    `unseen_pool`/`visible_cards`) ships; `RustGame.unseen_pool()` matches Python
+    at every decision across all phases (`test_unseen_pool_equivalent`, 40 random
+    games draft→age III→endgame). No separate observation struct needed — the
+    Rust `GameState` already holds every public field the encoder reads;
+    phase-specific visibility (e.g. the draft-hidden tableau) is applied in the
+    token builders. Search-side pool helpers (`resample_hidden`/`enumerate_*`)
+    deferred to F3.
+  - **F2.2** — port `encode()` token builders simplest-first (global,
+    draft_offer, city_card, wonder, progress, discard, pool, pool_wonder,
+    tableau), reusing `minimum_payment`/scoring already in `engine.rs`; lock the
+    per-type feature order to `_SCHEMA`.
+  - **F2.3** — full `encode_state` bit-exact gate over ≥100k sampled states.
+- Status: **in progress** — codec covered; encoder foundation (F2.1) starting.
 
 ### F3 — Searcher + Gumbel root (shared crate)
 
