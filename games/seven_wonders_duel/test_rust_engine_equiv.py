@@ -430,6 +430,51 @@ def test_buffer_games_equivalent():
         assert n == min(F1A_GAMES, n), "fewer games compared than requested"
 
 
+F2_GAMES = int(os.environ.get("SWR_F2_GAMES", "60"))
+# Default is a fast multi-file subset; the ≥100k-state acceptance gate is
+# `SWR_F2_GAMES=0 pytest -k encode_corpus` (0 = every buffer game). See PHASE_F.md.
+
+
+def _compare_encodings(seed, first_player, action_indices, library_draws):
+    """Lean encode-only equivalence driver (no fingerprint/mask/roundtrip): drive
+    both engines and assert bit-identical encodings at every decision. Returns
+    the number of states compared."""
+
+    py = new_game(seed, first_player=first_player)
+    setup = extract_setup(py)
+    rg = swr.RustGame(library_draws=[list(d) for d in library_draws], **setup)
+    for i, idx in enumerate(action_indices):
+        rust_enc = [(ti, eid, aid, tuple(feats)) for ti, eid, aid, feats in rg.encode()]
+        _assert_encoding_equal(seed, i, _expected_encoding(py), rust_enc)
+        apply_action(py, decode_action(py, idx))
+        rg.apply_index(idx)
+    return len(action_indices)
+
+
+def test_encode_corpus_equivalent():
+    """F2.3: bit-exact encoder over the buffer corpus. Skips when buffers are
+    absent; runs ``SWR_F2_GAMES`` games (default 60; 0 = full ≥100k acceptance
+    gate) and reports the state count compared."""
+
+    if not os.path.isdir(BUFFER_DIR) or not glob.glob(
+        os.path.join(BUFFER_DIR, "*.jsonl")
+    ):
+        pytest.skip(f"no buffer corpus under {BUFFER_DIR} (F2.3 needs replay buffers)")
+
+    games = 0
+    states = 0
+    for _index, record in iter_buffer_records(F2_GAMES):
+        states += _compare_encodings(
+            record.seed,
+            record.first_player,
+            [m.action for m in record.moves],
+            _library_draws(record),
+        )
+        games += 1
+    assert games > 0, "buffer corpus present but yielded no games"
+    print(f"F2.3 encode corpus: {states} states over {games} games")
+
+
 def test_unseen_pool_equivalent():
     """F2.1: Rust `unseen_pool` (encoder foundation) matches Python's public
     projection at every decision, across all phases (random games span draft →

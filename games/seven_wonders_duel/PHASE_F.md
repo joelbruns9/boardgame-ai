@@ -81,8 +81,14 @@ more intricate than Kingdomino's.
     `encode(observation)` bit-for-bit (token type/entity_id/aux_id/features) at
     every decision across all phases (`test_encode_equivalent`, 40 random games).
   - **F2.3** — full `encode_state` bit-exact gate over ≥100k sampled states.
-- Status: **in progress** — codec covered; F2.1 + F2.2 done; F2.3 (≥100k gate)
-  remains.
+    **DONE 2026-07-20:** `test_encode_corpus_equivalent` (lean encode-only driver,
+    env-sized `SWR_F2_GAMES` like F1a; skips when buffers absent). Acceptance run
+    `SWR_F2_GAMES=2000`: **113,726 states bit-exact in 312s**; routine `pytest`
+    runs a 60-game subset. `SWR_F2_GAMES=0` sweeps the whole corpus.
+- Status: **GREEN 2026-07-20.** Codec covered by F1a; encoder ported and
+  bit-exact (pool + all nine token types) over 113k+ sampled states across all
+  phases. `cargo test` 3 / `pytest test_rust_engine_equiv.py` 7 green. Next: F3
+  (closed searcher + Gumbel root; mode scope resolved by E-Tier-1 above).
 
 ### F3 — Searcher + Gumbel root (shared crate)
 
