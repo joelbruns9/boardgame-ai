@@ -29,9 +29,11 @@ from .encoder import encode as py_encode, TokenType
 from .engine import apply_action
 from .game import ChanceKind
 from .pool import unseen_pool as py_unseen_pool
+from .portable_rng import PortableRng
 from .search import (
     chance_signature as py_chance_signature,
     enumerate_chains as py_enumerate_chains,
+    sample_outcomes as py_sample_outcomes,
 )
 
 _CHANCE_KIND_ID = {
@@ -51,6 +53,24 @@ _CHANCE_ID_MAP = {
     ChanceKind.GREAT_LIBRARY_DRAW: PROGRESS_IDS,
     ChanceKind.WONDER_GROUP_REVEAL: WONDER_IDS,
 }
+# Sampling additionally maps AGE_DEAL outcomes (card names) to card ids.
+_CHANCE_SAMPLE_ID_MAP = {**_CHANCE_ID_MAP, ChanceKind.AGE_DEAL: CARD_IDS}
+
+
+def _expected_sample(game, index, seed):
+    """Python sample_outcomes for a fresh PortableRng(seed), outcomes as id
+    lists: (outcomes, probability)."""
+
+    specs = py_chance_signature(game, decode_action(game, index))
+    outcomes, prob, _key = py_sample_outcomes(game, specs, PortableRng(seed))
+    mapped = []
+    for spec, outcome in zip(specs, outcomes):
+        id_map = _CHANCE_SAMPLE_ID_MAP[spec.kind]
+        if isinstance(outcome, str):
+            mapped.append([id_map[outcome]])
+        else:
+            mapped.append([id_map[name] for name in outcome])
+    return mapped, prob
 
 
 def _expected_signature(game, index):
@@ -632,6 +652,38 @@ def test_chance_signature_and_chains_equivalent():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked_sig > 1000 and checked_chains > 500
+
+
+def test_sample_outcomes_equivalent():
+    """F3.1b: Rust sample_outcomes reproduces Python's sampled chain under a
+    shared seed (portable RNG parity), including AGE_DEAL's shuffle path."""
+
+    checked = 0
+    for seed in range(25):
+        first_player, actions, library = random_game(seed, seed % 2)
+        py = new_game(seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for idx in actions:
+            for index in legal_action_indices(py):
+                specs = py_chance_signature(py, decode_action(py, index))
+                if not specs:
+                    continue
+                for rng_seed in (0, 1, 12345):
+                    exp_outcomes, exp_prob = _expected_sample(py, index, rng_seed)
+                    rust_outcomes, rust_prob = rg.sample_outcomes(index, rng_seed)
+                    rust_outcomes = [list(o) for o in rust_outcomes]
+                    assert rust_outcomes == exp_outcomes, (
+                        f"seed {seed} action {index} rng {rng_seed}: sample mismatch\n"
+                        f"  python: {exp_outcomes}\n  rust:   {rust_outcomes}"
+                    )
+                    if exp_prob is None:
+                        assert rust_prob is None
+                    else:
+                        assert rust_prob == pytest.approx(exp_prob, abs=1e-12)
+                    checked += 1
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked > 500
 
 
 def test_encoder_signature_matches():

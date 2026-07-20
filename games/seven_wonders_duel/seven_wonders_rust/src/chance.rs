@@ -4,9 +4,10 @@
 //! Sampling (`sample_outcomes`) and the supplied-outcome apply path
 //! (`make_with_chance`) land in F3.1b.
 
-use crate::data::{back_type_of, wonder_id};
+use crate::data::{back_type_of, card, layout, wonder_id};
 use crate::engine::{Action, ActionUse};
 use crate::pool::{unseen_pool, UnseenPool};
+use crate::rng::Rng;
 use crate::state::{coverers, GameState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,4 +196,77 @@ fn expand(
         ChanceKind::AgeDeal => panic!("cannot enumerate AGE_DEAL (sample-only)"),
     }
     results
+}
+
+/// Card ids of a back type, ascending by card NAME — the order Python's
+/// `sorted(pool.cards[back])` (a set of names) produces, which the AGE_DEAL
+/// sampler shuffles.
+fn pool_by_name(ids: &[usize]) -> Vec<usize> {
+    let mut v = ids.to_vec();
+    v.sort_by(|&a, &b| card(a).name.cmp(card(b).name));
+    v
+}
+
+/// Sample one outcome per spec from `rng`, mirroring `search.py::sample_outcomes`
+/// call-for-call. Returns `(outcomes, joint probability or None when any spec is
+/// sample-only)`, each outcome an id list (CardReveal `[id]`, GreatLibraryDraw
+/// `[p,p,p]`, WonderGroupReveal `[w,w,w,w]`, AgeDeal the 20-card deal order).
+pub fn sample_outcomes(
+    g: &GameState,
+    specs: &[ChanceSpec],
+    rng: &mut Rng,
+) -> (Vec<Vec<usize>>, Option<f64>) {
+    let pool = unseen_pool(g);
+    let mut used = vec![false; crate::data::NUM_CARDS];
+    let mut outcomes: Vec<Vec<usize>> = Vec::new();
+    let mut prob: Option<f64> = Some(1.0);
+    for spec in specs {
+        match spec.kind {
+            ChanceKind::CardReveal => {
+                let back = spec.context[2] as usize;
+                let names: Vec<usize> =
+                    pool.cards[back].iter().copied().filter(|&c| !used[c]).collect();
+                let choice = names[rng.randrange(names.len() as u64) as usize];
+                used[choice] = true;
+                outcomes.push(vec![choice]);
+                if let Some(p) = prob.as_mut() {
+                    *p *= 1.0 / names.len() as f64;
+                }
+            }
+            ChanceKind::GreatLibraryDraw => {
+                let subsets = combinations(&pool.offboard_progress, 3);
+                let i = rng.randrange(subsets.len() as u64) as usize;
+                outcomes.push(subsets[i].clone());
+                if let Some(p) = prob.as_mut() {
+                    *p *= 1.0 / subsets.len() as f64;
+                }
+            }
+            ChanceKind::WonderGroupReveal => {
+                let subsets = combinations(&pool.wonders, 4);
+                let i = rng.randrange(subsets.len() as u64) as usize;
+                outcomes.push(subsets[i].clone());
+                if let Some(p) = prob.as_mut() {
+                    *p *= 1.0 / subsets.len() as f64;
+                }
+            }
+            ChanceKind::AgeDeal => {
+                let age = spec.context[0] as usize;
+                let mut names = pool_by_name(&pool.cards[age - 1]); // AgeI/II/III back
+                rng.shuffle(&mut names);
+                let deal = if age == 3 {
+                    let mut guilds = pool_by_name(&pool.cards[3]); // Guild back
+                    rng.shuffle(&mut guilds);
+                    let mut deal: Vec<usize> = names[..17].to_vec();
+                    deal.extend_from_slice(&guilds[..3]);
+                    rng.shuffle(&mut deal);
+                    deal
+                } else {
+                    names[..layout(age as u8).len()].to_vec()
+                };
+                outcomes.push(deal);
+                prob = None;
+            }
+        }
+    }
+    (outcomes, prob)
 }

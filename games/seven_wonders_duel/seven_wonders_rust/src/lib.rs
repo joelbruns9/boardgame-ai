@@ -194,6 +194,17 @@ impl RustGame {
         Ok(chance::enumerate_chains(&self.state, &specs))
     }
 
+    /// F3.1b: sample one chance chain for action `index` from a fresh
+    /// `Rng(seed)` — the standalone-seed form the gate compares against Python's
+    /// `sample_outcomes(..., PortableRng(seed))`. Returns `(outcomes, prob)` with
+    /// `prob` absent when a spec is sample-only (AGE_DEAL).
+    fn sample_outcomes(&self, index: usize, seed: u64) -> (Vec<Vec<usize>>, Option<f64>) {
+        let action = codec::decode_action(&self.state, index);
+        let specs = chance::chance_signature(&self.state, &action);
+        let mut rng = rng::Rng::new(seed);
+        chance::sample_outcomes(&self.state, &specs, &mut rng)
+    }
+
     fn is_complete(&self) -> bool {
         self.state.phase == state::Phase::Complete
     }

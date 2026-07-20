@@ -182,11 +182,18 @@ arena/coalescing/`allow_threads` scaffolding.
       `pub(crate)`. Gate `test_chance_signature_and_chains_equivalent`: specs +
       chain outcomes/probabilities match Python at every legal action across 25
       random games (all phases); AGE_DEAL refused by both.
-    - **F3.1b (remaining):** `sample_outcomes` (portable RNG) + `make_with_chance`
-      (the supplied-outcome SWAP — `_override_reveal`/`_override_wonder_flip`/
-      Great-Library draw/`_validated_age_deal`). Gate: sampled chains match Python
-      under a shared seed; resulting states match. Includes the F2
-      hidden-resampling invariance follow-up.
+    - **F3.1b-i DONE 2026-07-20:** `sample_outcomes` in `chance.rs` (portable
+      `Rng`; AGE_DEAL uses `pool_by_name` alphabetical sort + triple shuffle to
+      match Python's `sorted(names)`). Exposed as `RustGame.sample_outcomes(index,
+      seed)`; gate `test_sample_outcomes_equivalent` reproduces Python's sampled
+      chain under shared seeds (0/1/12345) at every chance-bearing action across
+      25 random games, prob included.
+    - **F3.1b-ii (remaining):** `make_with_chance` — the supplied-outcome SWAP
+      (`_override_reveal` swapping the locked card into the outcome card's hidden
+      location, `_override_wonder_flip`, Great-Library draw override,
+      `_validated_age_deal`), threaded through the Rust apply path. Gate:
+      resulting states match Python's `apply_action(..., chance_outcomes=...)`.
+      Includes the F2 hidden-resampling invariance follow-up.
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
     materialization; matches Python to 1e-6 under a mock eval on deterministic
     positions (sampling off).

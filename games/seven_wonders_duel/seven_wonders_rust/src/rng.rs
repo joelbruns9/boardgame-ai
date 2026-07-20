@@ -2,12 +2,11 @@
 //! (PHASE_F.md F3.0/F3.1), so the Rust searcher reproduces the Python reference
 //! stream. Same constants as `kingdomino_rust::search::splitmix64`.
 
-#[allow(dead_code)] // gumbel/randrange are consumed by the F3.1b sampler/searcher
 pub struct Rng {
     state: u64,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // gumbel is consumed by the F3.3 Gumbel root
 impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng { state: seed }
