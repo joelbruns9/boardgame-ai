@@ -143,6 +143,11 @@ impl TableauState {
         (card_id, newly)
     }
 
+    /// Slot index at layout position `(row, x)`, if any.
+    pub fn slot_index_of(&self, row: i32, x: i32) -> Option<usize> {
+        (0..self.slots.len()).find(|&i| self.slot_id(i) == (row, x))
+    }
+
     pub fn reveal(&mut self, i: usize) {
         assert!(self.slots[i].present, "cannot reveal an absent card");
         self.slots[i].revealed = true;

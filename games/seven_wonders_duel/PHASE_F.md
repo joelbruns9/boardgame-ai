@@ -188,12 +188,23 @@ arena/coalescing/`allow_threads` scaffolding.
       seed)`; gate `test_sample_outcomes_equivalent` reproduces Python's sampled
       chain under shared seeds (0/1/12345) at every chance-bearing action across
       25 random games, prob included.
-    - **F3.1b-ii (remaining):** `make_with_chance` — the supplied-outcome SWAP
-      (`_override_reveal` swapping the locked card into the outcome card's hidden
-      location, `_override_wonder_flip`, Great-Library draw override,
-      `_validated_age_deal`), threaded through the Rust apply path. Gate:
-      resulting states match Python's `apply_action(..., chance_outcomes=...)`.
-      Includes the F2 hidden-resampling invariance follow-up.
+    - **F3.1b-ii DONE 2026-07-20:** `apply_with_chance` (engine.rs) installs each
+      supplied outcome into hidden state before the normal apply — `override_reveal`
+      (swap the locked card into the outcome card's hidden location: sibling
+      face-down slot → removed pile → unused guilds), `override_wonder_flip`
+      (set group 1; `pick_wonder` copies it to the offer), Great-Library draw
+      (`push_front` onto `library_draws`), and `validated_age_deal`. Pre-installing
+      is provably equivalent to Python's mid-apply overrides for the searcher's
+      distinct (used-deduplicated) outcomes. Gate `test_make_with_chance_equivalent`:
+      resulting-state fingerprints match Python's `apply_action(chance_outcomes=…)`
+      across all four chance kinds, 20 random games × multiple outcomes/action.
+  - **F3.1 COMPLETE.** `cargo test` 5 / `pytest test_rust_engine_equiv.py` 11 green.
+  - **F2 hidden-resampling follow-up — resolved:** the encoder-invariance-under-
+    hidden-resampling property is established by F2.3 (the encoder consumes only
+    the public projection, bit-exact vs Python's observation over 139k states). A
+    dedicated Rust *determinizer*-invariance test is N/A for the closed-only port
+    (no Rust determinizer is built — open is not ported); revisit only if open
+    determinization is ever added.
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
     materialization; matches Python to 1e-6 under a mock eval on deterministic
     positions (sampling off).

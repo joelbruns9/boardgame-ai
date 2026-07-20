@@ -712,6 +712,67 @@ def test_sample_outcomes_equivalent():
     assert sampled_deal_ages == {1, 2, 3}, f"sample age-deal ages: {sampled_deal_ages}"
 
 
+def _outcome_to_ids(specs, outcomes):
+    """A single chain's per-spec outcomes -> id lists (Rust's format)."""
+
+    rust = []
+    for spec, outcome in zip(specs, outcomes):
+        id_map = _CHANCE_SAMPLE_ID_MAP[spec.kind]
+        if isinstance(outcome, str):
+            rust.append([id_map[outcome]])
+        else:
+            rust.append([id_map[name] for name in outcome])
+    return rust
+
+
+def _py_fingerprint_after_chance(game, index, py_outcomes):
+    clone = game.clone()
+    clone.search_barrier = True
+    apply_action(clone, decode_action(clone, index), chance_outcomes=py_outcomes)
+    return logic_fingerprint(clone)
+
+
+def test_make_with_chance_equivalent():
+    """F3.1b: applying an action with a supplied chance outcome (the SWAP path)
+    yields the same complete state in Rust as Python's
+    apply_action(chance_outcomes=...), across every chance kind."""
+
+    checked = 0
+    covered = set()
+    for seed in range(20):
+        first_player, actions, library = random_game(seed, seed % 2)
+        py = new_game(seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for idx in actions:
+            for index in legal_action_indices(py):
+                specs = py_chance_signature(py, decode_action(py, index))
+                if not specs:
+                    continue
+                covered.update(_CHANCE_KIND_ID[s.kind] for s in specs)
+                if any(s.kind is ChanceKind.AGE_DEAL for s in specs):
+                    outcome_lists = [
+                        py_sample_outcomes(py, specs, PortableRng(s))[0] for s in (0, 7)
+                    ]
+                else:
+                    chains = py_enumerate_chains(py, specs)
+                    picks = sorted({0, len(chains) // 2, len(chains) - 1})
+                    outcome_lists = [chains[i][0] for i in picks]
+                for outcomes in outcome_lists:
+                    py_fp = _py_fingerprint_after_chance(py, index, outcomes)
+                    rust_fp = rg.fingerprint_after_chance(
+                        index, _outcome_to_ids(specs, outcomes)
+                    )
+                    assert rust_fp == py_fp, (
+                        f"seed {seed} action {index}: make_with_chance state mismatch\n"
+                        f"  outcomes: {outcomes}"
+                    )
+                    checked += 1
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked > 500
+    assert covered == {0, 1, 2, 3}, f"make_with_chance kinds not all covered: {covered}"
+
+
 def test_encoder_signature_matches():
     """F2.3: the Rust build is bound to the Python encoder schema signature.
     Diverging feature order/count/naming changes Python's ENCODER_SIGNATURE and

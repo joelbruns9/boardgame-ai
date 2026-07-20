@@ -205,6 +205,22 @@ impl RustGame {
         chance::sample_outcomes(&self.state, &specs, &mut rng)
     }
 
+    /// F3.1b: fingerprint of the state after applying action `index` with
+    /// supplied chance `outcomes` (one id list per spec). Non-destructive
+    /// (snapshot/restore) so the gate can probe many outcomes from one state.
+    fn fingerprint_after_chance(
+        &mut self,
+        index: usize,
+        outcomes: Vec<Vec<usize>>,
+    ) -> Vec<i32> {
+        let undo = self.state.snapshot();
+        let action = codec::decode_action(&self.state, index);
+        self.state.apply_with_chance(&action, &outcomes);
+        let fp = self.state.fingerprint();
+        self.state.restore(undo);
+        fp
+    }
+
     fn is_complete(&self) -> bool {
         self.state.phase == state::Phase::Complete
     }

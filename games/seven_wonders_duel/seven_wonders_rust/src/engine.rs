@@ -896,6 +896,126 @@ impl GameState {
     }
 }
 
+// --- F3.1b: supplied-outcome apply (make_with_chance) -------------------------
+
+impl GameState {
+    /// Apply `action` with searcher-supplied chance `outcomes` (one id list per
+    /// `chance_signature` spec, in order). Mirrors Python's
+    /// `apply_action(chance_outcomes=...)`: each outcome is installed into the
+    /// hidden state via a SWAP so the normal apply path resolves to it while the
+    /// world stays a consistent whole. Pre-installing before `apply_action` is
+    /// equivalent to Python's mid-apply overrides for the distinct outcomes the
+    /// searcher produces — reveal targets are used-deduplicated, so no swap ever
+    /// collides with an already-processed sibling slot.
+    pub fn apply_with_chance(&mut self, action: &Action, outcomes: &[Vec<usize>]) {
+        let specs = crate::chance::chance_signature(self, action);
+        assert_eq!(specs.len(), outcomes.len(), "outcome count != spec count");
+        for (spec, outcome) in specs.iter().zip(outcomes) {
+            match spec.kind {
+                crate::chance::ChanceKind::CardReveal => {
+                    let slot = self
+                        .tableau
+                        .slot_index_of(spec.context[0], spec.context[1])
+                        .expect("reveal slot not found");
+                    self.override_reveal(slot, outcome[0]);
+                }
+                crate::chance::ChanceKind::WonderGroupReveal => {
+                    self.override_wonder_flip(outcome)
+                }
+                crate::chance::ChanceKind::GreatLibraryDraw => {
+                    self.library_draws.push_front(outcome.clone())
+                }
+                crate::chance::ChanceKind::AgeDeal => {
+                    self.validated_age_deal(spec.context[0] as usize, outcome)
+                }
+            }
+        }
+        self.apply_action(action);
+    }
+
+    /// Install `new_id` at `slot`, swapping the previously-locked card into the
+    /// outcome card's hidden location (sibling face-down slot, then removed pile,
+    /// then unused guilds) — a port of `_override_reveal`.
+    fn override_reveal(&mut self, slot: usize, new_id: usize) {
+        let old_id = self.tableau.slots[slot].card_id;
+        if new_id == old_id {
+            return;
+        }
+        for j in 0..self.tableau.slots.len() {
+            let c = &self.tableau.slots[j];
+            if c.present && !c.revealed && c.card_id == new_id {
+                self.tableau.slots[j].card_id = old_id;
+                self.tableau.slots[slot].card_id = new_id;
+                return;
+            }
+        }
+        let age = self.age as usize;
+        if let Some(p) = self.removed_age_cards[age].iter().position(|&n| n == new_id) {
+            self.removed_age_cards[age][p] = old_id;
+            self.tableau.slots[slot].card_id = new_id;
+            return;
+        }
+        if let Some(p) = self.unused_guilds.iter().position(|&n| n == new_id) {
+            self.unused_guilds[p] = old_id;
+            if let Some(sp) = self.selected_guilds.iter().position(|&n| n == old_id) {
+                self.selected_guilds[sp] = new_id;
+            }
+            self.tableau.slots[slot].card_id = new_id;
+            return;
+        }
+        panic!("reveal outcome {new_id} not in the unseen pool");
+    }
+
+    /// Set the flipped second wonder group; `wonder_offer` is left for
+    /// `pick_wonder` to copy on the flip. Port of `_override_wonder_flip`.
+    fn override_wonder_flip(&mut self, outcome: &[usize]) {
+        let mut pool = self.wonder_groups[1].clone();
+        pool.extend_from_slice(&self.unused_wonders);
+        self.wonder_groups[1] = outcome.to_vec();
+        self.unused_wonders = pool.into_iter().filter(|w| !outcome.contains(w)).collect();
+    }
+
+    /// Rearrange the setup records so `age`'s deal is `deal`, keeping removed
+    /// cards / guild selection consistent — a port of `_validated_age_deal`.
+    fn validated_age_deal(&mut self, age: usize, deal: &[usize]) {
+        let mut visible = [false; crate::data::NUM_CARDS];
+        for &c in &self.discard_pile {
+            visible[c] = true;
+        }
+        for &c in &self.buried_cards {
+            visible[c] = true;
+        }
+        for city in &self.cities {
+            for &c in &city.buildings {
+                visible[c] = true;
+            }
+        }
+        let age_back = age - 1; // AgeI=0, AgeII=1, AgeIII=2
+        self.removed_age_cards[age] = (0..crate::data::NUM_CARDS)
+            .filter(|&c| {
+                crate::data::back_type_of(c) as usize == age_back
+                    && !deal.contains(&c)
+                    && !visible[c]
+            })
+            .collect();
+        if age == 3 {
+            use crate::data::BackType;
+            let guilds: Vec<usize> = deal
+                .iter()
+                .copied()
+                .filter(|&c| crate::data::back_type_of(c) == BackType::Guild)
+                .collect();
+            self.selected_guilds = guilds.clone();
+            self.unused_guilds = (0..crate::data::NUM_CARDS)
+                .filter(|&c| {
+                    crate::data::back_type_of(c) == BackType::Guild && !guilds.contains(&c)
+                })
+                .collect();
+        }
+        self.age_decks[age] = deal.to_vec();
+    }
+}
+
 // --- F1b make/unmake audit ----------------------------------------------------
 
 /// Exhaustive make/unmake audit from `state`, exploring every legal action to
