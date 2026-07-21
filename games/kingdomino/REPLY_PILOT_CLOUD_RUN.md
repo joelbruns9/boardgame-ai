@@ -118,13 +118,16 @@ export MIN_TOP_AGREE=$(python -c "import json; print(json.load(open('$PILOT_DIR/
 ## 4. Production labels
 
 Freeze 450 fresh production roots. The calibration roots are passed as a
-reserved set, so any state-key collision fails before tree generation.
+reserved set and excluded during trajectory collection; collection continues
+until it has the requested number of unique, disjoint roots. The production
+seed is deliberately far from the calibration seed to avoid wasting trajectory
+work traversing the same games.
 
 ```bash
 python -m games.kingdomino.reply_pilot \
   --mode freeze --checkpoint "$BASE_CKPT" \
   --positions-path "$PILOT_DIR/training_roots.jsonl" \
-  --positions 450 --seed 20260720 --trajectory-sims 3200 \
+  --positions 450 --seed 20270720 --trajectory-sims 3200 \
   --reserved-test-path "$PILOT_DIR/calibration_roots.jsonl"
 ```
 

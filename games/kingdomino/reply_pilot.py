@@ -22,7 +22,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -644,12 +644,58 @@ def _manifest_contract(args: argparse.Namespace, *, positions_sha: str,
     }
 
 
+def _training_root_filter(
+    blocked: dict[str, str],
+) -> tuple[Callable[[GameState], bool], dict[str, int]]:
+    """Accept unique eligible roots while excluding every held-out state key."""
+    selected: set[str] = set()
+    stats = {"held_out_candidates_skipped": 0, "duplicate_candidates_skipped": 0}
+
+    def accept(state: GameState) -> bool:
+        if not reply_root_eligible(state):
+            return False
+        key = public_state_key(state)
+        if key in blocked:
+            stats["held_out_candidates_skipped"] += 1
+            return False
+        if key in selected:
+            stats["duplicate_candidates_skipped"] += 1
+            return False
+        selected.add(key)
+        return True
+
+    return accept, stats
+
+
+def _blocked_training_root_keys(args: argparse.Namespace) -> dict[str, str]:
+    blocked: dict[str, str] = {}
+    for blocked_path in (args.frozen_eval_path, args.reserved_test_path):
+        if blocked_path and Path(blocked_path).exists():
+            for state, _source in load_frozen_positions(blocked_path):
+                blocked[public_state_key(state)] = str(blocked_path)
+    return blocked
+
+
+def _validate_training_roots(
+    records: list[tuple[GameState, dict[str, Any]]],
+    blocked: dict[str, str],
+) -> None:
+    keys = [public_state_key(state) for state, _source in records]
+    if not all(reply_root_eligible(state) for state, _source in records):
+        raise ValueError("training-root artifact contains an ineligible state")
+    if len(set(keys)) != len(keys):
+        raise ValueError("training-root artifact contains duplicate state keys")
+    collisions = [(key, blocked[key]) for key in keys if key in blocked]
+    if collisions:
+        raise ValueError(f"training-root leakage into held-out data: {collisions[:3]}")
+
+
 def freeze_training_roots(args: argparse.Namespace) -> dict[str, Any]:
     output = Path(args.positions_path)
+    blocked = _blocked_training_root_keys(args)
     if output.exists() and not args.force:
         records = load_frozen_positions(output)
-        if not all(reply_root_eligible(state) for state, _source in records):
-            raise ValueError("existing training-root artifact contains an ineligible state")
+        _validate_training_roots(records, blocked)
         return {"path": str(output), "positions": len(records), "sha256": file_sha256(output)}
 
     net, checkpoint_cfg = load_checkpoint_network(args.checkpoint, args.device)
@@ -662,25 +708,20 @@ def freeze_training_roots(args: argparse.Namespace) -> dict[str, Any]:
         evaluator, checkpoint_path=args.checkpoint,
         config=SearchConfig(root_search_sims=args.trajectory_sims, seed=args.seed),
     )
+    position_filter, filter_stats = _training_root_filter(blocked)
     records = generate_az_midgame_positions(
         search, count=args.positions, seed=args.seed,
         min_deck=args.min_deck, max_deck=args.max_deck,
-        position_filter=reply_root_eligible,
+        position_filter=position_filter,
     )
-
-    blocked: dict[str, str] = {}
-    for blocked_path in (args.frozen_eval_path, args.reserved_test_path):
-        if blocked_path and Path(blocked_path).exists():
-            for state, _source in load_frozen_positions(blocked_path):
-                blocked[public_state_key(state)] = str(blocked_path)
-    collisions = [(public_state_key(state), blocked[public_state_key(state)])
-                  for state, _source in records if public_state_key(state) in blocked]
-    if collisions:
-        raise ValueError(f"training-root leakage into held-out data: {collisions[:3]}")
+    _validate_training_roots(records, blocked)
 
     result = write_frozen_positions(records, output)
     result["eligible_opponent_reply_roots"] = len(records)
     result["checkpoint_sha256"] = sha256_file(args.checkpoint)
+    result["held_out_state_keys"] = len(blocked)
+    result["held_out_paths"] = sorted(set(blocked.values()))
+    result.update(filter_stats)
     _atomic_json(output.with_suffix(".manifest.json"), result)
     return result
 

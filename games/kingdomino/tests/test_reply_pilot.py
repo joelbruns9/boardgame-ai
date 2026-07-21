@@ -10,6 +10,8 @@ import pytest
 from games.kingdomino.denial_search import DenialSearch, SearchConfig, public_state_key
 from games.kingdomino.denial_signal_sweep import file_sha256
 from games.kingdomino.reply_pilot import (
+    _training_root_filter,
+    _validate_training_roots,
     decode_array_blob,
     merge_shards,
     reply_root_eligible,
@@ -50,6 +52,29 @@ def _example(tmp_path: Path, *, position_index: int, seed: int):
         max_target_entropy=10.0,
         reject_ties=False,
     )
+
+
+def test_training_root_filter_excludes_held_out_and_duplicate_states():
+    held_out = _eligible_state(300)
+    candidate = _eligible_state(500)
+    assert public_state_key(candidate) != public_state_key(held_out)
+
+    blocked = {public_state_key(held_out): "held-out.jsonl"}
+    position_filter, stats = _training_root_filter(blocked)
+
+    assert not position_filter(held_out)
+    assert position_filter(candidate)
+    assert not position_filter(candidate.copy())
+    assert stats == {
+        "held_out_candidates_skipped": 1,
+        "duplicate_candidates_skipped": 1,
+    }
+
+    _validate_training_roots([(candidate, {})], blocked)
+    with pytest.raises(ValueError, match="leakage"):
+        _validate_training_roots([(held_out, {})], blocked)
+    with pytest.raises(ValueError, match="duplicate"):
+        _validate_training_roots([(candidate, {}), (candidate.copy(), {})], blocked)
 
 
 def test_reply_example_roundtrip_is_self_contained_and_valid(tmp_path):
