@@ -55,7 +55,7 @@ pub struct Node {
     pub value_sum_p0: f64,
 }
 
-fn state_actor(state: &GameState) -> usize {
+pub(crate) fn state_actor(state: &GameState) -> usize {
     state
         .pending_choice
         .as_ref()

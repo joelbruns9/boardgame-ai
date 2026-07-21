@@ -26,7 +26,7 @@ import random
 from .buffer import from_json_line
 from .codec import decode_action, legal_action_indices
 from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
-from .encoder import encode as py_encode, TokenType
+from .encoder import Encoding, Token, encode as py_encode, TokenType
 from .engine import apply_action
 from .game import ChanceKind
 from .pool import unseen_pool as py_unseen_pool
@@ -394,6 +394,91 @@ def test_closed_search_rejects_bad_config():
     assert end.is_complete()
     with pytest.raises(ValueError):
         end.closed_search(16, 8, 1)
+
+
+def _make_net_adapter(evaluator):
+    """Python `(tokens, actor, legal) -> (value_actor, priors)` adapter that the
+    Rust PyEval calls: rebuild an Encoding from Rust tokens, run the net, and
+    return the same value/priors Python's `_evaluate` computes."""
+
+    token_types = list(TokenType)
+
+    def adapter(tokens, actor, legal):
+        toks = tuple(
+            Token(token_types[ti], eid, aid, tuple(feats))
+            for ti, eid, aid, feats in tokens
+        )
+        ev = evaluator.evaluate([Encoding(actor=actor, tokens=toks)], [list(legal)])[0]
+        value_actor = float(ev.wdl[0] - ev.wdl[2])
+        return value_actor, [float(p) for p in ev.policy]
+
+    return adapter
+
+
+def test_closed_search_net_matches_python():
+    """F3.4: the Rust searcher driven by the REAL net (via PyEval + the F2 Rust
+    encoder) is bit-identical to Python's searcher on the same net — the
+    end-to-end validation of the whole F3 port with real evaluations."""
+
+    pytest.importorskip("torch")
+    import torch
+
+    from .inference import Evaluator
+    from .net import SWDNet
+
+    torch.manual_seed(3)
+    evaluator = Evaluator(SWDNet(32, 1, 2))
+    adapter = _make_net_adapter(evaluator)
+
+    checked = 0
+    for game_seed in range(3):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                legal = legal_action_indices(py)
+                for sims, seed, force in [(16, 1, False), (32, 5, False), (24, 3, True)]:
+                    mcts = GumbelMCTS(
+                        evaluator,
+                        SearchConfig(
+                            sims=sims,
+                            top_k=8,
+                            mode="closed",
+                            seed=seed,
+                            force_expand_root_chance=force,
+                        ),
+                    )
+                    result = mcts.search(py)
+                    root = mcts._closed_root
+                    act, av, rv, visits, policy, topk, rsims, dig = rg.closed_search_net(
+                        adapter, sims, 8, seed, force=force
+                    )
+                    ctx = f"game {game_seed} sims {sims} seed {seed} force {force}"
+                    assert act == result.action_index, f"{ctx}: action"
+                    assert rsims == result.sims, f"{ctx}: sims"
+                    assert list(topk) == list(result.gumbel_topk), f"{ctx}: topk"
+                    assert list(visits) == [result.visits[a] for a in legal], f"{ctx}: visits"
+                    assert av == pytest.approx(result.action_value, abs=1e-9), f"{ctx}: av"
+                    assert rv == pytest.approx(result.root_value, abs=1e-9), f"{ctx}: rv"
+                    for j, a in enumerate(legal):
+                        assert policy[j] == pytest.approx(
+                            result.policy_target[a], abs=1e-9
+                        ), f"{ctx}: policy"
+                    expected = []
+                    _digest_ref(root, expected)
+                    _assert_digest_equal(expected, list(dig), f"{ctx}: tree")
+                    checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked >= 6
 
 
 def test_ln_parity_matches_python():

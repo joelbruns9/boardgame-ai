@@ -9,6 +9,7 @@
 
 use crate::codec::legal_action_indices;
 use crate::state::{GameState, Phase};
+use pyo3::prelude::*;
 
 /// `(value_p0, priors)` where `priors` is aligned to `legal_action_indices`.
 /// Terminal states return the game value and empty priors.
@@ -78,5 +79,46 @@ impl MockEval {
 impl Eval for MockEval {
     fn evaluate(&self, state: &GameState) -> (f64, Vec<f64>) {
         MockEval::eval_state(state)
+    }
+}
+
+/// F3.4: real-net evaluator. Encodes with the Rust F2 encoder and calls a Python
+/// adapter `(tokens, actor, legal) -> (value_actor, priors)` that runs the net —
+/// so the Rust searcher uses identical net inputs/outputs to Python's reference.
+/// This is a *scalar* per-leaf bridge for correctness; F4 replaces it with leaf
+/// coalescing + GIL release for throughput (do NOT make this the production
+/// batching boundary).
+pub struct PyEval {
+    adapter: Py<PyAny>,
+}
+
+impl PyEval {
+    pub fn new(adapter: Py<PyAny>) -> Self {
+        PyEval { adapter }
+    }
+}
+
+impl Eval for PyEval {
+    fn evaluate(&self, state: &GameState) -> (f64, Vec<f64>) {
+        if state.phase == Phase::Complete {
+            return (terminal_value_p0(state), Vec::new());
+        }
+        let actor = crate::tree::state_actor(state);
+        let tokens: Vec<(usize, i32, i32, Vec<f64>)> = crate::encoder::encode(state)
+            .into_iter()
+            .map(|t| (t.type_id, t.entity_id, t.aux_id, t.features))
+            .collect();
+        let legal = legal_action_indices(state);
+        Python::attach(|py| {
+            let out = self
+                .adapter
+                .bind(py)
+                .call1((tokens, actor, legal))
+                .expect("net adapter call failed");
+            let (value_actor, priors): (f64, Vec<f64>) =
+                out.extract().expect("net adapter returned an unexpected shape");
+            let value_p0 = if actor == 0 { value_actor } else { -value_actor };
+            (value_p0, priors)
+        })
     }
 }

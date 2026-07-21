@@ -294,7 +294,21 @@ arena/coalescing/`allow_threads` scaffolding.
       state). `Box<Node>` + full-state clone per child + linear child lookup +
       scalar `Eval` remain gate scaffolding; the scalar evaluator boundary must
       NOT become the production batching interface.
-  - **F3.4** — batched real-evaluator bridge across the pyo3 boundary (feeds F4).
+  - **F3.4** — real-evaluator bridge across the pyo3 boundary (feeds F4).
+    **DONE 2026-07-21:** `eval.rs::PyEval` — a real-net `Eval` that encodes with
+    the F2 Rust encoder and calls a Python adapter `(tokens, actor, legal) ->
+    (value_actor, priors)` running the net; `RustGame.closed_search_net(adapter,
+    …)` runs the full Gumbel search on it. Gate `test_closed_search_net_matches_
+    python`: with a real `SWDNet` the Rust searcher is **bit-identical** to
+    Python's `GumbelMCTS` on the same net — chosen action, visits, top-k, values,
+    policy, and the full tree digest (incl. net-derived node values) — across
+    sims/seeds and force-expansion off/on. This validates the entire F3 port
+    (RNG + chance engine + tree + Gumbel root) against the actual network, not
+    just the mock. **Scalar per-leaf bridge for correctness only** — F4 replaces
+    this boundary with leaf coalescing + GIL release for the ≥20× throughput
+    gate (the batched fast path is deliberately NOT bit-identical to the
+    sequential reference, since coalescing evaluates multiple leaves before
+    backprop; it is validated by throughput + agreement, not this gate).
   - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
   - Carries the F2 sign-off follow-up: hidden-resampling invariance test once
     determinization lands (F3.1).
