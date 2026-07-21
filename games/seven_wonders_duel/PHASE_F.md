@@ -238,10 +238,22 @@ arena/coalescing/`allow_threads` scaffolding.
       the tree must iterate children in **insertion order** (like Python's dict)
       so probability-weighted `q_p0` and value backprop match bit-for-bit; use an
       insertion-ordered children map, not a `HashMap`.
-    - **Remaining:** `ClosedNode`/`_Edge`/`_Child`, expand/select(PUCT)/
-      closed_child(sample + observable-key dedup)/descend/force_expand_root, a
-      fixed-schedule driver + tree digest, gated to 1e-6 vs the Python reference
-      searcher under `MockEval`.
+    - **DONE 2026-07-20:** `tree.rs` — `Node`/`Edge`/`Child` with **insertion-
+      ordered** children (a `Vec`, so probability-weighted `q_p0` and backprop
+      fold in Python's dict order), `expand`/`select` (PUCT)/`closed_child`
+      (sample via the portable `Rng`, dedup by observable key)/`descend`/a fixed
+      round-robin root driver + a canonical DFS `digest`. Gate
+      `test_closed_tree_matches_python`: the full tree digest (visits, values,
+      edge/child stats, keys) is bit-identical to the Python reference searcher
+      (real `GumbelMCTS` closed methods) under `MockEval`, across sims {16,48} and
+      seeds, over play-age positions in 8 games. (`force_expand_root` /
+      probability-weighted edges are wired but exercised in F3.3.)
+    - **Gotcha logged:** the gate first failed only under pytest — a duplicate-
+      module artifact (`_closed_tree_ref` used an absolute `from
+      games.seven_wonders_duel.search import`, resolving to a second package copy
+      whose codec saw the state's enums as foreign and returned 0 legal actions).
+      Fix: import via the module-relative `.search` like the rest of the tests.
+      The tree code was correct throughout (direct call always passed).
   - **F3.3** — Gumbel root (top-k + sequential halving + completed-Q policy
     target) + `force_expand_root_chance`; full `search()` matches Python
     (visits/values/chosen action) under mock across seeds, flag off and on.

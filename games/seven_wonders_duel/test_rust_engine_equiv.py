@@ -31,6 +31,8 @@ from .game import ChanceKind
 from .pool import unseen_pool as py_unseen_pool
 from .portable_rng import PortableRng
 from .search import (
+    GumbelMCTS,
+    SearchConfig,
     chance_signature as py_chance_signature,
     enumerate_chains as py_enumerate_chains,
     sample_outcomes as py_sample_outcomes,
@@ -137,6 +139,95 @@ def test_mock_eval_matches_python():
                 break
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
+
+
+def _mock_evaluate(state):
+    """(value_p0, priors dict) mock for a GumbelMCTS subclass."""
+
+    value, weights = mock_eval(state)
+    if state.phase is Phase.COMPLETE:
+        return value, {}
+    legal = legal_action_indices(state)
+    return value, {a: w for a, w in zip(legal, weights)}
+
+
+def _closed_tree_ref(state, sims, seed):
+    """Python reference closed tree with the mock oracle + fixed round-robin root
+    schedule (mirrors tree.rs::closed_tree_fixed), reusing the real searcher."""
+
+    mcts = GumbelMCTS(None, SearchConfig(mode="closed", seed=seed, c_puct=1.5))
+    mcts._evaluate = _mock_evaluate  # type: ignore[method-assign]
+    root_state = state.clone()
+    root_state.search_barrier = True
+    root = mcts._make_closed_node(root_state)
+    root.visits += 1
+    root.value_sum_p0 += mcts._expand_closed(root)
+    n = max(len(root.edges), 1)
+    for i in range(sims):
+        mcts._descend_closed(root, forced_edge=root.edges[i % n])
+    return root
+
+
+def _digest_ref(node, out):
+    out.append(float(node.visits))
+    out.append(node.value_sum_p0)
+    out.append(float(len(node.edges)))
+    for edge in node.edges:
+        out.append(float(edge.action_index))
+        out.append(float(edge.visits))
+        out.append(edge.value_sum_p0)
+        out.append(edge.prior)
+        out.append(1.0 if edge.probability_weighted else 0.0)
+        out.append(float(len(edge.children)))
+        for key, child in edge.children.items():
+            mapped = _map_key(edge.specs, key)
+            out.append(float(sum(len(part) for part in mapped)))
+            for part in mapped:
+                out.extend(float(k) for k in part)
+            out.append(float(child.samples))
+            out.append(float("nan") if child.probability is None else child.probability)
+            _digest_ref(child.node, out)
+
+
+def _assert_digest_equal(expected, got, ctx):
+    assert len(got) == len(expected), f"{ctx}: digest length {len(got)} != {len(expected)}"
+    for i, (e, g) in enumerate(zip(expected, got)):
+        if e != e and g != g:  # both NaN
+            continue
+        assert g == pytest.approx(e, rel=0, abs=1e-9), f"{ctx}: digest[{i}] {g} != {e}"
+
+
+def test_closed_tree_matches_python():
+    """F3.2: the Rust closed tree (nodes/edges/children, PUCT descent,
+    outcome-keyed materialization) is bit-identical to the Python reference under
+    the mock oracle — full DFS digest, across sims and RNG seeds."""
+
+    checked = 0
+    for game_seed in range(8):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 6
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                for sims in (16, 48):
+                    for seed in (1, 7):
+                        expected = []
+                        _digest_ref(_closed_tree_ref(py, sims, seed), expected)
+                        got = list(rg.closed_tree_digest(sims, seed))
+                        _assert_digest_equal(
+                            expected, got, f"game {game_seed} move {i} sims {sims} seed {seed}"
+                        )
+                        checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked > 20
 
 
 def test_gumbel_stream_matches_python():

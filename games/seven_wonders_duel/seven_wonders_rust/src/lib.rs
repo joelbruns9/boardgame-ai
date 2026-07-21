@@ -16,6 +16,7 @@ mod pool;
 mod rng;
 mod rules;
 mod state;
+mod tree;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -243,6 +244,17 @@ impl RustGame {
     /// for the tree-equivalence gate.
     fn mock_eval(&self) -> (f64, Vec<f64>) {
         eval::MockEval::eval_state(&self.state)
+    }
+
+    /// F3.2: build the closed tree from the current state with `MockEval`, a
+    /// fixed round-robin root schedule, `sims` simulations and RNG `seed`, and
+    /// return its canonical digest for the 1e-6 equivalence gate.
+    #[pyo3(signature = (sims, seed, c_puct=1.5))]
+    fn closed_tree_digest(&self, sims: usize, seed: u64, c_puct: f64) -> Vec<f64> {
+        let root = tree::closed_tree_fixed(&self.state, sims, &eval::MockEval, seed, c_puct);
+        let mut out = Vec::new();
+        tree::digest(&root, &mut out);
+        out
     }
 
     fn is_complete(&self) -> bool {
