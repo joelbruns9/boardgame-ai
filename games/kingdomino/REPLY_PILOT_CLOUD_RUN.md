@@ -117,7 +117,7 @@ export MIN_TOP_AGREE=$(python -c "import json; print(json.load(open('$PILOT_DIR/
 
 ## 4. Production labels
 
-Freeze 450 fresh production roots. The calibration roots are passed as a
+Freeze 500 fresh production roots. The calibration roots are passed as a
 reserved set and excluded during trajectory collection; collection continues
 until it has the requested number of unique, disjoint roots. The production
 seed is deliberately far from the calibration seed to avoid wasting trajectory
@@ -127,7 +127,7 @@ work traversing the same games.
 python -m games.kingdomino.reply_pilot \
   --mode freeze --checkpoint "$BASE_CKPT" \
   --positions-path "$PILOT_DIR/training_roots.jsonl" \
-  --positions 450 --seed 20270720 --trajectory-sims 3200 \
+  --positions 500 --seed 20270720 --trajectory-sims 3200 \
   --reserved-test-path "$PILOT_DIR/calibration_roots.jsonl"
 ```
 
@@ -164,7 +164,7 @@ python -m games.kingdomino.reply_pilot \
   --validation-output "$PILOT_DIR/reply_validation.jsonl"
 ```
 
-Expect roughly 1,200–1,600 accepted examples, not 2,000. The exact count is a
+Expect roughly 1,000–1,300 accepted examples from 500 roots, not 2,000. The exact count is a
 measured outcome; quality and disjointness gates take precedence over volume.
 
 ## 5. Equal-step control and treatment
