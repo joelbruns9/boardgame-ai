@@ -342,15 +342,20 @@ Leaf coalescing + GIL release (KD M6 design: `py.detach`, in-process
 coalescing, `leaf_batch > 1`); ONNX/tch in-process only if profiles show the
 Python hop dominating.
 
-**Design doc: `F4_THROUGHPUT_DESIGN.md`** (2026-07-21) — F4 is the one Phase F
-step whose fast path is *deliberately not bit-identical* to the sequential
-reference (coalescing evaluates leaves before backprop), so it is validated
-differently: `leaf_batch=1` must reproduce the F3.3 digest exactly, then
-`leaf_batch>1` by statistical agreement + trap-fixture blunder rate. The doc
-covers the Gumbel-vs-PUCT coalescing question (scheme A: batch within a halving
-round), the selection/eval/backprop phase split, GIL/`py.detach`, the perf work
-(flat encode buffers, precomputed actor/legal, batched forced children), the
-benchmark methodology, and sub-steps F4.0–F4.4.
+**Design doc: `F4_THROUGHPUT_DESIGN.md`** (2026-07-21) — F4's fast path is
+*deliberately not bit-identical* (coalescing defers backprops), so it's validated
+by: `leaf_batch=1` reproduces the F3.3 digest exactly, then `leaf_batch>1`
+(virtual loss) by statistical agreement + trap-fixture blunder rate + a
+`leaf_batch` sweep. Architecture follows KD's measured recipe for the same box/GPU
+(RTX 5090): **in-process coalescing** — ~32 concurrent game searches multiplexed
+on **1–2 cores** (threads/channels or a cooperative loop, **not rayon**), each
+with **virtual loss `lb≈6` (required, not optional)**, an in-process coalescer +
+`py.detach` around the GPU forward; the rest of the box is the **exact endgame
+solver's** (self-play is core-frugal by design). Virtual loss works with Gumbel
+(the root only schedules; sims descend PUCT below it) — flush pending backprops at
+halving-round boundaries. Sub-steps: F4.0 phase-split searcher (+ leaf_batch=1
+oracle), F4.1 virtual loss + coalescer, F4.2 benchmark, F4.3 perf, F4.4 optional
+in-process NN.
 
 - **Gate F4 (= Phase F exit):** ≥20× self-play throughput vs the Python loop
   at equal settings (KD achieved ~28×).

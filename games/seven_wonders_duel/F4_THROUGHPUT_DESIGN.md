@@ -52,53 +52,61 @@ within a round; flush before each reduction. Round batch sizes are healthy
 Tune `leaf_batch` by the KD method (sweep, find where quality declines — KD's
 answer was 6; 7WD's may differ, esp. on a big GPU).
 
-### 2b. Two batching levers — cross-worker is the primary one (2026-07-21)
+### 2b. Both batching levers are required (KD empirics, 2026-07-21)
 
-Training runs on a rented multi-core box + a powerful GPU, **multi-process from
-the start**. That makes the dominant batching lever **cross-worker**, not
-intra-worker:
+Kingdomino ran the same class of GPU (RTX 5090) and its measured recipe to keep it
+**relatively busy** was **~32 concurrent games AND virtual loss (`leaf_batch≈6`)**
+— *both together*. Cross-game concurrency alone did **not** fill the GPU. So for
+7WD (same GPU, same box):
 
-- **Cross-worker batching (a central inference server) is quality-free.** Each
-  self-play worker's search is fully independent, so batching their eval requests
-  together has **zero** effect on any single search — no virtual-loss
-  cross-contamination. A powerful GPU is filled by *many workers*, not by
-  degrading each search.
-- **Intra-worker virtual-loss coalescing trades a little quality for batch size.**
-  It is the *secondary* lever, needed only if worker count can't fill the GPU.
+- **Virtual-loss intra-search coalescing is required, not optional** (`leaf_batch`
+  ≈ 6, re-tune by the KD sweep). It multiplies each game's per-eval batch.
+- **Cross-game batching is via IN-PROCESS coalescing**, not a separate server
+  process: ~32 game searches multiplexed **in one process on 1–2 cores**, an
+  in-process coalescer accumulating their eval requests, GIL released
+  (`py.detach`) during the GPU forward so Rust tree work overlaps inference. (KD
+  M6: in-process coalescing + `py.detach`, `lb=6` → mean_batch ~45, ~6.1k
+  evals/s.)
+- **Cores are scarce:** most of the box is reserved for the **exact endgame
+  solver** (7WD's Phase H analog — exact relabeling / tail solve), so self-play
+  must be **core-frugal by design** — hence game-multiplexing on 1–2 cores, not a
+  process per core.
+- **No rayon** for game generation (its work-stealing overhead was too high at
+  game-step granularity). Use threads + channels or a single-threaded cooperative
+  coalescing loop.
 
-So on the target box: **N worker processes at `leaf_batch=1`** (max quality) +
-**one inference server** coalescing across them into big GPU batches. Intra-worker
-virtual-loss coalescing is an optional add-on.
+**F3.4's `PyEval` still fits** — its adapter becomes "submit to the in-process
+coalescer and wait." But the searcher **does** need the §3a phase split to collect
+`leaf_batch` leaves via virtual loss and yield to the coalescer, so that work is
+core F4, not deferred.
 
-**F3.4's `PyEval` already fits this**: its Python adapter can point at
-"submit-to-server-and-wait" instead of "run local net." A worker = the F3.4 Rust
-searcher + a server-submit adapter — no new searcher code for the multi-process
-path.
-
-## 3. System architecture (multi-process + inference server — primary)
+## 3. System architecture (in-process coalescing — KD M6 model)
 
 ```
- worker 0 (proc): Rust searcher --submit(leaf)--> \
- worker 1 (proc): Rust searcher --submit(leaf)-->  inference server (GPU net):
- ...                                              coalesce across workers over a
- worker N (proc): Rust searcher --submit(leaf)--> /  short window -> big batch ->
-                                                     forward -> dispatch replies
+ one self-play process, 1-2 cores:
+   game 0 search --lb=6 leaves--> \
+   game 1 search --lb=6 leaves-->  in-process coalescer --> GPU net (py.detach):
+   ... (~32 games multiplexed)      accumulate across games    big batch, forward,
+   game 31 search --lb=6 leaves--> /  ~45 leaves/batch          scatter replies
+
+ remaining cores: exact endgame solver (separate workload)
 ```
 
-- **Workers** are processes (sidestep the GIL). Each runs the F3.4 Rust searcher;
-  its `PyEval` adapter is a **server-submit** call (`submit(encoded_leaf) ->
-  (value, priors)`) instead of a local net. `leaf_batch=1` (max quality).
-- **Inference server** owns the GPU net, collects requests from all workers over
-  a small time/size window, batches them, runs one forward, and returns per-worker
-  replies. This is the quality-free batch lever (§2b).
-- Reuse the KD **inference-service design** (§2b of `AZ_PROJECT_PLAN.md` flagged it
-  as an extract-now item).
+- **~32 concurrent game searches** multiplexed on **1–2 cores** (cooperative loop
+  or threads + channels — **not rayon**, not a process per game). Each runs the
+  §3a phase-split searcher with virtual loss (`leaf_batch≈6`).
+- **In-process coalescer** accumulates the games' eval requests, releases the GIL
+  (`py.detach`) and runs one GPU forward, then scatters replies back to the games.
+- **F3.4 `PyEval` adapter** points at "submit to the coalescer and wait" instead
+  of a local net.
+- **Exact endgame solver** runs on the remaining cores — self-play stays within
+  its 1–2-core budget.
 
-## 3a. Intra-worker phase split (secondary — for optional coalescing + the oracle)
+## 3a. Phase-split searcher (core — enables virtual-loss coalescing + the oracle)
 
-Refactor the searcher into three phases so a *single worker* can also batch its
-own leaves (virtual-loss coalescing, the secondary lever) and — critically — so
-the `leaf_batch=1` oracle gate (§4.1) is well defined:
+Refactor the searcher into three phases so a game can collect `leaf_batch` leaves
+per eval (virtual loss) and yield to the coalescer, and so the `leaf_batch=1`
+oracle gate (§4b) is well defined:
 
 1. **Selection / materialization** — descend from the root (forced edge at the
    root per the Gumbel schedule; PUCT below), sampling chance and materializing
@@ -133,36 +141,41 @@ in-process** (no Python hop) — a bigger lift, deferred unless needed.
 
 ## 4. Validation strategy
 
-### 4a. Multi-process path — already searcher-equivalent
-Each worker runs the **existing F3.4 `closed_search_net`** at `leaf_batch=1`, which
-is already gated equal-to-Python. So the primary path needs **no new searcher
-equivalence work**. New checks:
-- **Inference-server batch invariance:** a batched forward returns the same
-  per-request values (to fp tolerance) as evaluating each request alone — i.e.
-  batching workers together doesn't change any worker's evaluations.
-- **Harness correctness:** workers produce complete, valid, replayable games; the
-  buffer schema is intact.
+### 4a. Phase-split `leaf_batch=1` == the sequential oracle, exactly
+The phase-split searcher at batch size 1 (no coalescing / virtual loss) MUST
+reproduce the F3.3 `search_closed` result + tree digest to 1e-9. This proves the
+refactor is correct before virtual loss changes behavior — the one hard gate F4
+keeps, and the reason the phase split must support batch=1.
 
-### 4b. Intra-worker coalescing (optional, only if built)
-- **`leaf_batch=1` == the sequential oracle, exactly.** The phase-split searcher
-  at batch size 1 (no coalescing/virtual loss) MUST reproduce the F3.3
-  `search_closed` result + tree digest to 1e-9 — proves the refactor before any
-  batching changes behavior.
-- **`leaf_batch>1` validated statistically**, not exactly: chosen-action agreement
-  rate + root-value/policy agreement vs sequential, and the **trap-suite blunder
-  rate** on the E-Tier-1 consequential fixtures (`35:63`, `107:60`) — must not
-  blunder more than sequential. Sweep `leaf_batch` to find where quality declines
-  (KD's method; KD's answer was 6).
+### 4b. `leaf_batch>1` (virtual loss) validated statistically + on quality
+Not exact (deferred backprops). Validate:
+- chosen-action agreement rate + root-value/policy agreement vs the sequential
+  searcher over many positions;
+- **trap-suite blunder rate** on the E-Tier-1 consequential fixtures (`35:63`,
+  `107:60`) — must not blunder more than sequential;
+- **sweep `leaf_batch`** to find where quality declines (KD's method → 6; re-tune
+  for 7WD). This is the required-lever knob, not optional.
 
-### 4c. Throughput benchmark (§5).
+### 4c. In-process coalescer batch invariance
+A batched GPU forward returns the same per-request values (to fp tolerance) as
+evaluating each request alone — batching concurrent games together doesn't change
+any single game's evaluations. (Quality only comes from virtual loss, §4b, not
+from coalescing.)
+
+### 4d. Harness correctness
+The ~32 concurrent games produce complete, valid, replayable games; buffer schema
+intact; and self-play stays within its 1–2-core budget (the exact solver keeps the
+rest).
+
+### 4e. Throughput benchmark (§5).
 
 ## 5. Benchmark methodology (the ≥20× gate)
 
 - **Baseline:** the Python self-play loop (`phase_d`/`self_play` path) driving the
   Python `GumbelMCTS`, in its best config on the same box (it is GIL-limited —
   KD's threaded generation saturated ~4×).
-- **Candidate:** the Rust multi-process workers + inference server on the same
-  net/settings/box.
+- **Candidate:** the Rust in-process coalescing self-play (~32 concurrent games,
+  virtual loss, 1–2 cores) on the same net/settings/box.
 - **Equal settings:** identical sims, top_k, net checkpoint, closed mode, same
   hardware (the target cloud box: multi-core + the training GPU).
 - **Metric:** **aggregate games/s** across all workers (primary); leaves/s and
@@ -172,39 +185,40 @@ equivalence work**. New checks:
 - **Gate:** ≥20× aggregate games/s vs the Python loop at equal settings. Record
   the number + box spec in `PHASE_F.md` (KD's ~28× is the yardstick).
 
-## 6. Sub-sequence (reordered 2026-07-21 — multi-process first)
+## 6. Sub-sequence (revised 2026-07-21 — KD in-process model)
 
-The multi-process + inference-server path reuses the F3.4 searcher, so the big
-searcher refactor is deferred and made conditional.
+- **F4.0** — **phase-split searcher** (§3a: selection → collect leaf → eval →
+  backprop, path recording; likely an arena to record paths safely). Gate:
+  `leaf_batch=1` reproduces the F3.3 digest exactly (§4a).
+- **F4.1** — **virtual loss + in-process coalescer** across ~32 concurrent game
+  searches on 1–2 cores (threads/channels or a cooperative loop — no rayon),
+  `py.detach` around the GPU forward, `PyEval` adapter → coalescer-submit. Gates:
+  coalescer batch invariance (§4c), statistical + trap-blunder validation and the
+  `leaf_batch` sweep (§4b), harness correctness (§4d).
+- **F4.2** — **throughput benchmark** (§5): aggregate games/s + GPU utilization +
+  component breakdown (encode / coalesce / GPU forward / tree) vs the Python loop.
+  Measure first, then decide (agreed).
+- **F4.3** — **perf tuning** as profiles dictate: flat encode buffers, precomputed
+  actor/legal, batched forced children (keep priors, kill the first-visit
+  re-eval), concurrency count, coalescer window, 1-vs-2-core split. Iterate to
+  ≥20× with headroom.
+- **F4.4** *(conditional)* — **tch/ONNX in-process** only if the Python/torch hop
+  still dominates after coalescing.
 
-- **F4.1** — **inference server + multi-process self-play harness.** Server owns
-  the GPU net, coalesces requests across workers into batches (batch-invariance
-  check, §4a). Workers are processes running `closed_search_net` with a
-  server-submit adapter (`leaf_batch=1`). Reuse the KD inference-service design.
-- **F4.2** — **throughput benchmark** (§5): full-loop games/s + component
-  breakdown (encode / IPC / GPU forward / tree) vs the Python loop; measure GPU
-  utilization. This informs everything below (agreed: measure first, then decide).
-- **F4.3** — **perf tuning** as profiles dictate: `py.detach` in the worker,
-  server window/batch tuning, flat encode buffers, precomputed actor/legal,
-  batched forced children (keep priors, kill the first-visit re-eval), worker
-  count. Iterate to ≥20× (aim for headroom).
-- **F4.4** *(conditional)* — **intra-worker virtual-loss coalescing.** The phase
-  split (§3a) + virtual loss + `leaf_batch` sweep (§4b). Build **only if** F4.2
-  shows the GPU underutilized despite max workers (i.e. cross-worker batching
-  alone can't fill it).
-- **F4.5** *(conditional)* — **tch/ONNX in-process** only if the Python/torch hop
-  still dominates after coalescing (§3a of `AZ_PROJECT_PLAN`).
+Throughout: self-play stays within a **1–2-core budget**; the rest of the box is
+the exact endgame solver's.
 
-## 7. Open decisions (resolve as they arise, log here)
+## 7. Open decisions / constraints (log here)
 
-1. **Multi-process: yes, from the start** (2026-07-21, user — training on a rented
-   multi-core box + powerful GPU). Cross-worker batching via the inference server
-   is the primary, quality-free lever (§2b); more workers, not virtual loss, fills
-   the GPU.
-2. **Intra-worker virtual-loss coalescing:** works with Gumbel (§2a); deferred to
-   F4.4 and only if needed. Tune `leaf_batch` by the KD sweep.
-3. **Python-hop vs tch/ONNX in-process:** measure full-loop throughput +
-   components first (agreed), decide at F4.5.
+1. **In-process coalescing on 1–2 cores, ~32 concurrent games, virtual loss
+   `lb≈6`** (2026-07-21, user — KD's measured recipe to keep an RTX 5090 busy on
+   the same box). Both levers required; virtual loss is not optional. **No rayon**
+   (work-stealing overhead too high at game-step granularity).
+2. **Core budget:** most cores reserved for the exact endgame solver → self-play
+   is core-frugal by design.
+3. **`leaf_batch`:** start ≈6 (KD), re-tune by the quality-decline sweep (§4b).
+4. **Python-hop vs tch/ONNX in-process:** measure full-loop throughput +
+   components first (agreed), decide at F4.4.
 
 ## 8. Reuse from Kingdomino
 KD M5/M6: `allow_threads`/`py.detach`, in-process coalescing, `leaf_batch>1`
