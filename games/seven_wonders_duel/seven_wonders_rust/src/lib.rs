@@ -272,7 +272,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
-    ) -> (usize, f64, f64, Vec<u32>, Vec<f64>, Vec<usize>, usize, Vec<f64>) {
+    ) -> PyResult<(usize, f64, f64, Vec<u32>, Vec<f64>, Vec<usize>, usize, Vec<f64>)> {
         let cfg = tree::SearchConfig {
             sims,
             top_k,
@@ -282,10 +282,11 @@ impl RustGame {
             seed,
             force_expand_root_chance: force,
         };
-        let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg);
+        let (res, root) =
+            tree::search_closed(&self.state, &eval::MockEval, &cfg).map_err(PyValueError::new_err)?;
         let mut dig = Vec::new();
         tree::digest(&root, &mut dig);
-        (
+        Ok((
             res.action_index,
             res.action_value,
             res.root_value,
@@ -294,7 +295,7 @@ impl RustGame {
             res.gumbel_topk,
             res.sims,
             dig,
-        )
+        ))
     }
 
     fn is_complete(&self) -> bool {
@@ -329,6 +330,13 @@ fn gumbel_stream(seed: u64, n: usize) -> Vec<f64> {
     (0..n).map(|_| r.gumbel()).collect()
 }
 
+/// `x.ln()` for each input — the gate uses it to confirm cross-runtime `ln`
+/// parity over the range `log_prior = ln(max(prior, 1e-12))` covers.
+#[pyfunction]
+fn ln_values(xs: Vec<f64>) -> Vec<f64> {
+    xs.iter().map(|&x| x.ln()).collect()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -342,6 +350,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::gumbel_stream;
+
+    #[pymodule_export]
+    use super::ln_values;
 }
 
 #[cfg(test)]

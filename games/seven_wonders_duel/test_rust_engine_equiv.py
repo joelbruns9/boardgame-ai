@@ -19,6 +19,7 @@ names to ids through the identical `data.py` tables, so id agreement is implied.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 
@@ -171,6 +172,11 @@ def _closed_tree_ref(state, sims, seed):
 def _digest_ref(node, out):
     out.append(float(node.visits))
     out.append(node.value_sum_p0)
+    out.append(float(node.actor))
+    out.append(1.0 if node.terminal else 0.0)
+    fp = logic_fingerprint(node.state)
+    out.append(float(len(fp)))
+    out.extend(float(x) for x in fp)
     out.append(float(len(node.edges)))
     for edge in node.edges:
         out.append(float(edge.action_index))
@@ -181,8 +187,9 @@ def _digest_ref(node, out):
         out.append(float(len(edge.children)))
         for key, child in edge.children.items():
             mapped = _map_key(edge.specs, key)
-            out.append(float(sum(len(part) for part in mapped)))
+            out.append(float(len(mapped)))  # number of parts
             for part in mapped:
+                out.append(float(len(part)))  # length of this part
                 out.extend(float(k) for k in part)
             out.append(float(child.samples))
             out.append(float("nan") if child.probability is None else child.probability)
@@ -293,6 +300,109 @@ def test_closed_search_matches_python():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked >= 20
+
+
+def _tree_stats(node, stats=None):
+    if stats is None:
+        stats = {"weighted": 0, "weighted_multi": 0, "none_prob": 0, "age_deal": 0}
+    for edge in node.edges:
+        if edge.probability_weighted:
+            stats["weighted"] += 1
+            if len(edge.children) > 1:
+                stats["weighted_multi"] += 1
+        if any(s.kind is ChanceKind.AGE_DEAL for s in edge.specs):
+            stats["age_deal"] += 1
+        for child in edge.children.values():
+            if child.probability is None:
+                stats["none_prob"] += 1
+            _tree_stats(child.node, stats)
+    return stats
+
+
+def _drive_to_draft(seed, n_picks):
+    """Both engines driven `n_picks` draft picks (legal[0] each). At n_picks==3
+    the next pick fires WONDER_GROUP_REVEAL (enumerable); at 7 it fires
+    AGE_DEAL(1) (sample-only). Draft picks 0-2 fire no chance, and the wonder
+    flip at pick 3 resolves from locked state on both sides."""
+
+    py = new_game(seed, first_player=seed % 2)
+    rg = swr.RustGame(library_draws=[], **extract_setup(py))
+    for _ in range(n_picks):
+        idx = legal_action_indices(py)[0]
+        apply_action(py, decode_action(py, idx))
+        rg.apply_index(idx)
+    return py, rg
+
+
+def test_closed_search_force_expansion_coverage():
+    """F3.3: force-expansion actually engages — a WONDER_GROUP_REVEAL root edge
+    is materialized as a probability-weighted edge with many children, and the
+    tree stays bit-identical to Python."""
+
+    py, rg = _drive_to_draft(0, 3)
+    specs = py_chance_signature(py, decode_action(py, legal_action_indices(py)[0]))
+    assert any(s.kind is ChanceKind.WONDER_GROUP_REVEAL for s in specs)
+    result, root = _mock_search(py, 32, 8, 3, True)
+    stats = _tree_stats(root)
+    assert stats["weighted"] >= 1, "force-expansion produced no weighted edge"
+    assert stats["weighted_multi"] >= 1, "no weighted edge with multiple children"
+    act, _av, _rv, _v, _p, _tk, _s, dig = rg.closed_search(32, 8, 3, force=True)
+    expected = []
+    _digest_ref(root, expected)
+    _assert_digest_equal(expected, list(dig), "force-expansion tree")
+    assert act == result.action_index
+
+
+def test_closed_search_age_deal_coverage():
+    """F3.3: AGE_DEAL edges materialize sample-only (probability=None) children,
+    coalesced by observable deal key, bit-identical to Python."""
+
+    py, rg = _drive_to_draft(1, 7)
+    specs = py_chance_signature(py, decode_action(py, legal_action_indices(py)[0]))
+    assert any(s.kind is ChanceKind.AGE_DEAL for s in specs)
+    result, root = _mock_search(py, 32, 8, 2, False)
+    stats = _tree_stats(root)
+    assert stats["age_deal"] >= 1, "no AGE_DEAL edge exercised"
+    assert stats["none_prob"] >= 1, "no None-probability (sample-only) child"
+    act, _av, _rv, _v, _p, _tk, _s, dig = rg.closed_search(32, 8, 2, force=False)
+    expected = []
+    _digest_ref(root, expected)
+    _assert_digest_equal(expected, list(dig), "age-deal tree")
+    assert act == result.action_index
+
+
+def test_closed_search_rejects_bad_config():
+    """F3.3: the search enforces the Python config contract (sims/top_k > 0, a
+    searchable root) rather than silently degrading."""
+
+    py = new_game(0, first_player=0)
+    rg = swr.RustGame(library_draws=[], **extract_setup(py))
+    # Advance out of the draft so there is a normal searchable root.
+    for _ in range(9):
+        idx = legal_action_indices(py)[0]
+        apply_action(py, decode_action(py, idx))
+        rg.apply_index(idx)
+    with pytest.raises(ValueError):
+        rg.closed_search(0, 8, 1)
+    with pytest.raises(ValueError):
+        rg.closed_search(16, 0, 1)
+    # Terminal root: drive a full random game and search at the end.
+    first_player, actions, library = random_game(0, 0)
+    end = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(new_game(0, first_player=first_player)))
+    for idx in actions:
+        end.apply_index(idx)
+    assert end.is_complete()
+    with pytest.raises(ValueError):
+        end.closed_search(16, 8, 1)
+
+
+def test_ln_parity_matches_python():
+    """F3.3: cross-runtime ln() parity over the range log_prior covers, so the
+    Gumbel selection is bit-identical even on positions the search gate misses."""
+
+    xs = [(i + 1) / 100000 for i in range(100000)]  # (0, 1]
+    xs += [1e-12, 0.5, 1.0, 2.0, 1e-9, 0.9999999]
+    assert swr.ln_values(xs) == [math.log(x) for x in xs]
 
 
 def test_gumbel_stream_matches_python():

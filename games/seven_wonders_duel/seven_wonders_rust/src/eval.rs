@@ -48,8 +48,8 @@ fn to_unit(h: u64) -> f64 {
 
 impl MockEval {
     /// Standalone value+priors for one state — mirrors the Python `mock_eval`
-    /// reference. `priors` are normalized weights aligned to the sorted legal
-    /// indices (empty at terminals).
+    /// reference. `priors` are raw (unnormalized) per-action weights aligned to
+    /// the sorted legal indices (empty at terminals); see `evaluate` for why.
     pub fn eval_state(state: &GameState) -> (f64, Vec<f64>) {
         let fp = state.fingerprint();
         let h = fold_fingerprint(&fp);
@@ -57,10 +57,15 @@ impl MockEval {
         if state.phase == Phase::Complete {
             return (terminal_value_p0(state), Vec::new());
         }
-        // Raw per-action weights in [0,1) — deliberately NOT normalized: a
-        // cross-language sum would diverge in the last ULP, and PUCT/Gumbel are
-        // invariant to a common scale/shift, so raw weights keep the oracle
-        // bit-identical without changing search behavior.
+        // Raw per-action weights in [0,1) — deliberately NOT normalized.
+        // Normalizing needs a cross-language sum that diverges in the last ULP;
+        // leaving them raw keeps the oracle bit-identical on both sides, which is
+        // all the equivalence gate needs (Python and Rust consume the SAME priors
+        // and so build the SAME tree). NOTE: raw weights are not a probability
+        // distribution, so this oracle does NOT reproduce a normalized
+        // evaluator's PUCT exploration — `Q + c_puct*prior*...` is not
+        // scale-invariant. F3.4 must gate against production-shaped normalized
+        // priors.
         let legal = legal_action_indices(state);
         let priors = legal
             .iter()

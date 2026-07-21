@@ -249,7 +249,7 @@ fn sigma(cfg: &SearchConfig, q: f64, max_visits: u32) -> f64 {
 /// Materialize + evaluate every enumerable chance child of each root edge (AGE_DEAL
 /// stays sampled), marking those edges probability-weighted — the closed-mode
 /// catastrophe-coverage toggle (port of `_force_expand_root`).
-fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) {
+fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> Result<(), String> {
     for edge in &mut root.edges {
         if edge.specs.is_empty()
             || edge
@@ -281,20 +281,44 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) {
                 },
             ));
         }
+        // The enumerated children must carry the full chance mass before the edge
+        // trusts the invariant in `q_p0` (port of Python's check).
+        let mass: f64 = edge
+            .children
+            .iter()
+            .map(|(_, c)| c.probability.unwrap_or(0.0))
+            .sum();
+        if (mass - 1.0).abs() > 1e-9 {
+            return Err(format!(
+                "force-expanded edge {} holds probability mass {mass} != 1",
+                edge.action_index
+            ));
+        }
         edge.probability_weighted = true;
     }
+    Ok(())
 }
 
 /// Full closed search with a Gumbel root (top-k + sequential halving +
 /// completed-Q policy target), a port of `_gumbel_root` + `_search_closed`.
 /// Returns the result and the built tree (for the digest gate).
-pub fn search_closed<E: Eval>(state: &GameState, eval: &E, cfg: &SearchConfig) -> (SearchResult, Node) {
+pub fn search_closed<E: Eval>(
+    state: &GameState,
+    eval: &E,
+    cfg: &SearchConfig,
+) -> Result<(SearchResult, Node), String> {
+    if cfg.sims < 1 || cfg.top_k < 1 {
+        return Err("sims and top_k must be positive".into());
+    }
     let mut root = Node::make(state.clone());
+    if root.terminal || root.legal.is_empty() {
+        return Err("cannot search a terminal or action-less root".into());
+    }
     let root_value_p0 = root.expand(eval);
     root.visits += 1;
     root.value_sum_p0 += root_value_p0;
-    if cfg.force_expand_root_chance && !root.terminal {
-        force_expand_root(&mut root, eval);
+    if cfg.force_expand_root_chance {
+        force_expand_root(&mut root, eval)?;
     }
     let sign = if root.actor == 0 { 1.0 } else { -1.0 };
     let root_value = sign * root_value_p0;
@@ -398,14 +422,21 @@ pub fn search_closed<E: Eval>(state: &GameState, eval: &E, cfg: &SearchConfig) -
         gumbel_topk: topk,
         sims: sims_used,
     };
-    (result, root)
+    Ok((result, root))
 }
 
-/// Canonical depth-first serialization of the tree (visits, values, edge stats,
-/// child keys/samples/probabilities) for the equivalence gate.
+/// Canonical depth-first serialization for the equivalence gate. Includes the
+/// node actor/terminal flag and the full state fingerprint (so equal digests
+/// imply equal states), plus edge stats and child keys serialized with explicit
+/// part counts and per-part lengths ([[1],[2]] and [[1,2]] must not collide).
 pub fn digest(node: &Node, out: &mut Vec<f64>) {
     out.push(node.visits as f64);
     out.push(node.value_sum_p0);
+    out.push(node.actor as f64);
+    out.push(if node.terminal { 1.0 } else { 0.0 });
+    let fp = node.state.fingerprint();
+    out.push(fp.len() as f64);
+    out.extend(fp.iter().map(|&x| x as f64));
     out.push(node.edges.len() as f64);
     for edge in &node.edges {
         out.push(edge.action_index as f64);
@@ -415,11 +446,10 @@ pub fn digest(node: &Node, out: &mut Vec<f64>) {
         out.push(if edge.probability_weighted { 1.0 } else { 0.0 });
         out.push(edge.children.len() as f64);
         for (key, child) in &edge.children {
-            out.push(key.iter().map(|k| k.len()).sum::<usize>() as f64);
+            out.push(key.len() as f64); // number of parts
             for part in key {
-                for &k in part {
-                    out.push(k as f64);
-                }
+                out.push(part.len() as f64); // length of this part
+                out.extend(part.iter().map(|&k| k as f64));
             }
             out.push(child.samples as f64);
             out.push(child.probability.unwrap_or(f64::NAN));

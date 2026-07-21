@@ -265,6 +265,35 @@ arena/coalescing/`allow_threads` scaffolding.
     `sims`, `gumbel_topk`, per-action visits, action/root value, policy target,
     AND the full tree digest are bit-identical to the real Python searcher under
     `MockEval`, across sims {16,64} × seeds × **force-expansion off and on**.
+  - **F3 searcher review-hardening (2026-07-20, external review — sequential
+    halving verified over 408 combos, tie-breaking + ln approved; six fixes):**
+    - **Force-expansion now actually exercised** (it was a no-op — the corpus had
+      0 weighted edges): `test_closed_search_force_expansion_coverage` drives a
+      draft `WONDER_GROUP_REVEAL` root and asserts a probability-weighted edge
+      with many children; `test_closed_search_age_deal_coverage` drives an
+      AGE_DEAL root and asserts sample-only (`None`-probability) children. Both
+      still bit-identical to Python.
+    - **Config contract enforced** — `search_closed` returns `Result`/`PyResult`
+      and rejects `sims<1`, `top_k<1`, and a terminal/action-less root (was
+      silently degrading); `test_closed_search_rejects_bad_config`.
+    - **Force-expansion mass validated** before an edge is marked weighted
+      (ported Python's tolerance check).
+    - **Digest completed + disambiguated** — now includes node actor/terminal and
+      the full **state fingerprint** (equal digests ⇒ equal states), and encodes
+      child keys with explicit part counts + per-part lengths (`[[1],[2]]` vs
+      `[[1,2]]` no longer collide).
+    - **`ln` parity gated directly** (`ln_values` + `test_ln_parity`, 100k values
+      over (0,1] plus edges) — closes the `log_prior` last-bit concern.
+    - **Wrong comment fixed** — `MockEval` priors are raw/unnormalized for
+      *implementation parity* (both sides consume identical priors), NOT because
+      PUCT is scale-invariant (it isn't); noted that F3.4 must gate with
+      production-shaped normalized priors.
+    - **Deferred to F3.4/F4 (throughput):** forced children are evaluated then
+      re-evaluated on first visit (matches Python's double-eval — not a
+      divergence; the batched NN evaluator fixes it by preserving expansion
+      state). `Box<Node>` + full-state clone per child + linear child lookup +
+      scalar `Eval` remain gate scaffolding; the scalar evaluator boundary must
+      NOT become the production batching interface.
   - **F3.4** — batched real-evaluator bridge across the pyo3 boundary (feeds F4).
   - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
   - Carries the F2 sign-off follow-up: hidden-resampling invariance test once
