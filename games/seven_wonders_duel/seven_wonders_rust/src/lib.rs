@@ -250,11 +250,11 @@ impl RustGame {
     /// fixed round-robin root schedule, `sims` simulations and RNG `seed`, and
     /// return its canonical digest for the 1e-6 equivalence gate.
     #[pyo3(signature = (sims, seed, c_puct=1.5))]
-    fn closed_tree_digest(&self, sims: usize, seed: u64, c_puct: f64) -> Vec<f64> {
-        let root = tree::closed_tree_fixed(&self.state, sims, &eval::MockEval, seed, c_puct);
+    fn closed_tree_digest(&self, sims: usize, seed: u64, c_puct: f64) -> PyResult<Vec<f64>> {
+        let root = tree::closed_tree_fixed(&self.state, sims, &eval::MockEval, seed, c_puct)?;
         let mut out = Vec::new();
         tree::digest(&root, &mut out);
-        out
+        Ok(out)
     }
 
     /// F3.3: full closed search (Gumbel root + sequential halving) from the
@@ -283,7 +283,7 @@ impl RustGame {
             force_expand_root_chance: force,
         };
         let (res, root) =
-            tree::search_closed(&self.state, &eval::MockEval, &cfg).map_err(PyValueError::new_err)?;
+            tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
         tree::digest(&root, &mut dig);
         Ok((
@@ -325,7 +325,7 @@ impl RustGame {
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, root) =
-            tree::search_closed(&self.state, &evaluator, &cfg).map_err(PyValueError::new_err)?;
+            tree::search_closed(&self.state, &evaluator, &cfg)?;
         let mut dig = Vec::new();
         tree::digest(&root, &mut dig);
         Ok((

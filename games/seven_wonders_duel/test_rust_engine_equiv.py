@@ -481,6 +481,108 @@ def test_closed_search_net_matches_python():
     assert checked >= 6
 
 
+def _play_age_position(game_seed, first_i=8):
+    first_player, actions, library = random_game(game_seed, game_seed % 2)
+    py = new_game(game_seed, first_player=first_player)
+    rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+    for i, idx in enumerate(actions):
+        if i >= first_i and py.phase is Phase.PLAY_AGE and py.pending_choice is None:
+            return py, rg
+        apply_action(py, decode_action(py, idx))
+        rg.apply_index(idx)
+    raise AssertionError("no play-age position found")
+
+
+def test_closed_search_net_propagates_adapter_error():
+    """F3.4: an adapter raising a Python exception surfaces as that exception
+    through search, not a PanicException (operational errors are not Rust
+    invariants)."""
+
+    _py, rg = _play_age_position(0)
+
+    def bad(tokens, actor, legal):
+        raise RuntimeError("adapter sentinel")
+
+    with pytest.raises(RuntimeError, match="adapter sentinel"):
+        rg.closed_search_net(bad, 8, 8, 1)
+
+
+def test_closed_search_net_validates_contract():
+    """F3.4: PyEval enforces the evaluator contract (finite value, priors aligned
+    to legal, finite/nonnegative priors, positive mass)."""
+
+    _py, rg = _play_age_position(0)
+    # A valid uniform adapter runs to completion.
+    rg.closed_search_net(lambda t, a, legal: (0.0, [1.0] * len(legal)), 8, 8, 1)
+    bad_adapters = [
+        lambda t, a, l: (0.0, [1.0] * (len(l) + 1)),      # too many priors
+        lambda t, a, l: (0.0, [1.0] * (len(l) - 1)),      # too few priors
+        lambda t, a, l: (0.0, [float("nan")] * len(l)),   # non-finite prior
+        lambda t, a, l: (0.0, [-1.0] * len(l)),           # negative prior
+        lambda t, a, l: (0.0, [0.0] * len(l)),            # zero-mass policy
+        lambda t, a, l: (float("inf"), [1.0] * len(l)),   # non-finite value
+    ]
+    for adapter in bad_adapters:
+        with pytest.raises(ValueError):
+            rg.closed_search_net(adapter, 8, 8, 1)
+
+
+def _enumerable_reveal_root(game):
+    for a in legal_action_indices(game):
+        kinds = {s.kind for s in py_chance_signature(game, decode_action(game, a))}
+        if ChanceKind.CARD_REVEAL in kinds and ChanceKind.AGE_DEAL not in kinds:
+            return True
+    return False
+
+
+def test_closed_search_net_force_expansion():
+    """F3.4: force-expansion composed with the REAL net — a CARD_REVEAL root is
+    materialized as a probability-weighted, multi-outcome edge, bit-for-bit (to
+    1e-9) with Python on the same net."""
+
+    pytest.importorskip("torch")
+    import torch
+
+    from .inference import Evaluator
+    from .net import SWDNet
+
+    torch.manual_seed(3)
+    evaluator = Evaluator(SWDNet(32, 1, 2))
+    adapter = _make_net_adapter(evaluator)
+
+    found = None
+    for game_seed in range(8):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for i, idx in enumerate(actions):
+            if i >= 8 and py.phase is Phase.PLAY_AGE and py.pending_choice is None:
+                if _enumerable_reveal_root(py):
+                    found = (py, rg)
+                    break
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+        if found:
+            break
+    assert found is not None, "no enumerable CARD_REVEAL root found"
+    py, rg = found
+
+    mcts = GumbelMCTS(
+        evaluator,
+        SearchConfig(sims=32, top_k=8, mode="closed", seed=1, force_expand_root_chance=True),
+    )
+    result = mcts.search(py)
+    root = mcts._closed_root
+    stats = _tree_stats(root)
+    assert stats["weighted"] >= 1, "real-net force-expansion produced no weighted edge"
+    assert stats["weighted_multi"] >= 1, "no weighted edge with multiple outcomes"
+    act, *_rest, dig = rg.closed_search_net(adapter, 32, 8, 1, force=True)
+    expected = []
+    _digest_ref(root, expected)
+    _assert_digest_equal(expected, list(dig), "net force-expansion tree")
+    assert act == result.action_index
+
+
 def test_ln_parity_matches_python():
     """F3.3: cross-runtime ln() parity over the range log_prior covers, so the
     Gumbel selection is bit-identical even on positions the search gate misses."""

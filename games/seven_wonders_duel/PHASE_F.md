@@ -299,16 +299,38 @@ arena/coalescing/`allow_threads` scaffolding.
     the F2 Rust encoder and calls a Python adapter `(tokens, actor, legal) ->
     (value_actor, priors)` running the net; `RustGame.closed_search_net(adapter,
     …)` runs the full Gumbel search on it. Gate `test_closed_search_net_matches_
-    python`: with a real `SWDNet` the Rust searcher is **bit-identical** to
-    Python's `GumbelMCTS` on the same net — chosen action, visits, top-k, values,
-    policy, and the full tree digest (incl. net-derived node values) — across
-    sims/seeds and force-expansion off/on. This validates the entire F3 port
-    (RNG + chance engine + tree + Gumbel root) against the actual network, not
-    just the mock. **Scalar per-leaf bridge for correctness only** — F4 replaces
-    this boundary with leaf coalescing + GIL release for the ≥20× throughput
-    gate (the batched fast path is deliberately NOT bit-identical to the
-    sequential reference, since coalescing evaluates multiple leaves before
-    backprop; it is validated by throughput + agreement, not this gate).
+    python`: with a real `SWDNet` the Rust searcher **matches** Python's
+    `GumbelMCTS` on the same net — chosen action/top-k/visits/state-fingerprints
+    **exactly**, values/policy/node-values **within 1e-9** — across sims/seeds and
+    force-expansion off/on (1e-9, not exact, so it also catches the f32-vs-f64
+    subtraction subtlety). Validates the entire F3 port (RNG + chance engine +
+    tree + Gumbel root) against the actual network, not just the mock.
+    **Scalar per-leaf bridge for correctness only** — F4 replaces this boundary
+    with leaf coalescing + GIL release for the ≥20× throughput gate (that batched
+    fast path is deliberately NOT bit-identical to the sequential reference —
+    coalescing evaluates multiple leaves before backprop — so it is validated by
+    throughput + agreement, not this gate).
+  - **F3.4 review-hardening (2026-07-21, external review — float plumbing /
+    encoding / determinism / GIL approved; three fixes):**
+    - **Fallible evaluator** — `Eval::evaluate` now returns `PyResult`; `PyEval`
+      propagates the adapter's original `PyErr` (CUDA OOM / bad checkpoint /
+      Python bug) through the whole search instead of panicking, and
+      `search_closed`/`closed_tree_fixed`/`closed_search[_net]` thread it. Gate
+      `test_closed_search_net_propagates_adapter_error`.
+    - **Contract validation** — `PyEval` rejects a non-finite value, a prior
+      count ≠ legal count, non-finite/negative priors, and a zero-mass policy
+      (`test_closed_search_net_validates_contract`).
+    - **Real-net force-expansion actually exercised** — the earlier net gate's
+      force cases were no-ops (0 weighted edges); `test_closed_search_net_force_
+      expansion` finds a CARD_REVEAL root and asserts a weighted multi-outcome
+      edge, matching Python to 1e-9. `cargo test` 6 / `pytest` 24 green.
+    - **F4 handoff notes (from review):** F4 needs more than `evaluate_batch` —
+      split descent into selection/materialization, pending-leaf batched eval,
+      and backprop; pass precomputed actor/legal to the evaluator; encode into
+      reusable flat buffers (not Python token objects); batch forced children and
+      keep their priors (kill the first-visit re-eval); keep the scalar search as
+      the oracle and require `leaf_batch=1` to match it exactly before testing
+      larger batches statistically.
   - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
   - Carries the F2 sign-off follow-up: hidden-resampling invariance test once
     determinization lands (F3.1).

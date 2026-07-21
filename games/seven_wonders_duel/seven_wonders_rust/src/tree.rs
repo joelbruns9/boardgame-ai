@@ -13,6 +13,8 @@ use crate::codec::{decode_action, legal_action_indices};
 use crate::eval::{terminal_value_p0, Eval};
 use crate::rng::Rng;
 use crate::state::{GameState, Phase};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 
 pub struct Child {
     pub probability: Option<f64>,
@@ -90,8 +92,8 @@ impl Node {
         }
     }
 
-    fn expand<E: Eval>(&mut self, eval: &E) -> f64 {
-        let (value_p0, priors) = eval.evaluate(&self.state);
+    fn expand<E: Eval>(&mut self, eval: &E) -> PyResult<f64> {
+        let (value_p0, priors) = eval.evaluate(&self.state)?;
         if !self.terminal {
             self.edges = self
                 .legal
@@ -112,7 +114,7 @@ impl Node {
                 })
                 .collect();
         }
-        value_p0
+        Ok(value_p0)
     }
 
     fn select(&self, c_puct: f64) -> usize {
@@ -171,30 +173,30 @@ fn descend<E: Eval>(
     eval: &E,
     rng: &mut Rng,
     c_puct: f64,
-) -> f64 {
+) -> PyResult<f64> {
     if node.terminal {
         let v = terminal_value_p0(&node.state);
         node.visits += 1;
         node.value_sum_p0 += v;
-        return v;
+        return Ok(v);
     }
     if node.edges.is_empty() {
-        let v = node.expand(eval);
+        let v = node.expand(eval)?;
         node.visits += 1;
         node.value_sum_p0 += v;
-        return v;
+        return Ok(v);
     }
     let edge_idx = forced.unwrap_or_else(|| node.select(c_puct));
     let child_idx = closed_child(node, edge_idx, rng);
     let v = {
         let child = &mut *node.edges[edge_idx].children[child_idx].1.node;
-        descend(child, None, eval, rng, c_puct)
+        descend(child, None, eval, rng, c_puct)?
     };
     node.edges[edge_idx].visits += 1;
     node.edges[edge_idx].value_sum_p0 += v;
     node.visits += 1;
     node.value_sum_p0 += v;
-    v
+    Ok(v)
 }
 
 /// Build a closed tree from `state` with a fixed round-robin root-edge schedule
@@ -206,18 +208,18 @@ pub fn closed_tree_fixed<E: Eval>(
     eval: &E,
     seed: u64,
     c_puct: f64,
-) -> Node {
+) -> PyResult<Node> {
     let root_state = state.clone();
     let mut root = Node::make(root_state);
-    let v = root.expand(eval);
+    let v = root.expand(eval)?;
     root.visits += 1;
     root.value_sum_p0 += v;
     let mut rng = Rng::new(seed);
     let n_edges = root.edges.len().max(1);
     for i in 0..sims {
-        descend(&mut root, Some(i % n_edges), eval, &mut rng, c_puct);
+        descend(&mut root, Some(i % n_edges), eval, &mut rng, c_puct)?;
     }
-    root
+    Ok(root)
 }
 
 // --- F3.3: force-expansion + Gumbel root --------------------------------------
@@ -249,7 +251,7 @@ fn sigma(cfg: &SearchConfig, q: f64, max_visits: u32) -> f64 {
 /// Materialize + evaluate every enumerable chance child of each root edge (AGE_DEAL
 /// stays sampled), marking those edges probability-weighted — the closed-mode
 /// catastrophe-coverage toggle (port of `_force_expand_root`).
-fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> Result<(), String> {
+fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
     for edge in &mut root.edges {
         if edge.specs.is_empty()
             || edge
@@ -269,7 +271,7 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> Result<(), String> {
                 .apply_with_chance(&action, &outcomes)
                 .expect("enumerated outcome must be valid");
             let mut child_node = Node::make(child_state);
-            let (value_p0, _) = eval.evaluate(&child_node.state);
+            let (value_p0, _) = eval.evaluate(&child_node.state)?;
             child_node.visits = 1;
             child_node.value_sum_p0 = value_p0;
             edge.children.push((
@@ -289,10 +291,10 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> Result<(), String> {
             .map(|(_, c)| c.probability.unwrap_or(0.0))
             .sum();
         if (mass - 1.0).abs() > 1e-9 {
-            return Err(format!(
+            return Err(PyValueError::new_err(format!(
                 "force-expanded edge {} holds probability mass {mass} != 1",
                 edge.action_index
-            ));
+            )));
         }
         edge.probability_weighted = true;
     }
@@ -306,15 +308,17 @@ pub fn search_closed<E: Eval>(
     state: &GameState,
     eval: &E,
     cfg: &SearchConfig,
-) -> Result<(SearchResult, Node), String> {
+) -> PyResult<(SearchResult, Node)> {
     if cfg.sims < 1 || cfg.top_k < 1 {
-        return Err("sims and top_k must be positive".into());
+        return Err(PyValueError::new_err("sims and top_k must be positive"));
     }
     let mut root = Node::make(state.clone());
     if root.terminal || root.legal.is_empty() {
-        return Err("cannot search a terminal or action-less root".into());
+        return Err(PyValueError::new_err(
+            "cannot search a terminal or action-less root",
+        ));
     }
-    let root_value_p0 = root.expand(eval);
+    let root_value_p0 = root.expand(eval)?;
     root.visits += 1;
     root.value_sum_p0 += root_value_p0;
     if cfg.force_expand_root_chance {
@@ -373,7 +377,7 @@ pub fn search_closed<E: Eval>(
                 if sims_used >= budget {
                     break 'outer;
                 }
-                descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct);
+                descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct)?;
                 q_hat[j] = Some(sign * root.edges[j].q_p0());
                 visits[j] = root.edges[j].visits;
                 sims_used += 1;
