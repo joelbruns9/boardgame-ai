@@ -342,9 +342,19 @@ Leaf coalescing + GIL release (KD M6 design: `py.detach`, in-process
 coalescing, `leaf_batch > 1`); ONNX/tch in-process only if profiles show the
 Python hop dominating.
 
+**Design doc: `F4_THROUGHPUT_DESIGN.md`** (2026-07-21) — F4 is the one Phase F
+step whose fast path is *deliberately not bit-identical* to the sequential
+reference (coalescing evaluates leaves before backprop), so it is validated
+differently: `leaf_batch=1` must reproduce the F3.3 digest exactly, then
+`leaf_batch>1` by statistical agreement + trap-fixture blunder rate. The doc
+covers the Gumbel-vs-PUCT coalescing question (scheme A: batch within a halving
+round), the selection/eval/backprop phase split, GIL/`py.detach`, the perf work
+(flat encode buffers, precomputed actor/legal, batched forced children), the
+benchmark methodology, and sub-steps F4.0–F4.4.
+
 - **Gate F4 (= Phase F exit):** ≥20× self-play throughput vs the Python loop
   at equal settings (KD achieved ~28×).
-- Status: not started.
+- Status: **designed 2026-07-21; not started.**
 
 ## Crate split ("extract at two")
 
