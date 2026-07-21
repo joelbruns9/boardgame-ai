@@ -174,6 +174,20 @@ This uses one pre-registered treatment setting: 15% reply batch fraction and
 batches, including the same D4 transforms; sampled indices and transforms are
 logged. Only treatment receives grouped reply loss.
 
+To maximize paid-box utilization, the guarded cloud runner can wait for the
+background root freeze, resume all production shards, enforce structural and
+accepted-count gates, create the root-disjoint split, and start both training
+arms without a manual pause:
+
+```bash
+nohup env PYTHON=/venv/main/bin/python PILOT_THREADS=4 PILOT_SHARDS=4 \
+  bash run_reply_pilot_training_cloud.sh \
+  > "$PILOT_DIR/production_to_training.log" 2>&1 &
+```
+
+This automation deliberately stops after training. Review
+`pilot_training_report.json` before launching behavior or strength evaluation.
+
 ```bash
 python -m games.kingdomino.reply_training \
   --checkpoint "$BASE_CKPT" \
