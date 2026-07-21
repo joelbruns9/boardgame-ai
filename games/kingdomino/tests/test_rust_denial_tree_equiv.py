@@ -15,6 +15,7 @@ from games.kingdomino.denial_search import (
 from games.kingdomino.encoder import encode_state
 from games.kingdomino.game import GameState, Phase
 from games.kingdomino.reply_pilot import (
+    _confirm_rust_parent_tree_labels,
     _confirm_rust_reply_label,
     serialize_rust_reply_example,
     validate_reply_example,
@@ -237,3 +238,41 @@ def test_fixed_reply_research_reproduces_parent_tree_and_records_cross_seed(tmp_
         reject_ties=False)
     validate_reply_example(row)
     assert row["quality_accept"]
+
+
+def test_full_parent_tree_confirmation_amortizes_all_reply_labels(tmp_path):
+    state = next(
+        candidate for seed in range(2500, 3200)
+        if ((candidate := _round_start(seed)).pending_claims[0].player
+            != candidate.pending_claims[1].player)
+    )
+    checkpoint = tmp_path / "fixture.pt"
+    checkpoint.write_bytes(b"fixture")
+    search = DenialSearch(
+        _EncodedEvaluator(), checkpoint_path=str(checkpoint),
+        config=SearchConfig(pick_plies=3, chance_k=1, seed=91,
+                            root_search_sims=0, placement_top_k=2),
+    )
+    result = search.search_position_rust(
+        state, rayon_threads=2, rust_evaluator=_rust_evaluator)
+    confirmation_calls = []
+    search_position_rust = search.search_position_rust
+
+    def tracked_search_position_rust(*args, **kwargs):
+        confirmation_calls.append(kwargs.get("chance_seed"))
+        return search_position_rust(*args, **kwargs)
+
+    search.search_position_rust = tracked_search_position_rust
+    confirmations = _confirm_rust_parent_tree_labels(
+        search, state, root_result=None, primary_result=result,
+        base_seed=91, seed_count=3, seed_stride=1_000_003,
+        rayon_threads=2)
+
+    assert confirmation_calls == [1_000_094, 2_000_097]
+    assert set(confirmations) == {
+        label["parent_pick_domino_id"] for label in result["reply_labels"]}
+    for cross in confirmations.values():
+        assert cross["confirmation_scope"] == "full-parent-tree"
+        assert cross["seeds"] == [91, 1_000_094, 2_000_097]
+        assert cross["top_pick_agreement"] == 1.0
+        assert cross["max_searched_seed_sd"] == 0.0

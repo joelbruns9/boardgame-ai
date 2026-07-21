@@ -866,6 +866,7 @@ class DenialSearch:
         root_result=None,
         rayon_threads: int = 1,
         rust_evaluator=None,
+        chance_seed: Optional[int] = None,
     ) -> dict[str, Any]:
         """Run the Rust/Rayon forced tree and return oracle-comparable rows.
 
@@ -890,7 +891,12 @@ class DenialSearch:
             action = actions[0]
             root_actions.append((int(pick), int(encode_action(action, state))))
 
-        rows, chance_mode = self._chance_rows(state.deck)
+        if chance_seed is None or int(chance_seed) == int(self.config.seed):
+            rows, chance_mode = self._chance_rows(state.deck)
+        else:
+            rows, chance_mode = chance_rows(
+                state.deck, int(self.config.chance_k),
+                seed=int(chance_seed), drew=4)
         if rust_evaluator is None:
             if self._rust_evaluator is None:
                 self._rust_evaluator = make_rust_evaluator(
