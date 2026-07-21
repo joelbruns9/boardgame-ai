@@ -227,6 +227,21 @@ arena/coalescing/`allow_threads` scaffolding.
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
     materialization; matches Python to 1e-6 under a mock eval on deterministic
     positions (sampling off).
+    - **Foundation DONE 2026-07-20:** `eval.rs` — an `Eval` trait + `MockEval`, a
+      deterministic fingerprint-derived oracle (splitmix fold → value_p0 in
+      [-1,1) + raw per-action weight priors). Priors are **unnormalized** on
+      purpose: a cross-language normalization *sum* diverges in the last ULP, and
+      PUCT/Gumbel are invariant to a common scale, so raw weights stay
+      bit-identical. Gate `test_mock_eval_matches_python` matches at every state
+      incl. terminal.
+    - **Design note (surfaced here):** cross-language f64 **sum order** matters —
+      the tree must iterate children in **insertion order** (like Python's dict)
+      so probability-weighted `q_p0` and value backprop match bit-for-bit; use an
+      insertion-ordered children map, not a `HashMap`.
+    - **Remaining:** `ClosedNode`/`_Edge`/`_Child`, expand/select(PUCT)/
+      closed_child(sample + observable-key dedup)/descend/force_expand_root, a
+      fixed-schedule driver + tree digest, gated to 1e-6 vs the Python reference
+      searcher under `MockEval`.
   - **F3.3** — Gumbel root (top-k + sequential halving + completed-Q policy
     target) + `force_expand_root_chance`; full `search()` matches Python
     (visits/values/chosen action) under mock across seeds, flag off and on.

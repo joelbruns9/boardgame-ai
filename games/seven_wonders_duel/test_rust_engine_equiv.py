@@ -79,6 +79,66 @@ def _map_key(specs, py_key):
     return out
 
 
+_MASK64 = (1 << 64) - 1
+
+
+def _mock_mix(h):
+    h = ((h ^ (h >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    h = ((h ^ (h >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return h ^ (h >> 31)
+
+
+def _mock_fold(fp):
+    h = 0x9E3779B97F4A7C15
+    for x in fp:
+        h = _mock_mix((h ^ (x & _MASK64)) & _MASK64)
+    return h
+
+
+def _mock_unit(h):
+    return (h >> 11) / (1 << 53)
+
+
+def _mock_terminal_value(game):
+    if game.winner is None:
+        return 0.0
+    return 1.0 if game.winner == 0 else -1.0
+
+
+def mock_eval(game):
+    """Python reference for the deterministic fingerprint-based leaf oracle
+    (mirrors eval.rs::MockEval): (value_p0, priors aligned to legal indices)."""
+
+    h = _mock_fold(logic_fingerprint(game))
+    value = _mock_unit(h) * 2 - 1
+    if game.phase is Phase.COMPLETE:
+        return _mock_terminal_value(game), []
+    legal = legal_action_indices(game)
+    # Raw weights (unnormalized) — see eval.rs::MockEval for why.
+    return value, [
+        _mock_unit(_mock_mix(h ^ ((a * 0x9E3779B97F4A7C15) & _MASK64))) for a in legal
+    ]
+
+
+def test_mock_eval_matches_python():
+    """F3.2 foundation: the Rust MockEval oracle equals the Python reference
+    (value + aligned priors) at every state incl. terminal, bit-for-bit."""
+
+    for seed in range(20):
+        first_player, actions, library = random_game(seed, seed % 2)
+        py = new_game(seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for idx in actions + [None]:
+            exp_v, exp_priors = mock_eval(py)
+            rust_v, rust_priors = rg.mock_eval()
+            assert rust_v == exp_v, f"seed {seed}: mock value {rust_v} != {exp_v}"
+            assert list(rust_priors) == exp_priors, f"seed {seed}: mock priors differ"
+            if idx is None:
+                break
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+
+
 def test_gumbel_stream_matches_python():
     """F3.3 prerequisite: Rust gumbel() equals Python's in bulk across seeds
     (cross-runtime ln parity, not just a 3-value golden)."""

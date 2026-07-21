@@ -11,6 +11,7 @@ mod codec;
 mod data;
 mod encoder;
 mod engine;
+mod eval;
 mod pool;
 mod rng;
 mod rules;
@@ -235,6 +236,13 @@ impl RustGame {
                 Err(PyValueError::new_err(e))
             }
         }
+    }
+
+    /// F3.2: deterministic mock leaf evaluation of the current state
+    /// `(value_p0, priors aligned to legal_action_indices)` — the shared oracle
+    /// for the tree-equivalence gate.
+    fn mock_eval(&self) -> (f64, Vec<f64>) {
+        eval::MockEval::eval_state(&self.state)
     }
 
     fn is_complete(&self) -> bool {
