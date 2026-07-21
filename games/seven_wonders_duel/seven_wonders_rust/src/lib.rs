@@ -257,6 +257,46 @@ impl RustGame {
         out
     }
 
+    /// F3.3: full closed search (Gumbel root + sequential halving) from the
+    /// current state under `MockEval`. Returns `(action_index, action_value,
+    /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
+    /// `visits`/`policy_target` aligned to `legal_action_indices`.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    fn closed_search(
+        &self,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+    ) -> (usize, f64, f64, Vec<u32>, Vec<f64>, Vec<usize>, usize, Vec<f64>) {
+        let cfg = tree::SearchConfig {
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+        };
+        let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg);
+        let mut dig = Vec::new();
+        tree::digest(&root, &mut dig);
+        (
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            dig,
+        )
+    }
+
     fn is_complete(&self) -> bool {
         self.state.phase == state::Phase::Complete
     }

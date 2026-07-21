@@ -257,6 +257,14 @@ arena/coalescing/`allow_threads` scaffolding.
   - **F3.3** — Gumbel root (top-k + sequential halving + completed-Q policy
     target) + `force_expand_root_chance`; full `search()` matches Python
     (visits/values/chosen action) under mock across seeds, flag off and on.
+    **DONE 2026-07-20:** `tree.rs::search_closed` + `force_expand_root` + a
+    `SearchConfig`/`SearchResult`, ported from `_gumbel_root`/`_search_closed`.
+    Gumbel keys drawn from the portable `Rng` in legal order; sequential halving,
+    first-argmax best, and a legal-order left-folded policy normalizer match
+    Python's sums. Gate `test_closed_search_matches_python`: chosen action,
+    `sims`, `gumbel_topk`, per-action visits, action/root value, policy target,
+    AND the full tree digest are bit-identical to the real Python searcher under
+    `MockEval`, across sims {16,64} × seeds × **force-expansion off and on**.
   - **F3.4** — batched real-evaluator bridge across the pyo3 boundary (feeds F4).
   - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
   - Carries the F2 sign-off follow-up: hidden-resampling invariance test once

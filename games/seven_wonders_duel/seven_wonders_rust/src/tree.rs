@@ -220,6 +220,187 @@ pub fn closed_tree_fixed<E: Eval>(
     root
 }
 
+// --- F3.3: force-expansion + Gumbel root --------------------------------------
+
+pub struct SearchConfig {
+    pub sims: usize,
+    pub top_k: usize,
+    pub c_puct: f64,
+    pub c_visit: f64,
+    pub c_scale: f64,
+    pub seed: u64,
+    pub force_expand_root_chance: bool,
+}
+
+pub struct SearchResult {
+    pub action_index: usize,
+    pub action_value: f64,
+    pub root_value: f64,
+    pub visits: Vec<u32>,        // aligned to root.legal
+    pub policy_target: Vec<f64>, // aligned to root.legal
+    pub gumbel_topk: Vec<usize>, // action indices
+    pub sims: usize,
+}
+
+fn sigma(cfg: &SearchConfig, q: f64, max_visits: u32) -> f64 {
+    (cfg.c_visit + max_visits as f64) * cfg.c_scale * q
+}
+
+/// Materialize + evaluate every enumerable chance child of each root edge (AGE_DEAL
+/// stays sampled), marking those edges probability-weighted — the closed-mode
+/// catastrophe-coverage toggle (port of `_force_expand_root`).
+fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) {
+    for edge in &mut root.edges {
+        if edge.specs.is_empty()
+            || edge
+                .specs
+                .iter()
+                .any(|s| s.kind == crate::chance::ChanceKind::AgeDeal)
+        {
+            continue;
+        }
+        let action = decode_action(&root.state, edge.action_index);
+        for (outcomes, probability, key) in chance::enumerate_chains(&root.state, &edge.specs) {
+            if edge.children.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            let mut child_state = root.state.clone();
+            child_state
+                .apply_with_chance(&action, &outcomes)
+                .expect("enumerated outcome must be valid");
+            let mut child_node = Node::make(child_state);
+            let (value_p0, _) = eval.evaluate(&child_node.state);
+            child_node.visits = 1;
+            child_node.value_sum_p0 = value_p0;
+            edge.children.push((
+                key,
+                Child {
+                    probability: Some(probability),
+                    node: Box::new(child_node),
+                    samples: 0,
+                },
+            ));
+        }
+        edge.probability_weighted = true;
+    }
+}
+
+/// Full closed search with a Gumbel root (top-k + sequential halving +
+/// completed-Q policy target), a port of `_gumbel_root` + `_search_closed`.
+/// Returns the result and the built tree (for the digest gate).
+pub fn search_closed<E: Eval>(state: &GameState, eval: &E, cfg: &SearchConfig) -> (SearchResult, Node) {
+    let mut root = Node::make(state.clone());
+    let root_value_p0 = root.expand(eval);
+    root.visits += 1;
+    root.value_sum_p0 += root_value_p0;
+    if cfg.force_expand_root_chance && !root.terminal {
+        force_expand_root(&mut root, eval);
+    }
+    let sign = if root.actor == 0 { 1.0 } else { -1.0 };
+    let root_value = sign * root_value_p0;
+    let n = root.edges.len();
+    let legal: Vec<usize> = root.legal.clone();
+
+    // Gumbel keys (one per legal action, in sorted order) then the per-edge
+    // priors, log-priors, and any forced (probability-weighted) initial Q.
+    let mut rng = Rng::new(cfg.seed);
+    let log_prior: Vec<f64> = root.edges.iter().map(|e| e.prior.max(1e-12).ln()).collect();
+    let gumbel: Vec<f64> = (0..n).map(|_| rng.gumbel()).collect();
+    let initial_q: Vec<Option<f64>> = root
+        .edges
+        .iter()
+        .map(|e| {
+            if e.probability_weighted {
+                Some(sign * e.q_p0())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut q_hat: Vec<Option<f64>> = vec![None; n];
+    let mut visits: Vec<u32> = vec![0; n];
+    let completed_q = |j: usize, q_hat: &[Option<f64>]| -> f64 {
+        q_hat[j].or(initial_q[j]).unwrap_or(root_value)
+    };
+
+    let mut candidates: Vec<usize> = (0..n).collect();
+    candidates.sort_by(|&a, &b| {
+        (gumbel[b] + log_prior[b])
+            .partial_cmp(&(gumbel[a] + log_prior[a]))
+            .unwrap()
+    });
+    candidates.truncate(cfg.top_k.min(n).max(0));
+    if candidates.is_empty() {
+        candidates.push(0);
+    }
+    let topk: Vec<usize> = candidates.iter().map(|&j| legal[j]).collect();
+
+    let budget = cfg.sims;
+    let mut sims_used = 0usize;
+    let rounds_total = ((candidates.len().max(2) as f64).log2().ceil() as usize).max(1);
+    let mut round_index = 0usize;
+    while sims_used < budget {
+        let rounds_remaining = rounds_total.saturating_sub(round_index).max(1);
+        let per_action = ((budget - sims_used) / (rounds_remaining * candidates.len())).max(1);
+        'outer: for idx in 0..candidates.len() {
+            let j = candidates[idx];
+            for _ in 0..per_action {
+                if sims_used >= budget {
+                    break 'outer;
+                }
+                descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct);
+                q_hat[j] = Some(sign * root.edges[j].q_p0());
+                visits[j] = root.edges[j].visits;
+                sims_used += 1;
+            }
+        }
+        if candidates.len() > 1 {
+            let max_visits = visits.iter().copied().max().unwrap_or(0);
+            candidates.sort_by(|&a, &b| {
+                let ka = gumbel[a] + log_prior[a] + sigma(cfg, completed_q(a, &q_hat), max_visits);
+                let kb = gumbel[b] + log_prior[b] + sigma(cfg, completed_q(b, &q_hat), max_visits);
+                kb.partial_cmp(&ka).unwrap()
+            });
+            candidates.truncate((candidates.len() / 2).max(1));
+        }
+        round_index += 1;
+    }
+
+    let max_visits = visits.iter().copied().max().unwrap_or(0);
+    // best = first argmax over the surviving candidates.
+    let mut best = candidates[0];
+    let mut best_score = f64::NEG_INFINITY;
+    for &j in &candidates {
+        let s = gumbel[j] + log_prior[j] + sigma(cfg, completed_q(j, &q_hat), max_visits);
+        if s > best_score {
+            best_score = s;
+            best = j;
+        }
+    }
+
+    // Improved policy over ALL legal actions (completed Q); left-fold the
+    // normalizer in legal order to match Python's sum.
+    let logits: Vec<f64> = (0..n)
+        .map(|j| log_prior[j] + sigma(cfg, completed_q(j, &q_hat), max_visits))
+        .collect();
+    let peak = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = logits.iter().map(|&v| (v - peak).exp()).collect();
+    let total = weights.iter().fold(0.0_f64, |a, &b| a + b);
+    let policy_target: Vec<f64> = weights.iter().map(|&w| w / total).collect();
+
+    let result = SearchResult {
+        action_index: legal[best],
+        action_value: completed_q(best, &q_hat),
+        root_value: sign * root.value_p0(),
+        visits,
+        policy_target,
+        gumbel_topk: topk,
+        sims: sims_used,
+    };
+    (result, root)
+}
+
 /// Canonical depth-first serialization of the tree (visits, values, edge stats,
 /// child keys/samples/probabilities) for the equivalence gate.
 pub fn digest(node: &Node, out: &mut Vec<f64>) {

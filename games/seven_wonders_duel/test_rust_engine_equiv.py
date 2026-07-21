@@ -230,6 +230,71 @@ def test_closed_tree_matches_python():
     assert checked > 20
 
 
+def _mock_search(state, sims, top_k, seed, force):
+    mcts = GumbelMCTS(
+        None,
+        SearchConfig(
+            sims=sims,
+            top_k=top_k,
+            mode="closed",
+            seed=seed,
+            force_expand_root_chance=force,
+        ),
+    )
+    mcts._evaluate = _mock_evaluate  # type: ignore[method-assign]
+    result = mcts.search(state)
+    return result, mcts._closed_root
+
+
+def test_closed_search_matches_python():
+    """F3.3: the full closed search (Gumbel root + sequential halving + policy
+    target, with force-expansion off AND on) matches the Python reference —
+    chosen action, visits, top-k, values, policy target, and the whole tree."""
+
+    checked = 0
+    for game_seed in range(6):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                legal = legal_action_indices(py)
+                for sims in (16, 64):
+                    for seed in (1, 5):
+                        for force in (False, True):
+                            result, root = _mock_search(py, sims, 8, seed, force)
+                            (act, av, rv, visits, policy, topk, rsims, dig) = rg.closed_search(
+                                sims, 8, seed, force=force
+                            )
+                            ctx = f"game {game_seed} sims {sims} seed {seed} force {force}"
+                            assert act == result.action_index, f"{ctx}: action"
+                            assert rsims == result.sims, f"{ctx}: sims"
+                            assert list(topk) == list(result.gumbel_topk), f"{ctx}: topk"
+                            assert list(visits) == [result.visits[a] for a in legal], (
+                                f"{ctx}: visits"
+                            )
+                            assert av == pytest.approx(result.action_value, abs=1e-9), f"{ctx}: av"
+                            assert rv == pytest.approx(result.root_value, abs=1e-9), f"{ctx}: rv"
+                            for j, a in enumerate(legal):
+                                assert policy[j] == pytest.approx(
+                                    result.policy_target[a], abs=1e-9
+                                ), f"{ctx}: policy[{a}]"
+                            exp_dig = []
+                            _digest_ref(root, exp_dig)
+                            _assert_digest_equal(exp_dig, list(dig), f"{ctx}: tree")
+                            checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked >= 20
+
+
 def test_gumbel_stream_matches_python():
     """F3.3 prerequisite: Rust gumbel() equals Python's in bulk across seeds
     (cross-runtime ln parity, not just a 3-value golden)."""
