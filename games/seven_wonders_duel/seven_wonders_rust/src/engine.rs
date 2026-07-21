@@ -907,9 +907,23 @@ impl GameState {
     /// equivalent to Python's mid-apply overrides for the distinct outcomes the
     /// searcher produces — reveal targets are used-deduplicated, so no swap ever
     /// collides with an already-processed sibling slot.
-    pub fn apply_with_chance(&mut self, action: &Action, outcomes: &[Vec<usize>]) {
+    pub fn apply_with_chance(
+        &mut self,
+        action: &Action,
+        outcomes: &[Vec<usize>],
+    ) -> Result<(), String> {
         let specs = crate::chance::chance_signature(self, action);
-        assert_eq!(specs.len(), outcomes.len(), "outcome count != spec count");
+        if specs.len() != outcomes.len() {
+            return Err(format!(
+                "expected {} chance outcome(s), got {}",
+                specs.len(),
+                outcomes.len()
+            ));
+        }
+        // Validate every outcome against the pre-state BEFORE any mutation, so a
+        // malformed supply cannot leave the state partially applied (the solver
+        // make/unmake contract). Valid search outcomes always pass.
+        self.validate_chance(&specs, outcomes)?;
         for (spec, outcome) in specs.iter().zip(outcomes) {
             match spec.kind {
                 crate::chance::ChanceKind::CardReveal => {
@@ -931,6 +945,94 @@ impl GameState {
             }
         }
         self.apply_action(action);
+        Ok(())
+    }
+
+    fn validate_chance(
+        &self,
+        specs: &[crate::chance::ChanceSpec],
+        outcomes: &[Vec<usize>],
+    ) -> Result<(), String> {
+        use crate::chance::ChanceKind;
+        use crate::data::{back_type_of, BackType, NUM_CARDS};
+        let pool = crate::pool::unseen_pool(self);
+        let distinct = |v: &[usize]| {
+            let mut s = v.to_vec();
+            s.sort_unstable();
+            s.dedup();
+            s.len() == v.len()
+        };
+        let mut revealed = Vec::new();
+        for (spec, o) in specs.iter().zip(outcomes) {
+            match spec.kind {
+                ChanceKind::CardReveal => {
+                    let back = spec.context[2] as usize;
+                    if o.len() != 1 {
+                        return Err("card reveal outcome must be one card".into());
+                    }
+                    let c = o[0];
+                    if c >= NUM_CARDS || back_type_of(c) as usize != back {
+                        return Err(format!("reveal {c} has the wrong back type"));
+                    }
+                    if revealed.contains(&c) || !pool.cards[back].contains(&c) {
+                        return Err(format!("reveal {c} is not in the unseen pool"));
+                    }
+                    revealed.push(c);
+                }
+                ChanceKind::WonderGroupReveal => {
+                    let mut flip_pool = self.wonder_groups[1].clone();
+                    flip_pool.extend_from_slice(&self.unused_wonders);
+                    if o.len() != 4 || !distinct(o) || o.iter().any(|w| !flip_pool.contains(w)) {
+                        return Err("invalid wonder-flip outcome".into());
+                    }
+                }
+                ChanceKind::GreatLibraryDraw => {
+                    if o.len() != 3
+                        || !distinct(o)
+                        || o.iter().any(|p| !pool.offboard_progress.contains(p))
+                    {
+                        return Err("invalid Great Library draw".into());
+                    }
+                }
+                ChanceKind::AgeDeal => {
+                    let age = spec.context[0] as usize;
+                    if o.len() != crate::data::layout(age as u8).len() || !distinct(o) {
+                        return Err("age deal has the wrong size or a duplicate".into());
+                    }
+                    let mut visible = [false; NUM_CARDS];
+                    for &c in &self.discard_pile {
+                        visible[c] = true;
+                    }
+                    for &c in &self.buried_cards {
+                        visible[c] = true;
+                    }
+                    for city in &self.cities {
+                        for &c in &city.buildings {
+                            visible[c] = true;
+                        }
+                    }
+                    let mut guilds = 0;
+                    for &c in o {
+                        let back = back_type_of(c);
+                        let ok_back = if age == 3 {
+                            back == BackType::AgeIII || back == BackType::Guild
+                        } else {
+                            back as usize == age - 1
+                        };
+                        if !ok_back || visible[c] {
+                            return Err(format!("card {c} cannot be in an age {age} deal"));
+                        }
+                        if back == BackType::Guild {
+                            guilds += 1;
+                        }
+                    }
+                    if age == 3 && guilds != 3 {
+                        return Err("age III deal needs exactly 3 guilds".into());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Install `new_id` at `slot`, swapping the previously-locked card into the

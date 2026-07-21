@@ -205,6 +205,25 @@ arena/coalescing/`allow_threads` scaffolding.
     dedicated Rust *determinizer*-invariance test is N/A for the closed-only port
     (no Rust determinizer is built — open is not ported); revisit only if open
     determinization is ever added.
+  - **F3.1 review-hardening (2026-07-20, external review — no valid-path
+    divergence found; four contract gaps closed before F3.2/F3.3):**
+    - **Observable keys** now returned by `enumerate_chains`/`sample_outcomes`
+      (`age_deal_key` coalesces hidden deals with the same public signature;
+      off-AGE_DEAL the key equals the outcomes). Gate compares key parity,
+      including the AGE_DEAL face-up/back-marker encoding — so F3.2 keys children
+      correctly instead of by hidden deals.
+    - **`apply_with_chance` is checked + atomic** — `validate_chance` runs a full
+      pre-mutation pass (reveal back/pool membership + distinctness, wonder-flip
+      length/uniqueness/pool, Great-Library subset, age-deal size/backs/visible/
+      3-guilds) and returns `Result`; malformed input errors with the state
+      untouched (`test_make_with_chance_rejects_malformed`).
+    - **Gumbel parity gated in bulk** — `gumbel_stream` + a Rust golden test
+      compare 500 draws across 5 seeds (cross-runtime `ln` parity), the F3.3
+      root-selection prerequisite.
+    - **SWAP branch coverage asserted** — the make_with_chance gate now requires
+      sibling / removed-pile / unused-guild reveal sources, a sequential
+      same-back reveal, and all three age-deal ages. `cargo test` 6 / `pytest
+      test_rust_engine_equiv.py` 13 green.
   - **F3.2** — Rust closed-node tree + PUCT descent + outcome-keyed child
     materialization; matches Python to 1e-6 under a mock eval on deterministic
     positions (sampling off).

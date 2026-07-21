@@ -74,4 +74,16 @@ mod tests {
         r.shuffle(&mut seq);
         assert_eq!(seq, [3, 1, 6, 2, 4, 0, 7, 5]);
     }
+
+    #[test]
+    fn gumbel_golden_matches_python() {
+        // Pinned Python PortableRng(7).gumbel() stream — F3.3 root selection
+        // needs these bit-identical (cross-runtime ln parity).
+        let mut r = Rng::new(7);
+        let seq: Vec<f64> = (0..3).map(|_| r.gumbel()).collect();
+        assert_eq!(
+            seq,
+            [0.7051848236225707, 4.0786199258627525, -0.8373431815918142]
+        );
+    }
 }

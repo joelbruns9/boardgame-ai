@@ -178,11 +178,15 @@ impl RustGame {
             .collect()
     }
 
-    /// F3.1a: all `(outcomes, probability)` chains for action `index`'s
-    /// enumerable chance specs. Each chain's `outcomes` is one id list per spec
-    /// (CardReveal `[card_id]`, GreatLibraryDraw `[p,p,p]`, WonderGroupReveal
-    /// `[w,w,w,w]`). Errors on AgeDeal (sample-only).
-    fn enumerate_chains(&self, index: usize) -> PyResult<Vec<(Vec<Vec<usize>>, f64)>> {
+    /// F3.1a: all `(outcomes, probability, observable_key)` chains for action
+    /// `index`'s enumerable chance specs. Each chain's `outcomes` is one id list
+    /// per spec (CardReveal `[card_id]`, GreatLibraryDraw `[p,p,p]`,
+    /// WonderGroupReveal `[w,w,w,w]`); `key` equals the outcomes off AGE_DEAL.
+    /// Errors on AgeDeal (sample-only).
+    fn enumerate_chains(
+        &self,
+        index: usize,
+    ) -> PyResult<Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)>> {
         let action = codec::decode_action(&self.state, index);
         let specs = chance::chance_signature(&self.state, &action);
         if specs
@@ -198,7 +202,11 @@ impl RustGame {
     /// `Rng(seed)` — the standalone-seed form the gate compares against Python's
     /// `sample_outcomes(..., PortableRng(seed))`. Returns `(outcomes, prob)` with
     /// `prob` absent when a spec is sample-only (AGE_DEAL).
-    fn sample_outcomes(&self, index: usize, seed: u64) -> (Vec<Vec<usize>>, Option<f64>) {
+    fn sample_outcomes(
+        &self,
+        index: usize,
+        seed: u64,
+    ) -> (Vec<Vec<usize>>, Option<f64>, Vec<Vec<i32>>) {
         let action = codec::decode_action(&self.state, index);
         let specs = chance::chance_signature(&self.state, &action);
         let mut rng = rng::Rng::new(seed);
@@ -212,13 +220,21 @@ impl RustGame {
         &mut self,
         index: usize,
         outcomes: Vec<Vec<usize>>,
-    ) -> Vec<i32> {
+    ) -> PyResult<Vec<i32>> {
         let undo = self.state.snapshot();
         let action = codec::decode_action(&self.state, index);
-        self.state.apply_with_chance(&action, &outcomes);
-        let fp = self.state.fingerprint();
-        self.state.restore(undo);
-        fp
+        let result = self.state.apply_with_chance(&action, &outcomes);
+        match result {
+            Ok(()) => {
+                let fp = self.state.fingerprint();
+                self.state.restore(undo);
+                Ok(fp)
+            }
+            Err(e) => {
+                self.state.restore(undo);
+                Err(PyValueError::new_err(e))
+            }
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -245,6 +261,14 @@ fn encoder_signature() -> &'static str {
     encoder::ENCODER_SIGNATURE
 }
 
+/// `n` consecutive `gumbel()` draws from `Rng(seed)` — lets the gate check
+/// cross-runtime `ln` parity in bulk (F3.3 needs bit-identical Gumbel keys).
+#[pyfunction]
+fn gumbel_stream(seed: u64, n: usize) -> Vec<f64> {
+    let mut r = rng::Rng::new(seed);
+    (0..n).map(|_| r.gumbel()).collect()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -255,6 +279,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::encoder_signature;
+
+    #[pymodule_export]
+    use super::gumbel_stream;
 }
 
 #[cfg(test)]

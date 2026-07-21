@@ -55,14 +55,47 @@ _CHANCE_ID_MAP = {
 }
 # Sampling additionally maps AGE_DEAL outcomes (card names) to card ids.
 _CHANCE_SAMPLE_ID_MAP = {**_CHANCE_ID_MAP, ChanceKind.AGE_DEAL: CARD_IDS}
+_NUM_CARDS = len(CARD_IDS)
+
+
+def _map_key(specs, py_key):
+    """Python observable key -> Rust's Vec<Vec<i32>> encoding. AGE_DEAL keys mix
+    face-up card ids with `NUM_CARDS + back_id` markers for face-down slots."""
+
+    out = []
+    for spec, part in zip(specs, py_key):
+        if spec.kind is ChanceKind.AGE_DEAL:
+            # BackType is a str subclass, so test it before the card-name case.
+            out.append(
+                [
+                    _NUM_CARDS + _BACK_ID[e] if isinstance(e, BackType) else CARD_IDS[e]
+                    for e in part
+                ]
+            )
+        elif spec.kind is ChanceKind.CARD_REVEAL:
+            out.append([CARD_IDS[part]])  # part is a single card name
+        else:  # GreatLibrary / wonder flip: part is a tuple of names
+            out.append([_CHANCE_ID_MAP[spec.kind][name] for name in part])
+    return out
+
+
+def test_gumbel_stream_matches_python():
+    """F3.3 prerequisite: Rust gumbel() equals Python's in bulk across seeds
+    (cross-runtime ln parity, not just a 3-value golden)."""
+
+    for seed in (0, 1, 7, 99, 2**40 + 5):
+        rust = swr.gumbel_stream(seed, 500)
+        rng = PortableRng(seed)
+        expected = [rng.gumbel() for _ in range(500)]
+        assert rust == expected, f"gumbel divergence at seed {seed}"
 
 
 def _expected_sample(game, index, seed):
-    """Python sample_outcomes for a fresh PortableRng(seed), outcomes as id
-    lists: (outcomes, probability)."""
+    """Python sample_outcomes for a fresh PortableRng(seed): (outcomes, prob, key)
+    with outcomes and key as id lists."""
 
     specs = py_chance_signature(game, decode_action(game, index))
-    outcomes, prob, _key = py_sample_outcomes(game, specs, PortableRng(seed))
+    outcomes, prob, key = py_sample_outcomes(game, specs, PortableRng(seed))
     mapped = []
     for spec, outcome in zip(specs, outcomes):
         id_map = _CHANCE_SAMPLE_ID_MAP[spec.kind]
@@ -70,7 +103,7 @@ def _expected_sample(game, index, seed):
             mapped.append([id_map[outcome]])
         else:
             mapped.append([id_map[name] for name in outcome])
-    return mapped, prob
+    return mapped, prob, _map_key(specs, key)
 
 
 def _expected_signature(game, index):
@@ -650,10 +683,14 @@ def test_chance_signature_and_chains_equivalent():
                         rg.enumerate_chains(index)
                     continue
                 expected = _expected_chains_dict(py, index)
-                rust = {
-                    tuple(tuple(o) for o in outcomes): prob
-                    for outcomes, prob in rg.enumerate_chains(index)
-                }
+                rust = {}
+                for outcomes, prob, key in rg.enumerate_chains(index):
+                    outcome_tup = tuple(tuple(o) for o in outcomes)
+                    # Off AGE_DEAL the observable key equals the outcomes.
+                    assert [list(k) for k in key] == [list(o) for o in outcomes], (
+                        f"seed {seed} action {index}: enumerate key != outcomes"
+                    )
+                    rust[outcome_tup] = prob
                 assert rust.keys() == expected.keys(), (
                     f"seed {seed} action {index}: chain outcome set mismatch"
                 )
@@ -692,12 +729,17 @@ def test_sample_outcomes_equivalent():
                     s.context[0] for s in specs if s.kind is ChanceKind.AGE_DEAL
                 )
                 for rng_seed in (0, 1, 12345):
-                    exp_outcomes, exp_prob = _expected_sample(py, index, rng_seed)
-                    rust_outcomes, rust_prob = rg.sample_outcomes(index, rng_seed)
+                    exp_outcomes, exp_prob, exp_key = _expected_sample(py, index, rng_seed)
+                    rust_outcomes, rust_prob, rust_key = rg.sample_outcomes(index, rng_seed)
                     rust_outcomes = [list(o) for o in rust_outcomes]
+                    rust_key = [list(k) for k in rust_key]
                     assert rust_outcomes == exp_outcomes, (
                         f"seed {seed} action {index} rng {rng_seed}: sample mismatch\n"
                         f"  python: {exp_outcomes}\n  rust:   {rust_outcomes}"
+                    )
+                    assert rust_key == exp_key, (
+                        f"seed {seed} action {index} rng {rng_seed}: key mismatch\n"
+                        f"  python: {exp_key}\n  rust:   {rust_key}"
                     )
                     if exp_prob is None:
                         assert rust_prob is None
@@ -732,6 +774,23 @@ def _py_fingerprint_after_chance(game, index, py_outcomes):
     return logic_fingerprint(clone)
 
 
+def _reveal_source(game, spec, name):
+    """Which SWAP branch a reveal outcome exercises: the slot's own card,
+    a sibling face-down slot, the removed pile, or the unused guilds."""
+
+    slot_id, _back = spec.context
+    if name == game.tableau.cards[slot_id].card_name:
+        return "self"
+    for sid, card in game.tableau.cards.items():
+        if sid != slot_id and card.present and not card.revealed and card.card_name == name:
+            return "sibling"
+    if name in game.removed_age_cards.get(game.age, ()):
+        return "removed"
+    if name in game.unused_guilds:
+        return "guild"
+    return "unknown"
+
+
 def test_make_with_chance_equivalent():
     """F3.1b: applying an action with a supplied chance outcome (the SWAP path)
     yields the same complete state in Rust as Python's
@@ -739,6 +798,9 @@ def test_make_with_chance_equivalent():
 
     checked = 0
     covered = set()
+    swap_sources = set()
+    deal_ages = set()
+    seq_same_back = False
     for seed in range(20):
         first_player, actions, library = random_game(seed, seed % 2)
         py = new_game(seed, first_player=first_player)
@@ -749,6 +811,12 @@ def test_make_with_chance_equivalent():
                 if not specs:
                     continue
                 covered.update(_CHANCE_KIND_ID[s.kind] for s in specs)
+                deal_ages.update(
+                    s.context[0] for s in specs if s.kind is ChanceKind.AGE_DEAL
+                )
+                reveal_backs = [s.context[1] for s in specs if s.kind is ChanceKind.CARD_REVEAL]
+                if len(reveal_backs) >= 2 and len(set(reveal_backs)) == 1:
+                    seq_same_back = True
                 if any(s.kind is ChanceKind.AGE_DEAL for s in specs):
                     outcome_lists = [
                         py_sample_outcomes(py, specs, PortableRng(s))[0] for s in (0, 7)
@@ -758,6 +826,9 @@ def test_make_with_chance_equivalent():
                     picks = sorted({0, len(chains) // 2, len(chains) - 1})
                     outcome_lists = [chains[i][0] for i in picks]
                 for outcomes in outcome_lists:
+                    for spec, outcome in zip(specs, outcomes):
+                        if spec.kind is ChanceKind.CARD_REVEAL:
+                            swap_sources.add(_reveal_source(py, spec, outcome))
                     py_fp = _py_fingerprint_after_chance(py, index, outcomes)
                     rust_fp = rg.fingerprint_after_chance(
                         index, _outcome_to_ids(specs, outcomes)
@@ -771,6 +842,43 @@ def test_make_with_chance_equivalent():
             rg.apply_index(idx)
     assert checked > 500
     assert covered == {0, 1, 2, 3}, f"make_with_chance kinds not all covered: {covered}"
+    # SWAP branch coverage (reviewer): the gate must exercise sibling, removed,
+    # and unused-guild reveal sources, sequential same-back reveals, and every
+    # age-deal age (age-3 = the guild-partition rebuild).
+    assert {"sibling", "removed", "guild"} <= swap_sources, f"swap sources: {swap_sources}"
+    assert seq_same_back, "no sequential same-back reveal exercised"
+    assert deal_ages == {1, 2, 3}, f"age-deal ages: {deal_ages}"
+
+
+def test_make_with_chance_rejects_malformed():
+    """F3.1b: apply_with_chance validates before mutating and rejects malformed
+    supplied outcomes rather than panicking on a partial state."""
+
+    fp, actions, library = random_game(3, 1)
+    py = new_game(3, first_player=1)
+    rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+    for idx in actions:
+        for index in legal_action_indices(py):
+            specs = py_chance_signature(py, decode_action(py, index))
+            reveal = next(
+                (i for i, s in enumerate(specs) if s.kind is ChanceKind.CARD_REVEAL),
+                None,
+            )
+            if reveal is None:
+                continue
+            chains = py_enumerate_chains(py, specs)
+            good = _outcome_to_ids(specs, chains[0][0])
+            # Corrupt the reveal outcome to an illegal shape (two cards).
+            bad = [list(o) for o in good]
+            bad[reveal] = bad[reveal] * 2
+            fp_before = rg.fingerprint()
+            with pytest.raises(ValueError):
+                rg.fingerprint_after_chance(index, bad)
+            assert rg.fingerprint() == fp_before  # state untouched
+            return
+        apply_action(py, decode_action(py, idx))
+        rg.apply_index(idx)
+    raise AssertionError("no reveal-bearing action found to test rejection")
 
 
 def test_encoder_signature_matches():

@@ -128,14 +128,49 @@ fn combinations(items: &[usize], k: usize) -> Vec<Vec<usize>> {
     }
 }
 
-/// All `(outcomes, joint_probability)` chains for enumerable specs, with each
-/// spec's outcome as an id list (CardReveal `[card_id]`, GreatLibraryDraw
-/// `[p,p,p]`, WonderGroupReveal `[w,w,w,w]`). Sequential CardReveals condition
-/// later pools on earlier picks. Panics on AgeDeal (sample-only), like Python.
-pub fn enumerate_chains(g: &GameState, specs: &[ChanceSpec]) -> Vec<(Vec<Vec<usize>>, f64)> {
+/// Observable signature of an AGE_DEAL (CODEC_SPEC §4.2): per layout slot, the
+/// card id if face-up else a `NUM_CARDS + back_id` marker — two hidden deals with
+/// the same signature are the same chance child. Port of `age_deal_key`.
+pub fn age_deal_key(age: usize, deal: &[usize]) -> Vec<i32> {
+    layout(age as u8)
+        .iter()
+        .zip(deal)
+        .map(|(slot, &cid)| {
+            if slot.face_up {
+                cid as i32
+            } else {
+                crate::data::NUM_CARDS as i32 + back_type_of(cid) as i32
+            }
+        })
+        .collect()
+}
+
+/// The observable key of a non-AGE outcome is the outcome ids themselves.
+fn outcome_key(outcomes: &[Vec<usize>]) -> Vec<Vec<i32>> {
+    outcomes
+        .iter()
+        .map(|o| o.iter().map(|&x| x as i32).collect())
+        .collect()
+}
+
+/// All `(outcomes, joint_probability, observable_key)` chains for enumerable
+/// specs. Each spec's outcome is an id list (CardReveal `[card_id]`,
+/// GreatLibraryDraw `[p,p,p]`, WonderGroupReveal `[w,w,w,w]`); the key equals the
+/// outcomes (no coalescing off AGE_DEAL). Sequential CardReveals condition later
+/// pools on earlier picks. Panics on AgeDeal (sample-only), like Python.
+pub fn enumerate_chains(
+    g: &GameState,
+    specs: &[ChanceSpec],
+) -> Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)> {
     let pool = unseen_pool(g);
     let mut used = vec![false; crate::data::NUM_CARDS];
     expand(&pool, specs, 0, &mut used)
+        .into_iter()
+        .map(|(outcomes, p)| {
+            let key = outcome_key(&outcomes);
+            (outcomes, p, key)
+        })
+        .collect()
 }
 
 fn expand(
@@ -209,17 +244,20 @@ fn pool_by_name(ids: &[usize]) -> Vec<usize> {
 
 /// Sample one outcome per spec from `rng`, mirroring `search.py::sample_outcomes`
 /// call-for-call. Returns `(outcomes, joint probability or None when any spec is
-/// sample-only)`, each outcome an id list (CardReveal `[id]`, GreatLibraryDraw
-/// `[p,p,p]`, WonderGroupReveal `[w,w,w,w]`, AgeDeal the 20-card deal order).
+/// sample-only, observable key)`. Each outcome is an id list (CardReveal `[id]`,
+/// GreatLibraryDraw `[p,p,p]`, WonderGroupReveal `[w,w,w,w]`, AgeDeal the 20-card
+/// deal order); AgeDeal's key coalesces via `age_deal_key`, all others equal the
+/// outcome.
 pub fn sample_outcomes(
     g: &GameState,
     specs: &[ChanceSpec],
     rng: &mut Rng,
-) -> (Vec<Vec<usize>>, Option<f64>) {
+) -> (Vec<Vec<usize>>, Option<f64>, Vec<Vec<i32>>) {
     let pool = unseen_pool(g);
     let mut used = vec![false; crate::data::NUM_CARDS];
     let mut outcomes: Vec<Vec<usize>> = Vec::new();
     let mut prob: Option<f64> = Some(1.0);
+    let mut key: Vec<Vec<i32>> = Vec::new();
     for spec in specs {
         match spec.kind {
             ChanceKind::CardReveal => {
@@ -229,6 +267,7 @@ pub fn sample_outcomes(
                 let choice = names[rng.randrange(names.len() as u64) as usize];
                 used[choice] = true;
                 outcomes.push(vec![choice]);
+                key.push(vec![choice as i32]);
                 if let Some(p) = prob.as_mut() {
                     *p *= 1.0 / names.len() as f64;
                 }
@@ -236,6 +275,7 @@ pub fn sample_outcomes(
             ChanceKind::GreatLibraryDraw => {
                 let subsets = combinations(&pool.offboard_progress, 3);
                 let i = rng.randrange(subsets.len() as u64) as usize;
+                key.push(subsets[i].iter().map(|&x| x as i32).collect());
                 outcomes.push(subsets[i].clone());
                 if let Some(p) = prob.as_mut() {
                     *p *= 1.0 / subsets.len() as f64;
@@ -244,6 +284,7 @@ pub fn sample_outcomes(
             ChanceKind::WonderGroupReveal => {
                 let subsets = combinations(&pool.wonders, 4);
                 let i = rng.randrange(subsets.len() as u64) as usize;
+                key.push(subsets[i].iter().map(|&x| x as i32).collect());
                 outcomes.push(subsets[i].clone());
                 if let Some(p) = prob.as_mut() {
                     *p *= 1.0 / subsets.len() as f64;
@@ -263,10 +304,11 @@ pub fn sample_outcomes(
                 } else {
                     names[..layout(age as u8).len()].to_vec()
                 };
+                key.push(age_deal_key(age, &deal));
                 outcomes.push(deal);
                 prob = None;
             }
         }
     }
-    (outcomes, prob)
+    (outcomes, prob, key)
 }
