@@ -13,6 +13,7 @@ torch, reads a payload, or interprets a game.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,6 +25,8 @@ from .checkpoint_lifecycle import (
     UNTRAINED,
     CheckpointArtifact,
     artifact_for,
+    atomic_copy,
+    atomic_write_bytes,
     install,
 )
 from .contract import (
@@ -81,6 +84,15 @@ class ControllerConfig:
             raise ValueError("buffer_autosave_every must be non-negative")
         if self.iterations < 0:
             raise ValueError("iterations must be non-negative")
+        if self.revert_reset_after > 0 and self.mode != GeneratorMode.SOFT_GATE:
+            # A revert-reset copies current_best over latest, discarding the
+            # rolling frontier.  That only makes sense for soft_gate; in latest
+            # or current_best mode it would silently destroy the learner the
+            # mode exists to keep.  Refuse the incompatible combination loudly.
+            raise ValueError(
+                "revert_reset_after is a soft_gate-only feature; it must be 0 "
+                f"for mode {self.mode.value}"
+            )
 
 
 class RunController:
@@ -99,6 +111,11 @@ class RunController:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.latest_path = self.checkpoint_dir / "latest.pt"
         self.current_best_path = self.checkpoint_dir / "current_best.pt"
+        # Crash-recovery journal: a pending marker plus byte backups of the two
+        # rolling checkpoints, taken before an iteration mutates them.  See
+        # ``_begin_iteration`` / ``_reconcile_pending``.
+        self.pending_path = self.checkpoint_dir / "pending_iteration.json"
+        self.recovery_dir = self.checkpoint_dir / "_recovery"
         self.state: GeneratorState = initial_state(config.mode)
         self.latest_artifact: CheckpointArtifact | None = None
         self.current_best_artifact: CheckpointArtifact | None = None
@@ -116,6 +133,9 @@ class RunController:
     def _bootstrap_checkpoints(self) -> None:
         """Fresh run: init learner and install identical latest + best."""
 
+        # A fresh run (no rows) fully re-establishes both rolling files below, so
+        # any journal from an interrupted first iteration is stale -- drop it.
+        self._clear_pending()
         init = self.adapter.initialize_learner(seed=self.config.seed)
         self.latest_artifact = install(
             init.path,
@@ -148,6 +168,12 @@ class RunController:
                 f"cannot resume a {self.state.mode.value} run as "
                 f"{self.config.mode.value}; start a new run directory instead"
             )
+        self._validate_lifecycle_config(last)
+        # Recover from an iteration interrupted after it began mutating the
+        # rolling checkpoints but before its row was durably appended.  Must run
+        # before the on-disk hash verification below, which assumes latest/best
+        # match the last committed row.
+        self._reconcile_pending(rows)
         best_state = TRAINED if self.state.bootstrap_state == TRAINED else UNTRAINED
         self.current_best_artifact = self._verify_on_disk(
             self.current_best_path,
@@ -189,6 +215,117 @@ class RunController:
             )
         return artifact
 
+    # -- lifecycle-config guard ----------------------------------------------
+
+    def _lifecycle_config(self) -> dict[str, Any]:
+        """The lifecycle settings that must stay fixed for the life of a run.
+
+        Persisted in every row so a resume can reject an invocation that would
+        silently change semantics (e.g. dropping ``--promotion-every 3``, which
+        would corrupt the resume-stable cadence ordinal).
+        """
+
+        return {
+            "promotion_every": self.config.promotion_every,
+            "bootstrap_policy": self.config.bootstrap_policy.value,
+            "revert_reset_after": self.config.revert_reset_after,
+            "anchor_gate_every_promotions": self.config.anchor_gate_every_promotions,
+        }
+
+    def _validate_lifecycle_config(self, last_row: dict[str, Any]) -> None:
+        persisted = last_row.get("lifecycle_config")
+        if not persisted:
+            # Row predates this field; nothing to validate against.
+            return
+        current = self._lifecycle_config()
+        mismatched = {
+            key: (persisted[key], current[key])
+            for key in current
+            if key in persisted and persisted[key] != current[key]
+        }
+        if mismatched:
+            details = "; ".join(
+                f"{key}: run started with {was!r} but resumed with {now!r}"
+                for key, (was, now) in sorted(mismatched.items())
+            )
+            raise ValueError(
+                "cannot resume with changed lifecycle configuration ("
+                f"{details}); repeat the original flags or start a new run "
+                "directory"
+            )
+
+    # -- crash-recovery journal ----------------------------------------------
+
+    def _begin_iteration(self, iteration: int) -> None:
+        """Snapshot the rolling checkpoints before an iteration mutates them.
+
+        Backs up ``latest``/``current_best`` beside the run and writes a pending
+        marker.  If the iteration is interrupted before its row is committed,
+        ``_reconcile_pending`` rolls the rolling files back to this snapshot so a
+        resume finds them consistent with the last committed row instead of
+        refusing the run on a hash mismatch.
+        """
+
+        assert self.latest_artifact is not None
+        assert self.current_best_artifact is not None
+        self.recovery_dir.mkdir(parents=True, exist_ok=True)
+        atomic_copy(self.latest_path, self.recovery_dir / "latest.pt")
+        atomic_copy(self.current_best_path, self.recovery_dir / "current_best.pt")
+        atomic_write_bytes(
+            self.pending_path,
+            json.dumps(
+                {
+                    "iteration": iteration,
+                    "latest_sha256": self.latest_artifact.sha256,
+                    "current_best_sha256": self.current_best_artifact.sha256,
+                }
+            ).encode("utf-8"),
+        )
+
+    def _commit_iteration(self) -> None:
+        """Clear the pending marker once the iteration's row is durable."""
+
+        self._clear_pending()
+
+    def _clear_pending(self) -> None:
+        try:
+            self.pending_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _reconcile_pending(self, rows: list[dict[str, Any]]) -> None:
+        if not self.pending_path.is_file():
+            return
+        journal = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        pending_iter = int(journal["iteration"])
+        last_iter = int(rows[-1]["iteration"])
+        if pending_iter == last_iter:
+            # The row was appended but the marker outlived the commit (crash
+            # between append and clear).  On-disk already matches the last row;
+            # roll forward by simply dropping the stale marker.
+            self._clear_pending()
+            return
+        if pending_iter != last_iter + 1:
+            raise ValueError(
+                f"pending-iteration journal is for iteration {pending_iter}, "
+                f"which is neither the last committed iteration ({last_iter}) "
+                "nor its successor; refusing to guess how to reconcile"
+            )
+        # The successor iteration was interrupted before committing its row.
+        # Restore both rolling files from the pre-iteration backups.
+        self._restore_backup("latest.pt", self.latest_path)
+        self._restore_backup("current_best.pt", self.current_best_path)
+        self._clear_pending()
+
+    def _restore_backup(self, name: str, destination: Path) -> None:
+        backup = self.recovery_dir / name
+        if not backup.is_file():
+            raise FileNotFoundError(
+                f"pending iteration cannot be rolled back: backup {backup} is "
+                "missing; the run directory is inconsistent"
+            )
+        atomic_copy(backup, destination)
+
     def run(self) -> list[dict[str, Any]]:
         self.initialize()
         completed = [int(row["iteration"]) for row in self.store.iterations()]
@@ -203,6 +340,10 @@ class RunController:
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         rows = self.store.iterations()
         state = self.state
+
+        # Snapshot the rolling checkpoints before any mutation so an interrupted
+        # iteration can be rolled back on resume rather than bricking the run.
+        self._begin_iteration(iteration)
 
         generator_source = select_generator_source(state)
         generator_checkpoint = (
@@ -304,6 +445,8 @@ class RunController:
             anchor_metrics=anchor_metrics,
         )
         self.store.append_iteration(row)
+        # The row is now durable; the pre-iteration snapshot is no longer needed.
+        self._commit_iteration()
         self._emit_iteration_summary(row, generation, replay)
         self._maybe_autosave(iteration)
         return row
@@ -404,6 +547,7 @@ class RunController:
             "iteration": iteration,
             "log_schema_version": LOG_SCHEMA_VERSION,
             "control_state": self.state.as_row(),
+            "lifecycle_config": self._lifecycle_config(),
             "generator_mode": self.state.mode.value,
             "generator_source": generator_source.value,
             "generator_checkpoint": (

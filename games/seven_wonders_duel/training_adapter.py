@@ -12,6 +12,7 @@ instead of restarting from the protected best every iteration.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,12 @@ class SevenWondersDuelLifecycleAdapter:
             request.iteration,
             source_checkpoint=request.learner_checkpoint,
         )
+        # The controller installs a returned candidate over both latest and
+        # (on bootstrap/promote) the protected best.  Refuse to certify a
+        # diverged or unreadable checkpoint as trained so a NaN run cannot
+        # overwrite the frontier -- an interrupted train just re-runs from the
+        # last committed row (see RunController's crash-recovery journal).
+        self._validate_candidate(candidate, request.iteration)
         artifact = artifact_for(
             candidate,
             role="candidate",
@@ -104,6 +111,31 @@ class SevenWondersDuelLifecycleAdapter:
             trained=True,
             metrics=dict(loop.last_training_stats),
         )
+
+    def _validate_candidate(self, candidate: Path, iteration: int) -> None:
+        """Finite-metric + reload check before a candidate is certified trained."""
+
+        for epoch in self.loop.last_training_stats.get("epochs") or []:
+            for section in ("train", "val"):
+                for key, value in (epoch.get(section) or {}).items():
+                    if isinstance(value, (int, float)) and not math.isfinite(value):
+                        raise RuntimeError(
+                            f"iteration {iteration} training diverged: non-finite "
+                            f"{section}.{key}={value}; refusing to advance latest.pt"
+                        )
+        try:
+            model = self.loop.load_model(candidate)
+        except Exception as exc:  # noqa: BLE001 - any reload failure is disqualifying
+            raise RuntimeError(
+                f"iteration {iteration} candidate {candidate} failed to reload: "
+                f"{exc}"
+            ) from exc
+        for name, tensor in model.state_dict().items():
+            if torch.is_floating_point(tensor) and not torch.isfinite(tensor).all():
+                raise RuntimeError(
+                    f"iteration {iteration} candidate has non-finite weights in "
+                    f"{name}; refusing to advance latest.pt"
+                )
 
     def evaluate_promotion(self, request: PromotionRequest) -> PromotionResult:
         report = self.loop.promotion_gate(

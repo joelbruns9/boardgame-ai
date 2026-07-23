@@ -67,6 +67,7 @@ class FakeAdapter:
         self.resets: list[Path] = []
         self.autosaves: list[int] = []
         self.autosave_should_fail = False
+        self.fail_promotion_at: int | None = None
 
     def initialize_learner(self, *, seed: int):
         path = self.work / "init.pt"
@@ -105,6 +106,10 @@ class FakeAdapter:
         )
 
     def evaluate_promotion(self, request: PromotionRequest) -> PromotionResult:
+        if request.iteration == self.fail_promotion_at:
+            # Simulate a crash after latest.pt was advanced but before the row
+            # was committed (the gate runs between those two steps).
+            raise RuntimeError("simulated gate crash")
         if not self.decisions:
             raise AssertionError("evaluate_promotion called with no scripted decision")
         return PromotionResult(decision=self.decisions.pop(0), metrics={"games": 50})
@@ -574,3 +579,128 @@ def test_revert_does_not_delete_latest_and_recovery_trains_from_it(tmp_path):
     assert rows[1]["current_best_sha256"] == _sha_of_bytes(b"init|t0")
     # iter2 generates with best but the candidate descends from the preserved latest.
     assert rows[2]["latest_sha256"] == _sha_of_bytes(b"init|t0|t1|t2")
+
+
+# -- controller: crash recovery (interrupted iteration) ---------------------
+
+
+def test_interrupted_iteration_rolls_back_and_resumes(tmp_path):
+    """An iteration crash after latest.pt advanced but before its row committed
+    must not brick the run: resume rolls the rolling files back to the last
+    committed state and re-runs the iteration."""
+
+    store = MemoryStore()
+    first, adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=2,
+        store=store,
+    )
+    adapter.fail_promotion_at = 1  # crash mid-iter1, after latest advanced
+    with pytest.raises(RuntimeError, match="simulated gate crash"):
+        first.run()
+
+    # Disk is ahead of the manifest: latest advanced, but only iter0 committed.
+    assert first.latest_path.read_bytes() == b"init|t0|t1"
+    assert [row["iteration"] for row in store.iterations()] == [0]
+    assert first.pending_path.is_file()
+
+    # A fresh controller resumes: the interrupted iter1 is rolled back and re-run.
+    second, adapter2, _store2 = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=1,
+        store=store,
+    )
+    second.initialize()
+    assert second.latest_path.read_bytes() == b"init|t0"  # rolled back
+    assert not second.pending_path.is_file()
+    row = second.run_iteration(1)
+    assert row["iteration"] == 1
+    assert second.latest_path.read_bytes() == b"init|t0|t1"
+
+
+def test_stale_pending_marker_after_commit_rolls_forward(tmp_path):
+    """A crash between appending the row and clearing the marker leaves a marker
+    for the already-committed iteration; resume drops it without rolling back."""
+
+    store = MemoryStore()
+    controller, _adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=2,
+        store=store,
+    )
+    controller.run()
+    committed_latest = controller.latest_path.read_bytes()
+    # Simulate the marker outliving its commit (iteration == last committed row).
+    controller._begin_iteration(1)
+    assert controller.pending_path.is_file()
+
+    resumed, _adapter2, _store2 = _controller(
+        tmp_path, mode=GeneratorMode.SOFT_GATE, iterations=0, store=store
+    )
+    resumed.initialize()
+    assert not resumed.pending_path.is_file()
+    assert resumed.latest_path.read_bytes() == committed_latest  # unchanged
+
+
+# -- controller: lifecycle-config guard on resume ---------------------------
+
+
+def test_resume_refuses_changed_promotion_cadence(tmp_path):
+    store = MemoryStore()
+    first, _adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue", "continue"],
+        iterations=3,
+        promotion_every=2,
+        store=store,
+    )
+    first.run()
+    second, _adapter2, _store2 = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        iterations=1,
+        promotion_every=1,  # silently different cadence
+        store=store,
+    )
+    with pytest.raises(ValueError, match="changed lifecycle configuration"):
+        second.initialize()
+
+
+def test_resume_accepts_matching_lifecycle_config(tmp_path):
+    store = MemoryStore()
+    first, _adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=2,
+        promotion_every=2,
+        store=store,
+    )
+    first.run()
+    second, _adapter2, _store2 = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        iterations=1,
+        promotion_every=2,  # same cadence -> allowed
+        store=store,
+    )
+    second.initialize()  # must not raise
+
+
+# -- controller: revert_reset_after is soft_gate-only -----------------------
+
+
+def test_revert_reset_after_rejected_for_non_soft_modes(tmp_path):
+    with pytest.raises(ValueError, match="soft_gate-only"):
+        _controller(
+            tmp_path,
+            mode=GeneratorMode.LATEST,
+            revert_reset_after=1,
+        )
