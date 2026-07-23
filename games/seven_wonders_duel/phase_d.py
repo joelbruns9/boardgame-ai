@@ -16,17 +16,24 @@ import math
 from pathlib import Path
 import random
 import shutil
+import sys
 import time
 from typing import Any, Sequence
 
 import torch
 
 from games.az_loop import (
+    BootstrapPolicy,
+    ControllerConfig,
     EloLedger,
     GameJob,
+    GeneratorMode,
     HallOfFame,
     LinearSchedule,
+    MatchOutcome,
     ReplayWindow,
+    RunController,
+    RunLog,
     RunManifest,
     SPRT,
     play_match,
@@ -48,6 +55,12 @@ from .game import Phase
 from .inference import Evaluator
 from .loop_adapter import SevenWondersDuelLoopAdapter
 from .loop_inference import CoalescingEvaluator
+from .rust_bridge import (
+    phase_d_records_from_rust,
+    rust_flat_batch_adapter,
+    rust_games_for_self_play,
+    rust_seat_routed_flat_batch_adapter,
+)
 from .search import GumbelMCTS, SearchConfig, SearchResult, state_actor
 from .train import (
     baselines,
@@ -98,10 +111,13 @@ class PhaseDConfig:
     games_per_iteration: int = 500
     seed_games: int = 5_000
     replay_window: int = 20
+    save_buffer: str = ""
+    warm_buffer: str = ""
     seed_retain_fraction: float = 1.0
     curriculum_anneal_iterations: int = 10
     opponent_fraction: float = 0.15
     bot_policy_iterations: int = 10
+    bot_exploration: float = 0.05
     draft_prior_iterations: int = 20
     cheap_sims_min: int = 16
     cheap_sims_max: int = 24
@@ -115,7 +131,9 @@ class PhaseDConfig:
     train_epochs: int = 8
     train_batch_size: int = 512
     learning_rate: float = 2e-4
+    weight_decay: float = 1e-4
     aux_weight: float = 0.2
+    train_patience: int = 8
     val_fraction: float = 0.1
     min_games_to_train: int = 2
     gate_sims: int = 64
@@ -124,6 +142,21 @@ class PhaseDConfig:
     gate_beta: float = 0.05
     gate_indifference: float = 0.03
     anchor_gate_every_promotions: int = 3
+    selfplay_generator_mode: str = "strict_gate"
+    bootstrap_policy: str = "gate"
+    promotion_every: int = 1
+    revert_reset_after: int = 0
+    buffer_autosave_every: int = 0
+    warm_buffer_max_staleness: int = 0
+    generation_backend: str = "rust"
+    gate_backend: str = "rust"
+    rust_slots: int = 16
+    rust_global_batch_cap: int = 256
+    rust_max_inflight_batches: int = 1
+    rust_scheduler_workers: int = 1
+    leaf_batch: int = 1
+    force_root_chance: bool = True
+    age_deal_samples: int = 32
 
     def validate(self) -> None:
         if self.workers <= 0 or self.games_per_iteration <= 0:
@@ -138,6 +171,7 @@ class PhaseDConfig:
             "seed_retain_fraction",
             "opponent_fraction",
             "full_search_fraction",
+            "bot_exploration",
         ):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
@@ -152,6 +186,48 @@ class PhaseDConfig:
             raise ValueError("gate_max_games must be a positive even number")
         if self.anchor_gate_every_promotions < 0:
             raise ValueError("anchor_gate_every_promotions must be non-negative")
+        valid_modes = {mode.value for mode in GeneratorMode}
+        if self.selfplay_generator_mode not in valid_modes:
+            raise ValueError(
+                f"selfplay_generator_mode must be one of {sorted(valid_modes)}"
+            )
+        valid_policies = {policy.value for policy in BootstrapPolicy}
+        if self.bootstrap_policy not in valid_policies:
+            raise ValueError(
+                f"bootstrap_policy must be one of {sorted(valid_policies)}"
+            )
+        if self.promotion_every < 0:
+            raise ValueError("promotion_every must be non-negative")
+        if self.revert_reset_after < 0:
+            raise ValueError("revert_reset_after must be non-negative")
+        if self.buffer_autosave_every < 0:
+            raise ValueError("buffer_autosave_every must be non-negative")
+        if self.warm_buffer_max_staleness < 0:
+            raise ValueError("warm_buffer_max_staleness must be non-negative")
+        if self.gate_backend not in ("rust", "python"):
+            raise ValueError("gate_backend must be rust or python")
+        if self.generation_backend not in ("rust", "python"):
+            raise ValueError("generation_backend must be rust or python")
+        if min(
+            self.rust_slots,
+            self.rust_global_batch_cap,
+            self.rust_max_inflight_batches,
+            self.rust_scheduler_workers,
+            self.leaf_batch,
+        ) <= 0:
+            raise ValueError("Rust scheduler geometry must be positive")
+        if self.leaf_batch > self.rust_global_batch_cap:
+            raise ValueError("leaf_batch cannot exceed rust_global_batch_cap")
+        if not 0 <= self.age_deal_samples <= 32:
+            raise ValueError("age_deal_samples must be in [0, 32]")
+        if self.d_model <= 0 or self.d_model % 4 or self.layers <= 0:
+            raise ValueError("d_model must be positive/divisible by 4 and layers positive")
+        if self.train_epochs <= 0 or self.train_batch_size <= 0:
+            raise ValueError("training epochs and batch size must be positive")
+        if self.learning_rate <= 0 or self.weight_decay < 0:
+            raise ValueError("learning_rate must be positive and weight_decay non-negative")
+        if self.train_patience <= 0:
+            raise ValueError("train_patience must be positive")
 
 
 def curriculum_fraction(initial: float, iteration: int, duration: int) -> float:
@@ -321,6 +397,37 @@ def _write_records(path: Path, records: Sequence[GameRecord]) -> None:
     temporary.replace(path)
 
 
+def filter_warm_records_by_staleness(
+    records: Sequence[GameRecord], max_staleness: int
+) -> tuple[list[GameRecord], dict[str, int]]:
+    """Drop imported games older than ``max_staleness`` iterations.
+
+    Age is measured against the newest numbered iteration present in the import.
+    Curriculum records (``iteration is None``) are never aged out.  Source
+    iteration metadata is preserved exactly -- records are filtered, never
+    renumbered.  Returns the retained records and actual loaded/retained/dropped
+    counts.
+    """
+
+    numbered = [
+        record.iteration for record in records if record.iteration is not None
+    ]
+    newest = max(numbered, default=0)
+    retained = [
+        record
+        for record in records
+        if record.iteration is None or (newest - record.iteration) < max_staleness
+    ]
+    stats = {
+        "loaded": len(records),
+        "retained": len(retained),
+        "dropped": len(records) - len(retained),
+        "newest_iteration": newest,
+        "max_staleness": max_staleness,
+    }
+    return retained, stats
+
+
 def summarize_records(records: Sequence[GameRecord]) -> dict[str, Any]:
     moves = [move for record in records for move in record.moves]
     searched = [move for move in moves if move.sims > 0]
@@ -369,6 +476,9 @@ def generate_seed_buffer(
     seed: int,
     workers: int,
     process_workers: int = 0,
+    backend: str = "python",
+    rust_slots: int = 16,
+    rust_global_batch_cap: int = 256,
 ) -> list[GameRecord]:
     destination = Path(path)
     if destination.exists():
@@ -383,7 +493,48 @@ def generate_seed_buffer(
         GameJob(index=index, seed=seed + 10_000_000 + index, kind="curriculum_seed")
         for index in range(games)
     ]
-    if process_workers:
+    if backend == "rust":
+        import seven_wonders_rust as swr
+
+        grouped: dict[tuple[str, int], list[GameJob]] = {}
+        for job in jobs:
+            bot_type = CURRICULUM_BOT_TYPES[
+                (job.index // 2) % len(CURRICULUM_BOT_TYPES)
+            ]
+            grouped.setdefault((bot_type().name, job.index % 2), []).append(job)
+        indexed: dict[int, GameRecord] = {}
+        for (rush_name, rush_seat), group_jobs in grouped.items():
+            for start in range(0, len(group_jobs), rust_slots):
+                chunk = group_jobs[start : start + rust_slots]
+                seeds = [job.seed for job in chunk]
+                first_players = [(job.index // 2) % 2 for job in chunk]
+                raw_records, _ = swr.self_play_many_flat_net(
+                    adapter=lambda _payload: [],
+                    games=rust_games_for_self_play(seeds, first_players),
+                    game_seeds=seeds,
+                    global_batch_cap=rust_global_batch_cap,
+                    leaf_batch=1,
+                    cheap_sims_min=1,
+                    cheap_sims_max=1,
+                    full_sims_min=1,
+                    full_sims_max=1,
+                    full_search_fraction=0.0,
+                    top_k=1,
+                    draft_prior=0.0,
+                    iteration=None,
+                    bot_p0=rush_name if rush_seat == 0 else "greedy",
+                    bot_p1=rush_name if rush_seat == 1 else "greedy",
+                    bot_exploration=0.0,
+                    bot_policy_iterations=0,
+                )
+                for raw in raw_records:
+                    raw["agents"]["kind"] = "curriculum_seed"
+                converted = phase_d_records_from_rust(raw_records)
+                indexed.update(
+                    {job.index: record for job, record in zip(chunk, converted)}
+                )
+        records = [indexed[job.index] for job in jobs]
+    elif process_workers:
         records = run_jobs_in_processes(
             jobs, _bot_seed_game, workers=process_workers
         )
@@ -610,13 +761,120 @@ class PhaseDLoop:
             self.run_dir / "elo", fixed_ratings={GreedyBot.name: 1000.0}
         )
         self.manifest = RunManifest(self.run_dir, Path(__file__).resolve().parents[2])
+        self.training_log = self.run_dir / "training_log.jsonl"
+        self.warm_records: list[GameRecord] = []
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
+        self.last_warm_stats: dict[str, int] = {}
+
+    def _append_training_log(self, row: dict[str, Any]) -> None:
+        """Append one completed iteration using the manifest's existing metrics."""
+
+        with self.training_log.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+    def _sync_training_log(self, manifest: dict[str, Any]) -> None:
+        """Backfill manifest rows missing from an interrupted or older run's log."""
+
+        logged_iterations: set[int] = set()
+        if self.training_log.exists():
+            with self.training_log.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        logged_iterations.add(int(json.loads(line)["iteration"]))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"invalid training log row {line_number}: "
+                            f"{self.training_log}"
+                        ) from exc
+        for row in manifest.get("iterations", []):
+            if int(row["iteration"]) not in logged_iterations:
+                self._append_training_log(row)
 
     def _new_model(self):
         return build_model("transformer", self.config.d_model, self.config.layers)
 
-    def initialize(self) -> None:
+    def _warm_records_for_iteration(self, iteration: int) -> list[GameRecord]:
+        """Age imported records through the same iteration replay window."""
+
+        if not self.warm_records:
+            return []
+        numbered = [
+            record.iteration
+            for record in self.warm_records
+            if record.iteration is not None
+        ]
+        newest = max(numbered, default=0)
+        return [
+            record
+            for record in self.warm_records
+            if newest - (record.iteration if record.iteration is not None else newest)
+            + iteration
+            < self.config.replay_window
+        ]
+
+    def _save_replay_buffer(self) -> None:
+        """Atomically export the replay set available at the latest generation."""
+
+        if not self.config.save_buffer:
+            return
+        iteration_paths = sorted(self.buffer_dir.glob("iter_[0-9][0-9][0-9][0-9].jsonl"))
+        if iteration_paths:
+            latest = int(iteration_paths[-1].stem.removeprefix("iter_"))
+            records = self.training_records(latest)
+        else:
+            records = self._warm_records_for_iteration(0)
+            seed_path = self.buffer_dir / "curriculum_seed.jsonl"
+            if seed_path.exists():
+                records += read_records(seed_path)
+        destination = Path(self.config.save_buffer)
+        _write_records(destination, records)
+        print(f"Buffer saved: {len(records)} games -> {destination}")
+
+    def _load_warm_buffer(self, warm_path: Path) -> None:
+        """Import a saved buffer, applying the staleness age filter."""
+
+        if not warm_path.exists():
+            raise FileNotFoundError(f"warm buffer does not exist: {warm_path}")
+        max_staleness = (
+            self.config.warm_buffer_max_staleness or self.config.replay_window
+        )
+        records = read_records(warm_path)
+        self.warm_records, self.last_warm_stats = filter_warm_records_by_staleness(
+            records, max_staleness
+        )
+        stats = self.last_warm_stats
+        print(
+            f"Buffer loaded: {stats['loaded']} games from {warm_path} "
+            f"(retained {stats['retained']}, dropped {stats['dropped']} "
+            f"older than staleness {max_staleness})"
+        )
+
+    def _autosave_replay_buffer(self, completed_iterations: int) -> None:
+        """Atomically autosave every N completed iterations; never fatal.
+
+        Scheduling and failure policy live here so a failed export warns and the
+        run continues.  The write itself is atomic (temp + os.replace), so a hard
+        kill mid-save can only leave a stale ``.tmp`` beside the last valid
+        export, never a truncated replacement.
+        """
+
+        every = self.config.buffer_autosave_every
+        if every <= 0 or not self.config.save_buffer:
+            return
+        if completed_iterations % every != 0:
+            return
+        try:
+            self._save_replay_buffer()
+        except Exception as exc:  # never terminate training on an autosave failure
+            print(
+                f"WARNING: buffer autosave failed after "
+                f"{completed_iterations} iterations: {exc}"
+            )
+
+    def initialize(self, *, bootstrap_checkpoint: bool = True) -> None:
         had_manifest = self.manifest.path.exists()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         if not had_manifest:
@@ -633,7 +891,9 @@ class PhaseDLoop:
                     ),
                 },
             )
-        if not self.current_best.exists():
+        # The soft-gate controller owns latest.pt/current_best.pt creation via the
+        # lifecycle adapter; the legacy strict-gate path seeds current_best here.
+        if bootstrap_checkpoint and not self.current_best.exists():
             if had_manifest:
                 payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
                 if payload.get("iterations") or payload.get("checkpoints"):
@@ -652,6 +912,10 @@ class PhaseDLoop:
                 },
             )
             torch.save(checkpoint, self.current_best)
+        manifest_payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
+        self._sync_training_log(manifest_payload)
+        if self.config.warm_buffer:
+            self._load_warm_buffer(Path(self.config.warm_buffer))
         if self.config.seed_games:
             generate_seed_buffer(
                 self.buffer_dir / "curriculum_seed.jsonl",
@@ -659,6 +923,9 @@ class PhaseDLoop:
                 seed=self.config.seed,
                 workers=self.config.workers,
                 process_workers=self.config.process_workers,
+                backend=self.config.generation_backend,
+                rust_slots=self.config.rust_slots,
+                rust_global_batch_cap=self.config.rust_global_batch_cap,
             )
 
     def load_model(self, path: str | Path):
@@ -683,6 +950,8 @@ class PhaseDLoop:
             )
             for index in range(self.config.games_per_iteration)
         ]
+        if self.config.generation_backend == "rust":
+            return self._generate_iteration_rust(model, iteration, destination, jobs)
         if self.config.process_workers:
             source = getattr(model, "_orig_mod", model)
             model_state = {
@@ -731,10 +1000,107 @@ class PhaseDLoop:
         _write_records(destination, records)
         return records
 
+    def _generate_iteration_rust(
+        self,
+        model,
+        iteration: int,
+        destination: Path,
+        jobs: list[GameJob],
+    ) -> list[GameRecord]:
+        """Generate neural and curriculum-bot games in the Rust scheduler."""
+
+        import seven_wonders_rust as swr
+
+        mix_fraction = curriculum_fraction(
+            self.config.opponent_fraction,
+            iteration,
+            self.config.curriculum_anneal_iterations,
+        )
+        grouped: dict[tuple[str | None, int | None], list[GameJob]] = {}
+        for job in jobs:
+            rng = random.Random(job.seed ^ 0xC6BC279692B5CC83)
+            if rng.random() < mix_fraction:
+                bot_type = CURRICULUM_BOT_TYPES[
+                    (job.index // 2) % len(CURRICULUM_BOT_TYPES)
+                ]
+                key = (bot_type().name, job.index % 2)
+            else:
+                key = (None, None)
+            grouped.setdefault(key, []).append(job)
+
+        evaluator = Evaluator(
+            model,
+            self.config.device,
+            self.config.rust_global_batch_cap,
+        )
+        adapter = rust_flat_batch_adapter(evaluator)
+        started = time.monotonic()
+        indexed: dict[int, GameRecord] = {}
+        rust_metrics = []
+        draft_prior = LinearSchedule(
+            1.0, 0.0, self.config.draft_prior_iterations
+        ).value(iteration)
+        neural_games = 0
+        bot_games = 0
+        for (bot_name, bot_seat), group_jobs in grouped.items():
+            if bot_name is None:
+                neural_games += len(group_jobs)
+            else:
+                bot_games += len(group_jobs)
+            for start in range(0, len(group_jobs), self.config.rust_slots):
+                chunk = group_jobs[start : start + self.config.rust_slots]
+                seeds = [job.seed for job in chunk]
+                first_players = [(job.index // 2) % 2 for job in chunk]
+                raw_records, metrics = swr.self_play_many_flat_net(
+                    adapter=adapter,
+                    games=rust_games_for_self_play(seeds, first_players),
+                    game_seeds=seeds,
+                    global_batch_cap=self.config.rust_global_batch_cap,
+                    leaf_batch=self.config.leaf_batch,
+                    cheap_sims_min=self.config.cheap_sims_min,
+                    cheap_sims_max=self.config.cheap_sims_max,
+                    full_sims_min=self.config.full_sims_min,
+                    full_sims_max=self.config.full_sims_max,
+                    full_search_fraction=self.config.full_search_fraction,
+                    top_k=self.config.top_k,
+                    draft_prior=draft_prior,
+                    iteration=iteration,
+                    force=self.config.force_root_chance,
+                    age_deal_samples=self.config.age_deal_samples,
+                    max_inflight_batches=self.config.rust_max_inflight_batches,
+                    scheduler_workers=self.config.rust_scheduler_workers,
+                    bot_p0=bot_name if bot_seat == 0 else None,
+                    bot_p1=bot_name if bot_seat == 1 else None,
+                    bot_exploration=self.config.bot_exploration,
+                    bot_policy_iterations=self.config.bot_policy_iterations,
+                )
+                converted = phase_d_records_from_rust(raw_records)
+                indexed.update(
+                    {job.index: record for job, record in zip(chunk, converted)}
+                )
+                rust_metrics.append(metrics)
+
+        records = [indexed[job.index] for job in jobs]
+        elapsed = time.monotonic() - started
+        self.last_generation_stats = {
+            "seconds": elapsed,
+            "games_per_second": len(records) / elapsed if elapsed else 0.0,
+            "mode": "rust",
+            "rust_games": neural_games,
+            "rust_bot_games": bot_games,
+            "python_bot_games": 0,
+            "rust_chunks": len(rust_metrics),
+            "python_inference_batches": 0,
+            "python_inference_positions": 0,
+        }
+        _write_records(destination, records)
+        return records
+
     def training_records(self, iteration: int) -> list[GameRecord]:
         window = ReplayWindow(self.config.replay_window)
         paths = window.paths(self.buffer_dir, iteration)
-        live = [record for path in paths for record in read_records(path)]
+        live = self._warm_records_for_iteration(iteration)
+        live.extend(record for path in paths for record in read_records(path))
         seed_fraction = curriculum_fraction(
             self.config.seed_retain_fraction,
             iteration,
@@ -749,7 +1115,13 @@ class PhaseDLoop:
         rng.shuffle(seed_records)
         return live + seed_records[: min(desired, len(seed_records))]
 
-    def train_candidate(self, records: list[GameRecord], iteration: int) -> Path:
+    def train_candidate(
+        self,
+        records: list[GameRecord],
+        iteration: int,
+        *,
+        source_checkpoint: str | Path | None = None,
+    ) -> Path:
         if len(records) < self.config.min_games_to_train:
             raise ValueError(
                 f"need {self.config.min_games_to_train} games to train, "
@@ -765,7 +1137,11 @@ class PhaseDLoop:
         torch.manual_seed(self.config.seed + iteration)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.seed + iteration)
-        model = self.load_model(self.current_best)
+        # Soft-gate runs continue the rolling learner from latest.pt; strict-gate
+        # and direct callers default to current_best (the historical behavior).
+        model = self.load_model(
+            source_checkpoint if source_checkpoint is not None else self.current_best
+        )
         newest_iteration = max(
             (
                 example.iteration
@@ -797,7 +1173,9 @@ class PhaseDLoop:
             epochs=self.config.train_epochs,
             batch_size=self.config.train_batch_size,
             lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
             aux_weight=self.config.aux_weight,
+            patience=self.config.train_patience,
         )
         self.last_training_stats = {
             "examples": len(examples),
@@ -809,6 +1187,7 @@ class PhaseDLoop:
             ),
             "newest_iteration": newest_iteration,
             "pretrain_newest_metrics": pretrain_metrics,
+            "epochs": history,
         }
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
         checkpoint = make_checkpoint(
@@ -898,6 +1277,176 @@ class PhaseDLoop:
             index += count
         return outcomes
 
+    def _rust_model_gate_waves(
+        self,
+        candidate_spec: ModelAgentSpec,
+        opponent_spec: ModelAgentSpec,
+        test: SPRT,
+        seed_offset: int,
+    ) -> list[MatchOutcome]:
+        """Run paired model-vs-model SPRT games in the Rust F4 scheduler."""
+
+        import seven_wonders_rust as swr
+
+        def evaluator(spec: ModelAgentSpec) -> Evaluator:
+            model = build_model("transformer", spec.d_model, spec.layers)
+            model.load_state_dict(spec.model_state)
+            return Evaluator(
+                model,
+                self.config.device,
+                self.config.rust_global_batch_cap,
+            )
+
+        candidate_eval = evaluator(candidate_spec)
+        opponent_eval = evaluator(opponent_spec)
+        adapters = (
+            rust_seat_routed_flat_batch_adapter(
+                (candidate_eval, opponent_eval)
+            ),
+            rust_seat_routed_flat_batch_adapter(
+                (opponent_eval, candidate_eval)
+            ),
+        )
+        outcomes: list[MatchOutcome] = []
+        maximum_pairs = self.config.gate_max_games // 2
+        for start in range(0, maximum_pairs, self.config.rust_slots):
+            pair_indices = list(
+                range(start, min(start + self.config.rust_slots, maximum_pairs))
+            )
+            seeds = [self.config.seed + seed_offset + pair for pair in pair_indices]
+            first_players = [pair % 2 for pair in pair_indices]
+            leg_records = []
+            for adapter in adapters:
+                records, _ = swr.self_play_many_flat_net(
+                    adapter=adapter,
+                    games=rust_games_for_self_play(seeds, first_players),
+                    game_seeds=seeds,
+                    global_batch_cap=self.config.rust_global_batch_cap,
+                    leaf_batch=1,
+                    cheap_sims_min=self.config.gate_sims,
+                    cheap_sims_max=self.config.gate_sims,
+                    full_sims_min=self.config.gate_sims,
+                    full_sims_max=self.config.gate_sims,
+                    full_search_fraction=0.0,
+                    top_k=self.config.top_k,
+                    draft_prior=0.0,
+                    iteration=-1,
+                    force=self.config.force_root_chance,
+                    age_deal_samples=self.config.age_deal_samples,
+                    max_inflight_batches=self.config.rust_max_inflight_batches,
+                    scheduler_workers=self.config.rust_scheduler_workers,
+                    deterministic_actions=True,
+                )
+                leg_records.append(records)
+            for offset, (pair, seed, first_player) in enumerate(
+                zip(pair_indices, seeds, first_players)
+            ):
+                for leg, candidate_seat in enumerate((0, 1)):
+                    record = leg_records[leg][offset]
+                    agents = (
+                        (candidate_spec.name, opponent_spec.name)
+                        if candidate_seat == 0
+                        else (opponent_spec.name, candidate_spec.name)
+                    )
+                    scores = record["scores"]
+                    outcome = MatchOutcome(
+                        seed=seed,
+                        first_player=first_player,
+                        agents=agents,
+                        winner=record["winner"],
+                        scores=tuple(scores) if scores is not None else None,
+                        victory_type=record["victory_type"] or "unknown",
+                        actions=len(record["moves"]),
+                    )
+                    outcomes.append(outcome)
+                    result = test.update(outcome.score_for(candidate_seat))
+                    game_index = pair * 2 + leg
+                    if game_index % 2 == 1 and result.decision != "continue":
+                        return outcomes
+        return outcomes
+
+    def _rust_bot_gate_waves(
+        self,
+        candidate_spec: ModelAgentSpec,
+        opponent_spec: BotAgentSpec,
+        test: SPRT,
+        seed_offset: int,
+    ) -> list[MatchOutcome]:
+        """Run model-vs-bot anchor games wholly in the Rust game loop."""
+
+        import seven_wonders_rust as swr
+
+        model = build_model(
+            "transformer", candidate_spec.d_model, candidate_spec.layers
+        )
+        model.load_state_dict(candidate_spec.model_state)
+        evaluator = Evaluator(
+            model, self.config.device, self.config.rust_global_batch_cap
+        )
+        adapter = rust_flat_batch_adapter(evaluator)
+        outcomes: list[MatchOutcome] = []
+        maximum_pairs = self.config.gate_max_games // 2
+        bot_name = opponent_spec.bot.name
+        for start in range(0, maximum_pairs, self.config.rust_slots):
+            pair_indices = list(
+                range(start, min(start + self.config.rust_slots, maximum_pairs))
+            )
+            seeds = [self.config.seed + seed_offset + pair for pair in pair_indices]
+            first_players = [pair % 2 for pair in pair_indices]
+            leg_records = []
+            for candidate_seat in (0, 1):
+                records, _ = swr.self_play_many_flat_net(
+                    adapter=adapter,
+                    games=rust_games_for_self_play(seeds, first_players),
+                    game_seeds=seeds,
+                    global_batch_cap=self.config.rust_global_batch_cap,
+                    leaf_batch=1,
+                    cheap_sims_min=self.config.gate_sims,
+                    cheap_sims_max=self.config.gate_sims,
+                    full_sims_min=self.config.gate_sims,
+                    full_sims_max=self.config.gate_sims,
+                    full_search_fraction=0.0,
+                    top_k=self.config.top_k,
+                    draft_prior=0.0,
+                    iteration=-1,
+                    force=self.config.force_root_chance,
+                    age_deal_samples=self.config.age_deal_samples,
+                    max_inflight_batches=self.config.rust_max_inflight_batches,
+                    scheduler_workers=self.config.rust_scheduler_workers,
+                    deterministic_actions=True,
+                    bot_p0=bot_name if candidate_seat == 1 else None,
+                    bot_p1=bot_name if candidate_seat == 0 else None,
+                    bot_exploration=0.0,
+                    bot_policy_iterations=0,
+                )
+                leg_records.append(records)
+            for offset, (pair, seed, first_player) in enumerate(
+                zip(pair_indices, seeds, first_players)
+            ):
+                for leg, candidate_seat in enumerate((0, 1)):
+                    record = leg_records[leg][offset]
+                    agents = (
+                        (candidate_spec.name, bot_name)
+                        if candidate_seat == 0
+                        else (bot_name, candidate_spec.name)
+                    )
+                    scores = record["scores"]
+                    outcome = MatchOutcome(
+                        seed=seed,
+                        first_player=first_player,
+                        agents=agents,
+                        winner=record["winner"],
+                        scores=tuple(scores) if scores is not None else None,
+                        victory_type=record["victory_type"] or "unknown",
+                        actions=len(record["moves"]),
+                    )
+                    outcomes.append(outcome)
+                    result = test.update(outcome.score_for(candidate_seat))
+                    game_index = pair * 2 + leg
+                    if game_index % 2 == 1 and result.decision != "continue":
+                        return outcomes
+        return outcomes
+
     def _sprt_match(
         self,
         candidate_spec: GateAgentSpec,
@@ -913,7 +1462,23 @@ class PhaseDLoop:
             alpha=self.config.gate_alpha,
             beta=self.config.gate_beta,
         )
-        if self.config.process_workers:
+        if (
+            self.config.gate_backend == "rust"
+            and isinstance(candidate_spec, ModelAgentSpec)
+            and isinstance(opponent_spec, ModelAgentSpec)
+        ):
+            outcomes = self._rust_model_gate_waves(
+                candidate_spec, opponent_spec, test, seed_offset
+            )
+        elif (
+            self.config.gate_backend == "rust"
+            and isinstance(candidate_spec, ModelAgentSpec)
+            and isinstance(opponent_spec, BotAgentSpec)
+        ):
+            outcomes = self._rust_bot_gate_waves(
+                candidate_spec, opponent_spec, test, seed_offset
+            )
+        elif self.config.process_workers:
             outcomes = self._play_gate_waves(
                 candidate_spec, opponent_spec, test, seed_offset
             )
@@ -958,10 +1523,13 @@ class PhaseDLoop:
             outcomes,
         )
 
-    def promotion_gate(self, candidate: str | Path) -> GateResult:
+    def promotion_gate(
+        self, candidate: str | Path, *, opponent: str | Path | None = None
+    ) -> GateResult:
+        opponent = Path(opponent) if opponent is not None else self.current_best
         report, outcomes = self._sprt_match(
             self._model_agent_spec(candidate, "candidate"),
-            self._model_agent_spec(self.current_best, "best"),
+            self._model_agent_spec(opponent, "best"),
             threshold=0.50,
             seed_offset=50_000_000,
         )
@@ -1053,22 +1621,85 @@ class PhaseDLoop:
             "training_performance": self.last_training_stats,
         }
         self.manifest.append_iteration(row)
+        self._append_training_log(row)
         return row
 
     def run(self) -> list[dict[str, Any]]:
+        mode = GeneratorMode(self.config.selfplay_generator_mode)
+        if mode == GeneratorMode.STRICT_GATE:
+            return self._run_strict_gate()
+        return self._run_controller(mode)
+
+    def _run_strict_gate(self) -> list[dict[str, Any]]:
+        """Legacy Phase D lifecycle: gate every candidate against current_best."""
+
         self.initialize()
         payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
         completed = [row["iteration"] for row in payload.get("iterations", [])]
         start = max(completed, default=-1) + 1
-        return [
-            self.run_iteration(iteration)
-            for iteration in range(start, start + self.config.iterations)
-        ]
+        rows: list[dict[str, Any]] = []
+        try:
+            for iteration in range(start, start + self.config.iterations):
+                rows.append(self.run_iteration(iteration))
+                self._autosave_replay_buffer(iteration + 1)
+            return rows
+        finally:
+            if self.config.save_buffer:
+                try:
+                    self._save_replay_buffer()
+                except Exception as exc:
+                    print(f"WARNING: buffer save failed: {exc}")
+
+    def _run_controller(self, mode: GeneratorMode) -> list[dict[str, Any]]:
+        """Soft-gate lifecycle: the shared controller owns latest/best roles."""
+
+        from .training_adapter import SevenWondersDuelLifecycleAdapter
+
+        self.initialize(bootstrap_checkpoint=False)
+        controller = RunController(
+            adapter=SevenWondersDuelLifecycleAdapter(self),
+            store=_PhaseDRunStore(self),
+            checkpoint_dir=self.checkpoint_dir,
+            config=ControllerConfig(
+                mode=mode,
+                bootstrap_policy=BootstrapPolicy(self.config.bootstrap_policy),
+                promotion_every=self.config.promotion_every,
+                revert_reset_after=self.config.revert_reset_after,
+                anchor_gate_every_promotions=self.config.anchor_gate_every_promotions,
+                buffer_autosave_every=self.config.buffer_autosave_every,
+                seed=self.config.seed,
+                iterations=self.config.iterations,
+            ),
+        )
+        try:
+            return controller.run()
+        finally:
+            if self.config.save_buffer:
+                try:
+                    self._save_replay_buffer()
+                except Exception as exc:
+                    print(f"WARNING: buffer save failed: {exc}")
+
+
+class _PhaseDRunStore:
+    """Adapts the run manifest + training log to the controller's RunStore."""
+
+    def __init__(self, loop: "PhaseDLoop"):
+        self.loop = loop
+
+    def append_iteration(self, row: dict[str, Any]) -> None:
+        self.loop.manifest.append_iteration(row)
+        self.loop._append_training_log(row)
+
+    def iterations(self) -> list[dict[str, Any]]:
+        payload = json.loads(self.loop.manifest.path.read_text(encoding="utf-8"))
+        return payload.get("iterations", [])
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--seed", type=int, default=20260718)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--games-per-iteration", type=int, default=500)
     parser.add_argument("--seed-games", type=int, default=5_000)
@@ -1077,13 +1708,106 @@ def main(argv=None) -> int:
         "--process-workers",
         type=int,
         default=0,
-        help="self-play generation processes (0 = threaded generation); "
-        "scales with CPU cores because each process owns an interpreter and "
-        "runs CPU inference on its own model copy",
+        help="legacy Python-backend generation/gate processes (0 = threads); "
+        "the Rust generation and Rust gate backends do not use this setting",
     )
+    parser.add_argument("--inference-batch", type=int, default=64)
+    parser.add_argument("--inference-wait-ms", type=float, default=2.0)
+    parser.add_argument("--replay-window", type=int, default=20)
+    parser.add_argument(
+        "--save-buffer",
+        default="",
+        help="atomically save the final replay games to this JSONL path",
+    )
+    parser.add_argument(
+        "--warm-buffer",
+        default="",
+        help="load replay games from a prior --save-buffer JSONL export",
+    )
+    parser.add_argument("--seed-retain-fraction", type=float, default=1.0)
+    parser.add_argument("--curriculum-anneal-iterations", type=int, default=10)
+    parser.add_argument("--opponent-fraction", type=float, default=0.15)
+    parser.add_argument("--bot-policy-iterations", type=int, default=10)
+    parser.add_argument("--bot-exploration", type=float, default=0.05)
+    parser.add_argument("--draft-prior-iterations", type=int, default=20)
+    parser.add_argument("--cheap-sims-min", type=int, default=16)
+    parser.add_argument("--cheap-sims-max", type=int, default=24)
+    parser.add_argument("--full-sims-min", type=int, default=64)
+    parser.add_argument("--full-sims-max", type=int, default=128)
+    parser.add_argument("--full-search-fraction", type=float, default=0.25)
+    parser.add_argument("--search-mode", choices=("closed", "open"), default="closed")
+    parser.add_argument("--top-k", type=int, default=16)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--train-epochs", type=int, default=8)
+    parser.add_argument("--train-batch-size", type=int, default=512)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--aux-weight", type=float, default=0.2)
+    parser.add_argument("--train-patience", type=int, default=8)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--min-games-to-train", type=int, default=2)
+    parser.add_argument(
+        "--generation-backend", choices=("rust", "python"), default="rust"
+    )
+    parser.add_argument("--gate-backend", choices=("rust", "python"), default="rust")
+    parser.add_argument("--gate-sims", type=int, default=64)
+    parser.add_argument("--gate-max-games", type=int, default=400)
+    parser.add_argument("--gate-alpha", type=float, default=0.05)
+    parser.add_argument("--gate-beta", type=float, default=0.05)
+    parser.add_argument("--gate-indifference", type=float, default=0.03)
+    parser.add_argument("--rust-slots", type=int, default=16)
+    parser.add_argument("--rust-global-batch-cap", type=int, default=256)
+    parser.add_argument("--rust-max-inflight-batches", type=int, default=1)
+    parser.add_argument("--rust-scheduler-workers", type=int, default=1)
+    parser.add_argument("--leaf-batch", type=int, default=1)
+    parser.add_argument(
+        "--force-root-chance", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--age-deal-samples", type=int, choices=(0, 4, 8, 16, 32), default=32)
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
     parser.add_argument(
+        "--selfplay-generator-mode",
+        choices=tuple(mode.value for mode in GeneratorMode),
+        default="strict_gate",
+        help="strict_gate = legacy gate-every-candidate lifecycle; soft_gate = "
+        "cumulative rolling learner with promotion protection",
+    )
+    parser.add_argument(
+        "--bootstrap-policy",
+        choices=tuple(policy.value for policy in BootstrapPolicy),
+        default="gate",
+        help="auto_first_trained installs the first trained learner as best "
+        "without a strength gate; gate preserves the old behavior",
+    )
+    parser.add_argument("--promotion-every", type=int, default=1)
+    parser.add_argument("--revert-reset-after", type=int, default=0)
+    parser.add_argument(
+        "--buffer-autosave-every",
+        type=int,
+        default=0,
+        help="atomically re-export --save-buffer every N iterations (0 = on exit "
+        "only); a failed autosave warns but never terminates training",
+    )
+    parser.add_argument(
+        "--warm-buffer-max-staleness",
+        type=int,
+        default=0,
+        help="drop warm-buffer games older than N iterations at import "
+        "(0 = default to --replay-window)",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--run-log",
+        default="",
+        help="human-readable transcript path (default <run-dir>/run.log)",
+    )
+    parser.add_argument(
+        "--no-run-log",
+        action="store_true",
+        help="disable the human-readable transcript; JSONL/manifest are unaffected",
     )
     parser.add_argument(
         "--plumbing-smoke",
@@ -1093,12 +1817,61 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     config = PhaseDConfig(
         run_dir=args.run_dir,
+        seed=args.seed,
         iterations=args.iterations,
         games_per_iteration=args.games_per_iteration,
         seed_games=args.seed_games,
         workers=args.workers,
         process_workers=args.process_workers,
+        inference_batch=args.inference_batch,
+        inference_wait_ms=args.inference_wait_ms,
+        replay_window=args.replay_window,
+        save_buffer=args.save_buffer,
+        warm_buffer=args.warm_buffer,
+        seed_retain_fraction=args.seed_retain_fraction,
+        curriculum_anneal_iterations=args.curriculum_anneal_iterations,
+        opponent_fraction=args.opponent_fraction,
+        bot_policy_iterations=args.bot_policy_iterations,
+        bot_exploration=args.bot_exploration,
+        draft_prior_iterations=args.draft_prior_iterations,
+        cheap_sims_min=args.cheap_sims_min,
+        cheap_sims_max=args.cheap_sims_max,
+        full_sims_min=args.full_sims_min,
+        full_sims_max=args.full_sims_max,
+        full_search_fraction=args.full_search_fraction,
+        search_mode=args.search_mode,
+        top_k=args.top_k,
+        d_model=args.d_model,
+        layers=args.layers,
+        train_epochs=args.train_epochs,
+        train_batch_size=args.train_batch_size,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        aux_weight=args.aux_weight,
+        train_patience=args.train_patience,
+        val_fraction=args.val_fraction,
+        min_games_to_train=args.min_games_to_train,
+        generation_backend=args.generation_backend,
+        gate_backend=args.gate_backend,
+        gate_sims=args.gate_sims,
+        gate_max_games=args.gate_max_games,
+        gate_alpha=args.gate_alpha,
+        gate_beta=args.gate_beta,
+        gate_indifference=args.gate_indifference,
+        rust_slots=args.rust_slots,
+        rust_global_batch_cap=args.rust_global_batch_cap,
+        rust_max_inflight_batches=args.rust_max_inflight_batches,
+        rust_scheduler_workers=args.rust_scheduler_workers,
+        leaf_batch=args.leaf_batch,
+        force_root_chance=args.force_root_chance,
+        age_deal_samples=args.age_deal_samples,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
+        selfplay_generator_mode=args.selfplay_generator_mode,
+        bootstrap_policy=args.bootstrap_policy,
+        promotion_every=args.promotion_every,
+        revert_reset_after=args.revert_reset_after,
+        buffer_autosave_every=args.buffer_autosave_every,
+        warm_buffer_max_staleness=args.warm_buffer_max_staleness,
         device=args.device,
     )
     if args.plumbing_smoke:
@@ -1120,18 +1893,52 @@ def main(argv=None) -> int:
             gate_max_games=2,
             anchor_gate_every_promotions=1,
         )
-    loop = PhaseDLoop(config)
-    rows = loop.run()
-    output: Any = rows
-    if args.plumbing_smoke:
-        output = {
-            "iterations": rows,
-            "explicit_phase_gate": [
-                asdict(result) for result in loop.phase_gate()
-            ],
+    run_log_path = args.run_log or str(Path(config.run_dir) / "run.log")
+    header = {
+        "Run directory": Path(config.run_dir).resolve(),
+        "Command": " ".join(sys.argv),
+        "Resume iteration": _resume_iteration_label(config.run_dir),
+        "Generator mode": config.selfplay_generator_mode,
+        "Structured log": (Path(config.run_dir) / "training_log.jsonl").resolve(),
+        "Manifest": (Path(config.run_dir) / "run_manifest.json").resolve(),
+    }
+    with RunLog(run_log_path, enabled=not args.no_run_log, header=header) as run_log:
+        loop = PhaseDLoop(config)
+        rows = loop.run()
+        latest_ckpt = loop.checkpoint_dir / "latest.pt"
+        run_log.completion_fields = {
+            "Completed iterations": len(rows),
+            "Latest checkpoint": (
+                latest_ckpt if latest_ckpt.exists() else loop.current_best
+            ),
+            "Current best": loop.current_best,
+            "Final buffer": config.save_buffer or "disabled",
         }
+        output: Any = rows
+        if args.plumbing_smoke:
+            output = {
+                "iterations": rows,
+                "explicit_phase_gate": [
+                    asdict(result) for result in loop.phase_gate()
+                ],
+            }
     print(json.dumps(output, indent=2))
     return 0
+
+
+def _resume_iteration_label(run_dir: str | Path) -> str:
+    manifest_path = Path(run_dir) / "run_manifest.json"
+    if not manifest_path.exists():
+        return "new run"
+    try:
+        prior = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+            "iterations", []
+        )
+    except (json.JSONDecodeError, OSError):
+        return "new run"
+    if not prior:
+        return "new run"
+    return str(max(int(row["iteration"]) for row in prior) + 1)
 
 
 if __name__ == "__main__":
