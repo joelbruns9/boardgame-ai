@@ -117,14 +117,17 @@ export MIN_TOP_AGREE=$(python -c "import json; print(json.load(open('$PILOT_DIR/
 
 ## 4. Production labels
 
-Freeze 450 fresh production roots. The calibration roots are passed as a
-reserved set, so any state-key collision fails before tree generation.
+Freeze 500 fresh production roots. The calibration roots are passed as a
+reserved set and excluded during trajectory collection; collection continues
+until it has the requested number of unique, disjoint roots. The production
+seed is deliberately far from the calibration seed to avoid wasting trajectory
+work traversing the same games.
 
 ```bash
 python -m games.kingdomino.reply_pilot \
   --mode freeze --checkpoint "$BASE_CKPT" \
   --positions-path "$PILOT_DIR/training_roots.jsonl" \
-  --positions 450 --seed 20260720 --trajectory-sims 3200 \
+  --positions 500 --seed 20270720 --trajectory-sims 3200 \
   --reserved-test-path "$PILOT_DIR/calibration_roots.jsonl"
 ```
 
@@ -161,7 +164,7 @@ python -m games.kingdomino.reply_pilot \
   --validation-output "$PILOT_DIR/reply_validation.jsonl"
 ```
 
-Expect roughly 1,200–1,600 accepted examples, not 2,000. The exact count is a
+Expect roughly 1,000–1,300 accepted examples from 500 roots, not 2,000. The exact count is a
 measured outcome; quality and disjointness gates take precedence over volume.
 
 ## 5. Equal-step control and treatment
@@ -170,6 +173,20 @@ This uses one pre-registered treatment setting: 15% reply batch fraction and
 `lambda_reply=0.15`. Both arms receive the exact same 1,000 ordinary replay
 batches, including the same D4 transforms; sampled indices and transforms are
 logged. Only treatment receives grouped reply loss.
+
+To maximize paid-box utilization, the guarded cloud runner can wait for the
+background root freeze, resume all production shards, enforce structural and
+accepted-count gates, create the root-disjoint split, and start both training
+arms without a manual pause:
+
+```bash
+nohup env PYTHON=/venv/main/bin/python PILOT_THREADS=4 PILOT_SHARDS=4 \
+  bash run_reply_pilot_training_cloud.sh \
+  > "$PILOT_DIR/production_to_training.log" 2>&1 &
+```
+
+This automation deliberately stops after training. Review
+`pilot_training_report.json` before launching behavior or strength evaluation.
 
 ```bash
 python -m games.kingdomino.reply_training \
