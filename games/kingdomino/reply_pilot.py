@@ -508,6 +508,7 @@ def _confirm_rust_reply_label(
         sum(candidate == value for value in top_by_seed.values())
         for candidate in set(top_by_seed.values())) / len(top_by_seed)
     return {
+        "confirmation_scope": "isolated-reply-tree",
         "seeds": list(by_seed),
         "top_pick_by_seed": {str(seed): pick for seed, pick in top_by_seed.items()},
         "top_pick_agreement": float(agreement),
@@ -515,6 +516,88 @@ def _confirm_rust_reply_label(
             "none" if pick is None else str(pick): value for pick, value in seed_sd.items()},
         "max_searched_seed_sd": max(seed_sd.values(), default=0.0),
     }
+
+
+def _confirm_rust_parent_tree_labels(
+    search: DenialSearch, state: GameState, *, root_result,
+    primary_result: dict[str, Any], base_seed: int, seed_count: int,
+    seed_stride: int, rayon_threads: int,
+) -> dict[Optional[int], dict[str, Any]]:
+    """Confirm all reply labels with full parent-tree reruns.
+
+    A reply-only tree can present the same states to CUDA in different batch
+    shapes than the parent tree. On Blackwell this can perturb a near-tied
+    placement ranking even when the semantic tree is identical. Full parent
+    reruns preserve the target's batching/context and amortize each alternate
+    chance seed across every reply label.
+    """
+    if seed_count < 2:
+        raise ValueError("cross-seed confirmation requires at least two seeds")
+
+    def index_result(
+        result: dict[str, Any],
+    ) -> dict[Optional[int], dict[Optional[int], dict]]:
+        indexed: dict[Optional[int], dict[Optional[int], dict]] = {}
+        for label in result["reply_labels"]:
+            parent = label["parent_pick_domino_id"]
+            if parent in indexed:
+                raise ValueError(
+                    f"duplicate reply parent in confirmation tree: {parent!r}")
+            indexed[parent] = {
+                row["pick_domino_id"]: row for row in label["per_pick"]}
+        return indexed
+
+    seeds = [int(base_seed) + offset * int(seed_stride)
+             for offset in range(seed_count)]
+    by_seed = {seeds[0]: index_result(primary_result)}
+    expected_parents = set(by_seed[seeds[0]])
+    for seed in seeds[1:]:
+        alternate = search.search_position_rust(
+            state, root_result=root_result, rayon_threads=rayon_threads,
+            chance_seed=seed)
+        indexed = index_result(alternate)
+        if set(indexed) != expected_parents:
+            raise ValueError("reply parent IDs changed across confirmation seeds")
+        for parent in expected_parents:
+            if set(indexed[parent]) != set(by_seed[seeds[0]][parent]):
+                raise ValueError(
+                    "reply pick IDs changed across confirmation seeds: "
+                    f"parent={parent!r}")
+        by_seed[seed] = indexed
+
+    def pick_order(pick):
+        return -1 if pick is None else int(pick)
+
+    confirmed = {}
+    for parent in expected_parents:
+        top_by_seed = {
+            seed: max(by_seed[seed][parent], key=lambda pick: (
+                float(by_seed[seed][parent][pick]["searched_value_actor"]),
+                -pick_order(pick)))
+            for seed in seeds
+        }
+        seed_sd = {
+            pick: float(np.std([
+                float(by_seed[seed][parent][pick]["searched_value_actor"])
+                for seed in seeds
+            ], ddof=0))
+            for pick in by_seed[seeds[0]][parent]
+        }
+        agreement = max(
+            sum(candidate == value for value in top_by_seed.values())
+            for candidate in set(top_by_seed.values())) / len(top_by_seed)
+        confirmed[parent] = {
+            "confirmation_scope": "full-parent-tree",
+            "seeds": seeds,
+            "top_pick_by_seed": {
+                str(seed): pick for seed, pick in top_by_seed.items()},
+            "top_pick_agreement": float(agreement),
+            "searched_seed_sd_by_pick": {
+                "none" if pick is None else str(pick): value
+                for pick, value in seed_sd.items()},
+            "max_searched_seed_sd": max(seed_sd.values(), default=0.0),
+        }
+    return confirmed
 
 
 def _implementation_sha256() -> str:
@@ -664,13 +747,19 @@ def generate_shard(args: argparse.Namespace) -> dict[str, Any]:
             rust_result = search.search_position_rust(
                 state, root_result=root_result, rayon_threads=args.rayon_threads)
             labels = rust_result["reply_labels"]
-            for label in labels:
-                if (args.calibration or _primary_passes_locked_filter(label, args)):
-                    label["cross_seed"] = _confirm_rust_reply_label(
-                        search, label, base_seed=args.seed,
-                        seed_count=args.confirmation_seeds,
-                        seed_stride=args.confirmation_seed_stride,
-                        rayon_threads=args.rayon_threads)
+            labels_to_confirm = [
+                label for label in labels
+                if args.calibration or _primary_passes_locked_filter(label, args)]
+            if labels_to_confirm:
+                confirmations = _confirm_rust_parent_tree_labels(
+                    search, state, root_result=root_result,
+                    primary_result=rust_result, base_seed=args.seed,
+                    seed_count=args.confirmation_seeds,
+                    seed_stride=args.confirmation_seed_stride,
+                    rayon_threads=args.rayon_threads)
+                for label in labels_to_confirm:
+                    label["cross_seed"] = confirmations[
+                        label["parent_pick_domino_id"]]
             examples = [serialize_rust_reply_example(
                 label, rust_evaluator=search._rust_evaluator,
                 position_index=index, root_state_key=public_state_key(state),
