@@ -302,6 +302,262 @@ def test_closed_search_matches_python():
     assert checked >= 20
 
 
+def test_resumable_leaf_batch_one_matches_f3_oracle():
+    """F4.1 exact refactor gate: the arena-backed selection/eval/backprop state
+    machine at leaf_batch=1 reproduces the permanent F3.3 sequential Rust oracle,
+    including canonical topology and all discrete/floating outputs."""
+
+    checked = 0
+    for game_seed in range(6):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                for sims in (16, 64):
+                    for seed in (1, 5):
+                        for force in (False, True):
+                            expected = rg.closed_search(sims, 8, seed, force=force)
+                            got = rg.closed_search_resumable(sims, 8, seed, force=force)
+                            ctx = (
+                                f"game {game_seed} move {i} sims {sims} "
+                                f"seed {seed} force {force}"
+                            )
+                            assert got[0] == expected[0], f"{ctx}: action"
+                            assert got[3] == expected[3], f"{ctx}: visits"
+                            assert got[5] == expected[5], f"{ctx}: top-k"
+                            assert got[6] == expected[6], f"{ctx}: sims"
+                            assert got[1] == pytest.approx(expected[1], abs=1e-9), f"{ctx}: av"
+                            assert got[2] == pytest.approx(expected[2], abs=1e-9), f"{ctx}: rv"
+                            assert list(got[4]) == pytest.approx(
+                                list(expected[4]), rel=0, abs=1e-9
+                            ), f"{ctx}: policy"
+                            _assert_digest_equal(list(expected[7]), list(got[7]), f"{ctx}: tree")
+                            checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+
+    # Dedicated chance roots cover the two root-specific structures that a
+    # random play-age sample may miss: enumerable forced children and AGE_DEAL.
+    for seed, picks, force in ((0, 3, True), (1, 7, False)):
+        _py, rg = _drive_to_draft(seed, picks)
+        expected = rg.closed_search(32, 8, 3, force=force)
+        got = rg.closed_search_resumable(32, 8, 3, force=force)
+        ctx = f"draft seed {seed} picks {picks} force {force}"
+        assert got[0] == expected[0], f"{ctx}: action"
+        assert got[3] == expected[3], f"{ctx}: visits"
+        assert got[5] == expected[5], f"{ctx}: top-k"
+        assert got[6] == expected[6], f"{ctx}: sims"
+        assert got[1] == pytest.approx(expected[1], rel=0, abs=1e-9), f"{ctx}: av"
+        assert got[2] == pytest.approx(expected[2], rel=0, abs=1e-9), f"{ctx}: rv"
+        assert list(got[4]) == pytest.approx(list(expected[4]), rel=0, abs=1e-9)
+        _assert_digest_equal(list(expected[7]), list(got[7]), f"{ctx}: tree")
+        checked += 1
+    assert checked >= 20
+
+
+def test_resumable_leaf_batch_one_phase_strata():
+    """F4.1 coverage hardening across every searchable game phase, pending
+    choices, and a late Age-III root whose recorded action reaches a terminal
+    leaf. Configs deliberately vary non-power-of-two budgets/top-k/seeds."""
+
+    wanted = {
+        "draft": 2,
+        "age_1": 2,
+        "age_2": 2,
+        "age_3": 2,
+        "between_ages": 2,
+        "pending_choice": 2,
+        "terminal_leaf_root": 2,
+    }
+    covered = {name: 0 for name in wanted}
+
+    def compare(rg, stratum, game_seed, move):
+        ordinal = sum(covered.values())
+        sims = (7, 13, 23)[ordinal % 3]
+        top_k = (3, 5, 8)[ordinal % 3]
+        seed = 1009 + game_seed * 101 + move
+        force = ordinal % 4 == 0
+        expected = rg.closed_search(sims, top_k, seed, force=force)
+        got = rg.closed_search_resumable(sims, top_k, seed, force=force)
+        ctx = (
+            f"{stratum} game {game_seed} move {move} sims {sims} "
+            f"top_k {top_k} seed {seed} force {force}"
+        )
+        assert got[0] == expected[0], f"{ctx}: action"
+        assert got[3] == expected[3], f"{ctx}: visits"
+        assert got[5] == expected[5], f"{ctx}: top-k"
+        assert got[6] == expected[6], f"{ctx}: sims"
+        assert got[1] == pytest.approx(expected[1], rel=0, abs=1e-9), f"{ctx}: av"
+        assert got[2] == pytest.approx(expected[2], rel=0, abs=1e-9), f"{ctx}: rv"
+        assert list(got[4]) == pytest.approx(list(expected[4]), rel=0, abs=1e-9)
+        _assert_digest_equal(list(expected[7]), list(got[7]), f"{ctx}: tree")
+        covered[stratum] += 1
+
+    for game_seed in range(60):
+        if all(covered[name] >= count for name, count in wanted.items()):
+            break
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for move, idx in enumerate(actions):
+            strata = []
+            if py.pending_choice is not None:
+                strata.append("pending_choice")
+            elif py.phase is Phase.WONDER_DRAFT:
+                strata.append("draft")
+            elif py.phase is Phase.CHOOSE_NEXT_START_PLAYER:
+                strata.append("between_ages")
+            elif py.phase is Phase.PLAY_AGE:
+                strata.append(f"age_{py.age}")
+
+            # This recorded legal action is known to finish the game. With a
+            # top-k covering all late-root actions, at least one scheduled
+            # simulation therefore exercises the no-evaluator terminal path.
+            probe = py.clone()
+            apply_action(probe, decode_action(probe, idx))
+            if probe.phase is Phase.COMPLETE:
+                strata.append("terminal_leaf_root")
+
+            for stratum in strata:
+                if stratum in wanted and covered[stratum] < wanted[stratum]:
+                    compare(rg, stratum, game_seed, move)
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+
+    assert covered == wanted
+
+
+def test_wu_leaf_waves_accounting_and_cleanup():
+    """F4.2 WU waves schedule every simulation exactly once, deduplicate only
+    NN rows (never backups), drain before reductions, and leave no incomplete
+    counts at successful return. The Rust session enforces the latter two as
+    runtime invariants; these assertions gate the externally visible accounting."""
+
+    collision_seen = False
+    shortened_wave_seen = False
+    for game_seed in range(4):
+        _py, rg = _play_age_position(game_seed)
+        for leaf_batch in (2, 4, 8):
+            result = rg.closed_search_batched(
+                leaf_batch, 67, 8, 700 + game_seed, force=game_seed % 2 == 0
+            )
+            _act, _av, _rv, visits, policy, topk, sims, metrics, root_q, _digest = result
+            (
+                scheduled,
+                requested,
+                unique,
+                terminal,
+                collisions,
+                waves,
+                max_paths,
+                max_unique,
+            ) = metrics
+            ctx = f"game {game_seed} leaf_batch {leaf_batch}"
+            assert sims == scheduled == 67, ctx
+            assert sum(visits) == 67, ctx
+            assert requested + terminal == 67, ctx
+            assert unique + collisions == requested, ctx
+            assert 1 <= waves <= requested, ctx
+            assert 1 <= max_paths <= leaf_batch, ctx
+            assert 1 <= max_unique <= max_paths, ctx
+            assert len(policy) == len(visits), ctx
+            assert len(root_q) == len(visits), ctx
+            assert len(topk) <= 8, ctx
+            collision_seen |= collisions > 0
+            shortened_wave_seen |= max_paths < leaf_batch or requested % leaf_batch != 0
+    assert collision_seen, "WU corpus produced no duplicate pending leaf"
+    assert shortened_wave_seen, "no wave was shortened at a round/budget boundary"
+
+
+def test_wu_leaf_batch_one_surface_is_exact_and_rejects_zero():
+    """The general F4.2 surface must retain the F4.1 exact bypass at batch one
+    and reject a zero-sized wave rather than spin or silently degrade."""
+
+    _py, rg = _play_age_position(2)
+    expected = rg.closed_search(31, 5, 91, force=True)
+    got = rg.closed_search_batched(1, 31, 5, 91, force=True)
+    assert got[:7] == expected[:7]
+    scheduled, requested, unique, terminal, collisions, waves, max_paths, max_unique = got[7]
+    assert scheduled == 31
+    assert requested + terminal == 31
+    assert requested == unique
+    assert collisions == 0
+    assert waves == requested
+    assert max_paths == max_unique == 1
+    assert len(got[8]) == len(got[3])
+    _assert_digest_equal(list(expected[7]), list(got[9]), "F4.2 leaf_batch=1 tree")
+    with pytest.raises(ValueError):
+        rg.closed_search_batched(0, 31, 5, 91)
+
+
+def test_wu_terminal_leaves_need_no_nn_rows():
+    """A late root with terminal descendants accounts those simulations but
+    does not send them through the evaluator batch."""
+
+    found = False
+    for game_seed in range(20):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for idx in actions:
+            probe = py.clone()
+            apply_action(probe, decode_action(probe, idx))
+            if probe.phase is Phase.COMPLETE:
+                result = rg.closed_search_batched(8, 16, 16, 31337 + game_seed)
+                metrics = result[7]
+                assert metrics[0] == 16
+                assert metrics[3] > 0, "known terminal root produced no terminal leaves"
+                assert metrics[1] + metrics[3] == 16
+                found = True
+                break
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+        if found:
+            break
+    assert found, "failed to harvest a late terminal-reaching root"
+
+
+def test_wu_evaluator_error_clears_pending_and_preserves_original_error():
+    """An evaluator error during a multi-leaf wave surfaces unchanged. A fresh
+    search on the same RustGame then succeeds, guarding against leaked session
+    state or stranded WU counters at the PyO3 boundary."""
+
+    _py, rg = _play_age_position(0)
+    calls = 0
+
+    def flaky(tokens, actor, legal):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("F4.2 evaluator sentinel")
+        return 0.0, [1.0] * len(legal)
+
+    with pytest.raises(RuntimeError, match="F4.2 evaluator sentinel"):
+        rg.closed_search_batched_net(flaky, 8, 32, 8, 17)
+
+    shape_calls = 0
+
+    def bad_shape(tokens, actor, legal):
+        nonlocal shape_calls
+        shape_calls += 1
+        size = len(legal) + (1 if shape_calls == 3 else 0)
+        return 0.0, [1.0] * size
+
+    with pytest.raises(ValueError, match="priors"):
+        rg.closed_search_batched_net(bad_shape, 8, 32, 8, 17)
+    good = lambda tokens, actor, legal: (0.0, [1.0] * len(legal))
+    result = rg.closed_search_batched_net(good, 8, 32, 8, 17)
+    assert result[6] == result[7][0] == 32
+
+
 def _tree_stats(node, stats=None):
     if stats is None:
         stats = {"weighted": 0, "weighted_multi": 0, "none_prob": 0, "age_deal": 0}
@@ -474,6 +730,22 @@ def test_closed_search_net_matches_python():
                     expected = []
                     _digest_ref(root, expected)
                     _assert_digest_equal(expected, list(dig), f"{ctx}: tree")
+
+                    # The independently implemented F4.1 arena/state-machine
+                    # path must also reproduce the F3.4 scalar-net oracle.
+                    resumed = rg.closed_search_resumable_net(
+                        adapter, sims, 8, seed, force=force
+                    )
+                    assert resumed[0] == act, f"{ctx}: resumable action"
+                    assert resumed[3] == visits, f"{ctx}: resumable visits"
+                    assert resumed[5] == topk, f"{ctx}: resumable top-k"
+                    assert resumed[6] == rsims, f"{ctx}: resumable sims"
+                    assert resumed[1] == pytest.approx(av, abs=1e-9), f"{ctx}: resumable av"
+                    assert resumed[2] == pytest.approx(rv, abs=1e-9), f"{ctx}: resumable rv"
+                    assert list(resumed[4]) == pytest.approx(
+                        list(policy), rel=0, abs=1e-9
+                    ), f"{ctx}: resumable policy"
+                    _assert_digest_equal(list(dig), list(resumed[7]), f"{ctx}: resumable tree")
                     checked += 1
                 tested_here = True
             apply_action(py, decode_action(py, idx))

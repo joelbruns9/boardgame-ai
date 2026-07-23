@@ -13,8 +13,7 @@ use crate::data::{
     ScienceSymbol, NUM_CARDS, NUM_WONDERS,
 };
 use crate::engine::{
-    choice_producers, fixed_production, minimum_payment, opponent_trade_production,
-    trade_discounts,
+    choice_producers, fixed_production, minimum_payment, opponent_trade_production, trade_discounts,
 };
 use crate::pool::{unseen_pool, UnseenPool};
 use crate::rules::discard_income;
@@ -94,7 +93,9 @@ pub fn encode(g: &GameState) -> Vec<Token> {
     e.pool_tokens(&mut tokens);
     e.pool_wonder_token(&mut tokens);
     debug_assert!(
-        tokens.iter().all(|t| t.features.len() == FEATURE_COUNTS[t.type_id]),
+        tokens
+            .iter()
+            .all(|t| t.features.len() == FEATURE_COUNTS[t.type_id]),
         "encoder token feature count disagrees with FEATURE_COUNTS"
     );
     tokens
@@ -213,9 +214,7 @@ impl Enc<'_> {
         let g = self.g;
         let mut total: i32 = self.obtainable.iter().map(|&cid| card(cid).shields).sum();
         for &wid in &g.cities[seat].wonders {
-            if !g.cities[seat].built_wonders.contains(&wid)
-                && !g.retired_wonders.contains(&wid)
-            {
+            if !g.cities[seat].built_wonders.contains(&wid) && !g.retired_wonders.contains(&wid) {
                 total += wonder(wid).shields;
             }
         }
@@ -251,8 +250,7 @@ impl Enc<'_> {
             .contains(&progress_id("Theology"));
         let (mut unbuilt, mut extra) = (0, 0);
         for &wid in &g.cities[seat].wonders {
-            if g.cities[seat].built_wonders.contains(&wid) || g.retired_wonders.contains(&wid)
-            {
+            if g.cities[seat].built_wonders.contains(&wid) || g.retired_wonders.contains(&wid) {
                 continue;
             }
             unbuilt += 1;
@@ -334,7 +332,11 @@ impl Enc<'_> {
         v.push(mil_bound as f64);
         v.push(if mil_bound >= dist_win { 1.0 } else { 0.0 });
         v.push(sci_missing as f64);
-        v.push(if have_count + sci_missing >= 6 { 1.0 } else { 0.0 });
+        v.push(if have_count + sci_missing >= 6 {
+            1.0
+        } else {
+            0.0
+        });
         v
     }
 
@@ -405,13 +407,13 @@ impl Enc<'_> {
         let affordable = g.cities[seat].coins >= cost;
         let have = &self.symbols[seat];
         let completes_pair = match c.science {
-            Some(s) => {
-                have[s as usize] && !g.cities[seat].claimed_science_pairs.contains(&s)
-            }
+            Some(s) => have[s as usize] && !g.cities[seat].claimed_science_pairs.contains(&s),
             None => false,
         };
         let gives_sixth = match c.science {
-            Some(s) => !have[s as usize] && self.symbols[seat].iter().filter(|&&b| b).count() + 1 >= 6,
+            Some(s) => {
+                !have[s as usize] && self.symbols[seat].iter().filter(|&&b| b).count() + 1 >= 6
+            }
             None => false,
         };
         let shields = effective_shields(g, seat, cid);
@@ -541,7 +543,11 @@ impl Enc<'_> {
                     let payment =
                         minimum_payment(g, seat, w.cost.as_ref().expect("wonder cost"), None, true);
                     (
-                        if city.coins >= payment.total_coins { 1.0 } else { 0.0 },
+                        if city.coins >= payment.total_coins {
+                            1.0
+                        } else {
+                            0.0
+                        },
                         payment.total_coins,
                     )
                 };
@@ -609,9 +615,10 @@ impl Enc<'_> {
 
     fn discard_tokens(&self, out: &mut Vec<Token>) {
         let g = self.g;
-        let mausoleum = g.pending_choice.as_ref().map_or(false, |p| {
-            p.kind == PendingChoiceKind::BuildFromDiscardFree
-        });
+        let mausoleum = g
+            .pending_choice
+            .as_ref()
+            .map_or(false, |p| p.kind == PendingChoiceKind::BuildFromDiscardFree);
         for &cid in &g.discard_pile {
             out.push(Token {
                 type_id: T_DISCARD,

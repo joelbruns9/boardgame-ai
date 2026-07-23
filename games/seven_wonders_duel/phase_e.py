@@ -34,7 +34,10 @@ neither of which the trap actor's own move can improve for them.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import time
 import zlib
@@ -66,6 +69,39 @@ from .search import (
     expand_exhaustive,
     state_actor,
 )
+
+
+@contextmanager
+def _stage_lock(run_dir: Path, stage: str):
+    """OS-released single-writer lock for append-only resumable stage files."""
+
+    path = run_dir / f".{stage}.lock"
+    handle = path.open("a+b")
+    if path.stat().st_size == 0:
+        handle.write(b"0")
+        handle.flush()
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise RuntimeError(f"another {stage} writer holds {path}") from exc
+    try:
+        yield
+    finally:
+        if os.name == "nt":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 MILITARY_REACH = 5  # max plausible one-action shield swing (3 shields +
 # Strategy +1, with one square of slack)
@@ -563,6 +599,45 @@ def exact_ground_truth(
     }
 
 
+_GROUND_TRUTH_EVALUATOR = None
+_GROUND_TRUTH_DEPTH = 0
+_GROUND_TRUTH_FRONTIER_CAP = 0
+
+
+def _ground_truth_process_init(checkpoint: str, device: str, depth: int, frontier_cap: int):
+    global _GROUND_TRUTH_EVALUATOR, _GROUND_TRUTH_DEPTH, _GROUND_TRUTH_FRONTIER_CAP
+    _GROUND_TRUTH_EVALUATOR = load_evaluator(checkpoint, device)
+    _GROUND_TRUTH_DEPTH = depth
+    _GROUND_TRUTH_FRONTIER_CAP = frontier_cap
+
+
+def _ground_truth_row(position: dict, evaluator, depth: int, frontier_cap: int) -> dict:
+    state = reconstruct(position)
+    truth = exact_ground_truth(
+        state,
+        evaluator,
+        depth=depth,
+        frontier_cap=frontier_cap,
+    )
+    row = {"id": position["id"], "skipped": truth is None}
+    if truth is not None:
+        row.update(truth)
+        trap_q = max(truth["exact_q"][str(a)] for a in position["traps"])
+        row["trap_gap"] = truth["exact_root"] - trap_q
+    return row
+
+
+def _ground_truth_process_row(position: dict) -> dict:
+    if _GROUND_TRUTH_EVALUATOR is None:
+        raise RuntimeError("ground-truth process evaluator was not initialized")
+    return _ground_truth_row(
+        position,
+        _GROUND_TRUTH_EVALUATOR,
+        _GROUND_TRUTH_DEPTH,
+        _GROUND_TRUTH_FRONTIER_CAP,
+    )
+
+
 def run_ground_truth(args, run_dir: Path, positions: list[dict], evaluator) -> dict:
     path = run_dir / "ground_truth.jsonl"
     done: dict[str, dict] = {}
@@ -572,33 +647,44 @@ def run_ground_truth(args, run_dir: Path, positions: list[dict], evaluator) -> d
                 row = json.loads(line)
                 done[row["id"]] = row
     start = time.time()
+
+    def evaluate_position(position):
+        return _ground_truth_row(
+            position,
+            evaluator,
+            args.gt_depth,
+            args.gt_frontier_cap,
+        )
+
+    pending = [position for position in positions if position["id"] not in done]
     with path.open("a", encoding="utf-8", newline="\n") as handle:
-        for i, position in enumerate(positions):
-            if position["id"] in done:
-                continue
-            state = reconstruct(position)
-            truth = exact_ground_truth(
-                state,
-                evaluator,
-                depth=args.gt_depth,
-                frontier_cap=args.gt_frontier_cap,
+        if args.groundtruth_process_workers:
+            pool = ProcessPoolExecutor(
+                max_workers=args.groundtruth_process_workers,
+                initializer=_ground_truth_process_init,
+                initargs=(
+                    str(args.checkpoint),
+                    args.device,
+                    args.gt_depth,
+                    args.gt_frontier_cap,
+                ),
             )
-            row = {"id": position["id"], "skipped": truth is None}
-            if truth is not None:
-                row.update(truth)
-                # How much picking the best trap actually costs vs optimal:
-                # near-zero gaps mark already-decided positions where a trap
-                # pick is inconsequential; the report segments on this.
-                trap_q = max(truth["exact_q"][str(a)] for a in position["traps"])
-                row["trap_gap"] = truth["exact_root"] - trap_q
-            done[position["id"]] = row
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
-            handle.flush()
-            if (i + 1) % 10 == 0 or i + 1 == len(positions):
-                print(
-                    f"groundtruth: {len(done)}/{len(positions)} "
-                    f"({time.time() - start:.0f}s)"
-                )
+            mapper = _ground_truth_process_row
+        else:
+            pool = ThreadPoolExecutor(max_workers=args.groundtruth_workers)
+            mapper = evaluate_position
+        with pool:
+            futures = [pool.submit(mapper, position) for position in pending]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                row = future.result()
+                done[row["id"]] = row
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+                handle.flush()
+                if completed % 10 == 0 or completed == len(pending):
+                    print(
+                        f"groundtruth: {len(done)}/{len(positions)} "
+                        f"({time.time() - start:.0f}s)"
+                    )
     skipped = sum(1 for row in done.values() if row.get("skipped"))
     if skipped:
         print(f"groundtruth: {skipped} positions skipped (frontier cap)")
@@ -814,6 +900,8 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gt-depth", type=int, default=2)
     parser.add_argument("--gt-frontier-cap", type=int, default=60000)
+    parser.add_argument("--groundtruth-workers", type=int, default=1)
+    parser.add_argument("--groundtruth-process-workers", type=int, default=0)
     parser.add_argument(
         "--variants",
         nargs="+",
@@ -851,7 +939,9 @@ def main(argv=None) -> int:
             )
         }
 
-    needs_net = args.stage in ("groundtruth", "evaluate", "all")
+    needs_net = args.stage in ("groundtruth", "evaluate", "all") and not (
+        args.stage == "groundtruth" and args.groundtruth_process_workers
+    )
     evaluator = None
     if needs_net:
         if args.checkpoint is None:
@@ -859,7 +949,8 @@ def main(argv=None) -> int:
         evaluator = load_evaluator(args.checkpoint, args.device)
 
     if args.stage in ("harvest", "all"):
-        positions = run_harvest(args, run_dir)
+        with _stage_lock(run_dir, "harvest"):
+            positions = run_harvest(args, run_dir)
         if len(positions) < 100:
             print(
                 f"WARNING: only {len(positions)} positions (plan asks >=100); "
@@ -869,12 +960,14 @@ def main(argv=None) -> int:
         positions = load_positions()
 
     if args.stage in ("groundtruth", "all"):
-        truths = run_ground_truth(args, run_dir, positions, evaluator)
+        with _stage_lock(run_dir, "groundtruth"):
+            truths = run_ground_truth(args, run_dir, positions, evaluator)
     elif args.stage in ("evaluate", "report"):
         truths = load_truths()
 
     if args.stage in ("evaluate", "all"):
-        rows = run_evaluate(args, run_dir, positions, truths, evaluator)
+        with _stage_lock(run_dir, "evaluate"):
+            rows = run_evaluate(args, run_dir, positions, truths, evaluator)
     elif args.stage == "report":
         path = run_dir / "results.jsonl"
         if not path.exists():

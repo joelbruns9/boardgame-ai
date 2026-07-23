@@ -1,0 +1,159 @@
+{
+  "schema_version": "f4-contract-1",
+  "preregistered_utc_date": "2026-07-21",
+  "purpose": "F4.0 thresholds and benchmark contract frozen before any leaf_batch>1 sweep",
+  "exact_refactor_gate": {
+    "leaf_batch": 1,
+    "discrete_and_structure": "exact",
+    "floating_absolute_tolerance": 1e-9,
+    "required_force_expand_settings": [false, true]
+  },
+  "fast_search_quality_gate": {
+    "pending_policy": "wu_incomplete_visits",
+    "candidate_leaf_batches": [2, 4, 6, 8],
+    "selection_rule": "largest candidate satisfying every eligibility gate",
+    "corpus": {
+      "minimum_total_positions": 240,
+      "minimum_consequential_positions": 50,
+      "minimum_baseline_clean_consequential_positions": 30,
+      "consequential_gap_minimum": 0.25,
+      "minimum_positions_per_game_phase": 30,
+      "minimum_paired_search_seeds_per_position": 32
+    },
+    "natural_variance_control": {
+      "sequential_independent_seed_pairs_per_position": 32,
+      "same_position_and_checkpoint_as_fast_comparison": true
+    },
+    "eligibility": {
+      "new_blunders_on_baseline_clean_consequential_fixtures": 0,
+      "aggregate_consequential_trap_rate_delta_one_sided_95_upper": 0.02,
+      "aggregate_mean_sequential_tree_regret_max": 0.01,
+      "aggregate_p95_sequential_tree_regret_max": 0.05,
+      "large_gap_chosen_action_agreement_min": 0.97,
+      "large_gap_minimum": 0.25,
+      "medium_gap_chosen_action_agreement_min": 0.90,
+      "medium_gap_minimum": 0.05,
+      "mean_root_policy_jensen_shannon_divergence_max": 0.03,
+      "p95_root_policy_jensen_shannon_divergence_max": 0.10,
+      "mean_absolute_root_value_error_max": 0.03,
+      "p95_absolute_root_value_error_max": 0.10
+    },
+    "confidence_method": {
+      "unit": "position-clustered paired bootstrap",
+      "one_sided_confidence": 0.95,
+      "minimum_resamples": 10000,
+      "fixed_seed": 4040
+    },
+    "playing_strength": {
+      "minimum_seat_swapped_pairs": 1200,
+      "minimum_games": 2400,
+      "non_inferiority_margin_elo": -25.0,
+      "one_sided_confidence": 0.95,
+      "opponent": "sequential_f3_3_oracle",
+      "paired_game_and_search_seeds": true
+    },
+    "diagnostic_reopen_thresholds": {
+      "duplicate_leaf_fraction": 0.35,
+      "note": "Exceeding this does not itself fail quality, but reopens a pending-edge cap experiment."
+    }
+  },
+  "quality_lock_format": {
+    "path": "f4_quality_lock.json",
+    "required_fields": [
+      "schema_version",
+      "contract_sha256",
+      "pending_policy",
+      "leaf_batch",
+      "pending_edge_cap",
+      "force_expand_root_chance",
+      "checkpoint_sha256",
+      "corpus_sha256",
+      "production_search",
+      "gate_results",
+      "approved_utc"
+    ],
+    "cloud_quality_sensitive_overrides_forbidden": [
+      "pending_policy",
+      "leaf_batch",
+      "pending_edge_cap",
+      "force_expand_root_chance",
+      "sims",
+      "top_k",
+      "inference_precision"
+    ]
+  },
+  "laptop_comparative_benchmark": {
+    "minimum_speedup_lower_confidence_bound": 20.0,
+    "confidence": 0.95,
+    "minimum_warmup_games": 16,
+    "minimum_measured_games_per_repetition": 100,
+    "minimum_repetitions": 5,
+    "game_seed_start": 404000,
+    "first_player_order": "alternating",
+    "search": {
+      "cheap_sims_min": 16,
+      "cheap_sims_max": 24,
+      "full_sims_min": 64,
+      "full_sims_max": 128,
+      "full_search_fraction": 0.25,
+      "top_k": 16,
+      "mode": "closed",
+      "draft_prior": 0.0,
+      "temperature": "phase_d.temperature_for_move",
+      "quality_sensitive_fields_from_lock": true
+    },
+    "required_manifest_fields": [
+      "git_commit",
+      "dirty_worktree",
+      "checkpoint_sha256",
+      "config_sha256",
+      "device",
+      "inference_precision",
+      "python_version",
+      "rustc_version",
+      "torch_version",
+      "cuda_version",
+      "cpu_model",
+      "gpu_model",
+      "cpu_thread_environment",
+      "warmup_games",
+      "measured_games",
+      "repetitions"
+    ]
+  },
+  "required_metrics": [
+    "games_per_second",
+    "moves_per_second",
+    "scheduled_simulations_per_second",
+    "requested_nn_leaves_per_second",
+    "unique_nn_leaves_per_second",
+    "terminal_leaves",
+    "collisions",
+    "dedupe_ratio",
+    "global_batch_leaves_mean",
+    "global_batch_leaves_p50",
+    "global_batch_leaves_p95",
+    "global_batch_tokens_mean",
+    "global_batch_tokens_p50",
+    "global_batch_tokens_p95",
+    "padding_ratio",
+    "scheduler_ready_fraction",
+    "scheduler_waiting_fraction",
+    "scheduler_idle_fraction",
+    "queue_wait_seconds",
+    "rust_tree_seconds",
+    "rust_chance_seconds",
+    "rust_encode_pack_seconds",
+    "rust_record_seconds",
+    "pyo3_tensor_seconds",
+    "h2d_seconds",
+    "gpu_forward_seconds",
+    "gather_d2h_seconds",
+    "scatter_seconds",
+    "cpu_utilization",
+    "gpu_busy_fraction",
+    "peak_host_memory_bytes",
+    "peak_gpu_memory_bytes",
+    "oom_count"
+  ]
+}

@@ -38,6 +38,8 @@ def _git(repo: Path, *args: str) -> str:
         cwd=repo,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else "unknown"

@@ -278,12 +278,13 @@ def train_loop(
     epochs: int,
     batch_size: int = 512,
     lr: float = 2e-4,
+    weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     patience: int = 8,
     log=print,
 ):
     model.to(device).train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -356,7 +357,9 @@ def main(argv=None) -> int:
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT_DEFAULT)
+    parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--overfit", action="store_true", help="no split, no early stop")
     parser.add_argument(
@@ -406,7 +409,9 @@ def main(argv=None) -> int:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
+        patience=args.patience,
     )
     final = evaluate(
         model,
@@ -424,6 +429,7 @@ def main(argv=None) -> int:
             "model": args.model,
             "d_model": args.d_model,
             "layers": args.layers,
+            "weight_decay": args.weight_decay,
             "aux_weight": args.aux_weight,
         }
         torch.save(make_checkpoint(model, config), out / f"{args.model}.pt")

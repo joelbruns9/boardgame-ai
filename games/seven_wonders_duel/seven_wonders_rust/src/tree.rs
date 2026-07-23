@@ -37,7 +37,9 @@ impl Edge {
         if self.probability_weighted {
             self.children
                 .iter()
-                .map(|(_, c)| c.probability.expect("weighted child needs probability") * c.node.value_p0())
+                .map(|(_, c)| {
+                    c.probability.expect("weighted child needs probability") * c.node.value_p0()
+                })
                 .sum()
         } else if self.visits > 0 {
             self.value_sum_p0 / self.visits as f64
@@ -224,6 +226,7 @@ pub fn closed_tree_fixed<E: Eval>(
 
 // --- F3.3: force-expansion + Gumbel root --------------------------------------
 
+#[derive(Clone, Debug)]
 pub struct SearchConfig {
     pub sims: usize,
     pub top_k: usize,
@@ -232,6 +235,9 @@ pub struct SearchConfig {
     pub c_scale: f64,
     pub seed: u64,
     pub force_expand_root_chance: bool,
+    /// Common root AgeDeal samples per legal action. Zero preserves the legacy
+    /// independently-sampled behavior.
+    pub age_deal_samples: usize,
 }
 
 pub struct SearchResult {

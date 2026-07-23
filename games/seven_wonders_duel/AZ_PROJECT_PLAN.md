@@ -57,7 +57,7 @@ runner. This plan is milestone 7 onward.
 | Control model | Flat MLP on same features | Fast baseline + architecturally independent sparring partner (run5/run10 monoculture lesson) |
 | Buffer schema | Replayable from day 1: seed + action sequence + per-move search stats | Reanalyze (Phase G) is a bolt-on, not a migration |
 | Gating | SPRT (fishtest-style), not fixed-N matches | ~3× cheaper gating on clear results |
-| Exact layer | Expectiminimax + Star1/Star2 tail solver, Age III exact / Ages I–II exact-to-boundary | §7; reuses the generic Rust `search::Game` trait (game #2) |
+| Exact layer | **No planned endgame solver** | Buried/unrevealed identities make a true-state solve information-leaking and an exact information-set solve expensive; use closed chance search, optional force expansion, stronger quality gates, and scaled MCTS instead. Reopen only from measured post-training tail blunders |
 
 ---
 
@@ -67,10 +67,10 @@ runner. This plan is milestone 7 onward.
 inventory so no phase silently rebuilds something that exists — and so nothing
 KD-shaped gets forced onto 7WD where it doesn't fit.
 
-### Reuse via extraction (the "build one, extract at two" items — extraction happens now)
+### Reuse and conditional extraction (the "build one, extract at two" items are audited now)
 | Asset | Where it lives | Action |
 |---|---|---|
-| Generic search trait (`Game`/`Eval`/`SearchConfig`, `splitmix64`, expectiminimax `value`/`choose_action`, Star-ready chance children) | `kingdomino_rust/src/search.rs` | Physical crate split into a shared search crate at Phase F; 7WD implements `Game` (needed by the Phase H solver regardless) |
+| Search/inference scaffolding (`Game`/`Eval`/`SearchConfig` boundary shape, `splitmix64`, arena/pending paths, coalescing, instrumentation) | `kingdomino_rust/src/search.rs`, M6 batching path | Reuse patterns immediately; physically extract only the concrete surface shared by both production clients after 7WD's fresh Gumbel/chance MCTS proves it |
 | Python loop harness: worker orchestration, promotion/gating, HOF, run manifests | `threaded_self_play.py`, `hof.py`, `evaluation.py`, `test_run_manifest.py` pattern | **Audit coupling in early Phase D, extract a game-agnostic loop package behind a small GameAdapter interface** (setup/step/encode/codec/match-runner). Same rule that justified `search.rs` |
 | Elo ledger + anchors tooling | `elo_rating.py`, `elo_db*.json`, `elo_anchors*.csv`, `round_robin_eval.py` | Near-verbatim with agent adapters; add SPRT termination (new — KD used fixed-N round robins) |
 | Batched inference service (leaf coalescing, GIL release / `allow_threads`, double-buffering) | `inference_service.py`, M6 Rust coalescing design | Port the design; the transformer swaps in behind the same batching boundary |
@@ -304,31 +304,37 @@ cleared; raise consequential yield before any "world best" claim.
 
 ## 8. Phase F — Rust port (the Kingdomino discipline)
 
-Reuse `kingdomino_rust`'s generic `search::Game` trait — 7WD is impl #2, the
-"extract at two" moment. Physical crate split into a shared search/NN crate happens
-here, per the standing plan.
+Reuse KD's proven arena, RNG, detached-Rust, coalescing, and instrumentation
+patterns, but write 7WD's Gumbel/chance MCTS in `seven_wonders_rust`. Physical
+shared-crate extraction is conditional on a concrete production surface genuinely
+shared by both games; the old Phase-H-solver rationale no longer applies.
 
 Working doc: `PHASE_F.md` (gate definitions, crate-split decisions, running log).
 
 Order, each step behind a bit-exact/1e-6 equivalence gate vs the Python reference
 (the Kingdomino M1–M6 pattern):
-1. **Engine with make/unmake from day one** (solver and MCTS share one state core —
-   do not retrofit like Kingdomino had to). Differential gate: replay ≥10k Python
+1. **Engine with make/unmake from day one** (MCTS and complete Rust self-play share
+   one state core — do not retrofit the mutation boundary later). Differential
+   gate: replay ≥10k Python
    games byte-exactly; make/unmake round-trip fingerprint test. This is the cost
    center — 7WD effect resolution (chains, pendings, supremacies, extra turns) is
    meaningfully more intricate than Kingdomino.
 2. **Encoder + codec in Rust**, bit-exact vs Python on ≥100k sampled states.
 3. **Searcher (winning mode per §7's decision rule; both if Tier 1 was close)**
-   + Gumbel root — written fresh in the shared
-   crate per the §2b decision, porting KD's arena/coalescing/`allow_threads`
-   scaffolding; tree values match the Python reference searcher on fixed
-   seeds/positions.
-4. **Batched inference bridge**: leaf coalescing + GIL release (port the Kingdomino
-   `allow_threads` + in-process coalescing design); or ONNX/tch in-process if the
-   Python hop dominates profiles.
+   + Gumbel root — written in `seven_wonders_rust`, porting KD's
+   arena/coalescing/`allow_threads` scaffolding. Extract only independently
+   reusable, dependency-light primitives when the reuse audit justifies it;
+   tree values match the Python reference searcher on fixed seeds/positions.
+4. **Batched inference bridge + complete Rust hot path**: arena/phase-split search,
+   WU-style incomplete visits, cooperative full-game Rust scheduling, flat
+   transformer buffers, and one global-batch Python/Torch worker. Measure the
+   Python/Torch boundary; use ONNX/tch/native inference only if it remains a
+   material bottleneck.
 
-Phase gate: ≥20× self-play throughput vs Python loop at equal settings (Kingdomino
-achieved ~28×).
+Phase gate is conjunctive: exact `leaf_batch=1` refactor, strengthened fast-search
+quality/non-inferiority, scheduler/replay correctness, complete Rust hot path,
+≥20× vs Python at equal settings on the laptop (Kingdomino achieved ~28×), and a
+confirmed production configuration from the checked-in Rust-only cloud sweep.
 
 ## 9. Phase G — Scaled training + modern training science
 
@@ -359,31 +365,28 @@ these statistics are policy-generated and never become encoder features or
 training targets (circularity); the sole stats-into-training channels remain the
 annealed draft prior and buffer seeding (§2, §6).
 
-## 10. Phase H — Exact layer (expectiminimax tail solver)
+## 10. Phase H — Retired exact-layer proposal
 
-Not pure alpha-beta: expectiminimax with alpha-beta on decision layers + Star1/Star2
-on reveal chance nodes (bounded, 3-valued terminal outcomes prune hard). Exactness is
-game-theoretically sound despite hidden cards because information is symmetric —
-expectimax over the exchangeability marginals IS the true game.
+**Decision 2026-07-21: no planned 7WD endgame solver.** A solver over the engine's
+true buried/unrevealed identities would leak information unavailable to either
+player. A game-theoretically correct information-set solver would have to average
+over every hidden arrangement consistent with public knowledge and is not assumed
+to be a cost-effective training component. The short suffix after every future
+playable card is public is not enough current leverage to reserve implementation
+time or CPU capacity.
 
-- **Age III tail solve**: exact win/tie/loss from the official cascade; catches
-  mid-age military/science instant wins. Feasibility: decision branching ~4–8
-  (pyramid tapers), reveal m ≤ 6 late, TT + NN-policy move ordering → last 6–8 cards
-  in ~seconds at Rust speeds; trigger on cards-remaining threshold or tree-size
-  estimate; iterative deepening under the move clock; completed solve overrides MCTS.
-- **Ages I/II**: exact-to-boundary with NN leaf at the pre-deal age boundary (solving
-  past the deal is combinatorial). Ensure boundary states appear in training data or
-  average the NN over sampled deals.
-- **Root tactical verifier** (all phases of the game): shallow exact check that no
-  candidate move allows an immediate loss via reveal or reply; cheap veto layer over
-  the MCTS choice.
-- **Training feedback**: relabel all buffer positions within solver range with proven
-  values — the highest-quality value targets available, manufactured offline.
+Closed chance-aware MCTS, the optional force-expansion toggle, the consequential
+trap suite, reanalysis, and eval-time simulation scaling are the planned tactical
+tools. Reopen an exact public-tail diagnostic only if later trained checkpoints
+show systematic consequential tail blunders that more search and force expansion
+do not fix. Any reopened solver must have an explicit no-hidden-information-leak
+gate and is not part of the self-play throughput architecture.
 
 ## 11. Phase I — Evaluation & the world-best campaign
 
 - **Eval-time scaling**: tree reuse across moves, pondering, 10–50k sims for matches,
-  force-expanded chance nodes at the root, tail solver active. Strength here is
+  and force-expanded chance nodes at the root when the quality/cost gate supports
+  them. Strength here is
   nearly free and ZeusAI's eval config (5k sims) is the bar to clear on search alone.
 - **Anchors**: fixed ladder = random → greedy → rush bots → Phase-D net → HOF
   checkpoints; Elo ledger maintained per run (Kingdomino tooling).
@@ -401,12 +404,12 @@ expectimax over the exchangeability marginals IS the true game.
 | Risk | Mitigation |
 |---|---|
 | 7WD engine port complexity (pendings, chains, supremacies) blows Phase F budget | Make/unmake differential gates vs Python on day 1; port effect-by-effect against the rules-oracle matrix |
-| Gumbel low-sim search misses 1/11 catastrophic reveals | Closed-mode force-expansion near root; root tactical verifier; trap-suite regression per checkpoint |
+| Gumbel low-sim search misses 1/11 catastrophic reveals | Closed-mode force-expansion near root; strengthened consequential trap/regret gates; reanalysis and higher eval-time sims |
 | Stale-prior pathology if open mode wins the A/B | Re-run trap suite mid-training; per-descent prior re-masking; revisit decision if blunder rate drifts |
 | Rush-bot seeding biases the policy | Anneal to zero; monitor victory mix; seeded games excluded from policy targets after iteration ~10 (value targets only) |
 | Draft prior locks in ZeusAI's (possibly wrong) tiers | λ→0 anneal; log pick-rate divergence from tiers as the net takes over |
 | Aux heads distract capacity at small scale | Aux loss weights ~0.1–0.3; ablate once in Phase D |
-| Value head miscalibrated at age boundaries (pre-deal states) | Include boundary states in training encodes; or average NN over sampled deals in solver leaves |
+| Value head miscalibrated at age boundaries (pre-deal states) | Include boundary states in training encodes; reanalyze with the current net over sampled public-consistent deals if diagnostics require it |
 | Buffer schema missing a field reanalyze needs later | A4 gate: full bit-exact replay from (seed, actions) — anything derivable is recoverable |
 
 ## 13. What is deliberately NOT in scope (yet)

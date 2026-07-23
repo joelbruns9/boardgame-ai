@@ -58,10 +58,10 @@ pub struct PendingChoice {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CityState {
     pub coins: i32,
-    pub wonders: Vec<usize>,        // wonder ids, draft order
-    pub built_wonders: Vec<usize>,  // wonder ids, build order
-    pub buildings: Vec<usize>,      // card ids, build order
-    pub progress_tokens: Vec<usize>, // progress ids, acquire order
+    pub wonders: Vec<usize>,                       // wonder ids, draft order
+    pub built_wonders: Vec<usize>,                 // wonder ids, build order
+    pub buildings: Vec<usize>,                     // card ids, build order
+    pub progress_tokens: Vec<usize>,               // progress ids, acquire order
     pub claimed_science_pairs: Vec<ScienceSymbol>, // set semantics
 }
 
@@ -115,9 +115,7 @@ impl TableauState {
         if !card.present {
             return false;
         }
-        !coverers(self.age, i)
-            .iter()
-            .any(|&c| self.slots[c].present)
+        !coverers(self.age, i).iter().any(|&c| self.slots[c].present)
     }
 
     /// Slot indices of accessible cards, in layout order.
@@ -135,9 +133,7 @@ impl TableauState {
         let card_id = self.slots[i].card_id;
         self.slots[i].present = false;
         let mut newly: Vec<usize> = (0..self.slots.len())
-            .filter(|&j| {
-                self.slots[j].present && !self.slots[j].revealed && self.is_accessible(j)
-            })
+            .filter(|&j| self.slots[j].present && !self.slots[j].revealed && self.is_accessible(j))
             .collect();
         newly.sort_by_key(|&j| self.slot_id(j));
         (card_id, newly)
@@ -156,8 +152,7 @@ impl TableauState {
     /// Index of the unique accessible slot holding `card_id` (accessible ⇒
     /// revealed; no duplicate cards ⇒ bijective). Mirrors `_slot_for_card`.
     pub fn accessible_slot_of(&self, card_id: usize) -> Option<usize> {
-        (0..self.slots.len())
-            .find(|&i| self.is_accessible(i) && self.slots[i].card_id == card_id)
+        (0..self.slots.len()).find(|&i| self.is_accessible(i) && self.slots[i].card_id == card_id)
     }
 }
 

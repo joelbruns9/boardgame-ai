@@ -13,7 +13,7 @@ the slow reference implementation permanently.
 
 ### F1 — Engine with make/unmake (the cost center)
 
-One state core shared by MCTS and the future Phase H solver; make/unmake from
+One state core shared by MCTS and the full Rust self-play path; make/unmake from
 day one, not retrofitted. Port effect-by-effect against `RULES_ORACLE.md`;
 7WD resolution (chains, pendings, supremacies, extra turns) is meaningfully
 more intricate than Kingdomino's.
@@ -120,10 +120,11 @@ more intricate than Kingdomino's.
     hidden cards) to preserve the "real GameState instead of stub" and
     "face-down back class from hidden id" guarantees.
 
-### F3 — Searcher + Gumbel root (shared crate)
+### F3 — Searcher + Gumbel root (in-crate; extraction conditional)
 
-Written fresh in the shared search crate (see crate split below), porting KD's
-arena/coalescing/`allow_threads` scaffolding.
+Written fresh inside `seven_wonders_rust`, porting KD's
+arena/coalescing/`allow_threads` scaffolding. A shared-crate extraction remains
+an independently gated, conditional follow-up (see crate split below).
 
 - **Mode scope — resolved by E-Tier-1 (2026-07-20 verdict below):** port the
   **closed searcher with `force_expand_root_chance` as a runtime toggle** (one
@@ -327,53 +328,241 @@ arena/coalescing/`allow_threads` scaffolding.
     - **F4 handoff notes (from review):** F4 needs more than `evaluate_batch` —
       split descent into selection/materialization, pending-leaf batched eval,
       and backprop; pass precomputed actor/legal to the evaluator; encode into
-      reusable flat buffers (not Python token objects); batch forced children and
-      keep their priors (kill the first-visit re-eval); keep the scalar search as
-      the oracle and require `leaf_batch=1` to match it exactly before testing
-      larger batches statistically.
+      reusable flat buffers (not Python token objects); cache batched forced-child
+      evaluations but consume them on the first ordinary visit so search depth and
+      accounting stay unchanged; keep the scalar search as the oracle and require
+      `leaf_batch=1` to match it exactly before testing larger batches
+      statistically.
   - **F3.5** *(conditional)* — physical shared-crate extraction, KD gates intact.
   - Carries the F2 sign-off follow-up: hidden-resampling invariance test once
     determinization lands (F3.1).
-- Status: **scoped 2026-07-20; not started.** F1 + F2 green.
+- Status: **complete 2026-07-21.** F1–F3 green; conditional F3.5 extraction was
+  not triggered.
 
 ### F4 — Batched inference bridge
 
-Leaf coalescing + GIL release (KD M6 design: `py.detach`, in-process
-coalescing, `leaf_batch > 1`); ONNX/tch in-process only if profiles show the
-Python hop dominating.
+**Design doc: `F4_THROUGHPUT_DESIGN.md`** (revised 2026-07-21). The complete
+self-play hot path moves to Rust: game/chance advancement, resumable Gumbel search,
+action sampling, recording, and a cooperative pool of game slots. Python remains
+only the cold control plane and one global-batch Torch inference worker; the
+Python/Torch boundary is explicitly profiled before any native-NN decision.
 
-**Design doc: `F4_THROUGHPUT_DESIGN.md`** (2026-07-21) — F4's fast path is
-*deliberately not bit-identical* (coalescing defers backprops), so it's validated
-by: `leaf_batch=1` reproduces the F3.3 digest exactly, then `leaf_batch>1`
-(virtual loss) by statistical agreement + trap-fixture blunder rate + a
-`leaf_batch` sweep. Architecture follows KD's measured recipe for the same box/GPU
-(RTX 5090): **in-process coalescing** — ~32 concurrent game searches multiplexed
-on **1–2 cores** (threads/channels or a cooperative loop, **not rayon**), each
-with **virtual loss `lb≈6` (required, not optional)**, an in-process coalescer +
-`py.detach` around the GPU forward; the rest of the box is the **exact endgame
-solver's** (self-play is core-frugal by design). Virtual loss works with Gumbel
-(the root only schedules; sims descend PUCT below it) — flush pending backprops at
-halving-round boundaries. Sub-steps: F4.0 phase-split searcher (+ leaf_batch=1
-oracle), F4.1 virtual loss + coalescer, F4.2 benchmark, F4.3 perf, F4.4 optional
-in-process NN.
+The fast search uses **WU-style incomplete visit counts** below the Gumbel root:
+pending simulations contribute to effective PUCT visits but never inject a
+fictional Q value. Leaf waves follow the sequential root schedule and fully drain
+before every halving reduction. `leaf_batch` and the pending policy are selected
+by the strengthened laptop quality suite and checked into
+`f4_quality_lock.json`; cloud calibration may not retune them.
 
-- **Gate F4 (= Phase F exit):** ≥20× self-play throughput vs the Python loop
-  at equal settings (KD achieved ~28×).
-- Status: **designed 2026-07-21; not started.**
+There is **no planned 7WD exact endgame solver and no reserved CPU budget**.
+Scheduler threads/shards, concurrent slots, global batch cap, wait window,
+buffering, and transformer packing are tuned for maximum games/s on the target
+cloud GPU. The checked-in `run_f4_cloud_sweep.sh` runs only the Rust production
+generator — no Python self-play baseline on rented time.
+
+Sub-steps: F4.0 contracts/instrumentation; F4.1 arena + exact resumable phase
+split; F4.2 WU leaf waves + laptop quality lock; F4.3 complete Rust game slot;
+F4.4 cooperative scheduler/global coalescer; F4.5 transformer boundary +
+semantic-safe forced cache; F4.6 local/cloud performance exit; F4.7 optional
+native NN.
+
+- **F4.0 DONE 2026-07-21 — preregistered contracts.**
+  `f4_contract.json` freezes the quality sample sizes/margins before any
+  `leaf_batch>1` observation, the laptop comparison, quality-lock fields, cloud
+  override prohibitions, and the complete component-metric vocabulary. Headline
+  quality bars: ≥240 stratified positions (≥50 consequential, ≥30 baseline-clean
+  consequential), 32 paired seeds/position, zero new clean-fixture blunders,
+  one-sided 95% upper trap-rate delta ≤+2 percentage points, regret/policy/value
+  bounds, and playing-strength lower bound ≥-25 Elo over ≥1,200 seat-swapped
+  pairs. The laptop speed gate remains a 95% lower speedup bound ≥20× over at
+  least five 100-game repetitions after warmup.
+- **F4.1 DONE 2026-07-21 — arena + exact resumable phase split.**
+  `tree_resumable.rs` is deliberately separate from `tree.rs`, which remains the
+  permanent F3.3 oracle. The new path stores stable arena node IDs and pending
+  `(node_id, edge_id, chance_child_id)` steps, separates selection/materialization
+  from aligned evaluation application and backup, bypasses pending-count behavior
+  at `leaf_batch=1`, and preserves the scalar forced-child semantics pending the
+  separately gated F4.5 cache. The exact gate compares action/top-k/visits/sims,
+  policy/value to 1e-9, and the full canonical topology digest. Coverage includes
+  mock + real-net adapters, force off/on, enumerable and sampled chance, draft,
+  Ages I–III, between-age and pending choices, terminal leaves, varied seeds,
+  top-k, and non-power-of-two sim budgets. Acceptance run: `cargo test` 6/6 and
+  `pytest test_rust_engine_equiv.py` 26/26 green.
+- **F4.2 mechanics + calibration harness DONE 2026-07-21; registered quality
+  gate measured and failed.**
+  The arena now carries WU incomplete node/edge counts used only in deeper PUCT
+  exploration; completed Q is never perturbed. Scalar-order selection can fill a
+  leaf wave across root-candidate boundaries but the session refuses to reduce a
+  halving round until all requests/backups drain and every incomplete count is
+  zero. Pending leaves are deduplicated in insertion order, expanded once, and
+  backed up once per scheduled path; terminal leaves complete without an NN row.
+  Batch response alignment is checked, and evaluator/shape failures clear the
+  whole pending wave before surfacing the original error. Metrics cover scheduled,
+  requested/unique/terminal leaves, collisions, waves, and maximum path/unique
+  fill. `leaf_batch=1` still bypasses WU and remains full-digest exact.
+
+  `f4_quality.py` consumes the preregistered contract and a Phase-E-compatible
+  corpus, runs paired sequential-vs-WU searches, records completed-Q regret,
+  gap-stratified agreement, policy JS divergence, root-value error, trap deltas,
+  collision/fill metrics, natural sequential-seed variance, and the clustered
+  one-sided confidence bound. It cannot write `f4_quality_lock.json`; the
+  seat-swapped strength gate must also pass. `f4_corpus.py` deterministically
+  preserves the complete consequential Phase-E subset, then fills the registered
+  phase strata from replay buffers and records phase/chance coverage plus source
+  hashes. Rejected Phase-E candidates are intentionally not multiplied across the
+  32-seed sweep.
+
+  Smoke results are honest rather than promoted: one existing buffer supplies
+  307 positions with every phase quota ≥30 (card reveal 182, Great Library 16,
+  wonder reveal 4, age deal 33), but the current Phase-E bank has only **11/50**
+  required consequential positions. Therefore `structural_eligible=false`, no
+  leaf-batch sweep is accepted, and no quality lock exists yet. Regression run:
+  `cargo test` 6/6; Rust-equivalence + quality-contract pytest 32/32 green.
+
+  Final registered calibration (2026-07-21): Phase-E expansion produced 650
+  unique replayable candidates and 649 exact depth-2 labels (one frontier-cap
+  skip). The assembled corpus is structurally eligible with 306 positions, 100
+  consequential and 71 baseline-clean consequential fixtures, and phase counts
+  40/54/122/30/30/30 for Ages I/II/III, between-ages, pending-choice, and draft.
+  All 39,168 paired rows completed. No registered fast candidate passed: batch 2
+  cleared large-gap agreement, trap-rate non-inferiority, and value-error bounds,
+  but failed zero-new-clean-blunder, regret, policy-divergence, and medium-gap
+  agreement; batches 4/6/8 failed additional gates. Therefore
+  `largest_position_eligible_leaf_batch=null`, the strength runner was correctly
+  not started, and no `f4_quality_lock.json` was written. Frozen thresholds were
+  not changed after observing the result.
+
+- **F4.3 DONE 2026-07-21 — complete Rust self-play slot.**
+  `self_play.rs` owns a whole network-vs-network game after its locked setup:
+  the portable game RNG, full/cheap simulation selection, inclusive simulation
+  range, per-move search seed, Phase-D Wonder-tier prior blend, temperature
+  action sampling, search/game advancement, actual chance logging, policy
+  eligibility, move statistics, and final result. The fixed game RNG contract is
+  `SplitMix64(game_seed ^ 0xC6BC279692B5CC83)`, consumed per move in the order
+  full/cheap choice, simulation count, search seed, action sample. Both mock and
+  Python-network evaluator entry points return only after the game completes;
+  Python does not drive individual moves.
+
+  `rust_bridge.phase_d_record_from_rust` is cold-path compatibility work: it
+  converts the completed Rust record into the existing schema-1 `GameRecord`,
+  recomputes Python's RNG-inclusive mask/state/trajectory digests by replay, and
+  rejects any legal-mask, actor, chance-log, or final-result divergence. Great
+  Library's sole play-time simulator RNG draw is pre-locked at setup, so it does
+  not force control back across the language boundary. Targeted gate: a complete
+  `leaf_batch=1` game matches the independent sequential Python oracle
+  move-for-move (actions, schedule/seeds, visits/top-k/root values and policy
+  within 1e-14), final logic fingerprint, JSONL schema round-trip and replay;
+  the deterministic-record/Great-Library fixture, real evaluator-boundary full
+  game, and error/config contracts also pass (`pytest
+  test_f4_self_play.py`: 4/4 green). Full regression remains for the
+  scheduled overnight run.
+
+- **F4.4 DONE 2026-07-21 — cooperative scheduler + global coalescer.**
+  `run_many`/`run_many_pipelined` maintain independent resumable game slots and
+  advance each ready slot until it yields one indivisible root or WU leaf-wave
+  request. Requests are packed in stable slot order up to `global_batch_cap`,
+  never split across batches, and scattered by explicit slot/request ownership.
+  Completion order cannot affect returned order: records always follow input job
+  order. The network entry detaches the caller's GIL; one dedicated inference
+  worker owns the Python adapter, and configurable one/two-plus batch buffering
+  lets Rust scatter and advance batch N while the worker executes batch N+1.
+
+  The F4.4 adapter contract is one Python call over ordered
+  `(tokens, actor, legal)` rows and aligned `(value_actor, legal_priors)` rows.
+  `rust_global_batch_adapter` remains the object-boundary correctness fallback;
+  F4.5's production boundary below replaces it without changing scheduler
+  ownership/scatter semantics.
+
+  Every error path cancels outstanding search waves before returning. Adapter
+  errors/OOMs retain their original Python exception; row/shape errors are
+  localized before scatter; configurable inference timeout wakes all slots. A
+  timed-out Python/Torch call cannot be killed safely, so its worker is detached
+  with no slot/search ownership and exits when that call returns. The gate covers
+  cooperative-vs-independent exact games at `leaf_batch=1`, mixed token/legal
+  lengths, scalar-vs-global evaluator equivalence, cross-game leaf-wave fill,
+  deterministic ordering, replay/schema validity, dedicated-thread ownership,
+  adapter/shape/timeout cleanup, split-wave cap rejection, and a 12-slot stress
+  run (`pytest test_f4_scheduler.py`: 7/7 green).
+
+- **F4.5 DONE 2026-07-21 — flat transformer boundary + semantic-safe forced
+  cache.** `self_play_many_flat_net` packs reusable Rust numeric scratch into
+  aligned writable byte buffers (token offsets/type/entity/aux/features, actor,
+  legal offsets/actions). Cached actor/legal metadata flows from arena nodes and
+  root move metadata through global groups and the worker instead of being
+  recomputed during packing. `_RustFlatBatchAdapter` builds tensors directly,
+  runs the model once per global batch, gathers only legal logits, and transfers
+  only actor-relative value plus ragged legal policy rows back to Rust. It does
+  not reconstruct Python `Token`/`Encoding` objects or copy full policy and
+  auxiliary heads to CPU.
+
+  Boundary metrics add total/max tokens, padded tokens/padding ratio, Rust
+  encode-pack, queue wait, Python call, and result extraction. The Python adapter
+  separately records tensor construction, H2D, forward, legal gather, and D2H;
+  diagnostic synchronization is opt-in so production timing remains
+  asynchronous. Forced root children are materialized and evaluated in capped
+  batches, retain value+priors while preserving the old seeded visit/value, then
+  consume the cache on their first ordinary visit, expand, stop, and back up the
+  same value—avoiding both a duplicate inference and an extra-ply semantic drift.
+  Cooperative `force=true` is now supported.
+
+  Gates cover exact object-vs-flat deterministic games, real SWDNet boundary
+  agreement, replay/schema validity, buffer/cap contracts, exact forced-cache
+  result and tree digest at `leaf_batch=1` with fewer evaluator calls, and exact
+  independent-vs-cooperative forced games. Acceptance: `cargo test` 6/6 and 25
+  targeted F4.1–F4.5 Python regressions green. Final verification after all F4
+  implementation changes: `cargo fmt --check`, `cargo test` 6/6, and the complete
+  Seven Wonders Duel Python suite 295/295 green (one existing PyTorch warning).
+
+- **F4.6 implementation DONE 2026-07-21; registered measurements pending.**
+  `f4_throughput_bench.py` provides the frozen laptop Python-vs-Rust comparison
+  and the Rust-only cloud primitive. Runs are append-only/resumable, reject a
+  checkpoint or algorithm setting that differs from `f4_quality_lock.json`, emit
+  JSONL + CSV rows and exact manifests, and cover every registered scheduler,
+  inference-boundary, utilization, memory, collision, padding, and throughput
+  metric. The laptop decision uses a fixed-seed paired bootstrap over at least
+  five 100-game repetitions and accepts only when its one-sided 95% speedup lower
+  bound reaches 20x.
+
+  `run_f4_cloud_sweep.sh` is a checked-in staged Rust-only sweep over batch/slot
+  geometry, buffering, pinned transfer, and approved Torch compile modes. It
+  records OOM/operational failures instead of selecting them, ranks only
+  quality-locked eligible rows, repeats the winner, and runs a separate
+  synchronized diagnostic. `f4_cloud_finalize.py` refuses underfilled
+  confirmation, changed production geometry, non-synchronized diagnostics, or a
+  checkpoint/software/target-box mismatch. The shell script passes `bash -n` on
+  the development machine.
+
+- **F4.7 conditional decision implemented 2026-07-21.** Native inference is
+  required only when the synchronized target-box diagnostic attributes at least
+  15% of wall time to removable Python/PyO3 tensor-boundary work and the resulting
+  Amdahl upper bound is at least 1.10x. Otherwise the measured decision is
+  `skip_native_inference`; F4.7 does not become an unconditional port.
+
+- **Gate F4 (= Phase F exit, conjunctive):** `leaf_batch=1` equivalence;
+  strengthened WU/leaf-batch quality and playing-strength non-inferiority;
+  inference/scheduler and replay/schema correctness; complete Rust hot path;
+  ≥20× vs Python at equal settings on the laptop; and a confirmed Rust-only
+  production configuration from the cloud sweep.
+- Status: **all planned F4 implementation and conditional-F4.7 decision tooling
+  is present and the full regression suite is green. The registered fast-search
+  position gate failed, so F4 has not exited: strength, the quality lock, the
+  registered laptop comparison, and target-box cloud confirmation are correctly
+  blocked. Implementation artifacts are not substituted for those measurements.**
 
 ## Crate split ("extract at two")
 
-`kingdomino_rust/src/search.rs` (generic `Game`/`Eval`/`SearchConfig`,
-`splitmix64`, expectiminimax, Star-ready chance children) splits into a shared
-search/NN crate; 7WD is impl #2, KD is the regression client whose existing
-equivalence gates must keep passing unchanged.
+Potentially shared pieces include the generic `Game`/`Eval`/`SearchConfig`
+boundary shape, `splitmix64`, arena/pending-path machinery, inference batching,
+and instrumentation. Physical extraction remains conditional: 7WD is a fresh
+Gumbel/chance MCTS rather than a second client of KD's expectiminimax algorithm,
+so extract only a concrete surface that both production clients actually use.
 
 **F1 resolution (2026-07-19):** the physical shared-search-crate split is
 deferred to F3, as this section's open questions already anticipate — F1 has no
 searcher, so `seven_wonders_rust` is a standalone engine-only crate (`data` +
 `state` + `engine` + `codec` + pyo3 `lib`). Nothing KD-shaped is shared yet;
-F3 revisits the split when the Gumbel searcher and Star solver force the trait
-surface (open questions 1–4 below).
+F3 revisits the split when the Gumbel searcher makes the genuinely shared trait
+surface concrete (open questions 1–4 below).
 
 **F3 scoping resolution (2026-07-20):** deferred *again* — build the 7WD Gumbel
 searcher **inside `seven_wonders_rust`** first (adapting KD's `splitmix64`/arena/
@@ -384,14 +573,14 @@ shared; designing the trait boundary before the searcher exists risks churn and
 puts KD's regression gates at risk early. Open questions 1–4 are answered at
 extraction time, not up front.
 
-Open questions — resolve when F3 forces them, log answers below:
+Open questions — resolve only if production reuse triggers extraction, then log
+answers below:
 
 1. Crate layout and name; what moves (search trait, arena, coalescing, RNG)
    vs. what stays game-side (encoders, codecs, pyo3 modules).
-2. Trait surface for 7WD's chance layer: does `Game` grow first-class chance
-   nodes (4 chance kinds, search barrier, `resample_hidden`/UnseenPool), or
-   does the Gumbel MCTS sit beside the expectiminimax solver with a narrower
-   shared core?
+2. Trait surface for 7WD's chance layer: do shared interfaces grow first-class
+   chance nodes (4 chance kinds, search barrier, `resample_hidden`/UnseenPool),
+   or does the Gumbel MCTS keep a narrower game-local chance core?
 3. pyo3 boundary: one shared extension module or per-game modules over shared
    rlib internals.
 4. Where KD's regression gates run after the split (CI story for two clients).
@@ -446,9 +635,9 @@ Open questions — resolve when F3 forces them, log answers below:
     logic_fingerprint` mirrors it exactly. Compared at every decision plus final
     — strictly stronger than an end-state or trajectory hash, and it localizes
     the first divergent field on failure.
-  - **make/unmake (F1b):** snapshot-based undo — provides the solver-facing API
-    "from day one" and passes the round-trip gate; a journaled-delta undo is a
-    documented F3 optimization if search profiling wants cheaper undo. The gate
+  - **make/unmake (F1b):** snapshot-based undo — provides the search/self-play
+    mutation API "from day one" and passes the round-trip gate; a journaled-delta
+    undo is a documented optimization if profiling wants cheaper undo. The gate
     validates either implementation unchanged.
   - **Effect-parity gotcha confirmed:** only `total_coins`/`trade_coins` of a
     payment affect state (Economy rebate, Urbanism chain bonus), so the Rust
@@ -522,3 +711,36 @@ Open questions — resolve when F3 forces them, log answers below:
   - **Robustness caveat.** The mode decision is sound on this data, but 11
     consequential positions is thin for the "blunder rate ≈ 0" bar (plan §9).
     Raise consequential yield before treating robustness as cleared.
+- 2026-07-21: **No 7WD endgame solver or reserved solver cores.** Hidden cards
+  and three buried cards per round make a perfect-information tail solver a poor
+  match for the information-set game. Phase F reserves no CPU cores for one and
+  relies on search expansion plus forced-child retention.
+- 2026-07-21: **Full CPU self-play hot path in Rust; Python remains the control
+  plane and initial inference host.** Move generation, traversal, Gumbel
+  scheduling, chance handling, backup, and game advancement stay in Rust. The
+  Python/Torch boundary remains initially, but enqueue, transfer, forward,
+  synchronization, and decode costs are measured explicitly.
+- 2026-07-21: **WU-style incomplete visits are the default parallel-tree
+  mechanism.** Pending simulations increment counts used in PUCT exploration
+  while completed-value means remain unchanged. This preserves per-simulation
+  Gumbel accounting better than BU-style aggregated backups; Kingdomino-style
+  value-penalty virtual loss is only a gated fallback.
+- 2026-07-21: **Laptop locks quality; cloud sweep tunes production throughput.**
+  Laptop results retain the Rust-vs-Python comparison and lock `leaf_batch`.
+  The cloud benchmark runs only the production Rust path and sweeps scheduler
+  and batching settings for maximum self-play games/s on the rented GPU host.
+- 2026-07-21: **F4 implementation started; F4.0/F4.1 green.** Preregistered the
+  numerical quality/throughput/metrics contract in `f4_contract.json`, then added
+  the independent arena-backed resumable search path in `tree_resumable.rs`.
+  Keeping the recursive F3.3 tree untouched made the exact refactor gate a real
+  oracle comparison rather than a self-comparison. Mock, real-net, all-phase,
+  pending-choice, terminal-leaf, forced-enumeration, and sampled AGE_DEAL coverage
+  pass to 1e-9/full-digest exactness; full Rust equivalence module 26/26 green.
+- 2026-07-21: **F4.2 WU waves landed; calibration correctly remains open.** WU
+  incomplete counts, round-boundary drains, stable aligned batch requests,
+  pending-leaf dedup with per-path backup, terminal bypass, cleanup, and metrics
+  are gated in Rust/Python. Added the contract-driven position-quality runner and
+  deterministic stratified corpus builder. The all-phase corpus smoke cleared
+  structural phase coverage from one replay buffer but confirmed the known
+  consequential-fixture deficit (11 available vs 50 preregistered); no quality
+  lock was emitted.

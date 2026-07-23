@@ -12,7 +12,8 @@ from games.seven_wonders_duel.bots import (
     play_game,
     play_series,
 )
-from games.seven_wonders_duel.engine import ActionUse, legal_actions
+from games.seven_wonders_duel.codec import encode_action
+from games.seven_wonders_duel.engine import ActionUse, apply_action, legal_actions
 from games.seven_wonders_duel.game import (
     PendingChoice,
     PendingChoiceKind,
@@ -20,6 +21,7 @@ from games.seven_wonders_duel.game import (
     new_game,
 )
 from games.seven_wonders_duel.pool import resample_hidden
+from games.seven_wonders_duel.rust_bridge import rust_game_for_self_play
 
 
 RUSH_BOTS = (
@@ -27,6 +29,14 @@ RUSH_BOTS = (
     ScienceEconomyBot,
     MilitaryAggressiveBot,
     MilitaryEconomyBot,
+)
+
+RUST_BOTS = (
+    (GreedyBot, "greedy"),
+    (ScienceAggressiveBot, "science_aggressive/v1"),
+    (ScienceEconomyBot, "science_economy/v1"),
+    (MilitaryAggressiveBot, "military_aggressive/v1"),
+    (MilitaryEconomyBot, "military_economy/v1"),
 )
 
 
@@ -186,3 +196,21 @@ def test_terminal_state_has_no_bot_action():
     game = new_game(1)
     game.phase = Phase.COMPLETE
     assert legal_actions(game) == ()
+
+
+@pytest.mark.parametrize(("bot_type", "rust_name"), RUST_BOTS)
+def test_rust_bot_matches_python_for_a_complete_deterministic_game(
+    bot_type, rust_name
+):
+    seed = 2026072300
+    game = new_game(seed, first_player=1)
+    rust = rust_game_for_self_play(seed, 1)
+    bot = bot_type()
+    moves = 0
+    while game.phase is not Phase.COMPLETE:
+        expected = encode_action(game, bot.select_action(game))
+        assert rust.bot_action(rust_name) == expected
+        apply_action(game, bot.select_action(game))
+        rust.apply_index(expected)
+        moves += 1
+        assert moves <= 256

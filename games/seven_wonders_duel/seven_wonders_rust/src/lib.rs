@@ -6,6 +6,7 @@
 //! indices. See `state.rs` for why no Python RNG is modelled and why the
 //! fingerprint is the equivalence surface.
 
+mod bots;
 mod chance;
 mod codec;
 mod data;
@@ -15,13 +16,17 @@ mod eval;
 mod pool;
 mod rng;
 mod rules;
+mod self_play;
 mod state;
 mod tree;
+mod tree_resumable;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use std::collections::VecDeque;
 
+use eval::Eval;
 use state::{GameState, Setup};
 
 fn card_ids(names: &[String]) -> Vec<usize> {
@@ -32,6 +37,147 @@ fn wonder_ids(names: &[String]) -> Vec<usize> {
 }
 fn progress_ids(names: &[String]) -> Vec<usize> {
     names.iter().map(|n| data::progress_id(n)).collect()
+}
+
+fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("schema", 1)?;
+    out.set_item("spec_version", "codec-1")?;
+    out.set_item("seed", record.seed)?;
+    out.set_item("first_player", record.first_player)?;
+    out.set_item("iteration", record.iteration)?;
+    out.set_item("winner", record.winner)?;
+    out.set_item(
+        "victory_type",
+        record.victory_type.map(|kind| match kind {
+            state::VictoryType::Military => "military",
+            state::VictoryType::Scientific => "scientific",
+            state::VictoryType::Civilian => "civilian",
+            state::VictoryType::SharedCivilian => "shared_civilian",
+        }),
+    )?;
+    out.set_item("scores", record.scores)?;
+    let kind = if record.agent_names.iter().any(|name| name != "network") {
+        "mixed"
+    } else {
+        "self_play"
+    };
+    out.set_item(
+        "agents",
+        [
+            ("p0", record.agent_names[0].as_str()),
+            ("p1", record.agent_names[1].as_str()),
+            ("kind", kind),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>(),
+    )?;
+
+    let moves = PyList::empty(py);
+    for row in record.moves {
+        let item = PyDict::new(py);
+        item.set_item("i", row.i)?;
+        item.set_item("actor", row.actor)?;
+        item.set_item("action", row.action)?;
+        item.set_item("legal", row.legal)?;
+        item.set_item("visits", row.visits)?;
+        item.set_item(
+            "policy_target",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.policy_target)
+            },
+        )?;
+        item.set_item(
+            "root_value",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.root_value)
+            },
+        )?;
+        item.set_item("sims", row.sims)?;
+        item.set_item("mode", if row.is_bot { "bot" } else { "closed" })?;
+        item.set_item(
+            "gumbel_topk",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.gumbel_topk)
+            },
+        )?;
+        item.set_item("policy_excluded", row.policy_excluded)?;
+        item.set_item("full_search", row.full_search)?;
+        item.set_item("search_seed", row.search_seed)?;
+        moves.append(item)?;
+    }
+    out.set_item("moves", moves)?;
+
+    let chance_log = PyList::empty(py);
+    for event in record.chance_log {
+        let item = PyDict::new(py);
+        item.set_item("move_index", event.move_index)?;
+        item.set_item("kind_id", event.kind as u8)?;
+        item.set_item("outcome_ids", event.outcome.clone())?;
+        item.set_item(
+            "outcome",
+            event
+                .outcome
+                .into_iter()
+                .map(|id| self_play::component_name(event.kind, id))
+                .collect::<Vec<_>>(),
+        )?;
+        chance_log.append(item)?;
+    }
+    out.set_item("chance_log", chance_log)?;
+    out.set_item("final_fingerprint", record.final_fingerprint)?;
+    Ok(out.unbind())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_self_play_config(
+    game_seed: u64,
+    iteration: Option<i64>,
+    leaf_batch: usize,
+    cheap_sims_min: usize,
+    cheap_sims_max: usize,
+    full_sims_min: usize,
+    full_sims_max: usize,
+    full_search_fraction: f64,
+    top_k: usize,
+    draft_prior: f64,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    max_moves: usize,
+) -> self_play::SelfPlayConfig {
+    self_play::SelfPlayConfig {
+        game_seed,
+        iteration,
+        leaf_batch,
+        leaf_batch_by_player: None,
+        deterministic_actions: false,
+        cheap_sims_min,
+        cheap_sims_max,
+        full_sims_min,
+        full_sims_max,
+        full_search_fraction,
+        top_k,
+        draft_prior,
+        c_puct,
+        c_visit,
+        c_scale,
+        force_expand_root_chance: force,
+        age_deal_samples,
+        age_deal_samples_by_player: None,
+        bot_by_player: [None, None],
+        bot_exploration: 0.0,
+        bot_policy_iterations: 10,
+        max_moves,
+    }
 }
 
 /// A 7WD game state driven from Python by codec action index.
@@ -93,8 +239,7 @@ impl RustGame {
             selected_guilds: card_ids(&selected_guilds),
             unused_guilds: card_ids(&unused_guilds),
         };
-        let draws: VecDeque<Vec<usize>> =
-            library_draws.iter().map(|d| progress_ids(d)).collect();
+        let draws: VecDeque<Vec<usize>> = library_draws.iter().map(|d| progress_ids(d)).collect();
         Ok(RustGame {
             state: GameState::from_setup(setup, draws),
         })
@@ -126,6 +271,21 @@ impl RustGame {
         Ok(())
     }
 
+    #[pyo3(signature = (kind, seed=0, exploration=0.0))]
+    fn bot_action(&self, kind: &str, seed: u64, exploration: f64) -> PyResult<usize> {
+        let kind = bots::BotKind::parse(kind)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown Rust bot: {kind}")))?;
+        if !(0.0..=1.0).contains(&exploration) {
+            return Err(PyValueError::new_err("exploration must be in [0, 1]"));
+        }
+        Ok(bots::select_action(
+            &self.state,
+            kind,
+            &mut rng::Rng::new(seed),
+            exploration,
+        ))
+    }
+
     /// F1b: apply `index` then unmake, returning whether the *complete* state is
     /// restored (`GameState: PartialEq`, not just the cross-language
     /// fingerprint). Leaves the game unchanged (snapshot-based undo).
@@ -151,7 +311,16 @@ impl RustGame {
     /// Returns `(age1, age2, age3, guild, wonders, offboard_progress)`, each a
     /// sorted id list — the encoder's hidden-structure inputs. Viewer-independent
     /// (hidden info is symmetric).
-    fn unseen_pool(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+    fn unseen_pool(
+        &self,
+    ) -> (
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+    ) {
         let p = pool::unseen_pool(&self.state);
         let [age1, age2, age3, guild] = p.cards;
         (age1, age2, age3, guild, p.wonders, p.offboard_progress)
@@ -191,10 +360,7 @@ impl RustGame {
     ) -> PyResult<Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)>> {
         let action = codec::decode_action(&self.state, index);
         let specs = chance::chance_signature(&self.state, &action);
-        if specs
-            .iter()
-            .any(|s| s.kind == chance::ChanceKind::AgeDeal)
-        {
+        if specs.iter().any(|s| s.kind == chance::ChanceKind::AgeDeal) {
             return Err(PyValueError::new_err("cannot enumerate AGE_DEAL chains"));
         }
         Ok(chance::enumerate_chains(&self.state, &specs))
@@ -272,7 +438,16 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
-    ) -> PyResult<(usize, f64, f64, Vec<u32>, Vec<f64>, Vec<usize>, usize, Vec<f64>)> {
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        Vec<f64>,
+    )> {
         let cfg = tree::SearchConfig {
             sims,
             top_k,
@@ -281,9 +456,9 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            age_deal_samples: 0,
         };
-        let (res, root) =
-            tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
+        let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
         tree::digest(&root, &mut dig);
         Ok((
@@ -294,6 +469,238 @@ impl RustGame {
             res.policy_target,
             res.gumbel_topk,
             res.sims,
+            dig,
+        ))
+    }
+
+    /// F4.1: arena-backed, phase-split closed search.  `leaf_batch=1` is the
+    /// exact refactor gate: selection/materialization yields an evaluation
+    /// request, evaluation is applied separately, and stable arena paths are
+    /// backed up before the next simulation is selected.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    fn closed_search_resumable(
+        &self,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        Vec<f64>,
+    )> {
+        let cfg = tree::SearchConfig {
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+            age_deal_samples: 0,
+        };
+        let (res, arena) = tree_resumable::search_closed(&self.state, &eval::MockEval, &cfg)?;
+        let mut dig = Vec::new();
+        tree_resumable::digest(&arena, &mut dig);
+        Ok((
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            dig,
+        ))
+    }
+
+    /// F4.1 real-evaluator counterpart to `closed_search_resumable`. This is
+    /// still the scalar F3.4 Python adapter; F4.4/F4.5 replace the boundary,
+    /// while this method keeps the phase split independently gateable today.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    fn closed_search_resumable_net(
+        &self,
+        adapter: Py<PyAny>,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        Vec<f64>,
+    )> {
+        let cfg = tree::SearchConfig {
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+            age_deal_samples: 0,
+        };
+        let evaluator = eval::PyEval::new(adapter);
+        let (res, arena) = tree_resumable::search_closed(&self.state, &evaluator, &cfg)?;
+        let mut dig = Vec::new();
+        tree_resumable::digest(&arena, &mut dig);
+        Ok((
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            dig,
+        ))
+    }
+
+    /// F4.2 WU-PUCT leaf waves under the deterministic mock evaluator. Returns
+    /// the normal search tuple plus `(scheduled, requested, unique, terminal,
+    /// collisions, waves, max_wave_paths, max_wave_unique)`, completed-Q aligned
+    /// to legal actions, and the tree digest.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    fn closed_search_batched(
+        &self,
+        leaf_batch: usize,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        (usize, usize, usize, usize, usize, usize, usize, usize),
+        Vec<f64>,
+        Vec<f64>,
+    )> {
+        let cfg = tree::SearchConfig {
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+            age_deal_samples: 0,
+        };
+        let (res, arena, metrics) =
+            tree_resumable::search_closed_batched(&self.state, &eval::MockEval, &cfg, leaf_batch)?;
+        let mut dig = Vec::new();
+        tree_resumable::digest(&arena, &mut dig);
+        Ok((
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            (
+                metrics.scheduled_simulations,
+                metrics.requested_nn_leaves,
+                metrics.unique_nn_leaves,
+                metrics.terminal_leaves,
+                metrics.collisions,
+                metrics.leaf_waves,
+                metrics.max_wave_paths,
+                metrics.max_wave_unique,
+            ),
+            metrics.root_completed_q,
+            dig,
+        ))
+    }
+
+    /// F4.2 WU leaf-wave path through the scalar correctness adapter. The
+    /// adapter remains one Python call per unique leaf until the F4.4 global
+    /// coalescer; this surface gates batched search semantics with a real net.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (adapter, leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    fn closed_search_batched_net(
+        &self,
+        adapter: Py<PyAny>,
+        leaf_batch: usize,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        (usize, usize, usize, usize, usize, usize, usize, usize),
+        Vec<f64>,
+        Vec<f64>,
+    )> {
+        let cfg = tree::SearchConfig {
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+            age_deal_samples: 0,
+        };
+        let evaluator = eval::PyEval::new(adapter);
+        let (res, arena, metrics) =
+            tree_resumable::search_closed_batched(&self.state, &evaluator, &cfg, leaf_batch)?;
+        let mut dig = Vec::new();
+        tree_resumable::digest(&arena, &mut dig);
+        Ok((
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            (
+                metrics.scheduled_simulations,
+                metrics.requested_nn_leaves,
+                metrics.unique_nn_leaves,
+                metrics.terminal_leaves,
+                metrics.collisions,
+                metrics.leaf_waves,
+                metrics.max_wave_paths,
+                metrics.max_wave_unique,
+            ),
+            metrics.root_completed_q,
             dig,
         ))
     }
@@ -313,7 +720,16 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
-    ) -> PyResult<(usize, f64, f64, Vec<u32>, Vec<f64>, Vec<usize>, usize, Vec<f64>)> {
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        Vec<f64>,
+    )> {
         let cfg = tree::SearchConfig {
             sims,
             top_k,
@@ -322,10 +738,10 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            age_deal_samples: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
-        let (res, root) =
-            tree::search_closed(&self.state, &evaluator, &cfg)?;
+        let (res, root) = tree::search_closed(&self.state, &evaluator, &cfg)?;
         let mut dig = Vec::new();
         tree::digest(&root, &mut dig);
         Ok((
@@ -338,6 +754,109 @@ impl RustGame {
             res.sims,
             dig,
         ))
+    }
+
+    /// F4.3: run one complete network-vs-network self-play game in Rust under
+    /// the deterministic Phase-D schedule.  Python is called only for neural
+    /// leaf evaluations and receives one completed raw record at the end.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        adapter, game_seed, leaf_batch, cheap_sims_min, cheap_sims_max,
+        full_sims_min, full_sims_max, full_search_fraction, top_k, draft_prior,
+        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+        age_deal_samples=0, max_moves=256
+    ))]
+    fn self_play_net(
+        &self,
+        adapter: Py<PyAny>,
+        game_seed: u64,
+        leaf_batch: usize,
+        cheap_sims_min: usize,
+        cheap_sims_max: usize,
+        full_sims_min: usize,
+        full_sims_max: usize,
+        full_search_fraction: f64,
+        top_k: usize,
+        draft_prior: f64,
+        iteration: Option<i64>,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+        age_deal_samples: usize,
+        max_moves: usize,
+    ) -> PyResult<Py<PyDict>> {
+        let cfg = make_self_play_config(
+            game_seed,
+            iteration,
+            leaf_batch,
+            cheap_sims_min,
+            cheap_sims_max,
+            full_sims_min,
+            full_sims_max,
+            full_search_fraction,
+            top_k,
+            draft_prior,
+            c_puct,
+            c_visit,
+            c_scale,
+            force,
+            age_deal_samples,
+            max_moves,
+        );
+        let evaluator = eval::PyEval::new(adapter);
+        let record = self_play::run(&self.state, &evaluator, &cfg)?;
+        Python::attach(|py| self_play_record_to_py(py, record))
+    }
+
+    /// Deterministic mock-evaluator counterpart used by the F4.3 full-game
+    /// oracle and replay/schema gates.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        game_seed, leaf_batch, cheap_sims_min, cheap_sims_max, full_sims_min,
+        full_sims_max, full_search_fraction, top_k, draft_prior,
+        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+        age_deal_samples=0, max_moves=256
+    ))]
+    fn self_play_mock(
+        &self,
+        game_seed: u64,
+        leaf_batch: usize,
+        cheap_sims_min: usize,
+        cheap_sims_max: usize,
+        full_sims_min: usize,
+        full_sims_max: usize,
+        full_search_fraction: f64,
+        top_k: usize,
+        draft_prior: f64,
+        iteration: Option<i64>,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+        age_deal_samples: usize,
+        max_moves: usize,
+    ) -> PyResult<Py<PyDict>> {
+        let cfg = make_self_play_config(
+            game_seed,
+            iteration,
+            leaf_batch,
+            cheap_sims_min,
+            cheap_sims_max,
+            full_sims_min,
+            full_sims_max,
+            full_search_fraction,
+            top_k,
+            draft_prior,
+            c_puct,
+            c_visit,
+            c_scale,
+            force,
+            age_deal_samples,
+            max_moves,
+        );
+        let record = self_play::run(&self.state, &eval::MockEval, &cfg)?;
+        Python::attach(|py| self_play_record_to_py(py, record))
     }
 
     fn is_complete(&self) -> bool {
@@ -379,6 +898,719 @@ fn ln_values(xs: Vec<f64>) -> Vec<f64> {
     xs.iter().map(|&x| x.ln()).collect()
 }
 
+fn scheduler_result_to_py(
+    py: Python<'_>,
+    result: self_play::SchedulerResult,
+) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+    let records = result
+        .records
+        .into_iter()
+        .map(|record| self_play_record_to_py(py, record))
+        .collect::<PyResult<_>>()?;
+    let metrics = PyDict::new(py);
+    let m = result.metrics;
+    metrics.set_item("games", m.games)?;
+    metrics.set_item("moves", m.moves)?;
+    metrics.set_item("simulations", m.simulations)?;
+    metrics.set_item("requested_nn_leaves", m.requested_nn_leaves)?;
+    metrics.set_item("unique_nn_leaves", m.unique_nn_leaves)?;
+    metrics.set_item("terminal_leaves", m.terminal_leaves)?;
+    metrics.set_item("collisions", m.collisions)?;
+    metrics.set_item("global_batches", m.global_batches)?;
+    metrics.set_item("global_rows", m.global_rows)?;
+    metrics.set_item("root_rows", m.root_rows)?;
+    metrics.set_item("leaf_rows", m.leaf_rows)?;
+    metrics.set_item("forced_rows", m.forced_rows)?;
+    metrics.set_item("forced_card_reveal_rows", m.forced_rows_by_kind[0])?;
+    metrics.set_item("forced_great_library_rows", m.forced_rows_by_kind[1])?;
+    metrics.set_item("forced_wonder_group_rows", m.forced_rows_by_kind[2])?;
+    metrics.set_item("forced_age_deal_rows", m.forced_rows_by_kind[3])?;
+    metrics.set_item("ordinary_leaf_rows", m.ordinary_leaf_rows)?;
+    metrics.set_item("forced_cache_hits", m.forced_cache_hits)?;
+    metrics.set_item("forced_rows_per_search", m.forced_rows_per_search.clone())?;
+    metrics.set_item("max_batch_rows", m.max_batch_rows)?;
+    metrics.set_item("scheduler_cycles", m.scheduler_cycles)?;
+    metrics.set_item("scheduler_workers", m.scheduler_workers)?;
+    metrics.set_item("max_inflight_batches", m.max_inflight_batches)?;
+    metrics.set_item("boundary_tokens", m.boundary_tokens)?;
+    metrics.set_item("boundary_padded_tokens", m.boundary_padded_tokens)?;
+    metrics.set_item("boundary_max_tokens", m.boundary_max_tokens)?;
+    metrics.set_item("encode_pack_ns", m.encode_pack_ns)?;
+    metrics.set_item("queue_wait_ns", m.queue_wait_ns)?;
+    metrics.set_item("py_call_ns", m.py_call_ns)?;
+    metrics.set_item("extract_ns", m.extract_ns)?;
+    metrics.set_item("rust_tree_ns", m.rust_tree_ns)?;
+    metrics.set_item("rust_chance_ns", m.rust_chance_ns)?;
+    metrics.set_item("rust_record_ns", m.rust_record_ns)?;
+    metrics.set_item("scatter_ns", m.scatter_ns)?;
+    metrics.set_item("scheduler_ready_slot_cycles", m.scheduler_ready_slot_cycles)?;
+    metrics.set_item(
+        "scheduler_waiting_slot_cycles",
+        m.scheduler_waiting_slot_cycles,
+    )?;
+    metrics.set_item("scheduler_idle_slot_cycles", m.scheduler_idle_slot_cycles)?;
+    metrics.set_item(
+        "padding_ratio",
+        if m.boundary_padded_tokens == 0 {
+            0.0
+        } else {
+            1.0 - m.boundary_tokens as f64 / m.boundary_padded_tokens as f64
+        },
+    )?;
+    metrics.set_item("batch_rows", m.batch_rows.clone())?;
+    metrics.set_item(
+        "mean_batch_rows",
+        if m.batch_rows.is_empty() {
+            0.0
+        } else {
+            m.batch_rows.iter().sum::<usize>() as f64 / m.batch_rows.len() as f64
+        },
+    )?;
+    Ok((records, metrics.unbind()))
+}
+
+fn search_result_to_py(
+    py: Python<'_>,
+    result: tree::SearchResult,
+    metrics: tree_resumable::SearchMetrics,
+    digest: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("action", result.action_index)?;
+    out.set_item("action_value", result.action_value)?;
+    out.set_item("root_value", result.root_value)?;
+    out.set_item("visits", result.visits)?;
+    out.set_item("policy", result.policy_target)?;
+    out.set_item("topk", result.gumbel_topk)?;
+    out.set_item("sims", result.sims)?;
+    out.set_item("completed_q", metrics.root_completed_q)?;
+    out.set_item("digest", digest)?;
+    let counters = PyDict::new(py);
+    counters.set_item("scheduled", metrics.scheduled_simulations)?;
+    counters.set_item("requested", metrics.requested_nn_leaves)?;
+    counters.set_item("unique", metrics.unique_nn_leaves)?;
+    counters.set_item("terminal", metrics.terminal_leaves)?;
+    counters.set_item("collisions", metrics.collisions)?;
+    counters.set_item("waves", metrics.leaf_waves)?;
+    counters.set_item("max_wave_paths", metrics.max_wave_paths)?;
+    counters.set_item("max_wave_unique", metrics.max_wave_unique)?;
+    out.set_item("metrics", counters)?;
+    let nn_work = PyDict::new(py);
+    nn_work.set_item("forced_rows", metrics.forced_outcome_rows)?;
+    nn_work.set_item("forced_cache_hits", metrics.cached_forced_leaves)?;
+    out.set_item("nn_work", nn_work)?;
+    Ok(out.unbind())
+}
+
+/// F4.6 position-calibration primitive: run many independent root searches
+/// through one flat global evaluator instead of paying a scalar Python hop for
+/// every leaf. Results remain in input order and use the same resumable search.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
+    c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+    age_deal_samples=0, inference_timeout_ms=0.0
+))]
+fn search_many_flat_net(
+    py: Python<'_>,
+    adapter: Py<PyAny>,
+    games: Vec<Py<RustGame>>,
+    search_seeds: Vec<u64>,
+    global_batch_cap: usize,
+    leaf_batch: usize,
+    sims: usize,
+    top_k: usize,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    inference_timeout_ms: f64,
+) -> PyResult<Vec<Py<PyDict>>> {
+    if games.is_empty() || games.len() != search_seeds.len() {
+        return Err(PyValueError::new_err(
+            "games and search_seeds must be non-empty and aligned",
+        ));
+    }
+    if global_batch_cap == 0 || leaf_batch == 0 || sims == 0 || top_k == 0 {
+        return Err(PyValueError::new_err(
+            "global_batch_cap, leaf_batch, sims, and top_k must be positive",
+        ));
+    }
+    if leaf_batch > global_batch_cap {
+        return Err(PyValueError::new_err(format!(
+            "leaf_batch={leaf_batch} exceeds global_batch_cap={global_batch_cap}"
+        )));
+    }
+    let states: Vec<GameState> = games
+        .iter()
+        .map(|game| game.borrow(py).state.clone())
+        .collect();
+    let (worker, timed_out, _boundary_metrics, worker_handle) =
+        eval::spawn_py_flat_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+    let outputs = py.detach(move || {
+        let state_refs: Vec<&GameState> = states.iter().collect();
+        let actors: Vec<_> = states.iter().map(tree::state_actor).collect();
+        let legals: Vec<_> = states.iter().map(codec::legal_action_indices).collect();
+        let roots = worker.evaluate_batch_prepared(&state_refs, &actors, &legals)?;
+        let mut sessions = Vec::with_capacity(states.len());
+        for ((state, seed), evaluation) in states.iter().zip(search_seeds).zip(roots) {
+            let cfg = tree::SearchConfig {
+                sims,
+                top_k,
+                c_puct,
+                c_visit,
+                c_scale,
+                seed,
+                force_expand_root_chance: force,
+                age_deal_samples,
+            };
+            let session = if force {
+                tree_resumable::begin_search_from_root_forced(state, &cfg, leaf_batch, evaluation)?
+            } else {
+                tree_resumable::begin_search_from_root(state, &cfg, leaf_batch, evaluation)?
+            };
+            sessions.push(Some(session));
+        }
+
+        struct Group {
+            slot: usize,
+            request: tree_resumable::EvalBatchRequest,
+            states: Vec<GameState>,
+            actors: Vec<usize>,
+            legals: Vec<Vec<usize>>,
+        }
+
+        let mut completed: Vec<
+            Option<(tree::SearchResult, tree_resumable::SearchMetrics, Vec<f64>)>,
+        > = (0..sessions.len()).map(|_| None).collect();
+        while completed.iter().any(Option::is_none) {
+            let mut groups = VecDeque::new();
+            let live = sessions
+                .iter()
+                .filter(|session| session.is_some())
+                .count()
+                .max(1);
+            let forced_row_limit = (global_batch_cap / live).max(1);
+            for slot in 0..sessions.len() {
+                let Some(session) = sessions[slot].as_mut() else {
+                    continue;
+                };
+                match session.next_event_with_limit(forced_row_limit) {
+                    Ok(tree_resumable::SearchEvent::Evaluation(request)) => {
+                        let states = match session.evaluation_states(&request) {
+                            Ok(rows) => rows.into_iter().cloned().collect(),
+                            Err(err) => {
+                                session.cancel_pending();
+                                return Err(err);
+                            }
+                        };
+                        groups.push_back(Group {
+                            slot,
+                            actors: request.leaves.iter().map(|leaf| leaf.actor).collect(),
+                            legals: request
+                                .leaves
+                                .iter()
+                                .map(|leaf| leaf.legal.clone())
+                                .collect(),
+                            request,
+                            states,
+                        });
+                    }
+                    Ok(tree_resumable::SearchEvent::Complete) => {
+                        let session = sessions[slot].take().expect("session must exist");
+                        let (result, arena, metrics) = session.into_result()?;
+                        let mut digest = Vec::new();
+                        tree_resumable::digest(&arena, &mut digest);
+                        completed[slot] = Some((result, metrics, digest));
+                    }
+                    Err(err) => {
+                        session.cancel_pending();
+                        return Err(err);
+                    }
+                }
+            }
+            while !groups.is_empty() {
+                let mut batch = Vec::new();
+                let mut rows = 0;
+                while let Some(group) = groups.front() {
+                    let count = group.states.len();
+                    if count > global_batch_cap {
+                        for session in sessions.iter_mut().flatten() {
+                            session.cancel_pending();
+                        }
+                        return Err(PyValueError::new_err(format!(
+                            "search leaf wave has {count} rows above global cap {global_batch_cap}"
+                        )));
+                    }
+                    if !batch.is_empty() && rows + count > global_batch_cap {
+                        break;
+                    }
+                    rows += count;
+                    batch.push(groups.pop_front().expect("front group must exist"));
+                }
+                let owned: Vec<_> = batch
+                    .iter()
+                    .flat_map(|group| group.states.iter().cloned())
+                    .collect();
+                let actors: Vec<_> = batch
+                    .iter()
+                    .flat_map(|group| group.actors.iter().copied())
+                    .collect();
+                let legals: Vec<_> = batch
+                    .iter()
+                    .flat_map(|group| group.legals.iter().cloned())
+                    .collect();
+                let evaluations = match worker
+                    .submit_prepared(owned, actors, legals)
+                    .and_then(|ticket| ticket.wait())
+                {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        for session in sessions.iter_mut().flatten() {
+                            session.cancel_pending();
+                        }
+                        return Err(err);
+                    }
+                };
+                let mut cursor = 0;
+                for group in batch {
+                    let count = group.states.len();
+                    let result = sessions[group.slot]
+                        .as_mut()
+                        .expect("search session must exist")
+                        .apply_evaluations(
+                            group.request.request_id,
+                            evaluations[cursor..cursor + count].to_vec(),
+                        );
+                    cursor += count;
+                    if let Err(err) = result {
+                        for session in sessions.iter_mut().flatten() {
+                            session.cancel_pending();
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        drop(worker);
+        if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+            drop(worker_handle);
+        } else if worker_handle.join().is_err() {
+            return Err(PyRuntimeError::new_err(
+                "flat search inference worker panicked during shutdown",
+            ));
+        }
+        Ok(completed
+            .into_iter()
+            .map(|row| row.expect("all searches must complete"))
+            .collect::<Vec<_>>())
+    })?;
+    outputs
+        .into_iter()
+        .map(|(result, metrics, digest)| search_result_to_py(py, result, metrics, digest))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cooperative_jobs(
+    py: Python<'_>,
+    games: &[Py<RustGame>],
+    game_seeds: &[u64],
+    iteration: Option<i64>,
+    leaf_batch: usize,
+    cheap_sims_min: usize,
+    cheap_sims_max: usize,
+    full_sims_min: usize,
+    full_sims_max: usize,
+    full_search_fraction: f64,
+    top_k: usize,
+    draft_prior: f64,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    max_moves: usize,
+) -> PyResult<Vec<(GameState, self_play::SelfPlayConfig)>> {
+    if games.len() != game_seeds.len() {
+        return Err(PyValueError::new_err(format!(
+            "received {} games but {} game seeds",
+            games.len(),
+            game_seeds.len()
+        )));
+    }
+    games
+        .iter()
+        .zip(game_seeds)
+        .map(|(game, &game_seed)| {
+            let state = game.borrow(py).state.clone();
+            let cfg = make_self_play_config(
+                game_seed,
+                iteration,
+                leaf_batch,
+                cheap_sims_min,
+                cheap_sims_max,
+                full_sims_min,
+                full_sims_max,
+                full_search_fraction,
+                top_k,
+                draft_prior,
+                c_puct,
+                c_visit,
+                c_scale,
+                force,
+                age_deal_samples,
+                max_moves,
+            );
+            Ok((state, cfg))
+        })
+        .collect()
+}
+
+/// F4.4 deterministic cooperative scheduler under the mock evaluator.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
+    cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    force=false, age_deal_samples=0, max_moves=256
+))]
+fn self_play_many_mock(
+    py: Python<'_>,
+    games: Vec<Py<RustGame>>,
+    game_seeds: Vec<u64>,
+    global_batch_cap: usize,
+    leaf_batch: usize,
+    cheap_sims_min: usize,
+    cheap_sims_max: usize,
+    full_sims_min: usize,
+    full_sims_max: usize,
+    full_search_fraction: f64,
+    top_k: usize,
+    draft_prior: f64,
+    iteration: Option<i64>,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    max_moves: usize,
+) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+    let jobs = cooperative_jobs(
+        py,
+        &games,
+        &game_seeds,
+        iteration,
+        leaf_batch,
+        cheap_sims_min,
+        cheap_sims_max,
+        full_sims_min,
+        full_sims_max,
+        full_search_fraction,
+        top_k,
+        draft_prior,
+        c_puct,
+        c_visit,
+        c_scale,
+        force,
+        age_deal_samples,
+        max_moves,
+    )?;
+    let result = py.detach(move || self_play::run_many(jobs, &eval::MockEval, global_batch_cap))?;
+    scheduler_result_to_py(py, result)
+}
+
+/// F4.4 global Python evaluator boundary. `adapter(rows)` is called once per
+/// global batch; each row is `(tokens, actor, legal)` and results stay aligned.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
+    cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
+    max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
+    age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false
+))]
+fn self_play_many_net(
+    py: Python<'_>,
+    adapter: Py<PyAny>,
+    games: Vec<Py<RustGame>>,
+    game_seeds: Vec<u64>,
+    global_batch_cap: usize,
+    leaf_batch: usize,
+    cheap_sims_min: usize,
+    cheap_sims_max: usize,
+    full_sims_min: usize,
+    full_sims_max: usize,
+    full_search_fraction: f64,
+    top_k: usize,
+    draft_prior: f64,
+    iteration: Option<i64>,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    max_moves: usize,
+    inference_timeout_ms: f64,
+    max_inflight_batches: usize,
+    scheduler_workers: usize,
+    leaf_batch_p0: Option<usize>,
+    leaf_batch_p1: Option<usize>,
+    age_deal_samples_p0: Option<usize>,
+    age_deal_samples_p1: Option<usize>,
+    deterministic_actions: bool,
+) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+    let mut jobs = cooperative_jobs(
+        py,
+        &games,
+        &game_seeds,
+        iteration,
+        leaf_batch,
+        cheap_sims_min,
+        cheap_sims_max,
+        full_sims_min,
+        full_sims_max,
+        full_search_fraction,
+        top_k,
+        draft_prior,
+        c_puct,
+        c_visit,
+        c_scale,
+        force,
+        age_deal_samples,
+        max_moves,
+    )?;
+    match (leaf_batch_p0, leaf_batch_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) if p0 > 0 && p1 > 0 => {
+            for (_, cfg) in &mut jobs {
+                cfg.leaf_batch_by_player = Some([p0, p1]);
+                cfg.deterministic_actions = deterministic_actions;
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "leaf_batch_p0 and leaf_batch_p1 must be positive",
+            ));
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "leaf_batch_p0 and leaf_batch_p1 must be supplied together",
+            ));
+        }
+    }
+    if leaf_batch_p0.is_none() {
+        for (_, cfg) in &mut jobs {
+            cfg.deterministic_actions = deterministic_actions;
+        }
+    }
+    match (age_deal_samples_p0, age_deal_samples_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) if p0 <= 32 && p1 <= 32 => {
+            for (_, cfg) in &mut jobs {
+                cfg.age_deal_samples_by_player = Some([p0, p1]);
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "age_deal_samples_p0 and age_deal_samples_p1 cannot exceed 32",
+            ));
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "age_deal_samples_p0 and age_deal_samples_p1 must be supplied together",
+            ));
+        }
+    }
+    let (worker, timed_out, worker_handle) =
+        eval::spawn_py_batch_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+    let result = py.detach(move || {
+        let result = self_play::run_many_pipelined_sharded(
+            jobs,
+            &worker,
+            global_batch_cap,
+            max_inflight_batches,
+            scheduler_workers,
+        );
+        drop(worker);
+        if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+            // Rust cannot safely kill a Python/Torch call. Detach the timed-out
+            // worker so every scheduler slot wakes immediately; the worker owns
+            // no slot/search state and exits when the adapter call returns.
+            drop(worker_handle);
+            return result;
+        }
+        if worker_handle.join().is_err() {
+            return Err(PyRuntimeError::new_err(
+                "global inference worker panicked during shutdown",
+            ));
+        }
+        result
+    })?;
+    scheduler_result_to_py(py, result)
+}
+
+/// F4.5 production-shaped flat transformer boundary. The adapter receives one
+/// dictionary of packed byte buffers and returns only actor value plus priors
+/// aligned to the packed legal-action rows.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
+    cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
+    max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
+    age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
+    bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
+))]
+fn self_play_many_flat_net(
+    py: Python<'_>,
+    adapter: Py<PyAny>,
+    games: Vec<Py<RustGame>>,
+    game_seeds: Vec<u64>,
+    global_batch_cap: usize,
+    leaf_batch: usize,
+    cheap_sims_min: usize,
+    cheap_sims_max: usize,
+    full_sims_min: usize,
+    full_sims_max: usize,
+    full_search_fraction: f64,
+    top_k: usize,
+    draft_prior: f64,
+    iteration: Option<i64>,
+    c_puct: f64,
+    c_visit: f64,
+    c_scale: f64,
+    force: bool,
+    age_deal_samples: usize,
+    max_moves: usize,
+    inference_timeout_ms: f64,
+    max_inflight_batches: usize,
+    scheduler_workers: usize,
+    leaf_batch_p0: Option<usize>,
+    leaf_batch_p1: Option<usize>,
+    age_deal_samples_p0: Option<usize>,
+    age_deal_samples_p1: Option<usize>,
+    deterministic_actions: bool,
+    bot_p0: Option<String>,
+    bot_p1: Option<String>,
+    bot_exploration: f64,
+    bot_policy_iterations: i64,
+) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+    let mut jobs = cooperative_jobs(
+        py,
+        &games,
+        &game_seeds,
+        iteration,
+        leaf_batch,
+        cheap_sims_min,
+        cheap_sims_max,
+        full_sims_min,
+        full_sims_max,
+        full_search_fraction,
+        top_k,
+        draft_prior,
+        c_puct,
+        c_visit,
+        c_scale,
+        force,
+        age_deal_samples,
+        max_moves,
+    )?;
+    match (leaf_batch_p0, leaf_batch_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) if p0 > 0 && p1 > 0 => {
+            for (_, cfg) in &mut jobs {
+                cfg.leaf_batch_by_player = Some([p0, p1]);
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "leaf_batch_p0 and leaf_batch_p1 must be positive",
+            ));
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "leaf_batch_p0 and leaf_batch_p1 must be supplied together",
+            ));
+        }
+    }
+    let parse_bot = |name: Option<&str>| -> PyResult<Option<bots::BotKind>> {
+        name.map(|value| {
+            bots::BotKind::parse(value)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown Rust bot: {value}")))
+        })
+        .transpose()
+    };
+    let bot_by_player = [parse_bot(bot_p0.as_deref())?, parse_bot(bot_p1.as_deref())?];
+    for (_, cfg) in &mut jobs {
+        cfg.deterministic_actions = deterministic_actions;
+        cfg.bot_by_player = bot_by_player;
+        cfg.bot_exploration = bot_exploration;
+        cfg.bot_policy_iterations = bot_policy_iterations;
+    }
+    match (age_deal_samples_p0, age_deal_samples_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) if p0 <= 32 && p1 <= 32 => {
+            for (_, cfg) in &mut jobs {
+                cfg.age_deal_samples_by_player = Some([p0, p1]);
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "age_deal_samples_p0 and age_deal_samples_p1 cannot exceed 32",
+            ));
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "age_deal_samples_p0 and age_deal_samples_p1 must be supplied together",
+            ));
+        }
+    }
+    let (worker, timed_out, boundary_metrics, worker_handle) =
+        eval::spawn_py_flat_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+    let result = py.detach(move || {
+        let mut result = self_play::run_many_pipelined_sharded(
+            jobs,
+            &worker,
+            global_batch_cap,
+            max_inflight_batches,
+            scheduler_workers,
+        );
+        drop(worker);
+        if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+            drop(worker_handle);
+            return result;
+        }
+        if worker_handle.join().is_err() {
+            return Err(PyRuntimeError::new_err(
+                "flat inference worker panicked during shutdown",
+            ));
+        }
+        if let Ok(output) = &mut result {
+            let counters = boundary_metrics
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("boundary metrics lock poisoned"))?
+                .clone();
+            output.metrics.boundary_tokens = counters.tokens;
+            output.metrics.boundary_padded_tokens = counters.padded_tokens;
+            output.metrics.boundary_max_tokens = counters.max_tokens;
+            output.metrics.encode_pack_ns = counters.encode_pack_ns;
+            output.metrics.queue_wait_ns = counters.queue_wait_ns;
+            output.metrics.py_call_ns = counters.py_call_ns;
+            output.metrics.extract_ns = counters.extract_ns;
+        }
+        result
+    })?;
+    scheduler_result_to_py(py, result)
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -395,6 +1627,18 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::ln_values;
+
+    #[pymodule_export]
+    use super::self_play_many_mock;
+
+    #[pymodule_export]
+    use super::self_play_many_net;
+
+    #[pymodule_export]
+    use super::self_play_many_flat_net;
+
+    #[pymodule_export]
+    use super::search_many_flat_net;
 }
 
 #[cfg(test)]

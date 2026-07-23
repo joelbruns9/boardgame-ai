@@ -123,7 +123,10 @@ pub fn decode_action(g: &GameState, index: usize) -> Action {
         } else {
             (PROGRESS_LIBRARY_BASE, index - PROGRESS_LIBRARY_BASE)
         };
-        let pending = g.pending_choice.as_ref().expect("no pending choice in state");
+        let pending = g
+            .pending_choice
+            .as_ref()
+            .expect("no pending choice in state");
         assert_eq!(
             pending_base(pending.kind),
             base,

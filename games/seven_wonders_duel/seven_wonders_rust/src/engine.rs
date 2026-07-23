@@ -5,8 +5,7 @@
 //! locked state; only the Great Library draw consumes a recorded outcome.
 
 use crate::data::{
-    self, card, progress, progress_id, wonder, CardColor, Cost, EffectKind, Resource,
-    ScienceSymbol,
+    self, card, progress, progress_id, wonder, CardColor, Cost, EffectKind, Resource, ScienceSymbol,
 };
 use crate::rules::{discard_income, normal_trade_unit_cost};
 use crate::state::{GameState, PendingChoice, PendingChoiceKind, Phase, VictoryType};
@@ -106,7 +105,9 @@ fn count_color(g: &GameState, player: usize, color: CardColor) -> i32 {
 }
 
 fn has_token(g: &GameState, player: usize, name: &str) -> bool {
-    g.cities[player].progress_tokens.contains(&progress_id(name))
+    g.cities[player]
+        .progress_tokens
+        .contains(&progress_id(name))
 }
 
 pub(crate) fn fixed_production(g: &GameState, player: usize) -> [i32; 5] {
@@ -301,9 +302,7 @@ fn unbuilt_wonders(g: &GameState, player: usize) -> Vec<usize> {
         .wonders
         .iter()
         .copied()
-        .filter(|w| {
-            !g.cities[player].built_wonders.contains(w) && !g.retired_wonders.contains(w)
-        })
+        .filter(|w| !g.cities[player].built_wonders.contains(w) && !g.retired_wonders.contains(w))
         .collect()
 }
 
@@ -412,8 +411,7 @@ impl GameState {
                 self.wonder_burials.push((wid, card_id));
                 self.cities[player].built_wonders.push(wid);
 
-                let total_built: usize =
-                    self.cities.iter().map(|c| c.built_wonders.len()).sum();
+                let total_built: usize = self.cities.iter().map(|c| c.built_wonders.len()).sum();
                 if total_built == 7 {
                     let remaining: Vec<usize> = self
                         .cities
@@ -840,11 +838,22 @@ impl GameState {
         let city = &self.cities[player];
         let military = self.military_victory_points(player);
         let guild = self.guild_victory_points(player);
-        let buildings: i32 =
-            city.buildings.iter().map(|&c| card(c).victory_points).sum::<i32>() + guild;
-        let wonders: i32 = city.built_wonders.iter().map(|&w| wonder(w).victory_points).sum();
-        let mut progress_vp: i32 =
-            city.progress_tokens.iter().map(|&p| progress(p).victory_points).sum();
+        let buildings: i32 = city
+            .buildings
+            .iter()
+            .map(|&c| card(c).victory_points)
+            .sum::<i32>()
+            + guild;
+        let wonders: i32 = city
+            .built_wonders
+            .iter()
+            .map(|&w| wonder(w).victory_points)
+            .sum();
+        let mut progress_vp: i32 = city
+            .progress_tokens
+            .iter()
+            .map(|&p| progress(p).victory_points)
+            .sum();
         for &pid in &city.progress_tokens {
             for effect in progress(pid).effects {
                 if effect.kind == EffectKind::VpPerProgress {
@@ -933,9 +942,7 @@ impl GameState {
                         .expect("reveal slot not found");
                     self.override_reveal(slot, outcome[0]);
                 }
-                crate::chance::ChanceKind::WonderGroupReveal => {
-                    self.override_wonder_flip(outcome)
-                }
+                crate::chance::ChanceKind::WonderGroupReveal => self.override_wonder_flip(outcome),
                 crate::chance::ChanceKind::GreatLibraryDraw => {
                     self.library_draws.push_front(outcome.clone())
                 }
@@ -1052,7 +1059,10 @@ impl GameState {
             }
         }
         let age = self.age as usize;
-        if let Some(p) = self.removed_age_cards[age].iter().position(|&n| n == new_id) {
+        if let Some(p) = self.removed_age_cards[age]
+            .iter()
+            .position(|&n| n == new_id)
+        {
             self.removed_age_cards[age][p] = old_id;
             self.tableau.slots[slot].card_id = new_id;
             return;

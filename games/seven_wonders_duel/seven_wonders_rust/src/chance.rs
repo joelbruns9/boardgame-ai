@@ -262,8 +262,11 @@ pub fn sample_outcomes(
         match spec.kind {
             ChanceKind::CardReveal => {
                 let back = spec.context[2] as usize;
-                let names: Vec<usize> =
-                    pool.cards[back].iter().copied().filter(|&c| !used[c]).collect();
+                let names: Vec<usize> = pool.cards[back]
+                    .iter()
+                    .copied()
+                    .filter(|&c| !used[c])
+                    .collect();
                 let choice = names[rng.randrange(names.len() as u64) as usize];
                 used[choice] = true;
                 outcomes.push(vec![choice]);
