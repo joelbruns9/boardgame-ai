@@ -341,6 +341,41 @@ class GumbelMCTS:
             return self._search_open(state)
         raise ValueError(f"unknown mode: {self.config.mode}")
 
+    # ---- incremental (advisor) API ---------------------------------------
+    # `search()` runs the whole Gumbel sequential-halving budget in one shot,
+    # whose schedule is coupled to the total sim count -- so it cannot be
+    # resumed chunk-by-chunk. The advisor host wants the opposite: a tree it
+    # can crank one sim at a time and read between cranks (monotone refinement,
+    # streaming display, cancel-any-time). The Gumbel root is a training-target
+    # device; plain PUCT descent underneath it is naturally incremental, gives
+    # the visits+Q a recommendation needs, and is exposed here.
+
+    def make_root(self, state: GameState) -> ClosedNode:
+        """Build and expand a closed-mode root for incremental search.
+
+        Same root setup as ``_search_closed`` -- barrier clone, expand, seed
+        the root visit, optional forced chance expansion -- but runs NO
+        simulations. Callers drive :meth:`descend` to add sims one at a time.
+        """
+
+        if self.config.mode != "closed":
+            raise ValueError("make_root/descend support closed mode only")
+        root_state = state.clone()
+        root_state.search_barrier = True
+        root = self._make_closed_node(root_state)
+        root_value_p0 = self._expand_closed(root)
+        root.visits += 1
+        root.value_sum_p0 += root_value_p0
+        if self.config.force_expand_root_chance and not root.terminal:
+            self._force_expand_root(root)
+        return root
+
+    def descend(self, root: ClosedNode) -> None:
+        """Run one PUCT simulation from an existing root. Monotone: successive
+        calls deepen the same tree rather than restart it."""
+
+        self._descend_closed(root, None)
+
     def _gumbel_root(
         self, legal, priors, simulate, root_value, root_actor, initial_q=None
     ):

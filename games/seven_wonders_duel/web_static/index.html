@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>7 Wonders Duel Advisor</title>
+<style>
+  :root {
+    --bg:#0f1419; --panel:#1a2330; --soft:#232f40; --text:#e6edf3;
+    --dim:#8b98a5; --accent:#58a6ff; --good:#56d364; --bad:#f85149;
+    --warn:#d29922; --border:#30363d;
+  }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); margin:0; padding:20px;
+         font-family:ui-sans-serif,-apple-system,system-ui,sans-serif; }
+  h1 { font-size:19px; margin:0 0 14px; font-weight:600; }
+  h2 { font-size:12px; margin:14px 0 8px; color:var(--dim);
+       text-transform:uppercase; letter-spacing:.06em; }
+  .layout { display:grid; grid-template-columns:minmax(320px,1fr) minmax(340px,1fr);
+            gap:20px; max-width:1200px; margin:0 auto; }
+  .panel { background:var(--panel); border:1px solid var(--border);
+           border-radius:8px; padding:16px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:0 0 3px; }
+  input { background:var(--soft); color:var(--text); border:1px solid var(--border);
+          border-radius:4px; padding:6px 9px; font-size:13px; width:100%;
+          font-family:ui-monospace,monospace; }
+  .row { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr));
+         gap:10px; margin-bottom:10px; }
+  button { background:var(--accent); color:var(--bg); border:0; border-radius:4px;
+           padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:var(--soft); color:var(--text); border:1px solid var(--border); }
+  .actions { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .status { font-size:12px; color:var(--dim); }
+  .state-meta { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; margin-bottom:6px; }
+  .state-meta b { color:var(--text); }
+  .cities { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .city { background:var(--soft); border:1px solid var(--border); border-radius:6px;
+          padding:10px; font-size:12px; }
+  .city.turn { border-color:var(--accent); }
+  .city h3 { margin:0 0 6px; font-size:13px; }
+  .city .k { color:var(--dim); }
+  .legal { display:flex; flex-direction:column; gap:4px; max-height:220px; overflow:auto; }
+  .legal button { background:var(--soft); color:var(--text); border:1px solid var(--border);
+                  text-align:left; font-weight:400; padding:6px 9px; }
+  .legal button:hover { border-color:var(--accent); }
+  .rec { background:var(--soft); border:1px solid var(--border); border-radius:6px;
+         padding:9px 11px; display:grid; grid-template-columns:26px 1fr auto; gap:10px;
+         align-items:center; margin-bottom:6px; }
+  .rec.top { border-color:var(--good); box-shadow:0 0 0 1px var(--good) inset; }
+  .rank { font-size:16px; font-weight:700; color:var(--dim); text-align:center; }
+  .rec.top .rank { color:var(--good); }
+  .rec-label { font-size:13px; font-weight:600; }
+  .bar { height:5px; background:var(--panel); border-radius:3px; margin-top:5px; overflow:hidden; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .rec-stats { font-size:11px; color:var(--dim); margin-top:3px; }
+  .rec-q { text-align:right; }
+  .rec-q .v { font-size:17px; font-weight:700; }
+  .rec-q .v.good { color:var(--good); } .rec-q .v.bad { color:var(--bad); }
+  .rec-q .l { font-size:10px; color:var(--dim); text-transform:uppercase; }
+  .err { background:rgba(248,81,73,.1); color:var(--bad); border:1px solid var(--bad);
+         border-radius:4px; padding:8px 11px; font-size:12px; margin-bottom:8px; }
+  .empty { color:var(--dim); font-style:italic; padding:24px 0; text-align:center; }
+</style>
+</head>
+<body>
+<h1>7 Wonders Duel Advisor <span class="status" id="game-id"></span></h1>
+<div class="layout">
+  <div class="panel">
+    <h2>Position</h2>
+    <div class="row">
+      <div><label>Seed</label><input id="seed" value="7" /></div>
+      <div><label>First player</label><input id="first_player" value="0" /></div>
+    </div>
+    <label>Move prefix (action indices, comma-separated)</label>
+    <input id="prefix" value="" placeholder="e.g. 3, 12, 7" />
+    <div class="actions">
+      <button id="load">Load position</button>
+      <button class="ghost" id="reset">Reset</button>
+      <span class="status" id="load-status"></span>
+    </div>
+
+    <h2>State</h2>
+    <div id="state"><div class="empty">Load a position to begin.</div></div>
+
+    <h2>Legal actions — click to advance</h2>
+    <div class="legal" id="legal"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Advisor</h2>
+    <div class="row">
+      <div><label>Engine</label><input id="engine" value="auto" /></div>
+      <div><label>Max sims</label><input id="max_sims" value="800" /></div>
+      <div><label>Top K</label><input id="top_k" value="6" /></div>
+    </div>
+    <label>Checkpoint path (optional if server has a default)</label>
+    <input id="checkpoint_path" value="" placeholder="models/7wd/.../best.pt" />
+    <div class="actions">
+      <button id="recommend">Recommend (stream)</button>
+      <button class="ghost" id="stop" disabled>Stop</button>
+      <span class="status" id="rec-status"></span>
+    </div>
+
+    <h2>Recommendations</h2>
+    <div id="recs"><div class="empty">Load a position, then Recommend.</div></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let currentJob = null, polling = null;
+
+function wireState() {
+  return {
+    seed: parseInt($("seed").value, 10) || 0,
+    first_player: parseInt($("first_player").value, 10) || 0,
+    prefix: $("prefix").value.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)),
+  };
+}
+
+async function loadState() {
+  $("load-status").textContent = "loading…";
+  try {
+    const r = await fetch("/api/state", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({state: wireState()}),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "bad state");
+    renderState(data);
+    $("load-status").textContent = "";
+  } catch (e) {
+    $("state").innerHTML = `<div class="err">${e.message}</div>`;
+    $("legal").innerHTML = "";
+    $("load-status").textContent = "error";
+  }
+}
+
+function renderState(s) {
+  const winner = s.terminal
+    ? (s.winner == null ? "draw" : `player ${s.winner} wins`)
+    : "";
+  $("state").innerHTML = `
+    <div class="state-meta">
+      <span>Phase <b>${s.phase}</b></span>
+      <span>Age <b>${s.age}</b></span>
+      <span>${s.terminal ? "Result <b>"+winner+"</b>" : "To move <b>player "+s.actor+"</b>"}</span>
+    </div>
+    <div class="cities">
+      ${s.cities ? s.cities.map(c => cityCard(c)).join("") : cityFallback(s)}
+    </div>`;
+  const legal = s.legal_actions || [];
+  $("legal").innerHTML = legal.length
+    ? legal.map(a => `<button data-idx="${a.action_id}">[${a.action_id}] ${a.label}</button>`).join("")
+    : `<div class="empty">${s.terminal ? "Game over." : "No legal actions."}</div>`;
+  $("legal").querySelectorAll("button").forEach(b =>
+    b.addEventListener("click", () => advance(b.dataset.idx)));
+}
+
+function cityCard(c) {
+  const cls = c.to_move ? "city turn" : "city";
+  return `<div class="${cls}"><h3>Player ${c.player}${c.to_move ? " ●" : ""}</h3>
+    <div><span class="k">coins</span> ${c.coins}</div>
+    <div><span class="k">wonders</span> ${c.built_wonders}/${c.wonders} built</div>
+    <div><span class="k">buildings</span> ${c.buildings}</div>
+    <div><span class="k">science pairs</span> ${c.science_pairs}</div></div>`;
+}
+function cityFallback(s) {
+  return `<div class="city"><h3>Board</h3><div class="k">active player ${s.active_player}</div></div>`;
+}
+
+function advance(idx) {
+  const cur = $("prefix").value.trim();
+  $("prefix").value = cur ? cur + ", " + idx : String(idx);
+  loadState();
+}
+
+function recBody() {
+  const cp = $("checkpoint_path").value.trim();
+  const b = {
+    state: wireState(),
+    engine: $("engine").value.trim() || "auto",
+    max_sims: parseInt($("max_sims").value, 10) || 800,
+    chunk_sims: 100,
+    top_k: parseInt($("top_k").value, 10) || 6,
+  };
+  if (cp) b.checkpoint_path = cp;
+  return b;
+}
+
+async function startRecommend() {
+  stopRecommend();
+  $("recs").innerHTML = `<div class="empty">searching…</div>`;
+  $("rec-status").textContent = "starting…";
+  try {
+    const r = await fetch("/api/recommend/start", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(recBody()),
+    });
+    const job = await r.json();
+    if (!r.ok) throw new Error(job.detail || "start failed");
+    currentJob = job.job_id;
+    $("stop").disabled = false;
+    poll();
+  } catch (e) {
+    $("recs").innerHTML = `<div class="err">${e.message}</div>`;
+    $("rec-status").textContent = "error";
+  }
+}
+
+async function poll() {
+  if (!currentJob) return;
+  try {
+    const r = await fetch(`/api/recommend/poll?job_id=${currentJob}`);
+    const job = await r.json();
+    if (job.snapshot) renderRecs(job.snapshot);
+    $("rec-status").textContent = `${job.status} — ${job.sims_done}/${job.sims_target} sims`;
+    if (["done", "error", "cancelled"].includes(job.status)) {
+      if (job.error) $("recs").insertAdjacentHTML("afterbegin", `<div class="err">${job.error}</div>`);
+      finishRecommend();
+      return;
+    }
+    polling = setTimeout(poll, 150);
+  } catch (e) {
+    $("rec-status").textContent = "poll error";
+    finishRecommend();
+  }
+}
+
+function renderRecs(snap) {
+  if (!snap.recommendations || !snap.recommendations.length) {
+    $("recs").innerHTML = `<div class="empty">No recommendations.</div>`;
+    return;
+  }
+  const wp = (q) => ((q + 1) / 2 * 100).toFixed(1);
+  $("recs").innerHTML = snap.recommendations.map(r => `
+    <div class="rec ${r.rank === 1 ? "top" : ""}">
+      <div class="rank">#${r.rank}</div>
+      <div>
+        <div class="rec-label">${r.label}</div>
+        <div class="bar"><span style="width:${(r.visit_frac*100).toFixed(0)}%"></span></div>
+        <div class="rec-stats">${r.visits} visits (${(r.visit_frac*100).toFixed(0)}%) · prior ${(r.prior*100).toFixed(1)}%</div>
+      </div>
+      <div class="rec-q">
+        <div class="v ${r.q_value >= 0 ? "good" : "bad"}">${wp(r.q_value)}%</div>
+        <div class="l">win</div>
+      </div>
+    </div>`).join("");
+}
+
+async function stopRecommend() {
+  if (polling) { clearTimeout(polling); polling = null; }
+  if (currentJob) {
+    try {
+      await fetch("/api/recommend/stop", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({job_id: currentJob}),
+      });
+    } catch (e) { /* best effort */ }
+  }
+}
+function finishRecommend() {
+  if (polling) { clearTimeout(polling); polling = null; }
+  currentJob = null;
+  $("stop").disabled = true;
+}
+
+$("load").addEventListener("click", loadState);
+$("reset").addEventListener("click", () => { $("prefix").value = ""; loadState(); });
+$("recommend").addEventListener("click", startRecommend);
+$("stop").addEventListener("click", () => { stopRecommend(); finishRecommend(); $("rec-status").textContent = "stopped"; });
+
+fetch("/health").then(r => r.json()).then(h => { $("game-id").textContent = "· " + h.game_id; }).catch(() => {});
+</script>
+</body>
+</html>
