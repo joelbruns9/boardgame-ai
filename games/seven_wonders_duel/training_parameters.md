@@ -17,8 +17,10 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --save-buffer games\seven_wonders_duel\runs\laptop_training_01\buffer_final.jsonl `
   --d-model 128 `
   --layers 4 `
-  --train-epochs 8 `
+  --train-steps 300 `
+  --train-warmup-steps 100 `
   --train-batch-size 512 `
+  --validate-every 100 `
   --learning-rate 2e-4 `
   --cheap-sims-min 16 `
   --cheap-sims-max 24 `
@@ -32,8 +34,10 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --leaf-batch 1 `
   --age-deal-samples 32 `
   --gate-sims 64 `
-  --gate-max-games 100 `
-  --anchor-gate-every-promotions 3
+  --promotion-every 4 `
+  --gate-max-games 800 `
+  --anchor-gate-every-promotions 3 `
+  --anchor-every-iterations 3
 ```
 
 PowerShell uses the backtick at the end of a line as its continuation
@@ -53,8 +57,10 @@ Each iteration performs these steps:
 2. Generate `games-per-iteration` new games.
 3. Combine recent iteration files with the retained bot seed curriculum.
 4. Split whole games into training and validation sets.
-5. Train a candidate for up to `train-epochs` epochs.
-6. Compare the candidate with `current_best.pt` using a paired SPRT gate.
+5. Train a candidate for `train-steps` optimizer updates on uniform random
+   minibatches, carrying AdamW moments over from the previous iteration.
+6. Every `promotion-every` iterations, compare the candidate with
+   `current_best.pt` using a paired SPRT gate.
 7. Promote an accepted candidate and periodically run fixed bot-anchor gates.
 8. Save the candidate, metrics, records, Elo results, and manifest updates.
 
@@ -416,19 +422,46 @@ Number of transformer layers. More layers increase representation depth and
 roughly linearly increase most trunk parameters and forward-pass work.
 Checkpoints require the same architecture when loaded.
 
-### `--train-epochs`
+### `--train-steps`
 
-**Default:** `8`. **Value:** positive integer
+**Default:** `300`. **Value:** positive integer
 
-Maximum full passes over the iteration's combined training dataset. Early
-stopping can end training sooner based on validation performance.
+Optimizer updates per iteration, drawn as uniform random minibatches from the
+replay buffer. This replaces the former `--train-epochs`.
+
+An epoch visits every buffered position once, so as the buffer grows old
+positions are re-presented on every subsequent iteration while the amount of
+*new* data per iteration stays flat. Run 02 reached roughly 113 training
+presentations per newly generated position by iteration 11 (2.0M presentations
+against ~17.8k new examples); AlphaGo Zero sat near 1-2. A fixed step budget
+decouples training cost from buffer size and makes training pressure per unit
+of new data an explicit, logged quantity -- see `samples_per_new_position` in
+`training_log.jsonl`.
+
+At `--train-batch-size 512`, 300 steps consumes 153,600 samples. Against a
+typical ~18k new positions per iteration that is about 8.5x, which is the
+KataGo `max-train-bucket-per-new-data` regime.
+
+### `--train-warmup-steps`
+
+**Default:** `100`. **Value:** non-negative integer
+
+Linear learning-rate warmup, applied **only** on a cold optimizer. Once
+optimizer state is being carried across iterations the learning rate is flat.
+Re-warming every iteration would reproduce the sawtooth the old per-iteration
+cosine restart already caused.
+
+Optimizer state (AdamW moments) persists in `checkpoints/optimizer_state.pt`
+between iterations and is cleared on a revert, when the weights jump backwards
+and the accumulated moments no longer describe the loss surface under them.
 
 ### `--train-batch-size`
 
 **Default:** `512`. **Value:** positive integer
 
 Examples per gradient update. Larger batches improve GPU utilization but use
-more VRAM and perform fewer optimizer updates per epoch.
+more VRAM. With a fixed step budget, a larger batch consumes proportionally
+more samples per iteration rather than performing fewer updates.
 
 ### `--learning-rate`
 
@@ -453,21 +486,51 @@ Relative weight applied to auxiliary training objectives alongside the main
 policy/value losses. Changing it changes both optimization and the combined
 validation score used for early stopping.
 
-### `--train-patience`
+### `--validate-every`
 
-**Default:** `8`. **Value:** positive integer
+**Default:** `100`. **Value:** positive integer
 
-Number of epochs without validation improvement tolerated before early
-stopping. With the default eight training epochs, a patience of eight normally
-allows the entire requested training phase.
+Evaluate the held-out set every N steps (and always on the final step). The
+validation snapshot is fixed for the duration of an iteration, so the
+checkpoints at step 100, 200 and 300 are compared against identical examples.
+
+### `--restore-best-val`
+
+**Default:** off.
+
+Restore the lowest-validation-loss weights at the end of an iteration.
+
+This is **off by default and should stay off** until arena games establish that
+validation loss predicts playing strength. It was unconditionally *on* in run
+02 (inside the old `train_loop`), and from iteration 3 onward the best epoch
+was always epoch 0 -- so every candidate shipped was the epoch-0 weights and
+the other seven epochs were computed and discarded, about 4,500s of an 8.4h
+run.
+
+Validation loss is not a strength measure. A stronger network can score worse
+against older, weaker MCTS targets precisely because it disagrees with them.
+Use it to detect when further updates stop generalizing; use arena games to
+decide what is stronger.
 
 ### `--val-fraction`
 
-**Default:** `0.1`. **Typical range:** `0.0–1.0`
+**Default:** `0.05`. **Typical range:** `0.0–1.0`
 
 Fraction of whole games held out for validation. The split is game-honest: all
 positions from one game stay together, preventing near-duplicate positions from
 the same trajectory from leaking into both sets.
+
+### `--val-split-salt`
+
+**Default:** `swd-v1`.
+
+Salt for the train/validation assignment hash. A game's side is decided by
+`blake2b(salt | iteration | game_key)`, so it stays fixed for as long as the
+game lives in the replay window. The previous split reseeded from
+`seed + iteration` on every training iteration, which let a game validate at
+one iteration, train at the next and validate again at the third --
+contaminating the holdout and understating validation loss on older data.
+Changing the salt re-draws the whole split; do not change it mid-run.
 
 ### `--min-games-to-train`
 
@@ -475,6 +538,46 @@ the same trajectory from leaking into both sets.
 
 Minimum number of available replay games required before candidate training.
 This is principally a safety check for smoke tests and damaged/empty buffers.
+
+## Search Constants
+
+### `c_visit` / `c_scale`
+
+**Defaults:** `50.0` / `0.1`.
+
+The Gumbel-AlphaZero sigma factor, `(c_visit + max_visits) * c_scale`, applied
+to the completed Q values of the root's legal actions.
+
+`c_scale` was `1.0` until 2026-07-25, and sigma was applied to a **raw**
+actor-relative Q in [-1, 1]. That made sigma span +/-50 while log-prior
+differences are ~1-3, so the completed-Q term swamped the prior by more than an
+order of magnitude and the improved policy was effectively independent of what
+the network had learned about move preferences.
+
+Sigma now min-max rescales completed Q to [0, 1] across the root's legal
+actions first, matching the paper and mctx's
+`qtransform_completed_by_mix_value` (whose `value_scale` default is the 0.1
+adopted here). Two properties follow, both covered by tests: sigma is invariant
+to shifting or scaling the Q window, so a decision scores the same in a winning
+position as in a losing one; and when no search information exists yet -- every
+action sharing the root value -- sigma collapses to zero and the improved
+policy is exactly the prior.
+
+**This changes `policy_target`, which is a training target.** Targets recorded
+before this change are not comparable with new ones; start a run from a fresh
+buffer rather than mixing them.
+
+### Action selection in evaluation
+
+Self-play plays a temperature-annealed sample from `policy_target`. Competitive
+play (gate, arena, anchors) plays `argmax(policy_target)`.
+
+It must not play `SearchResult.action_index`: that is the Gumbel-perturbed
+selection, and Gumbel keys are exploration noise. At low simulation counts the
+sigma term is near-constant across unvisited actions and the selection reduces
+to `argmax(gumbel + log_prior)`, which by the Gumbel-max trick is an exact
+*sample* from the prior rather than its argmax. `deterministic_actions=true`
+only suppresses the additional temperature sampling; it does not remove this.
 
 ## Promotion and Anchor Evaluation
 
@@ -528,6 +631,25 @@ after the third, sixth, ninth, and subsequent promotions. `0` disables periodic
 anchor gates. Anchor results characterize progress and Phase D exit criteria;
 they do not block the candidate-vs-best strength ratchet.
 
+Note this cadence is keyed to *promotions*, so it never fires in a run where
+nothing is promoted. Run 02 promoted nothing across 12 iterations and therefore
+never measured the bot suite at all. Prefer `--anchor-every-iterations` when
+promotions are rare or the gate is disabled.
+
+### `--anchor-every-iterations`
+
+**Default:** `0` (promotion-keyed only). **Value:** non-negative integer
+
+Also runs the bot-anchor suite every N iterations regardless of promotions,
+measuring `latest.pt` (the rolling learner) rather than `current_best.pt`.
+
+The bot suite is the only opponent set outside the self-play distribution, and
+the two can move in opposite directions: run 02's iteration 11 beat iteration 0
+head-to-head at 59.5% while *losing* ground against two of the five scripted
+bots (science_aggressive 90% -> 74%, military_aggressive 80% -> 70%). A
+head-to-head promotion number on its own does not establish that a checkpoint
+got better.
+
 ## Training Lifecycle
 
 These arguments select how the loop treats the learner, self-play generator, and
@@ -562,13 +684,35 @@ consulted by the soft-gate modes.
 
 ### `--promotion-every`
 
-**Default:** `1`. **Value:** non-negative integer
+**Default:** `4`. **Value:** non-negative integer
 
 Runs the paired-SPRT promotion check after every N completed training
 iterations. `1` gates every iteration; `0` disables automatic promotion checks
 (the learner still advances). Non-gated iterations log
 `promotion_action: "not_scheduled"` and never touch the consecutive-revert
 counter.
+
+**Size the gate before you schedule it.** A gate that cannot resolve its own
+indifference region costs games and returns nothing. Run 02 ran
+`--promotion-every 1` with `--gate-max-games 100` against a 3% indifference
+region: 11 of 11 candidates returned `probation`, `current_best` never moved
+off iteration 0, and the gate games consumed roughly as much wall clock as all
+training combined.
+
+That was arithmetic, not luck. Under Wald's approximation a candidate sitting
+at the H1 boundary (53%) needs about **368** games to be accepted at
+alpha = beta = 0.05, and a candidate that is genuinely *equal* to the best sits
+at the midpoint of the indifference region where the log-likelihood ratio has
+no drift -- no finite budget ever reaches a boundary. The configuration warns
+at startup (`UnderpoweredGateWarning`) with the number it would need.
+
+Three workable configurations:
+
+| Intent | Settings |
+|---|---|
+| Real gate | `--promotion-every 4 --gate-max-games 800` |
+| Coarse gate | `--promotion-every 4 --gate-indifference 0.10 --gate-max-games 200` |
+| No gate | `--promotion-every 0` (soft-gate rolling learner; spend the games on self-play) |
 
 ### `--revert-reset-after`
 

@@ -149,20 +149,38 @@ def test_evaluate_compares_selected_action_q(
         }
     }
 
+    # The Gumbel-perturbed pick and the improved policy's argmax deliberately
+    # disagree: quality metrics must follow the action a competitive game would
+    # actually PLAY, not the exploration action.
+    others = [
+        int(entry["action"]) for entry in position["actions"] if int(entry["action"]) != chosen
+    ]
+    gumbel_pick = others[0]
+    policy_target = {int(entry["action"]): 0.1 for entry in position["actions"]}
+    policy_target[chosen] = 0.9
+    completed_q = {int(entry["action"]): 0.9 for entry in position["actions"]}
+    completed_q[chosen] = 0.25
+
     class FakeMCTS:
         def __init__(self, _evaluator, _config):
             pass
 
         def search(self, _state):
             return SimpleNamespace(
-                action_index=chosen,
-                action_value=0.25,
+                action_index=gumbel_pick,
+                action_value=0.9,
                 root_value=-0.75,
+                policy_target=policy_target,
+                completed_q=completed_q,
             )
 
     monkeypatch.setattr(pe, "GumbelMCTS", FakeMCTS)
     args = SimpleNamespace(variants=["closed"], sims=[1], seeds=1, top_k=1)
     rows = pe.run_evaluate(args, tmp_path, [position], truths, evaluator=None)
+    assert rows[0]["action"] == chosen
+    assert rows[0]["gumbel_action"] == gumbel_pick
+    assert rows[0]["gumbel_disagreed"] is True
+    # 0.25 (search Q for the played action) vs 0.2 (its exact Q).
     assert rows[0]["action_q_error"] == pytest.approx(0.05)
     assert rows[0]["action_regret"] == pytest.approx(0.7)
 

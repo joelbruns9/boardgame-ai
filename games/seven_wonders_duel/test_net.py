@@ -32,6 +32,7 @@ from games.seven_wonders_duel.train import (
     load_checkpoint,
     make_checkpoint,
     migrate_state_dict,
+    train_steps,
 )
 
 
@@ -244,6 +245,103 @@ def test_iteration_split_keeps_unlabeled_curriculum_in_training(examples):
         {e.iteration for e in train if e.iteration is not None}
         & {e.iteration for e in val}
     )
+
+
+def test_train_steps_runs_exactly_the_budget_independent_of_buffer_size(examples):
+    """The point of the step budget: cost stops tracking buffer size.
+
+    Under epochs, a buffer that grew 78k -> 276k made every iteration more
+    expensive while adding a constant ~18k new positions.
+    """
+
+    model = SWDNet(32, 1, 2)
+    small = list(examples[:8])
+    large = list(examples) * 20
+    history_small, _ = train_steps(
+        model, small, None, device="cpu", steps=6, batch_size=4,
+        validate_every=3, log=lambda *_: None,
+    )
+    history_large, _ = train_steps(
+        model, large, None, device="cpu", steps=6, batch_size=4,
+        validate_every=3, log=lambda *_: None,
+    )
+    assert [row["step"] for row in history_small] == [3, 6]
+    assert [row["step"] for row in history_large] == [3, 6]
+
+
+def test_train_steps_records_a_final_window_on_an_uneven_budget(examples):
+    model = SWDNet(32, 1, 2)
+    history, _ = train_steps(
+        model, list(examples), None, device="cpu", steps=7, batch_size=4,
+        validate_every=3, log=lambda *_: None,
+    )
+    assert [row["step"] for row in history] == [3, 6, 7]
+
+
+def test_train_steps_warms_up_cold_and_not_warm(examples):
+    """Warmup is for a fresh optimizer only.
+
+    Re-warming on every self-play iteration would reproduce the sawtooth the
+    per-iteration cosine restart already caused.
+    """
+
+    model = SWDNet(32, 1, 2)
+    cold, state = train_steps(
+        model, list(examples), None, device="cpu", steps=4, batch_size=4,
+        lr=1e-3, warmup_steps=4, validate_every=1, log=lambda *_: None,
+    )
+    assert [row["lr"] for row in cold] == pytest.approx(
+        [2.5e-4, 5e-4, 7.5e-4, 1e-3]
+    )
+    warm, _ = train_steps(
+        model, list(examples), None, device="cpu", steps=4, batch_size=4,
+        lr=1e-3, warmup_steps=4, validate_every=1, optimizer_state=state,
+        log=lambda *_: None,
+    )
+    assert [row["lr"] for row in warm] == pytest.approx([1e-3] * 4)
+
+
+def test_train_steps_carries_optimizer_moments_across_calls(examples):
+    model = SWDNet(32, 1, 2)
+    _, state = train_steps(
+        model, list(examples), None, device="cpu", steps=3, batch_size=4,
+        validate_every=3, log=lambda *_: None,
+    )
+    assert state["state"], "expected AdamW moments to be populated"
+    first = next(iter(state["state"].values()))
+    assert first["step"].item() == 3
+    _, resumed = train_steps(
+        model, list(examples), None, device="cpu", steps=2, batch_size=4,
+        validate_every=2, optimizer_state=state, log=lambda *_: None,
+    )
+    # Step counts continue rather than restarting, so bias correction stays
+    # consistent instead of re-spiking every iteration.
+    assert next(iter(resumed["state"].values()))["step"].item() == 5
+
+
+def test_train_steps_leaves_best_val_restoration_off_by_default(examples):
+    """Run 02 silently shipped epoch-0 weights every iteration from iter 3 on.
+
+    With restoration off the returned weights are the ones the budget actually
+    produced; with it on they are whichever validation liked best.
+    """
+
+    labeled = [
+        dataclasses.replace(example, iteration=index % 2, game_key=index)
+        for index, example in enumerate(examples)
+    ]
+    model = SWDNet(32, 1, 2)
+    train_steps(
+        model, labeled, labeled[:8], device="cpu", steps=4, batch_size=4,
+        validate_every=2, log=lambda *_: None,
+    )
+    plain = {k: v.clone() for k, v in model.state_dict().items()}
+    train_steps(
+        model, labeled, labeled[:8], device="cpu", steps=4, batch_size=4,
+        validate_every=2, restore_best_val=True, seed=1, log=lambda *_: None,
+    )
+    restored = model.state_dict()
+    assert set(plain) == set(restored)
 
 
 def test_aux_padding_row_stays_zero_after_training(examples):

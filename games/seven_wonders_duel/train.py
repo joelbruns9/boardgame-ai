@@ -13,9 +13,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
+import struct
 import time
 from pathlib import Path
 
@@ -201,6 +203,53 @@ def game_honest_split(examples: list[Example], val_frac: float, seed: int = 0):
     return train, val
 
 
+def stable_is_validation(
+    iteration: int | None, game_key: int, val_frac: float, salt: str = ""
+) -> bool:
+    """Assign one game to train/validation by a hash of its identity.
+
+    The assignment depends only on ``(salt, iteration, game_key)``, so a game
+    keeps the same side for as long as it lives in the replay window.  The old
+    per-iteration reshuffle (``phase_d_game_honest_split`` reseeded from
+    ``seed + iteration``) let a game validate at one iteration, train at the
+    next and validate again at the third -- which contaminates the holdout and
+    understates validation loss on older data.
+
+    ``blake2b`` rather than :func:`hash` because the builtin is randomized per
+    process; the split has to survive a resume.  Curriculum seed games carry
+    ``iteration is None`` and are always training-only.
+    """
+
+    if val_frac <= 0.0 or iteration is None:
+        return False
+    digest = hashlib.blake2b(
+        f"{salt}|{iteration}|{game_key}".encode(), digest_size=8
+    ).digest()
+    return struct.unpack("<Q", digest)[0] / 2.0**64 < val_frac
+
+
+def stable_game_split(
+    examples: list[Example], val_frac: float, salt: str = ""
+) -> tuple[list[Example], list[Example]]:
+    """Split by :func:`stable_is_validation`, never sharing a game."""
+
+    if not 0.0 <= val_frac < 1.0:
+        raise ValueError("val_frac must lie in [0, 1)")
+    decisions: dict[tuple[int | None, int], bool] = {}
+    train: list[Example] = []
+    val: list[Example] = []
+    for example in examples:
+        key = (example.iteration, example.game_key)
+        held = decisions.get(key)
+        if held is None:
+            held = stable_is_validation(
+                example.iteration, example.game_key, val_frac, salt
+            )
+            decisions[key] = held
+        (val if held else train).append(example)
+    return train, val
+
+
 def make_checkpoint(model, config: dict) -> dict:
     model = getattr(model, "_orig_mod", model)  # unwrap torch.compile
     return {
@@ -283,6 +332,17 @@ def train_loop(
     patience: int = 8,
     log=print,
 ):
+    """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
+
+    The self-play loop uses :func:`train_steps` instead. Epochs make sense here,
+    where the dataset is fixed and training runs once; inside the loop they made
+    training cost track buffer size and re-presented old positions on every
+    iteration. Note this function restores the best-validation weights
+    unconditionally, which is appropriate for a one-shot offline fit but was the
+    source of run 02 silently discarding seven of its eight epochs per
+    iteration.
+    """
+
     model.to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -346,6 +406,145 @@ def train_loop(
     if best["state"] is not None:
         model.load_state_dict(best["state"])
     return history
+
+
+def train_steps(
+    model,
+    train_examples: list[Example],
+    val_examples: list[Example] | None,
+    *,
+    device: str,
+    steps: int,
+    batch_size: int = 512,
+    lr: float = 2e-4,
+    warmup_steps: int = 0,
+    weight_decay: float = 1e-4,
+    aux_weight: float = AUX_WEIGHT_DEFAULT,
+    validate_every: int = 100,
+    optimizer_state: dict | None = None,
+    restore_best_val: bool = False,
+    seed: int = 0,
+    log=print,
+) -> tuple[list[dict], dict]:
+    """Fixed-budget training on uniform random minibatches from the replay.
+
+    Replaces the epoch loop.  An epoch presents every buffered position once,
+    so as the buffer grows old positions are re-presented on every subsequent
+    iteration -- run 02 reached ~113 presentations per new position while
+    adding only ~18k new examples.  Here the budget is ``steps`` optimizer
+    updates regardless of buffer size, which makes training pressure per unit
+    of new data an explicit, logged quantity rather than a side effect.
+
+    ``optimizer_state`` carries AdamW moments across self-play iterations.  A
+    cold start (``None``) warms the learning rate up over ``warmup_steps``; a
+    warm start skips warmup, because re-warming every iteration would just
+    reproduce the sawtooth the cosine restart already caused.
+
+    ``restore_best_val`` defaults to *off*.  Run 02 had it unconditionally on
+    (via ``train_loop``), so from iteration 3 onward every candidate was the
+    epoch-0 weights and the other seven epochs were computed and discarded.
+    Validation stays diagnostic here until arena games show it predicts
+    strength.
+
+    Returns ``(history, optimizer_state)``.
+    """
+
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    if not train_examples:
+        raise ValueError("train_steps needs at least one training example")
+    model.to(device).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    warm = optimizer_state is not None
+    if warm:
+        optimizer.load_state_dict(optimizer_state)
+        # A resumed state carries the LR that was saved with it; the schedule
+        # below is the single source of truth, so re-assert it.
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+    use_amp = device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    rng = random.Random(seed)
+    population = range(len(train_examples))
+    best = {"val_total": float("inf"), "step": -1, "state": None}
+    history: list[dict] = []
+    running: dict[str, float] = {}
+    window_start = time.time()
+    window_steps = 0
+
+    def learning_rate(step: int) -> float:
+        if warm or warmup_steps <= 0:
+            return lr
+        return lr * min(1.0, (step + 1) / warmup_steps)
+
+    for step in range(steps):
+        current_lr = learning_rate(step)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+        batch = collate(
+            [train_examples[i] for i in rng.choices(population, k=batch_size)], device
+        )
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", enabled=use_amp):
+            outputs = model(batch)
+            total, parts = compute_losses(outputs, batch, aux_weight)
+        scaler.scale(total).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        for key, value in parts.items():
+            running[key] = running.get(key, 0.0) + value
+        window_steps += 1
+
+        done = step + 1
+        if done % validate_every and done != steps:
+            continue
+        train_parts = {k: v / window_steps for k, v in running.items()}
+        row = {
+            "step": done,
+            "lr": current_lr,
+            "train": train_parts,
+            "secs": time.time() - window_start,
+        }
+        running = {}
+        window_steps = 0
+        if val_examples:
+            val_metrics = evaluate(model, val_examples, device, batch_size, aux_weight)
+            row["val"] = val_metrics
+            log(
+                f"step {done}: train total {train_parts['total']:.4f} "
+                f"(policy {train_parts['policy']:.4f} value {train_parts['value']:.4f}) "
+                f"| val total {val_metrics['total']:.4f} "
+                f"value_acc {val_metrics['value_acc']:.3f} "
+                f"joint7_acc {val_metrics['joint7_acc']:.3f} "
+                f"policy_top1 {val_metrics['policy_top1']:.3f} "
+                f"[{row['secs']:.0f}s]"
+            )
+            if val_metrics["total"] < best["val_total"] - 1e-4:
+                best = {
+                    "val_total": val_metrics["total"],
+                    "step": done,
+                    "state": (
+                        {
+                            k: v.detach().cpu().clone()
+                            for k, v in model.state_dict().items()
+                        }
+                        if restore_best_val
+                        else None
+                    ),
+                }
+        else:
+            log(
+                f"step {done}: train total {train_parts['total']:.4f} "
+                f"(policy {train_parts['policy']:.4f} value {train_parts['value']:.4f} "
+                f"joint7 {train_parts['joint7']:.4f}) [{row['secs']:.0f}s]"
+            )
+        history.append(row)
+        window_start = time.time()
+
+    if restore_best_val and best["state"] is not None:
+        log(f"restoring best-validation weights from step {best['step']}")
+        model.load_state_dict(best["state"])
+    return history, optimizer.state_dict()
 
 
 def main(argv=None) -> int:

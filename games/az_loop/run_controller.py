@@ -69,6 +69,7 @@ class ControllerConfig:
     promotion_every: int = 1
     revert_reset_after: int = 0
     anchor_gate_every_promotions: int = 0
+    anchor_every_iterations: int = 0
     buffer_autosave_every: int = 0
     seed: int = 0
     iterations: int = 1
@@ -80,6 +81,8 @@ class ControllerConfig:
             raise ValueError("revert_reset_after must be non-negative")
         if self.anchor_gate_every_promotions < 0:
             raise ValueError("anchor_gate_every_promotions must be non-negative")
+        if self.anchor_every_iterations < 0:
+            raise ValueError("anchor_every_iterations must be non-negative")
         if self.buffer_autosave_every < 0:
             raise ValueError("buffer_autosave_every must be non-negative")
         if self.iterations < 0:
@@ -230,6 +233,7 @@ class RunController:
             "bootstrap_policy": self.config.bootstrap_policy.value,
             "revert_reset_after": self.config.revert_reset_after,
             "anchor_gate_every_promotions": self.config.anchor_gate_every_promotions,
+            "anchor_every_iterations": self.config.anchor_every_iterations,
         }
 
     def _validate_lifecycle_config(self, last_row: dict[str, Any]) -> None:
@@ -503,11 +507,32 @@ class RunController:
     def _maybe_run_anchors(
         self, action: PromotionAction, iteration: int
     ) -> dict[str, Any] | None:
-        if action not in (PromotionAction.PROMOTE, PromotionAction.BOOTSTRAP_PROMOTE):
+        due = self._anchors_due_on_promotion(action) or self._anchors_due_on_iteration(
+            iteration
+        )
+        if not due:
             return None
+        # On an iteration-cadence anchor there may have been no promotion at
+        # all, so current_best can still be an early checkpoint.  Measure the
+        # learner that self-play is actually using.
+        checkpoint = (
+            self.current_best_path
+            if self._anchors_due_on_promotion(action)
+            else self.latest_path
+        )
+        result = self.adapter.evaluate_anchors(
+            AnchorRequest(iteration=iteration, checkpoint=checkpoint)
+        )
+        if result is None:
+            return None
+        return {"passed": result.passed, "checkpoint": str(checkpoint), **result.metrics}
+
+    def _anchors_due_on_promotion(self, action: PromotionAction) -> bool:
+        if action not in (PromotionAction.PROMOTE, PromotionAction.BOOTSTRAP_PROMOTE):
+            return False
         cadence = self.config.anchor_gate_every_promotions
         if cadence <= 0:
-            return None
+            return False
         promotions = 1 + sum(
             1
             for row in self.store.iterations()
@@ -517,14 +542,20 @@ class RunController:
                 PromotionAction.BOOTSTRAP_PROMOTE.value,
             )
         )
-        if promotions % cadence != 0:
-            return None
-        result = self.adapter.evaluate_anchors(
-            AnchorRequest(iteration=iteration, checkpoint=self.current_best_path)
-        )
-        if result is None:
-            return None
-        return {"passed": result.passed, **result.metrics}
+        return promotions % cadence == 0
+
+    def _anchors_due_on_iteration(self, iteration: int) -> bool:
+        """Out-of-distribution tracking that does not depend on promotions.
+
+        Self-play strength and strength against opponents outside the self-play
+        distribution can move in opposite directions -- run 02's iteration 11
+        beat iteration 0 head to head while losing ground against two of the
+        five scripted bots -- so the bot suite has to be sampled on its own
+        clock rather than only when the promotion gate happens to fire.
+        """
+
+        cadence = self.config.anchor_every_iterations
+        return cadence > 0 and (iteration + 1) % cadence == 0
 
     def _build_row(
         self,

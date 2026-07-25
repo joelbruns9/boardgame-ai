@@ -40,7 +40,7 @@ def _adapter(loop: _FakeLoop) -> SevenWondersDuelLifecycleAdapter:
 
 def test_validate_passes_for_finite_metrics_and_weights():
     loop = _FakeLoop(
-        stats={"epochs": [{"train": {"total": 0.9, "policy": 0.4}, "val": {"total": 1.0}}]},
+        stats={"steps": [{"train": {"total": 0.9, "policy": 0.4}, "val": {"total": 1.0}}]},
         weights=torch.tensor([0.1, -0.2, 0.3]),
     )
     _adapter(loop)._validate_candidate(Path("candidate.pt"), 3)  # must not raise
@@ -48,7 +48,7 @@ def test_validate_passes_for_finite_metrics_and_weights():
 
 def test_validate_rejects_non_finite_training_metric():
     loop = _FakeLoop(
-        stats={"epochs": [{"train": {"total": float("nan")}}]},
+        stats={"steps": [{"train": {"total": float("nan")}}]},
         weights=torch.tensor([0.0]),
     )
     with pytest.raises(RuntimeError, match="training diverged"):
@@ -57,7 +57,7 @@ def test_validate_rejects_non_finite_training_metric():
 
 def test_validate_rejects_non_finite_weights():
     loop = _FakeLoop(
-        stats={"epochs": [{"train": {"total": 0.5}}]},
+        stats={"steps": [{"train": {"total": 0.5}}]},
         weights=torch.tensor([0.0, float("inf")]),
     )
     with pytest.raises(RuntimeError, match="non-finite weights"):
@@ -66,7 +66,7 @@ def test_validate_rejects_non_finite_weights():
 
 def test_validate_rejects_unreadable_checkpoint():
     loop = _FakeLoop(
-        stats={"epochs": [{"train": {"total": 0.5}}]},
+        stats={"steps": [{"train": {"total": 0.5}}]},
         weights=torch.tensor([0.0]),
         reload_error=True,
     )

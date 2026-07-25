@@ -290,6 +290,30 @@ fn temperature(move_index: usize) -> f64 {
     1.0 + (0.25 - 1.0) * progress
 }
 
+/// The action to PLAY in a competitive game: argmax of the improved policy.
+///
+/// `SearchResult::action_index` is the Gumbel-perturbed selection -- correct as
+/// self-play's exploration action (it is what gives the sampled move its
+/// policy-improvement property), but it carries exploration noise that has no
+/// place in an arena or advisor game. `policy_target` is built from the same
+/// logits WITHOUT the Gumbel keys, so its argmax is the noise-free choice.
+///
+/// First-max tie-break over `legal` order, matching Python's `max(dict, key=)`.
+fn best_policy_action(legal: &[usize], policy: &[f64]) -> usize {
+    assert_eq!(legal.len(), policy.len());
+    let mut best = *legal
+        .first()
+        .expect("search root cannot have no legal actions");
+    let mut best_weight = f64::NEG_INFINITY;
+    for (&action, &weight) in legal.iter().zip(policy) {
+        if weight > best_weight {
+            best_weight = weight;
+            best = action;
+        }
+    }
+    best
+}
+
 fn sample_policy(legal: &[usize], policy: &[f64], temp: f64, rng: &mut Rng) -> usize {
     assert_eq!(legal.len(), policy.len());
     let power = 1.0 / temp;
@@ -363,7 +387,7 @@ pub fn run<E: Eval>(
         let (result, _, _) =
             tree_resumable::search_closed_batched(&state, &eval, &search_cfg, leaf_batch)?;
         let action = if cfg.deterministic_actions {
-            result.action_index
+            best_policy_action(&legal, &result.policy_target)
         } else {
             sample_policy(&legal, &result.policy_target, temperature(i), &mut rng)
         };
@@ -781,7 +805,7 @@ impl GameSlot {
     fn finish_move(&mut self, meta: SearchMeta, result: crate::tree::SearchResult) -> PyResult<()> {
         let i = self.moves.len();
         let action = if self.cfg.deterministic_actions {
-            result.action_index
+            best_policy_action(&meta.legal, &result.policy_target)
         } else {
             sample_policy(
                 &meta.legal,

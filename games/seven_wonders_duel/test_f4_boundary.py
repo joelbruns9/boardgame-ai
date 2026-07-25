@@ -452,3 +452,120 @@ def test_f4_rust_seat_routed_adapter_uses_the_actor_checkpoint():
     )
     assert results[0]["root_value"] > 0.99
     assert results[1]["root_value"] < -0.99
+
+
+def test_two_net_arena_searches_each_move_under_the_movers_own_net():
+    """Regression: the arena must never mix networks inside one search tree.
+
+    `rust_seat_routed_flat_batch_adapter` dispatched each packed row to the net
+    of that row's ACTING player, so opponent-to-move leaves inside a search were
+    evaluated by the opponent's network and neither side ever searched with its
+    own net.  A strong net facing a weak one then read garbage for every reply
+    while handing the weak net good values for its own replies, inverting the
+    result (0.225 vs 0.925 against a random-init net at 2 sims).
+
+    Two nets with opposite constant value heads make the mixing visible: every
+    batch a search issues must carry a single value, because a whole search
+    belongs to exactly one network.
+    """
+
+    import seven_wonders_rust as swr
+    import torch
+
+    from .inference import Evaluator
+    from .phase_d import PhaseDConfig, PhaseDLoop
+    from .train import build_model
+
+    models = [build_model("transformer", 32, 1) for _ in range(2)]
+    for model in models:
+        for parameter in model.parameters():
+            parameter.data.zero_()
+    models[0].heads.value.bias.data.copy_(torch.tensor([10.0, 0.0, -10.0]))
+    models[1].heads.value.bias.data.copy_(torch.tensor([-10.0, 0.0, 10.0]))
+
+    loop = PhaseDLoop(
+        PhaseDConfig(
+            run_dir="runs/seven_wonders_duel/_two_net_arena_test",
+            device="cpu",
+            d_model=32,
+            layers=1,
+            gate_sims=2,
+            gate_max_games=2,
+            top_k=2,
+            promotion_every=0,
+            rust_slots=2,
+            rust_global_batch_cap=16,
+        )
+    )
+
+    seen: list[set[float]] = []
+
+    def recording(evaluator):
+        inner = rust_flat_batch_adapter(evaluator)
+
+        def adapter(payload):
+            produced = inner(payload)
+            seen.append({round(value, 6) for value, _ in produced})
+            return produced
+
+        return adapter
+
+    adapters = tuple(recording(Evaluator(model, "cpu", 16)) for model in models)
+    records = loop._play_two_net_games(
+        swr, rust_games_for_self_play([4242], [0]), [4242], adapters
+    )
+
+    assert len(records) == 1
+    assert records[0]["winner"] in (0, 1, None)
+    assert records[0]["actions"] > 0
+    assert seen, "expected the arena to evaluate at least one batch"
+    for batch in seen:
+        assert len(batch) == 1, f"batch mixed values from both nets: {batch}"
+
+
+def test_two_net_arena_plays_the_improved_policy_argmax():
+    """Regression: arena play must not use the Gumbel-perturbed action.
+
+    `SearchResult.action_index` is the exploration action; at low simulation
+    counts it reduces to argmax(gumbel + log_prior), which by the Gumbel-max
+    trick is an exact SAMPLE from the prior rather than its argmax.  A stub
+    searcher whose `action` disagrees with its `policy` argmax pins down which
+    one the arena applies.
+    """
+
+    from .phase_d import PhaseDConfig, PhaseDLoop
+
+    loop = PhaseDLoop(
+        PhaseDConfig(
+            run_dir="runs/seven_wonders_duel/_two_net_argmax_test",
+            device="cpu",
+            gate_sims=2,
+            gate_max_games=2,
+            promotion_every=0,
+        )
+    )
+    games = rust_games_for_self_play([909], [0])
+    applied: list[int] = []
+
+    class StubSearcher:
+        """Reports the LAST legal action as `action` and the FIRST as best."""
+
+        @staticmethod
+        def search_many_flat_net(adapter, batch, seeds, *args, **kwargs):
+            results = []
+            for game in batch:
+                legal = game.legal_action_indices()
+                policy = [0.0] * len(legal)
+                policy[0] = 1.0  # argmax -> legal[0]
+                applied.append(legal[0])
+                results.append({"action": legal[-1], "policy": policy})
+            return results
+
+    records = loop._play_two_net_games(
+        StubSearcher(), games, [909], (object(), object())
+    )
+    assert records[0]["actions"] == len(applied)
+    assert games[0].is_complete()
+    # If the arena had played `action` (the last legal index) instead of the
+    # policy argmax, the game would have followed a different line entirely.
+    assert applied, "stub searcher was never consulted"

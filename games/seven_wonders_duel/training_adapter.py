@@ -115,9 +115,10 @@ class SevenWondersDuelLifecycleAdapter:
     def _validate_candidate(self, candidate: Path, iteration: int) -> None:
         """Finite-metric + reload check before a candidate is certified trained."""
 
-        for epoch in self.loop.last_training_stats.get("epochs") or []:
+        history = self.loop.last_training_stats.get("steps") or []
+        for window in history:
             for section in ("train", "val"):
-                for key, value in (epoch.get(section) or {}).items():
+                for key, value in (window.get(section) or {}).items():
                     if isinstance(value, (int, float)) and not math.isfinite(value):
                         raise RuntimeError(
                             f"iteration {iteration} training diverged: non-finite "
@@ -161,8 +162,10 @@ class SevenWondersDuelLifecycleAdapter:
         )
 
     def on_learner_reset(self, best_checkpoint: Path) -> None:
-        # Stage B (persistent optimizer clearing) lands in a later milestone.
-        return None
+        # A revert rewinds the weights to the protected best; the carried AdamW
+        # moments describe the rejected trajectory, so drop them and let the
+        # next iteration warm up cold from current_best.
+        self.loop.clear_optimizer_state()
 
     def autosave(self, iteration: int) -> None:
         # The controller owns cadence + failure policy; just do the atomic write.

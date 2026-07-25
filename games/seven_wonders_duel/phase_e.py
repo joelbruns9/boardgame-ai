@@ -120,7 +120,12 @@ VARIANTS = {
     "open": ("open", False),
     "closed_forced": ("closed", True),
 }
-RESULT_SCHEMA = 2  # selected-action Q/error replaced the invalid root-mean metric
+# 3: metrics read the action a competitive game would PLAY -- argmax of the
+# improved policy -- not `SearchResult.action_index`, which carries the
+# Gumbel exploration noise.  Schema-2 rows measured a perturbed choice, so
+# every trap/regret figure recorded under them is superseded and the loader
+# below skips them.
+RESULT_SCHEMA = 3
 
 
 # --------------------------------------------------------------------------
@@ -750,26 +755,31 @@ def run_evaluate(
                         )
                         t0 = time.time()
                         result = GumbelMCTS(evaluator, config).search(state)
+                        # The action a gate or advisor game would actually play.
+                        # `result.action_index` is the Gumbel-perturbed
+                        # selection; scoring traps and regret against it
+                        # measures exploration noise rather than search quality.
+                        played = max(
+                            result.policy_target, key=result.policy_target.get
+                        )
+                        search_q = result.completed_q[played]
+                        exact_q = truth["exact_q"][str(played)]
                         row = {
                             "schema": RESULT_SCHEMA,
                             "id": position["id"],
                             "variant": variant,
                             "sims": sims,
                             "seed": seed_index,
-                            "action": result.action_index,
-                            "trap_pick": result.action_index in trap_set,
-                            "unsafe_pick": result.action_index in unsafe_set,
+                            "action": played,
+                            "gumbel_action": result.action_index,
+                            "gumbel_disagreed": played != result.action_index,
+                            "trap_pick": played in trap_set,
+                            "unsafe_pick": played in unsafe_set,
                             "root_value": result.root_value,
-                            "search_q": result.action_value,
-                            "exact_action_q": truth["exact_q"][
-                                str(result.action_index)
-                            ],
-                            "action_q_error": abs(
-                                result.action_value
-                                - truth["exact_q"][str(result.action_index)]
-                            ),
-                            "action_regret": truth["exact_root"]
-                            - truth["exact_q"][str(result.action_index)],
+                            "search_q": search_q,
+                            "exact_action_q": exact_q,
+                            "action_q_error": abs(search_q - exact_q),
+                            "action_regret": truth["exact_root"] - exact_q,
                             "ms": round((time.time() - t0) * 1000.0, 1),
                         }
                         rows.append(row)

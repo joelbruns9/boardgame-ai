@@ -6,6 +6,43 @@ from dataclasses import dataclass
 import math
 
 
+def expected_games_to_decide(
+    p0: float,
+    p1: float,
+    *,
+    alpha: float = 0.05,
+    beta: float = 0.05,
+    true_rate: float | None = None,
+) -> float:
+    """Wald's expected sample size for this SPRT against a true score rate.
+
+    Returns ``inf`` when the log-likelihood ratio has zero drift, which is the
+    case that matters in practice: a candidate that is *exactly* as strong as
+    the current best sits at the midpoint of the indifference region, the LLR
+    random-walks without trend, and the test never reaches a boundary.  A gate
+    configured with a small ``max_games`` therefore does not "usually decide" --
+    it decides essentially never, and every iteration reads as probation.
+
+    ``true_rate`` defaults to ``p1`` (a genuinely stronger candidate), which is
+    the number a run budget should be sized against.
+    """
+
+    if not 0.0 < p0 < p1 < 1.0:
+        raise ValueError("require 0 < p0 < p1 < 1")
+    rate = p1 if true_rate is None else true_rate
+    if not 0.0 <= rate <= 1.0:
+        raise ValueError("true_rate must lie in [0, 1]")
+    upper = math.log((1.0 - beta) / alpha)
+    lower = math.log(beta / (1.0 - alpha))
+    win = math.log(p1 / p0)
+    loss = math.log((1.0 - p1) / (1.0 - p0))
+    drift = rate * win + (1.0 - rate) * loss
+    if abs(drift) < 1e-12:
+        return math.inf
+    accept = 1.0 - beta if rate >= (p0 + p1) / 2.0 else alpha
+    return (accept * upper + (1.0 - accept) * lower) / drift
+
+
 @dataclass(frozen=True, slots=True)
 class SPRTResult:
     decision: str

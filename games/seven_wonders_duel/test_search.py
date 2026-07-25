@@ -529,3 +529,76 @@ def test_self_play_smoke_both_modes(evaluator):
         move += 1
     assert game.phase is Phase.COMPLETE
     assert game.search_barrier is False
+
+
+# -- sigma normalisation ----------------------------------------------------
+
+
+def test_sigma_rescales_completed_q_to_the_unit_interval(evaluator):
+    """The Gumbel-AlphaZero factor applies to a [0, 1]-rescaled Q.
+
+    Applied to a raw actor-relative q in [-1, 1] with c_scale=1.0, sigma spanned
+    +/-50 against log-prior differences of ~1-3, so the network's move
+    preferences were erased from the improved policy.
+    """
+
+    mcts = GumbelMCTS(evaluator, SearchConfig(c_visit=50.0, c_scale=0.1))
+    sigma = mcts._sigma({0: -1.0, 1: 0.0, 2: 1.0}, max_visits=0)
+    # Worst action pinned to 0, best to the full (c_visit + max_visits)*c_scale.
+    assert sigma[0] == pytest.approx(0.0)
+    assert sigma[2] == pytest.approx(5.0)
+    assert sigma[1] == pytest.approx(2.5)
+    # Scale grows with visits, exactly as the paper's factor does.
+    assert mcts._sigma({0: 0.0, 1: 1.0}, max_visits=50)[1] == pytest.approx(10.0)
+
+
+def test_sigma_is_translation_and_scale_invariant(evaluator):
+    """Only the ORDERING and relative spacing of completed Q may matter.
+
+    An absolute-valued sigma made the prior's influence depend on how good the
+    position happened to be, so identical decisions scored differently in a
+    winning position than in a losing one.
+    """
+
+    mcts = GumbelMCTS(evaluator, SearchConfig())
+    base = mcts._sigma({0: -0.5, 1: 0.0, 2: 0.25}, max_visits=3)
+    shifted = mcts._sigma({0: 0.0, 1: 0.5, 2: 0.75}, max_visits=3)
+    stretched = mcts._sigma({0: -1.0, 1: 0.0, 2: 0.5}, max_visits=3)
+    for action in base:
+        assert base[action] == pytest.approx(shifted[action])
+        assert base[action] == pytest.approx(stretched[action])
+
+
+def test_sigma_collapses_when_no_search_information_exists(evaluator):
+    """All-equal completed Q must leave the improved policy equal to the prior."""
+
+    mcts = GumbelMCTS(evaluator, SearchConfig())
+    sigma = mcts._sigma({0: 0.3, 1: 0.3, 2: 0.3}, max_visits=0)
+    assert set(sigma.values()) == {0.0}
+
+
+def test_prior_survives_into_the_improved_policy(evaluator):
+    """Regression: the improved policy must still reflect the network's prior.
+
+    With unnormalised sigma the completed-Q term swamped log-prior by ~25x, so
+    `policy_target` was effectively independent of the network's move
+    preferences and search discarded most of what the net had learned.
+    """
+
+    game = new_game(11, first_player=0)
+    for _ in range(12):
+        if game.phase is Phase.COMPLETE or game.pending_choice is not None:
+            break
+        apply_action(game, decode_action(game, legal_action_indices(game)[0]))
+    mcts = GumbelMCTS(evaluator, SearchConfig(sims=8, top_k=8, mode="closed", seed=3))
+    result = mcts.search(game)
+    legal = legal_action_indices(game)
+    priors = mcts._evaluate(game)[1]
+    target = result.policy_target
+    # Unvisited actions differ only through their prior, so among the actions
+    # the search never touched, prior order must be preserved in the target.
+    unvisited = [a for a in legal if result.visits.get(a, 0) == 0]
+    if len(unvisited) >= 2:
+        by_prior = sorted(unvisited, key=lambda a: priors[a])
+        by_target = sorted(unvisited, key=lambda a: target[a])
+        assert by_prior == by_target

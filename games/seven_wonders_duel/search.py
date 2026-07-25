@@ -288,6 +288,10 @@ class SearchResult:
     gumbel_topk: tuple  # the initial Gumbel top-k candidate set (buffer field)
     sims: int  # always <= config.sims
     mode: str
+    # action_index -> completed Q (root-actor perspective).  `action_value` is
+    # only the Gumbel-selected action's entry; a caller that plays a different
+    # action (evaluation plays argmax(policy_target)) needs that action's Q.
+    completed_q: dict
 
 
 @dataclass(slots=True)
@@ -297,7 +301,9 @@ class SearchConfig:
     mode: str = "closed"  # or "open"
     c_puct: float = 1.5
     c_visit: float = 50.0
-    c_scale: float = 1.0
+    # mctx's `value_scale`; pairs with the [0, 1] min-max rescale in `_sigma`.
+    # Was 1.0 against a raw q in [-1, 1], which made sigma swamp the prior.
+    c_scale: float = 0.1
     seed: int = 0
     force_expand_root_chance: bool = False
     """Closed mode: exhaustively materialize and evaluate every enumerable
@@ -331,8 +337,29 @@ class GumbelMCTS:
         priors = {index: float(p) for index, p in zip(legal, evaluation.policy)}
         return value_p0, priors
 
-    def _sigma(self, q: float, max_visits: int) -> float:
-        return (self.config.c_visit + max_visits) * self.config.c_scale * q
+    def _sigma(self, completed: dict, max_visits: int) -> dict:
+        """Gumbel-AlphaZero sigma over MIN-MAX NORMALISED completed Q values.
+
+        The (c_visit + max_visits) * c_scale * q form is from the paper, but the
+        paper (and mctx's ``qtransform_completed_by_mix_value``) applies it to a
+        Q rescaled to [0, 1] across the root's actions.  Applied to a raw
+        actor-relative q in [-1, 1] with c_scale=1.0, sigma spanned +/-50 while
+        log-prior differences are ~1-3, so the prior contributed essentially
+        nothing to the improved policy and the search ignored the network's
+        move preferences.
+
+        Rescaling per call (rather than once) is required: completed Q changes
+        as simulations accumulate, so the normalisation window has to track it.
+        When every action shares a value -- no search information yet -- the
+        span guard collapses sigma to zero and the improved policy is exactly
+        the prior, which is the correct degenerate case.
+        """
+
+        values = list(completed.values())
+        low = min(values)
+        span = max(max(values) - low, 1e-8)
+        scale = (self.config.c_visit + max_visits) * self.config.c_scale
+        return {a: scale * (q - low) / span for a, q in completed.items()}
 
     def search(self, state: GameState) -> SearchResult:
         if self.config.mode == "closed":
@@ -423,36 +450,29 @@ class GumbelMCTS:
                     break
             if len(candidates) > 1:
                 max_visits = max(visits.values()) if visits else 0
+                sigma = self._sigma({a: completed_q(a) for a in legal}, max_visits)
                 candidates = sorted(
                     candidates,
-                    key=lambda a: gumbel[a]
-                    + log_prior[a]
-                    + self._sigma(completed_q(a), max_visits),
+                    key=lambda a: gumbel[a] + log_prior[a] + sigma[a],
                     reverse=True,
                 )[: max(1, len(candidates) // 2)]
             round_index += 1
 
         max_visits = max(visits.values()) if visits else 0
-        best = max(
-            candidates,
-            key=lambda a: gumbel[a]
-            + log_prior[a]
-            + self._sigma(completed_q(a), max_visits),
-        )
         # Improved policy over ALL legal actions: completed Q (an exact forced
         # chance expectation when available, otherwise the root value for an
-        # unvisited action) — the Gumbel policy target.
-        completed = {
-            a: completed_q(a) for a in legal
-        }
-        logits = {
-            a: log_prior[a] + self._sigma(completed[a], max_visits) for a in legal
-        }
+        # unvisited action) — the Gumbel policy target.  Sigma normalises over
+        # this same full-legal window, so the halving key, the played action and
+        # the target all share one scale.
+        completed = {a: completed_q(a) for a in legal}
+        sigma = self._sigma(completed, max_visits)
+        best = max(candidates, key=lambda a: gumbel[a] + log_prior[a] + sigma[a])
+        logits = {a: log_prior[a] + sigma[a] for a in legal}
         peak = max(logits.values())
         weights = {a: math.exp(v - peak) for a, v in logits.items()}
         total = sum(weights.values())
         policy_target = {a: w / total for a, w in weights.items()}
-        return best, completed[best], visits, policy_target, sims_used, topk
+        return best, completed[best], visits, policy_target, sims_used, topk, completed
 
     # ---- closed mode ------------------------------------------------------
 
@@ -595,7 +615,15 @@ class GumbelMCTS:
             for edge in root.edges
             if edge.probability_weighted
         }
-        best, action_value, visits, policy_target, sims, topk = self._gumbel_root(
+        (
+            best,
+            action_value,
+            visits,
+            policy_target,
+            sims,
+            topk,
+            completed,
+        ) = self._gumbel_root(
             root.legal,
             priors,
             simulate,
@@ -613,6 +641,7 @@ class GumbelMCTS:
             gumbel_topk=topk,
             sims=sims,
             mode="closed",
+            completed_q=completed,
         )
 
     # ---- open mode --------------------------------------------------------
@@ -686,7 +715,15 @@ class GumbelMCTS:
             q = sign * (root.edge_value_p0.get(action_index, 0.0) / n) if n else 0.0
             return q, n
 
-        best, action_value, visits, policy_target, sims, topk = self._gumbel_root(
+        (
+            best,
+            action_value,
+            visits,
+            policy_target,
+            sims,
+            topk,
+            completed,
+        ) = self._gumbel_root(
             legal, priors, simulate, sign * root_value_p0, root.actor
         )
         self._open_root = root
@@ -699,6 +736,7 @@ class GumbelMCTS:
             gumbel_topk=topk,
             sims=sims,
             mode="open",
+            completed_q=completed,
         )
 
 

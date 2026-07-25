@@ -19,6 +19,7 @@ import shutil
 import sys
 import time
 from typing import Any, Sequence
+import warnings
 
 import torch
 
@@ -36,6 +37,7 @@ from games.az_loop import (
     RunLog,
     RunManifest,
     SPRT,
+    expected_games_to_decide,
     play_match,
     run_jobs,
     run_jobs_in_processes,
@@ -68,7 +70,8 @@ from .train import (
     evaluate as evaluate_model,
     load_checkpoint,
     make_checkpoint,
-    train_loop,
+    stable_game_split,
+    train_steps,
 )
 
 
@@ -114,7 +117,12 @@ class PhaseDConfig:
     save_buffer: str = ""
     warm_buffer: str = ""
     seed_retain_fraction: float = 1.0
-    curriculum_anneal_iterations: int = 10
+    # -1 = fit the anneal to the run (half its length).  A fixed duration that
+    # outlives the run never completes: run 02 used 20 over 12 iterations and
+    # still carried 450 of the 1000 bot seed games at the end.  Under a fixed
+    # step budget that residue is a permanent share of every minibatch, so the
+    # anneal has to finish inside the run it is configured for.
+    curriculum_anneal_iterations: int = -1
     opponent_fraction: float = 0.15
     bot_policy_iterations: int = 10
     bot_exploration: float = 0.05
@@ -128,13 +136,16 @@ class PhaseDConfig:
     top_k: int = 16
     d_model: int = 128
     layers: int = 4
-    train_epochs: int = 8
+    train_steps: int = 300
+    train_warmup_steps: int = 100
     train_batch_size: int = 512
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     aux_weight: float = 0.2
-    train_patience: int = 8
-    val_fraction: float = 0.1
+    validate_every: int = 100
+    restore_best_val: bool = False
+    val_fraction: float = 0.05
+    val_split_salt: str = "swd-v1"
     min_games_to_train: int = 2
     gate_sims: int = 64
     gate_max_games: int = 400
@@ -142,9 +153,14 @@ class PhaseDConfig:
     gate_beta: float = 0.05
     gate_indifference: float = 0.03
     anchor_gate_every_promotions: int = 3
+    # Iteration-cadence out-of-distribution anchor.  The promotion-keyed
+    # cadence above never fired in run 02 because nothing was ever promoted,
+    # so the bot suite -- the only opponent set outside the self-play
+    # distribution -- went unmeasured for the whole run.
+    anchor_every_iterations: int = 0
     selfplay_generator_mode: str = "strict_gate"
     bootstrap_policy: str = "gate"
-    promotion_every: int = 1
+    promotion_every: int = 4
     revert_reset_after: int = 0
     buffer_autosave_every: int = 0
     warm_buffer_max_staleness: int = 0
@@ -157,6 +173,38 @@ class PhaseDConfig:
     leaf_batch: int = 1
     force_root_chance: bool = True
     age_deal_samples: int = 32
+
+    def anneal_iterations(self) -> int:
+        """Curriculum anneal duration with the ``-1`` auto sentinel resolved."""
+
+        return resolve_anneal_iterations(
+            self.curriculum_anneal_iterations, self.iterations
+        )
+
+    def gate_power(self) -> dict[str, Any]:
+        """How many games this gate needs before it can decide anything.
+
+        Run 02 configured 100 games against a 3% indifference region and
+        returned ``probation`` on 11 of 11 candidates while spending roughly as
+        much wall clock on gate games as on training.  That was not bad luck:
+        a candidate at the H1 boundary needs ~368 games here, and one that is
+        genuinely equal to the best needs unboundedly many.  Surfacing the
+        number at config time makes an underpowered gate a visible choice.
+        """
+
+        delta = self.gate_indifference
+        needed = expected_games_to_decide(
+            max(0.001, 0.50 - delta),
+            min(0.999, 0.50 + delta),
+            alpha=self.gate_alpha,
+            beta=self.gate_beta,
+        )
+        return {
+            "expected_games_to_accept_at_h1": needed,
+            "gate_max_games": self.gate_max_games,
+            "underpowered": self.gate_max_games < needed,
+            "resolvable": self.gate_max_games >= needed,
+        }
 
     def validate(self) -> None:
         if self.workers <= 0 or self.games_per_iteration <= 0:
@@ -184,6 +232,20 @@ class PhaseDConfig:
             raise ValueError("search_mode must be closed or open")
         if self.gate_max_games <= 0 or self.gate_max_games % 2:
             raise ValueError("gate_max_games must be a positive even number")
+        power = self.gate_power()
+        if self.promotion_every > 0 and power["underpowered"]:
+            warnings.warn(
+                f"promotion gate is underpowered: {self.gate_max_games} games "
+                f"cannot resolve a {self.gate_indifference:.0%} indifference "
+                f"region (a candidate at the H1 boundary needs about "
+                f"{power['expected_games_to_accept_at_h1']:.0f} games, and an "
+                "evenly-matched candidate needs unboundedly many). Every "
+                "iteration will read as probation. Raise --gate-max-games, "
+                "widen --gate-indifference, or set --promotion-every 0 to skip "
+                "the gate and spend the games on self-play instead.",
+                UnderpoweredGateWarning,
+                stacklevel=2,
+            )
         if self.anchor_gate_every_promotions < 0:
             raise ValueError("anchor_gate_every_promotions must be non-negative")
         valid_modes = {mode.value for mode in GeneratorMode}
@@ -222,66 +284,41 @@ class PhaseDConfig:
             raise ValueError("age_deal_samples must be in [0, 32]")
         if self.d_model <= 0 or self.d_model % 4 or self.layers <= 0:
             raise ValueError("d_model must be positive/divisible by 4 and layers positive")
-        if self.train_epochs <= 0 or self.train_batch_size <= 0:
-            raise ValueError("training epochs and batch size must be positive")
+        if self.train_steps <= 0 or self.train_batch_size <= 0:
+            raise ValueError("train_steps and batch size must be positive")
+        if self.train_warmup_steps < 0:
+            raise ValueError("train_warmup_steps must be non-negative")
+        if self.validate_every <= 0:
+            raise ValueError("validate_every must be positive")
+        if not 0.0 <= self.val_fraction < 1.0:
+            raise ValueError("val_fraction must lie in [0, 1)")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
-        if self.train_patience <= 0:
-            raise ValueError("train_patience must be positive")
+
+
+class UnderpoweredGateWarning(UserWarning):
+    """The promotion gate cannot resolve its own indifference region."""
 
 
 def curriculum_fraction(initial: float, iteration: int, duration: int) -> float:
     return LinearSchedule(initial, 0.0, duration).value(iteration)
 
 
-def temperature_for_move(move_index: int) -> float:
-    return LinearSchedule(1.0, 0.25, 20).value(move_index)
+def resolve_anneal_iterations(configured: int, iterations: int) -> int:
+    """Resolve the ``-1`` auto sentinel to half the planned run length.
 
-
-def phase_d_game_honest_split(
-    examples: list[Example], val_frac: float, seed: int = 0
-) -> tuple[list[Example], list[Example]]:
-    """Online split: hold games out within each self-play generation.
-
-    Every labeled iteration contributes fresh games to both train and
-    validation without sharing a game between them. Curriculum examples
-    (iteration=None) are training-only. The offline trainer retains its
-    whole-iteration split for temporal/generalization analysis.
+    Anything explicitly configured is honoured as-is; the caller warns when an
+    explicit duration outlives the run and so leaves seed data in the buffer at
+    the final iteration.
     """
 
-    if not 0.0 <= val_frac < 1.0:
-        raise ValueError("val_frac must lie in [0, 1)")
-    validation_keys: set[tuple[int, int]] = set()
-    iterations = sorted(
-        {example.iteration for example in examples if example.iteration is not None}
-    )
-    for iteration in iterations:
-        game_keys = sorted(
-            {
-                example.game_key
-                for example in examples
-                if example.iteration == iteration
-            }
-        )
-        if val_frac <= 0.0 or len(game_keys) < 2:
-            continue
-        rng = random.Random(seed ^ (iteration * 0x9E3779B1))
-        rng.shuffle(game_keys)
-        held = min(len(game_keys) - 1, max(1, round(len(game_keys) * val_frac)))
-        validation_keys.update((iteration, key) for key in game_keys[:held])
-    train = [
-        example
-        for example in examples
-        if example.iteration is None
-        or (example.iteration, example.game_key) not in validation_keys
-    ]
-    validation = [
-        example
-        for example in examples
-        if example.iteration is not None
-        and (example.iteration, example.game_key) in validation_keys
-    ]
-    return train, validation
+    if configured >= 0:
+        return configured
+    return max(1, iterations // 2)
+
+
+def temperature_for_move(move_index: int) -> float:
+    return LinearSchedule(1.0, 0.25, 20).value(move_index)
 
 
 def should_run_anchor_gate(
@@ -385,7 +422,12 @@ class SearchAgent:
             ),
             self.draft_prior,
         )
-        return search.search(state).action_index
+        result = search.search(state)
+        # Not `result.action_index`: that is the Gumbel-perturbed selection,
+        # which belongs to self-play exploration.  A gate or arena game plays
+        # the improved policy's argmax, built from the same logits without the
+        # Gumbel keys.
+        return max(result.policy_target, key=result.policy_target.get)
 
 
 def _write_records(path: Path, records: Sequence[GameRecord]) -> None:
@@ -683,7 +725,7 @@ def _self_play_game(
 ) -> GameRecord:
     rng = random.Random(job.seed ^ 0xC6BC279692B5CC83)
     mix_fraction = curriculum_fraction(
-        config.opponent_fraction, iteration, config.curriculum_anneal_iterations
+        config.opponent_fraction, iteration, config.anneal_iterations()
     )
     mixed = rng.random() < mix_fraction
     bot = None
@@ -1014,7 +1056,7 @@ class PhaseDLoop:
         mix_fraction = curriculum_fraction(
             self.config.opponent_fraction,
             iteration,
-            self.config.curriculum_anneal_iterations,
+            self.config.anneal_iterations(),
         )
         grouped: dict[tuple[str | None, int | None], list[GameJob]] = {}
         for job in jobs:
@@ -1104,7 +1146,7 @@ class PhaseDLoop:
         seed_fraction = curriculum_fraction(
             self.config.seed_retain_fraction,
             iteration,
-            self.config.curriculum_anneal_iterations,
+            self.config.anneal_iterations(),
         )
         seed_path = self.buffer_dir / "curriculum_seed.jsonl"
         if seed_fraction <= 0.0 or not seed_path.exists():
@@ -1114,6 +1156,44 @@ class PhaseDLoop:
         rng = random.Random(self.config.seed + iteration)
         rng.shuffle(seed_records)
         return live + seed_records[: min(desired, len(seed_records))]
+
+    @property
+    def optimizer_state_path(self) -> Path:
+        return self.checkpoint_dir / "optimizer_state.pt"
+
+    def _load_optimizer_state(self) -> dict | None:
+        """AdamW moments carried across self-play iterations.
+
+        Rebuilding the optimizer every iteration threw away the moment
+        estimates and restarted the LR schedule, so each iteration re-descended
+        ground the previous one had already covered.  Absent or unreadable
+        state is not an error -- a cold start just warms up again.
+        """
+
+        path = self.optimizer_state_path
+        if not path.exists():
+            return None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:  # noqa: BLE001 - corrupt state is recoverable
+            print(f"optimizer state unreadable ({error}); starting cold")
+            return None
+        return payload.get("state")
+
+    def _save_optimizer_state(self, state: dict, iteration: int) -> None:
+        payload = {"state": state, "iteration": iteration}
+        temporary = self.optimizer_state_path.with_suffix(".pt.tmp")
+        torch.save(payload, temporary)
+        temporary.replace(self.optimizer_state_path)
+
+    def clear_optimizer_state(self) -> None:
+        """Drop the carried moments when the learner is reset to current_best.
+
+        After a revert the weights jump backwards; moments accumulated against
+        the rejected trajectory no longer describe the loss surface under them.
+        """
+
+        self.optimizer_state_path.unlink(missing_ok=True)
 
     def train_candidate(
         self,
@@ -1129,8 +1209,8 @@ class PhaseDLoop:
             )
         examples = examples_from_records(records)
         target_baselines = baselines(examples)
-        train_examples, val_examples = phase_d_game_honest_split(
-            examples, self.config.val_fraction, self.config.seed + iteration
+        train_examples, val_examples = stable_game_split(
+            examples, self.config.val_fraction, self.config.val_split_salt
         )
         if not train_examples:
             raise ValueError("game-honest split produced no training examples")
@@ -1165,18 +1245,25 @@ class PhaseDLoop:
                 self.config.train_batch_size,
                 self.config.aux_weight,
             )
-        history = train_loop(
+        history, optimizer_state = train_steps(
             model,
             train_examples,
             val_examples,
             device=self.config.device,
-            epochs=self.config.train_epochs,
+            steps=self.config.train_steps,
             batch_size=self.config.train_batch_size,
             lr=self.config.learning_rate,
+            warmup_steps=self.config.train_warmup_steps,
             weight_decay=self.config.weight_decay,
             aux_weight=self.config.aux_weight,
-            patience=self.config.train_patience,
+            validate_every=self.config.validate_every,
+            optimizer_state=self._load_optimizer_state(),
+            restore_best_val=self.config.restore_best_val,
+            seed=self.config.seed + iteration,
         )
+        self._save_optimizer_state(optimizer_state, iteration)
+        samples = self.config.train_steps * self.config.train_batch_size
+        new_examples = len(temporal_examples)
         self.last_training_stats = {
             "examples": len(examples),
             "train_examples": len(train_examples),
@@ -1187,7 +1274,20 @@ class PhaseDLoop:
             ),
             "newest_iteration": newest_iteration,
             "pretrain_newest_metrics": pretrain_metrics,
-            "epochs": history,
+            # The KataGo quantity: how hard each newly generated position is
+            # trained on.  Run 02 ran at ~113x here; AlphaGo Zero sat near 1-2x.
+            "new_examples": new_examples,
+            "samples_consumed": samples,
+            "samples_per_new_position": (
+                samples / new_examples if new_examples else None
+            ),
+            "buffer_passes": samples / len(train_examples),
+            "curriculum_fraction": curriculum_fraction(
+                self.config.seed_retain_fraction,
+                iteration,
+                self.config.anneal_iterations(),
+            ),
+            "steps": history,
         }
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
         checkpoint = make_checkpoint(
@@ -1299,13 +1399,21 @@ class PhaseDLoop:
 
         candidate_eval = evaluator(candidate_spec)
         opponent_eval = evaluator(opponent_spec)
+        # One SINGLE-net adapter per checkpoint.  The former seat-routed adapter
+        # dispatched each packed row to the net of that row's *acting* player,
+        # so inside one search tree the opponent's network evaluated every
+        # opponent-to-move leaf and neither side ever searched with its own net.
+        # A strong net facing a weak one then read garbage for every reply while
+        # handing the weak net good values for its own replies, which inverted
+        # the result: iter0 scored 0.225 against a random-init net at 2 sims
+        # under that routing versus 0.925 with clean evaluation, and the gap
+        # widened with depth because each extra simulation added another
+        # wrongly-evaluated leaf.  Games are now stepped from Python so a whole
+        # search always runs under the mover's own network; games sharing a
+        # mover still batch together.
         adapters = (
-            rust_seat_routed_flat_batch_adapter(
-                (candidate_eval, opponent_eval)
-            ),
-            rust_seat_routed_flat_batch_adapter(
-                (opponent_eval, candidate_eval)
-            ),
+            rust_flat_batch_adapter(candidate_eval),
+            rust_flat_batch_adapter(opponent_eval),
         )
         outcomes: list[MatchOutcome] = []
         maximum_pairs = self.config.gate_max_games // 2
@@ -1316,28 +1424,19 @@ class PhaseDLoop:
             seeds = [self.config.seed + seed_offset + pair for pair in pair_indices]
             first_players = [pair % 2 for pair in pair_indices]
             leg_records = []
-            for adapter in adapters:
-                records, _ = swr.self_play_many_flat_net(
-                    adapter=adapter,
-                    games=rust_games_for_self_play(seeds, first_players),
-                    game_seeds=seeds,
-                    global_batch_cap=self.config.rust_global_batch_cap,
-                    leaf_batch=1,
-                    cheap_sims_min=self.config.gate_sims,
-                    cheap_sims_max=self.config.gate_sims,
-                    full_sims_min=self.config.gate_sims,
-                    full_sims_max=self.config.gate_sims,
-                    full_search_fraction=0.0,
-                    top_k=self.config.top_k,
-                    draft_prior=0.0,
-                    iteration=-1,
-                    force=self.config.force_root_chance,
-                    age_deal_samples=self.config.age_deal_samples,
-                    max_inflight_batches=self.config.rust_max_inflight_batches,
-                    scheduler_workers=self.config.rust_scheduler_workers,
-                    deterministic_actions=True,
+            for candidate_seat in (0, 1):
+                # adapters[seat] is the net sitting in that seat this leg.
+                seat_adapters = (
+                    adapters if candidate_seat == 0 else (adapters[1], adapters[0])
                 )
-                leg_records.append(records)
+                leg_records.append(
+                    self._play_two_net_games(
+                        swr,
+                        rust_games_for_self_play(seeds, first_players),
+                        seeds,
+                        seat_adapters,
+                    )
+                )
             for offset, (pair, seed, first_player) in enumerate(
                 zip(pair_indices, seeds, first_players)
             ):
@@ -1356,7 +1455,7 @@ class PhaseDLoop:
                         winner=record["winner"],
                         scores=tuple(scores) if scores is not None else None,
                         victory_type=record["victory_type"] or "unknown",
-                        actions=len(record["moves"]),
+                        actions=record["actions"],
                     )
                     outcomes.append(outcome)
                     result = test.update(outcome.score_for(candidate_seat))
@@ -1364,6 +1463,67 @@ class PhaseDLoop:
                     if game_index % 2 == 1 and result.decision != "continue":
                         return outcomes
         return outcomes
+
+    def _play_two_net_games(
+        self,
+        swr,
+        games: list,
+        seeds: list[int],
+        seat_adapters: tuple,
+    ) -> list[dict]:
+        """Step a batch of games, searching each move under the mover's net.
+
+        Each ply partitions the live games by whose turn it is and issues one
+        batched search per seat, so a search never mixes networks.  Splitting by
+        seat roughly halves the rows per batch versus the old shared-tree call;
+        that is the cost of correctness here, and arena batches were already
+        small relative to the scheduler's capacity.
+        """
+
+        live = list(range(len(games)))
+        actions_played = [0] * len(games)
+        move_index = 0
+        while live:
+            by_seat: dict[int, list[int]] = {0: [], 1: []}
+            for slot in live:
+                by_seat[games[slot].actor].append(slot)
+            for seat, slots in by_seat.items():
+                if not slots:
+                    continue
+                results = swr.search_many_flat_net(
+                    seat_adapters[seat],
+                    [games[slot] for slot in slots],
+                    # Distinct per game, per ply, and per seat.
+                    [
+                        seeds[slot] + move_index * 1_000_003 + seat * 7_919
+                        for slot in slots
+                    ],
+                    self.config.rust_global_batch_cap,
+                    1,
+                    self.config.gate_sims,
+                    self.config.top_k,
+                    force=self.config.force_root_chance,
+                    age_deal_samples=self.config.age_deal_samples,
+                )
+                for slot, result in zip(slots, results):
+                    legal = games[slot].legal_action_indices()
+                    policy = result["policy"]
+                    # argmax of the improved policy, not the Gumbel-perturbed
+                    # `action`: exploration noise has no place in an arena game.
+                    best = max(range(len(legal)), key=lambda i: policy[i])
+                    games[slot].apply_index(legal[best])
+                    actions_played[slot] += 1
+            move_index += 1
+            live = [slot for slot in live if not games[slot].is_complete()]
+        return [
+            {
+                "winner": game.winner,
+                "victory_type": game.victory_type,
+                "scores": game.final_scores,
+                "actions": actions,
+            }
+            for game, actions in zip(games, actions_played)
+        ]
 
     def _rust_bot_gate_waves(
         self,
@@ -1666,6 +1826,7 @@ class PhaseDLoop:
                 promotion_every=self.config.promotion_every,
                 revert_reset_after=self.config.revert_reset_after,
                 anchor_gate_every_promotions=self.config.anchor_gate_every_promotions,
+                anchor_every_iterations=self.config.anchor_every_iterations,
                 buffer_autosave_every=self.config.buffer_autosave_every,
                 seed=self.config.seed,
                 iterations=self.config.iterations,
@@ -1725,7 +1886,13 @@ def main(argv=None) -> int:
         help="load replay games from a prior --save-buffer JSONL export",
     )
     parser.add_argument("--seed-retain-fraction", type=float, default=1.0)
-    parser.add_argument("--curriculum-anneal-iterations", type=int, default=10)
+    parser.add_argument(
+        "--curriculum-anneal-iterations",
+        type=int,
+        default=-1,
+        help="iterations over which the bot seed buffer anneals to zero; "
+        "-1 fits it to half the run so it always completes",
+    )
     parser.add_argument("--opponent-fraction", type=float, default=0.15)
     parser.add_argument("--bot-policy-iterations", type=int, default=10)
     parser.add_argument("--bot-exploration", type=float, default=0.05)
@@ -1739,13 +1906,28 @@ def main(argv=None) -> int:
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--train-epochs", type=int, default=8)
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=300,
+        help="optimizer updates per iteration on uniform random minibatches",
+    )
+    parser.add_argument("--train-warmup-steps", type=int, default=100)
     parser.add_argument("--train-batch-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--aux-weight", type=float, default=0.2)
-    parser.add_argument("--train-patience", type=int, default=8)
-    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--validate-every", type=int, default=100)
+    parser.add_argument(
+        "--restore-best-val",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="restore the best-validation weights at the end of an iteration; "
+        "diagnostic-only by default until arena games show validation loss "
+        "predicts strength",
+    )
+    parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument("--val-split-salt", default="swd-v1")
     parser.add_argument("--min-games-to-train", type=int, default=2)
     parser.add_argument(
         "--generation-backend", choices=("rust", "python"), default="rust"
@@ -1767,6 +1949,14 @@ def main(argv=None) -> int:
     parser.add_argument("--age-deal-samples", type=int, choices=(0, 4, 8, 16, 32), default=32)
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
     parser.add_argument(
+        "--anchor-every-iterations",
+        type=int,
+        default=0,
+        help="also run the bot anchor suite every N iterations regardless of "
+        "promotions, so out-of-distribution strength is tracked even when the "
+        "promotion gate never fires (0 = promotion-keyed only)",
+    )
+    parser.add_argument(
         "--selfplay-generator-mode",
         choices=tuple(mode.value for mode in GeneratorMode),
         default="strict_gate",
@@ -1780,7 +1970,14 @@ def main(argv=None) -> int:
         help="auto_first_trained installs the first trained learner as best "
         "without a strength gate; gate preserves the old behavior",
     )
-    parser.add_argument("--promotion-every", type=int, default=1)
+    parser.add_argument(
+        "--promotion-every",
+        type=int,
+        default=4,
+        help="run the promotion gate every N iterations (0 = never). A gate's "
+        "cost scales with --gate-max-games, which must be large enough to "
+        "resolve --gate-indifference or the gate decides nothing",
+    )
     parser.add_argument("--revert-reset-after", type=int, default=0)
     parser.add_argument(
         "--buffer-autosave-every",
@@ -1843,13 +2040,16 @@ def main(argv=None) -> int:
         top_k=args.top_k,
         d_model=args.d_model,
         layers=args.layers,
-        train_epochs=args.train_epochs,
+        train_steps=args.train_steps,
+        train_warmup_steps=args.train_warmup_steps,
         train_batch_size=args.train_batch_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
-        train_patience=args.train_patience,
+        validate_every=args.validate_every,
+        restore_best_val=args.restore_best_val,
         val_fraction=args.val_fraction,
+        val_split_salt=args.val_split_salt,
         min_games_to_train=args.min_games_to_train,
         generation_backend=args.generation_backend,
         gate_backend=args.gate_backend,
@@ -1866,6 +2066,7 @@ def main(argv=None) -> int:
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
+        anchor_every_iterations=args.anchor_every_iterations,
         selfplay_generator_mode=args.selfplay_generator_mode,
         bootstrap_policy=args.bootstrap_policy,
         promotion_every=args.promotion_every,
@@ -1887,7 +2088,9 @@ def main(argv=None) -> int:
             full_sims_min=1,
             full_sims_max=1,
             full_search_fraction=1.0,
-            train_epochs=1,
+            train_steps=2,
+            train_warmup_steps=0,
+            validate_every=1,
             train_batch_size=64,
             gate_sims=1,
             gate_max_games=2,

@@ -28,13 +28,22 @@ from games.seven_wonders_duel.phase_d import (
     curriculum_fraction,
     filter_warm_records_by_staleness,
     generate_seed_buffer,
-    phase_d_game_honest_split,
+    resolve_anneal_iterations,
+    UnderpoweredGateWarning,
     should_run_anchor_gate,
     temperature_for_move,
 )
 from games.seven_wonders_duel import phase_d as phase_d_module
 from games.seven_wonders_duel.phase_d import _write_records
-from games.az_loop import GameJob
+from games.seven_wonders_duel.train import stable_game_split, stable_is_validation
+from games.az_loop import GameJob, expected_games_to_decide
+
+# Most tests here run deliberately degenerate gates (2-4 games) to keep
+# them fast; the underpowered-gate warning is correct there and only
+# noise.  The test that asserts the warning fires opts back in locally.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore::games.seven_wonders_duel.phase_d.UnderpoweredGateWarning"
+)
 
 
 class UniformEvaluator:
@@ -101,23 +110,126 @@ class SplitExample:
     move: int
 
 
-def test_phase_d_split_trains_on_fresh_games_without_game_leakage():
-    examples = [
-        SplitExample(iteration, iteration * 100 + game, move)
-        for iteration in (0, 1)
-        for game in range(10)
+def _split_population(iterations=(0, 1), games=40):
+    return [
+        SplitExample(iteration, iteration * 1000 + game, move)
+        for iteration in iterations
+        for game in range(games)
         for move in range(2)
     ]
+
+
+def test_stable_split_trains_on_fresh_games_without_game_leakage():
+    examples = _split_population()
     curriculum = [SplitExample(None, 10_000 + game, 0) for game in range(3)]
-    train, validation = phase_d_game_honest_split(
-        examples + curriculum, val_frac=0.2, seed=9
-    )
-    train_keys = {(example.iteration, example.game_key) for example in train}
-    val_keys = {(example.iteration, example.game_key) for example in validation}
+    train, validation = stable_game_split(examples + curriculum, 0.2, "salt")
+    train_keys = {(e.iteration, e.game_key) for e in train}
+    val_keys = {(e.iteration, e.game_key) for e in validation}
     assert not (train_keys & val_keys)
-    assert {example.iteration for example in validation} == {0, 1}
-    assert {0, 1} <= {example.iteration for example in train}
+    assert {e.iteration for e in validation} == {0, 1}
+    assert {0, 1} <= {e.iteration for e in train}
     assert all(example in train for example in curriculum)
+
+
+def test_stable_split_keeps_a_game_on_the_same_side_across_iterations():
+    """The property run 02's split lacked.
+
+    ``phase_d_game_honest_split`` reseeded from ``seed + iteration`` every
+    training iteration, so a game could validate at iteration 3, train at 4 and
+    validate again at 5 -- contaminating the holdout.  Assignment must depend
+    only on the game's identity, not on when the split is taken.
+    """
+
+    early = _split_population(iterations=(0, 1))
+    late = _split_population(iterations=(0, 1, 2, 3))
+    _, early_val = stable_game_split(early, 0.2, "salt")
+    _, late_val = stable_game_split(late, 0.2, "salt")
+    early_keys = {(e.iteration, e.game_key) for e in early_val}
+    late_keys = {(e.iteration, e.game_key) for e in late_val}
+    assert early_keys
+    # Every game held out early is still held out once the buffer has grown.
+    assert early_keys <= late_keys
+
+
+def test_stable_split_is_process_independent():
+    """blake2b, not the builtin hash, so a resume reproduces the split."""
+
+    examples = _split_population()
+    first = {
+        (e.iteration, e.game_key) for e in stable_game_split(examples, 0.2, "s")[1]
+    }
+    second = {
+        (e.iteration, e.game_key) for e in stable_game_split(examples, 0.2, "s")[1]
+    }
+    assert first == second
+    assert stable_is_validation(0, 7, 0.2, "s") == stable_is_validation(0, 7, 0.2, "s")
+    # A different salt must be able to produce a different assignment.
+    salts = {stable_is_validation(0, key, 0.2, "other") for key in range(200)}
+    assert salts == {True, False}
+
+
+def test_stable_split_holds_out_roughly_the_requested_fraction():
+    examples = _split_population(iterations=range(6), games=200)
+    train, validation = stable_game_split(examples, 0.05, "salt")
+    held = len({e.game_key for e in validation})
+    total = held + len({e.game_key for e in train})
+    assert 0.03 < held / total < 0.08
+
+
+def test_curriculum_examples_are_never_validation():
+    curriculum = [SplitExample(None, key, 0) for key in range(500)]
+    train, validation = stable_game_split(curriculum, 0.5, "salt")
+    assert not validation
+    assert len(train) == 500
+
+
+def test_curriculum_anneal_auto_fits_inside_the_run():
+    """Run 02 configured 20 anneal iterations for a 12-iteration run.
+
+    The seed buffer was still at 45% of its original size at the last
+    iteration.  ``-1`` resolves to half the run so the anneal always finishes.
+    """
+
+    assert resolve_anneal_iterations(-1, 12) == 6
+    assert resolve_anneal_iterations(-1, 40) == 20
+    assert resolve_anneal_iterations(-1, 1) == 1
+    # An explicit duration is still honoured verbatim.
+    assert resolve_anneal_iterations(20, 12) == 20
+    assert resolve_anneal_iterations(0, 12) == 0
+    # Auto-fitted, the curriculum is fully gone by the end of the run.
+    assert curriculum_fraction(1.0, 12, resolve_anneal_iterations(-1, 12)) == 0.0
+
+
+def test_gate_power_flags_the_configuration_that_never_decided():
+    """Run 02: 100 games against a 3% indifference region, 11/11 probation."""
+
+    run02 = PhaseDConfig(gate_max_games=100, gate_indifference=0.03)
+    power = run02.gate_power()
+    assert power["underpowered"]
+    assert 350 < power["expected_games_to_accept_at_h1"] < 400
+    generous = PhaseDConfig(gate_max_games=1000, gate_indifference=0.03)
+    assert generous.gate_power()["resolvable"]
+
+
+def test_evenly_matched_candidate_never_resolves():
+    """The reason a small gate returns probation rather than a verdict.
+
+    At the midpoint of the indifference region the log-likelihood ratio has no
+    drift, so no finite game budget reaches a boundary.
+    """
+
+    assert expected_games_to_decide(0.47, 0.53, true_rate=0.50) == float("inf")
+    assert expected_games_to_decide(0.47, 0.53, true_rate=0.53) < float("inf")
+
+
+def test_underpowered_gate_warns_only_when_the_gate_runs():
+    with pytest.warns(UnderpoweredGateWarning, match="underpowered"):
+        PhaseDConfig(gate_max_games=100, promotion_every=1).validate()
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")
+        PhaseDConfig(gate_max_games=100, promotion_every=0).validate()
 
 
 def test_anchor_gate_cadence_counts_promotions_not_iterations():
@@ -253,7 +365,9 @@ def test_initialize_train_checkpoint_and_promote_plumbing(tmp_path: Path):
         seed_games=2,
         d_model=32,
         layers=1,
-        train_epochs=1,
+        train_steps=2,
+        train_warmup_steps=0,
+        validate_every=1,
         train_batch_size=64,
         min_games_to_train=2,
         device="cpu",
@@ -519,7 +633,9 @@ def _soft_gate_config(tmp_path: Path, **overrides) -> PhaseDConfig:
         full_sims_max=1,
         full_search_fraction=1.0,
         top_k=2,
-        train_epochs=1,
+        train_steps=2,
+        train_warmup_steps=0,
+        validate_every=1,
         train_batch_size=64,
         gate_sims=1,
         gate_max_games=2,

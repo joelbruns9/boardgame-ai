@@ -250,8 +250,25 @@ pub struct SearchResult {
     pub sims: usize,
 }
 
-fn sigma(cfg: &SearchConfig, q: f64, max_visits: u32) -> f64 {
-    (cfg.c_visit + max_visits as f64) * cfg.c_scale * q
+/// Gumbel-AlphaZero sigma over MIN-MAX NORMALISED completed Q values.
+///
+/// Port of Python's `GumbelMCTS._sigma`. The paper (and mctx's
+/// `qtransform_completed_by_mix_value`) applies the (c_visit + max_visits) *
+/// c_scale factor to a Q rescaled to [0, 1] across the root's actions; applied
+/// to a raw actor-relative q in [-1, 1] it swamped the log-prior entirely.
+///
+/// Operation order is load-bearing: `scale * (q - low) / span` must group as
+/// `(scale * (q - low)) / span` to stay bit-identical with Python's
+/// left-associative evaluation.
+pub fn sigma_vector(cfg: &SearchConfig, completed: &[f64], max_visits: u32) -> Vec<f64> {
+    let low = completed.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = completed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (high - low).max(1e-8);
+    let scale = (cfg.c_visit + max_visits as f64) * cfg.c_scale;
+    completed
+        .iter()
+        .map(|&q| scale * (q - low) / span)
+        .collect()
 }
 
 /// Materialize + evaluate every enumerable chance child of each root edge (AGE_DEAL
@@ -391,9 +408,11 @@ pub fn search_closed<E: Eval>(
         }
         if candidates.len() > 1 {
             let max_visits = visits.iter().copied().max().unwrap_or(0);
+            let completed: Vec<f64> = (0..n).map(|j| completed_q(j, &q_hat)).collect();
+            let sig = sigma_vector(cfg, &completed, max_visits);
             candidates.sort_by(|&a, &b| {
-                let ka = gumbel[a] + log_prior[a] + sigma(cfg, completed_q(a, &q_hat), max_visits);
-                let kb = gumbel[b] + log_prior[b] + sigma(cfg, completed_q(b, &q_hat), max_visits);
+                let ka = gumbel[a] + log_prior[a] + sig[a];
+                let kb = gumbel[b] + log_prior[b] + sig[b];
                 kb.partial_cmp(&ka).unwrap()
             });
             candidates.truncate((candidates.len() / 2).max(1));
@@ -402,22 +421,24 @@ pub fn search_closed<E: Eval>(
     }
 
     let max_visits = visits.iter().copied().max().unwrap_or(0);
+    // Improved policy over ALL legal actions (completed Q); sigma normalises
+    // over this same full-legal window so the halving key, the played action
+    // and the target share one scale.
+    let completed: Vec<f64> = (0..n).map(|j| completed_q(j, &q_hat)).collect();
+    let sig = sigma_vector(cfg, &completed, max_visits);
     // best = first argmax over the surviving candidates.
     let mut best = candidates[0];
     let mut best_score = f64::NEG_INFINITY;
     for &j in &candidates {
-        let s = gumbel[j] + log_prior[j] + sigma(cfg, completed_q(j, &q_hat), max_visits);
+        let s = gumbel[j] + log_prior[j] + sig[j];
         if s > best_score {
             best_score = s;
             best = j;
         }
     }
 
-    // Improved policy over ALL legal actions (completed Q); left-fold the
-    // normalizer in legal order to match Python's sum.
-    let logits: Vec<f64> = (0..n)
-        .map(|j| log_prior[j] + sigma(cfg, completed_q(j, &q_hat), max_visits))
-        .collect();
+    // Left-fold the normalizer in legal order to match Python's sum.
+    let logits: Vec<f64> = (0..n).map(|j| log_prior[j] + sig[j]).collect();
     let peak = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let weights: Vec<f64> = logits.iter().map(|&v| (v - peak).exp()).collect();
     let total = weights.iter().fold(0.0_f64, |a, &b| a + b);

@@ -66,6 +66,7 @@ class FakeAdapter:
         self.archived: list[str] = []
         self.resets: list[Path] = []
         self.autosaves: list[int] = []
+        self.anchor_calls: list[tuple[int, str]] = []
         self.autosave_should_fail = False
         self.fail_promotion_at: int | None = None
 
@@ -115,6 +116,7 @@ class FakeAdapter:
         return PromotionResult(decision=self.decisions.pop(0), metrics={"games": 50})
 
     def evaluate_anchors(self, request: AnchorRequest):
+        self.anchor_calls.append((request.iteration, Path(request.checkpoint).name))
         return AnchorResult(passed=True, metrics={"opponents": 5})
 
     def archive_best(self, artifact) -> None:
@@ -143,6 +145,7 @@ def _controller(
     revert_reset_after: int = 0,
     store: MemoryStore | None = None,
     anchor_every: int = 0,
+    anchor_every_iterations: int = 0,
     autosave_every: int = 0,
 ) -> tuple[RunController, FakeAdapter, MemoryStore]:
     ckpt = tmp_path / "checkpoints"
@@ -158,6 +161,7 @@ def _controller(
             promotion_every=promotion_every,
             revert_reset_after=revert_reset_after,
             anchor_gate_every_promotions=anchor_every,
+            anchor_every_iterations=anchor_every_iterations,
             buffer_autosave_every=autosave_every,
             iterations=iterations,
         ),
@@ -704,3 +708,81 @@ def test_revert_reset_after_rejected_for_non_soft_modes(tmp_path):
             mode=GeneratorMode.LATEST,
             revert_reset_after=1,
         )
+
+
+# -- controller: iteration-cadence out-of-distribution anchors --------------
+
+
+def test_anchors_run_on_iteration_cadence_without_any_promotion(tmp_path):
+    """The gap run 02 fell into.
+
+    Its anchor cadence was keyed to promotions, the promotion gate returned
+    probation on all 11 candidates, and so the bot suite -- the only opponent
+    set outside the self-play distribution -- was never measured.  With an
+    iteration cadence the anchors fire regardless.
+    """
+
+    controller, adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"] * 6,
+        iterations=6,
+        promotion_every=1,
+        anchor_every=0,
+        anchor_every_iterations=2,
+    )
+    controller.run()
+    assert [call[0] for call in adapter.anchor_calls] == [1, 3, 5]
+
+
+def test_iteration_cadence_anchors_measure_the_rolling_learner(tmp_path):
+    """Nothing was promoted, so current_best is stale; measure latest.pt."""
+
+    controller, adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"] * 2,
+        iterations=2,
+        promotion_every=1,
+        anchor_every_iterations=1,
+    )
+    controller.run()
+    # Iteration 0 bootstrap-promotes, so it reads current_best; iteration 1 is
+    # probation and must read the rolling learner instead.
+    assert adapter.anchor_calls[-1] == (1, "latest.pt")
+
+
+def test_zero_iteration_cadence_keeps_promotion_keyed_behaviour(tmp_path):
+    controller, adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"] * 3,
+        iterations=3,
+        promotion_every=1,
+        anchor_every=0,
+        anchor_every_iterations=0,
+    )
+    controller.run()
+    assert adapter.anchor_calls == []
+
+
+def test_anchor_cadence_change_is_rejected_on_resume(tmp_path):
+    store = MemoryStore()
+    first, _adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=1,
+        anchor_every_iterations=2,
+        store=store,
+    )
+    first.run()
+    second, _a2, _s2 = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        iterations=1,
+        anchor_every_iterations=5,
+        store=store,
+    )
+    with pytest.raises(ValueError, match="anchor_every_iterations"):
+        second.initialize()

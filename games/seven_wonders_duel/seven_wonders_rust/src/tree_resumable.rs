@@ -642,9 +642,9 @@ fn materialize_paired_age_deals(
     Ok(ForcedRows { nodes, by_kind })
 }
 
-fn sigma(cfg: &SearchConfig, q: f64, max_visits: u32) -> f64 {
-    (cfg.c_visit + max_visits as f64) * cfg.c_scale * q
-}
+// Sigma lives in `tree`: one min-max-normalised definition shared by the
+// scalar searcher and this resumable one, so the two cannot drift.
+use crate::tree::sigma_vector;
 
 #[derive(Clone, Debug, Default)]
 pub struct SearchMetrics {
@@ -844,14 +844,13 @@ impl SearchSession {
         }
         if self.candidates.len() > 1 {
             let max_visits = self.visits.iter().copied().max().unwrap_or(0);
-            let cfg = &self.cfg;
-            let q_hat = &self.q_hat;
-            let initial_q = &self.initial_q;
-            let root_value = self.root_value;
+            let completed: Vec<f64> = (0..self.legal.len())
+                .map(|j| self.q_hat[j].or(self.initial_q[j]).unwrap_or(self.root_value))
+                .collect();
+            let sig = sigma_vector(&self.cfg, &completed, max_visits);
             self.candidates.sort_by(|&a, &b| {
-                let completed = |j: usize| q_hat[j].or(initial_q[j]).unwrap_or(root_value);
-                let ka = self.gumbel[a] + self.log_prior[a] + sigma(cfg, completed(a), max_visits);
-                let kb = self.gumbel[b] + self.log_prior[b] + sigma(cfg, completed(b), max_visits);
+                let ka = self.gumbel[a] + self.log_prior[a] + sig[a];
+                let kb = self.gumbel[b] + self.log_prior[b] + sig[b];
                 kb.partial_cmp(&ka).unwrap()
             });
             self.candidates.truncate((self.candidates.len() / 2).max(1));
@@ -1163,19 +1162,19 @@ impl SearchSession {
             return Err(PyRuntimeError::new_err("search session is not complete"));
         }
         let max_visits = self.visits.iter().copied().max().unwrap_or(0);
+        let completed: Vec<f64> = (0..self.legal.len()).map(|j| self.completed_q(j)).collect();
+        let sig = sigma_vector(&self.cfg, &completed, max_visits);
         let mut best = self.candidates[0];
         let mut best_score = f64::NEG_INFINITY;
         for &j in &self.candidates {
-            let score = self.gumbel[j]
-                + self.log_prior[j]
-                + sigma(&self.cfg, self.completed_q(j), max_visits);
+            let score = self.gumbel[j] + self.log_prior[j] + sig[j];
             if score > best_score {
                 best_score = score;
                 best = j;
             }
         }
         let logits: Vec<f64> = (0..self.legal.len())
-            .map(|j| self.log_prior[j] + sigma(&self.cfg, self.completed_q(j), max_visits))
+            .map(|j| self.log_prior[j] + sig[j])
             .collect();
         let peak = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let weights: Vec<f64> = logits.iter().map(|&value| (value - peak).exp()).collect();

@@ -428,7 +428,7 @@ impl RustGame {
     /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
     /// `visits`/`policy_target` aligned to `legal_action_indices`.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search(
         &self,
         sims: usize,
@@ -478,7 +478,7 @@ impl RustGame {
     /// request, evaluation is applied separately, and stable arena paths are
     /// backed up before the next simulation is selected.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search_resumable(
         &self,
         sims: usize,
@@ -527,7 +527,7 @@ impl RustGame {
     /// still the scalar F3.4 Python adapter; F4.4/F4.5 replace the boundary,
     /// while this method keeps the phase split independently gateable today.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search_resumable_net(
         &self,
         adapter: Py<PyAny>,
@@ -579,7 +579,7 @@ impl RustGame {
     /// collisions, waves, max_wave_paths, max_wave_unique)`, completed-Q aligned
     /// to legal actions, and the tree digest.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search_batched(
         &self,
         leaf_batch: usize,
@@ -643,7 +643,7 @@ impl RustGame {
     /// adapter remains one Python call per unique leaf until the F4.4 global
     /// coalescer; this surface gates batched search semantics with a real net.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (adapter, leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search_batched_net(
         &self,
         adapter: Py<PyAny>,
@@ -709,7 +709,7 @@ impl RustGame {
     /// callable `(tokens, actor, legal) -> (value_actor, priors)`; the Rust
     /// encoder (F2) feeds it, so results match Python's searcher on the same net.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false))]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
     fn closed_search_net(
         &self,
         adapter: Py<PyAny>,
@@ -763,7 +763,7 @@ impl RustGame {
     #[pyo3(signature = (
         adapter, game_seed, leaf_batch, cheap_sims_min, cheap_sims_max,
         full_sims_min, full_sims_max, full_search_fraction, top_k, draft_prior,
-        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
         age_deal_samples=0, max_moves=256
     ))]
     fn self_play_net(
@@ -815,7 +815,7 @@ impl RustGame {
     #[pyo3(signature = (
         game_seed, leaf_batch, cheap_sims_min, cheap_sims_max, full_sims_min,
         full_sims_max, full_search_fraction, top_k, draft_prior,
-        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+        iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
         age_deal_samples=0, max_moves=256
     ))]
     fn self_play_mock(
@@ -866,6 +866,34 @@ impl RustGame {
     #[getter]
     fn active_player(&self) -> usize {
         self.state.active_player
+    }
+
+    /// Seat that owns the next decision: the pending chooser when one exists,
+    /// otherwise the active player. This is the seat whose network must drive a
+    /// search from this position, so a two-network arena can pick the right one.
+    #[getter]
+    fn actor(&self) -> usize {
+        tree::state_actor(&self.state)
+    }
+
+    #[getter]
+    fn winner(&self) -> Option<usize> {
+        self.state.winner
+    }
+
+    #[getter]
+    fn victory_type(&self) -> Option<&'static str> {
+        self.state.victory_type.map(|kind| match kind {
+            state::VictoryType::Military => "military",
+            state::VictoryType::Scientific => "scientific",
+            state::VictoryType::Civilian => "civilian",
+            state::VictoryType::SharedCivilian => "shared_civilian",
+        })
+    }
+
+    #[getter]
+    fn final_scores(&self) -> Option<(i32, i32)> {
+        self.state.final_scores
     }
 }
 
@@ -1009,7 +1037,7 @@ fn search_result_to_py(
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (
     adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
-    c_puct=1.5, c_visit=50.0, c_scale=1.0, force=false,
+    c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
     age_deal_samples=0, inference_timeout_ms=0.0
 ))]
 fn search_many_flat_net(
@@ -1275,7 +1303,7 @@ fn cooperative_jobs(
 #[pyo3(signature = (
     games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
-    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, max_moves=256
 ))]
 fn self_play_many_mock(
@@ -1330,7 +1358,7 @@ fn self_play_many_mock(
 #[pyo3(signature = (
     adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
-    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false
@@ -1463,7 +1491,7 @@ fn self_play_many_net(
 #[pyo3(signature = (
     adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
-    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=1.0,
+    draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,

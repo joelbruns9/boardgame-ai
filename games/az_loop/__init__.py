@@ -36,7 +36,7 @@ from .manifest import RunManifest
 from .run_controller import ControllerConfig, RunController, RunStore
 from .run_log import RunLog
 from .schedule import LinearSchedule, ReplayWindow
-from .sprt import SPRT, SPRTResult
+from .sprt import SPRT, SPRTResult, expected_games_to_decide
 from .training_control import (
     BootstrapPolicy,
     GeneratorMode,
@@ -81,6 +81,7 @@ __all__ = [
     "RunStore",
     "SPRT",
     "SPRTResult",
+    "expected_games_to_decide",
     "TrainRequest",
     "TrainingResult",
     "TransitionResult",
