@@ -22,6 +22,29 @@ from .game import GameState, Phase, ResolvedChance, new_game
 SCHEMA_VERSION = 1
 SPEC_VERSION = "codec-1"
 
+TARGET_VERSION = 2
+"""Version of the TRAINING TARGET definition, independent of the codec.
+
+``schema``/``spec_version`` cover replay: what a state and an action mean.  They
+deliberately do not move when the *labels* change, and that is a real gap --
+2026-07-25's sigma fix rescaled completed Q to [0, 1] and dropped ``c_scale``
+1.0 -> 0.1, which changes every ``policy_target`` value while leaving the codec
+untouched.  Old records therefore stayed loadable and silently mixed two
+incompatible definitions of the thing the policy head regresses onto.
+
+1. completed Q with unnormalised sigma, ``c_visit=50``, ``c_scale=1.0``.  Sigma
+   spanned +/-50 against log-prior differences of ~1-3, so the prior barely
+   contributed to the target.
+2. completed Q min-max rescaled to [0, 1] across the root's legal actions, then
+   ``(c_visit + max_visits) * c_scale`` with ``c_scale=0.1`` (mctx's
+   ``value_scale``).
+
+Bump this whenever the meaning of ``policy_target``, ``root_value`` or the
+value label changes.  Replay is unaffected: because ``replay(record)``
+reproduces states bit-exactly, a stale record can always be RE-derived rather
+than discarded, so this gates training, not reading.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class MoveRecord:
@@ -58,6 +81,7 @@ class GameRecord:
     the chance outcomes, and the final state unchanged."""
     schema: int = SCHEMA_VERSION
     spec_version: str = SPEC_VERSION
+    target_version: int = TARGET_VERSION
 
 
 class ReplayMismatchError(RuntimeError):
@@ -287,6 +311,7 @@ def to_json_line(record: GameRecord) -> str:
     payload = {
         "schema": record.schema,
         "spec_version": record.spec_version,
+        "target_version": record.target_version,
         "setup": {"seed": record.seed, "first_player": record.first_player},
         "agents": record.agents,
         "iteration": record.iteration,
@@ -335,6 +360,11 @@ def from_json_line(line: str) -> GameRecord:
     return GameRecord(
         schema=payload["schema"],
         spec_version=payload["spec_version"],
+        # Absent means the file predates target versioning, which can only be
+        # definition 1.  Reading stays permissive on purpose -- replay and
+        # reanalyze must be able to open stale buffers to re-derive targets
+        # from them.  Enforcement belongs at the training boundary.
+        target_version=payload.get("target_version", 1),
         seed=payload["setup"]["seed"],
         first_player=payload["setup"]["first_player"],
         agents=dict(payload["agents"]),
@@ -387,3 +417,51 @@ def append_records(path, records) -> None:
 def read_records(path) -> list[GameRecord]:
     with open(path, "r", encoding="utf-8") as handle:
         return [from_json_line(line) for line in handle if line.strip()]
+
+
+class StaleTargetsError(RuntimeError):
+    """A buffer holds targets computed under a superseded definition."""
+
+
+def target_version_census(records) -> dict[int, int]:
+    """Count records per target definition."""
+
+    census: dict[int, int] = {}
+    for record in records:
+        census[record.target_version] = census.get(record.target_version, 0) + 1
+    return census
+
+
+def check_target_versions(records, *, source: str, allow_stale: bool = False):
+    """Refuse to train on targets that mean different things.
+
+    Training a single head against two definitions of ``policy_target`` is
+    silent corruption: nothing errors, the loss still falls, and the resulting
+    net is fit to an average of two objectives.  The failure is invisible in
+    every metric the loop reports, which is precisely why it needs to be
+    structural rather than documented.
+
+    Returns the census so callers can log what they accepted.
+    """
+
+    census = target_version_census(records)
+    stale = {version: n for version, n in census.items() if version != TARGET_VERSION}
+    if not stale:
+        return census
+    breakdown = ", ".join(
+        f"{n} record(s) at target_version={version}" for version, n in sorted(stale.items())
+    )
+    if allow_stale:
+        print(
+            f"WARNING: {source} mixes target definitions ({breakdown}; current "
+            f"is {TARGET_VERSION}) and stale targets were explicitly allowed. "
+            f"The policy head will be fit to inconsistent labels."
+        )
+        return census
+    raise StaleTargetsError(
+        f"{source} contains {breakdown}, but the current target definition is "
+        f"{TARGET_VERSION}. These were computed under a superseded rule and "
+        f"mixing them trains the policy head on two different objectives. "
+        f"Start from a fresh buffer, or pass allow_stale_targets to override "
+        f"knowingly. See TARGET_VERSION in buffer.py for what changed."
+    )

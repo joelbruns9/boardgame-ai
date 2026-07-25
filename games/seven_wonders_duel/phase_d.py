@@ -50,7 +50,13 @@ from .bots import (
     ScienceAggressiveBot,
     ScienceEconomyBot,
 )
-from .buffer import GameRecord, GameRecorder, read_records, to_json_line
+from .buffer import (
+    GameRecord,
+    GameRecorder,
+    check_target_versions,
+    read_records,
+    to_json_line,
+)
 from .codec import decode_action, encode_action
 from .dataset import Example, examples_from_records
 from .game import Phase
@@ -164,6 +170,10 @@ class PhaseDConfig:
     revert_reset_after: int = 0
     buffer_autosave_every: int = 0
     warm_buffer_max_staleness: int = 0
+    allow_stale_targets: bool = False
+    """Load a warm buffer whose targets predate the current definition.
+
+    Off by default: the mix is silent corruption, so it has to be chosen."""
     generation_backend: str = "rust"
     gate_backend: str = "rust"
     rust_slots: int = 16
@@ -884,6 +894,14 @@ class PhaseDLoop:
             self.config.warm_buffer_max_staleness or self.config.replay_window
         )
         records = read_records(warm_path)
+        # Before the staleness filter: an age window says nothing about whether
+        # the labels still mean the same thing, and a recent record computed
+        # under an old target rule is exactly as unusable as an ancient one.
+        check_target_versions(
+            records,
+            source=str(warm_path),
+            allow_stale=self.config.allow_stale_targets,
+        )
         self.warm_records, self.last_warm_stats = filter_warm_records_by_staleness(
             records, max_staleness
         )
@@ -1994,6 +2012,12 @@ def main(argv=None) -> int:
         "(0 = default to --replay-window)",
     )
     parser.add_argument(
+        "--allow-stale-targets",
+        action="store_true",
+        help="import a warm buffer whose policy targets were computed under a "
+        "superseded definition; trains the policy head on inconsistent labels",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument(
@@ -2073,6 +2097,7 @@ def main(argv=None) -> int:
         revert_reset_after=args.revert_reset_after,
         buffer_autosave_every=args.buffer_autosave_every,
         warm_buffer_max_staleness=args.warm_buffer_max_staleness,
+        allow_stale_targets=args.allow_stale_targets,
         device=args.device,
     )
     if args.plumbing_smoke:
