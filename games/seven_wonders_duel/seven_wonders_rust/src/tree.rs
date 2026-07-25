@@ -235,6 +235,10 @@ pub struct SearchConfig {
     pub c_scale: f64,
     pub seed: u64,
     pub force_expand_root_chance: bool,
+    /// Root action selection: false = Gumbel top-k + sequential halving (the
+    /// training-target generator), true = plain PUCT at the root with argmax
+    /// visits (what the advisor runs, and what evaluation should measure).
+    pub puct_root: bool,
     /// Common root AgeDeal samples per legal action. Zero preserves the legacy
     /// independently-sampled behavior.
     pub age_deal_samples: usize,
@@ -324,6 +328,72 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
     Ok(())
 }
 
+/// Plain PUCT from the root: a port of `GumbelMCTS._puct_root`.
+///
+/// The Gumbel root exists to make a small fixed budget produce an unbiased
+/// policy-improvement TARGET. Evaluation is not building a target, and the
+/// Gumbel keys perturb which candidates get searched at all, so competitive
+/// play selects at the root by PUCT like every node below it and plays argmax
+/// visits.
+fn puct_root<E: Eval>(
+    mut root: Node,
+    eval: &E,
+    cfg: &SearchConfig,
+    sign: f64,
+    root_value: f64,
+    legal: Vec<usize>,
+) -> PyResult<(SearchResult, Node)> {
+    let n = root.edges.len();
+    let mut rng = Rng::new(cfg.seed);
+    for _ in 0..cfg.sims {
+        descend(&mut root, None, eval, &mut rng, cfg.c_puct)?;
+    }
+    let visits: Vec<u32> = root.edges.iter().map(|e| e.visits).collect();
+    let completed: Vec<f64> = root
+        .edges
+        .iter()
+        .map(|e| {
+            if e.visits > 0 || e.probability_weighted {
+                sign * e.q_p0()
+            } else {
+                root_value
+            }
+        })
+        .collect();
+    // Left-fold in legal order to match Python's `sum`.
+    let total: f64 = visits.iter().fold(0.0_f64, |a, &b| a + b as f64);
+    let policy_target: Vec<f64> = if total > 0.0 {
+        visits.iter().map(|&v| v as f64 / total).collect()
+    } else {
+        // Every simulation hit a terminal root edge; fall back to the prior.
+        let mass: f64 = root.edges.iter().fold(0.0_f64, |a, e| a + e.prior);
+        let mass = if mass > 0.0 { mass } else { 1.0 };
+        root.edges.iter().map(|e| e.prior / mass).collect()
+    };
+    // Python's `max` returns the FIRST maximum in legal order; a strict `>`
+    // over the same order agrees on ties.
+    let mut best = 0usize;
+    let mut best_visits = 0u32;
+    for j in 0..n {
+        if visits[j] > best_visits {
+            best_visits = visits[j];
+            best = j;
+        }
+    }
+    let result = SearchResult {
+        action_index: legal[best],
+        action_value: completed[best],
+        root_value: sign * root.value_p0(),
+        visits,
+        policy_target,
+        // No Gumbel top-k exists here; an invented one would let a buffer row
+        // claim a candidate set that never happened.
+        gumbel_topk: Vec::new(),
+        sims: cfg.sims,
+    };
+    Ok((result, root))
+}
+
 /// Full closed search with a Gumbel root (top-k + sequential halving +
 /// completed-Q policy target), a port of `_gumbel_root` + `_search_closed`.
 /// Returns the result and the built tree (for the digest gate).
@@ -351,6 +421,10 @@ pub fn search_closed<E: Eval>(
     let root_value = sign * root_value_p0;
     let n = root.edges.len();
     let legal: Vec<usize> = root.legal.clone();
+
+    if cfg.puct_root {
+        return puct_root(root, eval, cfg, sign, root_value, legal);
+    }
 
     // Gumbel keys (one per legal action, in sorted order) then the per-edge
     // priors, log-priors, and any forced (probability-weighted) initial Q.

@@ -299,6 +299,15 @@ class SearchConfig:
     sims: int = 64
     top_k: int = 16
     mode: str = "closed"  # or "open"
+    root_selection: str = "gumbel"  # or "puct"
+    """How the ROOT picks which action to simulate next.
+
+    ``gumbel`` is Gumbel top-k + sequential halving: the training-target
+    generator, and what self-play must keep using.  ``puct`` selects at the
+    root by PUCT like every other node and plays argmax visits -- the search
+    the advisor runs, and therefore what evaluation should measure.
+    """
+
     c_puct: float = 1.5
     c_visit: float = 50.0
     # mctx's `value_scale`; pairs with the [0, 1] min-max rescale in `_sigma`.
@@ -560,6 +569,52 @@ class GumbelMCTS:
         node.value_sum_p0 += value
         return value
 
+    def _puct_root(self, root: ClosedNode, sign: float, root_value: float):
+        """Plain PUCT from the root — the search the advisor actually runs.
+
+        The Gumbel root exists to make a small, fixed simulation budget yield an
+        unbiased policy-improvement *target*.  Neither premise holds in
+        evaluation: the budget is not being spent to build a training target,
+        and Gumbel keys are exploration noise that perturb which candidates get
+        searched at all.  Competitive play wants the best move, so the root
+        selects by PUCT like every node below it and plays argmax visits.
+
+        Returns the same tuple shape as ``_gumbel_root`` so ``_search_closed``
+        can treat the two interchangeably.  ``gumbel_topk`` comes back empty:
+        there is no Gumbel top-k, and recording a fake one would let a buffer
+        row claim a candidate set that never existed.
+        """
+
+        for _ in range(self.config.sims):
+            self._descend_closed(root, forced_edge=None)
+        visits = {edge.action_index: edge.visits for edge in root.edges}
+        completed = {
+            edge.action_index: (
+                sign * edge.q_p0
+                if edge.visits or edge.probability_weighted
+                else root_value
+            )
+            for edge in root.edges
+        }
+        total = sum(visits.values())
+        if total > 0:
+            policy_target = {a: v / total for a, v in visits.items()}
+        else:  # every simulation hit a terminal root edge
+            mass = sum(edge.prior for edge in root.edges) or 1.0
+            policy_target = {e.action_index: e.prior / mass for e in root.edges}
+        # `max` over the legal order takes the FIRST maximum; Rust iterates the
+        # same order with a strict `>` so the two agree on ties.
+        best = max(root.legal, key=lambda a: visits.get(a, 0))
+        return (
+            best,
+            completed[best],
+            visits,
+            policy_target,
+            self.config.sims,
+            (),
+            completed,
+        )
+
     def _force_expand_root(self, root: ClosedNode) -> None:
         """Materialize + evaluate every enumerable chance child of the root's
         edges (catastrophe coverage: rare instant-loss reveals are guaranteed
@@ -615,22 +670,33 @@ class GumbelMCTS:
             for edge in root.edges
             if edge.probability_weighted
         }
-        (
-            best,
-            action_value,
-            visits,
-            policy_target,
-            sims,
-            topk,
-            completed,
-        ) = self._gumbel_root(
-            root.legal,
-            priors,
-            simulate,
-            sign * root_value_p0,
-            root.actor,
-            initial_q=forced_q,
-        )
+        if self.config.root_selection == "puct":
+            (
+                best,
+                action_value,
+                visits,
+                policy_target,
+                sims,
+                topk,
+                completed,
+            ) = self._puct_root(root, sign, sign * root_value_p0)
+        else:
+            (
+                best,
+                action_value,
+                visits,
+                policy_target,
+                sims,
+                topk,
+                completed,
+            ) = self._gumbel_root(
+                root.legal,
+                priors,
+                simulate,
+                sign * root_value_p0,
+                root.actor,
+                initial_q=forced_q,
+            )
         self._closed_root = root  # exposed for gates/inspection
         return SearchResult(
             action_index=best,

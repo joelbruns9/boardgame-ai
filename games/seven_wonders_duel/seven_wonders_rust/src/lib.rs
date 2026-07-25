@@ -428,7 +428,7 @@ impl RustGame {
     /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
     /// `visits`/`policy_target` aligned to `legal_action_indices`.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
     fn closed_search(
         &self,
         sims: usize,
@@ -438,6 +438,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        puct_root: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -456,6 +457,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root,
             age_deal_samples: 0,
         };
         let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
@@ -506,6 +508,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root: false,
             age_deal_samples: 0,
         };
         let (res, arena) = tree_resumable::search_closed(&self.state, &eval::MockEval, &cfg)?;
@@ -556,6 +559,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root: false,
             age_deal_samples: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
@@ -610,6 +614,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root: false,
             age_deal_samples: 0,
         };
         let (res, arena, metrics) =
@@ -675,6 +680,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root: false,
             age_deal_samples: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
@@ -709,7 +715,7 @@ impl RustGame {
     /// callable `(tokens, actor, legal) -> (value_actor, priors)`; the Rust
     /// encoder (F2) feeds it, so results match Python's searcher on the same net.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
     fn closed_search_net(
         &self,
         adapter: Py<PyAny>,
@@ -720,6 +726,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        puct_root: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -738,6 +745,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
+            puct_root,
             age_deal_samples: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
@@ -1092,6 +1100,7 @@ fn search_many_flat_net(
                 c_scale,
                 seed,
                 force_expand_root_chance: force,
+                puct_root: false,
                 age_deal_samples,
             };
             let session = if force {

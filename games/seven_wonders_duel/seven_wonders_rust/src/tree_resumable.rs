@@ -754,6 +754,7 @@ impl SearchSession {
                 c_scale: cfg.c_scale,
                 seed: cfg.seed,
                 force_expand_root_chance: cfg.force_expand_root_chance,
+                puct_root: false,
                 age_deal_samples: cfg.age_deal_samples,
             },
             leaf_batch,
