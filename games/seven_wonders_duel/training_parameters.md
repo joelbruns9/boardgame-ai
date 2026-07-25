@@ -7,14 +7,20 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m games.seven_wonders_duel.phase_d `
-  --run-dir games\seven_wonders_duel\runs\laptop_training_01 `
+  --run-dir games\seven_wonders_duel\runs\laptop_training_03 `
+  --seed 20260726 `
   --device cuda `
   --generation-backend rust `
   --gate-backend rust `
-  --iterations 5 `
-  --games-per-iteration 250 `
-  --seed-games 500 `
-  --save-buffer games\seven_wonders_duel\runs\laptop_training_01\buffer_final.jsonl `
+  --selfplay-generator-mode soft_gate `
+  --bootstrap-policy auto_first_trained `
+  --promotion-every 0 `
+  --anchor-every-iterations 2 `
+  --iterations 14 `
+  --games-per-iteration 300 `
+  --seed-games 5000 `
+  --save-buffer games\seven_wonders_duel\runs\laptop_training_03\buffer_final.jsonl `
+  --buffer-autosave-every 1 `
   --d-model 128 `
   --layers 4 `
   --train-steps 300 `
@@ -33,21 +39,38 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --rust-max-inflight-batches 1 `
   --leaf-batch 1 `
   --age-deal-samples 32 `
-  --gate-sims 64 `
-  --promotion-every 4 `
-  --gate-max-games 800 `
-  --anchor-gate-every-promotions 3 `
-  --anchor-every-iterations 3
+  --gate-sims 64
 ```
 
 PowerShell uses the backtick at the end of a line as its continuation
 character. There must be no spaces after a continuation backtick.
 
-The command above is a first meaningful laptop run, not a final-strength
-configuration. At the measured neural self-play rate of about 0.11 games/s,
-the 1,250 neural self-play games alone may take roughly three hours. Training
-and promotion games add to that time. Rust bot-only seed games are much faster
-because they do not invoke the neural network.
+This is a **learning-rate-of-the-loop** run, not a final-strength
+configuration. Its purpose is to establish that the fixed loop learns
+cumulatively and to expose parameter behaviour cheaply, so it deliberately
+spends wall clock on self-play rather than on gates.
+
+Why no promotion gate (`--promotion-every 0`): run 02 spent roughly half its
+wall clock on gate games and promoted nothing, because a 100-game budget cannot
+resolve a 3% indifference region. The alternatives are worse on a laptop -- a
+properly powered gate is ~800 games, which at `gate-sims 64` and the measured
+0.145 games/s is about 90 minutes *per gate*. Widening the band does not help
+either: see `--gate-sims` on why compression and a wider indifference region
+push the same way. The soft-gate rolling learner advances without a gate, and
+the cheap bot anchors every two iterations supply the out-of-distribution
+signal. Post-hoc `eval_suite` runs measure iteration-vs-iteration strength
+afterwards, off the critical path.
+
+The risk this accepts: with no ratchet, a *degrading* learner is not caught
+automatically. Anchors every two iterations are the tripwire, and every
+candidate checkpoint is retained, so a post-hoc arena can pick the best one.
+
+Note `--anchor-every-iterations`, not `--anchor-gate-every-promotions`: the
+promotion-keyed cadence never fires when nothing is promoted, which is exactly
+what happened in run 02 and why its bot suite was never measured.
+
+Do **not** pass `--warm-buffer` pointing at run 02's export. Every record in it
+is `target_version=1` and the loader will refuse it; see `--allow-stale-targets`.
 
 ## What One Iteration Does
 
@@ -195,6 +218,33 @@ never aged out. Source iteration metadata is preserved exactly -- records are
 filtered, never renumbered -- and the actual loaded/retained/dropped counts are
 reported. `0` uses the active `--replay-window` as the staleness bound.
 
+### `--allow-stale-targets`
+
+**Default:** off. **Value:** flag
+
+Imports a warm buffer whose `policy_target` values were computed under a
+superseded target definition.
+
+`buffer.TARGET_VERSION` versions what the **labels** mean, separately from
+`schema`/`spec_version`, which version the codec. The 2026-07-25 sigma change
+altered every `policy_target` without touching the codec, so old records stayed
+loadable and would have silently mixed two definitions of the objective the
+policy head regresses onto. Loading a warm buffer now checks this and refuses,
+naming the counts and versions it found.
+
+Age and target version are independent: the check runs *before*
+`--warm-buffer-max-staleness`, because a recent record computed under an old
+rule is exactly as unusable as an ancient one. One stale record among thousands
+still refuses -- the mix is the hazard, not the proportion.
+
+This flag overrides the refusal and warns. Reach for it only when you have
+decided the inconsistency is acceptable. The alternative is a fresh buffer, or
+re-deriving targets by replay, which stays possible because reading a stale
+record is still permitted.
+
+Every buffer produced before 2026-07-25 -- including run 02's
+`buffer_final.jsonl` -- is `target_version=1` and will refuse to load.
+
 ### `--seed-retain-fraction`
 
 **Default:** `1.0`. **Range:** `0.0–1.0`
@@ -205,11 +255,17 @@ shuffled deterministically each iteration.
 
 ### `--curriculum-anneal-iterations`
 
-**Default:** `10`. **Value:** integer duration
+**Default:** `-1` (auto). **Value:** integer duration, or `-1`
 
 Number of iterations over which both seed-buffer retention and mixed bot
-opponents decay from their initial fractions to zero. A value of `10` gives the
-early model structured examples, then transitions toward pure neural self-play.
+opponents decay from their initial fractions to zero. This gives the early
+model structured examples, then transitions toward pure neural self-play.
+
+`-1` fits the duration to **half the planned run** (`max(1, iterations // 2)`),
+so the anneal always completes. Any explicit non-negative value is honoured
+as-is, and the loop warns when an explicit duration outlives the run -- which
+would leave bot curriculum data still mixed into the buffer at the final
+iteration.
 
 ### `--opponent-fraction`
 
@@ -567,6 +623,12 @@ policy is exactly the prior.
 before this change are not comparable with new ones; start a run from a fresh
 buffer rather than mixing them.
 
+This is now enforced rather than advisory: records carry
+`buffer.TARGET_VERSION`, and importing a warm buffer that predates the change
+refuses unless `--allow-stale-targets` is passed. Bump `TARGET_VERSION`
+whenever the meaning of `policy_target`, `root_value` or the value label
+changes.
+
 ### Action selection in evaluation
 
 Self-play plays a temperature-annealed sample from `policy_target`. Competitive
@@ -588,6 +650,35 @@ only suppresses the additional temperature sampling; it does not remove this.
 Search simulations per neural move in candidate-vs-best and bot-anchor games.
 This is independent of the self-play cheap/full simulation ranges. Higher
 values reduce evaluation search noise but make gates slower.
+
+**Deeper gates measure a smaller margin.** Search is a policy-improvement
+operator, and it extracts more from a weak prior than a strong one, so a
+head-to-head compresses as both sides get more of it. Measured on run 02's
+iteration 0 vs iteration 11, matched conditions, 400 games per point, only
+`sims` varying:
+
+| gate-sims | iter11 score | iter11 Elo edge |
+|----------:|-------------:|----------------:|
+| 2         | 0.805        | +246            |
+| 64        | 0.650        | +107            |
+
+Non-overlapping CIs. Gating at 64 while self-play generates at `cheap_sims`
+16-24 therefore judges a regime the training data never comes from, and sees
+roughly **43%** of the improvement generation-regime play would show. That
+systematically under-credits policy-head gains, which is what a bootstrapping
+run mostly produces.
+
+This is a genuine trade-off, not a bug to fix. Gating at generation sims makes
+the ratchet responsive to the improvements actually being made; gating high is
+the more honest measure of deployed strength if the end product searches
+deeply. Note also that **widening `--gate-indifference` does not compensate** --
+compression shrinks the measured margin while a wider band demands a larger
+one, so the two push in the same direction.
+
+**Caveat: one knob drives both.** `--gate-sims` sets the simulation count for
+the promotion gate *and* the bot-anchor suite, so the natural split -- ratchet
+at generation sims, anchors deep for true-strength tracking -- is not currently
+expressible. Splitting it would need a separate `--anchor-sims`.
 
 ### `--gate-max-games`
 
@@ -645,10 +736,16 @@ measuring `latest.pt` (the rolling learner) rather than `current_best.pt`.
 
 The bot suite is the only opponent set outside the self-play distribution, and
 the two can move in opposite directions: run 02's iteration 11 beat iteration 0
-head-to-head at 59.5% while *losing* ground against two of the five scripted
-bots (science_aggressive 90% -> 74%, military_aggressive 80% -> 70%). A
-head-to-head promotion number on its own does not establish that a checkpoint
-got better.
+head-to-head while *losing* ground against two of the five scripted bots
+(science_aggressive 90% -> 74%, military_aggressive 80% -> 70%). A head-to-head
+promotion number on its own does not establish that a checkpoint got better.
+
+Both figures above were recorded under the pre-2026-07-25 evaluation defects.
+The head-to-head has since been re-measured on the same 400 seeds and is
+**0.650**, not the 0.595 originally recorded. The bot rows were never affected
+by the seat-routing bug -- they use a single-net adapter -- but they were still
+played with Gumbel-perturbed actions under unnormalised sigma, so treat them as
+indicative and re-measure before drawing conclusions.
 
 ## Training Lifecycle
 
