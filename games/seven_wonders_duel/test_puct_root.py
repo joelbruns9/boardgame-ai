@@ -151,3 +151,62 @@ def test_rust_puct_root_matches_python():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked >= 16, f"only {checked} positions compared"
+
+
+def test_rust_batched_puct_root_matches_python():
+    """The path evaluation ACTUALLY uses: search_many_flat_net -> tree_resumable.
+
+    Part 1 ported `tree::puct_root` (scalar). Gates never call it -- they go
+    through the resumable driver, which has its own root scheduling. A second
+    port needs its own equivalence test or it is unverified code on the path
+    that matters most.
+    """
+
+    checked = 0
+    for game_seed in range(3):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(
+            library_draws=[list(d) for d in library], **extract_setup(py)
+        )
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                legal = legal_action_indices(py)
+                for sims in (16, 64):
+                    for seed in (1, 5):
+                        result = _puct_search(py, sims, 8, seed, False)
+                        batched = rg.closed_search_batched(
+                            1, sims, 8, seed, force=False, puct_root=True
+                        )
+                        ctx = f"game {game_seed} sims {sims} seed {seed}"
+                        assert batched[0] == result.action_index, f"{ctx}: action"
+                        assert batched[6] == result.sims, f"{ctx}: sims"
+                        assert list(batched[5]) == [], f"{ctx}: topk"
+                        assert list(batched[3]) == [
+                            result.visits[a] for a in legal
+                        ], f"{ctx}: visits"
+                        for j, a in enumerate(legal):
+                            assert batched[4][j] == pytest.approx(
+                                result.policy_target[a], abs=1e-9
+                            ), f"{ctx}: policy[{a}]"
+                        checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked >= 8, f"only {checked} positions compared"
+
+
+def test_batched_puct_root_rejects_leaf_batch_above_one():
+    """WU virtual loss at the root is a different algorithm, not a knob."""
+
+    first_player, _actions, library = random_game(0, 0)
+    py = new_game(0, first_player=first_player)
+    rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+    with pytest.raises(Exception, match="leaf_batch"):
+        rg.closed_search_batched(4, 8, 4, 1, force=False, puct_root=True)

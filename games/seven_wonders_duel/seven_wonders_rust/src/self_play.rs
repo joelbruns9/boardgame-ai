@@ -38,6 +38,8 @@ pub struct SelfPlayConfig {
     pub c_visit: f64,
     pub c_scale: f64,
     pub force_expand_root_chance: bool,
+    /// PUCT root selection; evaluation only. Self-play must stay Gumbel.
+    pub puct_root: bool,
     pub age_deal_samples: usize,
     pub age_deal_samples_by_player: Option<[usize; 2]>,
     pub bot_by_player: [Option<BotKind>; 2],
@@ -379,7 +381,7 @@ pub fn run<E: Eval>(
             c_scale: cfg.c_scale,
             seed: search_seed,
             force_expand_root_chance: cfg.force_expand_root_chance,
-            puct_root: false,
+            puct_root: cfg.puct_root,
             age_deal_samples: cfg.age_deal_samples,
         };
         let leaf_batch = cfg
@@ -643,7 +645,7 @@ impl GameSlot {
                 c_scale: self.cfg.c_scale,
                 seed: search_seed,
                 force_expand_root_chance: self.cfg.force_expand_root_chance,
-                puct_root: false,
+                puct_root: self.cfg.puct_root,
                 age_deal_samples: self
                     .cfg
                     .age_deal_samples_by_player

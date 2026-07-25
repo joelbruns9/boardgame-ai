@@ -730,7 +730,14 @@ impl SearchSession {
             })
             .collect();
         let mut rng = Rng::new(cfg.seed);
-        let gumbel: Vec<f64> = (0..n).map(|_| rng.gumbel()).collect();
+        // A PUCT root draws no Gumbel keys, and must not CONSUME them either:
+        // the same rng samples chance outcomes, so drawing here would offset
+        // the whole stream against the scalar port and against Python.
+        let gumbel: Vec<f64> = if cfg.puct_root {
+            vec![0.0; n]
+        } else {
+            (0..n).map(|_| rng.gumbel()).collect()
+        };
         let mut candidates: Vec<usize> = (0..n).collect();
         candidates.sort_by(|&a, &b| {
             (gumbel[b] + log_prior[b])
@@ -754,7 +761,7 @@ impl SearchSession {
                 c_scale: cfg.c_scale,
                 seed: cfg.seed,
                 force_expand_root_chance: cfg.force_expand_root_chance,
-                puct_root: false,
+                puct_root: cfg.puct_root,
                 age_deal_samples: cfg.age_deal_samples,
             },
             leaf_batch,
@@ -868,6 +875,9 @@ impl SearchSession {
 
     fn launch_simulation(&mut self) {
         self.sims_launched += 1;
+        if self.cfg.puct_root {
+            return; // no per-action schedule to advance
+        }
         self.repeat_pos += 1;
         if self.repeat_pos >= self.per_action {
             self.repeat_pos = 0;
@@ -977,7 +987,10 @@ impl SearchSession {
                 }
                 return Ok(SearchEvent::Complete);
             }
-            if self.candidate_pos >= self.candidates.len() {
+            // PUCT root: no candidate set and no halving rounds -- the root
+            // selects like every node below it, so there is no schedule to
+            // advance and no round boundary to drain at.
+            if !self.cfg.puct_root && self.candidate_pos >= self.candidates.len() {
                 if !wave.simulations.is_empty() {
                     self.request_seq += 1;
                     return Ok(self.make_request(wave));
@@ -985,8 +998,12 @@ impl SearchSession {
                 self.finish_round()?;
                 continue;
             }
-            let root_edge = self.candidates[self.candidate_pos];
             let root_id = self.arena.root_id;
+            let root_edge = if self.cfg.puct_root {
+                self.arena.select(root_id, self.cfg.c_puct)
+            } else {
+                self.candidates[self.candidate_pos]
+            };
             let (mut pending, immediate) = select_leaf(
                 &mut self.arena,
                 root_id,
@@ -1154,6 +1171,45 @@ impl SearchSession {
         Ok(())
     }
 
+    /// Result for a PUCT root: play argmax visits, target is the visit
+    /// distribution. Mirrors `tree::puct_root` exactly -- the two are compared
+    /// against the same Python reference.
+    fn into_puct_result(mut self) -> PyResult<(SearchResult, Arena, SearchMetrics)> {
+        let n = self.legal.len();
+        let completed: Vec<f64> = (0..n).map(|j| self.completed_q(j)).collect();
+        // Left-fold in legal order to match Python's `sum`.
+        let total: f64 = self.visits.iter().fold(0.0_f64, |a, &b| a + b as f64);
+        let policy_target: Vec<f64> = if total > 0.0 {
+            self.visits.iter().map(|&v| v as f64 / total).collect()
+        } else {
+            let root = &self.arena.nodes[self.arena.root_id];
+            let mass: f64 = root.edges.iter().fold(0.0_f64, |a, e| a + e.prior);
+            let mass = if mass > 0.0 { mass } else { 1.0 };
+            root.edges.iter().map(|e| e.prior / mass).collect()
+        };
+        // First maximum in legal order, matching Python's `max`.
+        let mut best = 0usize;
+        let mut best_visits = 0u32;
+        for j in 0..n {
+            if self.visits[j] > best_visits {
+                best_visits = self.visits[j];
+                best = j;
+            }
+        }
+        let root_value = self.sign * self.arena.nodes[self.arena.root_id].value_p0();
+        self.metrics.root_completed_q = completed.clone();
+        let result = SearchResult {
+            action_index: self.legal[best],
+            action_value: completed[best],
+            root_value,
+            visits: self.visits,
+            policy_target,
+            gumbel_topk: Vec::new(),
+            sims: self.sims_completed,
+        };
+        Ok((result, self.arena, self.metrics))
+    }
+
     pub fn into_result(mut self) -> PyResult<(SearchResult, Arena, SearchMetrics)> {
         if self.sims_launched != self.cfg.sims
             || self.sims_completed != self.cfg.sims
@@ -1161,6 +1217,9 @@ impl SearchSession {
             || self.arena.incomplete_total() != 0
         {
             return Err(PyRuntimeError::new_err("search session is not complete"));
+        }
+        if self.cfg.puct_root {
+            return self.into_puct_result();
         }
         let max_visits = self.visits.iter().copied().max().unwrap_or(0);
         let completed: Vec<f64> = (0..self.legal.len()).map(|j| self.completed_q(j)).collect();
@@ -1217,6 +1276,15 @@ pub fn begin_search_from_root(
             "cooperative force expansion requires the F4.5 forced-child cache",
         ));
     }
+    if cfg.puct_root && leaf_batch > 1 {
+        // With leaf_batch > 1 the root would select under WU virtual loss --
+        // a different algorithm, not a throughput setting, exactly as the
+        // leaf_batch policy says. Evaluation runs leaf_batch=1.
+        return Err(PyValueError::new_err(
+            "puct_root requires leaf_batch=1; WU-UCT root selection is a \
+             separate algorithm needing its own quality approval",
+        ));
+    }
     let root = Node::make(state.clone());
     if root.terminal || root.legal.is_empty() {
         return Err(PyValueError::new_err(
@@ -1257,6 +1325,20 @@ pub fn begin_search_from_root_forced(
     Ok(session)
 }
 
+/// `puct_root` and `leaf_batch > 1` are incompatible: the root would select
+/// under WU virtual loss, which is a different algorithm rather than a
+/// throughput setting. Both session entry points must enforce it --
+/// `search_closed_batched` builds its session directly rather than going
+/// through `begin_search_from_root`.
+fn check_puct_root(cfg: &SearchConfig, leaf_batch: usize) -> PyResult<()> {
+    if cfg.puct_root && leaf_batch > 1 {
+        return Err(PyValueError::new_err(
+            "puct_root requires leaf_batch=1; WU-UCT root selection is a              separate algorithm needing its own quality approval",
+        ));
+    }
+    Ok(())
+}
+
 pub fn search_closed_batched<E: Eval>(
     state: &GameState,
     eval: &E,
@@ -1268,6 +1350,7 @@ pub fn search_closed_batched<E: Eval>(
             "sims, top_k, and leaf_batch must be positive",
         ));
     }
+    check_puct_root(cfg, leaf_batch)?;
     let root = Node::make(state.clone());
     if root.terminal || root.legal.is_empty() {
         return Err(PyValueError::new_err(

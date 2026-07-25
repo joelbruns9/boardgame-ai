@@ -151,6 +151,7 @@ fn make_self_play_config(
     c_visit: f64,
     c_scale: f64,
     force: bool,
+    puct_root: bool,
     age_deal_samples: usize,
     max_moves: usize,
 ) -> self_play::SelfPlayConfig {
@@ -171,6 +172,7 @@ fn make_self_play_config(
         c_visit,
         c_scale,
         force_expand_root_chance: force,
+        puct_root,
         age_deal_samples,
         age_deal_samples_by_player: None,
         bot_by_player: [None, None],
@@ -583,7 +585,7 @@ impl RustGame {
     /// collisions, waves, max_wave_paths, max_wave_unique)`, completed-Q aligned
     /// to legal actions, and the tree digest.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
     fn closed_search_batched(
         &self,
         leaf_batch: usize,
@@ -594,6 +596,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        puct_root: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -614,7 +617,7 @@ impl RustGame {
             c_scale,
             seed,
             force_expand_root_chance: force,
-            puct_root: false,
+            puct_root,
             age_deal_samples: 0,
         };
         let (res, arena, metrics) =
@@ -809,6 +812,7 @@ impl RustGame {
             c_visit,
             c_scale,
             force,
+            false, // self-play always uses the Gumbel root
             age_deal_samples,
             max_moves,
         );
@@ -860,6 +864,7 @@ impl RustGame {
             c_visit,
             c_scale,
             force,
+            false, // self-play always uses the Gumbel root
             age_deal_samples,
             max_moves,
         );
@@ -1046,7 +1051,7 @@ fn search_result_to_py(
 #[pyo3(signature = (
     adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
     c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-    age_deal_samples=0, inference_timeout_ms=0.0
+    age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -1063,6 +1068,7 @@ fn search_many_flat_net(
     force: bool,
     age_deal_samples: usize,
     inference_timeout_ms: f64,
+    puct_root: bool,
 ) -> PyResult<Vec<Py<PyDict>>> {
     if games.is_empty() || games.len() != search_seeds.len() {
         return Err(PyValueError::new_err(
@@ -1100,7 +1106,7 @@ fn search_many_flat_net(
                 c_scale,
                 seed,
                 force_expand_root_chance: force,
-                puct_root: false,
+                puct_root,
                 age_deal_samples,
             };
             let session = if force {
@@ -1268,6 +1274,7 @@ fn cooperative_jobs(
     c_visit: f64,
     c_scale: f64,
     force: bool,
+    puct_root: bool,
     age_deal_samples: usize,
     max_moves: usize,
 ) -> PyResult<Vec<(GameState, self_play::SelfPlayConfig)>> {
@@ -1298,6 +1305,7 @@ fn cooperative_jobs(
                 c_visit,
                 c_scale,
                 force,
+                puct_root,
                 age_deal_samples,
                 max_moves,
             );
@@ -1353,6 +1361,7 @@ fn self_play_many_mock(
         c_visit,
         c_scale,
         force,
+        false, // self-play always uses the Gumbel root
         age_deal_samples,
         max_moves,
     )?;
@@ -1419,6 +1428,7 @@ fn self_play_many_net(
         c_visit,
         c_scale,
         force,
+        false, // self-play always uses the Gumbel root
         age_deal_samples,
         max_moves,
     )?;
@@ -1505,7 +1515,7 @@ fn self_play_many_net(
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
-))]
+, puct_root=false))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -1539,6 +1549,7 @@ fn self_play_many_flat_net(
     bot_p1: Option<String>,
     bot_exploration: f64,
     bot_policy_iterations: i64,
+    puct_root: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1557,6 +1568,7 @@ fn self_play_many_flat_net(
         c_visit,
         c_scale,
         force,
+        puct_root,
         age_deal_samples,
         max_moves,
     )?;

@@ -67,6 +67,7 @@ class ArenaSettings:
     layers: int = 4
     top_k: int = 16
     search_mode: str = "closed"
+    eval_search_mode: str = "gumbel"
     age_deal_samples: int = 32
     force_root_chance: bool = True
 
@@ -92,6 +93,7 @@ class ArenaSettings:
                 layers=self.layers,
                 top_k=self.top_k,
                 search_mode=self.search_mode,
+                eval_search_mode=self.eval_search_mode,
             )
         )
 
@@ -117,6 +119,7 @@ def fingerprint(
             "layers": settings.layers,
             "top_k": settings.top_k,
             "search_mode": settings.search_mode,
+            "eval_search_mode": settings.eval_search_mode,
             "age_deal_samples": settings.age_deal_samples,
             "force_root_chance": settings.force_root_chance,
         },
@@ -419,6 +422,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--out", required=True, help="output directory")
     parser.add_argument("--sims", type=int, default=64)
+    parser.add_argument(
+        "--eval-search-mode",
+        choices=("gumbel", "puct"),
+        default="gumbel",
+        help="root selection; 'puct' matches the advisor. Part of the match "
+        "fingerprint, so switching re-runs rather than reusing cached results",
+    )
     parser.add_argument("--model-games", type=int, default=400)
     parser.add_argument("--bot-games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260724)
@@ -458,6 +468,7 @@ def main(argv=None) -> int:
         device=args.device,
         d_model=args.d_model,
         layers=args.layers,
+        eval_search_mode=args.eval_search_mode,
     )
 
     symmetry = None

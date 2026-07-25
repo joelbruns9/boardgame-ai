@@ -810,6 +810,36 @@ the promotion gate *and* the bot-anchor suite, so the natural split -- ratchet
 at generation sims, anchors deep for true-strength tracking -- is not currently
 expressible. Splitting it would need a separate `--anchor-sims`.
 
+### `--eval-search-mode`
+
+**Default:** `gumbel`. **Values:** `gumbel`, `puct`
+
+Root selection for **evaluation** games -- promotion gate, arena, and bot
+anchors. Self-play is unaffected and always uses the Gumbel root.
+
+The Gumbel root (top-k + sequential halving) exists to make a small fixed
+simulation budget yield an unbiased policy-improvement **target**. Evaluation is
+not building a target, and the Gumbel keys are exploration noise that perturb
+which candidates get searched at all. `puct` selects at the root by PUCT, like
+every node below it, and plays argmax visits.
+
+**This is the search the advisor runs** (`advisor_adapter` calls `descend()` at
+`c_puct` 1.5, never `_gumbel_root`). If the advisor is the product, `puct` is
+what a gate must measure for its numbers to mean advisor strength.
+
+Default stays `gumbel` because switching changes what every gate number means;
+results are not comparable across the two modes. `eval_suite` includes the mode
+in each match fingerprint, so changing it re-runs rather than silently reusing a
+cached result.
+
+Requires `leaf-batch 1` (which evaluation already uses). Above that the root
+would select under WU virtual loss -- a different algorithm, not a throughput
+setting, per the `--leaf-batch` policy. The Rust side raises rather than
+silently approximating.
+
+Measured cost: none. 32 games at 64 sims took 217s under `puct` against 219s
+under `gumbel`.
+
 ### `--gate-max-games`
 
 **Default:** `400`. **Constraint:** positive even integer

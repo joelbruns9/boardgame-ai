@@ -153,6 +153,19 @@ class PhaseDConfig:
     val_fraction: float = 0.05
     val_split_salt: str = "swd-v1"
     min_games_to_train: int = 2
+    eval_search_mode: str = "gumbel"
+    """Root selection for EVALUATION games (gate, arena, bot anchors).
+
+    ``puct`` matches the advisor, which runs plain PUCT via ``descend()``.  The
+    Gumbel root exists to make a small fixed budget yield an unbiased
+    policy-improvement TARGET; evaluation is not building a target, and the
+    Gumbel keys perturb which candidates get searched at all.  Self-play is
+    unaffected and always uses the Gumbel root.
+
+    Default stays ``gumbel`` because switching changes what every gate number
+    means -- results are not comparable across the two.
+    """
+
     record_fast_moves: bool = False
     """Emit training examples for cheap-search moves.
 
@@ -1551,6 +1564,7 @@ class PhaseDLoop:
                     self.config.top_k,
                     force=self.config.force_root_chance,
                     age_deal_samples=self.config.age_deal_samples,
+                    puct_root=self.config.eval_search_mode == "puct",
                 )
                 for slot, result in zip(slots, results):
                     legal = games[slot].legal_action_indices()
@@ -1621,6 +1635,7 @@ class PhaseDLoop:
                     max_inflight_batches=self.config.rust_max_inflight_batches,
                     scheduler_workers=self.config.rust_scheduler_workers,
                     deterministic_actions=True,
+                    puct_root=self.config.eval_search_mode == "puct",
                     bot_p0=bot_name if candidate_seat == 1 else None,
                     bot_p1=bot_name if candidate_seat == 0 else None,
                     bot_exploration=0.0,
@@ -2082,6 +2097,15 @@ def main(argv=None) -> int:
         "(0 = default to --replay-window)",
     )
     parser.add_argument(
+        "--eval-search-mode",
+        choices=("gumbel", "puct"),
+        default="gumbel",
+        help="root selection for evaluation games (gate, arena, anchors). "
+        "'puct' matches the advisor's search; self-play always uses gumbel. "
+        "Switching changes what gate numbers mean -- they are not comparable "
+        "across the two modes",
+    )
+    parser.add_argument(
         "--record-fast-moves",
         action="store_true",
         help="emit training examples for cheap-search moves; default off, "
@@ -2162,6 +2186,7 @@ def main(argv=None) -> int:
         min_games_to_train=args.min_games_to_train,
         min_buffer_positions=args.min_buffer_positions,
         record_fast_moves=args.record_fast_moves,
+        eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,
         gate_backend=args.gate_backend,
         gate_sims=args.gate_sims,
