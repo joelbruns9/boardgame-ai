@@ -104,15 +104,44 @@ def _joint7_class(winner: int | None, victory: VictoryType | None, actor: int) -
     return offset if winner == actor else 3 + offset
 
 
-def examples_from_record(record: GameRecord) -> list[Example]:
+def is_fast_search_move(move) -> bool:
+    """A cheap-search move: searched, but below the full simulation range.
+
+    ``policy_excluded`` alone conflates two different things -- a cheap search
+    and a curriculum bot's move. They are distinguished by ``sims``: a bot move
+    records none. Only the cheap searches are what KataGo's playout cap
+    randomization drops; bot moves are a curriculum device whose value labels
+    stay useful.
+    """
+
+    return move.policy_excluded and move.sims > 0
+
+
+def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
     example per recorded decision. A stale or tampered buffer raises
-    ReplayMismatchError instead of silently training on regenerated states."""
+    ReplayMismatchError instead of silently training on regenerated states.
+
+    Fast-search moves are replayed but emit no example unless
+    ``record_fast_moves``. They cannot be dropped from the *record* -- the
+    buffer's defining invariant is that ``replay(record)`` reproduces every
+    state from ``(seed, actions)``, so removing a move would break replay for
+    every later move in the game. Exclusion belongs here, at the example
+    boundary.
+
+    Wu (2020) §3.1: "Only turns with a full search are recorded for training."
+    The value target is limited by one noisy result per *game*, so additional
+    positions from the same game share that label and add little while
+    inflating the buffer.
+    """
 
     staged: list[tuple[Example, int]] = []  # (example, actor)
 
     def featurize(game, move):
+        # Replay still steps through this move -- only the example is dropped.
+        if not record_fast_moves and is_fast_search_move(move):
+            return
         actor = (
             game.pending_choice.player
             if game.pending_choice is not None
@@ -193,10 +222,10 @@ def examples_from_record(record: GameRecord) -> list[Example]:
     return [example for example, _ in staged]
 
 
-def examples_from_records(records) -> list[Example]:
+def examples_from_records(records, *, record_fast_moves: bool = False) -> list[Example]:
     out: list[Example] = []
     for record in records:
-        out.extend(examples_from_record(record))
+        out.extend(examples_from_record(record, record_fast_moves=record_fast_moves))
     return out
 
 

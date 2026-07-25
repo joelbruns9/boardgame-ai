@@ -25,8 +25,8 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --buffer-autosave-every 1 `
   --d-model 128 `
   --layers 4 `
-  --train-steps 300 `
-  --train-warmup-steps 100 `
+  --train-steps 75 `
+  --train-warmup-steps 50 `
   --train-batch-size 512 `
   --validate-every 100 `
   --learning-rate 2e-4 `
@@ -66,6 +66,13 @@ afterwards, off the critical path.
 The risk this accepts: with no ratchet, a *degrading* learner is not caught
 automatically. Anchors every two iterations are the tripwire, and every
 candidate checkpoint is retained, so a post-hoc arena can pick the best one.
+
+Why `--train-steps` is 75 and not 300: fast-search moves no longer produce
+training examples (see `--record-fast-moves`), which measured on run 02's buffer
+takes recorded positions from **69.6 to 22.0 per game** -- fast searches are
+68.3% of all moves. Holding 300 steps would put `samples_per_new_position` at
+23.3x, worse than the 8.5x it replaced. 75 steps gives **5.8x**, mid-band.
+Warmup drops to 50 so it cannot span the whole first iteration.
 
 Why the curriculum is smaller and steered (`--seed-games 2000`,
 `--opponent-fraction 0.25`, `--bot-policy-iterations 3`): the two bot pathways
@@ -652,6 +659,37 @@ game lives in the replay window. The previous split reseeded from
 one iteration, train at the next and validate again at the third --
 contaminating the holdout and understating validation loss on older data.
 Changing the salt re-draws the whole split; do not change it mid-run.
+
+### `--record-fast-moves`
+
+**Default:** off. **Value:** flag
+
+Emits training examples for cheap-search moves. Off by default, matching KataGo
+and Kingdomino.
+
+Wu (2020) §3.1: *"Only turns with a full search are recorded for training."* The
+value target is limited by one noisy binary result per **game**, so extra
+positions drawn from the same game share that label -- they inflate the buffer
+and dilute the share of each batch carrying a policy target, without adding
+proportional information.
+
+Fast-search moves are still **recorded in the buffer** and still replayed. They
+have to be: the buffer's defining invariant is that `replay(record)` reproduces
+every state from `(seed, actions)`, so removing a move would break replay for
+every later move in that game. The exclusion happens at the example boundary in
+`dataset.examples_from_record`.
+
+Bot moves are *not* affected. `policy_excluded` conflates two things -- a cheap
+search and a curriculum bot's move -- distinguished by `sims`, which a bot move
+records as zero. Bot moves keep contributing value targets.
+
+Measured on run 02's buffer, excluding fast searches takes recorded positions
+from **69.6 to 22.0 per game**; fast searches are 68.3% of all moves, bot moves
+7.3%, full searches 24.4%.
+
+**Changing this requires re-sizing `--train-steps`.** Turning it on roughly
+triples buffer size; at 300 games/iteration, `--train-steps 75` gives 5.8x with
+it off and about 1.8x with it on.
 
 ### `--min-buffer-positions`
 

@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from dataclasses import replace
+
 from .buffer import GameRecord, MoveRecord
 from .phase_d import PhaseDConfig, PhaseDLoop
 
@@ -112,3 +114,37 @@ def test_skipped_is_distinct_from_a_training_failure():
 
     failure = TrainingResult(candidate=None, trained=False)
     assert failure.skipped is False
+
+
+def test_fast_search_moves_are_identified_by_sims_not_just_exclusion():
+    """Bot moves are also policy_excluded; only searched ones are 'fast'."""
+
+    from .dataset import is_fast_search_move
+
+    cheap = MoveRecord(i=0, actor=0, action=0, mask_hash="h", policy_excluded=True, sims=16)
+    full = MoveRecord(i=1, actor=0, action=0, mask_hash="h", policy_excluded=False, sims=64)
+    bot = MoveRecord(i=2, actor=0, action=0, mask_hash="h", policy_excluded=True, sims=0)
+    assert is_fast_search_move(cheap) is True
+    assert is_fast_search_move(full) is False
+    assert is_fast_search_move(bot) is False, "bot moves keep their value target"
+
+
+def test_warmup_count_ignores_fast_moves_when_they_are_not_recorded(tmp_path: Path):
+    """The threshold must mean the same thing under either recording rule."""
+
+    loop = _loop(tmp_path, 10)
+    record = GameRecord(
+        seed=1, first_player=0, agents={}, iteration=0, winner=0,
+        victory_type="civilian", scores=(1, 0), chance_log=(),
+        moves=tuple(
+            MoveRecord(i=i, actor=0, action=0, mask_hash="h",
+                       policy_excluded=i % 4 != 0, sims=16 if i % 4 else 64)
+            for i in range(40)
+        ),
+        final_digest="sha256:0", trajectory_digest="sha256:0",
+    )
+    # 10 of 40 moves are full searches, so the 10-position threshold is met
+    # exactly -- counting raw moves would have passed at 40 and hidden this.
+    assert loop.buffer_warmup_shortfall([record]) == ""
+    loop.config = replace(loop.config, min_buffer_positions=11)
+    assert loop.buffer_warmup_shortfall([record]) != ""

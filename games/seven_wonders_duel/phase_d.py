@@ -58,7 +58,7 @@ from .buffer import (
     to_json_line,
 )
 from .codec import decode_action, encode_action
-from .dataset import Example, examples_from_records
+from .dataset import Example, examples_from_records, is_fast_search_move
 from .game import Phase
 from .inference import Evaluator
 from .loop_adapter import SevenWondersDuelLoopAdapter
@@ -153,6 +153,20 @@ class PhaseDConfig:
     val_fraction: float = 0.05
     val_split_salt: str = "swd-v1"
     min_games_to_train: int = 2
+    record_fast_moves: bool = False
+    """Emit training examples for cheap-search moves.
+
+    Off by default, matching KataGo (Wu 2020 §3.1: "Only turns with a full
+    search are recorded for training") and Kingdomino. The value target is
+    limited by one noisy result per *game*, so extra positions from the same
+    game share that label while inflating the buffer and diluting the share
+    of each batch that carries a policy target.
+
+    Turning this on restores the pre-2026-07-25 behaviour; it roughly
+    quadruples buffer size, so ``--train-steps`` must rise with it to keep
+    ``samples_per_new_position`` in range.
+    """
+
     min_buffer_positions: int = 0
     """Skip training until the replay buffer holds this many positions.
 
@@ -1238,7 +1252,9 @@ class PhaseDLoop:
                 f"need {self.config.min_games_to_train} games to train, "
                 f"got {len(records)}"
             )
-        examples = examples_from_records(records)
+        examples = examples_from_records(
+            records, record_fast_moves=self.config.record_fast_moves
+        )
         target_baselines = baselines(examples)
         train_examples, val_examples = stable_game_split(
             examples, self.config.val_fraction, self.config.val_split_salt
@@ -1775,14 +1791,20 @@ class PhaseDLoop:
     def buffer_warmup_shortfall(self, records: Sequence[GameRecord]) -> str:
         """Reason to skip training this iteration, or ``""`` to proceed.
 
-        Positions are counted as recorded moves, which is what
-        ``examples_from_records`` emits one example per.
+        Counts the moves that will actually become training examples, so the
+        threshold means the same thing regardless of ``--record-fast-moves``.
         """
 
         minimum = self.config.min_buffer_positions
         if minimum <= 0:
             return ""
-        positions = sum(len(record.moves) for record in records)
+        keep_fast = self.config.record_fast_moves
+        positions = sum(
+            1
+            for record in records
+            for move in record.moves
+            if keep_fast or not is_fast_search_move(move)
+        )
         if positions >= minimum:
             return ""
         return (
@@ -2060,6 +2082,13 @@ def main(argv=None) -> int:
         "(0 = default to --replay-window)",
     )
     parser.add_argument(
+        "--record-fast-moves",
+        action="store_true",
+        help="emit training examples for cheap-search moves; default off, "
+        "matching KataGo playout cap randomization. Raises buffer size ~4x, "
+        "so --train-steps must rise with it",
+    )
+    parser.add_argument(
         "--min-buffer-positions",
         type=int,
         default=0,
@@ -2132,6 +2161,7 @@ def main(argv=None) -> int:
         val_split_salt=args.val_split_salt,
         min_games_to_train=args.min_games_to_train,
         min_buffer_positions=args.min_buffer_positions,
+        record_fast_moves=args.record_fast_moves,
         generation_backend=args.generation_backend,
         gate_backend=args.gate_backend,
         gate_sims=args.gate_sims,
