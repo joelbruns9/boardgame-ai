@@ -89,6 +89,21 @@ class SevenWondersDuelLifecycleAdapter:
 
     def train(self, request: TrainRequest) -> TrainingResult:
         loop = self.loop
+        shortfall = loop.buffer_warmup_shortfall(request.replay.payload)
+        if shortfall:
+            # Nothing is installed on a skip, so hand back the incoming learner
+            # as the (unused) candidate rather than a fresh snapshot.
+            return TrainingResult(
+                candidate=artifact_for(
+                    Path(request.learner_checkpoint),
+                    role="candidate",
+                    iteration=request.iteration,
+                    training_state=UNTRAINED,
+                ),
+                trained=False,
+                skipped=True,
+                skip_reason=shortfall,
+            )
         candidate = loop.train_candidate(
             request.replay.payload,
             request.iteration,

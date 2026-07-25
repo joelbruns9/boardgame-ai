@@ -72,6 +72,17 @@ class TrainingResult:
     candidate: CheckpointArtifact  # immutable candidate_XXXX.pt snapshot
     trained: bool = True
     metrics: dict[str, Any] = field(default_factory=dict)
+    skipped: bool = False
+    """Training was deliberately not attempted this iteration.
+
+    Distinct from ``trained=False``, which means training was attempted and
+    failed to produce a usable learner -- that raises.  A skip is a planned
+    no-op: the buffer has not reached the configured minimum, so the iteration
+    generates games and stops.  ``candidate`` is the unchanged incoming learner
+    and must not be installed anywhere.
+    """
+
+    skip_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)

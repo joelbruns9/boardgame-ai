@@ -372,6 +372,30 @@ class RunController:
                 replay=replay,
             )
         )
+        if training.skipped:
+            # Buffer warmup: generate, record, and stop.  Nothing is installed,
+            # so latest.pt keeps whatever it held, and crucially no gate runs --
+            # comparing an untrained learner against the protected best burns
+            # evaluation games to re-measure a checkpoint that has not moved.
+            row = self._build_warmup_row(
+                iteration=iteration,
+                generator_source=generator_source,
+                generator_artifact=generator_artifact,
+                generation=generation,
+                replay=replay,
+                training=training,
+            )
+            self.store.append_iteration(row)
+            self._commit_iteration()
+            print(
+                f"iter {iteration:03d} | gen {generation.generated_games} "
+                f"({generator_source.value if hasattr(generator_source, 'value') else generator_source}) "
+                f"| replay {replay.training_games} | training skipped: "
+                f"{training.skip_reason}"
+            )
+            self._maybe_autosave(iteration)
+            return row
+
         if not training.trained:
             raise RuntimeError(
                 f"iteration {iteration} produced no trained learner; refusing to "
@@ -556,6 +580,60 @@ class RunController:
 
         cadence = self.config.anchor_every_iterations
         return cadence > 0 and (iteration + 1) % cadence == 0
+
+    def _build_warmup_row(
+        self,
+        *,
+        iteration: int,
+        generator_source: GeneratorSource,
+        generator_artifact: CheckpointArtifact | None,
+        generation,
+        replay,
+        training,
+    ) -> dict[str, Any]:
+        """Row for an iteration that generated games but did not train.
+
+        Deliberately carries the same identity fields as a normal row so the
+        log stays uniform, with ``training_skipped`` and ``promotion_action``
+        making the no-op explicit rather than leaving a gap in the sequence.
+        """
+
+        latest = self.latest_artifact
+        best = self.current_best_artifact
+        assert latest is not None and best is not None
+        row: dict[str, Any] = {
+            "iteration": iteration,
+            "log_schema_version": LOG_SCHEMA_VERSION,
+            "control_state": self.state.as_row(),
+            "lifecycle_config": self._lifecycle_config(),
+            "generator_mode": self.state.mode.value,
+            "generator_source": generator_source.value,
+            "generator_checkpoint": (
+                str(generator_artifact.path) if generator_artifact else None
+            ),
+            "generator_sha256": (
+                generator_artifact.sha256 if generator_artifact else None
+            ),
+            "learner_source": LATEST,
+            "latest_checkpoint": str(latest.path),
+            "latest_sha256": latest.sha256,
+            "current_best_checkpoint": str(best.path),
+            "current_best_sha256": best.sha256,
+            "current_best_iteration": self.state.current_best_iteration,
+            "bootstrap_state": self.state.bootstrap_state,
+            "training_skipped": True,
+            "training_skip_reason": training.skip_reason,
+            "promotion_scheduled": False,
+            "promotion_action": "not_scheduled",
+            "consecutive_reverts": self.state.consecutive_reverts,
+            "generated_games": generation.generated_games,
+            "training_games": replay.training_games,
+        }
+        if generation.metrics:
+            row["generation_performance"] = dict(generation.metrics)
+        if replay.metrics:
+            row["replay_summary"] = dict(replay.metrics)
+        return row
 
     def _build_row(
         self,

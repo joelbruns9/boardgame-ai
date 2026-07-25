@@ -18,7 +18,9 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --anchor-every-iterations 2 `
   --iterations 14 `
   --games-per-iteration 300 `
-  --seed-games 5000 `
+  --seed-games 2000 `
+  --opponent-fraction 0.25 `
+  --bot-policy-iterations 3 `
   --save-buffer games\seven_wonders_duel\runs\laptop_training_03\buffer_final.jsonl `
   --buffer-autosave-every 1 `
   --d-model 128 `
@@ -64,6 +66,21 @@ afterwards, off the critical path.
 The risk this accepts: with no ratchet, a *degrading* learner is not caught
 automatically. Anchors every two iterations are the tripwire, and every
 candidate checkpoint is retained, so a post-hoc arena can pick the best one.
+
+Why the curriculum is smaller and steered (`--seed-games 2000`,
+`--opponent-fraction 0.25`, `--bot-policy-iterations 3`): the two bot pathways
+are not equally valuable. Seed games are **bot vs bot and contain no search at
+all** -- every move becomes a one-hot target on the bot's choice, so 5,000 seed
+games teach the policy head to imitate greedy and rush bots. Mixed games run
+real MCTS for the neural seat and reach positions self-play does not.
+
+Since the routing investigation found iteration 0's value head sound and its
+**prior** actively harmful at low simulation counts, bot imitation is a credible
+mechanism. So: keep enough seed games to prefill the buffer, shift weight toward
+mixed games, and stop bot moves from supplying policy targets after iteration 3
+-- they still contribute trajectories and value labels. One cost to note: mixed
+games yield policy targets for one seat only, so a higher opponent fraction
+trades roughly 12% of policy targets for out-of-distribution coverage.
 
 Note `--anchor-every-iterations`, not `--anchor-gate-every-promotions`: the
 promotion-keyed cadence never fires when nothing is promoted, which is exactly
@@ -587,6 +604,33 @@ game lives in the replay window. The previous split reseeded from
 one iteration, train at the next and validate again at the third --
 contaminating the holdout and understating validation loss on older data.
 Changing the salt re-draws the whole split; do not change it mid-run.
+
+### `--min-buffer-positions`
+
+**Default:** `0` (disabled). **Value:** non-negative integer
+
+Skips training -- generation still runs -- until the replay buffer holds this
+many positions. **No promotion or anchor gate runs on a skipped iteration.**
+
+`--train-steps` is a fixed budget, so it presents the same 153,600 samples
+(at 300 steps x batch 512) whether the buffer holds 20,000 positions or 400,000.
+Against a first iteration of self-play alone that is roughly 7x over a small,
+single-policy dataset before any diversity exists.
+
+The bot seed curriculum currently masks this by prefilling the buffer -- with
+`--seed-games 2000` the first iteration already trains against ~140,000
+curriculum positions. Set this whenever you reduce or remove the curriculum;
+`--seed-games 0` without it repeats the failure mode.
+
+Counted in positions rather than games so it self-adjusts to
+`--games-per-iteration`; a position is one recorded move, matching what the
+dataset emits one example per. Skipped iterations are logged with
+`training_skipped` and `training_skip_reason`, and are distinct from a training
+*failure*, which still raises.
+
+The gate suppression matters independently: comparing an untrained learner
+against the protected best spends evaluation games re-measuring a checkpoint
+that has not moved.
 
 ### `--min-games-to-train`
 

@@ -153,6 +153,19 @@ class PhaseDConfig:
     val_fraction: float = 0.05
     val_split_salt: str = "swd-v1"
     min_games_to_train: int = 2
+    min_buffer_positions: int = 0
+    """Skip training until the replay buffer holds this many positions.
+
+    A fixed step budget hammers whatever is in the buffer, so a thin early
+    buffer gets trained on hard before any diversity exists: at
+    ``--train-steps 300 --train-batch-size 512`` the first iteration presents
+    153,600 samples, which against one iteration of self-play is ~7x over a
+    single-policy dataset.  The bot seed curriculum currently masks this by
+    prefilling the buffer; with ``--seed-games 0`` it does not.
+
+    Counted in positions, not games, so it self-adjusts to
+    ``--games-per-iteration``.  ``0`` disables the warmup.
+    """
     gate_sims: int = 64
     gate_max_games: int = 400
     gate_alpha: float = 0.05
@@ -1759,10 +1772,45 @@ class PhaseDLoop:
         temporary.replace(self.current_best)
         self.hof.add(self.current_best, iteration=iteration, tag="promoted")
 
+    def buffer_warmup_shortfall(self, records: Sequence[GameRecord]) -> str:
+        """Reason to skip training this iteration, or ``""`` to proceed.
+
+        Positions are counted as recorded moves, which is what
+        ``examples_from_records`` emits one example per.
+        """
+
+        minimum = self.config.min_buffer_positions
+        if minimum <= 0:
+            return ""
+        positions = sum(len(record.moves) for record in records)
+        if positions >= minimum:
+            return ""
+        return (
+            f"buffer holds {positions:,} positions, below the "
+            f"--min-buffer-positions warmup of {minimum:,}"
+        )
+
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         model = self.load_model(self.current_best)
         generated = self.generate_iteration(model, iteration)
         records = self.training_records(iteration)
+        shortfall = self.buffer_warmup_shortfall(records)
+        if shortfall:
+            print(f"iteration {iteration}: training skipped -- {shortfall}")
+            row = {
+                "iteration": iteration,
+                "generated_games": len(generated),
+                "training_games": len(records),
+                "training_skipped": True,
+                "training_skip_reason": shortfall,
+                "promoted": False,
+                "generated_summary": summarize_records(generated),
+                "training_summary": summarize_records(records),
+                "generation_performance": self.last_generation_stats,
+            }
+            self.manifest.append_iteration(row)
+            self._append_training_log(row)
+            return row
         candidate = self.train_candidate(records, iteration)
         promotion_gate = self.promotion_gate(candidate)
         promoted = promotion_gate.decision == "accept"
@@ -2012,6 +2060,14 @@ def main(argv=None) -> int:
         "(0 = default to --replay-window)",
     )
     parser.add_argument(
+        "--min-buffer-positions",
+        type=int,
+        default=0,
+        help="skip training (generate only) until the replay buffer holds this "
+        "many positions; no promotion or anchor gate runs on a skipped "
+        "iteration. 0 disables the warmup",
+    )
+    parser.add_argument(
         "--allow-stale-targets",
         action="store_true",
         help="import a warm buffer whose policy targets were computed under a "
@@ -2075,6 +2131,7 @@ def main(argv=None) -> int:
         val_fraction=args.val_fraction,
         val_split_salt=args.val_split_salt,
         min_games_to_train=args.min_games_to_train,
+        min_buffer_positions=args.min_buffer_positions,
         generation_backend=args.generation_backend,
         gate_backend=args.gate_backend,
         gate_sims=args.gate_sims,
