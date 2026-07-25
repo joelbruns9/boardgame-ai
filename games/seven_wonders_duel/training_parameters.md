@@ -515,6 +515,54 @@ At `--train-batch-size 512`, 300 steps consumes 153,600 samples. Against a
 typical ~18k new positions per iteration that is about 8.5x, which is the
 KataGo `max-train-bucket-per-new-data` regime.
 
+#### The relationship that must be maintained
+
+`--train-steps` and `--games-per-iteration` are **coupled**. Raising games per
+iteration without raising steps drives training pressure toward 1x; raising
+steps without raising games repeats run 02's 113x. Watch
+`samples_per_new_position` in `training_log.jsonl` and keep it near 4-8:
+
+```text
+samples_per_new_position
+  = train-steps * train-batch-size
+    / (games-per-iteration * positions-per-game * recorded-fraction)
+```
+
+Measured on run 02: **71.9 positions per game**. For the recommended run at 300
+games and 300 steps this gives 7.1x, and lifetime presentations work out to
+~8.5x for a position generated early in the run, ~7.1x on average.
+
+#### `recorded-fraction`: we deviate from KataGo here, deliberately
+
+That term is currently **1.0** -- every position is recorded. Cheap-search
+moves are stored with `policy_excluded=True`, so they carry no policy target
+but still supply value and auxiliary targets.
+
+KataGo does **not** do this. From Wu (2020) §3.1, Playout Cap Randomization:
+"Only turns with a full search are recorded for training." Kingdomino follows
+KataGo (`self_play.py:1196`, `record_fast_moves` defaults off and the example
+is never appended). Seven Wonders Duel is the outlier.
+
+The paper's reasoning is that the value target is data-limited at *one noisy
+binary result per game*, so the way to help value training is to play **more
+games**, not to record more positions from each game -- extra positions from
+one game share that single label and are highly correlated.
+
+Two consequences of our deviation, both worth knowing before changing it:
+
+* **The policy head sees ~25% of each batch.** With `--full-search-fraction
+  0.25`, only a quarter of sampled rows have `has_policy`. The policy loss is
+  averaged over those rows so its scale is right, but policy sample throughput
+  is a quarter of value sample throughput.
+* **Switching to KataGo's rule would shrink the buffer ~4x**, taking
+  `samples_per_new_position` from 7.1 to ~28 at unchanged settings. Aligning
+  would require `--train-steps` around 75, or ~4x more games per iteration --
+  which is what KataGo does, and what a laptop cannot.
+
+So the current setting is a reasonable adaptation to a small games budget, not
+an oversight. Revisit it on cloud hardware where more games per iteration is
+affordable.
+
 ### `--train-warmup-steps`
 
 **Default:** `100`. **Value:** non-negative integer
