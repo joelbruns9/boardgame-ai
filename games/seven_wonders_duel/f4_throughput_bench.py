@@ -350,6 +350,8 @@ def _run_rust(
     games_per_call: int = 0,
     cuda_events: bool = False,
     resource_sample_hz: float = 0.0,
+    conflict_free_waves: bool = False,
+    leaf_batch_override: int = 0,
 ) -> dict:
     import seven_wonders_rust as swr
 
@@ -393,6 +395,8 @@ def _run_rust(
     }
     scheduler_wall = live_slot_seconds = 0.0
     arena_nodes_peak = arena_bytes_peak = arena_node_bytes = 0
+    conflict_cuts = 0
+    wave_widths: list[int] = [0] * 17
     sampler.__enter__()
     for start in range(0, len(seeds), call_size):
         chunk = seeds[start : start + call_size]
@@ -403,7 +407,8 @@ def _run_rust(
             games=games,
             game_seeds=chunk,
             global_batch_cap=batch_cap,
-            leaf_batch=lock["leaf_batch"],
+            leaf_batch=leaf_batch_override or lock["leaf_batch"],
+            conflict_free_waves=conflict_free_waves,
             cheap_sims_min=search["cheap_sims_min"],
             cheap_sims_max=search["cheap_sims_max"],
             full_sims_min=search["full_sims_min"],
@@ -447,6 +452,9 @@ def _run_rust(
             arena_bytes_peak, int(metrics["arena_deep_bytes_slot_peak"])
         )
         arena_node_bytes = int(metrics["arena_node_struct_bytes"])
+        conflict_cuts += int(metrics["conflict_cuts"])
+        for bucket, count in enumerate(metrics["wave_width_histogram"]):
+            wave_widths[bucket] += int(count)
     sampler.__exit__(None, None, None)
     wall = time.perf_counter() - start_wall
     cpu = time.process_time() - start_cpu
@@ -618,6 +626,17 @@ def _run_rust(
         "arena_nodes_live_peak": arena_nodes_peak,
         "arena_deep_bytes_slot_peak": arena_bytes_peak,
         "arena_node_struct_bytes": arena_node_bytes,
+        # --- Phase 2: realized wave widths, never inferred from leaf_batch ---
+        "conflict_free_waves": bool(conflict_free_waves),
+        "conflict_cuts": conflict_cuts,
+        "wave_width_histogram": wave_widths,
+        "leaf_waves": sum(wave_widths),
+        "mean_wave_width": (
+            sum((bucket + 1) * count for bucket, count in enumerate(wave_widths))
+            / sum(wave_widths)
+            if sum(wave_widths)
+            else 0.0
+        ),
     } | sampler.summary()
 
 
@@ -723,6 +742,8 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "games_per_call": args.games_per_call,
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
+        "conflict_free_waves": args.conflict_free_waves,
+        "leaf_batch_override": args.leaf_batch,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -791,6 +812,12 @@ def run(args) -> dict:
     )
     if args.mode == "laptop" and not minimums_met and not args.allow_underfilled:
         raise ValueError("laptop run is below the preregistered sample minimums")
+    if args.leaf_batch and not args.conflict_free_waves:
+        raise ValueError(
+            "--leaf-batch above the lock requires --conflict-free-waves: "
+            "unconstrained leaf batching is an approximation, and its quality "
+            "cost is exactly what the Phase 2 invariant removes"
+        )
     search = dict(lock["production_search"])
     if search != frozen["search"]:
         raise ValueError("quality lock production search differs from the registered schedule")
@@ -818,6 +845,8 @@ def run(args) -> dict:
         "games_per_call": args.games_per_call,
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
+        "conflict_free_waves": args.conflict_free_waves,
+        "leaf_batch_override": args.leaf_batch,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -863,6 +892,8 @@ def run(args) -> dict:
             pinned_memory=args.pinned_memory,
             cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
             games_per_call=args.games_per_call,
+            conflict_free_waves=args.conflict_free_waves,
+            leaf_batch_override=args.leaf_batch,
         )
         if args.mode == "laptop":
             _run_python(
@@ -907,6 +938,8 @@ def run(args) -> dict:
                     games_per_call=args.games_per_call,
                     cuda_events=args.cuda_events,
                     resource_sample_hz=args.resource_sample_hz,
+                    conflict_free_waves=args.conflict_free_waves,
+                    leaf_batch_override=args.leaf_batch,
                 )
                 rust_row["isolated_forward_rows_ratio"] = (
                     rust_row["total_nn_rows_per_second"]
@@ -1004,6 +1037,21 @@ def main():
     parser.add_argument("--max-inflight-batches", type=int, default=2)
     parser.add_argument("--scheduler-workers", type=int, default=1)
     parser.add_argument("--python-workers", type=int, default=4)
+    parser.add_argument(
+        "--conflict-free-waves",
+        action="store_true",
+        help="hold the Phase 2 invariant: no two in-flight simulations in one "
+        "root candidate's subtree. Makes leaf_batch > 1 bit-identical to "
+        "leaf_batch = 1 (gated in test_f4_phase2_waves.py), so it is what "
+        "licenses --leaf-batch above 1 on an exploratory run.",
+    )
+    parser.add_argument(
+        "--leaf-batch",
+        type=int,
+        default=0,
+        help="override the lock's leaf_batch (0 = use the lock). Only sound "
+        "together with --conflict-free-waves, which is enforced.",
+    )
     parser.add_argument("--diagnostic-sync", action="store_true")
     parser.add_argument(
         "--cuda-events",

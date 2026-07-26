@@ -1,11 +1,21 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0 and 1 built and
-run; Phases 2–4 not started. Two results reroute the programme: the pipeline is
-**launch-bound** (Phase 0), so Phase 3b is unconditional and precedes Phase 4;
-and **slot count is worth far more than the scheduler work** (Phase 1 — +48% for
-16 → 32 slots, at no memory cost), so the Phase 4 slots axis should be swept
-early. Baseline is now **1,650 games/hour**, up from 1,301.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1 and 2 built
+and run; Phases 3–4 not started.
+
+Three results reroute the programme:
+
+1. The pipeline is **launch-bound** (Phase 0), so Phase 3b is unconditional and
+   precedes Phase 4.
+2. **Slot count is worth far more than the scheduler work** (Phase 1: +48% for
+   16 → 32 slots, at no memory cost), so sweep the Phase 4 slots axis early.
+3. **Wave widening is dead** (Phase 2): the conflict-free rule is exact, but
+   realized width is 1.19 rather than the predicted 2.58, so it buys 1.13× fewer
+   batches and no throughput. Both scheduler-side phases turned out to be
+   *correctness and measurement* work, not speed work.
+
+Baseline is **1,560–1,650 games/hour** (32 slots; the spread is real run-to-run
+variance), up from 1,301.
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
 work. Several rev-1 claims are withdrawn below rather than quietly edited.
@@ -386,6 +396,10 @@ Because the rule preserves scalar order, it also batches adjacent simulations
 from *different* candidates during repeated-candidate phases — which is where the
 width-2 mode comes from — so no RNG-changing reordering is required.
 
+> **Withdrawn by measurement.** The realized width is **1.19**, not 2.58 — see
+> "Phase 2 results" below. The `per_action` repetition in the Gumbel schedule
+> makes 90% of waves width 1, so the batch-count reduction is 1.13×, not 2.5×.
+
 **Gates.**
 
 * Bit-identity to `leaf_batch=1` across a **stratified corpus**: all
@@ -399,6 +413,84 @@ width-2 mode comes from — so no RNG-changing reordering is required.
   not merely its consequence.
 * Instrument the **realized wave-width distribution** in production runs; do not
   infer it from `top_k`.
+
+### Phase 2 results (2026-07-26, built and run)
+
+**What was built.** `SearchConfig::conflict_free_waves` (default off, so nothing
+existing moved). A wave records the root edge of every member; before selecting,
+if the upcoming candidate is already in the wave, the wave is cut and issued. The
+cut happens *before* `select_leaf`, so the schedule and the RNG stream are
+untouched and the next call re-derives exactly the same simulation — the rule
+never reorders, it only cuts. The invariant is asserted directly on every wave
+(Rust errors if an edge appears twice), and the realized width distribution is
+recorded as a histogram all the way out to the benchmark rows.
+
+**The strong claim holds.** Bit-identical to `leaf_batch = 1` across all five
+legal-count strata (≤2, 3–4, 5–8, 9–16, >16) × budgets {16, 17, 20, 24, 67} ×
+`leaf_batch` {2, 4, 8, 16}: action, visits, top-k, policy, action value, root
+value and the full tree digest, at zero tolerance. That includes the ≤2 and 3–4
+strata — the 52% of decisions the rev-1 identity result never covered. A negative
+control is gated too: with the rule *off*, wide `leaf_batch` does diverge on this
+corpus, so the identity result is evidence of something.
+
+**A second reordering source, which the plan did not anticipate.** The first run
+of the gate failed on exactly one quantity — `root_value`, in its last two bits,
+only when `force=True`. Cause: simulations whose value is known at selection time
+(terminal leaves, and forced children whose evaluation was cached) were backed up
+*immediately*, jumping ahead of earlier simulations still waiting on the network.
+Every backup adds into the shared root sum and float addition is not associative,
+so the sum differed. Under the rule such simulations now join the wave carrying
+their own value and back up in launch order; a wave that turns out to need no
+rows at all is settled inline rather than submitted as a zero-row batch. Without
+this the exactness claim is false, and `root_value` is a training target, so it
+is not a difference one may wave through.
+
+**The width prediction is withdrawn.** Realized mean wave width is **1.19**, not
+2.58. The distribution (production run, 32 slots, `leaf_batch = 16`):
+
+| width | 1 | 2 | 3–8 | 9–16 |
+|---|---|---|---|---|
+| share of waves | **90.1%** | 8.1% | 1.4% | 0.4% |
+
+**Mechanism.** The Gumbel schedule spends `per_action` *consecutive* simulations
+on one candidate before advancing, so whenever `per_action ≥ 2` the next
+simulation always repeats the current candidate and the wave is cut at width 1.
+Only a round with `per_action == 1` can produce a wide wave, and that is round 1
+alone: at cheap budgets `per_action = sims / (rounds × candidates)` is 1 in round
+1 and ≥ 2 in every later round, and full budgets have `per_action ≥ 2`
+throughout. 138,955 of 148,291 waves — 94% — were cut by the conflict rule. The
+rev-2 corpus estimate of 2.58 cheap / 2.03 full does not survive contact with the
+realized distribution the plan itself asked for.
+
+**Therefore no throughput gain.** Matched arms, 64 games, 32 slots, cap 256:
+
+| | `leaf_batch=1` | conflict-free, `leaf_batch=4` | conflict-free, `leaf_batch=16` |
+|---|---|---|---|
+| leaf waves | 168,213 | 150,869 | **148,291** (1.13× fewer) |
+| mean wave width | 1.000 | 1.163 | **1.188** |
+| global batches | 7,433 | 6,884 | **6,808** (1.09× fewer) |
+| mean rows/batch | 51.7 | 55.9 | 56.5 |
+| games/hour | 1,560 | 1,548 | **1,590** |
+
++1.9% is inside the ~10% run-to-run spread (the same configuration measured 1,650
+earlier in the session), so the honest reading is **flat**. It could not have been
+otherwise: 90% of waves are width 1, which *is* `leaf_batch = 1`.
+
+**What Phase 2 is worth.** Not throughput. It converts leaf batching from an
+approximation into an exact transformation, which retires the quality question
+that made `leaf_batch > 1` unusable — the plan's own conditional ("if it holds,
+leaf batching needs no quality gate at all") is now discharged. That matters if
+anything later needs wide waves. It is not a generation speedup.
+
+**Consequence for the programme.** Wave width cannot be widened without
+reordering simulations *within* a halving round so that consecutive ones come
+from different candidates — the "full-move round-robin reordering" already parked
+under "Later, gated on results". That permutes RNG consumption and so changes
+outputs, needing its own arena justification, and it would buy at most the
+~1.1–1.2× that batch-count reduction is worth on a launch-bound pipeline.
+Batch width is far cheaper to buy from concurrency: Phase 1 measured +48% from
+one slots step. **Recommendation: do not pursue wave widening. Go to Phase 3b
+(launch overhead) and the Phase 4 slots axis.**
 
 ---
 
@@ -473,10 +565,13 @@ Phase 0 timing split.
 
 ## Later, gated on results
 
-* **Full-move round-robin reordering.** Only if full moves remain a batch-count
-  bottleneck after Phase 2. Sound (order within a halving round is arbitrary) but
-  it permutes RNG consumption and changes full-move outputs, so it needs its own
-  arena justification. Measure Phase 2's actual full-move benefit (2.0×) first.
+* **Full-move round-robin reordering.** ~~Only if full moves remain a batch-count
+  bottleneck after Phase 2.~~ **Not recommended.** Phase 2 measured the actual
+  benefit available here: with waves already exact, reordering could raise mean
+  width from 1.19 towards the candidate count, but batch-count reduction is worth
+  only ~1.1× per 10% of batches removed on a launch-bound pipeline, against
+  permuting RNG consumption and changing every full-move output. Concurrency buys
+  the same batch width for nothing (Phase 1: +48%).
 * **Token-count bucketing** if padding exceeds ~20% once batches widen.
 * **Chance capping (`cheap_double_reveal_offsets`, X=3).** Re-measure *after* the
   exact pipeline is tuned: it touches only the per-row ~29%, and it makes batches
@@ -506,7 +601,10 @@ pinned laptop configuration.
   divergence measured at 0/432 moves. Throughput itself is flat — see the Phase 1
   results section; the gain the plan hoped for was not there to take.
 * Phase 2: leaf batches per search down ~2.5× cheap / ~2.0× full, bit-identical
-  across the stratified corpus.
+  across the stratified corpus. **Split verdict**: bit-identity **met** in full
+  (every stratum, every budget, zero tolerance, plus a negative control); the
+  batch-count target **missed** — 1.13×, not 2.5×, because realized wave width is
+  1.19. Throughput flat. See the Phase 2 results section.
 * Phase 3: `gather_seconds` per row flat in batch width.
 * Phase 4: rows/batch and games/hour reported against the Phase 0 cost model —
   **the expected multiplier is deliberately left blank until that model exists**,

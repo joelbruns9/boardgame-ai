@@ -68,6 +68,9 @@ pub struct SelfPlayConfig {
     pub bot_exploration: f64,
     pub bot_policy_iterations: i64,
     pub max_moves: usize,
+    /// Phase 2: hold the conflict-free wave invariant, making `leaf_batch > 1`
+    /// an exact batching of `leaf_batch = 1` rather than an approximation.
+    pub conflict_free_waves: bool,
 }
 
 impl SelfPlayConfig {
@@ -410,6 +413,7 @@ pub fn run<E: Eval>(
                     .map_or(cfg.cheap_double_reveal_offsets, |per_seat| per_seat[actor]),
                 full,
             ),
+            conflict_free_waves: cfg.conflict_free_waves,
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -525,6 +529,11 @@ pub struct SchedulerMetrics {
     pub arena_nodes_slot_peak: usize,
     pub arena_deep_bytes_slot_peak: usize,
     pub arena_node_struct_bytes: usize,
+    /// Phase 2: realized leaf-wave widths, and how many waves the conflict-free
+    /// invariant cut short. The plan requires the realized distribution; width
+    /// cannot be inferred from `top_k` or `leaf_batch`.
+    pub wave_width_histogram: [usize; tree_resumable::WAVE_WIDTH_BUCKETS],
+    pub conflict_cuts: usize,
 }
 
 pub struct SchedulerResult {
@@ -594,6 +603,14 @@ impl SchedulerMetrics {
             .arena_deep_bytes_slot_peak
             .max(other.arena_deep_bytes_slot_peak);
         self.arena_node_struct_bytes = other.arena_node_struct_bytes;
+        for (bucket, count) in self
+            .wave_width_histogram
+            .iter_mut()
+            .zip(other.wave_width_histogram)
+        {
+            *bucket += count;
+        }
+        self.conflict_cuts += other.conflict_cuts;
     }
 }
 
@@ -963,6 +980,14 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.rust_chance_ns += slot.chance_ns;
     metrics.rust_record_ns += slot.record_ns;
     metrics.scatter_ns += slot.scatter_ns;
+    for (bucket, count) in metrics
+        .wave_width_histogram
+        .iter_mut()
+        .zip(slot.wave_width_histogram)
+    {
+        *bucket += count;
+    }
+    metrics.conflict_cuts += slot.conflict_cuts;
 }
 
 struct SearchMeta {
@@ -1000,6 +1025,8 @@ struct GameSlot {
     forced_cache_hits: usize,
     forced_rows_per_search: Vec<usize>,
     fixed_support_edges: usize,
+    wave_width_histogram: [usize; tree_resumable::WAVE_WIDTH_BUCKETS],
+    conflict_cuts: usize,
     tree_ns: u64,
     chance_ns: u64,
     record_ns: u64,
@@ -1045,6 +1072,8 @@ impl GameSlot {
             forced_cache_hits: 0,
             forced_rows_per_search: Vec::new(),
             fixed_support_edges: 0,
+            wave_width_histogram: [0; tree_resumable::WAVE_WIDTH_BUCKETS],
+            conflict_cuts: 0,
             tree_ns: 0,
             chance_ns: 0,
             record_ns: 0,
@@ -1110,6 +1139,7 @@ impl GameSlot {
                         }),
                     full,
                 ),
+                conflict_free_waves: self.cfg.conflict_free_waves,
             },
         })
     }
@@ -1193,6 +1223,14 @@ impl GameSlot {
                 *target += value;
             }
             self.forced_cache_hits += metrics.cached_forced_leaves;
+            for (bucket, count) in self
+                .wave_width_histogram
+                .iter_mut()
+                .zip(metrics.wave_width_histogram)
+            {
+                *bucket += count;
+            }
+            self.conflict_cuts += metrics.conflict_cuts;
             self.forced_rows_per_search
                 .push(metrics.forced_outcome_rows);
             self.finish_move(meta, result)?;

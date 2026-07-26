@@ -331,6 +331,13 @@ pub struct SearchConfig {
     /// expansion exhaustive; a positive `X` keeps the balanced `n * X` support
     /// and CLOSES the edge.
     pub double_reveal_offsets: usize,
+    /// Phase 2: forbid two in-flight simulations in the same root candidate's
+    /// subtree. A wave is cut short rather than admitting the second one, so
+    /// every simulation in a wave descends a subtree no other member touches —
+    /// which makes `leaf_batch > 1` an exact batching of `leaf_batch = 1`
+    /// instead of a virtual-loss approximation of it. The taper is a consequence
+    /// of the invariant, not a configured schedule.
+    pub conflict_free_waves: bool,
 }
 
 pub struct SearchResult {

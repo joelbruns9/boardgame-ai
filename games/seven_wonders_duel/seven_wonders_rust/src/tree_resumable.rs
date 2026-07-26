@@ -20,6 +20,9 @@ use std::collections::HashMap;
 
 pub type NodeId = usize;
 
+/// Buckets in `SearchMetrics::wave_width_histogram`; the last one is "or wider".
+pub const WAVE_WIDTH_BUCKETS: usize = 17;
+
 pub struct Child {
     pub probability: Option<f64>,
     pub node_id: NodeId,
@@ -233,6 +236,13 @@ struct PendingSimulation {
     leaf_id: NodeId,
     root_edge: usize,
     has_incomplete: bool,
+    /// Value already known at selection time — a terminal leaf, or a forced
+    /// child whose evaluation was cached. Such a simulation needs no NN row, but
+    /// under the conflict-free rule it still joins the wave so that it cannot
+    /// back up *ahead* of an earlier pending simulation: every backup adds into
+    /// the shared root sum, and float addition is not associative, so reordering
+    /// perturbs `root_value` in its last bits.
+    immediate_value: Option<f64>,
 }
 
 /// Metadata needed to align an evaluator response to its pending simulation.
@@ -332,6 +342,7 @@ fn select_leaf(
                     leaf_id: node_id,
                     root_edge: forced_edge,
                     has_incomplete: false,
+                    immediate_value: None,
                 },
                 Some((value, None)),
             );
@@ -344,6 +355,7 @@ fn select_leaf(
                     leaf_id: node_id,
                     root_edge: forced_edge,
                     has_incomplete: false,
+                    immediate_value: None,
                 },
                 cached.map(|(value, priors)| (value, Some(priors))),
             );
@@ -740,6 +752,14 @@ pub struct SearchMetrics {
     pub leaf_waves: usize,
     pub max_wave_paths: usize,
     pub max_wave_unique: usize,
+    /// Realized wave widths, bucketed by path count: index `i` counts waves of
+    /// width `i + 1`, and the last bucket absorbs anything wider. The plan
+    /// requires the *realized* distribution: width cannot be inferred from
+    /// `top_k`, since the conflict rule cuts waves on candidate repetition.
+    pub wave_width_histogram: [usize; WAVE_WIDTH_BUCKETS],
+    /// Waves cut short by the conflict-free invariant rather than by
+    /// `leaf_batch`. Zero when the rule is off.
+    pub conflict_cuts: usize,
     pub cached_forced_leaves: usize,
     pub forced_outcome_rows: usize,
     pub forced_rows_by_kind: [usize; 4],
@@ -759,6 +779,10 @@ struct PendingWave {
     request_id: u64,
     simulations: Vec<PendingSimulation>,
     unique_leaf_ids: Vec<NodeId>,
+    /// Root edges already represented in this wave, for the Phase 2 invariant.
+    /// A `Vec` beats a set here: waves are a handful of entries and the linear
+    /// scan is cheaper than hashing.
+    root_edges: Vec<usize>,
 }
 
 enum PendingEvaluation {
@@ -858,6 +882,7 @@ impl SearchSession {
                 puct_root: cfg.puct_root,
                 age_deal_samples: cfg.age_deal_samples,
                 double_reveal_offsets: cfg.double_reveal_offsets,
+                conflict_free_waves: cfg.conflict_free_waves,
             },
             leaf_batch,
             rng,
@@ -995,7 +1020,55 @@ impl SearchSession {
         self.metrics.scheduled_simulations += 1;
     }
 
-    fn make_request(&mut self, wave: PendingWave) -> SearchEvent {
+    /// Assert the Phase 2 invariant directly, not merely its consequence: no two
+    /// in-flight simulations may share a root candidate. Checked on every wave
+    /// so a gate cannot pass by coincidence.
+    fn assert_conflict_free(&self, wave: &PendingWave) -> PyResult<()> {
+        for (position, edge) in wave.root_edges.iter().enumerate() {
+            if wave.root_edges[..position].contains(edge) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "conflict-free invariant violated: root edge {edge} appears \
+                     twice in one wave of {} simulations",
+                    wave.simulations.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Back up a wave that needs no evaluation at all, in launch order.
+    ///
+    /// Only reachable when every member carries its own value (terminal leaves
+    /// and cached forced children); submitting a zero-row batch instead would be
+    /// a protocol error at the boundary.
+    fn drain_immediate_wave(&mut self, wave: &mut PendingWave) -> PyResult<()> {
+        for mut pending in std::mem::take(&mut wave.simulations) {
+            let Some(value_p0) = pending.immediate_value else {
+                return Err(PyRuntimeError::new_err(
+                    "a wave with no evaluation rows holds a simulation that needs one",
+                ));
+            };
+            let root_edge = pending.root_edge;
+            clear_incomplete(&mut self.arena, &mut pending);
+            backup(&mut self.arena, pending, value_p0);
+            self.complete_simulation(root_edge);
+        }
+        wave.root_edges.clear();
+        Ok(())
+    }
+
+    fn make_request(&mut self, wave: PendingWave) -> PyResult<SearchEvent> {
+        if wave.unique_leaf_ids.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "refusing to request an evaluation for a wave with no NN rows",
+            ));
+        }
+        if self.cfg.conflict_free_waves {
+            self.assert_conflict_free(&wave)?;
+        }
+        let width = wave.simulations.len();
+        let bucket = width.min(WAVE_WIDTH_BUCKETS).saturating_sub(1);
+        self.metrics.wave_width_histogram[bucket] += 1;
         let leaves = wave
             .unique_leaf_ids
             .iter()
@@ -1013,11 +1086,11 @@ impl SearchSession {
         self.metrics.max_wave_paths = self.metrics.max_wave_paths.max(wave.simulations.len());
         self.metrics.max_wave_unique = self.metrics.max_wave_unique.max(wave.unique_leaf_ids.len());
         self.waiting = Some(PendingEvaluation::Wave(wave));
-        SearchEvent::Evaluation(EvalBatchRequest {
+        Ok(SearchEvent::Evaluation(EvalBatchRequest {
             request_id,
             leaves,
             forced: false,
-        })
+        }))
     }
 
     pub fn next_event(&mut self) -> PyResult<SearchEvent> {
@@ -1075,12 +1148,17 @@ impl SearchSession {
             request_id,
             simulations: Vec::new(),
             unique_leaf_ids: Vec::new(),
+            root_edges: Vec::new(),
         };
         loop {
             if self.sims_launched >= self.cfg.sims {
                 if !wave.simulations.is_empty() {
-                    self.request_seq += 1;
-                    return Ok(self.make_request(wave));
+                    if wave.unique_leaf_ids.is_empty() {
+                        self.drain_immediate_wave(&mut wave)?;
+                    } else {
+                        self.request_seq += 1;
+                        return self.make_request(wave);
+                    }
                 }
                 if self.sims_completed != self.cfg.sims || self.arena.incomplete_total() != 0 {
                     return Err(PyRuntimeError::new_err(
@@ -1094,8 +1172,12 @@ impl SearchSession {
             // advance and no round boundary to drain at.
             if !self.cfg.puct_root && self.candidate_pos >= self.candidates.len() {
                 if !wave.simulations.is_empty() {
-                    self.request_seq += 1;
-                    return Ok(self.make_request(wave));
+                    if wave.unique_leaf_ids.is_empty() {
+                        self.drain_immediate_wave(&mut wave)?;
+                    } else {
+                        self.request_seq += 1;
+                        return self.make_request(wave);
+                    }
                 }
                 self.finish_round()?;
                 continue;
@@ -1106,6 +1188,28 @@ impl SearchSession {
             } else {
                 self.candidates[self.candidate_pos]
             };
+            // Phase 2 invariant: never two in-flight simulations in the same
+            // root candidate's subtree. Cut the wave here instead of admitting
+            // the second one -- and do it BEFORE selecting, so the schedule and
+            // the RNG stream are untouched and the next call re-derives exactly
+            // this simulation. Because distinct root edges own disjoint arena
+            // nodes, the surviving members cannot see each other's virtual loss,
+            // which is what makes the wave an exact batching of scalar order.
+            if self.cfg.conflict_free_waves
+                && !wave.simulations.is_empty()
+                && wave.root_edges.contains(&root_edge)
+            {
+                if wave.unique_leaf_ids.is_empty() {
+                    // Every member carries its own value, so there is nothing to
+                    // evaluate: settle them here, in launch order, and then let
+                    // this simulation proceed into a fresh wave.
+                    self.drain_immediate_wave(&mut wave)?;
+                } else {
+                    self.request_seq += 1;
+                    self.metrics.conflict_cuts += 1;
+                    return self.make_request(wave);
+                }
+            }
             let (mut pending, immediate) = select_leaf(
                 &mut self.arena,
                 root_id,
@@ -1121,8 +1225,26 @@ impl SearchSession {
                 } else {
                     self.metrics.terminal_leaves += 1;
                 }
-                backup(&mut self.arena, pending, value_p0);
-                self.complete_simulation(root_edge);
+                if !self.cfg.conflict_free_waves {
+                    backup(&mut self.arena, pending, value_p0);
+                    self.complete_simulation(root_edge);
+                    continue;
+                }
+                // Exact order: this simulation carries its own value, but it
+                // must not back up before simulations launched ahead of it.
+                pending.immediate_value = Some(value_p0);
+                wave.simulations.push(pending);
+                wave.root_edges.push(root_edge);
+                if wave.simulations.len() >= self.leaf_batch {
+                    if wave.unique_leaf_ids.is_empty() {
+                        // Nothing to evaluate: settle it here and start fresh
+                        // rather than submitting an empty batch.
+                        self.drain_immediate_wave(&mut wave)?;
+                    } else {
+                        self.request_seq += 1;
+                        return self.make_request(wave);
+                    }
+                }
                 continue;
             }
             if self.leaf_batch > 1 {
@@ -1136,9 +1258,10 @@ impl SearchSession {
                 self.metrics.collisions += 1;
             }
             wave.simulations.push(pending);
+            wave.root_edges.push(root_edge);
             if wave.simulations.len() >= self.leaf_batch {
                 self.request_seq += 1;
-                return Ok(self.make_request(wave));
+                return self.make_request(wave);
             }
         }
     }
@@ -1289,12 +1412,19 @@ impl SearchSession {
             }
         }
         for mut pending in wave.simulations {
-            let row = wave
-                .unique_leaf_ids
-                .iter()
-                .position(|&leaf_id| leaf_id == pending.leaf_id)
-                .expect("pending leaf must have an evaluation row");
-            let value_p0 = evaluations[row].0;
+            // Members that carry their own value never asked for a row; taking
+            // it from `unique_leaf_ids` would mis-align every later member.
+            let value_p0 = match pending.immediate_value {
+                Some(value) => value,
+                None => {
+                    let row = wave
+                        .unique_leaf_ids
+                        .iter()
+                        .position(|&leaf_id| leaf_id == pending.leaf_id)
+                        .expect("pending leaf must have an evaluation row");
+                    evaluations[row].0
+                }
+            };
             clear_incomplete(&mut self.arena, &mut pending);
             let root_edge = pending.root_edge;
             backup(&mut self.arena, pending, value_p0);

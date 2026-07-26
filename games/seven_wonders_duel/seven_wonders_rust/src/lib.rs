@@ -155,6 +155,7 @@ fn make_self_play_config(
     age_deal_samples: usize,
     cheap_double_reveal_offsets: usize,
     max_moves: usize,
+    conflict_free_waves: bool,
 ) -> self_play::SelfPlayConfig {
     self_play::SelfPlayConfig {
         game_seed,
@@ -182,6 +183,7 @@ fn make_self_play_config(
         bot_exploration: 0.0,
         bot_policy_iterations: 10,
         max_moves,
+        conflict_free_waves,
     }
 }
 
@@ -433,7 +435,7 @@ impl RustGame {
     /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
     /// `visits`/`policy_target` aligned to `legal_action_indices`.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, double_reveal_offsets=0))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, double_reveal_offsets=0, conflict_free_waves=false))]
     fn closed_search(
         &self,
         sims: usize,
@@ -445,6 +447,7 @@ impl RustGame {
         force: bool,
         puct_root: bool,
         double_reveal_offsets: usize,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -466,6 +469,7 @@ impl RustGame {
             puct_root,
             age_deal_samples: 0,
             double_reveal_offsets,
+            conflict_free_waves,
         };
         let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -487,7 +491,7 @@ impl RustGame {
     /// request, evaluation is applied separately, and stable arena paths are
     /// backed up before the next simulation is selected.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, double_reveal_offsets=0))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, double_reveal_offsets=0, conflict_free_waves=false))]
     fn closed_search_resumable(
         &self,
         sims: usize,
@@ -498,6 +502,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         double_reveal_offsets: usize,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -519,6 +524,7 @@ impl RustGame {
             puct_root: false,
             age_deal_samples: 0,
             double_reveal_offsets,
+            conflict_free_waves,
         };
         let (res, arena) = tree_resumable::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -539,7 +545,7 @@ impl RustGame {
     /// still the scalar F3.4 Python adapter; F4.4/F4.5 replace the boundary,
     /// while this method keeps the phase split independently gateable today.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, conflict_free_waves=false))]
     fn closed_search_resumable_net(
         &self,
         adapter: Py<PyAny>,
@@ -550,6 +556,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -571,6 +578,7 @@ impl RustGame {
             puct_root: false,
             age_deal_samples: 0,
             double_reveal_offsets: 0,
+            conflict_free_waves,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena) = tree_resumable::search_closed(&self.state, &evaluator, &cfg)?;
@@ -593,7 +601,7 @@ impl RustGame {
     /// collisions, waves, max_wave_paths, max_wave_unique)`, completed-Q aligned
     /// to legal actions, and the tree digest.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
+    #[pyo3(signature = (leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, conflict_free_waves=false))]
     fn closed_search_batched(
         &self,
         leaf_batch: usize,
@@ -605,6 +613,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         puct_root: bool,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -628,6 +637,7 @@ impl RustGame {
             puct_root,
             age_deal_samples: 0,
             double_reveal_offsets: 0,
+            conflict_free_waves,
         };
         let (res, arena, metrics) =
             tree_resumable::search_closed_batched(&self.state, &eval::MockEval, &cfg, leaf_batch)?;
@@ -660,7 +670,7 @@ impl RustGame {
     /// adapter remains one Python call per unique leaf until the F4.4 global
     /// coalescer; this surface gates batched search semantics with a real net.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (adapter, leaf_batch, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, conflict_free_waves=false))]
     fn closed_search_batched_net(
         &self,
         adapter: Py<PyAny>,
@@ -672,6 +682,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -695,6 +706,7 @@ impl RustGame {
             puct_root: false,
             age_deal_samples: 0,
             double_reveal_offsets: 0,
+            conflict_free_waves,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena, metrics) =
@@ -728,7 +740,7 @@ impl RustGame {
     /// callable `(tokens, actor, legal) -> (value_actor, priors)`; the Rust
     /// encoder (F2) feeds it, so results match Python's searcher on the same net.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
+    #[pyo3(signature = (adapter, sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, conflict_free_waves=false))]
     fn closed_search_net(
         &self,
         adapter: Py<PyAny>,
@@ -740,6 +752,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         puct_root: bool,
+        conflict_free_waves: bool,
     ) -> PyResult<(
         usize,
         f64,
@@ -761,6 +774,7 @@ impl RustGame {
             puct_root,
             age_deal_samples: 0,
             double_reveal_offsets: 0,
+            conflict_free_waves,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, root) = tree::search_closed(&self.state, &evaluator, &cfg)?;
@@ -786,7 +800,8 @@ impl RustGame {
         adapter, game_seed, leaf_batch, cheap_sims_min, cheap_sims_max,
         full_sims_min, full_sims_max, full_search_fraction, top_k, draft_prior,
         iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
+        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
+        conflict_free_waves=false
     ))]
     fn self_play_net(
         &self,
@@ -808,6 +823,7 @@ impl RustGame {
         age_deal_samples: usize,
         cheap_double_reveal_offsets: usize,
         max_moves: usize,
+        conflict_free_waves: bool,
     ) -> PyResult<Py<PyDict>> {
         let cfg = make_self_play_config(
             game_seed,
@@ -828,6 +844,7 @@ impl RustGame {
             age_deal_samples,
             cheap_double_reveal_offsets,
             max_moves,
+            conflict_free_waves,
         );
         let evaluator = eval::PyEval::new(adapter);
         let record = self_play::run(&self.state, &evaluator, &cfg)?;
@@ -841,7 +858,8 @@ impl RustGame {
         game_seed, leaf_batch, cheap_sims_min, cheap_sims_max, full_sims_min,
         full_sims_max, full_search_fraction, top_k, draft_prior,
         iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
+        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
+        conflict_free_waves=false
     ))]
     fn self_play_mock(
         &self,
@@ -862,6 +880,7 @@ impl RustGame {
         age_deal_samples: usize,
         cheap_double_reveal_offsets: usize,
         max_moves: usize,
+        conflict_free_waves: bool,
     ) -> PyResult<Py<PyDict>> {
         let cfg = make_self_play_config(
             game_seed,
@@ -882,6 +901,7 @@ impl RustGame {
             age_deal_samples,
             cheap_double_reveal_offsets,
             max_moves,
+            conflict_free_waves,
         );
         let record = self_play::run(&self.state, &eval::MockEval, &cfg)?;
         Python::attach(|py| self_play_record_to_py(py, record))
@@ -1029,6 +1049,25 @@ fn scheduler_result_to_py(
     metrics.set_item("arena_nodes_slot_peak", m.arena_nodes_slot_peak)?;
     metrics.set_item("arena_deep_bytes_slot_peak", m.arena_deep_bytes_slot_peak)?;
     metrics.set_item("arena_node_struct_bytes", m.arena_node_struct_bytes)?;
+    metrics.set_item("wave_width_histogram", m.wave_width_histogram.to_vec())?;
+    metrics.set_item("conflict_cuts", m.conflict_cuts)?;
+    metrics.set_item(
+        "mean_wave_width",
+        {
+            let waves: usize = m.wave_width_histogram.iter().sum();
+            let paths: usize = m
+                .wave_width_histogram
+                .iter()
+                .enumerate()
+                .map(|(bucket, count)| (bucket + 1) * count)
+                .sum();
+            if waves == 0 {
+                0.0
+            } else {
+                paths as f64 / waves as f64
+            }
+        },
+    )?;
     metrics.set_item(
         "padding_ratio",
         if m.boundary_padded_tokens == 0 {
@@ -1095,7 +1134,7 @@ fn search_result_to_py(
     adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
     c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
     age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false,
-    double_reveal_offsets=0
+    double_reveal_offsets=0, conflict_free_waves=false
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -1114,6 +1153,7 @@ fn search_many_flat_net(
     inference_timeout_ms: f64,
     puct_root: bool,
     double_reveal_offsets: usize,
+    conflict_free_waves: bool,
 ) -> PyResult<Vec<Py<PyDict>>> {
     if games.is_empty() || games.len() != search_seeds.len() {
         return Err(PyValueError::new_err(
@@ -1154,6 +1194,7 @@ fn search_many_flat_net(
                 puct_root,
                 age_deal_samples,
                 double_reveal_offsets,
+                conflict_free_waves,
             };
             let session = if force {
                 tree_resumable::begin_search_from_root_forced(state, &cfg, leaf_batch, evaluation)?
@@ -1324,6 +1365,7 @@ fn cooperative_jobs(
     age_deal_samples: usize,
     cheap_double_reveal_offsets: usize,
     max_moves: usize,
+    conflict_free_waves: bool,
 ) -> PyResult<Vec<(GameState, self_play::SelfPlayConfig)>> {
     if games.len() != game_seeds.len() {
         return Err(PyValueError::new_err(format!(
@@ -1356,6 +1398,7 @@ fn cooperative_jobs(
                 age_deal_samples,
                 cheap_double_reveal_offsets,
                 max_moves,
+                conflict_free_waves,
             );
             Ok((state, cfg))
         })
@@ -1371,7 +1414,7 @@ fn cooperative_jobs(
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
     cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
-    max_active_slots=0
+    max_active_slots=0, conflict_free_waves=false
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -1397,6 +1440,7 @@ fn self_play_many_mock(
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
     max_active_slots: usize,
+    conflict_free_waves: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
         py,
@@ -1419,6 +1463,7 @@ fn self_play_many_mock(
         age_deal_samples,
         cheap_double_reveal_offsets,
         max_moves,
+        conflict_free_waves,
     )?;
     let mut jobs = jobs;
     match (cheap_double_reveal_offsets_p0, cheap_double_reveal_offsets_p1) {
@@ -1452,7 +1497,7 @@ fn self_play_many_mock(
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
-    max_active_slots=0
+    max_active_slots=0, conflict_free_waves=false
 ))]
 fn self_play_many_net(
     py: Python<'_>,
@@ -1487,6 +1532,7 @@ fn self_play_many_net(
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
     max_active_slots: usize,
+    conflict_free_waves: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1509,6 +1555,7 @@ fn self_play_many_net(
         age_deal_samples,
         cheap_double_reveal_offsets,
         max_moves,
+        conflict_free_waves,
     )?;
     match (leaf_batch_p0, leaf_batch_p1) {
         (None, None) => {}
@@ -1610,7 +1657,8 @@ fn self_play_many_net(
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_double_reveal_offsets_p0=None,
-    cheap_double_reveal_offsets_p1=None, max_active_slots=0))]
+    cheap_double_reveal_offsets_p1=None, max_active_slots=0,
+    conflict_free_waves=false))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -1649,6 +1697,7 @@ fn self_play_many_flat_net(
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
     max_active_slots: usize,
+    conflict_free_waves: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1671,6 +1720,7 @@ fn self_play_many_flat_net(
         age_deal_samples,
         cheap_double_reveal_offsets,
         max_moves,
+        conflict_free_waves,
     )?;
     match (leaf_batch_p0, leaf_batch_p1) {
         (None, None) => {}
