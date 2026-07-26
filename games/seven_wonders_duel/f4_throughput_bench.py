@@ -4,6 +4,22 @@ Laptop mode runs the Python and flat-buffer Rust generators at the frozen
 search settings, emits per-repetition JSONL, and computes a fixed-seed bootstrap
 lower bound for the speedup. Rust mode is the cloud-sweep primitive and never
 enters the Python self-play loop.
+
+Phase 0 of ``THROUGHPUT_ACTION_PLAN.md`` added the measurement apparatus the
+earlier revisions of that plan lacked:
+
+* ``--games-per-call`` submits many games per Rust call instead of one chunk per
+  ``--slots``, so a run has a steady-state window rather than being one long
+  drain. Every row now reports the steady-state and drain windows separately
+  (``steady_*`` / ``drain_*``); a single mean over both is what produced the
+  misleading "27 rows per batch" figure.
+* ``--cuda-events`` measures device execution independently of host dispatch.
+  ``gpu_busy_fraction`` is retained only because the contract requires it: it is
+  ``forward_seconds / wall`` with no synchronisation, i.e. a host timer, and is
+  **not** a valid GPU-bound indicator. Use ``device_forward_fraction`` or
+  ``nvml_utilization_mean`` instead.
+* Memory telemetry now reports CUDA *reserved* peak, sampled RSS, and the Rust
+  arena's node/byte peak, which is the quantity that bounds concurrent games.
 """
 
 from __future__ import annotations
@@ -180,6 +196,127 @@ def _run_python(
     }
 
 
+def window_split(metrics: dict) -> dict:
+    """Split one Rust call's batches into its steady-state and drain windows.
+
+    A call starts with every slot live and ends with concurrency decaying to a
+    single game. Averaging batch width over both regimes blends a well-fed
+    scheduler with a starving one, so the two are reported separately here.
+
+    The boundary is the first batch submitted while fewer slots were live than
+    the call's maximum; everything from there on is drain. Time comes from the
+    Rust-side submission offsets, so it is wall time, not a batch count.
+    """
+
+    rows = [int(value) for value in metrics.get("batch_rows", [])]
+    live = [int(value) for value in metrics.get("batch_live_slots", [])]
+    submitted = [int(value) for value in metrics.get("batch_submit_ns", [])]
+    wall = float(metrics.get("scheduler_wall_ns", 0)) / 1e9
+    empty = {
+        "steady_batches": 0,
+        "steady_rows": 0,
+        "steady_seconds": 0.0,
+        "drain_batches": 0,
+        "drain_rows": 0,
+        "drain_seconds": 0.0,
+    }
+    if not rows or len(live) != len(rows) or len(submitted) != len(rows):
+        return empty | {"steady_seconds": wall}
+    peak = max(live)
+    boundary = next(
+        (index for index, count in enumerate(live) if count < peak), len(rows)
+    )
+    steady_seconds = submitted[boundary] / 1e9 if boundary < len(rows) else wall
+    steady_seconds = min(steady_seconds, wall)
+    return {
+        "steady_batches": boundary,
+        "steady_rows": sum(rows[:boundary]),
+        "steady_seconds": steady_seconds,
+        "drain_batches": len(rows) - boundary,
+        "drain_rows": sum(rows[boundary:]),
+        "drain_seconds": max(0.0, wall - steady_seconds),
+    }
+
+
+class _ResourceSampler:
+    """Background sampler for the two quantities no cumulative counter gives.
+
+    NVML utilisation is the only GPU-side occupancy signal that does not come
+    from a host timer, and peak RSS on Linux needs sampling because the process
+    high-water mark is unavailable there.
+    """
+
+    def __init__(self, device: str, hz: float):
+        self.device = device
+        self.interval = 1.0 / hz if hz > 0 else 0.0
+        self.utilization: list[float] = []
+        self.rss: list[int] = []
+        self.nvml_available = False
+        self.rss_available = False
+        self._stop = None
+        self._thread = None
+
+    def __enter__(self):
+        if self.interval <= 0:
+            return self
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _loop(self):
+        try:
+            import psutil
+
+            process = psutil.Process()
+        except ImportError:
+            process = None
+        cuda = str(self.device).startswith("cuda")
+        self.rss_available = process is not None
+        while not self._stop.wait(self.interval):
+            if cuda:
+                try:
+                    self.utilization.append(float(torch.cuda.utilization(self.device)))
+                    self.nvml_available = True
+                except Exception:  # pragma: no cover - NVML absent or unsupported
+                    cuda = False
+            if process is not None:
+                try:
+                    self.rss.append(int(process.memory_info().rss))
+                except Exception:  # pragma: no cover - process introspection lost
+                    process = None
+                    self.rss_available = False
+
+    def __exit__(self, *exc):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=5.0)
+        return False
+
+    def summary(self) -> dict:
+        """Unavailable signals report ``None``, never 0.
+
+        A GPU utilisation of 0.0 and an *unmeasured* GPU utilisation lead to
+        opposite conclusions, and this whole phase exists because a metric was
+        read as something it was not.
+        """
+
+        return {
+            "nvml_available": self.nvml_available,
+            "nvml_utilization_mean": (
+                statistics.mean(self.utilization) if self.utilization else None
+            ),
+            "nvml_utilization_p95": (
+                _percentile(self.utilization, 0.95) if self.utilization else None
+            ),
+            "nvml_samples": len(self.utilization),
+            "rss_sampling_available": self.rss_available,
+            "sampled_peak_rss_bytes": max(self.rss) if self.rss else None,
+        }
+
+
 def _metric_delta(adapter, before: dict, row_start: int, token_start: int) -> dict:
     total = adapter.total_metrics
     return {
@@ -205,6 +342,9 @@ def _run_rust(
     diagnostic_sync: bool,
     pinned_memory: bool,
     cheap_double_reveal_offsets: int = 0,
+    games_per_call: int = 0,
+    cuda_events: bool = False,
+    resource_sample_hz: float = 0.0,
 ) -> dict:
     import seven_wonders_rust as swr
 
@@ -212,12 +352,17 @@ def _run_rust(
         evaluator,
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
+        cuda_events=cuda_events,
     )
     before = dict(adapter.total_metrics)
     row_start = len(adapter.batch_rows)
     token_start = len(adapter.batch_tokens)
     if evaluator.device != "cpu":
         torch.cuda.reset_peak_memory_stats(evaluator.device)
+    # 0 keeps the historical behaviour of one Rust call per `slots` games; any
+    # larger value gives the scheduler a window it can actually stay fed over.
+    call_size = games_per_call if games_per_call > 0 else slots
+    sampler = _ResourceSampler(evaluator.device, resource_sample_hz)
     start_wall = time.perf_counter()
     start_cpu = time.process_time()
     raw_metrics = []
@@ -230,8 +375,22 @@ def _run_rust(
         "wonder_group": 0,
         "age_deal": 0,
     }
-    for start in range(0, len(seeds), slots):
-        chunk = seeds[start : start + slots]
+    windows = {
+        key: 0.0
+        for key in (
+            "steady_batches",
+            "steady_rows",
+            "steady_seconds",
+            "drain_batches",
+            "drain_rows",
+            "drain_seconds",
+        )
+    }
+    scheduler_wall = live_slot_seconds = 0.0
+    arena_nodes_peak = arena_bytes_peak = arena_node_bytes = 0
+    sampler.__enter__()
+    for start in range(0, len(seeds), call_size):
+        chunk = seeds[start : start + call_size]
         first_players = [(start + index) % 2 for index in range(len(chunk))]
         games = rust_games_for_self_play(chunk, first_players)
         records, metrics = swr.self_play_many_flat_net(
@@ -269,8 +428,22 @@ def _run_rust(
             not move["policy_excluded"] for record in records for move in record["moves"]
         )
         raw_metrics.append(metrics)
+        split = window_split(metrics)
+        for key, value in split.items():
+            windows[key] += value
+        scheduler_wall += float(metrics["scheduler_wall_ns"]) / 1e9
+        live_slot_seconds += float(metrics["live_slot_ns"]) / 1e9
+        arena_nodes_peak = max(arena_nodes_peak, int(metrics["arena_nodes_live_peak"]))
+        arena_bytes_peak = max(
+            arena_bytes_peak, int(metrics["arena_deep_bytes_slot_peak"])
+        )
+        arena_node_bytes = int(metrics["arena_node_struct_bytes"])
+    sampler.__exit__(None, None, None)
     wall = time.perf_counter() - start_wall
     cpu = time.process_time() - start_cpu
+    # Query the CUDA events only now: draining mid-run would synchronise the
+    # very pipeline being measured.
+    adapter.drain_events()
     boundary = _metric_delta(adapter, before, row_start, token_start)
     batch_rows = boundary.pop("batch_rows")
     batch_tokens = boundary.pop("batch_tokens")
@@ -279,6 +452,14 @@ def _run_rust(
     total_padded = sum(batch_padded)
     peak_gpu = (
         int(torch.cuda.max_memory_allocated(evaluator.device))
+        if evaluator.device != "cpu"
+        else 0
+    )
+    # Reserved, not allocated: the caching allocator's reservation is what has
+    # to fit in device memory, so it is the number a concurrency ceiling is set
+    # from. `max_memory_allocated` understates it, sometimes badly.
+    peak_gpu_reserved = (
+        int(torch.cuda.max_memory_reserved(evaluator.device))
         if evaluator.device != "cpu"
         else 0
     )
@@ -357,6 +538,9 @@ def _run_rust(
         "gather_d2h_seconds": boundary["gather_seconds"] + boundary["d2h_seconds"],
         "scatter_seconds": scatter_seconds + extract_seconds,
         "cpu_utilization": cpu / wall / max(1, os.cpu_count() or 1),
+        # Contract-required, and a host timer: `forward_seconds` measures kernel
+        # dispatch, so this fraction is NOT evidence of a GPU-bound pipeline.
+        # `device_forward_fraction` and `nvml_utilization_mean` are.
         "gpu_busy_fraction": min(1.0, boundary["forward_seconds"] / wall),
         "peak_host_memory_bytes": peak_host,
         "peak_gpu_memory_bytes": peak_gpu,
@@ -368,7 +552,64 @@ def _run_rust(
         "sims": int(search["full_sims_min"]),
         "slots": slots,
         "scheduler_workers": scheduler_workers,
-    }
+        # --- Phase 0: host/device separation ---
+        "sync_seconds": boundary["sync_seconds"],
+        "device_h2d_seconds": boundary["device_h2d_seconds"],
+        "device_forward_seconds": boundary["device_forward_seconds"],
+        "device_gather_seconds": boundary["device_gather_seconds"],
+        "device_d2h_seconds": boundary["device_d2h_seconds"],
+        "device_total_seconds": sum(
+            boundary[key]
+            for key in (
+                "device_h2d_seconds",
+                "device_forward_seconds",
+                "device_gather_seconds",
+                "device_d2h_seconds",
+            )
+        ),
+        "device_forward_fraction": min(1.0, boundary["device_forward_seconds"] / wall),
+        "cuda_events": bool(cuda_events),
+        "diagnostic_sync": bool(diagnostic_sync),
+        # --- Phase 0: refill window and time-weighted occupancy ---
+        "games_per_call": call_size,
+        "calls": len(raw_metrics),
+        "steady_batches": int(windows["steady_batches"]),
+        "steady_seconds": windows["steady_seconds"],
+        "steady_rows_per_batch": (
+            windows["steady_rows"] / windows["steady_batches"]
+            if windows["steady_batches"]
+            else 0.0
+        ),
+        "steady_rows_per_second": (
+            windows["steady_rows"] / windows["steady_seconds"]
+            if windows["steady_seconds"] > 0
+            else 0.0
+        ),
+        "drain_batches": int(windows["drain_batches"]),
+        "drain_seconds": windows["drain_seconds"],
+        "drain_rows_per_batch": (
+            windows["drain_rows"] / windows["drain_batches"]
+            if windows["drain_batches"]
+            else 0.0
+        ),
+        "steady_drain_seconds_ratio": (
+            windows["steady_seconds"] / windows["drain_seconds"]
+            if windows["drain_seconds"] > 0
+            else 0.0
+        ),
+        "scheduler_wall_seconds": scheduler_wall,
+        # Mean games actually in flight, integrated over wall time. This is the
+        # occupancy figure that replaces `scheduler_*_fraction`, which count
+        # loop iterations rather than time.
+        "time_weighted_live_slots": (
+            live_slot_seconds / scheduler_wall if scheduler_wall > 0 else 0.0
+        ),
+        # --- Phase 0: memory ---
+        "peak_gpu_reserved_bytes": peak_gpu_reserved,
+        "arena_nodes_live_peak": arena_nodes_peak,
+        "arena_deep_bytes_slot_peak": arena_bytes_peak,
+        "arena_node_struct_bytes": arena_node_bytes,
+    } | sampler.summary()
 
 
 def speedup_summary(python_rows: list[dict], rust_rows: list[dict], seed: int) -> dict:
@@ -470,6 +711,9 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "measured_games": args.games,
         "repetitions": args.repetitions,
         "slots": args.slots,
+        "games_per_call": args.games_per_call,
+        "cuda_events": args.cuda_events,
+        "resource_sample_hz": args.resource_sample_hz,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -562,6 +806,9 @@ def run(args) -> dict:
         "games": args.games,
         "repetitions": args.repetitions,
         "slots": args.slots,
+        "games_per_call": args.games_per_call,
+        "cuda_events": args.cuda_events,
+        "resource_sample_hz": args.resource_sample_hz,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -606,6 +853,7 @@ def run(args) -> dict:
             diagnostic_sync=False,
             pinned_memory=args.pinned_memory,
             cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
+            games_per_call=args.games_per_call,
         )
         if args.mode == "laptop":
             _run_python(
@@ -647,6 +895,9 @@ def run(args) -> dict:
                     diagnostic_sync=args.diagnostic_sync,
                     pinned_memory=args.pinned_memory,
                     cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
+                    games_per_call=args.games_per_call,
+                    cuda_events=args.cuda_events,
+                    resource_sample_hz=args.resource_sample_hz,
                 )
                 rust_row["isolated_forward_rows_ratio"] = (
                     rust_row["total_nn_rows_per_second"]
@@ -730,11 +981,35 @@ def main():
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--slots", type=int, default=32)
+    parser.add_argument(
+        "--games-per-call",
+        type=int,
+        default=0,
+        help="games submitted per Rust call. 0 keeps the historical one-call-"
+        "per---slots chunking, whose every call is a drain. Pass a value well "
+        "above --slots (e.g. --games 256 --games-per-call 256 --slots 16) to "
+        "measure a steady-state window; note that until the Phase 1 slot pool "
+        "lands, a call runs all of its games concurrently.",
+    )
     parser.add_argument("--global-batch-cap", type=int, default=256)
     parser.add_argument("--max-inflight-batches", type=int, default=2)
     parser.add_argument("--scheduler-workers", type=int, default=1)
     parser.add_argument("--python-workers", type=int, default=4)
     parser.add_argument("--diagnostic-sync", action="store_true")
+    parser.add_argument(
+        "--cuda-events",
+        action="store_true",
+        help="bracket H2D/forward/gather/D2H with CUDA events so device "
+        "execution is measured separately from host dispatch. Events are "
+        "queried after the run, so this does not synchronise the pipeline.",
+    )
+    parser.add_argument(
+        "--resource-sample-hz",
+        type=float,
+        default=0.0,
+        help="background sampling rate for NVML GPU utilisation and RSS "
+        "(0 disables). 20 is a reasonable cross-check on the event timings.",
+    )
     parser.add_argument(
         "--cheap-double-reveal-offsets",
         type=int,

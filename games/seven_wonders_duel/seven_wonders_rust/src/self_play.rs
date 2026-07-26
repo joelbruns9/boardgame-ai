@@ -495,6 +495,34 @@ pub struct SchedulerMetrics {
     pub scheduler_ready_slot_cycles: u64,
     pub scheduler_waiting_slot_cycles: u64,
     pub scheduler_idle_slot_cycles: u64,
+    // --- Phase 0 telemetry ---
+    // The `*_slot_cycles` counters above count *loop iterations*, so they say
+    // nothing about how long slots were live. These integrate the slot census
+    // over wall time instead, and are the only occupancy numbers a throughput
+    // decision may be based on.
+    /// Wall time spent inside the scheduler loop.
+    pub scheduler_wall_ns: u64,
+    /// ∫ live slots dt. Divided by `scheduler_wall_ns` this is time-weighted
+    /// occupancy: the mean number of games actually in flight.
+    pub live_slot_ns: u64,
+    pub ready_slot_ns: u64,
+    pub waiting_slot_ns: u64,
+    pub idle_slot_ns: u64,
+    pub max_live_slots: usize,
+    /// Live slots at the moment each global batch was submitted, and that
+    /// submission's offset from the start of the scheduler loop. Together these
+    /// let the caller separate the steady-state window from the drain tail
+    /// instead of averaging over both. Offsets are loop-relative, so they are
+    /// only comparable across shards when `scheduler_workers == 1`.
+    pub batch_live_slots: Vec<usize>,
+    pub batch_submit_ns: Vec<u64>,
+    /// Peak of the summed arena node count over live slots, the peak for any
+    /// single slot, and a sampled deep-byte measurement of one slot's arena.
+    /// This is the term that bounds `max_active_slots`.
+    pub arena_nodes_live_peak: usize,
+    pub arena_nodes_slot_peak: usize,
+    pub arena_deep_bytes_slot_peak: usize,
+    pub arena_node_struct_bytes: usize,
 }
 
 pub struct SchedulerResult {
@@ -543,7 +571,119 @@ impl SchedulerMetrics {
         self.scheduler_ready_slot_cycles += other.scheduler_ready_slot_cycles;
         self.scheduler_waiting_slot_cycles += other.scheduler_waiting_slot_cycles;
         self.scheduler_idle_slot_cycles += other.scheduler_idle_slot_cycles;
+        // Shards run concurrently: wall time is the envelope, slot-seconds add,
+        // and the memory peaks are summed because a bound must hold even if the
+        // shard peaks coincide.
+        self.scheduler_wall_ns = self.scheduler_wall_ns.max(other.scheduler_wall_ns);
+        self.live_slot_ns += other.live_slot_ns;
+        self.ready_slot_ns += other.ready_slot_ns;
+        self.waiting_slot_ns += other.waiting_slot_ns;
+        self.idle_slot_ns += other.idle_slot_ns;
+        self.max_live_slots += other.max_live_slots;
+        self.batch_live_slots.extend(other.batch_live_slots);
+        self.batch_submit_ns.extend(other.batch_submit_ns);
+        self.arena_nodes_live_peak += other.arena_nodes_live_peak;
+        self.arena_nodes_slot_peak = self.arena_nodes_slot_peak.max(other.arena_nodes_slot_peak);
+        self.arena_deep_bytes_slot_peak = self
+            .arena_deep_bytes_slot_peak
+            .max(other.arena_deep_bytes_slot_peak);
+        self.arena_node_struct_bytes = other.arena_node_struct_bytes;
     }
+}
+
+/// Integrates the slot census over wall time and samples arena occupancy.
+///
+/// Charging works one cycle in arrears: each tick attributes the time since the
+/// previous tick to the census that was true over that interval, then records
+/// the new census. That is what makes `live_slot_ns / scheduler_wall_ns` an
+/// honest time-weighted occupancy rather than a per-iteration count.
+struct Occupancy {
+    start: Instant,
+    last: Instant,
+    live: usize,
+    ready: usize,
+    waiting: usize,
+    idle: usize,
+    probe: usize,
+}
+
+impl Occupancy {
+    fn new(slots: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last: now,
+            live: slots,
+            ready: slots,
+            waiting: 0,
+            idle: 0,
+            probe: 0,
+        }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    /// Charge elapsed time to the previous census, then adopt `slots`' current
+    /// one. `outstanding` is empty for the non-pipelined scheduler, where no
+    /// slot can be waiting on an in-flight batch.
+    fn tick(
+        &mut self,
+        metrics: &mut SchedulerMetrics,
+        slots: &[GameSlot],
+        outstanding: &[bool],
+    ) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last).as_nanos() as u64;
+        self.last = now;
+        metrics.live_slot_ns += dt * self.live as u64;
+        metrics.ready_slot_ns += dt * self.ready as u64;
+        metrics.waiting_slot_ns += dt * self.waiting as u64;
+        metrics.idle_slot_ns += dt * self.idle as u64;
+
+        let (mut live, mut ready, mut waiting, mut idle) = (0, 0, 0, 0);
+        let mut live_nodes = 0;
+        for (index, slot) in slots.iter().enumerate() {
+            if matches!(slot.stage, SlotStage::Complete) {
+                idle += 1;
+                continue;
+            }
+            live += 1;
+            live_nodes += slot.arena_nodes();
+            if outstanding.get(index).copied().unwrap_or(false) {
+                waiting += 1;
+            } else {
+                ready += 1;
+            }
+        }
+        self.live = live;
+        self.ready = ready;
+        self.waiting = waiting;
+        self.idle = idle;
+        metrics.max_live_slots = metrics.max_live_slots.max(live);
+        metrics.arena_nodes_live_peak = metrics.arena_nodes_live_peak.max(live_nodes);
+
+        // Deep byte accounting walks a whole arena, so sample one slot per
+        // cycle round-robin; the cost is negligible beside a global batch.
+        if !slots.is_empty() {
+            self.probe = (self.probe + 1) % slots.len();
+            let slot = &slots[self.probe];
+            metrics.arena_nodes_slot_peak =
+                metrics.arena_nodes_slot_peak.max(slot.arena_nodes());
+            metrics.arena_deep_bytes_slot_peak = metrics
+                .arena_deep_bytes_slot_peak
+                .max(slot.arena_deep_bytes());
+        }
+    }
+}
+
+/// Live slots at this instant, recorded alongside each batch submission.
+fn live_slot_count(slots: &[GameSlot]) -> usize {
+    slots
+        .iter()
+        .filter(|slot| !matches!(slot.stage, SlotStage::Complete))
+        .count()
 }
 
 struct SearchMeta {
@@ -935,6 +1075,22 @@ impl GameSlot {
         }
     }
 
+    /// Arena nodes this slot currently holds; zero between searches, when the
+    /// tree has been dropped.
+    fn arena_nodes(&self) -> usize {
+        match &self.stage {
+            SlotStage::Searching { session, .. } => session.arena_nodes(),
+            _ => 0,
+        }
+    }
+
+    fn arena_deep_bytes(&self) -> usize {
+        match &self.stage {
+            SlotStage::Searching { session, .. } => session.arena_deep_bytes(),
+            _ => 0,
+        }
+    }
+
     fn into_record(self) -> PyResult<GameRecord> {
         if self.state.phase != Phase::Complete || !matches!(self.stage, SlotStage::Complete) {
             return Err(PyRuntimeError::new_err(
@@ -1012,13 +1168,16 @@ pub fn run_many<E: Eval>(
     let mut metrics = SchedulerMetrics {
         games: slots.len(),
         scheduler_workers: 1,
+        arena_node_struct_bytes: std::mem::size_of::<tree_resumable::Node>(),
         ..SchedulerMetrics::default()
     };
+    let mut occupancy = Occupancy::new(slots.len());
 
     while slots
         .iter()
         .any(|slot| !matches!(slot.stage, SlotStage::Complete))
     {
+        occupancy.tick(&mut metrics, &slots, &[]);
         metrics.scheduler_cycles += 1;
         for slot in &slots {
             if matches!(slot.stage, SlotStage::Complete) {
@@ -1089,6 +1248,8 @@ pub fn run_many<E: Eval>(
                 .iter()
                 .flat_map(|group| group.legals.iter().cloned())
                 .collect();
+            metrics.batch_live_slots.push(live_slot_count(&slots));
+            metrics.batch_submit_ns.push(occupancy.elapsed_ns());
             let evaluations = match evaluator.evaluate_batch_prepared(&state_refs, &actors, &legals)
             {
                 Ok(rows) => rows,
@@ -1137,6 +1298,18 @@ pub fn run_many<E: Eval>(
         }
     }
 
+    occupancy.tick(&mut metrics, &slots, &[]);
+    metrics.scheduler_wall_ns = occupancy.elapsed_ns();
+    finalize_slot_metrics(&mut metrics, &slots);
+    let records = slots
+        .into_iter()
+        .map(GameSlot::into_record)
+        .collect::<PyResult<_>>()?;
+    Ok(SchedulerResult { records, metrics })
+}
+
+/// Fold the per-slot counters both schedulers accumulate into the run metrics.
+fn finalize_slot_metrics(metrics: &mut SchedulerMetrics, slots: &[GameSlot]) {
     metrics.moves = slots.iter().map(|slot| slot.moves.len()).sum();
     metrics.simulations = slots.iter().map(|slot| slot.simulations).sum();
     metrics.requested_nn_leaves = slots.iter().map(|slot| slot.requested_nn_leaves).sum();
@@ -1160,11 +1333,6 @@ pub fn run_many<E: Eval>(
     metrics.rust_chance_ns = slots.iter().map(|slot| slot.chance_ns).sum();
     metrics.rust_record_ns = slots.iter().map(|slot| slot.record_ns).sum();
     metrics.scatter_ns = slots.iter().map(|slot| slot.scatter_ns).sum();
-    let records = slots
-        .into_iter()
-        .map(GameSlot::into_record)
-        .collect::<PyResult<_>>()?;
-    Ok(SchedulerResult { records, metrics })
 }
 
 struct InflightBatch {
@@ -1253,10 +1421,13 @@ pub fn run_many_pipelined(
     let mut metrics = SchedulerMetrics {
         games: slots.len(),
         scheduler_workers: 1,
+        arena_node_struct_bytes: std::mem::size_of::<tree_resumable::Node>(),
         ..SchedulerMetrics::default()
     };
+    let mut occupancy = Occupancy::new(slots.len());
 
     loop {
+        occupancy.tick(&mut metrics, &slots, &outstanding);
         metrics.scheduler_cycles += 1;
         for (slot_index, slot) in slots.iter().enumerate() {
             if matches!(slot.stage, SlotStage::Complete) {
@@ -1305,6 +1476,8 @@ pub fn run_many_pipelined(
             metrics.global_rows += row_count;
             metrics.max_batch_rows = metrics.max_batch_rows.max(row_count);
             metrics.batch_rows.push(row_count);
+            metrics.batch_live_slots.push(live_slot_count(&slots));
+            metrics.batch_submit_ns.push(occupancy.elapsed_ns());
             inflight.push_back(InflightBatch {
                 groups,
                 row_count,
@@ -1369,29 +1542,9 @@ pub fn run_many_pipelined(
         }
     }
 
-    metrics.moves = slots.iter().map(|slot| slot.moves.len()).sum();
-    metrics.simulations = slots.iter().map(|slot| slot.simulations).sum();
-    metrics.requested_nn_leaves = slots.iter().map(|slot| slot.requested_nn_leaves).sum();
-    metrics.unique_nn_leaves = slots.iter().map(|slot| slot.unique_nn_leaves).sum();
-    metrics.terminal_leaves = slots.iter().map(|slot| slot.terminal_leaves).sum();
-    metrics.collisions = slots.iter().map(|slot| slot.collisions).sum();
-    metrics.forced_rows = slots.iter().map(|slot| slot.forced_rows).sum();
-    metrics.fixed_support_edges = slots.iter().map(|slot| slot.fixed_support_edges).sum();
-    for kind in 0..4 {
-        metrics.forced_rows_by_kind[kind] = slots
-            .iter()
-            .map(|slot| slot.forced_rows_by_kind[kind])
-            .sum();
-    }
-    metrics.forced_cache_hits = slots.iter().map(|slot| slot.forced_cache_hits).sum();
-    metrics.forced_rows_per_search = slots
-        .iter()
-        .flat_map(|slot| slot.forced_rows_per_search.iter().copied())
-        .collect();
-    metrics.rust_tree_ns = slots.iter().map(|slot| slot.tree_ns).sum();
-    metrics.rust_chance_ns = slots.iter().map(|slot| slot.chance_ns).sum();
-    metrics.rust_record_ns = slots.iter().map(|slot| slot.record_ns).sum();
-    metrics.scatter_ns = slots.iter().map(|slot| slot.scatter_ns).sum();
+    occupancy.tick(&mut metrics, &slots, &outstanding);
+    metrics.scheduler_wall_ns = occupancy.elapsed_ns();
+    finalize_slot_metrics(&mut metrics, &slots);
     let records = slots
         .into_iter()
         .map(GameSlot::into_record)

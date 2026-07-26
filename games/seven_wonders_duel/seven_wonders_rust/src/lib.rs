@@ -1006,6 +1006,28 @@ fn scheduler_result_to_py(
         m.scheduler_waiting_slot_cycles,
     )?;
     metrics.set_item("scheduler_idle_slot_cycles", m.scheduler_idle_slot_cycles)?;
+    // Phase 0: time-weighted occupancy. The `*_slot_cycles` counters above are
+    // loop-iteration counts and must not be read as time shares.
+    metrics.set_item("scheduler_wall_ns", m.scheduler_wall_ns)?;
+    metrics.set_item("live_slot_ns", m.live_slot_ns)?;
+    metrics.set_item("ready_slot_ns", m.ready_slot_ns)?;
+    metrics.set_item("waiting_slot_ns", m.waiting_slot_ns)?;
+    metrics.set_item("idle_slot_ns", m.idle_slot_ns)?;
+    metrics.set_item("max_live_slots", m.max_live_slots)?;
+    metrics.set_item(
+        "time_weighted_live_slots",
+        if m.scheduler_wall_ns == 0 {
+            0.0
+        } else {
+            m.live_slot_ns as f64 / m.scheduler_wall_ns as f64
+        },
+    )?;
+    metrics.set_item("batch_live_slots", m.batch_live_slots.clone())?;
+    metrics.set_item("batch_submit_ns", m.batch_submit_ns.clone())?;
+    metrics.set_item("arena_nodes_live_peak", m.arena_nodes_live_peak)?;
+    metrics.set_item("arena_nodes_slot_peak", m.arena_nodes_slot_peak)?;
+    metrics.set_item("arena_deep_bytes_slot_peak", m.arena_deep_bytes_slot_peak)?;
+    metrics.set_item("arena_node_struct_bytes", m.arena_node_struct_bytes)?;
     metrics.set_item(
         "padding_ratio",
         if m.boundary_padded_tokens == 0 {

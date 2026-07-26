@@ -334,6 +334,50 @@ impl GameState {
         self.clone()
     }
 
+    /// Bytes this state owns on the heap, i.e. everything a `clone()` allocates
+    /// beyond `size_of::<GameState>()`. Phase 0 memory telemetry: search arenas
+    /// hold one cloned `GameState` per node, so this is the term that actually
+    /// bounds how many games can be active at once.
+    pub fn heap_bytes(&self) -> usize {
+        let ids = |v: &Vec<usize>| v.capacity() * std::mem::size_of::<usize>();
+        let mut total = 0;
+        for city in &self.cities {
+            total += ids(&city.wonders)
+                + ids(&city.built_wonders)
+                + ids(&city.buildings)
+                + ids(&city.progress_tokens)
+                + city.claimed_science_pairs.capacity() * std::mem::size_of::<ScienceSymbol>();
+        }
+        total += ids(&self.available_progress_tokens)
+            + ids(&self.unused_progress_tokens)
+            + ids(&self.wonder_groups[0])
+            + ids(&self.wonder_groups[1])
+            + ids(&self.unused_wonders)
+            + ids(&self.wonder_offer)
+            + ids(&self.selected_guilds)
+            + ids(&self.unused_guilds)
+            + ids(&self.discard_pile)
+            + ids(&self.buried_cards)
+            + ids(&self.retired_wonders);
+        for deck in &self.age_decks {
+            total += ids(deck);
+        }
+        for removed in &self.removed_age_cards {
+            total += ids(removed);
+        }
+        total += self.tableau.slots.capacity() * std::mem::size_of::<TableauCard>();
+        total += self.wonder_burials.capacity() * std::mem::size_of::<(usize, usize)>();
+        total += self.military_tokens_remaining.capacity() * std::mem::size_of::<(i32, i32)>();
+        if let Some(choice) = &self.pending_choice {
+            total += ids(&choice.options);
+        }
+        total += self.library_draws.capacity() * std::mem::size_of::<Vec<usize>>();
+        for draw in &self.library_draws {
+            total += ids(draw);
+        }
+        total
+    }
+
     pub fn restore(&mut self, snap: GameState) {
         *self = snap;
     }

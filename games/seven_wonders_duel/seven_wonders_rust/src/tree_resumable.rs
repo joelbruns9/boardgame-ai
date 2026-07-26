@@ -1195,6 +1195,36 @@ impl SearchSession {
         }
     }
 
+    /// Nodes materialized by this search so far. Phase 0 memory telemetry.
+    pub fn arena_nodes(&self) -> usize {
+        self.arena.nodes.len()
+    }
+
+    /// Approximate resident bytes of this search's arena: node structs plus the
+    /// heap each node owns (its cloned `GameState`, edge/child vectors, legal
+    /// list). Excludes allocator slack. O(nodes + edges), so callers sample it
+    /// rather than reading it every cycle.
+    pub fn arena_deep_bytes(&self) -> usize {
+        let mut total = self.arena.nodes.capacity() * std::mem::size_of::<Node>();
+        for node in &self.arena.nodes {
+            total += node.state.heap_bytes();
+            total += node.legal.capacity() * std::mem::size_of::<usize>();
+            total += node.edges.capacity() * std::mem::size_of::<Edge>();
+            for edge in &node.edges {
+                total += edge.specs.capacity() * std::mem::size_of::<ChanceSpec>();
+                total += edge.children.capacity()
+                    * std::mem::size_of::<(Vec<Vec<i32>>, Child)>();
+                for (key, _) in &edge.children {
+                    total += key.capacity() * std::mem::size_of::<Vec<i32>>();
+                    for part in key {
+                        total += part.capacity() * std::mem::size_of::<i32>();
+                    }
+                }
+            }
+        }
+        total
+    }
+
     pub fn cancel_pending(&mut self) {
         if let Some(pending) = self.waiting.take() {
             if let PendingEvaluation::Wave(mut wave) = pending {

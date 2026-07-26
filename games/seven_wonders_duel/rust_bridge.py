@@ -156,14 +156,33 @@ def rust_global_batch_adapter(evaluator):
 
 
 class _RustFlatBatchAdapter:
-    """F4.5 packed-buffer transformer boundary with compact result transfer."""
+    """F4.5 packed-buffer transformer boundary with compact result transfer.
+
+    Every ``*_seconds`` counter here is a **host** timer: it measures how long
+    the calling thread spent in that section, which for CUDA work is enqueue
+    time, not device execution. With ``cuda_events=True`` the same four sections
+    are additionally bracketed by CUDA events, giving true device durations; the
+    events are queried lazily (:meth:`drain_events`) so reading them does not
+    itself synchronise the pipeline. Phase 0 of the throughput plan exists
+    because the earlier measurements conflated these two.
+    """
+
+    #: Query and release recorded events once this many have accumulated. They
+    #: belong to long-finished batches by then, so draining costs no stall.
+    _EVENT_DRAIN_THRESHOLD = 4096
 
     def __init__(
-        self, evaluator, *, diagnostic_sync: bool = False, pinned_memory: bool = False
+        self,
+        evaluator,
+        *,
+        diagnostic_sync: bool = False,
+        pinned_memory: bool = False,
+        cuda_events: bool = False,
     ):
         self.evaluator = evaluator
         self.diagnostic_sync = diagnostic_sync
         self.pinned_memory = pinned_memory
+        self.cuda_events = bool(cuda_events) and str(evaluator.device).startswith("cuda")
         self.last_metrics: dict[str, float | int] = {}
         self.total_metrics: dict[str, float | int] = {
             "batches": 0,
@@ -174,18 +193,78 @@ class _RustFlatBatchAdapter:
             "forward_seconds": 0.0,
             "gather_seconds": 0.0,
             "d2h_seconds": 0.0,
+            # Host time spent inside explicit synchronisation, so it can be
+            # subtracted from the sections above on --diagnostic-sync runs.
+            "sync_seconds": 0.0,
+            # Device time, populated only when cuda_events is on.
+            "device_h2d_seconds": 0.0,
+            "device_forward_seconds": 0.0,
+            "device_gather_seconds": 0.0,
+            "device_d2h_seconds": 0.0,
         }
         self.batch_rows: list[int] = []
         self.batch_tokens: list[int] = []
         self.batch_padded_tokens: list[int] = []
+        #: Per-batch device forward duration in milliseconds, in batch order.
+        self.batch_device_forward_ms: list[float] = []
+        self._events: list[tuple[str, object, object]] = []
 
     def _sync(self):
         if self.diagnostic_sync and str(self.evaluator.device).startswith("cuda"):
             import torch
 
+            started = time.perf_counter()
             torch.cuda.synchronize(self.evaluator.device)
+            self.total_metrics["sync_seconds"] += time.perf_counter() - started
 
-    def __call__(self, payload):
+    def _begin_event(self):
+        """Record a start event on the current stream, or return ``None``."""
+
+        if not self.cuda_events:
+            return None
+        import torch
+
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def _end_event(self, name: str, start):
+        if start is None:
+            return
+        import torch
+
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._events.append((name, start, end))
+        if len(self._events) >= self._EVENT_DRAIN_THRESHOLD:
+            self.drain_events()
+
+    def drain_events(self) -> None:
+        """Fold recorded CUDA events into the device totals and release them.
+
+        Safe to call at any time; call it once after a run before reading
+        ``total_metrics``. Each event is synchronised individually, which is
+        free for batches that have already completed.
+        """
+
+        for name, start, end in self._events:
+            end.synchronize()
+            seconds = start.elapsed_time(end) / 1000.0
+            self.total_metrics[f"device_{name}_seconds"] += seconds
+            if name == "forward":
+                self.batch_device_forward_ms.append(seconds * 1000.0)
+        self._events.clear()
+
+    def build_device_batch(self, payload):
+        """Unpack `payload` into the model's input tensors on the target device.
+
+        Split out of :meth:`__call__` so instrumentation (the cost model's
+        queue-depth probe) can drive the model with exactly the tensors
+        production builds, rather than an approximation of them. Returns the
+        batch, the per-row legal lengths and actions, and the host time spent in
+        tensor construction and in the host-to-device enqueue.
+        """
+
         import torch
 
         rows = int(payload["rows"])
@@ -242,6 +321,7 @@ class _RustFlatBatchAdapter:
         tensor_seconds = time.perf_counter() - tensor_start
 
         h2d_start = time.perf_counter()
+        h2d_event = self._begin_event()
         batch = {
             "type_ids": type_ids,
             "entity_ids": entity_ids,
@@ -255,16 +335,35 @@ class _RustFlatBatchAdapter:
                 key: value.to(self.evaluator.device, non_blocking=True)
                 for key, value in batch.items()
             }
+        self._end_event("h2d", h2d_event)
         self._sync()
         h2d_seconds = time.perf_counter() - h2d_start
+        return batch, legal_lengths, legal_actions, tensor_seconds, h2d_seconds
+
+    def __call__(self, payload):
+        import torch
+
+        rows = int(payload["rows"])
+        tokens = int(payload["tokens"])
+        max_tokens = int(payload["max_tokens"])
+        (
+            batch,
+            legal_lengths,
+            legal_actions,
+            tensor_seconds,
+            h2d_seconds,
+        ) = self.build_device_batch(payload)
 
         forward_start = time.perf_counter()
+        forward_event = self._begin_event()
         with torch.no_grad():
             outputs = self.evaluator.model(batch)
+        self._end_event("forward", forward_event)
         self._sync()
         forward_seconds = time.perf_counter() - forward_start
 
         gather_start = time.perf_counter()
+        gather_event = self._begin_event()
         device = outputs["policy"].device
         legal_rows = torch.repeat_interleave(
             torch.arange(rows, device=device), legal_lengths.to(device)
@@ -278,12 +377,18 @@ class _RustFlatBatchAdapter:
         compact_policy_tensor = torch.cat(compact_policy)
         wdl = torch.softmax(outputs["value"], dim=-1)
         value_actor = wdl[:, 0] - wdl[:, 2]
+        self._end_event("gather", gather_event)
         self._sync()
         gather_seconds = time.perf_counter() - gather_start
 
+        # The first blocking `.cpu()` is where an asynchronous pipeline actually
+        # waits for the device, so this host timer is a stall measurement, not a
+        # transfer measurement; the paired device event separates the two.
         d2h_start = time.perf_counter()
+        d2h_event = self._begin_event()
         policy_cpu = compact_policy_tensor.float().cpu()
         value_cpu = value_actor.float().cpu()
+        self._end_event("d2h", d2h_event)
         self._sync()
         d2h_seconds = time.perf_counter() - d2h_start
 
@@ -319,7 +424,11 @@ class _RustFlatBatchAdapter:
 
 
 def rust_flat_batch_adapter(
-    evaluator, *, diagnostic_sync: bool = False, pinned_memory: bool = False
+    evaluator,
+    *,
+    diagnostic_sync: bool = False,
+    pinned_memory: bool = False,
+    cuda_events: bool = False,
 ):
     """Return the F4.5 flat-buffer adapter for the current Torch evaluator."""
 
@@ -327,11 +436,16 @@ def rust_flat_batch_adapter(
         evaluator,
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
+        cuda_events=cuda_events,
     )
 
 
 def rust_seat_routed_flat_batch_adapter(
-    evaluators, *, diagnostic_sync: bool = False, pinned_memory: bool = False
+    evaluators,
+    *,
+    diagnostic_sync: bool = False,
+    pinned_memory: bool = False,
+    cuda_events: bool = False,
 ):
     """Route packed Rust rows to a different evaluator model for each seat.
 
@@ -391,6 +505,7 @@ def rust_seat_routed_flat_batch_adapter(
         proxy,
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
+        cuda_events=cuda_events,
     )
 
 

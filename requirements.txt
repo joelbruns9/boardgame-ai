@@ -16,3 +16,9 @@ torchvision
 # Actual runtime / build dependencies:
 numpy>=1.24
 maturin>=1.5        # builds the kingdomino_rust crate (needs Rust >= 1.85)
+
+# Throughput telemetry (7WD Phase 0). Optional: the benchmarks degrade to
+# reporting the corresponding metrics as unavailable rather than failing, but
+# without them there is no host-memory or GPU-utilisation measurement at all.
+psutil>=5.9         # sampled RSS / process peak working set
+nvidia-ml-py>=12.0  # torch.cuda.utilization(), the one non-host-timer GPU signal

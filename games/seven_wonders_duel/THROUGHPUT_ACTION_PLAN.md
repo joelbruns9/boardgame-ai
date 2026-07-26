@@ -1,6 +1,8 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** nothing built.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** Phase 0 built and run;
+Phases 1–4 not started. See "Phase 0 results" below — the branch point is
+resolved and it reroutes the programme.
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
 work. Several rev-1 claims are withdrawn below rather than quietly edited.
@@ -105,6 +107,146 @@ steady-state window is at least 4× the drain window.
 
 ---
 
+## Phase 0 results (2026-07-26, built and run)
+
+### What was built
+
+| item | where |
+|---|---|
+| single-call submission + steady/drain reporting | `f4_throughput_bench.py` (`--games-per-call`, `window_split`) |
+| repeated-pass grid with per-cell medians | `f4_cost_model.py` (`--passes`) |
+| host/device/sync separation via lazily-drained CUDA events | `rust_bridge.py` (`--cuda-events`) |
+| time-weighted slot occupancy, per-batch live-slot and timestamp series | `self_play.rs` (`Occupancy`), exported in `lib.rs` |
+| arena node/deep-byte peaks per active game | `tree_resumable.rs`, `state.rs::heap_bytes` |
+| memory telemetry: CUDA **reserved** peak, sampled RSS, sampled NVML | `f4_throughput_bench.py` (`--resource-sample-hz`) |
+| controlled rows × token-length sweep with a cost-model fit | `f4_cost_model.py` (new) |
+| launch-bound vs device-bound discriminator | `f4_cost_model.py::queue_depth_probe` |
+| gates | `test_f4_phase0_telemetry.py` (11 tests) |
+
+Optional deps `psutil` and `nvidia-ml-py` are now in `requirements.txt`. Without
+them the sampled metrics report `null` and an explicit `*_available: false` —
+never `0`, because an unmeasured utilisation and a zero utilisation argue for
+opposite decisions.
+
+### The branch point is resolved: **launch-bound**
+
+`queue_depth_probe` enqueues 50 forwards back to back with no synchronisation
+and times the host loop and the device span independently. RTX 3070 laptop,
+production checkpoint, widest token bucket:
+
+| rows | host enqueue ms/forward | device span ms/forward | verdict |
+|---|---|---|---|
+| 1 | 6.46 | 6.46 | launch-bound |
+| 8 | 6.36 | 6.36 | launch-bound |
+| 27 | 6.61 | 6.61 | launch-bound |
+| 64 | 7.33 | 7.33 | launch-bound |
+| 128 | 10.46 | 10.54 | launch-bound |
+| 256 | 16.15 | 16.35 | launch-bound |
+
+The host loop matches the device span to within 1% at every width: the host
+cannot get ahead of the device even when free to run 50 forwards ahead. The
+device span is therefore *not* evidence of device work — it is the host's own
+dispatch rate, observed on the device timeline. **The rev-2 inference was
+right: the ~7 ms is host dispatch.** So Phase 3b is live and takes priority over
+Phase 4, per the branch table above. A second run agreed within 10% (6.9–8.5 ms
+at 1–27 rows, same verdict at every width).
+
+Corroborating: a single row costs ~6.5 ms, which cannot be compute for a
+4-layer d128 transformer; and 256× the rows costs only ~2.5× the time.
+
+### Where the dispatch time goes (measured, 27×60 on the same GPU)
+
+| section | ms/forward | share |
+|---|---|---|
+| full forward | 6.26 | 100% |
+| `TokenEmbedder` | 4.59 | **73%** |
+| 4-layer `TransformerEncoder` | 1.33 | 21% |
+
+`TokenEmbedder.forward` loops over all 9 token types doing a boolean-masked
+gather and scatter per type. Of its 4.59 ms, the 9 `mask.any()` host
+synchronisations account for ~0.4 ms (measured separately: 0.50 ms with the
+`.any()` sync versus 0.10 ms for the masks alone) — real but only ~9%. The
+remaining ~4 ms is the launch load of the per-type dynamic-shape gather/scatter
+kernels themselves. Phase 3b should target the embedder loop first; that
+attribution is measured, but which specific rewrite recovers the time is not yet.
+
+### Cost model
+
+18 cells (3 token buckets × 6 widths), each the median of 3 passes of 25 calls.
+**Single passes were not fittable**: two independent one-pass runs disagreed by
+2× on the per-row terms and 20% on the fixed terms, which is why `--passes`
+exists and defaults to 3. Even so, per-cell spread across passes is 8–47%, so
+these coefficients are good to roughly ±15%, not better.
+
+| target | fixed ms | per row ms | per padded token ms | R² |
+|---|---|---|---|---|
+| host total | **7.61** | 0.0460 | 0.00059 | 0.994 |
+| device forward span | **6.30** | 0.0121 | 0.00029 | 0.963 |
+| device total span | 7.07 | 0.0304 | 0.00037 | 0.988 |
+| gather (per-row softmax loop) | 0.04 | **0.0229** | 0.00039 | 0.991 |
+| tensor build | 0.34 | −0.0025 | 0.00016 | 0.996 |
+
+Three things follow.
+
+1. The fixed per-batch term dominates everything below ~100 rows, confirming
+   rev 2's measurement and — with the probe above — identifying it as dispatch.
+2. The gather is the cleanest fit in the set and has essentially **no** fixed
+   cost: at the ~55 tokens/row of the middle bucket it is ~0.044 ms/row, which
+   reaches the 7.6 ms batch cost near **170 rows**. That is inside the measured
+   range, not an extrapolation: at 128 rows the gather is 4.1–6.6 ms against a
+   device forward of 8.8–10.4 ms, and by 256 rows it is 10.3–13.6 ms against
+   12.5–15.3 ms. **Phase 3's ordering argument survives**: widening batches
+   without fixing the gather converts one bottleneck into another.
+3. The host `forward_ms` section alone fits badly (R² 0.26) — as it should,
+   since it times an asynchronous enqueue. Its poor fit is itself evidence for
+   the launch-bound verdict.
+
+### Benchmark honesty check
+
+A 32-game single call (slots 16, cap 256) now reports its two regimes apart:
+
+| window | batches | seconds | rows/batch |
+|---|---|---|---|
+| steady | 1,189 | 23.7 | **69.4** |
+| drain | 2,654 | 45.1 | **39.7** |
+| blended (the single mean this phase replaces) | 3,843 | 68.8 | 48.9 |
+
+Steady/drain seconds ratio **0.53**, against the exit criterion of ≥ 4. The
+benchmark cannot yet meet it: without the Phase 1 slot pool a call has no
+refill, so every call is mostly drain. The apparatus to *measure* it is in
+place, which is what Phase 0 owed; the criterion becomes checkable in Phase 1.
+
+And the retired metric, measured against a real one — a separate 16-game run,
+because NVML was not installed when the 32-game run above was taken:
+`gpu_busy_fraction` **0.59** versus NVML utilisation **34.5%** (849 samples).
+The host timer overstates GPU occupancy by ~1.7×. Do not use it.
+
+### Memory, i.e. what actually bounds `max_active_slots`
+
+From the same 32-game run: CUDA peak **reserved** 237 MB against peak
+*allocated* 52 MB — the old metric understated the real device footprint by
+4.6×, though at this scale neither is near a ceiling. On the Rust side the
+arenas peaked at 9,297 live nodes summed across the 32 slots, and the deepest
+single slot sampled held **4.8 MB** of arena (node structs at 1,040 B each plus
+each node's cloned `GameState` heap). Sampled host RSS peaked at 1.2 GB in the
+16-game run.
+
+So the binding constraint on a rolling pool is host memory at single-digit MB
+per active game, not device memory. That leaves Phase 1 substantial headroom to
+raise `max_active_slots`; the exact ceiling should be read off these counters
+during Phase 1 rather than assumed from this one configuration.
+
+### Open from Phase 0
+
+* `--games-per-call` gives the benchmark one call, but concurrency still equals
+  the call's game count; genuine refill needs Phase 1's `max_active_slots`.
+* Timestamps are loop-relative per shard, so the steady/drain split is exact
+  only at `scheduler_workers = 1` (which Phase 4 mandates anyway).
+* `arena_deep_bytes_slot_peak` is sampled round-robin, one slot per scheduler
+  cycle: a lower bound on the true peak, not an exact one.
+
+---
+
 ## Phase 1 — bounded rolling active-game pool
 
 **Why before the sweeps:** the drain tail does not merely cost throughput, it
@@ -184,8 +326,15 @@ memory (the flag exists) and a narrower transfer dtype.
 `gather_seconds` per row measured at 27 and 256 rows to prove it no longer scales
 per row.
 
-**Phase 3b (conditional on Phase 0):** launch-overhead work — CUDA graphs,
-`torch.compile`, static shape buckets, `inference_mode`, buffer reuse.
+**Phase 3b — now unconditional, and promoted ahead of Phase 4.** Phase 0 showed
+the pipeline is launch-bound at every batch width, with 73% of the forward's
+dispatch in `TokenEmbedder`'s per-type masked gather/scatter loop. Levers, in
+the order the measurement suggests: collapse the embedder's per-type loop
+(single gathered index pass, or per-type padding removed), then CUDA graphs /
+`torch.compile` / static shape buckets / `inference_mode` / buffer reuse. Any
+change here alters the numerics of the forward, so it needs the same
+non-regression treatment as Phase 1's real-net path — it is not an exact
+refactor.
 
 ---
 
@@ -248,6 +397,10 @@ pinned laptop configuration.
 
 * Phase 0: a cost model with device and host separated, and a benchmark that
   actually refills slots. **No throughput target — this phase buys knowledge.**
+  **Met, except refill**: the cost model exists with host and device separated
+  and the launch-bound verdict established; the benchmark can submit one call
+  and reports steady/drain apart, but true refill needs Phase 1's pool, so the
+  "steady window ≥ 4× drain" criterion is carried into Phase 1.
 * Phase 1: time-weighted live-slot occupancy ≈ `max_active_slots` through steady
   state; mock-path records byte-identical.
 * Phase 2: leaf batches per search down ~2.5× cheap / ~2.0× full, bit-identical
