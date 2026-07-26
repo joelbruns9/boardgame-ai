@@ -5,6 +5,9 @@ and still off by default. The remaining gate is arena strength (*Future test 2*)
 which is what should decide whether `cheap_double_reveal_offsets=2` ships on.
 **Date:** 2026-07-25; mixed-back scope decision and Step 5 measurement
 2026-07-26.
+**Review brief:** `CHANCE_ENUMERATION_REVIEW_REQUEST.md` -- this document is the
+measurement and decision record; that one is what a reviewer should read first
+(scope, invariants, focus areas, sign-offs).
 
 ## The problem
 
