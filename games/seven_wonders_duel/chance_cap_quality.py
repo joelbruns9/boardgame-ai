@@ -361,6 +361,10 @@ def main(argv=None) -> int:
             "roots_with_double_reveal": len(rust_games),
             "roots_without": skipped,
             "edges": len(rows),
+            # Different-back edges are deliberately left exhaustive, so they
+            # appear here but never in the Level A caps.
+            "edges_same_back": sum(1 for row in rows if row["same_back"]),
+            "edges_mixed_back": sum(1 for row in rows if not row["same_back"]),
             "sims": args.sims,
         },
         "level_a_edge_q": summarise_level_a(rows, args.offsets),

@@ -288,18 +288,25 @@ pub fn distinct_offsets(modulus: usize, count: usize, seed: u64) -> Vec<usize> {
     chosen
 }
 
-/// The balanced `n * offsets` support of a PURE double card-reveal edge, in the
-/// `enumerate_chains` shape. `None` means the construction does not apply (a
-/// different signature, `offsets == 0`, or an `offsets` that would retain the
-/// whole space) and the caller must enumerate exhaustively.
+/// The balanced `n * offsets` support of a PURE double card-reveal edge whose
+/// two slots share a back, in the `enumerate_chains` shape. `None` means the
+/// construction does not apply (a different signature, two different backs,
+/// `offsets == 0`, or an `offsets` that would retain the whole space) and the
+/// caller must enumerate exhaustively.
 ///
 /// Stratify on the first reveal — every hidden card leads exactly one stratum,
 /// the marginal-coverage guarantee — then take the second by cyclic block:
-/// stratum `i` pairs with `first[(i + 1 + t) % n]` over the drawn offsets `t`,
+/// stratum `i` pairs with `names[(i + 1 + t) % n]` over the drawn offsets `t`,
 /// i.e. directed-pair distances `1..n-1`, so each card lands in second position
-/// exactly `offsets` times and a self-pair is unreachable. Different backs mean
-/// disjoint pools and no exclusion, so the cycle runs over the second pool with
-/// distances `0..n2-1` and second-position incidence is even to within one.
+/// exactly `offsets` times and a self-pair is unreachable.
+///
+/// Two different backs mean disjoint pools and a full `n1 * n2` grid. A cyclic
+/// support over the second pool would still be unbiased there, but only its
+/// first margin could be exact (a both-margins-balanced subset needs a size
+/// divisible by `lcm(n1, n2)`, usually the grid itself), and the retained count
+/// would depend on which slot is listed first. Those edges are 2.9% of the
+/// measured saving at 3-4x the Q error, so they stay exhaustive — see
+/// `search.py::balanced_double_reveal_chains`.
 pub fn balanced_double_reveal_chains(
     g: &GameState,
     specs: &[ChanceSpec],
@@ -312,33 +319,24 @@ pub fn balanced_double_reveal_chains(
     if specs.iter().any(|s| s.kind != ChanceKind::CardReveal) {
         return None;
     }
+    let back = specs[0].context[2] as usize;
+    if back != specs[1].context[2] as usize {
+        return None;
+    }
     let pool = unseen_pool(g);
-    let first_back = specs[0].context[2] as usize;
-    let second_back = specs[1].context[2] as usize;
-    let same_back = first_back == second_back;
-    let first = &pool.cards[first_back];
-    let second = &pool.cards[second_back];
-    let n = first.len();
-    let modulus = if same_back {
-        n.saturating_sub(1)
-    } else {
-        second.len()
-    };
+    let names = &pool.cards[back];
+    let n = names.len();
+    let modulus = n.saturating_sub(1); // distances 1..n-1, never a self-pair
     if offsets >= modulus {
         return None;
     }
-    let seed = double_reveal_offset_seed(search_seed, specs, [first, second]);
+    let seed = double_reveal_offset_seed(search_seed, specs, [names, names]);
     let chosen = distinct_offsets(modulus, offsets, seed);
     let weight = 1.0 / (n * offsets) as f64;
     let mut chains = Vec::with_capacity(n * offsets);
-    for (i, &name) in first.iter().enumerate() {
+    for (i, &name) in names.iter().enumerate() {
         for &offset in &chosen {
-            let other = if same_back {
-                first[(i + 1 + offset) % n]
-            } else {
-                second[(i + offset) % modulus]
-            };
-            let outcomes = vec![vec![name], vec![other]];
+            let outcomes = vec![vec![name], vec![names[(i + 1 + offset) % n]]];
             let key = outcome_key(&outcomes);
             chains.push((outcomes, weight, key));
         }

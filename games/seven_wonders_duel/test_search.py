@@ -651,18 +651,24 @@ def test_balanced_double_reveal_support_is_marginally_balanced(offsets):
     assert all(outcomes[0] != outcomes[1] for outcomes, _, _ in chains)
 
 
-def test_balanced_double_reveal_support_on_different_backs():
+def test_different_back_double_reveals_stay_exhaustive():
+    """Two backs means two disjoint pools and a full n1 x n2 grid.
+
+    A cyclic support over the second pool would be unbiased, but only its FIRST
+    margin could be exact -- a subset balanced in both margins needs a size
+    divisible by lcm(n1, n2), and these pool sizes are usually coprime, i.e. the
+    grid itself. It would also make the retained count depend on which slot is
+    listed first (board position). Measured: 2.9% of the cap's saving at 3-4x
+    the Q error, so these edges keep exact chance."""
+
     game, specs = _mixed_back_double_reveal()
     full = enumerate_chains(game, specs)
-    chains = balanced_double_reveal_chains(game, specs, 2, search_seed=5)
-    firsts = Counter(outcomes[0] for outcomes, _, _ in chains)
-    seconds = Counter(outcomes[1] for outcomes, _, _ in chains)
-    assert len(chains) == len(firsts) * 2
-    assert set(firsts.values()) == {2}  # first position still exactly covered
-    assert max(seconds.values()) - min(seconds.values()) <= 1  # even to within one
-    assert sum(probability for _, probability, _ in chains) == pytest.approx(1.0, abs=1e-12)
-    assert {key for _, _, key in chains} <= {key for _, _, key in full}
-    assert len(set(key for _, _, key in chains)) == len(chains)
+    firsts = {outcomes[0] for outcomes, _, _ in full}
+    seconds = {outcomes[1] for outcomes, _, _ in full}
+    assert not (firsts & seconds)  # disjoint pools: no exclusion, a full grid
+    assert len(full) == len(firsts) * len(seconds)
+    for offsets in (1, 2, 3):
+        assert balanced_double_reveal_chains(game, specs, offsets, 5) is None
 
 
 def test_balanced_double_reveal_falls_back_when_it_cannot_shrink():

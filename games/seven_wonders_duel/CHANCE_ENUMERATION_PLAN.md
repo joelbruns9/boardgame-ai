@@ -1,9 +1,9 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured; design revised after review; **Steps 1-4 done
-(2026-07-25)** -- built, quality-validated, and still off by default; Step 5
-(real throughput) outstanding.
-**Date:** 2026-07-25.
+**Status:** measured; design revised after review; **Steps 1-4 done** -- built,
+quality-validated, and still off by default; Step 5 (real throughput)
+outstanding.
+**Date:** 2026-07-25; mixed-back scope decision 2026-07-26.
 
 ## The problem
 
@@ -481,12 +481,13 @@ Step 1 `close_fixed_support`.
   exposed on `closed_search`, `closed_search_resumable` and
   `search_many_flat_net`. Step 3 adds the driver-level cheap-move gating
   (`cheap_double_reveal_offsets`); self-play still passes 0.
-* **Different backs, which the design did not cover.** The two uncovered slots
-  can carry different backs (Age III mixes guilds in). Those pools are disjoint,
-  so no exclusion applies and `n * (n-1)` is the wrong count. Handled as the
-  natural generalisation: the cycle runs over the second pool with distances
-  `0..n2-1`. First-position coverage is still exact; second-position incidence
-  is even to within one, since `n1` strata spread over `n2` residues.
+* **Different backs stay exhaustive** (decided 2026-07-26 -- see *Mixed-back
+  double reveals* below). The two uncovered slots can carry different backs
+  (Age III mixes guilds in); those pools are disjoint, so the outcome space is a
+  full `n1 * n2` grid rather than `n * (n-1)` directed pairs. A cyclic support
+  over the second pool was built first and *is* unbiased, but it was withdrawn:
+  it is worth 2.9% of the saving at 3-4x the Q error, and only its first margin
+  could be made exact. One construction, one guarantee.
 * **Offset draw.** FNV-1a over (domain tag, search seed, chance signature,
   both reveal pools) seeds a private `PortableRng` / `Rng`; a partial
   Fisher-Yates takes `X` distinct offsets, returned ascending so the support does
@@ -498,7 +499,7 @@ Step 1 `close_fixed_support`.
   runs Python, the scalar Rust oracle and the resumable searcher at `X` in
   {1,2,3} and asserts identical canonical digests.
 * **Other tests.** `test_search.py` -- balance/mass/distinctness/no-self-pair at
-  several `X` (and the mixed-back variant), fallback cases, offset-seed
+  several `X`, different-back edges falling back to exhaustive, offset-seed
   separation (search seed / position / signature), subset-uniformity of
   `distinct_offsets`, mean-unbiasedness through the real construction against a
   fixed leaf oracle, and force expansion capping *only* pure double reveals,
@@ -507,7 +508,7 @@ Step 1 `close_fixed_support`.
   asserts the capped support is a strict subset and that every other edge keeps
   exactly its exhaustive children. Full suite green (452 tests).
 * **Saving, sanity check only.** 180 mid-game roots from random-play
-  trajectories, total forced children: X=1 50.0%, **X=2 57.8%**, X=3 65.5% of
+  trajectories, total forced children: X=1 50.4%, **X=2 58.1%**, X=3 65.7% of
   exhaustive. That is *better* than the 70.5% projected in this document, and
   should not be believed as the self-play figure: this corpus averages ~92 forced
   children per root against real self-play's 40, exactly the Level-1 caveat
@@ -565,36 +566,31 @@ python -m games.seven_wonders_duel.chance_cap_quality \
 
 **Corpus:** run 02's buffer, `latest.pt`. 1,245 cheap searched decisions
 examined, of which **200 (16%) carry a pure double-reveal edge** -- consistent
-with Level 0's 14.6% -- giving **556 capped edges**. On the other 84% of roots
-the cap does nothing at all, so every number below is conditional on the cap
-applying.
+with Level 0's 14.6% -- giving 556 such edges, **529 of them capped** (the 27
+different-back edges stay exhaustive). On the other 84% of roots the cap does
+nothing at all, so every number below is conditional on the cap applying.
 
 #### Level A -- edge Q error, analytic (no search, no seed noise)
 
 Evaluate the whole outcome space once, then compare the exact
 probability-weighted Q with the balanced support's Q. Values are on [-1, 1].
 
-| X | retained | Q MAE | Q p95 | Q max | mixed-back MAE | worst outcome retained | terminal children dropped |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 15.8% | 4.1e-4 | 1.5e-3 | 1.8e-2 | 1.2e-3 | 16.4% | **0** |
-| **2** | **31.7%** | **2.2e-4** | **8.1e-4** | 1.3e-2 | 9.1e-4 | 32.9% | **0** |
-| 3 | 47.5% | 1.4e-4 | 5.1e-4 | 4.1e-3 | 2.5e-4 | 51.6% | **0** |
+| X | retained | Q MAE | Q p95 | Q max | worst outcome retained | terminal children dropped |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 15.7% | 3.7e-4 | 1.4e-3 | 1.2e-2 | 16.1% | **0** |
+| **2** | **31.4%** | **1.9e-4** | **7.8e-4** | 4.6e-3 | 32.5% | **0** |
+| 3 | 47.1% | 1.3e-4 | 5.0e-4 | 4.0e-3 | 51.4% | **0** |
 
 * **The error is two to three orders of magnitude below the Q differences that
-  decide a move.** Even the worst single edge in 556 is 1.8e-2 at X=1.
-* **No size trend** across pools 5-10 (X=2 MAE ranges 3.0e-5 to 4.5e-4); the
-  worst bucket is by signature, not size.
-* **Mixed-back edges are 3-4x worse than same-back** (9.1e-4 vs 3.7e-4 at X=1),
-  which is what the weaker second-position guarantee predicts -- the generalised
-  cycle balances second position only to within one. Still negligible in absolute
-  terms.
+  decide a move.** The worst single edge of 529 is 1.2e-2, at X=1.
+* **No size trend** across pools 5-10; error is flat in `n`.
 * **Catastrophe coverage is exactly as narrow as the review said.** The single
-  worst outcome is retained at 16/33/52% for X=1/2/3 -- i.e. at the rate a
+  worst outcome is retained at 16/33/51% for X=1/2/3 -- i.e. at the rate a
   *random* subset of that size would retain it. Balanced coverage buys marginal
   coverage, not pair coverage; it does not protect the specific worst pair. What
-  saves this in practice: **not one terminal child was dropped in 556 edges**,
+  saves this in practice: **not one terminal child was dropped in 529 edges**,
   and the mean shortfall between the worst retained outcome and the true worst
-  is 0.0068 / 0.0035 / 0.0022 for X=1/2/3.
+  is 0.0070 / 0.0037 / 0.0023 for X=1/2/3.
 
 #### Level B -- decision impact through the production searcher
 
@@ -605,13 +601,13 @@ much disagreement ordinary search noise produces at this budget.
 | run | action disagreement | regret when disagreeing (mean / p95) | policy KL (mean / p95) | survivors | top-k identical |
 |---|---:|---:|---:|---:|---:|
 | control: seed only, no cap | **11.0%** | **0.126 / 0.524** | 0.246 / 1.362 | 0.985 | 15.5% |
-| X = 1 | 8.5% | 0.018 / 0.084 | 0.219 / 1.097 | 1.000 | 100% |
-| **X = 2** | **8.0%** | **0.015 / 0.075** | 0.139 / 0.257 | 1.000 | 100% |
-| X = 3 | 6.0% | -0.008 / 0.071 | 0.101 / 0.140 | 1.000 | 100% |
+| X = 1 | 7.5% | 0.021 / 0.090 | 0.218 / 1.097 | 1.000 | 100% |
+| **X = 2** | **7.0%** | **0.017 / 0.082** | 0.138 / 0.257 | 1.000 | 100% |
+| X = 3 | 5.5% | -0.009 / 0.076 | 0.100 / 0.067 | 1.000 | 100% |
 
 * **Every capped run disagrees with the exhaustive search less often than the
   exhaustive search disagrees with itself under a different seed**, and when it
-  does disagree it costs ~8x less: 0.015 of value at X=2 against 0.126 for the
+  does disagree it costs ~7x less: 0.017 of value at X=2 against 0.126 for the
   control, judged by the exhaustive run's own completed Q. At X=3 the mean regret
   is *negative* -- the capped run's pick was marginally better by the baseline's
   own numbers, i.e. pure noise.
@@ -622,7 +618,7 @@ much disagreement ordinary search noise produces at this budget.
   says the decision-level effect is within a noise band whose true width is
   somewhere below 11%.
 * Forced rows over these 200 (double-reveal-carrying) roots: 50,240 exhaustive →
-  21,732 / 26,142 / 30,552 at X=1/2/3. Best case by construction, since these
+  22,524 / 26,776 / 31,028 at X=1/2/3. Best case by construction, since these
   roots were selected for having the edges the cap targets.
 
 #### Verdict
@@ -639,6 +635,70 @@ by default until both land.
 Rows are not GPU calls. Record games/hour, global batches, rows per batch, GPU
 utilisation, padded tokens, forced-phase wall time and scheduler idle time,
 before and after.
+
+---
+
+## Mixed-back double reveals: exhaustive, decided 2026-07-26
+
+Step 2 shipped a second construction for the case the design never covered --
+two uncovered slots with DIFFERENT backs. It was withdrawn after Step 4 measured
+what it was worth. Recorded here because "generalise it" is the tempting move
+and the arithmetic against it is not obvious.
+
+**The case.** Back types partition the card universe, so two different backs
+mean two disjoint pools: no exclusion, and the outcome space is the full
+`n1 * n2` grid at uniform `1 / (n1 * n2)` -- not `n * (n-1)` directed pairs.
+
+**It was not biased.** The withdrawn construction cycled over the second pool,
+`second[(i + t) % n2]` for `t` in a uniform random `X`-subset of `0..n2-1`. Each
+offset is included with probability `X / n2`, and for fixed `i` the map
+`t -> (i + t) % n2` is a bijection onto the second pool, so
+
+```
+E[est] = (1/(n1*X)) * (X/n2) * sum_i sum_t f(i, (i+t)%n2) = (1/(n1*n2)) * sum_ij f(i,j)
+```
+
+which is the exact expectation. Confirmed numerically: 4,000 seeds on an 8x6
+edge gave bias -2.9e-3 against a +-4.2e-3 95% CI.
+
+**Three reasons it went anyway.**
+
+1. **Only one margin can be exact.** First position is covered exactly `X`
+   times; second position only to within one, because `n1` strata spread over
+   `n2` residues. A subset balanced in *both* margins needs a size divisible by
+   `lcm(n1, n2)` -- and the observed shapes are usually coprime ((5,4), (5,9),
+   (9,5), (4,5)), where that lower bound **is the whole grid**. There is no
+   smaller exactly-balanced support to reach for.
+2. **The retained count depended on slot order.** Support size is `n1 * X`, and
+   which pool is "first" is decided by `(row, x)` -- board position. The same
+   shape keeps `5X` of 45 as (5,9) and `9X` of 45 as (9,5). Both orders occur in
+   the corpus.
+3. **It was worth almost nothing.** Measured over 386 corpus roots / 1,032
+   double-reveal edges:
+
+| | edges | outcomes | mean/edge | kept @ X=2 | saving |
+|---|---:|---:|---:|---:|---:|
+| same back | 977 (94.7%) | 58,214 | 59.6 | 26.7% | 42,650 |
+| **different backs** | **55 (5.3%)** | 1,917 (3.2%) | 34.9 | 32.8% | **1,289 (2.9%)** |
+
+Rare *and* individually small -- a guild pool is short. Meanwhile they carried
+3-4x the Q error of same-back edges (9.1e-4 vs 3.7e-4 at X=1) and contained the
+single worst edge in the whole corpus (1.3e-2, which dropped to 4.6e-3 once they
+were excluded).
+
+**Decision: different-back double reveals keep exact chance.** 2.9% of the
+saving is not worth a second construction with a weaker guarantee, an
+order-dependent support, and the worst error bucket. The shipped code is now the
+one construction the review approved.
+
+*If that 2.9% is ever wanted back*, the principled version is **block-stratified
+offsets** -- draw one offset uniformly from each of `X` equal blocks of
+`0..n2-1` instead of a free `X`-subset. Inclusion probability stays `X / n2`, so
+it remains exactly unbiased, while the second margin and the variance both
+tighten. It would improve the same-back case too. Not built: 3% does not pay for
+it.
+
+---
 
 ---
 

@@ -969,10 +969,11 @@ def balanced_double_reveal_chains(
     the same `(outcomes, probability, key)` shape as `enumerate_chains`.
 
     Returns None when the construction does not apply — a different chance
-    signature, `offsets <= 0`, or an `offsets` large enough that the full space
-    is no bigger — and the caller must then enumerate exhaustively.
+    signature, two DIFFERENT backs, `offsets <= 0`, or an `offsets` large enough
+    that the full space is no bigger — and the caller must then enumerate
+    exhaustively.
 
-    Construction (same back, `n` unseen cards, `X` offsets):
+    Construction (`n` unseen cards of the shared back, `X` offsets):
 
     * **Stratify on the first reveal.** Every hidden card is the first reveal in
       exactly one stratum. That is the marginal-coverage guarantee, and it is
@@ -985,11 +986,17 @@ def balanced_double_reveal_chains(
     * **Weight `1 / (n * X)`** — mass exactly 1, so the retained children carry
       a proper stratified expectation rather than a conditional one.
 
-    When the two slots have DIFFERENT backs the pools are disjoint (back types
-    partition the card universe), so no exclusion applies: the cycle runs over
-    the second pool as `second[(i + t) % n2]` with distances `0..n2-1`. First
-    position is still covered exactly once; second-position incidence is even to
-    within one, since `n1` strata spread over `n2` residues.
+    **Different backs stay exhaustive by choice, not by oversight.** Those pools
+    are disjoint (back types partition the card universe), so the outcome space
+    is the full `n1 * n2` grid and a cyclic support over the second pool would
+    still be unbiased — but only its FIRST margin could be exact, since a subset
+    balanced in both margins needs a size divisible by `lcm(n1, n2)`, and those
+    pool sizes are usually coprime (the grid itself). It would also make the
+    retained count depend on which slot happens to be listed first, which is
+    board position, not anything meaningful. Measured on the corpus those edges
+    are 5.3% of double reveals, 3.2% of their outcomes and **2.9% of the cap's
+    saving**, while carrying 3-4x the Q error — not a trade worth a second
+    construction with a weaker guarantee.
 
     The coverage claim is **marginal**: every hidden card in every revealed
     slot. It is not coverage of every dangerous PAIR interaction."""
@@ -998,31 +1005,22 @@ def balanced_double_reveal_chains(
         return None
     if any(spec.kind is not ChanceKind.CARD_REVEAL for spec in specs):
         return None
+    if specs[0].context[1] != specs[1].context[1]:
+        return None
     pool = unseen_pool(state.observation(state.active_player))
-    first = [name for name, _ in enumerate_card_reveal(pool, specs[0].context[1])]
-    same_back = specs[1].context[1] == specs[0].context[1]
-    second = (
-        first
-        if same_back
-        else [name for name, _ in enumerate_card_reveal(pool, specs[1].context[1])]
-    )
-    n = len(first)
-    modulus = n - 1 if same_back else len(second)
+    names = [name for name, _ in enumerate_card_reveal(pool, specs[0].context[1])]
+    n = len(names)
+    modulus = n - 1  # directed-pair distances 1..n-1, never a self-pair
     if offsets >= modulus:
         return None  # the balanced support would be the whole space (or larger)
     chosen = distinct_offsets(
-        modulus, offsets, double_reveal_offset_seed(search_seed, specs, (first, second))
+        modulus, offsets, double_reveal_offset_seed(search_seed, specs, (names, names))
     )
     weight = 1.0 / (n * offsets)
     chains = []
-    for i, name in enumerate(first):
+    for i, name in enumerate(names):
         for offset in chosen:
-            other = (
-                first[(i + 1 + offset) % n]
-                if same_back
-                else second[(i + offset) % modulus]
-            )
-            outcomes = [name, other]
+            outcomes = [name, names[(i + 1 + offset) % n]]
             chains.append((outcomes, weight, tuple(outcomes)))
     return chains
 
