@@ -204,6 +204,7 @@ def _run_rust(
     scheduler_workers: int,
     diagnostic_sync: bool,
     pinned_memory: bool,
+    cheap_double_reveal_offsets: int = 0,
 ) -> dict:
     import seven_wonders_rust as swr
 
@@ -249,6 +250,7 @@ def _run_rust(
             iteration=-1,
             force=lock["force_expand_root_chance"],
             age_deal_samples=lock["age_deal_sampler"]["sample_count"],
+            cheap_double_reveal_offsets=cheap_double_reveal_offsets,
             max_inflight_batches=max_inflight,
             scheduler_workers=scheduler_workers,
         )
@@ -362,6 +364,7 @@ def _run_rust(
         "global_batches": len(batch_rows),
         "leaf_batch": int(lock["leaf_batch"]),
         "force_expand_root_chance": bool(lock["force_expand_root_chance"]),
+        "cheap_double_reveal_offsets": int(cheap_double_reveal_offsets),
         "sims": int(search["full_sims_min"]),
         "slots": slots,
         "scheduler_workers": scheduler_workers,
@@ -475,6 +478,7 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "diagnostic_sync": args.diagnostic_sync,
         "isolated_forward_rows_per_second": args.isolated_forward_rows_per_second,
         "exploratory_seed_start": args.exploratory_seed_start,
+        "cheap_double_reveal_offsets": args.cheap_double_reveal_offsets,
         "exact_command": subprocess.list2cmdline(sys.argv),
     }
 
@@ -601,6 +605,7 @@ def run(args) -> dict:
             scheduler_workers=args.scheduler_workers,
             diagnostic_sync=False,
             pinned_memory=args.pinned_memory,
+            cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
         )
         if args.mode == "laptop":
             _run_python(
@@ -641,6 +646,7 @@ def run(args) -> dict:
                     scheduler_workers=args.scheduler_workers,
                     diagnostic_sync=args.diagnostic_sync,
                     pinned_memory=args.pinned_memory,
+                    cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
                 )
                 rust_row["isolated_forward_rows_ratio"] = (
                     rust_row["total_nn_rows_per_second"]
@@ -729,6 +735,13 @@ def main():
     parser.add_argument("--scheduler-workers", type=int, default=1)
     parser.add_argument("--python-workers", type=int, default=4)
     parser.add_argument("--diagnostic-sync", action="store_true")
+    parser.add_argument(
+        "--cheap-double-reveal-offsets",
+        type=int,
+        default=0,
+        help="balanced double-reveal support on cheap moves (0 = exhaustive). "
+        "Recorded in run_config, so an A/B needs one output directory per value.",
+    )
     parser.add_argument("--isolated-forward-rows-per-second", type=float, default=0.0)
     parser.add_argument("--pinned-memory", action="store_true")
     parser.add_argument(

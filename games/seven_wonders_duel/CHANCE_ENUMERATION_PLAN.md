@@ -1,9 +1,10 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured; design revised after review; **Steps 1-4 done** -- built,
-quality-validated, and still off by default; Step 5 (real throughput)
-outstanding.
-**Date:** 2026-07-25; mixed-back scope decision 2026-07-26.
+**Status:** **Steps 1-5 done** -- built, quality-validated, throughput measured,
+and still off by default. The remaining gate is arena strength (*Future test 2*),
+which is what should decide whether `cheap_double_reveal_offsets=2` ships on.
+**Date:** 2026-07-25; mixed-back scope decision and Step 5 measurement
+2026-07-26.
 
 ## The problem
 
@@ -626,15 +627,92 @@ much disagreement ordinary search noise produces at this budget.
 **Approximation quality is not the blocker; X = 2 is safe to sweep for
 strength.** The residual risk is worst-case *pair* coverage, which the balanced
 construction does not address and which no terminal outcome exercised here.
-What remains unproven is that the saved rows convert into throughput (Step 5)
-and that strength holds up over whole games (Future test 2) -- capping stays off
-by default until both land.
+Step 5 has since shown the saved rows do convert (+7.4% games/s at the pinned
+geometry, +14.5% with concurrency raised). The one thing still unproven is that
+strength holds up over whole games (*Future test 2*) -- capping stays off by
+default until that lands.
 
-### Step 5 -- measure real throughput
+### Step 5 -- measure real throughput -- **DONE 2026-07-26**
 
 Rows are not GPU calls. Record games/hour, global batches, rows per batch, GPU
 utilisation, padded tokens, forced-phase wall time and scheduler idle time,
 before and after.
+
+**Method.** `f4_throughput_bench.py --mode rust` already records every one of
+those; it gained a `--cheap-double-reveal-offsets` knob (recorded in
+`run_config.json`, so one output directory cannot mix values). The A/B mirrors
+the pinned laptop configuration exactly -- `--exploratory-leaf1`, 16 games x 3
+repetitions, slots 16, `global_batch_cap` 256, one in-flight batch, one
+scheduler worker -- so the X=0 arm is directly comparable to the recorded
+`confirmation_v2` baseline. Both arms replay the same seeds in the same order,
+so repetitions pair.
+
+```
+python -m games.seven_wonders_duel.f4_throughput_bench \
+  --mode rust --exploratory-leaf1 --checkpoint <ckpt> --output <dir>/x$X \
+  --games 16 --repetitions 3 --warmup-games 2 --slots 16 \
+  --global-batch-cap 256 --max-inflight-batches 1 --scheduler-workers 1 \
+  --python-workers 1 --cheap-double-reveal-offsets $X
+```
+
+#### Result: the cap pays, sub-linearly, and the geometry decides how much
+
+X=2 against X=0, paired by repetition (same seeds, same order):
+
+| | slots 16, 8 reps | slots 24, 6 reps |
+|---|---:|---:|
+| **games/s** | 0.3613 → **0.3882** | 0.4284 → **0.4902** |
+| **speedup** | **+7.4%** (CI [+5.5, +9.4], 8/8 wins) | **+14.5%** (CI [+9.6, +19.4], 6/6 wins) |
+| games/hour | 1,301 → 1,397 | 1,542 → 1,765 |
+| forced rows / game | 3,299 → 2,189 (-33.6%) | -33.5% |
+| total NN rows / game | 5,984 → 4,875 (**-18.5%**) | 5,963 → 4,870 (-18.3%) |
+| forced rows / search, p95 | 234 → 119 (-49.3%) | 233 → 120 (-48.4%) |
+| mean batch rows | 27.0 → 22.4 (-17.0%) | 38.5 → 32.4 (-15.9%) |
+| global batches | 3,554 → 3,492 (**-1.8%**) | 3,719 → 3,613 (-2.9%) |
+| GPU forward seconds | 25.84 → 25.59 (**-0.9%**) | 27.75 → 26.45 (-4.7%) |
+| GPU busy fraction | 0.583 → 0.620 | 0.495 → 0.539 |
+| padding ratio | 0.120 → 0.127 | 0.130 → 0.136 |
+| scheduler idle | 0.183 → 0.188 | 0.195 → 0.199 |
+| peak GPU bytes | 54.5M → 51.1M | 53.0M → 51.3M |
+
+**The plan's caveat was right: 18.5% fewer rows is not 18.5% more games.** The
+mechanism is legible in the table -- the scheduler issued the *same number of
+batches* (-1.8%), each 17% thinner, so GPU forward time barely moved (-0.9%). At
+these batch sizes forward cost is dominated by per-batch overhead, not row count,
+so a row cut that only thins batches is largely wasted. The 7.4% that did arrive
+came from CPU-side tree work (-14%) and better overlap, not from the GPU.
+
+**Raising concurrency doubles the conversion.** At slots 24 the freed capacity
+refills batches instead of thinning them and the same row saving is worth
+**+14.5%**. Capping and the concurrency geometry are not independent knobs: they
+should be tuned together. (Cross-geometry, slots 24 + X=2 is +35.7% games/s over
+the tuned slots-16 uncapped baseline, of which +18.6% is the slots change alone.)
+
+**No utilisation-knee collapse** at either geometry: padding +5%, scheduler idle
++2%, GPU busy *up*, peak GPU memory down. The risk was real in kind -- thinner
+batches -- but not in degree.
+
+Two incidental findings worth keeping:
+
+* **Enumeration itself is free.** `rust_chance_seconds` is 0.002s per
+  repetition. 100% of the cost being removed is network rows, which is why row
+  count was the right thing to measure in Level 0.
+* **The 3-repetition sweep overstated the gain** (+15% vs the 8-rep +7.4%),
+  inflated by one slow uncapped repetition. Recorded because a 3-rep A/B on this
+  laptop is not enough to size an effect this small.
+
+#### Offsets sweep (throughput only, 3 reps each -- does not resolve X)
+
+| X | games/s | vs X=0 | forced rows/game | mean batch | GPU busy |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.3414 | -- | 3,214 | 26.7 | 0.579 |
+| 1 | 0.4034 | +18.2% | 1,929 | 21.5 | 0.632 |
+| 2 | 0.3916 | +14.7% | 2,184 | 22.5 | 0.623 |
+| 3 | 0.3956 | +15.9% | 2,340 | 23.1 | 0.620 |
+
+X=1/2/3 are indistinguishable at this sample size (and the whole column is
+inflated -- see above). **Throughput does not choose X**; quality prefers larger
+X, so the choice belongs to arena strength (*Future test 2*).
 
 ---
 
@@ -712,10 +790,23 @@ At a fixed budget, is it better to spend on exact root chance or on depth?
 `--eval-search-mode puct`. Nothing measured so far bears on this, and it decides
 strength per unit compute. ~90 minutes.
 
-### 2. Offset sweep
+### 2. Offset sweep -- now the ONLY gate left before capping can ship on
 
-X in {1, 2, 3} against arena strength and games/hour, using the Step 4 quality
-metrics as the leading indicator.
+X in {1, 2, 3} against **arena strength**, using the Step 4 quality metrics as
+the leading indicator. Throughput and quality are both measured and neither
+separates X=1/2/3: the games/hour differences are inside the noise, and quality
+improves monotonically with X while all three are ~1e-4 in Q error. So strength
+decides, and it is the only thing still unmeasured. Run it against the banked
+`current_best.pt` with `--cheap-double-reveal-offsets` on the generation side
+only, X=2 first (the middle of the range, +7.4-14.5% games/s).
+
+### 2b. Re-tune concurrency WITH the cap on
+
+Step 5 found the two knobs interact: the same 18.5% row cut is worth +7.4% at
+slots 16 and +14.5% at slots 24, because more concurrency refills batches instead
+of thinning them. The slots/`global_batch_cap`/in-flight geometry was tuned
+against uncapped generation and should be re-swept once capping is on -- the
+optimum has moved. `f4_frontier.py` already exists for this.
 
 ### 3. One-ply Great Library resolver (was "collapse")
 
