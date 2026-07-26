@@ -176,6 +176,7 @@ fn make_self_play_config(
         puct_root,
         age_deal_samples,
         age_deal_samples_by_player: None,
+        cheap_double_reveal_offsets_by_player: None,
         cheap_double_reveal_offsets,
         bot_by_player: [None, None],
         bot_exploration: 0.0,
@@ -976,6 +977,7 @@ fn scheduler_result_to_py(
     metrics.set_item("root_rows", m.root_rows)?;
     metrics.set_item("leaf_rows", m.leaf_rows)?;
     metrics.set_item("forced_rows", m.forced_rows)?;
+    metrics.set_item("fixed_support_edges", m.fixed_support_edges)?;
     metrics.set_item("forced_card_reveal_rows", m.forced_rows_by_kind[0])?;
     metrics.set_item("forced_great_library_rows", m.forced_rows_by_kind[1])?;
     metrics.set_item("forced_wonder_group_rows", m.forced_rows_by_kind[2])?;
@@ -1039,6 +1041,7 @@ fn search_result_to_py(
     out.set_item("topk", result.gumbel_topk)?;
     out.set_item("sims", result.sims)?;
     out.set_item("completed_q", metrics.root_completed_q)?;
+    out.set_item("survivors", metrics.halving_survivors.clone())?;
     out.set_item("digest", digest)?;
     let counters = PyDict::new(py);
     counters.set_item("scheduled", metrics.scheduled_simulations)?;
@@ -1053,6 +1056,9 @@ fn search_result_to_py(
     let nn_work = PyDict::new(py);
     nn_work.set_item("forced_rows", metrics.forced_outcome_rows)?;
     nn_work.set_item("forced_cache_hits", metrics.cached_forced_leaves)?;
+    // Evaluation and gate runs require exact chance; they can assert this is
+    // zero rather than inspecting configuration plumbing by eye.
+    nn_work.set_item("fixed_support_edges", metrics.fixed_support_edges)?;
     out.set_item("nn_work", nn_work)?;
     Ok(out.unbind())
 }
@@ -1340,7 +1346,8 @@ fn cooperative_jobs(
     games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
-    force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
+    force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
+    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -1363,6 +1370,8 @@ fn self_play_many_mock(
     age_deal_samples: usize,
     cheap_double_reveal_offsets: usize,
     max_moves: usize,
+    cheap_double_reveal_offsets_p0: Option<usize>,
+    cheap_double_reveal_offsets_p1: Option<usize>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
         py,
@@ -1386,6 +1395,20 @@ fn self_play_many_mock(
         cheap_double_reveal_offsets,
         max_moves,
     )?;
+    let mut jobs = jobs;
+    match (cheap_double_reveal_offsets_p0, cheap_double_reveal_offsets_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) => {
+            for (_, cfg) in &mut jobs {
+                cfg.cheap_double_reveal_offsets_by_player = Some([p0, p1]);
+            }
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "cheap_double_reveal_offsets_p0 and _p1 must be supplied together",
+            ));
+        }
+    }
     let result = py.detach(move || self_play::run_many(jobs, &eval::MockEval, global_batch_cap))?;
     scheduler_result_to_py(py, result)
 }
@@ -1400,7 +1423,8 @@ fn self_play_many_mock(
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
-    age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false
+    age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
+    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None
 ))]
 fn self_play_many_net(
     py: Python<'_>,
@@ -1432,6 +1456,8 @@ fn self_play_many_net(
     age_deal_samples_p0: Option<usize>,
     age_deal_samples_p1: Option<usize>,
     deterministic_actions: bool,
+    cheap_double_reveal_offsets_p0: Option<usize>,
+    cheap_double_reveal_offsets_p1: Option<usize>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1477,6 +1503,21 @@ fn self_play_many_net(
     if leaf_batch_p0.is_none() {
         for (_, cfg) in &mut jobs {
             cfg.deterministic_actions = deterministic_actions;
+        }
+    }
+    match (cheap_double_reveal_offsets_p0, cheap_double_reveal_offsets_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) => {
+            // Seat-mirrored search-strength arena: capped versus exhaustive on
+            // one shared net.
+            for (_, cfg) in &mut jobs {
+                cfg.cheap_double_reveal_offsets_by_player = Some([p0, p1]);
+            }
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "cheap_double_reveal_offsets_p0 and _p1 must be supplied together",
+            ));
         }
     }
     match (age_deal_samples_p0, age_deal_samples_p1) {
@@ -1538,7 +1579,8 @@ fn self_play_many_net(
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
-, puct_root=false))]
+, puct_root=false, cheap_double_reveal_offsets_p0=None,
+    cheap_double_reveal_offsets_p1=None))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -1574,6 +1616,8 @@ fn self_play_many_flat_net(
     bot_exploration: f64,
     bot_policy_iterations: i64,
     puct_root: bool,
+    cheap_double_reveal_offsets_p0: Option<usize>,
+    cheap_double_reveal_offsets_p1: Option<usize>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1628,6 +1672,21 @@ fn self_play_many_flat_net(
         cfg.bot_by_player = bot_by_player;
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;
+    }
+    match (cheap_double_reveal_offsets_p0, cheap_double_reveal_offsets_p1) {
+        (None, None) => {}
+        (Some(p0), Some(p1)) => {
+            // Seat-mirrored search-strength arena: capped versus exhaustive on
+            // one shared net.
+            for (_, cfg) in &mut jobs {
+                cfg.cheap_double_reveal_offsets_by_player = Some([p0, p1]);
+            }
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "cheap_double_reveal_offsets_p0 and _p1 must be supplied together",
+            ));
+        }
     }
     match (age_deal_samples_p0, age_deal_samples_p1) {
         (None, None) => {}

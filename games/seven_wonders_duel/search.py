@@ -381,9 +381,9 @@ class SearchConfig:
 
     Zero (the default) keeps forced expansion exhaustive. A positive `X` keeps
     the balanced `n * X` support instead of all `n * (n - 1)` directed pairs —
-    every hidden card still appears exactly once in the first revealed slot and
-    exactly `X` times in the second, weighted `1 / (n * X)`, closed against
-    growth. Those edges are 54.5% of all forced children
+    every hidden card leads exactly one stratum, so it appears exactly `X` times
+    in the first revealed slot and exactly `X` times in the second, weighted
+    `1 / (n * X)`, closed against growth. Those edges are 54.5% of all forced children
     (CHANCE_ENUMERATION_PLAN.md). Everything else stays exhaustive; the cap is
     ignored once `X` would retain the full space anyway."""
 
@@ -708,17 +708,40 @@ class GumbelMCTS:
                 spec.kind is ChanceKind.AGE_DEAL for spec in edge.specs
             ):
                 continue
+            if edge.fixed_support:
+                # Re-entry with a different seed would append members of a
+                # SECOND support and only notice at the closing mass check, by
+                # which point the tree is already mutated. Refuse before that.
+                raise RuntimeError(
+                    "forced expansion re-entered an already-closed edge; a "
+                    "fixed support cannot be extended or replaced in place"
+                )
             balanced = balanced_double_reveal_chains(
                 root.state,
                 edge.specs,
                 self.config.double_reveal_offsets,
                 self.config.seed,
             )
-            for outcomes, probability, key in (
+            chains = (
                 balanced
                 if balanced is not None
                 else enumerate_chains(root.state, edge.specs)
-            ):
+            )
+            # Validate the support BEFORE materializing any of it: an evaluator
+            # failure part-way through then cannot leave a half-built edge whose
+            # mass is neither 1 nor recoverable.
+            held = sum(child.probability or 0.0 for child in edge.children.values())
+            incoming = sum(
+                probability
+                for _, probability, key in chains
+                if key not in edge.children
+            )
+            if abs(held + incoming - 1.0) > 1e-9:
+                raise RuntimeError(
+                    f"forced root edge would hold probability mass "
+                    f"{held + incoming:.6f} != 1"
+                )
+            for outcomes, probability, key in chains:
                 if key in edge.children:
                     continue
                 clone = root.state.clone()
@@ -1070,7 +1093,10 @@ def expand_exhaustive(
     """Fully expand a closed subtree, materializing every chance outcome with
     exact probabilities. ``depth=None`` runs to terminal; a finite depth stops
     there and evaluates the frontier with the net (the §5 net-leaves gate).
-    Gate/verifier utility for small positions — raises on AGE_DEAL."""
+    Gate/verifier utility for small positions — raises on AGE_DEAL, and on an
+    approximate edge: appending the omitted outcomes to a closed support would
+    push its re-normalised mass past 1 and corrupt the tree in place, several
+    steps before `closed_root_exact_value` got the chance to refuse it."""
 
     if node.terminal:
         return
@@ -1084,6 +1110,11 @@ def expand_exhaustive(
         mcts._expand_closed(node)
     next_depth = None if depth is None else depth - 1
     for edge in node.edges:
+        if edge.fixed_support:
+            raise ValueError(
+                "exhaustive expansion reached an approximate fixed-support edge; "
+                "its support is closed and cannot be completed in place"
+            )
         for outcomes, probability, key in enumerate_chains(node.state, edge.specs):
             if key not in edge.children:
                 clone = node.state.clone()

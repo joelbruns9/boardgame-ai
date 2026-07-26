@@ -470,6 +470,48 @@ def test_cheap_double_reveal_offsets_do_change_cheap_moves():
     assert differing, "capped cheap moves produced identical policy targets"
 
 
+def test_cheap_double_reveal_offsets_route_per_seat_for_the_arena():
+    """The search-strength gate needs capped-versus-exhaustive on ONE net, with
+    seats mirrored. Without a per-seat setting that arena cannot be run at all:
+    the production gate deliberately passes no offsets."""
+
+    import seven_wonders_rust as swr
+
+    seeds = [2026072640, 2026072641, 2026072642]
+    kwargs = _common(leaf_batch=1, global_batch_cap=8)
+    kwargs["full_search_fraction"] = 0.0  # arena games are all cheap moves
+
+    def run(p0, p1):
+        records, metrics = swr.self_play_many_mock(
+            games=rust_games_for_self_play(seeds, [0, 1, 0]),
+            game_seeds=seeds,
+            force=True,
+            cheap_double_reveal_offsets_p0=p0,
+            cheap_double_reveal_offsets_p1=p1,
+            **kwargs,
+        )
+        return records, metrics
+
+    exhaustive, exhaustive_metrics = run(0, 0)
+    mirrored, mirrored_metrics = run(0, 2)
+    swapped, swapped_metrics = run(2, 0)
+
+    # `fixed_support_edges` is the runtime witness: zero means exact chance.
+    assert exhaustive_metrics["fixed_support_edges"] == 0
+    assert mirrored_metrics["fixed_support_edges"] > 0
+    assert swapped_metrics["fixed_support_edges"] > 0
+    assert mirrored != exhaustive
+    assert swapped != mirrored  # the seats really are distinguished
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        swr.self_play_many_mock(
+            games=rust_games_for_self_play(seeds, [0, 1, 0]),
+            game_seeds=seeds,
+            cheap_double_reveal_offsets_p0=2,
+            **kwargs,
+        )
+
+
 def test_f4_r0_paired_age_deal_samples_skip_forced_age_one_setup():
     import seven_wonders_rust as swr
 

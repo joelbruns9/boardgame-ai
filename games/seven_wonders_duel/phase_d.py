@@ -226,6 +226,9 @@ class PhaseDConfig:
     cheap_double_reveal_offsets: int = 0
     """Balanced double-reveal support on CHEAP generation moves only.
 
+    Requires ``generation_backend='rust'``: the Python generator does not force
+    expand root chance, so a positive value there would silently do nothing.
+
     Zero keeps forced expansion exhaustive, which is what every run so far
     produced. A positive X trades exact root chance on a pure double card-reveal
     edge for the balanced ``n * X`` subset -- those edges are 54.5% of all forced
@@ -343,6 +346,17 @@ class PhaseDConfig:
             raise ValueError("age_deal_samples must be in [0, 32]")
         if self.cheap_double_reveal_offsets < 0:
             raise ValueError("cheap_double_reveal_offsets must be non-negative")
+        if self.cheap_double_reveal_offsets and self.generation_backend != "rust":
+            # The Python generation path builds its SearchConfig in `_search_move`
+            # without force expansion at all, so capping there is not merely
+            # unimplemented -- it cannot apply. Failing is the only honest
+            # option: silently generating uncapped games while the run manifest
+            # records a cap is exactly the kind of corruption that is invisible
+            # until someone compares two runs months later.
+            raise ValueError(
+                "cheap_double_reveal_offsets requires generation_backend='rust' "
+                "(the Python generator does not force-expand root chance)"
+            )
         if self.d_model <= 0 or self.d_model % 4 or self.layers <= 0:
             raise ValueError("d_model must be positive/divisible by 4 and layers positive")
         if self.train_steps <= 0 or self.train_batch_size <= 0:

@@ -29,6 +29,7 @@ from games.seven_wonders_duel.inference import Evaluator
 from games.seven_wonders_duel.net import SWDNet
 from games.seven_wonders_duel.pool import enumerate_card_reveal, unseen_pool
 from games.seven_wonders_duel.search import (
+    _Child,
     ChanceSpec,
     GumbelMCTS,
     SearchConfig,
@@ -584,6 +585,80 @@ def test_close_fixed_support_rejects_a_support_that_is_not_renormalised(evaluato
     with pytest.raises(ValueError, match="mass"):
         edge.close_fixed_support()
     assert not edge.fixed_support  # the edge is never closed over partial mass
+
+
+def test_exhaustive_expansion_refuses_to_complete_a_closed_support(evaluator):
+    """`expand_exhaustive` appends every omitted outcome, which on a closed edge
+    would push its re-normalised mass past 1 and corrupt the tree in place --
+    several steps before `closed_root_exact_value` could refuse it."""
+
+    mcts, root, edge = _truncated_fixed_support_root(evaluator)
+    retained = tuple(edge.children)
+    with pytest.raises(ValueError, match="fixed-support"):
+        expand_exhaustive(mcts, root, depth=1)
+    assert tuple(edge.children) == retained  # refused BEFORE mutating
+    assert sum(child.probability for child in edge.children.values()) == 1.0
+
+
+def test_forced_expansion_refuses_to_re_enter_a_closed_edge(evaluator):
+    """A second forced expansion under a different seed would append members of
+    a SECOND support and only notice at the closing mass check, by which point
+    the tree is already mutated."""
+
+    game = _double_uncover_state()
+    config = SearchConfig(
+        sims=8,
+        top_k=4,
+        mode="closed",
+        seed=0,
+        force_expand_root_chance=True,
+        double_reveal_offsets=2,
+    )
+    mcts = GumbelMCTS(evaluator, config)
+    root = mcts.make_root(game)
+    capped = [edge for edge in root.edges if edge.fixed_support]
+    assert capped
+    sizes = [len(edge.children) for edge in root.edges]
+
+    mcts.config.seed = 999  # a different support for the same signature
+    with pytest.raises(RuntimeError, match="already-closed edge"):
+        mcts._force_expand_root(root)
+    assert [len(edge.children) for edge in root.edges] == sizes
+    for edge in capped:
+        assert sum(c.probability for c in edge.children.values()) == pytest.approx(
+            1.0, abs=1e-9
+        )
+
+
+def test_forced_expansion_validates_mass_before_materializing(evaluator):
+    """Transactional: a support whose mass is wrong must be rejected before any
+    child is built, so an evaluator failure part-way cannot leave an edge whose
+    mass is neither 1 nor recoverable."""
+
+    game = _double_uncover_state()
+    mcts = GumbelMCTS(
+        evaluator,
+        SearchConfig(sims=8, top_k=4, mode="closed", seed=0, force_expand_root_chance=True),
+    )
+    root_state = game.clone()
+    root_state.search_barrier = True
+    root = mcts._make_closed_node(root_state)
+    mcts._expand_closed(root)
+    target = next(
+        edge
+        for edge in root.edges
+        if edge.specs and not any(s.kind is ChanceKind.AGE_DEAL for s in edge.specs)
+    )
+    # A child carrying mass that the enumeration will also offer: the union then
+    # exceeds 1 and expansion must refuse without evaluating anything.
+    outcomes, probability, key = enumerate_chains(game, target.specs)[0]
+    clone = root.state.clone()
+    clone.search_barrier = True
+    apply_action(clone, decode_action(clone, target.action_index), chance_outcomes=outcomes)
+    target.children[key] = _Child(probability=1.0, node=mcts._make_closed_node(clone))
+    with pytest.raises(RuntimeError, match="would hold probability mass"):
+        mcts._force_expand_root(root)
+    assert len(target.children) == 1  # nothing else materialized
 
 
 def test_exact_value_refuses_an_approximate_fixed_support_edge(evaluator):

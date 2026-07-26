@@ -21,6 +21,8 @@ live behaviour change.
 | 4 | Approximation-quality measurement | `941f232` | `chance_cap_quality.py` |
 | — | Mixed-back construction withdrawn | `bed527b` | `search.py`, `chance.rs` |
 | 5 | Throughput A/B | `f91d7a7` | `f4_throughput_bench.py` |
+| — | Review brief | `9e1af56` | this document |
+| — | Review response: guards, per-seat routing, corrected measurement | *this change* | `search.py`, `tree_resumable.rs`, `self_play.rs`, `lib.rs`, `phase_d.py`, `chance_cap_quality.py` |
 
 Python: `search.py` (`_Edge.fixed_support`, `close_fixed_support`,
 `fixed_support_index`, `double_reveal_offset_seed`, `distinct_offsets`,
@@ -89,27 +91,36 @@ exactly-weighted, **stratified** one:
 * **The selection rule** is one shared function with an identical golden table in
   `test_search.py` and `tree.rs::fixed_support_tests`.
 
-Full suite: 460 tests green. `cargo test --lib`: 8 green. No new clippy warnings
+* **The guards from the 2026-07-26 review** (§4.1): exhaustive expansion and
+  forced re-entry both refuse a closed edge without mutating it, and support mass
+  is validated before materialisation.
+* **Per-seat arena routing** and the `fixed_support_edges` runtime witness
+  (`test_f4_boundary.py`).
+
+Full suite: 464 tests green. `cargo test --lib`: 8 green. No new clippy warnings
 beyond two `type_complexity` matching the existing `enumerate_chains` signature.
 
 ## 4. Focus areas (highest value)
 
-### 4.1 Closure completeness — the one that can corrupt a tree silently
+### 4.1 Closure completeness -- **gap found and fixed 2026-07-26**
 
-Every path that appends to `edge.children` must be unable to do so on a
-fixed-support edge. Known appenders: `_closed_child` / `closed_child` (scalar and
-resumable — all three branch on the flag first), `expand_exhaustive` (test
-helper), `materialize_forced_root`, `materialize_paired_age_deals`.
+Production descent was closed correctly, but two non-descent paths were not:
 
-**The question I could not fully answer myself:** can force expansion ever run on
-a root that *already holds children*, so that two supports mix? `make_root`
-(advisor) and `begin_search_from_root_forced` each expand once per handle today,
-and `_force_expand_root` skips keys already present — but that skip is what would
-silently merge a stale support into a new one. Is there a resume, retry, or
-re-entry path that reaches it twice?
+* `expand_exhaustive` appended every omitted outcome to a closed edge, corrupting
+  its unit mass in place before `closed_root_exact_value` could refuse the tree.
+  It now raises on `fixed_support`.
+* Re-entering forced expansion with a different seed appended members of a
+  *second* support and only failed at the closing mass check, leaving the tree
+  mutated if the exception were caught. Forced expansion now refuses an
+  already-closed edge before touching anything, in Python and Rust.
+* Support mass is now validated **before** any child is materialised, in both
+  languages, so an evaluator failure part-way through cannot leave an edge whose
+  mass is neither 1 nor recoverable.
 
-Secondary: `closed_root_exact_value` now *raises* on a fixed-support edge. Is
-refusing right, or should it fall back to the sampled branch?
+Gated by `test_search.py::test_exhaustive_expansion_refuses_to_complete_a_closed_support`,
+`::test_forced_expansion_refuses_to_re_enter_a_closed_edge`, and
+`::test_forced_expansion_validates_mass_before_materializing` -- each asserts the
+tree is *unmutated* after the refusal, not merely that it raised.
 
 ### 4.2 RNG contract
 
@@ -127,13 +138,31 @@ seed includes the reveal slots, so three actions on the same slot (build /
 discard / wonder) share a support, but two actions uncovering *different* slots
 with the same pools do not. Sharing more would cancel more comparison noise.
 
-### 4.3 Gumbel amplification of the Q error
+### 4.3 Gumbel amplification of the Q error -- **WRONG, retracted 2026-07-26**
 
-Capped edge Q enters `completed_q`, which sigma rescales by
-`(c_visit + max_visits) * c_scale` ≈ 5–7 at these budgets. A measured 1.9e-4 mean
-Q error therefore lands at ~1e-3 in logit space against log-prior differences of
-1–3, i.e. ~3 orders down. That arithmetic is the whole basis for "the policy
-target barely moves" — please check it rather than trust it.
+This section originally argued that sigma multiplies a Q error by
+`(c_visit + max_visits) * c_scale` ~ 5-7, so 1.9e-4 lands at ~1e-3 in logit
+space, three orders below log-prior differences.
+
+**That omitted the min-max normalisation and was wrong by three orders of
+magnitude.** Sigma is `scale * (q - low) / span`, so a perturbation is *divided
+by the completed-Q span*; where the root's actions are nearly tied, the same
+absolute Q error saturates the whole sigma range. It also couples one edge's
+error into every action's sigma, and moving an endpoint rescales all of them.
+
+Measured (600 comparisons, `chance_cap_quality.py` now reports it):
+
+| | control (re-seed) | X = 2 | X = 3 |
+|---|---:|---:|---:|
+| max Δsigma, mean | 1.393 | 0.457 | 0.382 |
+| max Δsigma, max | 6.40 | 6.40 | 6.40 |
+| normalisation endpoint moved | 25.8% | 9.2% | 7.7% |
+| Δsigma exceeds top-2 logit margin | 37.5% | 15.5% | 14.8% |
+
+So the logit effect is ~0.46 on a scale whose logit margins average 1.8, and it
+exceeds the decisive margin in 15.5% of positions. No bound on the logit
+perturbation can be stated. What survives is the *comparison*: every figure is
+smaller than re-seeding the same search produces.
 
 ### 4.4 Training-target exposure, and whether `TARGET_VERSION` needs a bump
 
@@ -144,32 +173,81 @@ it changes which action gets played, hence the trajectory and the value labels
 attached to those positions. Combined with full-move byte-identity, I concluded
 no `TARGET_VERSION` bump is needed. Is that reasoning complete?
 
-### 4.5 Can the flag leak into evaluation?
+### 4.5 Can the flag leak into evaluation? -- **two fixes 2026-07-26**
 
-The gate/arena path deliberately does **not** receive it: arena games run
-`full_search_fraction = 0.0`, so every arena move takes the *cheap* branch and
-passing it there would cap chance in the games meant to measure capping.
-`test_phase_d.py` asserts the flag reaches the generation call and not the gate
-call, but that test reads source text — a better check is welcome. The advisor
-builds `SearchConfig` from `req.options` for `c_puct` and `force_expand` only, so
-a request cannot inject offsets; `eval_suite.py` and `f4_strength.py` never set
-it. Please confirm there is no fourth path.
+* **Runtime witness, not source inspection.** `fixed_support_edges` is now a
+  search and self-play metric counting root edges left holding an approximate
+  support. Exact-chance runs assert it is zero; `chance_cap_quality.py` asserts
+  zero on its uncapped arm, and `test_f4_boundary.py` asserts it on the arena
+  configuration. This replaces the source-text check.
+* **The Python generation backend silently ignored the flag.** `_search_move`
+  builds its `SearchConfig` without force expansion at all, so
+  `cheap_double_reveal_offsets > 0` with `generation_backend="python"` produced
+  uncapped games while the run manifest recorded a cap. `PhaseDConfig.validate`
+  now rejects that combination outright. (Separately and pre-existing: the Python
+  generator also ignores `force_root_chance`. Not fixed here -- it is a different
+  bug with its own blast radius, and it deserves its own change.)
+
+The gate/arena path still deliberately receives no offsets, so the arena is
+routed instead through new per-seat settings -- see §4.7.
 
 ### 4.6 Are the measurements strong enough to justify turning it on?
 
-Both soft spots are known and I would rather they be attacked than accepted:
+**Both soft spots were confirmed by the review and both are now fixed:**
 
-* **Level B's control is loose.** Re-seeding perturbs the Gumbel keys as well as
-  the chance stream (top-k identical: 15.5% control vs 100% capped), so "capping
-  disagrees less than re-seeding does" is bounded by a floor that is wider than
-  the thing being bounded. The clean evidence is the seed-free Level A error.
-* **Throughput is geometry-dependent.** +7.4% at the pinned slots-16 geometry
-  (8 paired reps, CI [+5.5, +9.4]) and +14.5% at slots 24, because an 18.5% row
-  cut mostly *thins* batches rather than removing them (batches −1.8%, GPU
-  forward −0.9%). A 3-rep A/B had said +15%; it was noise.
+* **One seed for every root** (Level A and B). Level A now enumerates the
+  estimator's *entire* realization space -- `C(n-1, X)` <= 45 subsets, 12,261 at
+  X=2 across 529 edges -- so no seed choice can flatter it. Result: signed bias
+  ~1e-19 (exact unbiasedness to float precision, previously only bounded by a
+  4,000-seed test), MAE over all draws 2.1e-4 against the single seed's 2.0e-4,
+  and **zero** terminal children dropped by any support of any edge. Level B now
+  derives a distinct seed per root, shared by both arms, with 3 paired replicates
+  (600 comparisons).
+* **The vacuous survivor metric.** "Actions with visits > 0" cannot see an
+  elimination -- anything visited in round 1 keeps visits forever, which is why it
+  read 1.000 everywhere. The searcher now exports the candidate set at every
+  sequential-halving reduction. Capping changes an elimination in **1.8%** of
+  positions (X=2) against the re-seed control's **59.2%**.
+* **The X=3 KL anomaly** (mean above p95) was a heavy tail, now reported: p99
+  2.71, max 6.28. Source identified -- roots whose completed-Q span is ~0, where
+  min-max normalisation is degenerate. The control shows it worse.
 
-Everything is also conditional on the ~16% of cheap roots that carry a pure
-double-reveal edge at all.
+**Still open:** the control re-draws the Gumbel keys as well as the chance stream,
+so it perturbs strictly more than capping does and remains a *loose* upper bound
+on the noise floor. A tighter control needs a diagnostic chance stream, or matched
+RNG consumption, so that only the chance draw differs. Not built.
+
+**Throughput is geometry-dependent**: +7.4% at slots 16 (8 paired reps, CI
+[+5.5, +9.4]) and +14.5% at slots 24. And see §4.8: the batches are so far below
+the cap that fixing the scheduler is worth more than any further approximation.
+
+### 4.7 Per-seat routing for the strength gate (added 2026-07-26)
+
+The production gate deliberately passes no offsets, which left the proposed offset
+arena unroutable. `cheap_double_reveal_offsets_p0/_p1` now exist on
+`self_play_many_mock/_net/_flat_net`, mirroring `age_deal_samples_by_player`, so
+capped can play exhaustive on one shared checkpoint with seats swapped. Gated by
+`test_f4_boundary.py::test_cheap_double_reveal_offsets_route_per_seat_for_the_arena`,
+which also asserts the two seats are actually distinguished and that a one-sided
+setting is rejected.
+
+Two distinct questions, now separated in the plan (*Future tests 2* and *2c*):
+**search** strength (same net, capped vs exhaustive) and **learning** strength
+(train with capped generation, evaluate both checkpoints exhaustively). The second
+is the shipping gate; the first is a cheap precondition.
+
+### 4.8 Scheduler utilisation is the bigger prize (added 2026-07-26)
+
+Confirmed in code: `self_play.rs::run_many` creates one slot per job and never
+replaces a finished one, and `phase_d.py` submits fixed chunks of `rust_slots`
+games, so concurrency falls monotonically as each chunk drains -- 18-20% of
+slot-cycles in the Step 5 runs were completed-and-idle. Mean batch is 27 rows at
+slots 16 (38.5 at slots 24) against a `global_batch_cap` of **256**, i.e. ~1.6
+rows per slot.
+
+A rolling active-game pool plus a slot sweep past 24 would turn row savings into
+*eliminated* batches instead of thinner ones, at exact search semantics. Recorded
+as *Future test 2b* and recommended ahead of any further approximation scope.
 
 ## 5. Known limitations / out of scope
 
@@ -213,14 +291,17 @@ python -m games.seven_wonders_duel.f4_throughput_bench --mode rust \
   --python-workers 1 --cheap-double-reveal-offsets 2
 ```
 
-## 7. Sign-offs requested
+## 7. Sign-offs -- requested, and the 2026-07-26 resolution
 
-1. **Closure is complete** — no reachable path appends a child to, or re-expands,
-   a fixed-support edge (§4.1).
-2. **The RNG contract holds** and nothing depends on cross-config stream
-   identity (§4.2).
-3. **No `TARGET_VERSION` bump is needed** given full-move byte-identity plus
-   cheap-move policy exclusion (§4.4).
-4. **The flag cannot reach evaluation, the gate, or the advisor** (§4.5).
-5. **The evidence supports enabling `X = 2`** subject to an arena-strength gate —
-   or a statement of what additional measurement would be needed (§4.6).
+| # | Claim | Outcome |
+|---|---|---|
+| 1 | Closure is complete | **Was not.** `expand_exhaustive` and forced re-entry could corrupt a closed edge; both now refuse before mutating, with tests asserting the tree is unmutated (§4.1). |
+| 2 | RNG contract holds | **Signed off.** Replay and `chance_log` use the game RNG; cross-config search-stream identity is not required for correctness. It does contaminate the A/B, which §4.6 leaves open. |
+| 3 | No `TARGET_VERSION` bump | **Signed off.** Cheap moves are dropped from training by default and full-search target semantics are unchanged; the trajectory distribution moves but no retained label's definition does. |
+| 4 | The flag cannot reach evaluation | **Signed off with two additions**: a runtime `fixed_support_edges` metric replaces source inspection, and the Python generation backend -- which silently ignored the flag -- is now rejected outright (§4.5). |
+| 5 | Enable X = 2 | **Not yet, and not X = 2.** After the sigma and seed corrections, X = 3 dominates X = 2 on every quality metric while throughput cannot separate them, so X = 3 is the conservative default. Capping stays off until the same-net arena and the paired training A/B pass (*Future tests 2, 2c*). |
+
+Reviewer's closing judgement, recorded because it sets the priority: *"The core
+support estimator and closed-edge implementation look sound. The best next work is
+strengthening the measurement and filling GPU batches -- not expanding
+approximation scope."* The measurement work is done; the batch work is §4.8.

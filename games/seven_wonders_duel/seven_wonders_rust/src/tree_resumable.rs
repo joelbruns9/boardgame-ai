@@ -448,11 +448,14 @@ type EnumeratedChain = (Vec<Vec<usize>>, f64, Vec<Vec<i32>>);
 struct ForcedRows {
     nodes: Vec<NodeId>,
     by_kind: [usize; 4],
+    /// Root edges closed over an approximate support by this phase.
+    fixed_support_edges: usize,
 }
 
 impl ForcedRows {
     fn extend(&mut self, other: ForcedRows) {
         self.nodes.extend(other.nodes);
+        self.fixed_support_edges += other.fixed_support_edges;
         for (target, value) in self.by_kind.iter_mut().zip(other.by_kind) {
             *target += value;
         }
@@ -471,6 +474,7 @@ fn materialize_forced_root(
     let edge_count = arena.nodes[root_id].edges.len();
     let mut forced_nodes = Vec::new();
     let mut by_kind = [0_usize; 4];
+    let mut fixed_support_edges = 0_usize;
     // Keyed by chance signature: both the exhaustive enumeration and the
     // balanced support depend only on the signature, the (fixed) root state and
     // the search seed -- which is also what makes edges sharing a signature
@@ -484,6 +488,14 @@ fn materialize_forced_root(
         };
         if skip {
             continue;
+        }
+        if arena.nodes[root_id].edges[edge_idx].fixed_support {
+            // Re-entry with another seed would append members of a SECOND
+            // support and only fail at the closing mass check, with the tree
+            // already mutated. Refuse before touching anything.
+            return Err(PyRuntimeError::new_err(
+                "forced expansion re-entered an already-closed edge; a fixed                  support cannot be extended or replaced in place",
+            ));
         }
         let (state, action_index, specs) = {
             let root = &arena.nodes[root_id];
@@ -530,6 +542,28 @@ fn materialize_forced_root(
             ChanceKind::CardReveal
         };
         by_kind[metric_kind as usize] += enumerated.len();
+        // Validate before materializing: an evaluator or bound failure part-way
+        // through must not leave a half-built edge whose mass is neither 1 nor
+        // recoverable.
+        {
+            let edge = &arena.nodes[root_id].edges[edge_idx];
+            let held: f64 = edge
+                .children
+                .iter()
+                .map(|(_, child)| child.probability.unwrap_or(0.0))
+                .sum();
+            let incoming: f64 = enumerated
+                .iter()
+                .filter(|(_, _, key)| !edge.children.iter().any(|(k, _)| k == key))
+                .map(|(_, probability, _)| *probability)
+                .sum();
+            if (held + incoming - 1.0).abs() > 1e-9 {
+                return Err(PyValueError::new_err(format!(
+                    "force-expanded edge {action_index} would hold probability mass {} != 1",
+                    held + incoming
+                )));
+            }
+        }
         let action = decode_action(&state, action_index);
         for (outcomes, probability, key) in enumerated.iter().cloned() {
             if arena.nodes[root_id].edges[edge_idx]
@@ -558,6 +592,7 @@ fn materialize_forced_root(
             // A capped edge holds a re-normalised subset: close it, or ordinary
             // descent would append omitted outcomes and break the mass.
             arena.nodes[root_id].edges[edge_idx].close_fixed_support()?;
+            fixed_support_edges += 1;
             continue;
         }
         let mass: f64 = arena.nodes[root_id].edges[edge_idx]
@@ -581,6 +616,7 @@ fn materialize_forced_root(
     Ok(ForcedRows {
         nodes: forced_nodes,
         by_kind,
+        fixed_support_edges,
     })
 }
 
@@ -656,6 +692,7 @@ fn materialize_paired_age_deals(
     }
 
     let mut nodes = Vec::new();
+    let mut closed_age_edges = 0_usize;
     for edge_idx in age_edges {
         let action_index = arena.nodes[root_id].edges[edge_idx].action_index;
         let action = decode_action(&root_state, action_index);
@@ -678,10 +715,15 @@ fn materialize_paired_age_deals(
         // The empirical sample weights are the edge's whole support from here
         // on: closing it keeps later descents inside the sampled deals.
         arena.nodes[root_id].edges[edge_idx].close_fixed_support()?;
+        closed_age_edges += 1;
     }
     let mut by_kind = [0_usize; 4];
     by_kind[ChanceKind::AgeDeal as usize] = nodes.len();
-    Ok(ForcedRows { nodes, by_kind })
+    Ok(ForcedRows {
+        nodes,
+        by_kind,
+        fixed_support_edges: closed_age_edges,
+    })
 }
 
 // Sigma lives in `tree`: one min-max-normalised definition shared by the
@@ -701,6 +743,15 @@ pub struct SearchMetrics {
     pub cached_forced_leaves: usize,
     pub forced_outcome_rows: usize,
     pub forced_rows_by_kind: [usize; 4],
+    /// Root edges left holding an APPROXIMATE closed support. Evaluation and
+    /// gate runs require exact chance, so they can assert this is zero instead
+    /// of inspecting configuration plumbing by eye.
+    pub fixed_support_edges: usize,
+    /// Sequential-halving candidate sets (action indices) at the start of every
+    /// round, so a diagnostic can see WHICH actions survived each reduction.
+    /// "Actions with visits > 0" cannot: anything visited in round 1 keeps its
+    /// visits forever, so that set is insensitive to every later elimination.
+    pub halving_survivors: Vec<Vec<usize>>,
     pub root_completed_q: Vec<f64>,
 }
 
@@ -790,7 +841,8 @@ impl SearchSession {
         if candidates.is_empty() {
             candidates.push(0);
         }
-        let topk = candidates.iter().map(|&j| legal[j]).collect();
+        let topk: Vec<usize> = candidates.iter().map(|&j| legal[j]).collect();
+        let initial_survivors = topk.clone();
         let rounds_total = ((candidates.len().max(2) as f64).log2().ceil() as usize).max(1);
         let per_action = (cfg.sims / (rounds_total * candidates.len())).max(1);
         Self {
@@ -831,7 +883,10 @@ impl SearchSession {
             forced_nodes,
             forced_cursor: 0,
             forced_finalized: false,
-            metrics: SearchMetrics::default(),
+            metrics: SearchMetrics {
+                halving_survivors: vec![initial_survivors],
+                ..SearchMetrics::default()
+            },
         }
     }
 
@@ -873,6 +928,7 @@ impl SearchSession {
     fn set_forced_rows(&mut self, forced: ForcedRows) {
         self.forced_nodes = forced.nodes;
         self.metrics.forced_rows_by_kind = forced.by_kind;
+        self.metrics.fixed_support_edges = forced.fixed_support_edges;
         self.forced_finalized = false;
     }
 
@@ -905,6 +961,9 @@ impl SearchSession {
                 kb.partial_cmp(&ka).unwrap()
             });
             self.candidates.truncate((self.candidates.len() / 2).max(1));
+            self.metrics.halving_survivors.push(
+                self.candidates.iter().map(|&j| self.legal[j]).collect(),
+            );
         }
         self.round_index += 1;
         self.candidate_pos = 0;
@@ -1424,6 +1483,7 @@ pub fn search_closed_batched<E: Eval>(
     };
     let mut session = SearchSession::new(arena, cfg, leaf_batch, forced_nodes.nodes);
     session.metrics.forced_rows_by_kind = forced_nodes.by_kind;
+    session.metrics.fixed_support_edges = forced_nodes.fixed_support_edges;
     loop {
         match session.next_event()? {
             SearchEvent::Complete => break,

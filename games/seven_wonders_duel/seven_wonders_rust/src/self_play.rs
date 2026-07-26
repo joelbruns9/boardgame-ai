@@ -61,6 +61,9 @@ pub struct SelfPlayConfig {
     /// Step 3). Values large enough to retain the whole outcome space are
     /// no-ops, resolved per edge.
     pub cheap_double_reveal_offsets: usize,
+    /// Per-seat override, for the seat-mirrored search-strength arena: it must
+    /// be possible to play capped against exhaustive with one shared net.
+    pub cheap_double_reveal_offsets_by_player: Option<[usize; 2]>,
     pub bot_by_player: [Option<BotKind>; 2],
     pub bot_exploration: f64,
     pub bot_policy_iterations: i64,
@@ -402,7 +405,11 @@ pub fn run<E: Eval>(
             force_expand_root_chance: cfg.force_expand_root_chance,
             puct_root: cfg.puct_root,
             age_deal_samples: cfg.age_deal_samples,
-            double_reveal_offsets: cheap_offsets(cfg.cheap_double_reveal_offsets, full),
+            double_reveal_offsets: cheap_offsets(
+                cfg.cheap_double_reveal_offsets_by_player
+                    .map_or(cfg.cheap_double_reveal_offsets, |per_seat| per_seat[actor]),
+                full,
+            ),
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -466,6 +473,9 @@ pub struct SchedulerMetrics {
     pub ordinary_leaf_rows: usize,
     pub forced_cache_hits: usize,
     pub forced_rows_per_search: Vec<usize>,
+    /// Root edges closed over an APPROXIMATE support. Exact-chance runs (gates,
+    /// evaluation) assert zero.
+    pub fixed_support_edges: usize,
     pub max_batch_rows: usize,
     pub scheduler_cycles: usize,
     pub scheduler_workers: usize,
@@ -506,6 +516,7 @@ impl SchedulerMetrics {
         self.root_rows += other.root_rows;
         self.leaf_rows += other.leaf_rows;
         self.forced_rows += other.forced_rows;
+        self.fixed_support_edges += other.fixed_support_edges;
         self.ordinary_leaf_rows += other.ordinary_leaf_rows;
         self.forced_cache_hits += other.forced_cache_hits;
         for kind in 0..4 {
@@ -569,6 +580,7 @@ struct GameSlot {
     forced_rows_by_kind: [usize; 4],
     forced_cache_hits: usize,
     forced_rows_per_search: Vec<usize>,
+    fixed_support_edges: usize,
     tree_ns: u64,
     chance_ns: u64,
     record_ns: u64,
@@ -613,6 +625,7 @@ impl GameSlot {
             forced_rows_by_kind: [0; 4],
             forced_cache_hits: 0,
             forced_rows_per_search: Vec::new(),
+            fixed_support_edges: 0,
             tree_ns: 0,
             chance_ns: 0,
             record_ns: 0,
@@ -671,7 +684,11 @@ impl GameSlot {
                     .age_deal_samples_by_player
                     .map_or(self.cfg.age_deal_samples, |samples| samples[actor]),
                 double_reveal_offsets: cheap_offsets(
-                    self.cfg.cheap_double_reveal_offsets,
+                    self.cfg
+                        .cheap_double_reveal_offsets_by_player
+                        .map_or(self.cfg.cheap_double_reveal_offsets, |per_seat| {
+                            per_seat[actor]
+                        }),
                     full,
                 ),
             },
@@ -748,6 +765,7 @@ impl GameSlot {
             self.terminal_leaves += metrics.terminal_leaves;
             self.collisions += metrics.collisions;
             self.forced_rows += metrics.forced_outcome_rows;
+            self.fixed_support_edges += metrics.fixed_support_edges;
             for (target, value) in self
                 .forced_rows_by_kind
                 .iter_mut()
@@ -1126,6 +1144,7 @@ pub fn run_many<E: Eval>(
     metrics.terminal_leaves = slots.iter().map(|slot| slot.terminal_leaves).sum();
     metrics.collisions = slots.iter().map(|slot| slot.collisions).sum();
     metrics.forced_rows = slots.iter().map(|slot| slot.forced_rows).sum();
+    metrics.fixed_support_edges = slots.iter().map(|slot| slot.fixed_support_edges).sum();
     for kind in 0..4 {
         metrics.forced_rows_by_kind[kind] = slots
             .iter()
@@ -1357,6 +1376,7 @@ pub fn run_many_pipelined(
     metrics.terminal_leaves = slots.iter().map(|slot| slot.terminal_leaves).sum();
     metrics.collisions = slots.iter().map(|slot| slot.collisions).sum();
     metrics.forced_rows = slots.iter().map(|slot| slot.forced_rows).sum();
+    metrics.fixed_support_edges = slots.iter().map(|slot| slot.fixed_support_edges).sum();
     for kind in 0..4 {
         metrics.forced_rows_by_kind[kind] = slots
             .iter()

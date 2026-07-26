@@ -102,20 +102,48 @@ def test_a_constant_oracle_makes_the_capped_expectation_exact():
 
 
 def test_level_a_summary_aggregates_by_pool_and_back():
+    def cap(**overrides):
+        base = {
+            "retained": 22,
+            "q_error": 0.02,
+            "terminal_retained": 1,
+            "worst_gap": 0.0,
+            "supports": 2,
+            "mean_abs_error": 0.02,
+            "signed_bias": 0.0,
+            "worst_support_error": 0.03,
+            "all_errors": [0.02, -0.02],
+            "worst_gap_mean_over_supports": 0.0,
+            "worst_case_covered_fraction": 1.0,
+            "terminal_drops_over_supports": 0,
+        }
+        return base | overrides
+
     rows = [
         {
             "outcomes": 110,
             "same_back": True,
             "pool": 11,
             "terminal_children": 1,
-            "caps": {2: {"retained": 22, "q_error": 0.02, "terminal_retained": 1, "worst_gap": 0.0}},
+            "caps": {2: cap()},
         },
         {
             "outcomes": 40,
             "same_back": False,
             "pool": None,
             "terminal_children": 2,
-            "caps": {2: {"retained": 16, "q_error": -0.04, "terminal_retained": 0, "worst_gap": 0.5}},
+            "caps": {
+                2: cap(
+                    retained=16,
+                    q_error=-0.04,
+                    terminal_retained=0,
+                    worst_gap=0.5,
+                    all_errors=[-0.04, 0.04],
+                    worst_support_error=0.04,
+                    worst_case_covered_fraction=0.0,
+                    terminal_drops_over_supports=2,
+                )
+            },
         },
     ]
     summary = summarise_level_a(rows, [2])[2]
@@ -125,6 +153,14 @@ def test_level_a_summary_aggregates_by_pool_and_back():
     assert summary["terminal_children_dropped"] == 2
     assert summary["worst_case_covered"] == pytest.approx(0.5)
     assert summary["q_mae_by_back"] == {"same": pytest.approx(0.02), "mixed": pytest.approx(0.04)}
+    # Aggregates over EVERY support the construction can draw, not just the one
+    # a seed happened to pick.
+    assert summary["supports_enumerated"] == 4
+    assert summary["all_q_mae"] == pytest.approx(0.03)
+    assert summary["signed_bias_mean"] == pytest.approx(0.0)
+    assert summary["worst_support_error_max"] == pytest.approx(0.04)
+    assert summary["worst_case_covered_over_supports"] == pytest.approx(0.5)
+    assert summary["terminal_drops_over_supports"] == 2
 
 
 def test_decision_comparison_scores_agreement_and_the_cost_of_disagreeing():

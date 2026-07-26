@@ -1,10 +1,11 @@
 # Chance-node enumeration: measurement, design, and build plan
 
 **Status:** **Steps 1-5 done** -- built, quality-validated, throughput measured,
-and still off by default. The remaining gate is arena strength (*Future test 2*),
-which is what should decide whether `cheap_double_reveal_offsets=2` ships on.
-**Date:** 2026-07-25; mixed-back scope decision and Step 5 measurement
-2026-07-26.
+reviewed, and still off by default. Current evidence favours **X = 3**, not the
+X = 2 this plan originally guessed. The remaining gates are strength: a same-net
+search arena (*Future test 2*) and a paired training continuation (*2c*).
+**Date:** 2026-07-25; mixed-back decision, Step 5 measurement, and external
+review + corrections 2026-07-26.
 **Review brief:** `CHANCE_ENUMERATION_REVIEW_REQUEST.md` -- this document is the
 measurement and decision record; that one is what a reviewer should read first
 (scope, invariants, focus areas, sign-offs).
@@ -363,8 +364,9 @@ directed pairs = n * X            (exhaustive once X >= n-1)
 weight         = 1 / (n * X)      -> mass exactly 1
 ```
 
-* **Stratify on the first reveal**: every hidden card appears in first position
-  exactly once. This is the marginal-coverage guarantee.
+* **Stratify on the first reveal**: every hidden card leads exactly one
+  stratum, so it appears `X` times in first position (once per retained offset).
+  This is the marginal-coverage guarantee.
 * **Second reveal by cyclic block**: stratum *i* takes seconds `i + d` for `X`
   offsets `d` drawn from `1..n-1`, so every card also appears exactly `X` times
   in second position.
@@ -464,7 +466,8 @@ this class, and one flag keeps the closed-support rule in a single place.
 1. Build the `n * X` directed-pair support with the cyclic construction and the
    domain-separated offset seed.
 2. Rust mirror; the parameter must reach both scalar and resumable paths.
-3. Tests: every card once in first position and `X` times in second; offsets
+3. Tests: every card leading exactly one stratum (so `X` times in first
+   position) and `X` times in second; offsets
    drawn from `1..n-1` (never a self-pair); mass exactly 1 at several `n`, `X`;
    exhaustive once `X >= n-1`; **support identical for two edges sharing a
    chance signature** (common random numbers); Python/Rust equivalence.
@@ -574,66 +577,109 @@ with Level 0's 14.6% -- giving 556 such edges, **529 of them capped** (the 27
 different-back edges stay exhaustive). On the other 84% of roots the cap does
 nothing at all, so every number below is conditional on the cap applying.
 
-#### Level A -- edge Q error, analytic (no search, no seed noise)
+#### Level A -- edge Q error over EVERY support the construction can draw
 
 Evaluate the whole outcome space once, then compare the exact
-probability-weighted Q with the balanced support's Q. Values are on [-1, 1].
+probability-weighted Q against the capped Q. Because `n <= 11` the estimator's
+entire realization space is `C(n-1, X)` -- at most 45 subsets -- so this
+enumerates **all** of them rather than measuring whichever one a seed happened to
+draw (2026-07-26 review, finding 2). 529 edges, 12,261 supports at X=2. Values
+are on [-1, 1].
 
-| X | retained | Q MAE | Q p95 | Q max | worst outcome retained | terminal children dropped |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 15.7% | 3.7e-4 | 1.4e-3 | 1.2e-2 | 16.1% | **0** |
-| **2** | **31.4%** | **1.9e-4** | **7.8e-4** | 4.6e-3 | 32.5% | **0** |
-| 3 | 47.1% | 1.3e-4 | 5.0e-4 | 4.0e-3 | 51.4% | **0** |
+| X | retained | MAE (all draws) | p95 | p99 | max | worst draw/edge, mean | signed bias | worst outcome retained | terminals dropped |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 15.7% | 3.4e-4 | 1.4e-3 | 2.8e-3 | 1.2e-2 | 6.3e-4 | **7e-19** | 15.7% | **0** |
+| 2 | 31.4% | 2.1e-4 | 8.3e-4 | 1.6e-3 | 1.2e-2 | 5.3e-4 | **4e-19** | 31.4% | **0** |
+| **3** | **47.1%** | **1.6e-4** | **6.2e-4** | **1.2e-3** | 8.3e-3 | 3.6e-4 | **1e-19** | 47.1% | **0** |
 
-* **The error is two to three orders of magnitude below the Q differences that
-  decide a move.** The worst single edge of 529 is 1.2e-2, at X=1.
-* **No size trend** across pools 5-10; error is flat in `n`.
+* **Unbiasedness is now exact, not statistical.** Averaged over the whole
+  realization space the signed bias is ~1e-19 (max over edges 2.3e-16) -- float
+  noise. The earlier 4,000-seed test could only bound this.
+* **The single-seed figures were not flattering.** MAE over all draws (2.1e-4 at
+  X=2) matches the production seed's realization (2.0e-4). The review's
+  methodological objection was right; the original number survives it.
+* **Even the worst possible draw is small**: 5.3e-4 mean per edge at X=2, 1.2e-2
+  on the worst edge of 529.
+* **No terminal child is dropped by ANY support of ANY edge** -- zero across all
+  12,261 realizations, not merely the sampled one.
 * **Catastrophe coverage is exactly as narrow as the review said.** The single
-  worst outcome is retained at 16/33/51% for X=1/2/3 -- i.e. at the rate a
-  *random* subset of that size would retain it. Balanced coverage buys marginal
-  coverage, not pair coverage; it does not protect the specific worst pair. What
-  saves this in practice: **not one terminal child was dropped in 529 edges**,
-  and the mean shortfall between the worst retained outcome and the true worst
-  is 0.0070 / 0.0037 / 0.0023 for X=1/2/3.
+  worst outcome is retained at 15.7/31.4/47.1% for X=1/2/3 -- precisely the
+  retained fraction, i.e. what a *random* subset of that size would achieve.
+  Balanced coverage buys marginal coverage, not pair coverage.
 
 #### Level B -- decision impact through the production searcher
 
-200 positions, cheap budget (`sims=20`), force on. **The control is the point of
-this table**: re-running the *uncapped* search under a different seed shows how
-much disagreement ordinary search noise produces at this budget.
+200 roots x 3 paired seed replicates = 600 comparisons, cheap budget
+(`sims=20`), force on. Each root gets its **own** seed and both arms share it
+(2026-07-26 review, finding 2 -- the first version reused one seed for every
+root). **The control is the point of the table**: re-running the *uncapped*
+search under a different seed shows how much ordinary search noise moves the same
+quantities.
 
-| run | action disagreement | regret when disagreeing (mean / p95) | policy KL (mean / p95) | survivors | top-k identical |
-|---|---:|---:|---:|---:|---:|
-| control: seed only, no cap | **11.0%** | **0.126 / 0.524** | 0.246 / 1.362 | 0.985 | 15.5% |
-| X = 1 | 7.5% | 0.021 / 0.090 | 0.218 / 1.097 | 1.000 | 100% |
-| **X = 2** | **7.0%** | **0.017 / 0.082** | 0.138 / 0.257 | 1.000 | 100% |
-| X = 3 | 5.5% | -0.009 / 0.076 | 0.100 / 0.067 | 1.000 | 100% |
+| run | action disagreement | regret when disagreeing | policy KL mean / p99 | policy L1 | max Δsigma mean / max | endpoint moved | Δsigma > top-2 margin | halving round changed | final survivors changed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| control: seed only | **15.8%** | **0.060** | 0.343 / 5.78 | 0.244 | **1.393** / 6.40 | 25.8% | 37.5% | **59.2%** | **46.3%** |
+| X = 1 | 8.2% | 0.018 | 0.219 / 6.23 | 0.156 | 0.626 / 6.40 | 12.3% | 18.3% | 2.7% | 2.5% |
+| X = 2 | 6.5% | 0.013 | 0.125 / 3.05 | 0.111 | 0.457 / 6.40 | 9.2% | 15.5% | 1.8% | 1.7% |
+| **X = 3** | **4.8%** | **0.007** | **0.097** / 2.71 | 0.087 | **0.382** / 6.40 | 7.7% | 14.8% | **1.7%** | **1.5%** |
 
-* **Every capped run disagrees with the exhaustive search less often than the
-  exhaustive search disagrees with itself under a different seed**, and when it
-  does disagree it costs ~7x less: 0.017 of value at X=2 against 0.126 for the
-  control, judged by the exhaustive run's own completed Q. At X=3 the mean regret
-  is *negative* -- the capped run's pick was marginally better by the baseline's
-  own numbers, i.e. pure noise.
-* **Caveat, and it matters:** changing the seed also re-draws the Gumbel keys
-  (top-k identical: 15.5% for the control, 100% for every capped run), so the
-  control perturbs strictly more than the chance stream and is a **loose upper
-  bound** on the noise floor. The clean, seed-free evidence is Level A; Level B
-  says the decision-level effect is within a noise band whose true width is
-  somewhere below 11%.
-* Forced rows over these 200 (double-reveal-carrying) roots: 50,240 exhaustive →
-  22,524 / 26,776 / 31,028 at X=1/2/3. Best case by construction, since these
-  roots were selected for having the edges the cap targets.
+**The sigma arithmetic in the first review request was wrong, by three orders of
+magnitude.** It claimed a 1.9e-4 Q error lands as ~1e-3 in logit space by
+multiplying by `(c_visit + max_visits) * c_scale`. Sigma is
+`scale * (q - low) / span`, so the perturbation is *divided by the completed-Q
+span*. Measured: mean max-Δsigma is **0.457** at X=2, and on near-tied roots it
+saturates the entire 6.40 sigma range. In 15.5% of positions it exceeds the logit
+margin between the best two actions. The claim is retracted; these numbers
+replace it.
 
-#### Verdict
+**What survives the correction is the comparison, not the bound.** On every
+decision-level metric the cap perturbs the search *less* than re-seeding it does:
+Δsigma 0.46 vs 1.39, KL 0.125 vs 0.343, disagreement 6.5% vs 15.8%, and regret
+0.013 vs 0.060 when it does disagree.
 
-**Approximation quality is not the blocker; X = 2 is safe to sweep for
-strength.** The residual risk is worst-case *pair* coverage, which the balanced
-construction does not address and which no terminal outcome exercised here.
-Step 5 has since shown the saved rows do convert (+7.4% games/s at the pinned
-geometry, +14.5% with concurrency raised). The one thing still unproven is that
-strength holds up over whole games (*Future test 2*) -- capping stays off by
-default until that lands.
+**Per-round survivors are now measured, and they are the strongest evidence.**
+The old "actions with visits > 0" metric was near-vacuous: anything visited in
+round 1 keeps visits forever, so it cannot see an elimination (it read 1.000
+everywhere). The searcher now exports the candidate set at every sequential-
+halving reduction. Capping changes an elimination in **1.8%** of positions
+(X=2) against the control's **59.2%**, and the final survivor set in 1.7% against
+46.3% -- a ~30x gap.
+
+**Heavy tails are real and shared.** KL p99 is 3.05 (X=2) against the control's
+5.78, with a maximum near the sigma range in both. The source is roots whose
+completed-Q span is ~0, where min-max normalisation is degenerate and *any*
+perturbation saturates. That pathology is a property of sigma at near-tied roots,
+not of capping: the control shows it worse.
+
+Forced rows across the 600 searches: 150,720 exhaustive -> 67,572 / 80,328 /
+93,084 at X=1/2/3.
+
+#### Verdict (revised after the 2026-07-26 review)
+
+**Approximation quality is not the blocker, but the evidence points at X = 3,
+not X = 2.** X=3 dominates X=2 on every quality metric measured -- Q MAE 1.6e-4
+vs 2.1e-4, action disagreement 4.8% vs 6.5%, regret 0.007 vs 0.013, max Δsigma
+0.38 vs 0.46, KL 0.097 vs 0.125 -- while the throughput sweep cannot separate
+them (X=2 retains 53% of forced rows, X=3 62%, and games/s differ by less than
+the repetition noise). "X=2" was the plan's original middle-of-the-range guess,
+never an empirically selected optimum. **From current evidence the conservative
+default is X = 3**, and X=2 should be adopted only if a strength or throughput
+advantage is actually demonstrated.
+
+Two residual risks, both documented rather than fixed:
+
+* **Worst-case pair coverage.** The single worst outcome is retained only at the
+  rate a random subset would (47% at X=3). No terminal child is dropped by any
+  support of any edge, which is why this was accepted.
+* **Degenerate-span roots.** Where completed Q is nearly tied, sigma's min-max
+  normalisation amplifies any perturbation to the full range. The control shows
+  this is a property of the transform, not of capping, but it means a *bound* on
+  the logit effect cannot be stated -- only the comparison against re-seeding.
+
+Step 5 shows the saved rows do convert (+7.4% games/s at the pinned geometry,
++14.5% with concurrency raised). The remaining gate is strength: a same-net
+search arena first, then a short paired training continuation (*Future tests 2
+and 2c*). Capping stays off by default until those land.
 
 ### Step 5 -- measure real throughput -- **DONE 2026-07-26**
 
@@ -793,23 +839,63 @@ At a fixed budget, is it better to spend on exact root chance or on depth?
 `--eval-search-mode puct`. Nothing measured so far bears on this, and it decides
 strength per unit compute. ~90 minutes.
 
-### 2. Offset sweep -- now the ONLY gate left before capping can ship on
+### 2. Search-strength arena (same net, seats mirrored)
 
-X in {1, 2, 3} against **arena strength**, using the Step 4 quality metrics as
-the leading indicator. Throughput and quality are both measured and neither
-separates X=1/2/3: the games/hour differences are inside the noise, and quality
-improves monotonically with X while all three are ~1e-4 in Q error. So strength
-decides, and it is the only thing still unmeasured. Run it against the banked
-`current_best.pt` with `--cheap-double-reveal-offsets` on the generation side
-only, X=2 first (the middle of the range, +7.4-14.5% games/s).
+**Routable as of 2026-07-26**: `cheap_double_reveal_offsets_p0/_p1` on
+`self_play_many_mock/_net/_flat_net` set the cap per seat, so capped can play
+exhaustive on ONE checkpoint with seats swapped. The production gate still passes
+no offsets, deliberately -- an arena that capped both sides would measure nothing.
 
-### 2b. Re-tune concurrency WITH the cap on
+This answers *search* strength only. It does **not** establish training-data
+quality; see 2c.
+
+Judge it against a deeper exhaustive PUCT oracle as well as head-to-head results.
+Ranking the two arms by the 20-simulation baseline's own completed Q -- which is
+what Step 4's regret metric does -- is weak evidence, because that Q is exactly
+the noisy quantity under test.
+
+### 2b. Re-tune concurrency WITH the cap on -- highest-value throughput work
 
 Step 5 found the two knobs interact: the same 18.5% row cut is worth +7.4% at
 slots 16 and +14.5% at slots 24, because more concurrency refills batches instead
-of thinning them. The slots/`global_batch_cap`/in-flight geometry was tuned
-against uncapped generation and should be re-swept once capping is on -- the
-optimum has moved. `f4_frontier.py` already exists for this.
+of thinning them. But the deeper problem is that **batches are nowhere near the
+cap**: mean 27 rows at slots 16 and 38.5 at slots 24 against a
+`global_batch_cap` of 256, i.e. ~1.6 rows per slot, so no plausible slot count
+fills a batch by itself.
+
+The structural cause, confirmed in the code (2026-07-26 review, finding 6):
+`self_play.rs::run_many` creates **one slot per job and never replaces a
+finished one**, and `phase_d.py` submits fixed chunks of `rust_slots` games. As a
+chunk drains, concurrency falls monotonically to zero -- 18-20% of slot-cycles in
+the Step 5 runs were completed-and-idle. Ordered by expected value:
+
+1. a rolling active-game pool that starts a new game the moment one completes
+   (accept `jobs > slots` in `run_many` rather than chunking in Python);
+2. a slot sweep well past 24 -- 32/48/64 -- given peak GPU memory of ~51MB;
+3. re-tune `max_inflight_batches` and scheduler workers with the cap on;
+4. instrument active-slot count and rows/batch against game progress, especially
+   each chunk's final quartile;
+5. token-count bucketing if padding grows with concurrency.
+
+All of these preserve exact search semantics, and they turn row savings into
+*eliminated* batches rather than thinner ones. **This is worth more than
+extending the approximation** (product chains, full moves) and should come first.
+
+### 2c. Learning-strength A/B -- the actual shipping gate
+
+A search arena cannot show whether capped generation produces worse training
+data. The shipping test is a short paired continuation:
+
+```
+same starting checkpoint
+same generated-game budget (and separately, same wall-clock budget)
+X = 0 versus X = 3 generation only
+ALL evaluation exhaustive
+```
+
+The wall-clock variant is the one that matters if the point is throughput: it
+asks whether the extra games bought by capping are worth more than their
+individual quality loss.
 
 ### 3. One-ply Great Library resolver (was "collapse")
 
