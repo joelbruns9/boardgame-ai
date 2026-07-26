@@ -1,7 +1,8 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured; design revised after review; **Steps 1-3 built
-(2026-07-25), off by default**; Steps 4-5 (quality + throughput) outstanding.
+**Status:** measured; design revised after review; **Steps 1-4 done
+(2026-07-25)** -- built, quality-validated, and still off by default; Step 5
+(real throughput) outstanding.
 **Date:** 2026-07-25.
 
 ## The problem
@@ -541,7 +542,7 @@ a full move always passes 0.
   validation rejects negatives, and the flag reaches the generation call and not
   the gate call. Full suite green (455 tests).
 
-### Step 4 -- validate approximation quality, not just throughput
+### Step 4 -- validate approximation quality, not just throughput -- **DONE 2026-07-25**
 
 Mean-unbiasedness is not sufficient. On the replay corpus, compare capped
 against exhaustive root output:
@@ -551,6 +552,87 @@ against exhaustive root output:
 * Gumbel top-k survivor disagreement;
 * policy-target KL divergence;
 * missed terminal / catastrophe outcomes.
+
+**Tool:** `chance_cap_quality.py` (gated by `test_chance_cap_quality.py`).
+Regenerate with:
+
+```
+python -m games.seven_wonders_duel.chance_cap_quality \
+  --buffer runs/laptop_training_10h_02/buffer_final.jsonl \
+  --checkpoint runs/laptop_training_10h_02/checkpoints/latest.pt \
+  --games 150 --roots 200 --offsets 1 2 3
+```
+
+**Corpus:** run 02's buffer, `latest.pt`. 1,245 cheap searched decisions
+examined, of which **200 (16%) carry a pure double-reveal edge** -- consistent
+with Level 0's 14.6% -- giving **556 capped edges**. On the other 84% of roots
+the cap does nothing at all, so every number below is conditional on the cap
+applying.
+
+#### Level A -- edge Q error, analytic (no search, no seed noise)
+
+Evaluate the whole outcome space once, then compare the exact
+probability-weighted Q with the balanced support's Q. Values are on [-1, 1].
+
+| X | retained | Q MAE | Q p95 | Q max | mixed-back MAE | worst outcome retained | terminal children dropped |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 15.8% | 4.1e-4 | 1.5e-3 | 1.8e-2 | 1.2e-3 | 16.4% | **0** |
+| **2** | **31.7%** | **2.2e-4** | **8.1e-4** | 1.3e-2 | 9.1e-4 | 32.9% | **0** |
+| 3 | 47.5% | 1.4e-4 | 5.1e-4 | 4.1e-3 | 2.5e-4 | 51.6% | **0** |
+
+* **The error is two to three orders of magnitude below the Q differences that
+  decide a move.** Even the worst single edge in 556 is 1.8e-2 at X=1.
+* **No size trend** across pools 5-10 (X=2 MAE ranges 3.0e-5 to 4.5e-4); the
+  worst bucket is by signature, not size.
+* **Mixed-back edges are 3-4x worse than same-back** (9.1e-4 vs 3.7e-4 at X=1),
+  which is what the weaker second-position guarantee predicts -- the generalised
+  cycle balances second position only to within one. Still negligible in absolute
+  terms.
+* **Catastrophe coverage is exactly as narrow as the review said.** The single
+  worst outcome is retained at 16/33/52% for X=1/2/3 -- i.e. at the rate a
+  *random* subset of that size would retain it. Balanced coverage buys marginal
+  coverage, not pair coverage; it does not protect the specific worst pair. What
+  saves this in practice: **not one terminal child was dropped in 556 edges**,
+  and the mean shortfall between the worst retained outcome and the true worst
+  is 0.0068 / 0.0035 / 0.0022 for X=1/2/3.
+
+#### Level B -- decision impact through the production searcher
+
+200 positions, cheap budget (`sims=20`), force on. **The control is the point of
+this table**: re-running the *uncapped* search under a different seed shows how
+much disagreement ordinary search noise produces at this budget.
+
+| run | action disagreement | regret when disagreeing (mean / p95) | policy KL (mean / p95) | survivors | top-k identical |
+|---|---:|---:|---:|---:|---:|
+| control: seed only, no cap | **11.0%** | **0.126 / 0.524** | 0.246 / 1.362 | 0.985 | 15.5% |
+| X = 1 | 8.5% | 0.018 / 0.084 | 0.219 / 1.097 | 1.000 | 100% |
+| **X = 2** | **8.0%** | **0.015 / 0.075** | 0.139 / 0.257 | 1.000 | 100% |
+| X = 3 | 6.0% | -0.008 / 0.071 | 0.101 / 0.140 | 1.000 | 100% |
+
+* **Every capped run disagrees with the exhaustive search less often than the
+  exhaustive search disagrees with itself under a different seed**, and when it
+  does disagree it costs ~8x less: 0.015 of value at X=2 against 0.126 for the
+  control, judged by the exhaustive run's own completed Q. At X=3 the mean regret
+  is *negative* -- the capped run's pick was marginally better by the baseline's
+  own numbers, i.e. pure noise.
+* **Caveat, and it matters:** changing the seed also re-draws the Gumbel keys
+  (top-k identical: 15.5% for the control, 100% for every capped run), so the
+  control perturbs strictly more than the chance stream and is a **loose upper
+  bound** on the noise floor. The clean, seed-free evidence is Level A; Level B
+  says the decision-level effect is within a noise band whose true width is
+  somewhere below 11%.
+* Forced rows over these 200 (double-reveal-carrying) roots: 50,240 exhaustive →
+  21,732 / 26,142 / 30,552 at X=1/2/3. Best case by construction, since these
+  roots were selected for having the edges the cap targets.
+
+#### Verdict
+
+**Approximation quality is not the blocker; X = 2 is safe to sweep for
+strength.** The residual risk is worst-case *pair* coverage, which the balanced
+construction does not address and which no terminal outcome exercised here.
+What remains unproven is that the saved rows convert into throughput (Step 5)
+and that strength holds up over whole games (Future test 2) -- capping stays off
+by default until both land.
 
 ### Step 5 -- measure real throughput
 
