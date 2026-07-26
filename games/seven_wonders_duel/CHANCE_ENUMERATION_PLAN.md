@@ -857,10 +857,13 @@ the noisy quantity under test.
 ### 2b. Scheduler and batch-fill work -- see `THROUGHPUT_ACTION_PLAN.md`
 
 Moved to its own document, because the Step 5 measurements turned it from a
-footnote into the main throughput programme: a rolling active-game pool, exact
-cheap-move leaf batching (measured bit-identical to `leaf_batch=1` at cheap
-budgets), then a slots sweep. Capping's own value should be re-measured after
-that work, since the two interact in both directions. Summary of the case:
+footnote into the main throughput programme: instrumentation first (the Step 5
+timers cannot separate host dispatch from device execution, and the benchmark
+cannot exercise slot refill), then a rolling active-game pool, then conflict-free
+leaf waves, then a joint slots/cap sweep. Capping's own value should be
+re-measured after that work, since the two interact in both directions -- it
+touches only the per-row share and it makes batches thinner. Summary of the
+case:
 
 Step 5 found the two knobs interact: the same 18.5% row cut is worth +7.4% at
 slots 16 and +14.5% at slots 24, because more concurrency refills batches instead

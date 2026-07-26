@@ -1,184 +1,258 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26. **Status:** nothing built yet; ordering and gates agreed.
-**Context:** `CHANCE_ENUMERATION_PLAN.md` Step 5 measured where the time goes
-while A/B-ing chance capping. Those numbers say the remaining wins are in the
-scheduler, not in more approximation.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** nothing built.
+**Rev 2 changed the ordering**: instrumentation now precedes all implementation,
+because the review showed the plan's own gates could not have measured its own
+work. Several rev-1 claims are withdrawn below rather than quietly edited.
 
-## The finding this all rests on
-
-**A GPU forward costs ~7.3 ms per batch almost regardless of how many rows are
-in it.**
-
-| slots | rows/batch | ms/batch | µs/row |
-|---|---:|---:|---:|
-| 16 | 27.0 | 7.27 | 270 |
-| 24 | 38.5 | 7.46 | 194 |
-
-Rows per batch rose 43%; per-batch cost rose 2.6%. The forward is latency-bound:
-~7.2 ms fixed + ~16 µs/row. We pay full price for batches 11% full (27 of a
-256 cap).
-
-Wall-clock split at slots 16 (44.3 s per 16-game repetition):
-
-| | share | scales with |
-|---|---:|---|
-| GPU forward | 58% | **batch count** |
-| Python adapter overhead (inside `pyo3_call`, beyond its sub-timers) | 6.5% | **batch count** |
-| `gather_d2h` | 15% | rows (72 µs/row) |
-| `encode_pack` | 8% | rows (39 µs/row) |
-| `pyo3_tensor` + `h2d` | 6% | rows (28 µs/row) |
-| Rust tree + chance | 2% | tree work |
-
-**≈65% per-batch, ≈29% per-row.** The taxonomy predicts the capping result
-(18.5% fewer rows × 29% ≈ 5.4%, plus tree savings; measured 6.9% wall) which is
-why it is trusted to rank the work. It also sets a ceiling: **every
-row-reduction idea is competing for a share of 29%.** Batch-count reduction
-attacks 65%.
-
-Two structural causes, both confirmed in code:
-
-1. `self_play.rs::run_many` creates **one slot per job and never replaces a
-   finished one**; `phase_d.py` submits fixed chunks of `rust_slots` games. Each
-   chunk's concurrency decays monotonically to zero — 18-20% of slot-cycles in
-   the Step 5 runs were completed-and-idle.
-2. `leaf_batch=1` in production, so each game contributes **one row per wave**.
-   16 slots therefore produce ~16-row leaf batches.
+Context: `CHANCE_ENUMERATION_PLAN.md` Step 5 measured where generation time goes
+while A/B-ing chance capping. Those numbers still say the remaining wins are in
+the scheduler and the boundary, not in more approximation — but they say it less
+precisely than rev 1 claimed.
 
 ---
 
-## Item 1 — rolling active-game pool
+## 0. Ledger: what is measured, what is inferred, what is withdrawn
 
-**Why first:** it is structural, and the drain tail does not merely cost
-throughput, it *contaminates* every measurement we would use to tune anything
-else. "Mean batch 27" is an average over a concurrency profile decaying from 16
-live games to 1, so a slots/inflight sweep run today measures a blend of
-well-fed and starving regimes and its optimum need not be the real one.
+### Measured and trustworthy
 
-**Development.** Accept `jobs > slots` in `run_many` / `run_many_pipelined`:
-keep an active window of `slots` games and start the next queued game the moment
-one completes. `phase_d.py` then stops chunking and passes the whole group.
+| fact | value | source |
+|---|---|---|
+| per-batch cost is ~flat in rows | 7.27 ms at 27 rows/batch, 7.46 ms at 38.5 | Step 5 paired A/B |
+| batch fill is far below the cap | mean 27 rows (slots 16), 38.5 (slots 24), cap **256** | same |
+| `run_many` never replaces a finished slot | one `GameSlot` per job; `phase_d` chunks by `rust_slots` | `self_play.rs:990`, `phase_d.py:1161` |
+| chance capping | +7.4% games/s (slots 16), +14.5% (slots 24) | Step 5 |
+| baseline | 1,301 games/hour, 58% "GPU busy", 12% padding | Step 5 |
+| conflict-free leaf-wave width, real corpus | **2.58** cheap / **2.03** full | corpus replay, 3,892 decisions |
+| cheap moves with `per_action == 1` in round 1 | **49%** | same |
+| leaf waves per search under the conflict rule | 20 → **8.0** cheap (2.5×), 96.6 → 47.8 full (2.0×) | same |
+| decisions with ≤ 4 legal actions | **52%** | same |
+| the eval worker is single-threaded and does not merge requests | `recv()` one at a time | `eval.rs:723` |
 
-**The risk to design around:** `run_many` returns records positionally and sets
-`metrics.games = slots.len()`. A pool needs explicit slot↔job bookkeeping to
-preserve input order. Per-game determinism is *not* at risk — each game keeps
-its own seed and its own search session, independent of what else is in flight.
+### Inferred, not yet established
 
-**Tests.**
+* **The 7.3 ms is probably host dispatch, not device execution.** `_sync()` is a
+  no-op unless `--diagnostic-sync` is passed (`rust_bridge.py:182`), which the
+  Step 5 runs did not pass — so `forward_seconds` times an *asynchronous*
+  enqueue and the real device wait lands later, in the blocking `.cpu()`.
+  Independent plausibility check: 27 rows × ~60 tokens through a 4-layer d128
+  transformer is tens of microseconds of compute, not 7 ms. **The per-batch
+  dominance conclusion survives; its attribution does not.**
+* Wall-clock shares below are **timer categories, not device attribution**:
+  "forward" 58%, gather+D2H 15%, `encode_pack` 8%, tensor+H2D 6%, tree 2%.
+* Per-row costs (these are safe, they scale with rows either way): `gather_d2h`
+  **72 µs/row**, `encode_pack` 39, `pyo3_tensor` 21, `h2d` 7 — ~29% of wall.
 
-* Records are **byte-identical** to the chunked path for the same seeds. This is
-  the real gate: a pool may change only the schedule, never a game's result.
-* Every existing F4 gate stays green (digest equality, `self_play_many_mock`
-  determinism, replay).
-* Active-slot count stays at `min(slots, jobs_remaining)` until the queue drains.
-* `scheduler_idle_slot_cycles` falls to ~0 outside the final window.
+### Withdrawn from rev 1
 
-**Expected:** removes the 18-20% idle slot-cycles and holds rows/batch at its
-well-fed value instead of averaging down.
-
----
-
-## Item 2 — cheap-only leaf batching
-
-**New evidence (2026-07-26).** Leaf batching is **already bit-identical** to
-`leaf_batch=1` at cheap budgets. 144 comparisons over 6 positions, checking
-action, visits, policy target and the full canonical digest:
-
-| sims | `leaf_batch` 2/4/8/16 vs 1 |
+| claim | why |
 |---|---|
-| **20** (cheap) | **48/48 bit-identical** |
-| 64 | policy target differs (action occasionally) |
-| 128 | visits and action differ |
+| "~1.7× on games/hour" | two-point fit of a mis-attributed timer |
+| "GPU busy > 0.85 → GPU-bound, stop" | `gpu_busy_fraction` is `forward_seconds / wall` with no synchronisation — a host timer |
+| "each game contributes 16 rows per wave" | measured mean width is **2.58** |
+| "leaf waves 20 → 2" | measured **20 → 8** |
+| "at cheap budgets the conflict condition never triggers" | false for **51%** of cheap moves; `candidates = min(top_k, n_legal)` and most positions have few legal actions |
+| "18% of capacity lost to idle slots" | `scheduler_idle_slot_cycles` counts loop iterations, not time |
+| "re-run the A/B at 16 games / 16 slots" | `jobs == slots` cannot refill; the gate would have measured nothing |
 
-The mechanism is `per_action`, recomputed after every halving reduction:
+### The correction that matters most
 
-```
-per_action = max((sims - completed) / (rounds_remaining * candidates), 1)
-```
-
-| | round 1 | after 1st reduction |
-|---|---|---|
-| sims=20 | 16 × 1 | (20−16)/(3×8) = 0 → **1** |
-| sims=64 | 16 × 1 | (64−16)/(3×8) = **2** |
-| sims=128 | **2** | 4 |
-
-While `per_action == 1`, consecutive simulations go to *different* root
-candidates and waves are cut at round boundaries, so every in-flight leaf sits
-in a different subtree and the WU virtual loss never perturbs a selection that
-matters. At `per_action >= 2` two in-flight leaves share a subtree and the
-approximation begins to bias the deeper descent. **The known leaf-batch quality
-loss is confined to the deep halving rounds; it is not inherent to batching.**
-
-**Development.** One rule: **cut the wave before any simulation that would enter
-a subtree already in flight.** At cheap budgets the condition never triggers, so
-`leaf_batch` up to `top_k` is exact; in deeper rounds the wave shrinks
-automatically — the taper, falling out of the invariant rather than being
-configured.
-
-**Tests.**
-
-* Promote the ad-hoc experiment to a gate: `leaf_batch ∈ {2,4,8,16}` is
-  bit-identical to 1 at cheap budgets, force on and off.
-* **Stronger claim to check after the rule lands:** *every* budget becomes
-  bit-identical, because the rule forces waves of 1 wherever
-  `per_action >= 2`. If that holds, leaf batching needs no quality gate at all.
-* Assert the invariant directly (no two in-flight simulations share a root
-  candidate), not just its consequence.
-* `leaf_waves` per cheap search drops ~`leaf_batch`× (~20 → ~2).
-
-**Expected:** each game contributes 16 rows per wave instead of 1, so 16 slots
-reach the 256-row cap. This is probably the single largest lever, and it is
-exact.
+Rev 1 said leaf-batch quality loss was confined to deep halving rounds at full
+budgets. Corpus measurement says **51% of cheap moves already start with
+`per_action ≥ 2`**, because half of all decisions have ≤ 4 legal actions. So
+today's `leaf_batch > 1` is unsafe on the *majority* case, which is the likeliest
+explanation of the quality degradation previously measured — and it makes the
+conflict-free rule the fix for that majority rather than a refinement for the
+tail. The rev-1 bit-identity result (48/48 at `sims=20`, `leaf_batch` 2/4/8/16)
+is real but was measured on six mid-Age-I positions with 12–18 legal actions,
+i.e. the unrepresentative half.
 
 ---
 
-## Item 3 — slots sweep 32 / 48 / 64
+## Phase 0 — instrumentation (blocks everything else)
 
-Only after 1 and 2, so it measures a scheduler that stays fed and produces wide
-waves. GPU headroom is large (peak 51 MB); the unknown is host memory per live
-game tree, which the sweep finds. Use `f4_throughput_bench.py --mode rust` (one
-output directory per configuration) and `f4_frontier.py` to analyse.
+Without this we cannot tell success from noise, and one outcome could reroute the
+whole programme.
+
+1. **Make the benchmark able to exercise refill.** Remove Python-side chunking in
+   `f4_throughput_bench.py` and submit `jobs >> slots` in one Rust call — at
+   least 8–16 windows (128–256 games at 16 slots). Report **steady state and
+   final drain separately**; a single mean over both is what produced "27 rows".
+2. **Separate the four times.** CPU enqueue, device execution, synchronisation,
+   transfer — CUDA events around the forward, plus `--diagnostic-sync` runs as a
+   cross-check and sampled NVML utilisation. Retire `gpu_busy_fraction` as a
+   decision input.
+3. **Time-weight the scheduler metrics.** Integrate live-slot count over wall
+   time and record live slots per batch, instead of counting loop iterations.
+4. **Fix memory telemetry.** CUDA peak *reserved* (not allocated), sampled RSS,
+   and Rust arena nodes/bytes per active game — the last is what bounds
+   `max_active_slots`.
+5. **Controlled batch-size / token-length sweep** with a fixed evaluator and no
+   search: rows ∈ {1, 8, 27, 64, 128, 256} × representative token lengths. This
+   is what actually establishes the per-batch/per-row cost model.
+
+**Exit criteria.** A cost model of the form *(fixed per batch, marginal per row,
+marginal per token)* with device and host separated, plus a benchmark whose
+steady-state window is at least 4× the drain window.
+
+**Branch immediately after Phase 0:**
+
+| what Phase 0 shows | consequence |
+|---|---|
+| the ~7.3 ms is mostly **host dispatch** | add CUDA graphs / `torch.compile` / static-shape buckets / `inference_mode` / buffer reuse as **Phase 3b**, and consider it *before* Phase 4 — it may substitute for much of the concurrency work |
+| the ~7.3 ms is mostly **device execution** | batch widening is the only lever; Phases 1–2 keep their priority and Phase 3b is dropped |
+| per-row costs already dominate at 27 rows | Phase 3 moves ahead of Phase 1 |
 
 ---
 
-## Decision gates and conditional work
+## Phase 1 — bounded rolling active-game pool
 
-Re-run the paired A/B (8 repetitions, slots 16) after items 1+2, then branch:
+**Why before the sweeps:** the drain tail does not merely cost throughput, it
+*contaminates* the measurements used to tune everything else. Mean batch 27 is an
+average over concurrency decaying from 16 live games to 1, so a slots/cap sweep
+run against it measures a blend of well-fed and starving regimes.
 
-| observation | conclusion | next |
+**Development.**
+
+* `run_many` / `run_many_pipelined` accept `jobs >> slots` with an explicit
+  **`max_active_slots`** parameter, distinct from job count.
+* Queued jobs stay **lightweight** (seed + config); instantiate `GameSlot` only
+  on activation, since `GameSlot::new` builds game state eagerly.
+* The slot budget is **global**, not per scheduler worker.
+* `phase_d.py` stops chunking and passes the whole group.
+* Records must return in **input order**, independent of completion order.
+
+**Two gates, because byte identity is not available on the net path.**
+
+| evaluator | gate | rationale |
 |---|---|---|
-| rows/batch > 100 **and** games/s up | producer fixed | Item 3, then re-measure capping |
-| rows/batch still < 50 | the **coalescer** is the limit, not the producer | instrument `EvalWorker` batch assembly: are waves arriving but not merging? |
-| GPU busy > 0.85 | GPU-bound at last | stop; further work needs a faster net or lower precision |
-| padding > 20% | wide batches now mixing token counts | token-count bucketing |
-| cpu_util ~0.5 **and** GPU busy < 0.75 | host-side serialisation | `max_inflight_batches` and worker sweep — but first explain the historical pathology where 7 python workers *dropped* mean batch to 5.2 rows and halved games/s |
-| per-row share now dominates | expected by construction: cutting batch count raises the per-row share | attack `gather_d2h` (72 µs/row): GPU-side fused gather then a single D2H, pinned memory, narrower dtypes |
+| **Mock** | records **byte-identical** to the chunked path for the same seeds | proves scheduler semantics; nothing but the schedule changed |
+| **Real net** | (a) row-wise output invariance across batch shapes, then (b) measured record/action divergence | `self_play.rs:1402` already documents that batch-shape sensitivity can change search choices through CUDA float ties |
 
-**Optional, only if its gate opens:**
+If (a) fails, the choice is explicit: enforce batch-invariant inference, or
+classify rolling as a **numerical refactor** needing a strength/non-regression
+gate rather than an identity gate.
 
-* **Full-move leaf batching (round-robin reorder).** If full moves remain a
-  batch-count bottleneck after Item 2, reorder the schedule round-robin within a
-  round so no two in-flight leaves ever share a subtree. Sequential halving does
-  not care about order within a round, so it is sound — but it permutes RNG
-  consumption and therefore changes full-move outputs, so it needs an arena
-  justification of its own. Not worth it unless the measurement asks.
+Plus: every existing F4 gate stays green; active slots hold at
+`min(max_active_slots, jobs_remaining)`; time-weighted live-slot occupancy rises.
+
+---
+
+## Phase 2 — conflict-free leaf waves
+
+**Rule:** never allow two in-flight simulations in the same root candidate's
+subtree — drain before selecting a candidate already represented in the pending
+wave. The taper falls out of the invariant rather than being configured.
+
+**Realistic expectation, from the corpus:** wave width **2.58** cheap / 2.03
+full, giving **2.5× / 2.0× fewer leaf batches**. Not the 10× rev 1 implied.
+Because the rule preserves scalar order, it also batches adjacent simulations
+from *different* candidates during repeated-candidate phases — which is where the
+width-2 mode comes from — so no RNG-changing reordering is required.
+
+**Gates.**
+
+* Bit-identity to `leaf_batch=1` across a **stratified corpus**: all
+  `sims ∈ 16..24` and full budgets, stratified by legal count (≤2, 3–4, 5–8,
+  9–16, >16), not just wide mid-Age positions.
+* **The strong claim to test:** with the rule in place, *every* budget and every
+  stratum should be bit-identical, because the rule forces a cut wherever a
+  candidate would repeat. If that holds, leaf batching needs no quality gate at
+  all. If it fails anywhere, the failing stratum names the mechanism.
+* Assert the invariant directly (no two in-flight sims share a root candidate),
+  not merely its consequence.
+* Instrument the **realized wave-width distribution** in production runs; do not
+  infer it from `top_k`.
+
+---
+
+## Phase 3 — vectorise the legal-policy gather
+
+**Moved ahead of the sweeps, for a dependency reason.** `rust_bridge.py:267` runs
+a Python loop calling `torch.softmax` **once per row**. At 27 rows that is
+1.9 ms/batch against 7.3 ms for the forward; it grows linearly with rows while
+the per-batch cost is flat, so it overtakes the forward somewhere near 100 rows.
+Widening batches before fixing it would convert the current 65/29 split into a
+gather-dominated one and make Phase 4 measure a pipeline that degrades as it
+widens.
+
+**Development.** Padded masked softmax or a segmented softmax over the compacted
+logits, compaction on GPU, then a **single** D2H transfer. Consider pinned
+memory (the flag exists) and a narrower transfer dtype.
+
+**Gate.** Row-wise outputs identical to the loop within tolerance, and the same
+`gather_seconds` per row measured at 27 and 256 rows to prove it no longer scales
+per row.
+
+**Phase 3b (conditional on Phase 0):** launch-overhead work — CUDA graphs,
+`torch.compile`, static shape buckets, `inference_mode`, buffer reuse.
+
+---
+
+## Phase 4 — joint sweep
+
+Only now, and **jointly**, because the axes interact: once waves widen, 16 slots
+× width 2.6 already changes what the 256 cap means.
+
+* slots ∈ {8, 16, 24, 32, 48, 64} × `global_batch_cap` ∈ {128, 256, 512},
+  subject to the memory ceiling Phase 0 measured.
+* `max_inflight_batches` after that.
+* Keep `scheduler_workers = 1`: sharded schedulers each submit their own batch to
+  a single serial worker that does not merge them (`eval.rs:723`), so batch
+  fragmentation is structural — that fully explains the historical pathology
+  where 7 workers dropped mean batch to 5.2 rows and halved games/s. Tree work is
+  ~2% of wall, so extra scheduler threads have little upside until batching is
+  centralised across shards.
+
+---
+
+## Measurement matrix
+
+Four arms, measured **independently**, so interactions and regressions are
+attributable:
+
+| arm | pool | conflict-free waves |
+|---|---|---|
+| baseline | off | off |
+| pool-only | on | off |
+| waves-only | off | on |
+| combined | on | on |
+
+Each at `jobs >> slots`, reporting steady state and drain separately, with the
+Phase 0 timing split.
+
+---
+
+## Later, gated on results
+
+* **Full-move round-robin reordering.** Only if full moves remain a batch-count
+  bottleneck after Phase 2. Sound (order within a halving round is arbitrary) but
+  it permutes RNG consumption and changes full-move outputs, so it needs its own
+  arena justification. Measure Phase 2's actual full-move benefit (2.0×) first.
+* **Token-count bucketing** if padding exceeds ~20% once batches widen.
 * **Chance capping (`cheap_double_reveal_offsets`, X=3).** Re-measure *after* the
-  batch work: it buys +7.4% (slots 16) / +14.5% (slots 24) today, but it only
-  touches the per-row 29%, and it makes batches thinner, so its value moves in
-  both directions. Still gated on arena strength independently.
+  exact pipeline is tuned: it touches only the per-row ~29%, and it makes batches
+  thinner, so its value moves in both directions. Independently gated on arena
+  strength.
 
 **Explicitly not next:** product chains (17.2% of forced children) and full-move
-capping. Both are more approximation risk chasing the same 29%, while Items 1-3
-are exact.
+capping. Both add approximation risk to chase the same per-row share, while
+Phases 1–4 are exact.
 
 ---
 
-## Target
+## Success criteria
 
-Baseline (slots 16, uncapped, pinned laptop configuration): **1,301 games/hour**,
-27 rows/batch, 58% GPU busy, 18% idle slot-cycles.
+Baseline: **1,301 games/hour**, 27 rows/batch, 12% padding, at slots 16 on the
+pinned laptop configuration.
 
-Success for Items 1-3: **rows/batch ≥ 100, idle slot-cycles < 5%, GPU busy
-> 0.75**, at byte-identical game records. If the ~16 µs/row marginal cost holds,
-that implies roughly **1.7×** on games/hour before any approximation is
-considered — the estimate the sweep is there to confirm or refute.
+* Phase 0: a cost model with device and host separated, and a benchmark that
+  actually refills slots. **No throughput target — this phase buys knowledge.**
+* Phase 1: time-weighted live-slot occupancy ≈ `max_active_slots` through steady
+  state; mock-path records byte-identical.
+* Phase 2: leaf batches per search down ~2.5× cheap / ~2.0× full, bit-identical
+  across the stratified corpus.
+* Phase 3: `gather_seconds` per row flat in batch width.
+* Phase 4: rows/batch and games/hour reported against the Phase 0 cost model —
+  **the expected multiplier is deliberately left blank until that model exists**,
+  since rev 1's estimate came from the timer this revision retired.
