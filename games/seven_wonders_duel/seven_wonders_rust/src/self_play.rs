@@ -20,6 +20,17 @@ use std::time::Instant;
 
 const GAME_RNG_XOR: u64 = 0xC6BC_2796_92B5_CC83;
 
+/// Chance capping is a cheap-move economy: a full-search move keeps the exact
+/// root expectation, so its policy target is bit-identical to an uncapped run's
+/// at the same state and seed.
+fn cheap_offsets(configured: usize, full: bool) -> usize {
+    if full {
+        0
+    } else {
+        configured
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SelfPlayConfig {
     pub game_seed: u64,
@@ -42,6 +53,14 @@ pub struct SelfPlayConfig {
     pub puct_root: bool,
     pub age_deal_samples: usize,
     pub age_deal_samples_by_player: Option<[usize; 2]>,
+    /// Offsets per first-reveal stratum for the balanced double-reveal support,
+    /// applied to CHEAP moves only. Zero keeps forced expansion exhaustive
+    /// everywhere. Full-search moves always pass 0, so their policy targets --
+    /// the training targets whose comparability across runs matters -- stay
+    /// exactly what an uncapped run would produce (CHANCE_ENUMERATION_PLAN.md
+    /// Step 3). Values large enough to retain the whole outcome space are
+    /// no-ops, resolved per edge.
+    pub cheap_double_reveal_offsets: usize,
     pub bot_by_player: [Option<BotKind>; 2],
     pub bot_exploration: f64,
     pub bot_policy_iterations: i64,
@@ -383,8 +402,7 @@ pub fn run<E: Eval>(
             force_expand_root_chance: cfg.force_expand_root_chance,
             puct_root: cfg.puct_root,
             age_deal_samples: cfg.age_deal_samples,
-            // Step 3 gates this per move (cheap vs full); exhaustive for now.
-            double_reveal_offsets: 0,
+            double_reveal_offsets: cheap_offsets(cfg.cheap_double_reveal_offsets, full),
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -652,8 +670,10 @@ impl GameSlot {
                     .cfg
                     .age_deal_samples_by_player
                     .map_or(self.cfg.age_deal_samples, |samples| samples[actor]),
-                // Step 3 gates this per move (cheap vs full); exhaustive for now.
-                double_reveal_offsets: 0,
+                double_reveal_offsets: cheap_offsets(
+                    self.cfg.cheap_double_reveal_offsets,
+                    full,
+                ),
             },
         })
     }

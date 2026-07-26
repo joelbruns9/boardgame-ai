@@ -1,7 +1,7 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured; design revised after review; **Steps 1-2 built
-(2026-07-25)**, Steps 3-5 outstanding.
+**Status:** measured; design revised after review; **Steps 1-3 built
+(2026-07-25), off by default**; Steps 4-5 (quality + throughput) outstanding.
 **Date:** 2026-07-25.
 
 ## The problem
@@ -405,7 +405,7 @@ handling product chains -- but both carry costs this scope deliberately avoids.
 
 | setting | value |
 |---|---|
-| `cheap_double_reveal_offsets` | **2** (flag; sweep 1/2/3) |
+| `cheap_double_reveal_offsets` | **2** (flag; sweep 1/2/3) -- shipped defaulting to **0/off** until Steps 4-5 measure it |
 | full moves | **exhaustive, unchanged** |
 | single reveals, GL, GL products, wonder flip | **exhaustive, unchanged** |
 | AgeDeal samples | 32, unchanged |
@@ -512,13 +512,34 @@ Step 1 `close_fixed_support`.
   children per root against real self-play's 40, exactly the Level-1 caveat
   above. It confirms the cap bites; Step 5 measures throughput for real.
 
-### Step 3 -- apply to cheap moves only
+### Step 3 -- apply to cheap moves only -- **DONE 2026-07-25**
 
 1. `cheap_double_reveal_offsets` on the configs; hook where the driver already
    chooses cheap vs full sims.
 2. **Test that a full-search move at a fixed state and seed produces a
    bit-identical `policy_target`.** This is the claim that keeps buffers
    compatible; assert it, do not assume it.
+
+**What was built.** `cheap_double_reveal_offsets` on `SelfPlayConfig` (Rust) and
+`PhaseDConfig` (Python), plus a `--cheap-double-reveal-offsets` CLI flag. Both
+self-play drivers already compute `full: bool` before building the per-move
+`SearchConfig`; a one-line `cheap_offsets(configured, full)` gates it there, so
+a full move always passes 0.
+
+* **Default 0 -- off.** Turning it on by default would change generation before
+  Steps 4-5 have measured approximation quality or throughput. The recommended
+  `X = 2` stays a flag to sweep.
+* **The gate/arena path deliberately does NOT get it.** Arena games run
+  `full_search_fraction = 0.0`, so every arena move takes the *cheap* branch;
+  passing the flag there would cap chance in the very games meant to measure the
+  cap. Generation only. (Advisor is untouched -- it never sets it.)
+* **Tests.** `test_f4_boundary.py` -- with `full_search_fraction = 1.0`, records
+  are byte-identical at `X` in {1,2,3} against `X = 0` (the buffer-compatibility
+  claim, asserted end to end through self-play); with
+  `full_search_fraction = 0.0`, records and policy targets *do* differ, so a hook
+  that silently did nothing would not pass. `test_phase_d.py` -- default is 0,
+  validation rejects negatives, and the flag reaches the generation call and not
+  the gate call. Full suite green (455 tests).
 
 ### Step 4 -- validate approximation quality, not just throughput
 

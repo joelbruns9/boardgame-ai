@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
@@ -220,6 +221,26 @@ def test_evenly_matched_candidate_never_resolves():
 
     assert expected_games_to_decide(0.47, 0.53, true_rate=0.50) == float("inf")
     assert expected_games_to_decide(0.47, 0.53, true_rate=0.53) < float("inf")
+
+
+def test_cheap_double_reveal_offsets_default_off_and_reach_generation_only():
+    """Chance capping ships as an off-by-default generation flag.
+
+    Defaulting it on would change generation before Steps 4-5 measured its
+    approximation quality and throughput; passing it to the gate would confound
+    an arena result with the approximation being evaluated."""
+
+    assert PhaseDConfig().cheap_double_reveal_offsets == 0
+    PhaseDConfig(cheap_double_reveal_offsets=2).validate()
+    with pytest.raises(ValueError, match="cheap_double_reveal_offsets"):
+        PhaseDConfig(cheap_double_reveal_offsets=-1).validate()
+
+    source = inspect.getsource(PhaseDLoop)
+    generation, gate = (
+        source.index("cheap_sims_min=self.config.cheap_sims_min"),
+        source.index("cheap_sims_min=self.config.gate_sims"),
+    )
+    assert generation < source.index("cheap_double_reveal_offsets") < gate
 
 
 def test_underpowered_gate_warns_only_when_the_gate_runs():

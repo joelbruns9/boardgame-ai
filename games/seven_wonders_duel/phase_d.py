@@ -223,6 +223,15 @@ class PhaseDConfig:
     leaf_batch: int = 1
     force_root_chance: bool = True
     age_deal_samples: int = 32
+    cheap_double_reveal_offsets: int = 0
+    """Balanced double-reveal support on CHEAP generation moves only.
+
+    Zero keeps forced expansion exhaustive, which is what every run so far
+    produced. A positive X trades exact root chance on a pure double card-reveal
+    edge for the balanced ``n * X`` subset -- those edges are 54.5% of all forced
+    children (CHANCE_ENUMERATION_PLAN.md). Full-search moves and the arena/gate
+    always stay exhaustive, so training targets and gate results are unaffected
+    by the setting."""
 
     def anneal_iterations(self) -> int:
         """Curriculum anneal duration with the ``-1`` auto sentinel resolved."""
@@ -332,6 +341,8 @@ class PhaseDConfig:
             raise ValueError("leaf_batch cannot exceed rust_global_batch_cap")
         if not 0 <= self.age_deal_samples <= 32:
             raise ValueError("age_deal_samples must be in [0, 32]")
+        if self.cheap_double_reveal_offsets < 0:
+            raise ValueError("cheap_double_reveal_offsets must be non-negative")
         if self.d_model <= 0 or self.d_model % 4 or self.layers <= 0:
             raise ValueError("d_model must be positive/divisible by 4 and layers positive")
         if self.train_steps <= 0 or self.train_batch_size <= 0:
@@ -1167,6 +1178,9 @@ class PhaseDLoop:
                     iteration=iteration,
                     force=self.config.force_root_chance,
                     age_deal_samples=self.config.age_deal_samples,
+                    cheap_double_reveal_offsets=(
+                        self.config.cheap_double_reveal_offsets
+                    ),
                     max_inflight_batches=self.config.rust_max_inflight_batches,
                     scheduler_workers=self.config.rust_scheduler_workers,
                     bot_p0=bot_name if bot_seat == 0 else None,
@@ -2050,6 +2064,14 @@ def main(argv=None) -> int:
         "--force-root-chance", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--age-deal-samples", type=int, choices=(0, 4, 8, 16, 32), default=32)
+    parser.add_argument(
+        "--cheap-double-reveal-offsets",
+        type=int,
+        default=0,
+        help="offsets per first-reveal stratum on pure double card-reveal edges, "
+        "CHEAP generation moves only (0 = exhaustive, the shipped behaviour; "
+        "2 is the value CHANCE_ENUMERATION_PLAN.md recommends sweeping)",
+    )
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
     parser.add_argument(
         "--anchor-every-iterations",
@@ -2201,6 +2223,7 @@ def main(argv=None) -> int:
         leaf_batch=args.leaf_batch,
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
+        cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
         anchor_every_iterations=args.anchor_every_iterations,
         selfplay_generator_mode=args.selfplay_generator_mode,

@@ -153,6 +153,7 @@ fn make_self_play_config(
     force: bool,
     puct_root: bool,
     age_deal_samples: usize,
+    cheap_double_reveal_offsets: usize,
     max_moves: usize,
 ) -> self_play::SelfPlayConfig {
     self_play::SelfPlayConfig {
@@ -175,6 +176,7 @@ fn make_self_play_config(
         puct_root,
         age_deal_samples,
         age_deal_samples_by_player: None,
+        cheap_double_reveal_offsets,
         bot_by_player: [None, None],
         bot_exploration: 0.0,
         bot_policy_iterations: 10,
@@ -783,7 +785,7 @@ impl RustGame {
         adapter, game_seed, leaf_batch, cheap_sims_min, cheap_sims_max,
         full_sims_min, full_sims_max, full_search_fraction, top_k, draft_prior,
         iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-        age_deal_samples=0, max_moves=256
+        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
     ))]
     fn self_play_net(
         &self,
@@ -803,6 +805,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         age_deal_samples: usize,
+        cheap_double_reveal_offsets: usize,
         max_moves: usize,
     ) -> PyResult<Py<PyDict>> {
         let cfg = make_self_play_config(
@@ -822,6 +825,7 @@ impl RustGame {
             force,
             false, // self-play always uses the Gumbel root
             age_deal_samples,
+            cheap_double_reveal_offsets,
             max_moves,
         );
         let evaluator = eval::PyEval::new(adapter);
@@ -836,7 +840,7 @@ impl RustGame {
         game_seed, leaf_batch, cheap_sims_min, cheap_sims_max, full_sims_min,
         full_sims_max, full_search_fraction, top_k, draft_prior,
         iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-        age_deal_samples=0, max_moves=256
+        age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
     ))]
     fn self_play_mock(
         &self,
@@ -855,6 +859,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         age_deal_samples: usize,
+        cheap_double_reveal_offsets: usize,
         max_moves: usize,
     ) -> PyResult<Py<PyDict>> {
         let cfg = make_self_play_config(
@@ -874,6 +879,7 @@ impl RustGame {
             force,
             false, // self-play always uses the Gumbel root
             age_deal_samples,
+            cheap_double_reveal_offsets,
             max_moves,
         );
         let record = self_play::run(&self.state, &eval::MockEval, &cfg)?;
@@ -1287,6 +1293,7 @@ fn cooperative_jobs(
     force: bool,
     puct_root: bool,
     age_deal_samples: usize,
+    cheap_double_reveal_offsets: usize,
     max_moves: usize,
 ) -> PyResult<Vec<(GameState, self_play::SelfPlayConfig)>> {
     if games.len() != game_seeds.len() {
@@ -1318,6 +1325,7 @@ fn cooperative_jobs(
                 force,
                 puct_root,
                 age_deal_samples,
+                cheap_double_reveal_offsets,
                 max_moves,
             );
             Ok((state, cfg))
@@ -1332,7 +1340,7 @@ fn cooperative_jobs(
     games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
-    force=false, age_deal_samples=0, max_moves=256
+    force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -1353,6 +1361,7 @@ fn self_play_many_mock(
     c_scale: f64,
     force: bool,
     age_deal_samples: usize,
+    cheap_double_reveal_offsets: usize,
     max_moves: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
@@ -1374,6 +1383,7 @@ fn self_play_many_mock(
         force,
         false, // self-play always uses the Gumbel root
         age_deal_samples,
+        cheap_double_reveal_offsets,
         max_moves,
     )?;
     let result = py.detach(move || self_play::run_many(jobs, &eval::MockEval, global_batch_cap))?;
@@ -1388,7 +1398,7 @@ fn self_play_many_mock(
     adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
-    force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
+    force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false
 ))]
@@ -1412,6 +1422,7 @@ fn self_play_many_net(
     c_scale: f64,
     force: bool,
     age_deal_samples: usize,
+    cheap_double_reveal_offsets: usize,
     max_moves: usize,
     inference_timeout_ms: f64,
     max_inflight_batches: usize,
@@ -1441,6 +1452,7 @@ fn self_play_many_net(
         force,
         false, // self-play always uses the Gumbel root
         age_deal_samples,
+        cheap_double_reveal_offsets,
         max_moves,
     )?;
     match (leaf_batch_p0, leaf_batch_p1) {
@@ -1522,7 +1534,7 @@ fn self_play_many_net(
     adapter, games, game_seeds, global_batch_cap, leaf_batch, cheap_sims_min,
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
-    force=false, age_deal_samples=0, max_moves=256, inference_timeout_ms=0.0,
+    force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
@@ -1547,6 +1559,7 @@ fn self_play_many_flat_net(
     c_scale: f64,
     force: bool,
     age_deal_samples: usize,
+    cheap_double_reveal_offsets: usize,
     max_moves: usize,
     inference_timeout_ms: f64,
     max_inflight_batches: usize,
@@ -1581,6 +1594,7 @@ fn self_play_many_flat_net(
         force,
         puct_root,
         age_deal_samples,
+        cheap_double_reveal_offsets,
         max_moves,
     )?;
     match (leaf_batch_p0, leaf_batch_p1) {

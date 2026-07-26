@@ -420,6 +420,56 @@ def test_f4_r0_fixed_support_edges_never_grow_and_keep_unit_mass():
     assert not any(edge["probability_weighted"] for edge in legacy["edges"])
 
 
+def _self_play_records(cheap_double_reveal_offsets, full_search_fraction, seeds):
+    import seven_wonders_rust as swr
+
+    kwargs = _common(leaf_batch=1, global_batch_cap=8)
+    kwargs["full_search_fraction"] = full_search_fraction
+    records, _ = swr.self_play_many_mock(
+        games=rust_games_for_self_play(seeds, [0, 1, 0]),
+        game_seeds=seeds,
+        force=True,
+        cheap_double_reveal_offsets=cheap_double_reveal_offsets,
+        **kwargs,
+    )
+    return records
+
+
+def test_cheap_double_reveal_offsets_leave_full_search_moves_bit_identical():
+    """Chance-enumeration Step 3: capping is a CHEAP-move economy.
+
+    This is the claim that keeps buffers comparable across the change, so it is
+    asserted rather than assumed. With every move a full search, turning the cap
+    up must change nothing at all -- same actions, same visits, same policy
+    targets, same games. (Under a mixed schedule the recorded positions still
+    differ, because earlier cheap moves move the trajectory; what cannot differ
+    is a full-search move's target at a given state and seed.)"""
+
+    seeds = [2026072530, 2026072531, 2026072532]
+    baseline = _self_play_records(0, 1.0, seeds)
+    for offsets in (1, 2, 3):
+        assert _self_play_records(offsets, 1.0, seeds) == baseline
+    assert all(move["full_search"] for record in baseline for move in record["moves"])
+
+
+def test_cheap_double_reveal_offsets_do_change_cheap_moves():
+    """The converse: with every move cheap, the cap must actually be reaching
+    the searcher. A hook that silently did nothing would pass the test above."""
+
+    seeds = [2026072530, 2026072531, 2026072532]
+    baseline = _self_play_records(0, 0.0, seeds)
+    capped = _self_play_records(2, 0.0, seeds)
+    assert not any(move["full_search"] for record in baseline for move in record["moves"])
+    assert capped != baseline
+    differing = [
+        (game, move)
+        for game, (left, right) in enumerate(zip(baseline, capped))
+        for move in range(min(len(left["moves"]), len(right["moves"])))
+        if left["moves"][move]["policy_target"] != right["moves"][move]["policy_target"]
+    ]
+    assert differing, "capped cheap moves produced identical policy targets"
+
+
 def test_f4_r0_paired_age_deal_samples_skip_forced_age_one_setup():
     import seven_wonders_rust as swr
 
