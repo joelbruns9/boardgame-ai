@@ -1,6 +1,6 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured, designed, not yet implemented.
+**Status:** measured; design revised after review; not yet implemented.
 **Date:** 2026-07-25.
 
 ## The problem
@@ -223,194 +223,245 @@ equal budget.
 
 ---
 
-## Design
+## Review corrections (2026-07-25)
 
-### Decision 1 — Great Library collapse (exact, no accuracy cost)
+The first draft of the design below was reviewed and three blocking defects were
+found and **verified against the code**. They are recorded here because each one
+is a trap that is easy to walk back into.
 
-The Great Library draws 3 of the 5 offboard progress tokens; the player keeps
-the best one. So the outcome is determined entirely by **which token is best in
-the drawn subset**:
+### [P0, confirmed] A capped edge breaks the probability-mass invariant
 
-```
-P(rank-i token is best) = C(5−i, 2) / C(5,3)
-  rank 1 → 6/10 = 60%
-  rank 2 → 3/10 = 30%
-  rank 3 → 1/10 = 10%
-  rank 4, 5 → 0   (can never be best of three)
-```
+Force expansion asserts `mass == 1.0` **once**, at expansion time
+(`tree_resumable.rs` `materialize_forced_root`). Nothing re-checks it later.
 
-Therefore, with V₁ ≥ V₂ ≥ V₃ the sorted values of *holding* each token:
+But ordinary descent still samples from the **complete** chance distribution in
+`_closed_child` / `closed_child`: it draws an outcome, looks for a child with
+that observable key, and **appends a new child carrying its original
+probability** if none is found. With exhaustive expansion every key already
+exists, so this never fires. Under a cap, a descent that samples an omitted
+outcome silently appends it, the edge mass exceeds 1, and `q_p0` then computes a
+probability-weighted sum over more than unit mass with no error raised.
 
-> **E[max over the drawn 3-subset] = 0.6·V₁ + 0.3·V₂ + 0.1·V₃**
+**A capped edge must therefore have closed support**: later descents sample only
+among retained children, re-normalised. Rust already has exactly this mechanism
+for AgeDeal -- `paired_sampled` edges sample among existing children by
+cumulative empirical probability and never create new ones. The cap should reuse
+that pattern rather than invent one.
 
-This is an **exact identity, not an approximation**. It replaces 10 subset
-evaluations with **5 token evaluations** — and on the stacked wonder case,
-900 → 450.
+Three edge classes must be kept distinct:
 
-Design points:
-
-* **Hardcode 60/30/10.** The Great Library is the only route to the offboard
-  five (tokens acquired in play come from the board's face-up five via science
-  pairs), and it is a single wonder built at most once. The math cannot change.
-* **Assert the offboard pool is exactly 5** and fail loudly otherwise. If some
-  future change touches that pool, a loud failure beats silently wrong
-  probabilities weighting a training target.
-* **Do not collapse to a single value.** Keep **three children** with
-  probabilities .6/.3/.1 pointing at the top-3 token states, preserving tree
-  structure, `q_p0` probability weighting, and the `mass == 1.0` check.
-* Known limitation: the ranking freezes at expansion. If search would later
-  refine which token is best, the collapse cannot. Same character as the
-  existing one-shot evaluation of each subset.
-
-### Decision 2 — the wonder draft is NOT collapsible
-
-The identity above works because **one of three is taken**, which makes it a
-max. In the wonder draft **all four revealed wonders get drafted** between both
-players, so each of the 70 subsets leads to a genuinely different game. There
-is no max to collapse, and no static ranking recovers that — independent of the
-correlation issues (military wonders, Mausoleum/discard, Great Library/tokens).
-
-At 2.6% of children and once per game, it is not worth special handling. The
-per-edge cap covers it for free.
-
-> Keep distinct: a static wonder ranking as a **policy prior** (e.g. seeding
-> ZeusAI's published preferences via `--draft-prior-iterations`) is sound and
-> useful. A static ranking to **collapse chance outcomes** is not.
-
-### Decision 3 — per-edge cap with balanced coverage
-
-For an edge whose chain exceeds cap `Y`, with `n` distinct first-reveal
-candidates:
-
-```
-X = max(1, Y // n)          second-reveals per stratum
-chains = n × X              (exhaustive when n·(n−1) ≤ Y)
-weight = 1 / (n × X)        → mass still sums to exactly 1.0
-```
-
-* **Stratify on the first reveal** — every hidden card appears in first
-  position, which is the coverage guarantee. The first reveal is also the more
-  decision-relevant card.
-* **Second reveals via a cyclic block**: stratum *i* takes seconds
-  `{i+1, …, i+X} mod n`, so every card also appears exactly **X** times in
-  second position. Total **2X reveals per card**, perfectly balanced.
-* **Systematic sampling with a random start**: seed the cyclic offset from the
-  node's chance signature. Balanced at every node *and* unbiased in expectation
-  over the offset, because which pairs get chosen is independent of their
-  values. Deterministic and reproducible, since the seed comes from the
-  position.
-
-Why balanced beats random: it removes variance from single-card effects (the
-"trap card sampled 7 times" problem) at the cost of sampling pair interactions
-in a structured pattern — which the random start de-biases.
-
-**A cap ≥ 11 makes single reveals exhaustive automatically** (they max at 11),
-so no special case is needed for them.
-
-| cap Y | X at n=11 | chains | reveals per card |
-|---:|---:|---:|---:|
-| 16 | 1 | 11 | 2 |
-| 24 | 2 | 22 | 4 |
-| 32 | 2 | 22 | 4 |
-
-### Decision 4 — cap cheap moves only; full moves stay exhaustive
-
-**Cheap-search moves record no policy target.** They only advance the game. So
-exact chance on a cheap move buys a marginally better *move*, not a better
-*label*, while costing the same fixed ~40 forced children.
-
-This is the same principle already accepted for simulations via playout cap
-randomization: **spend accuracy where it becomes a label, not where it only
-advances the game.**
-
-Per 100 self-play moves:
-
-| configuration | NN calls | saving |
-|---|---:|---:|
-| current (exhaustive everywhere) | 6,550 | — |
-| **cap cheap only, full exhaustive** | **4,855** | **26%** |
-| cap everywhere | 4,290 | 35% |
-
-**Cheap-only captures ~74% of the available saving** and — decisively —
-**leaves every recorded policy target bit-identical**. No `TARGET_VERSION`
-bump, no buffer incompatibility, and if the run underperforms the labels are
-not in the suspect list. Capping full moves would put target quality under
-suspicion for the whole run, and subtle label corruption is the hardest failure
-to diagnose after the fact.
-
-### Settings
-
-| setting | value | note |
+| class | support | later descent |
 |---|---|---|
-| Great Library collapse | **everywhere** | exact; no accuracy cost on either move type |
-| cap on cheap moves | **Y = 24** (X=2 at n=11) | flag, sweepable 16/24/32 |
-| cap on full moves | **none** (exhaustive) | preserves label definition |
-| cap scope | **per-edge, all chain kinds** | covers stacked GL-wonder and wonder flip with one rule |
-| AgeDeal samples | **32**, unchanged | only ~6% of forced rows |
-| advisor | **exhaustive**, unchanged | differentiation vs ZeusAI's cap-11 |
+| `probability_weighted` | exhaustive, exact | always finds an existing child |
+| **approximate fixed-support** (new) | retained subset, re-normalised | samples **only** among retained |
+| ordinary sampled | grows lazily | may materialise a new child |
 
-Expected: **~1.35× more games per hour** in generation, converting directly
-into training data.
+**Mandatory test:** thousands of descents through a capped root edge must
+materialise no new child and leave mass at exactly 1.
+
+### [P0, confirmed] The Great Library collapse is NOT a drop-in identity
+
+The mathematics is right -- E[max over the drawn 3-subset] = .6*V1 + .3*V2 +
+.1*V3 -- but it does not describe the states this tree actually holds.
+
+Verified in `engine.py`: `CHOOSE_UNUSED_PROGRESS` draws the 3-token subset,
+emits the `GREAT_LIBRARY_DRAW` event, then calls `_set_pending_if_options` with
+`PendingChoiceKind.CHOOSE_UNUSED_PROGRESS` and `consume_all_options=True`. The
+pick is resolved **later**, by a separate action through
+`resolve_pending_choice`.
+
+So:
+
+* The 10 forced children today are **pending-choice states**, and the network
+  evaluates those. The proposed 5 "token taken" states are **one ply deeper**.
+* A singleton token is **not a valid Great Library chance outcome** -- the engine
+  requires a 3-token subset.
+* Three synthetic children would not match the 10 real chance keys, so later
+  sampling could not find them, producing new children -- the P0 above, again.
+* The resumable path caches both value **and priors** for the real
+  pending-choice node; priors from a post-choice state cannot be attached to it.
+* Search can currently refine the 3-option decision by descending into it. A
+  frozen ranking removes that.
+
+It may still be a worthwhile **one-ply Great Library resolver**, possibly
+stronger than what exists. But it is a **search-semantics change**, not a
+zero-cost identity, and it invalidates the claim that full-move policy targets
+stay bit-identical.
+
+**Removed from the first implementation.** See *Future tests*.
+
+### [P0, confirmed] "A per-edge cap across all chain kinds" was not a design
+
+The balanced first-reveal / cyclic-second construction is defined **only for a
+two-card reveal**. It is undefined for:
+
+* `wonder_group_reveal` -- 4-subsets, no first-reveal stratum, `n` has no meaning;
+* Great Library alone -- 10 unordered 3-subsets, not ordered pairs;
+* **product chains** -- capping the reveal component of `reveal + GL` to 22 and
+  then enumerating GL still yields 220 rows. A per-component cap is not a
+  per-edge cap.
+
+Consequently the cap curve above (`min(outcome_count, cap)`) **does not describe
+the balanced design** and overstates its saving. Corrected numbers below.
+
+### Other corrections accepted
+
+* **Unbiasedness needs a randomness contract.** A deterministic position-derived
+  offset is reproducible but not *conditionally* unbiased. The offset must be
+  uniform over directed-pair distances `1..n-1` (naive `mod n` can select
+  `(card, same card)`), drawn from a **domain-separated** seed built from the
+  search seed, the canonical public-state fingerprint, and the chance signature
+  -- and it must **not consume the main search RNG stream**. That exact bug class
+  already bit the PUCT root port, where drawing Gumbel keys from the shared RNG
+  offset every downstream chance sample. Edges sharing a signature should
+  deliberately share support: common random numbers reduce variance when
+  comparing actions.
+* **Rows are not GPU calls.** The `NN calls per move` model counts *rows*.
+  Production coalesces rows across games and chunks forced requests, so cutting
+  rows does not translate linearly into games/hour and may push batches below
+  the utilisation knee. All throughput figures here are **row-count upper
+  bounds** until measured.
+* **"Bit-identical targets" was too broad.** Correct claim: for a *fixed*
+  full-search root state and seed, the target is unchanged. Earlier cheap moves
+  still shift the trajectory, so the *set* of recorded positions differs -- fine,
+  and not a version bump. The Great Library collapse *would* change full-move
+  outputs, so that conclusion never covered it.
+* **The catastrophe guarantee is narrower than claimed.** Balanced coverage
+  gives **exact marginal coverage** -- every hidden card appears in each revealed
+  slot. It does *not* cover every dangerous **pair interaction**. Much better
+  than IID sampling; not a general catastrophe guarantee.
+* **Terminal-child filtering measures at nothing.** Proposed as an exact,
+  semantics-free saving: skip forced children that are already terminal, whose
+  values are known exactly. Verified correct -- `materialize_forced_root` pushes
+  *every* child with no terminal check. But measured on the replay corpus it is
+  **8 terminal children out of 163,712 (0.005%)**. Correct in principle, not
+  worth building.
 
 ---
 
-## Build plan
+## Design (revised)
 
-Each step is independently testable and independently revertable. Steps 1 and 2
-touch search semantics, so both need Python/Rust equivalence to the F3
-standard.
+### Scope: pure double card-reveal edges, on cheap moves only
 
-### Step 1 — Great Library collapse
+Everything else stays exhaustive in v1 -- single reveals, Great Library and its
+products, wonder flips, and every chain with more than one chance component.
+Those are the cases where the balanced construction is undefined or where the
+semantics are unsettled.
 
-1. `pool.py`: add the ranked-outcome helper beside `enumerate_great_library`.
-   Assert `len(offboard_progress) == 5`; raise loudly otherwise.
-2. `search.py`: in `_force_expand_root`, when a chain contains
-   `GREAT_LIBRARY_DRAW`, evaluate the 5 "token taken" states, sort by
-   **actor-relative** value, and emit 3 children at .6/.3/.1 instead of 10.
-3. Rust: mirror in `chance.rs` / `tree.rs` force-expansion.
-4. Tests:
-   - weights sum to 1.0 and match C(5−i,2)/C(5,3);
-   - the loud failure fires when the pool is not 5;
-   - collapsed expectation equals the exhaustive 10-subset expectation on a
-     fixed mock evaluator (this is the exactness claim — it must be an equality
-     test, not an approximation test);
-   - Python/Rust equivalence on real positions.
-5. Re-run Level 0 to confirm GL-containing combinations drop ~2×.
+### Construction
 
-### Step 2 — per-edge cap with balanced coverage
+For a pure double-reveal edge with `n` unseen cards and `X` offsets:
 
-1. `search.py`: add the capped chain builder — stratify first reveal, cyclic
-   block for seconds, offset seeded from the chance signature.
-2. Preserve `probability_weighted` semantics and the `mass == 1.0` assertion.
-3. Rust: mirror in `chance.rs`; the cap must be part of `SearchConfig` so it
-   reaches both the scalar and resumable paths.
-4. Tests:
-   - every hidden card appears exactly once in first position and X times in
-     second;
-   - mass sums to exactly 1.0 at several n and Y;
-   - exhaustive when `n·(n−1) ≤ Y` (the cap must not perturb small edges);
-   - single reveals untouched at any Y ≥ 11;
-   - unbiasedness: mean over random starts ≈ exhaustive expectation on a mock
-     evaluator;
-   - Python/Rust equivalence.
+```
+directed pairs = n * X            (exhaustive once X >= n-1)
+weight         = 1 / (n * X)      -> mass exactly 1
+```
 
-### Step 3 — tie the cap to the cheap/full split
+* **Stratify on the first reveal**: every hidden card appears in first position
+  exactly once. This is the marginal-coverage guarantee.
+* **Second reveal by cyclic block**: stratum *i* takes seconds `i + d` for `X`
+  offsets `d` drawn from `1..n-1`, so every card also appears exactly `X` times
+  in second position.
+* **Offsets from a domain-separated seed** (search seed + public-state
+  fingerprint + chance signature), never from the search RNG stream.
+* **Closed support**: the edge is marked approximate fixed-support; later
+  descents sample only among the `n * X` retained children.
 
-1. `SelfPlayConfig` / `PhaseDConfig`: `chance_cap_cheap` (default 24) and
-   `chance_cap_full` (default 0 = exhaustive).
-2. Hook at the point the self-play driver already chooses cheap vs full sims —
-   the chance policy rides along with the sim budget being selected there.
-3. CLI: `--chance-cap-cheap`, `--chance-cap-full`.
-4. Test that a full-search move produces a **bit-identical** `policy_target` to
-   the current code. This is the claim that lets buffers stay compatible; it
-   must be asserted, not assumed.
+The parameter is `cheap_double_reveal_offsets = X`, not a generic cap -- the
+retained row count is `n * X`, which is what the design actually produces.
 
-### Step 4 — validate
+### Corrected savings
 
-1. Re-run Level 0 and Level 1 and confirm the predicted reductions.
-2. Measure games/hour on a short generation run, before and after.
-3. Confirm `samples_per_new_position` is unchanged (the cap changes throughput,
-   not the sample-per-position accounting).
+Measured on the replay corpus (382,246 forced children total; pure double-reveal
+edges are 3,784 edges / 208,244 children, of which 156,110 sit on cheap roots;
+`n` ranges 5-11):
+
+| X | retained on cheap pure-cc | total forced children | vs current |
+|---:|---:|---:|---:|
+| 1 | 21,698 of 156,110 (13.9%) | 247,834 | 64.8% |
+| **2** | **43,396 (27.8%)** | **269,532** | **70.5%** |
+| 3 | 65,094 (41.7%) | 291,230 | 76.2% |
+| 4 | 86,792 (55.6%) | 312,928 | 81.9% |
+
+Translated to network **rows** per 100 self-play moves:
+
+| configuration | rows/100 moves | saving |
+|---|---:|---:|
+| current | 6,550 | -- |
+| X = 2 (recommended) | ~5,380 | **~18%** |
+| X = 1 | ~5,155 | ~21% |
+
+**This is materially less than the first draft claimed (26-35%)**, for two
+reasons the review identified: that projection applied `min(count, cap)` to
+*all* edge kinds including full moves, and `min(c, 24)` is more aggressive than
+`n * X`. The honest figure for this safe scope is **~18% fewer rows**, and that
+is a row-count upper bound on throughput, not a measured speedup.
+
+The larger savings remain available -- they require either capping full moves or
+handling product chains -- but both carry costs this scope deliberately avoids.
+
+### Settings
+
+| setting | value |
+|---|---|
+| `cheap_double_reveal_offsets` | **2** (flag; sweep 1/2/3) |
+| full moves | **exhaustive, unchanged** |
+| single reveals, GL, GL products, wonder flip | **exhaustive, unchanged** |
+| AgeDeal samples | 32, unchanged |
+| advisor | exhaustive, unchanged |
+
+---
+
+## Build plan (revised)
+
+### Step 1 -- the approximate fixed-support edge class
+
+Infrastructure before any approximation. No behaviour change yet.
+
+1. Add the third edge class alongside `probability_weighted` and ordinary
+   sampled, modelled on Rust's existing `paired_sampled`.
+2. `closed_child` in both languages: on a fixed-support edge, sample among
+   retained children by their stored weights; **never** materialise a new one.
+3. Tests: thousands of descents through a fixed-support edge materialise no new
+   child and leave mass at exactly 1; `q_p0` matches a hand-computed weighted
+   sum.
+
+### Step 2 -- balanced double-reveal support
+
+1. Build the `n * X` directed-pair support with the cyclic construction and the
+   domain-separated offset seed.
+2. Rust mirror; the parameter must reach both scalar and resumable paths.
+3. Tests: every card once in first position and `X` times in second; offsets
+   drawn from `1..n-1` (never a self-pair); mass exactly 1 at several `n`, `X`;
+   exhaustive once `X >= n-1`; **support identical for two edges sharing a
+   chance signature** (common random numbers); Python/Rust equivalence.
+4. Unbiasedness as a statistical test: mean root value over many random offsets
+   converges to the exhaustive value on a fixed mock evaluator.
+
+### Step 3 -- apply to cheap moves only
+
+1. `cheap_double_reveal_offsets` on the configs; hook where the driver already
+   chooses cheap vs full sims.
+2. **Test that a full-search move at a fixed state and seed produces a
+   bit-identical `policy_target`.** This is the claim that keeps buffers
+   compatible; assert it, do not assume it.
+
+### Step 4 -- validate approximation quality, not just throughput
+
+Mean-unbiasedness is not sufficient. On the replay corpus, compare capped
+against exhaustive root output:
+
+* Q mean-absolute error and p95 error, broken down by edge size and signature;
+* selected-action disagreement rate;
+* Gumbel top-k survivor disagreement;
+* policy-target KL divergence;
+* missed terminal / catastrophe outcomes.
+
+### Step 5 -- measure real throughput
+
+Rows are not GPU calls. Record games/hour, global batches, rows per batch, GPU
+utilisation, padded tokens, forced-phase wall time and scheduler idle time,
+before and after.
 
 ---
 
@@ -418,53 +469,55 @@ standard.
 
 ### 1. Equal-network-budget allocation (highest value)
 
-The central unanswered question: at a **fixed** network-call budget, is it
-better to spend on exact root chance or on depth?
+At a fixed budget, is it better to spend on exact root chance or on depth?
+`--full-sims 64` with force against `--full-sims 128` with
+`--no-force-root-chance`, matched at ~84 rows/move, 200-400 games through
+`--eval-search-mode puct`. Nothing measured so far bears on this, and it decides
+strength per unit compute. ~90 minutes.
 
-Compare `--full-sims 64` + force-root-chance against `--full-sims 128` +
-`--no-force-root-chance`, matched at ~84 calls/move, 200-400 games through the
-**fixed PUCT evaluation path** (`--eval-search-mode puct`). This directly
-answers "what maximizes strength per unit compute", which is the question that
-matters for a world-best player. ~90 minutes.
+### 2. Offset sweep
 
-### 2. Cap sweep
+X in {1, 2, 3} against arena strength and games/hour, using the Step 4 quality
+metrics as the leading indicator.
 
-Y ∈ {16, 24, 32} on cheap moves, arena strength plus games/hour. Establishes
-whether the accuracy/throughput curve is flat (take 16) or steep (take 32).
+### 3. One-ply Great Library resolver (was "collapse")
 
-### 3. Capping full moves too
+Re-scoped from a free identity to a **search-quality experiment**. Resolving the
+3-option choice one ply early may be stronger than evaluating the pending-choice
+state, and halves those rows. But it changes full-move outputs, so it needs a
+`TARGET_VERSION` bump, its own story for the cached value+priors on the
+pending-choice node, and an arena A/B against exhaustive.
 
-Worth ~9 additional points of throughput. A capped edge is still a
-**stratified** estimate over Y correctly-weighted outcomes — far closer to
-exact than the ~6 random visits an uncapped-but-unforced edge would get — so
-this may be nearly free. Run it as an A/B **after** a working baseline exists,
-never folded into a first run where it would be confounded. Requires a
-`TARGET_VERSION` bump.
+### 4. Product chains and a genuine per-edge cap
 
-### 4. Advisor deep-search child growth
+A generic cap must operate on the **whole Cartesian chain** with balanced
+incidence across every component -- an orthogonal / systematic product design.
+Capping one component and multiplying by the rest is not a per-edge cap. This is
+what unlocks the `reveal + GL` cases (17.2% of children).
+
+### 5. Capping full moves
+
+Worth roughly another 9 points. A capped edge is a **stratified** estimate over
+correctly-weighted outcomes, far closer to exact than the ~6 random visits an
+unforced edge would get, so it may be nearly free. Requires a `TARGET_VERSION`
+bump. Run only after a working baseline exists.
+
+### 6. Advisor deep-search child growth
 
 Deep afterstates have **no** cap; `closed_child` accumulates one child per
-distinct sampled outcome, bounded only by visit count. At 64 sims that is
-self-limiting. At advisor scale (thousands of simulations concentrated on a
-narrow principal variation) a deep node could approach its full outcome count —
-up to 110 children each needing an evaluation, exactly on the line that matters
-most.
+distinct sampled outcome, bounded only by visits. Self-limiting at 64 sims. At
+advisor scale (thousands of simulations on a narrow principal variation) a deep
+node could approach its full outcome count. Measure child counts per depth with
+the same `nn_work` counters; add visit-scaled widening if they balloon.
 
-Measure child counts per depth at a few thousand sims on real positions using
-the same `nn_work` counters. If they stay modest, this is ZeusAI-beating
-accuracy for free. If they balloon, add visit-scaled widening deeper in the
-tree.
+### 7. Progressive widening
 
-### 5. Progressive widening
+ZeusAI grows the afterstate limit with visits in non-training games. A
+visit-scaled limit spends children only where search concentrates -- a better
+shape than either a flat cap or exhaustive, and cheap once the fixed-support
+class exists.
 
-ZeusAI grows the afterstate limit with visits in non-training games. A fixed
-cap pays the same everywhere; a visit-scaled limit spends children only where
-search concentrates. Better shape than either a flat cap or exhaustive, and
-cheap to add once the cap exists.
-
-### 6. Re-measure on the trained distribution
+### 8. Re-measure on the trained distribution
 
 Level 0 used run 02's buffer. Chance-edge frequency depends on how the net
-plays — a stronger net that avoids or seeks pyramid positions differently will
-shift the distribution. Re-run Level 0 on run 03's buffer and confirm the cap
-is still sized correctly.
+plays. Re-run on run 03's buffer and confirm the sizing still holds.
