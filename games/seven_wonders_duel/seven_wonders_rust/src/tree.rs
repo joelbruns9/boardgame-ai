@@ -30,6 +30,32 @@ pub struct Edge {
     pub visits: u32,
     pub value_sum_p0: f64,
     pub probability_weighted: bool,
+    /// The children are an APPROXIMATE, re-normalised subset of the outcome
+    /// space and the edge is closed against growth (see `fixed_support_index`
+    /// and `search.py::_Edge.fixed_support`). Ordinary descent samples from the
+    /// COMPLETE distribution and appends whatever key it cannot find, which on
+    /// a truncated edge would push the mass past 1 with nothing raising; a
+    /// closed edge instead draws only among what it already holds.
+    pub fixed_support: bool,
+}
+
+/// Index of the child a fixed-support draw lands on: the first whose cumulative
+/// weight exceeds `target`. `None` means the draw fell past the final
+/// cumulative sum (float residue, ~1e-16 for unit mass) — callers take the last
+/// child. `search.py::fixed_support_index` folds in the same order with the
+/// same strict `<`, so both languages pick the same child from the same draw.
+pub(crate) fn fixed_support_index<I: IntoIterator<Item = f64>>(
+    weights: I,
+    target: f64,
+) -> Option<usize> {
+    let mut cumulative = 0.0;
+    for (index, weight) in weights.into_iter().enumerate() {
+        cumulative += weight;
+        if target < cumulative {
+            return Some(index);
+        }
+    }
+    None
 }
 
 impl Edge {
@@ -112,6 +138,7 @@ impl Node {
                         visits: 0,
                         value_sum_p0: 0.0,
                         probability_weighted: false,
+                        fixed_support: false,
                     }
                 })
                 .collect();
@@ -139,6 +166,22 @@ impl Node {
 /// Descend one edge: sample its chance chain and materialize/reuse the child,
 /// keyed by the observable key. Returns the child's index in `edge.children`.
 fn closed_child(node: &mut Node, edge_idx: usize, rng: &mut Rng) -> usize {
+    if node.edges[edge_idx].fixed_support {
+        let children = &mut node.edges[edge_idx].children;
+        assert!(!children.is_empty(), "fixed-support edge has no children");
+        let target = rng.next_float();
+        let idx = fixed_support_index(
+            children.iter().map(|(_, child)| {
+                child
+                    .probability
+                    .expect("fixed-support child needs a re-normalised weight")
+            }),
+            target,
+        )
+        .unwrap_or(children.len() - 1);
+        children[idx].1.samples += 1;
+        return idx;
+    }
     let (outcomes, probability, key) = if node.edges[edge_idx].specs.is_empty() {
         (Vec::new(), Some(1.0), Vec::new())
     } else {
@@ -201,6 +244,47 @@ fn descend<E: Eval>(
     Ok(v)
 }
 
+#[cfg(test)]
+mod fixed_support_tests {
+    use super::fixed_support_index;
+
+    /// The golden table is pinned identically in
+    /// `test_search.py::test_fixed_support_index_matches_the_rust_golden_table`;
+    /// both languages must map the same (weights, draw) to the same child.
+    #[test]
+    fn golden_table_matches_python() {
+        let uniform = [0.25, 0.25, 0.25, 0.25];
+        let skewed = [0.1, 0.7, 0.2];
+        let cases: &[(&[f64], f64, usize)] = &[
+            (&uniform, 0.0, 0),
+            (&uniform, 0.249_999, 0),
+            (&uniform, 0.25, 1),
+            (&uniform, 0.5, 2),
+            (&uniform, 0.999_999, 3),
+            (&skewed, 0.09, 0),
+            (&skewed, 0.1, 1),
+            (&skewed, 0.799_999, 1),
+            (&skewed, 0.8, 2),
+            (&[1.0], 0.0, 0),
+            (&[1.0], 0.999_999, 0),
+        ];
+        for &(weights, target, expected) in cases {
+            assert_eq!(
+                fixed_support_index(weights.iter().copied(), target),
+                Some(expected),
+                "weights {weights:?} target {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_past_the_last_cumulative_sum_falls_through_to_the_caller() {
+        // Float residue: the caller takes the last child rather than nothing.
+        assert_eq!(fixed_support_index([0.5, 0.5], 1.0), None);
+        assert_eq!(fixed_support_index([], 0.0), None);
+    }
+}
+
 /// Build a closed tree from `state` with a fixed round-robin root-edge schedule
 /// (the F3.2 stand-in for the F3.3 Gumbel root). Root is expanded and counted
 /// once, then `sims` descents cycle through the root edges.
@@ -242,6 +326,11 @@ pub struct SearchConfig {
     /// Common root AgeDeal samples per legal action. Zero preserves the legacy
     /// independently-sampled behavior.
     pub age_deal_samples: usize,
+    /// Offsets per first-reveal stratum on a PURE double card-reveal root edge
+    /// (`search.py::SearchConfig.double_reveal_offsets`). Zero keeps forced
+    /// expansion exhaustive; a positive `X` keeps the balanced `n * X` support
+    /// and CLOSES the edge.
+    pub double_reveal_offsets: usize,
 }
 
 pub struct SearchResult {
@@ -278,7 +367,10 @@ pub fn sigma_vector(cfg: &SearchConfig, completed: &[f64], max_visits: u32) -> V
 /// Materialize + evaluate every enumerable chance child of each root edge (AGE_DEAL
 /// stays sampled), marking those edges probability-weighted — the closed-mode
 /// catastrophe-coverage toggle (port of `_force_expand_root`).
-fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
+///
+/// With `cfg.double_reveal_offsets` set, a pure double card-reveal edge keeps
+/// the balanced `n * X` support instead and is CLOSED against later growth.
+fn force_expand_root<E: Eval>(root: &mut Node, eval: &E, cfg: &SearchConfig) -> PyResult<()> {
     for edge in &mut root.edges {
         if edge.specs.is_empty()
             || edge
@@ -289,7 +381,16 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
             continue;
         }
         let action = decode_action(&root.state, edge.action_index);
-        for (outcomes, probability, key) in chance::enumerate_chains(&root.state, &edge.specs) {
+        let balanced = chance::balanced_double_reveal_chains(
+            &root.state,
+            &edge.specs,
+            cfg.double_reveal_offsets,
+            cfg.seed,
+        );
+        let capped = balanced.is_some();
+        let chains =
+            balanced.unwrap_or_else(|| chance::enumerate_chains(&root.state, &edge.specs));
+        for (outcomes, probability, key) in chains {
             if edge.children.iter().any(|(k, _)| *k == key) {
                 continue;
             }
@@ -310,8 +411,9 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
                 },
             ));
         }
-        // The enumerated children must carry the full chance mass before the edge
-        // trusts the invariant in `q_p0` (port of Python's check).
+        // The retained children must carry the full (re-normalised) chance mass
+        // before the edge trusts the invariant in `q_p0` (port of Python's
+        // check). A capped edge is additionally closed against growth.
         let mass: f64 = edge
             .children
             .iter()
@@ -324,6 +426,7 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E) -> PyResult<()> {
             )));
         }
         edge.probability_weighted = true;
+        edge.fixed_support = capped;
     }
     Ok(())
 }
@@ -415,7 +518,7 @@ pub fn search_closed<E: Eval>(
     root.visits += 1;
     root.value_sum_p0 += root_value_p0;
     if cfg.force_expand_root_chance {
-        force_expand_root(&mut root, eval)?;
+        force_expand_root(&mut root, eval, cfg)?;
     }
     let sign = if root.actor == 0 { 1.0 } else { -1.0 };
     let root_value = sign * root_value_p0;

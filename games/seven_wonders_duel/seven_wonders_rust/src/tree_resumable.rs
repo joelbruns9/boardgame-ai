@@ -35,7 +35,33 @@ pub struct Edge {
     pub value_sum_p0: f64,
     pub incomplete: u32,
     pub probability_weighted: bool,
-    pub paired_sampled: bool,
+    /// Approximate, re-normalised subset of the outcome space, closed against
+    /// growth — see `tree::fixed_support_index`. The paired AgeDeal sampler is
+    /// the first member of this class; capped chance supports join it.
+    pub fixed_support: bool,
+}
+
+impl Edge {
+    /// Close an approximate edge. The retained children must already carry
+    /// re-normalised weights summing to 1: that is what makes their
+    /// probability-weighted Q a proper (stratified) expectation, and what
+    /// `q_p0` assumes for the life of the tree.
+    fn close_fixed_support(&mut self) -> PyResult<()> {
+        let mass: f64 = self
+            .children
+            .iter()
+            .map(|(_, child)| child.probability.unwrap_or(0.0))
+            .sum();
+        if self.children.is_empty() || (mass - 1.0).abs() > 1e-9 {
+            return Err(PyValueError::new_err(format!(
+                "fixed-support edge {} holds re-normalised mass {mass} != 1",
+                self.action_index
+            )));
+        }
+        self.probability_weighted = true;
+        self.fixed_support = true;
+        Ok(())
+    }
 }
 
 pub struct Node {
@@ -184,7 +210,7 @@ fn expand(arena: &mut Arena, node_id: NodeId, priors: Vec<f64>) -> PyResult<()> 
                 value_sum_p0: 0.0,
                 incomplete: 0,
                 probability_weighted: false,
-                paired_sampled: false,
+                fixed_support: false,
             }
         })
         .collect();
@@ -229,20 +255,21 @@ pub enum SearchEvent {
 }
 
 fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut Rng) -> NodeId {
-    if arena.nodes[node_id].edges[edge_idx].paired_sampled {
+    if arena.nodes[node_id].edges[edge_idx].fixed_support {
+        // Closed support: draw among the RETAINED children by their
+        // re-normalised weights, never materialize a new one.
         let target = rng.next_float();
         let children = &mut arena.nodes[node_id].edges[edge_idx].children;
-        let mut cumulative = 0.0;
-        let mut selected = children.len().saturating_sub(1);
-        for (index, (_, child)) in children.iter().enumerate() {
-            cumulative += child
-                .probability
-                .expect("paired sampled child needs an empirical probability");
-            if target < cumulative {
-                selected = index;
-                break;
-            }
-        }
+        assert!(!children.is_empty(), "fixed-support edge has no children");
+        let selected = crate::tree::fixed_support_index(
+            children.iter().map(|(_, child)| {
+                child
+                    .probability
+                    .expect("fixed-support child needs a re-normalised weight")
+            }),
+            target,
+        )
+        .unwrap_or(children.len() - 1);
         children[selected].1.samples += 1;
         return children[selected].1.node_id;
     }
@@ -435,12 +462,21 @@ impl ForcedRows {
 /// Materialize every tractable immediate root outcome without evaluating it.
 /// The returned stable arena IDs are consumed by the resumable forced phase, so
 /// the global scheduler can coalesce rows from independent games.
-fn materialize_forced_root(arena: &mut Arena) -> PyResult<ForcedRows> {
+fn materialize_forced_root(
+    arena: &mut Arena,
+    double_reveal_offsets: usize,
+    search_seed: u64,
+) -> PyResult<ForcedRows> {
     let root_id = arena.root_id;
     let edge_count = arena.nodes[root_id].edges.len();
     let mut forced_nodes = Vec::new();
     let mut by_kind = [0_usize; 4];
-    let mut enumeration_cache: HashMap<Vec<(u8, Vec<i32>)>, Vec<EnumeratedChain>> = HashMap::new();
+    // Keyed by chance signature: both the exhaustive enumeration and the
+    // balanced support depend only on the signature, the (fixed) root state and
+    // the search seed -- which is also what makes edges sharing a signature
+    // share their support. The flag records whether the entry is capped.
+    let mut enumeration_cache: HashMap<Vec<(u8, Vec<i32>)>, (bool, Vec<EnumeratedChain>)> =
+        HashMap::new();
     for edge_idx in 0..edge_count {
         let skip = {
             let edge = &arena.nodes[root_id].edges[edge_idx];
@@ -462,9 +498,18 @@ fn materialize_forced_root(arena: &mut Arena) -> PyResult<ForcedRows> {
             .iter()
             .map(|spec| (spec.kind as u8, spec.context.clone()))
             .collect();
-        let enumerated = enumeration_cache
-            .entry(signature)
-            .or_insert_with(|| chance::enumerate_chains(&state, &specs));
+        let (capped, enumerated) = enumeration_cache.entry(signature).or_insert_with(|| {
+            match chance::balanced_double_reveal_chains(
+                &state,
+                &specs,
+                double_reveal_offsets,
+                search_seed,
+            ) {
+                Some(chains) => (true, chains),
+                None => (false, chance::enumerate_chains(&state, &specs)),
+            }
+        });
+        let capped = *capped;
         if enumerated.len() > bound {
             return Err(PyValueError::new_err(format!(
                 "force-expanded edge {action_index} has {} outcomes above registered bound {bound}",
@@ -508,6 +553,12 @@ fn materialize_forced_root(arena: &mut Arena) -> PyResult<ForcedRows> {
                     samples: 0,
                 },
             ));
+        }
+        if capped {
+            // A capped edge holds a re-normalised subset: close it, or ordinary
+            // descent would append omitted outcomes and break the mass.
+            arena.nodes[root_id].edges[edge_idx].close_fixed_support()?;
+            continue;
         }
         let mass: f64 = arena.nodes[root_id].edges[edge_idx]
             .children
@@ -624,18 +675,9 @@ fn materialize_paired_age_deals(
                 },
             ));
         }
-        let mass: f64 = arena.nodes[root_id].edges[edge_idx]
-            .children
-            .iter()
-            .map(|(_, child)| child.probability.unwrap_or(0.0))
-            .sum();
-        if (mass - 1.0).abs() > 1e-9 {
-            return Err(PyValueError::new_err(format!(
-                "paired AgeDeal edge {action_index} holds probability mass {mass} != 1"
-            )));
-        }
-        arena.nodes[root_id].edges[edge_idx].probability_weighted = true;
-        arena.nodes[root_id].edges[edge_idx].paired_sampled = true;
+        // The empirical sample weights are the edge's whole support from here
+        // on: closing it keeps later descents inside the sampled deals.
+        arena.nodes[root_id].edges[edge_idx].close_fixed_support()?;
     }
     let mut by_kind = [0_usize; 4];
     by_kind[ChanceKind::AgeDeal as usize] = nodes.len();
@@ -763,6 +805,7 @@ impl SearchSession {
                 force_expand_root_chance: cfg.force_expand_root_chance,
                 puct_root: cfg.puct_root,
                 age_deal_samples: cfg.age_deal_samples,
+                double_reveal_offsets: cfg.double_reveal_offsets,
             },
             leaf_batch,
             rng,
@@ -1314,7 +1357,11 @@ pub fn begin_search_from_root_forced(
     let mut session = begin_search_from_root(state, &base_cfg, leaf_batch, root_evaluation)?;
     session.cfg.force_expand_root_chance = force;
     if force {
-        let mut forced = materialize_forced_root(&mut session.arena)?;
+        let mut forced = materialize_forced_root(
+            &mut session.arena,
+            cfg.double_reveal_offsets,
+            cfg.seed,
+        )?;
         forced.extend(materialize_paired_age_deals(
             &mut session.arena,
             cfg.age_deal_samples,
@@ -1364,7 +1411,8 @@ pub fn search_closed_batched<E: Eval>(
     arena.nodes[root_id].visits += 1;
     arena.nodes[root_id].value_sum_p0 += root_value_p0;
     let forced_nodes = if cfg.force_expand_root_chance {
-        let mut forced = materialize_forced_root(&mut arena)?;
+        let mut forced =
+            materialize_forced_root(&mut arena, cfg.double_reveal_offsets, cfg.seed)?;
         forced.extend(materialize_paired_age_deals(
             &mut arena,
             cfg.age_deal_samples,

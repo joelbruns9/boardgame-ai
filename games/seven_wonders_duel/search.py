@@ -42,7 +42,13 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .codec import decode_action, legal_action_indices
-from .data import TABLEAU_LAYOUTS, BackType, back_type_of, covering_slots
+from .data import (
+    CARD_IDS,
+    TABLEAU_LAYOUTS,
+    BackType,
+    back_type_of,
+    covering_slots,
+)
 from .encoder import encode
 from .engine import Action, ActionUse, apply_action
 from .game import ChanceKind, GameState, Phase
@@ -200,6 +206,27 @@ def sample_outcomes(
 # --------------------------------------------------------------------------
 
 
+def fixed_support_index(weights, target: float) -> int:
+    """Index of the child a fixed-support draw lands on: the first whose
+    cumulative weight exceeds `target`.
+
+    The last child absorbs the float residue — with mass 1 by construction the
+    residue is ~1e-16, and a draw past the final cumulative sum must still
+    resolve to an existing child rather than fall through. Rust's
+    `tree::fixed_support_index` mirrors this exactly (same fold order, same
+    strict `<`), so the two languages pick the same child from the same draw."""
+
+    weights = list(weights)
+    if not weights:
+        raise ValueError("fixed-support edge has no children to sample")
+    cumulative = 0.0
+    for index, weight in enumerate(weights):
+        cumulative += weight
+        if target < cumulative:
+            return index
+    return len(weights) - 1
+
+
 def state_actor(state: GameState) -> int:
     return (
         state.pending_choice.player
@@ -232,6 +259,37 @@ class _Edge:
     probability_weighted: bool = False
     """Use the current exact chance expectation for Q. Enabled only after
     every enumerable child has been materialized (forced root expansion)."""
+    fixed_support: bool = False
+    """The children are an APPROXIMATE, re-normalised subset of the outcome
+    space, and the edge is closed against growth.
+
+    Three edge classes must stay distinct (CHANCE_ENUMERATION_PLAN.md):
+
+    | class                   | support               | later descent           |
+    |-------------------------|-----------------------|-------------------------|
+    | `probability_weighted`  | exhaustive, exact     | always finds a child    |
+    | `fixed_support`         | retained subset       | samples only among them |
+    | ordinary sampled        | grows lazily          | may materialize a child |
+
+    An approximate edge MUST be closed: ordinary descent samples from the
+    COMPLETE chance distribution and appends any outcome it cannot find,
+    carrying that outcome's original probability. On a truncated edge that
+    would push the mass above 1 and `q_p0` would then return a weighted sum
+    over more than unit mass with nothing raising. Closing the support is
+    what keeps the invariant true for the life of the tree."""
+
+    def close_fixed_support(self) -> None:
+        """Mark an approximate edge closed. The retained children must already
+        carry re-normalised weights summing to 1 — that is what makes their
+        probability-weighted Q a proper (stratified) expectation."""
+
+        mass = sum(child.probability or 0.0 for child in self.children.values())
+        if not self.children or abs(mass - 1.0) > 1e-9:
+            raise ValueError(
+                f"fixed-support edge holds re-normalised mass {mass:.6f} != 1"
+            )
+        self.probability_weighted = True
+        self.fixed_support = True
 
     @property
     def q_p0(self) -> float:
@@ -318,6 +376,16 @@ class SearchConfig:
     """Closed mode: exhaustively materialize and evaluate every enumerable
     chance child of the root's edges before searching (plan §5 catastrophe
     coverage; AGE_DEAL edges stay sampled)."""
+    double_reveal_offsets: int = 0
+    """Offsets per first-reveal stratum on a PURE double card-reveal root edge.
+
+    Zero (the default) keeps forced expansion exhaustive. A positive `X` keeps
+    the balanced `n * X` support instead of all `n * (n - 1)` directed pairs —
+    every hidden card still appears exactly once in the first revealed slot and
+    exactly `X` times in the second, weighted `1 / (n * X)`, closed against
+    growth. Those edges are 54.5% of all forced children
+    (CHANCE_ENUMERATION_PLAN.md). Everything else stays exhaustive; the cap is
+    ignored once `X` would retain the full space anyway."""
 
 
 class GumbelMCTS:
@@ -501,6 +569,17 @@ class GumbelMCTS:
         child. Never touches the locked deal (barred clones + explicit
         outcomes)."""
 
+        if edge.fixed_support:
+            # Closed support: draw among the RETAINED children by their
+            # re-normalised weights and never materialize a new one (an omitted
+            # outcome re-entering the tree would break the mass invariant).
+            children = list(edge.children.values())
+            index = fixed_support_index(
+                (child.probability for child in children), self.rng.next_float()
+            )
+            child = children[index]
+            child.samples += 1
+            return child.node
         if edge.specs:
             outcomes, probability, key = sample_outcomes(
                 node.state, edge.specs, self.rng
@@ -618,14 +697,28 @@ class GumbelMCTS:
     def _force_expand_root(self, root: ClosedNode) -> None:
         """Materialize + evaluate every enumerable chance child of the root's
         edges (catastrophe coverage: rare instant-loss reveals are guaranteed
-        probability-weighted, never unsampled). AGE_DEAL edges stay sampled."""
+        probability-weighted, never unsampled). AGE_DEAL edges stay sampled.
+
+        With `double_reveal_offsets` set, a pure double card-reveal edge keeps
+        the balanced `n * X` support instead and is CLOSED — its children are a
+        re-normalised subset, so descent must never re-open it."""
 
         for edge in root.edges:
             if not edge.specs or any(
                 spec.kind is ChanceKind.AGE_DEAL for spec in edge.specs
             ):
                 continue
-            for outcomes, probability, key in enumerate_chains(root.state, edge.specs):
+            balanced = balanced_double_reveal_chains(
+                root.state,
+                edge.specs,
+                self.config.double_reveal_offsets,
+                self.config.seed,
+            )
+            for outcomes, probability, key in (
+                balanced
+                if balanced is not None
+                else enumerate_chains(root.state, edge.specs)
+            ):
                 if key in edge.children:
                     continue
                 clone = root.state.clone()
@@ -640,6 +733,9 @@ class GumbelMCTS:
                 child_node.visits = 1
                 child_node.value_sum_p0 = value_p0
                 edge.children[key] = _Child(probability=probability, node=child_node)
+            if balanced is not None:
+                edge.close_fixed_support()
+                continue
             mass = sum(child.probability for child in edge.children.values())
             if abs(mass - 1.0) > 1e-9:
                 raise RuntimeError(
@@ -806,6 +902,131 @@ class GumbelMCTS:
         )
 
 
+# --------------------------------------------------------------------------
+# Balanced double-reveal support — an approximate, exactly-weighted SUBSET of a
+# two-card-reveal edge's outcome space (CHANCE_ENUMERATION_PLAN.md, Step 2).
+# --------------------------------------------------------------------------
+
+_MASK64 = (1 << 64) - 1
+_FNV_OFFSET = 0xCBF29CE484222325
+_FNV_PRIME = 0x100000001B3
+# Domain separation: the offsets must be a function of the POSITION and the
+# search seed, and must not consume the main search RNG stream. Drawing them
+# from the shared stream is the bug class that bit the PUCT root port, where
+# Gumbel keys offset every downstream chance sample.
+_OFFSET_DOMAIN_TAG = 0x0FF5_E75E_ED01_7D0B
+
+_BACK_IDS = {back: index for index, back in enumerate(BackType)}
+_KIND_IDS = {kind: index for index, kind in enumerate(ChanceKind)}
+
+
+def _mix64(accumulator: int, value: int) -> int:
+    """One FNV-1a round over a 64-bit word (mirrored by Rust's `mix64`)."""
+
+    return ((accumulator ^ (value & _MASK64)) * _FNV_PRIME) & _MASK64
+
+
+def double_reveal_offset_seed(search_seed: int, specs, pools) -> int:
+    """Domain-separated seed for one edge's offset draw.
+
+    Built from the search seed, the chance signature, and the reveal pools (the
+    part of the public state the support is defined over) — deliberately NOT
+    from the action index, so two root edges sharing a chance signature draw the
+    same offsets. Common random numbers: comparing two actions over a common
+    support cancels the offset noise out of the comparison."""
+
+    accumulator = _mix64(_FNV_OFFSET, _OFFSET_DOMAIN_TAG)
+    accumulator = _mix64(accumulator, search_seed)
+    for spec in specs:
+        accumulator = _mix64(accumulator, _KIND_IDS[spec.kind])
+        (row, x), back = spec.context
+        for value in (row, x, _BACK_IDS[back]):
+            accumulator = _mix64(accumulator, value)
+    for names in pools:
+        accumulator = _mix64(accumulator, len(names))
+        for name in names:
+            accumulator = _mix64(accumulator, CARD_IDS[name])
+    return accumulator
+
+
+def distinct_offsets(modulus: int, count: int, seed: int) -> list[int]:
+    """`count` distinct offsets in `[0, modulus)`, uniform over subsets, from a
+    partial Fisher-Yates draw on a private stream. Returned ascending so the
+    support does not depend on draw order."""
+
+    rng = PortableRng(seed)
+    values = list(range(modulus))
+    for k in range(count):
+        j = k + rng.randrange(modulus - k)
+        values[k], values[j] = values[j], values[k]
+    return sorted(values[:count])
+
+
+def balanced_double_reveal_chains(
+    state: GameState, specs, offsets: int, search_seed: int
+) -> list[tuple[list, float, tuple]] | None:
+    """The balanced `n * offsets` support of a PURE double card-reveal edge, in
+    the same `(outcomes, probability, key)` shape as `enumerate_chains`.
+
+    Returns None when the construction does not apply — a different chance
+    signature, `offsets <= 0`, or an `offsets` large enough that the full space
+    is no bigger — and the caller must then enumerate exhaustively.
+
+    Construction (same back, `n` unseen cards, `X` offsets):
+
+    * **Stratify on the first reveal.** Every hidden card is the first reveal in
+      exactly one stratum. That is the marginal-coverage guarantee, and it is
+      what makes this strictly better than IID sampling at equal budget.
+    * **Second reveal by cyclic block.** Stratum `i` takes seconds
+      `first[(i + 1 + t) % n]` for `X` offsets `t` in `[0, n - 1)`, i.e.
+      directed-pair distances `1..n-1`. Each fixed distance is a bijection on
+      the pool, so every card appears exactly `X` times in second position, and
+      a self-pair is unreachable by construction (distance 0 is excluded).
+    * **Weight `1 / (n * X)`** — mass exactly 1, so the retained children carry
+      a proper stratified expectation rather than a conditional one.
+
+    When the two slots have DIFFERENT backs the pools are disjoint (back types
+    partition the card universe), so no exclusion applies: the cycle runs over
+    the second pool as `second[(i + t) % n2]` with distances `0..n2-1`. First
+    position is still covered exactly once; second-position incidence is even to
+    within one, since `n1` strata spread over `n2` residues.
+
+    The coverage claim is **marginal**: every hidden card in every revealed
+    slot. It is not coverage of every dangerous PAIR interaction."""
+
+    if offsets <= 0 or len(specs) != 2:
+        return None
+    if any(spec.kind is not ChanceKind.CARD_REVEAL for spec in specs):
+        return None
+    pool = unseen_pool(state.observation(state.active_player))
+    first = [name for name, _ in enumerate_card_reveal(pool, specs[0].context[1])]
+    same_back = specs[1].context[1] == specs[0].context[1]
+    second = (
+        first
+        if same_back
+        else [name for name, _ in enumerate_card_reveal(pool, specs[1].context[1])]
+    )
+    n = len(first)
+    modulus = n - 1 if same_back else len(second)
+    if offsets >= modulus:
+        return None  # the balanced support would be the whole space (or larger)
+    chosen = distinct_offsets(
+        modulus, offsets, double_reveal_offset_seed(search_seed, specs, (first, second))
+    )
+    weight = 1.0 / (n * offsets)
+    chains = []
+    for i, name in enumerate(first):
+        for offset in chosen:
+            other = (
+                first[(i + 1 + offset) % n]
+                if same_back
+                else second[(i + offset) % modulus]
+            )
+            outcomes = [name, other]
+            chains.append((outcomes, weight, tuple(outcomes)))
+    return chains
+
+
 def enumerate_chains(state: GameState, specs) -> list[tuple[list, float, tuple]]:
     """All (outcomes, joint probability, key) chains for enumerable specs —
     sequential CARD_REVEALs condition later pools on earlier outcomes. Used by
@@ -904,6 +1125,11 @@ def closed_root_exact_value(node: ClosedNode) -> float:
     for edge in node.edges:
         if not edge.children:
             raise ValueError("exact value requires every edge expanded")
+        if edge.fixed_support:
+            raise ValueError(
+                "exact value reached an approximate fixed-support edge — its "
+                "children are a re-normalised subset, not the full outcome space"
+            )
         if any(child.probability is None for child in edge.children.values()):
             # Sample-only chance (AGE_DEAL): Monte Carlo mean over samples.
             weight = sum(child.samples for child in edge.children.values())

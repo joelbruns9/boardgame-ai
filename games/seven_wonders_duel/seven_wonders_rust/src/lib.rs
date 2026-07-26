@@ -430,7 +430,7 @@ impl RustGame {
     /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
     /// `visits`/`policy_target` aligned to `legal_action_indices`.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, double_reveal_offsets=0))]
     fn closed_search(
         &self,
         sims: usize,
@@ -441,6 +441,7 @@ impl RustGame {
         c_scale: f64,
         force: bool,
         puct_root: bool,
+        double_reveal_offsets: usize,
     ) -> PyResult<(
         usize,
         f64,
@@ -461,6 +462,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root,
             age_deal_samples: 0,
+            double_reveal_offsets,
         };
         let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -482,7 +484,7 @@ impl RustGame {
     /// request, evaluation is applied separately, and stable arena paths are
     /// backed up before the next simulation is selected.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, double_reveal_offsets=0))]
     fn closed_search_resumable(
         &self,
         sims: usize,
@@ -492,6 +494,7 @@ impl RustGame {
         c_visit: f64,
         c_scale: f64,
         force: bool,
+        double_reveal_offsets: usize,
     ) -> PyResult<(
         usize,
         f64,
@@ -512,6 +515,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root: false,
             age_deal_samples: 0,
+            double_reveal_offsets,
         };
         let (res, arena) = tree_resumable::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -563,6 +567,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root: false,
             age_deal_samples: 0,
+            double_reveal_offsets: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena) = tree_resumable::search_closed(&self.state, &evaluator, &cfg)?;
@@ -619,6 +624,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root,
             age_deal_samples: 0,
+            double_reveal_offsets: 0,
         };
         let (res, arena, metrics) =
             tree_resumable::search_closed_batched(&self.state, &eval::MockEval, &cfg, leaf_batch)?;
@@ -685,6 +691,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root: false,
             age_deal_samples: 0,
+            double_reveal_offsets: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena, metrics) =
@@ -750,6 +757,7 @@ impl RustGame {
             force_expand_root_chance: force,
             puct_root,
             age_deal_samples: 0,
+            double_reveal_offsets: 0,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, root) = tree::search_closed(&self.state, &evaluator, &cfg)?;
@@ -1051,7 +1059,8 @@ fn search_result_to_py(
 #[pyo3(signature = (
     adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
     c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
-    age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false
+    age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false,
+    double_reveal_offsets=0
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -1069,6 +1078,7 @@ fn search_many_flat_net(
     age_deal_samples: usize,
     inference_timeout_ms: f64,
     puct_root: bool,
+    double_reveal_offsets: usize,
 ) -> PyResult<Vec<Py<PyDict>>> {
     if games.is_empty() || games.len() != search_seeds.len() {
         return Err(PyValueError::new_err(
@@ -1108,6 +1118,7 @@ fn search_many_flat_net(
                 force_expand_root_chance: force,
                 puct_root,
                 age_deal_samples,
+                double_reveal_offsets,
             };
             let session = if force {
                 tree_resumable::begin_search_from_root_forced(state, &cfg, leaf_batch, evaluation)?

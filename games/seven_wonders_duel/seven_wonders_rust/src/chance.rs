@@ -233,6 +233,119 @@ fn expand(
     results
 }
 
+// --- balanced double-reveal support (CHANCE_ENUMERATION_PLAN.md Step 2) ------
+// Port of `search.py::balanced_double_reveal_chains` and the two helpers it
+// needs. Bit-for-bit: same FNV-1a seed derivation, same partial Fisher-Yates
+// over the same `Rng`, same stratum-major emission order, same weight.
+
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x100_0000_01B3;
+/// Domain separation: offsets are a function of the POSITION and the search
+/// seed, drawn on a private stream so they never shift the main search RNG.
+const OFFSET_DOMAIN_TAG: u64 = 0x0FF5_E75E_ED01_7D0B;
+
+fn mix64(accumulator: u64, value: u64) -> u64 {
+    (accumulator ^ value).wrapping_mul(FNV_PRIME)
+}
+
+/// Domain-separated seed for one edge's offset draw: search seed + chance
+/// signature + reveal pools, and deliberately NOT the action index, so edges
+/// sharing a signature share their support (common random numbers).
+fn double_reveal_offset_seed(
+    search_seed: u64,
+    specs: &[ChanceSpec],
+    pools: [&[usize]; 2],
+) -> u64 {
+    let mut accumulator = mix64(FNV_OFFSET, OFFSET_DOMAIN_TAG);
+    accumulator = mix64(accumulator, search_seed);
+    for spec in specs {
+        accumulator = mix64(accumulator, spec.kind as u64);
+        for &value in &spec.context {
+            accumulator = mix64(accumulator, value as i64 as u64);
+        }
+    }
+    for pool in pools {
+        accumulator = mix64(accumulator, pool.len() as u64);
+        for &id in pool {
+            accumulator = mix64(accumulator, id as u64);
+        }
+    }
+    accumulator
+}
+
+/// `count` distinct offsets in `[0, modulus)`, uniform over subsets, from a
+/// partial Fisher-Yates draw on a private stream. Ascending, so the support
+/// does not depend on draw order.
+pub fn distinct_offsets(modulus: usize, count: usize, seed: u64) -> Vec<usize> {
+    let mut rng = Rng::new(seed);
+    let mut values: Vec<usize> = (0..modulus).collect();
+    for k in 0..count {
+        let j = k + rng.randrange((modulus - k) as u64) as usize;
+        values.swap(k, j);
+    }
+    let mut chosen = values[..count].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
+/// The balanced `n * offsets` support of a PURE double card-reveal edge, in the
+/// `enumerate_chains` shape. `None` means the construction does not apply (a
+/// different signature, `offsets == 0`, or an `offsets` that would retain the
+/// whole space) and the caller must enumerate exhaustively.
+///
+/// Stratify on the first reveal — every hidden card leads exactly one stratum,
+/// the marginal-coverage guarantee — then take the second by cyclic block:
+/// stratum `i` pairs with `first[(i + 1 + t) % n]` over the drawn offsets `t`,
+/// i.e. directed-pair distances `1..n-1`, so each card lands in second position
+/// exactly `offsets` times and a self-pair is unreachable. Different backs mean
+/// disjoint pools and no exclusion, so the cycle runs over the second pool with
+/// distances `0..n2-1` and second-position incidence is even to within one.
+pub fn balanced_double_reveal_chains(
+    g: &GameState,
+    specs: &[ChanceSpec],
+    offsets: usize,
+    search_seed: u64,
+) -> Option<Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)>> {
+    if offsets == 0 || specs.len() != 2 {
+        return None;
+    }
+    if specs.iter().any(|s| s.kind != ChanceKind::CardReveal) {
+        return None;
+    }
+    let pool = unseen_pool(g);
+    let first_back = specs[0].context[2] as usize;
+    let second_back = specs[1].context[2] as usize;
+    let same_back = first_back == second_back;
+    let first = &pool.cards[first_back];
+    let second = &pool.cards[second_back];
+    let n = first.len();
+    let modulus = if same_back {
+        n.saturating_sub(1)
+    } else {
+        second.len()
+    };
+    if offsets >= modulus {
+        return None;
+    }
+    let seed = double_reveal_offset_seed(search_seed, specs, [first, second]);
+    let chosen = distinct_offsets(modulus, offsets, seed);
+    let weight = 1.0 / (n * offsets) as f64;
+    let mut chains = Vec::with_capacity(n * offsets);
+    for (i, &name) in first.iter().enumerate() {
+        for &offset in &chosen {
+            let other = if same_back {
+                first[(i + 1 + offset) % n]
+            } else {
+                second[(i + offset) % modulus]
+            };
+            let outcomes = vec![vec![name], vec![other]];
+            let key = outcome_key(&outcomes);
+            chains.push((outcomes, weight, key));
+        }
+    }
+    Some(chains)
+}
+
 /// Card ids of a back type, ascending by card NAME — the order Python's
 /// `sorted(pool.cards[back])` (a set of names) produces, which the AGE_DEAL
 /// sampler shuffles.

@@ -1,6 +1,7 @@
 # Chance-node enumeration: measurement, design, and build plan
 
-**Status:** measured; design revised after review; not yet implemented.
+**Status:** measured; design revised after review; **Steps 1-2 built
+(2026-07-25)**, Steps 3-5 outstanding.
 **Date:** 2026-07-25.
 
 ## The problem
@@ -244,7 +245,7 @@ probability-weighted sum over more than unit mass with no error raised.
 
 **A capped edge must therefore have closed support**: later descents sample only
 among retained children, re-normalised. Rust already has exactly this mechanism
-for AgeDeal -- `paired_sampled` edges sample among existing children by
+for AgeDeal -- `paired_sampled` edges (renamed `fixed_support` in Step 1) sample among existing children by
 cumulative empirical probability and never create new ones. The cap should reuse
 that pattern rather than invent one.
 
@@ -414,7 +415,7 @@ handling product chains -- but both carry costs this scope deliberately avoids.
 
 ## Build plan (revised)
 
-### Step 1 -- the approximate fixed-support edge class
+### Step 1 -- the approximate fixed-support edge class -- **DONE 2026-07-25**
 
 Infrastructure before any approximation. No behaviour change yet.
 
@@ -426,7 +427,34 @@ Infrastructure before any approximation. No behaviour change yet.
    child and leave mass at exactly 1; `q_p0` matches a hand-computed weighted
    sum.
 
-### Step 2 -- balanced double-reveal support
+**What was built.** `fixed_support` is now a first-class edge flag in all three
+searchers: `search.py::_Edge`, `tree.rs::Edge` (scalar) and
+`tree_resumable.rs::Edge`. Rust's `paired_sampled` was **renamed** into it
+rather than left alongside -- the paired AgeDeal sampler always was a member of
+this class, and one flag keeps the closed-support rule in a single place.
+
+* Selection rule shared by both languages: `search.py::fixed_support_index` /
+  `tree::fixed_support_index` -- first child whose cumulative weight exceeds one
+  `next_float()` draw, last child absorbing the float residue. Pinned by an
+  identical golden table on both sides.
+* Closing an edge goes through `_Edge.close_fixed_support` /
+  `Edge::close_fixed_support`, which refuses any support that is not
+  re-normalised to mass 1 -- so a truncation cannot be half-applied.
+* `closed_root_exact_value` now **refuses** to descend a fixed-support edge:
+  its children are a subset, so an "exact" value through one would be a lie.
+* Nothing sets the flag except the AgeDeal sampler yet, so search output is
+  unchanged; the whole 7WD suite (440 tests) and every Rust/Python equivalence
+  gate stay green.
+* Tests: `test_search.py` -- golden table, 5,000 direct draws plus 200 full
+  descents materialise no child and hold mass at exactly 1, draws follow the
+  re-normalised weights, `q_p0` equals a hand-computed weighted sum (uniform and
+  skewed), partial mass is rejected, exact value refuses the edge.
+  `test_f4_boundary.py::test_f4_r0_fixed_support_edges_never_grow_and_keep_unit_mass`
+  parses the Rust tree digest and asserts the same no-growth/unit-mass invariant
+  on the Rust path, against a legacy-sampled contrast run that does grow.
+  `tree.rs::fixed_support_tests` covers the selection rule under `cargo test`.
+
+### Step 2 -- balanced double-reveal support -- **DONE 2026-07-25**
 
 1. Build the `n * X` directed-pair support with the cyclic construction and the
    domain-separated offset seed.
@@ -437,6 +465,52 @@ Infrastructure before any approximation. No behaviour change yet.
    chance signature** (common random numbers); Python/Rust equivalence.
 4. Unbiasedness as a statistical test: mean root value over many random offsets
    converges to the exhaustive value on a fixed mock evaluator.
+
+**What was built.** `search.py::balanced_double_reveal_chains` and its Rust
+mirror `chance.rs::balanced_double_reveal_chains` return the balanced support in
+the same `(outcomes, probability, key)` shape as `enumerate_chains`, or `None`
+when the construction does not apply (wrong signature, `X = 0`, or an `X` that
+would retain the whole space). Force expansion consumes it in all three
+searchers -- `_force_expand_root`, `tree.rs::force_expand_root`,
+`tree_resumable.rs::materialize_forced_root` -- and closes the edge through the
+Step 1 `close_fixed_support`.
+
+* **Parameter.** `double_reveal_offsets` on `SearchConfig` in both languages,
+  default 0 = exhaustive, plumbed to the scalar and resumable Rust paths and
+  exposed on `closed_search`, `closed_search_resumable` and
+  `search_many_flat_net`. Step 3 adds the driver-level cheap-move gating
+  (`cheap_double_reveal_offsets`); self-play still passes 0.
+* **Different backs, which the design did not cover.** The two uncovered slots
+  can carry different backs (Age III mixes guilds in). Those pools are disjoint,
+  so no exclusion applies and `n * (n-1)` is the wrong count. Handled as the
+  natural generalisation: the cycle runs over the second pool with distances
+  `0..n2-1`. First-position coverage is still exact; second-position incidence
+  is even to within one, since `n1` strata spread over `n2` residues.
+* **Offset draw.** FNV-1a over (domain tag, search seed, chance signature,
+  both reveal pools) seeds a private `PortableRng` / `Rng`; a partial
+  Fisher-Yates takes `X` distinct offsets, returned ascending so the support does
+  not depend on draw order. The action index is deliberately NOT in the seed, so
+  edges sharing a signature share their support.
+* **Cross-language equivalence is bit-exact, not just structural.** A seed-derived
+  support could diverge by one element and still look valid, so the gate compares
+  whole trees: `test_rust_engine_equiv.py::test_balanced_double_reveal_support_matches_python_and_the_resumable_path`
+  runs Python, the scalar Rust oracle and the resumable searcher at `X` in
+  {1,2,3} and asserts identical canonical digests.
+* **Other tests.** `test_search.py` -- balance/mass/distinctness/no-self-pair at
+  several `X` (and the mixed-back variant), fallback cases, offset-seed
+  separation (search seed / position / signature), subset-uniformity of
+  `distinct_offsets`, mean-unbiasedness through the real construction against a
+  fixed leaf oracle, and force expansion capping *only* pure double reveals,
+  closing them, and holding under 2,000 descents.
+  `test_rust_engine_equiv.py::test_balanced_double_reveal_support_shrinks_the_forced_tree`
+  asserts the capped support is a strict subset and that every other edge keeps
+  exactly its exhaustive children. Full suite green (452 tests).
+* **Saving, sanity check only.** 180 mid-game roots from random-play
+  trajectories, total forced children: X=1 50.0%, **X=2 57.8%**, X=3 65.5% of
+  exhaustive. That is *better* than the 70.5% projected in this document, and
+  should not be believed as the self-play figure: this corpus averages ~92 forced
+  children per root against real self-play's 40, exactly the Level-1 caveat
+  above. It confirms the cap bites; Step 5 measures throughput for real.
 
 ### Step 3 -- apply to cheap moves only
 

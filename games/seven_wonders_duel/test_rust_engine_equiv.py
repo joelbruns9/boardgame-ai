@@ -237,7 +237,7 @@ def test_closed_tree_matches_python():
     assert checked > 20
 
 
-def _mock_search(state, sims, top_k, seed, force):
+def _mock_search(state, sims, top_k, seed, force, double_reveal_offsets=0):
     mcts = GumbelMCTS(
         None,
         SearchConfig(
@@ -246,6 +246,7 @@ def _mock_search(state, sims, top_k, seed, force):
             mode="closed",
             seed=seed,
             force_expand_root_chance=force,
+            double_reveal_offsets=double_reveal_offsets,
         ),
     )
     mcts._evaluate = _mock_evaluate  # type: ignore[method-assign]
@@ -300,6 +301,105 @@ def test_closed_search_matches_python():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert checked >= 20
+
+
+def test_balanced_double_reveal_support_matches_python_and_the_resumable_path():
+    """Chance-enumeration Step 2: with `double_reveal_offsets` set, the whole
+    capped tree — support, weights, values, policy target — is bit-identical
+    across Python, the scalar Rust oracle, and the resumable searcher.
+
+    The construction is seed-derived, so an offset draw that diverged by one
+    element between languages would silently produce a different (still valid)
+    support; only a full-tree comparison catches that."""
+
+    checked = 0
+    for game_seed in range(6):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+                and _enumerable_reveal_root(py)
+            ):
+                legal = legal_action_indices(py)
+                for offsets in (1, 2, 3):
+                    for seed in (1, 5):
+                        result, root = _mock_search(py, 32, 8, seed, True, offsets)
+                        got = rg.closed_search(
+                            32, 8, seed, force=True, double_reveal_offsets=offsets
+                        )
+                        ctx = f"game {game_seed} offsets {offsets} seed {seed}"
+                        assert got[0] == result.action_index, f"{ctx}: action"
+                        assert list(got[3]) == [result.visits[a] for a in legal], (
+                            f"{ctx}: visits"
+                        )
+                        assert list(got[5]) == list(result.gumbel_topk), f"{ctx}: topk"
+                        assert got[1] == pytest.approx(result.action_value, abs=1e-9), (
+                            f"{ctx}: action value"
+                        )
+                        exp_dig = []
+                        _digest_ref(root, exp_dig)
+                        _assert_digest_equal(exp_dig, list(got[7]), f"{ctx}: tree")
+
+                        resumable = rg.closed_search_resumable(
+                            32, 8, seed, force=True, double_reveal_offsets=offsets
+                        )
+                        _assert_digest_equal(
+                            list(got[7]), list(resumable[7]), f"{ctx}: resumable tree"
+                        )
+                        checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked >= 12
+
+
+def test_balanced_double_reveal_support_shrinks_the_forced_tree():
+    """The cap must actually bite (and only on pure double reveals): a capped
+    root holds strictly fewer children than the exhaustive one, and the edges it
+    leaves alone keep exactly the children they had."""
+
+    found = None
+    for game_seed in range(8):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        for i, idx in enumerate(actions):
+            if i >= 8 and py.phase is Phase.PLAY_AGE and py.pending_choice is None:
+                specs = [
+                    py_chance_signature(py, decode_action(py, a))
+                    for a in legal_action_indices(py)
+                ]
+                if any(
+                    len(s) == 2 and all(x.kind is ChanceKind.CARD_REVEAL for x in s)
+                    for s in specs
+                ):
+                    found = py
+                    break
+            apply_action(py, decode_action(py, idx))
+        if found is not None:
+            break
+    assert found is not None, "no pure double-reveal root found"
+
+    _, exhaustive = _mock_search(found, 32, 8, 1, True)
+    _, capped = _mock_search(found, 32, 8, 1, True, 2)
+    shrunk = 0
+    for full_edge, capped_edge in zip(exhaustive.edges, capped.edges, strict=True):
+        pure_double = len(full_edge.specs) == 2 and all(
+            spec.kind is ChanceKind.CARD_REVEAL for spec in full_edge.specs
+        )
+        if pure_double and len(full_edge.children) > len(capped_edge.children):
+            assert capped_edge.fixed_support
+            assert set(capped_edge.children) < set(full_edge.children)
+            shrunk += 1
+        else:
+            assert not capped_edge.fixed_support
+            assert set(capped_edge.children) == set(full_edge.children)
+    assert shrunk > 0
 
 
 def test_resumable_leaf_batch_one_matches_f3_oracle():

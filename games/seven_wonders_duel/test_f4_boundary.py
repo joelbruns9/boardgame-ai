@@ -310,6 +310,116 @@ def test_f4_r0_paired_age_deal_samples_are_deterministic_and_globally_evaluated(
     assert paired["nn_work"]["forced_rows"] <= 8  # two actions x four common draws
 
 
+def _parse_tree_digest(values):
+    """Decode `tree_resumable::digest` into nested dicts.
+
+    Layout (kept in step with `digest`): node = visits, value_sum, actor,
+    terminal, fingerprint (length-prefixed), then length-prefixed edges; edge =
+    action_index, visits, value_sum, prior, probability_weighted, then
+    length-prefixed children; child = length-prefixed observable key, samples,
+    probability, then the child's node."""
+
+    position = 0
+
+    def node():
+        nonlocal position
+        visits = int(values[position])
+        position += 4  # visits, value_sum, actor, terminal
+        position += 1 + int(values[position])  # fingerprint
+        edge_count = int(values[position])
+        position += 1
+        edges = []
+        for _ in range(edge_count):
+            action_index = int(values[position])
+            edge_visits = int(values[position + 1])
+            weighted = values[position + 4] == 1.0
+            position += 5
+            child_count = int(values[position])
+            position += 1
+            children = []
+            for _ in range(child_count):
+                key_parts = int(values[position])
+                position += 1
+                for _ in range(key_parts):
+                    position += 1 + int(values[position])
+                samples = int(values[position])
+                probability = values[position + 1]
+                position += 2
+                children.append(
+                    {"samples": samples, "probability": probability, "node": node()}
+                )
+            edges.append(
+                {
+                    "action_index": action_index,
+                    "visits": edge_visits,
+                    "probability_weighted": weighted,
+                    "children": children,
+                }
+            )
+        return {"visits": visits, "edges": edges}
+
+    root = node()
+    assert position == len(values)
+    return root
+
+
+def test_f4_r0_fixed_support_edges_never_grow_and_keep_unit_mass():
+    """The closed (approximate fixed-support) edge class on the Rust side.
+
+    The paired AgeDeal sampler is its first member: its children are an
+    empirical, re-normalised subset of the deal space, so descent must draw
+    among exactly those children. If it fell back to ordinary sampling it would
+    append fresh children carrying their own probability and the edge's mass
+    would climb past 1 with nothing raising (CHANCE_ENUMERATION_PLAN.md)."""
+
+    import seven_wonders_rust as swr
+
+    _, actions, library = random_game(3, 0)
+    py = new_game(3, first_player=0)
+    rust = swr.RustGame(
+        library_draws=[list(draw) for draw in library], **extract_setup(py)
+    )
+    for action in actions:
+        if py.phase is Phase.CHOOSE_NEXT_START_PLAYER:
+            break
+        apply_action(py, decode_action(py, action))
+        rust.apply_index(action)
+    assert py.phase is Phase.CHOOSE_NEXT_START_PLAYER
+
+    samples = 4
+    sims = 64
+
+    def run(age_deal_samples):
+        result = swr.search_many_flat_net(
+            _DecodingFlatAdapter(),
+            [rust],
+            [8080],
+            8,
+            1,
+            sims,
+            4,
+            force=True,
+            age_deal_samples=age_deal_samples,
+        )[0]
+        return _parse_tree_digest(result["digest"])
+
+    closed = run(samples)
+    assert closed["edges"]
+    for edge in closed["edges"]:
+        # Every action here deals the next age, so every root edge is closed.
+        assert edge["probability_weighted"]
+        assert 0 < len(edge["children"]) <= samples  # no growth under descent
+        mass = sum(child["probability"] for child in edge["children"])
+        assert mass == pytest.approx(1.0, abs=1e-12)
+        drawn = sum(child["samples"] for child in edge["children"])
+        assert drawn == edge["visits"]  # every descent landed on a retained child
+
+    # Contrast: left open, the same edges accumulate a child per distinct deal.
+    legacy = run(0)
+    assert max(len(edge["children"]) for edge in legacy["edges"]) > samples
+    assert not any(edge["probability_weighted"] for edge in legacy["edges"])
+
+
 def test_f4_r0_paired_age_deal_samples_skip_forced_age_one_setup():
     import seven_wonders_rust as swr
 

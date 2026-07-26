@@ -383,6 +383,8 @@ pub fn run<E: Eval>(
             force_expand_root_chance: cfg.force_expand_root_chance,
             puct_root: cfg.puct_root,
             age_deal_samples: cfg.age_deal_samples,
+            // Step 3 gates this per move (cheap vs full); exhaustive for now.
+            double_reveal_offsets: 0,
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -650,6 +652,8 @@ impl GameSlot {
                     .cfg
                     .age_deal_samples_by_player
                     .map_or(self.cfg.age_deal_samples, |samples| samples[actor]),
+                // Step 3 gates this per move (cheap vs full); exhaustive for now.
+                double_reveal_offsets: 0,
             },
         })
     }

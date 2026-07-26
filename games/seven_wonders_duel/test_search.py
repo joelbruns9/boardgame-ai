@@ -5,6 +5,7 @@ buffer round-trip of Gumbel targets, self-play smoke."""
 
 import math
 import random
+from collections import Counter
 from itertools import combinations
 
 import pytest
@@ -26,14 +27,20 @@ from games.seven_wonders_duel.engine import Action, ActionUse, apply_action
 from games.seven_wonders_duel.game import ChanceKind, Phase, new_game
 from games.seven_wonders_duel.inference import Evaluator
 from games.seven_wonders_duel.net import SWDNet
+from games.seven_wonders_duel.pool import enumerate_card_reveal, unseen_pool
 from games.seven_wonders_duel.search import (
+    ChanceSpec,
     GumbelMCTS,
     SearchConfig,
     age_deal_key,
+    balanced_double_reveal_chains,
     chance_signature,
+    distinct_offsets,
+    double_reveal_offset_seed,
     closed_root_exact_value,
     enumerate_chains,
     expand_exhaustive,
+    fixed_support_index,
     state_actor,
 )
 
@@ -457,6 +464,339 @@ def test_force_expand_root_chance_materializes_all_enumerable_children(evaluator
             assert len(edge.children) == expected
             for child in edge.children.values():
                 assert child.node.visits >= 1  # evaluated at expansion
+
+
+# --- approximate fixed-support chance edges (chance-enumeration Step 1) -----
+
+
+def _truncated_fixed_support_root(evaluator, keep=8, weights=None, seed=0):
+    """A forced root whose widest chance edge is truncated to `keep` outcomes,
+    re-normalised and CLOSED — the third edge class, without yet having a
+    production rule that builds one (that is Step 2)."""
+
+    game = _double_uncover_state()
+    mcts = GumbelMCTS(
+        evaluator,
+        SearchConfig(
+            sims=8, top_k=4, mode="closed", seed=seed, force_expand_root_chance=True
+        ),
+    )
+    mcts.search(game)
+    root = mcts._closed_root
+    edge = max(root.edges, key=lambda e: len(e.children))
+    assert len(edge.children) > keep  # a real double reveal: 110 outcomes
+    weights = weights if weights is not None else [1.0 / keep] * keep
+    assert len(weights) == keep
+    edge.children = dict(list(edge.children.items())[:keep])
+    for child, weight in zip(edge.children.values(), weights, strict=True):
+        child.samples = 0
+        child.probability = weight
+    edge.close_fixed_support()
+    return mcts, root, edge
+
+
+def test_fixed_support_index_matches_the_rust_golden_table():
+    # Pinned identically in tree.rs::fixed_support_tests::golden_table_matches_python.
+    uniform = [0.25, 0.25, 0.25, 0.25]
+    skewed = [0.1, 0.7, 0.2]
+    cases = [
+        (uniform, 0.0, 0),
+        (uniform, 0.249999, 0),
+        (uniform, 0.25, 1),
+        (uniform, 0.5, 2),
+        (uniform, 0.999999, 3),
+        (skewed, 0.09, 0),
+        (skewed, 0.1, 1),
+        (skewed, 0.799999, 1),
+        (skewed, 0.8, 2),
+        ([1.0], 0.0, 0),
+        ([1.0], 0.999999, 0),
+    ]
+    for weights, target, expected in cases:
+        assert fixed_support_index(weights, target) == expected, (weights, target)
+    # A draw past the final cumulative sum (float residue) takes the last child.
+    assert fixed_support_index([0.5, 0.5], 1.0) == 1
+    with pytest.raises(ValueError, match="no children"):
+        fixed_support_index([], 0.0)
+
+
+def test_fixed_support_edge_never_grows_and_keeps_unit_mass(evaluator):
+    mcts, root, edge = _truncated_fixed_support_root(evaluator)
+    retained = tuple(edge.children)
+    nodes = {id(child.node) for child in edge.children.values()}
+
+    for _ in range(5000):
+        node = mcts._closed_child(root, edge)
+        assert id(node) in nodes  # only retained children are ever reached
+
+    assert tuple(edge.children) == retained  # nothing materialized
+    assert sum(child.probability for child in edge.children.values()) == 1.0
+    assert sum(child.samples for child in edge.children.values()) == 5000
+    assert all(child.samples > 0 for child in edge.children.values())
+    edge.q_p0  # the mass invariant still holds after thousands of draws
+
+    # The same through the integrated descent path, which also backs values up.
+    for _ in range(200):
+        mcts._descend_closed(root, forced_edge=edge)
+    assert tuple(edge.children) == retained
+    assert sum(child.probability for child in edge.children.values()) == 1.0
+
+
+def test_fixed_support_draws_follow_the_renormalised_weights(evaluator):
+    keep = 4
+    weights = [0.7, 0.1, 0.1, 0.1]
+    mcts, root, edge = _truncated_fixed_support_root(
+        evaluator, keep=keep, weights=weights, seed=3
+    )
+    draws = 6000
+    for _ in range(draws):
+        mcts._closed_child(root, edge)
+    empirical = [child.samples / draws for child in edge.children.values()]
+    for observed, weight in zip(empirical, weights, strict=True):
+        assert observed == pytest.approx(weight, abs=0.02)
+
+
+def test_fixed_support_q_is_the_weighted_sum_over_retained_children(evaluator):
+    keep = 8
+    mcts, root, edge = _truncated_fixed_support_root(evaluator, keep=keep)
+    values = [child.node.value_p0 for child in edge.children.values()]
+    assert edge.q_p0 == pytest.approx(sum(values) / keep, abs=1e-12)
+
+    skewed = [0.5, 0.2, 0.1, 0.1, 0.05, 0.03, 0.01, 0.01]
+    _, _, edge = _truncated_fixed_support_root(evaluator, keep=keep, weights=skewed)
+    values = [child.node.value_p0 for child in edge.children.values()]
+    hand = sum(w * v for w, v in zip(skewed, values, strict=True))
+    assert edge.q_p0 == pytest.approx(hand, abs=1e-12)
+
+
+def test_close_fixed_support_rejects_a_support_that_is_not_renormalised(evaluator):
+    game = _double_uncover_state()
+    mcts = GumbelMCTS(
+        evaluator,
+        SearchConfig(
+            sims=8, top_k=4, mode="closed", seed=0, force_expand_root_chance=True
+        ),
+    )
+    mcts.search(game)
+    edge = max(mcts._closed_root.edges, key=lambda e: len(e.children))
+    # Truncated but NOT re-normalised: the retained children hold mass < 1.
+    edge.children = dict(list(edge.children.items())[:8])
+    with pytest.raises(ValueError, match="mass"):
+        edge.close_fixed_support()
+    assert not edge.fixed_support  # the edge is never closed over partial mass
+
+
+def test_exact_value_refuses_an_approximate_fixed_support_edge(evaluator):
+    mcts, root, edge = _truncated_fixed_support_root(evaluator)
+    root.edges = [edge]  # isolate the approximate edge from unexpanded siblings
+    with pytest.raises(ValueError, match="fixed-support"):
+        closed_root_exact_value(root)
+
+
+# --- balanced double-reveal support (chance-enumeration Step 2) -------------
+
+
+def _double_reveal_specs(game=None):
+    game = game if game is not None else _double_uncover_state()
+    action = Action((4, 3), ActionUse.DISCARD_FOR_COINS)
+    specs = chance_signature(game, action)
+    assert [s.kind for s in specs] == [ChanceKind.CARD_REVEAL] * 2
+    assert specs[0].context[1] == specs[1].context[1]  # same back
+    return game, specs
+
+
+def _mixed_back_double_reveal():
+    """A double reveal whose two slots carry DIFFERENT backs (Age III mixes
+    guild backs in), where the pools are disjoint and the cycle runs over the
+    second pool instead."""
+
+    for seed in range(40):
+        game = new_game(seed, first_player=seed % 2)
+        rng = random.Random(seed * 7 + 1)
+        while game.phase is not Phase.COMPLETE:
+            for index in legal_action_indices(game):
+                specs = chance_signature(game, decode_action(game, index))
+                if (
+                    len(specs) == 2
+                    and all(s.kind is ChanceKind.CARD_REVEAL for s in specs)
+                    and specs[0].context[1] != specs[1].context[1]
+                ):
+                    return game, specs
+            apply_action(game, decode_action(game, rng.choice(legal_action_indices(game))))
+    pytest.skip("no mixed-back double reveal found")
+
+
+@pytest.mark.parametrize("offsets", [1, 2, 3])
+def test_balanced_double_reveal_support_is_marginally_balanced(offsets):
+    game, specs = _double_reveal_specs()
+    full = enumerate_chains(game, specs)
+    n = int(round(len(full) ** 0.5)) + 1  # |full| = n * (n - 1)
+    assert len(full) == n * (n - 1) == 110
+
+    chains = balanced_double_reveal_chains(game, specs, offsets, search_seed=17)
+    assert len(chains) == n * offsets
+    keys = [key for _, _, key in chains]
+    assert len(set(keys)) == len(keys)  # every retained pair distinct
+    assert set(keys) <= {key for _, _, key in full}  # and a real outcome
+    assert sum(probability for _, probability, _ in chains) == pytest.approx(1.0, abs=1e-12)
+    assert {probability for _, probability, _ in chains} == {1.0 / (n * offsets)}
+
+    firsts = Counter(outcomes[0] for outcomes, _, _ in chains)
+    seconds = Counter(outcomes[1] for outcomes, _, _ in chains)
+    # Marginal coverage: every hidden card leads exactly one stratum (and so
+    # appears `offsets` times as the first reveal) and lands exactly `offsets`
+    # times in the second slot. Never paired with itself.
+    assert len(firsts) == n and set(firsts.values()) == {offsets}
+    assert len(seconds) == n and set(seconds.values()) == {offsets}
+    assert all(outcomes[0] != outcomes[1] for outcomes, _, _ in chains)
+
+
+def test_balanced_double_reveal_support_on_different_backs():
+    game, specs = _mixed_back_double_reveal()
+    full = enumerate_chains(game, specs)
+    chains = balanced_double_reveal_chains(game, specs, 2, search_seed=5)
+    firsts = Counter(outcomes[0] for outcomes, _, _ in chains)
+    seconds = Counter(outcomes[1] for outcomes, _, _ in chains)
+    assert len(chains) == len(firsts) * 2
+    assert set(firsts.values()) == {2}  # first position still exactly covered
+    assert max(seconds.values()) - min(seconds.values()) <= 1  # even to within one
+    assert sum(probability for _, probability, _ in chains) == pytest.approx(1.0, abs=1e-12)
+    assert {key for _, _, key in chains} <= {key for _, _, key in full}
+    assert len(set(key for _, _, key in chains)) == len(chains)
+
+
+def test_balanced_double_reveal_falls_back_when_it_cannot_shrink():
+    game, specs = _double_reveal_specs()
+    assert balanced_double_reveal_chains(game, specs, 0, 1) is None  # disabled
+    # 11 unseen cards -> 10 directed distances; X = 10 IS the full space.
+    assert balanced_double_reveal_chains(game, specs, 10, 1) is None
+    assert balanced_double_reveal_chains(game, specs, 99, 1) is None
+    # Not a pure double reveal: single reveal, and a reveal + Great Library.
+    assert balanced_double_reveal_chains(game, specs[:1], 2, 1) is None
+    library = ChanceSpec(ChanceKind.GREAT_LIBRARY_DRAW)
+    assert balanced_double_reveal_chains(game, (specs[0], library), 2, 1) is None
+
+
+def test_offset_seed_separates_search_seed_position_and_signature():
+    game, specs = _double_reveal_specs()
+    pool = [
+        name
+        for name, _ in enumerate_card_reveal(
+            unseen_pool(game.observation(game.active_player)), specs[0].context[1]
+        )
+    ]
+    base = double_reveal_offset_seed(11, specs, (pool, pool))
+    assert base == double_reveal_offset_seed(11, specs, (pool, pool))  # reproducible
+    assert base != double_reveal_offset_seed(12, specs, (pool, pool))  # search seed
+    assert base != double_reveal_offset_seed(11, specs, (pool[:-1], pool))  # position
+    assert base != double_reveal_offset_seed(
+        11, (specs[1], specs[0]), (pool, pool)
+    )  # chance signature (which slots are being revealed, in order)
+
+
+def test_capped_edges_sharing_a_chance_signature_share_their_support(evaluator):
+    """Common random numbers. Taking one card as a build, a discard, or a wonder
+    fires the SAME reveals, so those edges must draw the same offsets — then
+    comparing the three actions is a comparison over one common support and the
+    offset noise cancels out of the comparison."""
+
+    game = _double_uncover_state()
+    mcts = GumbelMCTS(
+        evaluator,
+        SearchConfig(
+            sims=8,
+            top_k=4,
+            mode="closed",
+            seed=0,
+            force_expand_root_chance=True,
+            double_reveal_offsets=2,
+        ),
+    )
+    mcts.search(game)
+    by_signature = {}
+    for edge in mcts._closed_root.edges:
+        if edge.fixed_support:
+            by_signature.setdefault(edge.specs, []).append(set(edge.children))
+    assert by_signature
+    shared = [group for group in by_signature.values() if len(group) > 1]
+    assert shared, "expected several actions on one revealed slot"
+    for group in shared:
+        assert all(support == group[0] for support in group)
+
+
+def test_distinct_offsets_are_uniform_over_subsets():
+    modulus, count, draws = 5, 2, 4000
+    seen = Counter()
+    for seed in range(draws):
+        chosen = distinct_offsets(modulus, count, seed)
+        assert len(set(chosen)) == count
+        assert chosen == sorted(chosen)
+        assert all(0 <= value < modulus for value in chosen)
+        seen[tuple(chosen)] += 1
+    expected = draws / math.comb(modulus, count)
+    assert len(seen) == math.comb(modulus, count)  # every subset reachable
+    assert max(abs(hits - expected) for hits in seen.values()) < 0.25 * expected
+
+
+def test_balanced_double_reveal_estimator_is_unbiased():
+    """Mean-unbiasedness of the stratified estimator, run through the real
+    construction: averaging the support mean of a fixed leaf oracle over seeds
+    converges to the exhaustive expectation. (Not sufficient on its own —
+    Step 4 measures per-position error, not just the mean.)"""
+
+    game, specs = _double_reveal_specs()
+
+    def value(outcomes):  # a fixed, deterministic mock evaluator over the pair
+        return math.sin(float(hash((outcomes[0], outcomes[1])) % 100003))
+
+    full = enumerate_chains(game, specs)
+    exact = sum(probability * value(o) for o, probability, _ in full)
+    for offsets in (1, 2):
+        estimates = []
+        for seed in range(400):
+            chains = balanced_double_reveal_chains(game, specs, offsets, seed)
+            estimates.append(sum(p * value(o) for o, p, _ in chains))
+        assert sum(estimates) / len(estimates) == pytest.approx(exact, abs=0.03)
+
+
+def test_force_expansion_caps_only_pure_double_reveals_and_closes_them(evaluator):
+    game = _double_uncover_state()
+    offsets = 2
+    config = SearchConfig(
+        sims=8,
+        top_k=4,
+        mode="closed",
+        seed=0,
+        force_expand_root_chance=True,
+        double_reveal_offsets=offsets,
+    )
+    mcts = GumbelMCTS(evaluator, config)
+    mcts.search(game)
+    capped = 0
+    for edge in mcts._closed_root.edges:
+        if not edge.specs or any(
+            spec.kind is ChanceKind.AGE_DEAL for spec in edge.specs
+        ):
+            continue
+        balanced = balanced_double_reveal_chains(game, edge.specs, offsets, 0)
+        if balanced is None:
+            assert not edge.fixed_support
+            assert len(edge.children) == len(enumerate_chains(game, edge.specs))
+            continue
+        capped += 1
+        assert edge.fixed_support and edge.probability_weighted
+        assert set(edge.children) == {key for _, _, key in balanced}
+        assert sum(c.probability for c in edge.children.values()) == pytest.approx(
+            1.0, abs=1e-12
+        )
+        # Seeded with one evaluation at expansion; descents may add visits.
+        assert all(child.node.visits >= 1 for child in edge.children.values())
+        # Closed: thousands of descents stay inside the retained support.
+        keys = tuple(edge.children)
+        for _ in range(2000):
+            mcts._closed_child(mcts._closed_root, edge)
+        assert tuple(edge.children) == keys
+    assert capped > 0
 
 
 # --- Gumbel root contract + buffer round trip -------------------------------
