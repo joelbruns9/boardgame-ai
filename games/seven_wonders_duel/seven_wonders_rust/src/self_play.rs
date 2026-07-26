@@ -509,6 +509,8 @@ pub struct SchedulerMetrics {
     pub waiting_slot_ns: u64,
     pub idle_slot_ns: u64,
     pub max_live_slots: usize,
+    /// The activation ceiling this run was given (globally, across shards).
+    pub max_active_slots: usize,
     /// Live slots at the moment each global batch was submitted, and that
     /// submission's offset from the start of the scheduler loop. Together these
     /// let the caller separate the steady-state window from the drain tail
@@ -579,7 +581,11 @@ impl SchedulerMetrics {
         self.ready_slot_ns += other.ready_slot_ns;
         self.waiting_slot_ns += other.waiting_slot_ns;
         self.idle_slot_ns += other.idle_slot_ns;
-        self.max_live_slots += other.max_live_slots;
+        // Both are global figures every shard already reports identically:
+        // taking the max keeps them global rather than summing shard peaks that
+        // need not have coincided.
+        self.max_live_slots = self.max_live_slots.max(other.max_live_slots);
+        self.max_active_slots = other.max_active_slots;
         self.batch_live_slots.extend(other.batch_live_slots);
         self.batch_submit_ns.extend(other.batch_submit_ns);
         self.arena_nodes_live_peak += other.arena_nodes_live_peak;
@@ -608,13 +614,13 @@ struct Occupancy {
 }
 
 impl Occupancy {
-    fn new(slots: usize) -> Self {
+    fn new() -> Self {
         let now = Instant::now();
         Self {
             start: now,
             last: now,
-            live: slots,
-            ready: slots,
+            live: 0,
+            ready: 0,
             waiting: 0,
             idle: 0,
             probe: 0,
@@ -625,14 +631,18 @@ impl Occupancy {
         self.start.elapsed().as_nanos() as u64
     }
 
-    /// Charge elapsed time to the previous census, then adopt `slots`' current
+    /// Charge elapsed time to the previous census, then adopt the pool's current
     /// one. `outstanding` is empty for the non-pipelined scheduler, where no
     /// slot can be waiting on an in-flight batch.
+    ///
+    /// "Idle" is unused *capacity* — activations the budget allows but the queue
+    /// cannot fill — not finished games, since finished games leave the pool.
     fn tick(
         &mut self,
         metrics: &mut SchedulerMetrics,
-        slots: &[GameSlot],
+        pool: &SlotPool,
         outstanding: &[bool],
+        capacity: usize,
     ) {
         let now = Instant::now();
         let dt = now.duration_since(self.last).as_nanos() as u64;
@@ -642,13 +652,12 @@ impl Occupancy {
         metrics.waiting_slot_ns += dt * self.waiting as u64;
         metrics.idle_slot_ns += dt * self.idle as u64;
 
-        let (mut live, mut ready, mut waiting, mut idle) = (0, 0, 0, 0);
+        let (mut live, mut ready, mut waiting) = (0, 0, 0);
         let mut live_nodes = 0;
-        for (index, slot) in slots.iter().enumerate() {
-            if matches!(slot.stage, SlotStage::Complete) {
-                idle += 1;
+        for (index, entry) in pool.entries.iter().enumerate() {
+            let SlotEntry::Active(slot) = entry else {
                 continue;
-            }
+            };
             live += 1;
             live_nodes += slot.arena_nodes();
             if outstanding.get(index).copied().unwrap_or(false) {
@@ -660,30 +669,300 @@ impl Occupancy {
         self.live = live;
         self.ready = ready;
         self.waiting = waiting;
-        self.idle = idle;
+        self.idle = capacity.saturating_sub(live);
         metrics.max_live_slots = metrics.max_live_slots.max(live);
         metrics.arena_nodes_live_peak = metrics.arena_nodes_live_peak.max(live_nodes);
 
-        // Deep byte accounting walks a whole arena, so sample one slot per
+        // Deep byte accounting walks a whole arena, so sample one entry per
         // cycle round-robin; the cost is negligible beside a global batch.
-        if !slots.is_empty() {
-            self.probe = (self.probe + 1) % slots.len();
-            let slot = &slots[self.probe];
-            metrics.arena_nodes_slot_peak =
-                metrics.arena_nodes_slot_peak.max(slot.arena_nodes());
-            metrics.arena_deep_bytes_slot_peak = metrics
-                .arena_deep_bytes_slot_peak
-                .max(slot.arena_deep_bytes());
+        if !pool.entries.is_empty() {
+            self.probe = (self.probe + 1) % pool.entries.len();
+            if let SlotEntry::Active(slot) = &pool.entries[self.probe] {
+                metrics.arena_nodes_slot_peak =
+                    metrics.arena_nodes_slot_peak.max(slot.arena_nodes());
+                metrics.arena_deep_bytes_slot_peak = metrics
+                    .arena_deep_bytes_slot_peak
+                    .max(slot.arena_deep_bytes());
+            }
         }
     }
 }
 
-/// Live slots at this instant, recorded alongside each batch submission.
-fn live_slot_count(slots: &[GameSlot]) -> usize {
-    slots
-        .iter()
-        .filter(|slot| !matches!(slot.stage, SlotStage::Complete))
-        .count()
+/// Activation budget shared by every scheduler shard.
+///
+/// Phase 1 requires the slot budget to be **global**: sharding the scheduler
+/// must not multiply the number of games resident in memory. Each shard keeps
+/// one reserved activation — without it a shard could be permanently starved and
+/// the run would deadlock — and competes for the remainder through `spare`.
+pub struct SlotBudget {
+    spare: std::sync::atomic::AtomicUsize,
+    /// Games active across *all* shards, and its high-water mark. Summing each
+    /// shard's own peak would overstate concurrency, because shard peaks need
+    /// not coincide; this counter is the real thing.
+    live: std::sync::atomic::AtomicUsize,
+    peak_live: std::sync::atomic::AtomicUsize,
+    total: usize,
+    shards: usize,
+}
+
+impl SlotBudget {
+    pub fn new(max_active_slots: usize, shards: usize) -> PyResult<Self> {
+        let shards = shards.max(1);
+        if max_active_slots < shards {
+            return Err(PyValueError::new_err(format!(
+                "max_active_slots={max_active_slots} is below scheduler_workers={shards}: \
+                 every shard needs at least one active slot to make progress"
+            )));
+        }
+        Ok(Self {
+            spare: std::sync::atomic::AtomicUsize::new(max_active_slots - shards),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            peak_live: std::sync::atomic::AtomicUsize::new(0),
+            total: max_active_slots,
+            shards,
+        })
+    }
+
+    /// Activations happen once per game, so exact global accounting here is
+    /// cheap enough to prefer over sampling.
+    fn on_activate(&self) {
+        use std::sync::atomic::Ordering;
+        let live = self.live.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_live.fetch_max(live, Ordering::AcqRel);
+    }
+
+    fn on_retire(&self) {
+        self.live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub fn peak_live(&self) -> usize {
+        self.peak_live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Budget for a single-shard run, where every activation is local.
+    pub fn single(max_active_slots: usize) -> PyResult<Self> {
+        Self::new(max_active_slots.max(1), 1)
+    }
+
+    fn try_take(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.spare
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn give_back(&self) {
+        self.spare
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn shards(&self) -> usize {
+        self.shards
+    }
+}
+
+/// One job's position in the rolling pool.
+///
+/// Queued jobs hold only their starting state and config — no tree, no search
+/// session — because the arena a `GameSlot` accumulates is what actually bounds
+/// concurrency (Phase 0 measured several MB per active game against ~1 KB for a
+/// `GameState`). Finished games are retired to records immediately so a
+/// completed game stops costing memory the moment it ends.
+enum SlotEntry {
+    Queued(Box<(GameState, SelfPlayConfig)>),
+    Active(Box<GameSlot>),
+    Finished(Box<GameRecord>),
+    /// Transient hole while an entry is moved between the states above.
+    Taken,
+}
+
+/// Bounded rolling pool of active games over a longer queue of jobs.
+///
+/// Entries are indexed by **job index** throughout, so evaluation groups,
+/// scatter and the returned records all stay in input order regardless of the
+/// order in which games activate or finish.
+struct SlotPool {
+    entries: Vec<SlotEntry>,
+    next_queued: usize,
+    active_count: usize,
+    holds_reserved: bool,
+    budget_held: usize,
+    finished: usize,
+}
+
+impl SlotPool {
+    fn new(jobs: Vec<(GameState, SelfPlayConfig)>) -> Self {
+        Self {
+            entries: jobs
+                .into_iter()
+                .map(|job| SlotEntry::Queued(Box::new(job)))
+                .collect(),
+            next_queued: 0,
+            active_count: 0,
+            holds_reserved: false,
+            budget_held: 0,
+            finished: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn active_count(&self) -> usize {
+        self.active_count
+    }
+
+    /// Job indices of currently active games, ascending. Ascending order is what
+    /// makes batch packing deterministic.
+    fn active_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, SlotEntry::Active(_)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn slot_mut(&mut self, index: usize) -> PyResult<&mut GameSlot> {
+        match &mut self.entries[index] {
+            SlotEntry::Active(slot) => Ok(slot),
+            _ => Err(PyRuntimeError::new_err(format!(
+                "evaluation delivered to job {index}, which is not an active slot"
+            ))),
+        }
+    }
+
+    fn work_remaining(&self) -> bool {
+        self.active_count > 0 || self.next_queued < self.entries.len()
+    }
+
+    /// Activate queued jobs until the budget or the queue runs out.
+    fn refill(&mut self, budget: &SlotBudget) -> PyResult<usize> {
+        let mut activated = 0;
+        while self.next_queued < self.entries.len() {
+            // Every shard keeps one activation of its own; further concurrency
+            // is drawn from the shared pool.
+            if !self.holds_reserved {
+                self.holds_reserved = true;
+            } else if budget.try_take() {
+                self.budget_held += 1;
+            } else {
+                break;
+            }
+            let index = self.next_queued;
+            self.next_queued += 1;
+            let entry = std::mem::replace(&mut self.entries[index], SlotEntry::Taken);
+            let SlotEntry::Queued(job) = entry else {
+                return Err(PyRuntimeError::new_err(
+                    "pool queue pointer reached a job that is not queued",
+                ));
+            };
+            let (state, cfg) = *job;
+            match GameSlot::new(state, cfg) {
+                Ok(slot) => self.entries[index] = SlotEntry::Active(Box::new(slot)),
+                Err(err) => {
+                    self.release_activation();
+                    return Err(err);
+                }
+            }
+            self.active_count += 1;
+            budget.on_activate();
+            activated += 1;
+        }
+        Ok(activated)
+    }
+
+    fn release_activation(&mut self) {
+        if self.budget_held > 0 {
+            self.budget_held -= 1;
+        } else {
+            self.holds_reserved = false;
+        }
+    }
+
+    /// Turn a completed slot into its record, freeing its arena and its budget.
+    fn retire(
+        &mut self,
+        index: usize,
+        metrics: &mut SchedulerMetrics,
+        budget: &SlotBudget,
+    ) -> PyResult<()> {
+        let entry = std::mem::replace(&mut self.entries[index], SlotEntry::Taken);
+        let SlotEntry::Active(slot) = entry else {
+            self.entries[index] = entry;
+            return Err(PyRuntimeError::new_err(format!(
+                "cannot retire job {index}, which is not active"
+            )));
+        };
+        absorb_slot_metrics(metrics, &slot);
+        let record = slot.into_record()?;
+        self.entries[index] = SlotEntry::Finished(Box::new(record));
+        self.active_count -= 1;
+        self.finished += 1;
+        budget.on_retire();
+        if self.budget_held > 0 {
+            self.budget_held -= 1;
+            budget.give_back();
+        } else {
+            self.holds_reserved = false;
+        }
+        Ok(())
+    }
+
+    fn cancel_all(&mut self) {
+        for entry in &mut self.entries {
+            if let SlotEntry::Active(slot) = entry {
+                slot.cancel_pending();
+            }
+        }
+    }
+
+    /// Records in **input order**, independent of completion order.
+    fn into_records(self) -> PyResult<Vec<GameRecord>> {
+        self.entries
+            .into_iter()
+            .map(|entry| match entry {
+                SlotEntry::Finished(record) => Ok(*record),
+                _ => Err(PyRuntimeError::new_err(
+                    "scheduler attempted to emit a game that never completed",
+                )),
+            })
+            .collect()
+    }
+}
+
+/// Fold one finished slot's counters into the run metrics.
+///
+/// Done at retirement rather than at the end, because the pool drops each slot
+/// as soon as its game ends — that is the whole point of the pool.
+fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
+    metrics.moves += slot.moves.len();
+    metrics.simulations += slot.simulations;
+    metrics.requested_nn_leaves += slot.requested_nn_leaves;
+    metrics.unique_nn_leaves += slot.unique_nn_leaves;
+    metrics.terminal_leaves += slot.terminal_leaves;
+    metrics.collisions += slot.collisions;
+    metrics.forced_rows += slot.forced_rows;
+    metrics.fixed_support_edges += slot.fixed_support_edges;
+    for kind in 0..4 {
+        metrics.forced_rows_by_kind[kind] += slot.forced_rows_by_kind[kind];
+    }
+    metrics.forced_cache_hits += slot.forced_cache_hits;
+    metrics
+        .forced_rows_per_search
+        .extend(slot.forced_rows_per_search.iter().copied());
+    metrics.rust_tree_ns += slot.tree_ns;
+    metrics.rust_chance_ns += slot.chance_ns;
+    metrics.rust_record_ns += slot.record_ns;
+    metrics.scatter_ns += slot.scatter_ns;
 }
 
 struct SearchMeta {
@@ -1112,9 +1391,13 @@ impl GameSlot {
     }
 }
 
-fn cancel_all(slots: &mut [GameSlot]) {
-    for slot in slots {
-        slot.cancel_pending();
+/// `0` means "no pool": every job is active at once, which is what every
+/// pre-Phase-1 caller expected.
+fn resolve_max_active(max_active_slots: usize, jobs: usize) -> usize {
+    if max_active_slots == 0 {
+        jobs
+    } else {
+        max_active_slots.min(jobs)
     }
 }
 
@@ -1142,15 +1425,22 @@ fn validate_leaf_batches_fit(
     Ok(())
 }
 
-/// F4.4 deterministic cooperative scheduler. Every slot advances until it
-/// yields one indivisible root/leaf evaluation group; groups are packed in slot
-/// order up to `global_batch_cap`, evaluated once, and scattered before the next
-/// scheduler cycle. Records are always returned in input order, independent of
-/// the order in which games reach terminal states.
+/// F4.4 deterministic cooperative scheduler, F4/Phase-1 rolling pool.
+///
+/// Every active slot advances until it yields one indivisible root/leaf
+/// evaluation group; groups are packed in job-index order up to
+/// `global_batch_cap`, evaluated once, and scattered before the next scheduler
+/// cycle. `jobs` may greatly exceed `max_active_slots`: finished games are
+/// retired and queued ones activated in their place, so concurrency holds at
+/// `min(max_active_slots, jobs remaining)` instead of decaying to one.
+///
+/// Records are always returned in input order, independent of the order in
+/// which games activate or reach terminal states.
 pub fn run_many<E: Eval>(
     jobs: Vec<(GameState, SelfPlayConfig)>,
     evaluator: &E,
     global_batch_cap: usize,
+    max_active_slots: usize,
 ) -> PyResult<SchedulerResult> {
     if jobs.is_empty() {
         return Err(PyValueError::new_err(
@@ -1161,56 +1451,60 @@ pub fn run_many<E: Eval>(
         return Err(PyValueError::new_err("global_batch_cap must be positive"));
     }
     validate_leaf_batches_fit(&jobs, global_batch_cap)?;
-    let mut slots: Vec<GameSlot> = jobs
-        .into_iter()
-        .map(|(state, cfg)| GameSlot::new(state, cfg))
-        .collect::<PyResult<_>>()?;
+    let budget = SlotBudget::single(resolve_max_active(max_active_slots, jobs.len()))?;
+    let mut pool = SlotPool::new(jobs);
     let mut metrics = SchedulerMetrics {
-        games: slots.len(),
+        games: pool.len(),
         scheduler_workers: 1,
         arena_node_struct_bytes: std::mem::size_of::<tree_resumable::Node>(),
+        max_active_slots: budget.total(),
         ..SchedulerMetrics::default()
     };
-    let mut occupancy = Occupancy::new(slots.len());
+    let mut occupancy = Occupancy::new();
 
-    while slots
-        .iter()
-        .any(|slot| !matches!(slot.stage, SlotStage::Complete))
-    {
-        occupancy.tick(&mut metrics, &slots, &[]);
-        metrics.scheduler_cycles += 1;
-        for slot in &slots {
-            if matches!(slot.stage, SlotStage::Complete) {
-                metrics.scheduler_idle_slot_cycles += 1;
-            } else {
-                metrics.scheduler_ready_slot_cycles += 1;
-            }
+    while pool.work_remaining() {
+        if let Err(err) = pool.refill(&budget) {
+            pool.cancel_all();
+            return Err(err);
         }
+        occupancy.tick(&mut metrics, &pool, &[], budget.total());
+        metrics.scheduler_cycles += 1;
+        metrics.scheduler_ready_slot_cycles += pool.active_count() as u64;
+        metrics.scheduler_idle_slot_cycles +=
+            budget.total().saturating_sub(pool.active_count()) as u64;
+
         let mut groups = Vec::new();
-        let live = slots
-            .iter()
-            .filter(|slot| !matches!(slot.stage, SlotStage::Complete))
-            .count()
-            .max(1);
-        let forced_row_limit = (global_batch_cap / live).max(1);
-        for (slot_index, slot) in slots.iter_mut().enumerate() {
-            match slot.next_eval_group(slot_index, forced_row_limit) {
+        let mut retire = Vec::new();
+        let forced_row_limit = (global_batch_cap / pool.active_count().max(1)).max(1);
+        for slot_index in pool.active_indices() {
+            let outcome = pool
+                .slot_mut(slot_index)
+                .and_then(|slot| slot.next_eval_group(slot_index, forced_row_limit));
+            match outcome {
                 Ok(Some(group)) => groups.push(group),
-                Ok(None) => {}
+                // A slot that yields no group has finished its game.
+                Ok(None) => retire.push(slot_index),
                 Err(err) => {
-                    cancel_all(&mut slots);
+                    pool.cancel_all();
                     return Err(err);
                 }
             }
         }
+        for slot_index in retire {
+            if let Err(err) = pool.retire(slot_index, &mut metrics, &budget) {
+                pool.cancel_all();
+                return Err(err);
+            }
+        }
         if groups.is_empty() {
-            if slots
-                .iter()
-                .all(|slot| matches!(slot.stage, SlotStage::Complete))
-            {
+            if !pool.work_remaining() {
                 break;
             }
-            cancel_all(&mut slots);
+            // Retiring freed budget, so the next cycle can activate more work.
+            if pool.active_count() == 0 {
+                continue;
+            }
+            pool.cancel_all();
             return Err(PyRuntimeError::new_err(
                 "cooperative scheduler made no progress with live slots",
             ));
@@ -1218,22 +1512,13 @@ pub fn run_many<E: Eval>(
 
         let mut pending = std::collections::VecDeque::from(groups);
         while !pending.is_empty() {
-            let mut batch = Vec::new();
-            let mut row_count = 0;
-            while let Some(group) = pending.front() {
-                let group_rows = group.states.len();
-                if group_rows > global_batch_cap {
-                    cancel_all(&mut slots);
-                    return Err(PyValueError::new_err(format!(
-                        "evaluation group has {group_rows} rows, exceeding global_batch_cap={global_batch_cap}"
-                    )));
+            let (batch, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
+                Ok(taken) => taken,
+                Err(err) => {
+                    pool.cancel_all();
+                    return Err(err);
                 }
-                if !batch.is_empty() && row_count + group_rows > global_batch_cap {
-                    break;
-                }
-                row_count += group_rows;
-                batch.push(pending.pop_front().expect("front group must exist"));
-            }
+            };
 
             let owned_states: Vec<GameState> = batch
                 .iter()
@@ -1248,18 +1533,18 @@ pub fn run_many<E: Eval>(
                 .iter()
                 .flat_map(|group| group.legals.iter().cloned())
                 .collect();
-            metrics.batch_live_slots.push(live_slot_count(&slots));
+            metrics.batch_live_slots.push(pool.active_count());
             metrics.batch_submit_ns.push(occupancy.elapsed_ns());
             let evaluations = match evaluator.evaluate_batch_prepared(&state_refs, &actors, &legals)
             {
                 Ok(rows) => rows,
                 Err(err) => {
-                    cancel_all(&mut slots);
+                    pool.cancel_all();
                     return Err(err);
                 }
             };
             if evaluations.len() != row_count {
-                cancel_all(&mut slots);
+                pool.cancel_all();
                 return Err(PyValueError::new_err(format!(
                     "global evaluator returned {} rows for {row_count} states",
                     evaluations.len()
@@ -1270,69 +1555,51 @@ pub fn run_many<E: Eval>(
             metrics.max_batch_rows = metrics.max_batch_rows.max(row_count);
             metrics.batch_rows.push(row_count);
 
-            let mut cursor = 0;
-            for group in batch {
-                let count = group.states.len();
-                let rows = evaluations[cursor..cursor + count].to_vec();
-                cursor += count;
-                let result = match group.kind {
-                    EvalGroupKind::Root => {
-                        metrics.root_rows += count;
-                        slots[group.slot].apply_root(rows.into_iter().next().expect("root row"))
-                    }
-                    EvalGroupKind::Forced(request) => {
-                        metrics.leaf_rows += count;
-                        slots[group.slot].apply_wave(request, &group.states, rows)
-                    }
-                    EvalGroupKind::Wave(request) => {
-                        metrics.leaf_rows += count;
-                        metrics.ordinary_leaf_rows += count;
-                        slots[group.slot].apply_wave(request, &group.states, rows)
-                    }
-                };
-                if let Err(err) = result {
-                    cancel_all(&mut slots);
-                    return Err(err);
-                }
+            if let Err(err) = scatter_batch(&mut pool, &mut metrics, batch, evaluations) {
+                pool.cancel_all();
+                return Err(err);
             }
         }
     }
 
-    occupancy.tick(&mut metrics, &slots, &[]);
+    occupancy.tick(&mut metrics, &pool, &[], budget.total());
     metrics.scheduler_wall_ns = occupancy.elapsed_ns();
-    finalize_slot_metrics(&mut metrics, &slots);
-    let records = slots
-        .into_iter()
-        .map(GameSlot::into_record)
-        .collect::<PyResult<_>>()?;
+    // Exact, from the activation counter, rather than the cycle-boundary sample.
+    metrics.max_live_slots = budget.peak_live();
+    let records = pool.into_records()?;
     Ok(SchedulerResult { records, metrics })
 }
 
-/// Fold the per-slot counters both schedulers accumulate into the run metrics.
-fn finalize_slot_metrics(metrics: &mut SchedulerMetrics, slots: &[GameSlot]) {
-    metrics.moves = slots.iter().map(|slot| slot.moves.len()).sum();
-    metrics.simulations = slots.iter().map(|slot| slot.simulations).sum();
-    metrics.requested_nn_leaves = slots.iter().map(|slot| slot.requested_nn_leaves).sum();
-    metrics.unique_nn_leaves = slots.iter().map(|slot| slot.unique_nn_leaves).sum();
-    metrics.terminal_leaves = slots.iter().map(|slot| slot.terminal_leaves).sum();
-    metrics.collisions = slots.iter().map(|slot| slot.collisions).sum();
-    metrics.forced_rows = slots.iter().map(|slot| slot.forced_rows).sum();
-    metrics.fixed_support_edges = slots.iter().map(|slot| slot.fixed_support_edges).sum();
-    for kind in 0..4 {
-        metrics.forced_rows_by_kind[kind] = slots
-            .iter()
-            .map(|slot| slot.forced_rows_by_kind[kind])
-            .sum();
+/// Deliver one evaluated batch back to the slots that produced it.
+fn scatter_batch(
+    pool: &mut SlotPool,
+    metrics: &mut SchedulerMetrics,
+    batch: Vec<EvalGroup>,
+    evaluations: Vec<(f64, Vec<f64>)>,
+) -> PyResult<()> {
+    let mut cursor = 0;
+    for group in batch {
+        let count = group.states.len();
+        let rows = evaluations[cursor..cursor + count].to_vec();
+        cursor += count;
+        let slot = pool.slot_mut(group.slot)?;
+        match group.kind {
+            EvalGroupKind::Root => {
+                metrics.root_rows += count;
+                slot.apply_root(rows.into_iter().next().expect("root row"))?;
+            }
+            EvalGroupKind::Forced(request) => {
+                metrics.leaf_rows += count;
+                slot.apply_wave(request, &group.states, rows)?;
+            }
+            EvalGroupKind::Wave(request) => {
+                metrics.leaf_rows += count;
+                metrics.ordinary_leaf_rows += count;
+                slot.apply_wave(request, &group.states, rows)?;
+            }
+        }
     }
-    metrics.forced_cache_hits = slots.iter().map(|slot| slot.forced_cache_hits).sum();
-    metrics.forced_rows_per_search = slots
-        .iter()
-        .flat_map(|slot| slot.forced_rows_per_search.iter().copied())
-        .collect();
-    metrics.rust_tree_ns = slots.iter().map(|slot| slot.tree_ns).sum();
-    metrics.rust_chance_ns = slots.iter().map(|slot| slot.chance_ns).sum();
-    metrics.rust_record_ns = slots.iter().map(|slot| slot.record_ns).sum();
-    metrics.scatter_ns = slots.iter().map(|slot| slot.scatter_ns).sum();
+    Ok(())
 }
 
 struct InflightBatch {
@@ -1341,28 +1608,37 @@ struct InflightBatch {
     ticket: EvalTicket,
 }
 
+/// Advance every active slot that is not already waiting on an in-flight batch,
+/// and report which slots finished their game so the caller can retire them.
 fn collect_ready_groups(
-    slots: &mut [GameSlot],
+    pool: &mut SlotPool,
     outstanding: &mut [bool],
     pending: &mut std::collections::VecDeque<EvalGroup>,
     global_batch_cap: usize,
+    finished: &mut Vec<usize>,
 ) -> PyResult<usize> {
     let mut collected = 0;
-    let ready = slots
+    let active = pool.active_indices();
+    let ready = active
         .iter()
-        .enumerate()
-        .filter(|(slot, game)| !outstanding[*slot] && !matches!(game.stage, SlotStage::Complete))
+        .filter(|index| !outstanding[**index])
         .count()
         .max(1);
     let forced_row_limit = (global_batch_cap / ready).max(1);
-    for (slot_index, slot) in slots.iter_mut().enumerate() {
+    for slot_index in active {
         if outstanding[slot_index] {
             continue;
         }
-        if let Some(group) = slot.next_eval_group(slot_index, forced_row_limit)? {
-            outstanding[slot_index] = true;
-            pending.push_back(group);
-            collected += 1;
+        match pool
+            .slot_mut(slot_index)?
+            .next_eval_group(slot_index, forced_row_limit)?
+        {
+            Some(group) => {
+                outstanding[slot_index] = true;
+                pending.push_back(group);
+                collected += 1;
+            }
+            None => finished.push(slot_index),
         }
     }
     Ok(collected)
@@ -1399,6 +1675,7 @@ pub fn run_many_pipelined(
     worker: &EvalWorker,
     global_batch_cap: usize,
     max_inflight_batches: usize,
+    budget: &SlotBudget,
 ) -> PyResult<SchedulerResult> {
     if jobs.is_empty() {
         return Err(PyValueError::new_err(
@@ -1411,45 +1688,61 @@ pub fn run_many_pipelined(
         ));
     }
     validate_leaf_batches_fit(&jobs, global_batch_cap)?;
-    let mut slots: Vec<GameSlot> = jobs
-        .into_iter()
-        .map(|(state, cfg)| GameSlot::new(state, cfg))
-        .collect::<PyResult<_>>()?;
-    let mut outstanding = vec![false; slots.len()];
+    let mut pool = SlotPool::new(jobs);
+    let mut outstanding = vec![false; pool.len()];
     let mut pending = std::collections::VecDeque::new();
     let mut inflight = std::collections::VecDeque::<InflightBatch>::new();
     let mut metrics = SchedulerMetrics {
-        games: slots.len(),
+        games: pool.len(),
         scheduler_workers: 1,
         arena_node_struct_bytes: std::mem::size_of::<tree_resumable::Node>(),
+        max_active_slots: budget.total(),
         ..SchedulerMetrics::default()
     };
-    let mut occupancy = Occupancy::new(slots.len());
+    let mut occupancy = Occupancy::new();
+    // The shared budget bounds every shard together, so a single shard's own
+    // ceiling is only known once it has actually acquired activations.
+    let local_capacity = budget.total() / budget.shards().max(1);
 
     loop {
-        occupancy.tick(&mut metrics, &slots, &outstanding);
+        if let Err(err) = pool.refill(budget) {
+            pool.cancel_all();
+            return Err(err);
+        }
+        occupancy.tick(&mut metrics, &pool, &outstanding, local_capacity);
         metrics.scheduler_cycles += 1;
-        for (slot_index, slot) in slots.iter().enumerate() {
-            if matches!(slot.stage, SlotStage::Complete) {
-                metrics.scheduler_idle_slot_cycles += 1;
-            } else if outstanding[slot_index] {
+        for slot_index in pool.active_indices() {
+            if outstanding[slot_index] {
                 metrics.scheduler_waiting_slot_cycles += 1;
             } else {
                 metrics.scheduler_ready_slot_cycles += 1;
             }
         }
-        if let Err(err) =
-            collect_ready_groups(&mut slots, &mut outstanding, &mut pending, global_batch_cap)
-        {
-            cancel_all(&mut slots);
+        metrics.scheduler_idle_slot_cycles +=
+            local_capacity.saturating_sub(pool.active_count()) as u64;
+        let mut finished = Vec::new();
+        if let Err(err) = collect_ready_groups(
+            &mut pool,
+            &mut outstanding,
+            &mut pending,
+            global_batch_cap,
+            &mut finished,
+        ) {
+            pool.cancel_all();
             return Err(err);
+        }
+        for slot_index in finished {
+            if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
+                pool.cancel_all();
+                return Err(err);
+            }
         }
 
         while inflight.len() < max_inflight_batches && !pending.is_empty() {
             let (groups, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
                 Ok(batch) => batch,
                 Err(err) => {
-                    cancel_all(&mut slots);
+                    pool.cancel_all();
                     return Err(err);
                 }
             };
@@ -1468,7 +1761,7 @@ pub fn run_many_pipelined(
             let ticket = match worker.submit_prepared(owned_states, actors, legals) {
                 Ok(ticket) => ticket,
                 Err(err) => {
-                    cancel_all(&mut slots);
+                    pool.cancel_all();
                     return Err(err);
                 }
             };
@@ -1476,7 +1769,7 @@ pub fn run_many_pipelined(
             metrics.global_rows += row_count;
             metrics.max_batch_rows = metrics.max_batch_rows.max(row_count);
             metrics.batch_rows.push(row_count);
-            metrics.batch_live_slots.push(live_slot_count(&slots));
+            metrics.batch_live_slots.push(pool.active_count());
             metrics.batch_submit_ns.push(occupancy.elapsed_ns());
             inflight.push_back(InflightBatch {
                 groups,
@@ -1487,13 +1780,15 @@ pub fn run_many_pipelined(
         }
 
         let Some(flight) = inflight.pop_front() else {
-            if slots
-                .iter()
-                .all(|slot| matches!(slot.stage, SlotStage::Complete))
-            {
+            if !pool.work_remaining() {
                 break;
             }
-            cancel_all(&mut slots);
+            // Nothing in flight and nothing ready: the only legitimate reason is
+            // that retiring freed budget which the next refill will spend.
+            if pool.active_count() == 0 {
+                continue;
+            }
+            pool.cancel_all();
             return Err(PyRuntimeError::new_err(
                 "pipelined scheduler made no progress with live slots",
             ));
@@ -1501,12 +1796,12 @@ pub fn run_many_pipelined(
         let evaluations = match flight.ticket.wait() {
             Ok(rows) => rows,
             Err(err) => {
-                cancel_all(&mut slots);
+                pool.cancel_all();
                 return Err(err);
             }
         };
         if evaluations.len() != flight.row_count {
-            cancel_all(&mut slots);
+            pool.cancel_all();
             return Err(PyValueError::new_err(format!(
                 "global evaluator returned {} rows for {} states",
                 evaluations.len(),
@@ -1514,41 +1809,21 @@ pub fn run_many_pipelined(
             )));
         }
 
-        let mut cursor = 0;
-        for group in flight.groups {
-            let count = group.states.len();
-            let rows = evaluations[cursor..cursor + count].to_vec();
-            cursor += count;
-            let result = match group.kind {
-                EvalGroupKind::Root => {
-                    metrics.root_rows += count;
-                    slots[group.slot].apply_root(rows.into_iter().next().expect("root row"))
-                }
-                EvalGroupKind::Forced(request) => {
-                    metrics.leaf_rows += count;
-                    slots[group.slot].apply_wave(request, &group.states, rows)
-                }
-                EvalGroupKind::Wave(request) => {
-                    metrics.leaf_rows += count;
-                    metrics.ordinary_leaf_rows += count;
-                    slots[group.slot].apply_wave(request, &group.states, rows)
-                }
-            };
+        for group in &flight.groups {
             outstanding[group.slot] = false;
-            if let Err(err) = result {
-                cancel_all(&mut slots);
-                return Err(err);
-            }
+        }
+        if let Err(err) = scatter_batch(&mut pool, &mut metrics, flight.groups, evaluations) {
+            pool.cancel_all();
+            return Err(err);
         }
     }
 
-    occupancy.tick(&mut metrics, &slots, &outstanding);
+    occupancy.tick(&mut metrics, &pool, &outstanding, local_capacity);
     metrics.scheduler_wall_ns = occupancy.elapsed_ns();
-    finalize_slot_metrics(&mut metrics, &slots);
-    let records = slots
-        .into_iter()
-        .map(GameSlot::into_record)
-        .collect::<PyResult<_>>()?;
+    // Exact and global: with shards this is concurrency across all of them, not
+    // this shard's own peak.
+    metrics.max_live_slots = budget.peak_live();
+    let records = pool.into_records()?;
     Ok(SchedulerResult { records, metrics })
 }
 
@@ -1558,12 +1833,16 @@ pub fn run_many_pipelined(
 /// Search choices can still differ across shard counts when the evaluator is
 /// sensitive to batch shape (notably through CUDA floating-point ties); only
 /// result ordering, not cross-shard bit identity, is guaranteed.
+/// The activation budget is **global**: sharding the scheduler must not
+/// multiply the number of games resident in memory, so all shards draw from one
+/// `SlotBudget` rather than each receiving `max_active_slots` of their own.
 pub fn run_many_pipelined_sharded(
     jobs: Vec<(GameState, SelfPlayConfig)>,
     worker: &EvalWorker,
     global_batch_cap: usize,
     max_inflight_batches: usize,
     scheduler_workers: usize,
+    max_active_slots: usize,
 ) -> PyResult<SchedulerResult> {
     if scheduler_workers == 0 {
         return Err(PyValueError::new_err("scheduler_workers must be positive"));
@@ -1579,11 +1858,22 @@ pub fn run_many_pipelined_sharded(
         ));
     }
     validate_leaf_batches_fit(&jobs, global_batch_cap)?;
+    let active_cap = resolve_max_active(max_active_slots, jobs.len());
     if scheduler_workers == 1 || jobs.len() == 1 {
-        return run_many_pipelined(jobs, worker, global_batch_cap, max_inflight_batches);
+        let budget = SlotBudget::single(active_cap)?;
+        return run_many_pipelined(
+            jobs,
+            worker,
+            global_batch_cap,
+            max_inflight_batches,
+            &budget,
+        );
     }
     let shard_count = scheduler_workers.min(jobs.len());
     let chunk_size = (jobs.len() + shard_count - 1) / shard_count;
+    // Deliberately not widened to fit: a budget below the shard count is a
+    // configuration error, and silently raising it would defeat the ceiling.
+    let budget = SlotBudget::new(active_cap, shard_count)?;
     let mut shards = Vec::new();
     let mut remaining = jobs.into_iter();
     loop {
@@ -1593,12 +1883,19 @@ pub fn run_many_pipelined_sharded(
         }
         shards.push(chunk);
     }
+    let budget = &budget;
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = shards
             .into_iter()
             .map(|shard| {
                 scope.spawn(move || {
-                    run_many_pipelined(shard, worker, global_batch_cap, max_inflight_batches)
+                    run_many_pipelined(
+                        shard,
+                        worker,
+                        global_batch_cap,
+                        max_inflight_batches,
+                        budget,
+                    )
                 })
             })
             .collect();

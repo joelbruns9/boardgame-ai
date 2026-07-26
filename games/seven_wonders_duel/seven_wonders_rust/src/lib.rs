@@ -1014,6 +1014,7 @@ fn scheduler_result_to_py(
     metrics.set_item("waiting_slot_ns", m.waiting_slot_ns)?;
     metrics.set_item("idle_slot_ns", m.idle_slot_ns)?;
     metrics.set_item("max_live_slots", m.max_live_slots)?;
+    metrics.set_item("max_active_slots", m.max_active_slots)?;
     metrics.set_item(
         "time_weighted_live_slots",
         if m.scheduler_wall_ns == 0 {
@@ -1369,7 +1370,8 @@ fn cooperative_jobs(
     cheap_sims_max, full_sims_min, full_sims_max, full_search_fraction, top_k,
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
-    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None
+    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
+    max_active_slots=0
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -1394,6 +1396,7 @@ fn self_play_many_mock(
     max_moves: usize,
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
+    max_active_slots: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
         py,
@@ -1431,7 +1434,9 @@ fn self_play_many_mock(
             ));
         }
     }
-    let result = py.detach(move || self_play::run_many(jobs, &eval::MockEval, global_batch_cap))?;
+    let result = py.detach(move || {
+        self_play::run_many(jobs, &eval::MockEval, global_batch_cap, max_active_slots)
+    })?;
     scheduler_result_to_py(py, result)
 }
 
@@ -1446,7 +1451,8 @@ fn self_play_many_mock(
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
-    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None
+    cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
+    max_active_slots=0
 ))]
 fn self_play_many_net(
     py: Python<'_>,
@@ -1480,6 +1486,7 @@ fn self_play_many_net(
     deterministic_actions: bool,
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
+    max_active_slots: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1569,6 +1576,7 @@ fn self_play_many_net(
             global_batch_cap,
             max_inflight_batches,
             scheduler_workers,
+            max_active_slots,
         );
         drop(worker);
         if timed_out.load(std::sync::atomic::Ordering::Acquire) {
@@ -1602,7 +1610,7 @@ fn self_play_many_net(
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_double_reveal_offsets_p0=None,
-    cheap_double_reveal_offsets_p1=None))]
+    cheap_double_reveal_offsets_p1=None, max_active_slots=0))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -1640,6 +1648,7 @@ fn self_play_many_flat_net(
     puct_root: bool,
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
+    max_active_slots: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1737,6 +1746,7 @@ fn self_play_many_flat_net(
             global_batch_cap,
             max_inflight_batches,
             scheduler_workers,
+            max_active_slots,
         );
         drop(worker);
         if timed_out.load(std::sync::atomic::Ordering::Acquire) {

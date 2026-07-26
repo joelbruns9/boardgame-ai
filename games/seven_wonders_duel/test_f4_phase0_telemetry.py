@@ -117,6 +117,27 @@ def test_window_split_separates_steady_state_from_drain():
     assert split["drain_seconds"] == pytest.approx(0.002)
 
 
+def test_window_split_survives_transient_dips_in_a_pooled_run():
+    """A pool dips for a cycle on every retirement; that is not the drain.
+
+    Splitting at the *first* dip would call this run 20% steady when it is 80%
+    steady, which is how a healthy pooled run gets misread as a starving one.
+    """
+
+    metrics = {
+        "batch_rows": [20, 9, 21, 20, 22, 8, 3],
+        "batch_live_slots": [8, 5, 8, 8, 8, 4, 1],
+        "batch_submit_ns": [0, 1_000, 2_000, 3_000, 4_000_000, 4_500_000, 4_800_000],
+        "scheduler_wall_ns": 5_000_000,
+    }
+    split = window_split(metrics)
+    assert split["steady_batches"] == 5
+    assert split["steady_rows"] == 92
+    assert split["drain_batches"] == 2
+    assert split["drain_rows"] == 11
+    assert split["steady_seconds"] == pytest.approx(0.0045)
+
+
 def test_window_split_handles_a_run_that_never_drains():
     metrics = {
         "batch_rows": [16, 16],

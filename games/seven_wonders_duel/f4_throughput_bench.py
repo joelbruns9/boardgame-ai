@@ -199,13 +199,18 @@ def _run_python(
 def window_split(metrics: dict) -> dict:
     """Split one Rust call's batches into its steady-state and drain windows.
 
-    A call starts with every slot live and ends with concurrency decaying to a
-    single game. Averaging batch width over both regimes blends a well-fed
-    scheduler with a starving one, so the two are reported separately here.
+    A call ends with concurrency decaying to a single game. Averaging batch
+    width over that tail and over the fed regime blends a well-served scheduler
+    with a starving one, so the two are reported separately here.
 
-    The boundary is the first batch submitted while fewer slots were live than
-    the call's maximum; everything from there on is drain. Time comes from the
-    Rust-side submission offsets, so it is wall time, not a batch count.
+    The boundary is the batch *after the last one* that ran at full occupancy —
+    i.e. the point beyond which the pool never refills to its ceiling again.
+    Using the *first* dip instead would be wrong for a pooled run: occupancy
+    dips for a cycle whenever a game retires before its replacement activates,
+    and a single such dip would misclassify most of a healthy run as drain.
+
+    Time comes from the Rust-side submission offsets, so it is wall time, not a
+    batch count.
     """
 
     rows = [int(value) for value in metrics.get("batch_rows", [])]
@@ -223,9 +228,9 @@ def window_split(metrics: dict) -> dict:
     if not rows or len(live) != len(rows) or len(submitted) != len(rows):
         return empty | {"steady_seconds": wall}
     peak = max(live)
-    boundary = next(
-        (index for index, count in enumerate(live) if count < peak), len(rows)
-    )
+    boundary = max(
+        index for index, count in enumerate(live) if count == peak
+    ) + 1
     steady_seconds = submitted[boundary] / 1e9 if boundary < len(rows) else wall
     steady_seconds = min(steady_seconds, wall)
     return {
@@ -412,6 +417,10 @@ def _run_rust(
             cheap_double_reveal_offsets=cheap_double_reveal_offsets,
             max_inflight_batches=max_inflight,
             scheduler_workers=scheduler_workers,
+            # Phase 1: `slots` is now the pool's activation ceiling, not the
+            # number of games in the call. With --games-per-call above it, the
+            # scheduler refills instead of draining.
+            max_active_slots=slots,
         )
         games_done += len(records)
         moves += int(metrics["moves"])
@@ -988,8 +997,8 @@ def main():
         help="games submitted per Rust call. 0 keeps the historical one-call-"
         "per---slots chunking, whose every call is a drain. Pass a value well "
         "above --slots (e.g. --games 256 --games-per-call 256 --slots 16) to "
-        "measure a steady-state window; note that until the Phase 1 slot pool "
-        "lands, a call runs all of its games concurrently.",
+        "measure a steady-state window: --slots is the pool's activation "
+        "ceiling and the scheduler refills it as games finish.",
     )
     parser.add_argument("--global-batch-cap", type=int, default=256)
     parser.add_argument("--max-inflight-batches", type=int, default=2)

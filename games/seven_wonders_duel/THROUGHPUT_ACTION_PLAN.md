@@ -1,8 +1,11 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** Phase 0 built and run;
-Phases 1–4 not started. See "Phase 0 results" below — the branch point is
-resolved and it reroutes the programme.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0 and 1 built and
+run; Phases 2–4 not started. Two results reroute the programme: the pipeline is
+**launch-bound** (Phase 0), so Phase 3b is unconditional and precedes Phase 4;
+and **slot count is worth far more than the scheduler work** (Phase 1 — +48% for
+16 → 32 slots, at no memory cost), so the Phase 4 slots axis should be swept
+early. Baseline is now **1,650 games/hour**, up from 1,301.
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
 work. Several rev-1 claims are withdrawn below rather than quietly edited.
@@ -278,6 +281,97 @@ gate rather than an identity gate.
 Plus: every existing F4 gate stays green; active slots hold at
 `min(max_active_slots, jobs_remaining)`; time-weighted live-slot occupancy rises.
 
+### Phase 1 results (2026-07-26, built and run)
+
+**What was built.** `SlotPool` in `self_play.rs` replaces `Vec<GameSlot>` with
+per-job entries that are `Queued` (state + config only), `Active` (a real slot
+with its arena) or `Finished` (a record). Both schedulers accept
+`max_active_slots`; `0` preserves the old "everything active" behaviour. A
+completed game is retired to its record the cycle it ends — freeing its arena and
+its activation — and the lowest-indexed queued job takes its place. Records are
+emitted by job index, so input order is independent of activation and completion
+order. `SlotBudget` is a shared atomic, so sharded schedulers draw from **one**
+global ceiling (each shard keeps one reserved activation, or a shard could starve
+and the run would deadlock); a budget below `scheduler_workers` is now an error
+rather than being silently widened. `phase_d.py` submits whole groups.
+
+**Gate 1 (mock): passed, exactly.** Records are byte-identical to the unpooled
+path at `max_active_slots ∈ {1, 2, 3, 5, 12, 64}`, and byte-identical to the
+**chunked** path it replaces (three calls of three games versus one pooled call
+of nine at a ceiling of three). Under a batch-shape-independent evaluator the
+schedule provably cannot matter, and it doesn't.
+
+**Gate 2 (real net): passed.** (a) Row-wise outputs are invariant across batch
+shapes — the same position evaluates identically alone, in a group, and in a
+padded group. (b) Divergence is then *measured*, not assumed: **0 of 432 moves**
+across 6 games between pooled and unpooled play. Reported this way on purpose —
+CPU float determinism does not license the same claim on CUDA.
+
+**Occupancy: criterion met.** 64 games, ceiling 16, RTX 3070 laptop:
+
+| | chunked (4 calls × 16) | pooled (1 call, ceiling 16) |
+|---|---|---|
+| time-weighted live slots | 13.47 | **14.62** |
+| steady ÷ drain seconds | 1.40 | **3.98** |
+| drain seconds | 83.8 | **41.6** |
+| global batches | 14,438 | **13,146** |
+| mean rows/batch | 26.6 | **29.3** |
+| games/hour | 1,145 | 1,113 |
+
+The remaining gap to 16.0 is the genuine end-of-queue tail: the last 16 games
+have nothing left to refill from. It shrinks as games-per-call rises.
+
+**Throughput at matched concurrency: no gain, and Phase 0 explains why.**
+1,145 → 1,113 games/hour is a 2.8% regression, within the ~10% run-to-run spread
+Phase 0 measured, so the honest reading is *flat*. This corrects rev 2's framing:
+the drain tail was **not** costing meaningful throughput. Batch count fell only
+9%, and on a launch-bound pipeline that caps the available win at ~9% before the
+slightly wider batches give some of it back. Mean batch width barely moved
+(26.6 → 29.3) because width is set by *games × rows-per-wave* (~2.6), not by how
+well-fed the pool is — 16 games can only ever produce ~40 rows.
+
+**But the sweep the pool made safe to run found the real lever: concurrency.**
+Same 64 games, same cap, pooled, ceiling raised from 16 to 32:
+
+| | pooled, 16 slots | pooled, 32 slots |
+|---|---|---|
+| games/hour | 1,113 | **1,650** |
+| global batches | 13,146 | **7,433** |
+| mean rows/batch | 29.3 | **51.7** |
+| time-weighted live slots | 14.6 | 28.7 |
+| peak host RSS | 1.20 GB | 1.21 GB |
+| CUDA peak reserved | 237 MB | 237 MB |
+
+**+48% for doubling the slot count, at no measurable memory cost.** Halving the
+batch count on a launch-bound pipeline is exactly the win Phase 0's cost model
+predicts, and the memory telemetry says there is plenty of headroom to go further.
+
+**Attribution, measured rather than assumed.** The +48% is *not* the pool's doing:
+a chunked run at 32 slots reaches **1,630** games/hour, statistically the same as
+the pooled 1,650. Higher concurrency was always available; it simply had never
+been swept, because until Phase 0 the measurements could not distinguish a
+well-fed scheduler from a starving one. The pool's own throughput contribution is
+~0 at matched concurrency (1,145 vs 1,113 at 16 slots; 1,630 vs 1,650 at 32).
+
+So Phase 1's value is what its own success criteria claimed, and not more:
+
+1. **The measurement contamination is gone** — steady ÷ drain went 1.40 → 3.98 at
+   16 slots and 0.92 → 2.29 at 32, so Phase 4's sweeps no longer measure a blend
+   of fed and starving regimes. This is what made the concurrency finding above
+   trustworthy.
+2. **Concurrency is decoupled from call size.** The benchmark could always fake it
+   by choosing chunk size = concurrency; real generation cannot, because
+   `phase_d` group sizes are whatever the curriculum mix produces. A 20-game
+   group at `rust_slots=16` used to run 16 games and then 4 — a badly starved
+   second window. Now it holds 16 throughout.
+3. **Memory is bounded and measured** — a pool of 2 over 16 games peaks at a
+   fraction of the arena of 16 (gated in `test_f4_phase1_pool.py`), and the
+   32-slot run above shows the headroom that bound leaves.
+
+**Not converted:** `f4_strength.py` and the `phase_d.py` arena/eval paths still
+chunk. That is deliberate — they are gates, and changing their batch shapes
+would perturb the results they exist to measure.
+
 ---
 
 ## Phase 2 — conflict-free leaf waves
@@ -339,6 +433,11 @@ refactor.
 ---
 
 ## Phase 4 — joint sweep
+
+**Promoted by the Phase 1 measurement.** A single point on this sweep (slots
+16 → 32) was worth **+48%**, more than Phases 1–2 were expected to deliver
+together, and the memory telemetry says 32 is nowhere near a ceiling. Run the
+slots axis early and properly rather than last.
 
 Only now, and **jointly**, because the axes interact: once waves widen, 16 slots
 × width 2.6 already changes what the 256 cap means.
@@ -402,7 +501,10 @@ pinned laptop configuration.
   and reports steady/drain apart, but true refill needs Phase 1's pool, so the
   "steady window ≥ 4× drain" criterion is carried into Phase 1.
 * Phase 1: time-weighted live-slot occupancy ≈ `max_active_slots` through steady
-  state; mock-path records byte-identical.
+  state; mock-path records byte-identical. **Met**: 14.62 of a 16 ceiling,
+  byte-identical at every pool size and against the chunked path, real-net
+  divergence measured at 0/432 moves. Throughput itself is flat — see the Phase 1
+  results section; the gain the plan hoped for was not there to take.
 * Phase 2: leaf batches per search down ~2.5× cheap / ~2.0× full, bit-identical
   across the stratified corpus.
 * Phase 3: `gather_seconds` per row flat in batch width.

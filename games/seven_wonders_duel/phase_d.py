@@ -621,8 +621,8 @@ def generate_seed_buffer(
             grouped.setdefault((bot_type().name, job.index % 2), []).append(job)
         indexed: dict[int, GameRecord] = {}
         for (rush_name, rush_seat), group_jobs in grouped.items():
-            for start in range(0, len(group_jobs), rust_slots):
-                chunk = group_jobs[start : start + rust_slots]
+            # One call per group; the Rust pool keeps `rust_slots` games active.
+            for chunk in [group_jobs]:
                 seeds = [job.seed for job in chunk]
                 first_players = [(job.index // 2) % 2 for job in chunk]
                 raw_records, _ = swr.self_play_many_flat_net(
@@ -643,6 +643,7 @@ def generate_seed_buffer(
                     bot_p1=rush_name if rush_seat == 1 else "greedy",
                     bot_exploration=0.0,
                     bot_policy_iterations=0,
+                    max_active_slots=rust_slots,
                 )
                 for raw in raw_records:
                     raw["agents"]["kind"] = "curriculum_seed"
@@ -1172,41 +1173,44 @@ class PhaseDLoop:
                 neural_games += len(group_jobs)
             else:
                 bot_games += len(group_jobs)
-            for start in range(0, len(group_jobs), self.config.rust_slots):
-                chunk = group_jobs[start : start + self.config.rust_slots]
-                seeds = [job.seed for job in chunk]
-                first_players = [(job.index // 2) % 2 for job in chunk]
-                raw_records, metrics = swr.self_play_many_flat_net(
-                    adapter=adapter,
-                    games=rust_games_for_self_play(seeds, first_players),
-                    game_seeds=seeds,
-                    global_batch_cap=self.config.rust_global_batch_cap,
-                    leaf_batch=self.config.leaf_batch,
-                    cheap_sims_min=self.config.cheap_sims_min,
-                    cheap_sims_max=self.config.cheap_sims_max,
-                    full_sims_min=self.config.full_sims_min,
-                    full_sims_max=self.config.full_sims_max,
-                    full_search_fraction=self.config.full_search_fraction,
-                    top_k=self.config.top_k,
-                    draft_prior=draft_prior,
-                    iteration=iteration,
-                    force=self.config.force_root_chance,
-                    age_deal_samples=self.config.age_deal_samples,
-                    cheap_double_reveal_offsets=(
-                        self.config.cheap_double_reveal_offsets
-                    ),
-                    max_inflight_batches=self.config.rust_max_inflight_batches,
-                    scheduler_workers=self.config.rust_scheduler_workers,
-                    bot_p0=bot_name if bot_seat == 0 else None,
-                    bot_p1=bot_name if bot_seat == 1 else None,
-                    bot_exploration=self.config.bot_exploration,
-                    bot_policy_iterations=self.config.bot_policy_iterations,
-                )
-                converted = phase_d_records_from_rust(raw_records)
-                indexed.update(
-                    {job.index: record for job, record in zip(chunk, converted)}
-                )
-                rust_metrics.append(metrics)
+            # Phase 1: the whole group goes in one call, with the Rust
+            # scheduler holding `rust_slots` games active and activating a
+            # queued game whenever one finishes. Chunking here made every chunk
+            # its own drain, so mean concurrency was well below `rust_slots`.
+            seeds = [job.seed for job in group_jobs]
+            first_players = [(job.index // 2) % 2 for job in group_jobs]
+            raw_records, metrics = swr.self_play_many_flat_net(
+                adapter=adapter,
+                games=rust_games_for_self_play(seeds, first_players),
+                game_seeds=seeds,
+                global_batch_cap=self.config.rust_global_batch_cap,
+                leaf_batch=self.config.leaf_batch,
+                cheap_sims_min=self.config.cheap_sims_min,
+                cheap_sims_max=self.config.cheap_sims_max,
+                full_sims_min=self.config.full_sims_min,
+                full_sims_max=self.config.full_sims_max,
+                full_search_fraction=self.config.full_search_fraction,
+                top_k=self.config.top_k,
+                draft_prior=draft_prior,
+                iteration=iteration,
+                force=self.config.force_root_chance,
+                age_deal_samples=self.config.age_deal_samples,
+                cheap_double_reveal_offsets=(
+                    self.config.cheap_double_reveal_offsets
+                ),
+                max_inflight_batches=self.config.rust_max_inflight_batches,
+                scheduler_workers=self.config.rust_scheduler_workers,
+                max_active_slots=self.config.rust_slots,
+                bot_p0=bot_name if bot_seat == 0 else None,
+                bot_p1=bot_name if bot_seat == 1 else None,
+                bot_exploration=self.config.bot_exploration,
+                bot_policy_iterations=self.config.bot_policy_iterations,
+            )
+            converted = phase_d_records_from_rust(raw_records)
+            indexed.update(
+                {job.index: record for job, record in zip(group_jobs, converted)}
+            )
+            rust_metrics.append(metrics)
 
         records = [indexed[job.index] for job in jobs]
         elapsed = time.monotonic() - started
