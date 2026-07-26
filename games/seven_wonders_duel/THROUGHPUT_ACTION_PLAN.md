@@ -9,13 +9,16 @@ Three results reroute the programme:
    precedes Phase 4.
 2. **Slot count is worth far more than the scheduler work** (Phase 1: +48% for
    16 → 32 slots, at no memory cost), so sweep the Phase 4 slots axis early.
-3. **Wave widening is dead** (Phase 2): the conflict-free rule is exact, but
-   realized width is 1.19 rather than the predicted 2.58, so it buys 1.13× fewer
-   batches and no throughput. Both scheduler-side phases turned out to be
-   *correctness and measurement* work, not speed work.
+3. **Wave widening needed a schedule change, not a batching change** (Phase 2 /
+   2b). The conflict-free rule is exact but realized width was only 1.19, because
+   the *blocked* halving order repeats a candidate on consecutive simulations.
+   Interleaving the round — which sequential halving permits and the Python
+   reference simply never did — takes width to 2.15 and throughput **+19%**. It
+   changes every search output, so it is off by default pending a strength
+   result.
 
-Baseline is **1,560–1,650 games/hour** (32 slots; the spread is real run-to-run
-variance), up from 1,301.
+Baseline is **1,661 games/hour** at 32 slots (mean of two runs; run-to-run spread
+is ~9%), up from 1,301 — and **1,977** with the interleaved schedule enabled.
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
 work. Several rev-1 claims are withdrawn below rather than quietly edited.
@@ -484,13 +487,77 @@ anything later needs wide waves. It is not a generation speedup.
 
 **Consequence for the programme.** Wave width cannot be widened without
 reordering simulations *within* a halving round so that consecutive ones come
-from different candidates — the "full-move round-robin reordering" already parked
-under "Later, gated on results". That permutes RNG consumption and so changes
-outputs, needing its own arena justification, and it would buy at most the
-~1.1–1.2× that batch-count reduction is worth on a launch-bound pipeline.
-Batch width is far cheaper to buy from concurrency: Phase 1 measured +48% from
-one slots step. **Recommendation: do not pursue wave widening. Go to Phase 3b
-(launch overhead) and the Phase 4 slots axis.**
+from different candidates. That reordering was prototyped immediately — see
+below — and it works, so the earlier "do not pursue" recommendation is withdrawn.
+
+### Phase 2b — interleaved halving rounds (2026-07-26, prototyped and measured)
+
+**The blocked order was never required.** `search.py:518` reads
+`for action in candidates: for _ in range(per_action)`. Sequential halving fixes
+only *how many* simulations each surviving candidate receives per round, never
+the order they are issued in, so cycling the candidate list `per_action` times is
+equally faithful. The blocked order is a reference-implementation choice that the
+Rust port inherited by being bit-identical to it.
+
+`SearchConfig::round_robin_candidates` (default **off**, both languages) switches
+the interleaving. It is not a refactor: a round visits different leaves, so every
+search output changes. It is a different, equally valid sample.
+
+**Why "batch deeper after each halving" cannot work instead.** Exact batching
+requires that no two in-flight simulations make a *statistics-based* decision at
+a shared node. The root is uniquely safe because the Gumbel root reads its edge
+from the fixed schedule and consults no visits or Q at all. Every node below it
+selects by PUCT. Two simulations entering the same root candidate therefore both
+decide at that candidate's child, where the second sees the first's virtual loss
+in place of its real backup — and even if their paths diverge below that node,
+the divergence decision was already contaminated. Root-level disjointness is not
+merely sufficient for bit-identity, it is **necessary**; the batching boundary
+cannot be moved deeper. Interleaving is the only lever.
+
+**Gates (`test_f4_round_robin.py`), all passing.** Identity has to be
+re-anchored, not reused:
+
+| gate | result |
+|---|---|
+| Rust round-robin ≡ Python reference under round-robin (force on and off, 3 budget/top-k combos) | pass |
+| Phase 2 exactness carries over: conflict-free `leaf_batch` 2/8/16 ≡ `leaf_batch=1` under the new order, incl. tree digest at zero tolerance | pass |
+| allocation unchanged — same sims, same total root visits, same Gumbel top-k — while outputs *do* differ | pass |
+| realized width rises (corpus of full searches): **1.28 → 3.34**, 2.6× fewer waves | pass |
+
+**Production measurement.** 64 games, 32 slots, cap 256, `leaf_batch=16`,
+conflict-free on, two runs per arm back to back:
+
+| | blocked | interleaved |
+|---|---|---|
+| games/hour | 1,590 / 1,732 → **mean 1,661** | 2,005 / 1,949 → **mean 1,977** |
+| global batches | 6,808 | **4,562** (1.49× fewer) |
+| mean rows/batch | 56.5 | **85.1** |
+| mean wave width | 1.19 | **2.15** |
+| leaf waves | 148,291 | **87,951** |
+| simulations run | 210,810 | 209,454 |
+
+**+19%**, and the same work is being done (simulations within 0.6%; the
+deterministic counters are identical across repeats). Run-to-run spread was 8.9%
+blocked and 2.9% interleaved, so the effect is well outside noise. This is the
+first phase in the programme to actually move throughput on the scheduler side,
+and it lands close to the ~+20% predicted from the schedule arithmetic beforehand.
+
+Realized width is 2.15 rather than the corpus figure of 3.34 because 44% of waves
+are still width 1: positions with few legal actions halve their candidate set down
+to **one** survivor, and a single-candidate round can only ever issue width-1
+waves. Cheap searches also already had `per_action = 1` under the frozen config
+(`top_k=16`, 16–24 sims), so interleaving changes nothing for them — the entire
+gain comes from full searches, which are ~94% of all leaf waves.
+
+**Not free, and off by default.** Every recorded gate and quality lock is anchored
+to the blocked order, and the generated training distribution shifts. Turning this
+on in production needs a **strength/arena justification, not an identity one**,
+plus re-anchoring the F3 fixtures. What Phase 2 bought is that the batching on top
+of it is provably exact, so the only open question is the reordering itself.
+
+**Remaining headroom here:** mean rows/batch is 85 against a 256 cap (p95 134),
+so the cap is not yet binding; and 55% of all NN rows are forced root-chance rows
+that no wave work touches.
 
 ---
 
@@ -566,12 +633,10 @@ Phase 0 timing split.
 ## Later, gated on results
 
 * **Full-move round-robin reordering.** ~~Only if full moves remain a batch-count
-  bottleneck after Phase 2.~~ **Not recommended.** Phase 2 measured the actual
-  benefit available here: with waves already exact, reordering could raise mean
-  width from 1.19 towards the candidate count, but batch-count reduction is worth
-  only ~1.1× per 10% of batches removed on a launch-bound pipeline, against
-  permuting RNG consumption and changing every full-move output. Concurrency buys
-  the same batch width for nothing (Phase 1: +48%).
+  bottleneck after Phase 2.~~ **Done and measured — see Phase 2b: +19%.** What
+  remains is the decision, not the code: it changes every search output, so it
+  needs an arena/strength result and re-anchored F3 fixtures before production
+  use. It is off by default until then.
 * **Token-count bucketing** if padding exceeds ~20% once batches widen.
 * **Chance capping (`cheap_double_reveal_offsets`, X=3).** Re-measure *after* the
   exact pipeline is tuned: it touches only the per-row ~29%, and it makes batches

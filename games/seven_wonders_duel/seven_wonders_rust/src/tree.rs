@@ -331,6 +331,18 @@ pub struct SearchConfig {
     /// expansion exhaustive; a positive `X` keeps the balanced `n * X` support
     /// and CLOSES the edge.
     pub double_reveal_offsets: usize,
+    /// Phase 2 follow-up: interleave the sequential-halving round instead of
+    /// blocking it. Sequential halving fixes only *how many* simulations each
+    /// surviving candidate gets per round, not their order, so visiting
+    /// `c0, c1, .., ck, c0, c1, ..` is as faithful as `c0 x per_action, c1 x
+    /// per_action, ..`. The blocked order came from the Python reference
+    /// (`search.py`), and it is what holds realized wave width at 1.19: with
+    /// `per_action >= 2` the next simulation always repeats the current
+    /// candidate, so the conflict-free rule cuts every wave to width 1.
+    ///
+    /// This changes which leaves a round visits, hence every search output — it
+    /// is a different, equally valid sample, not a refactor.
+    pub round_robin_candidates: bool,
     /// Phase 2: forbid two in-flight simulations in the same root candidate's
     /// subtree. A wave is cut short rather than admitting the second one, so
     /// every simulation in a wave descends a subtree no other member touches —

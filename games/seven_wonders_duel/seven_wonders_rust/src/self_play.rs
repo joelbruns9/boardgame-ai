@@ -71,6 +71,10 @@ pub struct SelfPlayConfig {
     /// Phase 2: hold the conflict-free wave invariant, making `leaf_batch > 1`
     /// an exact batching of `leaf_batch = 1` rather than an approximation.
     pub conflict_free_waves: bool,
+    /// Phase 2 follow-up: interleave each halving round instead of blocking it,
+    /// so consecutive simulations come from different candidates and waves can
+    /// actually widen. Changes search outputs — see `tree::SearchConfig`.
+    pub round_robin_candidates: bool,
 }
 
 impl SelfPlayConfig {
@@ -414,6 +418,7 @@ pub fn run<E: Eval>(
                 full,
             ),
             conflict_free_waves: cfg.conflict_free_waves,
+            round_robin_candidates: cfg.round_robin_candidates,
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -1140,6 +1145,7 @@ impl GameSlot {
                     full,
                 ),
                 conflict_free_waves: self.cfg.conflict_free_waves,
+                round_robin_candidates: self.cfg.round_robin_candidates,
             },
         })
     }

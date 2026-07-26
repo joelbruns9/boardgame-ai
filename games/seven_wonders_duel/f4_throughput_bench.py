@@ -352,6 +352,7 @@ def _run_rust(
     resource_sample_hz: float = 0.0,
     conflict_free_waves: bool = False,
     leaf_batch_override: int = 0,
+    round_robin_candidates: bool = False,
 ) -> dict:
     import seven_wonders_rust as swr
 
@@ -409,6 +410,7 @@ def _run_rust(
             global_batch_cap=batch_cap,
             leaf_batch=leaf_batch_override or lock["leaf_batch"],
             conflict_free_waves=conflict_free_waves,
+            round_robin_candidates=round_robin_candidates,
             cheap_sims_min=search["cheap_sims_min"],
             cheap_sims_max=search["cheap_sims_max"],
             full_sims_min=search["full_sims_min"],
@@ -628,6 +630,7 @@ def _run_rust(
         "arena_node_struct_bytes": arena_node_bytes,
         # --- Phase 2: realized wave widths, never inferred from leaf_batch ---
         "conflict_free_waves": bool(conflict_free_waves),
+        "round_robin_candidates": bool(round_robin_candidates),
         "conflict_cuts": conflict_cuts,
         "wave_width_histogram": wave_widths,
         "leaf_waves": sum(wave_widths),
@@ -744,6 +747,7 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "resource_sample_hz": args.resource_sample_hz,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
+        "round_robin_candidates": args.round_robin_candidates,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -847,6 +851,7 @@ def run(args) -> dict:
         "resource_sample_hz": args.resource_sample_hz,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
+        "round_robin_candidates": args.round_robin_candidates,
         "global_batch_cap": args.global_batch_cap,
         "max_inflight_batches": args.max_inflight_batches,
         "scheduler_workers": args.scheduler_workers,
@@ -894,6 +899,7 @@ def run(args) -> dict:
             games_per_call=args.games_per_call,
             conflict_free_waves=args.conflict_free_waves,
             leaf_batch_override=args.leaf_batch,
+            round_robin_candidates=args.round_robin_candidates,
         )
         if args.mode == "laptop":
             _run_python(
@@ -940,6 +946,7 @@ def run(args) -> dict:
                     resource_sample_hz=args.resource_sample_hz,
                     conflict_free_waves=args.conflict_free_waves,
                     leaf_batch_override=args.leaf_batch,
+                    round_robin_candidates=args.round_robin_candidates,
                 )
                 rust_row["isolated_forward_rows_ratio"] = (
                     rust_row["total_nn_rows_per_second"]
@@ -1051,6 +1058,14 @@ def main():
         default=0,
         help="override the lock's leaf_batch (0 = use the lock). Only sound "
         "together with --conflict-free-waves, which is enforced.",
+    )
+    parser.add_argument(
+        "--round-robin-candidates",
+        action="store_true",
+        help="interleave each sequential-halving round instead of blocking it. "
+        "Changes every search output (a different, equally valid sample), so it "
+        "needs a strength justification, not an identity one -- but it is what "
+        "lets conflict-free waves actually widen. See test_f4_round_robin.py.",
     )
     parser.add_argument("--diagnostic-sync", action="store_true")
     parser.add_argument(

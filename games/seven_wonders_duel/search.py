@@ -376,6 +376,23 @@ class SearchConfig:
     """Closed mode: exhaustively materialize and evaluate every enumerable
     chance child of the root's edges before searching (plan §5 catastrophe
     coverage; AGE_DEAL edges stay sampled)."""
+    round_robin_candidates: bool = False
+    """Interleave each sequential-halving round instead of blocking it.
+
+    Sequential halving fixes only *how many* simulations each surviving
+    candidate receives in a round, not the order they are issued in, so
+    ``c0, c1, .., ck, c0, c1, ..`` is as faithful as ``c0 x per_action,
+    c1 x per_action, ..``. The blocked order below is the original choice and
+    the one every recorded gate is anchored to.
+
+    It matters for throughput because the Rust searcher batches leaves across
+    root candidates: under the blocked order the next simulation repeats the
+    current candidate whenever ``per_action >= 2``, which holds realized leaf
+    wave width at 1.19 (THROUGHPUT_ACTION_PLAN.md, Phase 2). Interleaving lets a
+    wave hold one simulation per candidate.
+
+    This changes which leaves a round visits and therefore every search output.
+    It is a different, equally valid sample -- not a refactor."""
     double_reveal_offsets: int = 0
     """Offsets per first-reveal stratum on a PURE double card-reveal root edge.
 
@@ -515,16 +532,22 @@ class GumbelMCTS:
             per_action = max(
                 1, (budget - sims_used) // (rounds_remaining * len(candidates))
             )
-            for action in candidates:
-                for _ in range(per_action):
-                    if sims_used >= budget:
-                        break
-                    q, n = simulate(action)
-                    q_hat[action] = q
-                    visits[action] = n
-                    sims_used += 1
+            # Blocked (default) issues `per_action` consecutive simulations per
+            # candidate; interleaved cycles the candidate list `per_action`
+            # times. Same allocation, different order -- see
+            # `SearchConfig.round_robin_candidates`.
+            schedule = (
+                [action for _ in range(per_action) for action in candidates]
+                if self.config.round_robin_candidates
+                else [action for action in candidates for _ in range(per_action)]
+            )
+            for action in schedule:
                 if sims_used >= budget:
                     break
+                q, n = simulate(action)
+                q_hat[action] = q
+                visits[action] = n
+                sims_used += 1
             if len(candidates) > 1:
                 max_visits = max(visits.values()) if visits else 0
                 sigma = self._sigma({a: completed_q(a) for a in legal}, max_visits)

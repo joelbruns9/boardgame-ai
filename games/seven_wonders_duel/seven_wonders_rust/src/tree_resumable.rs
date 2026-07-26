@@ -883,6 +883,7 @@ impl SearchSession {
                 age_deal_samples: cfg.age_deal_samples,
                 double_reveal_offsets: cfg.double_reveal_offsets,
                 conflict_free_waves: cfg.conflict_free_waves,
+                round_robin_candidates: cfg.round_robin_candidates,
             },
             leaf_batch,
             rng,
@@ -1005,10 +1006,35 @@ impl SearchSession {
         if self.cfg.puct_root {
             return; // no per-action schedule to advance
         }
+        if self.cfg.round_robin_candidates {
+            // Interleaved: one simulation per candidate, then cycle. Sequential
+            // halving cares only that each candidate receives `per_action`
+            // simulations before the reduction, so this allocation is identical
+            // to the blocked one — only the order differs.
+            self.candidate_pos += 1;
+            if self.candidate_pos >= self.candidates.len() {
+                self.candidate_pos = 0;
+                self.repeat_pos += 1;
+            }
+            return;
+        }
         self.repeat_pos += 1;
         if self.repeat_pos >= self.per_action {
             self.repeat_pos = 0;
             self.candidate_pos += 1;
+        }
+    }
+
+    /// Has this halving round issued its whole allocation?
+    ///
+    /// The two orders exhaust along different axes: blocked walks
+    /// `candidate_pos` to the end, interleaved walks `repeat_pos` to
+    /// `per_action`.
+    fn round_exhausted(&self) -> bool {
+        if self.cfg.round_robin_candidates {
+            self.repeat_pos >= self.per_action
+        } else {
+            self.candidate_pos >= self.candidates.len()
         }
     }
 
@@ -1170,7 +1196,7 @@ impl SearchSession {
             // PUCT root: no candidate set and no halving rounds -- the root
             // selects like every node below it, so there is no schedule to
             // advance and no round boundary to drain at.
-            if !self.cfg.puct_root && self.candidate_pos >= self.candidates.len() {
+            if !self.cfg.puct_root && self.round_exhausted() {
                 if !wave.simulations.is_empty() {
                     if wave.unique_leaf_ids.is_empty() {
                         self.drain_immediate_wave(&mut wave)?;
