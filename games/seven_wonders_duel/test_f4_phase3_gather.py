@@ -56,6 +56,31 @@ def test_vectorised_gather_matches_the_per_row_loop(corpus):
             ), f"rows={size} row={index}: policy"
 
 
+def test_gather_is_run_to_run_deterministic(corpus):
+    """Repeated identical calls must return bit-identical policies.
+
+    This gate exists because the first implementation failed it. A scatter-based
+    segmented sum (`index_add_`) accumulates with atomics on CUDA, so its result
+    varied by ~8e-7 relative between runs — which would have made generation
+    irreproducible at a fixed seed, a worse property than any tolerance. The
+    padded formulation writes each cell exactly once and reduces within a row, so
+    it is deterministic; on CPU this passes either way, so it only bites on CUDA.
+    """
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(13)
+    evaluator = Evaluator(SWDNet(32, 1, 2), device=device, max_batch=512)
+    adapter = rust_flat_batch_adapter(evaluator, vectorized_gather=True)
+    payload = build_payload(corpus[:24])
+
+    def flat(result):
+        return [value for _value, policy in result for value in policy]
+
+    first = flat(adapter(payload))
+    for repeat in range(15):
+        assert flat(adapter(payload)) == first, f"repeat {repeat} differed"
+
+
 def test_each_rows_policy_is_a_distribution_over_its_own_legal_actions(corpus):
     """A segmented softmax's failure mode is leaking mass across segments.
 

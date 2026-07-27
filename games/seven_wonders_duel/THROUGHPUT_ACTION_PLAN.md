@@ -42,8 +42,12 @@ fingerprints).
 | + vectorised gather (3) | **3,332 (2.01×)** |
 | interleaved schedule (2b) on top of 3b | 2,628 — the +5% that no longer justifies its cost |
 
-**Recommendation: ship `fused_embedder` and `vectorized_gather`; leave
-`round_robin_candidates` off.** All three are off by default today.
+**`fused_embedder` and `vectorized_gather` now ship ON** (`398febf`);
+`round_robin_candidates` stays off. Measured at the real production settings
+(`leaf_batch=1` from the lock, conflict-free off, 32 slots): **1,633 -> 3,250
+games/hour, 1.99x**, with identical batch counts and simulation totals.
+
+Review brief: `THROUGHPUT_REVIEW_REQUEST.md`.
 
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
@@ -644,11 +648,21 @@ two more of the same kind beside it:
    envelope between `py_call_ns` and the sum of the components, which is exactly
    the quantity Phase 0's `native_inference_assessment` already tracked.
 
-**What was built** (`vectorized_gather`, default off). A segmented softmax over
-the compacted logits -- `legal_rows` already labels each logit with its row, so
-`scatter_reduce_(amax)` + `index_add_` replace the loop with a fixed number of
-kernels; values and policies concatenated into **one** D2H transfer; and a single
-bulk `tolist()` instead of per-element `float()`.
+**What was built** (`vectorized_gather`, **on by default** since `398febf`). The
+compacted logits are scattered into a padded `[rows, max_legal]` matrix and given
+one row-wise `torch.softmax`; values and policies are concatenated into **one**
+D2H transfer; and a single bulk `tolist()` replaces per-element `float()`.
+
+**A scatter-based segmented sum was tried first and rejected.**
+`scatter_reduce_(amax)` + `index_add_` is the obvious formulation and is slightly
+faster, but `index_add_` accumulates with **atomics on CUDA**, so its result
+varies run to run — measured ~8e-7 relative over 50 repeats. That would have made
+generation irreproducible at a fixed seed, which is a worse property than any
+tolerance, and it was nearly shipped: the flaw was found while writing the review
+brief, not by the gates. The padded formulation writes each cell exactly once and
+reduces within a row, so it is deterministic, costs 0.4% (3,236 vs 3,250
+games/hour, inside noise), and measured **bit-identical** to the per-row loop on
+the verification corpus rather than merely within tolerance.
 
 **Measured** (64 games, 32 slots, cap 256, `leaf_batch=16`, fused embedder on):
 
@@ -666,8 +680,9 @@ while the gather timer fell only 13.7 s: **about half the win was the Python
 it. Batch counts and simulation totals are identical again, and the end-to-end
 gate additionally asserts equal final fingerprints, so the search is untouched.
 
-**Gates** (`test_f4_phase3_gather.py`, 6 tests): row-wise agreement with the loop
-to 1e-6 across widths; each row's policy normalised over *its own* legal actions
+**Gates** (`test_f4_phase3_gather.py`, 8 tests): **run-to-run determinism** (the
+gate the first implementation failed); row-wise agreement with the loop to 1e-6
+across widths; each row's policy normalised over *its own* legal actions
 (a segmented softmax's failure mode is leaking mass across segments, which
 row-wise agreement can hide); zero-legal terminal rows not poisoning the batch
 with NaN; per-row cost falling with width and beating the loop at width in the

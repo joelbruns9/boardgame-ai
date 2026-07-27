@@ -378,28 +378,35 @@ class _RustFlatBatchAdapter:
         )
         compact_logits = outputs["policy"][legal_rows, legal_actions.to(device)]
         if self.vectorized_gather:
-            # Segmented softmax: one set of kernels for the whole batch instead of
-            # one `torch.softmax` launch per row. `legal_rows` already labels each
-            # compacted logit with its row, so the row boundaries need no loop.
-            # Same formula `torch.softmax` uses (subtract the segment max, then
-            # normalise), so agreement is to float reduction order.
-            segment_max = torch.full(
-                (rows,),
+            # Scatter the compacted logits into a padded [rows, max_legal] matrix
+            # and take one row-wise softmax, instead of one softmax launch per
+            # row. This is `torch.softmax` over exactly the same elements, so it
+            # is the loop's arithmetic with a different reduction order.
+            #
+            # Deliberately NOT a scatter-based segmented sum: `index_add_` on CUDA
+            # accumulates with atomics, so its result varies run to run (measured
+            # ~8e-7 relative). That would make generation irreproducible at a
+            # fixed seed, which is a worse property than the ~1e-7 this costs.
+            # The scatter below writes each cell exactly once, and softmax reduces
+            # within a row, so both are deterministic.
+            max_legal = max(1, int(legal_lengths.max()) if rows else 1)
+            # Exclusive prefix sum of the row lengths: where each row's block
+            # begins in the compacted array.
+            row_starts = torch.cumsum(legal_lengths, 0) - legal_lengths
+            starts = torch.repeat_interleave(
+                row_starts.to(device), legal_lengths.to(device)
+            )
+            columns = torch.arange(len(legal_actions), device=device) - starts
+            padded = torch.full(
+                (rows, max_legal),
                 float("-inf"),
                 device=device,
                 dtype=compact_logits.dtype,
             )
-            segment_max.scatter_reduce_(
-                0, legal_rows, compact_logits, reduce="amax", include_self=True
-            )
-            shifted = (compact_logits - segment_max[legal_rows]).exp()
-            denominator = torch.zeros(
-                rows, device=device, dtype=shifted.dtype
-            ).index_add_(0, legal_rows, shifted)
-            # Rows with no legal actions (terminal leaves) leave a zero
-            # denominator, but `legal_rows` never refers to them, so the division
-            # never reads it.
-            compact_policy_tensor = shifted / denominator[legal_rows]
+            padded[legal_rows, columns] = compact_logits
+            # A row with no legal actions stays all -inf and softmaxes to NaN, but
+            # `legal_rows` never refers to it, so the gather below never reads it.
+            compact_policy_tensor = torch.softmax(padded, dim=1)[legal_rows, columns]
         else:
             compact_policy = []
             offset = 0
