@@ -838,19 +838,16 @@ def run(args) -> dict:
         raise ValueError("production throughput requires forced root chance")
     evaluator = load_evaluator(str(args.checkpoint), args.device)
     evaluator.max_batch = args.global_batch_cap
-    if args.fused_embedder:
-        from .net import fuse_for_inference
-
-        if not fuse_for_inference(evaluator.model):
-            raise ValueError("this checkpoint's model has no fusable token embedder")
-        # The cache self-invalidates on device moves and state-dict loads, so a
-        # later step could silently disable it and quietly invalidate the whole
-        # measurement. Confirm it survived rather than assuming.
-        if evaluator.model.embedder._fused is None:
-            raise RuntimeError(
-                "the fused embedder was invalidated after fusing; measure again "
-                "with fusing moved after every model move"
-            )
+    # `Evaluator` fuses by default; this only has to honour an explicit opt-out
+    # and then confirm the state actually in force, since the cache
+    # self-invalidates on device moves and a silent unfuse would misreport.
+    if not args.fused_embedder:
+        evaluator.model.embedder.unfuse()
+    elif evaluator.model.embedder._fused is None:
+        raise RuntimeError(
+            "the fused embedder was invalidated after construction; measure "
+            "again with fusing moved after every model move"
+        )
     if args.torch_compile != "none":
         evaluator.model = torch.compile(evaluator.model, mode=args.torch_compile)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -1085,23 +1082,23 @@ def main():
         help="override the lock's leaf_batch (0 = use the lock). Only sound "
         "together with --conflict-free-waves, which is enforced.",
     )
+    # Phases 3 and 3b are ON by default, matching production. The negatives
+    # exist so a run can measure what they are worth without editing code.
     parser.add_argument(
-        "--vectorized-gather",
-        action="store_true",
-        help="Phase 3: segmented softmax instead of one softmax launch per row, "
-        "a single D2H transfer instead of two, and one bulk tolist() instead of "
-        "a Python float() per legal action. All three scale per row while the "
-        "per-batch cost is flat. Same arithmetic, different reduction order.",
+        "--no-vectorized-gather",
+        dest="vectorized_gather",
+        action="store_false",
+        help="disable Phase 3's segmented softmax / single D2H / bulk tolist() "
+        "and go back to the per-row loop.",
     )
     parser.add_argument(
-        "--fused-embedder",
-        action="store_true",
-        help="Phase 3b: fuse the token embedder's per-type loop into one gather "
-        "plus one matmul, removing ~18 host syncs and ~50 kernel launches per "
-        "forward. Arithmetically the same computation with a different reduction "
-        "order, so outputs move by ~2e-6 and a tie can flip; inference only, the "
-        "training path is untouched.",
+        "--no-fused-embedder",
+        dest="fused_embedder",
+        action="store_false",
+        help="disable Phase 3b's fused token embedder and go back to the "
+        "per-type masked loop.",
     )
+    parser.set_defaults(vectorized_gather=True, fused_embedder=True)
     parser.add_argument(
         "--round-robin-candidates",
         action="store_true",

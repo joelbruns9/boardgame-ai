@@ -21,7 +21,7 @@ import torch
 
 from .dataset import collate_inputs, vectorize
 from .encoder import Encoding, encode
-from .net import masked_policy_log_softmax
+from .net import fuse_for_inference, masked_policy_log_softmax
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,10 +38,21 @@ class Evaluator:
     """Synchronous batched evaluator. Thread-safety and cross-caller
     coalescing arrive with the Phase F service; the API does not change."""
 
-    def __init__(self, model, device: str = "cpu", max_batch: int = 512):
+    def __init__(
+        self,
+        model,
+        device: str = "cpu",
+        max_batch: int = 512,
+        fuse_embedder: bool = True,
+    ):
         self.model = model.to(device).eval()
         self.device = device
         self.max_batch = max_batch
+        # Fuse the token embedder's per-type loop by default: it is inference-only
+        # (the cache self-invalidates on train/load/move), leaves training
+        # bit-identical, and is worth 1.5x end to end -- THROUGHPUT_ACTION_PLAN.md
+        # Phase 3b. Must come after `.to()`, which invalidates the cache.
+        self.fused_embedder = bool(fuse_embedder) and fuse_for_inference(self.model)
 
     @torch.no_grad()
     def evaluate(

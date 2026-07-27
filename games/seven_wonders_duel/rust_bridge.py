@@ -178,7 +178,7 @@ class _RustFlatBatchAdapter:
         diagnostic_sync: bool = False,
         pinned_memory: bool = False,
         cuda_events: bool = False,
-        vectorized_gather: bool = False,
+        vectorized_gather: bool = True,
     ):
         self.evaluator = evaluator
         self.diagnostic_sync = diagnostic_sync
@@ -187,7 +187,8 @@ class _RustFlatBatchAdapter:
         #: single D2H transfer, and one bulk `tolist()`. All three of those costs
         #: scale per row while the per-batch cost is flat, so they are what makes
         #: a wider batch stop paying. Arithmetically the same computation in a
-        #: different reduction order (~1e-7), so it is off by default.
+        #: different reduction order (~1e-7); on by default since Phase 3, which
+        #: measured +33.6% end to end with identical scheduler work.
         self.vectorized_gather = bool(vectorized_gather)
         self.cuda_events = bool(cuda_events) and str(evaluator.device).startswith("cuda")
         self.last_metrics: dict[str, float | int] = {}
@@ -480,7 +481,7 @@ def rust_flat_batch_adapter(
     diagnostic_sync: bool = False,
     pinned_memory: bool = False,
     cuda_events: bool = False,
-    vectorized_gather: bool = False,
+    vectorized_gather: bool = True,
 ):
     """Return the F4.5 flat-buffer adapter for the current Torch evaluator."""
 
@@ -499,6 +500,7 @@ def rust_seat_routed_flat_batch_adapter(
     diagnostic_sync: bool = False,
     pinned_memory: bool = False,
     cuda_events: bool = False,
+    vectorized_gather: bool = True,
 ):
     """Route packed Rust rows to a different evaluator model for each seat.
 
@@ -554,11 +556,19 @@ def rust_seat_routed_flat_batch_adapter(
     proxy.max_batch = min(evaluator.max_batch for evaluator in evaluators)
     proxy.model = _SeatRoutedModel([evaluator.model for evaluator in evaluators])
     proxy.model.to(proxy.device).eval()
+    # `.to()` runs `_apply` on every child, which invalidates each embedder's
+    # fused cache by design. Re-fuse, or seat-routed arena play would silently
+    # fall back to the per-type loop.
+    from .net import fuse_for_inference
+
+    for model in proxy.model.models:
+        fuse_for_inference(model)
     return _RustFlatBatchAdapter(
         proxy,
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
+        vectorized_gather=vectorized_gather,
     )
 
 

@@ -181,8 +181,29 @@ def test_vectorised_gather_does_the_same_scheduler_work():
     ]
 
 
-def test_vectorised_gather_is_off_by_default():
-    """Every recorded gate is anchored to the loop's arithmetic."""
+def test_vectorised_gather_is_on_by_default_and_can_be_turned_off():
+    """Shipped as the default since Phase 3; the opt-out is the measurement path."""
 
     evaluator = _evaluator()
-    assert rust_flat_batch_adapter(evaluator).vectorized_gather is False
+    assert rust_flat_batch_adapter(evaluator).vectorized_gather is True
+    assert (
+        rust_flat_batch_adapter(evaluator, vectorized_gather=False).vectorized_gather
+        is False
+    )
+
+
+def test_evaluator_fuses_the_embedder_by_default_and_can_be_told_not_to():
+    """Phase 3b ships through `Evaluator`, so every inference path inherits it."""
+
+    from .inference import Evaluator
+
+    torch.manual_seed(31)
+    model = SWDNet(32, 1, 2)
+    evaluator = Evaluator(model, device="cpu", max_batch=8)
+    assert evaluator.fused_embedder is True
+    assert evaluator.model.embedder._fused is not None
+
+    torch.manual_seed(31)
+    plain = Evaluator(SWDNet(32, 1, 2), device="cpu", max_batch=8, fuse_embedder=False)
+    assert plain.fused_embedder is False
+    assert plain.model.embedder._fused is None
