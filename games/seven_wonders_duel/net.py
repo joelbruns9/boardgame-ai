@@ -60,6 +60,8 @@ class TokenEmbedder(nn.Module):
         #: Fused inference tensors, built by `fuse()`. `None` = use the per-type
         #: loop, which is the training path and stays untouched.
         self._fused: dict[str, torch.Tensor] | None = None
+        #: Autograd version counters of the copied parameters at `fuse()` time.
+        self._fused_versions: tuple[int, ...] = ()
         # The cache copies `entity`/`feature` but reads `type_embedding`/`aux`
         # live, so anything that rewrites parameters in place would leave it
         # PARTIALLY stale — a silently wrong forward rather than a loud one.
@@ -67,6 +69,14 @@ class TokenEmbedder(nn.Module):
         self.register_load_state_dict_post_hook(
             lambda module, incompatible_keys: module.unfuse()
         )
+
+    #: Fall back to the per-type loop when the fused projection's temporary
+    #: ``[rows, tokens, n_types, d_model]`` would exceed this. The fused path
+    #: computes all nine type projections and selects one, so that temporary
+    #: grows with model width and batch size: ~87 MB at d128 with 256 rows of 74
+    #: tokens, ~262 MB at d384, ~524 MB at d384 with a 512-row cap. A safety
+    #: valve — no measured configuration reaches it.
+    MAX_PROJECTION_BYTES = 512 * 1024 * 1024
 
     def fuse(self) -> None:
         """Build the fused inference tensors from the per-type parameters.
@@ -93,6 +103,11 @@ class TokenEmbedder(nn.Module):
         weights or moving devices — the cache is a snapshot.
         """
 
+        if self.training:
+            raise RuntimeError(
+                "fuse() is inference-only and the cache is a detached snapshot; "
+                "call model.eval() before fusing"
+            )
         device = self.type_embedding.weight.device
         dtype = self.type_embedding.weight.dtype
         offsets = []
@@ -119,6 +134,7 @@ class TokenEmbedder(nn.Module):
             linear = self.feature[token_type.value]
             feature_weight[index, :, : linear.in_features] = linear.weight.detach()
             feature_bias[index] = linear.bias.detach()
+        self._fused_versions = self._parameter_versions()
         self._fused = {
             "entity_weight": entity_weight,
             "entity_offsets": torch.tensor(offsets, device=device, dtype=torch.long),
@@ -128,10 +144,38 @@ class TokenEmbedder(nn.Module):
             "feature_bias": feature_bias.reshape(-1),
         }
 
+    def _snapshot_sources(self):
+        """Exactly the parameters `fuse()` copies."""
+
+        for token_type in TOKEN_TYPES:
+            yield self.entity[token_type.value].weight
+            yield self.feature[token_type.value].weight
+            yield self.feature[token_type.value].bias
+
+    def _parameter_versions(self) -> tuple[int, ...]:
+        return tuple(tensor._version for tensor in self._snapshot_sources())
+
+    def _snapshot_is_current(self) -> bool:
+        """Has any copied parameter been written in place since `fuse()`?
+
+        `train()`, `load_state_dict()` and `_apply()` cover the ordinary ways
+        parameters change — but not all of them. An optimizer step taken while
+        still in eval mode, an EMA/SWA `copy_`/`lerp_`, or a direct `.data` write
+        would each leave a *partially* stale cache: the copied `entity`/`feature`
+        go stale while `type_embedding`/`aux` are still read live, which is a
+        silently wrong forward rather than a loud one. Autograd's per-tensor
+        version counter observes every in-place write, so consulting it is the one
+        cheap way to be certain — 27 integer reads against a forward measured in
+        milliseconds.
+        """
+
+        return self._fused_versions == self._parameter_versions()
+
     def unfuse(self) -> None:
         """Drop the fused cache and return to the per-type loop."""
 
         self._fused = None
+        self._fused_versions = ()
 
     def _apply(self, *args, **kwargs):
         """`.to()`, `.cuda()`, `.float()` etc. all land here — drop the cache.
@@ -157,6 +201,14 @@ class TokenEmbedder(nn.Module):
             self.unfuse()
         return super().train(mode)
 
+    def _fits_projection_budget(self, batch: dict[str, torch.Tensor]) -> bool:
+        rows, tokens = batch["type_ids"].shape
+        needed = (
+            rows * tokens * len(TOKEN_TYPES) * self.d_model
+            * batch["features"].element_size()
+        )
+        return needed <= self.MAX_PROJECTION_BYTES
+
     def _forward_fused(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         fused = self._fused
         assert fused is not None
@@ -177,7 +229,12 @@ class TokenEmbedder(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         if self._fused is not None and not self.training:
-            return self._forward_fused(batch)
+            if not self._snapshot_is_current():
+                # A copied parameter was written in place behind the cache's
+                # back. Drop it rather than serve a stale answer.
+                self.unfuse()
+            elif self._fits_projection_budget(batch):
+                return self._forward_fused(batch)
         type_ids = batch["type_ids"]
         out = self.type_embedding(type_ids) + self.aux(batch["aux_ids"])
         per_type = torch.zeros_like(out)
@@ -241,18 +298,42 @@ class SWDNet(nn.Module):
         return self.heads(readout)
 
 
-def fuse_for_inference(model: nn.Module) -> bool:
+def fusion_is_profitable(device) -> bool:
+    """Is fusing measured to pay on this device?
+
+    Fusing trades ~9× the projection arithmetic for ~18 fewer host syncs and ~50
+    fewer kernel launches per forward. That is overwhelmingly worth it where
+    launches and syncs cost something, and simply extra work where they do not.
+    Measured on an RTX 3070 laptop (Phase 3b review response):
+
+    * **CUDA** — 3.17× at d128/8 rows, 1.17× at d128/256 rows, and 1.01–1.07× for
+      d256L8 and d384L12 at width. A win or neutral everywhere measured, never a
+      loss: bigger models converge towards neutral rather than regressing.
+    * **CPU** — 1.31× at 8 rows but **0.90× at 64**. No launch overhead to
+      recover, so the extra arithmetic is pure cost. Off by default here.
+
+    Callers who have measured their own configuration can override with
+    ``force=True``.
+    """
+
+    return str(device).startswith("cuda")
+
+
+def fuse_for_inference(model: nn.Module, *, force: bool = False) -> bool:
     """Switch `model`'s token embedder to its fused inference path.
 
-    Returns whether anything was fused, so a caller can report honestly instead
-    of assuming. Only valid in eval mode — see `TokenEmbedder.fuse`. The fused
-    path is arithmetically the same computation with a different reduction order,
-    so outputs move by ~2e-6; that is a numerical change, not an exact refactor,
-    and it can flip a search decision at a tie.
+    Returns whether anything was fused, so a caller can report honestly rather
+    than assume. Declines where fusing is not measured to pay unless `force`.
+    Only valid in eval mode — see `TokenEmbedder.fuse`. The fused path is
+    arithmetically the same computation with a different reduction order, so
+    outputs move by ~2e-6; that is a numerical change, not an exact refactor, and
+    it can flip a search decision at a tie.
     """
 
     embedder = getattr(model, "embedder", None)
     if embedder is None or not hasattr(embedder, "fuse"):
+        return False
+    if not force and not fusion_is_profitable(embedder.type_embedding.weight.device):
         return False
     embedder.fuse()
     return True

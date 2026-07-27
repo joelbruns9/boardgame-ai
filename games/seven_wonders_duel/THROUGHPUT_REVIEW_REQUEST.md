@@ -241,16 +241,150 @@ python -m games.seven_wonders_duel.f4_cost_model \
   --checkpoint <ckpt> --device cuda --output /tmp/cost_model
 ```
 
-## 8. Sign-offs requested
+## 8. Review response (2026-07-26)
 
-1. **Cache invalidation is complete** — no remaining path mutates parameters in
-   place while a fused snapshot is live (§5, highest value).
-2. **Shipping ~2e-6 drift into generation by default needs no strength gate**,
-   on the evidence given — or a statement of what evidence would be needed.
-3. **`SlotBudget` accounting is leak-free and cannot deadlock**, including error
-   paths.
-4. **The segmented softmax is safe for every caller**, not only self-play.
-5. **The recommendation to leave `round_robin_candidates` off** is the right
-   cost/benefit call: +5% post-fusion, against re-anchoring every recorded
-   fixture. Note the *risk* is low — measured, it perturbs search less than a
-   reseed does (79% vs 25% same action).
+Every finding was checked against the code and, where it was a measurement claim,
+re-measured. **Four accepted and fixed, one accepted and corrected in wording, one
+accepted with a data-driven amendment, one accepted in part.** Nothing was
+dismissed.
+
+### P0 — fusion enabled beyond its measured envelope — **accepted, amended by measurement**
+
+Correct that it was shipped universally on one measurement. Measured the rest
+(RTX 3070 laptop, unfused → fused, host ms/forward):
+
+| device | model | 8 rows | 64 rows | 256 rows |
+|---|---|---|---|---|
+| CPU | d128 L4 | 1.31× | **0.90×** | — |
+| CPU | d256 L8 | 1.00× | 0.98× | — |
+| CUDA | d128 L4 | 3.17× | 2.52× | 1.17× |
+| CUDA | d256 L8 | 2.06× | 1.13× | 1.01× |
+| CUDA | d384 L12 | 1.76× | 1.07× | 1.02× |
+
+**The CPU half of the concern is confirmed** — 0.90× at width, no launch overhead
+to recover. **The larger-model half is not**: on CUDA, bigger models converge
+towards *neutral* (1.01–1.02×), never a loss, because a deeper model adds kernels
+as fast as it adds arithmetic.
+
+So the gate is on **device, not model size** (`net.fusion_is_profitable`): fuse on
+CUDA, decline on CPU, `force=True` to override. Gating by model size would have
+cost real speedup on cloud for no measured benefit.
+
+The **memory** concern is separate and real, and is handled independently:
+`TokenEmbedder.MAX_PROJECTION_BYTES` (512 MB) makes `forward` fall back to the
+per-type loop when `[rows, tokens, n_types, d_model]` would exceed it. No measured
+configuration reaches it; it is a valve, not a path.
+
+Not taken: the gathered-weight `bmm`/`einsum` alternative. It would help CPU, but
+CPU is now off by default, and materialising per-token weights is *larger* than
+the temporary it replaces. Recorded as a follow-up if CPU inference ever matters.
+
+### P1 — cache not completely self-invalidating — **accepted, fixed**
+
+The class-level claim was false, exactly as described. `fuse()` now records the
+autograd `_version` of all 27 copied parameters, and `forward` drops the cache if
+any changed. That covers optimizer steps in eval mode, EMA/SWA `copy_`/`lerp_`,
+and direct `.data` writes — every in-place path, since the version counter is what
+autograd itself uses. `fuse()` additionally raises if called while training.
+Cost is 27 integer reads against a millisecond forward.
+
+### P1 — the "no decision changed" gate did not prove that — **accepted, fixed; claim refined**
+
+Correct, and the refinement matters. Replaced with a full paired-trajectory
+comparison (`assert_records_identical`) that splits the two things I had
+conflated:
+
+* **discrete decisions asserted exactly equal** — action, legal mask, visits,
+  sims, Gumbel top-k, chance log, winner, scores, final fingerprint;
+* **recorded continuous targets compared within tolerance**, because they inherit
+  the network drift, with the observed maximum reported rather than assumed.
+
+Run on the **production checkpoint on CUDA** with the real search (128-sim full
+budgets, `top_k=16`, `force=True`), 12 games / **836 moves**:
+
+* every discrete decision identical — **zero action changes**;
+* max policy-target drift **7.7e-05**, max root-value drift **1.4e-06**.
+
+So the original claim was right in substance and wrong in what it had evidence
+for. "No search decision changed" now holds on 836 real moves; "records are
+identical" was never true and is no longer implied — policy targets move at 1e-5,
+which is far below the noise a training target already carries.
+
+The vectorised gather, separately, is **bit-identical** on records (0.0 drift).
+
+### P1 — `SlotBudget` is not leak-free — **accepted, both leaks fixed**
+
+1. Confirmed. `release_activation` decremented `budget_held` without
+   `budget.give_back()`, so a failed `GameSlot::new` stranded a token. It now
+   takes the budget and returns the borrowed token.
+2. Confirmed, and fixed rather than documented: `donate_reservation_if_finished`
+   hands a shard's reservation back once its queue is empty and its last slot
+   retires, so usable concurrency no longer shrinks as shards finish.
+
+Four Rust unit tests cover the accounting directly
+(`self_play::budget_tests`) — the paths are not reachable from Python.
+
+Not fixed: a shard that *errors* mid-run leaves its tokens with the pool. The run
+is aborting anyway, so the only effect is the concurrency of other shards during a
+failing run. Documented rather than restructured.
+
+### P1 — the headline is not an end-to-end production measurement — **accepted**
+
+Correct. The 1,633 → 3,250 figure is the F4 benchmark configuration, not a Phase D
+iteration, and the differences listed (16 slots, randomised 64–128 budgets, draft
+prior, ~15% curriculum-bot games in eight groups) are all real. The plan header
+now says so explicitly and states that the **relative** improvement is what should
+transfer.
+
+The `_generate_iteration_rust` A/B has **not** been run — flagged as the
+recommended next validation rather than quietly claimed.
+
+The observation that bot groups average ~9 games and so cannot fill 16 slots is a
+finding about *this work*: the Phase 1 pool cannot combine them because the Python
+wrapper applies one bot configuration per call. Recorded as the per-job bot
+routing follow-up.
+
+### P2 — "launch-bound" wording too strong — **accepted**
+
+The tool was corrected but the narrative was not. Now stated as **fixed
+launch/synchronisation overhead dominates**, with an explicit note that the
+evidence does not separate host dispatch from device-side launch latency or fixed
+device work, and that the host≈device equality cannot separate them either.
+
+### P2 — round-robin rationale — **accepted**
+
+"Milder than a reseed" bounds the perturbation magnitude; it does not establish
+equal strength or absence of bias, and a reseed changing Gumbel keys is exactly
+why its disagreement is larger. Reworded, and the reasons for leaving it off are
+now the ones that hold: two runs inside noise, unmeasured on the fully live path,
+Phase 4 may change it, fixtures anchored to the blocked order. Recorded as a
+Phase 4 arm.
+
+### Not adopted
+
+* **Empty-row sentinel logit** in the padded softmax. The reviewer confirms the
+  current code is safe for all callers and offers this defensively. It would add a
+  write on every batch to remove NaNs that are provably never read, and the
+  "provably never read" property is already gated
+  (`test_rows_with_no_legal_actions_do_not_poison_the_batch`). Declined as a cost
+  with no failure mode behind it — happy to add it if a future caller ever indexes
+  the padded matrix directly.
+
+## 9. Sign-offs — status after the review
+
+| # | Request | Review verdict | Now |
+|---|---|---|---|
+| 1 | Cache invalidation complete | **No** | Fixed: parameter `_version` guard covers every in-place path; `fuse()` rejects training mode. **Re-requested.** |
+| 2 | ~2e-6 drift needs no strength gate | **Conditional** on a paired production/CUDA record gate | Gate added and run: 836 moves, **zero** decision changes, targets drift 7.7e-05. **Condition believed met — please confirm.** |
+| 3 | `SlotBudget` leak-free | **No** | Both leaks fixed, four Rust unit tests added. Error-path stranding documented as accepted. **Re-requested.** |
+| 4 | Padded softmax safe for every caller | **Yes** | No change; sentinel-logit suggestion declined with reasons (§8). |
+| 5 | Leave round-robin off | **Yes, provisionally** | Rationale reworded to the reasons that hold; recorded as a Phase 4 arm. Agreed. |
+
+Two further things a reviewer may want to look at, both introduced by this
+response rather than reviewed already:
+
+* the **device gate** (`fusion_is_profitable`) — is CUDA-vs-CPU the right axis,
+  given larger CUDA models measured neutral rather than negative?
+* the **projection budget** fallback — a second numerical path selected by batch
+  size. It is unreachable in every measured configuration, but it does mean
+  results could in principle depend on batch shape at extreme sizes.

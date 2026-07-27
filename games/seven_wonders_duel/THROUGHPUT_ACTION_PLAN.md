@@ -11,17 +11,24 @@ not arithmetic.
 
 Five results reroute the programme:
 
-1. The pipeline is **launch-bound** (Phase 0), so Phase 3b is unconditional and
-   precedes Phase 4.
+1. **Fixed launch/synchronisation overhead dominates** the per-batch cost
+   (Phase 0), so Phase 3b is unconditional and precedes Phase 4. Stated that way
+   deliberately: the evidence (per-row cost collapsing with width, plus the
+   embedder rewrite's measured effect) establishes a large fixed cost made of
+   launches and syncs. It does *not* separate host dispatch from device-side
+   launch latency or fixed device work, and the host-vs-device-span equality
+   cannot separate them either -- see the probe caveat in `f4_cost_model.py`.
 2. **Slot count is worth far more than the scheduler work** (Phase 1: +48% for
    16 → 32 slots, at no memory cost), so sweep the Phase 4 slots axis early.
 3. **Wave widening needed a schedule change, not a batching change** (Phase 2 /
    2b). The conflict-free rule is exact but realized width was only 1.19, because
    the *blocked* halving order repeats a candidate on consecutive simulations.
    Interleaving the round takes width to 2.15 and throughput +19% — but see (4):
-   that margin falls to +5% once the forward is cheap. It stays off on
-   cost/benefit (re-anchoring recorded fixtures), *not* on risk: measured, it
-   perturbs the search several times less than a plain reseed does.
+   that margin falls to +5% once the forward is cheap. It stays off: the gain is
+   two runs inside noise, unmeasured on the fully live path, and it would require
+   re-anchoring every recorded fixture. Measured, it perturbs the search less than
+   a plain reseed does — which bounds the magnitude but does not prove equal
+   strength. Revisit as a Phase 4 arm.
 4. **The win was in the embedder** (Phase 3b): fusing `TokenEmbedder`'s per-type
    loop into one gather plus one matmul removes ~18 host syncs and ~50 kernel
    launches per forward, for **1.50×** end to end.
@@ -43,9 +50,17 @@ fingerprints).
 | interleaved schedule (2b) on top of 3b | 2,628 — the +5% that no longer justifies its cost |
 
 **`fused_embedder` and `vectorized_gather` now ship ON** (`398febf`);
-`round_robin_candidates` stays off. Measured at the real production settings
-(`leaf_batch=1` from the lock, conflict-free off, 32 slots): **1,633 -> 3,250
-games/hour, 1.99x**, with identical batch counts and simulation totals.
+`round_robin_candidates` stays off. Measured in the **F4 benchmark
+configuration** (`leaf_batch=1` from the lock, conflict-free off, 32 slots, 64
+neural games, fixed 128-sim full budgets): **1,633 -> 3,250 games/hour, 1.99x**.
+
+> That figure is *not* a Phase D iteration. Phase D defaults to 16 slots,
+> randomises full budgets over 64-128, applies a draft prior in early iterations,
+> and spends ~15% of games on curriculum bots split across eight
+> `(bot type, seat)` groups. The **relative** boundary improvement should
+> transfer -- it is per-batch work that every configuration pays -- but the
+> absolute games/hour will not. A full `_generate_iteration_rust` A/B has **not**
+> been run; see the review response in `THROUGHPUT_REVIEW_REQUEST.md`.
 
 Review brief: `THROUGHPUT_REVIEW_REQUEST.md`.
 
@@ -602,15 +617,25 @@ pairs, agreement with the blocked baseline:
 
 **Reordering perturbs the search several times less than a plain reseed does**,
 because it keeps the seed and therefore the Gumbel keys, the top-k candidate set
-and the per-round allocation — all of which a reseed destroys. An earlier draft of
-this section called for a "strength/arena justification, not an identity one";
-that overstated the risk. The change is *milder* than something the training loop
-already does every game.
+and the per-round allocation — all of which a reseed destroys.
 
-**The real cost is bookkeeping, not quality**: every recorded fixture and quality
-lock is anchored to the blocked order and would need re-anchoring. That, against
-+5% once the embedder is fused, is why it stays off — a cost/benefit call, not a
-safety one.
+**What that does and does not establish.** It bounds the *magnitude* of the
+perturbation against a familiar one, which is why an earlier draft's demand for a
+"strength/arena justification" overstated the risk. It does **not** establish
+equal playing strength or absence of bias: a reseed is unbiased by construction
+and a reorder is only argued to be, and the disagreement rates say nothing about
+which search is stronger. Treat it as "not obviously risky", not as "proven safe".
+
+**Why it stays off** — several reasons, none of them the risk:
+
+* +5% post-fusion is two runs, inside historical run-to-run noise;
+* it has not been measured on the fully live fused + vectorised path, where its
+  value should shrink further still;
+* Phase 4 may change its marginal value either way;
+* every recorded fixture and quality lock is anchored to the blocked order.
+
+Revisit it as a **Phase 4 arm**, and only if its gain on the fully optimised path
+is material.
 
 **Remaining headroom here:** mean rows/batch is 85 against a 256 cap (p95 134),
 so the cap is not yet binding; and 55% of all NN rows are forced root-chance rows

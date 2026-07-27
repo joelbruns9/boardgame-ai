@@ -195,15 +195,22 @@ def test_vectorised_gather_does_the_same_scheduler_work():
             **kwargs,
         )
 
+    from .test_f4_phase3b_fused import assert_records_identical
+
     loop_records, loop_metrics = play(False)
     fast_records, fast_metrics = play(True)
+    # Full trajectories, not just counts and fingerprints: two different move
+    # sequences can reach the same final state, and counts stay equal when
+    # actions change.
+    drift = assert_records_identical(loop_records, fast_records)
+    print(
+        f"vectorised vs loop: every decision identical; "
+        f"max policy-target drift {drift['max_policy_target_drift']:.2e}"
+    )
     assert fast_metrics["simulations"] == loop_metrics["simulations"]
     assert fast_metrics["global_batches"] == loop_metrics["global_batches"]
     assert fast_metrics["moves"] == loop_metrics["moves"]
     assert list(fast_metrics["batch_rows"]) == list(loop_metrics["batch_rows"])
-    assert [record["final_fingerprint"] for record in fast_records] == [
-        record["final_fingerprint"] for record in loop_records
-    ]
 
 
 def test_vectorised_gather_is_on_by_default_and_can_be_turned_off():
@@ -222,13 +229,17 @@ def test_evaluator_fuses_the_embedder_by_default_and_can_be_told_not_to():
 
     from .inference import Evaluator
 
+    from .net import fusion_is_profitable
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(31)
-    model = SWDNet(32, 1, 2)
-    evaluator = Evaluator(model, device="cpu", max_batch=8)
-    assert evaluator.fused_embedder is True
-    assert evaluator.model.embedder._fused is not None
+    evaluator = Evaluator(SWDNet(32, 1, 2), device=device, max_batch=8)
+    # Fusing is enabled only where it is measured to pay -- CUDA. On CPU the
+    # extra arithmetic is a ~10% loss at width, so the default declines.
+    assert evaluator.fused_embedder is fusion_is_profitable(device)
+    assert (evaluator.model.embedder._fused is not None) is evaluator.fused_embedder
 
     torch.manual_seed(31)
-    plain = Evaluator(SWDNet(32, 1, 2), device="cpu", max_batch=8, fuse_embedder=False)
+    plain = Evaluator(SWDNet(32, 1, 2), device=device, max_batch=8, fuse_embedder=False)
     assert plain.fused_embedder is False
     assert plain.model.embedder._fused is None

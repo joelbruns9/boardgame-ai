@@ -257,12 +257,71 @@ def test_training_cannot_run_through_a_stale_snapshot():
     assert torch.equal(forced, loop), "training mode must use the per-type loop"
 
 
-def test_fused_self_play_does_the_same_work():
-    """End-to-end: the schedule must be unchanged, not merely the arithmetic.
+def assert_records_identical(left, right, context="", target_tolerance=1e-4):
+    """Compare two self-play record sets field by field, and report the drift.
 
-    Identical batch counts and simulation totals through the real scheduler are
-    the strongest available evidence that a ~2e-6 shift flipped no search
-    decision.
+    Counting simulations, batches and moves does **not** establish that no search
+    decision changed: actions can differ while every count matches, and two
+    different move sequences can even reach the same final fingerprint. Only the
+    trajectory settles it.
+
+    The split matters and is asserted as such:
+
+    * **Discrete decisions must be exactly equal** — action, legal mask, visits,
+      sims, Gumbel top-k, chance log, winner, scores, final fingerprint. These are
+      the search's actual choices.
+    * **Recorded continuous targets are compared within a tolerance**, because
+      they inherit the network's ~2e-6 arithmetic drift. `policy_target` is
+      derived from completed-Q values, so it inherits that drift directly;
+      measured max is ~2e-6, which is far below the noise a training target
+      already carries. Asserting exact equality here would assert something
+      untrue -- an earlier version of this helper did, and failed.
+
+    Returns the observed maximum drift so callers can report it rather than
+    assume it.
+    """
+
+    assert len(left) == len(right), f"{context}: record count"
+    worst_policy = 0.0
+    worst_root = 0.0
+    for record_index, (a, b) in enumerate(zip(left, right)):
+        where = f"{context}game {record_index}"
+        assert a["seed"] == b["seed"], f"{where}: seed"
+        assert a["final_fingerprint"] == b["final_fingerprint"], f"{where}: fingerprint"
+        assert a["winner"] == b["winner"], f"{where}: winner"
+        assert a["scores"] == b["scores"], f"{where}: scores"
+        assert a["chance_log"] == b["chance_log"], f"{where}: chance log"
+        assert len(a["moves"]) == len(b["moves"]), f"{where}: move count"
+        for move_index, (x, y) in enumerate(zip(a["moves"], b["moves"])):
+            at = f"{where} move {move_index}"
+            # --- the search's decisions: exact ---
+            assert x["action"] == y["action"], f"{at}: action"
+            assert list(x["legal"]) == list(y["legal"]), f"{at}: legal"
+            assert list(x["visits"]) == list(y["visits"]), f"{at}: visits"
+            assert x["sims"] == y["sims"], f"{at}: sims"
+            assert x["gumbel_topk"] == y["gumbel_topk"], f"{at}: top-k"
+            # --- recorded targets: within tolerance, drift reported ---
+            if x["policy_target"] is not None and y["policy_target"] is not None:
+                assert len(x["policy_target"]) == len(y["policy_target"]), at
+                for p, q in zip(x["policy_target"], y["policy_target"]):
+                    worst_policy = max(worst_policy, abs(p - q))
+                assert x["policy_target"] == pytest.approx(
+                    y["policy_target"], rel=0, abs=target_tolerance
+                ), f"{at}: policy target"
+            if x["root_value"] is not None and y["root_value"] is not None:
+                worst_root = max(worst_root, abs(x["root_value"] - y["root_value"]))
+                assert x["root_value"] == pytest.approx(
+                    y["root_value"], rel=0, abs=target_tolerance
+                ), f"{at}: root value"
+    return {"max_policy_target_drift": worst_policy, "max_root_value_drift": worst_root}
+
+
+def test_fused_self_play_produces_identical_trajectories():
+    """End-to-end: every search decision and training target must be unchanged.
+
+    This is the gate behind the claim that a ~2e-6 shift flips nothing. An
+    earlier version compared only simulation and batch counts, which cannot
+    establish it — counts stay equal when actions change.
     """
 
     import seven_wonders_rust as swr
@@ -300,10 +359,16 @@ def test_fused_self_play_does_the_same_work():
         )
 
     model.embedder.unfuse()
-    _plain_records, plain = play()
+    plain_records, plain = play()
     model.embedder.fuse()
-    _fused_records, fused = play()
+    fused_records, fused = play()
 
+    drift = assert_records_identical(plain_records, fused_records)
+    print(
+        f"fused vs unfused: every decision identical; "
+        f"max policy-target drift {drift['max_policy_target_drift']:.2e}, "
+        f"max root-value drift {drift['max_root_value_drift']:.2e}"
+    )
     assert fused["simulations"] == plain["simulations"]
     assert fused["global_batches"] == plain["global_batches"]
     assert fused["moves"] == plain["moves"]

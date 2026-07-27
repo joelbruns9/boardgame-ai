@@ -785,6 +785,12 @@ impl SlotBudget {
         self.total
     }
 
+    /// Activations currently available beyond each shard's reservation. Test
+    /// surface: the accounting invariants are not otherwise observable.
+    pub fn spare_for_test(&self) -> usize {
+        self.spare.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn shards(&self) -> usize {
         self.shards
     }
@@ -817,6 +823,8 @@ struct SlotPool {
     holds_reserved: bool,
     budget_held: usize,
     finished: usize,
+    /// A finished shard's reservation is given back exactly once.
+    donated_reservation: bool,
 }
 
 impl SlotPool {
@@ -831,6 +839,7 @@ impl SlotPool {
             holds_reserved: false,
             budget_held: 0,
             finished: 0,
+            donated_reservation: false,
         }
     }
 
@@ -891,7 +900,9 @@ impl SlotPool {
             match GameSlot::new(state, cfg) {
                 Ok(slot) => self.entries[index] = SlotEntry::Active(Box::new(slot)),
                 Err(err) => {
-                    self.release_activation();
+                    // The activation was already accounted for; hand it back, or
+                    // a failed construction strands a token for the whole run.
+                    self.release_activation(budget);
                     return Err(err);
                 }
             }
@@ -902,9 +913,12 @@ impl SlotPool {
         Ok(activated)
     }
 
-    fn release_activation(&mut self) {
+    /// Give back one activation: the shared token if this slot borrowed one,
+    /// otherwise the shard's own reservation.
+    fn release_activation(&mut self, budget: &SlotBudget) {
         if self.budget_held > 0 {
             self.budget_held -= 1;
+            budget.give_back();
         } else {
             self.holds_reserved = false;
         }
@@ -930,13 +944,27 @@ impl SlotPool {
         self.active_count -= 1;
         self.finished += 1;
         budget.on_retire();
-        if self.budget_held > 0 {
-            self.budget_held -= 1;
-            budget.give_back();
-        } else {
-            self.holds_reserved = false;
-        }
+        self.release_activation(budget);
+        self.donate_reservation_if_finished(budget);
         Ok(())
+    }
+
+    /// Once a shard can never activate again, hand its reserved activation to
+    /// the shards still running.
+    ///
+    /// Each shard keeps one reservation so it cannot be starved into a deadlock,
+    /// but that reservation is dead weight after its queue empties: without this,
+    /// total usable concurrency shrinks by one for every shard that finishes.
+    fn donate_reservation_if_finished(&mut self, budget: &SlotBudget) {
+        if self.donated_reservation
+            || self.holds_reserved
+            || self.active_count > 0
+            || self.next_queued < self.entries.len()
+        {
+            return;
+        }
+        self.donated_reservation = true;
+        budget.give_back();
     }
 
     fn cancel_all(&mut self) {
@@ -1960,6 +1988,81 @@ pub fn run_many_pipelined_sharded(
     }
     metrics.scheduler_workers = shard_count;
     Ok(SchedulerResult { records, metrics })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn pool_with(jobs: usize) -> SlotPool {
+        // Entries are never activated in these tests; only the accounting is
+        // under test, so empty queued jobs would need a GameState. Build the
+        // pool directly with the queue pointer pre-positioned instead.
+        let mut pool = SlotPool::new(Vec::new());
+        pool.entries = Vec::new();
+        pool.next_queued = 0;
+        let _ = jobs;
+        pool
+    }
+
+    #[test]
+    fn spare_starts_at_total_minus_one_reservation_per_shard() {
+        let budget = SlotBudget::new(8, 3).expect("valid budget");
+        assert_eq!(budget.spare_for_test(), 5);
+        assert_eq!(budget.total(), 8);
+    }
+
+    #[test]
+    fn budget_below_shard_count_is_rejected() {
+        assert!(SlotBudget::new(2, 4).is_err());
+        assert!(SlotBudget::new(4, 4).is_ok());
+    }
+
+    #[test]
+    fn releasing_a_borrowed_activation_returns_the_token() {
+        // The bug this guards: a failed GameSlot::new released the local counter
+        // without giving the shared token back, stranding capacity for the run.
+        let budget = SlotBudget::single(4).expect("valid budget");
+        let mut pool = pool_with(0);
+        pool.holds_reserved = true;
+        assert!(budget.try_take());
+        pool.budget_held = 1;
+        assert_eq!(budget.spare_for_test(), 2);
+
+        pool.release_activation(&budget);
+        assert_eq!(pool.budget_held, 0);
+        assert_eq!(budget.spare_for_test(), 3, "borrowed token must come back");
+
+        // The reservation itself is local and must NOT inflate the shared spare.
+        pool.release_activation(&budget);
+        assert!(!pool.holds_reserved);
+        assert_eq!(budget.spare_for_test(), 3);
+    }
+
+    #[test]
+    fn a_finished_shard_donates_its_reservation() {
+        // Without this, usable concurrency shrinks by one per finished shard.
+        let budget = SlotBudget::new(4, 2).expect("valid budget");
+        assert_eq!(budget.spare_for_test(), 2);
+        let mut pool = pool_with(0);
+        pool.holds_reserved = false;
+        pool.active_count = 0;
+        pool.next_queued = 0; // entries is empty: the queue is exhausted
+
+        pool.donate_reservation_if_finished(&budget);
+        assert_eq!(budget.spare_for_test(), 3, "reservation donated once");
+        pool.donate_reservation_if_finished(&budget);
+        assert_eq!(budget.spare_for_test(), 3, "and only once");
+    }
+
+    #[test]
+    fn a_shard_still_holding_work_keeps_its_reservation() {
+        let budget = SlotBudget::new(4, 2).expect("valid budget");
+        let mut pool = pool_with(0);
+        pool.holds_reserved = true;
+        pool.donate_reservation_if_finished(&budget);
+        assert_eq!(budget.spare_for_test(), 2, "still active: no donation");
+    }
 }
 
 pub fn component_name(kind: ChanceKind, id: usize) -> &'static str {

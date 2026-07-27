@@ -48,10 +48,11 @@ class Evaluator:
         self.model = model.to(device).eval()
         self.device = device
         self.max_batch = max_batch
-        # Fuse the token embedder's per-type loop by default: it is inference-only
-        # (the cache self-invalidates on train/load/move), leaves training
-        # bit-identical, and is worth 1.5x end to end -- THROUGHPUT_ACTION_PLAN.md
-        # Phase 3b. Must come after `.to()`, which invalidates the cache.
+        # Fuse the token embedder's per-type loop where it is measured to pay --
+        # CUDA only; on CPU there is no launch overhead to recover and the extra
+        # arithmetic costs ~10% at width (`net.fusion_is_profitable`). Worth 1.5x
+        # end to end on the production path (THROUGHPUT_ACTION_PLAN.md Phase 3b).
+        # Must come after `.to()`, which invalidates the cache by design.
         self.fused_embedder = bool(fuse_embedder) and fuse_for_inference(self.model)
 
     @torch.no_grad()
