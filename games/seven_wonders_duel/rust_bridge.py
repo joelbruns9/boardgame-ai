@@ -178,10 +178,17 @@ class _RustFlatBatchAdapter:
         diagnostic_sync: bool = False,
         pinned_memory: bool = False,
         cuda_events: bool = False,
+        vectorized_gather: bool = False,
     ):
         self.evaluator = evaluator
         self.diagnostic_sync = diagnostic_sync
         self.pinned_memory = pinned_memory
+        #: Phase 3: replace the per-row softmax loop with a segmented softmax, a
+        #: single D2H transfer, and one bulk `tolist()`. All three of those costs
+        #: scale per row while the per-batch cost is flat, so they are what makes
+        #: a wider batch stop paying. Arithmetically the same computation in a
+        #: different reduction order (~1e-7), so it is off by default.
+        self.vectorized_gather = bool(vectorized_gather)
         self.cuda_events = bool(cuda_events) and str(evaluator.device).startswith("cuda")
         self.last_metrics: dict[str, float | int] = {}
         self.total_metrics: dict[str, float | int] = {
@@ -369,12 +376,38 @@ class _RustFlatBatchAdapter:
             torch.arange(rows, device=device), legal_lengths.to(device)
         )
         compact_logits = outputs["policy"][legal_rows, legal_actions.to(device)]
-        compact_policy = []
-        offset = 0
-        for count in legal_lengths.tolist():
-            compact_policy.append(torch.softmax(compact_logits[offset : offset + count], dim=0))
-            offset += count
-        compact_policy_tensor = torch.cat(compact_policy)
+        if self.vectorized_gather:
+            # Segmented softmax: one set of kernels for the whole batch instead of
+            # one `torch.softmax` launch per row. `legal_rows` already labels each
+            # compacted logit with its row, so the row boundaries need no loop.
+            # Same formula `torch.softmax` uses (subtract the segment max, then
+            # normalise), so agreement is to float reduction order.
+            segment_max = torch.full(
+                (rows,),
+                float("-inf"),
+                device=device,
+                dtype=compact_logits.dtype,
+            )
+            segment_max.scatter_reduce_(
+                0, legal_rows, compact_logits, reduce="amax", include_self=True
+            )
+            shifted = (compact_logits - segment_max[legal_rows]).exp()
+            denominator = torch.zeros(
+                rows, device=device, dtype=shifted.dtype
+            ).index_add_(0, legal_rows, shifted)
+            # Rows with no legal actions (terminal leaves) leave a zero
+            # denominator, but `legal_rows` never refers to them, so the division
+            # never reads it.
+            compact_policy_tensor = shifted / denominator[legal_rows]
+        else:
+            compact_policy = []
+            offset = 0
+            for count in legal_lengths.tolist():
+                compact_policy.append(
+                    torch.softmax(compact_logits[offset : offset + count], dim=0)
+                )
+                offset += count
+            compact_policy_tensor = torch.cat(compact_policy)
         wdl = torch.softmax(outputs["value"], dim=-1)
         value_actor = wdl[:, 0] - wdl[:, 2]
         self._end_event("gather", gather_event)
@@ -386,8 +419,17 @@ class _RustFlatBatchAdapter:
         # transfer measurement; the paired device event separates the two.
         d2h_start = time.perf_counter()
         d2h_event = self._begin_event()
-        policy_cpu = compact_policy_tensor.float().cpu()
-        value_cpu = value_actor.float().cpu()
+        if self.vectorized_gather:
+            # One transfer, not two: values and policies are concatenated on the
+            # device and split again on the host.
+            merged = torch.cat(
+                (value_actor.float(), compact_policy_tensor.float())
+            ).cpu()
+            value_cpu = merged[:rows]
+            policy_cpu = merged[rows:]
+        else:
+            policy_cpu = compact_policy_tensor.float().cpu()
+            value_cpu = value_actor.float().cpu()
         self._end_event("d2h", d2h_event)
         self._sync()
         d2h_seconds = time.perf_counter() - d2h_start
@@ -395,14 +437,23 @@ class _RustFlatBatchAdapter:
         legal_counts = legal_lengths.tolist()
         result = []
         offset = 0
-        for row, count in enumerate(legal_counts):
-            result.append(
-                (
-                    float(value_cpu[row]),
-                    [float(value) for value in policy_cpu[offset : offset + count]],
+        if self.vectorized_gather:
+            # `tolist()` converts in one C call; indexing element by element cost
+            # a Python `float()` per legal action, millions of them per run.
+            values = value_cpu.tolist()
+            policies = policy_cpu.tolist()
+            for row, count in enumerate(legal_counts):
+                result.append((values[row], policies[offset : offset + count]))
+                offset += count
+        else:
+            for row, count in enumerate(legal_counts):
+                result.append(
+                    (
+                        float(value_cpu[row]),
+                        [float(value) for value in policy_cpu[offset : offset + count]],
+                    )
                 )
-            )
-            offset += count
+                offset += count
 
         current = {
             "batches": 1,
@@ -429,6 +480,7 @@ def rust_flat_batch_adapter(
     diagnostic_sync: bool = False,
     pinned_memory: bool = False,
     cuda_events: bool = False,
+    vectorized_gather: bool = False,
 ):
     """Return the F4.5 flat-buffer adapter for the current Torch evaluator."""
 
@@ -437,6 +489,7 @@ def rust_flat_batch_adapter(
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
+        vectorized_gather=vectorized_gather,
     )
 
 

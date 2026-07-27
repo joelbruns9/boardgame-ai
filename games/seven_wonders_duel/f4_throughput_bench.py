@@ -353,6 +353,7 @@ def _run_rust(
     conflict_free_waves: bool = False,
     leaf_batch_override: int = 0,
     round_robin_candidates: bool = False,
+    vectorized_gather: bool = False,
 ) -> dict:
     import seven_wonders_rust as swr
 
@@ -361,6 +362,7 @@ def _run_rust(
         diagnostic_sync=diagnostic_sync,
         pinned_memory=pinned_memory,
         cuda_events=cuda_events,
+        vectorized_gather=vectorized_gather,
     )
     before = dict(adapter.total_metrics)
     row_start = len(adapter.batch_rows)
@@ -635,6 +637,7 @@ def _run_rust(
             is not None
         ),
         "round_robin_candidates": bool(round_robin_candidates),
+        "vectorized_gather": bool(vectorized_gather),
         "conflict_cuts": conflict_cuts,
         "wave_width_histogram": wave_widths,
         "leaf_waves": sum(wave_widths),
@@ -750,6 +753,7 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
         "fused_embedder": args.fused_embedder,
+        "vectorized_gather": args.vectorized_gather,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
         "round_robin_candidates": args.round_robin_candidates,
@@ -868,6 +872,7 @@ def run(args) -> dict:
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
         "fused_embedder": args.fused_embedder,
+        "vectorized_gather": args.vectorized_gather,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
         "round_robin_candidates": args.round_robin_candidates,
@@ -919,6 +924,7 @@ def run(args) -> dict:
             conflict_free_waves=args.conflict_free_waves,
             leaf_batch_override=args.leaf_batch,
             round_robin_candidates=args.round_robin_candidates,
+            vectorized_gather=args.vectorized_gather,
         )
         if args.mode == "laptop":
             _run_python(
@@ -966,6 +972,7 @@ def run(args) -> dict:
                     conflict_free_waves=args.conflict_free_waves,
                     leaf_batch_override=args.leaf_batch,
                     round_robin_candidates=args.round_robin_candidates,
+                    vectorized_gather=args.vectorized_gather,
                 )
                 rust_row["isolated_forward_rows_ratio"] = (
                     rust_row["total_nn_rows_per_second"]
@@ -1077,6 +1084,14 @@ def main():
         default=0,
         help="override the lock's leaf_batch (0 = use the lock). Only sound "
         "together with --conflict-free-waves, which is enforced.",
+    )
+    parser.add_argument(
+        "--vectorized-gather",
+        action="store_true",
+        help="Phase 3: segmented softmax instead of one softmax launch per row, "
+        "a single D2H transfer instead of two, and one bulk tolist() instead of "
+        "a Python float() per legal action. All three scale per row while the "
+        "per-batch cost is flat. Same arithmetic, different reduction order.",
     )
     parser.add_argument(
         "--fused-embedder",

@@ -1,13 +1,15 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1, 2, 2b and 3b
-built and run; Phase 3 (gather) and Phase 4 (sweep) not started.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1, 2, 2b, 3 and
+3b built and run; Phase 4 (joint sweep) not started.
 
-**Generation is 1.50× faster than the Phase-1 baseline** — 1,661 → 2,495
-games/hour at 32 slots — and the whole of that came from Phase 3b, a change to
-how the network's embedder is *dispatched*, not from any of the scheduler work.
+**Generation is 2.01× faster than the Phase-1 baseline** — 1,661 → 3,332
+games/hour at 32 slots — and *all* of it came from the two boundary phases (3b
+and 3), none from the scheduler work the plan was built around. Both are
+dispatch-shaped: they remove kernel launches, host syncs and per-element Python,
+not arithmetic.
 
-Four results reroute the programme:
+Five results reroute the programme:
 
 1. The pipeline is **launch-bound** (Phase 0), so Phase 3b is unconditional and
    precedes Phase 4.
@@ -20,13 +22,26 @@ Four results reroute the programme:
    that margin nearly vanishes once the forward is cheap, so it stays off.
 4. **The win was in the embedder** (Phase 3b): fusing `TokenEmbedder`'s per-type
    loop into one gather plus one matmul removes ~18 host syncs and ~50 kernel
-   launches per forward, for **1.50×** end to end. It changes no algorithm, keeps
-   every checkpoint loadable, leaves training bit-identical, and provably flipped
-   no search decision across 210k simulations.
+   launches per forward, for **1.50×** end to end.
+5. **And in the gather** (Phase 3): a segmented softmax, one D2H transfer instead
+   of two, and one bulk `tolist()` instead of a Python `float()` per legal action
+   — **another 1.34×**. Half of that came from the `float()` loop, which no timer
+   category had ever contained.
 
-Baseline is **1,661 games/hour** at 32 slots (mean of two runs; run-to-run spread
-~9%), up from 1,301; **2,495** with the fused embedder, and 2,628 with the
-interleaved schedule also on — the +5% that no longer justifies its cost.
+Neither (4) nor (5) changes an algorithm; both keep every checkpoint loadable,
+leave training bit-identical, and provably flipped no search decision across
+210k simulations (identical batch counts, simulation totals and final
+fingerprints).
+
+| configuration | games/hour |
+|---|---|
+| Phase-1 baseline, 32 slots | 1,661 |
+| + fused embedder (3b) | 2,495 (1.50×) |
+| + vectorised gather (3) | **3,332 (2.01×)** |
+| interleaved schedule (2b) on top of 3b | 2,628 — the +5% that no longer justifies its cost |
+
+**Recommendation: ship `fused_embedder` and `vectorized_gather`; leave
+`round_robin_candidates` off.** All three are off by default today.
 
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
@@ -588,7 +603,54 @@ memory (the flag exists) and a narrower transfer dtype.
 `gather_seconds` per row measured at 27 and 256 rows to prove it no longer scales
 per row.
 
-**Phase 3b — now unconditional, and promoted ahead of Phase 4.** Phase 0 showed
+### Phase 3 results (2026-07-26, built and measured) — **another 1.34x**
+
+**Three per-row costs, not one.** The plan named the softmax loop; measuring found
+two more of the same kind beside it:
+
+1. one `torch.softmax` **launch per row** (~85 per batch at 32 slots);
+2. **two** device-to-host transfers, one for policies and one for values;
+3. a Python `float()` **per legal action** while building the result list --
+   ~1,275 per batch, ~5.8M per run. No timer category covered this: it sat in the
+   envelope between `py_call_ns` and the sum of the components, which is exactly
+   the quantity Phase 0's `native_inference_assessment` already tracked.
+
+**What was built** (`vectorized_gather`, default off). A segmented softmax over
+the compacted logits -- `legal_rows` already labels each logit with its row, so
+`scatter_reduce_(amax)` + `index_add_` replace the loop with a fixed number of
+kernels; values and policies concatenated into **one** D2H transfer; and a single
+bulk `tolist()` instead of per-element `float()`.
+
+**Measured** (64 games, 32 slots, cap 256, `leaf_batch=16`, fused embedder on):
+
+| | fused only | + vectorised gather |
+|---|---|---|
+| games/hour | 2,517 / 2,395 / 2,572 -> **2,495** | 3,408 / 3,256 -> **3,332** |
+| wall | 96.2 s | **67.6 s** |
+| `gather_d2h_seconds` | 27.1 | **13.4** |
+| `pyo3_call_seconds` (whole envelope) | 68.3 | **41.8** |
+| batches / simulations | 6,808 / 210,810 | 6,808 / 210,810 |
+
+**+33.6%**, for **2.01x over the Phase-1 baseline**. Note the envelope fell 26.5 s
+while the gather timer fell only 13.7 s: **about half the win was the Python
+`float()` loop**, a cost no phase had named because no timer category contained
+it. Batch counts and simulation totals are identical again, and the end-to-end
+gate additionally asserts equal final fingerprints, so the search is untouched.
+
+**Gates** (`test_f4_phase3_gather.py`, 6 tests): row-wise agreement with the loop
+to 1e-6 across widths; each row's policy normalised over *its own* legal actions
+(a segmented softmax's failure mode is leaking mass across segments, which
+row-wise agreement can hide); zero-legal terminal rows not poisoning the batch
+with NaN; per-row cost falling with width and beating the loop at width in the
+same run; identical scheduler work and fingerprints end to end.
+
+Not done, deliberately: a narrower transfer dtype. fp16 priors carry ~1e-3
+relative error into PUCT, a different class of change from ~1e-7, and the
+transfer is already one small copy.
+
+---
+
+**Phase 3b -- now unconditional, and promoted ahead of Phase 4.** Phase 0 showed
 the pipeline is launch-bound at every batch width, with 73% of the forward's
 dispatch in `TokenEmbedder`'s per-type masked gather/scatter loop. Levers, in
 the order the measurement suggests: collapse the embedder's per-type loop
@@ -748,7 +810,9 @@ pinned laptop configuration.
   (every stratum, every budget, zero tolerance, plus a negative control); the
   batch-count target **missed** — 1.13×, not 2.5×, because realized wave width is
   1.19. Throughput flat. See the Phase 2 results section.
-* Phase 3: `gather_seconds` per row flat in batch width.
+* Phase 3: `gather_seconds` per row flat in batch width. **Met** — per-row cost
+  falls with width and beats the loop 3x at width; +33.6% end to end, for 2.01x
+  over the Phase-1 baseline.
 * Phase 4: rows/batch and games/hour reported against the Phase 0 cost model —
   **the expected multiplier is deliberately left blank until that model exists**,
   since rev 1's estimate came from the timer this revision retired.
