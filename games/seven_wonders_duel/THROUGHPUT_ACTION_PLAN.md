@@ -1,9 +1,13 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1 and 2 built
-and run; Phases 3–4 not started.
+**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1, 2, 2b and 3b
+built and run; Phase 3 (gather) and Phase 4 (sweep) not started.
 
-Three results reroute the programme:
+**Generation is 1.50× faster than the Phase-1 baseline** — 1,661 → 2,495
+games/hour at 32 slots — and the whole of that came from Phase 3b, a change to
+how the network's embedder is *dispatched*, not from any of the scheduler work.
+
+Four results reroute the programme:
 
 1. The pipeline is **launch-bound** (Phase 0), so Phase 3b is unconditional and
    precedes Phase 4.
@@ -12,13 +16,18 @@ Three results reroute the programme:
 3. **Wave widening needed a schedule change, not a batching change** (Phase 2 /
    2b). The conflict-free rule is exact but realized width was only 1.19, because
    the *blocked* halving order repeats a candidate on consecutive simulations.
-   Interleaving the round — which sequential halving permits and the Python
-   reference simply never did — takes width to 2.15 and throughput **+19%**. It
-   changes every search output, so it is off by default pending a strength
-   result.
+   Interleaving the round takes width to 2.15 and throughput +19% — but see (4):
+   that margin nearly vanishes once the forward is cheap, so it stays off.
+4. **The win was in the embedder** (Phase 3b): fusing `TokenEmbedder`'s per-type
+   loop into one gather plus one matmul removes ~18 host syncs and ~50 kernel
+   launches per forward, for **1.50×** end to end. It changes no algorithm, keeps
+   every checkpoint loadable, leaves training bit-identical, and provably flipped
+   no search decision across 210k simulations.
 
 Baseline is **1,661 games/hour** at 32 slots (mean of two runs; run-to-run spread
-is ~9%), up from 1,301 — and **1,977** with the interleaved schedule enabled.
+~9%), up from 1,301; **2,495** with the fused embedder, and 2,628 with the
+interleaved schedule also on — the +5% that no longer justifies its cost.
+
 **Rev 2 changed the ordering**: instrumentation now precedes all implementation,
 because the review showed the plan's own gates could not have measured its own
 work. Several rev-1 claims are withdrawn below rather than quietly edited.
@@ -588,6 +597,75 @@ the order the measurement suggests: collapse the embedder's per-type loop
 change here alters the numerics of the forward, so it needs the same
 non-regression treatment as Phase 1's real-net path — it is not an exact
 refactor.
+
+### Phase 3b results (2026-07-26, built and measured) — **1.50×**
+
+**Root cause, precisely.** The loop's cost is not arithmetic, it is *shape*. Each
+of the 9 token types does `mask = type_ids == t`, `mask.any()`, and then
+**boolean-mask indexing** (`entity_ids[mask]`, `per_type[mask] = rows`), whose
+output shape is data-dependent — so each type forces host synchronisations on top
+of its handful of small kernels. Nine types, ~18 syncs and ~50 launches, to
+compute something the GPU does in tens of microseconds.
+
+**What was built.** `TokenEmbedder.fuse()` replaces the loop with:
+
+* the 9 entity tables concatenated into one, with per-type id offsets, so the
+  lookup is a **single gather**;
+* the 9 feature projections as one `[n_types × d_model, MAX_FEATURES]` matmul,
+  zero-padded beyond each type's own `in_features` so unused columns contribute
+  exactly nothing, then a gather picking each token's own type slice.
+
+Zero syncs, ~6 kernels. Crucially the **parameters are not renamed or moved**:
+`entity`/`feature` remain canonical, so every existing checkpoint loads unchanged
+and the training path keeps its original numerics bit for bit. The fused cache is
+a detached snapshot used only in eval mode, and it self-invalidates on
+`train()`, `load_state_dict()` and `_apply()` (`.to()`/`.float()`/…) — building
+those hooks was prompted by a gate failure showing the cache would otherwise go
+*partially* stale (it copies `entity`/`feature` but reads `type_embedding`/`aux`
+live), which is a silently wrong forward rather than a loud one.
+
+**Micro-measurement** (RTX 3070 laptop, production checkpoint, host ms/forward):
+
+| rows × tokens | per-type loop | fused | speedup | max deviation |
+|---|---|---|---|---|
+| 1 × 60 | 6.79 | 2.19 | **3.10×** | 7e-07 |
+| 27 × 60 | 7.24 | 2.03 | **3.57×** | 2e-06 |
+| 64 × 60 | 7.39 | 2.33 | 3.17× | 2e-06 |
+| 128 × 74 | 10.63 | 5.29 | 2.01× | 2e-06 |
+| 256 × 74 | 15.94 | 10.02 | 1.59× | 2e-06 |
+
+**End-to-end** (64 games, 32 slots, cap 256, `leaf_batch=16`, conflict-free on):
+
+| arm | games/hour (runs) | mean | vs base | batches |
+|---|---|---|---|---|
+| blocked | 1590, 1732 | 1,661 | 1.00× | 6,808 |
+| blocked **+ fused** | 2517, 2395, 2572 | **2,495** | **1.50×** | 6,808 |
+| round-robin | 2005, 1949 | 1,977 | 1.19× | 4,562 |
+| round-robin + fused | 2610, 2647 | **2,628** | **1.58×** | 4,562 |
+
+`gpu_forward_seconds` falls 61.5 s → 18.9 s; device forward span 78.4 s → 31.9 s;
+`device_forward_fraction` 0.54 → 0.35.
+
+**The search is untouched.** Batch counts (6,808) and simulation totals (210,810)
+are *identical* between fused and unfused arms — so a ~2e-6 output shift flipped
+no search decision across 210k simulations. That is much stronger evidence than a
+tolerance check, and it is gated (`test_f4_phase3b_fused.py`, 10 tests: agreement
+on every head, padding exactness, offset mapping asserted directly, zero-padded
+columns proven irrelevant, checkpoint layout unchanged, cache invalidation, no
+training through a snapshot, and identical scheduler work end to end).
+
+### This retires the Phase 2b recommendation
+
+Round-robin's marginal value **collapses from +19% to +5%** once the embedder is
+fused (2,495 → 2,628). It was only ever buying fewer forwards, and forwards are
+now 2.5–3.5× cheaper. Since interleaving costs a re-anchoring of every recorded
+gate and a shift in the training distribution, **+5% does not justify it.**
+Recommendation: ship the fused embedder, leave `round_robin_candidates` off.
+
+**Next on this axis, unmeasured:** `torch.compile` / CUDA graphs / static shape
+buckets on top of the fused path (the flag already exists), and the gather's
+per-row softmax loop (Phase 3 proper) — now a larger share of what remains, at
+26–28 s of an 88 s run.
 
 ---
 

@@ -630,6 +630,10 @@ def _run_rust(
         "arena_node_struct_bytes": arena_node_bytes,
         # --- Phase 2: realized wave widths, never inferred from leaf_batch ---
         "conflict_free_waves": bool(conflict_free_waves),
+        "fused_embedder": bool(
+            getattr(getattr(evaluator.model, "embedder", None), "_fused", None)
+            is not None
+        ),
         "round_robin_candidates": bool(round_robin_candidates),
         "conflict_cuts": conflict_cuts,
         "wave_width_histogram": wave_widths,
@@ -745,6 +749,7 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "games_per_call": args.games_per_call,
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
+        "fused_embedder": args.fused_embedder,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
         "round_robin_candidates": args.round_robin_candidates,
@@ -829,6 +834,19 @@ def run(args) -> dict:
         raise ValueError("production throughput requires forced root chance")
     evaluator = load_evaluator(str(args.checkpoint), args.device)
     evaluator.max_batch = args.global_batch_cap
+    if args.fused_embedder:
+        from .net import fuse_for_inference
+
+        if not fuse_for_inference(evaluator.model):
+            raise ValueError("this checkpoint's model has no fusable token embedder")
+        # The cache self-invalidates on device moves and state-dict loads, so a
+        # later step could silently disable it and quietly invalidate the whole
+        # measurement. Confirm it survived rather than assuming.
+        if evaluator.model.embedder._fused is None:
+            raise RuntimeError(
+                "the fused embedder was invalidated after fusing; measure again "
+                "with fusing moved after every model move"
+            )
     if args.torch_compile != "none":
         evaluator.model = torch.compile(evaluator.model, mode=args.torch_compile)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -849,6 +867,7 @@ def run(args) -> dict:
         "games_per_call": args.games_per_call,
         "cuda_events": args.cuda_events,
         "resource_sample_hz": args.resource_sample_hz,
+        "fused_embedder": args.fused_embedder,
         "conflict_free_waves": args.conflict_free_waves,
         "leaf_batch_override": args.leaf_batch,
         "round_robin_candidates": args.round_robin_candidates,
@@ -1058,6 +1077,15 @@ def main():
         default=0,
         help="override the lock's leaf_batch (0 = use the lock). Only sound "
         "together with --conflict-free-waves, which is enforced.",
+    )
+    parser.add_argument(
+        "--fused-embedder",
+        action="store_true",
+        help="Phase 3b: fuse the token embedder's per-type loop into one gather "
+        "plus one matmul, removing ~18 host syncs and ~50 kernel launches per "
+        "forward. Arithmetically the same computation with a different reduction "
+        "order, so outputs move by ~2e-6 and a tie can flip; inference only, the "
+        "training path is untouched.",
     )
     parser.add_argument(
         "--round-robin-candidates",
