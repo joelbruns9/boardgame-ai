@@ -1142,17 +1142,26 @@ class PhaseDLoop:
             iteration,
             self.config.anneal_iterations(),
         )
-        grouped: dict[tuple[str | None, int | None], list[GameJob]] = {}
+        # One entry per job, in job order: the bot's name and seat, or None for
+        # a pure self-play game. Assignment is unchanged -- same RNG stream, same
+        # bot type, same seat -- only the *scheduling* differs: every game now
+        # goes into a single scheduler call.
+        #
+        # Grouping by (bot type, seat) and calling once per group was forced by
+        # the old per-call bot API, and it cost ~22% of generation: ~15% of games
+        # split over up to eight groups, each draining its own slot pool a few
+        # games at a time, so bot games ran at ~0.52 games/s against the neural
+        # group's 1.40 regardless of how many slots the pool had.
+        assignments: list[tuple[str, int] | None] = []
         for job in jobs:
             rng = random.Random(job.seed ^ 0xC6BC279692B5CC83)
             if rng.random() < mix_fraction:
                 bot_type = CURRICULUM_BOT_TYPES[
                     (job.index // 2) % len(CURRICULUM_BOT_TYPES)
                 ]
-                key = (bot_type().name, job.index % 2)
+                assignments.append((bot_type().name, job.index % 2))
             else:
-                key = (None, None)
-            grouped.setdefault(key, []).append(job)
+                assignments.append(None)
 
         evaluator = Evaluator(
             model,
@@ -1161,58 +1170,53 @@ class PhaseDLoop:
         )
         adapter = rust_flat_batch_adapter(evaluator)
         started = time.monotonic()
-        indexed: dict[int, GameRecord] = {}
         rust_metrics = []
         draft_prior = LinearSchedule(
             1.0, 0.0, self.config.draft_prior_iterations
         ).value(iteration)
-        neural_games = 0
-        bot_games = 0
-        for (bot_name, bot_seat), group_jobs in grouped.items():
-            if bot_name is None:
-                neural_games += len(group_jobs)
-            else:
-                bot_games += len(group_jobs)
-            # Phase 1: the whole group goes in one call, with the Rust
-            # scheduler holding `rust_slots` games active and activating a
-            # queued game whenever one finishes. Chunking here made every chunk
-            # its own drain, so mean concurrency was well below `rust_slots`.
-            seeds = [job.seed for job in group_jobs]
-            first_players = [(job.index // 2) % 2 for job in group_jobs]
-            raw_records, metrics = swr.self_play_many_flat_net(
-                adapter=adapter,
-                games=rust_games_for_self_play(seeds, first_players),
-                game_seeds=seeds,
-                global_batch_cap=self.config.rust_global_batch_cap,
-                leaf_batch=self.config.leaf_batch,
-                cheap_sims_min=self.config.cheap_sims_min,
-                cheap_sims_max=self.config.cheap_sims_max,
-                full_sims_min=self.config.full_sims_min,
-                full_sims_max=self.config.full_sims_max,
-                full_search_fraction=self.config.full_search_fraction,
-                top_k=self.config.top_k,
-                draft_prior=draft_prior,
-                iteration=iteration,
-                force=self.config.force_root_chance,
-                age_deal_samples=self.config.age_deal_samples,
-                cheap_double_reveal_offsets=(
-                    self.config.cheap_double_reveal_offsets
-                ),
-                max_inflight_batches=self.config.rust_max_inflight_batches,
-                scheduler_workers=self.config.rust_scheduler_workers,
-                max_active_slots=self.config.rust_slots,
-                bot_p0=bot_name if bot_seat == 0 else None,
-                bot_p1=bot_name if bot_seat == 1 else None,
-                bot_exploration=self.config.bot_exploration,
-                bot_policy_iterations=self.config.bot_policy_iterations,
-            )
-            converted = phase_d_records_from_rust(raw_records)
-            indexed.update(
-                {job.index: record for job, record in zip(group_jobs, converted)}
-            )
-            rust_metrics.append(metrics)
-
-        records = [indexed[job.index] for job in jobs]
+        bot_games = sum(1 for entry in assignments if entry is not None)
+        neural_games = len(jobs) - bot_games
+        # Phase 1 put a whole group in one call so the scheduler could hold
+        # `rust_slots` games active and activate a queued game whenever one
+        # finished. Per-game bot assignment extends that to the whole iteration:
+        # neural and curriculum-bot games share one pool.
+        seeds = [job.seed for job in jobs]
+        first_players = [(job.index // 2) % 2 for job in jobs]
+        raw_records, metrics = swr.self_play_many_flat_net(
+            adapter=adapter,
+            games=rust_games_for_self_play(seeds, first_players),
+            game_seeds=seeds,
+            global_batch_cap=self.config.rust_global_batch_cap,
+            leaf_batch=self.config.leaf_batch,
+            cheap_sims_min=self.config.cheap_sims_min,
+            cheap_sims_max=self.config.cheap_sims_max,
+            full_sims_min=self.config.full_sims_min,
+            full_sims_max=self.config.full_sims_max,
+            full_search_fraction=self.config.full_search_fraction,
+            top_k=self.config.top_k,
+            draft_prior=draft_prior,
+            iteration=iteration,
+            force=self.config.force_root_chance,
+            age_deal_samples=self.config.age_deal_samples,
+            cheap_double_reveal_offsets=(
+                self.config.cheap_double_reveal_offsets
+            ),
+            max_inflight_batches=self.config.rust_max_inflight_batches,
+            scheduler_workers=self.config.rust_scheduler_workers,
+            max_active_slots=self.config.rust_slots,
+            bots_p0=[
+                entry[0] if entry is not None and entry[1] == 0 else None
+                for entry in assignments
+            ],
+            bots_p1=[
+                entry[0] if entry is not None and entry[1] == 1 else None
+                for entry in assignments
+            ],
+            bot_exploration=self.config.bot_exploration,
+            bot_policy_iterations=self.config.bot_policy_iterations,
+        )
+        records = phase_d_records_from_rust(raw_records)
+        rust_metrics.append(metrics)
         elapsed = time.monotonic() - started
         self.last_generation_stats = {
             "seconds": elapsed,

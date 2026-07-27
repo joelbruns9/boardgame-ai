@@ -37,13 +37,16 @@ launches, host syncs, and per-element Python — not about search or arithmetic.
 | — | **Ship the live pair by default** | `398febf` | `inference.py`, `rust_bridge.py`, `f4_throughput_bench.py` |
 | — | Review 1 response: fusion envelope, cache staleness, budget leaks | `8819012` | `net.py`, `inference.py`, `self_play.rs` |
 | — | Phase D A/B (the missing end-to-end measurement) | uncommitted | `f4_phase_d_ab.py` (new) |
-| — | Review 2 response: `.data` contract, abort accounting, gate holes | uncommitted | `net.py`, `self_play.rs`, `f4_phase_d_ab.py`, `test_f4_phase3b_fused.py` |
+| — | Review 2 response: `.data` contract, abort accounting, gate holes | `2de8976` | `net.py`, `self_play.rs`, `f4_phase_d_ab.py`, `test_f4_phase3b_fused.py` |
+| 4 | Free-axis sweep (slots/cap/inflight) on the real path | uncommitted | `f4_phase_d_sweep.py` (new) |
+| 4b | Per-game curriculum-bot routing (+28%) | uncommitted | `lib.rs`, `phase_d.py`, `test_f4_bot_routing.py` (new) |
 
 New test files: `test_f4_phase0_telemetry.py` (13), `test_f4_phase1_pool.py` (13),
 `test_f4_phase2_waves.py` (5), `test_f4_round_robin.py` (4),
-`test_f4_phase3b_fused.py` (11), `test_f4_phase3_gather.py` (8). Suite: **518
-Python + 16 cargo, green** (2026-07-27, after the second review's fixes; was 517
-+ 8 at first submission). New tool: `f4_phase_d_ab.py`.
+`test_f4_phase3b_fused.py` (11), `test_f4_phase3_gather.py` (8),
+`test_f4_bot_routing.py` (9). Suite: **527 Python + 16 cargo, green**
+(2026-07-27; was 517 + 8 at first submission). New tools: `f4_phase_d_ab.py`,
+`f4_phase_d_sweep.py`.
 
 ## 2. What changed (design)
 

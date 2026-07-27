@@ -1,7 +1,8 @@
 # Throughput action plan (7WD generation)
 
-**Date:** 2026-07-26 (rev 2, after review). **Status:** Phases 0, 1, 2, 2b, 3 and
-3b built and run; Phase 4 (joint sweep) not started.
+**Date:** 2026-07-27 (rev 3). **Status:** Phases 0, 1, 2, 2b, 3 and 3b built and
+run; **Phase 4 free-axis sweep done on the real Phase D path**, and the bot-group
+fragmentation it exposed is fixed (§ Phase 4 below).
 
 **Generation is 2.01× faster than the Phase-1 baseline** — 1,661 → 3,332
 games/hour at 32 slots — and *all* of it came from the two boundary phases (3b
@@ -79,6 +80,85 @@ chained trajectory digest, final digest, action sequence, per-move sim counts)
 "byte-identical records": policy targets and root values are excluded, because
 the fused embedder moves them at ~1e-5; record-level equivalence is gated
 separately by `assert_records_identical`.
+
+## Phase 4 — the free axes, swept on the real path (2026-07-27)
+
+`f4_phase_d_sweep.py`, 128 games per point, two repetitions with the grid order
+reversed on the second, RTX 3070 laptop, production checkpoint. The three axes
+that do not change what the search computes, swept jointly because the cap binds
+as slots rise:
+
+| slots | games/hour (cap 256, inflight 1) | vs 16 |
+|---|---|---|
+| 16 | 2,912 | 1.00× |
+| 32 | 3,512 | 1.21× |
+| 48 | **3,705** | **1.27×** |
+
+* **`global_batch_cap` and `max_inflight_batches` do nothing here.** All twelve
+  grid points landed within ±1.5%, inside the run-to-run spread. Both stay at
+  256 / 1. The prediction that the cap would bind at 32 slots did not hold once
+  Phase 3 had made the rows cheap.
+* **Slots saturate**: +21% for 16→32, then +5% for 32→48. Phase 1's benchmark
+  figure for the same step was **+48%** — the fourth measurement in this
+  programme where a benchmark number only partly transferred, for the same
+  reason each time: the boundary phases removed the cost that concurrency was
+  hiding.
+* **Trajectories identical across all twelve points**, so these axes are free in
+  the strong sense.
+* **Memory is not a constraint**: peak arena 4.9 MB at 16 slots, 10.8 MB at 48.
+
+**Recommended: `--rust-slots 48`**, cap and inflight unchanged.
+
+### The finding the sweep was not looking for
+
+Per-group timing showed curriculum-bot groups running at **~0.52 games/s at
+every slot count** while the neural group scaled 0.97 → 1.40. At the best point
+that is **15% of the games taking 32% of generation time**, and it is entirely a
+scheduling artefact: `bot_p0`/`bot_p1` were per-*call*, so a mix of bot
+configurations forced one call per `(bot type, seat)` group — up to eight pools
+of two or three games each, sending three-row batches into a boundary whose cost
+is nearly fixed per batch.
+
+Fixed by making bot assignment per-*game* (`bots_p0`/`bots_p1`, one entry per
+game); `SelfPlayConfig::bot_by_player` was already per-game, so only the pyo3
+boundary and the Phase D caller changed. The scalar form stays for callers that
+genuinely have one configuration per call (seed buffer, arena, gates).
+
+| configuration (cap 256, inflight 1) | before routing | after routing |
+|---|---|---|
+| 16 slots | 2,912 | 3,514 (+21%) |
+| 32 slots | 3,512 | 4,510 (+28%) |
+| 48 slots | 3,705 | **4,760 (+28%)** |
+
+Projected +22%, measured +28%: merging the groups also widens the batches the
+neural games see, so the gain is larger than the bot games' own idle time.
+Slots also pay *more* after the fix (1.35× for 16→48, up from 1.27×), because
+the pool is uniformly fed instead of being drained by tiny calls.
+
+Assignment is unchanged — same RNG stream, same bot type, same seat, same
+proportion — and gated exactly (`test_f4_bot_routing.py`): recorded `agents` per
+game match the grouped path, every action is unchanged, recorded targets drift
+only by the documented batch-shape amount, and `_generate_iteration_rust` is
+asserted to issue exactly one scheduler call even at `opponent_fraction=1.0`.
+
+### Where generation now stands
+
+| | games/hour | 300-game iteration |
+|---|---|---|
+| run 02 as actually run (16 slots, pre-fusion) | 1,278 | 14.1 min |
+| shipped fusion + gather, 16 slots | 2,912 | 6.2 min |
+| + 48 slots | 3,705 | 4.9 min |
+| + per-game bot routing | **4,760** | **3.8 min** |
+
+**3.7× against the last real training run** (median of its twelve iterations,
+845 s per 300 games). That row is an observation, not a controlled arm: run 02
+used a different checkpoint, 300 games rather than 128, and an
+iteration-dependent draft prior. The controlled measurements are the A/B (1.89×)
+and the sweep rows above (1.27× slots, +28% routing). Remaining known costs, none of them
+scheduler-shaped: 55% of NN rows are forced root-chance rows (`age_deal_samples`,
+a quality decision belonging to the chance-capping programme), and the CPU-side
+`encode_pack`/tensor build, which `scheduler_workers` is the only built lever
+against and which this sweep did not touch.
 
 So the benchmark's **1.99× transfers as 1.89×** on the production generation
 path. The small shortfall is the expected direction: Phase D runs 16 slots rather

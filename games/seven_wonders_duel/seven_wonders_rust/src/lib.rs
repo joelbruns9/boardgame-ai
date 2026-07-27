@@ -1681,7 +1681,8 @@ fn self_play_many_net(
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256, inference_timeout_ms=0.0,
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
-    bot_p0=None, bot_p1=None, bot_exploration=0.0, bot_policy_iterations=10
+    bot_p0=None, bot_p1=None, bots_p0=None, bots_p1=None,
+    bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
     conflict_free_waves=false, round_robin_candidates=false))]
@@ -1717,6 +1718,8 @@ fn self_play_many_flat_net(
     deterministic_actions: bool,
     bot_p0: Option<String>,
     bot_p1: Option<String>,
+    bots_p0: Option<Vec<Option<String>>>,
+    bots_p1: Option<Vec<Option<String>>>,
     bot_exploration: f64,
     bot_policy_iterations: i64,
     puct_root: bool,
@@ -1775,10 +1778,55 @@ fn self_play_many_flat_net(
         })
         .transpose()
     };
+    // Bots are a per-game property (`SelfPlayConfig::bot_by_player`), but the
+    // scalar form broadcasts one assignment over the whole call. That forces a
+    // caller with a mix -- Phase D self-play is ~15% curriculum-bot games split
+    // across (bot type, seat) -- to issue one call per combination, and a call
+    // of three games drains a slot pool of forty-eight and sends three-row
+    // batches into a boundary whose cost is almost entirely fixed per batch.
+    //
+    // `bots_p0`/`bots_p1` take one entry per game instead, so such a caller can
+    // put every game in one call and let the scheduler interleave them. The
+    // scalar form stays for callers that genuinely have one configuration for
+    // the call (the curriculum seed buffer, the arena and evaluation paths).
+    let per_game_bots = match (&bots_p0, &bots_p1) {
+        (None, None) => None,
+        (Some(p0), Some(p1)) => {
+            if bot_p0.is_some() || bot_p1.is_some() {
+                return Err(PyValueError::new_err(
+                    "bots_p0/bots_p1 replace bot_p0/bot_p1; supply one form, not both",
+                ));
+            }
+            if p0.len() != jobs.len() || p1.len() != jobs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "bots_p0 ({}) and bots_p1 ({}) must have one entry per game ({})",
+                    p0.len(),
+                    p1.len(),
+                    jobs.len()
+                )));
+            }
+            let mut parsed = Vec::with_capacity(jobs.len());
+            for (left, right) in p0.iter().zip(p1.iter()) {
+                parsed.push([
+                    parse_bot(left.as_deref())?,
+                    parse_bot(right.as_deref())?,
+                ]);
+            }
+            Some(parsed)
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "bots_p0 and bots_p1 must be supplied together",
+            ));
+        }
+    };
     let bot_by_player = [parse_bot(bot_p0.as_deref())?, parse_bot(bot_p1.as_deref())?];
-    for (_, cfg) in &mut jobs {
+    for (index, (_, cfg)) in jobs.iter_mut().enumerate() {
         cfg.deterministic_actions = deterministic_actions;
-        cfg.bot_by_player = bot_by_player;
+        cfg.bot_by_player = match &per_game_bots {
+            Some(bots) => bots[index],
+            None => bot_by_player,
+        };
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;
     }
