@@ -219,11 +219,20 @@ def queue_depth_probe(adapter, payload: dict, depth: int) -> dict:
     enqueuing `depth` forwards back to back with no synchronisation in between
     and timing the host loop and the device span independently.
 
-    * host loop ≈ device span  → the host cannot get ahead: **launch-bound**,
-      and the fix is fewer/larger kernel launches (CUDA graphs, compile, static
-      shapes), not wider batches.
-    * host loop ≪ device span  → the host runs ahead and the device is
-      saturated: **device-bound**, and batch widening is the only lever.
+    * host loop ≈ device span  → the host could not get ahead.
+    * host loop ≪ device span  → the host ran ahead of a saturated device.
+
+    **This ratio alone cannot distinguish the two regimes**, and reading it as if
+    it could is a trap: when the device is genuinely saturated the host *also*
+    blocks, because the CUDA launch queue fills, so a device-bound run reports
+    `host ≈ device` exactly like a launch-bound one. The ratio is only conclusive
+    in the launch-bound direction when the queue never fills — i.e. at small
+    models and narrow batches.
+
+    The sound discriminator is `device_ms_per_row` across widths, which
+    :func:`launch_bound_verdict` computes from a set of probes: launch-bound work
+    has a large fixed cost per batch, so its per-row cost collapses as the batch
+    widens; device-bound work pays per row and stays flat.
     """
 
     batch, _, _, _, _ = adapter.build_device_batch(payload)
@@ -246,15 +255,62 @@ def queue_depth_probe(adapter, payload: dict, depth: int) -> dict:
     end.record()
     torch.cuda.synchronize(adapter.evaluator.device)
     device_ms = start.elapsed_time(end)
+    rows = payload["rows"]
     return {
-        "rows": payload["rows"],
+        "rows": rows,
         "supported": True,
         "depth": depth,
         "host_enqueue_ms_per_forward": host_ms / depth,
         "device_span_ms_per_forward": device_ms / depth,
-        # 1.0 means the host is the pacer; near 0 means the device is.
+        # 1.0 means the host never got ahead — of dispatch cost OR of a full
+        # launch queue. See the docstring: not a regime verdict on its own.
         "host_pacing_ratio": host_ms / device_ms if device_ms > 0 else 0.0,
-        "verdict": "launch_bound" if host_ms > 0.8 * device_ms else "device_bound",
+        "device_us_per_row": (device_ms / depth) * 1000.0 / max(1, rows),
+    }
+
+
+def launch_bound_verdict(probes: list[dict]) -> dict:
+    """Decide the regime from how device cost per row scales with batch width.
+
+    Launch-bound work carries a large fixed cost per batch, so widening the batch
+    amortises it and the per-row cost collapses. Device-bound work pays per row,
+    so the per-row cost barely moves. This is what the throughput levers hinge on:
+    fewer/wider batches only help in the first regime, because batching changes
+    the number of batches, never the number of rows.
+    """
+
+    usable = sorted(
+        (probe for probe in probes if probe.get("supported")),
+        key=lambda probe: probe["rows"],
+    )
+    if len(usable) < 2:
+        return {"decided": False, "reason": "need probes at two or more widths"}
+    narrow, wide = usable[0], usable[-1]
+    drop = (
+        narrow["device_us_per_row"] / wide["device_us_per_row"]
+        if wide["device_us_per_row"] > 0
+        else 0.0
+    )
+    if drop > 4.0:
+        regime = "launch_bound"
+    elif drop > 1.5:
+        regime = "mixed"
+    else:
+        regime = "device_bound"
+    return {
+        "decided": True,
+        "regime": regime,
+        "narrow_rows": narrow["rows"],
+        "wide_rows": wide["rows"],
+        "device_us_per_row_narrow": narrow["device_us_per_row"],
+        "device_us_per_row_wide": wide["device_us_per_row"],
+        "per_row_cost_drop": drop,
+        "implication": {
+            "launch_bound": "wider/fewer batches pay: raise slots, batch leaves",
+            "mixed": "some fixed cost remains; measure before widening further",
+            "device_bound": "batching buys ~nothing; only fewer ROWS or a faster "
+            "device helps",
+        }[regime],
     }
 
 
@@ -380,9 +436,19 @@ def run(args) -> dict:
                     f"queue-probe: rows={rows:>4} "
                     f"host={probe['host_enqueue_ms_per_forward']:.3f} ms "
                     f"device_span={probe['device_span_ms_per_forward']:.3f} ms "
-                    f"-> {probe['verdict']}",
+                    f"device={probe['device_us_per_row']:.1f} us/row",
                     flush=True,
                 )
+        verdict = launch_bound_verdict(probes)
+        if verdict.get("decided"):
+            print(
+                f"queue-probe: {verdict['regime'].upper()} -- device cost per row "
+                f"{verdict['device_us_per_row_narrow']:.1f} -> "
+                f"{verdict['device_us_per_row_wide']:.1f} us "
+                f"({verdict['per_row_cost_drop']:.2f}x drop). "
+                f"{verdict['implication']}",
+                flush=True,
+            )
 
     summary = {
         "schema": SCHEMA,
@@ -399,6 +465,7 @@ def run(args) -> dict:
         ],
         "cells": cells,
         "queue_depth_probes": probes,
+        "regime": launch_bound_verdict(probes),
         "fits": [
             fit_cost_model(cells, target)
             for target in (
@@ -464,6 +531,7 @@ def main():
             {
                 "fits": summary["fits"],
                 "queue_depth_probes": summary["queue_depth_probes"],
+                "regime": summary["regime"],
             },
             indent=2,
             sort_keys=True,
