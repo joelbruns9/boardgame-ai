@@ -19,7 +19,9 @@ Five results reroute the programme:
    2b). The conflict-free rule is exact but realized width was only 1.19, because
    the *blocked* halving order repeats a candidate on consecutive simulations.
    Interleaving the round takes width to 2.15 and throughput +19% — but see (4):
-   that margin nearly vanishes once the forward is cheap, so it stays off.
+   that margin falls to +5% once the forward is cheap. It stays off on
+   cost/benefit (re-anchoring recorded fixtures), *not* on risk: measured, it
+   perturbs the search several times less than a plain reseed does.
 4. **The win was in the embedder** (Phase 3b): fusing `TokenEmbedder`'s per-type
    loop into one gather plus one matmul removes ~18 host syncs and ~50 kernel
    launches per forward, for **1.50×** end to end.
@@ -573,11 +575,38 @@ waves. Cheap searches also already had `per_action = 1` under the frozen config
 (`top_k=16`, 16–24 sims), so interleaving changes nothing for them — the entire
 gain comes from full searches, which are ~94% of all leaf waves.
 
-**Not free, and off by default.** Every recorded gate and quality lock is anchored
-to the blocked order, and the generated training distribution shifts. Turning this
-on in production needs a **strength/arena justification, not an identity one**,
-plus re-anchoring the F3 fixtures. What Phase 2 bought is that the batching on top
-of it is provably exact, so the only open question is the reordering itself.
+**Why reordering changes outputs at all** — and it is a narrower channel than it
+first looks. Root-candidate subtrees are disjoint, so the k-th visit to candidate
+`c` sees exactly the same subtree state under either order: nothing else touched
+it in between. Every channel by which order could matter is therefore closed
+except one — **the single per-search chance RNG**. `select_leaf` draws card
+reveals, Age deals and Great Library outcomes from one `Rng` in launch order, so
+reordering re-partitions that stream across candidates. Each candidate explores
+different *sampled chance outcomes*, not a different algorithm. (A second,
+last-bits channel: root `value_sum_p0` accumulates backups in launch order, and
+float addition is not associative.)
+
+**Measured against the obvious yardstick.** A reseed is a change nobody worries
+about — every self-play game uses a different seed. Over 24 (position, budget)
+pairs, agreement with the blocked baseline:
+
+| | reorder (same seed) | reseed (blocked, seed+1) |
+|---|---|---|
+| same action chosen | **79%** | 25% |
+| identical visit counts | **58%** | 4% |
+| identical policy target | **29%** | 0% |
+
+**Reordering perturbs the search several times less than a plain reseed does**,
+because it keeps the seed and therefore the Gumbel keys, the top-k candidate set
+and the per-round allocation — all of which a reseed destroys. An earlier draft of
+this section called for a "strength/arena justification, not an identity one";
+that overstated the risk. The change is *milder* than something the training loop
+already does every game.
+
+**The real cost is bookkeeping, not quality**: every recorded fixture and quality
+lock is anchored to the blocked order and would need re-anchoring. That, against
++5% once the embedder is fused, is why it stays off — a cost/benefit call, not a
+safety one.
 
 **Remaining headroom here:** mean rows/batch is 85 against a 256 cap (p95 134),
 so the cap is not yet binding; and 55% of all NN rows are forced root-chance rows
@@ -773,10 +802,11 @@ Phase 0 timing split.
 ## Later, gated on results
 
 * **Full-move round-robin reordering.** ~~Only if full moves remain a batch-count
-  bottleneck after Phase 2.~~ **Done and measured — see Phase 2b: +19%.** What
-  remains is the decision, not the code: it changes every search output, so it
-  needs an arena/strength result and re-anchored F3 fixtures before production
-  use. It is off by default until then.
+  bottleneck after Phase 2.~~ **Done and measured — see Phase 2b.** +19% alone,
+  but only +5% once the embedder is fused, and it would require re-anchoring every
+  recorded fixture. Not worth that bookkeeping for +5%. Note the *risk* is low:
+  it perturbs search less than a reseed does. If the fixtures ever need
+  re-anchoring for another reason, turn it on at the same time.
 * **Token-count bucketing** if padding exceeds ~20% once batches widen.
 * **Chance capping (`cheap_double_reveal_offsets`, X=3).** Re-measure *after* the
   exact pipeline is tuned: it touches only the per-row ~29%, and it makes batches
