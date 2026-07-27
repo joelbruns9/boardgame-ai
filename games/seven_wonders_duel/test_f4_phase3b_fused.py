@@ -203,6 +203,89 @@ def test_loading_weights_invalidates_the_snapshot():
     assert torch.allclose(refused, expected, rtol=0, atol=TOLERANCE)
 
 
+def test_fused_cache_invalidation_contract():
+    """What the version+address guard catches, and the one thing it cannot.
+
+    `train()`/`load_state_dict()`/`_apply()` are covered by their own tests; this
+    pins the guard that exists for the paths they miss — a parameter written in
+    place while the model stays in eval mode. Four cases, three covered and one
+    deliberately not:
+
+    * an optimizer-style `no_grad` in-place write — the version counter moves;
+    * an EMA/SWA `detach().copy_` — `detach()` shares the counter, so it moves;
+    * rebinding `parameter.data = other` — the counter does *not* move, which is
+      why the guard also compares storage addresses;
+    * an in-place write through `.data` — invisible to both, because each
+      `.data` access mints a fresh version counter over the same storage.
+
+    The fourth is asserted as *not detected* on purpose. It is the documented
+    boundary of the contract (`_snapshot_is_current`), and asserting it means a
+    future torch change or a stronger guard fails here loudly instead of
+    silently widening what the docstring claims.
+    """
+
+    batch = _batch()
+
+    def fused_model():
+        model = _model()
+        model.embedder.fuse()
+        assert model.embedder._fused is not None
+        return model
+
+    def loop_output(model):
+        """What the per-type loop produces from the *current* parameters."""
+
+        model.embedder.unfuse()
+        with torch.no_grad():
+            return model.embedder(batch)
+
+    # 1. Optimizer step taken while still in eval mode.
+    model = fused_model()
+    with torch.no_grad():
+        model.embedder.feature[TOKEN_TYPES[0].value].weight.add_(0.5)
+    assert not model.embedder._snapshot_is_current()
+    with torch.no_grad():
+        served = model.embedder(batch)
+    assert torch.allclose(served, loop_output(model), rtol=0, atol=TOLERANCE)
+
+    # 2. EMA/SWA copy through detach(), which shares the version counter.
+    model = fused_model()
+    source = _model(seed=99)
+    with torch.no_grad():
+        model.embedder.entity[TOKEN_TYPES[0].value].weight.detach().copy_(
+            source.embedder.entity[TOKEN_TYPES[0].value].weight
+        )
+    assert not model.embedder._snapshot_is_current()
+
+    # 3. Rebinding `.data` swaps storage without touching the counter.
+    model = fused_model()
+    parameter = model.embedder.feature[TOKEN_TYPES[1].value].weight
+    versions_before = tuple(version for version, _ in model.embedder._parameter_versions())
+    parameter.data = parameter.data.clone() + 0.5
+    versions_after = tuple(version for version, _ in model.embedder._parameter_versions())
+    assert versions_before == versions_after, "rebinding does not bump the counter"
+    assert not model.embedder._snapshot_is_current(), "the address must catch it"
+
+    # 4. The boundary: an in-place write through `.data` is NOT detected.
+    model = fused_model()
+    with torch.no_grad():
+        stale = model.embedder(batch)
+    model.embedder.feature[TOKEN_TYPES[0].value].weight.data.add_(0.5)
+    assert model.embedder._snapshot_is_current(), (
+        "if this now fails, `.data` writes became detectable -- widen the "
+        "contract in `_snapshot_is_current` rather than deleting this assertion"
+    )
+    with torch.no_grad():
+        served = model.embedder(batch)
+    assert torch.equal(served, stale), "the documented failure: a stale forward"
+    # And the documented remedy restores correctness.
+    fresh = loop_output(model)
+    assert not torch.allclose(stale, fresh, rtol=0, atol=TOLERANCE)
+    model.embedder.fuse()
+    with torch.no_grad():
+        assert torch.allclose(model.embedder(batch), fresh, rtol=0, atol=TOLERANCE)
+
+
 def test_moving_the_model_invalidates_the_snapshot():
     """`.to()` / `.float()` move parameters but not the cache."""
 
@@ -301,6 +384,16 @@ def assert_records_identical(left, right, context="", target_tolerance=1e-4):
             assert x["sims"] == y["sims"], f"{at}: sims"
             assert x["gumbel_topk"] == y["gumbel_topk"], f"{at}: top-k"
             # --- recorded targets: within tolerance, drift reported ---
+            # Presence is a discrete fact and is asserted exactly: comparing only
+            # when both sides are non-None would let a target *disappear* from
+            # one arm and still pass, which is a bigger change than any drift
+            # this tolerance is meant to absorb.
+            assert (x["policy_target"] is None) == (
+                y["policy_target"] is None
+            ), f"{at}: policy target present on one side only"
+            assert (x["root_value"] is None) == (
+                y["root_value"] is None
+            ), f"{at}: root value present on one side only"
             if x["policy_target"] is not None and y["policy_target"] is not None:
                 assert len(x["policy_target"]) == len(y["policy_target"]), at
                 for p, q in zip(x["policy_target"], y["policy_target"]):

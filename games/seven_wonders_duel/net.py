@@ -61,7 +61,7 @@ class TokenEmbedder(nn.Module):
         #: loop, which is the training path and stays untouched.
         self._fused: dict[str, torch.Tensor] | None = None
         #: Autograd version counters of the copied parameters at `fuse()` time.
-        self._fused_versions: tuple[int, ...] = ()
+        self._fused_versions: tuple[tuple[int, int], ...] = ()
         # The cache copies `entity`/`feature` but reads `type_embedding`/`aux`
         # live, so anything that rewrites parameters in place would leave it
         # PARTIALLY stale — a silently wrong forward rather than a loud one.
@@ -152,21 +152,45 @@ class TokenEmbedder(nn.Module):
             yield self.feature[token_type.value].weight
             yield self.feature[token_type.value].bias
 
-    def _parameter_versions(self) -> tuple[int, ...]:
-        return tuple(tensor._version for tensor in self._snapshot_sources())
+    def _parameter_versions(self) -> tuple[tuple[int, int], ...]:
+        """Per-parameter (version counter, storage address).
+
+        The address catches rebinding — `parameter.data = other` swaps the
+        storage without touching the version counter — which the counter alone
+        misses.
+        """
+
+        return tuple(
+            (tensor._version, tensor.data_ptr())
+            for tensor in self._snapshot_sources()
+        )
 
     def _snapshot_is_current(self) -> bool:
-        """Has any copied parameter been written in place since `fuse()`?
+        """Has any copied parameter changed since `fuse()`?
 
         `train()`, `load_state_dict()` and `_apply()` cover the ordinary ways
         parameters change — but not all of them. An optimizer step taken while
-        still in eval mode, an EMA/SWA `copy_`/`lerp_`, or a direct `.data` write
-        would each leave a *partially* stale cache: the copied `entity`/`feature`
-        go stale while `type_embedding`/`aux` are still read live, which is a
-        silently wrong forward rather than a loud one. Autograd's per-tensor
-        version counter observes every in-place write, so consulting it is the one
-        cheap way to be certain — 27 integer reads against a forward measured in
-        milliseconds.
+        still in eval mode, or an EMA/SWA `copy_`/`lerp_`, would leave a
+        *partially* stale cache: the copied `entity`/`feature` go stale while
+        `type_embedding`/`aux` are still read live, which is a silently wrong
+        forward rather than a loud one. Autograd's per-tensor version counter
+        observes those writes, and the storage address observes rebinding, so
+        consulting both is cheap certainty for them — 54 integer reads against a
+        forward measured in milliseconds.
+
+        **Not covered: in-place writes routed through `.data`**, i.e.
+        `parameter.data.add_(x)` or `parameter.data.copy_(x)`. Unlike
+        `.detach()`, which shares the version counter, each `.data` access
+        returns a fresh view with its own counter, so such a write is invisible
+        to *any* counter-based guard and leaves the storage address unchanged.
+        Nothing observes it short of comparing the parameter values themselves,
+        which costs the reads and the device sync that fusing exists to avoid.
+
+        The contract is therefore: **mutating a fused module through `.data` is
+        unsupported — call `unfuse()` (or `load_state_dict`/`train()`) after any
+        such write.** `test_fused_cache_invalidation_contract` pins both halves.
+        In this codebase nothing writes through `.data`: training builds its own
+        model and `Evaluator` fuses a model it then only reads.
         """
 
         return self._fused_versions == self._parameter_versions()

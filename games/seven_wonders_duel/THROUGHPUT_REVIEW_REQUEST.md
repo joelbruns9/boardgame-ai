@@ -10,9 +10,12 @@ are built but off (`conflict_free_waves`, `round_robin_candidates`, and the
 rolling pool's `max_active_slots` beyond what `phase_d` now passes). The live pair
 is where review effort should go — see §5.
 
-Headline: **1.99× generation throughput at the production settings**, 1,633 →
-3,250 games/hour (64 games, 32 slots, cap 256, `leaf_batch=1`), with *identical*
-batch counts and simulation totals before and after.
+Headline: **1.99× generation throughput in the F4 benchmark configuration**,
+1,633 → 3,250 games/hour (64 games, 32 slots, cap 256, `leaf_batch=1`), with
+*identical* batch counts and simulation totals before and after — and, since
+2026-07-27, **1.89× on the real Phase D generation path**, 1,361 → 2,578
+games/hour (`f4_phase_d_ab.py`, three interleaved repetitions, identical discrete
+trajectories in every arm; §8).
 
 The uncomfortable summary: **none of the throughput came from the scheduler work
 the plan was built around.** Phases 1 and 2 are correctness and measurement work.
@@ -32,11 +35,15 @@ launches, host syncs, and per-element Python — not about search or arithmetic.
 | 3 | Vectorised legal-policy gather | `d1b790e` | `rust_bridge.py`, `f4_throughput_bench.py` |
 | — | Fix: unsound regime verdict in the Phase 0 probe | `c816789` | `f4_cost_model.py` |
 | — | **Ship the live pair by default** | `398febf` | `inference.py`, `rust_bridge.py`, `f4_throughput_bench.py` |
+| — | Review 1 response: fusion envelope, cache staleness, budget leaks | `8819012` | `net.py`, `inference.py`, `self_play.rs` |
+| — | Phase D A/B (the missing end-to-end measurement) | uncommitted | `f4_phase_d_ab.py` (new) |
+| — | Review 2 response: `.data` contract, abort accounting, gate holes | uncommitted | `net.py`, `self_play.rs`, `f4_phase_d_ab.py`, `test_f4_phase3b_fused.py` |
 
 New test files: `test_f4_phase0_telemetry.py` (13), `test_f4_phase1_pool.py` (13),
 `test_f4_phase2_waves.py` (5), `test_f4_round_robin.py` (4),
-`test_f4_phase3b_fused.py` (10), `test_f4_phase3_gather.py` (8). Suite: 517
-Python + 8 cargo, green.
+`test_f4_phase3b_fused.py` (11), `test_f4_phase3_gather.py` (8). Suite: **518
+Python + 16 cargo, green** (2026-07-27, after the second review's fixes; was 517
++ 8 at first submission). New tool: `f4_phase_d_ab.py`.
 
 ## 2. What changed (design)
 
@@ -197,6 +204,11 @@ place rather than edited away; the short version:
 * **Phase 4 (joint sweep) not done.** One point on the slots axis was worth +48%;
   the axis is unswept, and `global_batch_cap=256` will start binding (p95 batch
   was 134 at 32 slots before Phase 3).
+* **The Phase D A/B is one box, one checkpoint, one slot count.** 1.89× is
+  measured on an RTX 3070 laptop at `rust_slots=16` with the d128 L4 production
+  checkpoint. It does not decompose the shortfall against the benchmark's 1.99×
+  into the slot count and the small bot groups, and it says nothing about cloud
+  hardware (below).
 * **Cloud config unmeasured.** A faster GPU pushes toward launch-bound (width
   pays), a bigger model pushes toward device-bound (width buys nothing); measured
   here, the model effect dominates on fixed hardware. Run `f4_cost_model.py` on
@@ -235,6 +247,10 @@ python -m games.seven_wonders_duel.f4_throughput_bench --mode rust \
   --python-workers 1 --cuda-events --allow-underfilled
 # ...and the before, same command plus:
 #   --no-fused-embedder --no-vectorized-gather
+
+# Reproduce the Phase D A/B, real generation path, ~26 min
+python -m games.seven_wonders_duel.f4_phase_d_ab \
+  --checkpoint <ckpt> --output /tmp/phase_d_ab --games 64 --repetitions 3
 
 # Regime / cost model on any box (~3 min)
 python -m games.seven_wonders_duel.f4_cost_model \
@@ -279,14 +295,49 @@ Not taken: the gathered-weight `bmm`/`einsum` alternative. It would help CPU, bu
 CPU is now off by default, and materialising per-token weights is *larger* than
 the temporary it replaces. Recorded as a follow-up if CPU inference ever matters.
 
-### P1 — cache not completely self-invalidating — **accepted, fixed**
+### P1 — cache not completely self-invalidating — **accepted, fixed; and the fix's own claim was then wrong (see below)**
 
 The class-level claim was false, exactly as described. `fuse()` now records the
 autograd `_version` of all 27 copied parameters, and `forward` drops the cache if
-any changed. That covers optimizer steps in eval mode, EMA/SWA `copy_`/`lerp_`,
-and direct `.data` writes — every in-place path, since the version counter is what
-autograd itself uses. `fuse()` additionally raises if called while training.
-Cost is 27 integer reads against a millisecond forward.
+any changed. That covers optimizer steps in eval mode and EMA/SWA
+`copy_`/`lerp_`. `fuse()` additionally raises if called while training.
+
+**Correction (2026-07-27, second review).** This response then claimed the guard
+covered "direct `.data` writes — every in-place path", and that was wrong.
+`parameter.data.add_(x)` does **not** bump `parameter._version`: unlike
+`.detach()`, which shares the version counter, every `.data` access mints a fresh
+one over the same storage. The reviewer demonstrated a retained cache and a stale
+output error of ~1.0. Verified here directly:
+
+```
+p = torch.nn.Parameter(torch.zeros(3))
+with torch.no_grad(): p.add_(1.0)   # _version 0 -> 1   (caught)
+p.data.add_(1.0)                    # _version 1 -> 1   (NOT caught)
+p.detach().add_(1.0)                # _version 1 -> 2   (caught)
+```
+
+Two changes rather than one:
+
+* **Strengthened where it is cheap.** The snapshot now records
+  `(version, data_ptr)` per parameter, which additionally catches *rebinding* —
+  `parameter.data = other` swaps storage while leaving the counter untouched,
+  so that path was silently uncovered too. 54 pointer/integer reads, no sync.
+* **Narrowed where it cannot be.** In-place writes routed through `.data` are
+  invisible to any counter-based guard, and the only thing that would see them is
+  comparing parameter values — the reads and the device sync that fusing exists to
+  avoid. So the contract is now explicit: **mutating a fused module through
+  `.data` is unsupported; call `unfuse()` after such a write.** The completeness
+  claim is withdrawn from the docstring.
+
+`test_fused_cache_invalidation_contract` pins all four cases, including asserting
+that a `.data` write is *not* detected — so a torch change or a stronger guard
+fails the test loudly instead of quietly widening what the docs claim. In this
+codebase nothing writes through `.data`: training builds its own model, and
+`Evaluator` fuses a model it then only reads.
+
+Also worth stating plainly: the version guard shipped in the first response with
+**no test of its own** — `train()`, `load_state_dict()` and `_apply()` had tests,
+the new guard did not. That is how a false completeness claim survived to review.
 
 ### P1 — the "no decision changed" gate did not prove that — **accepted, fixed; claim refined**
 
@@ -324,9 +375,26 @@ The vectorised gather, separately, is **bit-identical** on records (0.0 drift).
 Four Rust unit tests cover the accounting directly
 (`self_play::budget_tests`) — the paths are not reachable from Python.
 
-Not fixed: a shard that *errors* mid-run leaves its tokens with the pool. The run
-is aborting anyway, so the only effect is the concurrency of other shards during a
-failing run. Documented rather than restructured.
+**Third leak, found by the second review and now fixed.** The first response
+documented rather than fixed the error path, on the reasoning that "the run is
+aborting anyway". That reasoning was wrong about the mechanism: shards run under
+`std::thread::scope` and a failing shard's error is only collected after the
+scope joins, so its siblings keep working at reduced concurrency for the rest of
+the run — and `cancel_all` restored none of the three quantities (`budget_held`,
+the shard reservation, the global `live` count).
+
+`cancel_all` is replaced by `abort(&budget)`, which cancels pending work and then
+performs exactly the accounting `retire` does for each active slot — one
+`on_retire` and one `release_activation` — before donating the now-dead
+reservation. It is idempotent, and all 17 error paths route through it. Two Rust
+tests cover it: full restoration plus idempotency, and the invariant that matters
+(after one shard aborts, a sibling can reach the *full* budget). Rust suite now
+15 tests.
+
+Still true, and now the only accepted residue: a shard that panics rather than
+returning `Err` unwinds without running `abort`. Closing that would take an RAII
+guard holding `&SlotBudget` in the pool; the pool is per-shard and dropped at the
+scope boundary, so the exposure is a panicking run only.
 
 ### P1 — the headline is not an end-to-end production measurement — **accepted**
 
@@ -336,8 +404,45 @@ prior, ~15% curriculum-bot games in eight groups) are all real. The plan header
 now says so explicitly and states that the **relative** improvement is what should
 transfer.
 
-The `_generate_iteration_rust` A/B has **not** been run — flagged as the
-recommended next validation rather than quietly claimed.
+**Update (2026-07-27): the `_generate_iteration_rust` A/B has now been run**, so
+this finding is closed with a measurement rather than a caveat.
+`f4_phase_d_ab.py` calls `_generate_iteration_rust` with exactly the jobs
+`generate_iteration` builds — 16 slots, randomised 64–128 budgets, annealed draft
+prior, curriculum-bot grouping — and toggles the two features at the `phase_d`
+module boundary, leaving production code untouched. 64 games (55 neural + 9 bot
+in 6 groups), three repetitions, arms interleaved `A B B A A B` so drift on a
+laptop GPU cannot be read as an effect:
+
+| arm | seconds (3 runs) | median | games/hour |
+|---|---|---|---|
+| before | 170.7 / 168.5 / 169.3 | 169.3 | 1,361 |
+| after | 89.4 / 88.1 / 91.3 | 89.4 | **2,578** |
+
+**1.89×**, against 1.99× in the benchmark configuration. Within-arm spread 1.3%
+and 3.6%; the ranges do not overlap. All six runs produced **identical discrete
+trajectories** — winner, chained trajectory digest, final digest, action
+sequence, per-move sim counts — which is the sanity check that the arms did the
+same work rather than less of it.
+
+Two corrections to how that check was first written and reported (second review):
+
+* It is **not** "byte-identical records". The fingerprint deliberately excludes
+  policy targets and root values, which drift at ~1e-5 under the fused embedder
+  (§8 P1 above), and several other record fields. Record-level equivalence is
+  gated separately by `assert_records_identical`; this is the discrete-trajectory
+  check, and the report and the JSON key now say so.
+* The cross-arm comparison **could false-positive**: it took one arbitrary
+  fingerprint per arm, so an arm that disagreed with *itself* across repetitions
+  could still report agreement. It now unions every run's fingerprint and
+  requires exactly one distinct value, exiting non-zero otherwise. The recorded
+  run satisfies the stricter rule without a re-run: both arms were internally
+  consistent (`self_consistent_within_arm` true for each, i.e. one fingerprint
+  apiece) *and* the arms agreed, which together imply a single distinct
+  fingerprint across all six runs. The benchmark was not re-timed.
+
+The shortfall is in the expected direction and its magnitude is not decomposed:
+16 slots instead of 32 and ~14% of games in bot groups too small to fill the pool
+both dilute a per-batch saving, but this run does not separate the two.
 
 The observation that bot groups average ~9 games and so cannot fill 16 slots is a
 finding about *this work*: the Phase 1 pool cannot combine them because the Python
@@ -370,21 +475,29 @@ Phase 4 arm.
   with no failure mode behind it — happy to add it if a future caller ever indexes
   the padded matrix directly.
 
-## 9. Sign-offs — status after the review
+## 9. Sign-offs — status after two reviews
 
-| # | Request | Review verdict | Now |
-|---|---|---|---|
-| 1 | Cache invalidation complete | **No** | Fixed: parameter `_version` guard covers every in-place path; `fuse()` rejects training mode. **Re-requested.** |
-| 2 | ~2e-6 drift needs no strength gate | **Conditional** on a paired production/CUDA record gate | Gate added and run: 836 moves, **zero** decision changes, targets drift 7.7e-05. **Condition believed met — please confirm.** |
-| 3 | `SlotBudget` leak-free | **No** | Both leaks fixed, four Rust unit tests added. Error-path stranding documented as accepted. **Re-requested.** |
-| 4 | Padded softmax safe for every caller | **Yes** | No change; sentinel-logit suggestion declined with reasons (§8). |
-| 5 | Leave round-robin off | **Yes, provisionally** | Rationale reworded to the reasons that hold; recorded as a Phase 4 arm. Agreed. |
+| # | Request | R1 | R2 | Now |
+|---|---|---|---|---|
+| 1 | Cache invalidation complete | **No** | **No** — `.data` writes bypass `_version` | Claim **withdrawn, not re-asserted**: guard strengthened with `data_ptr` (catches rebinding), `.data` in-place writes declared unsupported, contract pinned by `test_fused_cache_invalidation_contract`. **Sign-off now sought on the narrowed contract, not on completeness.** |
+| 2 | ~2e-6 drift needs no strength gate | **Conditional** | not revisited | Gate added and run: 836 moves, **zero** decision changes, targets drift 7.7e-05; the gate's `None`-parity hole (R2) is closed. **Condition believed met — please confirm.** |
+| 3 | `SlotBudget` leak-free | **No** | **No** — `cancel_all` strands everything | Third leak fixed: `abort(&budget)` restores tokens, reservation and `live`; 17 call sites; 2 new Rust tests. **Panic-path residue remains and is stated, so this is "leak-free on every `Err` path", not unconditionally. Re-requested on that wording.** |
+| 4 | Padded softmax safe for every caller | **Yes** | — | No change; sentinel-logit suggestion declined with reasons (§8). |
+| 5 | Leave round-robin off | **Yes, provisionally** | — | Rationale reworded; recorded as a Phase 4 arm. Agreed. |
+| 6 | Phase D A/B validates the headline | — | "credible" | 1.89×; equivalence check tightened after R2 (union across runs, non-zero exit). |
 
-Two further things a reviewer may want to look at, both introduced by this
-response rather than reviewed already:
+Still unreviewed, both introduced by the first response:
 
 * the **device gate** (`fusion_is_profitable`) — is CUDA-vs-CPU the right axis,
   given larger CUDA models measured neutral rather than negative?
 * the **projection budget** fallback — a second numerical path selected by batch
   size. It is unreachable in every measured configuration, but it does mean
   results could in principle depend on batch shape at extreme sizes.
+
+**Pattern worth naming across both rounds.** Three of the four R2 findings are the
+same failure: a *guard* was asserted to be complete without a test that could
+have falsified it — the version guard shipped untested, the A/B's equivalence
+check compared one sample per arm, and `assert_records_identical` skipped absent
+targets. The measurements themselves have held up under both reviews; the claims
+about what the checks prove have not. Every fix in this round adds the test that
+would have caught the overstatement.

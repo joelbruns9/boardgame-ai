@@ -56,11 +56,34 @@ neural games, fixed 128-sim full budgets): **1,633 -> 3,250 games/hour, 1.99x**.
 
 > That figure is *not* a Phase D iteration. Phase D defaults to 16 slots,
 > randomises full budgets over 64-128, applies a draft prior in early iterations,
-> and spends ~15% of games on curriculum bots split across eight
-> `(bot type, seat)` groups. The **relative** boundary improvement should
-> transfer -- it is per-batch work that every configuration pays -- but the
-> absolute games/hour will not. A full `_generate_iteration_rust` A/B has **not**
-> been run; see the review response in `THROUGHPUT_REVIEW_REQUEST.md`.
+> and spends ~15% of games on curriculum bots split across `(bot type, seat)`
+> groups. The **relative** boundary improvement was expected to transfer -- it is
+> per-batch work that every configuration pays -- but the absolute games/hour
+> was not.
+
+**The Phase D A/B has now been run** (`f4_phase_d_ab.py`), calling
+`_generate_iteration_rust` with exactly the jobs `generate_iteration` builds, so
+all four Phase D differences are inside the measurement. RTX 3070 laptop,
+production checkpoint (d128 L4), 64 games (55 neural + 9 curriculum-bot in 6
+groups), three repetitions with the arms interleaved `A B B A A B`:
+
+| arm | seconds per 64 games | games/hour |
+|---|---|---|
+| before (both off) | 170.7 / 168.5 / **169.3** | 1,361 |
+| after (fused + gather) | 89.4 / 88.1 / **89.4** | **2,578 (1.89×)** |
+
+Medians of three; within-arm spread 1.3% and 3.6%, ranges disjoint. **The
+discrete trajectory of every game was identical across all six runs** (winner,
+chained trajectory digest, final digest, action sequence, per-move sim counts)
+-- the same 64 seeds ran in each arm, so the arms did the same work. Not
+"byte-identical records": policy targets and root values are excluded, because
+the fused embedder moves them at ~1e-5; record-level equivalence is gated
+separately by `assert_records_identical`.
+
+So the benchmark's **1.99× transfers as 1.89×** on the production generation
+path. The small shortfall is the expected direction: Phase D runs 16 slots rather
+than 32 and spends ~14% of its games on curriculum-bot groups too small to fill
+the slot pool, both of which dilute a per-batch saving.
 
 Review brief: `THROUGHPUT_REVIEW_REQUEST.md`.
 

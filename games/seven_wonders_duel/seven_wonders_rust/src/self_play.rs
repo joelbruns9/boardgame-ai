@@ -791,6 +791,13 @@ impl SlotBudget {
         self.spare.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Games currently active across all shards. `peak_live` is the shipped
+    /// metric; the instantaneous count is what abort/retire accounting is
+    /// asserted against.
+    pub fn live_for_test(&self) -> usize {
+        self.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn shards(&self) -> usize {
         self.shards
     }
@@ -967,12 +974,41 @@ impl SlotPool {
         budget.give_back();
     }
 
-    fn cancel_all(&mut self) {
-        for entry in &mut self.entries {
-            if let SlotEntry::Active(slot) = entry {
-                slot.cancel_pending();
-            }
+    /// Abandon this shard's work and return everything it holds to the budget.
+    ///
+    /// Cancelling pending evaluations is not enough on an error path: the shard
+    /// still holds one activation per active slot — borrowed tokens, its own
+    /// reservation, and the global `live` count. Shards run concurrently under
+    /// `std::thread::scope` and a failing one is only joined at the end, so
+    /// anything it keeps starves its siblings for the rest of the run.
+    ///
+    /// Idempotent: retired entries are replaced, so a second call finds nothing
+    /// to release.
+    fn abort(&mut self, budget: &SlotBudget) {
+        for index in 0..self.entries.len() {
+            let SlotEntry::Active(slot) = &mut self.entries[index] else {
+                continue;
+            };
+            slot.cancel_pending();
+            self.entries[index] = SlotEntry::Taken;
+            self.active_count -= 1;
+            // Exactly the pair `retire` performs, minus the record: one global
+            // live count and one activation (borrowed token or reservation).
+            budget.on_retire();
+            self.release_activation(budget);
         }
+        // An activation taken but never turned into an active slot: `refill`
+        // reserves before it constructs, and the queue-pointer invariant check
+        // returns in between. Rare, but this is the path that is supposed to
+        // hold under errors, so it drains rather than assuming.
+        while self.budget_held > 0 {
+            self.release_activation(budget);
+        }
+        // The queue can never be drained now, so the reservation is dead weight
+        // for the same reason a finished shard's is.
+        self.holds_reserved = false;
+        self.next_queued = self.entries.len();
+        self.donate_reservation_if_finished(budget);
     }
 
     /// Records in **input order**, independent of completion order.
@@ -1536,7 +1572,7 @@ pub fn run_many<E: Eval>(
 
     while pool.work_remaining() {
         if let Err(err) = pool.refill(&budget) {
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(err);
         }
         occupancy.tick(&mut metrics, &pool, &[], budget.total());
@@ -1557,14 +1593,14 @@ pub fn run_many<E: Eval>(
                 // A slot that yields no group has finished its game.
                 Ok(None) => retire.push(slot_index),
                 Err(err) => {
-                    pool.cancel_all();
+                    pool.abort(&budget);
                     return Err(err);
                 }
             }
         }
         for slot_index in retire {
             if let Err(err) = pool.retire(slot_index, &mut metrics, &budget) {
-                pool.cancel_all();
+                pool.abort(&budget);
                 return Err(err);
             }
         }
@@ -1576,7 +1612,7 @@ pub fn run_many<E: Eval>(
             if pool.active_count() == 0 {
                 continue;
             }
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(PyRuntimeError::new_err(
                 "cooperative scheduler made no progress with live slots",
             ));
@@ -1587,7 +1623,7 @@ pub fn run_many<E: Eval>(
             let (batch, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
                 Ok(taken) => taken,
                 Err(err) => {
-                    pool.cancel_all();
+                    pool.abort(&budget);
                     return Err(err);
                 }
             };
@@ -1611,12 +1647,12 @@ pub fn run_many<E: Eval>(
             {
                 Ok(rows) => rows,
                 Err(err) => {
-                    pool.cancel_all();
+                    pool.abort(&budget);
                     return Err(err);
                 }
             };
             if evaluations.len() != row_count {
-                pool.cancel_all();
+                pool.abort(&budget);
                 return Err(PyValueError::new_err(format!(
                     "global evaluator returned {} rows for {row_count} states",
                     evaluations.len()
@@ -1628,7 +1664,7 @@ pub fn run_many<E: Eval>(
             metrics.batch_rows.push(row_count);
 
             if let Err(err) = scatter_batch(&mut pool, &mut metrics, batch, evaluations) {
-                pool.cancel_all();
+                pool.abort(&budget);
                 return Err(err);
             }
         }
@@ -1778,7 +1814,7 @@ pub fn run_many_pipelined(
 
     loop {
         if let Err(err) = pool.refill(budget) {
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(err);
         }
         occupancy.tick(&mut metrics, &pool, &outstanding, local_capacity);
@@ -1800,12 +1836,12 @@ pub fn run_many_pipelined(
             global_batch_cap,
             &mut finished,
         ) {
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(err);
         }
         for slot_index in finished {
             if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
-                pool.cancel_all();
+                pool.abort(&budget);
                 return Err(err);
             }
         }
@@ -1814,7 +1850,7 @@ pub fn run_many_pipelined(
             let (groups, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
                 Ok(batch) => batch,
                 Err(err) => {
-                    pool.cancel_all();
+                    pool.abort(&budget);
                     return Err(err);
                 }
             };
@@ -1833,7 +1869,7 @@ pub fn run_many_pipelined(
             let ticket = match worker.submit_prepared(owned_states, actors, legals) {
                 Ok(ticket) => ticket,
                 Err(err) => {
-                    pool.cancel_all();
+                    pool.abort(&budget);
                     return Err(err);
                 }
             };
@@ -1860,7 +1896,7 @@ pub fn run_many_pipelined(
             if pool.active_count() == 0 {
                 continue;
             }
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(PyRuntimeError::new_err(
                 "pipelined scheduler made no progress with live slots",
             ));
@@ -1868,12 +1904,12 @@ pub fn run_many_pipelined(
         let evaluations = match flight.ticket.wait() {
             Ok(rows) => rows,
             Err(err) => {
-                pool.cancel_all();
+                pool.abort(&budget);
                 return Err(err);
             }
         };
         if evaluations.len() != flight.row_count {
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(PyValueError::new_err(format!(
                 "global evaluator returned {} rows for {} states",
                 evaluations.len(),
@@ -1885,7 +1921,7 @@ pub fn run_many_pipelined(
             outstanding[group.slot] = false;
         }
         if let Err(err) = scatter_batch(&mut pool, &mut metrics, flight.groups, evaluations) {
-            pool.cancel_all();
+            pool.abort(&budget);
             return Err(err);
         }
     }
@@ -2062,6 +2098,145 @@ mod budget_tests {
         pool.holds_reserved = true;
         pool.donate_reservation_if_finished(&budget);
         assert_eq!(budget.spare_for_test(), 2, "still active: no donation");
+    }
+
+    fn sample_setup() -> crate::state::Setup {
+        crate::state::Setup {
+            first_player: 0,
+            available_progress_tokens: vec![0, 1, 2, 3, 4],
+            unused_progress_tokens: vec![5, 6, 7, 8, 9],
+            wonder_groups: [vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            unused_wonders: vec![8, 9, 10, 11],
+            age_decks: [
+                Vec::new(),
+                (0..20).collect(),
+                (0..20).collect(),
+                (0..20).collect(),
+            ],
+            removed_age_cards: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            selected_guilds: Vec::new(),
+            unused_guilds: Vec::new(),
+        }
+    }
+
+    fn sample_config(game_seed: u64) -> SelfPlayConfig {
+        SelfPlayConfig {
+            game_seed,
+            iteration: None,
+            leaf_batch: 1,
+            leaf_batch_by_player: None,
+            deterministic_actions: false,
+            cheap_sims_min: 2,
+            cheap_sims_max: 2,
+            full_sims_min: 2,
+            full_sims_max: 2,
+            full_search_fraction: 0.0,
+            top_k: 2,
+            draft_prior: 0.0,
+            c_puct: 1.25,
+            c_visit: 50.0,
+            c_scale: 1.0,
+            force_expand_root_chance: false,
+            puct_root: false,
+            age_deal_samples: 0,
+            age_deal_samples_by_player: None,
+            cheap_double_reveal_offsets: 0,
+            cheap_double_reveal_offsets_by_player: None,
+            bot_by_player: [None, None],
+            bot_exploration: 0.0,
+            bot_policy_iterations: 1,
+            max_moves: 512,
+            conflict_free_waves: false,
+            round_robin_candidates: false,
+        }
+    }
+
+    fn queued_jobs(count: usize) -> Vec<(GameState, SelfPlayConfig)> {
+        (0..count)
+            .map(|index| {
+                (
+                    GameState::from_setup(sample_setup(), std::collections::VecDeque::new()),
+                    sample_config(index as u64 + 1),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aborting_a_shard_returns_every_activation_it_holds() {
+        // The bug this guards: on a mid-run error `cancel_all` stopped the
+        // pending work but kept the shard's borrowed tokens, its reservation and
+        // its share of the global live count. Shards are joined only at the end
+        // of the scope, so the surviving ones ran the rest of the job at reduced
+        // concurrency.
+        let budget = SlotBudget::new(6, 2).expect("valid budget");
+        assert_eq!(budget.spare_for_test(), 4, "6 total minus one per shard");
+
+        let mut pool = SlotPool::new(queued_jobs(3));
+        let activated = pool.refill(&budget).expect("activation succeeds");
+        assert_eq!(activated, 3);
+        assert_eq!(pool.active_count(), 3);
+        assert_eq!(budget.live_for_test(), 3);
+        assert_eq!(budget.spare_for_test(), 2, "one reserved + two borrowed");
+
+        pool.abort(&budget);
+
+        assert_eq!(pool.active_count(), 0);
+        assert_eq!(budget.live_for_test(), 0, "global live count restored");
+        assert_eq!(
+            budget.spare_for_test(),
+            5,
+            "both borrowed tokens back, plus the reservation donated because \
+             an aborted shard can never activate again"
+        );
+
+        // Idempotent: every call site aborts then returns, but a second call
+        // must not manufacture budget.
+        pool.abort(&budget);
+        assert_eq!(budget.spare_for_test(), 5);
+        assert_eq!(budget.live_for_test(), 0);
+    }
+
+    #[test]
+    fn aborting_releases_an_activation_taken_but_never_activated() {
+        // `refill` takes the activation before constructing the slot, and the
+        // queue-pointer invariant check can return in between. That token
+        // belongs to no active slot, so the per-slot loop alone would miss it.
+        let budget = SlotBudget::new(4, 2).expect("valid budget");
+        let mut pool = SlotPool::new(queued_jobs(2));
+        // Corrupt the queue exactly as the invariant error describes.
+        pool.entries[0] = SlotEntry::Taken;
+
+        assert!(pool.refill(&budget).is_err(), "the invariant must be caught");
+        pool.abort(&budget);
+
+        assert_eq!(budget.live_for_test(), 0);
+        assert_eq!(
+            budget.spare_for_test(),
+            3,
+            "the reservation is donated and no borrowed token is stranded"
+        );
+        assert_eq!(pool.budget_held, 0);
+    }
+
+    #[test]
+    fn aborting_leaves_a_sibling_shard_its_full_share() {
+        // The consequence the fix exists for, stated as an invariant: after one
+        // shard aborts, everything it held is available to the other.
+        let budget = SlotBudget::new(4, 2).expect("valid budget");
+        let mut failing = SlotPool::new(queued_jobs(2));
+        failing.refill(&budget).expect("activation succeeds");
+        assert_eq!(budget.spare_for_test(), 1);
+
+        failing.abort(&budget);
+
+        let mut survivor = SlotPool::new(queued_jobs(3));
+        let activated = survivor.refill(&budget).expect("activation succeeds");
+        assert_eq!(
+            activated, 3,
+            "the survivor must reach the full budget, not a shrunken one"
+        );
+        assert_eq!(budget.live_for_test(), 3);
     }
 }
 
