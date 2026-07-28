@@ -52,7 +52,7 @@ _VICTORY_OFFSET = {
 }
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Example:
     type_ids: np.ndarray  # [T] int8
     entity_ids: np.ndarray  # [T] int16
@@ -72,6 +72,25 @@ class Example:
     sci_final_opp: float
     game_key: int  # for game-honest splits
     iteration: int | None  # for iteration-honest splits (Phase D)
+
+    def __post_init__(self) -> None:
+        """Make the arrays read-only as well as the fields.
+
+        `frozen=True` stops the *attributes* being rebound, but a numpy array
+        reached through a frozen attribute is still writable, so freezing alone
+        would leave `example.features[0, 0] = 1.0` working. That matters because
+        Phase D's example cache hands the same object to every iteration whose
+        replay window contains the game: an in-place write would propagate
+        silently into every later iteration.
+
+        Every array here is freshly allocated during derivation (`vectorize`,
+        `np.zeros`, `np.asarray` over a new list), so nothing else holds a
+        writable alias to them.
+        """
+
+        for field in ("type_ids", "entity_ids", "aux_ids", "features", "legal",
+                      "policy_target"):
+            getattr(self, field).setflags(write=False)
 
 
 def vectorize(encoding: Encoding) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -181,26 +200,20 @@ def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False)
         else:
             policy[int(np.searchsorted(legal, move.action))] = 1.0
         type_ids, entity_ids, aux_ids, features = vectorize(encoding)
+        # Inputs only: the outcome labels are unknown until the replay finishes,
+        # so the Example is built once, complete, below. It used to be built here
+        # with placeholder labels and back-filled in place; `Example` is frozen
+        # now that the Phase D cache hands the same object to every iteration
+        # whose replay window contains the game.
         staged.append(
             (
-                Example(
-                    type_ids=type_ids,
-                    entity_ids=entity_ids,
-                    aux_ids=aux_ids,
-                    features=features,
-                    legal=legal,
-                    policy_target=policy,
-                    has_policy=not move.policy_excluded,
-                    value_class=0,
-                    joint7_class=0,
-                    margin=0.0,
-                    margin_valid=False,
-                    military_final=0.0,
-                    sci_final_my=0.0,
-                    sci_final_opp=0.0,
-                    game_key=record.seed,
-                    iteration=record.iteration,
-                ),
+                type_ids,
+                entity_ids,
+                aux_ids,
+                features,
+                legal,
+                policy,
+                not move.policy_excluded,
                 actor,
             )
         )
@@ -208,18 +221,44 @@ def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False)
     game = replay(record, on_state=featurize)
     final_position = game.conflict_position
     sci_counts = (len(_science_symbols(game, 0)), len(_science_symbols(game, 1)))
-    for example, actor in staged:
-        example.value_class = _actor_value_class(game.winner, actor)
-        example.joint7_class = _joint7_class(game.winner, game.victory_type, actor)
+    examples: list[Example] = []
+    for (
+        type_ids,
+        entity_ids,
+        aux_ids,
+        features,
+        legal,
+        policy,
+        has_policy,
+        actor,
+    ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
-            example.margin = (mine - theirs) / 20.0
-            example.margin_valid = True
+            margin, margin_valid = (mine - theirs) / 20.0, True
+        else:
+            margin, margin_valid = 0.0, False
         rel = final_position if actor == 0 else -final_position
-        example.military_final = rel / 9.0
-        example.sci_final_my = sci_counts[actor] / 6.0
-        example.sci_final_opp = sci_counts[1 - actor] / 6.0
-    return [example for example, _ in staged]
+        examples.append(
+            Example(
+                type_ids=type_ids,
+                entity_ids=entity_ids,
+                aux_ids=aux_ids,
+                features=features,
+                legal=legal,
+                policy_target=policy,
+                has_policy=has_policy,
+                value_class=_actor_value_class(game.winner, actor),
+                joint7_class=_joint7_class(game.winner, game.victory_type, actor),
+                margin=margin,
+                margin_valid=margin_valid,
+                military_final=rel / 9.0,
+                sci_final_my=sci_counts[actor] / 6.0,
+                sci_final_opp=sci_counts[1 - actor] / 6.0,
+                game_key=record.seed,
+                iteration=record.iteration,
+            )
+        )
+    return examples
 
 
 def examples_from_records(records, *, record_fast_moves: bool = False) -> list[Example]:
@@ -301,7 +340,12 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         pad_mask[row, :count] = False
         legal_indices = torch.from_numpy(example.legal.astype(np.int64))
         legal_mask[row, legal_indices] = True
-        policy[row, legal_indices] = torch.from_numpy(example.policy_target)
+        # `.astype` copies, matching the lines above: the stored arrays are
+        # read-only, and `torch.from_numpy` on a read-only array yields a tensor
+        # torch believes it may write.
+        policy[row, legal_indices] = torch.from_numpy(
+            example.policy_target.astype(np.float32)
+        )
         has_policy[row] = example.has_policy
         value_class[row] = example.value_class
         joint7[row] = example.joint7_class

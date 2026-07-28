@@ -9,7 +9,8 @@ toy run; tests use deliberately tiny configurations and do not launch training.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, OrderedDict
+import hashlib
 from dataclasses import asdict, dataclass, replace
 import json
 import math
@@ -58,7 +59,12 @@ from .buffer import (
     to_json_line,
 )
 from .codec import decode_action, encode_action
-from .dataset import Example, examples_from_records, is_fast_search_move
+from .dataset import (
+    Example,
+    examples_from_record,
+    examples_from_records,
+    is_fast_search_move,
+)
 from .game import Phase
 from .inference import Evaluator
 from .loop_adapter import SevenWondersDuelLoopAdapter
@@ -178,6 +184,25 @@ class PhaseDConfig:
     Turning this on restores the pre-2026-07-25 behaviour; it roughly
     quadruples buffer size, so ``--train-steps`` must rise with it to keep
     ``samples_per_new_position`` in range.
+    """
+
+    example_cache_examples: int = 250_000
+    """Vectorized examples held in memory across iterations (0 disables).
+
+    `examples_from_records` replays every game through the verified engine path
+    -- mask hashes, actors, chance log, trajectory and final digests -- which is
+    what makes a stale or tampered buffer raise instead of silently training on
+    regenerated states.  Buffer files are immutable once written, so re-deriving
+    the whole replay window every iteration re-verifies data that cannot have
+    changed: measured at 223 s over 1,633 games and 404 s over 4,800, against
+    11 s of actual training.
+
+    Each game is therefore replayed once per process and its examples kept.  The
+    cap bounds that at roughly 12.5 KB per example (~3.1 GB at the default),
+    evicting least-recently-used games -- which are the iterations that have
+    left the replay window.  Size it above
+    ``replay_window * games_per_iteration * 20 + seed_games * 60`` or the window
+    itself will thrash.
     """
 
     min_buffer_positions: int = 0
@@ -326,6 +351,8 @@ class PhaseDConfig:
             raise ValueError("revert_reset_after must be non-negative")
         if self.buffer_autosave_every < 0:
             raise ValueError("buffer_autosave_every must be non-negative")
+        if self.example_cache_examples < 0:
+            raise ValueError("example_cache_examples must be non-negative")
         if self.warm_buffer_max_staleness < 0:
             raise ValueError("warm_buffer_max_staleness must be non-negative")
         if self.gate_backend not in ("rust", "python"):
@@ -881,6 +908,11 @@ class PhaseDLoop:
         self.manifest = RunManifest(self.run_dir, Path(__file__).resolve().parents[2])
         self.training_log = self.run_dir / "training_log.jsonl"
         self.warm_records: list[GameRecord] = []
+        # Per-game vectorized examples, keyed by the game's own content digest.
+        # Ordered so eviction can be least-recently-used: the games that fall out
+        # are the iterations that have left the replay window.
+        self._example_cache: OrderedDict[tuple, list[Example]] = OrderedDict()
+        self.last_example_cache_stats: dict[str, int] = {}
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
         self.last_warm_stats: dict[str, int] = {}
@@ -1289,6 +1321,100 @@ class PhaseDLoop:
 
         self.optimizer_state_path.unlink(missing_ok=True)
 
+    def _cached_examples(self, records: list[GameRecord]) -> list[Example]:
+        """Vectorized examples for `records`, replaying each game at most once.
+
+        Equivalent to `examples_from_records(records, ...)` -- same examples, same
+        order -- but a game already replayed in this process is served from the
+        cache instead of being replayed again.  Kingdomino's loop keeps encoded
+        examples in a live ring buffer and never re-derives them; 7WD stores
+        compact, verifiable game *records* and rebuilds, which costs the whole
+        replay window every iteration.  This keeps 7WD's records as the durable
+        source of truth and pays their verification once per process.
+
+        Keyed on a sha256 of the record's own canonical serialization -- the same
+        `to_json_line` that wrote it -- so the key covers every field the examples
+        depend on and every field replay verifies.
+
+        `trajectory_digest` is not sufficient and was the first version of this
+        key. It chains the *replayed states*, so it says nothing about
+        `policy_target`, `visits`, `sims` or `policy_excluded` -- which decide
+        both whether a move becomes an example at all (`is_fast_search_move`) and
+        what its policy label is. Two records with the same played trajectory and
+        different search targets, which is exactly what reanalysis and warm-buffer
+        imports produce, would have shared an entry. It is also a *stored* field,
+        so keying on it let a record whose actions were altered without updating
+        it hit the cache and skip the replay that would have caught the
+        alteration. Hashing the whole record costs ~0.74 ms per game (~3.6 s over
+        a 4,800-game window, ~1% of an iteration) and removes both.
+        """
+
+        cache = self._example_cache
+        fast = self.config.record_fast_moves
+        derived_games = 0
+        derived_examples = 0
+        used: set[tuple] = set()
+        out: list[Example] = []
+        for record in records:
+            key = (
+                hashlib.sha256(to_json_line(record).encode("utf-8")).hexdigest(),
+                fast,
+            )
+            cached = cache.get(key)
+            if cached is None:
+                cached = examples_from_record(record, record_fast_moves=fast)
+                cache[key] = cached
+                derived_games += 1
+                derived_examples += len(cached)
+            else:
+                cache.move_to_end(key)
+            used.add(key)
+            out.extend(cached)
+
+        capacity = max(0, self.config.example_cache_examples)
+        held = sum(len(value) for value in cache.values())
+        evicted = 0
+        if capacity == 0:
+            cache.clear()
+            held = 0
+        else:
+            # Evict strictly to the cap, including games in the current window.
+            # `out` already holds every reference this training call needs, so
+            # dropping a current-window entry costs a replay next iteration and
+            # nothing else. An earlier version refused to evict below the current
+            # window, which meant a window larger than the cap was retained in
+            # full -- the cap silently did nothing, which is the opposite of what
+            # a memory bound is for. Entries touched above sit at the end, so
+            # eviction still takes the least recently used first.
+            while cache and held > capacity:
+                key, dropped = next(iter(cache.items()))
+                del cache[key]
+                held -= len(dropped)
+                evicted += 1
+        self.last_example_cache_stats = {
+            "games": len(records),
+            "examples": len(out),
+            "replayed_games": derived_games,
+            "replayed_examples": derived_examples,
+            "cached_games": len(cache),
+            "cached_examples": held,
+            "evicted_games": evicted,
+            "capacity_examples": capacity,
+        }
+        # The condition that matters is not "did we evict" but "is the cap below
+        # one window": that is the state where every iteration re-replays
+        # everything, and it must be loud on the *first* such call rather than
+        # inferred later from a slow run.
+        if capacity and len(out) > capacity:
+            print(
+                f"example cache cap ({capacity:,}) is below this window "
+                f"({len(out):,} examples); every iteration will re-replay the "
+                "whole window. Raise --example-cache-examples to at least "
+                f"{len(out):,} (~{len(out) * 12.5 / 1e6:.1f} GB) or shrink "
+                "--replay-window."
+            )
+        return out
+
     def train_candidate(
         self,
         records: list[GameRecord],
@@ -1301,9 +1427,7 @@ class PhaseDLoop:
                 f"need {self.config.min_games_to_train} games to train, "
                 f"got {len(records)}"
             )
-        examples = examples_from_records(
-            records, record_fast_moves=self.config.record_fast_moves
-        )
+        examples = self._cached_examples(records)
         target_baselines = baselines(examples)
         train_examples, val_examples = stable_game_split(
             examples, self.config.val_fraction, self.config.val_split_salt
@@ -1383,6 +1507,10 @@ class PhaseDLoop:
                 iteration,
                 self.config.anneal_iterations(),
             ),
+            # How much of the replay window had to be replayed rather than
+            # served from the cache. `replayed_games` well above one iteration's
+            # worth means the cache is thrashing against its cap.
+            "example_cache": dict(self.last_example_cache_stats),
             "steps": history,
         }
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
@@ -2165,6 +2293,16 @@ def main(argv=None) -> int:
         "iteration. 0 disables the warmup",
     )
     parser.add_argument(
+        "--example-cache-examples",
+        type=int,
+        default=250_000,
+        help="vectorized examples held in memory across iterations (~12.5 KB "
+        "each, so 250k is ~3.1 GB). Games already replayed are served from "
+        "the cache instead of being re-replayed; 0 disables it and restores "
+        "the previous behaviour of rebuilding the whole replay window every "
+        "iteration",
+    )
+    parser.add_argument(
         "--allow-stale-targets",
         action="store_true",
         help="import a warm buffer whose policy targets were computed under a "
@@ -2229,6 +2367,7 @@ def main(argv=None) -> int:
         val_split_salt=args.val_split_salt,
         min_games_to_train=args.min_games_to_train,
         min_buffer_positions=args.min_buffer_positions,
+        example_cache_examples=args.example_cache_examples,
         record_fast_moves=args.record_fast_moves,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,
