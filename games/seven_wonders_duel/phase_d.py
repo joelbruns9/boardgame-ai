@@ -80,11 +80,13 @@ from .train import (
     baselines,
     build_model,
     evaluate as evaluate_model,
+    heads_from_config,
     load_checkpoint,
     make_checkpoint,
     stable_game_split,
     train_steps,
 )
+from .net import LEGACY_HEADS
 
 
 CURRICULUM_BOT_TYPES = (
@@ -148,6 +150,13 @@ class PhaseDConfig:
     top_k: int = 16
     d_model: int = 128
     layers: int = 4
+    heads: int | None = None
+    """Attention heads; ``None`` derives 64 dimensions per head from d_model.
+
+    Explicit only to hold a head count fixed while sweeping width. Whatever it
+    resolves to is written into every checkpoint and is what rebuilds use.
+    """
+
     train_steps: int = 300
     train_warmup_steps: int = 100
     train_batch_size: int = 512
@@ -700,7 +709,7 @@ def _process_generation_init(
     # One BLAS thread per process: generation scales by process count, and
     # oversubscribing cores with intra-op threads slows every worker down.
     torch.set_num_threads(1)
-    model = build_model("transformer", config.d_model, config.layers)
+    model = build_model("transformer", config.d_model, config.layers, config.heads)
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
     # a few ms on a core, while fanning every process into one GPU serializes
@@ -730,6 +739,13 @@ class ModelAgentSpec:
     sims: int
     mode: str
     top_k: int
+    heads: int = LEGACY_HEADS
+    """Head count the weights were trained under; never re-derived.
+
+    Defaulted rather than required so older pickled specs still load, and set to
+    the historical value for the same reason a checkpoint without a ``heads``
+    key resolves to it.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -747,7 +763,7 @@ def _spec_name(spec: GateAgentSpec) -> str:
 def _build_gate_agent(spec: GateAgentSpec, device: str, inference_batch: int):
     if isinstance(spec, BotAgentSpec):
         return BotAgent(spec.bot)
-    model = build_model("transformer", spec.d_model, spec.layers)
+    model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
     model.load_state_dict(spec.model_state)
     return SearchAgent(
         spec.name,
@@ -944,7 +960,27 @@ class PhaseDLoop:
                 self._append_training_log(row)
 
     def _new_model(self):
-        return build_model("transformer", self.config.d_model, self.config.layers)
+        return build_model(
+            "transformer",
+            self.config.d_model,
+            self.config.layers,
+            self.config.heads,
+        )
+
+    @staticmethod
+    def _built_heads(model) -> int:
+        """The head count a model was actually built with.
+
+        Read off the attention module rather than re-derived from config, so a
+        checkpoint can never record a head count the weights were not trained
+        under.  Note `model.heads` is the output-head bundle, not this.
+        """
+
+        source = getattr(model, "_orig_mod", model)
+        encoder = getattr(source, "encoder", None)
+        if encoder is not None and len(encoder.layers):
+            return int(encoder.layers[0].self_attn.num_heads)
+        return int(getattr(source, "attention_heads", LEGACY_HEADS))
 
     def _warm_records_for_iteration(self, iteration: int) -> list[GameRecord]:
         """Age imported records through the same iteration replay window."""
@@ -1060,12 +1096,14 @@ class PhaseDLoop:
                         "refusing to resume from random weights"
                     )
             torch.manual_seed(self.config.seed)
+            bootstrap_model = self._new_model()
             checkpoint = make_checkpoint(
-                self._new_model(),
+                bootstrap_model,
                 {
                     "model": "transformer",
                     "d_model": self.config.d_model,
                     "layers": self.config.layers,
+                    "heads": self._built_heads(bootstrap_model),
                     "iteration": -1,
                 },
             )
@@ -1087,7 +1125,29 @@ class PhaseDLoop:
             )
 
     def load_model(self, path: str | Path):
-        model = self._new_model()
+        """Rebuild a saved model under the architecture it was trained with.
+
+        The head count comes from the checkpoint, not the run config, and a
+        disagreement raises.  Attention parameter shapes do not encode the head
+        count, so `load_state_dict` accepts a mismatch and the model silently
+        computes something the weights were never trained for -- unlike a
+        d_model or layer-count mismatch, which fails loudly on shape.
+        """
+
+        stored = torch.load(path, map_location="cpu", weights_only=False).get(
+            "config", {}
+        )
+        heads = heads_from_config(stored)
+        expected = self._built_heads(self._new_model())
+        if heads != expected:
+            raise ValueError(
+                f"checkpoint {path} was trained with heads={heads} but this run "
+                f"builds heads={expected}; resume with the original --heads or "
+                "start a new run directory"
+            )
+        model = build_model(
+            "transformer", self.config.d_model, self.config.layers, heads
+        )
         load_checkpoint(path, model)
         return model
 
@@ -1520,6 +1580,7 @@ class PhaseDLoop:
                 "model": "transformer",
                 "d_model": self.config.d_model,
                 "layers": self.config.layers,
+                "heads": self._built_heads(model),
                 "iteration": iteration,
                 "history": history,
                 "baselines": target_baselines,
@@ -1539,6 +1600,7 @@ class PhaseDLoop:
             },
             d_model=self.config.d_model,
             layers=self.config.layers,
+            heads=self._built_heads(model),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -1613,7 +1675,7 @@ class PhaseDLoop:
         import seven_wonders_rust as swr
 
         def evaluator(spec: ModelAgentSpec) -> Evaluator:
-            model = build_model("transformer", spec.d_model, spec.layers)
+            model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
             model.load_state_dict(spec.model_state)
             return Evaluator(
                 model,
@@ -1762,7 +1824,10 @@ class PhaseDLoop:
         import seven_wonders_rust as swr
 
         model = build_model(
-            "transformer", candidate_spec.d_model, candidate_spec.layers
+            "transformer",
+            candidate_spec.d_model,
+            candidate_spec.layers,
+            candidate_spec.heads,
         )
         model.load_state_dict(candidate_spec.model_state)
         evaluator = Evaluator(
@@ -2174,6 +2239,12 @@ def main(argv=None) -> int:
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="attention heads (default: 64 dims per head, floor 4)",
+    )
+    parser.add_argument(
         "--train-steps",
         type=int,
         default=300,
@@ -2355,6 +2426,7 @@ def main(argv=None) -> int:
         top_k=args.top_k,
         d_model=args.d_model,
         layers=args.layers,
+        heads=args.heads,
         train_steps=args.train_steps,
         train_warmup_steps=args.train_warmup_steps,
         train_batch_size=args.train_batch_size,

@@ -296,9 +296,44 @@ class Heads(nn.Module):
         }
 
 
+#: Head count every checkpoint written before `heads` was configurable used.
+#: Readers MUST apply this to a checkpoint whose config has no ``heads`` key --
+#: not `default_heads`, which disagrees at d_model >= 384.  Attention parameter
+#: shapes (`in_proj_weight` [3D, D], `out_proj` [D, D]) do not depend on the head
+#: count, so a wrong value loads silently and changes what the network computes.
+LEGACY_HEADS = 4
+
+
+def default_heads(d_model: int) -> int:
+    """Head count for a new model of this width: 64 dimensions per head.
+
+    64 is the transformer-standard head width and what ZeusAI used (768/12).
+    The former hard-coded 4 gave 96- and 128-dim heads at d_model 384 and 512,
+    which would have handicapped every wide arm of the sizing experiment
+    against the narrow baseline it is being compared to.
+
+    The `max` floor keeps **d_model 128 at 4 heads**, exactly as every existing
+    checkpoint was built, so the sizing baseline stays bit-for-bit comparable to
+    run 03 rather than quietly becoming a different 2-head model.  It also keeps
+    the narrow test models (d_model 32/64) legal, where the bare ratio would ask
+    for 0 heads.  At d_model >= 256 the floor is inactive and the ratio governs.
+    """
+
+    return max(4, d_model // 64)
+
+
 class SWDNet(nn.Module):
-    def __init__(self, d_model: int = 128, layers: int = 4, heads: int = 4):
+    def __init__(
+        self, d_model: int = 128, layers: int = 4, heads: int | None = None
+    ):
         super().__init__()
+        heads = default_heads(d_model) if heads is None else int(heads)
+        if heads <= 0 or d_model % heads:
+            raise ValueError(
+                f"d_model={d_model} is not divisible by heads={heads}"
+            )
+        # NOT `self.heads` -- that name is the output-head bundle assigned below.
+        self.attention_heads = heads
         self.embedder = TokenEmbedder(d_model)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,

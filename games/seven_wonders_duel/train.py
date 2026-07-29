@@ -28,7 +28,7 @@ from .buffer import read_records
 from .dataset import Example, collate, examples_from_records
 from .encoder import ENCODER_SIGNATURE
 from .mlp import SWDMlp
-from .net import SWDNet, masked_policy_log_softmax
+from .net import LEGACY_HEADS, SWDNet, masked_policy_log_softmax
 
 AUX_WEIGHT_DEFAULT = 0.2
 
@@ -310,12 +310,26 @@ def load_checkpoint(path, model, *, migrate: bool = False) -> dict:
     return checkpoint
 
 
-def build_model(name: str, d_model: int, layers: int):
+def build_model(name: str, d_model: int, layers: int, heads: int | None = None):
+    """Build a model. ``heads=None`` derives the width-appropriate head count.
+
+    Rebuilding a *saved* model must pass the head count its checkpoint recorded
+    (`heads_from_config`), never the derived default: attention parameter shapes
+    are head-count independent, so a mismatch loads cleanly and silently
+    computes something else.
+    """
+
     if name == "transformer":
-        return SWDNet(d_model=d_model, layers=layers)
+        return SWDNet(d_model=d_model, layers=layers, heads=heads)
     if name == "mlp":
         return SWDMlp(d_model=d_model)
     raise ValueError(f"unknown model: {name}")
+
+
+def heads_from_config(config: dict) -> int:
+    """Head count for rebuilding a checkpoint, honouring pre-`heads` files."""
+
+    return int(config.get("heads", LEGACY_HEADS))
 
 
 def train_loop(

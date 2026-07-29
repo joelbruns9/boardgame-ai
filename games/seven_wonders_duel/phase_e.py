@@ -504,7 +504,7 @@ def load_evaluator(checkpoint_path: str, device: str):
     import torch
 
     from .inference import Evaluator
-    from .train import build_model, load_checkpoint
+    from .train import build_model, heads_from_config, load_checkpoint
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
@@ -512,6 +512,7 @@ def load_evaluator(checkpoint_path: str, device: str):
         config.get("model", "transformer"),
         config.get("d_model", 128),
         config.get("layers", 4),
+        heads_from_config(config),
     )
     load_checkpoint(checkpoint_path, model)
     return Evaluator(model, device=device)
