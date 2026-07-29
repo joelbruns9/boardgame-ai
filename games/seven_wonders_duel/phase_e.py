@@ -500,7 +500,11 @@ def reconstruct(position: dict) -> GameState:
     return state
 
 
-def load_evaluator(checkpoint_path: str, device: str):
+def load_evaluator(
+    checkpoint_path: str,
+    device: str,
+    precision: str = "fp32",
+):
     import torch
 
     from .inference import Evaluator
@@ -515,7 +519,7 @@ def load_evaluator(checkpoint_path: str, device: str):
         heads_from_config(config),
     )
     load_checkpoint(checkpoint_path, model)
-    return Evaluator(model, device=device)
+    return Evaluator(model, device=device, precision=precision)
 
 
 # --------------------------------------------------------------------------

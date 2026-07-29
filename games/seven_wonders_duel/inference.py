@@ -13,6 +13,7 @@ from the actor's seat.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -44,16 +45,32 @@ class Evaluator:
         device: str = "cpu",
         max_batch: int = 512,
         fuse_embedder: bool = True,
+        precision: str = "fp32",
     ):
+        if precision not in {"fp32", "bf16"}:
+            raise ValueError("precision must be fp32 or bf16")
         self.model = model.to(device).eval()
         self.device = device
         self.max_batch = max_batch
+        self.precision = precision
         # Fuse the token embedder's per-type loop where it is measured to pay --
         # CUDA only; on CPU there is no launch overhead to recover and the extra
         # arithmetic costs ~10% at width (`net.fusion_is_profitable`). Worth 1.5x
         # end to end on the production path (THROUGHPUT_ACTION_PLAN.md Phase 3b).
         # Must come after `.to()`, which invalidates the cache by design.
         self.fused_embedder = bool(fuse_embedder) and fuse_for_inference(self.model)
+
+    def autocast(self):
+        """Context for every forward through this evaluator's model.
+
+        The production speedup is CUDA bf16. CPU stays in fp32: autocast is not
+        faster for this model there, and keeping it out makes ``precision`` a
+        performance choice rather than an avoidable CPU numerical change.
+        """
+
+        if self.precision == "bf16" and str(self.device).startswith("cuda"):
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     @torch.no_grad()
     def evaluate(
@@ -70,16 +87,19 @@ class Evaluator:
             batch = collate_inputs(
                 [vectorize(e) for e in chunk], list(legals), self.device
             )
-            outputs = self.model(batch)
+            with self.autocast():
+                outputs = self.model(batch)
             log_policy = masked_policy_log_softmax(
-                outputs["policy"], batch["legal_mask"]
+                outputs["policy"].float(), batch["legal_mask"]
             )
             policy = log_policy.exp().cpu().numpy()
-            wdl = torch.softmax(outputs["value"], dim=-1).cpu().numpy()
-            joint7 = torch.softmax(outputs["joint7"], dim=-1).cpu().numpy()
-            margin = outputs["margin"].cpu().numpy()
-            military = outputs["military"].cpu().numpy()
-            science = outputs["science"].cpu().numpy()
+            wdl = torch.softmax(outputs["value"].float(), dim=-1).cpu().numpy()
+            joint7 = (
+                torch.softmax(outputs["joint7"].float(), dim=-1).cpu().numpy()
+            )
+            margin = outputs["margin"].float().cpu().numpy()
+            military = outputs["military"].float().cpu().numpy()
+            science = outputs["science"].float().cpu().numpy()
             for row, legal in enumerate(legals):
                 legal_indices = np.asarray(list(legal), dtype=np.int64)
                 results.append(

@@ -365,7 +365,8 @@ class _RustFlatBatchAdapter:
         forward_start = time.perf_counter()
         forward_event = self._begin_event()
         with torch.no_grad():
-            outputs = self.evaluator.model(batch)
+            with self.evaluator.autocast():
+                outputs = self.evaluator.model(batch)
         self._end_event("forward", forward_event)
         self._sync()
         forward_seconds = time.perf_counter() - forward_start
@@ -376,7 +377,9 @@ class _RustFlatBatchAdapter:
         legal_rows = torch.repeat_interleave(
             torch.arange(rows, device=device), legal_lengths.to(device)
         )
-        compact_logits = outputs["policy"][legal_rows, legal_actions.to(device)]
+        compact_logits = outputs["policy"].float()[
+            legal_rows, legal_actions.to(device)
+        ]
         if self.vectorized_gather:
             # Scatter the compacted logits into a padded [rows, max_legal] matrix
             # and take one row-wise softmax, instead of one softmax launch per
@@ -416,7 +419,7 @@ class _RustFlatBatchAdapter:
                 )
                 offset += count
             compact_policy_tensor = torch.cat(compact_policy)
-        wdl = torch.softmax(outputs["value"], dim=-1)
+        wdl = torch.softmax(outputs["value"].float(), dim=-1)
         value_actor = wdl[:, 0] - wdl[:, 2]
         self._end_event("gather", gather_event)
         self._sync()
@@ -523,6 +526,9 @@ def rust_seat_routed_flat_batch_adapter(
     devices = {str(evaluator.device) for evaluator in evaluators}
     if len(devices) != 1:
         raise ValueError("seat-routed evaluators must use the same device")
+    precisions = {getattr(evaluator, "precision", "fp32") for evaluator in evaluators}
+    if len(precisions) != 1:
+        raise ValueError("seat-routed evaluators must use the same precision")
 
     class _SeatRoutedModel(torch.nn.Module):
         def __init__(self, models):
@@ -556,7 +562,8 @@ def rust_seat_routed_flat_batch_adapter(
             return combined
 
     class _EvaluatorProxy:
-        pass
+        def autocast(self):
+            return evaluators[0].autocast()
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device

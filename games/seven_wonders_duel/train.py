@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -76,6 +77,30 @@ def compute_losses(
     }
 
 
+def _validate_precision(precision: str) -> None:
+    if precision not in {"fp32", "bf16"}:
+        raise ValueError("precision must be fp32 or bf16")
+
+
+def _evaluation_autocast(device: str, precision: str):
+    """Match bf16 training during validation without changing fp32 defaults."""
+
+    _validate_precision(precision)
+    if precision == "bf16" and str(device).startswith("cuda"):
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def _training_autocast(device: str, precision: str):
+    """Preserve the historical CUDA-fp16 baseline; opt into bf16 explicitly."""
+
+    _validate_precision(precision)
+    if not str(device).startswith("cuda"):
+        return contextlib.nullcontext()
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.autocast("cuda", dtype=dtype)
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -83,6 +108,7 @@ def evaluate(
     device: str,
     batch_size: int = 512,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
+    precision: str = "fp32",
 ):
     model.eval()
     sums: dict[str, float] = {}
@@ -93,8 +119,9 @@ def evaluate(
     count = 0
     for start in range(0, len(examples), batch_size):
         batch = collate(examples[start : start + batch_size], device)
-        outputs = model(batch)
-        _, parts = compute_losses(outputs, batch, aux_weight)
+        with _evaluation_autocast(device, precision):
+            outputs = model(batch)
+            _, parts = compute_losses(outputs, batch, aux_weight)
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
             sums[key] = sums.get(key, 0.0) + value * rows
@@ -344,6 +371,7 @@ def train_loop(
     weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     patience: int = 8,
+    precision: str = "fp32",
     log=print,
 ):
     """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
@@ -361,7 +389,10 @@ def train_loop(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    _validate_precision(precision)
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and precision == "fp32"
+    )
     rng = random.Random(0)
     best = {"val_total": float("inf"), "epoch": -1, "state": None}
     history = []
@@ -373,7 +404,7 @@ def train_loop(
         for start in range(0, len(train_examples), batch_size):
             batch = collate(train_examples[start : start + batch_size], device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", enabled=use_amp):
+            with _training_autocast(device, precision):
                 outputs = model(batch)
                 total, parts = compute_losses(outputs, batch, aux_weight)
             scaler.scale(total).backward()
@@ -386,7 +417,14 @@ def train_loop(
         train_parts = {k: v / batches for k, v in running.items()}
         row = {"epoch": epoch, "train": train_parts, "secs": time.time() - start_time}
         if val_examples:
-            val_metrics = evaluate(model, val_examples, device, batch_size, aux_weight)
+            val_metrics = evaluate(
+                model,
+                val_examples,
+                device,
+                batch_size,
+                aux_weight,
+                precision=precision,
+            )
             row["val"] = val_metrics
             log(
                 f"epoch {epoch}: train total {train_parts['total']:.4f} "
@@ -438,6 +476,7 @@ def train_steps(
     optimizer_state: dict | None = None,
     restore_best_val: bool = False,
     seed: int = 0,
+    precision: str = "fp32",
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -477,7 +516,10 @@ def train_steps(
         for group in optimizer.param_groups:
             group["lr"] = lr
     use_amp = device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    _validate_precision(precision)
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and precision == "fp32"
+    )
     rng = random.Random(seed)
     population = range(len(train_examples))
     best = {"val_total": float("inf"), "step": -1, "state": None}
@@ -499,7 +541,7 @@ def train_steps(
             [train_examples[i] for i in rng.choices(population, k=batch_size)], device
         )
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", enabled=use_amp):
+        with _training_autocast(device, precision):
             outputs = model(batch)
             total, parts = compute_losses(outputs, batch, aux_weight)
         scaler.scale(total).backward()
@@ -522,7 +564,14 @@ def train_steps(
         running = {}
         window_steps = 0
         if val_examples:
-            val_metrics = evaluate(model, val_examples, device, batch_size, aux_weight)
+            val_metrics = evaluate(
+                model,
+                val_examples,
+                device,
+                batch_size,
+                aux_weight,
+                precision=precision,
+            )
             row["val"] = val_metrics
             log(
                 f"step {done}: train total {train_parts['total']:.4f} "
@@ -567,6 +616,12 @@ def main(argv=None) -> int:
     parser.add_argument("--model", choices=("transformer", "mlp"), default="transformer")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="attention heads (default: 64 dims per head, floor 4)",
+    )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -582,6 +637,12 @@ def main(argv=None) -> int:
         "backend is unavailable on this platform)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="model-call precision; bf16 is opt-in",
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
@@ -598,7 +659,7 @@ def main(argv=None) -> int:
         train_examples, val_examples = game_honest_split(examples, args.val_frac)
         print(f"split: {len(train_examples)} train / {len(val_examples)} val states")
 
-    model = build_model(args.model, args.d_model, args.layers)
+    model = build_model(args.model, args.d_model, args.layers, args.heads)
     params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {params:,} params on {args.device}")
     if args.compile:
@@ -625,6 +686,7 @@ def main(argv=None) -> int:
         weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
         patience=args.patience,
+        precision=args.precision,
     )
     final = evaluate(
         model,
@@ -632,16 +694,24 @@ def main(argv=None) -> int:
         args.device,
         args.batch_size,
         args.aux_weight,
+        precision=args.precision,
     )
     print(f"final: {json.dumps({k: round(v, 4) for k, v in final.items()})}")
 
     if args.out:
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
+        source_model = getattr(model, "_orig_mod", model)
         config = {
             "model": args.model,
             "d_model": args.d_model,
             "layers": args.layers,
+            "heads": (
+                int(source_model.attention_heads)
+                if hasattr(source_model, "attention_heads")
+                else None
+            ),
+            "precision": args.precision,
             "weight_decay": args.weight_decay,
             "aux_weight": args.aux_weight,
         }

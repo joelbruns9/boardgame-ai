@@ -157,6 +157,9 @@ class PhaseDConfig:
     resolves to is written into every checkpoint and is what rebuilds use.
     """
 
+    precision: str = "fp32"
+    """Model-call precision. ``bf16`` is opt-in; ``fp32`` preserves defaults."""
+
     train_steps: int = 300
     train_warmup_steps: int = 100
     train_batch_size: int = 512
@@ -303,6 +306,8 @@ class PhaseDConfig:
         }
 
     def validate(self) -> None:
+        if self.precision not in {"fp32", "bf16"}:
+            raise ValueError("precision must be fp32 or bf16")
         if self.workers <= 0 or self.games_per_iteration <= 0:
             raise ValueError("workers and games_per_iteration must be positive")
         if self.process_workers < 0:
@@ -714,7 +719,12 @@ def _process_generation_init(
     # CPU inference per process: at generation batch sizes the tiny network is
     # a few ms on a core, while fanning every process into one GPU serializes
     # on the CUDA context. The GPU stays free for training and gates.
-    _PROCESS_STATE["evaluator"] = Evaluator(model, "cpu", config.inference_batch)
+    _PROCESS_STATE["evaluator"] = Evaluator(
+        model,
+        "cpu",
+        config.inference_batch,
+        precision=config.precision,
+    )
     _PROCESS_STATE["config"] = config
     _PROCESS_STATE["iteration"] = iteration
 
@@ -760,14 +770,19 @@ def _spec_name(spec: GateAgentSpec) -> str:
     return spec.bot.name if isinstance(spec, BotAgentSpec) else spec.name
 
 
-def _build_gate_agent(spec: GateAgentSpec, device: str, inference_batch: int):
+def _build_gate_agent(
+    spec: GateAgentSpec,
+    device: str,
+    inference_batch: int,
+    precision: str = "fp32",
+):
     if isinstance(spec, BotAgentSpec):
         return BotAgent(spec.bot)
     model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
     model.load_state_dict(spec.model_state)
     return SearchAgent(
         spec.name,
-        Evaluator(model, device, inference_batch),
+        Evaluator(model, device, inference_batch, precision=precision),
         sims=spec.sims,
         mode=spec.mode,
         top_k=spec.top_k,
@@ -778,14 +793,15 @@ def _process_gate_init(
     candidate_spec: GateAgentSpec,
     opponent_spec: GateAgentSpec,
     inference_batch: int,
+    precision: str,
 ) -> None:
     torch.set_num_threads(1)
     _PROCESS_STATE["gate_adapter"] = SevenWondersDuelLoopAdapter()
     _PROCESS_STATE["gate_candidate"] = _build_gate_agent(
-        candidate_spec, "cpu", inference_batch
+        candidate_spec, "cpu", inference_batch, precision
     )
     _PROCESS_STATE["gate_opponent"] = _build_gate_agent(
-        opponent_spec, "cpu", inference_batch
+        opponent_spec, "cpu", inference_batch, precision
     )
 
 
@@ -1080,6 +1096,8 @@ class PhaseDLoop:
                     "model": "transformer",
                     "d_model": self.config.d_model,
                     "layers": self.config.layers,
+                    "heads": self._built_heads(model),
+                    "precision": self.config.precision,
                     "parameters": sum(
                         parameter.numel() for parameter in model.parameters()
                     ),
@@ -1104,11 +1122,21 @@ class PhaseDLoop:
                     "d_model": self.config.d_model,
                     "layers": self.config.layers,
                     "heads": self._built_heads(bootstrap_model),
+                    "precision": self.config.precision,
                     "iteration": -1,
                 },
             )
             torch.save(checkpoint, self.current_best)
         manifest_payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
+        stored_precision = manifest_payload.get("config", {}).get(
+            "precision", "fp32"
+        )
+        if stored_precision != self.config.precision:
+            raise ValueError(
+                "cannot resume with changed precision: run started with "
+                f"{stored_precision!r} but resumed with "
+                f"{self.config.precision!r}"
+            )
         self._sync_training_log(manifest_payload)
         if self.config.warm_buffer:
             self._load_warm_buffer(Path(self.config.warm_buffer))
@@ -1192,7 +1220,12 @@ class PhaseDLoop:
             }
             _write_records(destination, records)
             return records
-        base = Evaluator(model, self.config.device, self.config.inference_batch)
+        base = Evaluator(
+            model,
+            self.config.device,
+            self.config.inference_batch,
+            precision=self.config.precision,
+        )
         started = time.monotonic()
         with CoalescingEvaluator(
             base,
@@ -1259,6 +1292,7 @@ class PhaseDLoop:
             model,
             self.config.device,
             self.config.rust_global_batch_cap,
+            precision=self.config.precision,
         )
         adapter = rust_flat_batch_adapter(evaluator)
         started = time.monotonic()
@@ -1524,6 +1558,7 @@ class PhaseDLoop:
                 self.config.device,
                 self.config.train_batch_size,
                 self.config.aux_weight,
+                precision=self.config.precision,
             )
         history, optimizer_state = train_steps(
             model,
@@ -1540,6 +1575,7 @@ class PhaseDLoop:
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
             seed=self.config.seed + iteration,
+            precision=self.config.precision,
         )
         self._save_optimizer_state(optimizer_state, iteration)
         samples = self.config.train_steps * self.config.train_batch_size
@@ -1581,6 +1617,7 @@ class PhaseDLoop:
                 "d_model": self.config.d_model,
                 "layers": self.config.layers,
                 "heads": self._built_heads(model),
+                "precision": self.config.precision,
                 "iteration": iteration,
                 "history": history,
                 "baselines": target_baselines,
@@ -1650,7 +1687,12 @@ class PhaseDLoop:
                 _process_gate_game,
                 workers=min(workers, count),
                 initializer=_process_gate_init,
-                initargs=(candidate_spec, opponent_spec, self.config.inference_batch),
+                initargs=(
+                    candidate_spec,
+                    opponent_spec,
+                    self.config.inference_batch,
+                    self.config.precision,
+                ),
             )
             for offset, outcome in enumerate(wave):
                 game_index = index + offset
@@ -1681,6 +1723,7 @@ class PhaseDLoop:
                 model,
                 self.config.device,
                 self.config.rust_global_batch_cap,
+                precision=self.config.precision,
             )
 
         candidate_eval = evaluator(candidate_spec)
@@ -1831,7 +1874,10 @@ class PhaseDLoop:
         )
         model.load_state_dict(candidate_spec.model_state)
         evaluator = Evaluator(
-            model, self.config.device, self.config.rust_global_batch_cap
+            model,
+            self.config.device,
+            self.config.rust_global_batch_cap,
+            precision=self.config.precision,
         )
         adapter = rust_flat_batch_adapter(evaluator)
         outcomes: list[MatchOutcome] = []
@@ -1935,10 +1981,16 @@ class PhaseDLoop:
             )
         else:
             candidate_agent = _build_gate_agent(
-                candidate_spec, self.config.device, self.config.inference_batch
+                candidate_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
             )
             opponent_agent = _build_gate_agent(
-                opponent_spec, self.config.device, self.config.inference_batch
+                opponent_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
             )
             outcomes = []
             for index in range(self.config.gate_max_games):
@@ -2245,6 +2297,12 @@ def main(argv=None) -> int:
         help="attention heads (default: 64 dims per head, floor 4)",
     )
     parser.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="model-call precision; bf16 is opt-in",
+    )
+    parser.add_argument(
         "--train-steps",
         type=int,
         default=300,
@@ -2427,6 +2485,7 @@ def main(argv=None) -> int:
         d_model=args.d_model,
         layers=args.layers,
         heads=args.heads,
+        precision=args.precision,
         train_steps=args.train_steps,
         train_warmup_steps=args.train_warmup_steps,
         train_batch_size=args.train_batch_size,

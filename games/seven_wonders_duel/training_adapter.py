@@ -53,12 +53,15 @@ class SevenWondersDuelLifecycleAdapter:
         loop = self.loop
         path = loop.checkpoint_dir / "_bootstrap_init.pt"
         torch.manual_seed(seed)
+        model = loop._new_model()
         checkpoint = make_checkpoint(
-            loop._new_model(),
+            model,
             {
                 "model": "transformer",
                 "d_model": loop.config.d_model,
                 "layers": loop.config.layers,
+                "heads": loop._built_heads(model),
+                "precision": loop.config.precision,
                 "iteration": -1,
             },
         )

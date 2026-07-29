@@ -24,14 +24,27 @@ import torch
 from . import phase_d as pd
 
 
-def make_arm_patches(fused: bool, gather: bool):
+def make_arm_patches(fused: bool, gather: bool, precision: str = "fp32"):
     """Return (enter, exit) that force the two toggles for one arm."""
 
     real_evaluator = pd.Evaluator
     real_adapter = pd.rust_flat_batch_adapter
+    forced_precision = precision
 
-    def evaluator(model, device="cpu", max_batch=512, fuse_embedder=True):
-        return real_evaluator(model, device, max_batch, fuse_embedder=fused)
+    def evaluator(
+        model,
+        device="cpu",
+        max_batch=512,
+        fuse_embedder=True,
+        precision="fp32",
+    ):
+        return real_evaluator(
+            model,
+            device,
+            max_batch,
+            fuse_embedder=fused,
+            precision=forced_precision,
+        )
 
     def adapter(evaluator_, **kwargs):
         kwargs["vectorized_gather"] = gather
@@ -48,8 +61,19 @@ def make_arm_patches(fused: bool, gather: bool):
     return enter, leave
 
 
-def run_arm(loop, model, iteration, jobs, destination, fused, gather):
-    enter, leave = make_arm_patches(fused, gather)
+def run_arm(
+    loop,
+    model,
+    iteration,
+    jobs,
+    destination,
+    fused,
+    gather,
+    precision="fp32",
+):
+    enter, leave = make_arm_patches(fused, gather, precision)
+    previous_precision = loop.config.precision
+    loop.config.precision = precision
     enter()
     try:
         if torch.cuda.is_available():
@@ -61,6 +85,7 @@ def run_arm(loop, model, iteration, jobs, destination, fused, gather):
         wall = time.monotonic() - started
     finally:
         leave()
+        loop.config.precision = previous_precision
     stats = dict(loop.last_generation_stats)
     stats["wall_seconds"] = wall
     stats["records"] = len(records)
@@ -94,7 +119,7 @@ def main() -> None:
     parser.add_argument(
         "--arms",
         default="before,after",
-        help="comma list from before,fused,gather,after",
+        help="comma list from before,fused,gather,after,fp32,bf16",
     )
     args = parser.parse_args()
 
@@ -119,10 +144,12 @@ def main() -> None:
         ]
 
     arm_settings = {
-        "before": (False, False),
-        "fused": (True, False),
-        "gather": (False, True),
-        "after": (True, True),
+        "before": (False, False, "fp32"),
+        "fused": (True, False, "fp32"),
+        "gather": (False, True, "fp32"),
+        "after": (True, True, "fp32"),
+        "fp32": (True, True, "fp32"),
+        "bf16": (True, True, "bf16"),
     }
     arms = [name.strip() for name in args.arms.split(",") if name.strip()]
     for name in arms:
@@ -149,7 +176,7 @@ def main() -> None:
     results: list[dict] = []
     fingerprints: dict[str, set] = {}
     for position, name in enumerate(order):
-        fused, gather = arm_settings[name]
+        fused, gather, precision = arm_settings[name]
         stats, fingerprint, _ = run_arm(
             loop,
             model,
@@ -163,6 +190,7 @@ def main() -> None:
         stats["position"] = position
         stats["fused_embedder"] = fused
         stats["vectorized_gather"] = gather
+        stats["precision"] = precision
         results.append(stats)
         fingerprints.setdefault(name, set()).add(fingerprint)
         print(
@@ -189,13 +217,28 @@ def main() -> None:
     for name in arms:
         summary[name]["speedup_vs_" + arms[0]] = base / summary[name]["median_seconds"]
 
-    # Every run of every arm must have produced the same games: same seeds, same
-    # jobs. Taking one fingerprint per arm would let an arm that is internally
-    # inconsistent still report agreement, so this unions across *runs*, not
-    # across arms.
+    # Every repeat within one arm must be deterministic. Different precision
+    # arms may legitimately take different discrete trajectories, so quantify
+    # that divergence instead of treating it as a timing failure.
     identical = {name: len(values) == 1 for name, values in fingerprints.items()}
     all_fingerprints = set().union(*fingerprints.values())
     consistent = len(all_fingerprints) == 1
+    representatives = {
+        name: next(iter(values)) for name, values in fingerprints.items()
+    }
+    base_fingerprint = representatives[arms[0]]
+    divergence = {}
+    for name, candidate in representatives.items():
+        changed = sum(
+            left != right
+            for left, right in zip(base_fingerprint, candidate)
+        )
+        divergence[name] = {
+            "changed_games": changed,
+            "games": len(base_fingerprint),
+            "rate": changed / len(base_fingerprint) if base_fingerprint else 0.0,
+        }
+    mixed_precision = len({arm_settings[name][2] for name in arms}) > 1
     payload = {
         "config": {
             "checkpoint": args.checkpoint,
@@ -218,6 +261,7 @@ def main() -> None:
         "runs": results,
         "summary": summary,
         "self_consistent_within_arm": identical,
+        "trajectory_divergence_vs_first_arm": divergence,
         # What the fingerprint covers: the *discrete* trajectory -- winner,
         # chained state digests, action sequence, per-move sim counts. It does
         # not compare policy targets or root values, which are continuous and
@@ -236,7 +280,12 @@ def main() -> None:
         "discrete trajectories identical across all runs: "
         f"{consistent} (within arm: {identical})"
     )
-    if not consistent:
+    if not all(identical.values()):
+        raise SystemExit(
+            "determinism invariant failed within an arm: "
+            f"{identical}"
+        )
+    if not consistent and not mixed_precision:
         raise SystemExit(
             f"equivalence invariant failed: {len(all_fingerprints)} distinct "
             "trajectory sets across runs -- the arms did not do the same work, "
