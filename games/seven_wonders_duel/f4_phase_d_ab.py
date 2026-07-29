@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -22,6 +23,29 @@ from pathlib import Path
 import torch
 
 from . import phase_d as pd
+
+
+_T_CRITICAL_95 = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+}
+
+
+def _mean_ci95(values: list[float]) -> tuple[float, float, float]:
+    mean = statistics.mean(values)
+    if len(values) < 2:
+        return mean, mean, mean
+    critical = _T_CRITICAL_95.get(len(values) - 1, 1.96)
+    margin = critical * statistics.stdev(values) / math.sqrt(len(values))
+    return mean, mean - margin, mean + margin
 
 
 def make_arm_patches(fused: bool, gather: bool, precision: str = "fp32"):
@@ -74,6 +98,12 @@ def run_arm(
     enter, leave = make_arm_patches(fused, gather, precision)
     previous_precision = loop.config.precision
     loop.config.precision = precision
+    observed_dtypes: set[str] = set()
+    raw_model = getattr(model, "_orig_mod", model)
+    value_head = raw_model.heads.value
+    dtype_hook = value_head.register_forward_hook(
+        lambda _module, _inputs, output: observed_dtypes.add(str(output.dtype))
+    )
     enter()
     try:
         if torch.cuda.is_available():
@@ -85,12 +115,25 @@ def run_arm(
         wall = time.monotonic() - started
     finally:
         leave()
+        dtype_hook.remove()
         loop.config.precision = previous_precision
+    expected_dtype = (
+        "torch.bfloat16"
+        if precision == "bf16" and str(loop.config.device).startswith("cuda")
+        else "torch.float32"
+    )
+    if observed_dtypes != {expected_dtype}:
+        raise RuntimeError(
+            f"{precision} arm expected {expected_dtype}, observed "
+            f"{sorted(observed_dtypes)}"
+        )
     stats = dict(loop.last_generation_stats)
     stats["wall_seconds"] = wall
     stats["records"] = len(records)
     stats["moves"] = sum(len(record.moves) for record in records)
     stats["moves_per_second"] = stats["moves"] / wall if wall else 0.0
+    stats["expected_forward_dtype"] = expected_dtype
+    stats["observed_forward_dtypes"] = sorted(observed_dtypes)
     # Fingerprint the trajectories so a speed change that also changed the games
     # cannot pass unnoticed.
     fingerprint = []
@@ -107,6 +150,50 @@ def run_arm(
     return stats, tuple(fingerprint), records
 
 
+def run_measured_arms(
+    loop,
+    model,
+    iteration: int,
+    jobs,
+    output: Path,
+    order: list[str],
+    arm_settings: dict[str, tuple[bool, bool, str]],
+) -> tuple[list[dict], dict[str, set]]:
+    """Run the declared arms, forwarding every setting into the timed call."""
+
+    results: list[dict] = []
+    fingerprints: dict[str, set] = {}
+    for position, name in enumerate(order):
+        fused, gather, precision = arm_settings[name]
+        stats, fingerprint, _ = run_arm(
+            loop,
+            model,
+            iteration,
+            jobs,
+            output / f"{position:02d}_{name}.jsonl",
+            fused,
+            gather,
+            precision,
+        )
+        stats["arm"] = name
+        stats["position"] = position
+        stats["fused_embedder"] = fused
+        stats["vectorized_gather"] = gather
+        stats["precision"] = precision
+        results.append(stats)
+        fingerprints.setdefault(name, set()).add(fingerprint)
+        print(
+            f"[{position}] {name:7s} {stats['wall_seconds']:7.2f}s  "
+            f"{stats['games_per_second']:.3f} games/s  "
+            f"{stats['moves_per_second']:.1f} moves/s  "
+            f"dtype={','.join(stats['observed_forward_dtypes'])} "
+            f"({stats['rust_games']} neural + {stats['rust_bot_games']} bot, "
+            f"{stats['rust_chunks']} groups)",
+            flush=True,
+        )
+    return results, fingerprints
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -116,6 +203,8 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--warmup-games", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--rust-slots", type=int, default=16)
+    parser.add_argument("--global-batch-cap", type=int, default=256)
     parser.add_argument(
         "--arms",
         default="before,after",
@@ -132,6 +221,8 @@ def main() -> None:
         games_per_iteration=args.games,
         seed_games=0,
         iterations=1,
+        rust_slots=args.rust_slots,
+        rust_global_batch_cap=args.global_batch_cap,
     )
     loop = pd.PhaseDLoop(config)
     loop.buffer_dir.mkdir(parents=True, exist_ok=True)
@@ -157,15 +248,16 @@ def main() -> None:
             raise SystemExit(f"unknown arm: {name}")
 
     if args.warmup_games:
-        print(f"warmup: {args.warmup_games} games", flush=True)
-        run_arm(
-            loop,
-            model,
-            args.iteration,
-            jobs_for(args.warmup_games, 999),
-            output / "warmup.jsonl",
-            *arm_settings[arms[-1]],
-        )
+        for name in arms:
+            print(f"warmup {name}: {args.warmup_games} games", flush=True)
+            run_arm(
+                loop,
+                model,
+                args.iteration,
+                jobs_for(args.warmup_games, 999),
+                output / f"warmup_{name}.jsonl",
+                *arm_settings[name],
+            )
 
     jobs = jobs_for(args.games, args.iteration)
     # A B B A ... so a monotone drift cancels within each arm.
@@ -173,34 +265,15 @@ def main() -> None:
     for repetition in range(args.repetitions):
         order.extend(arms if repetition % 2 == 0 else list(reversed(arms)))
 
-    results: list[dict] = []
-    fingerprints: dict[str, set] = {}
-    for position, name in enumerate(order):
-        fused, gather, precision = arm_settings[name]
-        stats, fingerprint, _ = run_arm(
-            loop,
-            model,
-            args.iteration,
-            jobs,
-            output / f"{position:02d}_{name}.jsonl",
-            fused,
-            gather,
-        )
-        stats["arm"] = name
-        stats["position"] = position
-        stats["fused_embedder"] = fused
-        stats["vectorized_gather"] = gather
-        stats["precision"] = precision
-        results.append(stats)
-        fingerprints.setdefault(name, set()).add(fingerprint)
-        print(
-            f"[{position}] {name:7s} {stats['wall_seconds']:7.2f}s  "
-            f"{stats['games_per_second']:.3f} games/s  "
-            f"{stats['moves_per_second']:.1f} moves/s  "
-            f"({stats['rust_games']} neural + {stats['rust_bot_games']} bot, "
-            f"{stats['rust_chunks']} groups)",
-            flush=True,
-        )
+    results, fingerprints = run_measured_arms(
+        loop,
+        model,
+        args.iteration,
+        jobs,
+        output,
+        order,
+        arm_settings,
+    )
 
     summary = {}
     for name in arms:
@@ -216,6 +289,23 @@ def main() -> None:
     base = summary[arms[0]]["median_seconds"]
     for name in arms:
         summary[name]["speedup_vs_" + arms[0]] = base / summary[name]["median_seconds"]
+    block_size = len(arms)
+    blocks = [
+        results[start : start + block_size]
+        for start in range(0, len(results), block_size)
+    ]
+    for name in arms:
+        paired = []
+        for block in blocks:
+            by_name = {row["arm"]: row for row in block}
+            paired.append(
+                by_name[arms[0]]["wall_seconds"]
+                / by_name[name]["wall_seconds"]
+            )
+        mean, lower, upper = _mean_ci95(paired)
+        summary[name]["paired_speedups_vs_" + arms[0]] = paired
+        summary[name]["mean_paired_speedup_vs_" + arms[0]] = mean
+        summary[name]["paired_speedup_ci95_vs_" + arms[0]] = [lower, upper]
 
     # Every repeat within one arm must be deterministic. Different precision
     # arms may legitimately take different discrete trajectories, so quantify
@@ -247,6 +337,7 @@ def main() -> None:
             "repetitions": args.repetitions,
             "arms": arms,
             "rust_slots": config.rust_slots,
+            "rust_global_batch_cap": config.rust_global_batch_cap,
             "full_sims": [config.full_sims_min, config.full_sims_max],
             "cheap_sims": [config.cheap_sims_min, config.cheap_sims_max],
             "full_search_fraction": config.full_search_fraction,

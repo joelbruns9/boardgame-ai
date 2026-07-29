@@ -15,12 +15,14 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import random
 import statistics
 import subprocess
 import sys
 import time
 from typing import Any
 
+import numpy as np
 import torch
 
 from games.kingdomino.promotion import wilson_lower_bound
@@ -314,6 +316,127 @@ def _tensor_batch(storage: dict, indices, device: str) -> dict:
     return batch
 
 
+def audit_tensor_cache(args) -> None:
+    """Verify the packed cache against production collation on real examples."""
+
+    output = Path(args.output)
+    cache_root = Path(args.cache_dir or args.output)
+    source = torch.load(
+        cache_root / "examples.pt", map_location="cpu", weights_only=False
+    )
+    packed = torch.load(
+        cache_root / "tensor_examples.pt",
+        map_location="cpu",
+        mmap=True,
+        weights_only=False,
+    )
+    examples = source["examples"]
+    train, val = stable_game_split(
+        examples, args.val_fraction, args.split_salt
+    )
+    train_indices = packed["train_indices"]
+    val_indices = packed["val_indices"]
+    expected_train = torch.tensor(
+        [
+            index
+            for index, example in enumerate(examples)
+            if not stable_is_validation(
+                example.iteration,
+                example.game_key,
+                args.val_fraction,
+                args.split_salt,
+            )
+        ],
+        dtype=torch.long,
+    )
+    expected_val = torch.tensor(
+        [
+            index
+            for index, example in enumerate(examples)
+            if stable_is_validation(
+                example.iteration,
+                example.game_key,
+                args.val_fraction,
+                args.split_salt,
+            )
+        ],
+        dtype=torch.long,
+    )
+    if not torch.equal(train_indices, expected_train):
+        raise AssertionError("packed train indices differ from stable_game_split")
+    if not torch.equal(val_indices, expected_val):
+        raise AssertionError(
+            "packed validation indices differ from stable_game_split"
+        )
+    if len(train) != len(train_indices) or len(val) != len(val_indices):
+        raise AssertionError("packed split lengths differ from object split")
+
+    rng = random.Random(args.audit_seed)
+    population = range(len(train))
+    digest = hashlib.sha256()
+    checked_rows = 0
+    checked_batches = []
+    for batch_index in range(args.audit_batches):
+        local_indices = rng.choices(population, k=args.batch_size)
+        global_indices = train_indices.index_select(
+            0, torch.tensor(local_indices, dtype=torch.long)
+        )
+        expected = collate([train[index] for index in local_indices])
+        actual = _tensor_batch(packed["storage"], global_indices, "cpu")
+        if actual.keys() != expected.keys():
+            raise AssertionError("packed and collated batch keys differ")
+        for key in expected:
+            if actual[key].dtype != expected[key].dtype:
+                raise AssertionError(
+                    f"batch {batch_index} {key} dtype differs: "
+                    f"{actual[key].dtype} != {expected[key].dtype}"
+                )
+            if not torch.equal(actual[key], expected[key]):
+                raise AssertionError(
+                    f"batch {batch_index} {key} values differ"
+                )
+        local_array = np.asarray(local_indices, dtype=np.int64)
+        global_array = global_indices.numpy()
+        digest.update(local_array.tobytes())
+        digest.update(global_array.tobytes())
+        checked_rows += len(local_indices)
+        checked_batches.append(
+            {
+                "batch": batch_index,
+                "local_sha256": hashlib.sha256(
+                    local_array.tobytes()
+                ).hexdigest(),
+                "global_sha256": hashlib.sha256(
+                    global_array.tobytes()
+                ).hexdigest(),
+            }
+        )
+
+    tensor_metadata = _read_json(cache_root / "tensor_examples.json")
+    payload = {
+        "cache_root": str(cache_root),
+        "examples": len(examples),
+        "train_examples": len(train),
+        "validation_examples": len(val),
+        "split_indices_exact": True,
+        "real_batches_exact": True,
+        "audit_batches": args.audit_batches,
+        "batch_size": args.batch_size,
+        "checked_rows": checked_rows,
+        "audit_seed": args.audit_seed,
+        "sample_sequence_sha256": digest.hexdigest(),
+        "batches": checked_batches,
+        "tensor_cache_sha256": tensor_metadata["sha256"],
+        "source_files": source["metadata"]["source_files"],
+    }
+    _atomic_json(output / "pipeline_audit.json", payload)
+    print(
+        f"pipeline audit passed: {args.audit_batches} real batches, "
+        f"{checked_rows:,} sampled rows, exact split/order/tensors",
+        flush=True,
+    )
+
+
 @torch.no_grad()
 def _evaluate_tensor_cache(
     model,
@@ -389,6 +512,7 @@ def _load_examples(output: Path, val_fraction: float, split_salt: str):
 
 def train_one(args) -> None:
     output = Path(args.output)
+    cache_root = Path(args.cache_dir or args.output)
     result_path, checkpoint_path = _job_paths(
         output, args.kind, args.arm, args.lr, args.seed
     )
@@ -402,7 +526,7 @@ def train_one(args) -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.cuda.reset_peak_memory_stats()
     packed = torch.load(
-        output / "tensor_examples.pt",
+        cache_root / "tensor_examples.pt",
         map_location="cpu",
         mmap=True,
         weights_only=False,
@@ -411,6 +535,7 @@ def train_one(args) -> None:
     train_indices = packed["train_indices"]
     val_indices = packed["val_indices"]
     dataset_meta = packed["metadata"]
+    tensor_metadata = _read_json(cache_root / "tensor_examples.json")
     model = build_model(
         "transformer",
         spec["d_model"],
@@ -479,6 +604,7 @@ def train_one(args) -> None:
             "dataset_source_files": [
                 row["name"] for row in dataset_meta["source_files"]
             ],
+            "tensor_cache_sha256": tensor_metadata["sha256"],
         },
     )
     torch.save(checkpoint, checkpoint_path)
@@ -497,6 +623,8 @@ def train_one(args) -> None:
         "warmup_fraction": args.warmup_fraction,
         "cosine_decay": True,
         "batching": "packed_tensor_v1",
+        "cache_root": str(cache_root),
+        "tensor_cache_sha256": tensor_metadata["sha256"],
         "train_examples": len(train_indices),
         "validation_examples": len(val_indices),
         "metrics": metrics,
@@ -1130,6 +1258,7 @@ def build_parser() -> argparse.ArgumentParser:
             "all",
             "prepare",
             "tensorize",
+            "audit-cache",
             "train-one",
             "arena-one",
             "report",
@@ -1142,6 +1271,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--buffer-dir",
         default="games/seven_wonders_duel/runs/laptop_training_03/buffers",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="directory containing examples.pt/tensor_examples.pt; defaults to output",
     )
     parser.add_argument("--games", type=int, default=12_000)
     parser.add_argument("--device", default="cuda")
@@ -1164,6 +1298,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rust-slots", type=int, default=48)
     parser.add_argument("--batch-cap", type=int, default=256)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--audit-batches", type=int, default=8)
+    parser.add_argument("--audit-seed", type=int, default=20260729)
     return parser
 
 
@@ -1175,6 +1311,8 @@ def main(argv=None) -> None:
         prepare_cache(args)
     elif args.command == "tensorize":
         tensorize_cache(args)
+    elif args.command == "audit-cache":
+        audit_tensor_cache(args)
     elif args.command == "train-one":
         if args.kind is None or args.arm is None or args.lr is None or args.seed is None:
             raise SystemExit("train-one requires --kind, --arm, --lr, and --seed")

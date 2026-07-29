@@ -10,12 +10,58 @@ torch = pytest.importorskip("torch")
 
 from .buffer import read_records
 from .dataset import collate, examples_from_record
+from . import f4_phase_d_ab
 from .f4_cost_model import build_payload, collect_corpus
 from .inference import Evaluator
 from .net import masked_policy_log_softmax
 from .phase_d import PhaseDConfig, PhaseDLoop
 from .rust_bridge import rust_flat_batch_adapter
 from .train import build_model, heads_from_config
+
+
+def test_phase_d_ab_forwards_declared_precision(monkeypatch, tmp_path: Path) -> None:
+    seen: list[tuple[bool, bool, str]] = []
+
+    def fake_run_arm(
+        _loop,
+        _model,
+        _iteration,
+        _jobs,
+        _destination,
+        fused,
+        gather,
+        precision,
+    ):
+        seen.append((fused, gather, precision))
+        stats = {
+            "wall_seconds": 1.0,
+            "games_per_second": 1.0,
+            "moves_per_second": 1.0,
+            "observed_forward_dtypes": [
+                "torch.bfloat16" if precision == "bf16" else "torch.float32"
+            ],
+            "rust_games": 1,
+            "rust_bot_games": 0,
+            "rust_chunks": 1,
+        }
+        return stats, (precision,), []
+
+    monkeypatch.setattr(f4_phase_d_ab, "run_arm", fake_run_arm)
+    settings = {
+        "fp32": (True, True, "fp32"),
+        "bf16": (True, True, "bf16"),
+    }
+    results, _ = f4_phase_d_ab.run_measured_arms(
+        object(),
+        object(),
+        0,
+        [],
+        tmp_path,
+        ["fp32", "bf16"],
+        settings,
+    )
+    assert seen == [settings["fp32"], settings["bf16"]]
+    assert [row["precision"] for row in results] == ["fp32", "bf16"]
 
 
 def _capture_value_dtype(evaluator: Evaluator, invoke) -> torch.dtype:
