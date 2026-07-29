@@ -64,6 +64,19 @@ def test_phase_d_ab_forwards_declared_precision(monkeypatch, tmp_path: Path) -> 
     assert [row["precision"] for row in results] == ["fp32", "bf16"]
 
 
+def test_phase_d_ab_rebuilds_the_checkpoint_architecture(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "wide.pt"
+    torch.save(
+        {"config": {"d_model": 384, "layers": 8, "heads": 6}},
+        checkpoint,
+    )
+    assert f4_phase_d_ab.checkpoint_architecture(checkpoint) == {
+        "d_model": 384,
+        "layers": 8,
+        "heads": 6,
+    }
+
+
 def _capture_value_dtype(evaluator: Evaluator, invoke) -> torch.dtype:
     seen: list[torch.dtype] = []
     handle = evaluator.model.heads.value.register_forward_hook(
@@ -134,6 +147,35 @@ def test_bf16_regular_evaluator_path_really_autocasts() -> None:
         ),
     )
     assert dtype is torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_bf16_real_net_is_batch_invariant_before_trajectory_comparison() -> None:
+    """W0.4: batch composition may move floats, not discrete root choices."""
+
+    from .codec import legal_action_indices
+    from .encoder import encode
+    from .game import new_game
+
+    games = [new_game(20260801 + seed) for seed in range(8)]
+    encodings = [
+        encode(game.observation(game.active_player)) for game in games
+    ]
+    legals = [legal_action_indices(game) for game in games]
+    torch.manual_seed(20260801)
+    evaluator = Evaluator(
+        build_model("transformer", 32, 1),
+        device="cuda",
+        precision="bf16",
+    )
+    batched = evaluator.evaluate(encodings, legals)
+    scalar = [
+        evaluator.evaluate([encoding], [legal])[0]
+        for encoding, legal in zip(encodings, legals)
+    ]
+    for together, alone in zip(batched, scalar):
+        assert together.policy.argmax() == alone.policy.argmax()
+        assert abs(float(together.wdl[0]) - float(alone.wdl[0])) < 1e-3
 
 
 def test_invalid_precision_is_rejected() -> None:

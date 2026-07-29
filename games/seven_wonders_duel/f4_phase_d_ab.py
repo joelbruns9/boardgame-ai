@@ -39,6 +39,24 @@ _T_CRITICAL_95 = {
 }
 
 
+def checkpoint_architecture(path: str | Path) -> dict[str, int]:
+    """Architecture required to rebuild an explicit benchmark checkpoint."""
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    config = checkpoint.get("config", {})
+    required = ("d_model", "layers")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(
+            f"checkpoint {path} lacks architecture fields: {missing}"
+        )
+    return {
+        "d_model": int(config["d_model"]),
+        "layers": int(config["layers"]),
+        "heads": pd.heads_from_config(config),
+    }
+
+
 def _mean_ci95(values: list[float]) -> tuple[float, float, float]:
     mean = statistics.mean(values)
     if len(values) < 2:
@@ -214,6 +232,7 @@ def main() -> None:
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    architecture = checkpoint_architecture(args.checkpoint)
 
     config = pd.PhaseDConfig(
         run_dir=str(output / "run"),
@@ -223,6 +242,7 @@ def main() -> None:
         iterations=1,
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.global_batch_cap,
+        **architecture,
     )
     loop = pd.PhaseDLoop(config)
     loop.buffer_dir.mkdir(parents=True, exist_ok=True)
