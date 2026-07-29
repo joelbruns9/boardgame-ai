@@ -477,6 +477,8 @@ def train_steps(
     restore_best_val: bool = False,
     seed: int = 0,
     precision: str = "fp32",
+    cosine_decay: bool = False,
+    batch_getter=None,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -529,16 +531,24 @@ def train_steps(
     window_steps = 0
 
     def learning_rate(step: int) -> float:
-        if warm or warmup_steps <= 0:
+        if not warm and warmup_steps > 0 and step < warmup_steps:
+            return lr * min(1.0, (step + 1) / warmup_steps)
+        if not cosine_decay:
             return lr
-        return lr * min(1.0, (step + 1) / warmup_steps)
+        decay_start = 0 if warm else min(warmup_steps, steps)
+        decay_steps = max(1, steps - decay_start)
+        progress = min(1.0, max(0.0, (step + 1 - decay_start) / decay_steps))
+        return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     for step in range(steps):
         current_lr = learning_rate(step)
         for group in optimizer.param_groups:
             group["lr"] = current_lr
-        batch = collate(
-            [train_examples[i] for i in rng.choices(population, k=batch_size)], device
+        sampled = rng.choices(population, k=batch_size)
+        batch = (
+            batch_getter(sampled, device)
+            if batch_getter is not None
+            else collate([train_examples[i] for i in sampled], device)
         )
         optimizer.zero_grad(set_to_none=True)
         with _training_autocast(device, precision):
