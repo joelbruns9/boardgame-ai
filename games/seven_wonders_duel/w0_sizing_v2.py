@@ -11,6 +11,7 @@ import argparse
 from dataclasses import asdict
 import hashlib
 import json
+import math
 from pathlib import Path
 import statistics
 import time
@@ -21,12 +22,15 @@ from games.kingdomino.promotion import wilson_lower_bound
 
 from .buffer import read_records
 from .dataset import examples_from_record
-from .phase_d import PhaseDConfig, PhaseDLoop
+from .inference import Evaluator
+from .phase_d import MatchOutcome, PhaseDConfig, PhaseDLoop
+from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
 from .train import build_model, heads_from_config
 from .w0_sizing import (
     _evaluate_tensor_cache,
     _load_agent,
     _pack_examples,
+    _tensor_batch,
 )
 
 
@@ -71,6 +75,40 @@ class _FixedPairCollector:
                 (self.game_scores[-2] + self.game_scores[-1]) / 2.0
             )
         return self
+
+
+def _root_priors_from_digest(digest: list[float]) -> list[float]:
+    """Extract root edge priors from the production search-tree digest."""
+
+    def read_node(cursor: int, capture: bool) -> tuple[int, list[float]]:
+        cursor += 4  # visits, value sum, actor, terminal
+        fingerprint_size = int(digest[cursor])
+        cursor += 1 + fingerprint_size
+        edge_count = int(digest[cursor])
+        cursor += 1
+        priors = []
+        for _ in range(edge_count):
+            prior = float(digest[cursor + 3])
+            children = int(digest[cursor + 5])
+            cursor += 6
+            if capture:
+                priors.append(prior)
+            for _ in range(children):
+                key_parts = int(digest[cursor])
+                cursor += 1
+                for _ in range(key_parts):
+                    part_size = int(digest[cursor])
+                    cursor += 1 + part_size
+                cursor += 2  # samples, probability
+                cursor, _ = read_node(cursor, False)
+        return cursor, priors
+
+    end, priors = read_node(0, True)
+    if end != len(digest):
+        raise ValueError(f"tree digest has {len(digest) - end} trailing values")
+    if not priors:
+        raise ValueError("tree digest has no root priors")
+    return priors
 
 
 def fixed_arena_one(args) -> None:
@@ -220,6 +258,314 @@ def aggregate_fixed_arenas(args) -> None:
     )
 
 
+def summarize_training(args) -> None:
+    """Apply the preregistered two-stage adaptive LR selection rule."""
+
+    output = Path(args.output)
+    all_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((output / "training").glob("*.json"))
+    ]
+    metrics_to_summarize = (
+        "total",
+        "value_acc",
+        "joint7_acc",
+        "policy_top1",
+    )
+    result = {
+        "rules": {
+            "stage_1": (
+                "retain every seed-0 LR within 1.0% of the arm's minimum"
+            ),
+            "stage_2": (
+                "select the lower LR among three-seed mean validation totals "
+                "within 0.5% of the minimum mean"
+            ),
+            "holdout_use": (
+                "post-selection audit only; external holdout cannot change LR"
+            ),
+        },
+        "arms": {},
+    }
+    cache_hashes = {row["tensor_cache_sha256"] for row in all_rows}
+    precisions = {row["precision"] for row in all_rows}
+    if len(cache_hashes) != 1 or len(precisions) != 1:
+        raise ValueError("training rows do not share one tensor cache/precision")
+
+    for arm in ("S", "M", "L"):
+        sweeps = [
+            row
+            for row in all_rows
+            if row["arm"] == arm
+            and row["kind"] == "sweep"
+            and row["seed"] == 0
+        ]
+        if not sweeps:
+            raise ValueError(f"{arm}: no sweep rows")
+        minimum = min(row["metrics"]["total"] for row in sweeps)
+        contenders = [
+            row
+            for row in sweeps
+            if row["metrics"]["total"] <= minimum * 1.01
+        ]
+        contender_summaries = []
+        for sweep in sorted(contenders, key=lambda row: row["learning_rate"]):
+            lr = float(sweep["learning_rate"])
+            rows = [
+                row
+                for row in all_rows
+                if row["arm"] == arm
+                and math.isclose(
+                    float(row["learning_rate"]), lr, rel_tol=0.0, abs_tol=1e-15
+                )
+                and int(row["seed"]) in (0, 1, 2)
+            ]
+            by_seed = {int(row["seed"]): row for row in rows}
+            if set(by_seed) != {0, 1, 2}:
+                raise ValueError(
+                    f"{arm} lr={lr:g}: expected seeds 0/1/2, "
+                    f"found {sorted(by_seed)}"
+                )
+            ordered = [by_seed[seed] for seed in (0, 1, 2)]
+            totals = [float(row["metrics"]["total"]) for row in ordered]
+            contender_summaries.append(
+                {
+                    "learning_rate": lr,
+                    "seed0_sweep_total": float(sweep["metrics"]["total"]),
+                    "validation_total_mean": statistics.mean(totals),
+                    "validation_total_sd": statistics.stdev(totals),
+                    "validation_total_min": min(totals),
+                    "validation_total_max": max(totals),
+                    "rows": ordered,
+                }
+            )
+        best_mean = min(
+            row["validation_total_mean"] for row in contender_summaries
+        )
+        tied = [
+            row
+            for row in contender_summaries
+            if row["validation_total_mean"] <= best_mean * 1.005
+        ]
+        selected = min(tied, key=lambda row: row["learning_rate"])
+        selected_rows = selected["rows"]
+        metric_summary = {}
+        for metric in metrics_to_summarize:
+            values = [
+                float(row["metrics"][metric]) for row in selected_rows
+            ]
+            metric_summary[metric] = {
+                "mean": statistics.mean(values),
+                "sd": statistics.stdev(values),
+                "min": min(values),
+                "max": max(values),
+            }
+        result["arms"][arm] = {
+            "sweep": sorted(
+                [
+                    {
+                        "learning_rate": float(row["learning_rate"]),
+                        "validation_total": float(row["metrics"]["total"]),
+                    }
+                    for row in sweeps
+                ],
+                key=lambda row: row["learning_rate"],
+            ),
+            "stage_1_minimum": minimum,
+            "stage_1_contenders": [
+                float(row["learning_rate"]) for row in contenders
+            ],
+            "contender_summaries": contender_summaries,
+            "selected_learning_rate": selected["learning_rate"],
+            "selected_tie_candidates": [
+                row["learning_rate"] for row in tied
+            ],
+            "metrics": metric_summary,
+            "training_seconds_mean": statistics.mean(
+                float(row["seconds"]) for row in selected_rows
+            ),
+            "training_milliseconds_per_step_mean": statistics.mean(
+                float(row["history"][-1]["secs"]) / int(row["steps"]) * 1000
+                for row in selected_rows
+            ),
+            "cuda_peak_allocated_bytes_max": max(
+                int(row["cuda_peak_allocated_bytes"]) for row in selected_rows
+            ),
+            "cuda_peak_reserved_bytes_max": max(
+                int(row["cuda_peak_reserved_bytes"]) for row in selected_rows
+            ),
+            "selected_checkpoints": [
+                {
+                    "seed": int(row["seed"]),
+                    "path": row["checkpoint"],
+                    "sha256": row["checkpoint_sha256"],
+                }
+                for row in selected_rows
+            ],
+        }
+    result["tensor_cache_sha256"] = next(iter(cache_hashes))
+    result["precision"] = next(iter(precisions))
+    _atomic_json(output / "training_summary.json", result)
+    for arm, row in result["arms"].items():
+        print(
+            f"{arm}: selected lr={row['selected_learning_rate']:.0e}, "
+            f"val.total={row['metrics']['total']['mean']:.6f}"
+            f"+/-{row['metrics']['total']['sd']:.6f}",
+            flush=True,
+        )
+
+
+def search_lift_one(args) -> None:
+    """Play fixed-N raw-policy vs production-search games with one checkpoint."""
+
+    if args.games <= 0 or args.games % 2:
+        raise ValueError("--games must be a positive even number")
+    output = Path(args.output)
+    result_path = output / "search_lift" / f"{args.label}.json"
+    if result_path.is_file() and not args.force:
+        print(f"search lift already complete: {result_path}", flush=True)
+        return
+    checkpoint_path = Path(args.checkpoint)
+    spec = _load_agent(
+        checkpoint_path, args.label, args.sims, "closed", args.top_k
+    )
+    model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
+    model.load_state_dict(spec.model_state)
+    evaluator = Evaluator(
+        model,
+        args.device,
+        args.batch_cap,
+        precision=args.precision,
+    )
+    adapter = rust_flat_batch_adapter(evaluator)
+
+    import seven_wonders_rust as swr
+
+    game_scores: list[float] = []
+    pair_scores: list[float] = []
+    outcomes = []
+    raw_search_disagreements = 0
+    decisions = 0
+    started = time.monotonic()
+    for start in range(0, args.games // 2, args.rust_slots):
+        pair_indices = list(
+            range(start, min(start + args.rust_slots, args.games // 2))
+        )
+        seeds = [args.seed_offset + pair for pair in pair_indices]
+        first_players = [pair % 2 for pair in pair_indices]
+        for search_seat in (0, 1):
+            games = rust_games_for_self_play(seeds, first_players)
+            actions_played = [0] * len(games)
+            live = list(range(len(games)))
+            move_index = 0
+            while live:
+                results = swr.search_many_flat_net(
+                    adapter,
+                    [games[slot] for slot in live],
+                    [
+                        seeds[slot] + move_index * 1_000_003
+                        for slot in live
+                    ],
+                    args.batch_cap,
+                    1,
+                    args.sims,
+                    args.top_k,
+                    force=False,
+                    age_deal_samples=0,
+                    puct_root=False,
+                )
+                for slot, result in zip(live, results):
+                    legal = games[slot].legal_action_indices()
+                    search_policy = result["policy"]
+                    raw_policy = _root_priors_from_digest(result["digest"])
+                    if len(raw_policy) != len(legal):
+                        raise AssertionError("root priors do not align to legal actions")
+                    raw_best = max(range(len(legal)), key=lambda i: raw_policy[i])
+                    search_best = max(
+                        range(len(legal)), key=lambda i: search_policy[i]
+                    )
+                    raw_search_disagreements += raw_best != search_best
+                    decisions += 1
+                    choice = (
+                        search_best
+                        if games[slot].actor == search_seat
+                        else raw_best
+                    )
+                    games[slot].apply_index(legal[choice])
+                    actions_played[slot] += 1
+                move_index += 1
+                live = [slot for slot in live if not games[slot].is_complete()]
+
+            for pair, seed, first_player, game, actions in zip(
+                pair_indices, seeds, first_players, games, actions_played
+            ):
+                score = (
+                    0.5
+                    if game.winner is None
+                    else float(game.winner == search_seat)
+                )
+                game_scores.append(score)
+                outcomes.append(
+                    asdict(
+                        MatchOutcome(
+                            seed=seed,
+                            first_player=first_player,
+                            agents=(
+                                ("search", "raw")
+                                if search_seat == 0
+                                else ("raw", "search")
+                            ),
+                            winner=game.winner,
+                            scores=(
+                                tuple(game.final_scores)
+                                if game.final_scores is not None
+                                else None
+                            ),
+                            victory_type=game.victory_type or "unknown",
+                            actions=actions,
+                        )
+                    )
+                )
+        # Legs are appended in seat blocks, so pair the matching seed explicitly.
+        block = len(pair_indices)
+        for offset in range(block):
+            pair_scores.append(
+                (game_scores[-2 * block + offset] + game_scores[-block + offset])
+                / 2.0
+            )
+    seconds = time.monotonic() - started
+    lower, upper = _wilson_interval(sum(pair_scores), len(pair_scores))
+    payload = {
+        "label": args.label,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": _sha256(checkpoint_path),
+        "precision": args.precision,
+        "sims": args.sims,
+        "games": len(game_scores),
+        "pairs": len(pair_scores),
+        "search_score_rate": sum(pair_scores) / len(pair_scores),
+        "wilson_lower_fixed_n": lower,
+        "wilson_upper_fixed_n": upper,
+        "raw_search_action_disagreements": raw_search_disagreements,
+        "decisions": decisions,
+        "raw_search_action_disagreement_rate": (
+            raw_search_disagreements / decisions
+        ),
+        "stopping": "fixed_n",
+        "seed_offset": args.seed_offset,
+        "seconds": seconds,
+        "pair_scores": pair_scores,
+        "outcomes": outcomes,
+    }
+    _atomic_json(result_path, payload)
+    print(
+        f"search lift {args.label}: score={payload['search_score_rate']:.3f}, "
+        f"CI=[{lower:.3f}, {upper:.3f}], "
+        f"action changes={payload['raw_search_action_disagreement_rate']:.1%}",
+        flush=True,
+    )
+
+
 def prepare_holdout(args) -> None:
     output = Path(args.output)
     destination = output / "holdout.pt"
@@ -340,6 +686,110 @@ def evaluate_holdout(args) -> None:
     )
 
 
+@torch.no_grad()
+def forward_bench(args) -> None:
+    """Measure a labelled, device-resident production-model forward at b256."""
+
+    output = Path(args.output)
+    result_path = (
+        output / "forward_bench" / f"{args.label}_{args.precision}.json"
+    )
+    if result_path.is_file() and not args.force:
+        print(f"forward benchmark already complete: {result_path}", flush=True)
+        return
+    checkpoint_path = Path(args.checkpoint)
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    config = checkpoint["config"]
+    model = build_model(
+        config.get("model", "transformer"),
+        int(config["d_model"]),
+        int(config["layers"]),
+        heads_from_config(config),
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    evaluator = Evaluator(
+        model,
+        args.device,
+        args.batch_size,
+        precision=args.precision,
+    )
+    packed = torch.load(
+        Path(args.cache_dir) / "tensor_examples.pt",
+        map_location="cpu",
+        mmap=True,
+        weights_only=False,
+    )
+    batch = _tensor_batch(
+        packed["storage"], torch.arange(args.batch_size), args.device
+    )
+    observed_dtypes: list[str] = []
+
+    def record_dtype(_module, _inputs, output_tensor):
+        observed_dtypes.append(str(output_tensor.dtype))
+
+    hook = evaluator.model.heads.value.register_forward_hook(record_dtype)
+    try:
+        for _ in range(args.warmups):
+            with evaluator.autocast():
+                evaluator.model(batch)
+        torch.cuda.synchronize()
+        observed_dtypes.clear()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        started = time.perf_counter()
+        for _ in range(args.repetitions):
+            with evaluator.autocast():
+                evaluator.model(batch)
+        torch.cuda.synchronize()
+        seconds = time.perf_counter() - started
+    finally:
+        hook.remove()
+    expected_dtype = (
+        "torch.bfloat16" if args.precision == "bf16" else "torch.float32"
+    )
+    if set(observed_dtypes) != {expected_dtype}:
+        raise AssertionError(
+            f"{args.precision} observed dtypes {sorted(set(observed_dtypes))}"
+        )
+    payload = {
+        "label": args.label,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": _sha256(checkpoint_path),
+        "parameters": sum(p.numel() for p in evaluator.model.parameters()),
+        "d_model": int(config["d_model"]),
+        "layers": int(config["layers"]),
+        "heads": heads_from_config(config),
+        "precision": args.precision,
+        "observed_dtype": expected_dtype,
+        "batch_size": args.batch_size,
+        "warmups": args.warmups,
+        "repetitions": args.repetitions,
+        "seconds": seconds,
+        "milliseconds_per_batch": seconds * 1000.0 / args.repetitions,
+        "rows_per_second": (
+            args.batch_size * args.repetitions / seconds
+        ),
+        "cuda_peak_allocated_bytes": (
+            int(torch.cuda.max_memory_allocated())
+            if torch.cuda.is_available()
+            else None
+        ),
+        "scope": (
+            "isolated fused model forward with a device-resident real b256 "
+            "batch; excludes encoding, transfer, search, and scheduling"
+        ),
+    }
+    _atomic_json(result_path, payload)
+    print(
+        f"forward {args.label} {args.precision}: "
+        f"{payload['rows_per_second']:,.0f} rows/s, "
+        f"{payload['milliseconds_per_batch']:.2f} ms/batch",
+        flush=True,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -365,6 +815,23 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--match", required=True)
     aggregate.add_argument("--expected-cells", type=int, default=9)
 
+    summary = subparsers.add_parser("summarize-training")
+    summary.add_argument("--output", required=True)
+
+    lift = subparsers.add_parser("search-lift-one")
+    lift.add_argument("--output", required=True)
+    lift.add_argument("--checkpoint", required=True)
+    lift.add_argument("--label", required=True)
+    lift.add_argument("--games", type=int, default=176)
+    lift.add_argument("--sims", type=int, default=64)
+    lift.add_argument("--top-k", type=int, default=16)
+    lift.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    lift.add_argument("--device", default="cuda")
+    lift.add_argument("--rust-slots", type=int, default=48)
+    lift.add_argument("--batch-cap", type=int, default=256)
+    lift.add_argument("--seed-offset", type=int, required=True)
+    lift.add_argument("--force", action="store_true")
+
     holdout = subparsers.add_parser("prepare-holdout")
     holdout.add_argument("--output", required=True)
     holdout.add_argument("--buffer-dir", required=True)
@@ -380,6 +847,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--batch-size", type=int, default=512)
     evaluate.add_argument("--force", action="store_true")
+
+    forward = subparsers.add_parser("forward-bench")
+    forward.add_argument("--output", required=True)
+    forward.add_argument("--cache-dir", required=True)
+    forward.add_argument("--checkpoint", required=True)
+    forward.add_argument("--label", required=True)
+    forward.add_argument(
+        "--precision", choices=("fp32", "bf16"), required=True
+    )
+    forward.add_argument("--device", default="cuda")
+    forward.add_argument("--batch-size", type=int, default=256)
+    forward.add_argument("--warmups", type=int, default=20)
+    forward.add_argument("--repetitions", type=int, default=100)
+    forward.add_argument("--force", action="store_true")
     return parser
 
 
@@ -389,10 +870,16 @@ def main(argv=None) -> None:
         fixed_arena_one(args)
     elif args.command == "aggregate-fixed-arenas":
         aggregate_fixed_arenas(args)
+    elif args.command == "summarize-training":
+        summarize_training(args)
+    elif args.command == "search-lift-one":
+        search_lift_one(args)
     elif args.command == "prepare-holdout":
         prepare_holdout(args)
-    else:
+    elif args.command == "evaluate-holdout":
         evaluate_holdout(args)
+    else:
+        forward_bench(args)
 
 
 if __name__ == "__main__":
