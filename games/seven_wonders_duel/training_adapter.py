@@ -13,6 +13,8 @@ instead of restarting from the protected best every iteration.
 from __future__ import annotations
 
 import math
+import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,8 +45,8 @@ from games.az_loop.contract import (
     TrainRequest,
 )
 
-from .buffer import replay
-from .engine import _science_symbols
+from .buffer import GameRecord
+from .dataset import GameDerivationStats
 from .phase_d import summarize_records
 from .train import make_checkpoint
 
@@ -69,7 +71,72 @@ def _distribution(values: list[int]) -> dict[str, float]:
     }
 
 
-def _record_stats(records, performance):
+def _record_identity(record: GameRecord) -> tuple[int, int | None, str, int]:
+    return (
+        int(record.seed),
+        record.iteration,
+        str(record.trajectory_digest),
+        len(record.moves),
+    )
+
+
+class _GameSpecificCollector:
+    """Merge observations from required example derivation into W3 stats."""
+
+    def __init__(self, records: list[GameRecord], target: dict[str, Any]):
+        self._remaining = Counter(_record_identity(record) for record in records)
+        self._expected = len(records)
+        self._observed = 0
+        self._age_three_civilian = 0
+        self._target = target
+
+    def observe(self, record: GameRecord, stats: GameDerivationStats) -> None:
+        identity = _record_identity(record)
+        if self._remaining[identity] <= 0:
+            return
+        self._remaining[identity] -= 1
+        self._observed += 1
+        reason = record.victory_type or "draw"
+        target = self._target
+        target["ending_age"][str(stats.ending_age)] = (
+            target["ending_age"].get(str(stats.ending_age), 0) + 1
+        )
+        self._age_three_civilian += int(
+            stats.ending_age == 3 and reason == "civilian"
+        )
+        target["science"]["sixth_symbol_wins"] += int(
+            reason == "scientific" and stats.sixth_science_symbol
+        )
+        target["science"]["tokens_taken"] += stats.progress_tokens
+        target["science"]["pairs_completed"] += stats.science_pairs
+        target["military"]["max_absolute_track"] = max(
+            target["military"]["max_absolute_track"],
+            stats.max_absolute_track,
+        )
+        target["military"]["tokens_triggered"] += (
+            stats.military_tokens_triggered
+        )
+        target["military"]["gold_pillaged"] += stats.military_gold_pillaged
+        target["draft_wonder"]["wonders_built"] += stats.wonders_built
+        target["draft_wonder"]["wonders_discarded"] += (
+            stats.wonders_discarded
+        )
+
+    def finalize(self) -> None:
+        if self._observed != self._expected:
+            raise RuntimeError(
+                "game-specific statistics were not collected during replay "
+                f"derivation: observed {self._observed}/{self._expected} games"
+            )
+        if self._expected:
+            self._target["draft_wonder"]["age_iii_completion_rate"] = (
+                self._age_three_civilian / self._expected
+            )
+
+
+def _record_stats(
+    records: list[GameRecord], performance: dict[str, Any]
+):
     summary = summarize_records(records)
     lengths = [len(record.moves) for record in records]
     scheduler = performance.get("rust_scheduler", {})
@@ -104,7 +171,6 @@ def _record_stats(records, performance):
         },
     }
     lengths_by_victory: dict[str, list[int]] = {}
-    age_three = 0
     for record in records:
         kind = record.agents.get("kind", "self_play")
         opponent = "hof" if kind == "league" else (
@@ -131,51 +197,10 @@ def _record_stats(records, performance):
             bucket["wins_by_seat"].get(winner_key, 0) + 1
         )
 
-        maximum_track = 0
-
-        def observe(game, _move):
-            nonlocal maximum_track
-            maximum_track = max(maximum_track, abs(game.conflict_position))
-
-        game = replay(record, on_state=observe)
-        maximum_track = max(maximum_track, abs(game.conflict_position))
-        game_specific["ending_age"][str(game.age)] = (
-            game_specific["ending_age"].get(str(game.age), 0) + 1
-        )
-        age_three += int(game.age == 3 and reason == "civilian")
-        symbols = [len(_science_symbols(game, seat)) for seat in (0, 1)]
-        game_specific["science"]["sixth_symbol_wins"] += int(
-            reason == "scientific" and max(symbols) >= 6
-        )
-        game_specific["science"]["tokens_taken"] += sum(
-            len(city.progress_tokens) for city in game.cities
-        )
-        game_specific["science"]["pairs_completed"] += sum(
-            len(city.claimed_science_pairs) for city in game.cities
-        )
-        game_specific["military"]["max_absolute_track"] = max(
-            game_specific["military"]["max_absolute_track"], maximum_track
-        )
-        game_specific["military"]["tokens_triggered"] += 4 - len(
-            game.military_tokens_remaining
-        )
-        game_specific["military"]["gold_pillaged"] += 14 - sum(
-            game.military_tokens_remaining.values()
-        )
-        game_specific["draft_wonder"]["wonders_built"] += sum(
-            len(city.built_wonders) for city in game.cities
-        )
-        game_specific["draft_wonder"]["wonders_discarded"] += len(
-            game.retired_wonders
-        )
     game_specific["victory_type_game_length"] = {
         reason: {"count": len(values), **_distribution(values)}
         for reason, values in lengths_by_victory.items()
     }
-    if records:
-        game_specific["draft_wonder"]["age_iii_completion_rate"] = (
-            age_three / len(records)
-        )
     generation = GenerationStats(
         games=len(records),
         moves=summary["moves"],
@@ -207,6 +232,7 @@ class SevenWondersDuelLifecycleAdapter:
 
     def __init__(self, loop: "PhaseDLoop"):
         self.loop = loop
+        self._pending_game_stats: tuple[int, _GameSpecificCollector] | None = None
 
     def initialize_learner(self, *, seed: int):
         loop = self.loop
@@ -238,6 +264,13 @@ class SevenWondersDuelLifecycleAdapter:
         loop.sample_resources("post_generation")
         generation, outcomes, game_specific = _record_stats(
             records, loop.last_generation_stats
+        )
+        # The controller retains this result until training finishes. The
+        # mutable game_specific payload is completed by the required replay
+        # derivation before the controller validates and writes the row.
+        self._pending_game_stats = (
+            request.iteration,
+            _GameSpecificCollector(records, game_specific),
         )
         model_stats = ModelStats(
             d_model=loop.config.d_model,
@@ -285,8 +318,28 @@ class SevenWondersDuelLifecycleAdapter:
 
     def train(self, request: TrainRequest) -> TrainingResult:
         loop = self.loop
+        collector = None
+        if (
+            self._pending_game_stats is not None
+            and self._pending_game_stats[0] == request.iteration
+        ):
+            collector = self._pending_game_stats[1]
+        observer = collector.observe if collector is not None else None
         shortfall = loop.buffer_warmup_shortfall(request.replay.payload)
         if shortfall:
+            # Warmup rows still require complete W3 statistics. Derive and cache
+            # their trainable positions now, so the required replay does useful
+            # buffer work instead of restoring the removed stats-only replay.
+            replay_started = time.monotonic()
+            examples = loop._cached_examples(
+                request.replay.payload,
+                on_record_derived=observer,
+            )
+            replay_seconds = time.monotonic() - replay_started
+            loop.phase_seconds["replay_derivation"] = replay_seconds
+            if collector is not None:
+                collector.finalize()
+                self._pending_game_stats = None
             # Nothing is installed on a skip, so hand back the incoming learner
             # as the (unused) candidate rather than a fresh snapshot.
             return TrainingResult(
@@ -299,12 +352,25 @@ class SevenWondersDuelLifecycleAdapter:
                 trained=False,
                 skipped=True,
                 skip_reason=shortfall,
+                metrics={
+                    "examples": len(examples),
+                    "new_examples": sum(
+                        example.iteration == request.iteration
+                        for example in examples
+                    ),
+                    "replay_derivation_seconds": replay_seconds,
+                },
+                resources=loop.resource_stats(),
             )
         candidate = loop.train_candidate(
             request.replay.payload,
             request.iteration,
             source_checkpoint=request.learner_checkpoint,
+            on_record_derived=observer,
         )
+        if collector is not None:
+            collector.finalize()
+            self._pending_game_stats = None
         # The controller installs a returned candidate over both latest and
         # (on bootstrap/promote) the protected best.  Refuse to certify a
         # diverged or unreadable checkpoint as trained so a NaN run cannot

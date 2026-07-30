@@ -1,9 +1,11 @@
 # 7WD cloud training: readiness plan
 
 **Status:** **W0/W1/W2 complete. W3 and W5 have implementations under review;
-their remaining corrections and production parameter closure are still open.**
-Revision 7.
-**Revision history:** r7 closes W2 from the successful 70-to-90 recovery,
+W3 opponent attribution and W5 decision/cost closure remain open.**
+Revision 8.
+**Revision history:** r8 removes W3's stats-only replay by collecting and
+caching game observations during required trainable-position derivation. r7
+closes W2 from the successful 70-to-90 recovery,
 bounded host-memory plateau, checked allocation/error path, and the target
 RTX 5090's 32 GB VRAM margin. Target-device VRAM measurement remains a short
 launch preflight, not an open memory-engineering workstream. r6 grounds
@@ -71,7 +73,7 @@ does not close it -- it makes it **measured every iteration**.
 | W0 | Model size + precision, decided by measurement | M | ~~Yes~~ **DONE 2026-07-29** |
 | W1 | Training schedules, growing window, HOF league | M | ~~Yes~~ **DONE 2026-07-29** |
 | W2 | Memory: fix the crash, bound the footprint, measure it | M | ~~Yes~~ **DONE 2026-07-30** |
-| W3 | Shared run-stats contract + reporting | M | **IMPLEMENTED; attribution and replay-overhead corrections pending** |
+| W3 | Shared run-stats contract + reporting | M | **IMPLEMENTED; opponent attribution correction pending** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
 | W5 | Gate efficiency + Wilson-LCB decision rule | M | **LOCAL GATES PASSED; RTX 5090 cap fit pending** |
 | W6 | Cloud setup script | M | **Yes** |
@@ -441,6 +443,17 @@ alongside it, or the field is actively misleading.
 - science: sixth-symbol races, tokens taken, pairs completed.
 - military: max track position, tokens triggered, gold pillaged.
 - draft/wonder: wonders built vs discarded, Age III completion rate.
+
+Game-extension observations are collected during the verified replay that
+creates trainable positions. The compact per-game summary is cached with those
+positions, so a warm cache supplies both without another replay. Warmup
+iterations also derive and cache positions once before writing their row. This
+removes the former unmeasured full replay from the adapter; its cost now belongs
+to the existing `replay_derivation` phase.
+
+**Implementation status:** the redundant-replay correction is complete.
+Opponent provenance still needs explicit, non-lossy HOF/curriculum attribution
+before W3 acceptance closes.
 
 **W3.4 -- `tools/az_report.py`.** *(M)* One command, any run directory: the
 block-aggregated outcome mix with binomial error bars, the gate ladder with

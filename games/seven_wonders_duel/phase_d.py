@@ -20,7 +20,7 @@ import random
 import shutil
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 import warnings
 
 import psutil
@@ -69,6 +69,7 @@ from .buffer import (
 from .codec import decode_action, encode_action
 from .dataset import (
     Example,
+    GameDerivationStats,
     examples_from_record,
     examples_from_records,
     is_fast_search_move,
@@ -1332,6 +1333,7 @@ class PhaseDLoop:
         # are the iterations that have left the replay window.
         self._example_cache: OrderedDict[tuple, list[Example]] = OrderedDict()
         self._example_cache_raw_bytes: dict[tuple, int] = {}
+        self._example_cache_game_stats: dict[tuple, GameDerivationStats] = {}
         self.cache_calibration_factor = DEFAULT_CACHE_CALIBRATION_FACTOR
         self._cache_calibrated = False
         self.last_example_cache_stats: dict[str, Any] = {}
@@ -2131,6 +2133,9 @@ class PhaseDLoop:
         for key in list(self._example_cache_raw_bytes):
             if key not in live:
                 del self._example_cache_raw_bytes[key]
+        for key in list(self._example_cache_game_stats):
+            if key not in live:
+                del self._example_cache_game_stats[key]
         raw = sum(self._example_cache_raw_bytes.get(key, 0) for key in live)
         estimated = int(math.ceil(raw * self.cache_calibration_factor))
         return raw, estimated
@@ -2145,6 +2150,7 @@ class PhaseDLoop:
         while self._example_cache and estimated > target:
             key, _dropped = self._example_cache.popitem(last=False)
             self._example_cache_raw_bytes.pop(key, None)
+            self._example_cache_game_stats.pop(key, None)
             evicted += 1
             _raw, estimated = self._cache_totals()
         return evicted
@@ -2179,16 +2185,25 @@ class PhaseDLoop:
             phase_seconds=self.phase_seconds,
         )
 
-    def _cached_examples(self, records: list[GameRecord]) -> list[Example]:
+    def _cached_examples(
+        self,
+        records: list[GameRecord],
+        *,
+        on_record_derived: (
+            Callable[[GameRecord, GameDerivationStats], None] | None
+        ) = None,
+    ) -> list[Example]:
         """Vectorized examples for `records`, replaying each game at most once.
 
         Equivalent to `examples_from_records(records, ...)` -- same examples, same
         order -- but a game already replayed in this process is served from the
-        cache instead of being replayed again.  Kingdomino's loop keeps encoded
-        examples in a live ring buffer and never re-derives them; 7WD stores
-        compact, verifiable game *records* and rebuilds, which costs the whole
-        replay window every iteration.  This keeps 7WD's records as the durable
-        source of truth and pays their verification once per process.
+        cache instead of being replayed again. Its W3 game-stat summary travels
+        with the cached examples, so reporting does not add another traversal.
+        Kingdomino's loop keeps encoded examples in a live ring buffer and never
+        re-derives them; 7WD stores compact, verifiable game *records* and
+        rebuilds, which costs the whole replay window every iteration. This
+        keeps 7WD's records as the durable source of truth and pays their
+        verification once per process.
 
         Keyed on a sha256 of the record's own canonical serialization -- the same
         `to_json_line` that wrote it -- so the key covers every field the examples
@@ -2221,9 +2236,21 @@ class PhaseDLoop:
                 fast,
             )
             cached = cache.get(key)
-            if cached is None:
-                cached = examples_from_record(record, record_fast_moves=fast)
+            game_stats = self._example_cache_game_stats.get(key)
+            if cached is None or game_stats is None:
+                derived: list[GameDerivationStats] = []
+                cached = examples_from_record(
+                    record,
+                    record_fast_moves=fast,
+                    on_derived=derived.append,
+                )
+                if len(derived) != 1:
+                    raise AssertionError(
+                        "example derivation must produce one game-stat summary"
+                    )
+                game_stats = derived[0]
                 cache[key] = cached
+                self._example_cache_game_stats[key] = game_stats
                 self._example_cache_raw_bytes[key] = self._examples_raw_array_bytes(
                     cached
                 )
@@ -2231,6 +2258,8 @@ class PhaseDLoop:
                 derived_examples += len(cached)
             else:
                 cache.move_to_end(key)
+            if on_record_derived is not None:
+                on_record_derived(record, game_stats)
             used.add(key)
             out.extend(cached)
 
@@ -2254,6 +2283,7 @@ class PhaseDLoop:
         if capacity == 0:
             cache.clear()
             self._example_cache_raw_bytes.clear()
+            self._example_cache_game_stats.clear()
         else:
             # Evict strictly to the cap, including games in the current window.
             # `out` already holds every reference this training call needs, so
@@ -2305,6 +2335,9 @@ class PhaseDLoop:
         iteration: int,
         *,
         source_checkpoint: str | Path | None = None,
+        on_record_derived: (
+            Callable[[GameRecord, GameDerivationStats], None] | None
+        ) = None,
     ) -> Path:
         if len(records) < self.config.min_games_to_train:
             raise ValueError(
@@ -2312,7 +2345,10 @@ class PhaseDLoop:
                 f"got {len(records)}"
             )
         replay_started = time.monotonic()
-        examples = self._cached_examples(records)
+        examples = self._cached_examples(
+            records,
+            on_record_derived=on_record_derived,
+        )
         replay_seconds = time.monotonic() - replay_started
         self.phase_seconds["replay_derivation"] = replay_seconds
         target_baselines = baselines(examples)

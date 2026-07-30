@@ -17,6 +17,7 @@ Targets (all actor-relative, §2):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -50,6 +51,21 @@ _VICTORY_OFFSET = {
     VictoryType.SCIENTIFIC: 1,
     VictoryType.MILITARY: 2,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class GameDerivationStats:
+    """Final-state observations collected during verified example derivation."""
+
+    ending_age: int
+    max_absolute_track: int
+    sixth_science_symbol: bool
+    progress_tokens: int
+    science_pairs: int
+    military_tokens_triggered: int
+    military_gold_pillaged: int
+    wonders_built: int
+    wonders_discarded: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +152,12 @@ def is_fast_search_move(move) -> bool:
     return move.policy_excluded and move.sims > 0
 
 
-def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False) -> list[Example]:
+def examples_from_record(
+    record: GameRecord,
+    *,
+    record_fast_moves: bool = False,
+    on_derived: Callable[[GameDerivationStats], None] | None = None,
+) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
     example per recorded decision. A stale or tampered buffer raises
@@ -152,12 +173,16 @@ def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False)
     Wu (2020) §3.1: "Only turns with a full search are recorded for training."
     The value target is limited by one noisy result per *game*, so additional
     positions from the same game share that label and add little while
-    inflating the buffer.
+    inflating the buffer. ``on_derived`` receives the W3 observations from this
+    same verified replay, avoiding a second stats-only traversal.
     """
 
     staged: list[tuple[Example, int]] = []  # (example, actor)
+    maximum_track = 0
 
     def featurize(game, move):
+        nonlocal maximum_track
+        maximum_track = max(maximum_track, abs(game.conflict_position))
         # Replay still steps through this move -- only the example is dropped.
         if not record_fast_moves and is_fast_search_move(move):
             return
@@ -219,8 +244,31 @@ def examples_from_record(record: GameRecord, *, record_fast_moves: bool = False)
         )
 
     game = replay(record, on_state=featurize)
+    maximum_track = max(maximum_track, abs(game.conflict_position))
     final_position = game.conflict_position
     sci_counts = (len(_science_symbols(game, 0)), len(_science_symbols(game, 1)))
+    if on_derived is not None:
+        on_derived(
+            GameDerivationStats(
+                ending_age=game.age,
+                max_absolute_track=maximum_track,
+                sixth_science_symbol=max(sci_counts) >= 6,
+                progress_tokens=sum(
+                    len(city.progress_tokens) for city in game.cities
+                ),
+                science_pairs=sum(
+                    len(city.claimed_science_pairs) for city in game.cities
+                ),
+                military_tokens_triggered=4
+                - len(game.military_tokens_remaining),
+                military_gold_pillaged=14
+                - sum(game.military_tokens_remaining.values()),
+                wonders_built=sum(
+                    len(city.built_wonders) for city in game.cities
+                ),
+                wonders_discarded=len(game.retired_wonders),
+            )
+        )
     examples: list[Example] = []
     for (
         type_ids,

@@ -15,8 +15,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from .buffer import GameRecord
-from .dataset import examples_from_records
+from .buffer import GameRecord, replay
+from .dataset import examples_from_record, examples_from_records
 from .phase_d import (
     DEFAULT_CACHE_CALIBRATION_FACTOR,
     LEGACY_EXAMPLE_BYTES,
@@ -102,6 +102,174 @@ def test_cache_returns_exactly_what_the_uncached_path_returns(tmp_path, records)
     assert len(warm) == len(expected)
     assert all(_same(a, b) for a, b in zip(warm, expected))
     assert loop.last_example_cache_stats["replayed_games"] == 0, "second pass replayed"
+
+
+def test_example_derivation_collects_game_stats_from_the_same_replay(records):
+    observed = []
+    examples_from_record(records[0], on_derived=observed.append)
+    assert len(observed) == 1
+    stats = observed[0]
+
+    maximum_track = 0
+
+    def observe(game, _move):
+        nonlocal maximum_track
+        maximum_track = max(maximum_track, abs(game.conflict_position))
+
+    game = replay(records[0], on_state=observe)
+    assert stats.ending_age == game.age
+    assert stats.max_absolute_track == maximum_track
+    assert stats.progress_tokens == sum(
+        len(city.progress_tokens) for city in game.cities
+    )
+    assert stats.science_pairs == sum(
+        len(city.claimed_science_pairs) for city in game.cities
+    )
+    assert stats.wonders_built == sum(
+        len(city.built_wonders) for city in game.cities
+    )
+    assert stats.wonders_discarded == len(game.retired_wonders)
+
+
+def test_cached_game_stats_do_not_require_another_replay(tmp_path, records):
+    loop = _loop(tmp_path)
+    cold = []
+    warm = []
+
+    loop._cached_examples(
+        records,
+        on_record_derived=lambda record, stats: cold.append((record.seed, stats)),
+    )
+    loop._cached_examples(
+        records,
+        on_record_derived=lambda record, stats: warm.append((record.seed, stats)),
+    )
+
+    assert warm == cold
+    assert loop.last_example_cache_stats["replayed_games"] == 0
+
+
+def test_w3_game_stats_are_completed_during_example_derivation(tmp_path, records):
+    from .engine import _science_symbols
+    from .training_adapter import _GameSpecificCollector, _record_stats
+
+    _generation, _outcomes, game_specific = _record_stats(records, {})
+    collector = _GameSpecificCollector(records, game_specific)
+    loop = _loop(tmp_path)
+    loop._cached_examples(records, on_record_derived=collector.observe)
+    collector.finalize()
+
+    expected_ages = {}
+    expected_maximum_track = 0
+    expected_science_wins = 0
+    expected_science_tokens = 0
+    expected_science_pairs = 0
+    expected_military_tokens = 0
+    expected_gold_pillaged = 0
+    expected_wonders_built = 0
+    expected_wonders_discarded = 0
+    expected_age_three = 0
+    for record in records:
+        maximum_track = 0
+
+        def observe(game, _move):
+            nonlocal maximum_track
+            maximum_track = max(maximum_track, abs(game.conflict_position))
+
+        game = replay(record, on_state=observe)
+        maximum_track = max(maximum_track, abs(game.conflict_position))
+        expected_ages[str(game.age)] = expected_ages.get(str(game.age), 0) + 1
+        expected_maximum_track = max(expected_maximum_track, maximum_track)
+        expected_science_wins += int(
+            record.victory_type == "scientific"
+            and max(len(_science_symbols(game, seat)) for seat in (0, 1)) >= 6
+        )
+        expected_science_tokens += sum(
+            len(city.progress_tokens) for city in game.cities
+        )
+        expected_science_pairs += sum(
+            len(city.claimed_science_pairs) for city in game.cities
+        )
+        expected_military_tokens += 4 - len(game.military_tokens_remaining)
+        expected_gold_pillaged += 14 - sum(
+            game.military_tokens_remaining.values()
+        )
+        expected_wonders_built += sum(
+            len(city.built_wonders) for city in game.cities
+        )
+        expected_wonders_discarded += len(game.retired_wonders)
+        expected_age_three += int(
+            game.age == 3 and record.victory_type == "civilian"
+        )
+
+    assert game_specific["ending_age"] == expected_ages
+    assert (
+        game_specific["military"]["max_absolute_track"]
+        == expected_maximum_track
+    )
+    assert (
+        game_specific["science"]["sixth_symbol_wins"]
+        == expected_science_wins
+    )
+    assert game_specific["science"]["tokens_taken"] == expected_science_tokens
+    assert game_specific["science"]["pairs_completed"] == expected_science_pairs
+    assert (
+        game_specific["military"]["tokens_triggered"]
+        == expected_military_tokens
+    )
+    assert (
+        game_specific["military"]["gold_pillaged"] == expected_gold_pillaged
+    )
+    assert (
+        game_specific["draft_wonder"]["wonders_built"]
+        == expected_wonders_built
+    )
+    assert (
+        game_specific["draft_wonder"]["wonders_discarded"]
+        == expected_wonders_discarded
+    )
+    assert game_specific["draft_wonder"]["age_iii_completion_rate"] == (
+        expected_age_three / len(records)
+    )
+
+
+def test_warmup_lifecycle_completes_stats_while_caching_positions(
+    tmp_path, records
+):
+    from games.az_loop import ReplayResult
+    from games.az_loop.contract import TrainRequest
+
+    from .training_adapter import (
+        SevenWondersDuelLifecycleAdapter,
+        _GameSpecificCollector,
+        _record_stats,
+    )
+
+    loop = _loop(tmp_path, min_buffer_positions=1_000_000)
+    adapter = SevenWondersDuelLifecycleAdapter(loop)
+    _generation, _outcomes, game_specific = _record_stats(records, {})
+    adapter._pending_game_stats = (
+        0,
+        _GameSpecificCollector(records, game_specific),
+    )
+    learner = tmp_path / "learner.pt"
+    learner.write_bytes(b"placeholder")
+
+    result = adapter.train(
+        TrainRequest(
+            iteration=0,
+            learner_checkpoint=learner,
+            replay=ReplayResult(
+                training_games=len(records),
+                payload=records,
+            ),
+        )
+    )
+
+    assert result.skipped
+    assert sum(game_specific["ending_age"].values()) == len(records)
+    assert loop.last_example_cache_stats["replayed_games"] == len(records)
+    assert result.metrics["replay_derivation_seconds"] >= 0.0
 
 
 def test_a_repeated_game_is_replayed_once_but_still_emitted_twice(tmp_path, records):

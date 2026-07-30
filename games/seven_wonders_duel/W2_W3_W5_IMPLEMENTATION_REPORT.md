@@ -59,7 +59,10 @@ Implemented `games/az_loop/stats.py` and schema version 2:
 - every v2 row attributes results to width, layers, heads, parameter count, and
   precision;
 - the 7WD extension records victory length/age, science, military, and
-  draft/wonder signals.
+  draft/wonder signals;
+- those game-specific observations are now collected during the verified replay
+  that creates trainable positions and cached with the examples. The former
+  stats-only full replay and its unattributed wall time are removed.
 
 `tools/az_report.py` reads either schema. Against `laptop_training_03`, it
 reproduced the ten-iteration outcome blocks, the gate ladder, and an
@@ -125,8 +128,8 @@ record target-device headroom, but no adaptive VRAM estimator or separate
 
 Final verification:
 
-- focused W2/W3/W5 Python tests: 95 passed;
-- full `games/seven_wonders_duel` Python suite: 641 passed, one existing
+- replay/statistics focused Python tests: 32 passed;
+- full `games/seven_wonders_duel` Python suite: 644 passed, one existing
   tensor-conversion warning;
 - Rust unit tests: 16 passed, with one non-fatal test-helper dead-code warning;
 - `git diff --check`: clean.
@@ -166,8 +169,8 @@ The cloud launch still runs one exact-geometry L/bf16 preflight and retains
 RSS/physical-VRAM telemetry, but those are operational checks rather than an
 open W2 engineering project.
 
-W3 still needs opponent-attribution and redundant-replay corrections. W5's
-decision rule and full promotion-plus-anchor cost budget remain under review;
+W3 still needs the opponent-attribution correction. W5's decision rule and
+full promotion-plus-anchor cost budget remain under review;
 RTX 5090 gate measurements and production cap selection belong to that W5 work.
 
 Commands and expected artifacts are in
