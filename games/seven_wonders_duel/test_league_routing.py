@@ -115,6 +115,40 @@ def test_routing_all_seats_to_network_zero_matches_no_routing():
     assert plain.pairs == routed.pairs
 
 
+def test_gate_wilson_stop_halts_rolling_scheduler_on_complete_pair():
+    """The worker stays live while queue admission stops on pair evidence."""
+
+    import seven_wonders_rust as swr
+
+    pair_count = 20
+    seeds = [
+        9000 + pair
+        for pair in range(pair_count)
+        for _candidate_seat in (0, 1)
+    ]
+    first_players = [
+        pair % 2
+        for pair in range(pair_count)
+        for _candidate_seat in (0, 1)
+    ]
+    nets_p0 = [0, 1] * pair_count
+    nets_p1 = [1, 0] * pair_count
+    recorder = _RoutingRecorder()
+    records, metrics = swr.self_play_many_flat_net(
+        adapter=recorder,
+        games=rust_games_for_self_play(seeds, first_players),
+        game_seeds=seeds,
+        nets_p0=nets_p0,
+        nets_p1=nets_p1,
+        gate_promotion_min_lcb=0.99,
+        gate_z=1.96,
+        max_active_slots=8,
+        scheduler_workers=1,
+        **_kwargs(),
+    )
+    assert len(records) == metrics["games"] == 2
+
+
 # -- the property that matters --------------------------------------------
 
 

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict
+import gc
 import hashlib
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -22,6 +23,7 @@ import time
 from typing import Any, Sequence
 import warnings
 
+import psutil
 import torch
 
 from games.az_loop import (
@@ -37,6 +39,7 @@ from games.az_loop import (
     LinearSchedule,
     MatchOutcome,
     ReplayWindow,
+    ResourceMonitor,
     RunController,
     RunLog,
     RunManifest,
@@ -46,6 +49,7 @@ from games.az_loop import (
     play_match,
     run_jobs,
     run_jobs_in_processes,
+    wilson_interval,
 )
 
 from .bots import (
@@ -92,6 +96,19 @@ from .train import (
     train_steps,
 )
 from .net import LEGACY_HEADS
+
+
+LEGACY_EXAMPLE_BYTES = 17_800
+MEASURED_ARRAY_BYTES = 13_100
+DEFAULT_CACHE_CALIBRATION_FACTOR = LEGACY_EXAMPLE_BYTES / MEASURED_ARRAY_BYTES
+EXAMPLE_ARRAY_FIELDS = (
+    "type_ids",
+    "entity_ids",
+    "aux_ids",
+    "features",
+    "legal",
+    "policy_target",
+)
 
 
 CURRICULUM_BOT_TYPES = (
@@ -209,14 +226,9 @@ class PhaseDConfig:
     hof_opponent_fraction: float = 0.0
     """Share of generation games played against an archived HOF checkpoint.
 
-    Zero preserves today's behaviour, where every game is ``current_best``
-    against itself and the HOF is write-only. Raising it buys opponent diversity
-    -- which is what mattered in Kingdomino -- at the cost of some games no
-    longer being on-policy for the current net.
-
-    Off by default because it changes both the memory profile and the batch
-    composition that W2's and W5's acceptances measure, so it has to be a
-    deliberate, recorded choice rather than a new silent default.
+    Zero remains the compatibility default. The cloud launch value is explicitly
+    pinned to 0.15; its realized share is recorded in schema-v2 stats and
+    re-validated on the cloud training host.
     """
 
     hof_sampling_mode: str = "recency"
@@ -306,12 +318,27 @@ class PhaseDConfig:
     11 s of actual training.
 
     Each game is therefore replayed once per process and its examples kept.  The
-    cap bounds that at roughly 12.5 KB per example (~3.1 GB at the default),
-    evicting least-recently-used games -- which are the iterations that have
-    left the replay window.  Size it above
+    compatibility count converts at the measured 17.8 KB per example (~4.45 GB
+    at the default), then a startup-calibrated retained-byte estimate enforces
+    the bound while evicting least-recently-used games. Size it above
     ``replay_window * games_per_iteration * 20 + seed_games * 60`` or the window
     itself will thrash.
     """
+
+    example_cache_bytes: int = 0
+    """Preferred cache ceiling in bytes; 0 converts the legacy count above."""
+
+    memory_budget_gb: float = 0.0
+    """Host-RSS budget; 0 resolves to 85% of physical RAM at startup."""
+
+    vram_budget_gb: float = 0.0
+    """Device-memory budget; 0 resolves to 90% of detected physical VRAM."""
+
+    memory_headroom_gb: float = 2.0
+    """Host memory deliberately reserved outside the process budget."""
+
+    example_cache_floor_bytes: int = 0
+    """Minimum retained cache after pressure eviction (0 permits a full drop)."""
 
     min_buffer_positions: int = 0
     """Skip training until the replay buffer holds this many positions.
@@ -331,7 +358,13 @@ class PhaseDConfig:
     gate_alpha: float = 0.05
     gate_beta: float = 0.05
     gate_indifference: float = 0.03
+    promotion_min_lcb: float = 0.50
+    revert_win_rate: float = 0.48
+    gate_confidence_z: float = 1.96
+    gate_slots: int = 48
+    gate_early_stop: bool = True
     anchor_gate_every_promotions: int = 3
+    anchor_games: int = 200
     # Iteration-cadence out-of-distribution anchor.  The promotion-keyed
     # cadence above never fired in run 02 because nothing was ever promoted,
     # so the bot suite -- the only opponent set outside the self-play
@@ -530,22 +563,16 @@ class PhaseDConfig:
             raise ValueError("search_mode must be closed or open")
         if self.gate_max_games <= 0 or self.gate_max_games % 2:
             raise ValueError("gate_max_games must be a positive even number")
-        power = self.gate_power()
-        if self.promotion_every > 0 and power["underpowered"]:
-            warnings.warn(
-                f"promotion gate is underpowered: {self.gate_max_games} games "
-                f"cannot resolve a {self.gate_indifference:.0%} indifference "
-                f"region (a candidate at the H1 boundary needs about "
-                f"{power['expected_games_to_accept_at_h1']:.0f} games, and an "
-                "evenly-matched candidate needs unboundedly many). Every "
-                "iteration will read as probation. Raise --gate-max-games, "
-                "widen --gate-indifference, or set --promotion-every 0 to skip "
-                "the gate and spend the games on self-play instead.",
-                UnderpoweredGateWarning,
-                stacklevel=2,
-            )
+        if not 0.0 <= self.promotion_min_lcb <= 1.0:
+            raise ValueError("promotion_min_lcb must lie in [0, 1]")
+        if not 0.0 <= self.revert_win_rate <= 1.0:
+            raise ValueError("revert_win_rate must lie in [0, 1]")
+        if self.gate_confidence_z <= 0 or self.gate_slots <= 0:
+            raise ValueError("gate_confidence_z and gate_slots must be positive")
         if self.anchor_gate_every_promotions < 0:
             raise ValueError("anchor_gate_every_promotions must be non-negative")
+        if self.anchor_games <= 0 or self.anchor_games % 2:
+            raise ValueError("anchor_games must be a positive even number")
         valid_modes = {mode.value for mode in GeneratorMode}
         if self.selfplay_generator_mode not in valid_modes:
             raise ValueError(
@@ -564,6 +591,12 @@ class PhaseDConfig:
             raise ValueError("buffer_autosave_every must be non-negative")
         if self.example_cache_examples < 0:
             raise ValueError("example_cache_examples must be non-negative")
+        if self.example_cache_bytes < 0 or self.example_cache_floor_bytes < 0:
+            raise ValueError("example cache byte bounds must be non-negative")
+        if self.memory_budget_gb < 0 or self.vram_budget_gb < 0:
+            raise ValueError("memory budgets must be non-negative")
+        if self.memory_headroom_gb < 0:
+            raise ValueError("memory_headroom_gb must be non-negative")
         if self.warm_buffer_max_staleness < 0:
             raise ValueError("warm_buffer_max_staleness must be non-negative")
         if self.gate_backend not in ("rust", "python"):
@@ -1228,6 +1261,51 @@ class GateResult:
     decision: str
     games: int
     score_rate: float
+    pairs: int = 0
+    wilson_lcb: float = 0.0
+    wilson_ucb: float = 1.0
+    stop_reason: str = ""
+    evaluated_games: int = 0
+    seconds: float = field(default=0.0, compare=False)
+    moves_per_game: float = 0.0
+    fixed_n: bool = False
+
+
+def wilson_pair_decision(
+    pair_scores: Sequence[float],
+    *,
+    promotion_min_lcb: float = 0.50,
+    revert_win_rate: float = 0.48,
+    z: float = 1.96,
+    fixed_n: bool = False,
+    measurement_threshold: float = 0.50,
+) -> tuple[str, int, float, float, float, str]:
+    """Three-way gate decision using independent seat-pairs as observations."""
+
+    if not pair_scores:
+        return "continue", 0, 0.0, 0.0, 1.0, "no_pairs"
+    points = 0.0
+    for index, score in enumerate(pair_scores, start=1):
+        if score not in (0.0, 0.5, 1.0):
+            raise ValueError("pair outcomes must be one of 0, 0.5, or 1")
+        points += score
+        rate = points / index
+        lcb, ucb = wilson_interval(points, index, z=z)
+        if fixed_n:
+            continue
+        if lcb > promotion_min_lcb:
+            return "accept", index, rate, lcb, ucb, "promotion_lcb"
+        if ucb < promotion_min_lcb:
+            return "reject", index, rate, lcb, ucb, "futility_ucb"
+    pairs = len(pair_scores)
+    rate = points / pairs
+    lcb, ucb = wilson_interval(points, pairs, z=z)
+    if fixed_n:
+        decision = "accept" if rate >= measurement_threshold else "reject"
+        return decision, pairs, rate, lcb, ucb, "fixed_n"
+    if rate < revert_win_rate:
+        return "reject", pairs, rate, lcb, ucb, "cap_revert_rate"
+    return "continue", pairs, rate, lcb, ucb, "cap_probation"
 
 
 class PhaseDLoop:
@@ -1253,10 +1331,35 @@ class PhaseDLoop:
         # Ordered so eviction can be least-recently-used: the games that fall out
         # are the iterations that have left the replay window.
         self._example_cache: OrderedDict[tuple, list[Example]] = OrderedDict()
-        self.last_example_cache_stats: dict[str, int] = {}
+        self._example_cache_raw_bytes: dict[tuple, int] = {}
+        self.cache_calibration_factor = DEFAULT_CACHE_CALIBRATION_FACTOR
+        self._cache_calibrated = False
+        self.last_example_cache_stats: dict[str, Any] = {}
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
+        self.last_gate_stats: dict[str, Any] = {}
         self.last_warm_stats: dict[str, int] = {}
+        self.resource_monitor = ResourceMonitor()
+        self.phase_seconds: dict[str, float] = {}
+        gib = 1024**3
+        total_ram = int(psutil.virtual_memory().total)
+        configured_host = (
+            int(config.memory_budget_gb * gib)
+            if config.memory_budget_gb > 0
+            else int(total_ram * 0.85)
+        )
+        self.memory_budget_bytes = max(
+            0, configured_host - int(config.memory_headroom_gb * gib)
+        )
+        if torch.cuda.is_available() and config.device.startswith("cuda"):
+            _free, total_vram = torch.cuda.mem_get_info()
+            self.vram_budget_bytes = (
+                int(config.vram_budget_gb * gib)
+                if config.vram_budget_gb > 0
+                else int(total_vram * 0.90)
+            )
+        else:
+            self.vram_budget_bytes = 0
 
     # -- schedule clock ----------------------------------------------------
 
@@ -1702,7 +1805,7 @@ class PhaseDLoop:
             f"cannot resume with changed training schedules ({detail})." + hint
         )
 
-    def load_model(self, path: str | Path):
+    def _load_model_checkpoint(self, path: str | Path):
         """Rebuild a saved model under the architecture it was trained with.
 
         The head count comes from the checkpoint, not the run config, and a
@@ -1712,9 +1815,8 @@ class PhaseDLoop:
         d_model or layer-count mismatch, which fails loudly on shape.
         """
 
-        stored = torch.load(path, map_location="cpu", weights_only=False).get(
-            "config", {}
-        )
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        stored = checkpoint.get("config", {})
         heads = heads_from_config(stored)
         expected = self._built_heads(self._new_model())
         if heads != expected:
@@ -1726,12 +1828,18 @@ class PhaseDLoop:
         model = build_model(
             "transformer", self.config.d_model, self.config.layers, heads
         )
-        load_checkpoint(path, model)
-        return model
+        load_checkpoint(path, model, checkpoint=checkpoint)
+        return model, checkpoint
+
+    def load_model(self, path: str | Path):
+        return self._load_model_checkpoint(path)[0]
 
     @staticmethod
-    def checkpoint_agent_name(path: str | Path, role: str) -> str:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    def checkpoint_agent_name(
+        path: str | Path, role: str, checkpoint: dict[str, Any] | None = None
+    ) -> str:
+        if checkpoint is None:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         iteration = checkpoint.get("config", {}).get("iteration", "unknown")
         return f"{role}_iter_{iteration}"
 
@@ -1934,7 +2042,14 @@ class PhaseDLoop:
             "rust_chunks": len(rust_metrics),
             "python_inference_batches": 0,
             "python_inference_positions": 0,
+            # W3: retain the scheduler evidence instead of reducing it to the
+            # number of chunks. These counters explain batch-width and forced
+            # expansion throughput changes across a long run.
+            "rust_scheduler": dict(metrics),
         }
+        if not hasattr(self, "phase_seconds"):
+            self.phase_seconds = {}
+        self.phase_seconds["generation"] = elapsed
         _write_records(destination, records)
         return records
 
@@ -1998,6 +2113,72 @@ class PhaseDLoop:
 
         self.optimizer_state_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _examples_raw_array_bytes(examples: Sequence[Example]) -> int:
+        return sum(
+            int(getattr(example, field).nbytes)
+            for example in examples
+            for field in EXAMPLE_ARRAY_FIELDS
+        )
+
+    def _cache_capacity_bytes(self) -> int:
+        if self.config.example_cache_bytes > 0:
+            return int(self.config.example_cache_bytes)
+        return int(self.config.example_cache_examples * LEGACY_EXAMPLE_BYTES)
+
+    def _cache_totals(self) -> tuple[int, int]:
+        live = set(self._example_cache)
+        for key in list(self._example_cache_raw_bytes):
+            if key not in live:
+                del self._example_cache_raw_bytes[key]
+        raw = sum(self._example_cache_raw_bytes.get(key, 0) for key in live)
+        estimated = int(math.ceil(raw * self.cache_calibration_factor))
+        return raw, estimated
+
+    def _evict_cache_to(self, target_estimated_bytes: int) -> int:
+        target = max(
+            int(self.config.example_cache_floor_bytes),
+            int(target_estimated_bytes),
+        )
+        evicted = 0
+        _raw, estimated = self._cache_totals()
+        while self._example_cache and estimated > target:
+            key, _dropped = self._example_cache.popitem(last=False)
+            self._example_cache_raw_bytes.pop(key, None)
+            evicted += 1
+            _raw, estimated = self._cache_totals()
+        return evicted
+
+    def sample_resources(self, phase: str) -> dict[str, int | float | None]:
+        sample = self.resource_monitor.sample(phase)
+        if self.memory_budget_bytes and int(sample["rss_bytes"] or 0) > self.memory_budget_bytes:
+            before = int(sample["rss_bytes"] or 0)
+            raw, estimated = self._cache_totals()
+            over = before - self.memory_budget_bytes
+            target = max(0, estimated - int(over * 1.25))
+            evicted = self._evict_cache_to(target)
+            gc.collect()
+            after = self.resource_monitor.sample(f"{phase}_after_pressure")
+            self.resource_monitor.pressure(
+                phase,
+                budget_bytes=self.memory_budget_bytes,
+                rss_before_bytes=before,
+                rss_after_bytes=int(after["rss_bytes"] or 0),
+                cache_raw_bytes=raw,
+                cache_estimated_bytes=estimated,
+                evicted_games=evicted,
+            )
+        return sample
+
+    def resource_stats(self):
+        raw, estimated = self._cache_totals()
+        return self.resource_monitor.as_stats(
+            cache_estimated_bytes=estimated,
+            cache_raw_array_bytes=raw,
+            cache_calibration_factor=self.cache_calibration_factor,
+            phase_seconds=self.phase_seconds,
+        )
+
     def _cached_examples(self, records: list[GameRecord]) -> list[Example]:
         """Vectorized examples for `records`, replaying each game at most once.
 
@@ -2028,6 +2209,8 @@ class PhaseDLoop:
 
         cache = self._example_cache
         fast = self.config.record_fast_moves
+        rss_before = int(psutil.Process().memory_info().rss)
+        raw_before, _estimated_before = self._cache_totals()
         derived_games = 0
         derived_examples = 0
         used: set[tuple] = set()
@@ -2041,6 +2224,9 @@ class PhaseDLoop:
             if cached is None:
                 cached = examples_from_record(record, record_fast_moves=fast)
                 cache[key] = cached
+                self._example_cache_raw_bytes[key] = self._examples_raw_array_bytes(
+                    cached
+                )
                 derived_games += 1
                 derived_examples += len(cached)
             else:
@@ -2048,12 +2234,26 @@ class PhaseDLoop:
             used.add(key)
             out.extend(cached)
 
-        capacity = max(0, self.config.example_cache_examples)
-        held = sum(len(value) for value in cache.values())
+        if derived_games and not self._cache_calibrated:
+            rss_after = int(psutil.Process().memory_info().rss)
+            raw_after, _estimated_after = self._cache_totals()
+            raw_delta = max(0, raw_after - raw_before)
+            rss_delta = max(0, rss_after - rss_before)
+            if raw_delta:
+                measured = rss_delta / raw_delta
+                # RSS is noisy because allocators reserve arenas. Never use a
+                # factor below the A1 measurement, and cap one-off noise so a
+                # concurrent allocation cannot disable the cache permanently.
+                self.cache_calibration_factor = min(
+                    3.0,
+                    max(DEFAULT_CACHE_CALIBRATION_FACTOR, measured),
+                )
+            self._cache_calibrated = True
+        capacity = self._cache_capacity_bytes()
         evicted = 0
         if capacity == 0:
             cache.clear()
-            held = 0
+            self._example_cache_raw_bytes.clear()
         else:
             # Evict strictly to the cap, including games in the current window.
             # `out` already holds every reference this training call needs, so
@@ -2063,33 +2263,40 @@ class PhaseDLoop:
             # full -- the cap silently did nothing, which is the opposite of what
             # a memory bound is for. Entries touched above sit at the end, so
             # eviction still takes the least recently used first.
-            while cache and held > capacity:
-                key, dropped = next(iter(cache.items()))
-                del cache[key]
-                held -= len(dropped)
-                evicted += 1
+            evicted = self._evict_cache_to(capacity)
+        raw_held, estimated_held = self._cache_totals()
+        held_examples = sum(len(value) for value in cache.values())
         self.last_example_cache_stats = {
             "games": len(records),
             "examples": len(out),
             "replayed_games": derived_games,
             "replayed_examples": derived_examples,
             "cached_games": len(cache),
-            "cached_examples": held,
+            "cached_examples": held_examples,
             "evicted_games": evicted,
-            "capacity_examples": capacity,
+            "capacity_bytes": capacity,
+            "raw_array_bytes": raw_held,
+            "estimated_bytes": estimated_held,
+            "calibration_factor": self.cache_calibration_factor,
+            # Retained for old dashboards; it is explicitly an estimate.
+            "capacity_examples": capacity // LEGACY_EXAMPLE_BYTES,
         }
         # The condition that matters is not "did we evict" but "is the cap below
         # one window": that is the state where every iteration re-replays
         # everything, and it must be loud on the *first* such call rather than
         # inferred later from a slow run.
-        if capacity and len(out) > capacity:
+        window_estimated = int(
+            self._examples_raw_array_bytes(out) * self.cache_calibration_factor
+        )
+        if capacity and window_estimated > capacity:
             print(
-                f"example cache cap ({capacity:,}) is below this window "
-                f"({len(out):,} examples); every iteration will re-replay the "
-                "whole window. Raise --example-cache-examples to at least "
-                f"{len(out):,} (~{len(out) * 12.5 / 1e6:.1f} GB) or shrink "
-                "--replay-window."
+                f"example cache cap ({capacity / 1e9:.2f} GB) is below this "
+                f"window ({len(out):,} examples, ~{window_estimated / 1e9:.2f} "
+                "GB calibrated); every iteration will re-replay the whole "
+                "window. Raise --example-cache-bytes/--example-cache-examples "
+                "or shrink --replay-window-cap-games."
             )
+        self.sample_resources("post_replay_derivation")
         return out
 
     def train_candidate(
@@ -2104,7 +2311,10 @@ class PhaseDLoop:
                 f"need {self.config.min_games_to_train} games to train, "
                 f"got {len(records)}"
             )
+        replay_started = time.monotonic()
         examples = self._cached_examples(records)
+        replay_seconds = time.monotonic() - replay_started
+        self.phase_seconds["replay_derivation"] = replay_seconds
         target_baselines = baselines(examples)
         train_examples, val_examples = stable_game_split(
             examples, self.config.val_fraction, self.config.val_split_salt
@@ -2143,6 +2353,7 @@ class PhaseDLoop:
                 self.config.aux_weight,
                 precision=self.config.precision,
             )
+        training_started = time.monotonic()
         history, optimizer_state = train_steps(
             model,
             train_examples,
@@ -2160,6 +2371,8 @@ class PhaseDLoop:
             seed=self.config.seed + iteration,
             precision=self.config.precision,
         )
+        training_seconds = time.monotonic() - training_started
+        self.phase_seconds["training"] = training_seconds
         self._save_optimizer_state(optimizer_state, iteration)
         samples = self.config.train_steps * self.config.train_batch_size
         new_examples = len(temporal_examples)
@@ -2188,6 +2401,9 @@ class PhaseDLoop:
             # served from the cache. `replayed_games` well above one iteration's
             # worth means the cache is thrashing against its cap.
             "example_cache": dict(self.last_example_cache_stats),
+            "replay_derivation_seconds": replay_seconds,
+            "seconds": training_seconds,
+            "precision": self.config.precision,
             "steps": history,
         }
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
@@ -2206,13 +2422,14 @@ class PhaseDLoop:
             },
         )
         torch.save(checkpoint, candidate)
+        self.sample_resources("post_training")
         return candidate
 
     def _model_agent_spec(self, path: str | Path, role: str) -> ModelAgentSpec:
-        model = self.load_model(path)
+        model, checkpoint = self._load_model_checkpoint(path)
         source = getattr(model, "_orig_mod", model)
         return ModelAgentSpec(
-            name=self.checkpoint_agent_name(path, role),
+            name=self.checkpoint_agent_name(path, role, checkpoint),
             model_state={
                 key: value.cpu() for key, value in source.state_dict().items()
             },
@@ -2223,6 +2440,57 @@ class PhaseDLoop:
             mode=self.config.search_mode,
             top_k=self.config.top_k,
         )
+
+    def _admit_gate(self, checkpoints: Sequence[str | Path]) -> None:
+        """Reserve host/device headroom before loading gate models.
+
+        Checkpoint file size is a conservative proxy for parameter bytes. Host
+        construction briefly holds the deserialized state and model tensors, so
+        count it twice; device construction holds one copy per evaluator.
+        """
+
+        if torch.cuda.is_available() and self.config.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        sample = self.sample_resources("pre_gate")
+        checkpoint_bytes = sum(Path(path).stat().st_size for path in checkpoints)
+        packed_bytes = self.config.rust_global_batch_cap * 512 * 1024
+        projected_host = int(sample["rss_bytes"] or 0) + 2 * checkpoint_bytes + packed_bytes
+        if self.memory_budget_bytes and projected_host > self.memory_budget_bytes:
+            need = projected_host - self.memory_budget_bytes
+            _raw, estimated = self._cache_totals()
+            evicted = self._evict_cache_to(max(0, estimated - int(need * 1.25)))
+            gc.collect()
+            after = self.resource_monitor.sample("pre_gate_after_eviction")
+            projected_host = (
+                int(after["rss_bytes"] or 0) + 2 * checkpoint_bytes + packed_bytes
+            )
+            self.resource_monitor.pressure(
+                "pre_gate_admission",
+                projected_rss_bytes=projected_host,
+                budget_bytes=self.memory_budget_bytes,
+                evicted_games=evicted,
+            )
+            if projected_host > self.memory_budget_bytes:
+                raise MemoryError(
+                    "promotion gate admission refused: projected host RSS "
+                    f"{projected_host / 1e9:.2f} GB exceeds budget "
+                    f"{self.memory_budget_bytes / 1e9:.2f} GB after cache eviction"
+                )
+        if self.vram_budget_bytes:
+            projected_vram = int(sample["vram_physical_bytes"] or 0) + checkpoint_bytes + packed_bytes
+            if projected_vram > self.vram_budget_bytes:
+                raise MemoryError(
+                    "promotion gate admission refused: projected physical VRAM "
+                    f"{projected_vram / 1e9:.2f} GB exceeds budget "
+                    f"{self.vram_budget_bytes / 1e9:.2f} GB"
+                )
+
+    def _cleanup_gate_resources(self) -> None:
+        self.resource_monitor.sample("gate_peak")
+        gc.collect()
+        if torch.cuda.is_available() and self.config.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        self.sample_resources("post_gate")
 
     def _gate_job(self, index: int, seed_offset: int) -> GameJob:
         return GameJob(
@@ -2374,6 +2642,117 @@ class PhaseDLoop:
                         return outcomes
         return outcomes
 
+    def _rust_model_gate_rolling(
+        self,
+        candidate_spec: ModelAgentSpec,
+        opponent_spec: ModelAgentSpec,
+        seed_offset: int,
+    ) -> list[MatchOutcome]:
+        """One rolling Rust scheduler call for both seat legs and all pairs.
+
+        Network ids are attached to the *searcher seat* (W1 routing), so every
+        leaf in one search uses the mover's network. Both legs share the active
+        pool, restoring batch width without the old per-leaf actor-routing bug.
+        """
+
+        import seven_wonders_rust as swr
+
+        def evaluator(spec: ModelAgentSpec) -> Evaluator:
+            model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
+            model.load_state_dict(spec.model_state)
+            return Evaluator(
+                model,
+                self.config.device,
+                self.config.rust_global_batch_cap,
+                precision=self.config.precision,
+            )
+
+        candidate_eval = evaluator(candidate_spec)
+        opponent_eval = evaluator(opponent_spec)
+        adapter = rust_searcher_routed_flat_batch_adapter(
+            (candidate_eval, opponent_eval)
+        )
+        pairs = self.config.gate_max_games // 2
+        seeds: list[int] = []
+        first_players: list[int] = []
+        candidate_seats: list[int] = []
+        nets_p0: list[int] = []
+        nets_p1: list[int] = []
+        for pair in range(pairs):
+            seed = self.config.seed + seed_offset + pair
+            first_player = pair % 2
+            for candidate_seat in (0, 1):
+                seeds.append(seed)
+                first_players.append(first_player)
+                candidate_seats.append(candidate_seat)
+                nets_p0.append(0 if candidate_seat == 0 else 1)
+                nets_p1.append(1 if candidate_seat == 0 else 0)
+        started = time.monotonic()
+        records, metrics = swr.self_play_many_flat_net(
+            adapter=adapter,
+            games=rust_games_for_self_play(seeds, first_players),
+            game_seeds=seeds,
+            global_batch_cap=self.config.rust_global_batch_cap,
+            leaf_batch=1,
+            cheap_sims_min=self.config.gate_sims,
+            cheap_sims_max=self.config.gate_sims,
+            full_sims_min=self.config.gate_sims,
+            full_sims_max=self.config.gate_sims,
+            full_search_fraction=0.0,
+            top_k=self.config.top_k,
+            draft_prior=0.0,
+            iteration=-1,
+            force=self.config.force_root_chance,
+            age_deal_samples=self.config.age_deal_samples,
+            max_inflight_batches=self.config.rust_max_inflight_batches,
+            # Statistical stopping needs one ordered pair stream. Generation
+            # may use multiple scheduler shards; the gate deliberately owns a
+            # separate one-worker scheduler and a separate slot count.
+            scheduler_workers=1,
+            max_active_slots=self.config.gate_slots,
+            deterministic_actions=True,
+            puct_root=self.config.eval_search_mode == "puct",
+            nets_p0=nets_p0,
+            nets_p1=nets_p1,
+            gate_promotion_min_lcb=(
+                self.config.promotion_min_lcb
+                if self.config.gate_early_stop
+                else None
+            ),
+            gate_z=self.config.gate_confidence_z,
+        )
+        elapsed = time.monotonic() - started
+        self.last_gate_stats = {
+            "seconds": elapsed,
+            "scheduler": dict(metrics),
+            "games_evaluated": len(records),
+            "moves": sum(len(record["moves"]) for record in records),
+            "worker_starts": 1,
+            "gate_slots": self.config.gate_slots,
+        }
+        outcomes: list[MatchOutcome] = []
+        for record, seed, first_player, candidate_seat in zip(
+            records, seeds, first_players, candidate_seats
+        ):
+            agents = (
+                (candidate_spec.name, opponent_spec.name)
+                if candidate_seat == 0
+                else (opponent_spec.name, candidate_spec.name)
+            )
+            scores = record["scores"]
+            outcomes.append(
+                MatchOutcome(
+                    seed=seed,
+                    first_player=first_player,
+                    agents=agents,
+                    winner=record["winner"],
+                    scores=tuple(scores) if scores is not None else None,
+                    victory_type=record["victory_type"] or "unknown",
+                    actions=len(record["moves"]),
+                )
+            )
+        return outcomes
+
     def _play_two_net_games(
         self,
         swr,
@@ -2442,6 +2821,8 @@ class PhaseDLoop:
         opponent_spec: BotAgentSpec,
         test: SPRT,
         seed_offset: int,
+        *,
+        max_games: int | None = None,
     ) -> list[MatchOutcome]:
         """Run model-vs-bot anchor games wholly in the Rust game loop."""
 
@@ -2462,7 +2843,7 @@ class PhaseDLoop:
         )
         adapter = rust_flat_batch_adapter(evaluator)
         outcomes: list[MatchOutcome] = []
-        maximum_pairs = self.config.gate_max_games // 2
+        maximum_pairs = (max_games or self.config.gate_max_games) // 2
         bot_name = opponent_spec.bot.name
         for start in range(0, maximum_pairs, self.config.rust_slots):
             pair_indices = list(
@@ -2607,38 +2988,249 @@ class PhaseDLoop:
             outcomes,
         )
 
+    @staticmethod
+    def _pair_scores(outcomes: Sequence[MatchOutcome]) -> list[float]:
+        if len(outcomes) % 2:
+            raise ValueError("gate outcomes must contain complete seat pairs")
+        paired = []
+        for index in range(0, len(outcomes), 2):
+            points = (
+                outcomes[index].score_for(0)
+                + outcomes[index + 1].score_for(1)
+            )
+            paired.append(1.0 if points > 1.0 else (0.5 if points == 1.0 else 0.0))
+        return paired
+
+    def _wilson_model_match(
+        self,
+        candidate_spec: ModelAgentSpec,
+        opponent_spec: ModelAgentSpec,
+        *,
+        seed_offset: int,
+    ) -> tuple[GateResult, list[MatchOutcome]]:
+        if self.config.gate_backend != "rust":
+            candidate_agent = _build_gate_agent(
+                candidate_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
+            )
+            opponent_agent = _build_gate_agent(
+                opponent_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
+            )
+            started = time.monotonic()
+            outcomes = []
+            for index in range(self.config.gate_max_games):
+                candidate_seat = index % 2
+                agents = (
+                    (candidate_agent, opponent_agent)
+                    if candidate_seat == 0
+                    else (opponent_agent, candidate_agent)
+                )
+                outcomes.append(
+                    play_match(
+                        self.adapter,
+                        agents,
+                        seed=self.config.seed + seed_offset + index // 2,
+                        first_player=(index // 2) % 2,
+                    )
+                )
+                if self.config.gate_early_stop and index % 2 == 1:
+                    interim = wilson_pair_decision(
+                        self._pair_scores(outcomes),
+                        promotion_min_lcb=self.config.promotion_min_lcb,
+                        revert_win_rate=self.config.revert_win_rate,
+                        z=self.config.gate_confidence_z,
+                    )
+                    if interim[-1] in ("promotion_lcb", "futility_ucb"):
+                        break
+            self.last_gate_stats = {
+                "seconds": time.monotonic() - started,
+                "games_evaluated": len(outcomes),
+                "worker_starts": 0,
+            }
+        else:
+            outcomes = self._rust_model_gate_rolling(
+                candidate_spec, opponent_spec, seed_offset
+            )
+        pair_scores = self._pair_scores(outcomes)
+        decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
+            pair_scores,
+            promotion_min_lcb=self.config.promotion_min_lcb,
+            revert_win_rate=self.config.revert_win_rate,
+            z=self.config.gate_confidence_z,
+        )
+        performance = self.last_gate_stats
+        evaluated_games = len(outcomes)
+        moves = sum(outcome.actions for outcome in outcomes)
+        return (
+            GateResult(
+                opponent=opponent_spec.name,
+                threshold=self.config.promotion_min_lcb,
+                decision=decision,
+                games=pairs * 2,
+                score_rate=rate,
+                pairs=pairs,
+                wilson_lcb=lcb,
+                wilson_ucb=ucb,
+                stop_reason=stop_reason,
+                evaluated_games=evaluated_games,
+                seconds=float(performance.get("seconds", 0.0)),
+                moves_per_game=moves / evaluated_games if evaluated_games else 0.0,
+                fixed_n=False,
+            ),
+            outcomes,
+        )
+
+    def _fixed_anchor_match(
+        self,
+        candidate_spec: ModelAgentSpec,
+        opponent_spec: BotAgentSpec,
+        *,
+        threshold: float,
+        seed_offset: int,
+    ) -> tuple[GateResult, list[MatchOutcome]]:
+        class _Continue:
+            decision = "continue"
+
+        class _NeverStop:
+            @staticmethod
+            def update(_score):
+                return _Continue()
+
+        started = time.monotonic()
+        if self.config.gate_backend == "rust":
+            outcomes = self._rust_bot_gate_waves(
+                candidate_spec,
+                opponent_spec,
+                _NeverStop(),
+                seed_offset,
+                max_games=self.config.anchor_games,
+            )
+        else:
+            candidate_agent = _build_gate_agent(
+                candidate_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
+            )
+            opponent_agent = _build_gate_agent(
+                opponent_spec,
+                self.config.device,
+                self.config.inference_batch,
+                self.config.precision,
+            )
+            outcomes = []
+            for index in range(self.config.anchor_games):
+                candidate_seat = index % 2
+                agents = (
+                    (candidate_agent, opponent_agent)
+                    if candidate_seat == 0
+                    else (opponent_agent, candidate_agent)
+                )
+                outcomes.append(
+                    play_match(
+                        self.adapter,
+                        agents,
+                        seed=self.config.seed + seed_offset + index // 2,
+                        first_player=(index // 2) % 2,
+                    )
+                )
+        elapsed = time.monotonic() - started
+        pair_scores = self._pair_scores(outcomes)
+        decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
+            pair_scores,
+            z=self.config.gate_confidence_z,
+            fixed_n=True,
+            measurement_threshold=threshold,
+        )
+        moves = sum(outcome.actions for outcome in outcomes)
+        return (
+            GateResult(
+                opponent=_spec_name(opponent_spec),
+                threshold=threshold,
+                decision=decision,
+                games=len(outcomes),
+                score_rate=rate,
+                pairs=pairs,
+                wilson_lcb=lcb,
+                wilson_ucb=ucb,
+                stop_reason=stop_reason,
+                evaluated_games=len(outcomes),
+                seconds=elapsed,
+                moves_per_game=moves / len(outcomes) if outcomes else 0.0,
+                fixed_n=True,
+            ),
+            outcomes,
+        )
+
     def promotion_gate(
         self, candidate: str | Path, *, opponent: str | Path | None = None
     ) -> GateResult:
         opponent = Path(opponent) if opponent is not None else self.current_best
-        report, outcomes = self._sprt_match(
-            self._model_agent_spec(candidate, "candidate"),
-            self._model_agent_spec(opponent, "best"),
-            threshold=0.50,
-            seed_offset=50_000_000,
-        )
-        self.elo.record(outcomes)
-        return report
+        self._admit_gate((candidate, opponent))
+        started = time.monotonic()
+        try:
+            candidate_spec = self._model_agent_spec(candidate, "candidate")
+            opponent_spec = self._model_agent_spec(opponent, "best")
+            report, outcomes = self._wilson_model_match(
+                candidate_spec,
+                opponent_spec,
+                seed_offset=50_000_000,
+            )
+            # Promotion evidence is allowed to stop on a boundary and is
+            # therefore not an Elo sample. Only fixed-N anchors enter the
+            # ladder; recording this prefix would bias ratings toward whichever
+            # boundary happened to stop the match.
+            return report
+        finally:
+            self.phase_seconds["gate"] = (
+                self.phase_seconds.get("gate", 0.0) + time.monotonic() - started
+            )
+            # Specs own CPU state dictionaries; evaluator/model objects are
+            # local to the gate helpers. Dropping both before empty_cache makes
+            # cleanup deterministic at the phase boundary.
+            if "candidate_spec" in locals():
+                del candidate_spec
+            if "opponent_spec" in locals():
+                del opponent_spec
+            self._cleanup_gate_resources()
 
     def anchor_gates(self, checkpoint: str | Path) -> list[GateResult]:
-        checkpoint_agent = self._model_agent_spec(checkpoint, "anchor_subject")
-        targets = [
-            (BotAgentSpec(GreedyBot()), 0.65),
-            *[(BotAgentSpec(bot_type()), 0.60) for bot_type in CURRICULUM_BOT_TYPES],
-        ]
-        reports = []
-        all_outcomes = []
-        for offset, (opponent, threshold) in enumerate(targets):
-            report, outcomes = self._sprt_match(
-                checkpoint_agent,
-                opponent,
-                threshold=threshold,
-                seed_offset=51_000_000 + offset * 1_000_000,
+        self._admit_gate((checkpoint,))
+        started = time.monotonic()
+        try:
+            checkpoint_agent = self._model_agent_spec(checkpoint, "anchor_subject")
+            targets = [
+                (BotAgentSpec(GreedyBot()), 0.65),
+                *[
+                    (BotAgentSpec(bot_type()), 0.60)
+                    for bot_type in CURRICULUM_BOT_TYPES
+                ],
+            ]
+            reports = []
+            all_outcomes = []
+            for offset, (opponent, threshold) in enumerate(targets):
+                report, outcomes = self._fixed_anchor_match(
+                    checkpoint_agent,
+                    opponent,
+                    threshold=threshold,
+                    seed_offset=51_000_000 + offset * 1_000_000,
+                )
+                reports.append(report)
+                all_outcomes.extend(outcomes)
+            self.elo.record(all_outcomes)
+            return reports
+        finally:
+            self.phase_seconds["gate"] = (
+                self.phase_seconds.get("gate", 0.0) + time.monotonic() - started
             )
-            reports.append(report)
-            all_outcomes.extend(outcomes)
-        self.elo.record(all_outcomes)
-        return reports
+            if "checkpoint_agent" in locals():
+                del checkpoint_agent
+            self._cleanup_gate_resources()
 
     def gate(
         self, candidate: str | Path, *, include_anchors: bool = True
@@ -2908,7 +3500,8 @@ def main(argv=None) -> int:
         type=float,
         default=0.0,
         help="share of generation games played against an archived HOF "
-        "checkpoint instead of current_best (0 = today's behaviour)",
+        "checkpoint instead of current_best (compatibility default: 0; "
+        "cloud launch value: 0.15)",
     )
     parser.add_argument(
         "--hof-sampling-mode",
@@ -2976,6 +3569,22 @@ def main(argv=None) -> int:
     parser.add_argument("--gate-alpha", type=float, default=0.05)
     parser.add_argument("--gate-beta", type=float, default=0.05)
     parser.add_argument("--gate-indifference", type=float, default=0.03)
+    parser.add_argument("--promotion-min-lcb", type=float, default=0.50)
+    parser.add_argument("--revert-win-rate", type=float, default=0.48)
+    parser.add_argument("--gate-confidence-z", type=float, default=1.96)
+    parser.add_argument(
+        "--gate-slots",
+        type=int,
+        default=48,
+        help="rolling active-game slots used only by model promotion gates",
+    )
+    parser.add_argument(
+        "--gate-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="stop promotion gates on Wilson promotion/futility evidence; "
+        "disable only for fixed-size cost calibration",
+    )
     parser.add_argument("--rust-slots", type=int, default=16)
     parser.add_argument("--rust-global-batch-cap", type=int, default=256)
     parser.add_argument("--rust-max-inflight-batches", type=int, default=1)
@@ -2994,6 +3603,12 @@ def main(argv=None) -> int:
         "2 is the value CHANCE_ENUMERATION_PLAN.md recommends sweeping)",
     )
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
+    parser.add_argument(
+        "--anchor-games",
+        type=int,
+        default=200,
+        help="fixed-N games per anchor opponent; anchors never early-stop",
+    )
     parser.add_argument(
         "--anchor-every-iterations",
         type=int,
@@ -3067,11 +3682,37 @@ def main(argv=None) -> int:
         "--example-cache-examples",
         type=int,
         default=250_000,
-        help="vectorized examples held in memory across iterations (~12.5 KB "
-        "each, so 250k is ~3.1 GB). Games already replayed are served from "
+        help="legacy cache count, converted at the measured 17.8 KB/example "
+        "(250k is ~4.45 GB). Games already replayed are served from "
         "the cache instead of being re-replayed; 0 disables it and restores "
         "the previous behaviour of rebuilding the whole replay window every "
         "iteration",
+    )
+    parser.add_argument(
+        "--example-cache-gb",
+        type=float,
+        default=0.0,
+        help="preferred calibrated cache ceiling in GB; 0 converts "
+        "--example-cache-examples for backward compatibility",
+    )
+    parser.add_argument(
+        "--memory-budget-gb",
+        type=float,
+        default=0.0,
+        help="host RSS budget in GB (0 = 85%% of detected RAM); configured "
+        "--memory-headroom-gb is reserved outside this process limit",
+    )
+    parser.add_argument(
+        "--vram-budget-gb",
+        type=float,
+        default=0.0,
+        help="physical device-memory budget in GB (0 = 90%% of detected VRAM)",
+    )
+    parser.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=2.0,
+        help="host RAM reserved outside the process RSS budget",
     )
     parser.add_argument(
         "--allow-stale-targets",
@@ -3150,6 +3791,10 @@ def main(argv=None) -> int:
         min_games_to_train=args.min_games_to_train,
         min_buffer_positions=args.min_buffer_positions,
         example_cache_examples=args.example_cache_examples,
+        example_cache_bytes=int(args.example_cache_gb * 1024**3),
+        memory_budget_gb=args.memory_budget_gb,
+        vram_budget_gb=args.vram_budget_gb,
+        memory_headroom_gb=args.memory_headroom_gb,
         record_fast_moves=args.record_fast_moves,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,
@@ -3159,6 +3804,11 @@ def main(argv=None) -> int:
         gate_alpha=args.gate_alpha,
         gate_beta=args.gate_beta,
         gate_indifference=args.gate_indifference,
+        promotion_min_lcb=args.promotion_min_lcb,
+        revert_win_rate=args.revert_win_rate,
+        gate_confidence_z=args.gate_confidence_z,
+        gate_slots=args.gate_slots,
+        gate_early_stop=args.gate_early_stop,
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,
@@ -3168,6 +3818,7 @@ def main(argv=None) -> int:
         age_deal_samples=args.age_deal_samples,
         cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
+        anchor_games=args.anchor_games,
         anchor_every_iterations=args.anchor_every_iterations,
         selfplay_generator_mode=args.selfplay_generator_mode,
         bootstrap_policy=args.bootstrap_policy,

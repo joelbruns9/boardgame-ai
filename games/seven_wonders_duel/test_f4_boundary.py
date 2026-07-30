@@ -92,6 +92,24 @@ def _flat_kwargs(*, force=False):
     }
 
 
+def test_flat_worker_preserves_terminal_python_exception():
+    """A terminal adapter failure must not be replaced by channel-disconnect."""
+
+    import seven_wonders_rust as swr
+
+    def fail_with_memory_error(_payload):
+        raise MemoryError("intentional boundary allocation failure")
+
+    seeds = [2026072490, 2026072491, 2026072492]
+    with pytest.raises(MemoryError, match="intentional boundary allocation failure"):
+        swr.self_play_many_flat_net(
+            adapter=fail_with_memory_error,
+            games=rust_games_for_self_play(seeds, [0, 1, 0]),
+            game_seeds=seeds,
+            **_flat_kwargs(),
+        )
+
+
 def test_f4_5_flat_packing_matches_object_boundary_exactly():
     import seven_wonders_rust as swr
 

@@ -322,8 +322,17 @@ def migrate_state_dict(old_state: dict, model) -> dict:
     return report
 
 
-def load_checkpoint(path, model, *, migrate: bool = False) -> dict:
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+def load_checkpoint(
+    path, model, *, migrate: bool = False, checkpoint: dict | None = None
+) -> dict:
+    """Load a checkpoint, optionally reusing an already-read payload.
+
+    Gate construction reads metadata and weights together; accepting the
+    payload avoids a second ``torch.load`` of each large checkpoint.
+    """
+
+    if checkpoint is None:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint["encoder_signature"] != ENCODER_SIGNATURE:
         if not migrate:
             raise ValueError(
@@ -527,6 +536,7 @@ def train_steps(
     best = {"val_total": float("inf"), "step": -1, "state": None}
     history: list[dict] = []
     running: dict[str, float] = {}
+    running_grad_norm = 0.0
     window_start = time.time()
     window_steps = 0
 
@@ -555,6 +565,13 @@ def train_steps(
             outputs = model(batch)
             total, parts = compute_losses(outputs, batch, aux_weight)
         scaler.scale(total).backward()
+        scaler.unscale_(optimizer)
+        grad_norm_sq = sum(
+            float(parameter.grad.detach().float().norm(2).item()) ** 2
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        )
+        running_grad_norm += math.sqrt(grad_norm_sq)
         scaler.step(optimizer)
         scaler.update()
         for key, value in parts.items():
@@ -570,8 +587,10 @@ def train_steps(
             "lr": current_lr,
             "train": train_parts,
             "secs": time.time() - window_start,
+            "grad_norm": running_grad_norm / window_steps,
         }
         running = {}
+        running_grad_norm = 0.0
         window_steps = 0
         if val_examples:
             val_metrics = evaluate(

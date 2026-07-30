@@ -17,6 +17,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn checked_bytearray<'py>(py: Python<'py>, src: &[u8]) -> PyResult<Bound<'py, PyByteArray>> {
+    PyByteArray::new_with(py, src.len(), |destination| {
+        destination.copy_from_slice(src);
+        Ok(())
+    })
+}
+
 /// `(value_p0, priors)` where `priors` is aligned to `legal_action_indices`.
 /// Terminal states return the game value and empty priors. Fallible so a real
 /// evaluator can surface operational errors (CUDA OOM, a bad checkpoint, a
@@ -496,23 +503,23 @@ impl Eval for PyFlatBatchEval {
             // mutated through the view. The adapter treats them as read-only.
             payload.set_item(
                 "token_offsets",
-                PyByteArray::new(py, &scratch.token_offsets),
+                checked_bytearray(py, &scratch.token_offsets)?,
             )?;
-            payload.set_item("type_ids", PyByteArray::new(py, &scratch.type_ids))?;
-            payload.set_item("entity_ids", PyByteArray::new(py, &scratch.entity_ids))?;
-            payload.set_item("aux_ids", PyByteArray::new(py, &scratch.aux_ids))?;
-            payload.set_item("features", PyByteArray::new(py, &scratch.features))?;
-            payload.set_item("actors", PyByteArray::new(py, &scratch.actors))?;
+            payload.set_item("type_ids", checked_bytearray(py, &scratch.type_ids)?)?;
+            payload.set_item("entity_ids", checked_bytearray(py, &scratch.entity_ids)?)?;
+            payload.set_item("aux_ids", checked_bytearray(py, &scratch.aux_ids)?)?;
+            payload.set_item("features", checked_bytearray(py, &scratch.features)?)?;
+            payload.set_item("actors", checked_bytearray(py, &scratch.actors)?)?;
             // Always present, so the adapter never has to branch on its
             // absence; all zeros in the single-network case.
-            payload.set_item("net_ids", PyByteArray::new(py, &scratch.net_ids))?;
+            payload.set_item("net_ids", checked_bytearray(py, &scratch.net_ids)?)?;
             payload.set_item(
                 "legal_offsets",
-                PyByteArray::new(py, &scratch.legal_offsets),
+                checked_bytearray(py, &scratch.legal_offsets)?,
             )?;
             payload.set_item(
                 "legal_actions",
-                PyByteArray::new(py, &scratch.legal_actions),
+                checked_bytearray(py, &scratch.legal_actions)?,
             )?;
             let call_start = Instant::now();
             let out = self.adapter.bind(py).call1((payload,))?;
@@ -597,6 +604,7 @@ pub struct EvalWorker {
     sender: mpsc::Sender<WorkerRequest>,
     timeout: Option<Duration>,
     timed_out: Arc<AtomicBool>,
+    terminal_error: Arc<Mutex<Option<PyErr>>>,
     max_rows: usize,
 }
 
@@ -604,6 +612,19 @@ pub struct EvalTicket {
     receiver: mpsc::Receiver<WorkerResponse>,
     timeout: Option<Duration>,
     timed_out: Arc<AtomicBool>,
+    terminal_error: Arc<Mutex<Option<PyErr>>>,
+}
+
+fn terminal_worker_error(terminal_error: &Mutex<Option<PyErr>>, fallback: &str) -> PyErr {
+    match terminal_error.lock() {
+        Ok(error) => match error.as_ref() {
+            Some(error) => Python::attach(|py| error.clone_ref(py)),
+            None => PyValueError::new_err(fallback.to_owned()),
+        },
+        Err(_) => PyValueError::new_err(format!(
+            "{fallback}; terminal inference error lock poisoned"
+        )),
+    }
 }
 
 impl EvalTicket {
@@ -618,12 +639,16 @@ impl EvalTicket {
                         timeout.as_secs_f64() * 1000.0
                     )))
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(PyValueError::new_err(
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(terminal_worker_error(
+                    &self.terminal_error,
                     "global inference worker dropped its response",
                 )),
             },
             None => self.receiver.recv().map_err(|_| {
-                PyValueError::new_err("global inference worker dropped its response")
+                terminal_worker_error(
+                    &self.terminal_error,
+                    "global inference worker dropped its response",
+                )
             })?,
         }
     }
@@ -664,7 +689,8 @@ impl EvalWorker {
             ));
         }
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.sender
+        if self
+            .sender
             .send(WorkerRequest {
                 states,
                 actors,
@@ -673,11 +699,18 @@ impl EvalWorker {
                 reply: reply_tx,
                 enqueued: Instant::now(),
             })
-            .map_err(|_| PyValueError::new_err("global inference worker is not running"))?;
+            .is_err()
+        {
+            return Err(terminal_worker_error(
+                &self.terminal_error,
+                "global inference worker is not running",
+            ));
+        }
         Ok(EvalTicket {
             receiver: reply_rx,
             timeout: self.timeout,
             timed_out: Arc::clone(&self.timed_out),
+            terminal_error: Arc::clone(&self.terminal_error),
         })
     }
 }
@@ -769,6 +802,8 @@ pub fn spawn_py_batch_worker(
     };
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let timed_out = Arc::new(AtomicBool::new(false));
+    let terminal_error = Arc::new(Mutex::new(None));
+    let worker_terminal_error = Arc::clone(&terminal_error);
     let handle = thread::spawn(move || {
         let evaluator = PyBatchEval::new(adapter);
         while let Ok(request) = request_rx.recv() {
@@ -779,9 +814,20 @@ pub fn spawn_py_batch_worker(
                 &request.legals,
                 &request.net_ids,
             );
-            let failed = result.is_err();
-            if request.reply.send(result).is_err() || failed {
-                break;
+            match result {
+                Ok(rows) => {
+                    if request.reply.send(Ok(rows)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let reply_error = Python::attach(|py| error.clone_ref(py));
+                    if let Ok(mut terminal) = worker_terminal_error.lock() {
+                        *terminal = Some(error);
+                    }
+                    let _ = request.reply.send(Err(reply_error));
+                    break;
+                }
             }
         }
     });
@@ -790,6 +836,7 @@ pub fn spawn_py_batch_worker(
             sender: request_tx,
             timeout,
             timed_out: Arc::clone(&timed_out),
+            terminal_error,
             max_rows,
         },
         timed_out,
@@ -824,6 +871,8 @@ pub fn spawn_py_flat_worker(
     };
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let timed_out = Arc::new(AtomicBool::new(false));
+    let terminal_error = Arc::new(Mutex::new(None));
+    let worker_terminal_error = Arc::clone(&terminal_error);
     let metrics = Arc::new(Mutex::new(BoundaryMetrics::default()));
     let worker_metrics = Arc::clone(&metrics);
     let handle = thread::spawn(move || {
@@ -839,9 +888,20 @@ pub fn spawn_py_flat_worker(
                 &request.legals,
                 &request.net_ids,
             );
-            let failed = result.is_err();
-            if request.reply.send(result).is_err() || failed {
-                break;
+            match result {
+                Ok(rows) => {
+                    if request.reply.send(Ok(rows)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let reply_error = Python::attach(|py| error.clone_ref(py));
+                    if let Ok(mut terminal) = worker_terminal_error.lock() {
+                        *terminal = Some(error);
+                    }
+                    let _ = request.reply.send(Err(reply_error));
+                    break;
+                }
             }
         }
     });
@@ -850,6 +910,7 @@ pub fn spawn_py_flat_worker(
             sender: request_tx,
             timeout,
             timed_out: Arc::clone(&timed_out),
+            terminal_error,
             max_rows,
         },
         timed_out,

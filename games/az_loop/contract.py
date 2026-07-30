@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .checkpoint_lifecycle import CheckpointArtifact
+from .stats import (
+    GateStats,
+    GenerationStats,
+    OutcomeStats,
+    ReplayStats,
+    ResourceStats,
+    TrainingStats,
+)
 from .training_control import GeneratorSource
 
 
@@ -58,6 +66,10 @@ class AnchorRequest:
 class GenerationResult:
     generated_games: int
     metrics: dict[str, Any] = field(default_factory=dict)
+    stats: GenerationStats | None = None
+    outcomes: OutcomeStats | None = None
+    resources: ResourceStats | None = None
+    game_specific: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +77,7 @@ class ReplayResult:
     training_games: int
     payload: Any = None  # opaque handle the adapter hands back to ``train``
     metrics: dict[str, Any] = field(default_factory=dict)
+    stats: ReplayStats | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,18 +96,22 @@ class TrainingResult:
     """
 
     skip_reason: str = ""
+    stats: TrainingStats | None = None
+    resources: ResourceStats | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class PromotionResult:
     decision: str  # "accept" | "continue" | "reject"
     metrics: dict[str, Any] = field(default_factory=dict)
+    stats: GateStats | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class AnchorResult:
     passed: bool
     metrics: dict[str, Any] = field(default_factory=dict)
+    stats: list[GateStats] = field(default_factory=list)
 
 
 class LifecycleAdapter(Protocol):
@@ -137,6 +154,15 @@ class LifecycleAdapter(Protocol):
 
     def on_learner_reset(self, best_checkpoint: Path) -> None:
         """Hook for a revert-reset: clear persisted optimizer state, etc."""
+        ...
+
+    def rollback_iteration(self, iteration: int) -> None:
+        """Remove game-specific outputs from an uncommitted iteration.
+
+        The controller restores rolling checkpoints itself. Adapters use this
+        hook for immutable buffers, candidates, and optimizer state that were
+        written before the interrupted row became durable.
+        """
         ...
 
     def autosave(self, iteration: int) -> None:

@@ -17,7 +17,12 @@ import pytest
 
 from .buffer import GameRecord
 from .dataset import examples_from_records
-from .phase_d import PhaseDConfig, PhaseDLoop
+from .phase_d import (
+    DEFAULT_CACHE_CALIBRATION_FACTOR,
+    LEGACY_EXAMPLE_BYTES,
+    PhaseDConfig,
+    PhaseDLoop,
+)
 
 
 def _same(left, right) -> bool:
@@ -324,3 +329,37 @@ def test_stats_report_what_was_replayed(tmp_path, records):
     assert warm["replayed_games"] == 0
     assert warm["cached_games"] == len(records)
     assert cold["examples"] == warm["examples"]
+
+
+def test_legacy_count_converts_at_measured_rss_cost(tmp_path):
+    loop = _loop(tmp_path, example_cache_examples=123)
+    assert loop._cache_capacity_bytes() == 123 * LEGACY_EXAMPLE_BYTES
+
+
+def test_cache_uses_calibrated_bytes_not_array_nbytes(tmp_path, records):
+    loop = _loop(tmp_path)
+    loop._cached_examples(records)
+    stats = loop.last_example_cache_stats
+    assert stats["calibration_factor"] >= DEFAULT_CACHE_CALIBRATION_FACTOR
+    assert stats["estimated_bytes"] >= stats["raw_array_bytes"]
+    assert stats["capacity_bytes"] == (
+        loop.config.example_cache_examples * LEGACY_EXAMPLE_BYTES
+    )
+
+
+def test_gate_admission_evicts_cache_before_clean_memory_error(tmp_path, records):
+    loop = _loop(tmp_path)
+    loop._cached_examples(records)
+    assert loop._example_cache
+    checkpoint = tmp_path / "placeholder.pt"
+    checkpoint.write_bytes(b"x" * 1024)
+    loop.memory_budget_bytes = 1
+
+    with pytest.raises(MemoryError, match="admission refused"):
+        loop._admit_gate((checkpoint, checkpoint))
+
+    assert not loop._example_cache
+    assert any(
+        event["phase"] == "pre_gate_admission"
+        for event in loop.resource_monitor.memory_pressure
+    )

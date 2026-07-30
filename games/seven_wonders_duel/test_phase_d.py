@@ -244,14 +244,56 @@ def test_cheap_double_reveal_offsets_default_off_and_reach_generation_only():
     assert generation < source.index("cheap_double_reveal_offsets") < gate
 
 
-def test_underpowered_gate_warns_only_when_the_gate_runs():
-    with pytest.warns(UnderpoweredGateWarning, match="underpowered"):
-        PhaseDConfig(gate_max_games=100, promotion_every=1).validate()
-    import warnings as _warnings
+def test_wilson_gate_config_does_not_reuse_the_obsolete_sprt_power_warning():
+    # W5 chooses a cap from measured cloud cost. Unlike the old SPRT
+    # indifference region, a smaller Wilson cap is still a valid (if stricter)
+    # three-way decision and must not warn that it can decide nothing.
+    PhaseDConfig(gate_max_games=100, promotion_every=1).validate()
+    with pytest.raises(ValueError, match="promotion_min_lcb"):
+        PhaseDConfig(promotion_min_lcb=1.1).validate()
 
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("error")
-        PhaseDConfig(gate_max_games=100, promotion_every=0).validate()
+
+def test_wilson_gate_uses_seat_pair_as_observation():
+    from .phase_d import wilson_pair_decision
+
+    # Twenty individual games would be the wrong n; these are ten independent
+    # seed/seat pairs and the interval must be computed at n=10.
+    pairs = [1.0, 0.0] * 4 + [1.0, 1.0]
+    decision, used, rate, lower, upper, reason = wilson_pair_decision(pairs)
+    assert used == 10
+    assert rate == pytest.approx(0.6)
+    assert lower < 0.5 < upper
+    assert decision == "continue"
+    assert reason == "cap_probation"
+
+
+def test_wilson_gate_promotes_reverts_and_futility_stops():
+    from .phase_d import wilson_pair_decision
+
+    promoted = wilson_pair_decision([1.0] * 20)
+    assert promoted[0] == "accept"
+    assert promoted[-1] == "promotion_lcb"
+
+    reverted = wilson_pair_decision([0.5] * 20, revert_win_rate=0.55)
+    assert reverted[0] == "reject"
+    assert reverted[-1] == "cap_revert_rate"
+
+    futile = wilson_pair_decision([0.0] * 20)
+    assert futile[0] == "reject"
+    assert futile[-1] == "futility_ucb"
+
+
+def test_anchor_wilson_measurement_is_fixed_n():
+    from .phase_d import wilson_pair_decision
+
+    result = wilson_pair_decision(
+        [1.0] * 20,
+        fixed_n=True,
+        measurement_threshold=0.6,
+    )
+    assert result[0] == "accept"
+    assert result[1] == 20
+    assert result[-1] == "fixed_n"
 
 
 def test_anchor_gate_cadence_counts_promotions_not_iterations():
@@ -545,9 +587,10 @@ def test_process_gate_is_bit_identical_to_sequential_gate(tmp_path: Path):
     result_seq = sequential.promotion_gate(sequential.current_best)
     result_par = parallel.promotion_gate(parallel.current_best)
     assert result_par == result_seq
-    ledger_seq = (sequential.run_dir / "elo" / "elo_games.jsonl").read_text()
-    ledger_par = (parallel.run_dir / "elo" / "elo_games.jsonl").read_text()
-    assert ledger_par == ledger_seq
+    # W5.6: boundary-stopped promotion evidence is not fed into Elo. Fixed-N
+    # anchors are the only unbiased ladder input.
+    assert not (sequential.run_dir / "elo" / "elo_games.jsonl").exists()
+    assert not (parallel.run_dir / "elo" / "elo_games.jsonl").exists()
 
 
 def test_rust_model_vs_bot_anchor_uses_native_bot_seat(tmp_path: Path):
@@ -951,7 +994,8 @@ def test_training_log_golden_rows_cover_all_lifecycle_actions(tmp_path, monkeypa
     for row in rows:
         missing = LIFECYCLE_ROW_FIELDS - set(row)
         assert not missing, missing
-        assert row["log_schema_version"] == 1
+        assert row["log_schema_version"] == 2
+        assert row["stats"]["schema_version"] == 2
         assert row["learner_source"] == "latest"
 
 
@@ -969,6 +1013,27 @@ def test_training_log_has_exactly_one_row_per_iteration_across_resume(
     rows = _read_log_rows(second)
     # Resume must not duplicate the already-logged iteration 0.
     assert [row["iteration"] for row in rows] == [0, 1]
+
+
+def test_pending_iteration_rollback_removes_restart_blockers(tmp_path):
+    from .training_adapter import SevenWondersDuelLifecycleAdapter
+
+    loop = PhaseDLoop(_soft_gate_config(tmp_path, iterations=1))
+    loop.buffer_dir.mkdir(parents=True, exist_ok=True)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    incomplete_buffer = loop.buffer_dir / "iter_0070.jsonl"
+    incomplete_candidate = loop.checkpoint_dir / "candidate_0070.pt"
+    prior_buffer = loop.buffer_dir / "iter_0069.jsonl"
+    for path in (incomplete_buffer, incomplete_candidate, prior_buffer):
+        path.write_bytes(b"partial")
+    loop.optimizer_state_path.write_bytes(b"stale moments")
+
+    SevenWondersDuelLifecycleAdapter(loop).rollback_iteration(70)
+
+    assert not incomplete_buffer.exists()
+    assert not incomplete_candidate.exists()
+    assert not loop.optimizer_state_path.exists()
+    assert prior_buffer.exists(), "committed iterations are immutable"
 
 
 def test_disabled_run_log_still_writes_structured_log(tmp_path, monkeypatch):

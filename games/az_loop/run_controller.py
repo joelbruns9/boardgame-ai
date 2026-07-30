@@ -14,7 +14,7 @@ torch, reads a payload, or interprets a game.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -48,10 +48,20 @@ from .training_control import (
     is_bootstrap_eligible,
     select_generator_source,
 )
+from .stats import (
+    GateStats,
+    GenerationStats,
+    IterationStats,
+    ModelStats,
+    OutcomeStats,
+    ReplayStats,
+    ResourceStats,
+    TrainingStats,
+)
 
 
 # Bump when the lifecycle row schema changes in a way consumers must notice.
-LOG_SCHEMA_VERSION = 1
+LOG_SCHEMA_VERSION = 2
 
 
 class RunStore(Protocol):
@@ -319,6 +329,9 @@ class RunController:
         # Restore both rolling files from the pre-iteration backups.
         self._restore_backup("latest.pt", self.latest_path)
         self._restore_backup("current_best.pt", self.current_best_path)
+        rollback = getattr(self.adapter, "rollback_iteration", None)
+        if rollback is not None:
+            rollback(pending_iter)
         self._clear_pending()
 
     def _restore_backup(self, name: str, destination: Path) -> None:
@@ -633,6 +646,13 @@ class RunController:
             row["generation_performance"] = dict(generation.metrics)
         if replay.metrics:
             row["replay_summary"] = dict(replay.metrics)
+        row["stats"] = self._build_iteration_stats(
+            generation=generation,
+            replay=replay,
+            training=training,
+            promotion_metrics={},
+            anchor_metrics=None,
+        ).to_dict()
         return row
 
     def _build_row(
@@ -687,7 +707,102 @@ class RunController:
         if training.metrics:
             row["training_performance"] = dict(training.metrics)
         if promotion_metrics:
-            row["promotion_gate"] = promotion_metrics
+            row["promotion_gate"] = {
+                key: value
+                for key, value in promotion_metrics.items()
+                if not key.startswith("_")
+            }
         if anchor_metrics is not None:
-            row["anchor_gates"] = anchor_metrics
+            row["anchor_gates"] = {
+                key: value
+                for key, value in anchor_metrics.items()
+                if not key.startswith("_")
+            }
+        row["stats"] = self._build_iteration_stats(
+            generation=generation,
+            replay=replay,
+            training=training,
+            promotion_metrics=promotion_metrics,
+            anchor_metrics=anchor_metrics,
+        ).to_dict()
         return row
+
+    @staticmethod
+    def _build_iteration_stats(
+        *,
+        generation,
+        replay,
+        training,
+        promotion_metrics: dict[str, Any],
+        anchor_metrics: dict[str, Any] | None,
+    ) -> IterationStats:
+        """Assemble and validate the schema-v2 block at the shared boundary."""
+
+        model_payload = generation.metrics.get("model", {})
+        model = (
+            model_payload
+            if isinstance(model_payload, ModelStats)
+            else ModelStats(**dict(model_payload))
+        )
+        gates = []
+        if getattr(training, "stats", None) is None and training.metrics:
+            training_stats = TrainingStats()
+        else:
+            training_stats = getattr(training, "stats", None) or TrainingStats()
+        promotion_stats = promotion_metrics.get("_stats")
+        if promotion_stats:
+            gates.append(GateStats(**dict(promotion_stats)))
+        if anchor_metrics:
+            gates.extend(
+                GateStats(**dict(item))
+                for item in anchor_metrics.get("_stats", [])
+            )
+        resource_payload = (
+            (anchor_metrics or {}).get("_resources")
+            or promotion_metrics.get("_resources")
+        )
+        resources = (
+            ResourceStats(**dict(resource_payload))
+            if resource_payload
+            else (
+                getattr(training, "resources", None)
+                or getattr(generation, "resources", None)
+                or ResourceStats()
+            )
+        )
+        replay_stats = getattr(replay, "stats", None) or ReplayStats(
+            window_games=replay.training_games
+        )
+        if training.metrics:
+            examples = int(training.metrics.get("examples", replay_stats.examples))
+            new_examples = int(
+                training.metrics.get("new_examples", replay_stats.new_examples)
+            )
+            replay_stats = replace(
+                replay_stats,
+                examples=examples,
+                new_examples=new_examples,
+                reuse_factor=(
+                    examples / new_examples if new_examples else None
+                ),
+                derivation_seconds=float(
+                    training.metrics.get(
+                        "replay_derivation_seconds",
+                        replay_stats.derivation_seconds,
+                    )
+                ),
+            )
+        stats = IterationStats(
+            generation=getattr(generation, "stats", None)
+            or GenerationStats(games=generation.generated_games),
+            outcomes=getattr(generation, "outcomes", None)
+            or OutcomeStats(),
+            replay=replay_stats,
+            training=training_stats,
+            gates=gates,
+            resources=resources,
+            model=model,
+            game_specific=dict(getattr(generation, "game_specific", {}) or {}),
+        )
+        stats.validate()
+        return stats

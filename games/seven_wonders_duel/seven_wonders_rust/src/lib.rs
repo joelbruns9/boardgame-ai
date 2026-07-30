@@ -1651,6 +1651,7 @@ fn self_play_many_net(
             max_inflight_batches,
             scheduler_workers,
             max_active_slots,
+            None,
         );
         drop(worker);
         if timed_out.load(std::sync::atomic::Ordering::Acquire) {
@@ -1687,7 +1688,8 @@ fn self_play_many_net(
     bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
-    conflict_free_waves=false, round_robin_candidates=false))]
+    conflict_free_waves=false, round_robin_candidates=false,
+    gate_promotion_min_lcb=None, gate_z=1.96))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -1734,6 +1736,8 @@ fn self_play_many_flat_net(
     max_active_slots: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
+    gate_promotion_min_lcb: Option<f64>,
+    gate_z: f64,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -1908,6 +1912,27 @@ fn self_play_many_flat_net(
     }
     let (worker, timed_out, boundary_metrics, worker_handle) =
         eval::spawn_py_flat_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+    let gate_stop = gate_promotion_min_lcb
+        .map(|promotion_min_lcb| {
+            if !(0.0..=1.0).contains(&promotion_min_lcb)
+                || !gate_z.is_finite()
+                || gate_z <= 0.0
+            {
+                return Err(PyValueError::new_err(
+                    "gate_promotion_min_lcb must lie in [0, 1] and gate_z must be positive",
+                ));
+            }
+            if jobs.len() % 2 != 0 {
+                return Err(PyValueError::new_err(
+                    "gate early stopping requires an even number of seat-paired jobs",
+                ));
+            }
+            Ok(self_play::GateStopConfig {
+                promotion_min_lcb,
+                z: gate_z,
+            })
+        })
+        .transpose()?;
     let result = py.detach(move || {
         let mut result = self_play::run_many_pipelined_sharded(
             jobs,
@@ -1916,6 +1941,7 @@ fn self_play_many_flat_net(
             max_inflight_batches,
             scheduler_workers,
             max_active_slots,
+            gate_stop,
         );
         drop(worker);
         if timed_out.load(std::sync::atomic::Ordering::Acquire) {
