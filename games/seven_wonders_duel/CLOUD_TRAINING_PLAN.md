@@ -1,11 +1,17 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0 and W1 complete; W2 (memory) is the next blocker.** Revision 5.
-**Revision history:** r4 folded in W0 from `runs/w0_sizing_v2/report_v2.md` and
+**Status:** **W0/W1 complete; W2/W3/W5 implementation and local acceptance
+complete, with
+production acceptance and parameter closure reserved for the RTX 5090 host.**
+Revision 6.
+**Revision history:** r6 grounds production acceptance on the RTX 5090 host,
+locks the explicit HOF launch fraction at 0.15, and leaves the gate-cap default
+open until that host's W5.7 fit. r4 folded in W0 from
+`runs/w0_sizing_v2/report_v2.md` and
 propagated its cost/sizing consequences into W2, W5 and W6. r3 (2026-07-28)
 rewrote r2 against an external review (10 findings, 9 confirmed against code, 1
 partially accepted).
-**Date:** 2026-07-29.
+**Date:** 2026-07-30.
 **Trigger:** `runs/laptop_training_03` died at iteration 70 of 90 with a host
 `MemoryError` after 11 h. The loop itself is healthy -- 9 promotions in 13 gates
 -- so the blocker is operational, not algorithmic.
@@ -45,11 +51,11 @@ does not close it -- it makes it **measured every iteration**.
 | fallback | **S = 128x4x4 heads / fp32** if cost becomes the primary objective, or if the run underperforms | W7a triggers |
 | replay window | **growing window**, `16 * games**0.6`, cap 20k games | W1 **done** |
 | curriculum bots | early accelerant only, annealed **in games** (10k) | W1 **done** |
-| opponent diversity | **HOF league sampling**, searcher-routed, learner-only labels; **default off** | W1 **done** |
+| opponent diversity | **HOF league sampling**, searcher-routed, learner-only labels; compatibility default off, cloud launch explicitly **0.15** | W1 **done**, launch value locked for W2/W5 |
 | schedules | every schedule in **games**; `schedule_basis` pinned per run | W1 **done** |
-| gate statistic | **port Kingdomino's Wilson-LCB three-way rule** (promote / probation / revert) | W5 |
-| gate budget | cap **800**, pair-level observations, futility via Wilson UCB | W5 |
-| gate cost | fix throughput **before** raising the cap | W5 |
+| gate statistic | **pair-level Wilson-LCB three-way rule** (promote / probation / revert), with UCB futility and fixed-N anchors | W5 **implemented** |
+| gate budget | configurable; **default remains provisional until the RTX 5090 200/400/800 fit** | W5.7 cloud acceptance |
+| gate cost | persistent rolling worker, concurrent seat legs, cloud-measured before selecting the cap | W5 **implemented**, W5.7 pending target host |
 | stagnation | **games-indexed** anchor + metric-triggered intervention ladder | W7 |
 | cloud target | vast.ai, single box | W6 |
 
@@ -61,10 +67,10 @@ does not close it -- it makes it **measured every iteration**.
 |---|---|---|---|
 | W0 | Model size + precision, decided by measurement | M | ~~Yes~~ **DONE 2026-07-29** |
 | W1 | Training schedules, growing window, HOF league | M | ~~Yes~~ **DONE 2026-07-29** |
-| W2 | Memory: fix the crash, bound the footprint, measure it | M | **Yes** |
-| W3 | Shared run-stats contract + reporting | M | **Yes** |
+| W2 | Memory: fix the crash, bound the footprint, measure it | M | **LOCAL S RESUME PASSED; RTX 5090 L soak pending** |
+| W3 | Shared run-stats contract + reporting | M | **LOCAL V2 ROWS PASSED; production rows pending** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
-| W5 | Gate efficiency + Wilson-LCB decision rule | M | **Yes** |
+| W5 | Gate efficiency + Wilson-LCB decision rule | M | **LOCAL GATES PASSED; RTX 5090 cap fit pending** |
 | W6 | Cloud setup script | M | **Yes** |
 | W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
 

@@ -1,0 +1,60 @@
+# W2/W3/W5 cloud acceptance
+
+Production evidence is collected on the RTX 5090 host. The laptop verifies
+correctness and the historical S-model resume only; it does not train L or
+select production resource parameters.
+
+## Before training
+
+Copy one W0 L checkpoint to the cloud host. Its playing strength is irrelevant
+to gate timing; its `384x8x6` tensor shapes are required.
+
+Run:
+
+```bash
+./games/seven_wonders_duel/run_w2_w3_w5_cloud_acceptance.sh \
+  /path/to/sweep_L_lr5e-05_seed0.pt \
+  /path/to/production_run \
+  /path/to/acceptance
+```
+
+This measures 200-, 400-, and 800-game L/bf16 gates on the target hardware and
+writes the fixed-cost/per-game fit. Do not use laptop timing or an S checkpoint
+to choose `--gate-max-games`. If a representative ungated iteration time is
+known, pass it as the fourth argument; the report recommends the largest
+measured cap whose projected gate share is at most 10%.
+
+The launch configuration is:
+
+- `--d-model 384 --layers 8 --heads 6`
+- `--precision bf16`
+- `--learning-rate 5e-5`
+- `--hof-opponent-fraction 0.15 --hof-start-games 10000`
+- `--promotion-min-lcb 0.50 --revert-win-rate 0.48`
+- `--anchor-games 200`
+- the measured gate cap and box-specific batching/slot values
+- explicit `--memory-budget-gb`, `--vram-budget-gb`, and
+  `--memory-headroom-gb` resolved from this host
+
+Record the resolved values in the run manifest. A production launch must not
+inherit the provisional local defaults accidentally.
+
+## During and after training
+
+Run the same command at any time to regenerate `az_report.json` and
+`az_report.md`. Once 60 iterations exist, it also validates that the fitted RSS
+change across the final 30 iterations is at most 5%.
+
+Required evidence:
+
+1. Every row is schema v2 and records model `384x8x6`, bf16, opponent mix,
+   scheduler rows/batches, cache bytes, RSS, and physical versus allocated VRAM.
+2. Realized HOF share converges to 0.15 after `hof_start_games`.
+3. No gate reports a channel-disconnect surrogate for a Python/CUDA failure.
+4. Gate timing uses at least three sizes and records moves per game.
+5. Promotion decisions use independent seat pairs; anchors are fixed-N.
+6. The last-30-iteration RSS fitted drift is at most 5%.
+
+The separate `laptop_training_03` 70→90 continuation remains an S-model
+regression test for resume and memory cleanup. It is not evidence for L sizing,
+throughput, stability, or the production gate cap.
