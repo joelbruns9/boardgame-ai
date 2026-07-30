@@ -66,8 +66,16 @@ Required cloud evidence:
    unused and do not count as HOF traffic.
 3. No gate reports a channel-disconnect surrogate for a Python/CUDA failure.
 4. Gate timing uses at least three sizes and records moves per game.
-5. Promotion decisions use independent seat pairs; anchors are fixed-N.
-6. The last-30-iteration RSS fitted drift check remains green as an operational
+5. Promotion decisions use independent seat pairs and are **fixed-N**: every
+   gate row's `evaluated_games` equals the rung it was issued, `fixed_n` is
+   true, and `stop_reason` is one of `promotion_lcb` / `revert_ucb` /
+   `probation` / `revert_suppressed_knot`. A short row means the sequential
+   rule has come back. Anchors stay fixed-N measurements.
+6. Gate rows carry `pair_scores`, so any gate can be re-decided offline under a
+   different threshold or rung without replaying games.
+7. The ladder moves: `control_state.gate_rung` rises after two consecutive
+   probations and falls after a promotion.
+8. The last-30-iteration RSS fitted drift check remains green as an operational
    leak alert. A failure pauses the affected run for diagnosis; it does not
    retroactively reopen W2.
 

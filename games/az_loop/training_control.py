@@ -71,6 +71,11 @@ class GeneratorState:
     consecutive_reverts: int = 0
     current_best_iteration: int = -1
     last_iteration: int = -1
+    gate_rung: int = 0
+    """Index into ``GateLadder.rungs`` for the *next* gate (W5.8)."""
+
+    consecutive_probations: int = 0
+    """Probations since the last decisive gate; drives the ladder step-up."""
 
     def as_row(self) -> dict[str, object]:
         """Self-contained control-state snapshot for a completed iteration row.
@@ -88,10 +93,14 @@ class GeneratorState:
             "consecutive_reverts": self.consecutive_reverts,
             "current_best_iteration": self.current_best_iteration,
             "last_iteration": self.last_iteration,
+            "gate_rung": self.gate_rung,
+            "consecutive_probations": self.consecutive_probations,
         }
 
     @classmethod
     def from_row(cls, control_state: dict[str, object]) -> "GeneratorState":
+        # The ladder fields postdate the schema, so a resume of a pre-ladder run
+        # starts at the bottom rung rather than refusing to load.
         return cls(
             mode=GeneratorMode(str(control_state["generator_mode"])),
             bootstrap_state=str(control_state["bootstrap_state"]),
@@ -99,7 +108,88 @@ class GeneratorState:
             consecutive_reverts=int(control_state["consecutive_reverts"]),
             current_best_iteration=int(control_state["current_best_iteration"]),
             last_iteration=int(control_state["last_iteration"]),
+            gate_rung=int(control_state.get("gate_rung", 0)),
+            consecutive_probations=int(control_state.get("consecutive_probations", 0)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class GateLadder:
+    """Scheduled gate sizes (W5.8).
+
+    The gate plays a fixed number of games, decided *before* the match from the
+    ladder position and the games clock -- never from the match's own data.  A
+    small gate is safe rather than merely cheap: with a confidence-bounded rule
+    on both sides, too little evidence produces probation, not a coin flip.  So
+    the size trades promotion *latency* against wall time and nothing else.
+
+    Step **up** after ``step_up_after`` consecutive probations (the learner is
+    improving by less than the current size can resolve), **down** one rung after
+    a promotion (the next candidate is likely to be resolvable again).
+    """
+
+    rungs: tuple[int, ...] = (100, 200, 400, 800)
+    step_up_after: int = 2
+    floor_games: int = 0
+    """Games that must exist before the ladder may step up at all.
+
+    Bootstrap gates are noisy and their probations are not evidence of
+    stagnation; without a floor they would ladder the run straight to the top
+    rung before the learner has said anything.
+    """
+
+    def validate(self) -> None:
+        if not self.rungs:
+            raise ValueError("gate ladder needs at least one rung")
+        if any(size <= 0 or size % 2 for size in self.rungs):
+            raise ValueError("every gate rung must be a positive even number")
+        if list(self.rungs) != sorted(self.rungs):
+            raise ValueError("gate rungs must be ascending")
+        if self.step_up_after <= 0:
+            raise ValueError("step_up_after must be positive")
+        if self.floor_games < 0:
+            raise ValueError("floor_games must be non-negative")
+
+    @property
+    def top(self) -> int:
+        return len(self.rungs) - 1
+
+    def games(self, rung: int) -> int:
+        return self.rungs[max(0, min(self.top, rung))]
+
+    @staticmethod
+    def fixed(games: int) -> "GateLadder":
+        """A one-rung ladder -- the pre-W5.8 behaviour of a single gate size."""
+
+        return GateLadder(rungs=(games,))
+
+
+def _ladder_after(
+    state: GeneratorState,
+    decision: str,
+    *,
+    ladder: GateLadder,
+    allow_step_up: bool,
+) -> dict[str, int]:
+    """Rung and probation counter for the *next* gate.
+
+    Only probation moves the ladder up, and only a promotion moves it down.  A
+    revert is decisive evidence, so it clears the counter without changing the
+    size: the confirming gate that could trigger a reset is worth running at the
+    same resolution that produced the first revert.
+    """
+
+    if decision == ACCEPT:
+        return {"gate_rung": max(0, state.gate_rung - 1), "consecutive_probations": 0}
+    if decision == REJECT:
+        return {"gate_rung": state.gate_rung, "consecutive_probations": 0}
+    probations = state.consecutive_probations + 1
+    if allow_step_up and probations >= ladder.step_up_after:
+        return {
+            "gate_rung": min(ladder.top, state.gate_rung + 1),
+            "consecutive_probations": 0,
+        }
+    return {"gate_rung": state.gate_rung, "consecutive_probations": probations}
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,11 +276,20 @@ def gate_transition(
     *,
     revert_reset_after: int,
     iteration: int,
+    ladder: GateLadder | None = None,
+    allow_step_up: bool = True,
 ) -> TransitionResult:
-    """Map a paired-SPRT decision onto the soft-gate lifecycle action."""
+    """Map a fixed-N gate decision onto the soft-gate lifecycle action."""
 
     if decision not in _GATE_DECISIONS:
         raise ValueError(f"unknown gate decision: {decision!r}")
+
+    rungs = _ladder_after(
+        state,
+        decision,
+        ladder=ladder or GateLadder(),
+        allow_step_up=allow_step_up,
+    )
 
     if decision == ACCEPT:
         action = PromotionAction.PROMOTE
@@ -205,6 +304,7 @@ def gate_transition(
                 consecutive_reverts=0,
                 current_best_iteration=iteration,
                 last_iteration=iteration,
+                **rungs,
             ),
         )
 
@@ -219,6 +319,7 @@ def gate_transition(
                 generator_source=_generator_after(state.mode, action),
                 consecutive_reverts=0,
                 last_iteration=iteration,
+                **rungs,
             ),
         )
 
@@ -235,6 +336,7 @@ def gate_transition(
             generator_source=_generator_after(state.mode, action),
             consecutive_reverts=0 if reset else count,
             last_iteration=iteration,
+            **rungs,
         ),
     )
 
@@ -260,6 +362,8 @@ def decide_transition(
     gate_decision: str | None,
     revert_reset_after: int,
     iteration: int,
+    ladder: GateLadder | None = None,
+    allow_step_up: bool = True,
 ) -> TransitionResult:
     """Single entry point the controller calls after training an iteration.
 
@@ -277,5 +381,7 @@ def decide_transition(
             gate_decision,
             revert_reset_after=revert_reset_after,
             iteration=iteration,
+            ladder=ladder,
+            allow_step_up=allow_step_up,
         )
     return not_scheduled_transition(state, iteration)

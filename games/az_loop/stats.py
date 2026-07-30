@@ -103,6 +103,12 @@ class GateStats:
     stop_reason: str = ""
     seconds: float = 0.0
     fixed_n: bool = False
+    pair_scores: list[float] = field(default_factory=list)
+    """Per-pair outcomes in {0, 0.5, 1} (W5.10).
+
+    A few hundred bytes that make any past gate re-decidable under a different
+    threshold or size without replaying the games.
+    """
 
 
 @dataclass(slots=True)

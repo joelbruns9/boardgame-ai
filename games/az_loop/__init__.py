@@ -60,6 +60,7 @@ from .stats import (
 )
 from .training_control import (
     BootstrapPolicy,
+    GateLadder,
     GeneratorMode,
     GeneratorSource,
     GeneratorState,
@@ -82,6 +83,7 @@ __all__ = [
     "GameAdapter",
     "GameJob",
     "GameSchedule",
+    "GateLadder",
     "GateStats",
     "GamesLedger",
     "GenerateRequest",

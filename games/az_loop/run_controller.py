@@ -14,7 +14,7 @@ torch, reads a payload, or interprets a game.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -38,6 +38,7 @@ from .contract import (
     TrainRequest,
 )
 from .training_control import (
+    GateLadder,
     BootstrapPolicy,
     GeneratorMode,
     GeneratorSource,
@@ -83,8 +84,10 @@ class ControllerConfig:
     buffer_autosave_every: int = 0
     seed: int = 0
     iterations: int = 1
+    gate_ladder: GateLadder = field(default_factory=GateLadder)
 
     def validate(self) -> None:
+        self.gate_ladder.validate()
         if self.promotion_every < 0:
             raise ValueError("promotion_every must be non-negative")
         if self.revert_reset_after < 0:
@@ -428,12 +431,18 @@ class RunController:
         scheduled = self._promotion_scheduled(rows, bootstrap)
         gate_decision: str | None = None
         promotion_metrics: dict[str, Any] = {}
+        ladder = self.config.gate_ladder
+        # W5.8: the size is resolved from the ladder position and the games
+        # clock *before* the match, never from the match's own results.
+        gate_games = ladder.games(state.gate_rung)
+        allow_step_up = self._total_games(rows) >= ladder.floor_games
         if scheduled:
             promotion = self.adapter.evaluate_promotion(
                 PromotionRequest(
                     iteration=iteration,
                     candidate_checkpoint=self.latest_path,
                     best_checkpoint=self.current_best_path,
+                    gate_games=gate_games,
                 )
             )
             gate_decision = promotion.decision
@@ -446,6 +455,8 @@ class RunController:
             gate_decision=gate_decision,
             revert_reset_after=self.config.revert_reset_after,
             iteration=iteration,
+            ladder=ladder,
+            allow_step_up=allow_step_up,
         )
 
         if transition.replace_best:
@@ -526,6 +537,12 @@ class RunController:
         if source == GeneratorSource.LATEST:
             return self.latest_artifact
         return self.current_best_artifact
+
+    @staticmethod
+    def _total_games(rows: list[dict[str, Any]]) -> int:
+        """Cumulative generated games, for the ladder's step-up floor."""
+
+        return sum(int(row.get("generated_games", 0) or 0) for row in rows)
 
     def _promotion_scheduled(
         self, rows: list[dict[str, Any]], bootstrap: bool

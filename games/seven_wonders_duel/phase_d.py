@@ -32,6 +32,7 @@ from games.az_loop import (
     EloLedger,
     GameJob,
     GameSchedule,
+    GateLadder,
     GamesLedger,
     GeneratorMode,
     GrowingReplayWindow,
@@ -361,10 +362,33 @@ class PhaseDConfig:
     gate_beta: float = 0.05
     gate_indifference: float = 0.03
     promotion_min_lcb: float = 0.50
-    revert_win_rate: float = 0.48
+    """Promote when the pair-level Wilson **lower** bound clears this (W5.5)."""
+
+    revert_max_ucb: float = 0.48
+    """Revert when the pair-level Wilson **upper** bound falls below this.
+
+    A confidence bound, not a point estimate: `rate < 0.48` reverts an evenly
+    matched candidate 32% of the time at 200 games and 35% at 100, which is
+    noise, not evidence. The threshold sits below `promotion_min_lcb` on
+    purpose -- a fixed threshold gets *more* sensitive as the ladder raises the
+    game count, and mild regression while training is normal, so the recoverable
+    direction is deliberately the less trigger-happy one.
+    """
+
     gate_confidence_z: float = 1.96
     gate_slots: int = 48
-    gate_early_stop: bool = True
+    gate_ladder_games: tuple[int, ...] = ()
+    """Gate-size rungs (W5.8); empty keeps one rung at ``gate_max_games``."""
+
+    gate_ladder_step_up_after: int = 2
+    gate_ladder_floor_games: int = 0
+    gate_revert_suppress_knots: tuple[int, ...] = ()
+    """Extra games-clock points after which one gate may not revert (W5.9).
+
+    Schedule-driven knots are derived from the schedules themselves; this is for
+    a disruption the config cannot see, such as an LR change made on resume.
+    """
+
     anchor_gate_every_promotions: int = 3
     anchor_games: int = 200
     # Iteration-cadence out-of-distribution anchor.  The promotion-keyed
@@ -494,6 +518,17 @@ class PhaseDConfig:
         )
         return identity
 
+    def gate_ladder(self) -> GateLadder:
+        """Scheduled gate sizes (W5.8), or one rung at ``gate_max_games``."""
+
+        if not self.gate_ladder_games:
+            return GateLadder.fixed(self.gate_max_games)
+        return GateLadder(
+            rungs=tuple(self.gate_ladder_games),
+            step_up_after=self.gate_ladder_step_up_after,
+            floor_games=self.gate_ladder_floor_games,
+        )
+
     def gate_power(self) -> dict[str, Any]:
         """How many games this gate needs before it can decide anything.
 
@@ -567,8 +602,13 @@ class PhaseDConfig:
             raise ValueError("gate_max_games must be a positive even number")
         if not 0.0 <= self.promotion_min_lcb <= 1.0:
             raise ValueError("promotion_min_lcb must lie in [0, 1]")
-        if not 0.0 <= self.revert_win_rate <= 1.0:
-            raise ValueError("revert_win_rate must lie in [0, 1]")
+        if not 0.0 <= self.revert_max_ucb <= 1.0:
+            raise ValueError("revert_max_ucb must lie in [0, 1]")
+        if self.revert_max_ucb > self.promotion_min_lcb:
+            # Otherwise a single result could satisfy both bounds and the
+            # three-way rule would stop being a partition.
+            raise ValueError("revert_max_ucb must not exceed promotion_min_lcb")
+        self.gate_ladder().validate()
         if self.gate_confidence_z <= 0 or self.gate_slots <= 0:
             raise ValueError("gate_confidence_z and gate_slots must be positive")
         if self.anchor_gate_every_promotions < 0:
@@ -1290,44 +1330,55 @@ class GateResult:
     evaluated_games: int = 0
     seconds: float = field(default=0.0, compare=False)
     moves_per_game: float = 0.0
-    fixed_n: bool = False
+    fixed_n: bool = True
+    pair_scores: tuple[float, ...] = ()
+    revert_suppressed: bool = False
 
 
 def wilson_pair_decision(
     pair_scores: Sequence[float],
     *,
     promotion_min_lcb: float = 0.50,
-    revert_win_rate: float = 0.48,
+    revert_max_ucb: float = 0.48,
     z: float = 1.96,
-    fixed_n: bool = False,
+    measurement: bool = False,
     measurement_threshold: float = 0.50,
+    revert_suppressed: bool = False,
 ) -> tuple[str, int, float, float, float, str]:
-    """Three-way gate decision using independent seat-pairs as observations."""
+    """Three-way gate decision using independent seat-pairs as observations.
+
+    The whole sample is read **once**, at its fixed size.  Evaluating the bounds
+    after every pair and stopping on the first crossing -- which this function
+    used to do -- is optional stopping: it promotes an evenly matched candidate
+    15-19% of the time instead of ~2%, and no promotion is ever undone anywhere
+    in the system (W5.5).
+
+    ``measurement=True`` is the anchor form: report the rate against a fixed
+    threshold with no lifecycle meaning.
+    """
 
     if not pair_scores:
         return "continue", 0, 0.0, 0.0, 1.0, "no_pairs"
     points = 0.0
-    for index, score in enumerate(pair_scores, start=1):
+    for score in pair_scores:
         if score not in (0.0, 0.5, 1.0):
             raise ValueError("pair outcomes must be one of 0, 0.5, or 1")
         points += score
-        rate = points / index
-        lcb, ucb = wilson_interval(points, index, z=z)
-        if fixed_n:
-            continue
-        if lcb > promotion_min_lcb:
-            return "accept", index, rate, lcb, ucb, "promotion_lcb"
-        if ucb < promotion_min_lcb:
-            return "reject", index, rate, lcb, ucb, "futility_ucb"
     pairs = len(pair_scores)
     rate = points / pairs
     lcb, ucb = wilson_interval(points, pairs, z=z)
-    if fixed_n:
+    if measurement:
         decision = "accept" if rate >= measurement_threshold else "reject"
         return decision, pairs, rate, lcb, ucb, "fixed_n"
-    if rate < revert_win_rate:
-        return "reject", pairs, rate, lcb, ucb, "cap_revert_rate"
-    return "continue", pairs, rate, lcb, ucb, "cap_probation"
+    if lcb > promotion_min_lcb:
+        return "accept", pairs, rate, lcb, ucb, "promotion_lcb"
+    if ucb < revert_max_ucb:
+        if revert_suppressed:
+            # W5.9: a schedule knot just moved the ground under the learner.
+            # One gate of amnesty, and the evidence is still on the row.
+            return "continue", pairs, rate, lcb, ucb, "revert_suppressed_knot"
+        return "reject", pairs, rate, lcb, ucb, "revert_ucb"
+    return "continue", pairs, rate, lcb, ucb, "probation"
 
 
 class PhaseDLoop:
@@ -1501,6 +1552,40 @@ class PhaseDLoop:
             curriculum_mix_fraction=self.curriculum_mix_fraction(iteration),
             draft_prior=self.draft_prior_amount(iteration),
         )
+
+    def schedule_knots(self) -> tuple[int, ...]:
+        """Games-clock points where a schedule stops or starts moving (W5.9).
+
+        These are the disruptions the config knows about: the curriculum finishes
+        annealing, the draft prior finishes annealing, and the HOF opponent share
+        switches on. Each changes the distribution the learner is training
+        against, so the candidate immediately afterwards can dip for reasons that
+        have nothing to do with the learner being worse.
+        """
+
+        if not self.config.uses_games_basis():
+            return tuple(sorted(set(self.config.gate_revert_suppress_knots)))
+        knots = {
+            self.config.curriculum_anneal_games,
+            self.config.draft_prior_games,
+            *self.config.gate_revert_suppress_knots,
+        }
+        if self.config.hof_opponent_fraction > 0:
+            knots.add(self.config.hof_start_games)
+        return tuple(sorted(knot for knot in knots if knot > 0))
+
+    def revert_suppressed(self, iteration: int) -> bool:
+        """True when a knot crossed within the gate cadence ending here.
+
+        Promotion stays live across a knot -- a candidate that clears the LCB
+        right after an LR change is genuinely better -- so only the revert
+        branch is suppressed, and only for the one gate that follows.
+        """
+
+        cadence = max(1, self.config.promotion_every)
+        opened = self.generation_clock(max(0, iteration - cadence + 1))
+        closed = self.training_clock(iteration)
+        return any(opened < knot <= closed for knot in self.schedule_knots())
 
     def window_selection(self, iteration: int) -> WindowSelection | None:
         """Which iterations the growing window covers, or ``None`` on the legacy basis."""
@@ -2704,12 +2789,16 @@ class PhaseDLoop:
         candidate_spec: ModelAgentSpec,
         opponent_spec: ModelAgentSpec,
         seed_offset: int,
+        games: int,
     ) -> list[MatchOutcome]:
         """One rolling Rust scheduler call for both seat legs and all pairs.
 
         Network ids are attached to the *searcher seat* (W1 routing), so every
         leaf in one search uses the mover's network. Both legs share the active
         pool, restoring batch width without the old per-leaf actor-routing bug.
+
+        The size is fixed by the caller and every game is played: there is no
+        mid-match stopping rule, so the scheduler is free to shard.
         """
 
         import seven_wonders_rust as swr
@@ -2729,7 +2818,7 @@ class PhaseDLoop:
         adapter = rust_searcher_routed_flat_batch_adapter(
             (candidate_eval, opponent_eval)
         )
-        pairs = self.config.gate_max_games // 2
+        pairs = games // 2
         seeds: list[int] = []
         first_players: list[int] = []
         candidate_seats: list[int] = []
@@ -2762,21 +2851,12 @@ class PhaseDLoop:
             force=self.config.force_root_chance,
             age_deal_samples=self.config.age_deal_samples,
             max_inflight_batches=self.config.rust_max_inflight_batches,
-            # Statistical stopping needs one ordered pair stream. Generation
-            # may use multiple scheduler shards; the gate deliberately owns a
-            # separate one-worker scheduler and a separate slot count.
-            scheduler_workers=1,
+            scheduler_workers=self.config.rust_scheduler_workers,
             max_active_slots=self.config.gate_slots,
             deterministic_actions=True,
             puct_root=self.config.eval_search_mode == "puct",
             nets_p0=nets_p0,
             nets_p1=nets_p1,
-            gate_promotion_min_lcb=(
-                self.config.promotion_min_lcb
-                if self.config.gate_early_stop
-                else None
-            ),
-            gate_z=self.config.gate_confidence_z,
         )
         elapsed = time.monotonic() - started
         self.last_gate_stats = {
@@ -2786,6 +2866,7 @@ class PhaseDLoop:
             "moves": sum(len(record["moves"]) for record in records),
             "worker_starts": 1,
             "gate_slots": self.config.gate_slots,
+            "gate_games": games,
         }
         outcomes: list[MatchOutcome] = []
         for record, seed, first_player, candidate_seat in zip(
@@ -3064,7 +3145,13 @@ class PhaseDLoop:
         opponent_spec: ModelAgentSpec,
         *,
         seed_offset: int,
+        games: int,
+        revert_suppressed: bool = False,
     ) -> tuple[GateResult, list[MatchOutcome]]:
+        """Play exactly ``games`` games, then decide once (W5.5)."""
+
+        if games <= 0 or games % 2:
+            raise ValueError("gate games must be a positive even number")
         if self.config.gate_backend != "rust":
             candidate_agent = _build_gate_agent(
                 candidate_spec,
@@ -3080,7 +3167,7 @@ class PhaseDLoop:
             )
             started = time.monotonic()
             outcomes = []
-            for index in range(self.config.gate_max_games):
+            for index in range(games):
                 candidate_seat = index % 2
                 agents = (
                     (candidate_agent, opponent_agent)
@@ -3095,30 +3182,23 @@ class PhaseDLoop:
                         first_player=(index // 2) % 2,
                     )
                 )
-                if self.config.gate_early_stop and index % 2 == 1:
-                    interim = wilson_pair_decision(
-                        self._pair_scores(outcomes),
-                        promotion_min_lcb=self.config.promotion_min_lcb,
-                        revert_win_rate=self.config.revert_win_rate,
-                        z=self.config.gate_confidence_z,
-                    )
-                    if interim[-1] in ("promotion_lcb", "futility_ucb"):
-                        break
             self.last_gate_stats = {
                 "seconds": time.monotonic() - started,
                 "games_evaluated": len(outcomes),
                 "worker_starts": 0,
+                "gate_games": games,
             }
         else:
             outcomes = self._rust_model_gate_rolling(
-                candidate_spec, opponent_spec, seed_offset
+                candidate_spec, opponent_spec, seed_offset, games
             )
         pair_scores = self._pair_scores(outcomes)
         decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
             pair_scores,
             promotion_min_lcb=self.config.promotion_min_lcb,
-            revert_win_rate=self.config.revert_win_rate,
+            revert_max_ucb=self.config.revert_max_ucb,
             z=self.config.gate_confidence_z,
+            revert_suppressed=revert_suppressed,
         )
         performance = self.last_gate_stats
         evaluated_games = len(outcomes)
@@ -3137,7 +3217,9 @@ class PhaseDLoop:
                 evaluated_games=evaluated_games,
                 seconds=float(performance.get("seconds", 0.0)),
                 moves_per_game=moves / evaluated_games if evaluated_games else 0.0,
-                fixed_n=False,
+                fixed_n=True,
+                pair_scores=tuple(pair_scores),
+                revert_suppressed=revert_suppressed,
             ),
             outcomes,
         )
@@ -3201,7 +3283,7 @@ class PhaseDLoop:
         decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
             pair_scores,
             z=self.config.gate_confidence_z,
-            fixed_n=True,
+            measurement=True,
             measurement_threshold=threshold,
         )
         moves = sum(outcome.actions for outcome in outcomes)
@@ -3220,13 +3302,26 @@ class PhaseDLoop:
                 seconds=elapsed,
                 moves_per_game=moves / len(outcomes) if outcomes else 0.0,
                 fixed_n=True,
+                pair_scores=tuple(pair_scores),
             ),
             outcomes,
         )
 
     def promotion_gate(
-        self, candidate: str | Path, *, opponent: str | Path | None = None
+        self,
+        candidate: str | Path,
+        *,
+        opponent: str | Path | None = None,
+        games: int = 0,
+        iteration: int | None = None,
     ) -> GateResult:
+        """Fixed-N promotion gate.
+
+        ``games`` comes from the controller's W5.8 ladder; zero falls back to
+        ``gate_max_games`` for callers that size the gate themselves (the W5.7
+        cost bench, and any direct use in tests).
+        """
+
         opponent = Path(opponent) if opponent is not None else self.current_best
         self._admit_gate((candidate, opponent))
         started = time.monotonic()
@@ -3237,6 +3332,10 @@ class PhaseDLoop:
                 candidate_spec,
                 opponent_spec,
                 seed_offset=50_000_000,
+                games=games or self.config.gate_max_games,
+                revert_suppressed=(
+                    False if iteration is None else self.revert_suppressed(iteration)
+                ),
             )
             # Promotion evidence is allowed to stop on a boundary and is
             # therefore not an Elo sample. Only fixed-N anchors enter the
@@ -3444,6 +3543,7 @@ class PhaseDLoop:
                 buffer_autosave_every=self.config.buffer_autosave_every,
                 seed=self.config.seed,
                 iterations=self.config.iterations,
+                gate_ladder=self.config.gate_ladder(),
             ),
         )
         try:
@@ -3626,21 +3726,53 @@ def main(argv=None) -> int:
     parser.add_argument("--gate-alpha", type=float, default=0.05)
     parser.add_argument("--gate-beta", type=float, default=0.05)
     parser.add_argument("--gate-indifference", type=float, default=0.03)
-    parser.add_argument("--promotion-min-lcb", type=float, default=0.50)
-    parser.add_argument("--revert-win-rate", type=float, default=0.48)
+    parser.add_argument(
+        "--promotion-min-lcb",
+        type=float,
+        default=0.50,
+        help="promote when the pair-level Wilson lower bound clears this",
+    )
+    parser.add_argument(
+        "--revert-max-ucb",
+        type=float,
+        default=0.48,
+        help="revert when the pair-level Wilson UPPER bound falls below this "
+        "(a confidence bound, not the old point-estimate --revert-win-rate)",
+    )
     parser.add_argument("--gate-confidence-z", type=float, default=1.96)
+    parser.add_argument(
+        "--gate-ladder-games",
+        type=int,
+        nargs="+",
+        default=[],
+        help="ascending even gate sizes (W5.8), e.g. 100 200 400 800; empty "
+        "keeps one rung at --gate-max-games",
+    )
+    parser.add_argument(
+        "--gate-ladder-step-up-after",
+        type=int,
+        default=2,
+        help="consecutive probations before the gate steps up one rung",
+    )
+    parser.add_argument(
+        "--gate-ladder-floor-games",
+        type=int,
+        default=0,
+        help="games that must exist before the ladder may step up at all",
+    )
+    parser.add_argument(
+        "--gate-revert-suppress-knots",
+        type=int,
+        nargs="+",
+        default=[],
+        help="extra games-clock points after which one gate may not revert "
+        "(W5.9); schedule-driven knots are derived automatically",
+    )
     parser.add_argument(
         "--gate-slots",
         type=int,
         default=48,
         help="rolling active-game slots used only by model promotion gates",
-    )
-    parser.add_argument(
-        "--gate-early-stop",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="stop promotion gates on Wilson promotion/futility evidence; "
-        "disable only for fixed-size cost calibration",
     )
     parser.add_argument("--rust-slots", type=int, default=16)
     parser.add_argument("--rust-global-batch-cap", type=int, default=256)
@@ -3862,10 +3994,13 @@ def main(argv=None) -> int:
         gate_beta=args.gate_beta,
         gate_indifference=args.gate_indifference,
         promotion_min_lcb=args.promotion_min_lcb,
-        revert_win_rate=args.revert_win_rate,
+        revert_max_ucb=args.revert_max_ucb,
+        gate_ladder_games=tuple(args.gate_ladder_games),
+        gate_ladder_step_up_after=args.gate_ladder_step_up_after,
+        gate_ladder_floor_games=args.gate_ladder_floor_games,
+        gate_revert_suppress_knots=tuple(args.gate_revert_suppress_knots),
         gate_confidence_z=args.gate_confidence_z,
         gate_slots=args.gate_slots,
-        gate_early_stop=args.gate_early_stop,
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,

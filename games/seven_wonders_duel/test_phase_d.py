@@ -264,31 +264,60 @@ def test_wilson_gate_uses_seat_pair_as_observation():
     assert rate == pytest.approx(0.6)
     assert lower < 0.5 < upper
     assert decision == "continue"
-    assert reason == "cap_probation"
+    assert reason == "probation"
 
 
-def test_wilson_gate_promotes_reverts_and_futility_stops():
+def test_wilson_gate_promotes_reverts_and_otherwise_probates():
     from .phase_d import wilson_pair_decision
 
     promoted = wilson_pair_decision([1.0] * 20)
     assert promoted[0] == "accept"
     assert promoted[-1] == "promotion_lcb"
 
-    reverted = wilson_pair_decision([0.5] * 20, revert_win_rate=0.55)
+    # W5.5: revert is a confidence bound, so a *tied* candidate is probation no
+    # matter how many pairs it is measured over -- the old point-estimate rule
+    # reverted a third of these.
+    tied = wilson_pair_decision([0.5] * 400)
+    assert tied[0] == "continue"
+    assert tied[-1] == "probation"
+
+    reverted = wilson_pair_decision([0.0] * 20)
     assert reverted[0] == "reject"
-    assert reverted[-1] == "cap_revert_rate"
-
-    futile = wilson_pair_decision([0.0] * 20)
-    assert futile[0] == "reject"
-    assert futile[-1] == "futility_ucb"
+    assert reverted[-1] == "revert_ucb"
 
 
-def test_anchor_wilson_measurement_is_fixed_n():
+def test_wilson_gate_never_stops_early_on_a_prefix():
+    from .phase_d import wilson_pair_decision
+
+    # A run of wins that crosses the promote boundary mid-match, then a
+    # regression to dead even. Optional stopping promotes on the prefix; the
+    # fixed-N rule reads the whole sample and returns probation.
+    prefix = [1.0] * 12
+    assert wilson_pair_decision(prefix)[0] == "accept", "prefix must be promotable"
+    scores = prefix + [0.0] * 12 + [0.5] * 16
+    decision, pairs, rate, _lcb, _ucb, reason = wilson_pair_decision(scores)
+    assert (decision, pairs, reason) == ("continue", 40, "probation")
+    assert rate == pytest.approx(0.5)
+
+
+def test_revert_is_suppressed_for_one_gate_after_a_schedule_knot():
+    from .phase_d import wilson_pair_decision
+
+    losing = [0.0] * 20
+    assert wilson_pair_decision(losing)[0] == "reject"
+    suppressed = wilson_pair_decision(losing, revert_suppressed=True)
+    assert suppressed[0] == "continue"
+    assert suppressed[-1] == "revert_suppressed_knot"
+    # Promotion is *not* suppressed: a knot is no reason to withhold a win.
+    assert wilson_pair_decision([1.0] * 20, revert_suppressed=True)[0] == "accept"
+
+
+def test_anchor_wilson_measurement_reports_against_its_threshold():
     from .phase_d import wilson_pair_decision
 
     result = wilson_pair_decision(
         [1.0] * 20,
-        fixed_n=True,
+        measurement=True,
         measurement_threshold=0.6,
     )
     assert result[0] == "accept"
@@ -732,8 +761,10 @@ def _soft_gate_config(tmp_path: Path, **overrides) -> PhaseDConfig:
     return PhaseDConfig(**base)
 
 
-def _scripted_gate(decision: str):
-    def gate(candidate, *, opponent=None):
+def _scripted_gate(decision: str, sizes: list[int] | None = None):
+    def gate(candidate, *, opponent=None, games=0, iteration=None):
+        if sizes is not None:
+            sizes.append(games)
         return GateResult("best", 0.5, decision, 2, 0.5)
 
     return gate
@@ -814,7 +845,7 @@ def test_soft_gate_reuses_paired_sprt_decision_unchanged(tmp_path, monkeypatch):
 
     seen: list[str] = []
 
-    def gate(candidate, *, opponent=None):
+    def gate(candidate, *, opponent=None, games=0, iteration=None):
         # Prove the adapter passes latest vs current_best into the real gate.
         assert Path(candidate).name == "latest.pt"
         assert Path(opponent).name == "current_best.pt"
@@ -986,7 +1017,7 @@ def test_training_log_golden_rows_cover_all_lifecycle_actions(tmp_path, monkeypa
     loop = PhaseDLoop(_soft_gate_config(tmp_path, iterations=4))
     decisions = iter(["continue", "reject", "accept"])
 
-    def gate(candidate, *, opponent=None):
+    def gate(candidate, *, opponent=None, games=0, iteration=None):
         return GateResult("best", 0.5, next(decisions), 2, 0.5)
 
     monkeypatch.setattr(loop, "promotion_gate", gate)
@@ -1058,3 +1089,156 @@ def test_disabled_run_log_still_writes_structured_log(tmp_path, monkeypatch):
     assert (loop.run_dir / "training_log.jsonl").exists()
     assert (loop.run_dir / "run_manifest.json").exists()
     assert not (loop.run_dir / "run.log").exists()
+
+
+# -- W5.8/W5.9: scheduled gate size and knot amnesty ------------------------
+
+
+def test_ladder_sizes_reach_the_gate_and_step_up_on_probation(tmp_path, monkeypatch):
+    sizes: list[int] = []
+    loop = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path,
+            iterations=4,
+            gate_ladder_games=(2, 4, 6),
+            gate_ladder_step_up_after=2,
+        )
+    )
+    monkeypatch.setattr(loop, "promotion_gate", _scripted_gate("continue", sizes))
+    rows = loop.run()
+
+    # Iteration 0 bootstraps (no gate), then three probations: the third runs at
+    # the second rung because the first two stepped the ladder up.
+    assert sizes == [2, 2, 4]
+    assert rows[-1]["control_state"]["gate_rung"] == 1
+
+
+def test_a_promotion_steps_the_ladder_back_down(tmp_path, monkeypatch):
+    sizes: list[int] = []
+    loop = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path,
+            iterations=5,
+            gate_ladder_games=(2, 4, 6),
+            gate_ladder_step_up_after=1,
+        )
+    )
+    decisions = iter(["continue", "continue", "accept"])
+
+    def gate(candidate, *, opponent=None, games=0, iteration=None):
+        sizes.append(games)
+        return GateResult("best", 0.5, next(decisions, "continue"), 2, 0.5)
+
+    monkeypatch.setattr(loop, "promotion_gate", gate)
+    loop.run()
+    # Up on each probation, then back one rung after the promotion.
+    assert sizes == [2, 4, 6, 4]
+
+
+def test_gate_size_falls_back_to_gate_max_games_without_a_ladder(tmp_path, monkeypatch):
+    sizes: list[int] = []
+    loop = PhaseDLoop(_soft_gate_config(tmp_path, iterations=3, gate_max_games=2))
+    monkeypatch.setattr(loop, "promotion_gate", _scripted_gate("continue", sizes))
+    loop.run()
+    assert sizes == [2, 2]
+
+
+def test_revert_suppression_covers_the_gate_that_follows_a_schedule_knot(tmp_path):
+    loop = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path,
+            schedule_basis="games",
+            curriculum_anneal_games=4,
+            draft_prior_games=4,
+            hof_opponent_fraction=0.0,
+            promotion_every=1,
+        )
+    )
+    knots = loop.schedule_knots()
+    assert 4 in knots
+
+    class _Ledger:
+        def __init__(self, per_iteration: int):
+            self.per_iteration = per_iteration
+
+        def total_before(self, iteration: int) -> int:
+            return max(0, iteration) * self.per_iteration
+
+        def total_through(self, iteration: int) -> int:
+            return (max(0, iteration) + 1) * self.per_iteration
+
+    loop.games_ledger = _Ledger(2)
+    # Iteration 1 spans games 2..4, so the knot at 4 lands inside it.
+    assert loop.revert_suppressed(1) is True
+    assert loop.revert_suppressed(2) is False
+
+
+def test_hof_start_is_only_a_knot_when_the_league_is_switched_on(tmp_path):
+    off = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path / "off",
+            schedule_basis="games",
+            hof_opponent_fraction=0.0,
+            hof_start_games=1234,
+        )
+    )
+    assert 1234 not in off.schedule_knots()
+    on = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path / "on",
+            schedule_basis="games",
+            hof_opponent_fraction=0.15,
+            hof_start_games=1234,
+        )
+    )
+    assert 1234 in on.schedule_knots()
+
+
+def test_revert_thresholds_must_partition_the_decision_space():
+    PhaseDConfig(promotion_min_lcb=0.50, revert_max_ucb=0.50).validate()
+    with pytest.raises(ValueError, match="revert_max_ucb must not exceed"):
+        PhaseDConfig(promotion_min_lcb=0.50, revert_max_ucb=0.55).validate()
+
+
+def test_confirmed_revert_resets_the_learner_but_a_single_one_does_not():
+    """W5.5's two-stage revert, driven by the real rule rather than a script.
+
+    No historical run reverts under this rule (A7 r10 restatement), so the path
+    from losing pair scores to REVERT_RESET has to be covered synthetically.
+    """
+
+    from games.az_loop import GateLadder
+    from games.az_loop.training_control import (
+        GeneratorMode,
+        PromotionAction,
+        gate_transition,
+        initial_state,
+    )
+    from .phase_d import wilson_pair_decision
+
+    losing = wilson_pair_decision([0.0] * 20)[0]
+    even = wilson_pair_decision([0.5] * 20)[0]
+    assert (losing, even) == ("reject", "continue")
+
+    ladder = GateLadder.fixed(40)
+    state = initial_state(GeneratorMode.SOFT_GATE)
+
+    first = gate_transition(
+        state, losing, revert_reset_after=2, iteration=1, ladder=ladder
+    )
+    assert first.action is PromotionAction.REVERT
+    assert first.reset_learner is False
+    assert first.next_state.consecutive_reverts == 1
+
+    # An even gate in between clears the count: only *consecutive* evidence of
+    # a regression is allowed to discard the learner.
+    interrupted = gate_transition(
+        first.next_state, even, revert_reset_after=2, iteration=2, ladder=ladder
+    )
+    assert interrupted.next_state.consecutive_reverts == 0
+
+    confirmed = gate_transition(
+        first.next_state, losing, revert_reset_after=2, iteration=2, ladder=ladder
+    )
+    assert confirmed.action is PromotionAction.REVERT_RESET
+    assert confirmed.reset_learner is True

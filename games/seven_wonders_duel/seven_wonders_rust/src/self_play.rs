@@ -176,28 +176,6 @@ pub struct GameRecord {
     pub agent_names: [String; 2],
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GateStopConfig {
-    pub promotion_min_lcb: f64,
-    pub z: f64,
-}
-
-fn wilson_interval(points: f64, observations: usize, z: f64) -> (f64, f64) {
-    if observations == 0 {
-        return (0.0, 1.0);
-    }
-    let n = observations as f64;
-    let p = (points / n).clamp(0.0, 1.0);
-    let z2 = z * z;
-    let denominator = 1.0 + z2 / n;
-    let centre = p + z2 / (2.0 * n);
-    let margin = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt();
-    (
-        ((centre - margin) / denominator).max(0.0),
-        ((centre + margin) / denominator).min(1.0),
-    )
-}
-
 fn agent_names(cfg: &SelfPlayConfig) -> [String; 2] {
     std::array::from_fn(|seat| {
         cfg.bot_by_player[seat].map_or_else(|| "network".to_owned(), |bot| bot.name().to_owned())
@@ -1066,62 +1044,6 @@ impl SlotPool {
         self.donate_reservation_if_finished(budget);
     }
 
-    /// Stop a gate after a complete evidence prefix while retaining the
-    /// finished pair records that produced the decision.
-    fn abort_unfinished_gate(&mut self, budget: &SlotBudget) {
-        for index in 0..self.entries.len() {
-            if let SlotEntry::Active(slot) = &mut self.entries[index] {
-                slot.cancel_pending();
-                self.entries[index] = SlotEntry::Taken;
-                self.active_count -= 1;
-                budget.on_retire();
-                self.release_activation(budget);
-            } else if matches!(&self.entries[index], SlotEntry::Queued(_)) {
-                self.entries[index] = SlotEntry::Taken;
-            }
-        }
-        while self.budget_held > 0 {
-            self.release_activation(budget);
-        }
-        self.holds_reserved = false;
-        self.next_queued = self.entries.len();
-        self.donate_reservation_if_finished(budget);
-    }
-
-    /// Independent observations are adjacent seed/seat pairs. Return the
-    /// contiguous finished prefix only; out-of-order later pairs cannot enter
-    /// the decision before an earlier pair completes.
-    fn gate_stop_pairs(&self, config: GateStopConfig) -> Option<usize> {
-        let mut points = 0.0;
-        let mut pairs = 0;
-        for pair in self.entries.chunks_exact(2) {
-            let (SlotEntry::Finished(left), SlotEntry::Finished(right)) = (&pair[0], &pair[1])
-            else {
-                break;
-            };
-            let score = |record: &GameRecord, candidate_seat: usize| {
-                record.winner.map_or(
-                    0.5,
-                    |winner| if winner == candidate_seat { 1.0 } else { 0.0 },
-                )
-            };
-            let game_points = score(left, 0) + score(right, 1);
-            points += if game_points > 1.0 {
-                1.0
-            } else if game_points == 1.0 {
-                0.5
-            } else {
-                0.0
-            };
-            pairs += 1;
-            let (lower, upper) = wilson_interval(points, pairs, config.z);
-            if lower > config.promotion_min_lcb || upper < config.promotion_min_lcb {
-                return Some(pairs);
-            }
-        }
-        None
-    }
-
     /// Records in **input order**, independent of completion order.
     fn into_records(self) -> PyResult<Vec<GameRecord>> {
         self.entries
@@ -1135,18 +1057,6 @@ impl SlotPool {
             .collect()
     }
 
-    fn into_gate_prefix(self, pairs: usize) -> PyResult<Vec<GameRecord>> {
-        self.entries
-            .into_iter()
-            .take(pairs * 2)
-            .map(|entry| match entry {
-                SlotEntry::Finished(record) => Ok(*record),
-                _ => Err(PyRuntimeError::new_err(
-                    "gate stopped without a complete finished pair prefix",
-                )),
-            })
-            .collect()
-    }
 }
 
 /// Fold one finished slot's counters into the run metrics.
@@ -1941,7 +1851,6 @@ pub fn run_many_pipelined(
     global_batch_cap: usize,
     max_inflight_batches: usize,
     budget: &SlotBudget,
-    gate_stop: Option<GateStopConfig>,
 ) -> PyResult<SchedulerResult> {
     if jobs.is_empty() {
         return Err(PyValueError::new_err(
@@ -1970,8 +1879,7 @@ pub fn run_many_pipelined(
     // ceiling is only known once it has actually acquired activations.
     let local_capacity = budget.total() / budget.shards().max(1);
 
-    let mut stopped_pairs = None;
-    'scheduler: loop {
+    loop {
         if let Err(err) = pool.refill(budget) {
             pool.abort(&budget);
             return Err(err);
@@ -2002,13 +1910,6 @@ pub fn run_many_pipelined(
             if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
                 pool.abort(&budget);
                 return Err(err);
-            }
-        }
-        if let Some(config) = gate_stop {
-            if let Some(pairs) = pool.gate_stop_pairs(config) {
-                stopped_pairs = Some(pairs);
-                pool.abort_unfinished_gate(budget);
-                break 'scheduler;
             }
         }
 
@@ -2114,10 +2015,7 @@ pub fn run_many_pipelined(
     // Exact and global: with shards this is concurrency across all of them, not
     // this shard's own peak.
     metrics.max_live_slots = budget.peak_live();
-    let records = match stopped_pairs {
-        Some(pairs) => pool.into_gate_prefix(pairs)?,
-        None => pool.into_records()?,
-    };
+    let records = pool.into_records()?;
     metrics.games = records.len();
     Ok(SchedulerResult { records, metrics })
 }
@@ -2138,7 +2036,6 @@ pub fn run_many_pipelined_sharded(
     max_inflight_batches: usize,
     scheduler_workers: usize,
     max_active_slots: usize,
-    gate_stop: Option<GateStopConfig>,
 ) -> PyResult<SchedulerResult> {
     if scheduler_workers == 0 {
         return Err(PyValueError::new_err("scheduler_workers must be positive"));
@@ -2155,11 +2052,6 @@ pub fn run_many_pipelined_sharded(
     }
     validate_leaf_batches_fit(&jobs, global_batch_cap)?;
     let active_cap = resolve_max_active(max_active_slots, jobs.len());
-    if gate_stop.is_some() && scheduler_workers != 1 {
-        return Err(PyValueError::new_err(
-            "gate early stopping requires scheduler_workers=1",
-        ));
-    }
     if scheduler_workers == 1 || jobs.len() == 1 {
         let budget = SlotBudget::single(active_cap)?;
         return run_many_pipelined(
@@ -2168,7 +2060,6 @@ pub fn run_many_pipelined_sharded(
             global_batch_cap,
             max_inflight_batches,
             &budget,
-            gate_stop,
         );
     }
     let shard_count = scheduler_workers.min(jobs.len());
@@ -2197,7 +2088,6 @@ pub fn run_many_pipelined_sharded(
                         global_batch_cap,
                         max_inflight_batches,
                         budget,
-                        None,
                     )
                 })
             })

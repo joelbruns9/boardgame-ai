@@ -115,8 +115,12 @@ def test_routing_all_seats_to_network_zero_matches_no_routing():
     assert plain.pairs == routed.pairs
 
 
-def test_gate_wilson_stop_halts_rolling_scheduler_on_complete_pair():
-    """The worker stays live while queue admission stops on pair evidence."""
+def test_gate_scheduler_plays_every_queued_pair():
+    """W5.5: the gate is fixed-N, so no pair is dropped by the scheduler.
+
+    The sequential stop this replaces returned a prefix, which is what made the
+    gate's promote decision optional-stopping-biased.
+    """
 
     import seven_wonders_rust as swr
 
@@ -140,13 +144,11 @@ def test_gate_wilson_stop_halts_rolling_scheduler_on_complete_pair():
         game_seeds=seeds,
         nets_p0=nets_p0,
         nets_p1=nets_p1,
-        gate_promotion_min_lcb=0.99,
-        gate_z=1.96,
         max_active_slots=8,
         scheduler_workers=1,
         **_kwargs(),
     )
-    assert len(records) == metrics["games"] == 2
+    assert len(records) == metrics["games"] == 2 * pair_count
 
 
 # -- the property that matters --------------------------------------------

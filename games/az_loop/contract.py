@@ -54,6 +54,12 @@ class PromotionRequest:
     iteration: int
     candidate_checkpoint: Path
     best_checkpoint: Path
+    gate_games: int = 0
+    """Fixed number of games this gate must play (W5.8 ladder).
+
+    Zero leaves the size to the adapter's own configuration, which is what a
+    game that has not adopted the ladder does.
+    """
 
 
 @dataclass(frozen=True, slots=True)

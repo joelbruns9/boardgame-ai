@@ -455,7 +455,10 @@ class SevenWondersDuelLifecycleAdapter:
 
     def evaluate_promotion(self, request: PromotionRequest) -> PromotionResult:
         report = self.loop.promotion_gate(
-            request.candidate_checkpoint, opponent=request.best_checkpoint
+            request.candidate_checkpoint,
+            opponent=request.best_checkpoint,
+            games=request.gate_games,
+            iteration=request.iteration,
         )
         stats = GateStats(
             opponent=report.opponent,
@@ -469,6 +472,7 @@ class SevenWondersDuelLifecycleAdapter:
             stop_reason=report.stop_reason,
             seconds=report.seconds,
             fixed_n=report.fixed_n,
+            pair_scores=list(report.pair_scores),
         )
         metrics = asdict(report)
         metrics["_stats"] = asdict(stats)
@@ -500,6 +504,7 @@ class SevenWondersDuelLifecycleAdapter:
                             stop_reason=report.stop_reason,
                             seconds=report.seconds,
                             fixed_n=True,
+                            pair_scores=list(report.pair_scores),
                         )
                     )
                     for report in reports

@@ -55,7 +55,6 @@ def run(args) -> dict:
             gate_sims=args.sims,
             gate_max_games=games,
             gate_slots=args.slots,
-            gate_early_stop=False,
             rust_slots=args.slots,
             rust_global_batch_cap=args.global_batch_cap,
             rust_max_inflight_batches=args.max_inflight_batches,
@@ -96,11 +95,13 @@ def run(args) -> dict:
         chosen = max(affordable, default=None)
         if chosen is not None:
             recommendation = {
-                "gate_max_games": chosen[0],
+                # W5.8: this is the ladder's *ceiling*, not a single cap --
+                # lower rungs are always affordable if the top one is.
+                "gate_ladder_ceiling_games": chosen[0],
                 "predicted_gate_fraction": chosen[1],
                 "predicted_gate_seconds": chosen[2],
                 "criterion": (
-                    f"largest measured cap at or below "
+                    f"largest measured rung at or below "
                     f"{args.max_gate_fraction:.1%} of wall time"
                 ),
             }

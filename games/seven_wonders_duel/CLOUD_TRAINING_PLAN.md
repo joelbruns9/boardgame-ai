@@ -1,9 +1,13 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0/W1/W2/W3 complete. W5 decision and complete-cost closure
-remain open.**
-Revision 9.
-**Revision history:** r9 closes W3 with explicit current-best/HOF/bot/HOF+bot
+**Status:** **W0/W1/W2/W3 complete. W5's throughput work is done; its decision
+rule is rewritten in r10 and needs re-implementing, and its per-rung cost fit on
+the target host remains open.**
+Revision 10.
+**Revision history:** r10 rewrites W5's decision rule after review: sequential
+stopping is removed (it ran at 15-19% false promotion), revert becomes a Wilson
+**UCB < 0.48** test with `revert_reset_after = 2`, and the single cap is replaced
+by a scheduled gate-size ladder. r9 closes W3 with explicit current-best/HOF/bot/HOF+bot
 provenance, actual-use handling for bot-shadowed HOF assignments, and realized
 opponent shares in `az_report`. r8 removes W3's stats-only replay by collecting and
 caching game observations during required trainable-position derivation. r7
@@ -60,9 +64,10 @@ does not close it -- it makes it **measured every iteration**.
 | curriculum bots | early accelerant only, annealed **in games** (10k) | W1 **done** |
 | opponent diversity | **HOF league sampling**, searcher-routed, learner-only labels; compatibility default off, cloud launch explicitly **0.15** | W1 **done**, launch value locked for W2/W5 |
 | schedules | every schedule in **games**; `schedule_basis` pinned per run | W1 **done** |
-| gate statistic | **pair-level Wilson-LCB three-way rule** (promote / probation / revert), with UCB futility and fixed-N anchors | W5 **implemented** |
-| gate budget | configurable; **default remains provisional until the RTX 5090 200/400/800 fit** | W5.7 cloud acceptance |
-| gate cost | persistent rolling worker, concurrent seat legs, cloud-measured before selecting the cap | W5 **implemented**, W5.7 pending target host |
+| gate statistic | **fixed-N pair-level Wilson three-way rule**: promote LCB > 0.50, revert UCB < 0.48, else probation. No mid-match stopping. Fixed-N anchors | W5.5 **rewritten in r10** |
+| revert cost | **two-stage**: first revert switches the generator only; `revert_reset_after = 2` before any learner reset | W5.5 **r10** |
+| gate budget | **scheduled ladder** 100/200/400/800, +1 rung after 2 probations, -1 after a promotion; `promotion_every` unchanged. Ceiling provisional until the RTX 5090 per-rung fit | W5.8 / W5.7 cloud acceptance |
+| gate cost | persistent rolling worker, concurrent seat legs, cloud-measured per rung | W5.1-5.4 **implemented**, W5.7 pending target host |
 | stagnation | **games-indexed** anchor + metric-triggered intervention ladder | W7 |
 | cloud target | vast.ai, single box | W6 |
 
@@ -77,7 +82,7 @@ does not close it -- it makes it **measured every iteration**.
 | W2 | Memory: fix the crash, bound the footprint, measure it | M | ~~Yes~~ **DONE 2026-07-30** |
 | W3 | Shared run-stats contract + reporting | M | ~~Yes~~ **DONE 2026-07-30** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
-| W5 | Gate efficiency + Wilson-LCB decision rule | M | **LOCAL GATES PASSED; RTX 5090 cap fit pending** |
+| W5 | Gate efficiency + fixed-N Wilson decision rule + size ladder | M | **THROUGHPUT DONE; W5.5 REWRITE (r10), W5.8-5.10 AND THE RTX 5090 PER-RUNG FIT OPEN** |
 | W6 | Cloud setup script | M | **Yes** |
 | W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
 
@@ -386,6 +391,13 @@ predictive VRAM model is not required for launch: L paths already ran on the
 short L/bf16 preflight with the exact batch, slot, HOF, and two-model gate
 geometry, then records actual physical and allocated peaks during training.
 
+**Recovery semantics worth knowing before someone re-derives them from the
+code:** rolling back an uncommitted iteration deletes its buffer file, its
+candidate, *and* the persisted Adam moments. The journal never snapshotted the
+moments, so the alternative was applying iteration-N moments to restored
+iteration-(N-1) weights. The restarted iteration therefore warms up cold, which
+is slower and sound; a post-crash iteration that looks slow is expected.
+
 **Acceptance result:** checked allocation failures preserve the original
 Python/CUDA exception; the cache converges to its calibrated byte ceiling;
 gate cleanup and restart rollback are implemented; and a copy of
@@ -534,35 +546,200 @@ concurrency to zero as each chunk drains") still live in the gate path.
 
 Target 193 s → ~50 s, which is what pays for the larger cap.
 
-### Decision rule -- port Kingdomino's
+### Decision rule -- fixed-N, pair-level Wilson, three-way (rewritten in r10)
 
 - **W5.5** *(M)* Port `games/kingdomino/promotion.py`'s Wilson rule and
-  `_generator_action_after_promotion_check` (`self_play.py:2908`):
-  - `wilson_lower_bound(points, games, z=1.96)`, **draws = 0.5 points**;
-  - **promote** if LCB > `promotion_min_lcb` (0.50);
-  - **revert** if win rate < `revert_win_rate` (0.48);
-  - **probation** otherwise;
+  `_generator_action_after_promotion_check` (`self_play.py:2908`). The gate
+  plays a **fixed** number of games, chosen *before* the match, and then decides
+  **once**:
   - **observation unit = the seat pair**, outcome in {0, 0.5, 1}. Wilson assumes
     independence, and paired games share a seed; pairing the unit makes the
     bound exact rather than mildly anti-conservative;
-  - cap **800**; futility stop when the Wilson **upper** bound falls below 0.50
-    (promotion arithmetically unreachable).
+  - Wilson interval on pairs at `z = 1.96`, **draws = 0.5 points**;
+  - **promote** if LCB > `promotion_min_lcb` (**0.50**);
+  - **revert** if UCB < `revert_max_ucb` (**0.48**);
+  - **probation** otherwise -- i.e. whenever the interval still spans the
+    threshold band. Probation is the default and the safe state in every
+    direction: the learner keeps training, the next gate is another look;
+  - **`revert_reset_after = 2`** (see the two-stage revert below).
 
 Why this and not the Bayesian spec from revision 2: it is already implemented
 and tested in this repo, Wilson handles draws natively (the Beta-Binomial
 fudged them), and the three-way output maps directly onto `az_loop`'s existing
 ACCEPT / CONTINUE / REJECT consumed by `gate_transition`.
 
-Replaying run 03 under this rule agrees on **9 of 13** gates (A7). The three
-promote → probation flips (gates 15, 20, 60) are gates SPRT truncated at 74-154
-games, where the interval is simply too wide to clear 0.50.
+Replaying run 03 under the LCB half of this rule agrees on **9 of 13** gates
+(A7). The three promote → probation flips (gates 15, 20, 60) are gates SPRT
+truncated at 74-154 games, where the interval is simply too wide to clear 0.50.
+Recomputed at the pair unit with the r10 revert test, run 03's two reverts also
+become probation -- so **no historical gate exercises the revert branch** and it
+has to be covered by a synthetic test rather than a replay (A7, r10
+restatement).
 
-**This settles the statistics of the cap.** Win rate required for LCB > 0.50:
-**0.598** at 100 games, **0.569** at 200, 0.549 at 400, **0.535** at 800. At
-today's 200-game cap a candidate needs a **+7%** edge to promote; at 800 it needs
-**+3.5%**. **It does not settle the cost of the cap -- see below.**
+#### Sequential stopping is removed (r10)
 
-### The cap's cost must be re-derived at L's width (new in r4)
+Revisions 6-9 shipped a rule that evaluated both boundaries **after every pair**
+and stopped on the first crossing. That is optional stopping, and it destroys the
+calibration the whole rule rests on. Simulated (40k trials per cell, 10% draw
+rate, z=1.96), the probability of **promoting an evenly-matched candidate**:
+
+| cap | stop-every-pair | decide once at the cap |
+|---|---:|---:|
+| 200 games | **14.9%** | 1.9% |
+| 800 games | **19.1%** | 1.8% |
+
+The larger cap made it *worse*, which inverts the entire cap argument below. It
+also mapped the futility crossing onto `REJECT`, so ~30% of evenly-matched
+candidates took the revert path, and it forced `scheduler_workers=1` in the gate
+path. Against that, the measured saving from futility stopping was **~8% of gate
+games** against an even candidate -- under 1% of run wall time, less than the
+sharding it prevented. Delete the sequential machinery on both sides of the
+boundary (`gate_stop_pairs`, `abort_unfinished_gate`, `into_gate_prefix`, the two
+pyo3 parameters, and the in-loop scan in `wilson_pair_decision`). The UCB
+computation stays -- as a **terminal** decision on the fixed sample.
+
+#### Correction: the pair unit costs one doubling (r10)
+
+The r4 sensitivity table below was computed with **games** as `n`. The rule uses
+**pairs**. Expected pair points equal the per-game win rate, so the numbers are
+directly comparable, but every row shifts one doubling:
+
+| games | pairs | pair win rate needed for LCB > 0.50 |
+|---:|---:|---:|
+| 200 | 100 | **0.598** |
+| 400 | 200 | 0.569 |
+| 800 | 400 | **0.549** |
+| 1,600 | 800 | 0.535 |
+
+So a 200-game gate needs a **+10%** edge, not +7%, and the +3.5% target needs
+1,600 games, not 800. Wilson's binomial variance is conservative when splits are
+common, so the true requirement sits somewhat below these; treat them as an
+upper bound.
+
+**The cap buys power, not safety.** Probability of promoting, by the candidate's
+true per-game strength `q` (simulated, fixed-N, z=1.96):
+
+| games | q=0.52 | q=0.55 | q=0.60 | q=0.65 | q=0.70 |
+|---:|---:|---:|---:|---:|---:|
+| 100 | -- | 8.9% | 25.1% | 50.6% | 76.7% |
+| 200 | 4.6% | 13.4% | 43.9% | 79.7% | 96.8% |
+| 400 | 6.5% | 24.0% | 74.0% | 97.8% | ~100% |
+| 800 | 9.5% | **42.2%** | 95.9% | ~100% | ~100% |
+
+The false-promotion column is flat at ~2% at **every** size. That is what makes a
+small early gate safe, and it is why the size is a cost/latency choice rather
+than a statistical one. It also explains run 02: at 13% power against a genuine
++5% net, a 200-game gate needs ~7 attempts to catch it.
+
+#### Why revert is a UCB, and why 0.48
+
+`revert_win_rate < 0.48` as a **point estimate** is unguarded, and it degrades
+exactly where the ladder wants to operate. Probability of reverting an
+evenly-matched candidate:
+
+| games | point estimate < 0.48 | UCB < 0.48 |
+|---:|---:|---:|
+| 50 | **37.5%** | 3.4% |
+| 100 | **35.3%** | 1.0% |
+| 200 | **31.7%** | 0.7% |
+| 800 | 19.0% | 0.1% |
+
+Under a soft gate that is a one-in-three chance of acting against a candidate
+that is simply equal. The UCB form fixes it: an equal candidate lands in
+probation ~97% of the time at every size, and a small gate degrades gracefully
+into "no opinion" rather than into noise.
+
+The threshold is **0.48, not 0.50**, and the asymmetry is deliberate in the
+opposite direction from r4's. A fixed threshold gets *more* sensitive as `n`
+grows, and the ladder grows `n` precisely when true differences are smallest, so
+a symmetric 0.50 rule becomes trigger-happy late in the run -- 43% revert against
+a q=0.45 candidate at the 800 rung. Mild regression during training is normal and
+expected, particularly across an LR or curriculum-mix knot, and the learner often
+needs a few iterations to work through it. Detection probability by true strength
+(simulated):
+
+| games | q=0.35 | q=0.40 | q=0.45 | q=0.50 |
+|---:|---:|---:|---:|---:|
+| 100 | 38.1% | 16.5% | 4.9% | 1.0% |
+| 200 | 65.0% | 27.9% | 6.3% | 0.7% |
+| 400 | 92.3% | 52.0% | 9.5% | 0.4% |
+| 800 | 99.8% | 81.2% | 14.9% | 0.1% |
+
+#### Two-stage revert: `revert_reset_after = 2`
+
+`gate_transition` already separates the cheap action from the expensive one, and
+the cloud run uses both:
+
+- **REVERT** -- the generator source switches to `current_best`. The learner
+  keeps its weights and keeps training. During a genuine hump this is the right
+  thing to do anyway: generate from the known-good net while the learner works
+  through the disruption. Nothing is lost.
+- **REVERT_RESET** -- `latest ← current_best`. This is the action that discards
+  learning, and it fires only after **2 consecutive** reverting gates.
+
+Requiring persistence rather than lowering the threshold is what separates a
+transient dip from a real regression. Probability of reaching REVERT_RESET
+(per-gate rates squared; conservative for a transient dip, since the second
+gate's true strength has already recovered):
+
+| rung | persistent q=0.40 | transient q=0.45 | equal q=0.50 |
+|---:|---:|---:|---:|
+| 400 | 27% | 0.9% | ~0% |
+| 800 | **66%** | **2.2%** | ~0% |
+
+A diverging learner (NaN, bad LR) sits at q ≈ 0.2-0.3 and is caught at the bottom
+rung immediately. A mild dip essentially never costs the learner. That is the
+separation the rule is for.
+
+- **W5.9** *(S, new in r10)* **Suppress revert across schedule knots.** The LR,
+  curriculum-mix, and window schedules are on a games clock, so their knots are
+  known config points rather than surprises. Force probation for the first gate
+  after a knot crosses. Promotion stays live -- a candidate that clears LCB > 0.50
+  right after an LR change is genuinely better and there is no reason to withhold
+  it. This targets the named mechanism directly instead of de-tuning the rule for
+  the other 95% of the run.
+
+- **W5.10** *(S, new in r10)* **Log the per-pair score vector** in the W3 gate
+  block, not just the aggregate. A few hundred bytes per gate, and it makes any
+  past gate re-decidable under a different threshold or size without replaying
+  games -- the property that made the A7 replay possible in the first place.
+
+### The gate-size ladder (new in r10)
+
+- **W5.8** *(M, new in r10)* Gate size is **scheduled**, not a single cap. Rungs
+  **100 → 200 → 400 → 800** games. Step **up** one rung after **2 consecutive
+  probations**; step **down** one rung after a promotion; hold a games-clock floor
+  before laddering at all so bootstrap noise does not ladder up. Early in a run
+  the learner is improving fast (q ≈ 0.65-0.70), where a 100-game gate already
+  promotes 51-77% of the time; late in a run the candidate is +2-3% and the
+  evidence has to be bought. Choosing `n` from *prior* gates and the clock is
+  statistically clean in a way sequential stopping is not: `n` is fixed before
+  the games are played, and the candidate is a different net every gate anyway.
+
+**`promotion_every` stays fixed.** Stretching the cadence as the rung rises would
+hold gate share constant at the cost of promotion latency; spending more of a
+mature run on the decision is the better trade, and it is made deliberately here
+rather than by accident. The consequence is that gate share **grows with the
+rung**, and the top rung is what W5.7 has to price.
+
+**Sizing for the pool, not for the worker count.** The quantisation that matters
+is not `n mod slots`:
+
+- `n` must be **even** -- both legs of a pair sit in the pool simultaneously, so
+  occupancy moves in units of two games. `gate_slots` should be even too.
+- `n` should be **>> `gate_slots`**, not congruent to it. Games have variable
+  length so they never finish in lockstep; W5.4's rolling refill removes the
+  drain, leaving a single tail at the end of the gate bounded by roughly one
+  pool's worth of games. At 48 slots the 100-game bottom rung is only ~2
+  pool-fills deep, which is where that tail starts to bite -- either keep the
+  bottom rung at >= 4x `gate_slots` or lower `gate_slots` on the low rungs.
+- If the gate is sharded (possible again now that the sequential stop is gone),
+  `n` divisible by **2 x shards** keeps shards balanced. Record order is
+  preserved globally, so pairing stays correct either way.
+- What actually drives GPU efficiency is `gate_slots` x leaves-in-flight ≈
+  `global_batch_cap`. Tune that; let `n` be any even number above the floor.
+
+### The rungs' cost must be re-derived at L's width (r4, rescoped in r10)
 
 A5's decomposition -- **193 s fixed + 1.74 s per game** -- was measured with the
 **1.03 M** net. The shipped net is **14.9 M**, and W0 measured production
@@ -579,16 +756,35 @@ reasoning that has failed review here before:
 | 200 games | 541 s | ~690 s |
 | 800 games | 1,585 s | ~2,610 s (~44 min) |
 
-If that estimate holds, an 800-game gate every fifth iteration is a materially
-larger share of the run than the 9.8% A5 measured, and the trade against the
-statistical benefit (+7% edge needed → +3.5%) becomes a real decision rather than
-an obvious one.
+Those two estimates imply **~50 s fixed + ~3.2 s per game** once W5.1-5.4 have
+landed -- i.e. the fixed cost that motivated the whole throughput package is
+mostly gone and gate cost is now **near-linear in games**. That is what makes the
+W5.8 ladder worth having: a low early rung genuinely costs proportionally less,
+where under the old 193 s fixed cost it would not have.
 
-**W5.7** *(S, new in r4)* **Re-measure the gate cost decomposition at L's width
-before setting the cap.** Same method as A5, three or more gate sizes rather than
-two so the fit is not a two-point extrapolation. This is the last input to the
-cap; do not hard-code 800 until it lands. The cap is a config value regardless, so
-this task gates the *default*, not the launch.
+It also sets the bill for the top rung. Iteration wall time required to keep
+gates at 10% of the run, at `promotion_every = 4` (share = G / (4I + G), so
+I = 2.25 G):
+
+| rung | gate cost (**estimate**) | iteration time needed for a 10% share |
+|---:|---:|---:|
+| 100 games | ~370 s | ~14 min |
+| 200 games | ~690 s | ~26 min |
+| 400 games | ~1,330 s | ~50 min |
+| 800 games | ~2,610 s | **~98 min** |
+
+If iterations land nearer 30-40 minutes, the 800 rung is 30-45% of wall time.
+That is not automatically wrong -- late in a run, where self-play is returning
++2-3% and the promote decision is the hard part, it may well be the better trade
+-- but it is a policy choice to make against a measured number, not one the
+ladder should make silently.
+
+**W5.7** *(S, r4; rescoped in r10)* **Re-measure the gate cost at L's width, per
+rung.** Same method as A5, at **100/200/400/800** so the fit is not a two-point
+extrapolation, plus a **representative ungated iteration wall time** from the
+same host. The deliverable is no longer "the cap" -- the ladder replaces it --
+but the **cost of each rung and the share each implies**, which is what sets the
+ladder's ceiling. Do not hard-code the top rung until it lands.
 
 **Decided 2026-07-29:** W5.7 runs against **W0's `sweep_L_lr5e-05_seed*.pt`
 checkpoints**, not a future cloud checkpoint. Gate cost is driven by tensor shapes
@@ -599,16 +795,19 @@ does affect is **game length** (W0 measured 68-70 moves/game across all three
 arms, so the effect is small); record moves/game with the fit so the assumption is
 checkable rather than assumed.
 
-Negative result worth recording: a statistically valid futility stop **never
-fires at n <= 200** -- even a 0.422 win rate at 96 games still has UCB ~0.52. It
-begins paying at n ~ 800, cutting clear losers around 300-400 games. Futility is
-worth having *because* of the larger cap, not instead of it.
+Negative result worth recording, and the reason r10 stopped treating futility as
+a stopping rule: a statistically valid futility stop **never fires at n <= 200**
+-- even a 0.422 win rate at 96 games still has UCB ~0.52 -- and even at n ~ 800 it
+saves only ~8% of gate games. The UCB is worth computing; it is not worth
+computing *mid-match*. It earns its place as the terminal revert test instead.
 
-- **W5.6** *(S)* **Gates are decisions; anchors are measurements.** Early
-  stopping biases the score rate toward whichever boundary stopped it, so W7's
-  anchor check runs **fixed-N with no early stopping**. Note run 03 feeds
-  truncated matches straight into `self.elo.record()`, biasing the ladder the
-  same way.
+- **W5.6** *(S)* **Gates are decisions; anchors are measurements.** W7's anchor
+  check runs **fixed-N with no early stopping**, at `--anchor-games` per
+  opponent. Run 03 fed SPRT-truncated matches straight into `self.elo.record()`,
+  which biases the ladder toward whichever boundary stopped each match.
+  **Implemented:** promotion gates no longer feed Elo at all -- fixed-N anchors
+  are the only ladder input, and `promotion_gate` records nothing. A run whose
+  `elo/elo_games.jsonl` contains model-vs-model rows has regressed.
 
 ### Known residual risk: no promotion rollback
 
@@ -620,9 +819,14 @@ keeping the possibly-bad best; `reset_learner` copies `current_best → latest`
 undone anywhere in the system.**
 
 The mitigation is the strict promote bound: LCB > 0.50 at z=1.96 is ~97.5%
-one-sided confidence, and the asymmetry against the 0.48 point-estimate revert
-threshold is deliberate -- promotion is irreversible and must be confident;
-reverting only discards a candidate. **Periodic HOF revalidation of
+one-sided confidence, held at ~2% false promotion at **every** rung by deciding
+once at a fixed `n` (r10; the sequential rule it replaces ran at 15-19%). Note
+that this is the error rate against an *equal* candidate, which is the case where
+a wrong promotion costs nothing; the tail that matters -- promoting a materially
+worse net -- is far smaller (0.5% at q=0.48, ~0.02% at q=0.45, at the 400 rung).
+Reverting is the recoverable direction and is deliberately the less trigger-happy
+one: UCB < 0.48, and two consecutive before any learning is discarded.
+**Periodic HOF revalidation of
 `current_best` against archived checkpoints, with demotion on loss, is the real
 fix and is deferred**; it is recorded here so the gap is known rather than
 assumed away.
@@ -639,7 +843,18 @@ assumed away.
   victory type is an **outcome**, not an exogenous covariate, and adjusting for
   it would bias rather than sharpen.
 - *Accumulating evidence across gates* -- the candidate is a different net every
-  gate, so the pair never repeats.
+  gate, so the pair never repeats. Note this cuts both ways: it is also why a
+  stagnating learner genuinely needs a bigger sample rather than more gates, which
+  is the argument for the W5.8 ladder.
+- *Sequential stopping inside a gate* (r10, after shipping it in r6-r9) -- 15-19%
+  false promotion against an even candidate, futility mapped onto REVERT, and
+  `scheduler_workers=1` forced, in exchange for under 1% of run wall time. Do not
+  re-propose it. Adapting the **next** gate's size from **past** gates is a
+  different thing and is what W5.8 does.
+- *Relaxing `z` to buy power* -- considered in r10 as an alternative to the
+  ladder. It works (z=1.28 at 400 games has more power than z=1.96 at 800, with
+  the q<=0.45 tail still under 0.4%), but it adds a second dial that interacts
+  with the first. `n` alone is the dial; `z` stays at 1.96.
 - *Harvesting gate games as training data* -- 1,240 games is **4.4%** of the
   28,000 self-play games, argmax-only, no search distributions, off-policy for
   both nets, and `_play_two_net_games` builds no `GameRecord` at all.
@@ -814,7 +1029,9 @@ composition their acceptances measure.
 W2 before W3: memory telemetry is a stats-schema field.
 W3 before W5/W6: an unattended multi-day run is only worth launching if it can
 be read afterwards -- the 27% generation decay is already unexplained.
-W5 throughput before the cap increase: the fixes pay for it.
+W5 throughput before the ladder's upper rungs: the fixes pay for them.
+W5.5's rewrite before any cloud gate runs: the r6-r9 sequential rule promotes an
+even candidate 15-19% of the time, and no promotion is ever undone.
 W7 in full before launch: W6.5 will refuse a mid-run pull.
 
 ---
@@ -925,6 +1142,16 @@ games as independent. W5.5 makes the *pair* the observation unit, which is
 exact; the absolute bounds above are therefore mildly anti-conservative and
 should be recomputed at implementation. Relative comparisons between rules are
 unaffected, since the same approximation applies on both sides.
+
+**r10 restatement of A7 at the pair unit.** The two lines above are per *game*;
+at `n = games / 2` the requirement is 0.598 @200, 0.569 @400, 0.549 @800 (see
+W5.5). The "KD rule" column also used the old point-estimate revert. Re-deciding
+the two revert rows under `UCB < 0.48`: gate 50 (0.465 over 100 pairs) gives
+[0.370, 0.562] and gate 65 (0.422 over 48 pairs) gives [0.293, 0.562] -- both
+**probation**. So run 03 contains **no** evidence that would have reverted under
+the shipped rule, which is the intended conservatism, and it means the revert
+branch is unexercised by any historical run. It needs a synthetic test, not a
+replay, to be trusted.
 
 **A8. W0 size and precision (2026-07-29).** Full record in
 `runs/w0_sizing_v2/report_v2.md`; that document is the authority and this is a
