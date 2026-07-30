@@ -48,6 +48,40 @@ pub trait Eval {
         }
         self.evaluate_batch(states)
     }
+
+    /// W1.3 league boundary: as `evaluate_batch_prepared`, plus one **network
+    /// id** per row so a single batch can mix games played by different
+    /// checkpoints.
+    ///
+    /// The id is resolved per row from the **searcher** (the slot whose search
+    /// produced the row), never from the leaf actor. When it is player 0's turn,
+    /// player 0's network drives the *entire* search and evaluates every leaf,
+    /// including the leaves where player 1 is to move -- that is what an "agent"
+    /// means here and in deployment. Routing on the leaf actor instead would let
+    /// the opponent's network evaluate the interior of my own tree, which is a
+    /// different (and wrong) player. Kingdomino's `row_search_actors` documents
+    /// the same distinction for its two-net rating path.
+    ///
+    /// The default ignores the ids, so every existing evaluator keeps its exact
+    /// behaviour and a caller that supplies no routing is byte-identical to
+    /// before.
+    fn evaluate_batch_prepared_routed(
+        &self,
+        states: &[&GameState],
+        actors: &[usize],
+        legals: &[Vec<usize>],
+        net_ids: &[u8],
+    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+        // Empty means "one network for every row" -- the ordinary self-play
+        // case, which the scheduler signals by sending no ids at all. Only a
+        // non-empty, wrongly-sized slice is a caller error.
+        if !net_ids.is_empty() && net_ids.len() != states.len() {
+            return Err(PyValueError::new_err(
+                "routed evaluator net ids are not row-aligned",
+            ));
+        }
+        self.evaluate_batch_prepared(states, actors, legals)
+    }
 }
 
 pub fn terminal_value_p0(state: &GameState) -> f64 {
@@ -300,6 +334,10 @@ struct FlatBatchBuilder {
     aux_ids: Vec<u8>,
     features: Vec<u8>,
     actors: Vec<u8>,
+    /// One network id per row, resolved from the searcher (see
+    /// `Eval::evaluate_batch_prepared_routed`). All zeros when the caller
+    /// supplied no routing, which is the single-network case.
+    net_ids: Vec<u8>,
     legal_offsets: Vec<u8>,
     legal_actions: Vec<u8>,
     rows: usize,
@@ -319,6 +357,7 @@ impl FlatBatchBuilder {
         self.aux_ids.clear();
         self.features.clear();
         self.actors.clear();
+        self.net_ids.clear();
         self.legal_offsets.clear();
         self.legal_actions.clear();
         self.rows = 0;
@@ -326,13 +365,25 @@ impl FlatBatchBuilder {
         self.max_tokens = 0;
     }
 
-    fn pack(&mut self, states: &[&GameState], actors: &[usize], legals: &[Vec<usize>]) {
+    /// `net_ids` may be empty, meaning "one network for every row". Anything
+    /// else must be row-aligned; the caller checks that before getting here.
+    fn pack_routed(
+        &mut self,
+        states: &[&GameState],
+        actors: &[usize],
+        legals: &[Vec<usize>],
+        net_ids: &[u8],
+    ) {
         self.clear();
         push_u32(&mut self.token_offsets, 0);
         push_u32(&mut self.legal_offsets, 0);
-        for ((state, &actor), legal) in states.iter().zip(actors).zip(legals) {
+        for (row, ((state, &actor), legal)) in
+            states.iter().zip(actors).zip(legals).enumerate()
+        {
             let tokens = crate::encoder::encode(state);
             self.actors.push(actor as u8);
+            self.net_ids
+                .push(net_ids.get(row).copied().unwrap_or(0));
             self.max_tokens = self.max_tokens.max(tokens.len());
             for token in tokens {
                 self.type_ids.push(token.type_id as u8);
@@ -400,6 +451,16 @@ impl Eval for PyFlatBatchEval {
         actors: &[usize],
         legals: &[Vec<usize>],
     ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+        self.evaluate_batch_prepared_routed(states, actors, legals, &[])
+    }
+
+    fn evaluate_batch_prepared_routed(
+        &self,
+        states: &[&GameState],
+        actors: &[usize],
+        legals: &[Vec<usize>],
+        net_ids: &[u8],
+    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
@@ -408,12 +469,17 @@ impl Eval for PyFlatBatchEval {
                 "flat evaluator metadata is not row-aligned",
             ));
         }
+        if !net_ids.is_empty() && net_ids.len() != states.len() {
+            return Err(PyValueError::new_err(
+                "flat evaluator net ids are not row-aligned",
+            ));
+        }
         let pack_start = Instant::now();
         let mut scratch = self
             .scratch
             .lock()
             .map_err(|_| PyValueError::new_err("flat batch scratch lock poisoned"))?;
-        scratch.pack(states, actors, legals);
+        scratch.pack_routed(states, actors, legals, net_ids);
         let legal_counts: Vec<_> = legals.iter().map(Vec::len).collect();
         let pack_ns = pack_start.elapsed().as_nanos() as u64;
         let rows = scratch.rows;
@@ -437,6 +503,9 @@ impl Eval for PyFlatBatchEval {
             payload.set_item("aux_ids", PyByteArray::new(py, &scratch.aux_ids))?;
             payload.set_item("features", PyByteArray::new(py, &scratch.features))?;
             payload.set_item("actors", PyByteArray::new(py, &scratch.actors))?;
+            // Always present, so the adapter never has to branch on its
+            // absence; all zeros in the single-network case.
+            payload.set_item("net_ids", PyByteArray::new(py, &scratch.net_ids))?;
             payload.set_item(
                 "legal_offsets",
                 PyByteArray::new(py, &scratch.legal_offsets),
@@ -513,6 +582,10 @@ struct WorkerRequest {
     states: Vec<GameState>,
     actors: Vec<usize>,
     legals: Vec<Vec<usize>>,
+    /// W1.3 routing, carried across the worker boundary. Empty means one
+    /// network. Dropping it here would silently un-route league games whenever
+    /// `max_inflight_batches > 1`, which is the production configuration.
+    net_ids: Vec<u8>,
     reply: mpsc::Sender<WorkerResponse>,
     enqueued: Instant,
 }
@@ -563,6 +636,16 @@ impl EvalWorker {
         actors: Vec<usize>,
         legals: Vec<Vec<usize>>,
     ) -> PyResult<EvalTicket> {
+        self.submit_prepared_routed(states, actors, legals, Vec::new())
+    }
+
+    pub fn submit_prepared_routed(
+        &self,
+        states: Vec<GameState>,
+        actors: Vec<usize>,
+        legals: Vec<Vec<usize>>,
+        net_ids: Vec<u8>,
+    ) -> PyResult<EvalTicket> {
         if states.is_empty() || states.len() > self.max_rows {
             return Err(PyValueError::new_err(format!(
                 "inference request has {} rows outside cap {}",
@@ -575,12 +658,18 @@ impl EvalWorker {
                 "inference request metadata is not row-aligned",
             ));
         }
+        if !net_ids.is_empty() && net_ids.len() != states.len() {
+            return Err(PyValueError::new_err(
+                "inference request net ids are not row-aligned",
+            ));
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         self.sender
             .send(WorkerRequest {
                 states,
                 actors,
                 legals,
+                net_ids,
                 reply: reply_tx,
                 enqueued: Instant::now(),
             })
@@ -594,6 +683,22 @@ impl EvalWorker {
 }
 
 impl Eval for EvalWorker {
+    fn evaluate_batch_prepared_routed(
+        &self,
+        states: &[&GameState],
+        actors: &[usize],
+        legals: &[Vec<usize>],
+        net_ids: &[u8],
+    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+        let ticket = self.submit_prepared_routed(
+            states.iter().map(|state| (*state).clone()).collect(),
+            actors.to_vec(),
+            legals.to_vec(),
+            net_ids.to_vec(),
+        )?;
+        ticket.wait()
+    }
+
     fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
         let mut rows = self.evaluate_batch(&[state])?;
         Ok(rows.remove(0))
@@ -668,7 +773,12 @@ pub fn spawn_py_batch_worker(
         let evaluator = PyBatchEval::new(adapter);
         while let Ok(request) = request_rx.recv() {
             let refs: Vec<&GameState> = request.states.iter().collect();
-            let result = evaluator.evaluate_batch_prepared(&refs, &request.actors, &request.legals);
+            let result = evaluator.evaluate_batch_prepared_routed(
+                &refs,
+                &request.actors,
+                &request.legals,
+                &request.net_ids,
+            );
             let failed = result.is_err();
             if request.reply.send(result).is_err() || failed {
                 break;
@@ -723,7 +833,12 @@ pub fn spawn_py_flat_worker(
                 counters.queue_wait_ns += request.enqueued.elapsed().as_nanos() as u64;
             }
             let refs: Vec<&GameState> = request.states.iter().collect();
-            let result = evaluator.evaluate_batch_prepared(&refs, &request.actors, &request.legals);
+            let result = evaluator.evaluate_batch_prepared_routed(
+                &refs,
+                &request.actors,
+                &request.legals,
+                &request.net_ids,
+            );
             let failed = result.is_err();
             if request.reply.send(result).is_err() || failed {
                 break;

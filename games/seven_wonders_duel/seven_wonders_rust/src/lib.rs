@@ -181,6 +181,7 @@ fn make_self_play_config(
         cheap_double_reveal_offsets_by_player: None,
         cheap_double_reveal_offsets,
         bot_by_player: [None, None],
+        net_by_player: [0, 0],
         bot_exploration: 0.0,
         bot_policy_iterations: 10,
         max_moves,
@@ -1682,6 +1683,7 @@ fn self_play_many_net(
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     bot_p0=None, bot_p1=None, bots_p0=None, bots_p1=None,
+    nets_p0=None, nets_p1=None,
     bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
@@ -1720,6 +1722,10 @@ fn self_play_many_flat_net(
     bot_p1: Option<String>,
     bots_p0: Option<Vec<Option<String>>>,
     bots_p1: Option<Vec<Option<String>>>,
+    // W1.3 league play: per-game network id for each seat. `None` (the
+    // default) means one network for every game, which packs no ids at all.
+    nets_p0: Option<Vec<u8>>,
+    nets_p1: Option<Vec<u8>>,
     bot_exploration: f64,
     bot_policy_iterations: i64,
     puct_root: bool,
@@ -1820,12 +1826,49 @@ fn self_play_many_flat_net(
             ));
         }
     };
+    // Per-game network assignment, same shape as `bots_p0`/`bots_p1` so league
+    // games and ordinary self-play share one scheduler call. Validated here
+    // rather than trusted: an out-of-range id would silently index the wrong
+    // model in the Python adapter.
+    let per_game_nets = match (&nets_p0, &nets_p1) {
+        (None, None) => None,
+        (Some(p0), Some(p1)) => {
+            if p0.len() != jobs.len() || p1.len() != jobs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "nets_p0 ({}) and nets_p1 ({}) must have one entry per game ({})",
+                    p0.len(),
+                    p1.len(),
+                    jobs.len()
+                )));
+            }
+            if p0.iter().chain(p1.iter()).any(|&id| id > 1) {
+                return Err(PyValueError::new_err(
+                    "network ids must be 0 or 1",
+                ));
+            }
+            Some(
+                p0.iter()
+                    .zip(p1.iter())
+                    .map(|(&left, &right)| [left, right])
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "nets_p0 and nets_p1 must be supplied together",
+            ));
+        }
+    };
     let bot_by_player = [parse_bot(bot_p0.as_deref())?, parse_bot(bot_p1.as_deref())?];
     for (index, (_, cfg)) in jobs.iter_mut().enumerate() {
         cfg.deterministic_actions = deterministic_actions;
         cfg.bot_by_player = match &per_game_bots {
             Some(bots) => bots[index],
             None => bot_by_player,
+        };
+        cfg.net_by_player = match &per_game_nets {
+            Some(nets) => nets[index],
+            None => [0, 0],
         };
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;

@@ -65,6 +65,15 @@ pub struct SelfPlayConfig {
     /// be possible to play capped against exhaustive with one shared net.
     pub cheap_double_reveal_offsets_by_player: Option<[usize; 2]>,
     pub bot_by_player: [Option<BotKind>; 2],
+    /// W1.3 league play: which network evaluates each seat's own searches.
+    ///
+    /// `[0, 0]` -- the default -- is ordinary self-play: one network, and the
+    /// packed `net_ids` come out all zeros, so the evaluation boundary is
+    /// byte-identical to a build without this field. `[0, 1]` puts the archived
+    /// opponent on seat 1: every leaf of *seat 1's* searches routes to network 1,
+    /// including the leaves where seat 0 is to move, because the searcher owns
+    /// the network.
+    pub net_by_player: [u8; 2],
     pub bot_exploration: f64,
     pub bot_policy_iterations: i64,
     pub max_moves: usize,
@@ -240,6 +249,30 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
 
     fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
         let rows = self.base.evaluate_batch(states)?;
+        if rows.len() != states.len() {
+            return Err(PyValueError::new_err(format!(
+                "evaluator returned {} rows for {} states",
+                rows.len(),
+                states.len()
+            )));
+        }
+        Ok(rows
+            .into_iter()
+            .zip(states)
+            .map(|((value, priors), state)| (value, blend_priors(state, priors, self.amount)))
+            .collect())
+    }
+
+    fn evaluate_batch_prepared_routed(
+        &self,
+        states: &[&GameState],
+        actors: &[usize],
+        legals: &[Vec<usize>],
+        net_ids: &[u8],
+    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+        let rows = self
+            .base
+            .evaluate_batch_prepared_routed(states, actors, legals, net_ids)?;
         if rows.len() != states.len() {
             return Err(PyValueError::new_err(format!(
                 "evaluator returned {} rows for {} states",
@@ -1114,6 +1147,11 @@ struct EvalGroup {
     states: Vec<GameState>,
     actors: Vec<usize>,
     legals: Vec<Vec<usize>>,
+    /// Network id for every row in this group. A group comes from one slot and
+    /// one search, so all its rows share a searcher and therefore one id --
+    /// which is why this can be a single value fanned out rather than derived
+    /// per leaf.
+    net_id: u8,
     kind: EvalGroupKind,
 }
 
@@ -1237,6 +1275,8 @@ impl GameSlot {
                         states: vec![self.state.clone()],
                         actors: vec![meta.actor],
                         legals: vec![meta.legal.clone()],
+                        // The root row's actor IS the searcher.
+                        net_id: self.cfg.net_by_player[meta.actor],
                         kind: EvalGroupKind::Root,
                     }));
                 }
@@ -1256,6 +1296,12 @@ impl GameSlot {
                                 slot: slot_index,
                                 states,
                                 actors: request.leaves.iter().map(|leaf| leaf.actor).collect(),
+                                // Deliberately the SEARCHER, not the leaf actor:
+                                // `self.state` is the real game state this search
+                                // is deciding a move for, so its actor owns every
+                                // leaf in the tree regardless of tree depth.
+                                net_id: self.cfg.net_by_player
+                                    [crate::tree::state_actor(&self.state)],
                                 legals: request
                                     .leaves
                                     .iter()
@@ -1403,7 +1449,15 @@ impl GameSlot {
             root_value: result.root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
-            policy_excluded: !meta.full,
+            // Cheap searches are excluded as always, and so is anything the
+            // archived opponent searched: network 0 is by definition the
+            // learner, so a policy target produced by network 1 would train the
+            // learner to imitate an older, weaker net. The move still records
+            // its visits and the game still supplies a value target -- only the
+            // policy label is withheld, exactly as for curriculum-bot moves.
+            // Kingdomino's `play_current_vs_hof_game` keeps "only current-owned
+            // labels" the same way.
+            policy_excluded: !meta.full || self.cfg.net_by_player[meta.actor] != 0,
             full_search: meta.full,
             search_seed: meta.search_seed,
             is_bot: false,
@@ -1641,9 +1695,21 @@ pub fn run_many<E: Eval>(
                 .iter()
                 .flat_map(|group| group.legals.iter().cloned())
                 .collect();
+            // One id per row, fanned out from each group's searcher. Left empty
+            // when every group is on network 0, so ordinary self-play submits the
+            // identical payload it always did.
+            let net_ids: Vec<u8> = if batch.iter().any(|group| group.net_id != 0) {
+                batch
+                    .iter()
+                    .flat_map(|group| std::iter::repeat(group.net_id).take(group.states.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             metrics.batch_live_slots.push(pool.active_count());
             metrics.batch_submit_ns.push(occupancy.elapsed_ns());
-            let evaluations = match evaluator.evaluate_batch_prepared(&state_refs, &actors, &legals)
+            let evaluations = match evaluator
+                .evaluate_batch_prepared_routed(&state_refs, &actors, &legals, &net_ids)
             {
                 Ok(rows) => rows,
                 Err(err) => {
@@ -1866,7 +1932,24 @@ pub fn run_many_pipelined(
                 .iter()
                 .flat_map(|group| group.legals.iter().cloned())
                 .collect();
-            let ticket = match worker.submit_prepared(owned_states, actors, legals) {
+            // Same fan-out as `run_many`: one id per row from each group's
+            // searcher, empty when nothing is routed. This path is the
+            // production one (`max_inflight_batches > 1`), so omitting it here
+            // would leave league routing working only in tests.
+            let net_ids: Vec<u8> = if groups.iter().any(|group| group.net_id != 0) {
+                groups
+                    .iter()
+                    .flat_map(|group| std::iter::repeat(group.net_id).take(group.states.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let ticket = match worker.submit_prepared_routed(
+                owned_states,
+                actors,
+                legals,
+                net_ids,
+            ) {
                 Ok(ticket) => ticket,
                 Err(err) => {
                     pool.abort(&budget);
@@ -2143,6 +2226,8 @@ mod budget_tests {
             cheap_double_reveal_offsets: 0,
             cheap_double_reveal_offsets_by_player: None,
             bot_by_player: [None, None],
+            net_by_player: [0, 0],
+        net_by_player: [0, 0],
             bot_exploration: 0.0,
             bot_policy_iterations: 1,
             max_moves: 512,

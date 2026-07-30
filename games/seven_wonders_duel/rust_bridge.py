@@ -337,6 +337,21 @@ class _RustFlatBatchAdapter:
             "features": features,
             "pad_mask": pad_mask,
             "actors": torch.frombuffer(payload["actors"], dtype=torch.uint8).long(),
+            # W1.3: which network owns each row, resolved in Rust from the
+            # SEARCHER, not the leaf actor. All zeros for ordinary self-play.
+            # Only the searcher-routed model reads it; every other model indexes
+            # the batch by key and ignores it.
+            #
+            # Absent is a meaningful state, not an error: a payload with no
+            # routing information describes a single-network batch, which is what
+            # `f4_cost_model.build_payload` and the fused-path benches construct
+            # by hand. Defaulting keeps those callers working without teaching
+            # each of them about a field they have no opinion on.
+            "net_ids": (
+                torch.frombuffer(payload["net_ids"], dtype=torch.uint8).long()
+                if "net_ids" in payload
+                else torch.zeros(rows, dtype=torch.long)
+            ),
         }
         if self.evaluator.device != "cpu":
             batch = {
@@ -504,6 +519,98 @@ def rust_flat_batch_adapter(
     )
 
 
+def rust_searcher_routed_flat_batch_adapter(
+    evaluators,
+    *,
+    diagnostic_sync: bool = False,
+    pinned_memory: bool = False,
+    cuda_events: bool = False,
+    vectorized_gather: bool = True,
+):
+    """Route packed Rust rows by the packed ``net_ids`` byte (W1.3).
+
+    Use this, not :func:`rust_seat_routed_flat_batch_adapter`, for league play.
+
+    ``net_ids`` is resolved inside Rust from the **searcher** -- the slot whose
+    search produced the row -- so when it is seat 0's turn, seat 0's network
+    evaluates every leaf of seat 0's tree, including the leaves where seat 1 is
+    to move. That is what an agent is here and in deployment. Routing on the
+    leaf actor instead (which is what the seat-routed adapter below does) lets
+    the opponent's network evaluate the interior of my own search tree, which is
+    a third player belonging to neither side.
+
+    A single ``self_play_many_flat_net`` call can therefore mix games with
+    different opponent assignments, keeping league generation in one scheduler
+    call rather than splitting the slot pool.
+    """
+
+    import torch
+
+    if len(evaluators) != 2:
+        raise ValueError("searcher-routed evaluation requires exactly two evaluators")
+    devices = {str(evaluator.device) for evaluator in evaluators}
+    if len(devices) != 1:
+        raise ValueError("searcher-routed evaluators must use the same device")
+    precisions = {getattr(evaluator, "precision", "fp32") for evaluator in evaluators}
+    if len(precisions) != 1:
+        raise ValueError("searcher-routed evaluators must use the same precision")
+
+    class _SearcherRoutedModel(torch.nn.Module):
+        def __init__(self, models):
+            super().__init__()
+            self.models = torch.nn.ModuleList(models)
+
+        def forward(self, batch):
+            net_ids = batch["net_ids"]
+            if torch.any((net_ids < 0) | (net_ids > 1)):
+                raise ValueError("packed net ids must be 0 or 1")
+            combined = None
+            for net, model in enumerate(self.models):
+                indices = torch.nonzero(net_ids == net, as_tuple=False).flatten()
+                if not len(indices):
+                    continue
+                net_batch = {
+                    key: value.index_select(0, indices)
+                    for key, value in batch.items()
+                    if key not in ("net_ids", "actors")
+                }
+                outputs = model(net_batch)
+                if combined is None:
+                    combined = {
+                        key: value.new_empty((len(net_ids), *value.shape[1:]))
+                        for key, value in outputs.items()
+                    }
+                for key, value in outputs.items():
+                    combined[key].index_copy_(0, indices, value)
+            if combined is None:
+                raise ValueError("searcher-routed batch cannot be empty")
+            return combined
+
+    class _EvaluatorProxy:
+        def autocast(self):
+            return evaluators[0].autocast()
+
+    proxy = _EvaluatorProxy()
+    proxy.device = evaluators[0].device
+    proxy.max_batch = min(evaluator.max_batch for evaluator in evaluators)
+    proxy.model = _SearcherRoutedModel([evaluator.model for evaluator in evaluators])
+    proxy.model.to(proxy.device).eval()
+    # `.to()` runs `_apply` on every child, which invalidates each embedder's
+    # fused cache by design. Re-fuse, or league generation would silently fall
+    # back to the per-type loop.
+    from .net import fuse_for_inference
+
+    for model in proxy.model.models:
+        fuse_for_inference(model)
+    return _RustFlatBatchAdapter(
+        proxy,
+        diagnostic_sync=diagnostic_sync,
+        pinned_memory=pinned_memory,
+        cuda_events=cuda_events,
+        vectorized_gather=vectorized_gather,
+    )
+
+
 def rust_seat_routed_flat_batch_adapter(
     evaluators,
     *,
@@ -512,11 +619,20 @@ def rust_seat_routed_flat_batch_adapter(
     cuda_events: bool = False,
     vectorized_gather: bool = True,
 ):
-    """Route packed Rust rows to a different evaluator model for each seat.
+    """Route packed Rust rows to a different evaluator model for each **leaf actor**.
 
-    Encodings and values remain actor-relative; the packed ``actors`` byte
-    selects which checkpoint evaluates each row. This keeps model-vs-model
-    arena games on the same Rust engine/search/coalescer used by self-play.
+    .. warning::
+
+       This is *not* the right routing for two-network play, and it is retained
+       only for the per-seat search-strength diagnostics that genuinely want
+       "whoever is to move at this position evaluates it".
+
+       The packed ``actors`` byte is the leaf actor, which alternates with tree
+       depth, so under this adapter one side's search has its opponent-to-move
+       nodes evaluated by the opponent's network. For league or arena play use
+       :func:`rust_searcher_routed_flat_batch_adapter`, which routes on the
+       searcher. Kingdomino's ``row_search_actors`` documents the same
+       distinction.
     """
 
     import torch
@@ -547,7 +663,7 @@ def rust_seat_routed_flat_batch_adapter(
                 seat_batch = {
                     key: value.index_select(0, indices)
                     for key, value in batch.items()
-                    if key != "actors"
+                    if key not in ("actors", "net_ids")
                 }
                 outputs = model(seat_batch)
                 if combined is None:
