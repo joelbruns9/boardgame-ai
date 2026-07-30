@@ -1346,12 +1346,55 @@ import glob
 
 import pytest
 
-BUFFER_DIR = os.path.join(os.path.dirname(__file__), "runs", "phase_d_toy", "buffers")
+# The equivalence corpus. The large gitignored gate-box buffers are used when
+# present; otherwise a fixed ~50-game corpus committed under testdata/ keeps
+# these tests running on a fresh checkout. W6.2: a cloud smoke that skips these
+# because `runs/` is gitignored passes vacuously, which is worse than no smoke.
+_GATE_BOX_BUFFERS = os.path.join(
+    os.path.dirname(__file__), "runs", "phase_d_toy", "buffers"
+)
+_COMMITTED_CORPUS = os.path.join(
+    os.path.dirname(__file__), "testdata", "equiv_corpus"
+)
+
+
+def _buffer_dir():
+    if glob.glob(os.path.join(_GATE_BOX_BUFFERS, "*.jsonl")):
+        return _GATE_BOX_BUFFERS
+    return _COMMITTED_CORPUS
+
+
+BUFFER_DIR = _buffer_dir()
 # F1a corpus size. Default is a fast-but-real multi-file subset for routine CI;
 # the documented ≥10k acceptance gate is `SWR_F1A_GAMES=0 pytest -k buffer`
 # (0 = every game in every buffer file). See PHASE_F.md.
 F1A_GAMES = int(os.environ.get("SWR_F1A_GAMES", "400"))
 F1A_DEEP_GAMES = 4  # games that additionally get the exhaustive depth-2 audit
+# The committed corpus is deliberately small. A request larger than it is
+# satisfied by the whole corpus rather than failing a count assertion, but the
+# corpus must never silently shrink below this.
+CORPUS_MIN_GAMES = 50
+
+
+def corpus_games():
+    """Games available in the active corpus."""
+
+    total = 0
+    for path in sorted(glob.glob(os.path.join(BUFFER_DIR, "*.jsonl"))):
+        with open(path, "r", encoding="utf-8") as handle:
+            total += sum(1 for line in handle if line.strip())
+    return total
+
+
+def requested_games(limit):
+    """``limit`` clamped to what the active corpus can actually supply."""
+
+    available = corpus_games()
+    assert available >= CORPUS_MIN_GAMES, (
+        f"corpus under {BUFFER_DIR} holds {available} games, "
+        f"below the {CORPUS_MIN_GAMES} the equivalence gate requires"
+    )
+    return available if limit <= 0 else min(limit, available)
 
 
 def iter_buffer_records(limit):
@@ -1411,19 +1454,22 @@ def test_random_games_equivalent():
 def test_buffer_games_equivalent():
     """F1a: byte-exact replay over the buffer corpus.
 
-    Skips (does not silently pass) when buffers are absent — they live under the
-    gitignored ``runs/`` and are present on the gate box, not a fresh checkout.
+    Uses the gate box's large gitignored buffers when present and the committed
+    ~50-game corpus otherwise, so this never skips on a fresh checkout (W6.2).
     Runs ``SWR_F1A_GAMES`` games across all buffer files (default 400; set 0 for
     the full ≥10k acceptance gate) and asserts the corpus was non-empty.
     """
 
-    if not os.path.isdir(BUFFER_DIR) or not glob.glob(
-        os.path.join(BUFFER_DIR, "*.jsonl")
-    ):
-        pytest.skip(f"no buffer corpus under {BUFFER_DIR} (F1a needs replay buffers)")
+    # Not a skip: the committed corpus makes absence a repository fault, and a
+    # silently skipped equivalence gate is exactly what W6.2 exists to prevent.
+    assert glob.glob(os.path.join(BUFFER_DIR, "*.jsonl")), (
+        f"no buffer corpus under {BUFFER_DIR}; the committed corpus at "
+        f"{_COMMITTED_CORPUS} is missing from this checkout"
+    )
 
+    expected = requested_games(F1A_GAMES)
     n = 0
-    for index, record in iter_buffer_records(F1A_GAMES):
+    for index, record in iter_buffer_records(expected):
         deep_every = 25 if index < F1A_DEEP_GAMES else None
         compare_game(
             record.seed,
@@ -1433,9 +1479,7 @@ def test_buffer_games_equivalent():
             deep_every=deep_every,
         )
         n += 1
-    assert n > 0, "buffer corpus present but yielded no games"
-    if F1A_GAMES > 0:
-        assert n == F1A_GAMES, f"compared {n} games, requested {F1A_GAMES}"
+    assert n == expected, f"compared {n} games, expected {expected}"
 
 
 F2_GAMES = int(os.environ.get("SWR_F2_GAMES", "60"))
@@ -1475,20 +1519,21 @@ def _compare_encodings(seed, first_player, action_indices, library_draws, covera
 
 
 def test_encode_corpus_equivalent():
-    """F2.3: bit-exact encoder over the buffer corpus. Skips when buffers are
-    absent; runs ``SWR_F2_GAMES`` games round-robin across all files (default 60;
+    """F2.3: bit-exact encoder over the buffer corpus. Never skips -- see F1a's
+    note on the committed corpus. Runs ``SWR_F2_GAMES`` games round-robin across all files (default 60;
     2000 or 0 = acceptance). At acceptance scale it enforces ≥100k states and
     full decision/token-type coverage."""
 
-    if not os.path.isdir(BUFFER_DIR) or not glob.glob(
-        os.path.join(BUFFER_DIR, "*.jsonl")
-    ):
-        pytest.skip(f"no buffer corpus under {BUFFER_DIR} (F2.3 needs replay buffers)")
+    assert glob.glob(os.path.join(BUFFER_DIR, "*.jsonl")), (
+        f"no buffer corpus under {BUFFER_DIR}; the committed corpus at "
+        f"{_COMMITTED_CORPUS} is missing from this checkout"
+    )
 
     coverage = {"token_types": set(), "decisions": set()}
+    expected = requested_games(F2_GAMES)
     games = 0
     states = 0
-    for _index, record in iter_buffer_records(F2_GAMES):
+    for _index, record in iter_buffer_records(expected):
         states += _compare_encodings(
             record.seed,
             record.first_player,
@@ -1497,9 +1542,7 @@ def test_encode_corpus_equivalent():
             coverage,
         )
         games += 1
-    assert games > 0, "buffer corpus present but yielded no games"
-    if F2_GAMES > 0:
-        assert games == F2_GAMES, f"compared {games} games, requested {F2_GAMES}"
+    assert games == expected, f"compared {games} games, expected {expected}"
     print(
         f"F2.3 encode corpus: {states} states over {games} games; "
         f"decisions={sorted(coverage['decisions'])} "

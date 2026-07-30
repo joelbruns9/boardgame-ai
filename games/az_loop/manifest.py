@@ -51,6 +51,25 @@ class RunManifest:
         self.repo_root = Path(repo_root)
         self.path = self.run_dir / "run_manifest.json"
 
+    def code_identity(self) -> dict[str, Any]:
+        """Commit plus a fingerprint of any uncommitted work (W6.5).
+
+        The commit alone is not the code that ran: a dirty tree at the same SHA
+        is different code.  The diff digest makes that difference comparable on
+        resume without storing the patch twice.
+        """
+
+        status = _git(self.repo_root, "status", "--porcelain")
+        diff = _git(self.repo_root, "diff", "--binary", "HEAD")
+        return {
+            "commit": _git(self.repo_root, "rev-parse", "HEAD"),
+            "branch": _git(self.repo_root, "rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(status and status != "unknown"),
+            "status_porcelain": status.splitlines() if status != "unknown" else [],
+            "diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+            "_diff": diff,
+        }
+
     def initialize(
         self,
         *,
@@ -59,9 +78,10 @@ class RunManifest:
         model_contract: dict[str, Any],
     ) -> dict[str, Any]:
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        status = _git(self.repo_root, "status", "--porcelain")
-        diff = _git(self.repo_root, "diff", "--binary", "HEAD")
-        (self.run_dir / "dirty_diff.patch").write_text(diff, encoding="utf-8")
+        identity = self.code_identity()
+        (self.run_dir / "dirty_diff.patch").write_text(
+            identity.pop("_diff"), encoding="utf-8"
+        )
         payload = {
             "manifest_version": 1,
             "run_id": self.run_dir.name,
@@ -69,12 +89,7 @@ class RunManifest:
                 timespec="seconds"
             ),
             "command": sys.argv,
-            "git": {
-                "commit": _git(self.repo_root, "rev-parse", "HEAD"),
-                "branch": _git(self.repo_root, "rev-parse", "--abbrev-ref", "HEAD"),
-                "dirty": bool(status and status != "unknown"),
-                "status_porcelain": status.splitlines() if status != "unknown" else [],
-            },
+            "git": identity,
             "config": (
                 dataclasses.asdict(config)
                 if dataclasses.is_dataclass(config)

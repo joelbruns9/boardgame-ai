@@ -22,3 +22,9 @@ maturin>=1.5        # builds the kingdomino_rust crate (needs Rust >= 1.85)
 # without them there is no host-memory or GPU-utilisation measurement at all.
 psutil>=5.9         # sampled RSS / process peak working set
 nvidia-ml-py>=12.0  # torch.cuda.utilization(), the one non-host-timer GPU signal
+
+# Not a dev-only dependency: the cloud setup runs the Rust/Python engine
+# equivalence suite on the rented box BEFORE training starts (W6.2), and that
+# smoke is the only check that the engine every measurement was taken on is the
+# engine that will run.  Without pytest installed there, it cannot run at all.
+pytest>=7.0

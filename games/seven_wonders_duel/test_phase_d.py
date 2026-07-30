@@ -1242,3 +1242,47 @@ def test_confirmed_revert_resets_the_learner_but_a_single_one_does_not():
     )
     assert confirmed.action is PromotionAction.REVERT_RESET
     assert confirmed.reset_learner is True
+
+
+# -- W6.5: a resume must run the code the run started on -------------------
+
+
+def _manifest_with_git(tmp_path: Path, git: dict) -> tuple[PhaseDLoop, dict]:
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    return loop, {"git": git, "config": {"precision": loop.config.precision}}
+
+
+def test_resume_on_a_different_commit_is_refused(tmp_path):
+    loop, payload = _manifest_with_git(tmp_path, {"commit": "0" * 40})
+    with pytest.raises(ValueError, match="cannot resume on different code"):
+        loop._refuse_changed_code(payload)
+
+
+def test_resume_override_downgrades_the_refusal_to_a_warning(tmp_path):
+    loop = PhaseDLoop(
+        _soft_gate_config(tmp_path, allow_resume_code_drift=True)
+    )
+    with pytest.warns(UserWarning, match="resuming on different code"):
+        loop._refuse_changed_code({"git": {"commit": "0" * 40}})
+
+
+def test_resume_on_the_same_commit_and_tree_is_allowed(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    identity = loop.manifest.code_identity()
+    identity.pop("_diff")
+    loop._refuse_changed_code({"git": identity})
+
+
+def test_uncommitted_changes_that_differ_are_refused(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    identity = loop.manifest.code_identity()
+    identity.pop("_diff")
+    identity["diff_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="uncommitted changes differ"):
+        loop._refuse_changed_code({"git": identity})
+
+
+def test_a_manifest_without_git_provenance_does_not_strand_the_run(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop._refuse_changed_code({})
+    loop._refuse_changed_code({"git": {"commit": "unknown"}})

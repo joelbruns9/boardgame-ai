@@ -7,6 +7,7 @@ helpers or subtly disagree about setup ordering.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 from .buffer import GameRecord, GameRecorder, replay, resolve_opponent_type
@@ -552,13 +553,23 @@ def rust_searcher_routed_flat_batch_adapter(
     if len(devices) != 1:
         raise ValueError("searcher-routed evaluators must use the same device")
     precisions = {getattr(evaluator, "precision", "fp32") for evaluator in evaluators}
-    if len(precisions) != 1:
-        raise ValueError("searcher-routed evaluators must use the same precision")
+    # Mixed precision is legitimate for exactly one purpose -- W6.2b's arena,
+    # where the two sides are the same weights and the dtype IS the treatment.
+    # It needs its own handling because the proxy below otherwise wraps the
+    # whole batch in one autocast, which would silently run both nets at the
+    # first evaluator's precision and measure nothing.
+    mixed_precision = len(precisions) != 1
+    autocasts = (
+        [evaluator.autocast for evaluator in evaluators] if mixed_precision else None
+    )
 
     class _SearcherRoutedModel(torch.nn.Module):
-        def __init__(self, models):
+        def __init__(self, models, autocasts=None):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
+            # None keeps the single-precision path byte-identical to the one
+            # W1's routing equivalence was verified against.
+            self.autocasts = autocasts
 
         def forward(self, batch):
             net_ids = batch["net_ids"]
@@ -574,7 +585,11 @@ def rust_searcher_routed_flat_batch_adapter(
                     for key, value in batch.items()
                     if key not in ("net_ids", "actors")
                 }
-                outputs = model(net_batch)
+                if self.autocasts is None:
+                    outputs = model(net_batch)
+                else:
+                    with self.autocasts[net]():
+                        outputs = model(net_batch)
                 if combined is None:
                     combined = {
                         key: value.new_empty((len(net_ids), *value.shape[1:]))
@@ -588,12 +603,18 @@ def rust_searcher_routed_flat_batch_adapter(
 
     class _EvaluatorProxy:
         def autocast(self):
+            if mixed_precision:
+                # Each net applies its own inside the routed forward.
+                return contextlib.nullcontext()
             return evaluators[0].autocast()
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device
     proxy.max_batch = min(evaluator.max_batch for evaluator in evaluators)
-    proxy.model = _SearcherRoutedModel([evaluator.model for evaluator in evaluators])
+    proxy.precision = "mixed" if mixed_precision else next(iter(precisions))
+    proxy.model = _SearcherRoutedModel(
+        [evaluator.model for evaluator in evaluators], autocasts
+    )
     proxy.model.to(proxy.device).eval()
     # `.to()` runs `_apply` on every child, which invalidates each embedder's
     # fused cache by design. Re-fuse, or league generation would silently fall

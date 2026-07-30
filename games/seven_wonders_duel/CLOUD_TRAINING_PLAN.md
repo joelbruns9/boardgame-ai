@@ -1,10 +1,15 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0/W1/W2/W3 complete. W5's throughput work is done; its decision
-rule is rewritten in r10 and needs re-implementing, and its per-rung cost fit on
-the target host remains open.**
-Revision 10.
-**Revision history:** r10 rewrites W5's decision rule after review: sequential
+**Status:** **W0/W1/W2/W3/W5/W6 complete. W7 (stagnation) is the last launch
+blocker; W5.7's per-rung gate-cost fit runs on the target host at first
+launch.**
+Revision 11.
+**Revision history:** r11 closes W6: a shared `setup_cloud_common.sh` with the
+Rust stages the 7WD script never had, an equivalence smoke that cannot pass
+vacuously, a committed corpus, the precision arena (which required per-net
+autocast in the routed adapter), the sweep-to-launch flag translation, the
+memory/VRAM preflight, the resume commit pin, the heartbeat, and the snapshot
+helper. r10 rewrites W5's decision rule after review: sequential
 stopping is removed (it ran at 15-19% false promotion), revert becomes a Wilson
 **UCB < 0.48** test with `revert_reset_after = 2`, and the single cap is replaced
 by a scheduled gate-size ladder. r9 closes W3 with explicit current-best/HOF/bot/HOF+bot
@@ -83,7 +88,7 @@ does not close it -- it makes it **measured every iteration**.
 | W3 | Shared run-stats contract + reporting | M | ~~Yes~~ **DONE 2026-07-30** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
 | W5 | Gate efficiency + fixed-N Wilson decision rule + size ladder | M | **THROUGHPUT DONE; W5.5 REWRITE (r10), W5.8-5.10 AND THE RTX 5090 PER-RUNG FIT OPEN** |
-| W6 | Cloud setup script | M | **Yes** |
+| W6 | Cloud setup script | M | ~~Yes~~ **DONE 2026-07-30** (box-side acceptance runs on first launch) |
 | W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
 
 **W1 preceded W2 and W5 validation** and is now done. W2 is closed: the original
@@ -861,7 +866,7 @@ assumed away.
 
 ---
 
-## W6 -- Cloud setup
+## W6 -- Cloud setup: DONE (2026-07-30)
 
 `setup_cloud_7wd.sh` (250 lines) **predates the Rust engine**: pure Python, no
 `rustup`, no `maturin`, header explicitly says the Rust build is
@@ -925,6 +930,38 @@ equivalence suite **runs** (zero unexpected skips) on the rented GPU before
 training starts; the L/bf16-vs-L/fp32 arena lands within its interval of 0.500;
 the VRAM preflight refuses a sub-16 GB box; launch flags come from that box's
 measured sweep; re-running resumes; a resume on a different commit is refused.
+
+**Implementation status (2026-07-30): built and tested; the box-side half of the
+acceptance runs on first launch.**
+
+| task | where |
+|---|---|
+| W6.1 | `setup_cloud_common.sh` (sourced, never executed) + a rewritten `setup_cloud_7wd.sh` with the Rust stages it never had |
+| W6.2 | `cloud_equivalence_smoke.py` + `cloud_equivalence_manifest.json`; a 50-game corpus committed under `testdata/equiv_corpus/`; `pytest` added to `requirements.txt` |
+| W6.2b | `precision_arena.py` |
+| W6.3 | `f4_launch_flags.py`, and `phase_d.build_parser()` extracted so the translation can be checked without launching |
+| W6.4 | `cloud_preflight.py` |
+| W6.5 | `RunManifest.code_identity()` + `PhaseDLoop._refuse_changed_code` |
+| W6.6 | `RunController.heartbeat_line` → stdout and `heartbeat.log` |
+| W6.7 | `games/az_loop/snapshot.py` |
+
+Three things the build changed relative to this specification:
+
+1. **The corpus tests no longer skip -- they fail.** With a committed corpus,
+   absence is a repository fault rather than an environment one, and the whole
+   point of W6.2 is that this suite must never be quietly absent. The runner
+   additionally checks that every test in the manifest **ran**: `-k` deselection
+   happens after pytest's collection hook, so a filtered-out test still looks
+   collected, and the first version of this check passed while two tests sat out.
+2. **Mixed-precision routing had to be built for W6.2b to mean anything.**
+   `rust_searcher_routed_flat_batch_adapter` wrapped the whole batch in one
+   autocast and refused two evaluators of different precisions. Lifting the
+   refusal without per-net autocast would have produced an arena that compared
+   bf16 with bf16 and reported a null. Each net now applies its own; the
+   single-precision path is untouched, so W1's bit-exact routing is unaffected.
+3. **The launch command is tested against the real parser.** A renamed flag in
+   `TRAIN_CMD` would otherwise be found on a rented box, after the toolchain
+   build, the equivalence suite, and the smoke have all passed.
 
 ---
 

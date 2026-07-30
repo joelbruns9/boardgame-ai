@@ -500,6 +500,7 @@ class RunController:
         # The row is now durable; the pre-iteration snapshot is no longer needed.
         self._commit_iteration()
         self._emit_iteration_summary(row, generation, replay)
+        self._emit_heartbeat(row)
         self._maybe_autosave(iteration)
         return row
 
@@ -512,6 +513,68 @@ class RunController:
             f"({row['generator_source']}) | replay {replay.training_games} | "
             f"{row['promotion_action']} | best_iter {row['current_best_iteration']}"
         )
+
+    @staticmethod
+    def heartbeat_line(row: dict[str, Any]) -> str:
+        """One line of run health, from the committed row alone (W6.6).
+
+        The transcript of a multi-day run is thousands of training-step lines.
+        This is the line someone reconnecting over SSH greps for: is it still
+        making games, is memory flat, is anything being promoted, and does it
+        still beat the bots.
+        """
+
+        stats = row.get("stats") or {}
+        generation = stats.get("generation") or {}
+        resources = stats.get("resources") or {}
+        gates = stats.get("gates") or []
+        # Both kinds are fixed-N since W5.5, so the discriminator is the reason:
+        # anchors are measurements against a threshold, promotion gates report
+        # which side of the decision they landed on.
+        anchors = [gate for gate in gates if gate.get("stop_reason") == "fixed_n"]
+        promotion = next(
+            (gate for gate in gates if gate.get("stop_reason") != "fixed_n"), None
+        )
+
+        parts = [
+            f"HEARTBEAT iter={row.get('iteration', -1):04d}",
+            f"games/s={float(generation.get('games_per_second', 0.0) or 0.0):.3f}",
+        ]
+        rss = resources.get("peak_rss_bytes") or 0
+        if rss:
+            parts.append(f"rss={int(rss) / 1024**3:.2f}GiB")
+        vram = resources.get("vram_peak_physical_bytes") or 0
+        if vram:
+            parts.append(f"vram={int(vram) / 1024**3:.2f}GiB")
+        parts.append(f"best_iter={row.get('current_best_iteration', -1)}")
+        parts.append(f"action={row.get('promotion_action', '-')}")
+        if promotion is not None:
+            parts.append(
+                f"gate={float(promotion.get('score_rate', 0.0)):.3f}"
+                f"[{float(promotion.get('wilson_lcb', 0.0)):.3f},"
+                f"{float(promotion.get('wilson_ucb', 1.0)):.3f}]"
+                f"n={int(promotion.get('games', 0))}"
+            )
+        if anchors:
+            worst = min(float(gate.get("score_rate", 0.0)) for gate in anchors)
+            mean = sum(float(gate.get("score_rate", 0.0)) for gate in anchors) / len(
+                anchors
+            )
+            parts.append(f"anchor={mean:.3f}(min {worst:.3f})")
+        return " ".join(parts)
+
+    def _emit_heartbeat(self, row: dict[str, Any]) -> None:
+        """Print the heartbeat and append it to a file that survives a reconnect."""
+
+        line = self.heartbeat_line(row)
+        print(line)
+        try:
+            with open(
+                self.checkpoint_dir.parent / "heartbeat.log", "a", encoding="utf-8"
+            ) as handle:
+                handle.write(line + "\n")
+        except OSError as exc:  # noqa: BLE001 - telemetry must never stop a run
+            print(f"WARNING: could not append to heartbeat.log: {exc}")
 
     def _maybe_autosave(self, iteration: int) -> None:
         """Owns autosave scheduling and failure policy; the adapter writes.

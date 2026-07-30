@@ -290,3 +290,90 @@ def test_out_of_range_network_ids_are_rejected():
 
     with pytest.raises(ValueError, match="network ids must be 0 or 1"):
         _play(nets_p0=[0, 0, 0], nets_p1=[2, 1, 1])
+
+
+
+def _autocast_probe(precision):
+    """An evaluator stand-in that records every time its autocast is entered."""
+
+    import contextlib
+
+    import torch
+
+    class _Probe:
+        def __init__(self):
+            self.precision = precision
+            self.device = "cpu"
+            self.max_batch = 8
+            self.entered = 0
+            self.model = torch.nn.Identity()
+
+        def autocast(self):
+            probe = self
+
+            @contextlib.contextmanager
+            def _recorder():
+                probe.entered += 1
+                yield
+
+            return _recorder()
+
+    return _Probe()
+
+
+def _routed_proxy(evaluators):
+    from .rust_bridge import rust_searcher_routed_flat_batch_adapter
+
+    return rust_searcher_routed_flat_batch_adapter(evaluators).evaluator
+
+
+def test_mixed_precision_routes_each_net_through_its_own_autocast():
+    """W6.2b: the arena's two sides must really run at different precisions.
+
+    The proxy wraps the whole batch in ONE autocast, so without per-net handling
+    the second net silently ran at the first's precision -- an arena that would
+    have compared bf16 with bf16 and reported a null.
+    """
+
+    import torch
+
+    bf16, fp32 = _autocast_probe("bf16"), _autocast_probe("fp32")
+    proxy = _routed_proxy((bf16, fp32))
+    assert proxy.precision == "mixed"
+
+    # The outer context must be inert, or it would apply to both nets.
+    with proxy.autocast():
+        pass
+    assert (bf16.entered, fp32.entered) == (0, 0)
+
+    batch = {
+        "net_ids": torch.tensor([0, 1, 0, 1]),
+        "features": torch.zeros(4, 3),
+    }
+    proxy.model(batch)
+    assert (bf16.entered, fp32.entered) == (1, 1), (
+        "each net must evaluate its own rows under its own precision"
+    )
+
+
+def test_same_precision_routing_keeps_the_single_outer_autocast():
+    """Regression guard: league play stays on the path W1 verified bit-exact."""
+
+    import torch
+
+    first, second = _autocast_probe("bf16"), _autocast_probe("bf16")
+    proxy = _routed_proxy((first, second))
+    assert proxy.precision == "bf16"
+
+    with proxy.autocast():
+        pass
+    assert first.entered == 1, "the shared outer autocast still comes from net 0"
+
+    batch = {
+        "net_ids": torch.tensor([0, 1]),
+        "features": torch.zeros(2, 3),
+    }
+    proxy.model(batch)
+    assert (first.entered, second.entered) == (1, 0), (
+        "no per-net autocast on the single-precision path"
+    )

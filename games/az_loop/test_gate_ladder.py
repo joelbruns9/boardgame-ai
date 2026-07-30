@@ -122,3 +122,54 @@ def test_rungs_must_be_ascending_positive_and_even():
         GateLadder(rungs=(101,)).validate()
     with pytest.raises(ValueError, match="at least one rung"):
         GateLadder(rungs=()).validate()
+
+
+# -- W6.6: run-health heartbeat --------------------------------------------
+
+
+def test_heartbeat_reports_health_from_the_committed_row_alone():
+    from .run_controller import RunController
+
+    row = {
+        "iteration": 42,
+        "current_best_iteration": 40,
+        "promotion_action": "probation",
+        "stats": {
+            "generation": {"games_per_second": 1.2345},
+            "resources": {
+                "peak_rss_bytes": 6 * 1024**3,
+                "vram_peak_physical_bytes": 9 * 1024**3,
+            },
+            # Every gate is fixed-N since W5.5; `stop_reason` is what
+            # separates a promotion decision from an anchor measurement.
+            "gates": [
+                {
+                    "fixed_n": True,
+                    "stop_reason": "probation",
+                    "score_rate": 0.53,
+                    "wilson_lcb": 0.47,
+                    "wilson_ucb": 0.59,
+                    "games": 400,
+                },
+                {"fixed_n": True, "stop_reason": "fixed_n", "score_rate": 0.82},
+                {"fixed_n": True, "stop_reason": "fixed_n", "score_rate": 0.66},
+            ],
+        },
+    }
+    line = RunController.heartbeat_line(row)
+    assert "iter=0042" in line
+    assert "games/s=1.234" in line or "games/s=1.235" in line
+    assert "rss=6.00GiB" in line
+    assert "vram=9.00GiB" in line
+    assert "best_iter=40" in line
+    assert "action=probation" in line
+    assert "gate=0.530[0.470,0.590]n=400" in line
+    assert "anchor=0.740(min 0.660)" in line
+
+
+def test_heartbeat_survives_a_row_with_no_stats_block():
+    from .run_controller import RunController
+
+    line = RunController.heartbeat_line({"iteration": 1})
+    assert "iter=0001" in line
+    assert "rss=" not in line, "absent telemetry should be absent, not zero"

@@ -382,6 +382,9 @@ class PhaseDConfig:
 
     gate_ladder_step_up_after: int = 2
     gate_ladder_floor_games: int = 0
+    allow_resume_code_drift: bool = False
+    """Permit a resume on a different commit or dirty tree (W6.5)."""
+
     gate_revert_suppress_knots: tuple[int, ...] = ()
     """Extra games-clock points after which one gate may not revert (W5.9).
 
@@ -1848,6 +1851,7 @@ class PhaseDLoop:
                 f"{stored_precision!r} but resumed with "
                 f"{self.config.precision!r}"
             )
+        self._refuse_changed_code(manifest_payload)
         self._refuse_changed_schedules(manifest_payload)
         self._sync_training_log(manifest_payload)
         if self.config.warm_buffer:
@@ -1863,6 +1867,52 @@ class PhaseDLoop:
                 rust_slots=self.config.rust_slots,
                 rust_global_batch_cap=self.config.rust_global_batch_cap,
             )
+
+    def _refuse_changed_code(self, manifest_payload: dict[str, Any]) -> None:
+        """Refuse a resume that runs different code than the run started with (W6.5).
+
+        A multi-day run is resumed by re-running the setup script, which pulls
+        first. Without this, a pull that lands between two iterations silently
+        splits the run across two engines, and every measurement afterwards is
+        attributed to whichever commit the manifest happened to record. The
+        commit alone is not enough: a dirty tree at the same SHA is different
+        code, so the launch-time diff digest is compared too.
+        """
+
+        stored = manifest_payload.get("git") or {}
+        stored_commit = str(stored.get("commit", "unknown"))
+        if stored_commit in ("", "unknown"):
+            # A manifest from a checkout without git provenance; nothing to
+            # compare against, and refusing would strand the run.
+            return
+        current = self.manifest.code_identity()
+        current.pop("_diff", None)
+        drift: list[str] = []
+        if current["commit"] not in ("", "unknown") and current["commit"] != stored_commit:
+            drift.append(
+                f"commit: run started on {stored_commit[:12]} but resumed on "
+                f"{current['commit'][:12]}"
+            )
+        elif "diff_sha256" in stored and stored["diff_sha256"] != current["diff_sha256"]:
+            drift.append(
+                "uncommitted changes differ from the ones the run started with"
+            )
+        if not drift:
+            return
+        detail = "; ".join(drift)
+        if self.config.allow_resume_code_drift:
+            warnings.warn(
+                f"resuming on different code ({detail}); "
+                "--allow-resume-code-drift was passed, so the run continues and "
+                "its rows now span more than one engine",
+                stacklevel=2,
+            )
+            return
+        raise ValueError(
+            f"cannot resume on different code ({detail}); check out the "
+            f"recorded commit, or pass --allow-resume-code-drift to accept a "
+            "run whose iterations span more than one engine"
+        )
 
     def _refuse_changed_schedules(self, manifest_payload: dict[str, Any]) -> None:
         """Refuse a resume that moves any schedule position (W1.4).
@@ -2790,6 +2840,7 @@ class PhaseDLoop:
         opponent_spec: ModelAgentSpec,
         seed_offset: int,
         games: int,
+        precisions: tuple[str, str] | None = None,
     ) -> list[MatchOutcome]:
         """One rolling Rust scheduler call for both seat legs and all pairs.
 
@@ -2803,18 +2854,28 @@ class PhaseDLoop:
 
         import seven_wonders_rust as swr
 
-        def evaluator(spec: ModelAgentSpec) -> Evaluator:
+        # Per-side precision exists for W6.2b's precision arena, where both
+        # sides are the *same* checkpoint and the only difference under test is
+        # the dtype the forward pass runs in. A normal gate passes None and both
+        # sides use the run's precision.
+        candidate_precision, opponent_precision = (
+            precisions
+            if precisions is not None
+            else (self.config.precision, self.config.precision)
+        )
+
+        def evaluator(spec: ModelAgentSpec, precision: str) -> Evaluator:
             model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
             model.load_state_dict(spec.model_state)
             return Evaluator(
                 model,
                 self.config.device,
                 self.config.rust_global_batch_cap,
-                precision=self.config.precision,
+                precision=precision,
             )
 
-        candidate_eval = evaluator(candidate_spec)
-        opponent_eval = evaluator(opponent_spec)
+        candidate_eval = evaluator(candidate_spec, candidate_precision)
+        opponent_eval = evaluator(opponent_spec, opponent_precision)
         adapter = rust_searcher_routed_flat_batch_adapter(
             (candidate_eval, opponent_eval)
         )
@@ -3147,6 +3208,7 @@ class PhaseDLoop:
         seed_offset: int,
         games: int,
         revert_suppressed: bool = False,
+        precisions: tuple[str, str] | None = None,
     ) -> tuple[GateResult, list[MatchOutcome]]:
         """Play exactly ``games`` games, then decide once (W5.5)."""
 
@@ -3190,7 +3252,7 @@ class PhaseDLoop:
             }
         else:
             outcomes = self._rust_model_gate_rolling(
-                candidate_spec, opponent_spec, seed_offset, games
+                candidate_spec, opponent_spec, seed_offset, games, precisions
             )
         pair_scores = self._pair_scores(outcomes)
         decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
@@ -3571,7 +3633,14 @@ class _PhaseDRunStore:
         return payload.get("iterations", [])
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Every Phase D flag, in one place a tool can inspect without running.
+
+    W6.3 needs to assert that the sweep's translated flags are accepted and
+    land where they should; that check must not launch a training run to
+    find out.
+    """
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--seed", type=int, default=20260718)
@@ -3738,6 +3807,12 @@ def main(argv=None) -> int:
         default=0.48,
         help="revert when the pair-level Wilson UPPER bound falls below this "
         "(a confidence bound, not the old point-estimate --revert-win-rate)",
+    )
+    parser.add_argument(
+        "--allow-resume-code-drift",
+        action="store_true",
+        help="resume even though the commit or working tree differs from the "
+        "one the run started on; its rows will span more than one engine",
     )
     parser.add_argument("--gate-confidence-z", type=float, default=1.96)
     parser.add_argument(
@@ -3927,6 +4002,11 @@ def main(argv=None) -> int:
         action="store_true",
         help="use tiny generation/training/gate budgets; verifies plumbing only",
     )
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     config = PhaseDConfig(
         run_dir=args.run_dir,
@@ -3995,6 +4075,7 @@ def main(argv=None) -> int:
         gate_indifference=args.gate_indifference,
         promotion_min_lcb=args.promotion_min_lcb,
         revert_max_ucb=args.revert_max_ucb,
+        allow_resume_code_drift=args.allow_resume_code_drift,
         gate_ladder_games=tuple(args.gate_ladder_games),
         gate_ladder_step_up_after=args.gate_ladder_step_up_after,
         gate_ladder_floor_games=args.gate_ladder_floor_games,
