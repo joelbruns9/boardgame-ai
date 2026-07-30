@@ -239,7 +239,14 @@ def test_tagging_names_the_opponent_only_in_league_games():
         nets_p1=(0, 0, 1),
     )
     records = [
-        FakeRecord(agents={"p0": "network", "p1": "network", "kind": "self_play"})
+        FakeRecord(
+            agents={
+                "p0": "network",
+                "p1": "network",
+                "kind": "self_play",
+                "opponent_type": "current_best",
+            }
+        )
         for _ in range(3)
     ]
     tagged = _tag_league_opponents(records, league)
@@ -254,7 +261,55 @@ def test_tagging_names_the_opponent_only_in_league_games():
     assert tagged[2].agents["p0"] == "network"
     for index in (1, 2):
         assert tagged[index].agents["kind"] == "league"
+        assert tagged[index].agents["opponent_type"] == "hof"
         assert tagged[index].agents["opponent_source"] == league.checkpoint
+        assert tagged[index].agents["league_assignment"] == league.name
+        assert tagged[index].agents["league_assignment_used"] == "true"
+
+
+def test_tagging_distinguishes_hof_bot_overlap_from_shadowed_assignment():
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class FakeRecord:
+        agents: dict
+
+    league = LeagueAssignment(
+        checkpoint="x.pt",
+        sha256="abc123def456789",
+        iteration_added=7,
+        # Game 0 assigns HOF to the bot seat; game 1 assigns it to the
+        # network seat, so only game 1 actually uses the archive.
+        nets_p0=(1, 0),
+        nets_p1=(0, 1),
+    )
+    records = [
+        FakeRecord(
+            agents={
+                "p0": "ScienceAggressiveBot",
+                "p1": "network",
+                "kind": "mixed",
+                "opponent_type": "bot",
+            }
+        )
+        for _ in range(2)
+    ]
+
+    tagged = _tag_league_opponents(records, league)
+
+    shadowed = tagged[0].agents
+    assert shadowed["p0"] == "ScienceAggressiveBot"
+    assert shadowed["opponent_type"] == "bot"
+    assert shadowed["league_assignment"] == league.name
+    assert shadowed["league_assignment_used"] == "false"
+    assert "opponent_source" not in shadowed
+
+    overlap = tagged[1].agents
+    assert overlap["p0"] == "ScienceAggressiveBot"
+    assert overlap["p1"] == league.name
+    assert overlap["opponent_type"] == "hof_bot"
+    assert overlap["league_assignment_used"] == "true"
+    assert overlap["opponent_source"] == league.checkpoint
 
 
 def test_tagging_refuses_a_length_mismatch():

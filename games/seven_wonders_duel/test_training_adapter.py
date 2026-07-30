@@ -7,11 +7,15 @@ gate can be exercised without a full self-play + training pipeline.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from games.seven_wonders_duel.training_adapter import SevenWondersDuelLifecycleAdapter
+from games.seven_wonders_duel.training_adapter import (
+    SevenWondersDuelLifecycleAdapter,
+    _record_stats,
+)
 
 
 class _FakeModel:
@@ -72,3 +76,35 @@ def test_validate_rejects_unreadable_checkpoint():
     )
     with pytest.raises(RuntimeError, match="failed to reload"):
         _adapter(loop)._validate_candidate(Path("candidate.pt"), 3)
+
+
+def test_w3_opponent_mix_uses_explicit_non_lossy_categories():
+    records = [
+        SimpleNamespace(
+            seed=index,
+            agents={"opponent_type": opponent, "kind": "legacy_is_ignored"},
+            moves=(),
+            victory_type=None,
+            winner=None,
+            first_player=0,
+            scores=None,
+        )
+        for index, opponent in enumerate(
+            ("current_best", "hof", "bot", "hof_bot")
+        )
+    ]
+
+    generation, outcomes, _game_specific = _record_stats(records, {})
+
+    assert generation.opponent_mix == {
+        "current_best": 1,
+        "hof": 1,
+        "bot": 1,
+        "hof_bot": 1,
+    }
+    assert set(outcomes.by_opponent_type) == {
+        "current_best",
+        "hof",
+        "bot",
+        "hof_bot",
+    }

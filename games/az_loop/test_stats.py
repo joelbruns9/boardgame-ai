@@ -67,6 +67,12 @@ def test_report_reads_schema_v1_and_v2_and_exposes_decay_diagnostics():
             games_per_second=0.8,
             mean_batch_size=12.0,
             forced_row_share=0.2,
+            opponent_mix={
+                "current_best": 7,
+                "hof": 1,
+                "bot": 1,
+                "hof_bot": 1,
+            },
         ),
         outcomes=OutcomeStats(terminal_reason={"score": 10}),
     )
@@ -77,7 +83,11 @@ def test_report_reads_schema_v1_and_v2_and_exposes_decay_diagnostics():
             "generated_games": 10,
             "generation_performance": {
                 "performance": {"games_per_second": 1.0},
-                "summary": {"games": 10, "victory_types": {"score": 10}},
+                "summary": {
+                    "games": 10,
+                    "victory_types": {"score": 10},
+                    "game_kinds": {"self_play": 10},
+                },
             },
         },
         {
@@ -92,3 +102,11 @@ def test_report_reads_schema_v1_and_v2_and_exposes_decay_diagnostics():
     assert report["throughput_diagnostic"]["diagnostic_fields_present"][
         "mean_batch_size"
     ]
+    assert report["opponent_mix"]["counts"] == {
+        "bot": 1,
+        "current_best": 17,
+        "hof": 1,
+        "hof_bot": 1,
+    }
+    assert report["opponent_mix"]["realized_hof_share"] == pytest.approx(0.1)
+    assert report["opponent_mix"]["realized_bot_share"] == pytest.approx(0.1)

@@ -45,7 +45,7 @@ from games.az_loop.contract import (
     TrainRequest,
 )
 
-from .buffer import GameRecord
+from .buffer import GameRecord, OPPONENT_TYPES, resolve_opponent_type
 from .dataset import GameDerivationStats
 from .phase_d import summarize_records
 from .train import make_checkpoint
@@ -144,7 +144,7 @@ def _record_stats(
     batches = int(scheduler.get("global_batches", 0))
     forced = int(scheduler.get("forced_rows", 0))
     seconds = float(performance.get("seconds", 0.0))
-    opponent_mix = {"current_best": 0, "hof": 0, "bot": 0}
+    opponent_mix = {opponent: 0 for opponent in OPPONENT_TYPES}
     terminal = {}
     winners = {"p0": 0, "p1": 0, "draw": 0}
     first_player_wins = 0
@@ -172,10 +172,7 @@ def _record_stats(
     }
     lengths_by_victory: dict[str, list[int]] = {}
     for record in records:
-        kind = record.agents.get("kind", "self_play")
-        opponent = "hof" if kind == "league" else (
-            "bot" if "curriculum" in kind else "current_best"
-        )
+        opponent = resolve_opponent_type(record.agents)
         opponent_mix[opponent] += 1
         reason = record.victory_type or "draw"
         terminal[reason] = terminal.get(reason, 0) + 1

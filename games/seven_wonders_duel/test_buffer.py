@@ -7,10 +7,12 @@ import pytest
 
 from games.seven_wonders_duel.buffer import (
     GameRecorder,
+    OPPONENT_TYPES,
     ReplayMismatchError,
     from_json_line,
     read_records,
     replay,
+    resolve_opponent_type,
     state_digest,
     to_json_line,
 )
@@ -62,6 +64,30 @@ def test_json_round_trip_is_byte_stable():
     assert recovered == record
     assert to_json_line(recovered) == line
     assert replay(recovered).phase is Phase.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("agents", "expected"),
+    [
+        ({"kind": "self_play"}, "current_best"),
+        ({"kind": "mixed"}, "bot"),
+        ({"kind": "curriculum_seed"}, "bot"),
+        ({"kind": "league"}, "hof"),
+        ({"kind": "league_mixed"}, "hof_bot"),
+        (
+            {"kind": "self_play", "opponent_type": "hof_bot"},
+            "hof_bot",
+        ),
+    ],
+)
+def test_opponent_type_is_explicit_with_legacy_fallback(agents, expected):
+    assert resolve_opponent_type(agents) == expected
+    assert expected in OPPONENT_TYPES
+
+
+def test_unknown_explicit_opponent_type_is_rejected():
+    with pytest.raises(ValueError, match="unknown opponent_type"):
+        resolve_opponent_type({"opponent_type": "mystery"})
 
 
 def test_jsonl_file_round_trip(tmp_path):

@@ -1,9 +1,11 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0/W1/W2 complete. W3 and W5 have implementations under review;
-W3 opponent attribution and W5 decision/cost closure remain open.**
-Revision 8.
-**Revision history:** r8 removes W3's stats-only replay by collecting and
+**Status:** **W0/W1/W2/W3 complete. W5 decision and complete-cost closure
+remain open.**
+Revision 9.
+**Revision history:** r9 closes W3 with explicit current-best/HOF/bot/HOF+bot
+provenance, actual-use handling for bot-shadowed HOF assignments, and realized
+opponent shares in `az_report`. r8 removes W3's stats-only replay by collecting and
 caching game observations during required trainable-position derivation. r7
 closes W2 from the successful 70-to-90 recovery,
 bounded host-memory plateau, checked allocation/error path, and the target
@@ -73,7 +75,7 @@ does not close it -- it makes it **measured every iteration**.
 | W0 | Model size + precision, decided by measurement | M | ~~Yes~~ **DONE 2026-07-29** |
 | W1 | Training schedules, growing window, HOF league | M | ~~Yes~~ **DONE 2026-07-29** |
 | W2 | Memory: fix the crash, bound the footprint, measure it | M | ~~Yes~~ **DONE 2026-07-30** |
-| W3 | Shared run-stats contract + reporting | M | **IMPLEMENTED; opponent attribution correction pending** |
+| W3 | Shared run-stats contract + reporting | M | ~~Yes~~ **DONE 2026-07-30** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
 | W5 | Gate efficiency + Wilson-LCB decision rule | M | **LOCAL GATES PASSED; RTX 5090 cap fit pending** |
 | W6 | Cloud setup script | M | **Yes** |
@@ -416,7 +418,7 @@ tolerant of v1 so run 03 stays analyzable.
 
 | group | fields |
 |---|---|
-| `generation` | games, moves, moves/game (mean, median, p10, p90), decisions searched, mean sims, seconds, games/s, **NN rows, rows/s, forced-row share, mean batch size**, **opponent mix (HOF vs current_best vs bot)** |
+| `generation` | games, moves, moves/game (mean, median, p10, p90), decisions searched, mean sims, seconds, games/s, **NN rows, rows/s, forced-row share, mean batch size**, **exclusive opponent mix (`current_best`, `hof`, `bot`, `hof_bot`)** |
 | `outcomes` | **`terminal_reason` histogram**, winner distribution, first-player win rate, mean margin, **split by opponent type** |
 | `replay` | window games, examples, new examples, reuse factor, staleness (max, mean, p90), **schedule value and realised window** |
 | `training` | per-head train/val losses, accuracies, lr, grad norm, steps, seconds, **replay-derivation seconds**, **precision in effect** |
@@ -451,18 +453,26 @@ iterations also derive and cache positions once before writing their row. This
 removes the former unmeasured full replay from the adapter; its cost now belongs
 to the existing `replay_derivation` phase.
 
-**Implementation status:** the redundant-replay correction is complete.
-Opponent provenance still needs explicit, non-lossy HOF/curriculum attribution
-before W3 acceptance closes.
+Opponent provenance is explicit in every new buffer record. HOF assignment and
+curriculum assignment can overlap: a real HOF-vs-bot game is `hof_bot`, while a
+nominal HOF assignment shadowed by the bot on that seat remains `bot` and records
+that the league assignment was unused. `az_report` reports exclusive counts and
+computes realized HOF share as `(hof + hof_bot) / games` and realized bot share
+as `(bot + hof_bot) / games`. Legacy `kind`-only buffers remain readable.
+
+**Implementation status:** W3 is complete. Both review corrections—the
+stats-only replay and lossy opponent attribution—are closed.
 
 **W3.4 -- `tools/az_report.py`.** *(M)* One command, any run directory: the
 block-aggregated outcome mix with binomial error bars, the gate ladder with
 Wilson bounds, the learning curve, throughput, RSS, and the victory mix against
 the ZeusAI/BGA reference. Without it the schema is just tidier JSON.
 
-**Acceptance:** a 7WD run and a synthetic second-game fixture both emit valid
-schema-v2 rows; `az_report.py` reproduces the planning tables; the 27%
-generation decay is diagnosable from the log alone.
+**Acceptance result:** 7WD and the synthetic second-game fixture emit valid
+schema-v2 rows; opponent routing/serialization/reporting tests cover all four
+categories and legacy fallback; `az_report.py` reproduces the planning tables,
+realized opponent shares, and the throughput diagnostics needed to explain the
+27% generation decay.
 
 ---
 
@@ -789,8 +799,9 @@ change only on evidence. All schedules in **games**.
 W0 (size + precision) -- DONE 2026-07-29: L = 384x8x6, bf16
   -> W1 (schedules, window, HOF) -- DONE 2026-07-29
     -> W2 (memory) -- DONE 2026-07-30
-      -> W3 (stats corrections) -> W5 (gates) -> W6 (cloud) -> W7 -> LAUNCH
-                                     ^ W5.7 measures complete gate cost at L's width
+      -> W3 (stats) -- DONE 2026-07-30
+        -> W5 (gates) -> W6 (cloud) -> W7 -> LAUNCH
+             ^ W5.7 measures complete gate cost at L's width
 
 W4 (BGA advisor, iter-60) -- parallel throughout
 ```

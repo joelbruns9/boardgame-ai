@@ -88,6 +88,32 @@ class ReplayMismatchError(RuntimeError):
     """A recorded game no longer reproduces under the current engine."""
 
 
+OPPONENT_TYPES = ("current_best", "hof", "bot", "hof_bot")
+
+
+def resolve_opponent_type(agents: dict[str, str]) -> str:
+    """Return the explicit W3 opponent category, with legacy compatibility.
+
+    New records carry ``opponent_type`` because ``kind`` cannot represent a
+    HOF-vs-curriculum-bot game. Old buffers remain readable; their historical
+    ``kind`` value is used when the explicit field is absent.
+    """
+
+    explicit = agents.get("opponent_type")
+    if explicit is not None:
+        if explicit not in OPPONENT_TYPES:
+            raise ValueError(f"unknown opponent_type metadata: {explicit!r}")
+        return explicit
+    kind = agents.get("kind", "self_play")
+    if kind == "league_mixed":
+        return "hof_bot"
+    if kind == "league":
+        return "hof"
+    if kind == "mixed" or kind == "bot" or "curriculum" in kind:
+        return "bot"
+    return "current_best"
+
+
 def mask_hash(game: GameState) -> str:
     payload = json.dumps(legal_action_indices(game)).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()[:16]

@@ -46,7 +46,7 @@ Implemented:
    stale optimizer moments after restoring `latest` and `current_best`, making
    the iteration that crashed inside a gate genuinely restartable.
 
-## W3 — shared statistics
+## W3 — shared statistics: DONE
 
 Implemented `games/az_loop/stats.py` and schema version 2:
 
@@ -62,7 +62,12 @@ Implemented `games/az_loop/stats.py` and schema version 2:
   draft/wonder signals;
 - those game-specific observations are now collected during the verified replay
   that creates trainable positions and cached with the examples. The former
-  stats-only full replay and its unattributed wall time are removed.
+  stats-only full replay and its unattributed wall time are removed;
+- every new record carries an explicit `opponent_type`: `current_best`, `hof`,
+  `bot`, or `hof_bot`. A HOF assignment shadowed by a bot is recorded as unused
+  and does not inflate realized HOF traffic;
+- `az_report.py` emits exclusive opponent counts plus realized HOF and bot
+  shares, with legacy `kind` values mapped for historical rows.
 
 `tools/az_report.py` reads either schema. Against `laptop_training_03`, it
 reproduced the ten-iteration outcome blocks, the gate ladder, and an
@@ -128,9 +133,9 @@ record target-device headroom, but no adaptive VRAM estimator or separate
 
 Final verification:
 
-- replay/statistics focused Python tests: 32 passed;
-- full `games/seven_wonders_duel` Python suite: 644 passed, one existing
-  tensor-conversion warning;
+- opponent-attribution focused Python tests: 92 passed;
+- full `games/seven_wonders_duel` plus `games/az_loop` Python suites: 660
+  passed, one existing tensor-conversion warning;
 - Rust unit tests: 16 passed, with one non-fatal test-helper dead-code warning;
 - `git diff --check`: clean.
 
@@ -169,8 +174,9 @@ The cloud launch still runs one exact-geometry L/bf16 preflight and retains
 RSS/physical-VRAM telemetry, but those are operational checks rather than an
 open W2 engineering project.
 
-W3 still needs the opponent-attribution correction. W5's decision rule and
-full promotion-plus-anchor cost budget remain under review;
+W3 is complete: schema, reporting, opponent attribution, and replay-cost
+accounting are closed. W5's decision rule and full promotion-plus-anchor cost
+budget remain under review;
 RTX 5090 gate measurements and production cap selection belong to that W5 work.
 
 Commands and expected artifacts are in

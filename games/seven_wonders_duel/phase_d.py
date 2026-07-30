@@ -64,6 +64,7 @@ from .buffer import (
     GameRecorder,
     check_target_versions,
     read_records,
+    resolve_opponent_type,
     to_json_line,
 )
 from .codec import decode_action, encode_action
@@ -805,9 +806,23 @@ def _tag_league_opponents(
             tagged.append(record)
             continue
         agents = dict(record.agents)
+        prior_type = resolve_opponent_type(agents)
+        agents["league_assignment"] = league.name
+        # Bot routing takes precedence over network routing inside Rust. When
+        # the archive was assigned to the bot-controlled seat, network 1 never
+        # evaluated a move; preserve the nominal assignment, but report the
+        # actual game as current-vs-bot.
+        if prior_type == "bot" and agents.get(f"p{seat}") != "network":
+            agents["league_assignment_used"] = "false"
+            tagged.append(replace(record, agents=agents))
+            continue
         agents[f"p{seat}"] = league.name
         agents["kind"] = "league"
+        agents["opponent_type"] = (
+            "hof_bot" if prior_type == "bot" else "hof"
+        )
         agents["opponent_source"] = league.checkpoint
+        agents["league_assignment_used"] = "true"
         tagged.append(replace(record, agents=agents))
     return tagged
 
@@ -883,7 +898,12 @@ def _bot_seed_game(job: GameJob) -> GameRecord:
     recorder = GameRecorder(
         job.seed,
         first_player=(job.index // 2) % 2,
-        agents={"p0": bots[0].name, "p1": bots[1].name, "kind": "curriculum_seed"},
+        agents={
+            "p0": bots[0].name,
+            "p1": bots[1].name,
+            "kind": "curriculum_seed",
+            "opponent_type": "bot",
+        },
         iteration=None,
     )
     while recorder.game.phase is not Phase.COMPLETE:
@@ -1215,6 +1235,7 @@ def _self_play_game(
         "p0": bot.name if bot_seat == 0 else "network",
         "p1": bot.name if bot_seat == 1 else "network",
         "kind": "mixed" if mixed else "self_play",
+        "opponent_type": "bot" if mixed else "current_best",
     }
     recorder = GameRecorder(
         job.seed,

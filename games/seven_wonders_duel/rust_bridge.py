@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from .buffer import GameRecord, GameRecorder, replay
+from .buffer import GameRecord, GameRecorder, replay, resolve_opponent_type
 from .codec import decode_action, legal_action_indices
 from .data import PROGRESS_IDS
 from .encoder import Encoding, Token, TokenType
@@ -721,10 +721,12 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
 
     if raw.get("schema") != 1 or raw.get("spec_version") != "codec-1":
         raise ValueError("unsupported Rust self-play record schema")
+    agents = dict(raw["agents"])
+    agents["opponent_type"] = resolve_opponent_type(agents)
     recorder = GameRecorder(
         int(raw["seed"]),
         first_player=int(raw["first_player"]),
-        agents=dict(raw["agents"]),
+        agents=agents,
         iteration=raw.get("iteration"),
     )
     expected_events: dict[int, list[tuple[str, str | tuple[str, ...]]]] = {}

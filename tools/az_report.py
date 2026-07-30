@@ -109,14 +109,55 @@ def _mean(rows: list[float]) -> float | None:
     return statistics.fmean(rows) if rows else None
 
 
+def _opponent_summary(counts: Counter[str]) -> dict[str, Any]:
+    total = sum(counts.values())
+    ordered = dict(sorted(counts.items()))
+    return {
+        "games": total,
+        "counts": ordered,
+        "rates": {
+            key: value / total if total else 0.0
+            for key, value in ordered.items()
+        },
+        # Categories are exclusive, while these operational shares intentionally
+        # include the real HOF-vs-bot overlap on both axes.
+        "realized_hof_share": (
+            (counts["hof"] + counts["hof_bot"]) / total if total else None
+        ),
+        "realized_bot_share": (
+            (counts["bot"] + counts["hof_bot"]) / total if total else None
+        ),
+    }
+
+
+def _legacy_opponent_mix(raw: dict[str, int]) -> dict[str, int]:
+    mapped: Counter[str] = Counter()
+    aliases = {
+        "self_play": "current_best",
+        "mixed": "bot",
+        "curriculum_seed": "bot",
+        "league": "hof",
+        "league_mixed": "hof_bot",
+    }
+    for name, count in raw.items():
+        mapped[aliases.get(name, name)] += int(count)
+    return dict(mapped)
+
+
 def build_report(rows: list[dict[str, Any]], block_size: int) -> dict[str, Any]:
     data = [normalized(row) for row in rows]
     blocks = []
     for start in range(0, len(data), block_size):
         block = data[start : start + block_size]
         terminal: Counter[str] = Counter()
+        opponents: Counter[str] = Counter()
         for row in block:
             terminal.update(row["outcomes"].get("terminal_reason", {}))
+            opponents.update(
+                _legacy_opponent_mix(
+                    row["generation"].get("opponent_mix", {})
+                )
+            )
         games = sum(terminal.values())
         mix = {}
         for reason, count in sorted(terminal.items()):
@@ -128,6 +169,7 @@ def build_report(rows: list[dict[str, Any]], block_size: int) -> dict[str, Any]:
                 "iterations": [block[0]["iteration"], block[-1]["iteration"]],
                 "games": games,
                 "outcome_mix": mix,
+                "opponent_mix": _opponent_summary(opponents),
                 "games_per_second": _mean(
                     [
                         float(row["generation"].get("games_per_second", 0.0))
@@ -183,8 +225,14 @@ def build_report(rows: list[dict[str, Any]], block_size: int) -> dict[str, Any]:
     )
     decay = None if not early else (late - early) / early
     totals: Counter[str] = Counter()
+    opponent_totals: Counter[str] = Counter()
     for row in data:
         totals.update(row["outcomes"].get("terminal_reason", {}))
+        opponent_totals.update(
+            _legacy_opponent_mix(
+                row["generation"].get("opponent_mix", {})
+            )
+        )
     total_games = sum(totals.values())
     reference = {
         key: {
@@ -201,6 +249,7 @@ def build_report(rows: list[dict[str, Any]], block_size: int) -> dict[str, Any]:
         "blocks": blocks,
         "gates": gates,
         "learning_and_resources": curve,
+        "opponent_mix": _opponent_summary(opponent_totals),
         "throughput_diagnostic": {
             "early_quartile_games_per_second": early,
             "late_quartile_games_per_second": late,
@@ -258,11 +307,39 @@ def markdown(report: dict[str, Any]) -> str:
             f"; mean batch {block['mean_batch_size']:.1f}; "
             f"peak RSS {block['peak_rss_bytes'] / 1024**2:.0f} MiB"
         )
+        opponents = ", ".join(
+            f"{name} {rate:.1%}"
+            for name, rate in block["opponent_mix"]["rates"].items()
+        )
         lines.append(
             f"- Iterations {block['iterations'][0]}-{block['iterations'][1]}: "
             f"{block['games']} games; {mix}; {block['games_per_second']:.3f} games/s"
-            f"{learning}{resources}."
+            f"{learning}{resources}; opponents {opponents or 'n/a'}."
         )
+    opponent_mix = report["opponent_mix"]
+    hof_share = opponent_mix["realized_hof_share"]
+    bot_share = opponent_mix["realized_bot_share"]
+    lines.extend(
+        [
+            "",
+            "## Opponent attribution",
+            "",
+            "- Exclusive counts: "
+            + (
+                ", ".join(
+                    f"{name} {count}"
+                    for name, count in opponent_mix["counts"].items()
+                )
+                or "none"
+            )
+            + ".",
+            "- Realized HOF share: "
+            + ("n/a" if hof_share is None else f"{hof_share:.1%}")
+            + "; realized curriculum-bot share: "
+            + ("n/a" if bot_share is None else f"{bot_share:.1%}")
+            + ".",
+        ]
+    )
     lines.extend(["", "## Gate ladder", ""])
     if not report["gates"]:
         lines.append("No gates recorded.")

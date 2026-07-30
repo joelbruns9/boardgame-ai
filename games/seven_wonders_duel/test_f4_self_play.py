@@ -128,7 +128,12 @@ def test_f4_3_leaf_batch_one_full_game_oracle_and_replay():
     assert raw["final_fingerprint"] == logic_fingerprint(expected_game)
     record = phase_d_record_from_rust(raw)
     assert record.iteration == 7
-    assert record.agents == {"p0": "network", "p1": "network", "kind": "self_play"}
+    assert record.agents == {
+        "p0": "network",
+        "p1": "network",
+        "kind": "self_play",
+        "opponent_type": "current_best",
+    }
     assert all(move.policy_target is not None for move in record.moves)
     assert all(math.isclose(sum(move.policy_target.values()), 1.0) for move in record.moves)
     assert logic_fingerprint(replay(record)) == logic_fingerprint(expected_game)

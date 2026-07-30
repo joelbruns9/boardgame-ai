@@ -1,4 +1,4 @@
-# W3/W5 cloud checks and W2 operational telemetry
+# W5 cloud checks and W2/W3 operational telemetry
 
 W2 is complete. The laptop established checked allocation failures, bounded
 host-memory behavior, cleanup, and restart recovery. L paths also ran on the
@@ -7,8 +7,9 @@ memory-hardening project.
 
 The cloud host still records RSS and physical/allocated VRAM. Those readings
 are operational telemetry and a launch sanity check, not deferred W2
-acceptance. Production gate timing and W3 run-stat validation must be collected
-on the RTX 5090; laptop measurements do not select production parameters.
+acceptance. W3 is also complete; production rows validate its statistics on the
+real workload. Production gate timing must be collected on the RTX 5090;
+laptop measurements do not select production parameters.
 
 ## Before training
 
@@ -60,7 +61,9 @@ Required cloud evidence:
 
 1. Every row is schema v2 and records model `384x8x6`, bf16, opponent mix,
    scheduler rows/batches, cache bytes, RSS, and physical versus allocated VRAM.
-2. Realized HOF share converges to 0.15 after `hof_start_games`.
+2. Realized HOF share, `(hof + hof_bot) / generated games`, converges to 0.15
+   after `hof_start_games`. Bot-shadowed nominal assignments are recorded as
+   unused and do not count as HOF traffic.
 3. No gate reports a channel-disconnect surrogate for a Python/CUDA failure.
 4. Gate timing uses at least three sizes and records moves per game.
 5. Promotion decisions use independent seat pairs; anchors are fixed-N.

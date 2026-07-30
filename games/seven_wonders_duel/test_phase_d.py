@@ -343,6 +343,7 @@ def test_seed_buffer_cycles_all_four_bots_through_both_seats(
     names = {bot_type().name for bot_type in CURRICULUM_BOT_TYPES}
     assert {record.agents["p0"] for record in records} & names == names
     assert {record.agents["p1"] for record in records} & names == names
+    assert all(record.agents["opponent_type"] == "bot" for record in records)
     for record in records:
         replay(record)
 
@@ -484,6 +485,10 @@ def test_real_model_rust_self_play_writes_replayable_iteration(tmp_path: Path):
     assert loop.last_generation_stats["mode"] == "rust"
     assert loop.last_generation_stats["rust_games"] == 2
     assert loop.last_generation_stats["python_bot_games"] == 0
+    assert all(
+        record.agents["opponent_type"] == "current_best"
+        for record in records
+    )
     assert all(not move.policy_excluded for record in records for move in record.moves)
     for record in records:
         replay(record)
@@ -514,6 +519,7 @@ def test_rust_self_play_keeps_curriculum_bot_seats_inside_rust(tmp_path: Path):
     assert loop.last_generation_stats["rust_bot_games"] == 2
     assert loop.last_generation_stats["python_bot_games"] == 0
     assert all(record.agents["kind"] == "mixed" for record in records)
+    assert all(record.agents["opponent_type"] == "bot" for record in records)
     assert all(any(move.mode == "bot" for move in record.moves) for record in records)
     assert all(
         all(move.policy_target is None for move in record.moves if move.mode == "bot")
@@ -556,6 +562,10 @@ def test_process_generation_is_deterministic_and_replayable(tmp_path: Path):
     records_b = second.generate_iteration(second.load_model(second.current_best), 0)
     assert records_a == records_b
     assert len(records_a) == 2
+    assert all(
+        record.agents["opponent_type"] == "current_best"
+        for record in records_a
+    )
     for record in records_a:
         replay(record)
 

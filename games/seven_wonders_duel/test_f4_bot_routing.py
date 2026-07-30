@@ -250,6 +250,9 @@ def test_phase_d_generation_issues_one_call_whatever_the_bot_mix(monkeypatch):
     assert loop.last_generation_stats["rust_games"] == 0
     kinds = {record.agents.get("kind") for record in records}
     assert kinds == {"mixed"}
+    assert {record.agents.get("opponent_type") for record in records} == {
+        "bot"
+    }
 
 
 @pytest.mark.parametrize(

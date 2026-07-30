@@ -439,7 +439,12 @@ relabeling, trap harvesting).
   "schema": 1,
   "spec_version": "codec-1",
   "setup": {"seed": 123, "first_player": 0},
-  "agents": {"p0": "run3/iter_0007", "p1": "hof/iter_0004"},
+  "agents": {
+    "p0": "run3/iter_0007",
+    "p1": "hof/iter_0004",
+    "kind": "league",
+    "opponent_type": "hof"
+  },
   "result": {"winner": 0, "victory_type": "civilian", "scores": [61, 55]},
   "chance_log": [{"kind": "CARD_REVEAL", "outcome": 41}, ...],
   "moves": [
@@ -468,6 +473,9 @@ relabeling, trap harvesting).
 - Seeded/bot games used for buffer seeding use the same schema with
   `sims: 0, visits: {}` and a `"policy_excluded": true` flag after iteration ~10
   (plan §6 seeding rules).
+- New records carry an explicit `agents.opponent_type`: `current_best`, `hof`,
+  `bot`, or `hof_bot`. `kind` remains for legacy readers. HOF assignments
+  shadowed by a bot-controlled seat are marked unused and remain type `bot`.
 
 Gates: replay reproduces every `mask_hash` and the final `setup_fingerprint`-style
 state hash; `chance_log` matches; a record survives JSON round-trip byte-stably.
