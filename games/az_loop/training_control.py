@@ -183,8 +183,14 @@ def _ladder_after(
         return {"gate_rung": max(0, state.gate_rung - 1), "consecutive_probations": 0}
     if decision == REJECT:
         return {"gate_rung": state.gate_rung, "consecutive_probations": 0}
+    if not allow_step_up:
+        # Below the floor the ladder does not count, rather than counting into a
+        # debt that is paid the moment the floor clears.  Otherwise bootstrap
+        # probations still ladder the run up, just later -- which is the thing
+        # the floor exists to prevent.
+        return {"gate_rung": state.gate_rung, "consecutive_probations": 0}
     probations = state.consecutive_probations + 1
-    if allow_step_up and probations >= ladder.step_up_after:
+    if probations >= ladder.step_up_after:
         return {
             "gate_rung": min(ladder.top, state.gate_rung + 1),
             "consecutive_probations": 0,

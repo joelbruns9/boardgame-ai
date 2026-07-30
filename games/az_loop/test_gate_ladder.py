@@ -84,8 +84,13 @@ def test_the_floor_holds_the_bottom_rung_through_bootstrap_probations():
     for _ in range(6):
         state = _step(state, CONTINUE, allow_step_up=False)
     assert state.gate_rung == 0, "bootstrap probation is not evidence of stagnation"
-    # Once the floor is cleared the same evidence ladders normally.
+    assert state.consecutive_probations == 0, (
+        "blocked probations must not accumulate into a debt that steps the "
+        "ladder up the moment the floor clears"
+    )
+    # Clearing the floor starts the count fresh: one probation is not enough.
     state = _step(state, CONTINUE)
+    assert state.gate_rung == 0
     state = _step(state, CONTINUE)
     assert state.gate_rung == 1
 
