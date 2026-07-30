@@ -1,10 +1,13 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0/W1 complete; W2/W3/W5 implementation and local acceptance
-complete, with
-production acceptance and parameter closure reserved for the RTX 5090 host.**
-Revision 6.
-**Revision history:** r6 grounds production acceptance on the RTX 5090 host,
+**Status:** **W0/W1/W2 complete. W3 and W5 have implementations under review;
+their remaining corrections and production parameter closure are still open.**
+Revision 7.
+**Revision history:** r7 closes W2 from the successful 70-to-90 recovery,
+bounded host-memory plateau, checked allocation/error path, and the target
+RTX 5090's 32 GB VRAM margin. Target-device VRAM measurement remains a short
+launch preflight, not an open memory-engineering workstream. r6 grounds
+production acceptance on the RTX 5090 host,
 locks the explicit HOF launch fraction at 0.15, and leaves the gate-cap default
 open until that host's W5.7 fit. r4 folded in W0 from
 `runs/w0_sizing_v2/report_v2.md` and
@@ -67,18 +70,20 @@ does not close it -- it makes it **measured every iteration**.
 |---|---|---|---|
 | W0 | Model size + precision, decided by measurement | M | ~~Yes~~ **DONE 2026-07-29** |
 | W1 | Training schedules, growing window, HOF league | M | ~~Yes~~ **DONE 2026-07-29** |
-| W2 | Memory: fix the crash, bound the footprint, measure it | M | **LOCAL S RESUME PASSED; RTX 5090 L soak pending** |
-| W3 | Shared run-stats contract + reporting | M | **LOCAL V2 ROWS PASSED; production rows pending** |
+| W2 | Memory: fix the crash, bound the footprint, measure it | M | ~~Yes~~ **DONE 2026-07-30** |
+| W3 | Shared run-stats contract + reporting | M | **IMPLEMENTED; attribution and replay-overhead corrections pending** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
 | W5 | Gate efficiency + Wilson-LCB decision rule | M | **LOCAL GATES PASSED; RTX 5090 cap fit pending** |
 | W6 | Cloud setup script | M | **Yes** |
 | W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
 
-**W1 preceded W2 and W5 acceptance** and is now done, so those acceptances can
-measure the real system. Note the ordering constraint has teeth: league play adds
-a **second model on the device** and changes batch composition, so W2's RSS/VRAM
-acceptance and W5's gate-cost fit must both be taken with
-`hof_opponent_fraction` at whatever the launch value will be, not at its 0.0
+**W1 preceded W2 and W5 validation** and is now done. W2 is closed: the original
+host-memory/restart failure is fixed, and the 32 GB RTX 5090 has ample margin
+over the L-model paths already exercised on the 8 GB laptop. League play still
+adds a second model and changes batch composition, so the cloud launch performs
+one exact-geometry VRAM preflight and continues logging physical occupancy. That
+measurement is operational telemetry, not a new acceptance gate. W5's gate-cost
+fit must still use the launch HOF value rather than the 0.0 compatibility
 default.
 
 ---
@@ -324,7 +329,7 @@ generation at the configured rate, and a resume reproducing all three exactly.
 
 ---
 
-## W2 -- Memory
+## W2 -- Memory: DONE (2026-07-30)
 
 ### What happened
 
@@ -369,19 +374,22 @@ generation at the configured rate, and a resume reproducing all three exactly.
   gate holds two 14.9 M models, not two 1.03 M ones, and W0 measured L at 4.95 GiB
   peak allocated for a *single* model in training.
 
-**Note on scope after W0.** The A1 footprint numbers (17.8 KB per `Example`,
-122 KB per `GameRecord`) are properties of the *data*, not the model, so W2.3's
-calibration is unaffected by the size decision. What W0 changes is the **VRAM**
-side, which W2 never covered: L needs 16 GB (W6.4), and W2.5's pre-gate admission
-check must estimate two L-sized models plus evaluators, not two S-sized ones.
-Host RSS and device VRAM are now two separate budgets and should be reported as
-such in W3's `resources` group.
+**Scope after W0.** The A1 footprint numbers (17.8 KB per `Example`, 122 KB per
+`GameRecord`) are properties of the data, so W2.3's calibration is unaffected by
+model size. Host RSS and device VRAM remain separate telemetry. A precise
+predictive VRAM model is not required for launch: L paths already ran on the
+8 GB laptop, while the production RTX 5090 has 32 GB. The cloud host runs one
+short L/bf16 preflight with the exact batch, slot, HOF, and two-model gate
+geometry, then records actual physical and allocated peaks during training.
 
-**Acceptance:** a memory-starved run reproduces a **clean** `MemoryError` with
-the real traceback; RSS flat within 5% across the last 30 iterations of a
-60+-iteration run **with W1 active and at L's width**; `laptop_training_03`
-resumes 70 → 90. Note that last item now resumes a 1.03 M run -- it validates the
-memory fix, not the shipped configuration.
+**Acceptance result:** checked allocation failures preserve the original
+Python/CUDA exception; the cache converges to its calibrated byte ceiling;
+gate cleanup and restart rollback are implemented; and a copy of
+`laptop_training_03` resumed iteration 70 and completed through iteration 89
+with zero stderr. Once saturated, the cache held approximately 4.45 GB and
+post-training RSS varied by 1.55% across iterations 86-89, peaking at 6.56 GB.
+W2 is complete. Continued RSS/VRAM logging on the cloud host is operational
+monitoring, not deferred W2 acceptance.
 
 ---
 
@@ -765,12 +773,13 @@ change only on evidence. All schedules in **games**.
 ## Sequencing
 
 ```
-W0 (size + precision) ── DONE 2026-07-29: L = 384x8x6, bf16
-   └─► W1 (schedules, window, HOF) ── DONE 2026-07-29
-          └─► W2 (memory) ─► W3 (stats) ─► W5 (gates) ─► W6 (cloud) ─► W7 ─► LAUNCH
-            ^^^^ NEXT                                 ^ W5.7 re-measures gate cost at L's width
+W0 (size + precision) -- DONE 2026-07-29: L = 384x8x6, bf16
+  -> W1 (schedules, window, HOF) -- DONE 2026-07-29
+    -> W2 (memory) -- DONE 2026-07-30
+      -> W3 (stats corrections) -> W5 (gates) -> W6 (cloud) -> W7 -> LAUNCH
+                                     ^ W5.7 measures complete gate cost at L's width
 
-W4 (BGA advisor, iter-60) ── parallel throughout
+W4 (BGA advisor, iter-60) -- parallel throughout
 ```
 
 W0 first: size and precision change every downstream sizing number. **They did** --

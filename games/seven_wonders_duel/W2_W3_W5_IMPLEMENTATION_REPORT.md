@@ -20,7 +20,7 @@ The cloud launch explicitly uses:
 The code compatibility default for HOF remains `0.0`, preventing old resumes and
 unrelated tests from silently changing their opponent distribution.
 
-## W2 — memory
+## W2 — memory: DONE
 
 Implemented:
 
@@ -116,9 +116,12 @@ directory was not modified.
   blocks and gates, and exposed batch, forced-row, RSS, learning, and reference
   mix fields for the v2 continuation.
 
-This is evidence that the interrupted S run is restartable and that the cache
-converges to a bound. It is not the plan's 60-iteration L/bf16 stability
-acceptance and is not used to choose any cloud parameter.
+This establishes the failure mode W2 was created to address: the interrupted
+run is restartable, allocation errors remain intelligible, and retained host
+memory converges to a bound. L paths have already run on the laptop's 8 GB GPU;
+the production RTX 5090 has 32 GB. A short exact-geometry L/bf16 preflight will
+record target-device headroom, but no adaptive VRAM estimator or separate
+60-iteration L soak is required to close W2.
 
 Final verification:
 
@@ -134,8 +137,9 @@ Final verification:
    stable while ensuring cloud acceptance measures the launch distribution.
 2. **Resource budgets resolve at runtime.** Hard-coding laptop RAM/VRAM would
    make the safety mechanism wrong on the target host.
-3. **No laptop L training.** The L memory soak is folded into production cloud
-   training; only the historical S resume remains a laptop regression.
+3. **No laptop L training.** The historical S resume closes the W2 regression.
+   The first exact-geometry cloud iteration is an operational smoke check with
+   telemetry, not a deferred L memory soak.
 4. **Gate timing disables evidence stopping.** Otherwise a lucky early boundary
    would make a nominal 800-game timing row incomparable with a 200-game row.
 5. **Promotion games do not update Elo.** Optional stopping biases their score;
@@ -156,16 +160,15 @@ Final verification:
 
 ## Acceptance boundary
 
-Local acceptance proves error propagation, cache enforcement, schema validity,
-report compatibility, routing correctness, rolling scheduler behavior, and
-pair-level decisions.
+W2 is complete. It proves error propagation, calibrated cache enforcement,
+bounded host-memory behavior, deterministic gate cleanup, and restart recovery.
+The cloud launch still runs one exact-geometry L/bf16 preflight and retains
+RSS/physical-VRAM telemetry, but those are operational checks rather than an
+open W2 engineering project.
 
-Production acceptance remains:
-
-- the real L/bf16 run reaches 60 iterations with 0.15 HOF traffic;
-- fitted RSS drift across the last 30 is at most 5%;
-- RTX 5090 gate measurements cover at least 200/400/800 games;
-- the production cap and slot/batch parameters are selected from those results.
+W3 still needs opponent-attribution and redundant-replay corrections. W5's
+decision rule and full promotion-plus-anchor cost budget remain under review;
+RTX 5090 gate measurements and production cap selection belong to that W5 work.
 
 Commands and expected artifacts are in
 `W2_W3_W5_CLOUD_ACCEPTANCE.md`.

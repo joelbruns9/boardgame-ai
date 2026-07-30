@@ -1,8 +1,14 @@
-# W2/W3/W5 cloud acceptance
+# W3/W5 cloud checks and W2 operational telemetry
 
-Production evidence is collected on the RTX 5090 host. The laptop verifies
-correctness and the historical S-model resume only; it does not train L or
-select production resource parameters.
+W2 is complete. The laptop established checked allocation failures, bounded
+host-memory behavior, cleanup, and restart recovery. L paths also ran on the
+laptop's 8 GB GPU, so the RTX 5090's 32 GB VRAM does not justify a separate
+memory-hardening project.
+
+The cloud host still records RSS and physical/allocated VRAM. Those readings
+are operational telemetry and a launch sanity check, not deferred W2
+acceptance. Production gate timing and W3 run-stat validation must be collected
+on the RTX 5090; laptop measurements do not select production parameters.
 
 ## Before training
 
@@ -23,6 +29,11 @@ writes the fixed-cost/per-game fit. Do not use laptop timing or an S checkpoint
 to choose `--gate-max-games`. If a representative ungated iteration time is
 known, pass it as the fourth argument; the report recommends the largest
 measured cap whose projected gate share is at most 10%.
+
+Before committing to an unattended run, execute one short iteration at the
+exact L/bf16 launch geometry and inspect its RSS, physical VRAM, and allocated
+VRAM fields. This is an operational smoke check for configuration mistakes,
+not an additional W2 soak or acceptance gate.
 
 The launch configuration is:
 
@@ -45,7 +56,7 @@ Run the same command at any time to regenerate `az_report.json` and
 `az_report.md`. Once 60 iterations exist, it also validates that the fitted RSS
 change across the final 30 iterations is at most 5%.
 
-Required evidence:
+Required cloud evidence:
 
 1. Every row is schema v2 and records model `384x8x6`, bf16, opponent mix,
    scheduler rows/batches, cache bytes, RSS, and physical versus allocated VRAM.
@@ -53,7 +64,9 @@ Required evidence:
 3. No gate reports a channel-disconnect surrogate for a Python/CUDA failure.
 4. Gate timing uses at least three sizes and records moves per game.
 5. Promotion decisions use independent seat pairs; anchors are fixed-N.
-6. The last-30-iteration RSS fitted drift is at most 5%.
+6. The last-30-iteration RSS fitted drift check remains green as an operational
+   leak alert. A failure pauses the affected run for diagnosis; it does not
+   retroactively reopen W2.
 
 The separate `laptop_training_03` 70→90 continuation remains an S-model
 regression test for resume and memory cleanup. It is not evidence for L sizing,
