@@ -25,6 +25,7 @@ from games.seven_wonders_duel.phase_d import (
     PhaseDLoop,
     WONDER_DRAFT_TIERS,
     _self_play_game,
+    ResolvedSchedules,
     blend_draft_priors,
     curriculum_fraction,
     filter_warm_records_by_staleness,
@@ -336,6 +337,11 @@ def test_final_buffer_export_can_warm_start_and_ages_through_replay_window(
             seed_games=0,
             warm_buffer=str(source),
             save_buffer=str(saved),
+            # Fixed iteration window on purpose: this test pins warm-buffer
+            # aging against an explicit `replay_window`, which is the legacy
+            # basis. The games-basis window is covered in test_games_clock.py
+            # and test_schedules_in_games.py.
+            schedule_basis="iterations",
             replay_window=2,
             d_model=32,
             layers=1,
@@ -370,7 +376,13 @@ def test_playout_cap_randomization_marks_cheap_policy_targets_excluded():
         top_k=2,
         device="cpu",
     )
-    record = _self_play_game(GameJob(0, 222), UniformEvaluator(), config, 0)
+    record = _self_play_game(
+        GameJob(0, 222),
+        UniformEvaluator(),
+        config,
+        0,
+        ResolvedSchedules(curriculum_mix_fraction=0.0, draft_prior=1.0),
+    )
     assert record.moves
     assert all(move.sims == 1 for move in record.moves)
     assert all(move.policy_target is not None for move in record.moves)

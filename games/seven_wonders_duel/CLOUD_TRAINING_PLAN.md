@@ -1,14 +1,24 @@
 # 7WD cloud training: readiness plan
 
-**Status:** proposed, nothing built. Revision 3 -- rewritten against an external
-review (10 findings, 9 confirmed against code, 1 partially accepted).
-**Date:** 2026-07-28.
+**Status:** **W0 and W1 complete; W2 (memory) is the next blocker.** Revision 5.
+**Revision history:** r4 folded in W0 from `runs/w0_sizing_v2/report_v2.md` and
+propagated its cost/sizing consequences into W2, W5 and W6. r3 (2026-07-28)
+rewrote r2 against an external review (10 findings, 9 confirmed against code, 1
+partially accepted).
+**Date:** 2026-07-29.
 **Trigger:** `runs/laptop_training_03` died at iteration 70 of 90 with a host
 `MemoryError` after 11 h. The loop itself is healthy -- 9 promotions in 13 gates
 -- so the blocker is operational, not algorithmic.
 
-Every number here was measured on `runs/laptop_training_03` or on this laptop
-(RTX 3070, 8 GB) during planning; the appendix records how.
+Every number here was measured on `runs/laptop_training_03`, on this laptop
+(RTX 3070, 8 GB), or in `runs/w0_sizing_v2`; the appendix records how.
+
+**The one number that changed everything downstream:** the chosen model is
+**14.9 M parameters, 14.5x the 1.03 M net every cost figure in revisions 1-3 was
+measured against**. Generation costs **1.85x** per game and a training step
+**5.12x**. Estimates that were derived at 128x4 are now flagged as such
+throughout, and W5's gate-budget arithmetic in particular needs re-deriving
+before its cap is set.
 
 **Scoreboard for the cloud run:**
 
@@ -29,12 +39,14 @@ does not close it -- it makes it **measured every iteration**.
 
 | question | decision | implemented by |
 |---|---|---|
-| model size | from the W0 experiment; **5-15M expected**, not 92M. No mid-run growth -- size is **manual** | W0 |
-| precision | **bf16 on every path**, explicit and persisted (see the corrected baseline in W0.3) | W0 |
-| replay window | **growing window**, sublinear power law in *total games* | W1 |
-| curriculum bots | early accelerant only, annealed **in games** (~10k) | W1 |
-| opponent diversity | **HOF league sampling** during generation | W1 |
-| schedules | every schedule expressed in **games, not iterations** | W1 |
+| model size | **`d_model=384`, `layers=8`, `heads=6`, 14.9 M params** -- measured, W0 accepted. No mid-run growth -- size is **manual** | W0 **done** |
+| precision | **bf16 on every path**, explicit and persisted -- but note the benefit is **width-dependent**, not universal (0.97x on 128x4, 1.69x on 384x8) | W0 **done** |
+| LR | **starting point 5e-5**, from W0's replicated fits -- and it sits on the **edge of the searched grid**, so treat it as provisional | W1 **done** (logged per iteration) |
+| fallback | **S = 128x4x4 heads / fp32** if cost becomes the primary objective, or if the run underperforms | W7a triggers |
+| replay window | **growing window**, `16 * games**0.6`, cap 20k games | W1 **done** |
+| curriculum bots | early accelerant only, annealed **in games** (10k) | W1 **done** |
+| opponent diversity | **HOF league sampling**, searcher-routed, learner-only labels; **default off** | W1 **done** |
+| schedules | every schedule in **games**; `schedule_basis` pinned per run | W1 **done** |
 | gate statistic | **port Kingdomino's Wilson-LCB three-way rule** (promote / probation / revert) | W5 |
 | gate budget | cap **800**, pair-level observations, futility via Wilson UCB | W5 |
 | gate cost | fix throughput **before** raising the cap | W5 |
@@ -47,8 +59,8 @@ does not close it -- it makes it **measured every iteration**.
 
 | # | Workstream | Size | Blocks launch? |
 |---|---|---|---|
-| W0 | Model size + precision, decided by measurement | M | **Yes** |
-| W1 | Training schedules, growing window, HOF league | M | **Yes** |
+| W0 | Model size + precision, decided by measurement | M | ~~Yes~~ **DONE 2026-07-29** |
+| W1 | Training schedules, growing window, HOF league | M | ~~Yes~~ **DONE 2026-07-29** |
 | W2 | Memory: fix the crash, bound the footprint, measure it | M | **Yes** |
 | W3 | Shared run-stats contract + reporting | M | **Yes** |
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
@@ -56,98 +68,197 @@ does not close it -- it makes it **measured every iteration**.
 | W6 | Cloud setup script | M | **Yes** |
 | W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
 
-**W1 precedes W2 and W5 acceptance**: HOF league sampling changes both the
-memory profile and batch composition those acceptances measure, so measuring
-them first measures the wrong system.
+**W1 preceded W2 and W5 acceptance** and is now done, so those acceptances can
+measure the real system. Note the ordering constraint has teeth: league play adds
+a **second model on the device** and changes batch composition, so W2's RSS/VRAM
+acceptance and W5's gate-cost fit must both be taken with
+`hof_opponent_fraction` at whatever the launch value will be, not at its 0.0
+default.
 
 ---
 
-## W0 -- Size and precision, decided by measurement
+## W0 -- Size and precision: DONE (2026-07-29)
 
-**W0.1 -- Size, on the banked buffer.** *(M)*
-`runs/laptop_training_03/buffers/` holds 28,000 games. Compare 128x4 (baseline),
-256x6, and 384x8.
+Full record: **`runs/w0_sizing_v2/report_v2.md`**. Commits `6384f0e` (W0.2),
+`8fde971` (W0.3), `774a82b` (W0.1), `d279308`..`d669588` (W0 V2 repairs).
+Verification: 573 tests pass in `games/seven_wonders_duel/`.
 
-Design, strengthened after review -- a single supervised run would measure
-imitation fit, not capacity or strength:
+**Outcome:** ship **L = `d_model=384`, `layers=8`, `heads=6`, bf16**.
 
-- **equal data and equal optimizer steps** per arm, identical splits;
-- **at least 3 seeds per arm**, reporting spread, not a single number;
-- a **per-width LR/warmup schedule** (a fixed 2e-4 favours the narrow arm);
-- a **paired arena** between the trained arms at fixed sims and paired seeds,
-  scored with the same Wilson bound as W5 -- validation loss alone cannot rank
-  playing strength;
-- a **search-improvement check**: does the wider net's policy still gain from
-  search at the production sims budget, or has it absorbed the gap?
-- report as a **validation / strength / throughput Pareto**, not a winner.
+| arm | params | val total | policy top-1 | vs S in arena | train ms/step | production cost/game |
+|---|---:|---:|---:|---:|---:|---:|
+| S = 128x4x4 | 1.03 M | **1.9311** | **0.6235** | -- | 67.0 | 1.00x (fp32) |
+| M = 256x6x4 | 5.21 M | 1.9443 | 0.6166 | 0.506 | 149.8 | 1.19x (bf16) |
+| **L = 384x8x6** | **14.90 M** | 1.9455 | 0.6145 | **0.558** | 343.0 | **1.85x (bf16)** |
 
-Primary value is a cheap **negative gate**: if a wider net cannot fit data you
-already own, do not scale. The arena carries any positive decision.
+Three sub-results matter downstream more than the size choice itself:
 
-Sizing context (measured):
+1. **Precision benefit is width-dependent.** bf16 is **0.97x** (a slowdown) on
+   S's production path, **1.26x** on M, **1.69x** on L. Revisions 1-3 locked
+   "bf16 everywhere" on a measurement taken at one width; that generalisation was
+   wrong, and it happens to be right for the arm we ship. If the fallback to S is
+   ever taken, **fp32 goes with it**.
+2. **Search still pays at every width.** L's search-vs-raw score is 0.875 with
+   39.2% action disagreement -- the wide policy has *not* absorbed the
+   64-simulation improvement gap. **Do not cut the cloud search budget.**
+3. **L does not fit an 8 GB GPU comfortably.** Peak allocated 4.95 GiB; the
+   physical sampler hit **7,978 of 8,192 MiB** during L training. **16 GB is the
+   cloud floor** (W6.4).
+
+**What W0 did not establish, carried forward as accepted risk.** The report's
+"Statistical scope" section is the authority; in brief:
+
+- **The width claim is not established at the level of training seeds.** L's
+  0.558 clears 0.5 on a game-level Wilson interval ([0.509, 0.606], 792 games)
+  but not on a seed-level interval ([0.482, 0.634]) -- checkpoint-seed variance
+  exceeded game-level noise, and per-seed scores were 0.549 / 0.502 / 0.623, so
+  the headline is concentrated in one of three L checkpoints. Settling it would
+  need 6-8 seeds per arm; that work is closed, not pending.
+- **The evidence that would have argued for S is confounded.** S is exactly the
+  architecture of the corpus generator (`laptop_training_03` iter 60, 128x4),
+  whose own val `policy_top1` was 0.6255 against S's 0.6235 -- so the supervised
+  metrics measure imitation fidelity, not strength, and cannot rank the arms.
+  Removing them as evidence *against* L is what carries the decision, together
+  with the expectation that 14.9 M parameters have more headroom under continued
+  self-play than 1.03 M. **That expectation is the bet this plan is making**, and
+  W7a's anchor is what will falsify it.
+- **The shipped configuration has never played a scored game.** All arenas ran
+  fp32; bf16 changed 43 of 64 L trajectories in the A/B. Closed by the pre-launch
+  check added to W6.2.
+- **L's LR of 5e-5 is the bottom edge of the searched grid.** Nothing lower was
+  tried, and all three L arena checkpoints inherit it. See W1.5.
+
+**Scope note, so the W0 statistical lesson is not over-applied.** "Fixed-N games
+cannot overcome checkpoint-seed variance" applies to claims that *generalise over
+training seeds* -- W0's width question. It does **not** weaken W5's gates or
+W7a's anchor: those compare two specific named checkpoints, which is exactly the
+estimand a game-level Wilson interval addresses. W5.5's pair-level Wilson rule
+stands unchanged.
+
+### Superseded reference data
+
+The sizing table below was measured pre-decision, in isolation, and is kept only
+because W6.3's sweep and W2's preflight cite it. **Production A/B figures
+supersede it for any cost decision** -- the isolated-forward numbers overstate
+bf16's benefit (2.41x isolated vs 1.69x in production for L) because they exclude
+encoding, transfer, search and scheduling.
 
 | config | params | fp32 rows/s @b256 | bf16 rows/s | advisor 800-sim move |
 |---|---|---|---|---|
-| **128x4 (current)** | 1.03 M | 14,118 | 32,182 | 0.3 s |
+| 128x4 (was current) | 1.03 M | 14,118 | 32,182 | 0.3 s |
 | 256x6 | 5.2 M | 3,645 | 9,835 | 0.3 s |
-| 384x8 | 14.9 M | 1,430 | 4,356 | 0.55 s |
+| **384x8 (chosen)** | 14.9 M | 1,430 | 4,356 | 0.55 s |
 | 512x8 | 26.2 M | 824 | 2,781 | 0.93 s |
 | 768x12 (ZeusAI) | 86.5 M | 239 | -- | 3.1 s |
 
-Generation demands **~4,960 NN rows/s** (A3), so the 1M net runs at ~35% NN
-utilisation. **Laptop advisor latency is not the binding constraint at any size
-in this table**; training throughput is.
-
-**W0.2 -- Expose and scale attention heads.** *(S)*
-`SWDNet.__init__` hard-codes `heads=4` and `build_model` does not expose it
-(`net.py:300`, `train.py:313`). At d_model 384/512 that is 96/128-dim heads
-against ZeusAI's 64-dim. Land `heads = d_model // 64` **before** W0.1 measures
-anything, or the wide arms are handicapped by construction.
-
-**W0.3 -- Precision as an explicit, persisted, per-path config.** *(M)*
-
-The starting point is not what revision 2 assumed. Audited:
-
-| path | share of run-03 wall clock | precision today |
-|---|---|---|
-| self-play generation | 77% | **fp32** (`rust_bridge.py:368` has no autocast; line 318 casts features float16 → **float32**) |
-| gates | 10% | **fp32**, same adapter |
-| validation | small | **fp32**, outside autocast (`train.py:96`) |
-| advisor / `Evaluator` | n/a | **fp32** (`inference.py:73`) |
-| training | ~2% | **already AMP fp16** with a `GradScaler` (`train.py:488`, no dtype argument → fp16 on CUDA) |
-
-So the work is: **add bf16 autocast to the four inference paths** (where 87% of
-the wall clock and all of the measured 2.3-3.0x live), and **change training's
-implicit fp16 to explicit bf16** (no meaningful speed change; drops the
-GradScaler and the overflow risk as the model widens).
-
-Requirements:
-- a single `--precision {fp32,bf16}` config value, **persisted in the manifest**
-  and validated on resume alongside `lifecycle_config`;
-- propagated to training, validation, self-play, gates, and the advisor;
-- a test per path asserting the dtype actually in effect -- an autocast context
-  that silently does nothing is the failure mode here;
-- A/B on `_generate_iteration_rust` via `f4_phase_d_ab.py`, **not** the
-  microbenchmark (history: 1.99x → 1.89x, +48% → +21%).
-
-Fidelity is already measured (A4): bf16 changes the argmax on 2 of 512 real
-positions, both where the net's own top-1/top-2 priors differ by 0.0016, worst
-value delta 5.3e-3 against a 39-sim noise floor of ~0.16. Context worth
-recording: **run 03 was already trained under fp16 AMP** -- reduced precision in
-training is the status quo that produced value_acc 0.732, not a new risk.
-
-**W0.4 -- Re-baseline the determinism gates.** *(S)*
-Bit-exact record comparison stops being the right assertion. Use the established
-shape: mock evaluator → byte-identical; real net → batch-invariance first, then
-*measured* divergence on the discrete trajectory (actions, digests, sims).
-
-**Acceptance:** a chosen `d_model`/`layers`/`heads` with a Pareto justification
-including arena results; `--precision` persisted, propagated, and per-path
-tested; generation A/B measured; determinism gates re-baselined.
+**The NN utilisation picture inverted.** Generation demands ~4,960 rows/s (A3).
+The 1.03 M net supplied 14,118 fp32 -- ~35% utilisation, GPU to spare. L supplies
+**5,873 bf16** rows/s on the isolated b256 bench, i.e. generation now runs at
+roughly **85% of NN capacity**. 7WD self-play has moved from CPU/scheduler-bound
+to **NN-bound**. Consequences: W5's fixed-overhead fixes still pay in full, but
+its *marginal* per-game cost will not shrink; and advisor latency (0.55 s at 800
+sims) remains comfortable.
 
 ---
 
-## W1 -- Training schedules, growing window, HOF league
+## W1 -- Training schedules, growing window, HOF league: DONE (2026-07-29)
+
+**Acceptance met on a real 6-iteration Rust generation run**, not mocks:
+curriculum mix annealed 0.150 -> 0.000 exactly at the configured game count;
+draft prior 1.000 -> 0.000 alongside it; window targets grew 26 -> 78 sublinearly
+with realised windows trailing by whole iterations; league play began exactly at
+the `hof_start_games` threshold and took 6 of 24 games (the configured 25%); the
+archive played 12 games on each seat; **0 of 839 archive moves kept a policy
+target while 463 learner moves did**; and a resume with the ledger deleted
+reproduced every schedule value, including with `games_per_iteration` doubled.
+707 tests pass.
+
+What shipped, and the three things worth knowing:
+
+1. **The clock is derived, never stored** (`games/az_loop/games_ledger.py`).
+   Cumulative games come from counting lines in the per-iteration buffer files,
+   which are immutable once written; a cache keyed on file size makes that cheap
+   and self-invalidating. There is deliberately no stored schedule position,
+   because a stored one drifts the moment `games_per_iteration` changes -- which
+   is the exact failure this workstream exists to prevent. Deleting the cache
+   changes no number.
+2. **`schedule_basis` is part of a run's identity.** `games` is the default;
+   `iterations` reproduces pre-2026-07-29 behaviour exactly. Changing the basis,
+   or any schedule constant, is refused on resume by the same mechanism as
+   `precision`. A manifest with no recorded basis defaults to `iterations`,
+   because a run written before the clock existed really did anneal on iteration
+   counts -- defaulting it to `games` would have silently rescaled every schedule
+   on the first resume after this shipped. `games_per_iteration` is deliberately
+   *absent* from the identity: making it free to change is the point.
+3. **League play required a Rust change, and the reason matters.** See below.
+
+### W1.3's correction: the searcher owns the network
+
+The first design for league play was Python-only, reusing
+`rust_seat_routed_flat_batch_adapter`. That was wrong twice over, and both errors
+are worth recording because they are easy to repeat.
+
+- **The routing key was wrong.** That adapter dispatches on the packed `actors`
+  byte, which is the **leaf** actor -- the player to move at the evaluated
+  position, which alternates with tree depth. Two-network play must dispatch on
+  the **searcher**: when it is seat 0's turn, seat 0's network drives the entire
+  search and evaluates *every* leaf, including the seat-1 nodes. Routing on the
+  leaf actor instead produces a player that is neither checkpoint, and nothing in
+  a run would report it -- the games complete, the records validate, and the
+  strength numbers quietly describe a chimera. Kingdomino documents exactly this
+  distinction on `row_search_actors` (`kingdomino_rust/src/lib.rs:9135`); 7WD had
+  the wrong-shaped primitive and no comment saying so. That adapter is now marked
+  as diagnostics-only.
+- **Splitting the games would not have helped.** `run_many` packs eval groups
+  "in job-index order up to `global_batch_cap`" across *all* active slots, so one
+  batch mixes games sitting at different plies with different searchers.
+  Partitioning games by opponent does not make a single adapter sufficient.
+
+So the packed payload now carries a per-row `net_ids`, resolved in Rust from the
+slot's real-state actor, and `self_play_many_flat_net` takes per-game
+`nets_p0`/`nets_p1` exactly as it already took `bots_p0`/`bots_p1`. One scheduler
+call still covers the whole iteration -- no split slot pool, no drain-tail cost.
+
+Two implementation traps found by the gates rather than by reasoning:
+
+- The trait's default `evaluate_batch_prepared_routed` initially rejected the
+  empty `net_ids` that ordinary self-play sends, which the F4 boundary tests
+  caught immediately.
+- Routing worked in `run_many` but silently did nothing in
+  `run_many_pipelined` -- the path production uses whenever
+  `max_inflight_batches > 1` -- because `WorkerRequest` dropped the field at the
+  worker boundary. **A league test that only exercised the direct scheduler would
+  have passed while production ran unrouted.**
+
+**Checkpoints are unaffected.** `ENCODER_SIGNATURE` is a hash of the feature
+schema, and a routing array is neither a token nor a feature, so it does not
+move; the F4 checkpoint boundary still accepts every existing net. The model
+reads its batch by key (`net.py:262`, `:236`), so an added key is ignored by
+construction. W0's L checkpoints remain valid.
+
+### Learner-only policy targets
+
+Following Kingdomino's `play_current_vs_hof_game` ("keep only current-owned
+labels"), the archive's moves are excluded from the policy loss -- enforced in
+Rust at the record site, where curriculum-bot moves are already excluded the same
+way. Network 0 is by definition the learner. The moves still exist and the game
+still supplies a value target for both seats; only the policy label is withheld,
+because a target produced by an older net trains the learner to imitate it.
+
+### Defaults, and what is still off
+
+`hof_opponent_fraction` defaults to **0.0**, so league play is inert until chosen
+-- it changes both the memory profile and the batch composition that W2's and
+W5's acceptances measure, so enabling it is a deliberate, recorded decision.
+`hof_start_games` defaults to 10,000, matching the curriculum's duration: the
+archive starts supplying opponents exactly as the bots stop.
+
+**Unmeasured:** the throughput cost of league play at production width. The
+one-call design should avoid the drain-tail penalty entirely, but the second
+model adds device memory and its own forward passes, and that has not been
+benchmarked. Worth folding into W5.7's measurement rather than asserting now.
+
+## W1 -- original specification (retained for the reasoning)
 
 Revision 2 declared these mandatory and gave them no implementing task; W3 only
 *recorded* their values. Current code contradicts all three: `replay_window:
@@ -187,6 +298,19 @@ resume-stable sampler keyed on the run seed.
 Schedule functions unit-tested at boundaries; a resume mid-schedule
 reproduces identical values; changing a schedule across resume is refused by
 the same mechanism as `lifecycle_config`.
+
+**W1.5 -- Decide the cloud LR schedule at L's width.** *(S, new in r4)*
+W0 selected **5e-5** for L, but it did so on a *fixed corpus with 4,000 steps*,
+and it is the **lowest LR W0 ever ran for L** -- the tie-band rule walked the
+selection to the grid edge and nothing below was tested. The cloud loop is a
+different regime: incremental fits per iteration, a growing window, and warm
+starts from `current_best`. So 5e-5 is a starting point, not a measured optimum.
+
+Requirements: the LR (and warmup) recorded per iteration in the W3 stats block
+alongside grad norm, so a too-high or too-low setting is *visible from the log*
+rather than inferred from a stalled gate ladder; the value pinned in the manifest
+and refused on resume (W6.5). No new sweep -- W0 is closed. This is a
+"make it observable and reversible" task, not a tuning task.
 
 **Acceptance:** a short run shows window growth tracking the formula, bot mix
 reaching zero at the configured game count, HOF opponents appearing in
@@ -235,11 +359,23 @@ generation at the configured rate, and a resume reproducing all three exactly.
 - **W2.6** *(S)* `--memory-budget-gb`; on breach evict to a floor and log a
   `memory_pressure` event. Slower re-replay beats losing a run.
 - **W2.7** *(S)* Free the gate's models explicitly at gate exit -- `del` +
-  `gc.collect()` + `torch.cuda.empty_cache()`.
+  `gc.collect()` + `torch.cuda.empty_cache()`. **W0 raises the stakes here**: a
+  gate holds two 14.9 M models, not two 1.03 M ones, and W0 measured L at 4.95 GiB
+  peak allocated for a *single* model in training.
+
+**Note on scope after W0.** The A1 footprint numbers (17.8 KB per `Example`,
+122 KB per `GameRecord`) are properties of the *data*, not the model, so W2.3's
+calibration is unaffected by the size decision. What W0 changes is the **VRAM**
+side, which W2 never covered: L needs 16 GB (W6.4), and W2.5's pre-gate admission
+check must estimate two L-sized models plus evaluators, not two S-sized ones.
+Host RSS and device VRAM are now two separate budgets and should be reported as
+such in W3's `resources` group.
 
 **Acceptance:** a memory-starved run reproduces a **clean** `MemoryError` with
 the real traceback; RSS flat within 5% across the last 30 iterations of a
-60+-iteration run **with W1 active**; `laptop_training_03` resumes 70 → 90.
+60+-iteration run **with W1 active and at L's width**; `laptop_training_03`
+resumes 70 → 90. Note that last item now resumes a 1.03 M run -- it validates the
+memory fix, not the shipped configuration.
 
 ---
 
@@ -269,7 +405,16 @@ tolerant of v1 so run 03 stays analyzable.
 | `replay` | window games, examples, new examples, reuse factor, staleness (max, mean, p90), **schedule value and realised window** |
 | `training` | per-head train/val losses, accuracies, lr, grad norm, steps, seconds, **replay-derivation seconds**, **precision in effect** |
 | `gates` | opponent, **win rate, Wilson LCB/UCB, games**, decision, stop reason |
-| `resources` | RSS post-gen/post-train/post-gate, peak RSS, cache bytes, GPU util, VRAM peak, seconds per phase |
+| `resources` | RSS post-gen/post-train/post-gate, peak RSS, cache bytes, GPU util, **VRAM peak allocated and peak physical, reported separately**, seconds per phase |
+| `model` | **`d_model`, `layers`, `heads`, parameter count** -- one row-level record of the configuration every other number in the row was produced by (new in r4) |
+
+The `model` group exists because of a W0 lesson: three of that study's harness
+failures came from a checkpoint's width being assumed rather than read, and its
+one wasted run rebuilt a 256-wide checkpoint as a 128-wide model. Any row whose
+numbers cannot be attributed to a width is a row that cannot be compared. Note
+also that PyTorch's allocator-**reserved** counter exceeded physical VRAM under
+Windows/WDDM in W0 and is not a capacity number -- log physical occupancy
+alongside it, or the field is actively misleading.
 
 `terminal_reason` is the game-agnostic form of victory type: Kingdomino emits
 `{"score": n}`, 7WD the civilian/military/scientific histogram.
@@ -375,9 +520,47 @@ Replaying run 03 under this rule agrees on **9 of 13** gates (A7). The three
 promote → probation flips (gates 15, 20, 60) are gates SPRT truncated at 74-154
 games, where the interval is simply too wide to clear 0.50.
 
-**This settles the cap.** Win rate required for LCB > 0.50: **0.598** at 100
-games, **0.569** at 200, 0.549 at 400, **0.535** at 800. At today's 200-game cap
-a candidate needs a **+7%** edge to promote; at 800 it needs **+3.5%**.
+**This settles the statistics of the cap.** Win rate required for LCB > 0.50:
+**0.598** at 100 games, **0.569** at 200, 0.549 at 400, **0.535** at 800. At
+today's 200-game cap a candidate needs a **+7%** edge to promote; at 800 it needs
+**+3.5%**. **It does not settle the cost of the cap -- see below.**
+
+### The cap's cost must be re-derived at L's width (new in r4)
+
+A5's decomposition -- **193 s fixed + 1.74 s per game** -- was measured with the
+**1.03 M** net. The shipped net is **14.9 M**, and W0 measured production
+generation at **1.85x** per game. The fixed 193 s is scheduler and
+worker-lifecycle overhead and should be roughly width-independent; the marginal
+1.74 s is search, which is now NN-bound.
+
+**Extrapolated, not measured** -- flagged deliberately, because scaling a
+two-point fit by a ratio measured on a different code path is exactly the kind of
+reasoning that has failed review here before:
+
+| gate size | at 128x4 (measured) | at 384x8, W5.1-5.4 landed (**estimate**) |
+|---|---:|---:|
+| 200 games | 541 s | ~690 s |
+| 800 games | 1,585 s | ~2,610 s (~44 min) |
+
+If that estimate holds, an 800-game gate every fifth iteration is a materially
+larger share of the run than the 9.8% A5 measured, and the trade against the
+statistical benefit (+7% edge needed → +3.5%) becomes a real decision rather than
+an obvious one.
+
+**W5.7** *(S, new in r4)* **Re-measure the gate cost decomposition at L's width
+before setting the cap.** Same method as A5, three or more gate sizes rather than
+two so the fit is not a two-point extrapolation. This is the last input to the
+cap; do not hard-code 800 until it lands. The cap is a config value regardless, so
+this task gates the *default*, not the launch.
+
+**Decided 2026-07-29:** W5.7 runs against **W0's `sweep_L_lr5e-05_seed*.pt`
+checkpoints**, not a future cloud checkpoint. Gate cost is driven by tensor shapes
+and the sims budget, not by checkpoint quality, so a 4,000-step fixed-corpus fit
+is an adequate timing proxy -- and it means W5.7 is unblocked today rather than
+waiting on the run it is supposed to configure. The one thing checkpoint quality
+does affect is **game length** (W0 measured 68-70 moves/game across all three
+arms, so the effect is small); record moves/game with the fit so the assumption is
+checkable rather than assumed.
 
 Negative result worth recording: a statistically valid futility stop **never
 fires at n <= 200** -- even a 0.422 win rate at 96 games still has UCB ~0.52. It
@@ -448,6 +631,15 @@ missing stages.
   fixed corpus** (~50 games) outside `runs/`; run the equivalence suite with
   `-p no:randomly -W error` and **fail on any unexpected skip** (assert the
   collected/skipped counts against an expected manifest).
+- **W6.2b** *(S, new in r4)* **Play the shipped configuration before trusting it.**
+  W0's arenas all ran fp32, and bf16 changed 43 of 64 L trajectories, so
+  **L/bf16 has never played a scored game**. Add a fixed-N **L/bf16 vs L/fp32**
+  arena to the cloud smoke -- same checkpoint on both sides, so this is a pure
+  precision-fidelity check with a known null (0.500) and no seed-variance problem
+  of the kind that limited W0's width claim. A few hundred games on the rented GPU
+  costs minutes and converts the largest residual W0 caveat into a measurement.
+  If it comes back off 0.500 by more than its interval, ship L/fp32 and accept the
+  1.69x cost.
 - **W6.3** *(M)* Sweep → launch-flag pipeline (`run_f4_cloud_sweep.sh` →
   `f4_cloud_select.py` → `f4_cloud_finalize.py`) with an **explicit flag
   translation layer**: the bench takes `--slots`, `--global-batch-cap`,
@@ -457,7 +649,10 @@ missing stages.
   (argparse rejects unknown flags) but silently produces a hand-copy step.
 - **W6.4** *(S)* Preflight memory sizing against the **maximum scheduled
   window** from W1.1, not the nominal current one, using W2.3's calibrated
-  factor plus headroom. Fail at setup, not at 3 a.m.
+  factor plus headroom. Fail at setup, not at 3 a.m. **Now also a VRAM gate:**
+  W0 measured L at 7,978 of 8,192 MiB physical on this laptop, so **refuse to
+  launch L on less than 16 GB** and check it in the same preflight. The
+  instance-selection consequence for vast.ai is a hard filter, not a preference.
 - **W6.5** *(S)* **Pin the commit and refuse incompatible resume.** The manifest
   records `git.commit` (`manifest.py:73`) and resume never compares it;
   `_validate_lifecycle_config` (`run_controller.py:238`) checks only lifecycle
@@ -475,8 +670,9 @@ missing stages.
 
 **Acceptance:** fresh box → training launched unattended in one command; the
 equivalence suite **runs** (zero unexpected skips) on the rented GPU before
-training starts; launch flags come from that box's measured sweep; re-running
-resumes; a resume on a different commit is refused.
+training starts; the L/bf16-vs-L/fp32 arena lands within its interval of 0.500;
+the VRAM preflight refuses a sub-16 GB box; launch flags come from that box's
+measured sweep; re-running resumes; a resume on a different commit is refused.
 
 ---
 
@@ -516,6 +712,18 @@ Also in the heartbeat: promotions in the last M games; val `value_acc` trend
 mix drift against the ZeusAI/BGA reference. The one automatic stop stays
 `--revert-reset-after`.
 
+**The anchor is also W0's falsifier (new in r4).** W0 could not establish that
+384x8 beats 128x4 at the level of training seeds; the decision rests on the
+expectation that 14.9 M parameters have more headroom *under continued self-play*
+than 1.03 M -- a claim no fixed-corpus study can test. The games-indexed anchor is
+the first instrument in this plan that can. Concretely: run 03 reached 70.9/13.0/
+16.1 civilian/scientific/military and 9 promotions in 13 gates at 1.03 M. If the
+L run's anchor slope is flat while its cost is 1.85x generation and 5.12x
+training-step, **the width bet has failed and S/fp32 is the documented fallback**
+(decisions table). Record the comparison explicitly in the heartbeat rather than
+leaving it to be reconstructed later -- that reconstruction is what cost four
+throwaway scripts in W3's motivating case.
+
 ### W7b -- Intervention ladder (present, disabled by default)
 
 States NORMAL → STAGNANT → INTERVENTION(k) → RE-MEASURE, escalating one rung at
@@ -551,13 +759,17 @@ change only on evidence. All schedules in **games**.
 ## Sequencing
 
 ```
-W0 (size + precision)
-   └─► W1 (schedules, window, HOF) ─► W2 (memory) ─► W3 (stats) ─► W5 (gates) ─► W6 (cloud) ─► W7 ─► LAUNCH
+W0 (size + precision) ── DONE 2026-07-29: L = 384x8x6, bf16
+   └─► W1 (schedules, window, HOF) ── DONE 2026-07-29
+          └─► W2 (memory) ─► W3 (stats) ─► W5 (gates) ─► W6 (cloud) ─► W7 ─► LAUNCH
+            ^^^^ NEXT                                 ^ W5.7 re-measures gate cost at L's width
 
 W4 (BGA advisor, iter-60) ── parallel throughout
 ```
 
-W0 first: size and precision change every downstream sizing number.
+W0 first: size and precision change every downstream sizing number. **They did** --
+see the flagged extrapolations in W2, W5 and W6. Any figure in this plan measured
+before 2026-07-29 was measured at 1.03 M parameters.
 W1 before W2/W5: HOF league sampling changes the memory profile and batch
 composition their acceptances measure.
 W2 before W3: memory telemetry is a stats-schema field.
@@ -575,6 +787,12 @@ W7 in full before launch: W6.5 will refuse a mid-run pull.
 - **Model growth mid-run.** Manual.
 - **Promotion rollback / HOF revalidation.** Deferred, recorded as a known
   residual risk in W5.
+- **Re-opening the width question.** W0 is closed. Establishing 384x8 > 128x4 at
+  seed level would take 6-8 training seeds per arm; the decision instead rests on
+  headroom under self-play, which W7a's anchor measures for free during the run
+  itself. Recorded in W0 as accepted risk, not as pending work.
+- **Tuning L's LR below 5e-5.** No new sweep. W1.5 makes the setting observable
+  and reversible instead.
 - **Multi-box sharded generation.** `phase_e/launch_shards.sh` is the precedent
   if throughput becomes the limit.
 - **Kingdomino migration onto the lifecycle controller.** W3 makes it possible
@@ -584,7 +802,14 @@ W7 in full before launch: W6.5 will refuse a mid-run pull.
 
 ---
 
-## Appendix -- measurements (2026-07-28)
+## Appendix -- measurements (2026-07-28 unless noted)
+
+**Read A3, A4 and A5 with the W0 result in hand.** All three were measured with
+the **1.03 M** net, which is no longer the shipped configuration. A3's utilisation
+conclusion inverts at L's width (~85%, not ~35%); A4's speedup range overstates
+what production delivers (1.69x, not 2.3-3.0x); A5's cost fit is the input W5.7
+re-measures. A1, A2, A6 and A7 are unaffected -- they concern data footprint, a
+crash chain, game outcomes and gate statistics, none of which depend on width.
 
 **A1. Memory footprint.** 100 games from `buffer_final.jsonl` through the real
 derivation path, RSS-delta: **17.8 KB per `Example`**, **122 KB per
@@ -661,3 +886,28 @@ games as independent. W5.5 makes the *pair* the observation unit, which is
 exact; the absolute bounds above are therefore mildly anti-conservative and
 should be recomputed at implementation. Relative comparisons between rules are
 unaffected, since the same approximation applies on both sides.
+
+**A8. W0 size and precision (2026-07-29).** Full record in
+`runs/w0_sizing_v2/report_v2.md`; that document is the authority and this is a
+pointer. Corpus: 12,000 games from `iter_0041`-`iter_0070`, 210,779 examples,
+game-honest split, cache SHA `149dd2ec…`, pipeline audited on 4,096 real rows.
+Three arms x three seeds; LR chosen by a bracketed sweep then replicated;
+792-game fixed-N arenas over all 3x3 checkpoint-seed cells; an untouched
+2,000-game holdout from iterations 36-40 consulted only after LR selection;
+573 tests green.
+
+Headline figures are in the W0 section above. The two results most likely to be
+misread if taken second-hand:
+
+- **The arena's 0.558 for L vs S is a game-level result, not a width result.**
+  Game-level Wilson [0.509, 0.606]; seed-level [0.482, 0.634]. Checkpoint-pair
+  variance (0.00378) exceeded within-cell game noise (0.00244), and per-L-seed
+  scores were 0.549 / 0.502 / 0.623. The design spent 792 games on the smallest of
+  three variance components. **The generalisable lesson for this repo: when the
+  claim is about a design choice rather than about two named checkpoints, seeds buy
+  power and games do not.**
+- **Supervised loss could not arbitrate.** S shares the corpus generator's exact
+  architecture (128x4) and converges on the teacher's own `policy_top1` (0.6235 vs
+  0.6255), so the metric measured imitation fidelity. Any future fixed-corpus
+  sizing study on self-play data has this confound built in and needs a design
+  that does not rank arms by fit to a teacher of one arm's shape.

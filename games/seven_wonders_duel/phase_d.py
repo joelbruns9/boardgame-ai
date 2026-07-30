@@ -29,7 +29,10 @@ from games.az_loop import (
     ControllerConfig,
     EloLedger,
     GameJob,
+    GameSchedule,
+    GamesLedger,
     GeneratorMode,
+    GrowingReplayWindow,
     HallOfFame,
     LinearSchedule,
     MatchOutcome,
@@ -38,6 +41,7 @@ from games.az_loop import (
     RunLog,
     RunManifest,
     SPRT,
+    WindowSelection,
     expected_games_to_decide,
     play_match,
     run_jobs,
@@ -73,6 +77,7 @@ from .rust_bridge import (
     phase_d_records_from_rust,
     rust_flat_batch_adapter,
     rust_games_for_self_play,
+    rust_searcher_routed_flat_batch_adapter,
     rust_seat_routed_flat_batch_adapter,
 )
 from .search import GumbelMCTS, SearchConfig, SearchResult, state_actor
@@ -141,6 +146,97 @@ class PhaseDConfig:
     bot_policy_iterations: int = 10
     bot_exploration: float = 0.05
     draft_prior_iterations: int = 20
+
+    schedule_basis: str = "games"
+    """Clock every training schedule reads: ``games`` or ``iterations``.
+
+    ``games`` is the default and the one the cloud plan locks (W1.2).  An
+    iteration is not a unit of anything: run 03 used 400 games/iteration, and a
+    cloud run at 500-800 would silently rescale every iteration-keyed schedule --
+    the curriculum would anneal out in half the games, the draft prior likewise.
+    Keying on cumulative games makes a configuration mean the same thing at any
+    ``games_per_iteration``.
+
+    ``iterations`` preserves the pre-2026-07-29 behaviour exactly, for resuming
+    runs whose manifests are expressed in it.  Which basis a run uses is part of
+    its identity: changing it across a resume is refused, because it silently
+    moves every schedule position.
+    """
+
+    curriculum_anneal_games: int = 10_000
+    """Games over which the curriculum-bot mix anneals to zero (``games`` basis).
+
+    10,000 is measured, not chosen: the net's win rate against the curriculum
+    bots passed ~95% by iteration 20 of run 03 at 400 games/iteration (A6), so
+    beyond that point the bots are supplying decided games rather than
+    instruction.  Counted in loop-generated games, excluding the seed corpus --
+    see ``GamesLedger``.
+    """
+
+    draft_prior_games: int = 10_000
+    """Games over which the wonder-draft tier prior anneals out (``games`` basis).
+
+    Held at the curriculum's duration deliberately: the prior exists to supply
+    broad draft competence while the bots are still teaching, and both are
+    scaffolding that should leave together.
+    """
+
+    replay_window_coefficient: float = 16.0
+    replay_window_exponent: float = 0.6
+    """Growing replay window: ``window = c * total_games ** alpha`` (W1.1).
+
+    Defaults put the window at ~75% of all games early (on-policy, fast
+    adaptation), ~4,000 games at 10k total, and ~16,000 at 100k -- sublinear, so
+    the newest iteration never becomes a vanishing fraction of each batch.
+    ``alpha`` in 0.5-0.8 per the plan; 0.6 sits mid-range.
+
+    These are a starting shape fitted to run 03's staleness-vs-value-accuracy
+    curve, which is suggestive rather than conclusive: the window grew
+    1,400 -> 8,000 games over iterations 0-20, froze at its iteration cap, and
+    value accuracy peaked at iteration 35 and decayed after.
+    """
+
+    replay_window_cap_games: int = 20_000
+    """Hard ceiling on the growing window, in games.
+
+    **Not an independent choice.** The window is what the example cache holds, so
+    this ceiling and ``example_cache_examples`` describe the same memory. At the
+    measured 17.8 KB per example and ~20 examples per game, 20,000 games is
+    roughly 7 GB of host RSS. W2.3 derives both from one budget; until then, a
+    change here that is not matched there is how a run dies at iteration 70.
+    """
+
+    hof_opponent_fraction: float = 0.0
+    """Share of generation games played against an archived HOF checkpoint.
+
+    Zero preserves today's behaviour, where every game is ``current_best``
+    against itself and the HOF is write-only. Raising it buys opponent diversity
+    -- which is what mattered in Kingdomino -- at the cost of some games no
+    longer being on-policy for the current net.
+
+    Off by default because it changes both the memory profile and the batch
+    composition that W2's and W5's acceptances measure, so it has to be a
+    deliberate, recorded choice rather than a new silent default.
+    """
+
+    hof_sampling_mode: str = "recency"
+    """How a HOF opponent is drawn: ``recency``, ``uniform``, or ``latest``.
+
+    ``recency`` weights recent checkpoints more heavily, which keeps the
+    opponent pool near the current frontier while still reaching back. Sampling
+    is keyed on the run seed and the iteration, so it is deterministic and
+    reproduces exactly on resume.
+    """
+
+    hof_start_games: int = 10_000
+    """Games before league play begins.
+
+    Early self-play checkpoints are weak and nearly identical to each other, so
+    a HOF drawn from them costs generation time without adding diversity.
+    Kingdomino gates this the same way (`hof_start_iter=50`); expressed in games
+    here, per W1.2. Defaults to the curriculum's duration, so the archive starts
+    supplying opponents exactly as the bots stop.
+    """
     cheap_sims_min: int = 16
     cheap_sims_max: int = 24
     full_sims_min: int = 64
@@ -280,6 +376,89 @@ class PhaseDConfig:
             self.curriculum_anneal_iterations, self.iterations
         )
 
+    def uses_games_basis(self) -> bool:
+        return self.schedule_basis == "games"
+
+    def curriculum_schedule(self) -> GameSchedule:
+        """Curriculum-bot mix against the games clock."""
+
+        return GameSchedule(self.opponent_fraction, 0.0, self.curriculum_anneal_games)
+
+    def seed_retain_schedule(self) -> GameSchedule:
+        """Share of the bot seed corpus retained, against the games clock.
+
+        Shares the curriculum's duration: the seed corpus and the live bot mix
+        are the same scaffolding, and retaining seed games after the bots have
+        annealed out would leave a permanent share of every minibatch coming
+        from opponents the net beats 95%+ of the time.
+        """
+
+        return GameSchedule(
+            self.seed_retain_fraction, 0.0, self.curriculum_anneal_games
+        )
+
+    def draft_prior_schedule(self) -> GameSchedule:
+        """Wonder-draft tier prior against the games clock."""
+
+        return GameSchedule(1.0, 0.0, self.draft_prior_games)
+
+    def growing_window(self) -> GrowingReplayWindow:
+        """The games-keyed replay window.
+
+        ``floor_games`` is one iteration's worth: below that the window would ask
+        for less than the run just generated, which whole-iteration selection
+        cannot express anyway.
+        """
+
+        return GrowingReplayWindow(
+            coefficient=self.replay_window_coefficient,
+            exponent=self.replay_window_exponent,
+            cap_games=self.replay_window_cap_games,
+            floor_games=max(1, self.games_per_iteration),
+        )
+
+    def schedule_identity(self) -> dict[str, Any]:
+        """The schedule fields a resume must not silently change (W1.4).
+
+        Only the fields for the *active* basis are included, so switching an
+        unused legacy knob is not treated as a change to a running schedule --
+        but ``schedule_basis`` itself is always here, because changing it moves
+        every position at once.
+        """
+
+        identity: dict[str, Any] = {"schedule_basis": self.schedule_basis}
+        if self.uses_games_basis():
+            identity.update(
+                curriculum_anneal_games=self.curriculum_anneal_games,
+                draft_prior_games=self.draft_prior_games,
+                opponent_fraction=self.opponent_fraction,
+                seed_retain_fraction=self.seed_retain_fraction,
+                replay_window_coefficient=self.replay_window_coefficient,
+                replay_window_exponent=self.replay_window_exponent,
+                replay_window_cap_games=self.replay_window_cap_games,
+            )
+            # `games_per_iteration` is deliberately absent. Under the games basis
+            # it no longer determines any schedule position, so a resume is free
+            # to change it -- that freedom is the entire point of W1.2, and
+            # pinning it here would reintroduce the coupling by the back door.
+            # (It still nudges the window's floor, which self-corrects within one
+            # iteration.) Under the iterations basis it is load-bearing, and
+            # `replay_window` below is what pins the resulting window.
+        else:
+            identity.update(
+                curriculum_anneal_iterations=self.curriculum_anneal_iterations,
+                draft_prior_iterations=self.draft_prior_iterations,
+                opponent_fraction=self.opponent_fraction,
+                seed_retain_fraction=self.seed_retain_fraction,
+                replay_window=self.replay_window,
+            )
+        identity.update(
+            hof_opponent_fraction=self.hof_opponent_fraction,
+            hof_sampling_mode=self.hof_sampling_mode,
+            hof_start_games=self.hof_start_games,
+        )
+        return identity
+
     def gate_power(self) -> dict[str, Any]:
         """How many games this gate needs before it can decide anything.
 
@@ -308,6 +487,24 @@ class PhaseDConfig:
     def validate(self) -> None:
         if self.precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
+        if self.schedule_basis not in {"games", "iterations"}:
+            raise ValueError("schedule_basis must be games or iterations")
+        if self.curriculum_anneal_games < 0 or self.draft_prior_games < 0:
+            raise ValueError(
+                "curriculum_anneal_games and draft_prior_games must be non-negative"
+            )
+        if not 0.0 <= self.hof_opponent_fraction <= 1.0:
+            raise ValueError("hof_opponent_fraction must lie in [0, 1]")
+        if self.hof_start_games < 0:
+            raise ValueError("hof_start_games must be non-negative")
+        if self.hof_sampling_mode not in {"recency", "uniform", "latest"}:
+            raise ValueError(
+                "hof_sampling_mode must be recency, uniform, or latest"
+            )
+        if self.schedule_basis == "games":
+            # Constructing it here turns an incoherent window into a config-time
+            # error rather than an iteration-30 surprise.
+            self.growing_window()
         if self.workers <= 0 or self.games_per_iteration <= 0:
             raise ValueError("workers and games_per_iteration must be positive")
         if self.process_workers < 0:
@@ -546,6 +743,41 @@ class SearchAgent:
         return max(result.policy_target, key=result.policy_target.get)
 
 
+def _tag_league_opponents(
+    records: Sequence[GameRecord], league: LeagueAssignment
+) -> list[GameRecord]:
+    """Name the archived opponent in each league game's ``agents`` block.
+
+    W1.3 requires the opponent identity recorded *per game* so W3 can split
+    outcomes by opponent -- "did we beat the archive" is a different question
+    from "did we beat ourselves", and pooling them hides both.
+
+    ``agents`` is pure metadata: it feeds neither ``final_digest`` nor
+    ``trajectory_digest``, so relabelling here cannot invalidate a record or
+    change what replay verifies. Records come back in job order (the Rust
+    scheduler guarantees it regardless of completion order), which is what makes
+    indexing into the assignment sound.
+    """
+
+    if len(records) != len(league.nets_p0):
+        raise ValueError(
+            f"league assignment covers {len(league.nets_p0)} games but "
+            f"{len(records)} records came back"
+        )
+    tagged: list[GameRecord] = []
+    for index, record in enumerate(records):
+        seat = league.archive_seat(index)
+        if seat is None:
+            tagged.append(record)
+            continue
+        agents = dict(record.agents)
+        agents[f"p{seat}"] = league.name
+        agents["kind"] = "league"
+        agents["opponent_source"] = league.checkpoint
+        tagged.append(replace(record, agents=agents))
+    return tagged
+
+
 def _write_records(path: Path, records: Sequence[GameRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -709,7 +941,10 @@ _PROCESS_STATE: dict[str, Any] = {}
 
 
 def _process_generation_init(
-    model_state: dict[str, torch.Tensor], config: PhaseDConfig, iteration: int
+    model_state: dict[str, torch.Tensor],
+    config: PhaseDConfig,
+    iteration: int,
+    schedules: ResolvedSchedules,
 ) -> None:
     # One BLAS thread per process: generation scales by process count, and
     # oversubscribing cores with intra-op threads slows every worker down.
@@ -727,6 +962,7 @@ def _process_generation_init(
     )
     _PROCESS_STATE["config"] = config
     _PROCESS_STATE["iteration"] = iteration
+    _PROCESS_STATE["schedules"] = schedules
 
 
 def _process_self_play_game(job: GameJob) -> GameRecord:
@@ -735,6 +971,7 @@ def _process_self_play_game(job: GameJob) -> GameRecord:
         _PROCESS_STATE["evaluator"],
         _PROCESS_STATE["config"],
         _PROCESS_STATE["iteration"],
+        _PROCESS_STATE["schedules"],
     )
 
 
@@ -821,11 +1058,84 @@ def _process_gate_game(job: GameJob):
     )
 
 
+@dataclass(frozen=True, slots=True)
+class LeagueAssignment:
+    """Which archived opponent this iteration plays, and in which games.
+
+    One opponent per iteration, following Kingdomino: sampling per game would
+    make the batch composition depend on how many games happen to draw each
+    checkpoint, and it would defeat the point of caching one opponent model on
+    the device for the whole iteration.
+
+    ``nets_p0``/``nets_p1`` are the per-game seat assignments handed to Rust:
+    network 0 is always the learner, network 1 the archive. A pure self-play
+    game is ``(0, 0)``. Seats alternate across the league games so the archive
+    plays both sides within a single iteration.
+    """
+
+    checkpoint: str
+    sha256: str
+    iteration_added: int
+    nets_p0: tuple[int, ...]
+    nets_p1: tuple[int, ...]
+
+    @property
+    def games(self) -> int:
+        return sum(
+            1
+            for p0, p1 in zip(self.nets_p0, self.nets_p1)
+            if p0 or p1
+        )
+
+    @property
+    def name(self) -> str:
+        """Stable opponent identity for stats and the ``agents`` block.
+
+        Carries the archive's iteration and checkpoint hash, so W3 can group
+        outcomes by opponent and two different archives can never collide under
+        one name.
+        """
+
+        return f"hof_iter_{self.iteration_added:04d}_{self.sha256[:12]}"
+
+    def opponent_for(self, index: int) -> str | None:
+        """The opponent in game ``index``, or ``None`` when it is pure self-play."""
+
+        if not (self.nets_p0[index] or self.nets_p1[index]):
+            return None
+        return self.name
+
+    def archive_seat(self, index: int) -> int | None:
+        """Seat the archive occupies in game ``index``, or ``None`` if absent."""
+
+        if self.nets_p0[index]:
+            return 0
+        if self.nets_p1[index]:
+            return 1
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSchedules:
+    """Schedule values for one iteration, resolved before generation starts.
+
+    Passed in rather than recomputed per game.  Under the games basis a schedule
+    reads the games ledger, which lives on the loop and is neither available in a
+    generation worker process nor safe to consult per game -- the clock must be
+    the same for every game in an iteration, or games within one iteration would
+    see different curriculum mixes.  Resolving once and passing the values makes
+    that invariant structural instead of hoped for.
+    """
+
+    curriculum_mix_fraction: float
+    draft_prior: float
+
+
 def _search_move(
     game,
     evaluator,
     config: PhaseDConfig,
-    iteration: int,
+    schedules: ResolvedSchedules,
     move_index: int,
     rng: random.Random,
 ) -> tuple[int, SearchResult, bool]:
@@ -834,9 +1144,7 @@ def _search_move(
         config.full_sims_min if full else config.cheap_sims_min,
         config.full_sims_max if full else config.cheap_sims_max,
     )
-    draft_amount = LinearSchedule(1.0, 0.0, config.draft_prior_iterations).value(
-        iteration
-    )
+    draft_amount = schedules.draft_prior
     search = CurriculumMCTS(
         evaluator,
         SearchConfig(
@@ -857,12 +1165,10 @@ def _self_play_game(
     evaluator,
     config: PhaseDConfig,
     iteration: int,
+    schedules: ResolvedSchedules,
 ) -> GameRecord:
     rng = random.Random(job.seed ^ 0xC6BC279692B5CC83)
-    mix_fraction = curriculum_fraction(
-        config.opponent_fraction, iteration, config.anneal_iterations()
-    )
-    mixed = rng.random() < mix_fraction
+    mixed = rng.random() < schedules.curriculum_mix_fraction
     bot = None
     bot_seat = None
     if mixed:
@@ -897,7 +1203,7 @@ def _self_play_game(
                 recorder.game,
                 evaluator,
                 config,
-                iteration,
+                schedules,
                 move_index,
                 rng,
             )
@@ -934,6 +1240,9 @@ class PhaseDLoop:
         self.current_best = self.checkpoint_dir / "current_best.pt"
         self.adapter = SevenWondersDuelLoopAdapter()
         self.hof = HallOfFame(self.run_dir / "hof")
+        # The schedule clock. Derived from the buffer files, which are immutable
+        # once written, so a resume recomputes it instead of restoring it.
+        self.games_ledger = GamesLedger(self.buffer_dir)
         self.elo = EloLedger(
             self.run_dir / "elo", fixed_ratings={GreedyBot.name: 1000.0}
         )
@@ -948,6 +1257,196 @@ class PhaseDLoop:
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
         self.last_warm_stats: dict[str, int] = {}
+
+    # -- schedule clock ----------------------------------------------------
+
+    def generation_clock(self, iteration: int) -> int:
+        """Games that existed when ``iteration`` began generating.
+
+        The value every generation-time schedule reads.  Deliberately *before*,
+        not *through*: a schedule keyed on games through the current iteration
+        would depend on the games it is itself deciding how to generate, and
+        would differ between a fresh run and a resume of the same iteration.
+        """
+
+        return self.games_ledger.total_before(iteration)
+
+    def training_clock(self, iteration: int) -> int:
+        """Games available once ``iteration`` has generated.
+
+        The value the replay window reads, because the window is applied after
+        generation, when selecting what to train on -- the games just written are
+        part of what is available.
+        """
+
+        return self.games_ledger.total_through(iteration)
+
+    def curriculum_mix_fraction(self, iteration: int) -> float:
+        """Share of generation games that pair the net against a curriculum bot."""
+
+        if self.config.uses_games_basis():
+            return self.config.curriculum_schedule().value(
+                self.generation_clock(iteration)
+            )
+        return curriculum_fraction(
+            self.config.opponent_fraction, iteration, self.config.anneal_iterations()
+        )
+
+    def draft_prior_amount(self, iteration: int) -> float:
+        """Weight on the wonder-draft tier prior at this point in the run."""
+
+        if self.config.uses_games_basis():
+            return self.config.draft_prior_schedule().value(
+                self.generation_clock(iteration)
+            )
+        return LinearSchedule(1.0, 0.0, self.config.draft_prior_iterations).value(
+            iteration
+        )
+
+    def seed_retain_fraction(self, iteration: int) -> float:
+        """Share of the bot seed corpus still mixed into training."""
+
+        if self.config.uses_games_basis():
+            return self.config.seed_retain_schedule().value(
+                self.training_clock(iteration)
+            )
+        return curriculum_fraction(
+            self.config.seed_retain_fraction,
+            iteration,
+            self.config.anneal_iterations(),
+        )
+
+    def league_assignment(self, iteration: int, games: int) -> LeagueAssignment | None:
+        """Draw this iteration's archived opponent, or ``None`` for pure self-play.
+
+        Deterministic and resume-stable: the RNG is keyed on the run seed and the
+        iteration only, so re-running an iteration draws the same opponent and
+        assigns it to the same games. Nothing about the draw depends on wall
+        clock, HOF directory ordering beyond its append order, or how far the run
+        got before it was interrupted.
+        """
+
+        config = self.config
+        if config.hof_opponent_fraction <= 0.0:
+            return None
+        if self.generation_clock(iteration) < config.hof_start_games:
+            return None
+        entries = self.hof.entries()
+        if not entries:
+            return None
+        league_games = int(round(games * config.hof_opponent_fraction))
+        if league_games <= 0:
+            return None
+        rng = random.Random(config.seed + iteration * 100_003)
+        entry = self.hof.sample(rng, mode=config.hof_sampling_mode)
+        if entry is None:
+            return None
+
+        # Which games are league games, and on which seat the archive sits.
+        # Spread by stride rather than taking a prefix: the first N games of an
+        # iteration are not interchangeable with the rest -- `first_player` is
+        # `(index // 2) % 2` -- so a prefix would correlate league play with
+        # seating.
+        nets_p0 = [0] * games
+        nets_p1 = [0] * games
+        if league_games >= games:
+            chosen = list(range(games))
+        else:
+            stride = games / league_games
+            chosen = sorted({int(i * stride) for i in range(league_games)})
+        for order, index in enumerate(chosen):
+            # Alternate the archive's seat so it plays both sides this iteration.
+            if order % 2:
+                nets_p0[index] = 1
+            else:
+                nets_p1[index] = 1
+        return LeagueAssignment(
+            checkpoint=entry.path,
+            sha256=entry.sha256,
+            iteration_added=entry.iteration,
+            nets_p0=tuple(nets_p0),
+            nets_p1=tuple(nets_p1),
+        )
+
+    def resolved_schedules(self, iteration: int) -> ResolvedSchedules:
+        """Freeze this iteration's generation-time schedule values."""
+
+        return ResolvedSchedules(
+            curriculum_mix_fraction=self.curriculum_mix_fraction(iteration),
+            draft_prior=self.draft_prior_amount(iteration),
+        )
+
+    def window_selection(self, iteration: int) -> WindowSelection | None:
+        """Which iterations the growing window covers, or ``None`` on the legacy basis."""
+
+        if not self.config.uses_games_basis():
+            return None
+        ledger = self.games_ledger
+        return self.config.growing_window().select(
+            self.training_clock(iteration),
+            iteration,
+            ledger.games_for,
+            ledger.known_iterations(),
+        )
+
+    def window_iterations(self, iteration: int) -> int:
+        """Window length in iterations, for the warm-buffer aging filter.
+
+        The warm buffer predates the games clock and ages records by iteration
+        distance.  Rather than leave it on a config value the games basis no
+        longer uses -- which would silently diverge from the real window -- derive
+        an equivalent length from the window actually in force.
+        """
+
+        selection = self.window_selection(iteration)
+        if selection is None:
+            return self.config.replay_window
+        if selection.iterations:
+            return len(selection.iterations)
+        target = self.config.growing_window().games(self.training_clock(iteration))
+        return max(1, target // max(1, self.config.games_per_iteration))
+
+    def schedule_state(self, iteration: int) -> dict[str, Any]:
+        """Every schedule's value and realised effect, for the stats row (W1.5).
+
+        Both the schedule value and the realised window, per the plan: a run
+        whose realised window sits far below its target has a window schedule
+        that is not doing what the config says, and that is invisible unless both
+        are logged.
+        """
+
+        selection = self.window_selection(iteration)
+        state: dict[str, Any] = {
+            "basis": self.config.schedule_basis,
+            "games_before_iteration": self.generation_clock(iteration),
+            "games_through_iteration": self.training_clock(iteration),
+            "curriculum_mix_fraction": self.curriculum_mix_fraction(iteration),
+            "draft_prior": self.draft_prior_amount(iteration),
+            "seed_retain_fraction": self.seed_retain_fraction(iteration),
+            "hof_opponent_fraction": self.config.hof_opponent_fraction,
+            "learning_rate": self.config.learning_rate,
+        }
+        league = self.league_assignment(iteration, self.config.games_per_iteration)
+        if league is None:
+            state["league_games"] = 0
+            state["league_opponent"] = None
+        else:
+            state.update(
+                league_games=league.games,
+                league_opponent=league.name,
+                league_opponent_sha256=league.sha256,
+                league_opponent_iteration=league.iteration_added,
+            )
+        if selection is None:
+            state["replay_window_iterations"] = self.config.replay_window
+        else:
+            state.update(
+                replay_window_target_games=selection.target_games,
+                replay_window_realised_games=selection.realised_games,
+                replay_window_iterations=len(selection.iterations),
+                replay_window_oldest_iteration=selection.oldest_iteration,
+            )
+        return state
 
     def _append_training_log(self, row: dict[str, Any]) -> None:
         """Append one completed iteration using the manifest's existing metrics."""
@@ -1009,12 +1508,13 @@ class PhaseDLoop:
             if record.iteration is not None
         ]
         newest = max(numbered, default=0)
+        window_iterations = self.window_iterations(iteration)
         return [
             record
             for record in self.warm_records
             if newest - (record.iteration if record.iteration is not None else newest)
             + iteration
-            < self.config.replay_window
+            < window_iterations
         ]
 
     def _save_replay_buffer(self) -> None:
@@ -1137,6 +1637,7 @@ class PhaseDLoop:
                 f"{stored_precision!r} but resumed with "
                 f"{self.config.precision!r}"
             )
+        self._refuse_changed_schedules(manifest_payload)
         self._sync_training_log(manifest_payload)
         if self.config.warm_buffer:
             self._load_warm_buffer(Path(self.config.warm_buffer))
@@ -1151,6 +1652,55 @@ class PhaseDLoop:
                 rust_slots=self.config.rust_slots,
                 rust_global_batch_cap=self.config.rust_global_batch_cap,
             )
+
+    def _refuse_changed_schedules(self, manifest_payload: dict[str, Any]) -> None:
+        """Refuse a resume that moves any schedule position (W1.4).
+
+        Same mechanism and same reasoning as the precision guard: a schedule
+        changed mid-run makes every iteration before and after it incomparable,
+        and the run has no way to record that it happened.
+
+        The default for a missing ``schedule_basis`` is ``iterations``, not the
+        config default -- a manifest written before the games clock existed
+        describes a run that really did anneal on iteration counts, so resuming
+        it under the new default is exactly the silent rescaling this guard is
+        for.  Such a run resumes with ``--schedule-basis iterations``.
+        """
+
+        stored_config = manifest_payload.get("config") or {}
+        if not stored_config:
+            return
+        stored_basis = stored_config.get("schedule_basis", "iterations")
+        stored = dict(self.config.schedule_identity())
+        for key in stored:
+            stored[key] = stored_config.get(key, None)
+        stored["schedule_basis"] = stored_basis
+        current = self.config.schedule_identity()
+
+        changed = {
+            key: (stored[key], value)
+            for key, value in current.items()
+            # A key absent from an older manifest cannot be compared, so it is
+            # not treated as a change -- only a value that is present and
+            # different is.  Basis is exempt: its default is known above.
+            if stored[key] is not None and stored[key] != value
+        }
+        if stored_basis != current["schedule_basis"]:
+            changed["schedule_basis"] = (stored_basis, current["schedule_basis"])
+        if not changed:
+            return
+        detail = "; ".join(
+            f"{key}: {was!r} -> {now!r}" for key, (was, now) in sorted(changed.items())
+        )
+        hint = ""
+        if "schedule_basis" in changed:
+            hint = (
+                f" To continue this run unchanged, pass "
+                f"--schedule-basis {stored_basis}."
+            )
+        raise ValueError(
+            f"cannot resume with changed training schedules ({detail})." + hint
+        )
 
     def load_model(self, path: str | Path):
         """Rebuild a saved model under the architecture it was trained with.
@@ -1196,8 +1746,14 @@ class PhaseDLoop:
             )
             for index in range(self.config.games_per_iteration)
         ]
+        # Resolved once, before any game runs: every game in an iteration must
+        # see the same schedule position, and the games clock advances as this
+        # iteration writes its buffer.
+        schedules = self.resolved_schedules(iteration)
         if self.config.generation_backend == "rust":
-            return self._generate_iteration_rust(model, iteration, destination, jobs)
+            return self._generate_iteration_rust(
+                model, iteration, destination, jobs, schedules
+            )
         if self.config.process_workers:
             source = getattr(model, "_orig_mod", model)
             model_state = {
@@ -1209,7 +1765,7 @@ class PhaseDLoop:
                 _process_self_play_game,
                 workers=self.config.process_workers,
                 initializer=_process_generation_init,
-                initargs=(model_state, self.config, iteration),
+                initargs=(model_state, self.config, iteration, schedules),
             )
             elapsed = time.monotonic() - started
             self.last_generation_stats = {
@@ -1234,7 +1790,9 @@ class PhaseDLoop:
         ) as service:
             records = run_jobs(
                 jobs,
-                lambda job: _self_play_game(job, service, self.config, iteration),
+                lambda job: _self_play_game(
+                    job, service, self.config, iteration, schedules
+                ),
                 workers=self.config.workers,
             )
             elapsed = time.monotonic() - started
@@ -1257,16 +1815,13 @@ class PhaseDLoop:
         iteration: int,
         destination: Path,
         jobs: list[GameJob],
+        schedules: ResolvedSchedules,
     ) -> list[GameRecord]:
         """Generate neural and curriculum-bot games in the Rust scheduler."""
 
         import seven_wonders_rust as swr
 
-        mix_fraction = curriculum_fraction(
-            self.config.opponent_fraction,
-            iteration,
-            self.config.anneal_iterations(),
-        )
+        mix_fraction = schedules.curriculum_mix_fraction
         # One entry per job, in job order: the bot's name and seat, or None for
         # a pure self-play game. Assignment is unchanged -- same RNG stream, same
         # bot type, same seat -- only the *scheduling* differs: every game now
@@ -1294,12 +1849,33 @@ class PhaseDLoop:
             self.config.rust_global_batch_cap,
             precision=self.config.precision,
         )
-        adapter = rust_flat_batch_adapter(evaluator)
+        league = self.league_assignment(iteration, len(jobs))
+        if league is None:
+            adapter = rust_flat_batch_adapter(evaluator)
+        else:
+            # Network 0 is the learner, network 1 the archive. Routed on the
+            # searcher inside Rust, so the archive's network drives the whole of
+            # the archive's search and nothing else -- see
+            # `rust_searcher_routed_flat_batch_adapter`.
+            opponent_model = self.load_model(league.checkpoint)
+            adapter = rust_searcher_routed_flat_batch_adapter(
+                (
+                    evaluator,
+                    Evaluator(
+                        opponent_model,
+                        self.config.device,
+                        self.config.rust_global_batch_cap,
+                        precision=self.config.precision,
+                    ),
+                )
+            )
+            print(
+                f"iteration {iteration}: league play -- {league.games} of "
+                f"{len(jobs)} games vs {league.name}"
+            )
         started = time.monotonic()
         rust_metrics = []
-        draft_prior = LinearSchedule(
-            1.0, 0.0, self.config.draft_prior_iterations
-        ).value(iteration)
+        draft_prior = schedules.draft_prior
         bot_games = sum(1 for entry in assignments if entry is not None)
         neural_games = len(jobs) - bot_games
         # Phase 1 put a whole group in one call so the scheduler could hold
@@ -1338,10 +1914,14 @@ class PhaseDLoop:
                 entry[0] if entry is not None and entry[1] == 1 else None
                 for entry in assignments
             ],
+            nets_p0=list(league.nets_p0) if league is not None else None,
+            nets_p1=list(league.nets_p1) if league is not None else None,
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
         )
         records = phase_d_records_from_rust(raw_records)
+        if league is not None:
+            records = _tag_league_opponents(records, league)
         rust_metrics.append(metrics)
         elapsed = time.monotonic() - started
         self.last_generation_stats = {
@@ -1359,15 +1939,18 @@ class PhaseDLoop:
         return records
 
     def training_records(self, iteration: int) -> list[GameRecord]:
-        window = ReplayWindow(self.config.replay_window)
-        paths = window.paths(self.buffer_dir, iteration)
+        selection = self.window_selection(iteration)
+        if selection is None:
+            paths = ReplayWindow(self.config.replay_window).paths(
+                self.buffer_dir, iteration
+            )
+        else:
+            paths = [
+                self.games_ledger.path_for(known) for known in selection.iterations
+            ]
         live = self._warm_records_for_iteration(iteration)
         live.extend(record for path in paths for record in read_records(path))
-        seed_fraction = curriculum_fraction(
-            self.config.seed_retain_fraction,
-            iteration,
-            self.config.anneal_iterations(),
-        )
+        seed_fraction = self.seed_retain_fraction(iteration)
         seed_path = self.buffer_dir / "curriculum_seed.jsonl"
         if seed_fraction <= 0.0 or not seed_path.exists():
             return live
@@ -1598,11 +2181,9 @@ class PhaseDLoop:
                 samples / new_examples if new_examples else None
             ),
             "buffer_passes": samples / len(train_examples),
-            "curriculum_fraction": curriculum_fraction(
-                self.config.seed_retain_fraction,
-                iteration,
-                self.config.anneal_iterations(),
-            ),
+            "curriculum_fraction": self.seed_retain_fraction(iteration),
+            # Every schedule's value and realised effect at this iteration.
+            "schedules": self.schedule_state(iteration),
             # How much of the replay window had to be replayed rather than
             # served from the cache. `replayed_games` well above one iteration's
             # worth means the cache is thrashing against its cap.
@@ -2281,6 +2862,67 @@ def main(argv=None) -> int:
     parser.add_argument("--bot-policy-iterations", type=int, default=10)
     parser.add_argument("--bot-exploration", type=float, default=0.05)
     parser.add_argument("--draft-prior-iterations", type=int, default=20)
+    parser.add_argument(
+        "--schedule-basis",
+        choices=("games", "iterations"),
+        default="games",
+        help="clock every training schedule reads (default: games). "
+        "'iterations' preserves pre-2026-07-29 behaviour for resuming old runs; "
+        "changing it across a resume is refused",
+    )
+    parser.add_argument(
+        "--curriculum-anneal-games",
+        type=int,
+        default=10_000,
+        help="games over which the curriculum-bot mix and seed corpus anneal to "
+        "zero (games basis); 10k is where the net passed ~95%% against the bots",
+    )
+    parser.add_argument(
+        "--draft-prior-games",
+        type=int,
+        default=10_000,
+        help="games over which the wonder-draft tier prior anneals out "
+        "(games basis)",
+    )
+    parser.add_argument(
+        "--replay-window-coefficient",
+        type=float,
+        default=16.0,
+        help="c in the growing window games = c * total_games ** alpha",
+    )
+    parser.add_argument(
+        "--replay-window-exponent",
+        type=float,
+        default=0.6,
+        help="alpha in the growing window; 0.5-0.8 keeps growth sublinear",
+    )
+    parser.add_argument(
+        "--replay-window-cap-games",
+        type=int,
+        default=20_000,
+        help="ceiling on the growing window, in games; must be sized against "
+        "the same memory budget as --example-cache-examples",
+    )
+    parser.add_argument(
+        "--hof-opponent-fraction",
+        type=float,
+        default=0.0,
+        help="share of generation games played against an archived HOF "
+        "checkpoint instead of current_best (0 = today's behaviour)",
+    )
+    parser.add_argument(
+        "--hof-sampling-mode",
+        choices=("recency", "uniform", "latest"),
+        default="recency",
+        help="how a HOF opponent is drawn when --hof-opponent-fraction > 0",
+    )
+    parser.add_argument(
+        "--hof-start-games",
+        type=int,
+        default=10_000,
+        help="games before league play begins; early checkpoints are weak and "
+        "near-identical, so an archive drawn from them adds cost, not diversity",
+    )
     parser.add_argument("--cheap-sims-min", type=int, default=16)
     parser.add_argument("--cheap-sims-max", type=int, default=24)
     parser.add_argument("--full-sims-min", type=int, default=64)
@@ -2475,6 +3117,15 @@ def main(argv=None) -> int:
         bot_policy_iterations=args.bot_policy_iterations,
         bot_exploration=args.bot_exploration,
         draft_prior_iterations=args.draft_prior_iterations,
+        schedule_basis=args.schedule_basis,
+        curriculum_anneal_games=args.curriculum_anneal_games,
+        draft_prior_games=args.draft_prior_games,
+        replay_window_coefficient=args.replay_window_coefficient,
+        replay_window_exponent=args.replay_window_exponent,
+        replay_window_cap_games=args.replay_window_cap_games,
+        hof_opponent_fraction=args.hof_opponent_fraction,
+        hof_sampling_mode=args.hof_sampling_mode,
+        hof_start_games=args.hof_start_games,
         cheap_sims_min=args.cheap_sims_min,
         cheap_sims_max=args.cheap_sims_max,
         full_sims_min=args.full_sims_min,

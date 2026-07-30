@@ -31,11 +31,18 @@ from .core import (
     run_jobs_in_processes,
 )
 from .elo import EloLedger
+from .games_ledger import GamesLedger, count_games, iteration_of_buffer_file
 from .hof import HOFEntry, HallOfFame
 from .manifest import RunManifest
 from .run_controller import ControllerConfig, RunController, RunStore
 from .run_log import RunLog
-from .schedule import LinearSchedule, ReplayWindow
+from .schedule import (
+    GameSchedule,
+    GrowingReplayWindow,
+    LinearSchedule,
+    ReplayWindow,
+    WindowSelection,
+)
 from .sprt import SPRT, SPRTResult, expected_games_to_decide
 from .training_control import (
     BootstrapPolicy,
@@ -60,11 +67,14 @@ __all__ = [
     "EloLedger",
     "GameAdapter",
     "GameJob",
+    "GameSchedule",
+    "GamesLedger",
     "GenerateRequest",
     "GenerationResult",
     "GeneratorMode",
     "GeneratorSource",
     "GeneratorState",
+    "GrowingReplayWindow",
     "HOFEntry",
     "HallOfFame",
     "LifecycleAdapter",
@@ -85,11 +95,14 @@ __all__ = [
     "TrainRequest",
     "TrainingResult",
     "TransitionResult",
+    "WindowSelection",
     "artifact_for",
     "atomic_copy",
     "atomic_write_bytes",
+    "count_games",
     "decide_transition",
     "initial_state",
+    "iteration_of_buffer_file",
     "install",
     "play_match",
     "run_jobs",

@@ -230,7 +230,14 @@ def test_phase_d_generation_issues_one_call_whatever_the_bot_mix(monkeypatch):
 
     with tempfile.TemporaryDirectory() as directory:
         records = loop._generate_iteration_rust(
-            model, 0, Path(directory) / "iter.jsonl", jobs
+            model,
+            0,
+            Path(directory) / "iter.jsonl",
+            jobs,
+            # Resolved by the caller now, so this bypassed-`__init__` loop needs
+            # no games ledger. 1.0 keeps the "every game is a bot game" setup;
+            # draft_prior 1.0 is what iteration 0 resolved to before.
+            pd.ResolvedSchedules(curriculum_mix_fraction=1.0, draft_prior=1.0),
         )
 
     assert len(calls) == 1, f"expected one scheduler call, got {len(calls)}"
