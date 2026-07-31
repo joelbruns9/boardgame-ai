@@ -3,30 +3,57 @@
 This document describes every command-line argument exposed by the Phase D
 training pipeline in `games.seven_wonders_duel.phase_d`.
 
+**Reconciled against the live parser on 2026-07-30** (W0-W7). If you add a flag,
+add it here: `games/seven_wonders_duel/test_setup_cloud.py` checks the cloud
+launch command against the parser, but nothing checks this document, so it goes
+stale silently. The quickest audit is to diff `build_parser()`'s option strings
+against the `###` headings below.
+
+Where a figure is quoted as measured, it comes from `runs/laptop_training_03`
+and its continuations on an RTX 3070 laptop at `d_model=128, layers=4`. The
+cloud configuration is `384x8x6` at bf16 and its costs are roughly 1.85x per
+generated game and 5.12x per training step; see `CLOUD_TRAINING_PLAN.md`.
+
 ## Recommended Laptop Command
 
 ```powershell
-.\.venv\Scripts\python.exe -m games.seven_wonders_duel.phase_d `
-  --run-dir games\seven_wonders_duel\runs\laptop_training_03 `
-  --seed 20260726 `
+./.venv/Scripts/python.exe -m games.seven_wonders_duel.phase_d `
+  --run-dir games/seven_wonders_duel/runs/<run_name> `
+  --seed 20260728 `
   --device cuda `
   --generation-backend rust `
   --gate-backend rust `
+  --schedule-basis games `
   --selfplay-generator-mode soft_gate `
   --bootstrap-policy auto_first_trained `
-  --promotion-every 0 `
-  --anchor-every-iterations 2 `
-  --iterations 14 `
-  --games-per-iteration 300 `
+  --promotion-every 5 `
+  --revert-reset-after 2 `
+  --promotion-min-lcb 0.50 `
+  --revert-max-ucb 0.48 `
+  --gate-ladder-games 100 200 400 800 `
+  --gate-ladder-step-up-after 2 `
+  --gate-ladder-floor-games 10000 `
+  --gate-sims 64 `
+  --anchor-every-iterations 5 `
+  --anchor-games 200 `
+  --self-anchor-games 200 `
+  --self-anchor-lag-games 20000 `
+  --self-anchor-every-games 10000 `
+  --iterations 30 `
+  --games-per-iteration 400 `
   --seed-games 2000 `
-  --opponent-fraction 0.25 `
-  --bot-policy-iterations 3 `
-  --save-buffer games\seven_wonders_duel\runs\laptop_training_03\buffer_final.jsonl `
+  --curriculum-anneal-games 10000 `
+  --draft-prior-games 10000 `
+  --replay-window-coefficient 16 `
+  --replay-window-exponent 0.6 `
+  --replay-window-cap-games 20000 `
+  --save-buffer games/seven_wonders_duel/runs/<run_name>/buffer_final.jsonl `
   --buffer-autosave-every 1 `
   --d-model 128 `
   --layers 4 `
-  --train-steps 75 `
-  --train-warmup-steps 50 `
+  --precision fp32 `
+  --train-steps 76 `
+  --train-warmup-steps 25 `
   --train-batch-size 512 `
   --validate-every 100 `
   --learning-rate 2e-4 `
@@ -35,66 +62,38 @@ training pipeline in `games.seven_wonders_duel.phase_d`.
   --full-sims-min 64 `
   --full-sims-max 128 `
   --full-search-fraction 0.25 `
-  --rust-slots 16 `
+  --rust-slots 48 `
   --rust-scheduler-workers 1 `
   --rust-global-batch-cap 256 `
   --rust-max-inflight-batches 1 `
   --leaf-batch 1 `
-  --age-deal-samples 32 `
-  --gate-sims 64
+  --age-deal-samples 32
 ```
 
 PowerShell uses the backtick at the end of a line as its continuation
 character. There must be no spaces after a continuation backtick.
 
-This is a **learning-rate-of-the-loop** run, not a final-strength
-configuration. Its purpose is to establish that the fixed loop learns
-cumulatively and to expose parameter behaviour cheaply, so it deliberately
-spends wall clock on self-play rather than on gates.
+**The gate is on, and that is a change from this page's previous advice.** The
+earlier version set `--promotion-every 0` and argued that gates were
+unaffordable on a laptop: "a properly powered gate is ~800 games, which at
+`gate-sims 64` and the measured 0.145 games/s is about 90 minutes per gate."
+Both halves of that are now wrong.
 
-Why no promotion gate (`--promotion-every 0`): run 02 spent roughly half its
-wall clock on gate games and promoted nothing, because a 100-game budget cannot
-resolve a 3% indifference region. The alternatives are worse on a laptop -- a
-properly powered gate is ~800 games, which at `gate-sims 64` and the measured
-0.145 games/s is about 90 minutes *per gate*. Widening the band does not help
-either: see `--gate-sims` on why compression and a wider indifference region
-push the same way. The soft-gate rolling learner advances without a gate, and
-the cheap bot anchors every two iterations supply the out-of-distribution
-signal. Post-hoc `eval_suite` runs measure iteration-vs-iteration strength
-afterwards, off the critical path.
+- *The cost.* Measured over iterations 70-89 of `laptop_training_03_w2_resume`
+  on this laptop, an iteration without a gate takes **8.4 min** and an iteration
+  with a 200-game/64-sim gate takes **16.1 min**, so the gate costs about
+  **7.7 min** -- not 90. The difference is W5's throughput work: one persistent
+  inference worker for the whole gate, models built once, both seat legs
+  concurrent in one rolling pool.
+- *The statistics.* The 800-game figure came from an SPRT indifference region.
+  The rule is now a fixed-N Wilson interval over **seat pairs**, and the gate
+  size is scheduled by a ladder rather than fixed. A small gate is safe, not
+  merely cheap: with confidence bounds on both sides, too little evidence
+  produces probation, never a coin flip.
 
-The risk this accepts: with no ratchet, a *degrading* learner is not caught
-automatically. Anchors every two iterations are the tripwire, and every
-candidate checkpoint is retained, so a post-hoc arena can pick the best one.
-
-Why `--train-steps` is 75 and not 300: fast-search moves no longer produce
-training examples (see `--record-fast-moves`), which measured on run 02's buffer
-takes recorded positions from **69.6 to 22.0 per game** -- fast searches are
-68.3% of all moves. Holding 300 steps would put `samples_per_new_position` at
-23.3x, worse than the 8.5x it replaced. 75 steps gives **5.8x**, mid-band.
-Warmup drops to 50 so it cannot span the whole first iteration.
-
-Why the curriculum is smaller and steered (`--seed-games 2000`,
-`--opponent-fraction 0.25`, `--bot-policy-iterations 3`): the two bot pathways
-are not equally valuable. Seed games are **bot vs bot and contain no search at
-all** -- every move becomes a one-hot target on the bot's choice, so 5,000 seed
-games teach the policy head to imitate greedy and rush bots. Mixed games run
-real MCTS for the neural seat and reach positions self-play does not.
-
-Since the routing investigation found iteration 0's value head sound and its
-**prior** actively harmful at low simulation counts, bot imitation is a credible
-mechanism. So: keep enough seed games to prefill the buffer, shift weight toward
-mixed games, and stop bot moves from supplying policy targets after iteration 3
--- they still contribute trajectories and value labels. One cost to note: mixed
-games yield policy targets for one seat only, so a higher opponent fraction
-trades roughly 12% of policy targets for out-of-distribution coverage.
-
-Note `--anchor-every-iterations`, not `--anchor-gate-every-promotions`: the
-promotion-keyed cadence never fires when nothing is promoted, which is exactly
-what happened in run 02 and why its bot suite was never measured.
-
-Do **not** pass `--warm-buffer` pointing at run 02's export. Every record in it
-is `target_version=1` and the loader will refuse it; see `--allow-stale-targets`.
+Set `--schedule-basis games` for any new run. The iterations basis is retained
+only so runs that started under it can be resumed; every schedule below reads
+the games clock when the basis is `games`.
 
 ## What One Iteration Does
 
@@ -182,11 +181,16 @@ initialization does not regenerate it.
 
 ### `--replay-window`
 
-**Default:** `20`. **Value:** positive integer
+**Default:** `20`. **Value:** positive integer. **Iterations basis only.**
 
-Number of recent iteration record files included in training. This is measured
-in iterations, not games or positions. A larger window improves historical
+Number of recent iteration record files included in training, measured in
+iterations rather than games or positions. A larger window improves historical
 diversity but makes the dataset less focused on the newest model.
+
+Under `--schedule-basis games` this value is ignored and the window comes from
+`--replay-window-coefficient/-exponent/-cap-games` below. It is still validated
+and still pinned on resume, because a run that started on the iterations basis
+must keep the window it was trained with.
 
 ### `--save-buffer`
 
@@ -198,7 +202,7 @@ masking the original failure. The temporary-file-plus-rename write prevents a
 partial export from replacing a previous good buffer. A typical setting is:
 
 ```powershell
---save-buffer games\seven_wonders_duel\runs\laptop_training_01\buffer_final.jsonl
+--save-buffer games/seven_wonders_duel/runs/laptop_training_01/buffer_final.jsonl
 ```
 
 The export contains the current live replay window, the still-retained portion
@@ -339,6 +343,78 @@ It is not the Rust scheduler shard count; use `rust-scheduler-workers` for that.
 Process count for legacy Python generation and gate execution. `0` uses Python
 threads. This option has no effect on normal Rust generation or Rust gates.
 
+## Schedules and the Games Clock
+
+Every schedule is expressed in **games**, not iterations, so that
+`--games-per-iteration` can change on a resume without moving any schedule
+position. The basis is pinned per run and a resume that changes it is refused.
+
+### `--schedule-basis`
+
+**Default:** `games`. **Choices:** `games`, `iterations`
+
+Which clock the schedules read. `games` uses the cumulative game count from the
+games ledger; `iterations` uses the iteration index and is retained only so
+pre-2026-07-29 runs remain resumable.
+
+The clock is deliberately *games before this iteration generated*, not games
+through it: a schedule keyed on the games it is itself deciding how to generate
+would differ between a fresh run and a resume of the same iteration.
+
+### `--curriculum-anneal-games`
+
+**Default:** `10000`. **Value:** non-negative integer. **Games basis.**
+
+Games over which the curriculum-bot mix anneals to zero. The measured basis for
+10k: the net beat the scripted bots 58.7%/78.0% at iterations 0-9 and
+98.6%/91.4% by 30-39, so the bots were exhausted as opponents at roughly 10k
+games. The iterations-basis equivalent is `--curriculum-anneal-iterations`.
+
+### `--draft-prior-games`
+
+**Default:** `10000`. **Value:** non-negative integer. **Games basis.**
+
+Games over which the wonder-draft tier prior anneals away. The iterations-basis
+equivalent is `--draft-prior-iterations`.
+
+### `--replay-window-coefficient`, `--replay-window-exponent`, `--replay-window-cap-games`
+
+**Defaults:** `16.0`, `0.6`, `20000`. **Games basis.**
+
+The growing replay window: `window_games = coefficient * total_games ** exponent`,
+capped. The defaults hold the window near 75% of all games early, when data is
+scarce and on-policy, and let it fall toward a fixed span later.
+
+The cap is what the W6.4 preflight sizes host memory against -- the run's
+*maximum* window, not its current one -- at a measured 122 KB per retained
+`GameRecord`.
+
+### `--hof-opponent-fraction`
+
+**Default:** `0.0`. **Value:** fraction in [0, 1]
+
+Share of generation games played against an archived Hall-of-Fame checkpoint
+instead of `current_best`. Zero is the compatibility default and keeps the HOF
+write-only. The cloud launch value is **0.15**, chosen explicitly rather than
+made a default so old resumes and unrelated tests keep their opponent mix.
+
+Archived opponents are routed by the **searcher** seat, so every leaf of one
+search uses the mover's network. Routing on the leaf actor instead would let the
+opponent's network evaluate the interior of your own search tree.
+
+### `--hof-sampling-mode`
+
+**Default:** `recency`. **Choices:** `recency`, `uniform`, `latest`
+
+How an archived opponent is drawn. `recency` weights newer archives linearly.
+
+### `--hof-start-games`
+
+**Default:** `10000`. **Value:** non-negative integer
+
+Games before league play begins. Early archives are weak enough that playing
+them is closer to curriculum than to opponent diversity.
+
 ## Search and Training-Target Quality
 
 ### `--cheap-sims-min`, `--cheap-sims-max`
@@ -396,6 +472,21 @@ metadata stored with search records.
 Controls forced materialization of root chance outcomes. The enabled path
 avoids redundant extra-ply evaluations and passed the exact forced-cache gate.
 Leave enabled for normal training; the negative form is useful for ablation.
+
+### `--cheap-double-reveal-offsets`
+
+**Default:** `0` (exhaustive -- the shipped behaviour). **Value:** non-negative
+integer
+
+Offsets per first-reveal stratum on pure double card-reveal chance edges, on
+**cheap generation moves only**. Zero enumerates the full support; a small value
+caps it, trading a fixed-support approximation for search width elsewhere.
+
+Off by default and deliberately so: the fixed-support machinery is built and
+reviewed but its arena and training A/B have not been run. `2` is the value
+`CHANCE_ENUMERATION_PLAN.md` recommends sweeping first. It reaches generation
+only -- gates and evaluation always enumerate exhaustively, so a change here
+cannot silently alter how candidates are compared.
 
 ### `--age-deal-samples`
 
@@ -501,6 +592,83 @@ Together with four layers, width 128 produces the current approximately
 Number of transformer layers. More layers increase representation depth and
 roughly linearly increase most trunk parameters and forward-pass work.
 Checkpoints require the same architecture when loaded.
+
+### `--heads`
+
+**Default:** unset (read from the checkpoint). **Value:** positive integer
+
+Attention-head count. Left unset it follows the checkpoint being loaded, which
+is the safe behaviour: three of W0's harness failures came from a checkpoint's
+geometry being assumed rather than read, and one wasted run rebuilt a 256-wide
+checkpoint as a 128-wide model.
+
+### `--precision`
+
+**Default:** `fp32`. **Choices:** `fp32`, `bf16`
+
+Precision for model calls on the generation, gate, and validation paths. Pinned
+per run: a resume that changes it is refused.
+
+**The benefit is width-dependent, which is easy to get wrong.** W0 measured bf16
+at **0.97x** on S's production path (a slowdown), **1.26x** on M, and **1.69x**
+on L. "bf16 everywhere" was locked in an earlier revision on a measurement taken
+at one width, and that generalisation was wrong. If the run falls back to
+S = 128x4, fp32 goes with it.
+
+bf16 is also not merely a rounding of the same policy: it changed 43 of 64 L
+trajectories in W0's arena. `precision_arena.py` plays one checkpoint against
+itself, bf16 versus fp32, against a known null of 0.500 -- run it before
+trusting a precision you have not played a scored game in.
+
+## Host and Device Memory
+
+The loop bounds host memory explicitly because run 03 died at iteration 70 with
+a host `MemoryError` inside a gate, and reported it as a channel-disconnect
+error from the inference worker rather than as the allocation failure it was.
+
+### `--example-cache-gb`
+
+**Default:** `0` (converts the legacy count). **Value:** GiB
+
+Preferred ceiling for the vectorised-example cache, in calibrated **retained**
+bytes. Games already replayed are served from the cache instead of being
+re-derived; the cache is why an iteration spends ~11 s training rather than
+~23 s re-replaying its window.
+
+### `--example-cache-examples`
+
+**Default:** `250000`. **Value:** non-negative integer
+
+Legacy count-based ceiling, converted at the measured **17.8 KB per example**
+(so 250k is about 4.45 GB). `0` disables the cache entirely.
+
+Summing the six numpy arrays in an `Example` gives ~13.1 KB, which understates
+the real cost by about 26% -- it excludes the ndarray objects, the dataclass,
+cache keys, list overhead, and allocator fragmentation. The bound is therefore
+applied to `nbytes x calibration_factor`, with the factor measured against RSS
+at startup and never allowed below the measured 17.8/13.1 ratio.
+
+### `--memory-budget-gb`
+
+**Default:** `0` (85% of detected RAM). **Value:** GiB
+
+Host RSS budget. On breach the cache is evicted toward a floor and a
+`memory_pressure` event is recorded in the stats row. Slower re-replay beats
+losing a run.
+
+### `--memory-headroom-gb`
+
+**Default:** `2.0`. **Value:** GiB
+
+Host memory reserved outside the process budget.
+
+### `--vram-budget-gb`
+
+**Default:** `0` (90% of detected VRAM). **Value:** GiB
+
+Physical device-memory budget, checked before a gate loads its two models.
+Reported separately from allocator-*reserved* memory, which exceeded physical
+VRAM under Windows/WDDM in W0 and is not a capacity number.
 
 ### `--train-steps`
 
@@ -622,11 +790,13 @@ Evaluate the held-out set every N steps (and always on the final step). The
 validation snapshot is fixed for the duration of an iteration, so the
 checkpoints at step 100, 200 and 300 are compared against identical examples.
 
-### `--restore-best-val`
+### `--restore-best-val` / `--no-restore-best-val`
 
 **Default:** off.
 
-Restore the lowest-validation-loss weights at the end of an iteration.
+Restore the lowest-validation-loss weights at the end of an iteration. The
+`--no-` form is the explicit negation, for a launch script that wants the
+setting stated rather than inherited.
 
 This is **off by default and should stay off** until arena games establish that
 validation loss predicts playing strength. It was unconditionally *on* in run
@@ -840,38 +1010,158 @@ silently approximating.
 Measured cost: none. 32 games at 64 sims took 217s under `puct` against 219s
 under `gumbel`.
 
+### The promotion rule
+
+A gate plays a **fixed** number of games, chosen before the match, and then
+decides **once**:
+
+| outcome | condition |
+|---|---|
+| promote | pair-level Wilson **LCB** > `--promotion-min-lcb` |
+| revert | pair-level Wilson **UCB** < `--revert-max-ucb` |
+| probation | otherwise -- the interval still spans the band |
+
+The observation unit is the **seat pair**, not the game: paired games share a
+seed, and Wilson assumes independence, so pairing makes the bound exact rather
+than mildly anti-conservative. A pair scores in {0, 0.5, 1}.
+
+**There is no mid-match stopping.** An earlier version evaluated both boundaries
+after every pair and stopped on the first crossing. That is optional stopping:
+simulated at 40k trials with a 10% draw rate, it promoted an *evenly matched*
+candidate 14.9% of the time at a 200-game cap and 19.1% at 800, against ~2% for
+the same rule read once at a fixed size. The larger cap made it worse, which
+inverts the entire argument for a larger cap. Nothing in the system ever undoes
+a promotion, so this matters.
+
+**The cap buys power, not safety.** Probability of promoting, by the candidate's
+true per-game strength (simulated, fixed-N, z=1.96):
+
+| games | q=0.52 | q=0.55 | q=0.60 | q=0.65 |
+|---:|---:|---:|---:|---:|
+| 100 | -- | 8.9% | 25.1% | 50.6% |
+| 200 | 4.6% | 13.4% | 43.9% | 79.7% |
+| 400 | 6.5% | 24.0% | 74.0% | 97.8% |
+| 800 | 9.5% | 42.2% | 95.9% | ~100% |
+
+The false-positive column is flat at ~2% at every size. That is what makes a
+small early gate safe.
+
+### `--promotion-min-lcb`
+
+**Default:** `0.50`. **Value:** fraction in [0, 1]
+
+Promote when the pair-level Wilson lower bound clears this. At z=1.96 that is
+~97.5% one-sided confidence against an equal candidate.
+
+Note the requirement in *pair* units: 0.598 at 200 games, 0.569 at 400, 0.549 at
+800. Expected pair points equal the per-game win rate, so these are directly
+comparable to a win rate -- but they are one doubling worse than the same table
+computed per game, which is a correction to earlier planning figures.
+
+### `--revert-max-ucb`
+
+**Default:** `0.48`. **Value:** fraction in [0, 1]. Must not exceed
+`--promotion-min-lcb`.
+
+Revert when the pair-level Wilson **upper** bound falls below this -- a
+confidence bound, not a point estimate. The previous `--revert-win-rate` compared
+the raw rate against 0.48 and reverted an evenly matched candidate **32%** of the
+time at 200 games and **35%** at 100. The UCB form leaves an equal candidate in
+probation ~97% of the time at every size.
+
+The threshold sits *below* `--promotion-min-lcb` deliberately. A fixed threshold
+gets more sensitive as the ladder raises the game count, and mild regression
+during training is normal -- particularly across an LR or curriculum-mix knot --
+so the recoverable direction is the less trigger-happy one.
+
+### `--gate-confidence-z`
+
+**Default:** `1.96`. **Value:** positive
+
+Wilson z for both bounds. Leave it at 1.96 and tune the gate **size** instead;
+two interacting dials make the promote and revert behaviour hard to reason about.
+
+### `--gate-ladder-games`
+
+**Default:** empty (one rung at `--gate-max-games`). **Value:** ascending even
+integers, e.g. `100 200 400 800`
+
+Scheduled gate sizes. The ladder steps **up** one rung after
+`--gate-ladder-step-up-after` consecutive probations and **down** one rung after
+a promotion. Early in a run the learner improves fast and a small gate resolves
+it; late in a run the candidate is +2-3% and the evidence has to be bought.
+
+Choosing the size from *prior* gates and the clock is sound in a way mid-match
+stopping is not: the size is fixed before the games are played, and the candidate
+is a different net every gate.
+
+### `--gate-ladder-step-up-after`
+
+**Default:** `2`. **Value:** positive integer
+
+Consecutive probations before the gate steps up a rung. A revert holds the rung
+rather than dropping it, so the gate that could confirm it runs at the resolution
+that produced it.
+
+### `--gate-ladder-floor-games`
+
+**Default:** `0`. **Value:** non-negative integer
+
+Games that must exist before the ladder may step up at all. Bootstrap gates are
+noisy and their probations are not evidence of stagnation. Below the floor the
+probation counter is held at zero rather than accumulating, so clearing the floor
+starts the count fresh instead of cashing in a backlog.
+
+### `--gate-revert-suppress-knots`
+
+**Default:** empty. **Value:** games-clock points
+
+Extra points after which one gate may not revert. Schedule-driven knots (the
+curriculum finishing, the draft prior finishing, HOF starting) are derived
+automatically; this is for a disruption the config cannot see, such as an LR
+change made on resume. Promotion is never suppressed -- a candidate that clears
+the LCB right after an LR change is genuinely better.
+
+### `--gate-slots`
+
+**Default:** `48`. **Value:** positive integer
+
+Rolling active-game slots used only by promotion gates. Both seat legs share one
+pool, so occupancy moves in units of two games; keep it even.
+
+What matters is `gate_slots x leaves-in-flight` filling
+`--rust-global-batch-cap`, not any relationship to the gate size. Keep the gate
+size well above the slot count -- at 48 slots a 100-game gate is only ~2
+pool-fills deep, which is where the end-of-gate drain starts to cost.
+
 ### `--gate-max-games`
 
 **Default:** `400`. **Constraint:** positive even integer
 
-Maximum games for each SPRT match. Games are evaluated in paired seat-swapped
-legs, so stopping is checked only after a complete pair. The test often stops
-before the cap when evidence is decisive.
+Gate size when `--gate-ladder-games` is empty, and the size the W5.7 cost bench
+uses. With a ladder configured this is unused.
 
-### `--gate-alpha`
+### `--gate-alpha`, `--gate-beta`, `--gate-indifference`
 
-**Default:** `0.05`. **Value:** probability
+**Defaults:** `0.05`, `0.05`, `0.03`. **Vestigial.**
 
-SPRT false-accept error target: the tolerated probability of accepting the
-candidate under the lower-strength hypothesis. Reducing it demands more
-evidence and usually more games.
+SPRT error targets and indifference half-width. They are still accepted and
+still recorded in the manifest, but **no promotion gate reads them** -- the rule
+above replaced SPRT entirely. They remain only so old run configurations parse.
 
-### `--gate-beta`
+### `--anchor-games`
 
-**Default:** `0.05`. **Value:** probability
+**Default:** `200`. **Constraint:** positive even integer
 
-SPRT false-reject error target: the tolerated probability of rejecting the
-candidate under the higher-strength hypothesis. Reducing it also makes the
-test more conservative and usually longer.
+Fixed games per bot-anchor opponent. Anchors never early-stop: they are
+measurements, not decisions, and early stopping biases a score toward whichever
+boundary stopped it. With five curriculum bots plus the greedy bot this is
+`6 x --anchor-games` per anchor gate, which is a real cost -- and it is not
+covered by the gate-cost fit, which measures promotion gates only.
 
-### `--gate-indifference`
-
-**Default:** `0.03`. **Value:** positive fraction
-
-Half-width around each target score rate used to form the two SPRT hypotheses.
-For promotion at a target of 0.50, the default compares approximately 0.47
-against 0.53. A narrower band distinguishes smaller improvements but needs more
-games; a wider band resolves faster but ignores small changes.
+Anchors are also the **only** input to the Elo ladder. Promotion gates no longer
+feed it: a run whose `elo/elo_games.jsonl` contains model-vs-model rows has
+regressed.
 
 ### `--anchor-gate-every-promotions`
 
@@ -906,6 +1196,100 @@ The head-to-head has since been re-measured on the same 400 seeds and is
 by the seat-routing bug -- they use a single-net adapter -- but they were still
 played with Gumbel-perturbed actions under unnormalised sigma, so treat them as
 indicative and re-measure before drawing conclusions.
+
+## Stagnation Detection and Response
+
+Elo cannot detect stagnation in this loop: every candidate plays only its own
+`current_best`, so the ladder has no fixed reference. A promotion-lagged anchor
+fails too, and fails exactly when it matters -- when promotions stop, both
+pointers freeze, and the score becomes a constant no threshold crosses.
+
+### `--self-anchor-games`
+
+**Default:** `0` (off). **Constraint:** non-negative even integer
+
+Fixed games for the self-anchor measurement. The opponent is whatever
+`current_best` was `--self-anchor-lag-games` ago.
+
+**Why games and not promotions.** The anchor is a time-shifted pointer into the
+history of bests, re-evaluated every measurement. The target (`now - lag`)
+advances every iteration; the history only grows on a promotion. So when
+promotions stop, the pointer keeps walking until it reaches `current_best`
+itself -- and then the measurement is a net against itself, which scores exactly
+**0.500**. The null calibrates itself and cannot go stale.
+
+A caught-up anchor is reported rather than played: with paired seeds, both seats
+swapped, and deterministic gate play, the two games of a pair are the same game,
+so the subject wins one and loses one. Playing it would spend a whole gate
+rediscovering a tie.
+
+### `--self-anchor-lag-games`
+
+**Default:** `20000`. **Value:** positive integer
+
+How far back the anchor sits. Also sets how long a frozen best takes to be
+caught: with no promotions, the anchor reaches `current_best` one lag after it
+was promoted.
+
+### `--self-anchor-every-games`
+
+**Default:** `10000`. **Value:** positive integer
+
+Games between measurements. Detection needs at least three, so this sets how
+long a fresh run takes before stagnation can be reported at all.
+
+### Detection
+
+Two independent triggers, both requiring several measurements -- never a single
+point, because one anchor score straddling 0.500 is what an evenly matched pair
+of nets looks like on any given afternoon:
+
+- **interval**: the recent intervals all include 0.500, so no measurement
+  distinguishes the current net from its own past self;
+- **slope**: the OLS slope of score against the games clock is at or below
+  0.005 per 10k games.
+
+The slope is per *games*, not per measurement: an intervention that lengthens
+the window changes the cadence, and a per-measurement slope would then mean two
+different things inside one series.
+
+The anchor is also W0's falsifier. The width decision rests on 14.9M parameters
+having more headroom under continued self-play than 1.03M -- a claim no
+fixed-corpus study can test. A flat anchor slope at L's cost (1.85x generation,
+5.12x training step) is the documented case for the S/fp32 fallback.
+
+### `--intervention-ladder`
+
+**Default:** off. **Flag.**
+
+Enables the response to detected stagnation. Detection reports either way; this
+only controls whether anything acts on it. Four rungs, escalated one at a time:
+
+1. **raise the search budget** (sims x1.5, full-search fraction x1.25) -- the
+   most principled first response, since stagnation usually means the
+   search-improved policy is no longer better than the raw policy at that budget;
+2. **jump the replay window** (x1.5);
+3. **raise the HOF fraction** (to 0.30);
+4. **LR warm restart** (x3).
+
+Model growth is deliberately not on this ladder; size is manual.
+
+Rungs are **exclusive** and always applied to the configuration as launched,
+never stacked -- stacking would make the second rung's effect unattributable,
+which is the whole reason for a measurement window between rungs. A recovery
+drops the rung; an exhausted ladder keeps the last one rather than making a
+fifth uncontrolled change on top of the four that did not work.
+
+Leave it off for a run whose purpose is to measure something. A rung that fires
+mid-series changes the regime the anchor is measuring, and it re-prices the run
+(rung 1 raises generation cost by ~1.5x, which invalidates any gate-share
+budget computed beforehand).
+
+### `--intervention-window-games`
+
+**Default:** `20000`. **Value:** positive integer
+
+Games a rung is held before its effect is judged.
 
 ## Training Lifecycle
 
@@ -982,6 +1366,28 @@ training on recovery data. `0` disables automatic learner reset. The counter is
 measured in gate checks, not iterations, and any `probation` or `promote` resets
 it.
 
+### `--allow-resume-code-drift`
+
+**Default:** off. **Flag.**
+
+Permits a resume whose commit -- or whose uncommitted diff -- differs from the
+one the run started on.
+
+Resuming is normally done by re-running the setup script, which pulls first, so
+without this guard an update landing between two iterations would silently split
+a run across two engines and attribute every later measurement to whichever
+commit the manifest happened to record. The commit alone is not enough: a dirty
+tree at the same SHA is different code, so a digest of the launch-time diff is
+compared too.
+
+Pass it when the drift is intentional and acknowledged -- continuing an older
+run under a new rule, for instance. The run's rows then genuinely span more than
+one engine, and comparisons across the boundary need that in mind.
+
+Precision and schedule positions have their own guards and are **not** covered
+by this flag; those refuse unconditionally, because changing them mid-run
+invalidates the data rather than merely complicating its provenance.
+
 ### `--run-log`
 
 **Default:** `<run-dir>/run.log`. **Value:** transcript path
@@ -1020,11 +1426,25 @@ actual Torch batch rows
   <= rust-global-batch-cap
 
 training history represented by live replay
-  ~= replay-window * games-per-iteration
+  ~= replay-window * games-per-iteration          (iterations basis)
+  ~= min(cap, coefficient * total_games ** exponent)   (games basis)
 
 initial curriculum contribution
   = bot seed records * seed-retain-fraction
   + new games * opponent-fraction
+
+promotion gate wall time
+  ~= fixed overhead + per-game search cost
+  measured at 128x4: ~7.7 min for 200 games at gate-sims 64
+  (an iteration without a gate is ~8.4 min on the same laptop)
+
+anchor gate wall time
+  ~= 6 opponents * anchor-games * per-game search cost
+
+peak host memory
+  ~= 122 KB * max_window_games
+   + example cache ceiling
+   + ~2 GB process
 ```
 
 Do not tune `leaf-batch` as ordinary geometry: values above one change the
@@ -1034,13 +1454,13 @@ search algorithm. Safe laptop throughput tuning should first vary
 
 ## Suggested Configurations
 
-| Use case | Iterations | Games/iteration | Seed games | Gate cap | Model | Notes |
-|---|---:|---:|---:|---:|---|---|
+| Use case | Iterations | Games/iteration | Seed games | Gate size | Model | Notes |
+|---|---:|---:|---:|---|---|---|
 | Plumbing only | overridden | 2 | 8 | 2 | 32 × 1 | Add `--plumbing-smoke`; not training |
 | Short CUDA validation | 2 | 50 | 250 | 20 | 128 × 4 | Checks records, losses, resume, and gates |
 | Laptop pilot | 5 | 250 | 500 | 100 | 128 × 4 | Recommended first meaningful run |
-| Longer laptop run | 10 | 500 | 5,000 | 200–400 | 128 × 4 | Multi-hour/overnight; inspect pilot first |
-| Cloud starting point | re-sweep | re-sweep | 5,000+ | 400 | choose after sizing | Re-sweep scheduler and model geometry |
+| Longer laptop run | 30 | 400 | 2,000 | ladder 100–800 | 128 × 4 | ~8.4 min/iteration measured; add ~7.7 min per gate |
+| Cloud launch | 60+ | re-sweep | 5,000+ | ladder, ceiling from the per-rung fit | 384 × 8 × 6, bf16 | See `CLOUD_TRAINING_PLAN.md`; scheduler geometry from that box's sweep |
 
 Here `128 × 4` means `d-model=128` and `layers=4`, not channels and residual
 blocks. Before a cloud run, re-sweep scheduler geometry on that hardware and
@@ -1054,21 +1474,34 @@ runs should use the soft-gate lifecycle, which keeps a cumulative rolling learne
 so an inconclusive short promotion check no longer discards it:
 
 ```powershell
-.\.venv\Scripts\python.exe -m games.seven_wonders_duel.phase_d `
-  --run-dir games\seven_wonders_duel\runs\<run_name> `
+./.venv/Scripts/python.exe -m games.seven_wonders_duel.phase_d `
+  --run-dir games/seven_wonders_duel/runs/<run_name> `
+  --schedule-basis games `
   --selfplay-generator-mode soft_gate `
   --bootstrap-policy auto_first_trained `
-  --promotion-every 1 `
-  --revert-reset-after 3 `
+  --promotion-every 5 `
+  --revert-reset-after 2 `
+  --promotion-min-lcb 0.50 `
+  --revert-max-ucb 0.48 `
+  --gate-ladder-games 100 200 400 800 `
+  --gate-ladder-floor-games 10000 `
+  --self-anchor-games 200 `
   --generation-backend rust `
   --gate-backend rust `
   --device cuda `
   --leaf-batch 1 `
-  --save-buffer games\seven_wonders_duel\runs\<run_name>\buffer_final.jsonl `
+  --save-buffer games/seven_wonders_duel/runs/<run_name>/buffer_final.jsonl `
   --buffer-autosave-every 1
 ```
 
 Fill in the game, search, model, and scheduler budgets from the sized laptop
-configuration (see the table above); the flags shown are the lifecycle controls
-that differ from a legacy strict-gate run. `run.log` is written under the run
-directory automatically.
+configuration (see the table above); the flags shown are the lifecycle and gate
+controls that differ from a legacy strict-gate run. `run.log` is written under
+the run directory automatically.
+
+`--revert-reset-after 2` is the two-stage revert: the first reverting gate
+switches the generator back to the protected best while the learner keeps its
+weights and keeps training, and only a **second consecutive** reverting gate
+rolls the learner back. Requiring persistence rather than lowering the threshold
+is what separates a transient dip -- normal across a schedule knot -- from a real
+regression.
