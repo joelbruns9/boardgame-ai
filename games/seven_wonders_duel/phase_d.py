@@ -1682,17 +1682,54 @@ class PhaseDLoop:
         target = now - lag
         if target <= 0:
             return None
-        # Each archived best was in force from the iteration it was promoted at
-        # until the next promotion, so the best in force at `target` is the
-        # newest archive whose promotion clock is at or before it.
-        best: tuple[int, Path] | None = None
-        for entry in self.hof.entries():
-            entry_games = self.games_ledger.total_through(entry.iteration)
-            if entry_games <= target and (best is None or entry_games >= best[0]):
-                best = (entry_games, Path(entry.path))
-        if best is None:
+        # The history of bests: every archived one, plus the CURRENT best. The
+        # current one must be a candidate or the pointer can never catch up --
+        # the HOF only ever holds *outgoing* bests, so leaving it out reproduces
+        # exactly the promotion-lagged failure this design rejects: promotions
+        # stop, the newest archive freezes, and the score becomes the constant
+        # gap between two arbitrary frozen nets.
+        history: list[tuple[int, Path]] = [
+            (self.games_ledger.total_through(entry.iteration), Path(entry.path))
+            for entry in self.hof.entries()
+        ]
+        current_iteration = self.current_best_iteration()
+        if current_iteration is not None:
+            history.append(
+                (
+                    self.games_ledger.total_through(current_iteration),
+                    Path(self.current_best),
+                )
+            )
+        # Each best was in force from its promotion until the next one, so the
+        # best in force at `target` is the newest whose clock is at or before it.
+        in_force = [item for item in history if item[0] <= target]
+        if not in_force:
             return None
-        return best[1], best[0]
+        return max(in_force)[1], max(in_force)[0]
+
+    def current_best_iteration(self) -> int | None:
+        """Iteration ``current_best`` was promoted at, from its own metadata."""
+
+        if not Path(self.current_best).is_file():
+            return None
+        stored = torch.load(
+            self.current_best, map_location="cpu", weights_only=False
+        ).get("config", {})
+        iteration = stored.get("iteration")
+        return None if iteration is None else int(iteration)
+
+    def anchor_caught_up(self, path: Path) -> bool:
+        """True when the anchor resolved to ``current_best`` itself.
+
+        Then the match is a net against itself: with paired seeds, both seats
+        swapped, and deterministic gate play, the two games of a pair are the
+        same game, so every pair scores exactly 0.5 and the result is 0.500 with
+        no variance. Playing it would burn a full gate to rediscover that, so
+        the null is reported directly. ``test_a_caught_up_anchor_is_exactly_the
+        _null_when_played`` plays it for real and checks this holds.
+        """
+
+        return Path(path).resolve() == Path(self.current_best).resolve()
 
     def self_anchor_gate(self, iteration: int) -> tuple[GateResult, int] | None:
         """Fixed-N ``current_best`` vs its games-lagged self (W7a).
@@ -1707,6 +1744,32 @@ class PhaseDLoop:
         if reference is None:
             return None
         path, anchor_games = reference
+        games = self.config.self_anchor_games
+        if self.anchor_caught_up(path):
+            # No promotion in longer than the lag. The measurement is a tie by
+            # construction, so record the null rather than spending a gate to
+            # reproduce it.
+            pairs = games // 2
+            lcb, ucb = wilson_interval(
+                pairs * 0.5, pairs, z=self.config.gate_confidence_z
+            )
+            return (
+                GateResult(
+                    opponent=f"self_lag_{anchor_games}_caught_up",
+                    threshold=0.50,
+                    decision="measurement",
+                    games=games,
+                    score_rate=0.5,
+                    pairs=pairs,
+                    wilson_lcb=lcb,
+                    wilson_ucb=ucb,
+                    stop_reason="fixed_n",
+                    evaluated_games=0,
+                    fixed_n=True,
+                    pair_scores=tuple([0.5] * pairs),
+                ),
+                anchor_games,
+            )
         self._admit_gate((self.current_best, path))
         started = time.monotonic()
         try:

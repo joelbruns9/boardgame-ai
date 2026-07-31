@@ -1471,3 +1471,99 @@ def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path)
 
     # The cadence holds it off until enough games have passed.
     assert loop.measure_stagnation(2) is None
+
+
+def test_a_caught_up_anchor_is_exactly_the_null_when_played(tmp_path):
+    """Play a checkpoint against itself and check the short-circuit's claim.
+
+    The caught-up anchor reports 0.500 without playing. That is only sound if
+    playing really would return 0.500: paired seeds with both seats swapped make
+    the two games of a pair the same game, so whichever seat wins, the subject
+    takes it once and loses it once. Verified rather than reasoned about.
+    """
+
+    import torch
+
+    from games.az_loop import wilson_interval
+
+    from .train import make_checkpoint
+
+    loop = PhaseDLoop(
+        _stagnation_config(tmp_path, self_anchor_games=4, gate_backend="python")
+    )
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        make_checkpoint(
+            loop._new_model(),
+            {
+                "model": "transformer",
+                "d_model": loop.config.d_model,
+                "layers": loop.config.layers,
+                "heads": loop._built_heads(loop._new_model()),
+                "iteration": 0,
+            },
+        ),
+        loop.current_best,
+    )
+    spec = loop._model_agent_spec(loop.current_best, "self")
+    report, outcomes = loop._wilson_model_match(
+        spec, spec, seed_offset=99_000, games=6
+    )
+    assert len(outcomes) == 6
+    assert loop._pair_scores(outcomes) == [0.5, 0.5, 0.5]
+    assert report.score_rate == 0.5
+
+    # And the short-circuit reproduces it exactly, interval included.
+    pairs = 3
+    lcb, ucb = wilson_interval(pairs * 0.5, pairs, z=loop.config.gate_confidence_z)
+    assert (report.wilson_lcb, report.wilson_ucb) == pytest.approx((lcb, ucb))
+
+
+def test_the_anchor_catches_up_to_current_best_when_promotions_stop(tmp_path):
+    """The property the whole design rests on (W7a).
+
+    Without current_best in the candidate set the pointer stalls at the newest
+    archive and compares two frozen nets -- the promotion-lagged failure this
+    anchor exists to avoid.
+    """
+
+    import torch
+
+    from .train import make_checkpoint
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        make_checkpoint(
+            loop._new_model(),
+            {
+                "model": "transformer",
+                "d_model": loop.config.d_model,
+                "layers": loop.config.layers,
+                "heads": loop._built_heads(loop._new_model()),
+                "iteration": 4,
+            },
+        ),
+        loop.current_best,
+    )
+    for iteration in (0, 2):
+        path = loop.checkpoint_dir / f"best_{iteration}.pt"
+        path.write_bytes(f"weights {iteration}".encode())
+        loop.hof.add(path, iteration=iteration)
+
+    # current_best (iteration 4) was promoted at clock 10.
+    assert loop.current_best_iteration() == 4
+
+    # Early: the target is behind current_best's promotion, so an archive wins.
+    path, anchor_games = loop.anchor_reference(6)  # clock 14, target 8
+    assert anchor_games == 6 and loop.anchor_caught_up(path) is False
+
+    # Later, with no further promotions, the pointer catches up.
+    path, anchor_games = loop.anchor_reference(8)  # clock 18, target 12
+    assert anchor_games == 10
+    assert loop.anchor_caught_up(path) is True
+
+    block = loop.measure_stagnation(8)
+    assert block["anchor"]["score_rate"] == 0.5
+    assert "caught_up" in block["anchor"]["opponent"]
