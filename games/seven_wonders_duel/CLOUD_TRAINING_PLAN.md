@@ -1,10 +1,13 @@
 # 7WD cloud training: readiness plan
 
-**Status:** **W0/W1/W2/W3/W5/W6 complete. W7 (stagnation) is the last launch
-blocker; W5.7's per-rung gate-cost fit runs on the target host at first
-launch.**
-Revision 11.
-**Revision history:** r11 closes W6: a shared `setup_cloud_common.sh` with the
+**Status:** **Every launch blocker is complete (W0-W3, W5-W7). What remains is
+box-side: W5.7's per-rung gate-cost fit, the equivalence smoke, the precision
+arena, and the throughput sweep all run on the RTX 5090 at first launch.**
+Revision 12.
+**Revision history:** r12 closes W7: a games-indexed self-anchor whose null is
+0.500 by construction, a detector that triggers on the interval or a slope but
+never a single point, and the four-rung intervention ladder present but
+disabled. r11 closes W6: a shared `setup_cloud_common.sh` with the
 Rust stages the 7WD script never had, an equivalence smoke that cannot pass
 vacuously, a committed corpus, the precision arena (which required per-net
 autocast in the routed adapter), the sweep-to-launch flag translation, the
@@ -89,7 +92,7 @@ does not close it -- it makes it **measured every iteration**.
 | W4 | BGA advisor end-to-end with the iter-60 model | M | No -- parallel |
 | W5 | Gate efficiency + fixed-N Wilson decision rule + size ladder | M | **THROUGHPUT DONE; W5.5 REWRITE (r10), W5.8-5.10 AND THE RTX 5090 PER-RUNG FIT OPEN** |
 | W6 | Cloud setup script | M | ~~Yes~~ **DONE 2026-07-30** (box-side acceptance runs on first launch) |
-| W7 | Stagnation detection + intervention ladder | M | **Yes** (both parts) |
+| W7 | Stagnation detection + intervention ladder | M | ~~Yes~~ **DONE 2026-07-30** |
 
 **W1 preceded W2 and W5 validation** and is now done. W2 is closed: the original
 host-memory/restart failure is fixed, and the 32 GB RTX 5090 has ample margin
@@ -965,7 +968,7 @@ Three things the build changed relative to this specification:
 
 ---
 
-## W7 -- Stagnation
+## W7 -- Stagnation: DONE (2026-07-30)
 
 Both halves ship **before** launch. Revision 2 had the intervention ladder
 landing mid-run; that does not work -- a running process will not pick it up,
@@ -1043,6 +1046,41 @@ attributable:
 Principle: schedules for what should change regardless; metrics for what should
 change only on evidence. All schedules in **games**.
 
+### Implementation status (2026-07-30)
+
+| piece | where |
+|---|---|
+| detector + ladder, pure and game-agnostic | `games/az_loop/stagnation.py` |
+| games-indexed anchor selection | `PhaseDLoop.anchor_reference` |
+| fixed-N measurement | `PhaseDLoop.self_anchor_gate` |
+| cadence, persistence, detection, response | `PhaseDLoop.measure_stagnation` + `stagnation.json` |
+| per-iteration hook | `LifecycleAdapter.measure` → `RunController._measure` |
+| heartbeat signals | `RunController.heartbeat_line` |
+| launch knobs | `--self-anchor-games/-lag-games/-every-games`, `--intervention-ladder` |
+
+The anchor is off by default (`--self-anchor-games 0`) and the ladder is off
+independently; the cloud launch script sets the anchor and leaves the ladder off,
+which is the "present but disabled" the plan asks for.
+
+Four things the build settled that the specification left open:
+
+1. **No HOF schema change was needed.** The archive records the iteration a
+   checkpoint was promoted at, and the games ledger converts that to a clock, so
+   "the best in force at `now - lag`" is the newest archive whose promotion clock
+   is at or before it. This also works on archives written before W7 existed.
+2. **The slope is per 10k games, not per measurement.** An intervention that
+   lengthens the window changes the cadence, and a per-measurement slope would
+   then mean two different things inside one series.
+3. **Rungs are exclusive and applied to the pristine config**, never stacked.
+   Stacking would make the second rung's effect unattributable, which is the
+   entire reason for the measurement window between rungs. `base_config` stays
+   as launched so W6.5's resume guards keep comparing against what the operator
+   actually typed, and a persisted rung is re-applied *after* those guards run.
+4. **Recovery drops the rung; exhaustion keeps it.** A recovered run should not
+   stay on an intervention nothing needs. An exhausted ladder should not drop
+   everything at once -- that would be a fifth uncontrolled change on top of the
+   four that did not work.
+
 ---
 
 ## Sequencing
@@ -1052,8 +1090,12 @@ W0 (size + precision) -- DONE 2026-07-29: L = 384x8x6, bf16
   -> W1 (schedules, window, HOF) -- DONE 2026-07-29
     -> W2 (memory) -- DONE 2026-07-30
       -> W3 (stats) -- DONE 2026-07-30
-        -> W5 (gates) -> W6 (cloud) -> W7 -> LAUNCH
-             ^ W5.7 measures complete gate cost at L's width
+        -> W5 (gates)  -- DONE 2026-07-30 (r10 rule + ladder)
+          -> W6 (cloud) -- DONE 2026-07-30
+            -> W7 (stagnation) -- DONE 2026-07-30
+              -> LAUNCH
+                 ^ on the box, before training: equivalence smoke, preflight,
+                   precision arena, throughput sweep, W5.7 per-rung gate cost
 
 W4 (BGA advisor, iter-60) -- parallel throughout
 ```

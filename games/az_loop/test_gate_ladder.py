@@ -164,7 +164,48 @@ def test_heartbeat_reports_health_from_the_committed_row_alone():
     assert "best_iter=40" in line
     assert "action=probation" in line
     assert "gate=0.530[0.470,0.590]n=400" in line
-    assert "anchor=0.740(min 0.660)" in line
+    assert "bots=0.740(min 0.660)" in line
+
+
+def test_heartbeat_carries_the_w7a_signals_when_a_measurement_ran():
+    from .run_controller import RunController
+
+    row = {
+        "iteration": 7,
+        "current_best_iteration": 5,
+        "promotion_action": "probation",
+        "promotions_in_window": "2/20000g",
+        "stats": {
+            "outcomes": {
+                "terminal_reason": {
+                    "civilian": 70,
+                    "scientific": 13,
+                    "military": 17,
+                }
+            },
+            "training": {"accuracies": {"value_acc": 0.612}},
+            "game_specific": {
+                "stagnation": {
+                    "anchor": {
+                        "score_rate": 0.58,
+                        "wilson_lcb": 0.52,
+                        "wilson_ucb": 0.64,
+                        "lag_games": 20_000,
+                    },
+                    "verdict": {"stagnant": True, "slope_per_10k_games": 0.001},
+                    "ladder": {"active": "raise_search_budget"},
+                }
+            },
+        },
+    }
+    line = RunController.heartbeat_line(row)
+    assert "self=0.580[0.520,0.640]lag=20000" in line
+    assert "slope=+0.0010/10k" in line
+    assert "STAGNANT" in line
+    assert "rung=raise_search_budget" in line
+    assert "value_acc=0.612" in line
+    assert "mix=0.70/0.13/0.17" in line
+    assert "promotions=2/20000g" in line
 
 
 def test_heartbeat_survives_a_row_with_no_stats_block():

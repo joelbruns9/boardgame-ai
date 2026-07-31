@@ -1286,3 +1286,188 @@ def test_a_manifest_without_git_provenance_does_not_strand_the_run(tmp_path):
     loop = PhaseDLoop(_soft_gate_config(tmp_path))
     loop._refuse_changed_code({})
     loop._refuse_changed_code({"git": {"commit": "unknown"}})
+
+
+# -- W7: stagnation detection and the intervention ladder -------------------
+
+
+def _stagnation_config(tmp_path, **overrides):
+    base = dict(
+        schedule_basis="games",
+        self_anchor_games=4,
+        self_anchor_lag_games=4,
+        self_anchor_every_games=2,
+        hof_opponent_fraction=0.0,
+    )
+    base.update(overrides)
+    return _soft_gate_config(tmp_path, **base)
+
+
+class _FakeLedger:
+    def __init__(self, per_iteration: int):
+        self.per_iteration = per_iteration
+
+    def total_before(self, iteration: int) -> int:
+        return max(0, iteration) * self.per_iteration
+
+    def total_through(self, iteration: int) -> int:
+        return (max(0, iteration) + 1) * self.per_iteration
+
+
+def test_the_anchor_is_the_best_in_force_at_the_lagged_games_clock(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in (0, 2, 4):
+        path = loop.checkpoint_dir / f"best_{iteration}.pt"
+        path.write_bytes(f"weights {iteration}".encode())
+        loop.hof.add(path, iteration=iteration)
+
+    # At iteration 5 the clock reads 12 games; 6 back is 6, and the best in
+    # force then was the one promoted at iteration 2 (clock 6).
+    reference = loop.anchor_reference(5)
+    assert reference is not None
+    path, anchor_games = reference
+    assert anchor_games == 6
+    assert path.read_bytes() == b"weights 2"
+
+
+def test_a_run_younger_than_the_lag_skips_rather_than_comparing_to_nothing(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=1_000))
+    loop.games_ledger = _FakeLedger(2)
+    assert loop.anchor_reference(1) is None
+    assert loop.measure_stagnation(1) is None
+
+
+def test_the_anchor_is_off_unless_asked_for(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    assert loop.config.self_anchor_games == 0
+    assert loop.measure_stagnation(3) is None
+
+
+def test_the_intervention_ladder_is_present_but_disabled_by_default(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    assert loop.config.intervention_ladder is False
+    assert loop.ladder.enabled is False
+
+
+def test_an_applied_rung_changes_the_schedules_and_clears_cleanly(tmp_path):
+    from games.az_loop.stagnation import DEFAULT_LADDER
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, intervention_ladder=True))
+    base = loop.base_config
+
+    loop.apply_intervention(DEFAULT_LADDER[0])
+    assert loop.config.full_sims_max > base.full_sims_max
+    assert loop.config.learning_rate == base.learning_rate
+
+    # Rungs are exclusive: the second must be applied to the pristine config,
+    # not stacked on the first, or its effect is unattributable.
+    loop.apply_intervention(DEFAULT_LADDER[3])
+    assert loop.config.full_sims_max == base.full_sims_max
+    assert loop.config.learning_rate > base.learning_rate
+
+    loop.apply_intervention(None)
+    assert loop.config == base
+
+
+def test_the_hof_rung_raises_the_opponent_fraction(tmp_path):
+    from games.az_loop.stagnation import DEFAULT_LADDER
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, intervention_ladder=True))
+    rung = next(r for r in DEFAULT_LADDER if r.name == "raise_hof_fraction")
+    loop.apply_intervention(rung)
+    assert loop.config.hof_opponent_fraction == rung.hof_fraction
+
+
+def test_a_persisted_rung_is_re_applied_after_a_resume(tmp_path):
+    from games.az_loop.stagnation import DEFAULT_LADDER, INTERVENING, LadderState
+
+    config = _stagnation_config(tmp_path, intervention_ladder=True)
+    loop = PhaseDLoop(config)
+    loop._write_stagnation_state(
+        {
+            "measurements": [],
+            "ladder": LadderState(
+                state=INTERVENING, rung=0, entered_at_games=10
+            ).as_dict(),
+        }
+    )
+
+    resumed = PhaseDLoop(config)
+    assert resumed.config.full_sims_max == resumed.base_config.full_sims_max
+    resumed.restore_intervention()
+    assert resumed.config.full_sims_max > resumed.base_config.full_sims_max
+    assert resumed.config.full_sims_max == int(
+        round(resumed.base_config.full_sims_max * DEFAULT_LADDER[0].sims_multiplier)
+    )
+
+
+def test_a_disabled_ladder_never_re_applies_a_rung_on_resume(tmp_path):
+    from games.az_loop.stagnation import INTERVENING, LadderState
+
+    config = _stagnation_config(tmp_path, intervention_ladder=False)
+    loop = PhaseDLoop(config)
+    loop._write_stagnation_state(
+        {
+            "measurements": [],
+            "ladder": LadderState(state=INTERVENING, rung=3).as_dict(),
+        }
+    )
+    resumed = PhaseDLoop(config)
+    resumed.restore_intervention()
+    assert resumed.config == resumed.base_config
+
+
+def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path):
+    """Plays real games against a real archived checkpoint.
+
+    The pure detector is tested in az_loop; this covers the seam -- HOF
+    selection, the fixed-N match, and the persisted history a resume reads.
+    """
+
+    loop = PhaseDLoop(
+        _stagnation_config(
+            tmp_path,
+            self_anchor_games=2,
+            self_anchor_lag_games=2,
+            gate_backend="python",
+        )
+    )
+    loop.games_ledger = _FakeLedger(2)
+    import torch
+
+    from .train import make_checkpoint
+
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        make_checkpoint(
+            loop._new_model(),
+            {
+                "model": "transformer",
+                "d_model": loop.config.d_model,
+                "layers": loop.config.layers,
+                "heads": loop._built_heads(loop._new_model()),
+                "iteration": 0,
+            },
+        ),
+        loop.current_best,
+    )
+    loop.hof.add(loop.current_best, iteration=0)
+
+    block = loop.measure_stagnation(2)
+    assert block is not None
+    anchor = block["anchor"]
+    assert anchor["games"] == 2, "fixed-N: every requested game is played"
+    assert anchor["lag_games"] >= loop.config.self_anchor_lag_games
+    assert 0.0 <= anchor["score_rate"] <= 1.0
+    # One measurement can never be a verdict.
+    assert block["verdict"]["stagnant"] is False
+    assert block["ladder"]["enabled"] is False
+
+    persisted = loop.stagnation_state()
+    assert len(persisted["measurements"]) == 1
+    assert persisted["ladder"]["state"] in ("normal", "stagnant")
+
+    # The cadence holds it off until enough games have passed.
+    assert loop.measure_stagnation(2) is None

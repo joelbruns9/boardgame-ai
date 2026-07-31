@@ -38,6 +38,8 @@
 #   HOF_FRACTION=0.15 GATE_LADDER="100 200 400 800"
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
+#   SELF_ANCHOR_GAMES=200 SELF_ANCHOR_LAG_GAMES=20000   W7a stagnation anchor
+#   INTERVENTION_LADDER=0                                W7b response (off)
 #   MEMORY_BUDGET_GB / VRAM_BUDGET_GB / MEMORY_HEADROOM_GB
 #   RUN_DIR_REL=runs/seven_wonders_duel/cloud
 #   LAUNCH=1        set 0 to stop after verification
@@ -81,6 +83,11 @@ HOF_START_GAMES="${HOF_START_GAMES:-10000}"
 GATE_LADDER="${GATE_LADDER:-100 200 400 800}"
 GATE_LADDER_FLOOR_GAMES="${GATE_LADDER_FLOOR_GAMES:-10000}"
 ANCHOR_GAMES="${ANCHOR_GAMES:-200}"
+SELF_ANCHOR_GAMES="${SELF_ANCHOR_GAMES:-200}"
+SELF_ANCHOR_LAG_GAMES="${SELF_ANCHOR_LAG_GAMES:-20000}"
+SELF_ANCHOR_EVERY_GAMES="${SELF_ANCHOR_EVERY_GAMES:-10000}"
+INTERVENTION_LADDER="${INTERVENTION_LADDER:-0}"
+INTERVENTION_WINDOW_GAMES="${INTERVENTION_WINDOW_GAMES:-20000}"
 REPLAY_WINDOW_CAP_GAMES="${REPLAY_WINDOW_CAP_GAMES:-20000}"
 EXAMPLE_CACHE_GB="${EXAMPLE_CACHE_GB:-0}"
 MEMORY_BUDGET_GB="${MEMORY_BUDGET_GB:-0}"
@@ -185,6 +192,14 @@ fi
 
 read -r -a LADDER_RUNGS <<< "$GATE_LADDER"
 
+# W7b ships present-but-disabled: detection reports either way, and enabling
+# the response is a deliberate choice made at launch, not mid-run.
+LADDER_FLAG=()
+if [ "$INTERVENTION_LADDER" = "1" ]; then
+  LADDER_FLAG=(--intervention-ladder)
+  warn "W7b intervention ladder ENABLED: stagnation will change the schedules."
+fi
+
 TRAIN_CMD=(
   "$PY" -m games.seven_wonders_duel.phase_d
   --run-dir "$RUN_DIR_REL"
@@ -206,10 +221,15 @@ TRAIN_CMD=(
   --gate-ladder-step-up-after 2
   --gate-ladder-floor-games "$GATE_LADDER_FLOOR_GAMES"
   --anchor-games "$ANCHOR_GAMES"
+  --self-anchor-games "$SELF_ANCHOR_GAMES"
+  --self-anchor-lag-games "$SELF_ANCHOR_LAG_GAMES"
+  --self-anchor-every-games "$SELF_ANCHOR_EVERY_GAMES"
+  --intervention-window-games "$INTERVENTION_WINDOW_GAMES"
   --replay-window-cap-games "$REPLAY_WINDOW_CAP_GAMES"
   --memory-budget-gb "$MEMORY_BUDGET_GB"
   --vram-budget-gb "$VRAM_BUDGET_GB"
   --memory-headroom-gb "$MEMORY_HEADROOM_GB"
+  "${LADDER_FLAG[@]}"
   "${TUNED_FLAGS[@]}"
 )
 

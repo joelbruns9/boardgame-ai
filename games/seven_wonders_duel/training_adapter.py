@@ -526,6 +526,11 @@ class SevenWondersDuelLifecycleAdapter:
         # next iteration warm up cold from current_best.
         self.loop.clear_optimizer_state()
 
+    def measure(self, iteration: int) -> dict[str, Any] | None:
+        """W7a: the games-indexed anchor, on its own games cadence."""
+
+        return self.loop.measure_stagnation(iteration)
+
     def rollback_iteration(self, iteration: int) -> None:
         """Make an interrupted iteration safely restartable.
 

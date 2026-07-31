@@ -32,7 +32,11 @@ from games.az_loop import (
     EloLedger,
     GameJob,
     GameSchedule,
+    AnchorMeasurement,
     GateLadder,
+    InterventionLadder,
+    LadderState,
+    StagnationDetector,
     GamesLedger,
     GeneratorMode,
     GrowingReplayWindow,
@@ -382,6 +386,23 @@ class PhaseDConfig:
 
     gate_ladder_step_up_after: int = 2
     gate_ladder_floor_games: int = 0
+    self_anchor_games: int = 0
+    """Fixed-N games for the W7a games-indexed self-anchor; 0 disables it."""
+
+    self_anchor_lag_games: int = 20_000
+    """How far back the anchor sits. The anchor catches up when learning stops,
+    which is what makes 0.500 the null."""
+
+    self_anchor_every_games: int = 10_000
+    """Games between anchor measurements."""
+
+    intervention_ladder: bool = False
+    """W7b. Present but disabled: a running process cannot pick up a mid-run
+    change, and restarting to get one is what W6.5 refuses."""
+
+    intervention_window_games: int = 20_000
+    """Games a rung is held before its effect is judged."""
+
     allow_resume_code_drift: bool = False
     """Permit a resume on a different commit or dirty tree (W6.5)."""
 
@@ -618,6 +639,12 @@ class PhaseDConfig:
             raise ValueError("anchor_gate_every_promotions must be non-negative")
         if self.anchor_games <= 0 or self.anchor_games % 2:
             raise ValueError("anchor_games must be a positive even number")
+        if self.self_anchor_games < 0 or self.self_anchor_games % 2:
+            raise ValueError("self_anchor_games must be a non-negative even number")
+        if self.self_anchor_lag_games <= 0 or self.self_anchor_every_games <= 0:
+            raise ValueError("self-anchor lag and cadence must be positive")
+        if self.intervention_window_games <= 0:
+            raise ValueError("intervention_window_games must be positive")
         valid_modes = {mode.value for mode in GeneratorMode}
         if self.selfplay_generator_mode not in valid_modes:
             raise ValueError(
@@ -1394,6 +1421,16 @@ class PhaseDLoop:
         self.current_best = self.checkpoint_dir / "current_best.pt"
         self.adapter = SevenWondersDuelLoopAdapter()
         self.hof = HallOfFame(self.run_dir / "hof")
+        # W7. `base_config` stays exactly as launched: the resume guards compare
+        # against it, and an intervention must never look like a config change
+        # the operator did not make.
+        self.base_config = config
+        self.stagnation_path = self.run_dir / "stagnation.json"
+        self.detector = StagnationDetector()
+        self.ladder = InterventionLadder(
+            enabled=config.intervention_ladder,
+            measurement_window_games=config.intervention_window_games,
+        )
         # The schedule clock. Derived from the buffer files, which are immutable
         # once written, so a resume recomputes it instead of restoring it.
         self.games_ledger = GamesLedger(self.buffer_dir)
@@ -1495,6 +1532,209 @@ class PhaseDLoop:
             iteration,
             self.config.anneal_iterations(),
         )
+
+    # -- W7 stagnation ------------------------------------------------------
+
+    def stagnation_state(self) -> dict[str, Any]:
+        """Anchor history and ladder position, across resumes."""
+
+        if not self.stagnation_path.exists():
+            return {"measurements": [], "ladder": LadderState().as_dict()}
+        return json.loads(self.stagnation_path.read_text(encoding="utf-8"))
+
+    def _write_stagnation_state(self, state: dict[str, Any]) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.stagnation_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.stagnation_path)
+
+    def apply_intervention(self, intervention) -> None:
+        """Rebuild the working config from the pristine one plus one rung (W7b).
+
+        Always from ``base_config``, never from the current config: rungs are
+        exclusive, so stacking them would make the second rung's effect
+        unattributable, which is the whole reason for the measurement window.
+        """
+
+        base = self.base_config
+        if intervention is None:
+            self.config = base
+            return
+        sims = intervention.sims_multiplier
+        self.config = replace(
+            base,
+            cheap_sims_min=max(1, int(round(base.cheap_sims_min * sims))),
+            cheap_sims_max=max(1, int(round(base.cheap_sims_max * sims))),
+            full_sims_min=max(1, int(round(base.full_sims_min * sims))),
+            full_sims_max=max(1, int(round(base.full_sims_max * sims))),
+            full_search_fraction=min(
+                1.0,
+                base.full_search_fraction
+                * intervention.full_search_fraction_multiplier,
+            ),
+            replay_window_coefficient=(
+                base.replay_window_coefficient * intervention.window_multiplier
+            ),
+            replay_window_cap_games=int(
+                round(base.replay_window_cap_games * intervention.window_multiplier)
+            ),
+            hof_opponent_fraction=(
+                base.hof_opponent_fraction
+                if intervention.hof_fraction is None
+                else intervention.hof_fraction
+            ),
+            learning_rate=base.learning_rate * intervention.learning_rate_multiplier,
+        )
+
+    def measure_stagnation(self, iteration: int) -> dict[str, Any] | None:
+        """Run the anchor if it is due, then update detection and the ladder.
+
+        Returns the W3 ``game_specific`` block for this iteration, or ``None``
+        when no measurement was due.
+        """
+
+        if self.config.self_anchor_games <= 0:
+            return None
+        state = self.stagnation_state()
+        measurements = [
+            AnchorMeasurement.from_dict(row) for row in state["measurements"]
+        ]
+        now = self.training_clock(iteration)
+        last = measurements[-1].games if measurements else None
+        if last is not None and now - last < self.config.self_anchor_every_games:
+            return None
+        result = self.self_anchor_gate(iteration)
+        if result is None:
+            return None
+        report, anchor_games = result
+        measurements.append(
+            AnchorMeasurement(
+                games=now,
+                score_rate=report.score_rate,
+                lower=report.wilson_lcb,
+                upper=report.wilson_ucb,
+                anchor_games=anchor_games,
+                iteration=iteration,
+            )
+        )
+        verdict = self.detector.verdict(measurements)
+        ladder_state = self.ladder.advance(
+            LadderState.from_dict(state.get("ladder")), verdict, now
+        )
+        self.apply_intervention(self.ladder.active(ladder_state))
+        self._write_stagnation_state(
+            {
+                "measurements": [item.as_dict() for item in measurements],
+                "ladder": ladder_state.as_dict(),
+            }
+        )
+        active = self.ladder.active(ladder_state)
+        return {
+            "anchor": {
+                "score_rate": report.score_rate,
+                "wilson_lcb": report.wilson_lcb,
+                "wilson_ucb": report.wilson_ucb,
+                "games": report.games,
+                "anchor_games": anchor_games,
+                "lag_games": now - anchor_games,
+                "opponent": report.opponent,
+            },
+            "verdict": {
+                "stagnant": verdict.stagnant,
+                "reasons": list(verdict.reasons),
+                "slope_per_10k_games": verdict.slope_per_10k_games,
+                "measurements": verdict.measurements_considered,
+            },
+            "ladder": {
+                **ladder_state.as_dict(),
+                "enabled": self.ladder.enabled,
+                "active": None if active is None else active.name,
+            },
+        }
+
+    def restore_intervention(self) -> None:
+        """Re-apply the persisted rung after a resume."""
+
+        if not self.config.intervention_ladder:
+            return
+        ladder_state = LadderState.from_dict(self.stagnation_state().get("ladder"))
+        self.apply_intervention(self.ladder.active(ladder_state))
+
+    def anchor_reference(self, iteration: int) -> tuple[Path, int] | None:
+        """The checkpoint that was ``current_best`` ``self_anchor_lag_games`` ago.
+
+        W7a. Indexed by **games**, not by promotions: a promotion-lagged anchor
+        freezes both pointers exactly when promotions stop, so its score becomes
+        a constant no threshold crosses. A games-indexed anchor keeps advancing,
+        catches up to a frozen best, and drives the score to 0.500 -- a net
+        against itself, which is a null nothing has to calibrate.
+
+        Returns ``(path, anchor_games)`` or ``None`` when the run is younger than
+        the lag, which is the documented "skip rather than compare against
+        nothing" case.
+        """
+
+        lag = self.config.self_anchor_lag_games
+        now = self.training_clock(iteration)
+        target = now - lag
+        if target <= 0:
+            return None
+        # Each archived best was in force from the iteration it was promoted at
+        # until the next promotion, so the best in force at `target` is the
+        # newest archive whose promotion clock is at or before it.
+        best: tuple[int, Path] | None = None
+        for entry in self.hof.entries():
+            entry_games = self.games_ledger.total_through(entry.iteration)
+            if entry_games <= target and (best is None or entry_games >= best[0]):
+                best = (entry_games, Path(entry.path))
+        if best is None:
+            return None
+        return best[1], best[0]
+
+    def self_anchor_gate(self, iteration: int) -> tuple[GateResult, int] | None:
+        """Fixed-N ``current_best`` vs its games-lagged self (W7a).
+
+        A measurement, not a decision: no early stopping (W5.6), no lifecycle
+        effect, and it never touches the promotion ladder.
+        """
+
+        if self.config.self_anchor_games <= 0:
+            return None
+        reference = self.anchor_reference(iteration)
+        if reference is None:
+            return None
+        path, anchor_games = reference
+        self._admit_gate((self.current_best, path))
+        started = time.monotonic()
+        try:
+            subject = self._model_agent_spec(self.current_best, "anchor_subject")
+            past = self._model_agent_spec(path, "anchor_past_self")
+            report, _outcomes = self._wilson_model_match(
+                subject,
+                past,
+                seed_offset=53_000_000 + iteration,
+                games=self.config.self_anchor_games,
+            )
+            # Rebuild as a measurement: the promote/revert wording of a gate
+            # decision has no meaning against a past self.
+            return (
+                replace(
+                    report,
+                    opponent=f"self_lag_{anchor_games}",
+                    threshold=0.50,
+                    decision="measurement",
+                    stop_reason="fixed_n",
+                ),
+                anchor_games,
+            )
+        finally:
+            self.phase_seconds["gate"] = (
+                self.phase_seconds.get("gate", 0.0) + time.monotonic() - started
+            )
+            self._cleanup_gate_resources()
 
     def league_assignment(self, iteration: int, games: int) -> LeagueAssignment | None:
         """Draw this iteration's archived opponent, or ``None`` for pure self-play.
@@ -1853,6 +2093,9 @@ class PhaseDLoop:
             )
         self._refuse_changed_code(manifest_payload)
         self._refuse_changed_schedules(manifest_payload)
+        # After the guards, never before: they compare against `base_config`,
+        # and an intervention is not a config change the operator made.
+        self.restore_intervention()
         self._sync_training_log(manifest_payload)
         if self.config.warm_buffer:
             self._load_warm_buffer(Path(self.config.warm_buffer))
@@ -3814,6 +4057,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume even though the commit or working tree differs from the "
         "one the run started on; its rows will span more than one engine",
     )
+    parser.add_argument(
+        "--self-anchor-games",
+        type=int,
+        default=0,
+        help="fixed-N games for the W7a games-indexed self-anchor (0 = off); "
+        "the anchor is whatever current_best was --self-anchor-lag-games ago",
+    )
+    parser.add_argument("--self-anchor-lag-games", type=int, default=20_000)
+    parser.add_argument("--self-anchor-every-games", type=int, default=10_000)
+    parser.add_argument(
+        "--intervention-ladder",
+        action="store_true",
+        help="enable W7b's response to detected stagnation; detection reports "
+        "either way",
+    )
+    parser.add_argument("--intervention-window-games", type=int, default=20_000)
     parser.add_argument("--gate-confidence-z", type=float, default=1.96)
     parser.add_argument(
         "--gate-ladder-games",
@@ -4075,6 +4334,11 @@ def main(argv=None) -> int:
         gate_indifference=args.gate_indifference,
         promotion_min_lcb=args.promotion_min_lcb,
         revert_max_ucb=args.revert_max_ucb,
+        self_anchor_games=args.self_anchor_games,
+        self_anchor_lag_games=args.self_anchor_lag_games,
+        self_anchor_every_games=args.self_anchor_every_games,
+        intervention_ladder=args.intervention_ladder,
+        intervention_window_games=args.intervention_window_games,
         allow_resume_code_drift=args.allow_resume_code_drift,
         gate_ladder_games=tuple(args.gate_ladder_games),
         gate_ladder_step_up_after=args.gate_ladder_step_up_after,

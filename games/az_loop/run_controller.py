@@ -482,6 +482,7 @@ class RunController:
             self.adapter.on_learner_reset(self.current_best_path)
 
         anchor_metrics = self._maybe_run_anchors(transition.action, iteration)
+        measurement = self._measure(iteration)
 
         self.state = transition.next_state
         row = self._build_row(
@@ -496,11 +497,16 @@ class RunController:
             promotion_metrics=promotion_metrics,
             anchor_metrics=anchor_metrics,
         )
+        if measurement:
+            row["measurements"] = measurement
+            stats = row.get("stats")
+            if isinstance(stats, dict):
+                stats.setdefault("game_specific", {})["stagnation"] = measurement
         self.store.append_iteration(row)
         # The row is now durable; the pre-iteration snapshot is no longer needed.
         self._commit_iteration()
         self._emit_iteration_summary(row, generation, replay)
-        self._emit_heartbeat(row)
+        self._emit_heartbeat(row, rows)
         self._maybe_autosave(iteration)
         return row
 
@@ -560,12 +566,57 @@ class RunController:
             mean = sum(float(gate.get("score_rate", 0.0)) for gate in anchors) / len(
                 anchors
             )
-            parts.append(f"anchor={mean:.3f}(min {worst:.3f})")
+            parts.append(f"bots={mean:.3f}(min {worst:.3f})")
+
+        # W7a. The games-indexed self-anchor is the one number that says whether
+        # the run is still learning, and it is also W0's falsifier: a flat slope
+        # at L's cost is the documented case for the S/fp32 fallback.
+        stagnation = (stats.get("game_specific") or {}).get("stagnation") or {}
+        anchor = stagnation.get("anchor") or {}
+        if anchor:
+            parts.append(
+                f"self={float(anchor.get('score_rate', 0.0)):.3f}"
+                f"[{float(anchor.get('wilson_lcb', 0.0)):.3f},"
+                f"{float(anchor.get('wilson_ucb', 1.0)):.3f}]"
+                f"lag={int(anchor.get('lag_games', 0))}"
+            )
+        verdict = stagnation.get("verdict") or {}
+        if verdict:
+            slope = verdict.get("slope_per_10k_games")
+            if slope is not None:
+                parts.append(f"slope={float(slope):+.4f}/10k")
+            if verdict.get("stagnant"):
+                parts.append("STAGNANT")
+        ladder = stagnation.get("ladder") or {}
+        if ladder.get("active"):
+            parts.append(f"rung={ladder['active']}")
+
+        # Learning and mix signals that turned before run 03 died: value_acc
+        # rolled over ~25 iterations early, and the victory mix drifts away from
+        # the reference long before a gate notices.
+        accuracies = (stats.get("training") or {}).get("accuracies") or {}
+        for key in ("value_acc", "val_value_acc"):
+            if key in accuracies:
+                parts.append(f"value_acc={float(accuracies[key]):.3f}")
+                break
+        terminal = (stats.get("outcomes") or {}).get("terminal_reason") or {}
+        total = sum(int(count) for count in terminal.values())
+        if total:
+            mix = "/".join(
+                f"{int(terminal.get(name, 0)) / total:.2f}"
+                for name in ("civilian", "scientific", "military")
+            )
+            parts.append(f"mix={mix}")
+        promotions = row.get("promotions_in_window")
+        if promotions is not None:
+            parts.append(f"promotions={promotions}")
         return " ".join(parts)
 
-    def _emit_heartbeat(self, row: dict[str, Any]) -> None:
+    def _emit_heartbeat(self, row: dict[str, Any], rows=None) -> None:
         """Print the heartbeat and append it to a file that survives a reconnect."""
 
+        if rows is not None:
+            row = {**row, "promotions_in_window": self._recent_promotions(rows, row)}
         line = self.heartbeat_line(row)
         print(line)
         try:
@@ -575,6 +626,42 @@ class RunController:
                 handle.write(line + "\n")
         except OSError as exc:  # noqa: BLE001 - telemetry must never stop a run
             print(f"WARNING: could not append to heartbeat.log: {exc}")
+
+    @staticmethod
+    def _recent_promotions(rows: list[dict[str, Any]], row: dict[str, Any]) -> str:
+        """Promotions over the last 20k games, as `count/window` (W7a).
+
+        A run that has stopped promoting is not necessarily stagnant -- the
+        anchor decides that -- but the two together separate "the gate is too
+        strict" from "the learner has stopped moving".
+        """
+
+        window_games = 20_000
+        recent = list(rows) + [row]
+        total = 0
+        promotions = 0
+        for past in reversed(recent):
+            total += int(past.get("generated_games", 0) or 0)
+            promotions += int(past.get("promotion_action") == "promote")
+            if total >= window_games:
+                break
+        return f"{promotions}/{total}g"
+
+    def _measure(self, iteration: int) -> dict[str, Any] | None:
+        """Run the adapter's periodic measurements, if it has any.
+
+        A measurement is telemetry: it never changes a lifecycle decision, and a
+        failure in it must not end a multi-day run.
+        """
+
+        measure = getattr(self.adapter, "measure", None)
+        if measure is None:
+            return None
+        try:
+            return measure(iteration)
+        except Exception as exc:  # noqa: BLE001 - telemetry is never fatal
+            print(f"WARNING: measurement failed at iteration {iteration}: {exc}")
+            return None
 
     def _maybe_autosave(self, iteration: int) -> None:
         """Owns autosave scheduling and failure policy; the adapter writes.

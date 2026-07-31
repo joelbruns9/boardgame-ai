@@ -162,6 +162,15 @@ class LifecycleAdapter(Protocol):
         """Hook for a revert-reset: clear persisted optimizer state, etc."""
         ...
 
+    def measure(self, iteration: int) -> dict[str, Any] | None:
+        """Periodic measurements the game owns, on its own cadence (W7a).
+
+        Called every iteration after the gates. The adapter decides whether
+        anything is due -- the controller has no games clock and no opinion
+        about what is worth measuring. Returns a block for the row, or None.
+        """
+        ...
+
     def rollback_iteration(self, iteration: int) -> None:
         """Remove game-specific outputs from an uncommitted iteration.
 
