@@ -103,13 +103,36 @@ class RunManifest:
             },
             "checkpoints": [],
             "iterations": [],
+            "iteration_log": {"path": "training_log.jsonl", "count": 0},
         }
         _atomic_json(self.path, payload)
         return payload
 
-    def append_iteration(self, row: dict[str, Any]) -> None:
+    def note_iteration(self, iteration: int) -> None:
+        """Record that an iteration completed, in O(1) manifest bytes.
+
+        This used to append the whole row, which made the manifest a verbatim
+        duplicate of ``training_log.jsonl`` -- and because every append rewrites
+        the file, the cost was quadratic in iterations.  Measured on run 03 at
+        iteration 149: a 188 MB manifest, of which 57.3 MB was an exact copy of
+        the log, costing 0.8 s to parse and 2.9 s to re-serialise *per
+        iteration*, and briefly allocating ~320 MB of peak RSS on a heap that
+        was already 6.5 GB.  That transient is the most plausible cause of the
+        MemoryError that killed the run this one continued from.
+
+        The rows live in the training log, which is append-only and therefore
+        flat in cost.  ``iterations`` stays in the payload but is never appended
+        to again: old runs keep the rows they already have, and
+        ``_sync_training_log`` copies them into the log on the next start.
+        """
+
         manifest = json.loads(self.path.read_text(encoding="utf-8"))
-        manifest["iterations"].append(row)
+        log = manifest.setdefault(
+            "iteration_log", {"path": "training_log.jsonl", "count": 0}
+        )
+        log["count"] = int(log.get("count", 0)) + 1
+        log["last_iteration"] = iteration
+        log.setdefault("first_iteration", iteration)
         _atomic_json(self.path, manifest)
 
     def add_checkpoint(self, path: str | Path, iteration: int, promoted: bool) -> None:

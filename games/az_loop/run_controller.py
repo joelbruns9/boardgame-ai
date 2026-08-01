@@ -79,6 +79,7 @@ class ControllerConfig:
     bootstrap_policy: BootstrapPolicy = BootstrapPolicy.GATE
     promotion_every: int = 1
     revert_reset_after: int = 0
+    probation_reset_after: int = 0
     anchor_gate_every_promotions: int = 0
     anchor_every_iterations: int = 0
     buffer_autosave_every: int = 0
@@ -100,15 +101,21 @@ class ControllerConfig:
             raise ValueError("buffer_autosave_every must be non-negative")
         if self.iterations < 0:
             raise ValueError("iterations must be non-negative")
-        if self.revert_reset_after > 0 and self.mode != GeneratorMode.SOFT_GATE:
-            # A revert-reset copies current_best over latest, discarding the
-            # rolling frontier.  That only makes sense for soft_gate; in latest
-            # or current_best mode it would silently destroy the learner the
-            # mode exists to keep.  Refuse the incompatible combination loudly.
-            raise ValueError(
-                "revert_reset_after is a soft_gate-only feature; it must be 0 "
-                f"for mode {self.mode.value}"
-            )
+        if self.probation_reset_after < 0:
+            raise ValueError("probation_reset_after must be non-negative")
+        for name, value in (
+            ("revert_reset_after", self.revert_reset_after),
+            ("probation_reset_after", self.probation_reset_after),
+        ):
+            if value > 0 and self.mode != GeneratorMode.SOFT_GATE:
+                # Either reset copies current_best over latest, discarding the
+                # rolling frontier.  That only makes sense for soft_gate; in
+                # latest or current_best mode it would silently destroy the
+                # learner the mode exists to keep.  Refuse it loudly.
+                raise ValueError(
+                    f"{name} is a soft_gate-only feature; it must be 0 "
+                    f"for mode {self.mode.value}"
+                )
 
 
 class RunController:
@@ -245,6 +252,7 @@ class RunController:
             "promotion_every": self.config.promotion_every,
             "bootstrap_policy": self.config.bootstrap_policy.value,
             "revert_reset_after": self.config.revert_reset_after,
+            "probation_reset_after": self.config.probation_reset_after,
             "anchor_gate_every_promotions": self.config.anchor_gate_every_promotions,
             "anchor_every_iterations": self.config.anchor_every_iterations,
         }
@@ -350,6 +358,10 @@ class RunController:
         self.initialize()
         completed = [int(row["iteration"]) for row in self.store.iterations()]
         start = max(completed, default=-1) + 1
+        # Remembered so the per-iteration banner can say "3/60" -- `iterations`
+        # is how many *more* to run, not a total, so the position in this
+        # invocation is the only honest denominator.
+        self._run_span = (start, self.config.iterations)
         return [
             self.run_iteration(iteration)
             for iteration in range(start, start + self.config.iterations)
@@ -360,6 +372,8 @@ class RunController:
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         rows = self.store.iterations()
         state = self.state
+
+        self._emit_iteration_banner(iteration)
 
         # Snapshot the rolling checkpoints before any mutation so an interrupted
         # iteration can be rolled back on resume rather than bricking the run.
@@ -457,6 +471,7 @@ class RunController:
             iteration=iteration,
             ladder=ladder,
             allow_step_up=allow_step_up,
+            probation_reset_after=self.config.probation_reset_after,
         )
 
         if transition.replace_best:
@@ -510,10 +525,170 @@ class RunController:
         self._maybe_autosave(iteration)
         return row
 
+    def _emit_iteration_banner(self, iteration: int) -> None:
+        """Rule-and-title header that delimits one iteration in the transcript.
+
+        Without this the transcript is an undifferentiated wall of step lines:
+        reading run 03 meant counting `iter NNNN` markers by eye to find where
+        an iteration started.
+        """
+
+        start, span = getattr(self, "_run_span", (iteration, 0))
+        position = (
+            f" ({iteration - start + 1}/{span})" if span else ""
+        )
+        print()
+        print("=" * 60)
+        print(f"Iteration {iteration}{position}")
+        print("=" * 60)
+
     @staticmethod
     def _emit_iteration_summary(row, generation, replay) -> None:
-        """Compact one-line human summary for the run transcript."""
+        """Indented per-phase block plus the compact one-line summary.
 
+        Everything here already existed in the committed row; only the training
+        log could show it, so diagnosing run 03 meant writing a script to read
+        JSONL that the transcript had implicitly discarded. The block is built
+        from ``row`` alone for the same reason ``heartbeat_line`` is: the row is
+        the durable record, so the transcript can never disagree with it.
+        """
+
+        stats = row.get("stats") or {}
+        out: list[str] = []
+
+        def section(label: str, body: str) -> None:
+            if body:
+                out.append(f"  {label}: {body}")
+
+        schedules = (row.get("training_performance") or {}).get("schedules") or {}
+        if schedules:
+            bits = [f"lr={float(schedules.get('learning_rate', 0.0)):.2e}"]
+            for key, name in (
+                ("curriculum_mix_fraction", "curriculum"),
+                ("hof_opponent_fraction", "hof"),
+                ("draft_prior", "draft_prior"),
+                ("seed_retain_fraction", "seed_retain"),
+            ):
+                if schedules.get(key) is not None:
+                    bits.append(f"{name}={float(schedules[key]):.3f}")
+            bits.append(f"window={schedules.get('replay_window_iterations', '-')}it")
+            section("schedule", " ".join(bits))
+
+        gen = stats.get("generation") or {}
+        if gen:
+            section(
+                "self-play",
+                f"{generation.generated_games} games "
+                f"({float(gen.get('games_per_second', 0.0) or 0.0):.2f}/s) "
+                f"src={row.get('generator_source')} "
+                f"sims={float(gen.get('mean_sims', 0.0) or 0.0):.1f} "
+                f"batch={float(gen.get('mean_batch_size', 0.0) or 0.0):.0f}",
+            )
+
+        outcomes = (stats.get("outcomes") or {}).get("terminal_reason") or {}
+        if outcomes:
+            total = sum(outcomes.values()) or 1
+            mix = "  ".join(
+                f"{name}={count} ({count / total:.0%})"
+                for name, count in sorted(
+                    outcomes.items(), key=lambda kv: -kv[1]
+                )
+            )
+            section("victories", mix)
+
+        specific = stats.get("game_specific") or {}
+        lengths = specific.get("victory_type_game_length") or {}
+        if lengths:
+            section(
+                "victory length",
+                "  ".join(
+                    f"{name}={float(data.get('median', 0)):.0f}"
+                    f"[{float(data.get('p10', 0)):.0f}-"
+                    f"{float(data.get('p90', 0)):.0f}]"
+                    for name, data in sorted(lengths.items())
+                ),
+            )
+        science = specific.get("science") or {}
+        if science:
+            pairs = int(science.get("pairs_completed", 0) or 0)
+            wins = int(science.get("sixth_symbol_wins", 0) or 0)
+            section(
+                "science",
+                f"sixth_symbol_wins={wins} pairs_completed={pairs} "
+                f"tokens={science.get('tokens_taken', 0)} "
+                f"conversion={wins / pairs if pairs else 0.0:.1%}",
+            )
+
+        perf = row.get("training_performance") or {}
+        training = stats.get("training") or {}
+        if training:
+            train_loss = (training.get("train_losses") or {}).get("total")
+            val_loss = (training.get("validation_losses") or {}).get("total")
+            # A run can train without a validation split (val_fraction 0, or a
+            # window too small to hold one out), so every loss here is optional.
+            def number(value: float | None, spec: str) -> str:
+                return "-" if value is None else format(float(value), spec)
+
+            gap = (
+                f" gap={val_loss - train_loss:+.4f}"
+                if train_loss is not None and val_loss is not None
+                else ""
+            )
+            accuracies = training.get("accuracies") or {}
+            section(
+                "train",
+                f"{training.get('steps', 0)} steps "
+                f"loss={number(train_loss, '.4f')} "
+                f"val={number(val_loss, '.4f')}{gap} "
+                f"value_acc={number(accuracies.get('value_acc'), '.3f')} "
+                f"top1={number(accuracies.get('policy_top1'), '.3f')} "
+                f"gnorm={number(training.get('gradient_norm'), '.2f')}",
+            )
+            # `policy` is KD's trainable_examples: when it drops below
+            # `examples`, part of the window is a seat the learner did not play
+            # and only its value labels are being used.
+            examples = int(perf.get("examples", 0) or 0)
+            policy_examples = perf.get("policy_examples")
+            policy = (
+                f" policy={policy_examples}"
+                f"({policy_examples / examples:.0%})"
+                if policy_examples is not None and examples
+                else ""
+            )
+            section(
+                "replay",
+                f"{replay.training_games} games "
+                f"reuse={float(perf.get('samples_per_new_position', 0.0) or 0.0):.1f}x "
+                f"passes={float(perf.get('buffer_passes', 0.0) or 0.0):.2f} "
+                f"new={perf.get('new_examples', 0)}{policy} "
+                f"derive={float(perf.get('replay_derivation_seconds', 0.0) or 0.0):.0f}s",
+            )
+
+        # The gate is the decision of record, so it gets its distance from its
+        # own bar spelled out -- "0.580 vs 0.598 needed" is the sentence run 03
+        # needed on screen and never had.
+        for gate in stats.get("gates") or []:
+            # Sequential gates report no Wilson bounds, so the interval and the
+            # margin are both optional even though the score never is.
+            lcb = gate.get("wilson_lcb")
+            ucb = gate.get("wilson_ucb")
+            interval = (
+                f" [{float(lcb):.3f},{float(ucb):.3f}]"
+                if lcb is not None and ucb is not None
+                else ""
+            )
+            margin = (
+                f" lcb_margin={float(lcb) - 0.5:+.3f}" if lcb is not None else ""
+            )
+            section(
+                "gate",
+                f"{float(gate.get('score_rate', 0.0) or 0.0):.3f}{interval} "
+                f"n={gate.get('games')} vs {gate.get('opponent')} "
+                f"-> {gate.get('decision')} ({gate.get('stop_reason')}){margin}",
+            )
+
+        for line in out:
+            print(line)
         print(
             f"iter {row['iteration']:03d} | gen {generation.generated_games} "
             f"({row['generator_source']}) | replay {replay.training_games} | "
@@ -568,9 +743,11 @@ class RunController:
             )
             parts.append(f"bots={mean:.3f}(min {worst:.3f})")
 
-        # W7a. The games-indexed self-anchor is the one number that says whether
+        # W7c. The games-indexed self-anchor is the one number that says whether
         # the run is still learning, and it is also W0's falsifier: a flat slope
-        # at L's cost is the documented case for the S/fp32 fallback.
+        # at L's cost is the documented case for the S/fp32 fallback. It tracks
+        # the learner's own trajectory; W7a tracked the promotion lineage and so
+        # went silent whenever promotions stopped.
         stagnation = (stats.get("game_specific") or {}).get("stagnation") or {}
         anchor = stagnation.get("anchor") or {}
         if anchor:
@@ -610,6 +787,17 @@ class RunController:
         promotions = row.get("promotions_in_window")
         if promotions is not None:
             parts.append(f"promotions={promotions}")
+
+        # W7b: the revert tally and the probation tally are two mechanisms
+        # reading the same gate. Which one is advancing says whether the run is
+        # being arrested by proven losses or by sustained inconclusiveness --
+        # and if probations dominate, the gate is underpowered rather than the
+        # learner bad. Absent when both are zero, so a healthy run stays quiet.
+        control = row.get("control_state") or {}
+        reverts = int(control.get("consecutive_reverts", 0) or 0)
+        probations = int(control.get("probations_since_decisive", 0) or 0)
+        if reverts or probations:
+            parts.append(f"reverts={reverts} probations={probations}")
         return " ".join(parts)
 
     def _emit_heartbeat(self, row: dict[str, Any], rows=None) -> None:

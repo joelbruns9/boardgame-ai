@@ -45,6 +45,12 @@
 #   LAUNCH=1        set 0 to stop after verification
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke
 #   SKIP_EQUIV=0    set 1 to skip the equivalence suite (do not do this)
+#   SWEEP_CHECKPOINT=<path>  runs the generation + gate scheduler sweeps
+#   SKIP_SWEEPS=0   set 1 to launch on defaults rather than this box
+#   GATE_SWEEP_RUNGS  gate sizes to sweep (default: ladder's middle rung)
+#   GATE_SLOTS / GATE_GLOBAL_BATCH_CAP  gate-side scheduler settings; the
+#                   gate wants a wider pool and cap than generation, and
+#                   sharing one value costs whichever path is misfitted
 # =============================================================================
 set -euo pipefail
 
@@ -96,6 +102,9 @@ MEMORY_HEADROOM_GB="${MEMORY_HEADROOM_GB:-2}"
 LAUNCH="${LAUNCH:-1}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 SKIP_EQUIV="${SKIP_EQUIV:-0}"
+SKIP_SWEEPS="${SKIP_SWEEPS:-0}"
+GATE_SLOTS="${GATE_SLOTS:-}"
+GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-}"
 CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
 common::require_python
@@ -158,6 +167,69 @@ else
 fi
 stage_done 8
 
+# ── STAGE 8b: Scheduler sweeps (generation and gate, separately) ─────────────
+#
+# Generation and the gate need *different* settings, and the axes interact, so
+# both are swept jointly on the box that will run them. Measured on the laptop
+# 3070 (d128 L4, 64 sims, 100-game gates, games/s):
+#
+#     slots \ cap     256      512     1024
+#     48 (shipped)   0.605    0.571    0.581
+#     144            0.752    0.816    0.840
+#
+# The cap's *sign* flips with slot count: at 48 slots widening it costs 4%, at
+# 144 slots it gains 12%. Generation is pinned near 48 slots and is ~85% of an
+# iteration, so `--gate-global-batch-cap` exists to keep a gate-sized cap away
+# from it. Sweeping either axis alone concludes the shipped setting is optimal.
+#
+# One gate sweep is enough: the optimum is stable in gate size. 144 slots /
+# 1024 cap won at 100, 200 and 600 games on the laptop 3070, and the gain over
+# 48/256 barely moved (1.39x at 100 games, 1.37x at 600). GATE_SWEEP_RUNGS
+# defaults to the ladder's middle rung; pass more than one value if a box looks
+# unlike the others, since nothing guarantees that stability on new hardware.
+
+stage 8b "Scheduler sweeps (generation, then gate)"
+if [ "$SKIP_SWEEPS" = "1" ]; then
+  warn "SKIP_SWEEPS=1 — launching on defaults rather than this box's measurement."
+elif [ -z "${SWEEP_CHECKPOINT:-}" ]; then
+  warn "SWEEP_CHECKPOINT unset; skipping both sweeps. Phase D will run on"
+  warn "defaults measured on a different GPU. Set it to a W0 L checkpoint."
+else
+  SWEEP_DIR="$REPO_DIR/$RUN_DIR_REL/sweeps"
+  mkdir -p "$SWEEP_DIR"
+
+  "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
+    --checkpoint "$SWEEP_CHECKPOINT" \
+    --work-dir "$SWEEP_DIR/generation" \
+    --output "$SWEEP_DIR/generation.json" \
+    --games "${SWEEP_GENERATION_GAMES:-$GAMES_PER_ITERATION}" \
+    --slots ${SWEEP_SLOTS:-16 48 96 144} \
+    --caps ${SWEEP_CAPS:-256 512 1024} \
+    || die "Generation sweep failed — do not launch on unmeasured settings."
+  ok "Generation sweep: $SWEEP_DIR/generation.json"
+
+  read -r -a _RUNGS <<< "$GATE_LADDER"
+  read -r -a _SWEEP_RUNGS <<< "${GATE_SWEEP_RUNGS:-${_RUNGS[$(( ${#_RUNGS[@]} / 2 ))]}}"
+  for RUNG in "${_SWEEP_RUNGS[@]}"; do
+    "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
+      --checkpoint "$SWEEP_CHECKPOINT" \
+      --work-dir "$SWEEP_DIR/gate_$RUNG" \
+      --output "$SWEEP_DIR/gate_$RUNG.json" \
+      --games "$RUNG" \
+      --slots ${SWEEP_SLOTS:-16 48 96 144} \
+      --caps ${SWEEP_CAPS:-256 512 1024} \
+      --sims "${GATE_SIMS:-64}" \
+      --precision "$PRECISION" \
+      || die "Gate sweep at rung $RUNG failed."
+    ok "Gate sweep (rung $RUNG): $SWEEP_DIR/gate_$RUNG.json"
+  done
+
+  warn "Sweeps are measured, not applied. Read the 'best' block of each and"
+  warn "relaunch with LAUNCH_FLAGS_JSON=$SWEEP_DIR/generation.json plus"
+  warn "GATE_SLOTS / GATE_GLOBAL_BATCH_CAP from the gate results."
+fi
+stage_done 8b
+
 # ── STAGE 9: Phase D plumbing smoke on CUDA ──────────────────────────────────
 stage 9 "Phase D plumbing smoke on CUDA"
 if [ "$SKIP_SMOKE" = "1" ]; then
@@ -191,6 +263,20 @@ else
 fi
 
 read -r -a LADDER_RUNGS <<< "$GATE_LADDER"
+
+# Gate-side scheduler settings, from stage 8b. Deliberately separate from the
+# generation flags in TUNED_FLAGS: the two paths run at different slot counts,
+# and the batch cap helps at one and hurts at the other.
+GATE_TUNED_FLAGS=()
+[ -n "$GATE_SLOTS" ] && GATE_TUNED_FLAGS+=(--gate-slots "$GATE_SLOTS")
+[ -n "$GATE_GLOBAL_BATCH_CAP" ] &&
+  GATE_TUNED_FLAGS+=(--gate-global-batch-cap "$GATE_GLOBAL_BATCH_CAP")
+if [ ${#GATE_TUNED_FLAGS[@]} -eq 0 ]; then
+  warn "GATE_SLOTS/GATE_GLOBAL_BATCH_CAP unset; the gate will run on generation's"
+  warn "scheduler settings, which measured ~1.2x slower on the laptop 3070."
+else
+  ok "Gate scheduler flags: ${GATE_TUNED_FLAGS[*]}"
+fi
 
 # W7b ships present-but-disabled: detection reports either way, and enabling
 # the response is a deliberate choice made at launch, not mid-run.
@@ -231,6 +317,7 @@ TRAIN_CMD=(
   --memory-headroom-gb "$MEMORY_HEADROOM_GB"
   "${LADDER_FLAG[@]}"
   "${TUNED_FLAGS[@]}"
+  "${GATE_TUNED_FLAGS[@]}"
 )
 
 if [ "$LAUNCH" != "1" ]; then

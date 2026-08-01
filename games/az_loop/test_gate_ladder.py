@@ -214,3 +214,130 @@ def test_heartbeat_survives_a_row_with_no_stats_block():
     line = RunController.heartbeat_line({"iteration": 1})
     assert "iter=0001" in line
     assert "rss=" not in line, "absent telemetry should be absent, not zero"
+
+
+# -- W7b: inconclusive gates accumulate ------------------------------------
+#
+# Run 03 degraded for 45 iterations without `revert_reset_after` firing. Both
+# rules below are about how a *probation* -- "at this many games we could not
+# tell" -- is allowed to affect the counters that arrest a bad learner.
+
+
+def test_probation_no_longer_clears_the_revert_tally():
+    # Run 03's actual sequence: a revert at iteration 105, then a 0.465 gate at
+    # 110 that was too close to call. The near-miss used to wipe the revert, so
+    # the three consecutive reverts a reset needs could never accumulate.
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    state = _step(state, REJECT)
+    assert state.consecutive_reverts == 1
+
+    state = _step(state, CONTINUE)
+    assert state.consecutive_reverts == 1, "a probation is not evidence of innocence"
+
+    result = gate_transition(
+        state,
+        REJECT,
+        revert_reset_after=2,
+        iteration=state.last_iteration + 1,
+        ladder=LADDER,
+    )
+    assert result.reset_learner, "the second revert should now reach the reset"
+
+
+def test_a_promotion_clears_the_revert_tally():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    state = _step(state, REJECT)
+    state = _step(state, ACCEPT)
+    assert state.consecutive_reverts == 0
+
+
+def test_sustained_probation_reaches_the_reset_on_its_own():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    for expected in (1, 2):
+        result = gate_transition(
+            state,
+            CONTINUE,
+            revert_reset_after=0,
+            probation_reset_after=3,
+            iteration=state.last_iteration + 1,
+            ladder=LADDER,
+        )
+        assert not result.reset_learner
+        state = result.next_state
+        assert state.probations_since_decisive == expected
+
+    result = gate_transition(
+        state,
+        CONTINUE,
+        revert_reset_after=0,
+        probation_reset_after=3,
+        iteration=state.last_iteration + 1,
+        ladder=LADDER,
+    )
+    assert result.reset_learner
+    assert result.action.value == "revert_reset"
+    assert result.next_state.probations_since_decisive == 0
+
+
+def test_the_probation_counter_survives_a_ladder_step_up():
+    # The ladder zeroes `consecutive_probations` every `step_up_after`, so the
+    # reset needs its own counter or it could never exceed step_up_after - 1.
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    for _ in range(3):
+        state = _step(state, CONTINUE, probation_reset_after=0)
+    assert state.gate_rung == 1, "the ladder stepped up and reset its own counter"
+    assert state.consecutive_probations == 1
+    assert state.probations_since_decisive == 3, "this counter is not the ladder's"
+
+
+def test_a_decisive_gate_clears_the_probation_counter():
+    for decisive in (ACCEPT, REJECT):
+        state = initial_state(GeneratorMode.SOFT_GATE)
+        state = _step(state, CONTINUE, probation_reset_after=0)
+        state = _step(state, CONTINUE, probation_reset_after=0)
+        assert state.probations_since_decisive == 2
+        state = _step(state, decisive, probation_reset_after=0)
+        assert state.probations_since_decisive == 0
+
+
+def test_probation_reset_is_off_by_default():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    for _ in range(10):
+        result = gate_transition(
+            state,
+            CONTINUE,
+            revert_reset_after=0,
+            iteration=state.last_iteration + 1,
+            ladder=LADDER,
+        )
+        assert not result.reset_learner
+        state = result.next_state
+
+
+def test_probation_reset_after_rejects_a_negative_value():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    with pytest.raises(ValueError, match="probation_reset_after"):
+        gate_transition(
+            state,
+            CONTINUE,
+            revert_reset_after=0,
+            probation_reset_after=-1,
+            iteration=0,
+            ladder=LADDER,
+        )
+
+
+def test_both_counters_round_trip_through_a_committed_row():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    state = _step(state, REJECT)
+    state = _step(state, CONTINUE, probation_reset_after=0)
+    restored = GeneratorState.from_row(state.as_row())
+    assert restored.consecutive_reverts == state.consecutive_reverts
+    assert restored.probations_since_decisive == state.probations_since_decisive
+
+
+def test_a_pre_w7b_row_resumes_with_a_zero_probation_counter():
+    state = initial_state(GeneratorMode.SOFT_GATE)
+    row = state.as_row()
+    del row["probations_since_decisive"]
+    assert GeneratorState.from_row(row).probations_since_decisive == 0

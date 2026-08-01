@@ -24,16 +24,28 @@ SEVEN_WONDERS_REFERENCE = {
 
 
 def load_rows(run_dir: Path) -> list[dict[str, Any]]:
-    manifest = run_dir / "run_manifest.json"
-    if manifest.exists():
-        return list(json.loads(manifest.read_text(encoding="utf-8")).get("iterations", []))
+    """Completed iterations, newest source first.
+
+    The training log is preferred: since the manifest stopped duplicating rows
+    it is the only complete source, and for a run that predates that change the
+    two agree because ``_sync_training_log`` backfills the log on every start.
+    The manifest is still read for a run whose log was never written.
+    """
+
     log = run_dir / "training_log.jsonl"
     if log.exists():
-        return [
+        rows = [
             json.loads(line)
             for line in log.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        if rows:
+            return rows
+    manifest = run_dir / "run_manifest.json"
+    if manifest.exists():
+        return list(
+            json.loads(manifest.read_text(encoding="utf-8")).get("iterations", [])
+        )
     raise FileNotFoundError(f"no run_manifest.json or training_log.jsonl in {run_dir}")
 
 

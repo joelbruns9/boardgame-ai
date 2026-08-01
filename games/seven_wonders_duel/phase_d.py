@@ -13,6 +13,7 @@ from collections import Counter, OrderedDict
 import gc
 import hashlib
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 import json
 import math
 from pathlib import Path
@@ -424,6 +425,7 @@ class PhaseDConfig:
     bootstrap_policy: str = "gate"
     promotion_every: int = 4
     revert_reset_after: int = 0
+    probation_reset_after: int = 0
     buffer_autosave_every: int = 0
     warm_buffer_max_staleness: int = 0
     allow_stale_targets: bool = False
@@ -434,6 +436,18 @@ class PhaseDConfig:
     gate_backend: str = "rust"
     rust_slots: int = 16
     rust_global_batch_cap: int = 256
+    gate_global_batch_cap: int = 0
+    """Gate-path batch cap; 0 follows ``rust_global_batch_cap``.
+
+    The cap's *sign* depends on the slot count it runs at, so generation and the
+    gate cannot share one value once their slot counts differ.  Measured on the
+    laptop 3070 at 64 sims (``w5_gate_slots_sweep``): at 48 slots raising the cap
+    from 256 to 1024 costs ~4%, because the scheduler waits on batches that will
+    never fill; at 144 slots the same change gains ~12%.  Generation is pinned at
+    48 slots by the throughput programme and is ~85% of an iteration, so a cap
+    chosen for a wide gate must not reach it.
+    """
+
     rust_max_inflight_batches: int = 1
     rust_scheduler_workers: int = 1
     leaf_batch: int = 1
@@ -541,6 +555,15 @@ class PhaseDConfig:
             hof_start_games=self.hof_start_games,
         )
         return identity
+
+    def gate_batch_cap(self) -> int:
+        """The batch cap every evaluation path runs under.
+
+        One accessor rather than the fallback spelled out at each call site, so
+        a new gate path cannot silently pick up generation's cap.
+        """
+
+        return self.gate_global_batch_cap or self.rust_global_batch_cap
 
     def gate_ladder(self) -> GateLadder:
         """Scheduled gate sizes (W5.8), or one rung at ``gate_max_games``."""
@@ -659,6 +682,8 @@ class PhaseDConfig:
             raise ValueError("promotion_every must be non-negative")
         if self.revert_reset_after < 0:
             raise ValueError("revert_reset_after must be non-negative")
+        if self.probation_reset_after < 0:
+            raise ValueError("probation_reset_after must be non-negative")
         if self.buffer_autosave_every < 0:
             raise ValueError("buffer_autosave_every must be non-negative")
         if self.example_cache_examples < 0:
@@ -685,6 +710,8 @@ class PhaseDConfig:
             raise ValueError("Rust scheduler geometry must be positive")
         if self.leaf_batch > self.rust_global_batch_cap:
             raise ValueError("leaf_batch cannot exceed rust_global_batch_cap")
+        if self.gate_global_batch_cap < 0:
+            raise ValueError("gate_global_batch_cap must be non-negative")
         if not 0 <= self.age_deal_samples <= 32:
             raise ValueError("age_deal_samples must be in [0, 32]")
         if self.cheap_double_reveal_offsets < 0:
@@ -895,6 +922,57 @@ def _tag_league_opponents(
         agents["league_assignment_used"] = "true"
         tagged.append(replace(record, agents=agents))
     return tagged
+
+
+@lru_cache(maxsize=64)
+def _digest_of(path: str, size: int, mtime_ns: int) -> str:
+    """sha256 of a checkpoint, memoised on (path, size, mtime).
+
+    Checkpoints are ~4 MB and the anchor compares two of them per measurement.
+    Keying on the stat fields rather than the path alone means a file rewritten
+    in place -- `latest.pt` every iteration -- re-hashes rather than returning a
+    stale digest.
+    """
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _file_digest(path: str | Path) -> str:
+    stat = Path(path).stat()
+    return _digest_of(str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+def _sanitize_non_finite(value: Any, path: str = "") -> tuple[Any, list[str]]:
+    """Replace inf/nan with None anywhere in a row, reporting where they were.
+
+    Returns ``(clean, paths)``. Containers are rebuilt only when something below
+    them changed, so a clean row comes back unchanged rather than deep-copied --
+    these rows carry the whole per-step history and are not small.
+    """
+
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value, []
+        return None, [path or "<root>"]
+    if isinstance(value, dict):
+        found: list[str] = []
+        clean: dict[Any, Any] = {}
+        for key, item in value.items():
+            cleaned, paths = _sanitize_non_finite(item, f"{path}/{key}")
+            clean[key] = cleaned
+            found.extend(paths)
+        return (clean if found else value), found
+    if isinstance(value, (list, tuple)):
+        found = []
+        items = []
+        for index, item in enumerate(value):
+            cleaned, paths = _sanitize_non_finite(item, f"{path}[{index}]")
+            items.append(cleaned)
+            found.extend(paths)
+        if not found:
+            return value, []
+        return (tuple(items) if isinstance(value, tuple) else items), found
+    return value, []
 
 
 def _write_records(path: Path, records: Sequence[GameRecord]) -> None:
@@ -1452,6 +1530,9 @@ class PhaseDLoop:
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
         self.last_gate_stats: dict[str, Any] = {}
+        # W7c: the anchor reuses this when it resolves to the same match.
+        self.last_promotion_gate: GateResult | None = None
+        self.last_promotion_gate_iteration: int | None = None
         self.last_warm_stats: dict[str, int] = {}
         self.resource_monitor = ResourceMonitor()
         self.phase_seconds: dict[str, float] = {}
@@ -1664,17 +1745,30 @@ class PhaseDLoop:
         self.apply_intervention(self.ladder.active(ladder_state))
 
     def anchor_reference(self, iteration: int) -> tuple[Path, int] | None:
-        """The checkpoint that was ``current_best`` ``self_anchor_lag_games`` ago.
+        """The learner's own checkpoint from ``self_anchor_lag_games`` ago.
 
-        W7a. Indexed by **games**, not by promotions: a promotion-lagged anchor
-        freezes both pointers exactly when promotions stop, so its score becomes
-        a constant no threshold crosses. A games-indexed anchor keeps advancing,
-        catches up to a frozen best, and drives the score to 0.500 -- a net
-        against itself, which is a null nothing has to calibrate.
+        W7c. The subject and the reference are both points on the *candidate*
+        trajectory -- the thing that trains every iteration -- not on the
+        promotion lineage.
 
-        Returns ``(path, anchor_games)`` or ``None`` when the run is younger than
-        the lag, which is the documented "skip rather than compare against
-        nothing" case.
+        W7a indexed the promotion lineage instead, and run 03 showed what that
+        costs.  ``current_best`` froze at iteration 60; once the clock passed
+        ``promotion + lag`` the reference resolved to ``current_best`` itself, so
+        the measurement was a net against itself and the code returned a
+        synthetic 0.500 rather than play it.  That is not "no improvement", it is
+        *no measurement*: the anchor went dark for 35 iterations spanning both a
+        collapse and a full recovery, and reported the same number throughout.
+        An anchor that is undefined exactly when promotions stop cannot answer
+        the question it exists for, because promotions stopping is the question.
+
+        ``candidate_NNNN.pt`` is written every iteration and is what ``latest.pt``
+        was installed from, so the candidate series *is* the history of the
+        learner.  It always advances, so the reference can never catch up and the
+        series never degenerates.
+
+        Returns ``(path, anchor_games)``, or ``None`` when the run is younger
+        than the lag -- the documented "skip rather than compare against
+        nothing" case -- or when the checkpoint that far back is gone.
         """
 
         lag = self.config.self_anchor_lag_games
@@ -1682,26 +1776,15 @@ class PhaseDLoop:
         target = now - lag
         if target <= 0:
             return None
-        # The history of bests: every archived one, plus the CURRENT best. The
-        # current one must be a candidate or the pointer can never catch up --
-        # the HOF only ever holds *outgoing* bests, so leaving it out reproduces
-        # exactly the promotion-lagged failure this design rejects: promotions
-        # stop, the newest archive freezes, and the score becomes the constant
-        # gap between two arbitrary frozen nets.
-        history: list[tuple[int, Path]] = [
-            (self.games_ledger.total_through(entry.iteration), Path(entry.path))
-            for entry in self.hof.entries()
-        ]
-        current_iteration = self.current_best_iteration()
-        if current_iteration is not None:
-            history.append(
-                (
-                    self.games_ledger.total_through(current_iteration),
-                    Path(self.current_best),
-                )
-            )
-        # Each best was in force from its promotion until the next one, so the
-        # best in force at `target` is the newest whose clock is at or before it.
+        history: list[tuple[int, Path]] = []
+        for known in self.games_ledger.known_iterations():
+            if known >= iteration:
+                continue
+            path = self.checkpoint_dir / f"candidate_{known:04d}.pt"
+            if path.is_file():
+                history.append((self.games_ledger.total_through(known), path))
+        # Each candidate was the learner from its own iteration until the next,
+        # so the one in force at `target` is the newest at or before it.
         in_force = [item for item in history if item[0] <= target]
         if not in_force:
             return None
@@ -1718,8 +1801,13 @@ class PhaseDLoop:
         iteration = stored.get("iteration")
         return None if iteration is None else int(iteration)
 
+    def anchor_subject(self) -> Path:
+        """The net the anchor measures: the learner, not the promoted best."""
+
+        return self.checkpoint_dir / "latest.pt"
+
     def anchor_caught_up(self, path: Path) -> bool:
-        """True when the anchor resolved to ``current_best`` itself.
+        """True when the anchor resolved to the subject itself.
 
         Then the match is a net against itself: with paired seeds, both seats
         swapped, and deterministic gate play, the two games of a pair are the
@@ -1727,28 +1815,81 @@ class PhaseDLoop:
         no variance. Playing it would burn a full gate to rediscover that, so
         the null is reported directly. ``test_a_caught_up_anchor_is_exactly_the
         _null_when_played`` plays it for real and checks this holds.
+
+        Kept after W7c retargeted the anchor to the candidate trajectory, where
+        it should now be unreachable: the reference is strictly older than the
+        current iteration, so it cannot be the subject.  It stays as the cheap
+        guard that keeps the degenerate case from ever being *played*, since a
+        pruned or relinked checkpoint could still alias the two.
         """
 
-        return Path(path).resolve() == Path(self.current_best).resolve()
+        subject = self.anchor_subject()
+        if not (Path(path).is_file() and subject.is_file()):
+            return False
+        if Path(path).resolve() == subject.resolve():
+            return True
+        # Distinct files can still hold identical weights -- `current_best.pt` is
+        # a copy of some candidate, and a revert-reset makes `latest.pt` a copy
+        # of `current_best.pt`. Compare contents, not paths.
+        return _file_digest(path) == _file_digest(subject)
+
+    def anchor_duplicates_gate(self, path: Path) -> bool:
+        """True when this iteration's promotion gate already played this match.
+
+        The gate plays ``latest`` against ``current_best``; the anchor plays
+        ``latest`` against a lagged candidate. When the lagged candidate is the
+        net that ``current_best`` was copied from, the two matches are the same
+        match, and under W7a's promotion-indexed reference that collision was
+        guaranteed rather than rare -- both ran on the same 2,000-game cadence.
+        Reusing the gate's result is exact, not an approximation: same subject,
+        same opponent weights, same fixed-N rule.
+        """
+
+        report = self.last_promotion_gate
+        if report is None or not Path(self.current_best).is_file():
+            return False
+        return _file_digest(path) == _file_digest(Path(self.current_best))
 
     def self_anchor_gate(self, iteration: int) -> tuple[GateResult, int] | None:
-        """Fixed-N ``current_best`` vs its games-lagged self (W7a).
+        """Fixed-N ``latest`` vs its games-lagged self (W7c).
 
         A measurement, not a decision: no early stopping (W5.6), no lifecycle
         effect, and it never touches the promotion ladder.
+
+        Two ways it avoids playing games it does not need to: the degenerate
+        self-match guard (``anchor_caught_up``), and reuse of this iteration's
+        promotion gate when that gate already played this exact pairing
+        (``anchor_duplicates_gate``).
         """
 
         if self.config.self_anchor_games <= 0:
+            return None
+        # `latest.pt` is installed by the soft-gate controller. A strict-gate run
+        # has no rolling learner file, so there is no subject to measure and the
+        # anchor skips rather than failing the iteration around it.
+        if not self.anchor_subject().is_file():
             return None
         reference = self.anchor_reference(iteration)
         if reference is None:
             return None
         path, anchor_games = reference
         games = self.config.self_anchor_games
+        if self.anchor_duplicates_gate(path):
+            report = self.last_promotion_gate
+            assert report is not None  # anchor_duplicates_gate checked it
+            return (
+                replace(
+                    report,
+                    opponent=f"self_lag_{anchor_games}_from_gate",
+                    threshold=0.50,
+                    decision="measurement",
+                ),
+                anchor_games,
+            )
         if self.anchor_caught_up(path):
-            # No promotion in longer than the lag. The measurement is a tie by
-            # construction, so record the null rather than spending a gate to
-            # reproduce it.
+            # The reference holds the subject's own weights. The measurement is
+            # a tie by construction, so record the null rather than spending a
+            # gate to reproduce it.
             pairs = games // 2
             lcb, ucb = wilson_interval(
                 pairs * 0.5, pairs, z=self.config.gate_confidence_z
@@ -1770,10 +1911,11 @@ class PhaseDLoop:
                 ),
                 anchor_games,
             )
-        self._admit_gate((self.current_best, path))
+        subject_path = self.anchor_subject()
+        self._admit_gate((subject_path, path))
         started = time.monotonic()
         try:
-            subject = self._model_agent_spec(self.current_best, "anchor_subject")
+            subject = self._model_agent_spec(subject_path, "anchor_subject")
             past = self._model_agent_spec(path, "anchor_past_self")
             report, _outcomes = self._wilson_model_match(
                 subject,
@@ -1966,10 +2108,58 @@ class PhaseDLoop:
         return state
 
     def _append_training_log(self, row: dict[str, Any]) -> None:
-        """Append one completed iteration using the manifest's existing metrics."""
+        """Append one completed iteration using the manifest's existing metrics.
 
+        Non-finite metrics are replaced with ``null`` and the paths that held
+        them are recorded on the row. ``allow_nan=False`` stays -- an
+        ``Infinity`` literal is not JSON and every reader would have to cope --
+        but telemetry must never be able to destroy a run: by the time this is
+        called, generation, training and the gate are all done, and the row is
+        pure reporting. Run ``rss_check`` died exactly here, at iteration 2, on
+        an ``inf`` gradient norm from a routine GradScaler overflow, discarding
+        nine minutes of completed work to report a number nothing consumes.
+
+        Sanitising is not silencing: the paths go on the row, a warning is
+        printed, and a reader can find them. A genuinely diverged loss still
+        shows up -- as a null beside a named field.
+        """
+
+        row, non_finite = _sanitize_non_finite(row)
+        if non_finite:
+            row = {**row, "non_finite_fields": non_finite}
+            print(
+                f"WARNING: iteration {row.get('iteration')} produced "
+                f"{len(non_finite)} non-finite metric(s), logged as null: "
+                + ", ".join(non_finite[:8])
+                + (" ..." if len(non_finite) > 8 else "")
+            )
         with self.training_log.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+    def training_log_rows(self) -> list[dict[str, Any]]:
+        """Every completed iteration, from the append-only log.
+
+        The log is the source of truth for rows; the manifest holds provenance
+        and a count (see ``RunManifest.note_iteration``).  Safe to call after
+        ``initialize``, which runs ``_sync_training_log`` and so guarantees any
+        rows an older run left in the manifest are present here.
+        """
+
+        if not self.training_log.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        with self.training_log.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"invalid training log row {line_number}: "
+                        f"{self.training_log}"
+                    ) from exc
+        return rows
 
     def _sync_training_log(self, manifest: dict[str, Any]) -> None:
         """Backfill manifest rows missing from an interrupted or older run's log."""
@@ -2876,6 +3066,11 @@ class PhaseDLoop:
         new_examples = len(temporal_examples)
         self.last_training_stats = {
             "examples": len(examples),
+            # KD's `trainable_examples`: how many of these carry a policy
+            # target. Below `examples` once league or bot games are in the
+            # window, because a seat the learner did not play contributes its
+            # value labels but not its policy (`learner_policy_seats`).
+            "policy_examples": sum(1 for example in examples if example.has_policy),
             "train_examples": len(train_examples),
             "validation_examples": len(val_examples),
             "train_games": len({example.game_key for example in train_examples}),
@@ -2951,7 +3146,7 @@ class PhaseDLoop:
             torch.cuda.empty_cache()
         sample = self.sample_resources("pre_gate")
         checkpoint_bytes = sum(Path(path).stat().st_size for path in checkpoints)
-        packed_bytes = self.config.rust_global_batch_cap * 512 * 1024
+        packed_bytes = self.config.gate_batch_cap() * 512 * 1024
         projected_host = int(sample["rss_bytes"] or 0) + 2 * checkpoint_bytes + packed_bytes
         if self.memory_budget_bytes and projected_host > self.memory_budget_bytes:
             need = projected_host - self.memory_budget_bytes
@@ -3069,7 +3264,7 @@ class PhaseDLoop:
             return Evaluator(
                 model,
                 self.config.device,
-                self.config.rust_global_batch_cap,
+                self.config.gate_batch_cap(),
                 precision=self.config.precision,
             )
 
@@ -3176,7 +3371,7 @@ class PhaseDLoop:
             return Evaluator(
                 model,
                 self.config.device,
-                self.config.rust_global_batch_cap,
+                self.config.gate_batch_cap(),
                 precision=precision,
             )
 
@@ -3205,7 +3400,7 @@ class PhaseDLoop:
             adapter=adapter,
             games=rust_games_for_self_play(seeds, first_players),
             game_seeds=seeds,
-            global_batch_cap=self.config.rust_global_batch_cap,
+            global_batch_cap=self.config.gate_batch_cap(),
             leaf_batch=1,
             cheap_sims_min=self.config.gate_sims,
             cheap_sims_max=self.config.gate_sims,
@@ -3292,7 +3487,7 @@ class PhaseDLoop:
                         seeds[slot] + move_index * 1_000_003 + seat * 7_919
                         for slot in slots
                     ],
-                    self.config.rust_global_batch_cap,
+                    self.config.gate_batch_cap(),
                     1,
                     self.config.gate_sims,
                     self.config.top_k,
@@ -3343,7 +3538,7 @@ class PhaseDLoop:
         evaluator = Evaluator(
             model,
             self.config.device,
-            self.config.rust_global_batch_cap,
+            self.config.gate_batch_cap(),
             precision=self.config.precision,
         )
         adapter = rust_flat_batch_adapter(evaluator)
@@ -3362,7 +3557,7 @@ class PhaseDLoop:
                     adapter=adapter,
                     games=rust_games_for_self_play(seeds, first_players),
                     game_seeds=seeds,
-                    global_batch_cap=self.config.rust_global_batch_cap,
+                    global_batch_cap=self.config.gate_batch_cap(),
                     leaf_batch=1,
                     cheap_sims_min=self.config.gate_sims,
                     cheap_sims_max=self.config.gate_sims,
@@ -3709,6 +3904,8 @@ class PhaseDLoop:
             # therefore not an Elo sample. Only fixed-N anchors enter the
             # ladder; recording this prefix would bias ratings toward whichever
             # boundary happened to stop the match.
+            self.last_promotion_gate = report
+            self.last_promotion_gate_iteration = iteration
             return report
         finally:
             self.phase_seconds["gate"] = (
@@ -3823,15 +4020,14 @@ class PhaseDLoop:
                 "training_summary": summarize_records(records),
                 "generation_performance": self.last_generation_stats,
             }
-            self.manifest.append_iteration(row)
             self._append_training_log(row)
+            self.manifest.note_iteration(iteration)
             return row
         candidate = self.train_candidate(records, iteration)
         promotion_gate = self.promotion_gate(candidate)
         promoted = promotion_gate.decision == "accept"
-        payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
         previous_promotions = sum(
-            bool(row.get("promoted")) for row in payload.get("iterations", [])
+            bool(row.get("promoted")) for row in self.training_log_rows()
         )
         if promoted:
             self.promote(candidate, iteration)
@@ -3861,8 +4057,8 @@ class PhaseDLoop:
             "generation_performance": self.last_generation_stats,
             "training_performance": self.last_training_stats,
         }
-        self.manifest.append_iteration(row)
         self._append_training_log(row)
+        self.manifest.note_iteration(iteration)
         return row
 
     def run(self) -> list[dict[str, Any]]:
@@ -3875,8 +4071,7 @@ class PhaseDLoop:
         """Legacy Phase D lifecycle: gate every candidate against current_best."""
 
         self.initialize()
-        payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
-        completed = [row["iteration"] for row in payload.get("iterations", [])]
+        completed = [row["iteration"] for row in self.training_log_rows()]
         start = max(completed, default=-1) + 1
         rows: list[dict[str, Any]] = []
         try:
@@ -3906,6 +4101,7 @@ class PhaseDLoop:
                 bootstrap_policy=BootstrapPolicy(self.config.bootstrap_policy),
                 promotion_every=self.config.promotion_every,
                 revert_reset_after=self.config.revert_reset_after,
+                probation_reset_after=self.config.probation_reset_after,
                 anchor_gate_every_promotions=self.config.anchor_gate_every_promotions,
                 anchor_every_iterations=self.config.anchor_every_iterations,
                 buffer_autosave_every=self.config.buffer_autosave_every,
@@ -3931,12 +4127,13 @@ class _PhaseDRunStore:
         self.loop = loop
 
     def append_iteration(self, row: dict[str, Any]) -> None:
-        self.loop.manifest.append_iteration(row)
+        # Log first: it is the source of truth, and a crash between the two
+        # writes should leave the row present rather than counted-but-lost.
         self.loop._append_training_log(row)
+        self.loop.manifest.note_iteration(int(row["iteration"]))
 
     def iterations(self) -> list[dict[str, Any]]:
-        payload = json.loads(self.loop.manifest.path.read_text(encoding="utf-8"))
-        return payload.get("iterations", [])
+        return self.loop.training_log_rows()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4173,6 +4370,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rust-slots", type=int, default=16)
     parser.add_argument("--rust-global-batch-cap", type=int, default=256)
+    parser.add_argument(
+        "--gate-global-batch-cap",
+        type=int,
+        default=0,
+        help=(
+            "batch cap for evaluation paths only (0 follows "
+            "--rust-global-batch-cap). The cap helps at high slot counts and "
+            "hurts at low ones, so a wide gate and a narrow generator need "
+            "different values. Size it with w5_gate_slots_sweep."
+        ),
+    )
     parser.add_argument("--rust-max-inflight-batches", type=int, default=1)
     parser.add_argument("--rust-scheduler-workers", type=int, default=1)
     parser.add_argument("--leaf-batch", type=int, default=1)
@@ -4226,6 +4434,17 @@ def build_parser() -> argparse.ArgumentParser:
         "resolve --gate-indifference or the gate decides nothing",
     )
     parser.add_argument("--revert-reset-after", type=int, default=0)
+    parser.add_argument(
+        "--probation-reset-after",
+        type=int,
+        default=0,
+        help=(
+            "reset the learner to current_best after this many consecutive "
+            "probations (0 disables). Sustained probation is the state where "
+            "nothing moves; pair with a gate ladder so resolution is bought "
+            "before progress is discarded."
+        ),
+    )
     parser.add_argument(
         "--buffer-autosave-every",
         type=int,
@@ -4411,6 +4630,7 @@ def main(argv=None) -> int:
         gate_slots=args.gate_slots,
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
+        gate_global_batch_cap=args.gate_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,
         rust_scheduler_workers=args.rust_scheduler_workers,
         leaf_batch=args.leaf_batch,
@@ -4424,6 +4644,7 @@ def main(argv=None) -> int:
         bootstrap_policy=args.bootstrap_policy,
         promotion_every=args.promotion_every,
         revert_reset_after=args.revert_reset_after,
+        probation_reset_after=args.probation_reset_after,
         buffer_autosave_every=args.buffer_autosave_every,
         warm_buffer_max_staleness=args.warm_buffer_max_staleness,
         allow_stale_targets=args.allow_stale_targets,

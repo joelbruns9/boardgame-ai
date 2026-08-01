@@ -77,6 +77,15 @@ class GeneratorState:
     consecutive_probations: int = 0
     """Probations since the last decisive gate; drives the ladder step-up."""
 
+    probations_since_decisive: int = 0
+    """Probations since the last promote or revert; drives the probation reset.
+
+    Deliberately *not* ``consecutive_probations``, which the ladder zeroes every
+    time it steps up (``_ladder_after``).  Sharing one counter would cap this one
+    at ``step_up_after - 1`` and the probation reset could never fire once the
+    ladder was on.  Same signal, two consumers, two lifetimes.
+    """
+
     def as_row(self) -> dict[str, object]:
         """Self-contained control-state snapshot for a completed iteration row.
 
@@ -95,6 +104,7 @@ class GeneratorState:
             "last_iteration": self.last_iteration,
             "gate_rung": self.gate_rung,
             "consecutive_probations": self.consecutive_probations,
+            "probations_since_decisive": self.probations_since_decisive,
         }
 
     @classmethod
@@ -110,6 +120,9 @@ class GeneratorState:
             last_iteration=int(control_state["last_iteration"]),
             gate_rung=int(control_state.get("gate_rung", 0)),
             consecutive_probations=int(control_state.get("consecutive_probations", 0)),
+            probations_since_decisive=int(
+                control_state.get("probations_since_decisive", 0)
+            ),
         )
 
 
@@ -284,11 +297,32 @@ def gate_transition(
     iteration: int,
     ladder: GateLadder | None = None,
     allow_step_up: bool = True,
+    probation_reset_after: int = 0,
 ) -> TransitionResult:
-    """Map a fixed-N gate decision onto the soft-gate lifecycle action."""
+    """Map a fixed-N gate decision onto the soft-gate lifecycle action.
+
+    Two rules here exist because run 03 spent 45 iterations degrading without
+    the reset ever firing, and both were about how *inconclusive* gates are
+    treated:
+
+    * A probation no longer clears ``consecutive_reverts``.  A revert is proof
+      the candidate is worse; a probation is only "at this many games we could
+      not tell", which is the modal outcome and is not evidence of innocence.
+      Clearing on it meant three reverts had to land with no near-miss between
+      them, and one 0.465 gate wiped a revert that had just fired.
+    * ``probation_reset_after`` makes a run of probations decisive in its own
+      right.  Sustained probation is the state where nothing moves: the learner
+      is not promoted, the generator is not rolled back, and the counter that
+      would reset it never advances.  Accumulating them bounds how long that can
+      last.  Off (0) by default, since on an underpowered gate probation may
+      mean the *gate* cannot resolve real progress rather than that there is
+      none -- pair it with a ladder that buys resolution first.
+    """
 
     if decision not in _GATE_DECISIONS:
         raise ValueError(f"unknown gate decision: {decision!r}")
+    if probation_reset_after < 0:
+        raise ValueError("probation_reset_after must be non-negative")
 
     rungs = _ladder_after(
         state,
@@ -308,6 +342,7 @@ def gate_transition(
                 bootstrap_state=TRAINED,
                 generator_source=_generator_after(state.mode, action),
                 consecutive_reverts=0,
+                probations_since_decisive=0,
                 current_best_iteration=iteration,
                 last_iteration=iteration,
                 **rungs,
@@ -315,15 +350,23 @@ def gate_transition(
         )
 
     if decision == CONTINUE:
-        action = PromotionAction.PROBATION
+        probations = state.probations_since_decisive + 1
+        reset = probation_reset_after > 0 and probations >= probation_reset_after
+        action = (
+            PromotionAction.REVERT_RESET if reset else PromotionAction.PROBATION
+        )
         return TransitionResult(
             action=action,
             replace_best=False,
-            reset_learner=False,
+            reset_learner=reset,
             next_state=replace(
                 state,
                 generator_source=_generator_after(state.mode, action),
-                consecutive_reverts=0,
+                # A probation is not evidence the candidate is sound, so it
+                # leaves the revert tally where it stands rather than clearing
+                # it.  Only a decisive gate moves that counter.
+                consecutive_reverts=state.consecutive_reverts,
+                probations_since_decisive=0 if reset else probations,
                 last_iteration=iteration,
                 **rungs,
             ),
@@ -341,6 +384,7 @@ def gate_transition(
             state,
             generator_source=_generator_after(state.mode, action),
             consecutive_reverts=0 if reset else count,
+            probations_since_decisive=0,
             last_iteration=iteration,
             **rungs,
         ),
@@ -370,6 +414,7 @@ def decide_transition(
     iteration: int,
     ladder: GateLadder | None = None,
     allow_step_up: bool = True,
+    probation_reset_after: int = 0,
 ) -> TransitionResult:
     """Single entry point the controller calls after training an iteration.
 
@@ -389,5 +434,6 @@ def decide_transition(
             iteration=iteration,
             ladder=ladder,
             allow_step_up=allow_step_up,
+            probation_reset_after=probation_reset_after,
         )
     return not_scheduled_transition(state, iteration)

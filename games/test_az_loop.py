@@ -100,11 +100,19 @@ def test_hof_elo_and_manifest_are_checkpoint_format_agnostic(tmp_path: Path):
         model_contract={"name": "test"},
     )
     manifest.add_checkpoint(checkpoint, 3, promoted=False)
-    manifest.append_iteration({"iteration": 3, "promoted": False})
+    manifest.note_iteration(3)
     payload = json.loads(manifest.path.read_text(encoding="utf-8"))
     assert payload["adapter_contract"]["adapter"] == "kingdomino"
     assert payload["checkpoints"][0]["iteration"] == 3
-    assert payload["iterations"] == [{"iteration": 3, "promoted": False}]
+    # The row itself belongs to training_log.jsonl; the manifest keeps a count
+    # so it stays O(1) per iteration instead of re-serialising every past row.
+    assert payload["iteration_log"] == {
+        "path": "training_log.jsonl",
+        "count": 1,
+        "first_iteration": 3,
+        "last_iteration": 3,
+    }
+    assert payload["iterations"] == []
 
 
 def test_kingdomino_adapter_completes_through_shared_match_runner():

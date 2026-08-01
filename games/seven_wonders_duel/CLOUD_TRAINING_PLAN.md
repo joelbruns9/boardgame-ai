@@ -988,11 +988,29 @@ are comparing two frozen networks, the score is a constant (say 0.60), and a
 `< 0.55` threshold never fires. It answers "were the last K promotions real?",
 and when promotions stop, the numerator and denominator stop with them.
 
-**The anchor is indexed by games.** Anchor = whatever `current_best` was N games
-ago (e.g. 20k). While learning, the anchor trails a genuinely weaker net. When
-learning stops, the anchor **advances until it catches up to the frozen
-`current_best`**, and the score converges to exactly **0.50** -- a net against
-itself. Unambiguous, self-calibrating, cannot go stale.
+**The anchor is indexed by games.** Anchor = the learner's own checkpoint from N
+games ago (e.g. 20k), taken from the `candidate_NNNN.pt` series.
+
+> **W7c correction (2026-07-31).** W7a indexed the *promotion lineage*: anchor =
+> whatever `current_best` was N games ago, on the reasoning that a frozen best
+> would let the anchor catch up and converge to 0.50 -- "a net against itself,
+> unambiguous and self-calibrating".
+>
+> Run 03 showed that 0.50 is not a measurement of anything. `current_best` froze
+> at iteration 60; once the clock passed `promotion + lag` the reference
+> resolved to `current_best` itself, and the code returned a synthetic 0.500
+> without playing a game. The series read 0.500 for **35 consecutive
+> iterations** -- spanning a 45-iteration collapse in which the learner fell to
+> 0.335 against its own ancestor, *and* the recovery that promoted at 0.610. It
+> reported the identical number throughout, and `STAGNANT` fired the whole time.
+>
+> An anchor that becomes undefined exactly when promotions stop cannot answer
+> the question it exists for, because "promotions have stopped" *is* the
+> question. It measured the promotion log, which is free.
+>
+> The candidate series advances every iteration whether or not anything is
+> promoted, so the reference always moves and the score always means something.
+> The degenerate-match guard is kept, but is now unreachable by construction.
 
 Specification: fixed N games, **no early stopping** (measurement, not decision --
 W5.6); report the score with its Wilson interval; trigger on the **interval or a

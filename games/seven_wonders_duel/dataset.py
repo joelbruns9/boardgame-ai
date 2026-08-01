@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .buffer import GameRecord, replay
+from .buffer import GameRecord, archive_policy_seats, replay
 from .codec import NUM_ACTIONS, legal_action_indices
 from .encoder import _FEATURE_COUNTS, _SCHEMA, Encoding, TokenType, encode
 from .engine import _science_symbols
@@ -179,6 +179,9 @@ def examples_from_record(
 
     staged: list[tuple[Example, int]] = []  # (example, actor)
     maximum_track = 0
+    # Empty except in league games. The archive's seat still contributes
+    # value labels below; only its policy is not a target.
+    archive_seats = archive_policy_seats(record.agents)
 
     def featurize(game, move):
         nonlocal maximum_track
@@ -238,7 +241,7 @@ def examples_from_record(
                 features,
                 legal,
                 policy,
-                not move.policy_excluded,
+                not move.policy_excluded and actor not in archive_seats,
                 actor,
             )
         )

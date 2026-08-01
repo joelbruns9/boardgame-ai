@@ -90,6 +90,43 @@ class ReplayMismatchError(RuntimeError):
 
 OPPONENT_TYPES = ("current_best", "hof", "bot", "hof_bot")
 
+def archive_policy_seats(agents: dict[str, str]) -> frozenset[int]:
+    """Seats played by an *archived* net, whose policy must not be a target.
+
+    A league game runs a full search for both seats, so without this the
+    archive's improved policy becomes a training target and the learner is
+    taught to imitate an older, weaker version of itself on roughly half the
+    positions of every league game.  Nothing else excluded it: ``sims > 0`` and
+    ``policy_excluded`` is false, because from the recorder's point of view it
+    is an ordinary searched move.
+
+    Deliberately **narrow**.  The obvious generalisation -- "exclude any seat
+    ``agents["pN"]`` does not call ``network``" -- is wrong, and quietly so:
+    curriculum-seed games name a scripted bot on *both* seats and record
+    ``policy_excluded=False``, because imitating those bots is the entire point
+    of the curriculum.  Widening this predicate would delete the curriculum's
+    policy signal while every test still passed.  Only an archive assigned by
+    ``_tag_league_opponents`` is excluded here, identified by the same three
+    fields that function writes.
+
+    Value labels are untouched.  The game was really played and really ended, so
+    its outcome stays a valid label for every position in it; only the *policy*
+    of a seat the learner does not own must not be imitated.  That matches how
+    curriculum-bot moves are already treated (``dataset.is_fast_search_move``:
+    "bot moves are a curriculum device whose value labels stay useful").
+    """
+
+    if agents.get("kind") != "league":
+        return frozenset()
+    # An archive assigned to a bot-controlled seat never evaluated a move, and
+    # `_tag_league_opponents` records that as `league_assignment_used=false`.
+    if agents.get("league_assignment_used") != "true":
+        return frozenset()
+    name = agents.get("league_assignment")
+    if name is None:
+        return frozenset()
+    return frozenset(seat for seat in (0, 1) if agents.get(f"p{seat}") == name)
+
 
 def resolve_opponent_type(agents: dict[str, str]) -> str:
     """Return the explicit W3 opponent category, with legacy compatibility.

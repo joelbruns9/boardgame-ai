@@ -537,6 +537,11 @@ def train_steps(
     history: list[dict] = []
     running: dict[str, float] = {}
     running_grad_norm = 0.0
+    # Steps whose gradients overflowed under GradScaler. Their norm is
+    # meaningless -- `scaler.step` skips the update entirely -- so they are
+    # counted rather than averaged in.
+    norm_steps = 0
+    overflow_steps = 0
     window_start = time.time()
     window_steps = 0
 
@@ -571,7 +576,16 @@ def train_steps(
             for parameter in model.parameters()
             if parameter.grad is not None
         )
-        running_grad_norm += math.sqrt(grad_norm_sq)
+        # An overflowed step yields inf/nan here. Averaging it in poisons the
+        # whole reporting window with inf, which then cannot be serialised --
+        # a scaler overflow is a routine AMP event and must not be able to
+        # kill a multi-hour run at the logging step.
+        step_grad_norm = math.sqrt(grad_norm_sq)
+        if math.isfinite(step_grad_norm):
+            running_grad_norm += step_grad_norm
+            norm_steps += 1
+        else:
+            overflow_steps += 1
         scaler.step(optimizer)
         scaler.update()
         for key, value in parts.items():
@@ -587,10 +601,15 @@ def train_steps(
             "lr": current_lr,
             "train": train_parts,
             "secs": time.time() - window_start,
-            "grad_norm": running_grad_norm / window_steps,
+            "grad_norm": (
+                running_grad_norm / norm_steps if norm_steps else None
+            ),
+            "grad_overflow_steps": overflow_steps,
         }
         running = {}
         running_grad_norm = 0.0
+        norm_steps = 0
+        overflow_steps = 0
         window_steps = 0
         if val_examples:
             val_metrics = evaluate(

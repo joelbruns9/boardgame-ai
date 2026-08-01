@@ -1230,12 +1230,20 @@ def test_confirmed_revert_resets_the_learner_but_a_single_one_does_not():
     assert first.reset_learner is False
     assert first.next_state.consecutive_reverts == 1
 
-    # An even gate in between clears the count: only *consecutive* evidence of
-    # a regression is allowed to discard the learner.
+    # W7b changed this. An even gate in between used to clear the count, on the
+    # reading that only *consecutive* evidence should discard the learner. Run
+    # 03 showed what that costs: a probation is "at 200 games we could not
+    # tell", not a finding that the candidate is sound, and one 0.465 gate wiped
+    # a revert that had just fired. The tally now survives an inconclusive gate
+    # and only a decisive one moves it.
     interrupted = gate_transition(
         first.next_state, even, revert_reset_after=2, iteration=2, ladder=ladder
     )
-    assert interrupted.next_state.consecutive_reverts == 0
+    assert interrupted.next_state.consecutive_reverts == 1
+    assert interrupted.reset_learner is False, (
+        "surviving the tally is not the same as advancing it: a probation must "
+        "not be able to trigger the reset by itself unless asked to"
+    )
 
     confirmed = gate_transition(
         first.next_state, losing, revert_reset_after=2, iteration=2, ladder=ladder
@@ -1304,8 +1312,9 @@ def _stagnation_config(tmp_path, **overrides):
 
 
 class _FakeLedger:
-    def __init__(self, per_iteration: int):
+    def __init__(self, per_iteration: int, horizon: int = 64):
         self.per_iteration = per_iteration
+        self.horizon = horizon
 
     def total_before(self, iteration: int) -> int:
         return max(0, iteration) * self.per_iteration
@@ -1313,23 +1322,60 @@ class _FakeLedger:
     def total_through(self, iteration: int) -> int:
         return (max(0, iteration) + 1) * self.per_iteration
 
+    def known_iterations(self) -> list[int]:
+        return list(range(self.horizon))
 
-def test_the_anchor_is_the_best_in_force_at_the_lagged_games_clock(tmp_path):
+
+def test_the_anchor_is_the_candidate_in_force_at_the_lagged_games_clock(tmp_path):
     loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    for iteration in (0, 2, 4):
-        path = loop.checkpoint_dir / f"best_{iteration}.pt"
+    for iteration in range(6):
+        path = loop.checkpoint_dir / f"candidate_{iteration:04d}.pt"
         path.write_bytes(f"weights {iteration}".encode())
-        loop.hof.add(path, iteration=iteration)
 
-    # At iteration 5 the clock reads 12 games; 6 back is 6, and the best in
-    # force then was the one promoted at iteration 2 (clock 6).
+    # At iteration 5 the clock reads 12 games; 6 back is 6, and the candidate
+    # in force then was iteration 2's (clock 6).
     reference = loop.anchor_reference(5)
     assert reference is not None
     path, anchor_games = reference
     assert anchor_games == 6
     assert path.read_bytes() == b"weights 2"
+
+
+def test_the_anchor_never_goes_dark_when_promotions_stop(tmp_path):
+    """W7c's whole point, and the inverse of what W7a asserted.
+
+    W7a anchored the promotion lineage, so once `current_best` had been frozen
+    for longer than the lag the reference resolved to `current_best` itself and
+    the measurement became a synthetic 0.500. Run 03 sat there for 35
+    iterations across a collapse *and* a recovery, reporting the same number.
+    The candidate trajectory advances every iteration whether or not anything
+    is promoted, so the reference keeps moving and the series stays live.
+    """
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in range(24):
+        path = loop.checkpoint_dir / f"candidate_{iteration:04d}.pt"
+        path.write_bytes(f"weights {iteration}".encode())
+    # A frozen best: promoted early and never again, exactly like run 03.
+    loop.current_best.write_bytes(b"weights 1")
+
+    seen = []
+    for iteration in range(4, 24):
+        reference = loop.anchor_reference(iteration)
+        assert reference is not None, f"iteration {iteration}: anchor went dark"
+        path, anchor_games = reference
+        assert not loop.anchor_caught_up(path), (
+            f"iteration {iteration}: the reference caught up to the subject "
+            "even though the candidate series advanced"
+        )
+        seen.append(anchor_games)
+
+    assert seen == sorted(seen), "the reference must advance monotonically"
+    assert len(set(seen)) > 1, "a reference that never moves is the W7a bug"
 
 
 def test_a_run_younger_than_the_lag_skips_rather_than_comparing_to_nothing(tmp_path):
@@ -1420,10 +1466,11 @@ def test_a_disabled_ladder_never_re_applies_a_rung_on_resume(tmp_path):
 
 
 def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path):
-    """Plays real games against a real archived checkpoint.
+    """Plays real games between the learner and a real past candidate.
 
-    The pure detector is tested in az_loop; this covers the seam -- HOF
-    selection, the fixed-N match, and the persisted history a resume reads.
+    The pure detector is tested in az_loop; this covers the seam -- reference
+    selection off the candidate trajectory, the fixed-N match, and the
+    persisted history a resume reads.
     """
 
     loop = PhaseDLoop(
@@ -1437,23 +1484,31 @@ def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path)
     loop.games_ledger = _FakeLedger(2)
     import torch
 
-    from .train import make_checkpoint
+    from games.seven_wonders_duel.train import make_checkpoint
 
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        make_checkpoint(
-            loop._new_model(),
-            {
-                "model": "transformer",
-                "d_model": loop.config.d_model,
-                "layers": loop.config.layers,
-                "heads": loop._built_heads(loop._new_model()),
-                "iteration": 0,
-            },
-        ),
-        loop.current_best,
-    )
-    loop.hof.add(loop.current_best, iteration=0)
+
+    def _save(path, iteration):
+        model = loop._new_model()
+        torch.save(
+            make_checkpoint(
+                model,
+                {
+                    "model": "transformer",
+                    "d_model": loop.config.d_model,
+                    "layers": loop.config.layers,
+                    "heads": loop._built_heads(model),
+                    "iteration": iteration,
+                },
+            ),
+            path,
+        )
+
+    # The learner's trajectory, and the learner itself as the subject.
+    for iteration in (0, 1):
+        _save(loop.checkpoint_dir / f"candidate_{iteration:04d}.pt", iteration)
+    _save(loop.anchor_subject(), 2)
+    _save(loop.current_best, 0)
 
     block = loop.measure_stagnation(2)
     assert block is not None
@@ -1519,51 +1574,504 @@ def test_a_caught_up_anchor_is_exactly_the_null_when_played(tmp_path):
     assert (report.wilson_lcb, report.wilson_ucb) == pytest.approx((lcb, ucb))
 
 
-def test_the_anchor_catches_up_to_current_best_when_promotions_stop(tmp_path):
-    """The property the whole design rests on (W7a).
+def test_the_anchor_reuses_the_gate_when_it_is_the_same_match(tmp_path):
+    """The gate plays latest-vs-current_best; sometimes the anchor wants that.
 
-    Without current_best in the candidate set the pointer stalls at the newest
-    archive and compares two frozen nets -- the promotion-lagged failure this
-    anchor exists to avoid.
+    `current_best.pt` is a byte copy of some candidate, so when the lagged
+    reference resolves to that candidate the two matches are identical -- same
+    subject, same opponent weights, same fixed-N rule. Under W7a's cadence that
+    collision happened on every measurement; reusing the result is exact.
     """
-
-    import torch
-
-    from .train import make_checkpoint
 
     loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        make_checkpoint(
-            loop._new_model(),
-            {
-                "model": "transformer",
-                "d_model": loop.config.d_model,
-                "layers": loop.config.layers,
-                "heads": loop._built_heads(loop._new_model()),
-                "iteration": 4,
-            },
-        ),
-        loop.current_best,
+    for iteration in range(6):
+        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+            f"weights {iteration}".encode()
+        )
+    # current_best was promoted from the candidate the anchor will resolve to.
+    loop.current_best.write_bytes(b"weights 2")
+    # A gate cannot have run without a rolling learner, so the subject exists.
+    loop.anchor_subject().write_bytes(b"weights 5")
+
+    path, _anchor_games = loop.anchor_reference(5)
+    assert path.read_bytes() == b"weights 2"
+
+    assert loop.anchor_duplicates_gate(path) is False, (
+        "with no gate this iteration there is nothing to reuse"
     )
-    for iteration in (0, 2):
-        path = loop.checkpoint_dir / f"best_{iteration}.pt"
-        path.write_bytes(f"weights {iteration}".encode())
-        loop.hof.add(path, iteration=iteration)
 
-    # current_best (iteration 4) was promoted at clock 10.
-    assert loop.current_best_iteration() == 4
+    loop.last_promotion_gate = GateResult(
+        opponent="current_best",
+        threshold=0.5,
+        decision="accept",
+        games=200,
+        score_rate=0.61,
+        pairs=100,
+        wilson_lcb=0.512,
+        wilson_ucb=0.700,
+        stop_reason="promotion_lcb",
+        evaluated_games=200,
+        fixed_n=True,
+    )
+    assert loop.anchor_duplicates_gate(path) is True
 
-    # Early: the target is behind current_best's promotion, so an archive wins.
-    path, anchor_games = loop.anchor_reference(6)  # clock 14, target 8
-    assert anchor_games == 6 and loop.anchor_caught_up(path) is False
+    report, anchor_games = loop.self_anchor_gate(5)
+    assert report.score_rate == 0.61, "the reused numbers must be the gate's"
+    assert report.decision == "measurement", "an anchor never decides anything"
+    assert "from_gate" in report.opponent, "the row must say it was reused"
+    assert anchor_games == 6
 
-    # Later, with no further promotions, the pointer catches up.
-    path, anchor_games = loop.anchor_reference(8)  # clock 18, target 12
-    assert anchor_games == 10
-    assert loop.anchor_caught_up(path) is True
 
-    block = loop.measure_stagnation(8)
-    assert block["anchor"]["score_rate"] == 0.5
-    assert "caught_up" in block["anchor"]["opponent"]
+def test_a_different_opponent_does_not_reuse_the_gate(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in range(6):
+        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+            f"weights {iteration}".encode()
+        )
+    loop.current_best.write_bytes(b"a different net entirely")
+    loop.anchor_subject().write_bytes(b"weights 5")
+    loop.last_promotion_gate = GateResult(
+        opponent="current_best",
+        threshold=0.5,
+        decision="accept",
+        games=200,
+        score_rate=0.61,
+        pairs=100,
+        wilson_lcb=0.512,
+        wilson_ucb=0.700,
+        stop_reason="promotion_lcb",
+        evaluated_games=200,
+        fixed_n=True,
+    )
+    path, _ = loop.anchor_reference(5)
+    assert loop.anchor_duplicates_gate(path) is False
+
+
+# -- the gate's batch cap is its own knob ----------------------------------
+#
+# `rust_global_batch_cap` used to be shared by generation and every evaluation
+# path. The w5_gate_slots_sweep grid showed the cap's sign depends on the slot
+# count it runs at -- at 48 slots a larger cap costs ~4%, at 144 slots it gains
+# ~12% -- so one value cannot serve two paths whose slot counts differ.
+
+
+def test_gate_batch_cap_follows_generation_until_it_is_set():
+    config = PhaseDConfig(rust_global_batch_cap=256)
+    assert config.gate_batch_cap() == 256
+
+    config = PhaseDConfig(rust_global_batch_cap=256, gate_global_batch_cap=1024)
+    assert config.gate_batch_cap() == 1024
+    assert config.rust_global_batch_cap == 256, (
+        "a gate-side cap must not reach generation, which is ~85% of an "
+        "iteration and is pinned at a slot count where a wide cap is a loss"
+    )
+
+
+def test_a_negative_gate_batch_cap_is_refused():
+    with pytest.raises(ValueError, match="gate_global_batch_cap"):
+        PhaseDConfig(gate_global_batch_cap=-1).validate()
+
+
+def test_every_evaluation_path_reads_the_gate_cap():
+    """No evaluation path may still be wired to generation's cap.
+
+    A source check rather than a behavioural one: the alternative is booting a
+    Rust scheduler per gate path, and the failure mode this guards -- a new gate
+    helper copying `self.config.rust_global_batch_cap` from its neighbour -- is
+    exactly the kind a source check catches and a slow integration test misses.
+    """
+
+    import re
+
+    from games.seven_wonders_duel import phase_d
+
+    gate_paths = (
+        "_admit_gate",
+        "_rust_model_gate_waves",
+        "_rust_model_gate_rolling",
+        "_play_two_net_games",
+        "_rust_bot_gate_waves",
+    )
+    source = inspect.getsource(phase_d.PhaseDLoop)
+    bodies = re.split(r"\n    def ", source)
+    for name in gate_paths:
+        body = next((b for b in bodies if b.startswith(f"{name}(")), None)
+        assert body is not None, f"{name} not found; rename the test with it"
+        assert "self.config.rust_global_batch_cap" not in body, (
+            f"{name} still reads generation's batch cap"
+        )
+        assert "gate_batch_cap()" in body, f"{name} never reads the gate cap"
+
+
+# -- the manifest stopped duplicating the training log ---------------------
+#
+# `append_iteration` re-read and re-serialised the whole manifest per
+# iteration, so its cost grew with the square of the run. On run 03 that was a
+# 188 MB file (57.3 MB of it an exact copy of training_log.jsonl), ~3.7 s of
+# CPU per iteration, and a ~320 MB transient allocation on an already-6.5 GB
+# heap. Rows now live only in the log.
+
+
+def test_the_manifest_keeps_a_count_not_the_rows(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.manifest.initialize(
+        config={"precision": loop.config.precision},
+        adapter_contract={},
+        model_contract={},
+    )
+    for iteration in range(5):
+        loop._append_training_log({"iteration": iteration, "promoted": False})
+        loop.manifest.note_iteration(iteration)
+
+    payload = json.loads(loop.manifest.path.read_text(encoding="utf-8"))
+    assert payload["iterations"] == [], "rows must not accumulate in the manifest"
+    assert payload["iteration_log"]["count"] == 5
+    assert payload["iteration_log"]["first_iteration"] == 0
+    assert payload["iteration_log"]["last_iteration"] == 4
+    assert [row["iteration"] for row in loop.training_log_rows()] == [0, 1, 2, 3, 4]
+
+
+def test_the_manifest_stays_flat_as_iterations_accumulate(tmp_path):
+    """The property the old code lacked: cost per iteration must not grow."""
+
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.manifest.initialize(
+        config={"precision": loop.config.precision},
+        adapter_contract={},
+        model_contract={},
+    )
+    fat_row = {"iteration": 0, "payload": ["x" * 64] * 200}
+    sizes = []
+    for iteration in range(12):
+        loop._append_training_log({**fat_row, "iteration": iteration})
+        loop.manifest.note_iteration(iteration)
+        sizes.append(loop.manifest.path.stat().st_size)
+
+    growth = sizes[-1] - sizes[0]
+    assert growth < 200, (
+        f"manifest grew {growth} bytes over 12 iterations; it must carry a "
+        "count, not the rows"
+    )
+
+
+def test_a_run_started_before_the_change_resumes_from_its_manifest_rows(tmp_path):
+    """Old runs keep their rows in the manifest and must not lose them.
+
+    `_sync_training_log` is the migration: it copies any manifest row the log
+    lacks into the log, so the log becomes complete on the first start after
+    the upgrade and the resume point is unchanged.
+    """
+
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.manifest.initialize(
+        config={"precision": loop.config.precision},
+        adapter_contract={},
+        model_contract={},
+    )
+    legacy = json.loads(loop.manifest.path.read_text(encoding="utf-8"))
+    legacy["iterations"] = [
+        {"iteration": 0, "promoted": False},
+        {"iteration": 1, "promoted": True},
+    ]
+    loop.manifest.path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert loop.training_log_rows() == [], "log starts empty, as on an old run"
+
+    loop._sync_training_log(legacy)
+
+    rows = loop.training_log_rows()
+    assert [row["iteration"] for row in rows] == [0, 1]
+    assert sum(bool(row.get("promoted")) for row in rows) == 1
+    store = phase_d_module._PhaseDRunStore(loop)
+    assert [row["iteration"] for row in store.iterations()] == [0, 1]
+
+
+def test_the_migration_does_not_duplicate_rows_already_logged(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.manifest.initialize(
+        config={"precision": loop.config.precision},
+        adapter_contract={},
+        model_contract={},
+    )
+    loop._append_training_log({"iteration": 0, "promoted": False})
+    loop._sync_training_log({"iterations": [{"iteration": 0, "promoted": False}]})
+    assert len(loop.training_log_rows()) == 1
+
+
+def test_the_store_round_trips_a_row_through_the_log(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.manifest.initialize(
+        config={"precision": loop.config.precision},
+        adapter_contract={},
+        model_contract={},
+    )
+    store = phase_d_module._PhaseDRunStore(loop)
+    store.append_iteration({"iteration": 7, "promoted": True, "stats": {}})
+    assert [row["iteration"] for row in store.iterations()] == [7]
+    payload = json.loads(loop.manifest.path.read_text(encoding="utf-8"))
+    assert payload["iteration_log"]["last_iteration"] == 7
+
+
+# -- league games must not teach the archive's policy ----------------------
+
+
+def _league_agents(seat: int, *, used: str = "true") -> dict[str, str]:
+    """What `_tag_league_opponents` writes for an archive on `seat`."""
+
+    agents = {
+        "p0": "network",
+        "p1": "network",
+        "kind": "league",
+        "opponent_type": "hof",
+        "league_assignment": "hof_iter_0060_abc",
+        "league_assignment_used": used,
+        "opponent_source": "/runs/x/hof/iter_0060.pt",
+    }
+    agents[f"p{seat}"] = "hof_iter_0060_abc"
+    return agents
+
+
+def test_the_archive_seat_is_the_only_one_excluded():
+    from games.seven_wonders_duel.buffer import archive_policy_seats
+
+    assert archive_policy_seats(_league_agents(0)) == frozenset({0})
+    assert archive_policy_seats(_league_agents(1)) == frozenset({1})
+
+
+def test_self_play_and_bot_records_keep_every_policy_target():
+    """The trap: 'any seat not called network' would gut the curriculum.
+
+    Curriculum-seed games name a scripted bot on *both* seats and record
+    `policy_excluded=False` -- imitating those bots is what the curriculum is
+    for. A wider predicate would silently delete that signal.
+    """
+
+    from games.seven_wonders_duel.buffer import archive_policy_seats
+
+    assert archive_policy_seats({"p0": "network", "p1": "network"}) == frozenset()
+    assert archive_policy_seats(
+        {"kind": "curriculum_seed", "p0": "science_aggressive/v1", "p1": "greedy"}
+    ) == frozenset()
+    assert archive_policy_seats(
+        {"kind": "mixed", "p0": "network", "p1": "greedy", "opponent_type": "bot"}
+    ) == frozenset()
+    assert archive_policy_seats({}) == frozenset(), "legacy records are self-play"
+
+
+def test_an_unused_league_assignment_excludes_nothing():
+    from games.seven_wonders_duel.buffer import archive_policy_seats
+
+    # The archive drew a bot-controlled seat, so it never evaluated a move.
+    assert archive_policy_seats(_league_agents(0, used="false")) == frozenset()
+
+
+def _played_record():
+    """A real, replayable game: random legal play, every policy trainable."""
+
+    import random as _random
+
+    from games.seven_wonders_duel.buffer import GameRecorder
+    from games.seven_wonders_duel.game import Phase
+
+    recorder = GameRecorder(11, agents={"p0": "network", "p1": "network"})
+    rng = _random.Random(42)
+    while recorder.game.phase is not Phase.COMPLETE:
+        recorder.play(rng.choice(legal_action_indices(recorder.game)))
+    return recorder.finish()
+
+
+def test_league_examples_drop_the_archive_policy_but_keep_its_value():
+    """End to end on a real replayed game, not a synthetic agents dict."""
+
+    from dataclasses import replace as dc_replace
+
+    from games.seven_wonders_duel.dataset import examples_from_record
+
+    record = _played_record()
+    baseline = examples_from_record(record)
+    assert baseline and all(example.has_policy for example in baseline), (
+        "the record must start with every policy trainable, or this proves nothing"
+    )
+
+    for seat in (0, 1):
+        league = dc_replace(record, agents=_league_agents(seat))
+        examples = examples_from_record(league)
+        assert len(examples) == len(baseline), "positions are kept, not dropped"
+
+        for example, base in zip(examples, baseline):
+            # Value-side labels must be untouched on BOTH seats: the game was
+            # really played and really ended.
+            assert example.value_class == base.value_class
+            assert example.joint7_class == base.joint7_class
+            assert example.margin == base.margin
+            assert np.array_equal(example.policy_target, base.policy_target)
+
+        trainable = sum(1 for example in examples if example.has_policy)
+        assert 0 < trainable < len(examples), (
+            f"seat {seat}: exactly one seat's policy should survive, "
+            f"got {trainable}/{len(examples)}"
+        )
+
+
+def test_the_two_seats_partition_the_policy_targets():
+    """Excluding seat 0 and seat 1 must account for every example exactly once."""
+
+    from dataclasses import replace as dc_replace
+
+    from games.seven_wonders_duel.dataset import examples_from_record
+
+    record = _played_record()
+    total = len(examples_from_record(record))
+    trainable = [
+        sum(
+            1
+            for example in examples_from_record(
+                dc_replace(record, agents=_league_agents(seat))
+            )
+            if example.has_policy
+        )
+        for seat in (0, 1)
+    ]
+    assert sum(trainable) == total, (
+        "every position belongs to exactly one actor, so the two exclusions "
+        "must sum to the whole game"
+    )
+
+
+def test_the_anchor_skips_when_there_is_no_rolling_learner(tmp_path):
+    """Strict-gate runs have no latest.pt, so there is no subject to measure."""
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=2))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in range(6):
+        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+            f"weights {iteration}".encode()
+        )
+    assert not loop.anchor_subject().is_file()
+    assert loop.self_anchor_gate(5) is None
+    assert loop.measure_stagnation(5) is None
+
+
+def test_a_missing_candidate_does_not_break_the_reference(tmp_path):
+    """Checkpoints can be pruned; the reference falls back to the newest kept."""
+
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in (0, 5):
+        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+            f"weights {iteration}".encode()
+        )
+
+    # Clock at iteration 5 is 12, target 6; candidate_0002 would have been the
+    # match but is gone, so the newest surviving one at or before it wins.
+    path, anchor_games = loop.anchor_reference(5)
+    assert path.read_bytes() == b"weights 0"
+    assert anchor_games == 2
+
+
+def test_the_reference_is_always_older_than_the_subject(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=2))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in range(12):
+        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+            f"weights {iteration}".encode()
+        )
+    for iteration in range(2, 12):
+        reference = loop.anchor_reference(iteration)
+        assert reference is not None
+        path, anchor_games = reference
+        assert anchor_games <= loop.games_ledger.total_through(iteration)
+        assert int(path.stem.split("_")[1]) < iteration, (
+            "the reference must never be the current iteration's own candidate"
+        )
+
+
+# -- telemetry must not be able to kill a run ------------------------------
+#
+# Run `rss_check` died at iteration 2 in `_append_training_log`, on an `inf`
+# gradient norm produced by a routine GradScaler overflow. Nine minutes of
+# completed generation, training and gating were discarded to report a number
+# nothing consumes. Two independent fixes: the norm no longer goes non-finite,
+# and a non-finite metric no longer raises.
+
+
+def test_non_finite_metrics_are_nulled_and_named():
+    from games.seven_wonders_duel.phase_d import _sanitize_non_finite
+
+    row = {
+        "iteration": 2,
+        "stats": {"training": {"gradient_norm": float("inf"), "loss": 1.5}},
+        "history": [{"grad_norm": float("nan")}, {"grad_norm": 2.0}],
+    }
+    clean, found = _sanitize_non_finite(row)
+    assert clean["stats"]["training"]["gradient_norm"] is None
+    assert clean["stats"]["training"]["loss"] == 1.5
+    assert clean["history"][0]["grad_norm"] is None
+    assert clean["history"][1]["grad_norm"] == 2.0
+    assert found == ["/stats/training/gradient_norm", "/history[0]/grad_norm"]
+
+
+def test_a_clean_row_is_returned_unchanged_not_copied():
+    from games.seven_wonders_duel.phase_d import _sanitize_non_finite
+
+    row = {"iteration": 1, "stats": {"a": [1.0, 2.0]}}
+    clean, found = _sanitize_non_finite(row)
+    assert found == []
+    assert clean is row, "rows carry the whole step history; do not deep-copy them"
+
+
+def test_an_infinite_gradient_norm_still_writes_the_row(tmp_path):
+    loop = PhaseDLoop(_soft_gate_config(tmp_path))
+    loop.training_log.parent.mkdir(parents=True, exist_ok=True)
+    loop._append_training_log(
+        {
+            "iteration": 2,
+            "generated_games": 400,
+            "stats": {"training": {"gradient_norm": float("inf")}},
+        }
+    )
+    rows = loop.training_log_rows()
+    assert len(rows) == 1
+    assert rows[0]["stats"]["training"]["gradient_norm"] is None
+    assert rows[0]["non_finite_fields"] == ["/stats/training/gradient_norm"]
+
+
+def test_an_overflowed_step_is_counted_not_averaged_into_the_norm():
+    """GradScaler skips the update on overflow, so its norm means nothing."""
+
+    import math as _math
+
+    import torch
+
+    from games.seven_wonders_duel.train import train_steps
+
+    record = _played_record()
+    from games.seven_wonders_duel.dataset import examples_from_record
+
+    examples = examples_from_record(record)
+    from games.seven_wonders_duel.train import build_model
+
+    model = build_model("transformer", 32, 1, 2)
+
+    history, _state = train_steps(
+        model,
+        examples,
+        None,
+        device="cpu",
+        steps=4,
+        batch_size=8,
+        validate_every=1,
+        seed=3,
+    )
+    for row in history:
+        assert row["grad_norm"] is None or _math.isfinite(row["grad_norm"]), (
+            "a reported gradient norm must always be finite or absent"
+        )
+        assert row["grad_overflow_steps"] == 0, "cpu fp32 cannot overflow"
+    assert torch is not None
