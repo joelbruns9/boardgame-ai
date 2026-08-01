@@ -3,7 +3,7 @@
 This document describes every command-line argument exposed by the Phase D
 training pipeline in `games.seven_wonders_duel.phase_d`.
 
-**Reconciled against the live parser on 2026-07-30** (W0-W7). If you add a flag,
+**Reconciled against the live parser on 2026-08-01** (W0-W7c). If you add a flag,
 add it here: `games/seven_wonders_duel/test_setup_cloud.py` checks the cloud
 launch command against the parser, but nothing checks this document, so it goes
 stale silently. The quickest audit is to diff `build_parser()`'s option strings
@@ -28,12 +28,15 @@ generated game and 5.12x per training step; see `CLOUD_TRAINING_PLAN.md`.
   --bootstrap-policy auto_first_trained `
   --promotion-every 5 `
   --revert-reset-after 2 `
+  --probation-reset-after 4 `
   --promotion-min-lcb 0.50 `
   --revert-max-ucb 0.48 `
-  --gate-ladder-games 100 200 400 800 `
+  --gate-ladder-games 200 600 1000 1500 `
   --gate-ladder-step-up-after 2 `
   --gate-ladder-floor-games 10000 `
   --gate-sims 64 `
+  --gate-slots 144 `
+  --gate-global-batch-cap 1024 `
   --anchor-every-iterations 5 `
   --anchor-games 200 `
   --self-anchor-games 200 `
@@ -402,6 +405,21 @@ Archived opponents are routed by the **searcher** seat, so every leaf of one
 search uses the mover's network. Routing on the leaf actor instead would let the
 opponent's network evaluate the interior of your own search tree.
 
+**The archive's own moves are not policy targets.** A league game runs a full
+search for both seats, so until 2026-08-01 every league game taught the learner
+to imitate an older, weaker net on roughly half its positions -- at 0.15 that is
+~7.5% of all training positions. `dataset.archive_policy_seats` now drops the
+policy target on the archive's seat while keeping its **value** labels: the game
+was really played and really ended, so the outcome stays valid for every
+position in it, and only the policy of a seat the learner does not own must not
+be imitated. This matches the existing treatment of curriculum-bot moves.
+
+Watch `policy=N(P%)` on the log's `replay:` line. It reads 100% with HOF off and
+drops below it once league games enter the window; that percentage is the check
+that the filter is live.
+
+Changing this share on a resume requires **`--allow-hof-change`**; see that flag.
+
 ### `--hof-sampling-mode`
 
 **Default:** `recency`. **Choices:** `recency`, `uniform`, `latest`
@@ -531,17 +549,48 @@ positions.
 
 **Default:** `16`. **Value:** positive integer
 
-Maximum concurrent game slots in each Rust scheduler call. More slots expose
+Maximum concurrent game slots in each **generation** call. More slots expose
 more leaves for global batching, but increase active tree state and CPU work.
-The current laptop sweep selected 16.
+The throughput programme selected **48** for generation on the laptop 3070; the
+default of 16 is the pre-sweep value. Gates use `--gate-slots` and want a
+different number -- see that flag.
 
 ### `--rust-global-batch-cap`
 
 **Default:** `256`. **Value:** positive integer
 
-Maximum number of neural rows packed into one flat Torch forward call. It must
-be at least `leaf-batch`. Larger caps allow better coalescing when enough work
-is ready, but do not force every batch to reach the cap.
+Maximum number of neural rows packed into one flat Torch forward call on the
+**generation** path. It must be at least `leaf-batch`. Larger caps allow better
+coalescing when enough work is ready, but do not force every batch to reach the
+cap.
+
+**The cap's sign depends on the slot count it runs at**, which is why generation
+and gates no longer share one value. Measured with `w5_gate_slots_sweep` on the
+laptop 3070 (d128 L4, 64 sims, 100-game gates, games/s):
+
+| slots \ cap | 256 | 512 | 1024 |
+|---|---|---|---|
+| 48 (generation ships here) | **0.605** | 0.571 | 0.581 |
+| 96 | 0.647 | 0.706 | 0.757 |
+| 144 | 0.752 | 0.816 | **0.840** |
+| 192 | 0.714 | 0.789 | 0.828 |
+
+At 48 slots widening the cap **costs** ~4%; at 144 slots the same change
+**gains** ~12%. At low slot counts the scheduler waits on batches that will
+never fill. Sweeping either axis alone concludes the shipped setting is already
+optimal, which is why the harness sweeps them jointly.
+
+### `--gate-global-batch-cap`
+
+**Default:** `0` (follow `--rust-global-batch-cap`). **Value:** non-negative
+integer
+
+The same cap for **evaluation** paths only: promotion gates, bot anchors, the
+self-anchor, and the two-net arena. Generation is ~85% of an iteration and is
+pinned near 48 slots, where a wide cap is a loss, so a cap chosen for a wide gate
+must not reach it.
+
+Ship `1024` alongside `--gate-slots 144`.
 
 ### `--rust-max-inflight-batches`
 
@@ -1129,10 +1178,27 @@ the LCB right after an LR change is genuinely better.
 Rolling active-game slots used only by promotion gates. Both seat legs share one
 pool, so occupancy moves in units of two games; keep it even.
 
-What matters is `gate_slots x leaves-in-flight` filling
-`--rust-global-batch-cap`, not any relationship to the gate size. Keep the gate
-size well above the slot count -- at 48 slots a 100-game gate is only ~2
-pool-fills deep, which is where the end-of-gate drain starts to cost.
+What matters is `gate_slots x leaves-in-flight` filling the gate's batch cap,
+not any relationship to the gate size. Keep the gate size well above the slot
+count -- at 48 slots a 100-game gate is only ~2 pool-fills deep, which is where
+the end-of-gate drain starts to cost.
+
+**Ship 144 with `--gate-global-batch-cap 1024`.** Measured 1.37x over the old
+48/256 on the laptop 3070, and confirmed in production: gate throughput on
+`laptop_training_03_w7` iterations 150-209 ran **0.79-0.84 games/s at every
+ladder rung**, against 0.60 before.
+
+Throughput is flat from 144 slots through 288 while mean batch rows keep
+climbing, so the ceiling is the serial scheduler thread rather than the slot
+count. The optimum is stable in gate size -- 144/1024 won at 100, 200 and 600
+games -- which is why one sweep is enough.
+
+Two traps when sizing this yourself, both visible as **bit-identical**
+`mean_batch_rows` between adjacent slot counts. The pool cannot hold more games
+in flight than the gate plays, so every slot count above `--games` measures the
+same configuration; and the reported speedup means nothing unless the baseline
+is held fixed, since `48/1024` is the pathological corner and flatters any
+comparison against it.
 
 ### `--gate-max-games`
 
@@ -1227,9 +1293,26 @@ rediscovering a tie.
 
 **Default:** `20000`. **Value:** positive integer
 
-How far back the anchor sits. Also sets how long a frozen best takes to be
-caught: with no promotions, the anchor reaches `current_best` one lag after it
-was promoted.
+How far back the anchor sits, on the learner's own `candidate_NNNN.pt` series.
+
+**W7c (2026-08-01) changed what the anchor tracks.** W7a indexed the promotion
+lineage, so with no promotions the reference caught up to `current_best` itself
+and the loop returned a synthetic 0.500 without playing. On
+`laptop_training_03_w7` that read 0.500 for **35 consecutive iterations**,
+spanning a 45-iteration collapse to 0.335 against its own ancestor *and* the
+recovery that promoted at 0.610 -- the identical number throughout, with
+`STAGNANT` firing the whole time. An anchor that goes undefined exactly when
+promotions stop cannot answer the question it exists for, because promotions
+stopping *is* the question.
+
+The candidate series advances every iteration whether or not anything is
+promoted, so the lag stays pinned at its configured value and the score always
+means something. After the change the same run produced a live series:
+`0.625 0.600 0.635 0.635 0.725 0.760 0.790 0.725 0.570 0.695 0.560 0.510`.
+
+Read a declining series carefully: the reference is advancing too, so a fall can
+mean the *past self* got stronger rather than the current one stalling, and a
+`revert_reset` inside the lag window throws the learner back within it.
 
 ### `--self-anchor-every-games`
 
@@ -1248,6 +1331,13 @@ of nets looks like on any given afternoon:
   distinguishes the current net from its own past self;
 - **slope**: the OLS slope of score against the games clock is at or below
   0.005 per 10k games.
+
+  **That 0.005 is a guess and it is far too small.** It could not be calibrated
+  while the anchor was returning synthetic nulls. The first live series
+  (`laptop_training_03_w7`, iterations 150-209) produced slopes between
+  **+0.31 and -0.55 per 10k games** -- two orders of magnitude larger -- so the
+  threshold as shipped fires on essentially any downward drift. Re-fit it from a
+  run whose anchor is live before relying on the slope trigger.
 
 The slope is per *games*, not per measurement: an intervention that lengthens
 the window changes the cadence, and a per-measurement slope would then mean two
@@ -1363,8 +1453,39 @@ In `soft_gate`, after this many **consecutive** `reject` gate checks the learner
 weights are reset to `current_best.pt` before the next training phase. Earlier
 rejects only switch generation to the protected best while the learner keeps
 training on recovery data. `0` disables automatic learner reset. The counter is
-measured in gate checks, not iterations, and any `probation` or `promote` resets
-it.
+measured in gate checks, not iterations.
+
+**Only a decisive gate clears it now.** Until 2026-07-31 a `probation` reset the
+counter too, on the reading that only consecutive evidence should discard a
+learner. A probation is not a finding that the candidate is sound -- it is "at
+this many games we could not tell", which is the modal outcome -- and on
+`laptop_training_03_w7` one 0.465 gate wiped a revert that had just fired,
+turning a 15-iteration minimum into 30 while the learner degraded. `promote` and
+`revert_reset` clear it; `probation` leaves it where it stands.
+
+### `--probation-reset-after`
+
+**Default:** `0` (off). **Value:** non-negative integer
+
+Reset the learner to `current_best.pt` after this many consecutive probations,
+counted on its own `probations_since_decisive` counter and cleared by any
+promote or revert.
+
+Sustained probation is the state in which nothing moves: the learner is not
+promoted, the generator is not rolled back, and the revert counter never
+advances. This bounds how long that can last. It needs a separate counter
+because the ladder zeroes `consecutive_probations` on every step-up, which would
+cap a shared counter at `--gate-ladder-step-up-after - 1`.
+
+**Pair it with a ladder, and set it no lower than 4.** On an underpowered gate a
+probation may mean the *gate* cannot resolve real progress rather than that
+there is none, so resolution should be bought before progress is discarded.
+
+Measured on `laptop_training_03_w7` at `4`: it fired twice (iterations 165 and
+190), and **both times the run promoted five iterations later** -- the same
+reset-then-promote pattern as the iteration-135 recovery. Over those 60
+iterations `consecutive_reverts` never left zero, so the revert-only mechanism
+would not have fired at all.
 
 ### `--allow-resume-code-drift`
 
@@ -1387,6 +1508,36 @@ one engine, and comparisons across the boundary need that in mind.
 Precision and schedule positions have their own guards and are **not** covered
 by this flag; those refuse unconditionally, because changing them mid-run
 invalidates the data rather than merely complicating its provenance.
+
+### `--allow-hof-change`
+
+**Default:** off. **Flag.**
+
+Permits a resume that changes `--hof-opponent-fraction`, `--hof-sampling-mode`
+or `--hof-start-games`. Every other schedule change is still refused, including
+a resume that moves a HOF field **and** a positional one in the same launch.
+
+The schedule guard's objection to a mid-run change is that the iterations either
+side become incomparable *and the run has no way to record it happened*. The
+second half is what this supplies, and the first half does not apply to the HOF
+share, because it is a **level** rather than a **position**: changing
+`--curriculum-anneal-games` retroactively moves where the run thinks it is on a
+curve, while changing the HOF share only alters the opponent mix from here on.
+
+Accepting the change:
+
+- appends `{at_games, changes, recorded_at_utc}` to `schedule_changes` in the
+  manifest, so a reader of the finished run can attribute every iteration to the
+  regime it actually trained under;
+- registers that games clock as a **revert-suppress knot**, giving the next gate
+  the same W5.9 amnesty every other distribution shift gets. Without it, the
+  first gate after enabling HOF scores against a suddenly harder opponent mix
+  and -- with `--probation-reset-after` active -- pushes toward a reset for the
+  wrong reason;
+- survives later resumes: the knots are read back from the manifest.
+
+Use `--hof-start-games 0` alongside it on an established run, since the default
+of 10000 is long past.
 
 ### `--run-log`
 

@@ -2075,3 +2075,149 @@ def test_an_overflowed_step_is_counted_not_averaged_into_the_norm():
         )
         assert row["grad_overflow_steps"] == 0, "cpu fp32 cannot overflow"
     assert torch is not None
+
+
+# -- W1.5: the HOF share may change on a resume ----------------------------
+#
+# The schedule guard's objection to a mid-run change is that the run cannot
+# record it happened. That is true of an annealing *position* -- changing
+# curriculum_anneal_iterations retroactively moves where the run thinks it is
+# on the curve -- but not of the HOF share, which is a *level* applied to each
+# iteration as it is generated. So this supplies the missing half rather than
+# weakening the guard: the change is written to the manifest against the games
+# clock, and that clock becomes a revert-suppress knot.
+
+
+def _resumable(tmp_path, **overrides):
+    """A run directory with one committed iteration, ready to resume."""
+
+    config = _soft_gate_config(tmp_path, **overrides)
+    loop = PhaseDLoop(config)
+    loop.manifest.initialize(
+        config=config,
+        adapter_contract={},
+        model_contract={},
+    )
+    return loop
+
+
+def test_a_hof_change_is_refused_without_the_flag(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+
+    resumed = PhaseDLoop(_soft_gate_config(tmp_path, hof_opponent_fraction=0.15))
+    with pytest.raises(ValueError, match="hof_opponent_fraction"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_the_refusal_says_which_flag_accepts_it(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(_soft_gate_config(tmp_path, hof_opponent_fraction=0.15))
+    with pytest.raises(ValueError, match="--allow-hof-change"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_the_flag_accepts_the_change_and_records_it(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+
+    resumed = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    resumed.games_ledger = _FakeLedger(400)
+    with pytest.warns(UserWarning, match="HOF opponent share changed"):
+        resumed._refuse_changed_schedules(payload)
+
+    recorded = json.loads(resumed.manifest.path.read_text(encoding="utf-8"))
+    entries = recorded["schedule_changes"]
+    assert len(entries) == 1
+    assert entries[0]["changes"]["hof_opponent_fraction"] == {
+        "from": 0.0,
+        "to": 0.15,
+    }
+    assert entries[0]["at_games"] > 0
+    assert entries[0]["recorded_at_utc"]
+
+
+def test_the_change_point_becomes_a_revert_suppress_knot(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    resumed.games_ledger = _FakeLedger(400)
+    # The config already contributes its own knots (curriculum_anneal_games),
+    # so the property is that the change *adds* one, not that none existed.
+    before = set(resumed.schedule_knots())
+    with pytest.warns(UserWarning):
+        resumed._refuse_changed_schedules(payload)
+
+    added = set(resumed.schedule_knots()) - before
+    assert len(added) == 1, "the change must register as a knot"
+    clock = added.pop()
+
+    # W5.9: the gate whose cadence spans the knot gets one revert's amnesty,
+    # so the learner is not reverted for a dip the opponent mix caused.
+    suppressed = [i for i in range(60, 68) if resumed.revert_suppressed(i)]
+    assert suppressed, f"no gate was amnestied for the knot at {clock} games"
+    assert all(
+        resumed.games_ledger.total_through(i) >= clock for i in suppressed
+    ), "amnesty must land on the gate after the change, not before it"
+
+
+def test_the_knot_survives_a_later_resume(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    first = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    first.games_ledger = _FakeLedger(400)
+    with pytest.warns(UserWarning):
+        first._refuse_changed_schedules(payload)
+    recorded = first.schedule_knots()
+
+    # A later resume that changes nothing must still see the knot.
+    later = PhaseDLoop(_soft_gate_config(tmp_path, hof_opponent_fraction=0.15))
+    later._reload_schedule_change_knots()
+    assert later.schedule_knots() == recorded
+
+
+def test_a_positional_schedule_change_is_still_refused_with_the_flag(tmp_path):
+    """The flag is not a general escape hatch: only the level may move."""
+
+    # These configs run on the games basis, where the annealing *position* is
+    # curriculum_anneal_games -- the iterations field is not in the identity.
+    started = _resumable(
+        tmp_path, hof_opponent_fraction=0.0, curriculum_anneal_games=10_000
+    )
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path,
+            hof_opponent_fraction=0.15,
+            curriculum_anneal_games=4_000,
+            allow_hof_change=True,
+        )
+    )
+    with pytest.raises(ValueError, match="curriculum_anneal_games"):
+        resumed._refuse_changed_schedules(payload)
+
+
+def test_an_unchanged_resume_records_nothing(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.15)
+    payload = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    resumed = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    resumed._refuse_changed_schedules(payload)
+    recorded = json.loads(resumed.manifest.path.read_text(encoding="utf-8"))
+    assert "schedule_changes" not in recorded

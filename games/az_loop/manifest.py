@@ -135,6 +135,26 @@ class RunManifest:
         log.setdefault("first_iteration", iteration)
         _atomic_json(self.path, manifest)
 
+    def record_schedule_change(self, entry: dict[str, Any]) -> None:
+        """Append a schedule change a resume was explicitly allowed to make.
+
+        The schedule guard's objection to a mid-run change is that the run has
+        no way to record it happened.  This is that way: an append-only list of
+        ``{at_games, changes, recorded_at_utc}``, so a reader of the finished run
+        can attribute every iteration to the regime it actually trained under.
+        """
+
+        manifest = json.loads(self.path.read_text(encoding="utf-8"))
+        manifest.setdefault("schedule_changes", []).append(
+            {
+                **entry,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+            }
+        )
+        _atomic_json(self.path, manifest)
+
     def add_checkpoint(self, path: str | Path, iteration: int, promoted: bool) -> None:
         checkpoint = Path(path)
         digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()

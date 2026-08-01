@@ -405,6 +405,24 @@ class PhaseDConfig:
     """Games a rung is held before its effect is judged."""
 
     allow_resume_code_drift: bool = False
+    allow_hof_change: bool = False
+    """Permit changing the HOF opponent share on a resume (W1.5).
+
+    The schedule guard exists because a changed schedule makes the
+    iterations either side of it incomparable *and the run has no way to
+    record that it happened*.  The HOF share is the one schedule field for
+    which the first half is not true: it is a **level** applied to each
+    iteration as it is generated, not a **position** on an annealing curve.
+    Changing ``curriculum_anneal_iterations`` mid-run retroactively moves
+    where the run thinks it is on that curve; changing the HOF share only
+    changes the opponent mix from here on, which is a regime change the
+    run can simply record.
+
+    So this does not weaken the guard, it supplies the missing half: the
+    change is written to the manifest with the games clock it took effect
+    at, and that clock becomes a revert-suppress knot so the next gate gets
+    the W5.9 amnesty every other distribution shift already gets.
+    """
     """Permit a resume on a different commit or dirty tree (W6.5)."""
 
     gate_revert_suppress_knots: tuple[int, ...] = ()
@@ -940,6 +958,12 @@ def _digest_of(path: str, size: int, mtime_ns: int) -> str:
 def _file_digest(path: str | Path) -> str:
     stat = Path(path).stat()
     return _digest_of(str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+HOF_SCHEDULE_KEYS = frozenset(
+    {"hof_opponent_fraction", "hof_sampling_mode", "hof_start_games"}
+)
+"""Schedule-identity keys a resume may change under ``--allow-hof-change``."""
 
 
 def _sanitize_non_finite(value: Any, path: str = "") -> tuple[Any, list[str]]:
@@ -1526,6 +1550,9 @@ class PhaseDLoop:
         self._example_cache_game_stats: dict[tuple, GameDerivationStats] = {}
         self.cache_calibration_factor = DEFAULT_CACHE_CALIBRATION_FACTOR
         self._cache_calibrated = False
+        # Games-clock points where a resume was allowed to move the HOF
+        # share; loaded from the manifest so they survive later resumes.
+        self._schedule_change_knots: tuple[int, ...] = ()
         self.last_example_cache_stats: dict[str, Any] = {}
         self.last_generation_stats: dict[str, Any] = {}
         self.last_training_stats: dict[str, Any] = {}
@@ -2011,12 +2038,19 @@ class PhaseDLoop:
         have nothing to do with the learner being worse.
         """
 
+        # A HOF share changed on resume is a knot on either basis: the opponent
+        # mix moved under the learner at a known clock, and the candidate right
+        # after it can dip for reasons that are not the learner getting worse.
+        recorded = getattr(self, "_schedule_change_knots", ())
         if not self.config.uses_games_basis():
-            return tuple(sorted(set(self.config.gate_revert_suppress_knots)))
+            return tuple(
+                sorted(set(self.config.gate_revert_suppress_knots) | set(recorded))
+            )
         knots = {
             self.config.curriculum_anneal_games,
             self.config.draft_prior_games,
             *self.config.gate_revert_suppress_knots,
+            *recorded,
         }
         if self.config.hof_opponent_fraction > 0:
             knots.add(self.config.hof_start_games)
@@ -2345,6 +2379,7 @@ class PhaseDLoop:
                 f"{self.config.precision!r}"
             )
         self._refuse_changed_code(manifest_payload)
+        self._reload_schedule_change_knots()
         self._refuse_changed_schedules(manifest_payload)
         # After the guards, never before: they compare against `base_config`,
         # and an intervention is not a config change the operator made.
@@ -2446,6 +2481,18 @@ class PhaseDLoop:
             changed["schedule_basis"] = (stored_basis, current["schedule_basis"])
         if not changed:
             return
+
+        # The HOF share is a level, not a position (see `allow_hof_change`), so
+        # it is the one part of the identity a resume may move -- but only when
+        # asked to, and only if nothing positional moved with it. A run that
+        # changes the HOF share *and* an annealing knot in the same resume is
+        # still refused: the second one is the incomparable kind.
+        hof_changed = {k: v for k, v in changed.items() if k in HOF_SCHEDULE_KEYS}
+        positional = {k: v for k, v in changed.items() if k not in HOF_SCHEDULE_KEYS}
+        if hof_changed and not positional and self.config.allow_hof_change:
+            self._record_hof_change(hof_changed)
+            return
+
         detail = "; ".join(
             f"{key}: {was!r} -> {now!r}" for key, (was, now) in sorted(changed.items())
         )
@@ -2455,8 +2502,56 @@ class PhaseDLoop:
                 f" To continue this run unchanged, pass "
                 f"--schedule-basis {stored_basis}."
             )
+        elif hof_changed and not positional:
+            hint = (
+                " The HOF share is a level rather than a schedule position, so "
+                "--allow-hof-change accepts this one, records it against the "
+                "games clock, and suppresses the next gate's revert."
+            )
         raise ValueError(
             f"cannot resume with changed training schedules ({detail})." + hint
+        )
+
+    def _record_hof_change(self, changed: dict[str, tuple[Any, Any]]) -> None:
+        """Write the change to the manifest and make it a revert-suppress knot.
+
+        Durability is the point: without it a reader of the finished run cannot
+        tell which iterations trained against the archive, which is exactly the
+        objection the schedule guard raises.
+        """
+
+        clock = self.games_ledger.total_through(
+            max(self.games_ledger.known_iterations(), default=-1)
+        )
+        self.manifest.record_schedule_change(
+            {
+                "at_games": clock,
+                "changes": {k: {"from": w, "to": n} for k, (w, n) in changed.items()},
+            }
+        )
+        self._reload_schedule_change_knots()
+        warnings.warn(
+            "HOF opponent share changed on resume ("
+            + "; ".join(f"{k}: {w!r} -> {n!r}" for k, (w, n) in sorted(changed.items()))
+            + f") at games clock {clock}; recorded in the manifest, and the next "
+            "gate's revert is suppressed while the opponent mix shifts",
+            stacklevel=2,
+        )
+
+    def _reload_schedule_change_knots(self) -> None:
+        """Recorded change points, read back so a later resume still sees them."""
+
+        try:
+            payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._schedule_change_knots = ()
+            return
+        self._schedule_change_knots = tuple(
+            sorted(
+                int(entry["at_games"])
+                for entry in payload.get("schedule_changes", [])
+                if int(entry.get("at_games", 0)) > 0
+            )
         )
 
     def _load_model_checkpoint(self, path: str | Path):
@@ -4318,6 +4413,15 @@ def build_parser() -> argparse.ArgumentParser:
         "one the run started on; its rows will span more than one engine",
     )
     parser.add_argument(
+        "--allow-hof-change",
+        action="store_true",
+        help="permit changing --hof-opponent-fraction / --hof-sampling-mode / "
+        "--hof-start-games on a resume. The share is a level rather than a "
+        "schedule position, so the change is recorded in the manifest against "
+        "the games clock and suppresses the next gate's revert. Any other "
+        "schedule change is still refused.",
+    )
+    parser.add_argument(
         "--self-anchor-games",
         type=int,
         default=0,
@@ -4622,6 +4726,7 @@ def main(argv=None) -> int:
         intervention_ladder=args.intervention_ladder,
         intervention_window_games=args.intervention_window_games,
         allow_resume_code_drift=args.allow_resume_code_drift,
+        allow_hof_change=args.allow_hof_change,
         gate_ladder_games=tuple(args.gate_ladder_games),
         gate_ladder_step_up_after=args.gate_ladder_step_up_after,
         gate_ladder_floor_games=args.gate_ladder_floor_games,
