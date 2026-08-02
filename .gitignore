@@ -53,6 +53,11 @@ Thumbs.db
 
 # Temp test directories created during validation runs
 tmp_*/
+tmp/
+
+# Tool scratch directories (MCP browser traces, agent working copies)
+.playwright-mcp/
+.codex-reply-pilot-fix/
 
 # Claude local context
 .claude/
