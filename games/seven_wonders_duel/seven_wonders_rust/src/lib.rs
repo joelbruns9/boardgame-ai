@@ -190,6 +190,47 @@ fn make_self_play_config(
     }
 }
 
+/// Enum-valued fields cross the boundary as **declaration indices**. Python and
+/// Rust declare `Phase`, `PendingChoiceKind`, `VictoryType` and `ScienceSymbol`
+/// in the same order, so the index is the contract; an out-of-range value is a
+/// serializer bug and must fail loudly rather than silently pick a variant.
+fn science_symbol_from_index(i: u8) -> PyResult<data::ScienceSymbol> {
+    use data::ScienceSymbol::*;
+    Ok(match i {
+        0 => ArmillarySphere,
+        1 => Wheel,
+        2 => Sundial,
+        3 => MortarAndPestle,
+        4 => SetSquare,
+        5 => QuillAndInk,
+        6 => Law,
+        other => return Err(PyValueError::new_err(format!("bad science symbol {other}"))),
+    })
+}
+
+fn pending_kind_from_index(i: u8) -> PyResult<state::PendingChoiceKind> {
+    use state::PendingChoiceKind::*;
+    Ok(match i {
+        0 => DestroyOpponentBrown,
+        1 => DestroyOpponentGrey,
+        2 => BuildFromDiscardFree,
+        3 => ChooseUnusedProgress,
+        4 => ChooseAvailableProgress,
+        other => return Err(PyValueError::new_err(format!("bad pending kind {other}"))),
+    })
+}
+
+fn victory_from_index(i: u8) -> PyResult<state::VictoryType> {
+    use state::VictoryType::*;
+    Ok(match i {
+        0 => Military,
+        1 => Scientific,
+        2 => Civilian,
+        3 => SharedCivilian,
+        other => return Err(PyValueError::new_err(format!("bad victory type {other}"))),
+    })
+}
+
 /// A 7WD game state driven from Python by codec action index.
 #[pyclass]
 struct RustGame {
@@ -253,6 +294,164 @@ impl RustGame {
         Ok(RustGame {
             state: GameState::from_setup(setup, draws),
         })
+    }
+
+    /// Construct from a **complete mid-game state** rather than a setup.
+    ///
+    /// `new` reaches a position by replaying actions from a locked deal, which
+    /// is all self-play needs. The advisor cannot: it rebuilds a position from a
+    /// public BGA observation, with hidden information supplied by a
+    /// determinizer and **no action history at all**, so there is no seed and no
+    /// prefix to replay. Without this the Rust engine, encoder and searcher are
+    /// all unreachable from the advisor.
+    ///
+    /// Ids are integers in the same spaces Python's `CARD_IDS` / `WONDER_IDS` /
+    /// `PROGRESS_IDS` use. Enum-valued fields are **declaration indices**, which
+    /// agree across the two languages by construction (`Phase`,
+    /// `PendingChoiceKind`, `VictoryType` and `ScienceSymbol` are declared in the
+    /// same order on both sides); `rust_bridge.rust_state()` is the only
+    /// supported producer of these arguments.
+    ///
+    /// This is a *wide* boundary and its whole value is exactness, so it is
+    /// gated by `test_rust_state_injection.py`, which asserts that an injected
+    /// state fingerprints identically to the same position reached by replay.
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        first_player, phase, active_player, age, cities, available_progress,
+        unused_progress, wonder_group0, wonder_group1, unused_wonders,
+        wonder_offer, wonder_round, wonder_pick_index, age_decks,
+        removed_age_cards, selected_guilds, unused_guilds, tableau_age,
+        tableau_slots, discard_pile, buried_cards, retired_wonders,
+        wonder_burials, pending_choice, pending_extra_turn, pending_shields,
+        conflict_position, military_tokens_remaining, winner, victory_type,
+        final_scores, library_draws
+    ))]
+    fn from_state(
+        first_player: usize,
+        phase: u8,
+        active_player: usize,
+        age: u8,
+        // (coins, wonders, built_wonders, buildings, progress_tokens, science_pairs)
+        cities: Vec<(i32, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<u8>)>,
+        available_progress: Vec<usize>,
+        unused_progress: Vec<usize>,
+        wonder_group0: Vec<usize>,
+        wonder_group1: Vec<usize>,
+        unused_wonders: Vec<usize>,
+        wonder_offer: Vec<usize>,
+        wonder_round: u8,
+        wonder_pick_index: u8,
+        age_decks: Vec<Vec<usize>>,
+        removed_age_cards: Vec<Vec<usize>>,
+        selected_guilds: Vec<usize>,
+        unused_guilds: Vec<usize>,
+        tableau_age: u8,
+        tableau_slots: Vec<(usize, bool, bool)>,
+        discard_pile: Vec<usize>,
+        buried_cards: Vec<usize>,
+        retired_wonders: Vec<usize>,
+        wonder_burials: Vec<(usize, usize)>,
+        pending_choice: Option<(u8, usize, Vec<usize>, bool)>,
+        pending_extra_turn: bool,
+        pending_shields: i32,
+        conflict_position: i32,
+        military_tokens_remaining: Vec<(i32, i32)>,
+        winner: Option<usize>,
+        victory_type: Option<u8>,
+        final_scores: Option<(i32, i32)>,
+        library_draws: Vec<Vec<usize>>,
+    ) -> PyResult<Self> {
+        fn four(v: Vec<Vec<usize>>, what: &str) -> PyResult<[Vec<usize>; 4]> {
+            let n = v.len();
+            <[Vec<usize>; 4]>::try_from(v).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "{what} must have 4 entries (index 0 unused, then ages 1..3), got {n}"
+                ))
+            })
+        }
+        if cities.len() != 2 {
+            return Err(PyValueError::new_err("cities must have exactly 2 entries"));
+        }
+        let phase = match phase {
+            0 => state::Phase::WonderDraft,
+            1 => state::Phase::PlayAge,
+            2 => state::Phase::ChooseNextStartPlayer,
+            3 => state::Phase::Complete,
+            other => return Err(PyValueError::new_err(format!("bad phase {other}"))),
+        };
+        let mut built_cities: Vec<state::CityState> = Vec::with_capacity(2);
+        for (coins, wonders, built_wonders, buildings, progress_tokens, pairs) in cities {
+            let mut claimed = Vec::with_capacity(pairs.len());
+            for p in pairs {
+                claimed.push(science_symbol_from_index(p)?);
+            }
+            built_cities.push(state::CityState {
+                coins,
+                wonders,
+                built_wonders,
+                buildings,
+                progress_tokens,
+                claimed_science_pairs: claimed,
+            });
+        }
+        let pending = match pending_choice {
+            None => None,
+            Some((kind, player, options, consume_all_options)) => Some(state::PendingChoice {
+                kind: pending_kind_from_index(kind)?,
+                player,
+                options,
+                consume_all_options,
+            }),
+        };
+        let victory = match victory_type {
+            None => None,
+            Some(v) => Some(victory_from_index(v)?),
+        };
+        let slots = tableau_slots
+            .into_iter()
+            .map(|(card_id, revealed, present)| state::TableauCard {
+                card_id,
+                revealed,
+                present,
+            })
+            .collect();
+        let state = GameState {
+            first_player,
+            phase,
+            active_player,
+            age,
+            cities: [built_cities.remove(0), built_cities.remove(0)],
+            available_progress_tokens: available_progress,
+            unused_progress_tokens: unused_progress,
+            wonder_groups: [wonder_group0, wonder_group1],
+            unused_wonders,
+            wonder_offer,
+            wonder_round,
+            wonder_pick_index,
+            age_decks: four(age_decks, "age_decks")?,
+            removed_age_cards: four(removed_age_cards, "removed_age_cards")?,
+            selected_guilds,
+            unused_guilds,
+            tableau: state::TableauState {
+                age: tableau_age,
+                slots,
+            },
+            discard_pile,
+            buried_cards,
+            retired_wonders,
+            wonder_burials,
+            pending_choice: pending,
+            pending_extra_turn,
+            pending_shields,
+            conflict_position,
+            military_tokens_remaining,
+            winner,
+            victory_type: victory,
+            final_scores,
+            library_draws: library_draws.into_iter().collect(),
+        };
+        Ok(RustGame { state })
     }
 
     /// Sorted codec indices of exactly the engine's legal actions.

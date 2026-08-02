@@ -12,10 +12,16 @@ import time
 
 from .buffer import GameRecord, GameRecorder, replay, resolve_opponent_type
 from .codec import decode_action, legal_action_indices
-from .data import PROGRESS_IDS
+from .data import (
+    CARD_IDS,
+    PROGRESS_IDS,
+    TABLEAU_LAYOUTS,
+    WONDER_IDS,
+    ScienceSymbol,
+)
 from .encoder import Encoding, Token, TokenType
 from .engine import apply_action
-from .game import new_game
+from .game import PendingChoiceKind, Phase, VictoryType, new_game
 
 
 def rust_setup(game) -> dict:
@@ -821,3 +827,135 @@ def phase_d_records_from_rust(
     return [
         phase_d_record_from_rust(raw, validate=validate) for raw in raw_records
     ]
+
+
+# --- full-state injection ---------------------------------------------------
+#
+# `rust_setup` + `rust_game_from_prefix` reach a position by replaying actions
+# from a locked deal, which is everything self-play needs. The advisor cannot use
+# that route: it rebuilds a position from a public BGA observation with hidden
+# information supplied by a determinizer and no action history, so there is no
+# seed and no prefix. `rust_state` serializes a whole GameState instead, which is
+# what unblocks the Rust engine/encoder/searcher for the advisor.
+#
+# Enum fields cross as *declaration indices*. Python declares Phase,
+# PendingChoiceKind, VictoryType and ScienceSymbol in the same order as Rust, so
+# the index is the contract. Built here rather than hard-coded so that reordering
+# either side breaks loudly in tests instead of silently remapping.
+
+_PHASE_INDEX = {member: i for i, member in enumerate(Phase)}
+_PENDING_KIND_INDEX = {member: i for i, member in enumerate(PendingChoiceKind)}
+_VICTORY_INDEX = {member: i for i, member in enumerate(VictoryType)}
+_SCIENCE_INDEX = {member: i for i, member in enumerate(ScienceSymbol)}
+
+
+def _city_tuple(city) -> tuple:
+    return (
+        int(city.coins),
+        [WONDER_IDS[w] for w in city.wonders],
+        [WONDER_IDS[w] for w in city.built_wonders],
+        [CARD_IDS[c] for c in city.buildings],
+        [PROGRESS_IDS[t] for t in city.progress_tokens],
+        [_SCIENCE_INDEX[s] for s in city.claimed_science_pairs],
+    )
+
+
+def rust_state(game) -> dict:
+    """Keyword arguments for ``seven_wonders_rust.RustGame.from_state``.
+
+    Mirrors every field of :class:`GameState` except ``rng`` (Rust keeps its own
+    stream) and ``seed``. ``library_draws`` is Rust-only bookkeeping and starts
+    empty; supply draws explicitly if the position can reach a Great Library.
+    """
+
+    layout = TABLEAU_LAYOUTS[game.tableau.age] if game.tableau.age else ()
+    slots = []
+    for slot in layout:
+        card = game.tableau.cards.get((slot.row, slot.x))
+        if card is None:
+            slots.append((0, False, False))
+        else:
+            # A TAKEN slot keeps its card id on both sides -- Rust's fingerprint
+            # pushes card_id unconditionally, and Python's TableauCard keeps
+            # card_name after removal. That retention is load-bearing: it is why
+            # visible_card_names sees a card buried under a wonder. Zeroing it
+            # here made 2,635 of 3,204 injected positions mismatch.
+            # A scraped state has card_name=None for an emptied slot (the
+            # observation cannot know it); 0 is the honest value there.
+            name = card.card_name
+            slots.append(
+                (CARD_IDS[name] if name else 0, bool(card.revealed), bool(card.present))
+            )
+
+    pending = None
+    if game.pending_choice is not None:
+        pc = game.pending_choice
+        progress_kinds = (
+            PendingChoiceKind.CHOOSE_UNUSED_PROGRESS,
+            PendingChoiceKind.CHOOSE_AVAILABLE_PROGRESS,
+        )
+        table = PROGRESS_IDS if pc.kind in progress_kinds else CARD_IDS
+        pending = (
+            _PENDING_KIND_INDEX[pc.kind],
+            int(pc.player),
+            [table[o] for o in pc.options],
+            bool(pc.consume_all_options),
+        )
+
+    return {
+        "first_player": int(game.first_player),
+        "phase": _PHASE_INDEX[game.phase],
+        "active_player": int(game.active_player),
+        "age": int(game.age),
+        "cities": [_city_tuple(c) for c in game.cities],
+        "available_progress": [PROGRESS_IDS[t] for t in game.available_progress_tokens],
+        "unused_progress": [PROGRESS_IDS[t] for t in game.unused_progress_tokens],
+        "wonder_group0": [WONDER_IDS[w] for w in game.wonder_groups[0]],
+        "wonder_group1": [WONDER_IDS[w] for w in game.wonder_groups[1]],
+        "unused_wonders": [WONDER_IDS[w] for w in game.unused_wonders],
+        "wonder_offer": [WONDER_IDS[w] for w in game.wonder_offer],
+        "wonder_round": int(game.wonder_round),
+        "wonder_pick_index": int(game.wonder_pick_index),
+        "age_decks": [[]] + [
+            [CARD_IDS[c] for c in game.age_decks[age]] for age in (1, 2, 3)
+        ],
+        "removed_age_cards": [[]] + [
+            [CARD_IDS[c] for c in game.removed_age_cards[age]] for age in (1, 2, 3)
+        ],
+        "selected_guilds": [CARD_IDS[c] for c in game.selected_guilds],
+        "unused_guilds": [CARD_IDS[c] for c in game.unused_guilds],
+        "tableau_age": int(game.tableau.age),
+        "tableau_slots": slots,
+        "discard_pile": [CARD_IDS[c] for c in game.discard_pile],
+        "buried_cards": [CARD_IDS[c] for c in game.buried_cards],
+        "retired_wonders": sorted(WONDER_IDS[w] for w in game.retired_wonders),
+        "wonder_burials": [
+            (WONDER_IDS[w], CARD_IDS[c]) for w, c in sorted(game.wonder_burials.items())
+        ],
+        "pending_choice": pending,
+        "pending_extra_turn": bool(game.pending_extra_turn),
+        "pending_shields": int(game.pending_shields),
+        "conflict_position": int(game.conflict_position),
+        # Python keeps a {position: penalty} dict; Rust an ordered vec. Sort by
+        # position to match Rust's ascending construction order.
+        "military_tokens_remaining": [
+            (int(pos), int(pen))
+            for pos, pen in sorted(game.military_tokens_remaining.items())
+        ],
+        "winner": None if game.winner is None else int(game.winner),
+        "victory_type": (
+            None if game.victory_type is None else _VICTORY_INDEX[game.victory_type]
+        ),
+        "final_scores": (
+            None if game.final_scores is None else tuple(int(s) for s in game.final_scores)
+        ),
+        "library_draws": [],
+    }
+
+
+def rust_game_from_state(game):
+    """A ``RustGame`` holding exactly ``game``'s position."""
+
+    import seven_wonders_rust
+
+    return seven_wonders_rust.RustGame.from_state(**rust_state(game))
