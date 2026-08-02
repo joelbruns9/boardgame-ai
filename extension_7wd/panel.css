@@ -1,0 +1,100 @@
+/* The panel sits inside the BGA page, so BGA's own `.building` rule and its
+   already-loaded spritesheet render the card art. `--scale` is what BGA's card
+   CSS multiplies by, so setting it on the art element is the whole sizing story
+   -- nothing is bundled and nothing is hard-coded to a pixel size. */
+
+#swd_advisor_panel {
+  position: fixed;
+  top: 70px;
+  right: 16px;
+  z-index: 99999;
+  width: 340px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: #16161af2;
+  color: #ececf1;
+  font: 13px/1.35 system-ui, -apple-system, Segoe UI, sans-serif;
+  border-radius: 10px;
+  padding: 10px 12px 12px;
+  box-shadow: 0 8px 28px #000000b0;
+  user-select: none;
+}
+
+#swd_advisor_panel .swd-adv-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+#swd_advisor_panel .swd-adv-title {
+  font-weight: 600;
+  flex: 1 1 auto;
+}
+
+#swd_advisor_panel .swd-adv-status {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+#swd_advisor_panel .swd-adv-drag {
+  cursor: move;
+  opacity: 0.4;
+  letter-spacing: -1px;
+  padding: 0 2px;
+}
+
+#swd_advisor_panel .swd-adv-sub {
+  font-size: 11px;
+  opacity: 0.6;
+  margin: 3px 0 8px;
+}
+
+#swd_advisor_panel .swd-adv-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid #ffffff14;
+}
+
+/* Q values on a handful of visits are unsearched noise; keep the row readable
+   but visibly weaker so it is not mistaken for a considered recommendation. */
+#swd_advisor_panel .swd-adv-thin {
+  opacity: 0.45;
+}
+
+#swd_advisor_panel .swd-adv-art {
+  --scale: 0.30;
+  flex: 0 0 auto;
+  border-radius: 4px;
+}
+
+#swd_advisor_panel .swd-adv-noart {
+  flex: 0 0 auto;
+  width: 74px;
+  height: 115px;
+  border: 1px dashed #ffffff2e;
+  border-radius: 4px;
+}
+
+#swd_advisor_panel .swd-adv-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#swd_advisor_panel .swd-adv-label {
+  font-weight: 500;
+}
+
+#swd_advisor_panel .swd-adv-meta {
+  font-size: 11px;
+  opacity: 0.55;
+  margin-top: 2px;
+}
+
+#swd_advisor_panel .swd-adv-q {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  font-weight: 600;
+}
