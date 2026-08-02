@@ -44,6 +44,16 @@ fn visible_cards(state: &GameState) -> [bool; NUM_CARDS] {
     for &c in &state.buried_cards {
         visible[c] = true;
     }
+    // Cards buried under constructed wonders are out of play and can never be
+    // revealed. In an engine-built state this is already implied -- a taken slot
+    // keeps its card_id in the tableau above, so the union is a no-op (measured
+    // in Python: 0 differences over 2243 PLAY_AGE observations across 40 games).
+    // It matters for *reconstructed* states: a BGA scrape cannot see which card
+    // left a now-empty slot, so without this the searcher would enumerate a
+    // buried card as a possible CARD_REVEAL outcome. Mirrors pool.py.
+    for &(_wonder, card) in &state.wonder_burials {
+        visible[card] = true;
+    }
     visible
 }
 
