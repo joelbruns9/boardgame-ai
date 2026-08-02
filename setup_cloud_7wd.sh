@@ -48,6 +48,14 @@
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke
 #   SKIP_EQUIV=0    set 1 to skip the equivalence suite (do not do this)
 #   SWEEP_CHECKPOINT=<path>  runs the generation + gate scheduler sweeps
+#                   (two-pass: stage 8b writes sweeps/measured_env.sh;
+#                    source it and re-run to launch on those numbers)
+#   RUST_SLOTS / RUST_GLOBAL_BATCH_CAP / RUST_MAX_INFLIGHT_BATCHES
+#                   generation-side scheduler settings, normally set by
+#                   sourcing measured_env.sh rather than by hand
+#   SWEEP_SLOTS_CSV / SWEEP_CAPS_CSV / SWEEP_INFLIGHT_CSV  generation grid
+#   SWEEP_SLOTS / SWEEP_CAPS  gate grid (space separated; different harness)
+#   SWEEP_GENERATION_GAMES=200 SWEEP_REPETITIONS=1
 #   SKIP_SWEEPS=0   set 1 to launch on defaults rather than this box
 #   GATE_SWEEP_RUNGS  gate sizes to sweep (default: ladder's middle rung)
 #   GATE_SLOTS / GATE_GLOBAL_BATCH_CAP  gate-side scheduler settings; the
@@ -110,6 +118,9 @@ SKIP_SMOKE="${SKIP_SMOKE:-0}"
 SKIP_EQUIV="${SKIP_EQUIV:-0}"
 SKIP_SWEEPS="${SKIP_SWEEPS:-0}"
 GATE_SLOTS="${GATE_SLOTS:-}"
+RUST_SLOTS="${RUST_SLOTS:-}"
+RUST_GLOBAL_BATCH_CAP="${RUST_GLOBAL_BATCH_CAP:-}"
+RUST_MAX_INFLIGHT_BATCHES="${RUST_MAX_INFLIGHT_BATCHES:-}"
 GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-}"
 CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
@@ -204,35 +215,52 @@ else
   SWEEP_DIR="$REPO_DIR/$RUN_DIR_REL/sweeps"
   mkdir -p "$SWEEP_DIR"
 
+  # f4_phase_d_sweep takes COMMA-separated axes and an --output DIRECTORY (it
+  # writes phase_d_sweep.json inside). w5_gate_slots_sweep takes space-separated
+  # axes and an --output FILE. They are different harnesses; test_setup_cloud
+  # arg-parses both invocations so this cannot drift again.
   "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
     --checkpoint "$SWEEP_CHECKPOINT" \
-    --work-dir "$SWEEP_DIR/generation" \
-    --output "$SWEEP_DIR/generation.json" \
-    --games "${SWEEP_GENERATION_GAMES:-$GAMES_PER_ITERATION}" \
-    --slots ${SWEEP_SLOTS:-16 48 96 144} \
-    --caps ${SWEEP_CAPS:-256 512 1024} \
-    || die "Generation sweep failed — do not launch on unmeasured settings."
-  ok "Generation sweep: $SWEEP_DIR/generation.json"
+    --output "$SWEEP_DIR/generation" \
+    --games "${SWEEP_GENERATION_GAMES:-200}" \
+    --repetitions "${SWEEP_REPETITIONS:-1}" \
+    --slots "${SWEEP_SLOTS_CSV:-48,96,144}" \
+    --caps "${SWEEP_CAPS_CSV:-256,1024}" \
+    --inflight "${SWEEP_INFLIGHT_CSV:-1}" \
+    --device cuda \
+    || die "Generation sweep failed - do not launch on unmeasured settings."
+  ok "Generation sweep: $SWEEP_DIR/generation/phase_d_sweep.json"
 
+  # Sweep the ladder's *lowest* rung: the gate optimum measured stable across
+  # 100/200/600-game gates on the laptop 3070, so the cheap rung answers the
+  # same question at a fraction of the games. Override with GATE_SWEEP_RUNGS.
   read -r -a _RUNGS <<< "$GATE_LADDER"
-  read -r -a _SWEEP_RUNGS <<< "${GATE_SWEEP_RUNGS:-${_RUNGS[$(( ${#_RUNGS[@]} / 2 ))]}}"
+  read -r -a _SWEEP_RUNGS <<< "${GATE_SWEEP_RUNGS:-${_RUNGS[0]}}"
   for RUNG in "${_SWEEP_RUNGS[@]}"; do
     "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
       --checkpoint "$SWEEP_CHECKPOINT" \
       --work-dir "$SWEEP_DIR/gate_$RUNG" \
       --output "$SWEEP_DIR/gate_$RUNG.json" \
       --games "$RUNG" \
-      --slots ${SWEEP_SLOTS:-16 48 96 144} \
-      --caps ${SWEEP_CAPS:-256 512 1024} \
+      --slots ${SWEEP_SLOTS:-48 96 144} \
+      --caps ${SWEEP_CAPS:-256 1024} \
       --sims "${GATE_SIMS:-64}" \
       --precision "$PRECISION" \
       || die "Gate sweep at rung $RUNG failed."
     ok "Gate sweep (rung $RUNG): $SWEEP_DIR/gate_$RUNG.json"
   done
 
-  warn "Sweeps are measured, not applied. Read the 'best' block of each and"
-  warn "relaunch with LAUNCH_FLAGS_JSON=$SWEEP_DIR/generation.json plus"
-  warn "GATE_SLOTS / GATE_GLOBAL_BATCH_CAP from the gate results."
+  # Turn both results into an env file pass 2 can source. The generation sweep
+  # writes {summary: [...]} sorted fastest-first; the gate sweep writes {best:
+  # {...}}. Neither is in the production-manifest shape f4_launch_flags reads,
+  # so the translation lives here rather than pretending LAUNCH_FLAGS_JSON can
+  # consume a sweep.
+  "$PY" "$REPO_DIR/games/seven_wonders_duel/sweep_launch_env.py" \
+    --sweep-dir "$SWEEP_DIR" --gate-rung "${_SWEEP_RUNGS[0]}" \
+    || die "Could not summarise the sweeps."
+
+  warn "Sweeps measure but do not apply. To launch on this box's numbers:"
+  warn "  source $SWEEP_DIR/measured_env.sh && bash \$0"
 fi
 stage_done 8b
 
@@ -258,7 +286,14 @@ LOG_FILE="$RUN_DIR/launch_$(date +%Y%m%dT%H%M%S).log"
 # W6.3: the throughput sweep and Phase D spell the same four settings
 # differently. Translate rather than re-type.
 TUNED_FLAGS=()
-if [ -n "${LAUNCH_FLAGS_JSON:-}" ]; then
+[ -n "$RUST_SLOTS" ] && TUNED_FLAGS+=(--rust-slots "$RUST_SLOTS")
+[ -n "$RUST_GLOBAL_BATCH_CAP" ] &&
+  TUNED_FLAGS+=(--rust-global-batch-cap "$RUST_GLOBAL_BATCH_CAP")
+[ -n "$RUST_MAX_INFLIGHT_BATCHES" ] &&
+  TUNED_FLAGS+=(--rust-max-inflight-batches "$RUST_MAX_INFLIGHT_BATCHES")
+if [ ${#TUNED_FLAGS[@]} -gt 0 ]; then
+  ok "Measured generation flags: ${TUNED_FLAGS[*]}"
+elif [ -n "${LAUNCH_FLAGS_JSON:-}" ]; then
   read -r -a TUNED_FLAGS <<< "$(
     "$PY" -m games.seven_wonders_duel.f4_launch_flags "$LAUNCH_FLAGS_JSON"
   )" || die "Could not translate $LAUNCH_FLAGS_JSON into Phase D flags."

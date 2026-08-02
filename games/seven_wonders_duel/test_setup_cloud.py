@@ -157,3 +157,104 @@ def test_the_common_library_is_shared_not_copied():
         "the rustup bootstrap belongs in the common library, not inlined here"
     )
     del kingdomino
+
+
+# -- stage 8b: the sweep invocations must actually parse ---------------------
+#
+# Both sweep calls in stage 8b were wrong and would have killed the setup
+# script on any box where SWEEP_CHECKPOINT was set: --work-dir does not exist
+# on f4_phase_d_sweep, its --output is a directory not a file, and its axes are
+# comma-separated strings while w5_gate_slots_sweep takes space-separated
+# lists. Two harnesses, two conventions, and nothing checked either.
+
+
+def _invocation(text: str, module: str) -> str:
+    """The raw shell text of stage 8b's call to one sweep harness."""
+
+    start = text.index(f'"$PY" -m games.seven_wonders_duel.{module}')
+    end = text.index("|| die", start)
+    return text[start:end]
+
+
+def _module_options(module: str) -> set[str]:
+    """Flags the module's real parser accepts, from its own --help.
+
+    A subprocess rather than importing and introspecting: both parsers are
+    built inside main(), and scraping --help is what an operator's shell would
+    hit anyway.
+    """
+
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", f"games.seven_wonders_duel.{module}", "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, f"{module} --help failed: {result.stderr[-400:]}"
+    return set(re.findall(r"(?<![\w-])--[a-z0-9][a-z0-9-]+", result.stdout))
+
+
+@pytest.mark.parametrize(
+    "module", ["f4_phase_d_sweep", "w5_gate_slots_sweep"]
+)
+def test_the_sweep_invocations_only_use_flags_that_exist(setup_text, module):
+    used = _long_flags(_invocation(setup_text, module))
+    assert len(used) >= 6, f"only extracted {used} from the {module} call"
+    unknown = sorted(used - _module_options(module))
+    assert not unknown, f"stage 8b passes flags {module} rejects: {unknown}"
+
+
+def test_the_generation_sweep_passes_comma_separated_axes(setup_text):
+    """f4_phase_d_sweep takes one string per axis, not a list.
+
+    `--slots 48 96 144` parses as --slots=48 plus three stray positionals, and
+    argparse rejects the whole command. That is the original bug.
+    """
+
+    block = _invocation(setup_text, "f4_phase_d_sweep")
+    for axis in ("--slots", "--caps", "--inflight"):
+        match = re.search(rf'{axis}\s+"([^"]*)"', block)
+        assert match, f"{axis} must be quoted as a single argument: {block}"
+        assert " " not in match.group(1), (
+            f"{axis} got {match.group(1)!r}; this harness splits on commas"
+        )
+    assert "--work-dir" not in block, (
+        "f4_phase_d_sweep has no --work-dir; its --output is a directory"
+    )
+
+
+def test_the_gate_sweep_passes_a_work_dir_and_a_file_output(setup_text):
+    block = _invocation(setup_text, "w5_gate_slots_sweep")
+    assert "--work-dir" in block, "this harness does take a --work-dir"
+    assert ".json" in block, "its --output is a file, not a directory"
+
+
+def test_the_sweep_env_handoff_matches_the_launcher(setup_text):
+    """measured_env.sh must set variables the launcher actually reads."""
+
+    from .sweep_launch_env import render
+
+    rendered = render(
+        {
+            "RUST_SLOTS": 96,
+            "RUST_GLOBAL_BATCH_CAP": 1024,
+            "RUST_MAX_INFLIGHT_BATCHES": 1,
+            "GATE_SLOTS": 144,
+            "GATE_GLOBAL_BATCH_CAP": 1024,
+        }
+    )
+    exported = [
+        line.removeprefix("export ").split("=", 1)[0]
+        for line in rendered.splitlines()
+        if line.startswith("export ")
+    ]
+    assert "SKIP_SWEEPS" in exported, "pass 2 must not re-measure"
+    for name in exported:
+        assert f'{name}="${{{name}:-' in setup_text, (
+            f"measured_env.sh exports {name}, but the launcher never reads it"
+        )
