@@ -19,6 +19,21 @@ The extension talks to `http://127.0.0.1:8000` and sends no checkpoint, so the
 host's env default is what gets used. `http://127.0.0.1:8000/` also serves the
 lab UI, which is a useful way to confirm the host is alive.
 
+**`cpu` is deliberate, not an oversight.** Measured on an RTX 3070 Laptop,
+3,000 sims on the same position:
+
+| device | time | throughput |
+|---|---|---|
+| cpu | 0.67s | 4,485 sims/s |
+| cuda | 0.65s | 4,593 sims/s |
+
+A ~2% difference, inside the noise. Search evaluates **one leaf at a time**
+against a **1.03M-parameter** net, which is far too little work per call to
+amortize kernel-launch overhead — the bottleneck is the Python tree walk, not
+the matmuls. CPU additionally skips CUDA context init at startup and leaves the
+GPU free for training runs, which matters when the advisor sits running for a
+whole game. Use `cuda` only if the CPU is otherwise busy.
+
 ## 2. Load the extension
 
 **Firefox** — `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on*
