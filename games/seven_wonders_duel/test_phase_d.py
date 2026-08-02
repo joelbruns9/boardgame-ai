@@ -1326,15 +1326,15 @@ class _FakeLedger:
         return list(range(self.horizon))
 
 
-def test_the_anchor_is_the_candidate_in_force_at_the_lagged_games_clock(tmp_path):
+def test_the_anchor_is_the_learner_in_force_at_the_lagged_games_clock(tmp_path):
     loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(6):
-        path = loop.checkpoint_dir / f"candidate_{iteration:04d}.pt"
+        path = loop.learner_checkpoint(iteration)
         path.write_bytes(f"weights {iteration}".encode())
 
-    # At iteration 5 the clock reads 12 games; 6 back is 6, and the candidate
+    # At iteration 5 the clock reads 12 games; 6 back is 6, and the learner
     # in force then was iteration 2's (clock 6).
     reference = loop.anchor_reference(5)
     assert reference is not None
@@ -1350,15 +1350,16 @@ def test_the_anchor_never_goes_dark_when_promotions_stop(tmp_path):
     for longer than the lag the reference resolved to `current_best` itself and
     the measurement became a synthetic 0.500. Run 03 sat there for 35
     iterations across a collapse *and* a recovery, reporting the same number.
-    The candidate trajectory advances every iteration whether or not anything
-    is promoted, so the reference keeps moving and the series stays live.
+    The post-transition learner trajectory advances every iteration whether or
+    not anything is promoted, so the reference keeps moving and the series
+    stays live.
     """
 
     loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(24):
-        path = loop.checkpoint_dir / f"candidate_{iteration:04d}.pt"
+        path = loop.learner_checkpoint(iteration)
         path.write_bytes(f"weights {iteration}".encode())
     # A frozen best: promoted early and never again, exactly like run 03.
     loop.current_best.write_bytes(b"weights 1")
@@ -1370,12 +1371,37 @@ def test_the_anchor_never_goes_dark_when_promotions_stop(tmp_path):
         path, anchor_games = reference
         assert not loop.anchor_caught_up(path), (
             f"iteration {iteration}: the reference caught up to the subject "
-            "even though the candidate series advanced"
+            "even though the learner series advanced"
         )
         seen.append(anchor_games)
 
     assert seen == sorted(seen), "the reference must advance monotonically"
     assert len(set(seen)) > 1, "a reference that never moves is the W7a bug"
+
+
+def test_legacy_reset_row_reconstructs_the_restored_learner(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path))
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best = loop.checkpoint_dir / "candidate_0000.pt"
+    rejected = loop.checkpoint_dir / "candidate_0001.pt"
+    best.write_bytes(b"promoted best")
+    rejected.write_bytes(b"rejected learner")
+    best_sha = phase_d_module._file_digest(best)
+    rows = [
+        {"iteration": 0, "latest_sha256": best_sha},
+        {
+            "iteration": 1,
+            "latest_sha256": best_sha,
+            "candidate_sha256": phase_d_module._file_digest(rejected),
+            "promotion_action": "revert_reset",
+        },
+    ]
+
+    loop._sync_learner_checkpoints(rows)
+
+    assert loop.learner_checkpoint(0).read_bytes() == b"promoted best"
+    assert loop.learner_checkpoint(1).read_bytes() == b"promoted best"
+    assert loop.learner_checkpoint(1).read_bytes() != rejected.read_bytes()
 
 
 def test_a_run_younger_than_the_lag_skips_rather_than_comparing_to_nothing(tmp_path):
@@ -1466,11 +1492,11 @@ def test_a_disabled_ladder_never_re_applies_a_rung_on_resume(tmp_path):
 
 
 def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path):
-    """Plays real games between the learner and a real past candidate.
+    """Plays real games between the learner and a real past learner snapshot.
 
     The pure detector is tested in az_loop; this covers the seam -- reference
-    selection off the candidate trajectory, the fixed-N match, and the
-    persisted history a resume reads.
+    selection off the post-transition learner trajectory, the fixed-N match,
+    and the persisted history a resume reads.
     """
 
     loop = PhaseDLoop(
@@ -1506,7 +1532,7 @@ def test_the_anchor_measurement_runs_end_to_end_and_feeds_the_detector(tmp_path)
 
     # The learner's trajectory, and the learner itself as the subject.
     for iteration in (0, 1):
-        _save(loop.checkpoint_dir / f"candidate_{iteration:04d}.pt", iteration)
+        _save(loop.learner_checkpoint(iteration), iteration)
     _save(loop.anchor_subject(), 2)
     _save(loop.current_best, 0)
 
@@ -1587,7 +1613,7 @@ def test_the_anchor_reuses_the_gate_when_it_is_the_same_match(tmp_path):
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(6):
-        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+        loop.learner_checkpoint(iteration).write_bytes(
             f"weights {iteration}".encode()
         )
     # current_best was promoted from the candidate the anchor will resolve to.
@@ -1598,7 +1624,7 @@ def test_the_anchor_reuses_the_gate_when_it_is_the_same_match(tmp_path):
     path, _anchor_games = loop.anchor_reference(5)
     assert path.read_bytes() == b"weights 2"
 
-    assert loop.anchor_duplicates_gate(path) is False, (
+    assert loop.anchor_duplicates_gate(path, 5) is False, (
         "with no gate this iteration there is nothing to reuse"
     )
 
@@ -1606,16 +1632,21 @@ def test_the_anchor_reuses_the_gate_when_it_is_the_same_match(tmp_path):
         opponent="current_best",
         threshold=0.5,
         decision="accept",
-        games=200,
+        games=4,
         score_rate=0.61,
-        pairs=100,
+        pairs=2,
         wilson_lcb=0.512,
         wilson_ucb=0.700,
         stop_reason="promotion_lcb",
         evaluated_games=200,
         fixed_n=True,
     )
-    assert loop.anchor_duplicates_gate(path) is True
+    loop.last_promotion_gate_iteration = 5
+    loop.last_promotion_gate_subject_sha256 = phase_d_module._file_digest(
+        loop.anchor_subject()
+    )
+    loop.last_promotion_gate_opponent_sha256 = phase_d_module._file_digest(path)
+    assert loop.anchor_duplicates_gate(path, 5) is True
 
     report, anchor_games = loop.self_anchor_gate(5)
     assert report.score_rate == 0.61, "the reused numbers must be the gate's"
@@ -1629,7 +1660,7 @@ def test_a_different_opponent_does_not_reuse_the_gate(tmp_path):
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(6):
-        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+        loop.learner_checkpoint(iteration).write_bytes(
             f"weights {iteration}".encode()
         )
     loop.current_best.write_bytes(b"a different net entirely")
@@ -1638,17 +1669,57 @@ def test_a_different_opponent_does_not_reuse_the_gate(tmp_path):
         opponent="current_best",
         threshold=0.5,
         decision="accept",
-        games=200,
+        games=4,
         score_rate=0.61,
-        pairs=100,
+        pairs=2,
         wilson_lcb=0.512,
         wilson_ucb=0.700,
         stop_reason="promotion_lcb",
         evaluated_games=200,
         fixed_n=True,
     )
+    loop.last_promotion_gate_iteration = 5
+    loop.last_promotion_gate_subject_sha256 = phase_d_module._file_digest(
+        loop.anchor_subject()
+    )
+    loop.last_promotion_gate_opponent_sha256 = phase_d_module._file_digest(
+        loop.current_best
+    )
     path, _ = loop.anchor_reference(5)
-    assert loop.anchor_duplicates_gate(path) is False
+    assert loop.anchor_duplicates_gate(path, 5) is False
+
+
+def test_anchor_gate_reuse_rejects_stale_subject_and_game_count(tmp_path):
+    loop = PhaseDLoop(_stagnation_config(tmp_path, self_anchor_lag_games=6))
+    loop.games_ledger = _FakeLedger(2)
+    loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for iteration in range(6):
+        loop.learner_checkpoint(iteration).write_bytes(f"weights {iteration}".encode())
+    loop.current_best.write_bytes(b"weights 2")
+    loop.anchor_subject().write_bytes(b"weights 5")
+    path, _ = loop.anchor_reference(5)
+    loop.last_promotion_gate = GateResult(
+        opponent="current_best",
+        threshold=0.5,
+        decision="continue",
+        games=4,
+        score_rate=0.5,
+        pairs=2,
+        fixed_n=True,
+    )
+    loop.last_promotion_gate_iteration = 5
+    loop.last_promotion_gate_subject_sha256 = phase_d_module._file_digest(
+        loop.anchor_subject()
+    )
+    loop.last_promotion_gate_opponent_sha256 = phase_d_module._file_digest(path)
+
+    assert loop.anchor_duplicates_gate(path, 4) is False, "a stale gate is not reusable"
+    loop.last_promotion_gate_iteration = 5
+    loop.last_promotion_gate = replace(loop.last_promotion_gate, games=6)
+    assert loop.anchor_duplicates_gate(path, 5) is False, "fixed-N sizes must match"
+    loop.last_promotion_gate = replace(loop.last_promotion_gate, games=4)
+    loop.anchor_subject().write_bytes(b"post-reset weights")
+    assert loop.anchor_duplicates_gate(path, 5) is False, "the subject changed"
 
 
 # -- the gate's batch cap is its own knob ----------------------------------
@@ -1948,7 +2019,7 @@ def test_the_anchor_skips_when_there_is_no_rolling_learner(tmp_path):
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(6):
-        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+        loop.learner_checkpoint(iteration).write_bytes(
             f"weights {iteration}".encode()
         )
     assert not loop.anchor_subject().is_file()
@@ -1963,11 +2034,11 @@ def test_a_missing_candidate_does_not_break_the_reference(tmp_path):
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in (0, 5):
-        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+        loop.learner_checkpoint(iteration).write_bytes(
             f"weights {iteration}".encode()
         )
 
-    # Clock at iteration 5 is 12, target 6; candidate_0002 would have been the
+    # Clock at iteration 5 is 12, target 6; learner_0002 would have been the
     # match but is gone, so the newest surviving one at or before it wins.
     path, anchor_games = loop.anchor_reference(5)
     assert path.read_bytes() == b"weights 0"
@@ -1979,7 +2050,7 @@ def test_the_reference_is_always_older_than_the_subject(tmp_path):
     loop.games_ledger = _FakeLedger(2)
     loop.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for iteration in range(12):
-        (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").write_bytes(
+        loop.learner_checkpoint(iteration).write_bytes(
             f"weights {iteration}".encode()
         )
     for iteration in range(2, 12):
@@ -1988,7 +2059,7 @@ def test_the_reference_is_always_older_than_the_subject(tmp_path):
         path, anchor_games = reference
         assert anchor_games <= loop.games_ledger.total_through(iteration)
         assert int(path.stem.split("_")[1]) < iteration, (
-            "the reference must never be the current iteration's own candidate"
+            "the reference must never be the current iteration's own learner"
         )
 
 
@@ -2221,3 +2292,55 @@ def test_an_unchanged_resume_records_nothing(tmp_path):
     resumed._refuse_changed_schedules(payload)
     recorded = json.loads(resumed.manifest.path.read_text(encoding="utf-8"))
     assert "schedule_changes" not in recorded
+
+
+def test_an_accepted_hof_regime_is_unchanged_on_the_next_resume(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    original = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    first = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    first.games_ledger = _FakeLedger(400)
+    with pytest.warns(UserWarning):
+        first._refuse_changed_schedules(original)
+
+    recorded = json.loads(first.manifest.path.read_text(encoding="utf-8"))
+    later = PhaseDLoop(_soft_gate_config(tmp_path, hof_opponent_fraction=0.15))
+    later._refuse_changed_schedules(recorded)
+
+    unchanged = json.loads(later.manifest.path.read_text(encoding="utf-8"))
+    assert len(unchanged["schedule_changes"]) == 1
+
+
+def test_a_second_hof_change_starts_from_the_effective_regime(tmp_path):
+    started = _resumable(tmp_path, hof_opponent_fraction=0.0)
+    original = json.loads(started.manifest.path.read_text(encoding="utf-8"))
+    first = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.15, allow_hof_change=True
+        )
+    )
+    first.games_ledger = _FakeLedger(400)
+    with pytest.warns(UserWarning):
+        first._refuse_changed_schedules(original)
+
+    after_first = json.loads(first.manifest.path.read_text(encoding="utf-8"))
+    second = PhaseDLoop(
+        _soft_gate_config(
+            tmp_path, hof_opponent_fraction=0.30, allow_hof_change=True
+        )
+    )
+    second.games_ledger = _FakeLedger(500)
+    with pytest.warns(UserWarning):
+        second._refuse_changed_schedules(after_first)
+
+    changes = json.loads(second.manifest.path.read_text(encoding="utf-8"))[
+        "schedule_changes"
+    ]
+    assert len(changes) == 2
+    assert changes[1]["changes"]["hof_opponent_fraction"] == {
+        "from": 0.15,
+        "to": 0.30,
+    }

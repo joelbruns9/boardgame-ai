@@ -117,8 +117,10 @@ class RunManifest:
         iteration 149: a 188 MB manifest, of which 57.3 MB was an exact copy of
         the log, costing 0.8 s to parse and 2.9 s to re-serialise *per
         iteration*, and briefly allocating ~320 MB of peak RSS on a heap that
-        was already 6.5 GB.  That transient is the most plausible cause of the
-        MemoryError that killed the run this one continued from.
+        was already 6.5 GB. Removing it empirically stopped the monotone creep,
+        but the mechanism remains unresolved: reading the JSONL history still
+        creates a comparable transient, while the removed manifest path also
+        performed roughly 380 MB of file I/O per iteration.
 
         The rows live in the training log, which is append-only and therefore
         flat in cost.  ``iterations`` stays in the payload but is never appended

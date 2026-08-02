@@ -51,6 +51,7 @@ from games.az_loop import (
     RunManifest,
     SPRT,
     WindowSelection,
+    atomic_copy,
     expected_games_to_decide,
     play_match,
     run_jobs,
@@ -406,22 +407,13 @@ class PhaseDConfig:
 
     allow_resume_code_drift: bool = False
     allow_hof_change: bool = False
-    """Permit changing the HOF opponent share on a resume (W1.5).
+    """Permit a recorded HOF regime change on a resume (W1.5).
 
-    The schedule guard exists because a changed schedule makes the
-    iterations either side of it incomparable *and the run has no way to
-    record that it happened*.  The HOF share is the one schedule field for
-    which the first half is not true: it is a **level** applied to each
-    iteration as it is generated, not a **position** on an annealing curve.
-    Changing ``curriculum_anneal_iterations`` mid-run retroactively moves
-    where the run thinks it is on that curve; changing the HOF share only
-    changes the opponent mix from here on, which is a regime change the
-    run can simply record.
-
-    So this does not weaken the guard, it supplies the missing half: the
-    change is written to the manifest with the games clock it took effect
-    at, and that clock becomes a revert-suppress knot so the next gate gets
-    the W5.9 amnesty every other distribution shift already gets.
+    All three HOF fields create a forward regime boundary, and
+    ``hof_start_games`` is positional. Recording the change does not make the
+    iterations across it comparable; consumers must segment metrics at the
+    boundary. The change and its games clock are persisted so that segmentation
+    is possible, and the clock becomes a revert-suppress knot.
     """
     """Permit a resume on a different commit or dirty tree (W6.5)."""
 
@@ -1560,6 +1552,8 @@ class PhaseDLoop:
         # W7c: the anchor reuses this when it resolves to the same match.
         self.last_promotion_gate: GateResult | None = None
         self.last_promotion_gate_iteration: int | None = None
+        self.last_promotion_gate_subject_sha256: str | None = None
+        self.last_promotion_gate_opponent_sha256: str | None = None
         self.last_warm_stats: dict[str, int] = {}
         self.resource_monitor = ResourceMonitor()
         self.phase_seconds: dict[str, float] = {}
@@ -1788,10 +1782,10 @@ class PhaseDLoop:
         An anchor that is undefined exactly when promotions stop cannot answer
         the question it exists for, because promotions stopping is the question.
 
-        ``candidate_NNNN.pt`` is written every iteration and is what ``latest.pt``
-        was installed from, so the candidate series *is* the history of the
-        learner.  It always advances, so the reference can never catch up and the
-        series never degenerates.
+        ``learner_NNNN.pt`` is copied from ``latest.pt`` after promotion and reset
+        effects have been applied. Raw candidates cannot be used here: on a reset
+        iteration they contain the rejected weights that were immediately
+        replaced and were never the learner in force.
 
         Returns ``(path, anchor_games)``, or ``None`` when the run is younger
         than the lag -- the documented "skip rather than compare against
@@ -1807,15 +1801,20 @@ class PhaseDLoop:
         for known in self.games_ledger.known_iterations():
             if known >= iteration:
                 continue
-            path = self.checkpoint_dir / f"candidate_{known:04d}.pt"
+            path = self.learner_checkpoint(known)
             if path.is_file():
                 history.append((self.games_ledger.total_through(known), path))
-        # Each candidate was the learner from its own iteration until the next,
+        # Each snapshot was the learner from its own iteration until the next,
         # so the one in force at `target` is the newest at or before it.
         in_force = [item for item in history if item[0] <= target]
         if not in_force:
             return None
         return max(in_force)[1], max(in_force)[0]
+
+    def learner_checkpoint(self, iteration: int) -> Path:
+        """Immutable post-transition learner snapshot for one iteration."""
+
+        return self.checkpoint_dir / f"learner_{iteration:04d}.pt"
 
     def current_best_iteration(self) -> int | None:
         """Iteration ``current_best`` was promoted at, from its own metadata."""
@@ -1843,7 +1842,7 @@ class PhaseDLoop:
         the null is reported directly. ``test_a_caught_up_anchor_is_exactly_the
         _null_when_played`` plays it for real and checks this holds.
 
-        Kept after W7c retargeted the anchor to the candidate trajectory, where
+        Kept after W7c retargeted the anchor to the learner trajectory, where
         it should now be unreachable: the reference is strictly older than the
         current iteration, so it cannot be the subject.  It stays as the cheap
         guard that keeps the degenerate case from ever being *played*, since a
@@ -1860,7 +1859,7 @@ class PhaseDLoop:
         # of `current_best.pt`. Compare contents, not paths.
         return _file_digest(path) == _file_digest(subject)
 
-    def anchor_duplicates_gate(self, path: Path) -> bool:
+    def anchor_duplicates_gate(self, path: Path, iteration: int) -> bool:
         """True when this iteration's promotion gate already played this match.
 
         The gate plays ``latest`` against ``current_best``; the anchor plays
@@ -1873,9 +1872,21 @@ class PhaseDLoop:
         """
 
         report = self.last_promotion_gate
-        if report is None or not Path(self.current_best).is_file():
+        subject = self.anchor_subject()
+        if (
+            report is None
+            or self.last_promotion_gate_iteration != iteration
+            or report.games != self.config.self_anchor_games
+            or self.last_promotion_gate_subject_sha256 is None
+            or self.last_promotion_gate_opponent_sha256 is None
+            or not subject.is_file()
+            or not path.is_file()
+        ):
             return False
-        return _file_digest(path) == _file_digest(Path(self.current_best))
+        return (
+            self.last_promotion_gate_subject_sha256 == _file_digest(subject)
+            and self.last_promotion_gate_opponent_sha256 == _file_digest(path)
+        )
 
     def self_anchor_gate(self, iteration: int) -> tuple[GateResult, int] | None:
         """Fixed-N ``latest`` vs its games-lagged self (W7c).
@@ -1901,7 +1912,7 @@ class PhaseDLoop:
             return None
         path, anchor_games = reference
         games = self.config.self_anchor_games
-        if self.anchor_duplicates_gate(path):
+        if self.anchor_duplicates_gate(path, iteration):
             report = self.last_promotion_gate
             assert report is not None  # anchor_duplicates_gate checked it
             return (
@@ -2195,6 +2206,51 @@ class PhaseDLoop:
                     ) from exc
         return rows
 
+    def _sync_learner_checkpoints(self, rows: Sequence[dict[str, Any]]) -> None:
+        """Backfill immutable post-transition learner snapshots for older runs.
+
+        Every trained champion originated as a retained candidate, so reset rows
+        can normally be reconstructed by matching the row's ``latest_sha256``
+        against the candidate archive. New iterations write these snapshots
+        directly through ``LifecycleAdapter.record_learner``.
+        """
+
+        if not rows:
+            return
+        sources: dict[str, Path] = {}
+        for pattern in ("learner_*.pt", "candidate_*.pt", "_bootstrap_init.pt"):
+            for path in self.checkpoint_dir.glob(pattern):
+                sources.setdefault(_file_digest(path), path)
+        for rolling in (self.current_best, self.checkpoint_dir / "latest.pt"):
+            if rolling.is_file():
+                sources.setdefault(_file_digest(rolling), rolling)
+
+        for row in sorted(rows, key=lambda item: int(item["iteration"])):
+            iteration = int(row["iteration"])
+            expected = row.get("latest_sha256")
+            if not expected:
+                continue
+            target = self.learner_checkpoint(iteration)
+            if target.is_file():
+                actual = _file_digest(target)
+                if actual != expected:
+                    raise ValueError(
+                        f"learner snapshot digest mismatch at iteration {iteration}: "
+                        f"row has {expected}, file has {actual}"
+                    )
+                sources.setdefault(actual, target)
+                continue
+            source = sources.get(str(expected))
+            if source is None:
+                warnings.warn(
+                    f"cannot reconstruct learner snapshot for iteration {iteration} "
+                    f"with digest {expected}; the self-anchor will skip that point",
+                    stacklevel=2,
+                )
+                continue
+            atomic_copy(source, target)
+            sources.setdefault(str(expected), target)
+
     def _sync_training_log(self, manifest: dict[str, Any]) -> None:
         """Backfill manifest rows missing from an interrupted or older run's log."""
 
@@ -2379,12 +2435,13 @@ class PhaseDLoop:
                 f"{self.config.precision!r}"
             )
         self._refuse_changed_code(manifest_payload)
-        self._reload_schedule_change_knots()
+        self._reload_schedule_change_knots(manifest_payload)
         self._refuse_changed_schedules(manifest_payload)
         # After the guards, never before: they compare against `base_config`,
         # and an intervention is not a config change the operator made.
         self.restore_intervention()
         self._sync_training_log(manifest_payload)
+        self._sync_learner_checkpoints(self.training_log_rows())
         if self.config.warm_buffer:
             self._load_warm_buffer(Path(self.config.warm_buffer))
         if self.config.seed_games:
@@ -2467,6 +2524,13 @@ class PhaseDLoop:
         for key in stored:
             stored[key] = stored_config.get(key, None)
         stored["schedule_basis"] = stored_basis
+        # The manifest config is immutable launch provenance. Recorded changes
+        # form the effective regime on later resumes, so compare with the last
+        # accepted value rather than repeatedly comparing with the launch value.
+        for entry in self._recorded_schedule_changes(manifest_payload):
+            for key, delta in entry.get("changes", {}).items():
+                if key in stored and isinstance(delta, dict) and "to" in delta:
+                    stored[key] = delta["to"]
         current = self.config.schedule_identity()
 
         changed = {
@@ -2482,11 +2546,9 @@ class PhaseDLoop:
         if not changed:
             return
 
-        # The HOF share is a level, not a position (see `allow_hof_change`), so
-        # it is the one part of the identity a resume may move -- but only when
-        # asked to, and only if nothing positional moved with it. A run that
-        # changes the HOF share *and* an annealing knot in the same resume is
-        # still refused: the second one is the incomparable kind.
+        # HOF changes are an explicit, recorded exception rather than comparable
+        # schedules. Any non-HOF schedule change in the same resume still makes
+        # the launch invalid under this narrow override.
         hof_changed = {k: v for k, v in changed.items() if k in HOF_SCHEDULE_KEYS}
         positional = {k: v for k, v in changed.items() if k not in HOF_SCHEDULE_KEYS}
         if hof_changed and not positional and self.config.allow_hof_change:
@@ -2504,9 +2566,9 @@ class PhaseDLoop:
             )
         elif hof_changed and not positional:
             hint = (
-                " The HOF share is a level rather than a schedule position, so "
-                "--allow-hof-change accepts this one, records it against the "
-                "games clock, and suppresses the next gate's revert."
+                " --allow-hof-change accepts this HOF-only regime boundary, "
+                "records it against the games clock, and suppresses the next "
+                "gate's revert; metrics across the boundary remain incomparable."
             )
         raise ValueError(
             f"cannot resume with changed training schedules ({detail})." + hint
@@ -2538,18 +2600,39 @@ class PhaseDLoop:
             stacklevel=2,
         )
 
-    def _reload_schedule_change_knots(self) -> None:
+    def _recorded_schedule_changes(
+        self, manifest_payload: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Recorded regime changes in games-clock order.
+
+        This is the single parser used both by the schedule guard and by knot
+        restoration, so they cannot disagree about which entries are effective.
+        Stable sorting preserves append order for multiple changes at one clock.
+        """
+
+        if manifest_payload is None:
+            try:
+                manifest_payload = json.loads(
+                    self.manifest.path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return []
+        entries = [
+            entry
+            for entry in manifest_payload.get("schedule_changes", [])
+            if isinstance(entry, dict) and int(entry.get("at_games", 0)) >= 0
+        ]
+        return sorted(entries, key=lambda entry: int(entry.get("at_games", 0)))
+
+    def _reload_schedule_change_knots(
+        self, manifest_payload: dict[str, Any] | None = None
+    ) -> None:
         """Recorded change points, read back so a later resume still sees them."""
 
-        try:
-            payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._schedule_change_knots = ()
-            return
         self._schedule_change_knots = tuple(
             sorted(
                 int(entry["at_games"])
-                for entry in payload.get("schedule_changes", [])
+                for entry in self._recorded_schedule_changes(manifest_payload)
                 if int(entry.get("at_games", 0)) > 0
             )
         )
@@ -4001,6 +4084,8 @@ class PhaseDLoop:
             # boundary happened to stop the match.
             self.last_promotion_gate = report
             self.last_promotion_gate_iteration = iteration
+            self.last_promotion_gate_subject_sha256 = _file_digest(candidate)
+            self.last_promotion_gate_opponent_sha256 = _file_digest(opponent)
             return report
         finally:
             self.phase_seconds["gate"] = (
@@ -4416,10 +4501,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-hof-change",
         action="store_true",
         help="permit changing --hof-opponent-fraction / --hof-sampling-mode / "
-        "--hof-start-games on a resume. The share is a level rather than a "
-        "schedule position, so the change is recorded in the manifest against "
-        "the games clock and suppresses the next gate's revert. Any other "
-        "schedule change is still refused.",
+        "--hof-start-games on a resume. The HOF-only regime boundary is "
+        "recorded against the games clock and suppresses the next gate's "
+        "revert; metrics across it remain incomparable. Any other schedule "
+        "change is still refused.",
     )
     parser.add_argument(
         "--self-anchor-games",

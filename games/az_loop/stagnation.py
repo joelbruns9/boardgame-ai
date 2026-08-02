@@ -1,11 +1,24 @@
 """W7: detect a run that has stopped learning, and escalate a response.
 
-The detection half rests on one property of a **games-indexed** anchor: the
-opponent is whatever ``current_best`` was N games ago, so when learning stops the
-anchor advances until it catches up and the score converges to exactly 0.500 --
-a net against itself.  That makes the null self-calibrating.  A promotion-lagged
-anchor cannot do this: when promotions stop, both pointers freeze and the score
-is a constant that no threshold ever crosses.
+The detection half reads a **games-indexed** anchor: a fixed-N score of the
+learner against its own checkpoint from N games ago.  The null is 0.500 --
+two equally strong nets -- and a run that is learning pushes the score above it,
+because the reference lags.
+
+**W7c (2026-08-01) changed where that reference comes from, and the original
+justification for the null did not survive.**  W7a indexed the promotion
+lineage, arguing that when learning stopped the anchor would catch up to
+``current_best`` and the score would converge to *exactly* 0.500 -- a net
+against itself, a self-calibrating null.  It does converge, but by resolving to
+the same file: the loop then reports a synthetic 0.500 without playing, so the
+series goes constant precisely when promotions stop, which is when the question
+is being asked. The reference is now the post-transition learner trajectory,
+which advances every iteration regardless of promotions.
+
+The null is still 0.500, but it is now reached statistically rather than by
+construction, so the lifecycle uses the measurement's Wilson interval. The
+score slope remains telemetry only: for a fixed lag it measures acceleration
+of learning, not whether learning continues.
 
 Everything here is pure and game-agnostic.  Measurements come from whatever the
 game uses to play a fixed-N match; the state survives a resume as a dict.
@@ -99,14 +112,6 @@ class StagnationDetector:
 
     null: float = 0.50
     min_measurements: int = 3
-    slope_epsilon: float = 0.005
-    """Score gain per 10k games below which the run is not improving.
-
-    A run that is learning moves the anchor score *up*, because the anchor lags.
-    Zero would be too strict a boundary for a noisy estimate, so this is the
-    smallest slope worth calling progress.
-    """
-
     def verdict(
         self, measurements: Sequence[AnchorMeasurement]
     ) -> StagnationVerdict:
@@ -123,16 +128,11 @@ class StagnationDetector:
         # be shown to beat its own past self.
         if all(measurement.lower <= self.null for measurement in recent):
             reasons.append(
-                f"the last {len(recent)} anchor intervals all include "
-                f"{self.null:.2f}: no measurement distinguishes the current net "
-                "from its own past self"
+                f"none of the last {len(recent)} anchor lower bounds clears "
+                f"{self.null:.2f}: no measurement establishes that the current "
+                "net beats its own past self"
             )
         slope = _slope_per_games(recent)
-        if slope is not None and slope <= self.slope_epsilon:
-            reasons.append(
-                f"anchor slope {slope:+.4f}/10k games is at or below "
-                f"{self.slope_epsilon:+.4f}"
-            )
         return StagnationVerdict(
             stagnant=bool(reasons),
             reasons=tuple(reasons),
@@ -179,9 +179,12 @@ DEFAULT_LADDER: tuple[Intervention, ...] = (
         rationale="opponent diversity; what mattered most in Kingdomino",
     ),
     Intervention(
-        name="lr_warm_restart",
+        name="lr_jump",
         learning_rate_multiplier=3.0,
-        rationale="last resort: the optimiser, not the data, is stuck",
+        rationale=(
+            "last resort: triple the LR while retaining AdamW moments; this is "
+            "an abrupt LR jump, not an optimizer or cosine restart"
+        ),
     ),
 )
 """The plan's four rungs, in its order. Model growth is NOT on this ladder."""

@@ -266,12 +266,20 @@ construction. W0's L checkpoints remain valid.
 
 ### Learner-only policy targets
 
+The Rust recorder is the primary enforcement point. The dataset-side
+`archive_policy_seats` check is defense in depth for imported, legacy,
+Python-written, or retagged records; it did not fix the live Rust path.
+
 Following Kingdomino's `play_current_vs_hof_game` ("keep only current-owned
 labels"), the archive's moves are excluded from the policy loss -- enforced in
 Rust at the record site, where curriculum-bot moves are already excluded the same
 way. Network 0 is by definition the learner. The moves still exist and the game
 still supplies a value target for both seats; only the policy label is withheld,
 because a target produced by an older net trains the learner to imitate it.
+Value labels are retained as a plausible experiment, not an unbiased
+current-policy target: league trajectories follow a mixed learner/archive
+policy. Compare all league values, learner-turn values only, and no league
+values before treating that choice as settled.
 
 ### Defaults, and what is still off
 
@@ -989,7 +997,8 @@ are comparing two frozen networks, the score is a constant (say 0.60), and a
 and when promotions stop, the numerator and denominator stop with them.
 
 **The anchor is indexed by games.** Anchor = the learner's own checkpoint from N
-games ago (e.g. 20k), taken from the `candidate_NNNN.pt` series.
+games ago (e.g. 20k), taken from immutable post-transition
+`learner_NNNN.pt` snapshots.
 
 > **W7c correction (2026-07-31).** W7a indexed the *promotion lineage*: anchor =
 > whatever `current_best` was N games ago, on the reasoning that a frozen best
@@ -1008,14 +1017,18 @@ games ago (e.g. 20k), taken from the `candidate_NNNN.pt` series.
 > the question it exists for, because "promotions have stopped" *is* the
 > question. It measured the promotion log, which is free.
 >
-> The candidate series advances every iteration whether or not anything is
-> promoted, so the reference always moves and the score always means something.
-> The degenerate-match guard is kept, but is now unreachable by construction.
+> The learner series advances every iteration whether or not anything is
+> promoted. Snapshots are written after lifecycle resolution, so a reset point
+> contains the restored best rather than the rejected raw candidate. The
+> degenerate-match guard remains reachable for a lag that lands on identical
+> reset weights and safely reports that one matchup as 0.500.
 
 Specification: fixed N games, **no early stopping** (measurement, not decision --
-W5.6); report the score with its Wilson interval; trigger on the **interval or a
-slope across several measurements**, never a single point; before N games have
+W5.6); report the score with its Wilson interval; trigger when recent lower
+bounds fail to clear 0.500, never from a single point; before N games have
 elapsed, use the bootstrap net or skip rather than comparing against nothing.
+The score slope remains telemetry only: at fixed lag it measures acceleration,
+not whether steady learning continues.
 
 Also in the heartbeat: promotions in the last M games; val `value_acc` trend
 (run 03's turned at iteration 35, ~25 iterations before the run died); victory
@@ -1028,8 +1041,9 @@ expectation that 14.9 M parameters have more headroom *under continued self-play
 than 1.03 M -- a claim no fixed-corpus study can test. The games-indexed anchor is
 the first instrument in this plan that can. Concretely: run 03 reached 70.9/13.0/
 16.1 civilian/scientific/military and 9 promotions in 13 gates at 1.03 M. If the
-L run's anchor slope is flat while its cost is 1.85x generation and 5.12x
-training-step, **the width bet has failed and S/fp32 is the documented fallback**
+L run repeatedly cannot establish an advantage over its lagged learner while
+its cost is 1.85x generation and 5.12x training-step, **the width bet has failed
+and S/fp32 is the documented fallback**
 (decisions table). Record the comparison explicitly in the heartbeat rather than
 leaving it to be reconstructed later -- that reconstruction is what cost four
 throwaway scripts in W3's motivating case.
@@ -1045,7 +1059,8 @@ attributable:
    policy is no longer better than the raw policy at that budget.
 2. **Jump the replay window** up its schedule.
 3. **Raise the HOF opponent fraction.**
-4. **LR warm restart or decay.**
+4. **LR jump.** Triple the LR while retaining AdamW moments; this is not an
+   optimizer restart and does not re-enable warmup or cosine decay.
 
 **Model growth is not on this ladder.** Size is manual.
 

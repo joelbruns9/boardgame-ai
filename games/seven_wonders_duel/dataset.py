@@ -179,8 +179,8 @@ def examples_from_record(
 
     staged: list[tuple[Example, int]] = []  # (example, actor)
     maximum_track = 0
-    # Empty except in league games. The archive's seat still contributes
-    # value labels below; only its policy is not a target.
+    # Empty except in league games. The archive's seat still contributes value
+    # labels as an explicit mixed-policy experiment; only its policy is masked.
     archive_seats = archive_policy_seats(record.agents)
 
     def featurize(game, move):

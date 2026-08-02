@@ -298,6 +298,7 @@ def gate_transition(
     ladder: GateLadder | None = None,
     allow_step_up: bool = True,
     probation_reset_after: int = 0,
+    gate_stop_reason: str | None = None,
 ) -> TransitionResult:
     """Map a fixed-N gate decision onto the soft-gate lifecycle action.
 
@@ -323,6 +324,22 @@ def gate_transition(
         raise ValueError(f"unknown gate decision: {decision!r}")
     if probation_reset_after < 0:
         raise ValueError("probation_reset_after must be non-negative")
+
+    if decision == CONTINUE and gate_stop_reason == "revert_suppressed_knot":
+        # This gate is explicitly excluded from lifecycle evidence: its apparent
+        # loss crossed a known distribution boundary. Keep the visible probation
+        # action, but do not move any reset or resolution counter.
+        action = PromotionAction.PROBATION
+        return TransitionResult(
+            action=action,
+            replace_best=False,
+            reset_learner=False,
+            next_state=replace(
+                state,
+                generator_source=_generator_after(state.mode, action),
+                last_iteration=iteration,
+            ),
+        )
 
     rungs = _ladder_after(
         state,
@@ -415,6 +432,7 @@ def decide_transition(
     ladder: GateLadder | None = None,
     allow_step_up: bool = True,
     probation_reset_after: int = 0,
+    gate_stop_reason: str | None = None,
 ) -> TransitionResult:
     """Single entry point the controller calls after training an iteration.
 
@@ -435,5 +453,6 @@ def decide_transition(
             ladder=ladder,
             allow_step_up=allow_step_up,
             probation_reset_after=probation_reset_after,
+            gate_stop_reason=gate_stop_reason,
         )
     return not_scheduled_transition(state, iteration)

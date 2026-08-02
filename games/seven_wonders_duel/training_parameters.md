@@ -27,7 +27,7 @@ generated game and 5.12x per training step; see `CLOUD_TRAINING_PLAN.md`.
   --selfplay-generator-mode soft_gate `
   --bootstrap-policy auto_first_trained `
   --promotion-every 5 `
-  --revert-reset-after 2 `
+  --revert-reset-after 3 `
   --probation-reset-after 4 `
   --promotion-min-lcb 0.50 `
   --revert-max-ucb 0.48 `
@@ -405,14 +405,17 @@ Archived opponents are routed by the **searcher** seat, so every leaf of one
 search uses the mover's network. Routing on the leaf actor instead would let the
 opponent's network evaluate the interior of your own search tree.
 
-**The archive's own moves are not policy targets.** A league game runs a full
-search for both seats, so until 2026-08-01 every league game taught the learner
-to imitate an older, weaker net on roughly half its positions -- at 0.15 that is
-~7.5% of all training positions. `dataset.archive_policy_seats` now drops the
-policy target on the archive's seat while keeping its **value** labels: the game
-was really played and really ended, so the outcome stays valid for every
-position in it, and only the policy of a seat the learner does not own must not
-be imitated. This matches the existing treatment of curriculum-bot moves.
+**The archive's own moves are not policy targets.** The production Rust recorder
+already enforces this in `self_play.rs::finish_move`: any actor routed to network
+1 (the archive) is written with `policy_excluded=true`. The additional
+`dataset.archive_policy_seats` check is defense in depth for imported, legacy,
+Python-written, or retagged records; it was not a fix to the live Rust path.
+
+The archive's **value** labels are currently retained as an experiment, not a
+correctness result. A league trajectory follows a mixed learner/archive policy,
+so its outcome is observed but is not an unbiased current-self-play value target.
+The settling comparison is all league values versus learner-turn values only
+versus no league values.
 
 Watch `policy=N(P%)` on the log's `replay:` line. It reads 100% with HOF off and
 drops below it once league games enter the window; that percentage is the check
@@ -1195,7 +1198,8 @@ games -- which is why one sweep is enough.
 
 Two traps when sizing this yourself, both visible as **bit-identical**
 `mean_batch_rows` between adjacent slot counts. The pool cannot hold more games
-in flight than the gate plays, so every slot count above `--games` measures the
+in flight than the gate plays, so every slot count above the requested game
+count measures the
 same configuration; and the reported speedup means nothing unless the baseline
 is held fixed, since `48/1024` is the pathological corner and flatters any
 comparison against it.
@@ -1274,15 +1278,13 @@ pointers freeze, and the score becomes a constant no threshold crosses.
 
 **Default:** `0` (off). **Constraint:** non-negative even integer
 
-Fixed games for the self-anchor measurement. The opponent is whatever
-`current_best` was `--self-anchor-lag-games` ago.
+Fixed games for the self-anchor measurement. The opponent is the rolling
+learner that was in force `--self-anchor-lag-games` ago.
 
-**Why games and not promotions.** The anchor is a time-shifted pointer into the
-history of bests, re-evaluated every measurement. The target (`now - lag`)
-advances every iteration; the history only grows on a promotion. So when
-promotions stop, the pointer keeps walking until it reaches `current_best`
-itself -- and then the measurement is a net against itself, which scores exactly
-**0.500**. The null calibrates itself and cannot go stale.
+The history is games-indexed rather than promotion-indexed, so it advances even
+when promotions stop. Each `learner_NNNN.pt` snapshot is written after lifecycle
+resolution; on a reset it contains the restored best, not the rejected raw
+candidate from that iteration.
 
 A caught-up anchor is reported rather than played: with paired seeds, both seats
 swapped, and deterministic gate play, the two games of a pair are the same game,
@@ -1293,7 +1295,8 @@ rediscovering a tie.
 
 **Default:** `20000`. **Value:** positive integer
 
-How far back the anchor sits, on the learner's own `candidate_NNNN.pt` series.
+How far back the anchor sits, on the learner's post-transition
+`learner_NNNN.pt` series.
 
 **W7c (2026-08-01) changed what the anchor tracks.** W7a indexed the promotion
 lineage, so with no promotions the reference caught up to `current_best` itself
@@ -1305,9 +1308,10 @@ recovery that promoted at 0.610 -- the identical number throughout, with
 promotions stop cannot answer the question it exists for, because promotions
 stopping *is* the question.
 
-The candidate series advances every iteration whether or not anything is
-promoted, so the lag stays pinned at its configured value and the score always
-means something. After the change the same run produced a live series:
+The learner series advances every iteration whether or not anything is
+promoted. After the change the same run produced a live series, but its original
+reset-adjacent points used raw candidates and must be re-derived before they are
+read as a strength curve:
 `0.625 0.600 0.635 0.635 0.725 0.760 0.790 0.725 0.570 0.695 0.560 0.510`.
 
 Read a declining series carefully: the reference is advancing too, so a fall can
@@ -1323,30 +1327,20 @@ long a fresh run takes before stagnation can be reported at all.
 
 ### Detection
 
-Two independent triggers, both requiring several measurements -- never a single
-point, because one anchor score straddling 0.500 is what an evenly matched pair
-of nets looks like on any given afternoon:
+One interval-based trigger requires several measurements -- never a single
+point. It fires when all recent Wilson lower bounds remain at or below 0.500, so
+no measurement establishes that the current learner beats its lagged self.
 
-- **interval**: the recent intervals all include 0.500, so no measurement
-  distinguishes the current net from its own past self;
-- **slope**: the OLS slope of score against the games clock is at or below
-  0.005 per 10k games.
-
-  **That 0.005 is a guess and it is far too small.** It could not be calibrated
-  while the anchor was returning synthetic nulls. The first live series
-  (`laptop_training_03_w7`, iterations 150-209) produced slopes between
-  **+0.31 and -0.55 per 10k games** -- two orders of magnitude larger -- so the
-  threshold as shipped fires on essentially any downward drift. Re-fit it from a
-  run whose anchor is live before relying on the slope trigger.
-
-The slope is per *games*, not per measurement: an intervention that lengthens
-the window changes the cadence, and a per-measurement slope would then mean two
-different things inside one series.
+The OLS slope of anchor score against games is still computed and reported as
+telemetry. It does not affect the verdict: with a fixed lag, steady learning
+produces a constant lagged strength advantage and therefore a near-zero slope;
+real learning curves often decelerate and produce a negative slope. The slope
+measures acceleration, not whether learning continues.
 
 The anchor is also W0's falsifier. The width decision rests on 14.9M parameters
 having more headroom under continued self-play than 1.03M -- a claim no
-fixed-corpus study can test. A flat anchor slope at L's cost (1.85x generation,
-5.12x training step) is the documented case for the S/fp32 fallback.
+fixed-corpus study can test. Repeated intervals unable to establish an advantage
+over the lagged learner at L's cost are the documented case for the S/fp32 fallback.
 
 ### `--intervention-ladder`
 
@@ -1360,7 +1354,7 @@ only controls whether anything acts on it. Four rungs, escalated one at a time:
    search-improved policy is no longer better than the raw policy at that budget;
 2. **jump the replay window** (x1.5);
 3. **raise the HOF fraction** (to 0.30);
-4. **LR warm restart** (x3).
+4. **LR jump** (x3), retaining the existing AdamW moments and skipping warmup.
 
 Model growth is deliberately not on this ladder; size is manual.
 
@@ -1517,12 +1511,10 @@ Permits a resume that changes `--hof-opponent-fraction`, `--hof-sampling-mode`
 or `--hof-start-games`. Every other schedule change is still refused, including
 a resume that moves a HOF field **and** a positional one in the same launch.
 
-The schedule guard's objection to a mid-run change is that the iterations either
-side become incomparable *and the run has no way to record it happened*. The
-second half is what this supplies, and the first half does not apply to the HOF
-share, because it is a **level** rather than a **position**: changing
-`--curriculum-anneal-games` retroactively moves where the run thinks it is on a
-curve, while changing the HOF share only alters the opponent mix from here on.
+All three fields create a forward regime boundary, and `--hof-start-games` is
+plainly positional. Recording the boundary does not make metrics across it
+comparable; consumers must segment results at `schedule_changes`. This flag is a
+narrow, explicit override that supplies the provenance needed to do so.
 
 Accepting the change:
 
@@ -1631,10 +1623,11 @@ so an inconclusive short promotion check no longer discards it:
   --selfplay-generator-mode soft_gate `
   --bootstrap-policy auto_first_trained `
   --promotion-every 5 `
-  --revert-reset-after 2 `
+  --revert-reset-after 3 `
+  --probation-reset-after 4 `
   --promotion-min-lcb 0.50 `
   --revert-max-ucb 0.48 `
-  --gate-ladder-games 100 200 400 800 `
+  --gate-ladder-games 200 600 1000 1500 `
   --gate-ladder-floor-games 10000 `
   --self-anchor-games 200 `
   --generation-backend rust `
@@ -1650,9 +1643,8 @@ configuration (see the table above); the flags shown are the lifecycle and gate
 controls that differ from a legacy strict-gate run. `run.log` is written under
 the run directory automatically.
 
-`--revert-reset-after 2` is the two-stage revert: the first reverting gate
-switches the generator back to the protected best while the learner keeps its
-weights and keeps training, and only a **second consecutive** reverting gate
-rolls the learner back. Requiring persistence rather than lowering the threshold
-is what separates a transient dip -- normal across a schedule knot -- from a real
-regression.
+`--revert-reset-after 3` requires three decisive reverting gates: earlier
+reverts switch generation back to the protected best while the learner keeps
+its weights and keeps training, and only the third reverting gate rolls the
+learner back. Probations do not erase that decisive evidence, but an explicitly
+suppressed schedule-knot revert advances none of the lifecycle counters.

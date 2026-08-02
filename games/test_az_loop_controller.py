@@ -67,6 +67,8 @@ class FakeAdapter:
         self.resets: list[Path] = []
         self.autosaves: list[int] = []
         self.anchor_calls: list[tuple[int, str]] = []
+        self.learner_snapshots: list[tuple[int, bytes]] = []
+        self.promotion_metrics: dict[str, Any] = {"games": 50}
         self.autosave_should_fail = False
         self.fail_promotion_at: int | None = None
 
@@ -113,7 +115,9 @@ class FakeAdapter:
             raise RuntimeError("simulated gate crash")
         if not self.decisions:
             raise AssertionError("evaluate_promotion called with no scripted decision")
-        return PromotionResult(decision=self.decisions.pop(0), metrics={"games": 50})
+        return PromotionResult(
+            decision=self.decisions.pop(0), metrics=dict(self.promotion_metrics)
+        )
 
     def evaluate_anchors(self, request: AnchorRequest):
         self.anchor_calls.append((request.iteration, Path(request.checkpoint).name))
@@ -124,6 +128,9 @@ class FakeAdapter:
 
     def on_learner_reset(self, best_checkpoint: Path) -> None:
         self.resets.append(Path(best_checkpoint))
+
+    def record_learner(self, iteration: int, learner_checkpoint: Path) -> None:
+        self.learner_snapshots.append((iteration, Path(learner_checkpoint).read_bytes()))
 
     def autosave(self, iteration: int) -> None:
         if self.autosave_should_fail:
@@ -143,6 +150,7 @@ def _controller(
     iterations: int = 1,
     promotion_every: int = 1,
     revert_reset_after: int = 0,
+    probation_reset_after: int = 0,
     store: MemoryStore | None = None,
     anchor_every: int = 0,
     anchor_every_iterations: int = 0,
@@ -160,6 +168,7 @@ def _controller(
             bootstrap_policy=policy,
             promotion_every=promotion_every,
             revert_reset_after=revert_reset_after,
+            probation_reset_after=probation_reset_after,
             anchor_gate_every_promotions=anchor_every,
             anchor_every_iterations=anchor_every_iterations,
             buffer_autosave_every=autosave_every,
@@ -227,10 +236,32 @@ def test_not_scheduled_leaves_revert_counter_untouched():
     assert not result.replace_best and not result.reset_learner
 
 
-def test_continue_resets_revert_counter():
+def test_continue_preserves_revert_counter():
     state = _soft_state(consecutive_reverts=2)
     result = gate_transition(state, "continue", revert_reset_after=3, iteration=7)
-    assert result.next_state.consecutive_reverts == 0
+    assert result.next_state.consecutive_reverts == 2
+
+
+def test_suppressed_revert_remains_visible_without_counting_as_probation(tmp_path):
+    controller, adapter, _store = _controller(
+        tmp_path,
+        mode=GeneratorMode.SOFT_GATE,
+        decisions=["continue"],
+        iterations=2,
+        probation_reset_after=1,
+    )
+    adapter.promotion_metrics = {
+        "games": 50,
+        "stop_reason": "revert_suppressed_knot",
+    }
+
+    rows = controller.run()
+
+    assert rows[1]["promotion_action"] == PromotionAction.PROBATION.value
+    assert rows[1]["promotion_gate"]["stop_reason"] == "revert_suppressed_knot"
+    assert rows[1]["control_state"]["consecutive_probations"] == 0
+    assert rows[1]["control_state"]["probations_since_decisive"] == 0
+    assert adapter.resets == []
 
 
 # -- controller: checkpoint separation --------------------------------------
@@ -352,6 +383,9 @@ def test_revert_reset_restores_best_weights_into_latest(tmp_path):
     assert rows[2]["promotion_action"] == PromotionAction.REVERT_RESET.value
     assert controller.latest_path.read_bytes() == controller.current_best_path.read_bytes()
     assert len(adapter.resets) == 1
+    reset_snapshot = dict(adapter.learner_snapshots)[2]
+    assert reset_snapshot == controller.current_best_path.read_bytes()
+    assert reset_snapshot != (tmp_path / "checkpoints/candidate_0002.pt").read_bytes()
 
 
 # -- controller: promotion cadence ------------------------------------------

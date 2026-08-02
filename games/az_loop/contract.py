@@ -162,6 +162,10 @@ class LifecycleAdapter(Protocol):
         """Hook for a revert-reset: clear persisted optimizer state, etc."""
         ...
 
+    def record_learner(self, iteration: int, learner_checkpoint: Path) -> None:
+        """Durably snapshot the post-transition learner for historical anchors."""
+        ...
+
     def measure(self, iteration: int) -> dict[str, Any] | None:
         """Periodic measurements the game owns, on its own cadence (W7a).
 

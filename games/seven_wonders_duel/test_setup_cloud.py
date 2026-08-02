@@ -104,11 +104,38 @@ def test_the_launch_configuration_matches_the_locked_decisions(setup_text):
     command = _block(setup_text, "TRAIN_CMD=(")
     # The decisions table in CLOUD_TRAINING_PLAN.md, as flags.
     assert "--selfplay-generator-mode soft_gate" in command
-    assert "--revert-reset-after 2" in command
+    assert '--bootstrap-policy "$BOOTSTRAP_POLICY"' in command
+    assert '--promotion-every "$PROMOTION_EVERY"' in command
+    assert '--revert-reset-after "$REVERT_RESET_AFTER"' in command
+    assert '--probation-reset-after "$PROBATION_RESET_AFTER"' in command
     assert "--promotion-min-lcb 0.50" in command
     assert "--revert-max-ucb 0.48" in command
     assert "--schedule-basis games" in command
     assert '--precision "$PRECISION"' in command
+
+
+def test_the_run03_lifecycle_defaults_match_the_documented_command(setup_text):
+    expected = {
+        "PROMOTION_EVERY": "5",
+        "BOOTSTRAP_POLICY": "auto_first_trained",
+        "PROBATION_RESET_AFTER": "4",
+        "REVERT_RESET_AFTER": "3",
+        "GATE_LADDER": "200 600 1000 1500",
+    }
+    for name, value in expected.items():
+        assert f'{name}="${{{name}:-{value}}}"' in setup_text
+
+    parameters = (REPO_ROOT / "games/seven_wonders_duel/training_parameters.md").read_text(
+        encoding="utf-8"
+    )
+    for flag, value in (
+        ("--promotion-every", "5"),
+        ("--bootstrap-policy", "auto_first_trained"),
+        ("--probation-reset-after", "4"),
+        ("--revert-reset-after", "3"),
+    ):
+        assert f"{flag} {value}" in parameters
+    assert "--gate-ladder-games 200 600 1000 1500" in parameters
 
 
 def test_the_common_library_defines_every_stage_the_game_script_calls(setup_text):

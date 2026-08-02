@@ -124,3 +124,29 @@ def test_kingdomino_adapter_completes_through_shared_match_runner():
     assert outcome.actions > 0
     assert outcome.scores is not None
     assert outcome.winner in (None, 0, 1)
+
+
+def test_memory_validator_prefers_training_log_rows(tmp_path: Path):
+    from tools.validate_az_memory_stability import _rows
+
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps({"iterations": [{"iteration": 0, "source": "manifest"}]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "training_log.jsonl").write_text(
+        json.dumps({"iteration": 1, "source": "log"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _rows(tmp_path) == [{"iteration": 1, "source": "log"}]
+
+
+def test_memory_validator_falls_back_to_legacy_manifest_rows(tmp_path: Path):
+    from tools.validate_az_memory_stability import _rows
+
+    legacy = [{"iteration": 0}, {"iteration": 1}]
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps({"iterations": legacy}), encoding="utf-8"
+    )
+
+    assert _rows(tmp_path) == legacy

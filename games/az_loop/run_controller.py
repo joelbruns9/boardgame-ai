@@ -407,6 +407,7 @@ class RunController:
             # so latest.pt keeps whatever it held, and crucially no gate runs --
             # comparing an untrained learner against the protected best burns
             # evaluation games to re-measure a checkpoint that has not moved.
+            self.adapter.record_learner(iteration, self.latest_path)
             row = self._build_warmup_row(
                 iteration=iteration,
                 generator_source=generator_source,
@@ -444,6 +445,7 @@ class RunController:
         bootstrap = is_bootstrap_eligible(state, self.config.bootstrap_policy)
         scheduled = self._promotion_scheduled(rows, bootstrap)
         gate_decision: str | None = None
+        gate_stop_reason: str | None = None
         promotion_metrics: dict[str, Any] = {}
         ladder = self.config.gate_ladder
         # W5.8: the size is resolved from the ladder position and the games
@@ -461,6 +463,7 @@ class RunController:
             )
             gate_decision = promotion.decision
             promotion_metrics = dict(promotion.metrics)
+            gate_stop_reason = promotion_metrics.get("stop_reason")
 
         transition = decide_transition(
             state,
@@ -472,6 +475,7 @@ class RunController:
             ladder=ladder,
             allow_step_up=allow_step_up,
             probation_reset_after=self.config.probation_reset_after,
+            gate_stop_reason=gate_stop_reason,
         )
 
         if transition.replace_best:
@@ -496,6 +500,9 @@ class RunController:
             )
             self.adapter.on_learner_reset(self.current_best_path)
 
+        # Persist the learner only after every lifecycle mutation. Candidate
+        # snapshots are pre-transition and therefore lie about reset iterations.
+        self.adapter.record_learner(iteration, self.latest_path)
         anchor_metrics = self._maybe_run_anchors(transition.action, iteration)
         measurement = self._measure(iteration)
 

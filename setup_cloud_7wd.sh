@@ -35,7 +35,9 @@
 # Knobs (env vars):
 #   ITERATIONS=60 GAMES_PER_ITERATION=500 SEED_GAMES=5000 WORKERS=8
 #   D_MODEL=384 LAYERS=8 HEADS=6 PRECISION=bf16 LEARNING_RATE=5e-5
-#   HOF_FRACTION=0.15 GATE_LADDER="100 200 400 800"
+#   HOF_FRACTION=0.15 GATE_LADDER="200 600 1000 1500"
+#   PROMOTION_EVERY=5 BOOTSTRAP_POLICY=auto_first_trained
+#   PROBATION_RESET_AFTER=4 REVERT_RESET_AFTER=3
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
 #   SELF_ANCHOR_GAMES=200 SELF_ANCHOR_LAG_GAMES=20000   W7a stagnation anchor
@@ -86,8 +88,12 @@ PRECISION="${PRECISION:-bf16}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 HOF_FRACTION="${HOF_FRACTION:-0.15}"
 HOF_START_GAMES="${HOF_START_GAMES:-10000}"
-GATE_LADDER="${GATE_LADDER:-100 200 400 800}"
+GATE_LADDER="${GATE_LADDER:-200 600 1000 1500}"
 GATE_LADDER_FLOOR_GAMES="${GATE_LADDER_FLOOR_GAMES:-10000}"
+PROMOTION_EVERY="${PROMOTION_EVERY:-5}"
+BOOTSTRAP_POLICY="${BOOTSTRAP_POLICY:-auto_first_trained}"
+PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-4}"
+REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-3}"
 ANCHOR_GAMES="${ANCHOR_GAMES:-200}"
 SELF_ANCHOR_GAMES="${SELF_ANCHOR_GAMES:-200}"
 SELF_ANCHOR_LAG_GAMES="${SELF_ANCHOR_LAG_GAMES:-20000}"
@@ -301,7 +307,11 @@ TRAIN_CMD=(
   --schedule-basis games
   --generation-backend rust --gate-backend rust
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
-  --selfplay-generator-mode soft_gate --revert-reset-after 2
+  --selfplay-generator-mode soft_gate
+  --bootstrap-policy "$BOOTSTRAP_POLICY"
+  --promotion-every "$PROMOTION_EVERY"
+  --revert-reset-after "$REVERT_RESET_AFTER"
+  --probation-reset-after "$PROBATION_RESET_AFTER"
   --promotion-min-lcb 0.50 --revert-max-ucb 0.48
   --gate-ladder-games "${LADDER_RUNGS[@]}"
   --gate-ladder-step-up-after 2

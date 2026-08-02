@@ -35,6 +35,7 @@ from games.az_loop import (
     ResourceMonitor,
     TrainingStats,
     artifact_for,
+    atomic_copy,
 )
 from games.az_loop.checkpoint_lifecycle import TRAINED, UNTRAINED
 from games.az_loop.contract import (
@@ -526,6 +527,11 @@ class SevenWondersDuelLifecycleAdapter:
         # next iteration warm up cold from current_best.
         self.loop.clear_optimizer_state()
 
+    def record_learner(self, iteration: int, learner_checkpoint: Path) -> None:
+        """Snapshot the learner after promotion/reset resolution, not before it."""
+
+        atomic_copy(learner_checkpoint, self.loop.learner_checkpoint(iteration))
+
     def measure(self, iteration: int) -> dict[str, Any] | None:
         """W7a: the games-indexed anchor, on its own games cadence."""
 
@@ -545,6 +551,7 @@ class SevenWondersDuelLifecycleAdapter:
         (loop.checkpoint_dir / f"candidate_{iteration:04d}.pt").unlink(
             missing_ok=True
         )
+        loop.learner_checkpoint(iteration).unlink(missing_ok=True)
         loop.clear_optimizer_state()
 
     def autosave(self, iteration: int) -> None:

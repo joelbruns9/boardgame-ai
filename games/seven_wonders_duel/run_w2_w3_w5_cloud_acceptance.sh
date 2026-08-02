@@ -30,8 +30,8 @@ if [[ -f "$run_dir/run_manifest.json" ]]; then
   python tools/az_report.py "$run_dir" \
     --output-prefix "$acceptance_dir/az_report"
   completed="$(
-    python -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("iterations", [])))' \
-      "$run_dir/run_manifest.json"
+    python -c 'import sys; from pathlib import Path; from tools.az_report import load_rows; print(len(load_rows(Path(sys.argv[1]))))' \
+      "$run_dir"
   )"
   if (( completed >= 60 )); then
     python tools/validate_az_memory_stability.py "$run_dir" \

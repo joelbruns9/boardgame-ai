@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
+import sys
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.az_report import load_rows
 
 
 def _rows(run_dir: Path):
-    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
-    return manifest.get("iterations", [])
+    return load_rows(run_dir)
 
 
 def main(argv=None) -> int:

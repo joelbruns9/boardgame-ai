@@ -91,14 +91,14 @@ class ReplayMismatchError(RuntimeError):
 OPPONENT_TYPES = ("current_best", "hof", "bot", "hof_bot")
 
 def archive_policy_seats(agents: dict[str, str]) -> frozenset[int]:
-    """Seats played by an *archived* net, whose policy must not be a target.
+    """Defense-in-depth exclusion for an archived net's policy targets.
 
-    A league game runs a full search for both seats, so without this the
-    archive's improved policy becomes a training target and the learner is
-    taught to imitate an older, weaker version of itself on roughly half the
-    positions of every league game.  Nothing else excluded it: ``sims > 0`` and
-    ``policy_excluded`` is false, because from the recorder's point of view it
-    is an ordinary searched move.
+    The production Rust recorder is the primary enforcement point:
+    ``self_play.rs:1461`` in ``finish_move`` sets ``policy_excluded`` whenever
+    the actor's network is not network 0 (the learner). This predicate protects
+    imported,
+    legacy, Python-written, or otherwise retagged records that do not carry that
+    recorder-side exclusion.
 
     Deliberately **narrow**.  The obvious generalisation -- "exclude any seat
     ``agents["pN"]`` does not call ``network``" -- is wrong, and quietly so:
@@ -109,11 +109,10 @@ def archive_policy_seats(agents: dict[str, str]) -> frozenset[int]:
     ``_tag_league_opponents`` is excluded here, identified by the same three
     fields that function writes.
 
-    Value labels are untouched.  The game was really played and really ended, so
-    its outcome stays a valid label for every position in it; only the *policy*
-    of a seat the learner does not own must not be imitated.  That matches how
-    curriculum-bot moves are already treated (``dataset.is_fast_search_move``:
-    "bot moves are a curriculum device whose value labels stay useful").
+    Value labels are untouched as an explicit experimental choice. League games
+    follow a mixed learner/archive policy, so those outcomes are observed labels
+    but not unbiased estimates of current-policy self-play value. The settling
+    experiment is all league values versus learner-turn values versus none.
     """
 
     if agents.get("kind") != "league":

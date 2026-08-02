@@ -57,26 +57,25 @@ def test_a_run_whose_anchor_caught_up_is_stagnant():
     # converges to a net against itself.
     verdict = DETECTOR.verdict(_series([0.52, 0.51, 0.50]))
     assert verdict.stagnant is True
-    assert any("include 0.50" in reason for reason in verdict.reasons)
+    assert any("clears 0.50" in reason for reason in verdict.reasons)
 
 
-def test_a_flat_but_confidently_winning_run_trips_only_the_slope_trigger():
-    # Still beating its past self by a clear margin, but no longer improving.
+def test_a_steady_learning_rate_is_not_stagnant():
+    # A constant fixed-lag advantage is steady learning, not stagnation. Its
+    # near-zero slope measures zero acceleration and remains telemetry only.
     verdict = DETECTOR.verdict(
         _series([0.70, 0.70, 0.70], lower_offset=-0.05)
     )
-    assert verdict.stagnant is True
-    assert not any("include" in reason for reason in verdict.reasons)
-    assert any("slope" in reason for reason in verdict.reasons)
+    assert verdict.stagnant is False
+    assert verdict.reasons == ()
+    assert verdict.slope_per_10k_games == pytest.approx(0.0)
 
 
 def test_the_interval_trigger_can_fire_alone_while_the_score_creeps_up():
-    # Improving too slowly to ever clear its own past self: the slope is above
-    # epsilon, so only the interval trigger fires.
+    # Improving too slowly to ever clear its own past self.
     verdict = DETECTOR.verdict(_series([0.50, 0.55, 0.60], lower_offset=-0.15))
     assert verdict.stagnant is True
-    assert any("include" in reason for reason in verdict.reasons)
-    assert not any("slope" in reason for reason in verdict.reasons)
+    assert any("lower bounds" in reason for reason in verdict.reasons)
 
 
 def test_a_rising_run_whose_latest_interval_clears_the_null_is_healthy():

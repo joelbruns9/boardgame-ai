@@ -341,3 +341,26 @@ def test_a_pre_w7b_row_resumes_with_a_zero_probation_counter():
     row = state.as_row()
     del row["probations_since_decisive"]
     assert GeneratorState.from_row(row).probations_since_decisive == 0
+
+
+def test_a_suppressed_revert_does_not_advance_or_trigger_any_counter():
+    state = GeneratorState(
+        mode=GeneratorMode.SOFT_GATE,
+        consecutive_reverts=1,
+        consecutive_probations=1,
+        probations_since_decisive=2,
+    )
+    result = gate_transition(
+        state,
+        CONTINUE,
+        revert_reset_after=2,
+        probation_reset_after=3,
+        iteration=4,
+        ladder=LADDER,
+        gate_stop_reason="revert_suppressed_knot",
+    )
+    assert result.action.value == "probation"
+    assert result.reset_learner is False
+    assert result.next_state.consecutive_reverts == 1
+    assert result.next_state.consecutive_probations == 1
+    assert result.next_state.probations_since_decisive == 2
