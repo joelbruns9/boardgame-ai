@@ -123,6 +123,10 @@ pub struct Arena {
 }
 
 impl Arena {
+    pub fn root_id(&self) -> NodeId {
+        self.root_id
+    }
+
     fn new(root: Node) -> Self {
         Self {
             nodes: vec![root],
@@ -1345,6 +1349,29 @@ impl SearchSession {
     }
 
     /// Nodes materialized by this search so far. Phase 0 memory telemetry.
+    /// Simulations completed so far. Needed by the advisor's resumable handle,
+    /// which advances a fixed chunk at a time and reports progress between
+    /// chunks rather than running to `cfg.sims` in one call.
+    pub fn sims_done(&self) -> usize {
+        self.sims_completed
+    }
+
+    /// Root readout for a streaming snapshot: `(root_visits, root_value_sum_p0,
+    /// root_actor, [(action_index, visits, value_sum_p0, prior)])`.
+    ///
+    /// Deliberately raw sums rather than means: the caller divides, and the
+    /// p0->actor sign flip stays in the Python adapter, which is the only layer
+    /// that knows whose turn it is.
+    pub fn root_stats(&self) -> (u32, f64, usize, Vec<(usize, u32, f64, f64)>) {
+        let root = &self.arena.nodes[self.arena.root_id()];
+        let edges = root
+            .edges
+            .iter()
+            .map(|e| (e.action_index, e.visits, e.value_sum_p0, e.prior))
+            .collect();
+        (root.visits, root.value_sum_p0, root.actor, edges)
+    }
+
     pub fn arena_nodes(&self) -> usize {
         self.arena.nodes.len()
     }

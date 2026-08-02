@@ -959,3 +959,28 @@ def rust_game_from_state(game):
     import seven_wonders_rust
 
     return seven_wonders_rust.RustGame.from_state(**rust_state(game))
+
+
+def rust_scalar_net_adapter(evaluator):
+    """`(tokens, actor, legal) -> (value_actor, priors)` for Rust's `PyEval`.
+
+    Rust hands over the token sequence its own encoder produced (F2, bit-exact
+    with `encoder.encode`), so the Python side only rebuilds an `Encoding` and
+    runs the net -- the encoding itself never happens in Python. This is the
+    scalar boundary; batched routing lives in the `*_flat_batch_adapter` family.
+
+    Lifted out of `test_rust_engine_equiv._make_net_adapter` so the advisor and
+    the equivalence gate drive the searcher through the identical adapter.
+    """
+
+    token_types = list(TokenType)
+
+    def adapter(tokens, actor, legal):
+        toks = tuple(
+            Token(token_types[ti], eid, aid, tuple(feats))
+            for ti, eid, aid, feats in tokens
+        )
+        row = evaluator.evaluate([Encoding(actor=actor, tokens=toks)], [list(legal)])[0]
+        return float(row.wdl[0] - row.wdl[2]), [float(p) for p in row.policy]
+
+    return adapter

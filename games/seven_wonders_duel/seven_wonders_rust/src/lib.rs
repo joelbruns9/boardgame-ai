@@ -231,6 +231,111 @@ fn victory_from_index(i: u8) -> PyResult<state::VictoryType> {
     })
 }
 
+/// A resumable PUCT search over a persistent tree — the advisor's searcher.
+///
+/// Every other Rust entry point is one-shot: give it `sims`, get a result. The
+/// advisor streams instead, deepening ONE tree across many `advance` calls so
+/// the panel's numbers refine while the user thinks. Calling a one-shot search
+/// per chunk would rebuild the tree each time and destroy that.
+///
+/// Fixed at `puct_root = true` and `leaf_batch = 1` on purpose:
+/// `check_puct_root` rejects PUCT-root together with leaf batching, because the
+/// root would then select under WU virtual loss. The advisor keeps PUCT-root
+/// semantics (matching the Python `_ClosedHandle` it replaces) and gives up
+/// root-level batching. See ADVISOR_RUST_UNIFICATION.md §5 step 4.
+///
+/// `force_expand_root_chance` is likewise unavailable here (it needs the F4.5
+/// forced-child cache), so root chance edges use visit-weighted Q rather than an
+/// exact expectation — a real difference from the Python advisor's default.
+#[pyclass]
+struct RustPuctSearch {
+    session: tree_resumable::SearchSession,
+    evaluator: eval::PyEval,
+}
+
+#[pymethods]
+impl RustPuctSearch {
+    /// Open a search over `game`'s position. Evaluates the root immediately
+    /// (one call through `adapter`) and expands it; runs no simulations.
+    #[staticmethod]
+    #[pyo3(signature = (game, adapter, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16))]
+    fn open(
+        game: &RustGame,
+        adapter: Py<PyAny>,
+        max_sims: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        top_k: usize,
+    ) -> PyResult<Self> {
+        let cfg = tree::SearchConfig {
+            sims: max_sims.max(1),
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: false,
+            puct_root: true,
+            age_deal_samples: 0,
+            double_reveal_offsets: 0,
+            conflict_free_waves: false,
+            round_robin_candidates: false,
+        };
+        let evaluator = eval::PyEval::new(adapter);
+        let root_evaluation = evaluator.evaluate(&game.state)?;
+        let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
+        Ok(RustPuctSearch { session, evaluator })
+    }
+
+    /// Run up to `chunk` more simulations; return the total completed. Stops on
+    /// the chunk boundary, so a caller can publish a snapshot and come back.
+    fn advance(&mut self, chunk: usize) -> PyResult<usize> {
+        let target = self.session.sims_done().saturating_add(chunk);
+        while self.session.sims_done() < target {
+            match self.session.next_event()? {
+                tree_resumable::SearchEvent::Complete => break,
+                tree_resumable::SearchEvent::Evaluation(request) => {
+                    let evaluations = {
+                        let states = self.session.evaluation_states(&request)?;
+                        let actors: Vec<_> =
+                            request.leaves.iter().map(|leaf| leaf.actor).collect();
+                        let legals: Vec<_> = request
+                            .leaves
+                            .iter()
+                            .map(|leaf| leaf.legal.clone())
+                            .collect();
+                        self.evaluator
+                            .evaluate_batch_prepared(&states, &actors, &legals)
+                    };
+                    match evaluations {
+                        Ok(rows) => self.session.apply_evaluations(request.request_id, rows)?,
+                        Err(err) => {
+                            self.session.cancel_pending();
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(self.session.sims_done())
+    }
+
+    /// `(sims_done, root_visits, root_value_sum_p0, root_actor,
+    /// [(action_index, visits, value_sum_p0, prior)])`. Raw sums: the caller
+    /// divides and applies the p0->actor sign, which keeps seat knowledge in the
+    /// Python adapter where it already lives.
+    fn snapshot(&self) -> (usize, u32, f64, usize, Vec<(usize, u32, f64, f64)>) {
+        let (visits, value_sum, actor, edges) = self.session.root_stats();
+        (self.session.sims_done(), visits, value_sum, actor, edges)
+    }
+
+    fn arena_nodes(&self) -> usize {
+        self.session.arena_nodes()
+    }
+}
+
 /// A 7WD game state driven from Python by codec action index.
 #[pyclass]
 struct RustGame {
@@ -2148,6 +2253,9 @@ fn self_play_many_flat_net(
 mod seven_wonders_rust {
     #[pymodule_export]
     use super::RustGame;
+
+    #[pymodule_export]
+    use super::RustPuctSearch;
 
     #[pymodule_export]
     use super::num_actions;
