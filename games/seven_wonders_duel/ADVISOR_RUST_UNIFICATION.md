@@ -214,7 +214,36 @@ second searcher — only exposing the knob.
 
 Ordered so that the thing which makes everything else trustworthy comes first.
 
-### Step 1 — Port the `pool.rs` divergence (small)
+### Step 1 — DONE 2026-08-02 (`8eada50`)
+
+`pool.rs` now unions `wonder_burials` into `visible_cards`, matching `pool.py`.
+Verified a no-op on the Rust side too: over **1,118 PLAY_AGE states — 998 of
+them carrying burials — 0 unseen-pool mismatches**, and `test_rust_engine_equiv`
+(32 tests) stayed green.
+
+### Step 2 — DONE 2026-08-02 (`44624f5`)
+
+`RustGame.from_state` + `rust_bridge.rust_state` inject a whole `GameState`.
+`test_rust_state_injection.py` is the gate: an injected state fingerprints
+byte-identically to the same position reached by replay, over **3,204 positions
+across all four phases**.
+
+**It caught a real bug on its first run — 2,635 of 3,204 mismatched.** Rust's
+fingerprint pushes a tableau slot's `card_id` *unconditionally*, including slots
+whose card has been taken, and Python's `TableauCard` likewise keeps
+`card_name` after removal. The serializer was zeroing them. That retention is
+the same fact behind step 1: it is precisely how a card buried under a wonder
+still reads as visible to the unseen-card pool. Two independent bugs, one
+underlying property.
+
+The scraped `testdata` positions — which replay cannot construct at all — now
+inject and agree with Python on `legal_action_indices` and on the unseen pool per
+back type. That is the first time the Rust side has been checked against a state
+it did not build itself.
+
+Enum fields cross as declaration indices, with a test pinning both orders.
+
+### Step 1 (original) — Port the `pool.rs` divergence (small)
 
 Union `wonder_burials` into the Rust `visible_card_names` equivalent
 (`seven_wonders_rust/src/pool.rs:~44`), matching `pool.py:62-79`.
