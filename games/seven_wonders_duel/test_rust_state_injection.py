@@ -186,3 +186,28 @@ def test_scraped_position_injects_and_agrees_with_python(name):
     assert sorted(rs[5]) == sorted(
         PROGRESS_IDS[n] for n in py_pool.offboard_progress
     )
+
+
+@pytest.mark.parametrize(
+    "name", ["bga_892846644_age3_reference", "bga_892846644_greatlibrary"]
+)
+def test_rust_can_search_an_injected_scraped_position(name):
+    """Step 3 of the unification, and it needed no prepass.
+
+    `apply_index` panics with "great library draw outcome missing from chance
+    log" when a draw is not pre-supplied, which is why the replay path
+    (`rust_game_from_prefix`) does a Python prepass first. The *searcher* does
+    not need one: it enumerates and samples Great Library outcomes itself from
+    `pool.offboard_progress` (chance.rs) and feeds them in. So an injected live
+    position -- including one already sitting on a Great Library choice, and
+    injected with `library_draws` empty -- is searchable as-is.
+    """
+    positions = dict((n, g) for n, g in _scraped_positions())
+    rust = rust_game_from_state(positions[name])
+    action, action_value, root_value, visits, policy, topk, sims, _digest = (
+        rust.closed_search_resumable(400, 8, 0, 1.5, 50.0, 0.1, False, 0, False, False)
+    )
+    assert sims == 400
+    assert action in legal_action_indices(positions[name])
+    assert -1.0 <= root_value <= 1.0
+    assert sum(visits) > 0

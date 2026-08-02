@@ -281,7 +281,44 @@ Then extend the injected corpus to positions Rust *cannot* replay — the
 determinized scrape states from `testdata/bga_892846644_*.json` — and assert
 Python and Rust agree on `legal_action_indices`, `unseen_pool` and `encode`.
 
-### Step 3 — Great Library prepass (§3.1)
+### Step 3 — DONE 2026-08-02: no prepass needed
+
+Search on an injected position handles Great Library by itself. `apply_index`
+panics without a pre-supplied draw, which is why the *replay* path does a Python
+prepass -- but the **searcher** enumerates and samples those outcomes from
+`pool.offboard_progress` (`chance.rs:207,389`) and feeds them in. An injected
+live position, including one already sitting on a Great Library choice and
+injected with `library_draws` empty, searches as-is.
+
+Verified on both scraped fixtures. On the Age III position Rust's mock search
+picks **action 61** -- the same "Build: Study" the Python advisor chose.
+
+### Step 4 — scoped 2026-08-02, TWO CONSTRAINTS FOUND
+
+Feasible: `SearchSession` (`tree_resumable.rs:799`) is **owned** -- no lifetime
+parameters, it owns its `Arena` -- so it can live in a `#[pyclass]` across calls.
+`begin_search_from_root` touches `&GameState` only at construction. That is the
+resumable handle; what is missing is the pyo3 wrapper and a snapshot readout.
+
+But `begin_search_from_root` rejects two things the advisor uses today:
+
+1. **`puct_root && leaf_batch > 1`** -- *"the root would select under WU virtual
+   loss"*. The advisor wants PUCT root (§4). So **root-level leaf batching and
+   PUCT root are mutually exclusive** in the current Rust searcher. This is a
+   direct answer to "should we leaf batch": at the root, not without either
+   accepting Gumbel root selection or teaching the root to select under virtual
+   loss. Batching deeper in the tree is unaffected.
+2. **`force_expand_root_chance`** -- *"requires the F4.5 forced-child cache"*.
+   The advisor currently defaults this to `True`
+   (`advisor_adapter.open_search`). Either that default changes for the Rust
+   path, or F4.5 lands first.
+
+Neither is fatal, both change the plan. Decide the root-selection question
+before writing the wrapper, because it determines whether the advisor keeps
+PUCT-root semantics (and gives up root batching) or moves to Gumbel root (and
+changes what the advisor's numbers mean, §4).
+
+### Step 3 (original) — Great Library prepass (§3.1)
 
 Decide and document how an injected position resolves `GREAT_LIBRARY_DRAW`:
 either supply the enumerated outcomes at injection (mirroring
