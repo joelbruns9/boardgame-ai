@@ -8,12 +8,26 @@ Firefox is the primary target; the same unmodified directory loads in Chrome.
 
 ## 1. Start the advisor host
 
+`pip install fastapi uvicorn` once, then from the repo root:
+
+PowerShell (Windows):
+
+```powershell
+$env:SWD_ADVISOR_CHECKPOINT = "games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt"
+$env:SWD_ADVISOR_DEVICE = "cpu"
+.venv\Scripts\python.exe -m uvicorn games.seven_wonders_duel.web_app:app --port 8000
+```
+
+bash:
+
 ```bash
-pip install fastapi uvicorn
 SWD_ADVISOR_CHECKPOINT=games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt \
 SWD_ADVISOR_DEVICE=cpu \
   uvicorn games.seven_wonders_duel.web_app:app --port 8000
 ```
+
+Confirm it before touching the browser: `http://127.0.0.1:8000/health` should
+return `{"ok":true,...}`.
 
 The extension talks to `http://127.0.0.1:8000` and sends no checkpoint, so the
 host's env default is what gets used. `http://127.0.0.1:8000/` also serves the
