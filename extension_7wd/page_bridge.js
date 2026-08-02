@@ -118,9 +118,15 @@
   // (sevenwondersduel.js:721), which makes a cheap, game-agnostic trigger. The
   // interval is a backstop: animations can land after the attribute changes, so
   // a taken card may not be out of the DOM at the instant we observe it.
+  // 400ms was too eager: BGA animates a constructed card into the player area,
+  // and a capture taken mid-flight shows fewer buildings than playersSituation
+  // already reports -- which _assert_fresh correctly rejects as stale. The
+  // content script also retries a rejected position, so this only has to be
+  // right most of the time.
+  const SETTLE_MS = 1200;
   const swd = document.getElementById("swd");
   if (swd) {
-    new MutationObserver(() => setTimeout(tick, 400)).observe(swd, {
+    new MutationObserver(() => setTimeout(tick, SETTLE_MS)).observe(swd, {
       attributes: true,
       attributeFilter: ["data-state"],
     });

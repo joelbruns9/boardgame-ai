@@ -30,8 +30,17 @@
 
   let jobId = null;
   let pollTimer = null;
+  let retryTimer = null;
+  let retries = 0;
+  // A rejected position is often transient rather than permanent: BGA animates a
+  // card into a player's area, and a capture taken mid-flight can show fewer
+  // buildings than playersSituation already reports, which _assert_fresh
+  // correctly calls stale. Re-ask a few times before giving up.
+  const MAX_RETRIES = 6;
+  const RETRY_MS = 1500;
   let art = null;
   let panel = null;
+  let lastSignature = null;
 
   // -- injection ------------------------------------------------------------
 
@@ -171,8 +180,20 @@
     });
     if (!reply) throw Object.assign(new Error("no reply from background"), { status: 0 });
     if (!reply.ok) {
+      // The host puts the real reason in the body -- FastAPI raises
+      // HTTPException(400, "bad state: <exception>") when the adapter refuses a
+      // position. Surfacing only the status code hides the one useful fact.
+      let detail = reply.error || "";
+      if (reply.body) {
+        try {
+          const parsed = JSON.parse(reply.body);
+          detail = parsed.detail || reply.body;
+        } catch (e) {
+          detail = reply.body;
+        }
+      }
       throw Object.assign(
-        new Error(reply.error || path + " -> HTTP " + reply.status),
+        new Error(detail || path + " -> HTTP " + reply.status),
         { status: reply.status }
       );
     }
@@ -199,6 +220,10 @@
       clearInterval(pollTimer);
       pollTimer = null;
     }
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
     if (!jobId) return;
     const dying = jobId;
     jobId = null;
@@ -224,11 +249,22 @@
         top_k: TOP_N,
       });
     } catch (err) {
+      const detail = (err && err.message) || "";
+      if (err && err.status === 400 && retries < MAX_RETRIES) {
+        retries += 1;
+        setStatus("retrying " + retries + "/" + MAX_RETRIES);
+        ensurePanel().querySelector('[data-role="sub"]').textContent = detail;
+        retryTimer = setTimeout(() => {
+          // Ask the page world for a fresh capture of the same position.
+          window.postMessage({ __swd: TAG, type: "recapture" }, window.location.origin);
+        }, RETRY_MS);
+        return;
+      }
       setStatus(reportFailure(err));
-      ensurePanel().querySelector('[data-role="sub"]').textContent =
-        (err && err.message) || "";
+      ensurePanel().querySelector('[data-role="sub"]').textContent = detail;
       return;
     }
+    retries = 0;
     jobId = started.job_id;
     pollTimer = setInterval(poll, POLL_MS);
   }
@@ -268,8 +304,13 @@
     if (msg.type === "position") {
       art = msg.payload.art;
       ensurePanel();
+      if (msg.payload.signature !== lastSignature) {
+        lastSignature = msg.payload.signature;
+        retries = 0; // genuinely new position
+      }
       startSearch(msg.payload.state);
     } else if (msg.type === "idle") {
+      lastSignature = null;
       stopCurrent();
       setStatus("waiting for your turn");
     } else if (msg.type === "capture_error") {
