@@ -69,6 +69,14 @@ def visible_card_names(observation: PlayerObservation) -> frozenset[str]:
         visible.update(city.buildings)
     visible.update(observation.discard_pile)
     visible.update(observation.buried_cards)
+    # Cards buried under constructed wonders are out of play and can never be
+    # revealed. In an engine-built state this is already implied -- a taken slot
+    # keeps its card_name in the tableau above, so the union is a no-op
+    # (verified: 0 differences over 2243 PLAY_AGE observations across 40 games).
+    # It matters for *reconstructed* states: a BGA scrape cannot see what card
+    # left a now-empty slot, so without this the searcher would enumerate a
+    # buried card as a possible CARD_REVEAL outcome.
+    visible.update(card for _wonder, card in observation.wonder_burials)
     return frozenset(visible)
 
 

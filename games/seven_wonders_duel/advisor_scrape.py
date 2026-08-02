@@ -56,9 +56,26 @@ from .pool import BACK_UNIVERSES, unseen_pool
 _SUPPORTED = (Phase.PLAY_AGE, Phase.COMPLETE)
 
 
-def determinize_observation(obs: PlayerObservation, rng: random.Random) -> GameState:
+def determinize_observation(
+    obs: PlayerObservation,
+    rng: random.Random,
+    *,
+    unknown_burial_ages: tuple[int, ...] = (),
+) -> GameState:
     """A full state whose ``observation(0)`` equals ``obs`` (public-exact) with
-    hidden information filled by a valid random determinization."""
+    hidden information filled by a valid random determinization.
+
+    ``unknown_burial_ages``: ages of cards buried under constructed wonders whose
+    *identity* we could not recover (BGA's ``gamedatas`` exposes only the age).
+    Constructing a wonder buries an age card permanently, so each such burial is
+    one more card of that age that is out of play and can never be revealed --
+    exactly the role ``removed_age_cards`` already plays. Passing the ages here
+    keeps the pool arithmetic honest: without it the buried cards stay in the
+    unseen pool and can be dealt into a face-down slot they can never occupy.
+
+    Burials whose identity *is* known arrive in ``obs.wonder_burials`` and are
+    excluded from the unseen pool directly, which is strictly sharper.
+    """
 
     if obs.phase not in _SUPPORTED:
         raise ValueError(
@@ -124,27 +141,49 @@ def determinize_observation(obs: PlayerObservation, rng: random.Random) -> GameS
         if pc.present and not pc.revealed:
             facedown_by_back.setdefault(pc.back, []).append(pc.slot_id)
 
+    # Cards buried under wonders are out of play. Known identities leave the
+    # unseen pool outright; unknown ones only add to the count that must land in
+    # the "removed" remainder. BGA reports a buried guild's age as 4.
+    buried_known = {card for _wonder, card in obs.wonder_burials}
+    unknown_by_age: dict[int, int] = {}
+    for age in unknown_burial_ages:
+        unknown_by_age[int(age)] = unknown_by_age.get(int(age), 0) + 1
+
+    def _unseen(back: BackType) -> list[str]:
+        return [name for name in pool.cards[back] if name not in buried_known]
+
     if obs.age in (1, 2):
         back = back_type_of_age(obs.age)
-        unseen = list(pool.cards[back])
+        unseen = _unseen(back)
         fds = facedown_by_back.get(back, [])
-        if len(unseen) != len(fds) + 3:
+        out_of_play = 3 + unknown_by_age.get(obs.age, 0)
+        if len(unseen) != len(fds) + out_of_play:
             raise ValueError(
-                f"age {obs.age} unseen={len(unseen)} != facedown {len(fds)} + 3 removed"
+                f"age {obs.age} unseen={len(unseen)} != facedown {len(fds)} + "
+                f"{out_of_play} out of play (3 removed + "
+                f"{unknown_by_age.get(obs.age, 0)} unidentified wonder burials)"
             )
         rng.shuffle(unseen)
         for slot_id, name in zip(fds, unseen):
             cards[slot_id].card_name = name
         state.removed_age_cards[obs.age] = tuple(unseen[len(fds):])
     else:  # age 3: AGE_III + GUILD backs, guilds split select/unused
-        age3 = list(pool.cards[BackType.AGE_III])
-        guild = list(pool.cards[BackType.GUILD])
+        age3 = _unseen(BackType.AGE_III)
+        guild = _unseen(BackType.GUILD)
         fds3 = facedown_by_back.get(BackType.AGE_III, [])
         fdsg = facedown_by_back.get(BackType.GUILD, [])
-        if len(age3) != len(fds3) + 3:
-            raise ValueError(f"age3 AGE_III {len(age3)} != facedown {len(fds3)} + 3")
-        if len(guild) != len(fdsg) + 4:
-            raise ValueError(f"age3 GUILD {len(guild)} != facedown {len(fdsg)} + 4 unused")
+        out3 = 3 + unknown_by_age.get(3, 0)
+        outg = 4 + unknown_by_age.get(4, 0)
+        if len(age3) != len(fds3) + out3:
+            raise ValueError(
+                f"age3 AGE_III {len(age3)} != facedown {len(fds3)} + {out3} "
+                f"out of play (3 removed + {unknown_by_age.get(3, 0)} burials)"
+            )
+        if len(guild) != len(fdsg) + outg:
+            raise ValueError(
+                f"age3 GUILD {len(guild)} != facedown {len(fdsg)} + {outg} "
+                f"out of play (4 unused + {unknown_by_age.get(4, 0)} burials)"
+            )
         rng.shuffle(age3)
         rng.shuffle(guild)
         for slot_id, name in zip(fds3, age3):
@@ -159,6 +198,19 @@ def determinize_observation(obs: PlayerObservation, rng: random.Random) -> GameS
         )
 
     state.tableau = TableauState(age=obs.age, cards=cards)
+
+    # Resolve any CARD_REVEAL the capture caught mid-flight. Taking a card
+    # uncovers its neighbours; the engine reveals them via a CARD_REVEAL chance
+    # event fired as part of that same action (TableauState.take_accessible,
+    # game.py:176), and `_card_at` treats an accessible-but-face-down slot as a
+    # hard error. A scrape taken mid-move -- during a pending choice, with the
+    # triggering card already off the structure -- can land in exactly that gap,
+    # because BGA defers its flip until the whole move resolves. The identity is
+    # unknowable from the snapshot, so it is sampled like any other face-down
+    # slot above; revealing it here is what the engine would have done.
+    for slot_id, card in state.tableau.cards.items():
+        if card.present and not card.revealed and state.tableau.is_accessible(slot_id):
+            card.revealed = True
     state.age_decks[obs.age] = tuple(c.card_name for c in cards.values() if c.present)
 
     # 3. determinize hidden: futures re-dealt, current reshuffled -----------

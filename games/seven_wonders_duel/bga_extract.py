@@ -43,14 +43,32 @@ Every gap above fails loudly; the mapper never emits a plausible-but-wrong wire.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
-from .data import CARDS_BY_NAME, PROGRESS_IDS, TABLEAU_LAYOUTS, BackType, back_type_of
+from .data import (  # noqa: F401
+    AGE_I_CARDS,
+    AGE_II_CARDS,
+    AGE_III_CARDS,
+    CARD_IDS,
+    CARDS_BY_NAME,
+    GUILD_CARDS,
+    PROGRESS_IDS,
+    TABLEAU_LAYOUTS,
+    BackType,
+    back_type_of,
+)
 from .engine import CardColor, back_type_of_age
 from .game import Phase, PendingChoiceKind
 
 # BGA game state where the active player picks/uses an age card -- the main turn.
 _MAIN_TURN_STATE = "playerTurn"
+
+# BGA's wonder-draft state (SevenWondersDuel::STATE_SELECT_WONDER_NAME). Not yet
+# a supported *position* -- see ADVISOR_IMPLEMENTATION_PLAN.md item A -- but the
+# freshness patch has to recognise it, because wondersSituation goes stale here
+# and nowhere else.
+_DRAFT_STATE = "selectWonder"
 
 # BGA mid-move pending-choice states -> engine PendingChoiceKind. All occur while
 # the engine phase is still PLAY_AGE (a pending_choice is set on the same turn),
@@ -99,6 +117,37 @@ class StaleGamedata(ValueError):
     and capture again."""
 
 
+# BGA title-cases card names ("Chamber Of Commerce") where the engine follows the
+# printed card ("Chamber of Commerce"). Verified against a live table's full
+# `buildings` material table (892846644): that is the only base-game divergence,
+# and the 73 engine names are unique under case folding, so folding aligns them
+# unambiguously. Base wonders (12/12) and progress tokens (10/10) match exactly.
+_CARDS_BY_FOLDED = {name.casefold(): name for name in CARDS_BY_NAME}
+
+# Card -> age, for cross-checking a log-parsed burial against BGA's structural
+# `constructed` age. Guilds report as age 4 (BGA's filterByAge(4)).
+_CARD_AGES: dict[str, int] = {}
+for _age, _group in ((1, AGE_I_CARDS), (2, AGE_II_CARDS), (3, AGE_III_CARDS), (4, GUILD_CARDS)):
+    for _card in _group:
+        _CARD_AGES[_card.name] = _age
+
+
+def _card_name(bga_name: str) -> str:
+    """Canonical engine card name for a BGA card name.
+
+    Every BGA name enters the wire through here, so the wire only ever carries
+    engine spellings. An unresolvable name is expansion content or a BGA rename:
+    fail typed and loud rather than with a bare KeyError deeper in the mapper.
+    """
+    canonical = _CARDS_BY_FOLDED.get(bga_name.casefold())
+    if canonical is None:
+        raise UnsupportedBgaState(
+            f"unknown BGA card name {bga_name!r}; the mapper covers base-game "
+            "cards only (expansion content and renames land here)"
+        )
+    return canonical
+
+
 def _sid(gamedatas: dict, key: str) -> str:
     """Player ids arrive as either str or int across BGA payloads; normalize."""
     return str(gamedatas[key])
@@ -131,7 +180,7 @@ def _assert_fresh(gamedatas: dict) -> None:
     for pid, situation in gamedatas["playersSituation"].items():
         reported = int(situation["scienceSymbolCount"])
         greens = sum(
-            CARDS_BY_NAME[b["type"]].science is not None
+            CARDS_BY_NAME[_card_name(b["type"])].science is not None
             for b in gamedatas["playerBuildings"].get(pid, [])
         )
         if greens != reported:
@@ -204,9 +253,12 @@ def _pending_choice(
             else PendingChoiceKind.DESTROY_OPPONENT_GREY
         )
         options = [
-            b["type"]
-            for b in gamedatas["playerBuildings"].get(opponent_pid, [])
-            if CARDS_BY_NAME[b["type"]].color is color
+            name
+            for name in (
+                _card_name(b["type"])
+                for b in gamedatas["playerBuildings"].get(opponent_pid, [])
+            )
+            if CARDS_BY_NAME[name].color is color
         ]
     elif name == "chooseProgressTokenFromBox":
         # Great Library: a random reveal of box Progress tokens, not derivable
@@ -250,7 +302,14 @@ def _science_pairs(building_names: list[str]) -> list[str]:
 
 def _city(gamedatas: dict, pid: str) -> dict:
     situation = gamedatas["playersSituation"][pid]
-    buildings = [b["type"] for b in gamedatas["playerBuildings"].get(pid, [])]
+    # Canonical card-id order. A city is a *set* of cards -- 7WD has no rule
+    # keyed on build order -- but BGA's two sources disagree on ordering
+    # (getAllDatas sorts by card_location_arg i.e. build order; the DOM groups by
+    # colour column). Sorting makes the wire identical either way.
+    buildings = sorted(
+        (_card_name(b["type"]) for b in gamedatas["playerBuildings"].get(pid, [])),
+        key=CARD_IDS.__getitem__,
+    )
 
     wonders_unbuilt: list[str] = []
     wonders_built: list[str] = []
@@ -301,7 +360,7 @@ def _tableau(gamedatas: dict, age: int) -> list[dict]:
         slot = (int(card["row"]) - 1, int(card["column"]))
         revealed = card.get("building") is not None
         if revealed:
-            name = blookup[str(card["building"])]["name"]
+            name = _card_name(blookup[str(card["building"])]["name"])
             back = back_type_of(name).value
         else:
             name = None
@@ -356,7 +415,176 @@ def _military(gamedatas: dict) -> tuple[int, list[list[int]]]:
     return pos, remaining
 
 
-def wire_from_bga(gamedatas: dict, *, resample_seed: int = 0) -> dict[str, Any]:
+# "<player> constructed Wonder "<wonder>" for N coin(s) using building "<card>"".
+# From the constructWonder notification (Wonder.php:58-73), which carries
+# buildingId/buildingName; BGA renders it into the game log, so a single snapshot
+# holds every burial. The message is clienttranslate()d, hence the loose middle
+# and the anchor on the two curly-quoted names.
+_BURIAL_LOG = re.compile(
+    r"Wonder\s*[“\"']([^”\"']+)[”\"'].*?"
+    r"building\s*[“\"']([^”\"']+)[”\"']"
+)
+
+
+def _wonder_burials(
+    gamedatas: dict, log_lines: list[str] | None
+) -> tuple[list[tuple[str, str]], tuple[int, ...]]:
+    """``(exact (wonder, card) pairs, ages of burials we could not identify)``.
+
+    Constructing a wonder buries an age card under it permanently. Two sources:
+
+    * **Structural (always available).** ``wondersSituation[pid][i]["constructed"]``
+      is the buried card's *age* (0 when unbuilt) -- see ``Player::getWondersData``
+      and ``Building::getBackSpriteXY``. This alone pins down how many cards of
+      each age are out of play, which is what the pool arithmetic needs.
+    * **The game log (identity).** Only matters for the *current* age: for a
+      finished age a buried card and a box-removed card are indistinguishable --
+      both are out of play forever and nothing ever reveals either.
+
+    The log is localized prose, so it is trusted only when it agrees with the
+    structural data: same number of burials, and each named card's age equal to
+    the wonder's ``constructed`` value. Any disagreement falls back to
+    "unidentified", which is blunter but never wrong.
+    """
+    wlookup = gamedatas["wonders"]
+    structural: list[tuple[str, int]] = []
+    for pid, rows in gamedatas["wondersSituation"].items():
+        if pid == "selection":
+            continue
+        for row in rows:
+            age = int(row.get("constructed") or 0)
+            if age:
+                structural.append((wlookup[str(row["wonder"])]["name"], age))
+
+    if not structural:
+        return [], ()
+
+    parsed: dict[str, str] = {}
+    for line in log_lines or []:
+        match = _BURIAL_LOG.search(line)
+        if match:
+            wonder, card = match.group(1).strip(), match.group(2).strip()
+            parsed.setdefault(wonder, card)
+
+    exact: list[tuple[str, str]] = []
+    unknown: list[int] = []
+    for wonder, age in structural:
+        card = parsed.get(wonder)
+        if card is None:
+            unknown.append(age)
+            continue
+        try:
+            canonical = _card_name(card)
+        except UnsupportedBgaState:
+            unknown.append(age)
+            continue
+        # Cross-check the prose against the structural age before trusting it.
+        if _CARD_AGES.get(canonical) != age:
+            unknown.append(age)
+            continue
+        exact.append((wonder, canonical))
+
+    return sorted(exact), tuple(unknown)
+
+
+def apply_dom_patch(gamedatas: dict, dom: dict) -> dict:
+    """Return ``gamedatas`` with the never-refreshed fields replaced from a DOM
+    re-read (``bga_snippet.captureDomPatch``), so a capture taken without an F5
+    describes the live board.
+
+    BGA leaves five fields at their page-load values (see the module docstring
+    and ADVISOR_IMPLEMENTATION_PLAN.md item B). The browser returns **numeric
+    ids only**; the id -> name mapping happens here against ``gamedatas``' own
+    material tables, so a BGA DOM change breaks a selector loudly in the page
+    rather than yielding a plausible-but-wrong name.
+
+    The result is ordinary ``gamedatas``-shaped data: ``wire_from_bga`` is
+    unchanged and its freshness cross-check still runs, now catching a bad patch
+    instead of a missing reload.
+    """
+    patched = dict(gamedatas)
+    buildings, tokens = gamedatas["buildings"], gamedatas.get("progressTokens", {})
+
+    def _named(table: dict, ids: list, kind: str) -> list[dict]:
+        rows = []
+        for index, item_id in enumerate(ids):
+            entry = table.get(str(item_id))
+            if entry is None:
+                raise UnsupportedBgaState(
+                    f"DOM patch references unknown {kind} id {item_id!r}; the "
+                    "capture and the gamedatas material table disagree"
+                )
+            rows.append({"id": str(item_id), "type": entry["name"], "location_arg": index})
+        return rows
+
+    patched["playerBuildings"] = {
+        pid: _named(buildings, ids, "building")
+        for pid, ids in dom["playerBuildings"].items()
+    }
+    patched["discardedBuildings"] = _named(
+        buildings, dom["discardedBuildings"], "building"
+    )
+
+    progress = {
+        "board": [
+            {"id": str(tid), "type": tokens[str(tid)]["name"], "location_arg": slot}
+            for slot, tid in dom["boardProgressTokens"]
+        ]
+    }
+    for pid, ids in dom["playerProgressTokens"].items():
+        progress[pid] = _named(tokens, ids, "progress token")
+    patched["progressTokensSituation"] = progress
+
+    patched["militaryTrack"] = {
+        "tokens": {str(slot): value for slot, value in dom["militaryTokens"].items()},
+        "conflictPawn": dom["conflictPawn"],
+    }
+
+    # wondersSituation is stale during the wonder draft only -- outside it, BGA
+    # refreshes it via notif_constructWonder and argPlayerTurn. Patch it only in
+    # the draft, where nothing is constructed yet, because the DOM capture
+    # carries wonder ids but not each wonder's constructed flag.
+    if gamedatas["gamestate"]["name"] == _DRAFT_STATE:
+        patched["wondersSituation"] = {
+            "selection": [
+                {"id": str(wid), "type": gamedatas["wonders"][str(wid)]["name"],
+                 "location_arg": slot}
+                for slot, wid in enumerate(dom["wonderSelection"])
+            ],
+            **{
+                pid: [
+                    {"wonder": str(wid), "position": slot, "constructed": False}
+                    for slot, wid in enumerate(ids)
+                ]
+                for pid, ids in dom["playerWonders"].items()
+            },
+        }
+    return patched
+
+
+def wire_from_bga_payload(payload: dict, *, resample_seed: int | None = None) -> dict[str, Any]:
+    """Map the extension's ``{"bga": ..., "args": ..., "dom": ..., "log": [...]}``
+    envelope.
+
+    ``dom`` is optional: without it this is exactly ``wire_from_bga`` on a
+    freshly loaded page. ``args`` (the current state's server args) is carried
+    for cross-checks. ``log`` is the rendered game-log lines, used only to
+    identify cards buried under constructed wonders; without it those burials
+    are still *counted* (from ``wondersSituation``), just not named.
+    """
+    gamedatas = payload["bga"]
+    if payload.get("dom"):
+        gamedatas = apply_dom_patch(gamedatas, payload["dom"])
+    if resample_seed is None:
+        resample_seed = int(payload.get("resample_seed", 0))
+    return wire_from_bga(
+        gamedatas, resample_seed=resample_seed, log_lines=payload.get("log")
+    )
+
+
+def wire_from_bga(
+    gamedatas: dict, *, resample_seed: int = 0, log_lines: list[str] | None = None
+) -> dict[str, Any]:
     """Map a BGA ``gamedatas`` dict to the advisor scrape-wire envelope.
 
     Raises :class:`UnsupportedBgaState` for any position the scrape codec does
@@ -371,10 +599,23 @@ def wire_from_bga(gamedatas: dict, *, resample_seed: int = 0) -> dict[str, Any]:
     active_id = _sid(gamedatas["gamestate"], "active_player")
     active_player = 0 if active_id == p0 else 1
 
-    age = int(gamedatas["draftpool"]["age"])
+    # getAllDatas only fills draftpool once the wonder selection is empty
+    # (sevenwondersduel.game.php:685-688), so during the draft it arrives as
+    # `[]`. _phase already rejects that state; guard anyway so a future caller
+    # gets the typed error rather than a TypeError on list indices.
+    draftpool = gamedatas["draftpool"]
+    if not isinstance(draftpool, dict):
+        raise UnsupportedBgaState(
+            "draftpool is empty -- no age has been dealt yet (wonder draft)"
+        )
+    age = int(draftpool["age"])
     board_tokens = [t["type"] for t in gamedatas["progressTokensSituation"].get("board", [])]
-    discard_pile = [d["type"] for d in gamedatas.get("discardedBuildings", [])]
+    discard_pile = [_card_name(d["type"]) for d in gamedatas.get("discardedBuildings", [])]
     conflict_position, military = _military(gamedatas)
+    # Constructing a wonder buries an age card permanently. Identity from the
+    # game log when available; otherwise only the age, which still keeps the
+    # unseen-card pool honest. See _wonder_burials.
+    burials, unknown_burial_ages = _wonder_burials(gamedatas, log_lines)
 
     pending = _pending_choice(
         gamedatas,
@@ -394,7 +635,7 @@ def wire_from_bga(gamedatas: dict, *, resample_seed: int = 0) -> dict[str, Any]:
         "tableau": _tableau(gamedatas, age),
         "discard_pile": discard_pile,
         "buried_cards": [],       # Pantheon-only; base game empty
-        "wonder_burials": [],     # Agora-only
+        "wonder_burials": [list(pair) for pair in burials],
         "retired_wonders": [],    # Agora-only
         "pending_choice": pending,
         "pending_extra_turn": False,
@@ -405,4 +646,7 @@ def wire_from_bga(gamedatas: dict, *, resample_seed: int = 0) -> dict[str, Any]:
         "victory_type": None,
         "final_scores": None,
     }
-    return {"observation": observation, "resample_seed": int(resample_seed)}
+    envelope = {"observation": observation, "resample_seed": int(resample_seed)}
+    if unknown_burial_ages:
+        envelope["unknown_burial_ages"] = list(unknown_burial_ages)
+    return envelope

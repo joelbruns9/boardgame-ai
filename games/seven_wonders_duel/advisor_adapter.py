@@ -52,15 +52,35 @@ def _replay(seed: int, first_player: int, prefix: tuple[int, ...]) -> GameState:
     return game
 
 
-def _label(action: Action) -> str:
+def _card_name_at(game, slot_id) -> str | None:
+    """Name of the face-up card in ``slot_id``, or None.
+
+    A slot id is geometry; a human picks a *card*. Every label and field that
+    names a slot resolves it here so the advisor talks about "Chamber of
+    Commerce" rather than "(6, 5)" -- the extension also needs the name to
+    highlight the right card on the board.
+    """
+    if slot_id is None:
+        return None
+    card = game.tableau.cards.get(tuple(slot_id))
+    if card is None or not card.present or not card.revealed:
+        return None
+    return card.card_name
+
+
+def _label(action: Action, game=None) -> str:
+    card = _card_name_at(game, action.slot_id) if game is not None else None
+    where = card or (f"slot {action.slot_id}" if action.slot_id is not None else "")
     if action.use is ActionUse.DRAFT_WONDER:
         return f"Draft wonder: {action.wonder_name}"
     if action.use is ActionUse.CONSTRUCT_WONDER:
-        return f"Build wonder: {action.wonder_name} (slot {action.slot_id})"
+        # Which card a wonder consumes is a real decision in 7WD (it denies the
+        # card to the opponent), so name both.
+        return f"Wonder: {action.wonder_name} (using {where})"
     if action.use is ActionUse.CONSTRUCT_BUILDING:
-        return f"Construct building (slot {action.slot_id})"
+        return f"Build: {where}"
     if action.use is ActionUse.DISCARD_FOR_COINS:
-        return f"Discard for coins (slot {action.slot_id})"
+        return f"Discard for coins: {where}"
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
         return f"Resolve choice: {action.choice}"
     if action.use is ActionUse.CHOOSE_NEXT_START_PLAYER:
@@ -145,12 +165,27 @@ class SevenWondersAdvisor:
     # -- state codec --------------------------------------------------------
 
     def state_from_wire(self, payload: dict[str, Any]) -> _Position:
+        if "bga" in payload:
+            # Raw BGA capture from the browser extension:
+            #   {"bga": <gamedatas>, "args": <gamestate.args>, "dom": {...}}
+            # `dom` re-reads the fields BGA never refreshes so no page reload is
+            # needed; the mapping stays in Python. Yields the scrape-wire shape
+            # handled just below.
+            from .bga_extract import wire_from_bga_payload
+
+            payload = wire_from_bga_payload(payload)
         if "observation" in payload:
             from .advisor_scrape import determinize_observation, observation_from_wire
 
             obs = observation_from_wire(payload["observation"])
             rng = random.Random(int(payload.get("resample_seed", 0)))
-            game = determinize_observation(obs, rng)
+            game = determinize_observation(
+                obs,
+                rng,
+                unknown_burial_ages=tuple(
+                    int(a) for a in payload.get("unknown_burial_ages", ())
+                ),
+            )
             digest = hashlib.sha256(
                 json.dumps(payload["observation"], sort_keys=True, default=str).encode()
             ).hexdigest()[:16]
@@ -217,11 +252,12 @@ class SevenWondersAdvisor:
             views.append(
                 ActionView(
                     action_id=str(index),  # identity-indexed policy: index IS the id
-                    label=_label(action),
+                    label=_label(action, game),
                     kind=action.use.name,
                     fields={
                         "action_index": int(index),
                         "slot_id": action.slot_id,
+                        "card_name": _card_name_at(game, action.slot_id),
                         "wonder_name": action.wonder_name,
                         "choice": action.choice,
                     },

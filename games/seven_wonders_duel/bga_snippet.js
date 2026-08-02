@@ -7,20 +7,26 @@
 // Python mapper raises.
 //
 // FRESHNESS -- READ THIS. `gameui.gamedatas` is the *page-load* payload. BGA
-// patches some fields from its notification stream (scores, wonders) but leaves
-// others stale mid-game: playerBuildings, discardedBuildings, militaryTrack, and
-// progressTokensSituation keep their load-time values until the next full load.
-// So capture on a FRESHLY (RE)LOADED table. `wire_from_bga` cross-checks science
-// counts and raises StaleGamedata if it sees a stale snapshot, but the browser
-// side is responsible for triggering the reload. `captureAfterReload` does that;
-// prefer it for any table that has been open a while.
+// patches some fields from its notification stream (scores, draftpool) but
+// leaves five stale mid-game: playerBuildings, discardedBuildings,
+// militaryTrack, progressTokensSituation, and -- during the wonder draft only --
+// wondersSituation. They keep their load-time values until the next full load.
+//
+// `captureDomPatch` re-reads those five from the DOM so no reload is needed;
+// `captureForAdvisor` bundles gamedatas + state args + that patch into the
+// payload the host expects. `captureAfterReload` (F5 first) remains as the
+// reference capture to diff a patched capture against.
+//
+// `wire_from_bga` still cross-checks science counts and raises StaleGamedata,
+// which now catches a *broken patch* rather than a missing reload -- but note
+// that check is blind during the draft, when both counts are 0.
 //
 // Usage from a content script / userscript / devtools:
-//   const raw = captureBgaGamedatas();           // -> plain object, or throws
+//   const state = captureForAdvisor();           // -> plain object, or throws
 //   fetch("http://localhost:8000/api/recommend", {   // host wraps wire_from_bga
 //     method: "POST",
 //     headers: { "Content-Type": "application/json" },
-//     body: JSON.stringify({ state: { bga: raw } }),
+//     body: JSON.stringify({ state }),
 //   });
 //
 // The BGA game lives in a nested iframe; from the top window, hop to the frame
@@ -28,11 +34,14 @@
 
 function findGameWindow() {
   // Same-origin frames only; BGA's game iframe shares the origin.
+  // Marker is `wondersSituation`, which is present in every 7WD state. Do NOT
+  // use `draftpool`: getAllDatas leaves it `[]` during the wonder draft
+  // (sevenwondersduel.game.php:685-688), which only happens to be truthy in JS.
   const stack = [window.top];
   while (stack.length) {
     const w = stack.pop();
     try {
-      if (w.gameui && w.gameui.gamedatas && w.gameui.gamedatas.draftpool) return w;
+      if (w.gameui && w.gameui.gamedatas && w.gameui.gamedatas.wondersSituation) return w;
       for (let i = 0; i < w.frames.length; i++) stack.push(w.frames[i]);
     } catch (e) {
       /* cross-origin frame: skip */
@@ -76,6 +85,138 @@ function captureBgaSlim() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// FRESHNESS PATCH (item B of ADVISOR_IMPLEMENTATION_PLAN.md)
+//
+// Five gamedatas fields are never refreshed after page load, so we re-read them
+// from the DOM. This is the ONLY game knowledge in this file, and it is kept to
+// a list of selectors that return **numeric ids only** -- the id -> card-name
+// mapping stays in Python (bga_extract), so a BGA change breaks a selector
+// loudly here rather than producing a plausible-but-wrong name.
+//
+// Selector provenance (BGA Files/sevenwondersduel/):
+//   .player_buildings.player{PID}          tpl:222, written by notif_constructBuilding (js:3138)
+//   #discarded_cards_container             tpl:391, js:1213 (add) / js:3437 (remove)
+//   #board_progress_tokens                 tpl:307, js:1273
+//   .player_info.player{PID} .player_area_progress_tokens   tpl:346,372, js:1312
+//   .military_token_container[data-military-token-number]   tpl:316, js:5094
+//   #wonder_selection_container            tpl:187, js:2625
+//   .player_wonders.player{PID}            tpl:47,  js:2707
+//
+// TRAPS, both load-bearing:
+//   * --conflict-pawn-position is already in SERVER frame (-9..9), same as
+//     gamedatas.militaryTrack.conflictPawn. The per-seat mirroring is done by
+//     CSS via --invert-military-positions (css:954). Do not flip it here.
+//   * Military token slots are read by their data-military-token-number
+//     attribute, NOT by #military_tokens>div:nth-of-type(i) -- that index is
+//     mirrored by invertMilitaryTrack() (js:1746) for one of the two seats.
+
+// Throw rather than return a partial patch: a missing selector must fail loudly.
+function _required(root, selector) {
+  const node = root.querySelector(selector);
+  if (!node) throw new Error(`7WD DOM patch: selector not found: ${selector}`);
+  return node;
+}
+
+function _idsUnder(root, selector, attr) {
+  return [..._required(root, selector).querySelectorAll(`[${attr}]`)].map((n) =>
+    parseInt(n.getAttribute(attr), 10)
+  );
+}
+
+function captureDomPatch() {
+  const w = findGameWindow();
+  const doc = w.document;
+  const g = w.gameui.gamedatas;
+  const pids = Object.keys(g.players).map(String);
+
+  const playerBuildings = {};
+  const playerWonders = {};
+  const playerProgressTokens = {};
+  for (const pid of pids) {
+    playerBuildings[pid] = _idsUnder(doc, `.player_buildings.player${pid}`, "data-building-id");
+    playerWonders[pid] = _idsUnder(doc, `.player_wonders.player${pid}`, "data-wonder-id");
+    playerProgressTokens[pid] = _idsUnder(
+      doc,
+      `.player_info.player${pid} .player_area_progress_tokens`,
+      "data-progress-token-id"
+    );
+  }
+
+  // Board progress tokens keep their slot: BGA renders slot N into the
+  // (N+1)'th child of #board_progress_tokens (js:1283). Emit [slot, id] so
+  // Python can rebuild location_arg rather than guess at ordering.
+  const boardTokens = [];
+  const tokenSlots = _required(doc, "#board_progress_tokens").children;
+  for (let i = 0; i < tokenSlots.length; i++) {
+    const tok = tokenSlots[i].querySelector("[data-progress-token-id]");
+    if (tok) boardTokens.push([i, parseInt(tok.getAttribute("data-progress-token-id"), 10)]);
+  }
+
+  // Military tokens: value comes from the military_token_{value} class on the
+  // child node; an empty container means the token has been captured.
+  const militaryTokens = {};
+  for (let n = 1; n <= 4; n++) {
+    const container = _required(doc, `.military_token_container[data-military-token-number="${n}"]`);
+    const token = container.querySelector(".military_token");
+    let value = 0;
+    if (token) {
+      const m = /(?:^|\s)military_token_(\d+)(?:\s|$)/.exec(token.className);
+      if (!m) throw new Error(`7WD DOM patch: unreadable military token value in slot ${n}`);
+      value = parseInt(m[1], 10);
+    }
+    militaryTokens[n] = value;
+  }
+
+  const conflictPawnRaw = w
+    .getComputedStyle(doc.documentElement)
+    .getPropertyValue("--conflict-pawn-position")
+    .trim();
+  if (conflictPawnRaw === "") {
+    throw new Error("7WD DOM patch: --conflict-pawn-position is unset");
+  }
+
+  return {
+    playerBuildings,
+    playerWonders,
+    playerProgressTokens,
+    boardProgressTokens: boardTokens,
+    discardedBuildings: _idsUnder(doc, "#discarded_cards_container", "data-building-id"),
+    wonderSelection: _idsUnder(doc, "#wonder_selection_container", "data-wonder-id"),
+    militaryTokens,
+    conflictPawn: parseInt(conflictPawnRaw, 10),
+  };
+}
+
+// The payload the host's {"bga": ...} branch expects. `args` is the current
+// state's server args (gameui.gamedatas.gamestate.args) -- fresh every turn,
+// captured verbatim, used by Python only for cross-checks.
+// Rendered game-log lines. Constructing a wonder buries an age card under it
+// permanently, and `gamedatas` records only that card's *age* -- the identity
+// lives solely in the constructWonder log line ("...using building X"). Python
+// only trusts a parsed line when it agrees with the structural age, so a stale,
+// trimmed or differently-localized log degrades to "counted but unnamed" rather
+// than to a wrong position. Deduped: BGA renders each entry more than once.
+function captureGameLog() {
+  const doc = findGameWindow().document;
+  const seen = new Set();
+  for (const node of doc.querySelectorAll("#logs .log, .log")) {
+    const text = node.textContent.trim();
+    if (text) seen.add(text);
+  }
+  return [...seen];
+}
+
+function captureForAdvisor() {
+  const g = captureBgaGamedatas();
+  return {
+    bga: g,
+    args: g.gamestate && g.gamestate.args ? g.gamestate.args : null,
+    dom: captureDomPatch(),
+    log: captureGameLog(),
+  };
+}
+
 // Reload the game frame, wait for gamedatas to come back fresh, then capture.
 // Use this when the table may have been open across several moves.
 async function captureAfterReload() {
@@ -102,6 +243,8 @@ if (typeof module !== "undefined") {
     findGameWindow,
     captureBgaGamedatas,
     captureBgaSlim,
+    captureDomPatch,
+    captureForAdvisor,
     captureAfterReload,
   };
 }

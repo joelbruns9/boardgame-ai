@@ -26,6 +26,11 @@ Cargo.lock
 # Reference papers (large PDFs kept locally, backed up separately)
 references/
 
+# Third-party BGA game source dumps (kept locally; not ours to redistribute).
+# games/seven_wonders_duel/ADVISOR_IMPLEMENTATION_PLAN.md cites these by
+# file:line -- the citations assume you have the dump at this path.
+BGA Files/
+
 # Checkpoints and large binary artifacts
 checkpoints*/
 *.pkl
