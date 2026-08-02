@@ -160,14 +160,38 @@
 
   // -- advisor --------------------------------------------------------------
 
+  // All network goes through the background script: the page is https and the
+  // advisor is http://127.0.0.1, so a fetch from here is blocked as mixed
+  // content. See background.js.
+  async function call(path, init) {
+    const reply = await api.runtime.sendMessage({
+      kind: "swd-fetch",
+      url: HOST + path,
+      init,
+    });
+    if (!reply) throw Object.assign(new Error("no reply from background"), { status: 0 });
+    if (!reply.ok) {
+      throw Object.assign(
+        new Error(reply.error || path + " -> HTTP " + reply.status),
+        { status: reply.status }
+      );
+    }
+    return reply.body ? JSON.parse(reply.body) : null;
+  }
+
   async function post(path, body) {
-    const res = await fetch(HOST + path, {
+    return call(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(path + " -> HTTP " + res.status);
-    return res.json();
+  }
+
+  // "offline" and "the host rejected it" are different problems; say which.
+  function reportFailure(err) {
+    if (err && err.status === 0) return "host offline";
+    if (err && err.status) return "host error " + err.status;
+    return "request failed";
   }
 
   async function stopCurrent() {
@@ -200,7 +224,9 @@
         top_k: TOP_N,
       });
     } catch (err) {
-      setStatus("host offline");
+      setStatus(reportFailure(err));
+      ensurePanel().querySelector('[data-role="sub"]').textContent =
+        (err && err.message) || "";
       return;
     }
     jobId = started.job_id;
@@ -211,13 +237,12 @@
     if (!jobId) return;
     let resp;
     try {
-      const res = await fetch(
-        HOST + "/api/recommend/poll?job_id=" + encodeURIComponent(jobId)
+      resp = await call(
+        "/api/recommend/poll?job_id=" + encodeURIComponent(jobId),
+        { method: "GET" }
       );
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      resp = await res.json();
     } catch (err) {
-      setStatus("host offline");
+      setStatus(reportFailure(err));
       clearInterval(pollTimer);
       pollTimer = null;
       return;

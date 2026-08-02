@@ -55,16 +55,20 @@ Two halves, because neither can do the whole job:
 | file | world | responsibility |
 |---|---|---|
 | `page_bridge.js` | MAIN (page) | sees `window.gameui`, detects your turn, captures the board |
-| `content.js` | isolated | fetches the advisor, renders the panel |
+| `content.js` | isolated | renders the panel, proxies network via the background |
+| `background.js` | extension | the only place that reaches the advisor |
 
 A content script cannot read `window.gameui` — isolated world, and Firefox's
 `wrappedJSObject` escape hatch does not exist in Chrome. So the bridge runs in
 the page and hands data over by `postMessage`.
 
-The split is not only about access. The advisor is `http://127.0.0.1` while BGA
-is `https`, so a page-context fetch would be blocked as mixed content. A content
-script with `host_permissions` is not subject to that, which is why all network
-access lives on the isolated side.
+**Network has to go through the background script.** The advisor is
+`http://127.0.0.1` while BGA is `https`, so the request is blocked as mixed
+content from *any* page context -- and `host_permissions` does not exempt a
+content script either. This was not theoretical: the first live run failed with
+a bare `host offline` while the host was healthy. The background context is not
+a page, so no page CSP or mixed-content rule applies. `extension_kingdomino`
+does the same thing for the same reason.
 
 `bga_snippet.js` is a **copy** of `games/seven_wonders_duel/bga_snippet.js` — an
 extension has to be self-contained. `test_extension_assets.py` fails if the two
@@ -107,7 +111,8 @@ get a placeholder instead of a card, never a wrong position.
 
 | panel says | meaning |
 |---|---|
-| `host offline` | the uvicorn host is not running, or not on port 8000 |
+| `host offline` | the request never reached the host: uvicorn not running, wrong port, or blocked in the browser |
+| `host error 4xx/5xx` | the host answered and rejected it -- look at the uvicorn terminal for the traceback |
 | `capture failed` | a DOM selector missed; the message names it. Reloading the table is the quick workaround and confirms it is a freshness problem |
 | `waiting for your turn` | working as intended — it is the opponent's move |
 | a dashed placeholder instead of a card | the name lookup missed; cosmetic only |

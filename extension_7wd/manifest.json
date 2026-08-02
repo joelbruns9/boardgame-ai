@@ -9,7 +9,9 @@
       "strict_min_version": "115.0"
     }
   },
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "*://*.boardgamearena.com/*",
     "http://127.0.0.1:8000/*",
@@ -17,17 +19,34 @@
   ],
   "content_scripts": [
     {
-      "matches": ["*://*.boardgamearena.com/*"],
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ],
       "all_frames": true,
-      "js": ["content.js"],
-      "css": ["panel.css"],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "panel.css"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["bga_snippet.js", "page_bridge.js"],
-      "matches": ["*://*.boardgamearena.com/*"]
+      "resources": [
+        "bga_snippet.js",
+        "page_bridge.js"
+      ],
+      "matches": [
+        "*://*.boardgamearena.com/*"
+      ]
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": [
+      "background.js"
+    ]
+  }
 }

@@ -35,9 +35,14 @@ def test_extension_snippet_matches_canonical():
 def test_manifest_is_cross_browser_mv3():
     manifest = json.loads((_EXTENSION / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["manifest_version"] == 3
-    # No background key at all: Chrome MV3 wants a service_worker and Firefox
-    # wants background.scripts, so the portable answer is to need neither.
-    assert "background" not in manifest
+    # Both background forms are declared on purpose: Chrome MV3 reads
+    # service_worker and ignores scripts, Firefox MV3 the reverse. That keeps a
+    # single manifest. A background context is REQUIRED (not optional): the page
+    # is https and the advisor is http://127.0.0.1, so a content-script fetch is
+    # blocked as mixed content -- observed live as a bare "host offline".
+    background = manifest["background"]
+    assert background["service_worker"] == "background.js"
+    assert background["scripts"] == ["background.js"]
     # Firefox needs an explicit add-on id to load unsigned.
     assert manifest["browser_specific_settings"]["gecko"]["id"]
     hosts = manifest["host_permissions"]
@@ -55,13 +60,16 @@ def _code_only(source: str) -> str:
     return "\n".join(re.sub(r"//.*$", "", line) for line in source.splitlines())
 
 
-@pytest.mark.parametrize("name", ["content.js", "page_bridge.js", "bga_snippet.js"])
+@pytest.mark.parametrize(
+    "name", ["content.js", "page_bridge.js", "bga_snippet.js", "background.js"]
+)
 def test_extension_scripts_declare_no_browser_specific_globals(name):
     """Firefox-only or Chrome-only globals would break the other browser."""
     code = _code_only((_EXTENSION / name).read_text(encoding="utf-8"))
     assert "wrappedJSObject" not in code, "Firefox-only; breaks Chrome"
-    if name != "content.js":
-        # Only the isolated-world script may touch extension APIs at all.
+    if name not in ("content.js", "background.js"):
+        # Page-world scripts must not touch extension APIs; they do not have
+        # them. content.js and background.js are extension contexts and may.
         assert not re.search(r"\bchrome\.runtime\b|\bbrowser\.runtime\b", code)
 
 
@@ -74,3 +82,17 @@ def test_page_bridge_states_match_the_mapper():
     block = source.split("const ADVISABLE = new Set([", 1)[1].split("]);", 1)[0]
     declared = set(re.findall(r'"([^"]+)"', block))
     assert declared == {_MAIN_TURN_STATE} | set(_PENDING_STATES)
+
+
+def test_only_the_background_script_makes_network_calls():
+    """Mixed content: the page is https, the advisor is http://127.0.0.1. A
+    content-script fetch is blocked before it leaves the browser -- this failed
+    on a live table as a bare "host offline". All network must go through the
+    background context, which is not a page and so has no such rule.
+    """
+    content = _code_only((_EXTENSION / "content.js").read_text(encoding="utf-8"))
+    assert "fetch(" not in content, "content.js must proxy via runtime.sendMessage"
+    bridge = _code_only((_EXTENSION / "page_bridge.js").read_text(encoding="utf-8"))
+    assert "fetch(" not in bridge, "the page world must never reach the advisor"
+    background = _code_only((_EXTENSION / "background.js").read_text(encoding="utf-8"))
+    assert "fetch(" in background
