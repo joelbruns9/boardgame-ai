@@ -126,6 +126,53 @@ class _ClosedHandle:
         pass
 
 
+class _RustClosedHandle:
+    """SearchHandle over the Rust resumable PUCT tree.
+
+    Same contract as :class:`_ClosedHandle` -- ``advance`` deepens ONE tree
+    across calls -- but the tree, the encoder and the selection all live in
+    Rust, which is what the training path uses. Only the leaf evaluation crosses
+    back into Python.
+
+    ``leaf_batch`` is fixed at 1: batching a PUCT root would select under
+    virtual loss, and at the root visits *are* the output, so it would change
+    the ranking rather than just the path to it. See
+    ADVISOR_RUST_UNIFICATION.md §5 step 4.
+    """
+
+    def __init__(self, search, actor: int, target: int):
+        self._search = search
+        self._sign = 1.0 if actor == 0 else -1.0
+        self._target = int(target)
+
+    def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
+        # Rust only checks the chunk boundary between evaluation requests, so a
+        # position whose simulations mostly terminate can overshoot. Harmless
+        # for streaming; it means "at least this many", not "exactly".
+        if not stop_event.is_set():
+            self._search.advance(int(chunk_sims))
+        sims_done, root_visits, root_value_sum, _actor, edges = self._search.snapshot()
+        entries = {
+            str(action_index): ActionStats(
+                visits=int(visits),
+                q_value=self._sign * (value_sum / visits if visits else 0.0),
+                prior=float(prior),
+            )
+            for action_index, visits, value_sum, prior in edges
+        }
+        return SearchSnapshot(
+            sims_done=int(sims_done),
+            sims_target=self._target,
+            root_value=self._sign
+            * (root_value_sum / root_visits if root_visits else 0.0),
+            entries=entries,
+            partial=stop_event.is_set(),
+        )
+
+    def close(self) -> None:  # the Rust arena is freed with the handle
+        self._search = None
+
+
 class SevenWondersAdvisor:
     """AdvisorAdapter for 7WD.  Pass ``evaluator=`` to inject a preloaded
     evaluator (tests); otherwise checkpoints load lazily from the request."""
@@ -267,11 +314,57 @@ class SevenWondersAdvisor:
 
     # -- search -------------------------------------------------------------
 
-    def open_search(self, state: _Position, req) -> _ClosedHandle:
+    def _open_rust_search(self, state: _Position, req):
+        """A Rust-backed handle, or None if the crate is unavailable.
+
+        Returns None rather than raising so ``search_impl='auto'`` degrades to
+        the Python searcher on a machine without the built extension.
+        """
+        try:
+            import seven_wonders_rust
+
+            from .rust_bridge import rust_game_from_state, rust_scalar_net_adapter
+        except ImportError:
+            return None
+        if not hasattr(seven_wonders_rust, "RustPuctSearch"):
+            return None  # crate predates the resumable handle
+
+        search = seven_wonders_rust.RustPuctSearch.open(
+            rust_game_from_state(state.game),
+            rust_scalar_net_adapter(self._evaluator(req)),
+            int(req.max_sims),
+            int(req.seed),
+            float(req.options.get("c_puct", 1.5)),
+        )
+        return _RustClosedHandle(search, state_actor(state.game), req.max_sims)
+
+    def open_search(self, state: _Position, req):
         engine = "nn" if req.engine in ("auto", "nn") else req.engine
         if engine != "nn":
             raise ValueError(f"unknown engine {req.engine!r}")
         force_expand = bool(req.options.get("force_expand_root_chance", True))
+
+        # search_impl: "rust" (default) | "python" | "auto"
+        #
+        # The Rust searcher is the same one self-play uses, gated against the
+        # Python tree by test_puct_root; measured ~2.5x on a representative
+        # position. It cannot force-expand the root chance layer (that needs the
+        # F4.5 forced-child cache), so an explicit force_expand_root_chance
+        # request falls back to Python rather than silently dropping it -- the
+        # two searches would otherwise differ in how root chance edges compute Q.
+        impl = str(req.options.get("search_impl", "rust")).lower()
+        explicit_force = "force_expand_root_chance" in req.options
+        if impl in ("rust", "auto") and not (explicit_force and force_expand):
+            handle = self._open_rust_search(state, req)
+            if handle is not None:
+                return handle
+            if impl == "rust":
+                raise RuntimeError(
+                    "search_impl='rust' but the Rust searcher is unavailable; "
+                    "build it with `maturin develop --release`, or pass "
+                    "options={'search_impl': 'python'}"
+                )
+
         config = SearchConfig(
             mode="closed",
             seed=int(req.seed),
