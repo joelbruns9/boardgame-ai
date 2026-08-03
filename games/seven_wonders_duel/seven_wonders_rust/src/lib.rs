@@ -250,11 +250,20 @@ fn victory_from_index(i: u8) -> PyResult<state::VictoryType> {
 #[pyclass]
 struct RustPuctSearch {
     session: tree_resumable::SearchSession,
-    /// `None` drives the deterministic `MockEval`, which is what the equivalence
-    /// gate needs: the one-shot `closed_search` it is compared against uses the
-    /// same Rust-internal mock, so a Python adapter could not reproduce it
-    /// byte-for-byte.
-    evaluator: Option<eval::PyEval>,
+    /// The leaf-evaluation boundary.
+    ///
+    /// `Scalar` calls Python once per leaf. `Batched` calls it once per wave --
+    /// the whole point of `leaf_batch > 1`, since batching the tree buys nothing
+    /// while evaluation is serial. `Mock` drives the deterministic Rust
+    /// evaluator, which the equivalence gate needs because the one-shot
+    /// `closed_search` it is compared against uses that same mock.
+    evaluator: HandleEval,
+}
+
+enum HandleEval {
+    Scalar(eval::PyEval),
+    Batched(eval::PyBatchEval),
+    Mock,
 }
 
 #[pymethods]
@@ -288,8 +297,19 @@ impl RustPuctSearch {
             conflict_free_waves: false,
             round_robin_candidates: false,
         };
-        let evaluator = eval::PyEval::new(adapter);
-        let root_evaluation = evaluator.evaluate(&game.state)?;
+        // A batched wave needs a batched boundary, or every leaf still crosses
+        // into Python on its own and leaf_batch changes nothing (measured: 1.00x
+        // through 1.07x across leaf_batch 1..16 on the scalar bridge).
+        let evaluator = if leaf_batch > 1 {
+            HandleEval::Batched(eval::PyBatchEval::new(adapter))
+        } else {
+            HandleEval::Scalar(eval::PyEval::new(adapter))
+        };
+        let root_evaluation = match &evaluator {
+            HandleEval::Batched(e) => e.evaluate(&game.state)?,
+            HandleEval::Scalar(e) => e.evaluate(&game.state)?,
+            HandleEval::Mock => eval::MockEval.evaluate(&game.state)?,
+        };
         // leaf_batch > 1 opts the root into virtual-loss selection; see
         // begin_search_from_root_virtual_loss for what that trades away.
         let session = if leaf_batch > 1 {
@@ -302,10 +322,7 @@ impl RustPuctSearch {
         } else {
             tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?
         };
-        Ok(RustPuctSearch {
-            session,
-            evaluator: Some(evaluator),
-        })
+        Ok(RustPuctSearch { session, evaluator })
     }
 
     /// Mock-evaluator twin of `open`, for the equivalence gate only.
@@ -338,7 +355,7 @@ impl RustPuctSearch {
         let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
         Ok(RustPuctSearch {
             session,
-            evaluator: None,
+            evaluator: HandleEval::Mock,
         })
     }
 
@@ -360,8 +377,13 @@ impl RustPuctSearch {
                             .map(|leaf| leaf.legal.clone())
                             .collect();
                         match &self.evaluator {
-                            Some(py) => py.evaluate_batch_prepared(&states, &actors, &legals),
-                            None => eval::MockEval
+                            HandleEval::Scalar(e) => {
+                                e.evaluate_batch_prepared(&states, &actors, &legals)
+                            }
+                            HandleEval::Batched(e) => {
+                                e.evaluate_batch_prepared(&states, &actors, &legals)
+                            }
+                            HandleEval::Mock => eval::MockEval
                                 .evaluate_batch_prepared(&states, &actors, &legals),
                         }
                     };

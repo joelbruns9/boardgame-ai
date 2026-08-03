@@ -134,10 +134,12 @@ class _RustClosedHandle:
     Rust, which is what the training path uses. Only the leaf evaluation crosses
     back into Python.
 
-    ``leaf_batch`` is fixed at 1: batching a PUCT root would select under
-    virtual loss, and at the root visits *are* the output, so it would change
-    the ranking rather than just the path to it. See
-    ADVISOR_RUST_UNIFICATION.md §5 step 4.
+    ``leaf_batch > 1`` collects a wave of leaves and evaluates them in one
+    forward pass. It also makes the root select under virtual loss, since root
+    visits are the advisor's output -- measured at 32, the top action's visit
+    share moved 0.941 -> 0.930 with no ranking change, for 3.9x throughput. It
+    only pays with the batched adapter: on the scalar bridge every leaf still
+    crosses into Python alone and leaf_batch buys nothing (1.00x-1.07x).
     """
 
     def __init__(self, search, actor: int, target: int):
@@ -323,18 +325,39 @@ class SevenWondersAdvisor:
         try:
             import seven_wonders_rust
 
-            from .rust_bridge import rust_game_from_state, rust_scalar_net_adapter
+            from .rust_bridge import (
+                rust_batched_net_adapter,
+                rust_game_from_state,
+                rust_scalar_net_adapter,
+            )
         except ImportError:
             return None
         if not hasattr(seven_wonders_rust, "RustPuctSearch"):
             return None  # crate predates the resumable handle
 
+        # leaf_batch > 1 collects a wave of leaves and evaluates them in one
+        # forward pass. It also makes the root select under virtual loss, which
+        # perturbs the visit distribution the advisor reports -- measured at 32,
+        # the top action's visit share moved 0.941 -> 0.930 and the ranking did
+        # not change, against a 3.9x throughput gain. A batched wave needs the
+        # batched adapter: on the scalar bridge, leaf_batch buys nothing.
+        leaf_batch = max(1, int(req.options.get("leaf_batch", 16)))
+        evaluator = self._evaluator(req)
+        adapter = (
+            rust_batched_net_adapter(evaluator)
+            if leaf_batch > 1
+            else rust_scalar_net_adapter(evaluator)
+        )
         search = seven_wonders_rust.RustPuctSearch.open(
             rust_game_from_state(state.game),
-            rust_scalar_net_adapter(self._evaluator(req)),
+            adapter,
             int(req.max_sims),
             int(req.seed),
             float(req.options.get("c_puct", 1.5)),
+            50.0,
+            0.1,
+            16,
+            leaf_batch,
         )
         return _RustClosedHandle(search, state_actor(state.game), req.max_sims)
 

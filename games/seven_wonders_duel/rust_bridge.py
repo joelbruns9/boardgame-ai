@@ -984,3 +984,41 @@ def rust_scalar_net_adapter(evaluator):
         return float(row.wdl[0] - row.wdl[2]), [float(p) for p in row.policy]
 
     return adapter
+
+
+def rust_batched_net_adapter(evaluator):
+    """`[(tokens, actor, legal), ...] -> [(value_actor, priors), ...]`, ONE call.
+
+    The counterpart to Rust's `PyBatchEval`. Where `rust_scalar_net_adapter`
+    crosses into Python once per leaf, this crosses once per wave and runs a
+    single batched forward pass, which is the only reason `leaf_batch > 1` is
+    worth anything: batching the *tree* while evaluation stays serial measured
+    1.00x-1.07x across leaf_batch 1..16.
+
+    Row order is the contract -- Rust matches results back to leaves by index,
+    and validates the count before any of it reaches the tree.
+    """
+
+    token_types = list(TokenType)
+
+    def adapter(rows):
+        encodings = []
+        legals = []
+        for tokens, actor, legal in rows:
+            encodings.append(
+                Encoding(
+                    actor=actor,
+                    tokens=tuple(
+                        Token(token_types[ti], eid, aid, tuple(feats))
+                        for ti, eid, aid, feats in tokens
+                    ),
+                )
+            )
+            legals.append(list(legal))
+        out = evaluator.evaluate(encodings, legals)
+        return [
+            (float(row.wdl[0] - row.wdl[2]), [float(p) for p in row.policy])
+            for row in out
+        ]
+
+    return adapter
