@@ -250,7 +250,11 @@ fn victory_from_index(i: u8) -> PyResult<state::VictoryType> {
 #[pyclass]
 struct RustPuctSearch {
     session: tree_resumable::SearchSession,
-    evaluator: eval::PyEval,
+    /// `None` drives the deterministic `MockEval`, which is what the equivalence
+    /// gate needs: the one-shot `closed_search` it is compared against uses the
+    /// same Rust-internal mock, so a Python adapter could not reproduce it
+    /// byte-for-byte.
+    evaluator: Option<eval::PyEval>,
 }
 
 #[pymethods]
@@ -286,7 +290,44 @@ impl RustPuctSearch {
         let evaluator = eval::PyEval::new(adapter);
         let root_evaluation = evaluator.evaluate(&game.state)?;
         let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
-        Ok(RustPuctSearch { session, evaluator })
+        Ok(RustPuctSearch {
+            session,
+            evaluator: Some(evaluator),
+        })
+    }
+
+    /// Mock-evaluator twin of `open`, for the equivalence gate only.
+    #[staticmethod]
+    #[pyo3(signature = (game, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16))]
+    fn open_mock(
+        game: &RustGame,
+        max_sims: usize,
+        seed: u64,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        top_k: usize,
+    ) -> PyResult<Self> {
+        let cfg = tree::SearchConfig {
+            sims: max_sims.max(1),
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: false,
+            puct_root: true,
+            age_deal_samples: 0,
+            double_reveal_offsets: 0,
+            conflict_free_waves: false,
+            round_robin_candidates: false,
+        };
+        let root_evaluation = eval::MockEval.evaluate(&game.state)?;
+        let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
+        Ok(RustPuctSearch {
+            session,
+            evaluator: None,
+        })
     }
 
     /// Run up to `chunk` more simulations; return the total completed. Stops on
@@ -306,8 +347,11 @@ impl RustPuctSearch {
                             .iter()
                             .map(|leaf| leaf.legal.clone())
                             .collect();
-                        self.evaluator
-                            .evaluate_batch_prepared(&states, &actors, &legals)
+                        match &self.evaluator {
+                            Some(py) => py.evaluate_batch_prepared(&states, &actors, &legals),
+                            None => eval::MockEval
+                                .evaluate_batch_prepared(&states, &actors, &legals),
+                        }
                     };
                     match evaluations {
                         Ok(rows) => self.session.apply_evaluations(request.request_id, rows)?,

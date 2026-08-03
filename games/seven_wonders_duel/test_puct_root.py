@@ -210,3 +210,58 @@ def test_batched_puct_root_rejects_leaf_batch_above_one():
     rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
     with pytest.raises(Exception, match="leaf_batch"):
         rg.closed_search_batched(4, 8, 4, 1, force=False, puct_root=True)
+
+
+# --- resumable PUCT handle (ADVISOR_RUST_UNIFICATION.md step 4) --------------
+
+
+def test_resumable_handle_matches_the_one_shot_puct_search():
+    """`RustPuctSearch` must reproduce the search `test_rust_puct_root_matches_python`
+    already gates against Python -- otherwise the advisor would run a searcher
+    whose equivalence is assumed rather than tested, which is the exact failure
+    this track exists to remove.
+
+    Chunking must not change the tree: the whole point of the handle is that N
+    simulations arrive as several `advance` calls instead of one.
+    """
+    from .rust_bridge import rust_game_from_state
+
+    compared = 0
+    for game_seed in range(4):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        for i, idx in enumerate(actions):
+            if i >= 8 and py.phase is Phase.PLAY_AGE and py.pending_choice is None:
+                for sims, chunks in ((64, (64,)), (64, (16, 16, 32)), (48, (1, 47))):
+                    for seed in (1, 5):
+                        # force=False: the resumable path cannot force-expand the
+                        # root chance layer (needs the F4.5 forced-child cache).
+                        one_shot = rg.closed_search(
+                            sims, 8, seed, force=False, puct_root=True
+                        )
+                        # open_mock, not open: the one-shot search above uses
+                        # Rust's internal MockEval, which a Python adapter
+                        # cannot reproduce byte-for-byte.
+                        handle = swr.RustPuctSearch.open_mock(
+                            rust_game_from_state(py), sims, seed, 1.5, 50.0, 0.1, 8
+                        )
+                        done = 0
+                        for chunk in chunks:
+                            done = handle.advance(chunk)
+                        sims_done, _rv, _rvs, _actor, edges = handle.snapshot()
+                        assert sims_done == done
+                        ctx = f"game {game_seed} sims {sims} chunks {chunks} seed {seed}"
+                        assert done == one_shot[6], f"{ctx}: sims"
+                        by_action = {a: v for a, v, _vs, _p in edges}
+                        legal = legal_action_indices(py)
+                        assert [by_action[a] for a in legal] == list(
+                            one_shot[3]
+                        ), f"{ctx}: visits"
+                        compared += 1
+                break_outer = compared > 0
+                if break_outer:
+                    break
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert compared >= 20, f"only {compared} comparisons"
