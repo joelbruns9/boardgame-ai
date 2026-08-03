@@ -4,7 +4,7 @@
 //! Sampling (`sample_outcomes`) and the supplied-outcome apply path
 //! (`make_with_chance`) land in F3.1b.
 
-use crate::data::{back_type_of, card, layout, wonder_id};
+use crate::data::{back_type_of, card, layout, wonder, wonder_id, EffectKind};
 use crate::engine::{Action, ActionUse};
 use crate::pool::{unseen_pool, UnseenPool};
 use crate::rng::Rng;
@@ -73,8 +73,39 @@ fn exhausts_the_age(g: &GameState, action: &Action) -> bool {
         return false;
     }
     let mut clone = g.clone();
+    install_throwaway_library_draw(&mut clone, action);
     clone.apply_action(action);
     clone.phase == Phase::ChooseNextStartPlayer
+}
+
+/// Give the dry-run clone a Great Library draw so applying the action cannot
+/// panic on an empty queue.
+///
+/// Python resolves that draw from the unseen pool, but Rust consumes a
+/// pre-locked `library_draws` entry, and an injected or searched state
+/// deliberately carries none — the searcher supplies one per descent. Without
+/// this, predicting the signature of a last-card Great Library build aborts the
+/// process instead of returning it.
+///
+/// Any valid draw does. The tokens decide which options are *offered*; whether
+/// the Age ends turns only on a pending choice arising at all, which is settled
+/// by the draw's size. Taking the first `count` unused tokens matches the
+/// length the engine asserts.
+fn install_throwaway_library_draw(clone: &mut GameState, action: &Action) {
+    if action.use_ != ActionUse::ConstructWonder || !clone.library_draws.is_empty() {
+        return;
+    }
+    let Some(wid) = action.wonder else { return };
+    for effect in wonder(wid).effects {
+        if effect.kind == EffectKind::ChooseUnusedProgress {
+            let count = (effect.amount as usize).min(clone.unused_progress_tokens.len());
+            if count > 0 {
+                clone
+                    .library_draws
+                    .push_back(clone.unused_progress_tokens[..count].to_vec());
+            }
+        }
+    }
 }
 
 pub fn chance_signature(g: &GameState, action: &Action) -> Vec<ChanceSpec> {

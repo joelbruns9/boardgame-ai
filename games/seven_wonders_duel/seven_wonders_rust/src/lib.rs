@@ -2398,6 +2398,83 @@ mod tests {
     }
 
     #[test]
+    fn the_chance_witness_catches_a_wrong_prediction() {
+        //! `apply_with_chance` cannot detect a mispredicted signature by
+        //! counting outcomes — the caller derived them from that same
+        //! signature. The witness compares the prediction against what the
+        //! engine actually left behind, so it has to fire in BOTH directions
+        //! or it is decoration.
+
+        use crate::chance::{chance_signature, ChanceKind, ChanceSpec};
+        use crate::engine::ChanceWitness;
+
+        let mut g = GameState::from_setup(sample_setup(), VecDeque::new());
+        while g.phase != Phase::PlayAge {
+            let legal = codec::legal_action_indices(&g);
+            g.apply_action(&codec::decode_action(&g, legal[0]));
+        }
+        // Play on until some take exposes a face-down card, so there is a real
+        // event to under-predict. At the start of Age I nothing is exposed by a
+        // single take: both coverers of a face-down slot are still present.
+        let index = loop {
+            let legal = codec::legal_action_indices(&g);
+            if let Some(&i) = legal
+                .iter()
+                .find(|&&i| !chance_signature(&g, &codec::decode_action(&g, i)).is_empty())
+            {
+                break i;
+            }
+            assert_eq!(g.phase, Phase::PlayAge, "left Age I without exposing a card");
+            g.apply_action(&codec::decode_action(&g, legal[0]));
+        };
+        let action = codec::decode_action(&g, index);
+        let specs = chance_signature(&g, &action);
+
+        let witness = ChanceWitness::of(&g);
+        g.apply_action(&action);
+
+        witness
+            .check(&g, &specs)
+            .expect("the true signature must agree with the engine");
+
+        let mut over = specs.clone();
+        over.push(ChanceSpec {
+            kind: ChanceKind::AgeDeal,
+            context: vec![2],
+        });
+        assert!(
+            witness.check(&g, &over).is_err(),
+            "an AGE_DEAL that never fired must be caught -- it has already \
+             rewritten age_decks by this point"
+        );
+
+        assert!(
+            witness.check(&g, &[]).is_err(),
+            "a CARD_REVEAL the engine fired unpredicted must be caught"
+        );
+
+        // The draw-queue arm, which the first version of this test missed and
+        // the Python equivalence gate caught: the length is only an invariant
+        // when the witness is taken BEFORE the outcome is pushed on. Reproduce
+        // that shape -- an outcome pre-installed for an event that never fires.
+        let queued = ChanceWitness::of(&g);
+        g.library_draws.push_front(vec![0, 1, 2]);
+        assert!(
+            queued
+                .check(
+                    &g,
+                    &[ChanceSpec {
+                        kind: ChanceKind::GreatLibraryDraw,
+                        context: vec![],
+                    }],
+                )
+                .is_err(),
+            "a GREAT_LIBRARY_DRAW that never fired must be caught -- its \
+             pre-installed outcome is still sitting on the queue"
+        );
+    }
+
+    #[test]
     fn fingerprint_deterministic_and_clone_equal() {
         let g = GameState::from_setup(sample_setup(), VecDeque::new());
         assert_eq!(g.fingerprint(), g.fingerprint());

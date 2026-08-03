@@ -9,6 +9,76 @@ change the code matter; style does not.
 
 ---
 
+## REVIEWED 2026-08-03 — outcome
+
+Three findings, **all three upheld**. Two are fixed; one is conceded and
+escalated to a measurement the reviewer is right to demand.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Rust dry run panics on a last-card Great Library from an injected state | **fixed** — `install_throwaway_library_draw` + regression test |
+| 2 | Off-distribution values reach the *preceding* action's Q, not just the chooser's prior | **conceded** — claim 12 below was wrong; strength gate specified, not yet run |
+| 3 | Rust never verifies which chance events actually fired | **fixed** — `ChanceWitness`, with a unit test that fires it both ways |
+
+**Finding 1 reproduced exactly as reported** (`PanicException: great library
+draw outcome missing from chance log`). The cause is a genuine asymmetry I
+missed: Python resolves a Great Library draw from the unseen pool, Rust pops a
+pre-locked `library_draws` entry, and injected/search states deliberately carry
+none. Every existing test builds its `RustGame` with draws supplied up front,
+which is why the whole suite was green over it. The dry run now installs a
+throwaway draw before applying; the tokens decide which options are *offered*,
+never whether the Age ends, so any valid draw serves. Regression test:
+`test_chance_signature_survives_a_last_card_great_library_from_an_injected_state`,
+which also pins the semantics — the draw sets a pending choice, so the deal
+correctly rides on the resolution rather than the take.
+
+**Finding 2 is the one I got wrong in this document.** Claim 12 said "only the
+prior at that node is affected, not the values search reads." That is false.
+The paired sampler materializes 32 full-tableau `CHOOSE_NEXT_START_PLAYER`
+children, evaluates them, and installs the probability-weighted mean as the
+edge's `initial_q` — so an off-distribution *value* propagates into the choice
+of which last-Age card to take. The claim understated the blast radius by a
+whole ply, and in the direction that matters. Gate specified in §7 below; it is
+a GPU job, so it is handed over rather than launched.
+
+**Finding 3 is upheld and the claim was false as written.** `apply_with_chance`
+compared `outcomes.len()` against a signature the caller derived from that same
+signature, so it could not detect either direction of error. Python is
+protected structurally (its chance context pops per event and raises on an
+empty list or a leftover); Rust had nothing. `ChanceWitness` now captures age,
+phase, wonder round, draw-queue length and revealed-slot count before the apply
+and checks them after. Note the gap predates this commit — my error was
+asserting it was covered, not creating it.
+
+**The fix was wrong twice, and the suite caught both — worth recording, because
+the second one is a trap for anyone extending the witness.**
+
+* *False positive on the Age I deal* (75 failures). I keyed "did a deal fire?"
+  on `age` or `tableau.age` moving. `from_setup` lays out the Age I tableau
+  **before the draft**, so the 8th draft pick's deal rebuilds an identical one:
+  that deal has no state delta at all. Leaving `WonderDraft` is the only honest
+  signal, and it is exact — `pick_wonder` enters `PlayAge` on the same pick that
+  deals.
+* *Witness captured after pre-installation.* The Great Library outcome is
+  pushed onto the very queue the witness measures, so the invariant ("one is
+  pushed iff predicted and popped iff fired, so the length must return to where
+  it started") only holds when measured **before** the install loop. Caught by
+  `test_make_with_chance_equivalent`: "draw queue went 2 -> 1".
+
+The Rust unit test passed through both, because the action it selected fired a
+CARD_REVEAL and no draw — a test written to prove a check "fires in both
+directions" only proved it for the one event kind it happened to pick. It now
+covers the draw-queue arm explicitly.
+
+**Throughput**: the reviewer's benchmark (≈3.96 ms/root Python vs ≈8.3 µs/root
+through the Rust binding) settles claims 6 and 7 — the production clone is
+negligible at two boundaries per game. Claims 8 and 10 upheld as sound. The
+160-row worst-case burst under the real coalescing scheduler remains unchecked.
+
+Everything below is the original request, kept as the record of what was asked.
+
+---
+
 ## What changed, in one paragraph
 
 The engine dealt the next Age as a *consequence* of the start-player choice, so
@@ -157,6 +227,15 @@ selects edges whose *only* chance event is the deal, requiring ≥2.
     that node is affected, not the values search reads. **I have not measured
     the strength cost.** If you think a head-to-head against the pre-change
     engine is warranted before the cloud run, say so.
+
+    > **WRONG, and upheld as finding 2.** The second sentence of that claim does
+    > not survive contact with `tree_resumable.rs:719`: the paired sampler
+    > *evaluates* 32 full-tableau `CHOOSE_NEXT_START_PLAYER` children and
+    > installs their probability-weighted mean as the edge's `initial_q`
+    > (`:943`). Off-distribution **values**, not just an off-distribution prior,
+    > therefore feed the selection of the preceding action — which last card of
+    > the Age to take. The impact is one ply wider than I claimed, on the side
+    > that changes play. Gate below.
 13. **The chooser is unchanged and correct.** `_finish_turn` picks the player
     behind on the military track, ties to the player who took the last card.
     Unmodified by this work; I assert it matches the rules.
@@ -217,10 +296,49 @@ the one that gets played.
 * Advisor item F, which this was sequenced ahead of, is untouched — the scrape
   codec still refuses `CHOOSE_NEXT_START_PLAYER`.
 
+## 7. The strength gate finding 2 asks for — not yet run
+
+`eval_suite` can only compare checkpoints *under one engine*, so the comparison
+has to be made across two builds of the crate. The scripted bots are the fixed
+reference: they are deterministic and engine-independent, so a change in
+`current_best`'s win rate against them is attributable to the reordering.
+Seeds no longer produce the same games, which is why this is a distributional
+comparison over a few hundred games rather than a paired one.
+
+Two runs, same arguments, one per side. **The Rust extension must be rebuilt
+between them** — the Python engine and the installed crate have to agree, and a
+stale wheel would silently measure a mixed pair::
+
+    # after (this commit, already installed)
+    python -m games.seven_wonders_duel.eval_suite \
+      --checkpoint run03=games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt \
+      --out games/seven_wonders_duel/runs/age_deal_gate_after \
+      --sims 64 --bot-games 400 --device cuda
+
+    # before
+    git checkout 38b144b~1
+    maturin develop --release -m games/seven_wonders_duel/seven_wonders_rust/Cargo.toml
+    python -m games.seven_wonders_duel.eval_suite \
+      --checkpoint run03=games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt \
+      --out games/seven_wonders_duel/runs/age_deal_gate_before \
+      --sims 64 --bot-games 400 --device cuda
+    git checkout bga-advisor-live
+    maturin develop --release -m games/seven_wonders_duel/seven_wonders_rust/Cargo.toml
+
+A single checkpoint means no model-vs-model matches and no symmetry check —
+both would be vacuous here, since it is the same net on both sides.
+
+**What the result should decide.** A drop outside noise at 400 games/bot means
+the advisor is serving a degraded net *today* and should either pin the old
+engine until the cloud run promotes a replacement, or accept the loss knowingly.
+No result changes the case for the reordering itself: the cloud run trains
+under the new engine, where these states are in-distribution by construction.
+
 ## Verification that did run
 
-`games/seven_wonders_duel` + `games/advisor`: **816 passed, 1 skipped**
-(the run-03 bf16 test). `cargo test --release`: 16 passed.
+`games/seven_wonders_duel` + `games/advisor`: **817 passed, 1 skipped**
+after the review fixes (**816 + 1** before them; the run-03 bf16 test is the
+skip). `cargo test --release`: 17 passed.
 `test_rust_engine_equiv`: 32 passed, including the chance-signature parity gate
 and the Python/Rust chance-log comparison that caught the mid-port divergence at
 move 28.

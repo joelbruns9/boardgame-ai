@@ -918,6 +918,111 @@ impl GameState {
     }
 }
 
+/// Observable evidence that the engine fired exactly the predicted chance events.
+///
+/// `apply_with_chance` pre-installs each outcome and then applies the action
+/// normally, so comparing `outcomes.len()` against `chance_signature` proves
+/// nothing: the caller built those outcomes from that same signature, so a
+/// wrong prediction agrees with itself. Python is protected structurally — its
+/// chance context pops one supplied outcome per event as the event fires, and
+/// raises on either an exhausted list or a leftover — and this is the Rust
+/// equivalent, written against what each kind of event leaves behind.
+///
+/// Neither direction is harmless. An overpredicted AgeDeal has already
+/// rewritten `age_decks` for an Age that was never dealt; an underpredicted one
+/// resolves from the locked deal, which is exactly the hidden state the search
+/// barrier exists to keep out of a search.
+pub(crate) struct ChanceWitness {
+    age: u8,
+    phase: Phase,
+    wonder_round: u8,
+    library_draws: usize,
+    revealed: usize,
+}
+
+impl ChanceWitness {
+    pub(crate) fn of(state: &GameState) -> Self {
+        Self {
+            age: state.age,
+            phase: state.phase,
+            wonder_round: state.wonder_round,
+            library_draws: state.library_draws.len(),
+            revealed: Self::revealed(state),
+        }
+    }
+
+    /// Monotone: `take_accessible` clears `present` but never `revealed`, so
+    /// this only ever grows, by one per CARD_REVEAL.
+    fn revealed(state: &GameState) -> usize {
+        state.tableau.slots.iter().filter(|slot| slot.revealed).count()
+    }
+
+    pub(crate) fn check(
+        &self,
+        state: &GameState,
+        specs: &[crate::chance::ChanceSpec],
+    ) -> Result<(), String> {
+        use crate::chance::ChanceKind;
+        let predicted =
+            |kind: ChanceKind| specs.iter().filter(|spec| spec.kind == kind).count();
+
+        // A deal advances the Age -- except Age I's, which the 8th draft pick
+        // fires while leaving `age` at 1. That one has NO state delta at all:
+        // `from_setup` already laid the Age I tableau out, so an unoverridden
+        // deal rebuilds an identical one. Leaving the draft is therefore the
+        // only honest signal for it, and it is an exact one, since `pick_wonder`
+        // enters PlayAge on the same pick that deals.
+        let dealt = state.age != self.age
+            || (self.phase == Phase::WonderDraft && state.phase != Phase::WonderDraft);
+        if dealt != (predicted(ChanceKind::AgeDeal) == 1) {
+            return Err(format!(
+                "predicted {} AGE_DEAL event(s) but the engine {} one",
+                predicted(ChanceKind::AgeDeal),
+                if dealt { "fired" } else { "did not fire" }
+            ));
+        }
+
+        let flipped = state.wonder_round != self.wonder_round;
+        if flipped != (predicted(ChanceKind::WonderGroupReveal) == 1) {
+            return Err(format!(
+                "predicted {} WONDER_GROUP_REVEAL event(s) but the engine {} one",
+                predicted(ChanceKind::WonderGroupReveal),
+                if flipped { "fired" } else { "did not fire" }
+            ));
+        }
+
+        // Measured from before pre-installation: one entry is pushed iff
+        // predicted and one popped iff fired, so either way the queue must come
+        // back to the length it started at.
+        if state.library_draws.len() != self.library_draws {
+            return Err(format!(
+                "predicted {} GREAT_LIBRARY_DRAW event(s) but the draw queue went {} -> {}",
+                predicted(ChanceKind::GreatLibraryDraw),
+                self.library_draws,
+                state.library_draws.len()
+            ));
+        }
+
+        let reveals = predicted(ChanceKind::CardReveal);
+        if dealt {
+            // A deal replaces the tableau wholesale, so the count is not
+            // comparable across it — but a deal means the take removed the last
+            // card of the Age, which can expose nothing.
+            if reveals != 0 {
+                return Err(format!(
+                    "predicted {reveals} CARD_REVEAL event(s) on the take that ends the Age"
+                ));
+            }
+        } else if Self::revealed(state) != self.revealed + reveals {
+            return Err(format!(
+                "predicted {reveals} CARD_REVEAL event(s) but {} slot(s) were revealed",
+                Self::revealed(state) - self.revealed
+            ));
+        }
+        Ok(())
+    }
+}
+
 // --- F3.1b: supplied-outcome apply (make_with_chance) -------------------------
 
 impl GameState {
@@ -946,6 +1051,10 @@ impl GameState {
         // malformed supply cannot leave the state partially applied (the solver
         // make/unmake contract). Valid search outcomes always pass.
         self.validate_chance(&specs, outcomes)?;
+        // BEFORE pre-installation: the Great Library outcome is pushed onto the
+        // very queue the witness measures, so capturing after it would count
+        // the push as if it were the engine's own work.
+        let before = ChanceWitness::of(self);
         for (spec, outcome) in specs.iter().zip(outcomes) {
             match spec.kind {
                 crate::chance::ChanceKind::CardReveal => {
@@ -965,7 +1074,7 @@ impl GameState {
             }
         }
         self.apply_action(action);
-        Ok(())
+        before.check(self, &specs)
     }
 
     fn validate_chance(

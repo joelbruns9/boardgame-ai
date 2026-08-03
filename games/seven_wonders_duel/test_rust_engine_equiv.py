@@ -1072,6 +1072,8 @@ from .game import (
 
 import seven_wonders_rust as swr
 
+from .rust_bridge import rust_game_from_state
+
 _SCIENCE_ORDER = {s: i for i, s in enumerate(ScienceSymbol)}
 _PHASE_ORD = {
     Phase.WONDER_DRAFT: 0,
@@ -1634,6 +1636,88 @@ def test_chance_signature_and_chains_equivalent():
     assert seen_kinds == {0, 1, 2, 3}, f"chance kinds not all covered: {seen_kinds}"
     assert seen_deal_ages == {1, 2, 3}, f"age-deal ages not all covered: {seen_deal_ages}"
     assert multi_reveal_seen, "no sequential multi-reveal action exercised"
+
+
+def _last_card_great_library_position():
+    """A position where the Age's last card can be spent on the Great Library.
+
+    Reached by construction, not by luck: random play almost never leaves the
+    Great Library unbuilt and affordable on exactly the last card of an Age.
+    """
+
+    for seed in range(300):
+        game = new_game(seed, first_player=seed % 2)
+        rng = random.Random(seed)
+        while game.phase is not Phase.COMPLETE:
+            present = sum(1 for card in game.tableau.cards.values() if card.present)
+            if (
+                game.phase is Phase.PLAY_AGE
+                and game.age < 3
+                and game.pending_choice is None
+                and present == 1
+            ):
+                city = game.cities[game.active_player]
+                if "The Great Library" not in city.built_wonders:
+                    for other in game.cities:
+                        if "The Great Library" in other.wonders:
+                            other.wonders.remove("The Great Library")
+                    city.wonders.insert(0, "The Great Library")
+                    city.coins = 100
+                    indices = [
+                        index
+                        for index in legal_action_indices(game)
+                        if decode_action(game, index).wonder_name == "The Great Library"
+                    ]
+                    if indices:
+                        return game, indices[0]
+                break
+            apply_action(
+                game, decode_action(game, rng.choice(legal_action_indices(game)))
+            )
+    raise AssertionError("no last-card Great Library position found")
+
+
+def test_chance_signature_survives_a_last_card_great_library_from_an_injected_state():
+    """The dry run in `exhausts_the_age` must not consume a chance outcome.
+
+    Predicting whether a take ends the Age means applying it to a clone, and
+    building the Great Library draws. Python resolves that from the unseen pool;
+    Rust pops a pre-locked `library_draws` entry, which an INJECTED state
+    deliberately has none of — so the dry run panicked (`great library draw
+    outcome missing from chance log`) instead of returning a signature. Every
+    other test builds its RustGame with the draws supplied up front, which is
+    why none of them saw it.
+    """
+
+    game, index = _last_card_great_library_position()
+    rust = rust_game_from_state(game)  # injected: library_draws is empty
+
+    # No panic, and the deal is NOT predicted here: the draw sets a pending
+    # choice, so the turn defers and the Age ends on the resolution instead.
+    signature = [(kind, list(ctx)) for kind, ctx in rust.chance_signature(index)]
+    assert signature == _expected_signature(game, index)
+    assert signature == [(_CHANCE_KIND_ID[ChanceKind.GREAT_LIBRARY_DRAW], [])]
+
+    # A sibling action at the same root does deal, and both engines say so.
+    plain = [
+        other
+        for other in legal_action_indices(game)
+        if decode_action(game, other).wonder_name is None
+    ]
+    assert plain
+    for other in plain:
+        rust_sig = [(kind, list(ctx)) for kind, ctx in rust.chance_signature(other)]
+        assert rust_sig == _expected_signature(game, other)
+        assert (_CHANCE_KIND_ID[ChanceKind.AGE_DEAL], [game.age + 1]) in rust_sig
+
+    # ... and the deferred deal really does ride on the pending resolution.
+    apply_action(game, decode_action(game, index))
+    assert game.pending_choice is not None
+    resolution = legal_action_indices(game)[0]
+    after = rust_game_from_state(game)
+    assert [(kind, list(ctx)) for kind, ctx in after.chance_signature(resolution)] == [
+        (_CHANCE_KIND_ID[ChanceKind.AGE_DEAL], [game.age + 1])
+    ]
 
 
 def test_sample_outcomes_equivalent():

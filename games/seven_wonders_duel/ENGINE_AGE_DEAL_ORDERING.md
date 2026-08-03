@@ -199,5 +199,34 @@ The only casualty in the tree is `test_bf16_real_position_fidelity`, which reads
 run-03's buffers for 512 real positions; it now skips on that refusal, since its
 subject is bf16 numerics and not engine semantics.
 
-**Still to do:** advisor item F (`ADVISOR_IMPLEMENTATION_PLAN.md`), which this
-change was sequenced ahead of.
+## 8. Review, 2026-08-03
+
+Three findings, all upheld — full record in `AGE_DEAL_ORDERING_REVIEW_REQUEST.md`.
+
+**Two fixed.** The Rust dry run panicked on a last-card Great Library build from
+an *injected* state: Python resolves that draw from the unseen pool, Rust pops a
+pre-locked `library_draws` entry, and injected states carry none. Every test
+supplied the draws up front, so the suite was green over a crash. Fixed by
+installing a throwaway draw before the trial apply, with a regression test on an
+injected position. Separately, `apply_with_chance` never checked *which* events
+the engine actually fired — it compared outcome count against a signature the
+caller derived from that same signature, so neither over- nor under-prediction
+could be detected. `ChanceWitness` now compares before/after evidence, and a
+unit test fires it in both directions.
+
+**One conceded and outstanding.** §2 above says the deficiency is confined to
+the starter-choice *prior*. That is wrong. The paired sampler evaluates 32
+full-tableau `CHOOSE_NEXT_START_PLAYER` children and installs their weighted
+mean as the preceding edge's `initial_q`, so off-distribution **values** reach
+the choice of which last card of the Age to take — one ply wider than claimed,
+on the side that changes play. **A strength gate against the scripted bots,
+before and after, is warranted before the cloud run**; the recipe is in §7 of
+the review request. This does not weaken the case for the reordering, which the
+cloud run makes moot by training under the new engine.
+
+**Throughput measured by the reviewer**: ≈3.96 ms/root in Python, ≈8.3 µs/root
+through the Rust binding — negligible at two boundaries per game. The 160-row
+worst-case burst under the real coalescing scheduler is still unchecked.
+
+**Still to do:** the strength gate above, and advisor item F
+(`ADVISOR_IMPLEMENTATION_PLAN.md`), which this change was sequenced ahead of.
