@@ -33,20 +33,16 @@ The extension talks to `http://127.0.0.1:8000` and sends no checkpoint, so the
 host's env default is what gets used. `http://127.0.0.1:8000/` also serves the
 lab UI, which is a useful way to confirm the host is alive.
 
-**`cpu` is deliberate, not an oversight.** Measured on an RTX 3070 Laptop,
-3,000 sims on the same position:
+**`cpu` is deliberate for the *current* model.** At 1.03M parameters, CPU and
+CUDA measured within ~2% of each other, and CPU additionally skips CUDA context
+init and leaves the GPU free for training runs — which matters for a host that
+sits running for a whole game.
 
-| device | time | throughput |
-|---|---|---|
-| cpu | 0.67s | 4,485 sims/s |
-| cuda | 0.65s | 4,593 sims/s |
-
-A ~2% difference, inside the noise. Search evaluates **one leaf at a time**
-against a **1.03M-parameter** net, which is far too little work per call to
-amortize kernel-launch overhead — the bottleneck is the Python tree walk, not
-the matmuls. CPU additionally skips CUDA context init at startup and leaves the
-GPU free for training runs, which matters when the advisor sits running for a
-whole game. Use `cuda` only if the CPU is otherwise busy.
+**Revisit this for a larger net.** At 11.4M parameters CUDA was 1.6× unbatched
+and 10.2× at batch 32. The advisor now batches leaf evaluation by default
+(`leaf_batch=16`), so that second figure should finally transfer — it did not
+when every leaf was evaluated on its own. See
+`games/seven_wonders_duel/ADVISOR_RUST_UNIFICATION.md` §2.4.
 
 ## 2. Load the extension
 
@@ -132,9 +128,12 @@ change as search deepens.
 * **No wonder-draft advice yet.** The draft is item A in
   `games/seven_wonders_duel/ADVISOR_IMPLEMENTATION_PLAN.md`; the bridge only
   wakes on `playerTurn` and the four mid-move choice states.
-* **Not yet run against a live table.** Every piece is tested — capture,
-  mapping, search, streaming, sprites — but this assembly has not been through a
-  real game. Expect the first session to find something.
+* **Run against a live table 2026-08-02**, and the advice looked sound. That
+  session found three bugs, all since fixed: mixed-content blocking on the
+  content-script fetch, a rejected position latching instead of retrying, and
+  the host's rejection reason being swallowed. **Not re-tested since the Rust
+  searcher, the batched evaluation boundary and the victory-type outlook
+  landed** — the searcher is now ~19× faster than during that session.
 
 ## Troubleshooting
 
