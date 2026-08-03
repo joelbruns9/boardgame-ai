@@ -704,6 +704,8 @@ def test_dom_ahead_of_science_count_is_accepted():
     """
     import copy
 
+    from .bga_extract import wire_from_bga_payload
+
     reference = _load_live_reference()
     payload = copy.deepcopy({"bga": reference["bga"], "dom": reference["dom"]})
     for situation in payload["bga"]["playersSituation"].values():
@@ -716,6 +718,8 @@ def test_dom_behind_science_count_is_still_stale():
     """The direction the check exists for must keep failing: gamedatas left at
     its page-load value while playersSituation stays fresh."""
     import copy
+
+    from .bga_extract import wire_from_bga_payload
 
     reference = _load_live_reference()
     payload = copy.deepcopy({"bga": reference["bga"], "dom": reference["dom"]})
