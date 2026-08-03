@@ -112,6 +112,18 @@ even though the old structure cannot be read back from BGA.
 quietly worse: advice that looks authoritative while ignoring information the
 player can see is worse than no advice.
 
+**Decided 2026-08-02: the engine is being corrected instead**, before the cloud
+run — see `ENGINE_AGE_DEAL_ORDERING.md`. The engine's ordering is a genuine
+rules deviation, not just an advisor inconvenience: it is the only place a
+player is given *less* information than the real game, and the net has learned
+this decision layout-blind across ~168k of them.
+
+That makes F mostly plumbing rather than a modelling problem — once the engine
+deals before asking, it agrees with BGA and the three seeding mechanisms above
+largely evaporate. **Sequence F after the engine change.** No retraining is
+forced by F itself: the two actions already occupy indices 1200/1201 of the
+trained action space and appear 2.0 times per self-play game.
+
 ### G. Wonder art in the panel (small)
 
 Draft rows render the dashed placeholder instead of the wonder. `content.js:150`
