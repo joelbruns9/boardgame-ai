@@ -687,3 +687,39 @@ def test_streaming_search_deepens_a_cumulative_tree():
         while job.active and time.time() < deadline:
             time.sleep(0.05)
     assert not job.active
+
+
+def test_dom_ahead_of_science_count_is_accepted():
+    """The failure a live game hit: "4 science buildings but science count = 3".
+
+    `scienceSymbolCount` counts science CARDS, not distinct symbols -- confirmed
+    on captures where a player holds a duplicated symbol (4 cards / 3 distinct,
+    reported as 4), so a duplicate cannot cause this. What does: BGA places a
+    built card into the DOM immediately (`notif_constructBuilding`) while
+    `scienceSymbolCount` refreshes only on the next state entry, so right after
+    an opponent builds a green card the DOM legitimately leads by one.
+
+    Refusing that would blind the advisor for a turn every time the opponent
+    takes a science card, and the DOM's position is the more current of the two.
+    """
+    import copy
+
+    reference = _load_live_reference()
+    payload = copy.deepcopy({"bga": reference["bga"], "dom": reference["dom"]})
+    for situation in payload["bga"]["playersSituation"].values():
+        situation["scienceSymbolCount"] = int(situation["scienceSymbolCount"]) - 1
+    wire = wire_from_bga_payload(payload)  # must not raise
+    assert wire["observation"]["cities"]
+
+
+def test_dom_behind_science_count_is_still_stale():
+    """The direction the check exists for must keep failing: gamedatas left at
+    its page-load value while playersSituation stays fresh."""
+    import copy
+
+    reference = _load_live_reference()
+    payload = copy.deepcopy({"bga": reference["bga"], "dom": reference["dom"]})
+    for pid in payload["dom"]["playerBuildings"]:
+        payload["dom"]["playerBuildings"][pid] = []
+    with pytest.raises(StaleGamedata):
+        wire_from_bga_payload(payload)

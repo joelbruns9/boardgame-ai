@@ -173,21 +173,37 @@ def _require_base_game(gamedatas: dict) -> None:
 
 
 def _assert_fresh(gamedatas: dict) -> None:
-    """Catch a stale page-load snapshot by an internal-consistency check: each
-    player's count of science-bearing buildings must equal BGA's own reported
-    ``scienceSymbolCount``. A mid-game read where ``playerBuildings`` hasn't been
-    refreshed fails here (e.g. 1 green card owned but 4 symbols reported)."""
+    """Catch a stale page-load snapshot by an internal-consistency check.
+
+    ``scienceSymbolCount`` counts a player's science-bearing **cards**, not their
+    distinct symbols -- verified on captures where a player holds a duplicated
+    symbol (4 cards / 3 distinct, reported as 4). So it should equal the number
+    of science cards we can see.
+
+    Only a *shortfall* is an error. That is the stale direction the check exists
+    for: ``playerBuildings`` left at its page-load value while ``playersSituation``
+    stays fresh, so we see 1 green card against 4 reported.
+
+    A *surplus* is benign and transient. With the DOM patch, buildings are read
+    from the board, which BGA updates the instant a card is placed
+    (``notif_constructBuilding``), while ``scienceSymbolCount`` only refreshes on
+    the next state entry. Right after an opponent builds a green card the DOM
+    legitimately leads by one -- observed live as "4 science buildings but
+    science count = 3". Refusing that would make the advisor blind for a turn
+    every time the opponent takes a science card, and the position it describes
+    is the *more* current of the two.
+    """
     for pid, situation in gamedatas["playersSituation"].items():
         reported = int(situation["scienceSymbolCount"])
         greens = sum(
             CARDS_BY_NAME[_card_name(b["type"])].science is not None
             for b in gamedatas["playerBuildings"].get(pid, [])
         )
-        if greens != reported:
+        if greens < reported:
             raise StaleGamedata(
-                f"player {pid}: {greens} science buildings in playerBuildings but "
-                f"scienceSymbolCount={reported}; gamedatas is stale -- reload the "
-                "table before capturing"
+                f"player {pid}: {greens} science buildings visible but "
+                f"scienceSymbolCount={reported}; gamedatas is stale -- reload "
+                "the table before capturing"
             )
 
 
