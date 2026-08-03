@@ -823,3 +823,27 @@ def test_wonder_and_token_sprite_cells_are_derived_not_read():
     assert max(x for x, _ in wonder_cells) < 5 and max(y for _, y in wonder_cells) < 4
     assert max(x for x, _ in token_cells) < 4 and max(y for _, y in token_cells) < 4
     assert cell(1, 5) == (0, 0) and cell(6, 5) == (0, 1) and cell(12, 5) == (1, 2)
+
+
+def test_a_start_player_capture_before_the_deal_is_refused():
+    """The transient that would otherwise advise on the wrong pyramid.
+
+    BGA deals the new Age and then asks who starts it, but a capture can beat
+    the notification that writes `draftpool`, leaving `gamedatas` describing the
+    Age that just ended -- exhausted. Nothing else catches it: `_assert_fresh`
+    keys on science counts, which are unaffected, and an exhausted structure
+    determinizes cleanly, because it is exactly the shape the pre-2026-08-03
+    engine produced at this phase. Measured before the guard: the wire came out
+    as age 2 with zero cards present and determinized without error.
+    """
+
+    data = _load_age3()
+    data["draftpool"] = {"age": "2", "cards": []}  # previous Age, exhausted
+    with pytest.raises(UnsupportedBgaState, match="before BGA dealt the next one"):
+        wire_from_bga(data)
+
+    # A partial structure is refused for the same reason.
+    full = _load_age3()["draftpool"]["cards"]
+    data["draftpool"] = {"age": "3", "cards": full[:11]}
+    with pytest.raises(UnsupportedBgaState, match="11 of 20"):
+        wire_from_bga(data)

@@ -670,6 +670,30 @@ def wire_from_bga(
         )
     else:
         age = int(draftpool["age"])
+
+    if phase is Phase.CHOOSE_NEXT_START_PLAYER:
+        # BGA deals the new Age and then asks who starts it, so by this state
+        # `draftpool` must hold a full, untouched structure. It does not if the
+        # capture beat the `notif_nextAgeDraftpoolReveal` that writes it
+        # (sevenwondersduel.js:4227 -> :1021): `gamedatas` then still describes
+        # the Age that just ENDED, which is exhausted.
+        #
+        # Nothing downstream catches that. `_assert_fresh` keys on science
+        # counts, which are unaffected, and an exhausted structure determinizes
+        # cleanly -- it is exactly the shape the pre-2026-08-03 engine produced
+        # at this phase. The result would be confident advice about a pyramid
+        # that is not the one on screen, which is the one failure mode this
+        # module exists to make impossible. Transient, and the extension retries
+        # a rejected position.
+        dealt = len(draftpool.get("cards") or ())
+        expected = len(TABLEAU_LAYOUTS[age])
+        if dealt != expected:
+            raise UnsupportedBgaState(
+                f"Age {age} shows {dealt} of {expected} cards at the start-player "
+                "choice -- captured after the Age ended but before BGA dealt the "
+                "next one; retry in a moment"
+            )
+
     board_tokens = [t["type"] for t in gamedatas["progressTokensSituation"].get("board", [])]
     discard_pile = [_card_name(d["type"]) for d in gamedatas.get("discardedBuildings", [])]
     conflict_position, military = _military(gamedatas)
