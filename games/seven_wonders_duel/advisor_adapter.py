@@ -284,6 +284,70 @@ class SevenWondersAdvisor:
                 {"action_id": v.action_id, "label": v.label, "kind": v.kind}
                 for v in self.action_views(state)
             ],
+            "victory_outlook": self._victory_outlook(state),
+        }
+
+    # Class order matches `dataset._joint7_class`: my civ/sci/mil, then the
+    # opponent's, then draw. Actor-framed, like every other value the host sees.
+    _JOINT7_LABELS = (
+        "you_civilian",
+        "you_scientific",
+        "you_military",
+        "opponent_civilian",
+        "opponent_scientific",
+        "opponent_military",
+        "draw",
+    )
+
+    def _victory_outlook(self, state: _Position) -> dict[str, Any] | None:
+        """The net's read of *how* the game ends, not just who wins.
+
+        One root evaluation, no search: these are properties of the position, so
+        they are reported here rather than through an annotator (annotators run
+        only when a search settles, and a streaming search at max_sims=1,000,000
+        never does).
+
+        For 7WD this is often more actionable than the win probability. On the
+        captured Age III position the net gave a -1.03 VP margin -- losing on
+        points -- alongside a 93% *scientific* win: the game ends before scoring.
+        A single number cannot say that.
+
+        Returns None when no evaluator is configured; the caller renders what it
+        gets.
+        """
+        game = state.game
+        if game.phase is Phase.COMPLETE:
+            return None
+        evaluator = self._injected
+        if evaluator is None:
+            if self._default_checkpoint is None:
+                return None
+            try:
+                from .phase_e import load_evaluator
+
+                key = (self._default_checkpoint, self._device)
+                evaluator = self._eval_cache.get(key)
+                if evaluator is None:
+                    evaluator = load_evaluator(self._default_checkpoint, self._device)
+                    self._eval_cache[key] = evaluator
+            except Exception:
+                return None
+        try:
+            row = evaluator.evaluate_states([game])[0]
+        except Exception:
+            return None
+        joint = [float(p) for p in row.joint7]
+        return {
+            "victory_type": dict(zip(self._JOINT7_LABELS, joint)),
+            "you_win": sum(joint[0:3]),
+            "opponent_wins": sum(joint[3:6]),
+            "draw": joint[6],
+            "wdl": [float(x) for x in row.wdl],
+            "vp_margin": float(row.margin),
+            "final_military": float(row.military),
+            # Trained as distinct symbols / 6, so 1.0 means the sixth symbol --
+            # a scientific win. See dataset.py "sci_final my/opp: ... /6".
+            "final_science": [float(x) for x in row.science],
         }
 
     def state_key(self, state: _Position) -> str:

@@ -101,6 +101,21 @@ names (`Chamber Of Commerce`) where the engine follows the printed card
 (`Chamber of Commerce`). Unlike the state mapping, a miss here is cosmetic — you
 get a placeholder instead of a card, never a wrong position.
 
+### The victory-type outlook
+
+Above the move list, the panel shows **how** the net expects the game to end,
+not just who wins — fetched once per position from `/api/state`.
+
+For 7WD that is often the more actionable fact. The committed Age III capture
+reads a **−1.0 VP margin** — losing on points — alongside a **94% scientific
+win**, because the game finishes before scoring ever happens. A single win
+percentage cannot express that.
+
+It comes from the net's `joint7` head (winner × victory type) plus the VP-margin
+and science forecasts, all of which were computed on every evaluation and thrown
+away until now. One root evaluation, so it appears immediately and does not
+change as search deepens.
+
 ### Two display rules that come from measurement
 
 * **The win percentage is withheld below 5,000 sims.** The same position read

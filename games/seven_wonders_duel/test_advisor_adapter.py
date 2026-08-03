@@ -242,3 +242,46 @@ def test_rust_and_python_searchers_produce_the_same_snapshot_shape():
     for stats in rust.entries.values():
         assert -1.0 <= stats.q_value <= 1.0
         assert 0.0 <= stats.prior <= 1.0
+
+
+def test_state_to_public_carries_a_victory_outlook():
+    """`how am I winning` is often more actionable than `am I winning` in 7WD.
+
+    Reported on the position rather than through an annotator: it is one root
+    evaluation and never changes as search deepens, and annotators only run when
+    a search *settles* -- which a streaming search at max_sims=1,000,000 never
+    does, so an annotator would never surface it at all.
+    """
+    adapter = _new_adapter()
+    public = adapter.state_to_public(_scraped_state(adapter))
+    outlook = public["victory_outlook"]
+    assert outlook is not None
+
+    kinds = outlook["victory_type"]
+    assert set(kinds) == {
+        "you_civilian",
+        "you_scientific",
+        "you_military",
+        "opponent_civilian",
+        "opponent_scientific",
+        "opponent_military",
+        "draw",
+    }
+    assert sum(kinds.values()) == pytest.approx(1.0, abs=1e-4)
+    assert outlook["you_win"] + outlook["opponent_wins"] + outlook["draw"] == (
+        pytest.approx(1.0, abs=1e-4)
+    )
+    assert len(outlook["wdl"]) == 3
+    assert len(outlook["final_science"]) == 2
+    assert isinstance(outlook["vp_margin"], float)
+
+
+def test_victory_outlook_is_absent_without_an_evaluator():
+    """No checkpoint configured must degrade to None, not raise: the panel
+    renders what it gets, and a missing stat is not a reason to fail a request."""
+    from .advisor_adapter import SevenWondersAdvisor
+
+    bare = SevenWondersAdvisor()  # no evaluator, no default checkpoint
+    public = bare.state_to_public(_scraped_state(bare))
+    assert public["victory_outlook"] is None
+    assert public["legal_actions"], "the rest of the payload must be unaffected"

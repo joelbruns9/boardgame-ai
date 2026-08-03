@@ -67,6 +67,7 @@
       '<span class="swd-adv-drag" data-role="drag" title="drag">::</span>' +
       "</div>" +
       '<div class="swd-adv-sub" data-role="sub"></div>' +
+      '<div class="swd-adv-outlook" data-role="outlook"></div>' +
       '<div class="swd-adv-rows" data-role="rows"></div>';
     document.body.appendChild(panel);
     makeDraggable(panel, panel.querySelector('[data-role="drag"]'));
@@ -167,6 +168,55 @@
     }
   }
 
+  // How the net expects the game to END, not just who wins. For 7WD that is
+  // usually the more actionable fact: a position can be losing on points and
+  // still be a 93% scientific win, because the game finishes before scoring.
+  // One root evaluation, so it is available immediately and never changes as
+  // search deepens -- rendered once per position, not per poll.
+  const OUTLOOK_LABELS = {
+    you_civilian: "you · civilian",
+    you_scientific: "you · science",
+    you_military: "you · military",
+    opponent_civilian: "opp · civilian",
+    opponent_scientific: "opp · science",
+    opponent_military: "opp · military",
+    draw: "draw",
+  };
+
+  function renderOutlook(outlook) {
+    const box = ensurePanel().querySelector('[data-role="outlook"]');
+    box.textContent = "";
+    if (!outlook) return;
+    const rows = Object.entries(outlook.victory_type || {})
+      .sort((a, b) => b[1] - a[1])
+      .filter(([, p]) => p >= 0.01)
+      .slice(0, 3);
+    for (const [key, p] of rows) {
+      const row = document.createElement("div");
+      row.className = "swd-adv-vt";
+      const bar = document.createElement("span");
+      bar.className = "swd-adv-bar";
+      bar.style.width = Math.max(2, Math.round(p * 100)) + "%";
+      if (key.startsWith("opponent")) bar.classList.add("swd-adv-bar-opp");
+      const txt = document.createElement("span");
+      txt.className = "swd-adv-vt-label";
+      txt.textContent = (OUTLOOK_LABELS[key] || key) + "  " + (p * 100).toFixed(0) + "%";
+      row.append(bar, txt);
+      box.appendChild(row);
+    }
+    const foot = document.createElement("div");
+    foot.className = "swd-adv-vt-foot";
+    const margin = outlook.vp_margin;
+    foot.textContent =
+      "VP margin " +
+      (margin >= 0 ? "+" : "") +
+      margin.toFixed(1) +
+      "  ·  science " +
+      (outlook.final_science || [0, 0]).map((x) => (x * 6).toFixed(1)).join(" / ") +
+      " symbols";
+    box.appendChild(foot);
+  }
+
   // -- advisor --------------------------------------------------------------
 
   // All network goes through the background script: the page is https and the
@@ -235,9 +285,19 @@
     }
   }
 
+  async function fetchOutlook(state) {
+    try {
+      const pub = await post("/api/state", { state });
+      renderOutlook(pub && pub.victory_outlook);
+    } catch (err) {
+      renderOutlook(null); // cosmetic; never blocks the search
+    }
+  }
+
   async function startSearch(state) {
     await stopCurrent();
     setStatus("searching…");
+    fetchOutlook(state);
     let started;
     try {
       started = await post("/api/recommend/start", {

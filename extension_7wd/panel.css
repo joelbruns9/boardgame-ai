@@ -98,3 +98,42 @@
   font-size: 15px;
   font-weight: 600;
 }
+
+/* Victory-type outlook: how the game ends, not just who wins. */
+#swd_advisor_panel .swd-adv-outlook {
+  margin: 2px 0 8px;
+}
+
+#swd_advisor_panel .swd-adv-vt {
+  position: relative;
+  height: 16px;
+  margin: 2px 0;
+  border-radius: 3px;
+  overflow: hidden;
+  background: #ffffff10;
+}
+
+#swd_advisor_panel .swd-adv-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: #35785a;
+}
+
+#swd_advisor_panel .swd-adv-bar-opp {
+  background: #8a3b3b;
+}
+
+#swd_advisor_panel .swd-adv-vt-label {
+  position: relative;
+  display: block;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+#swd_advisor_panel .swd-adv-vt-foot {
+  font-size: 11px;
+  opacity: 0.55;
+  margin-top: 4px;
+}
