@@ -6,10 +6,12 @@ import numpy as np
 import pytest
 
 from .buffer import replay
-from .codec import decode_action
+from .codec import decode_action, legal_action_indices
 from .dataset import FEATURE_COUNTS
 from .engine import apply_action
-from .game import Phase, new_game
+from .f4_corpus import is_paired_age_deal_root
+from .game import ChanceKind, Phase, new_game
+from .search import chance_signature
 from .rust_bridge import (
     phase_d_records_from_rust,
     rust_flat_batch_adapter,
@@ -24,6 +26,21 @@ from .test_rust_engine_equiv import (
     extract_setup,
     random_game,
 )
+
+
+def _pairable_age_deal_root(game):
+    """The take that empties the pyramid: where the paired sampler now acts.
+
+    Every action here must ALSO be pairable, not just two of them, so the tests
+    below can assert that every root edge ends up closed.
+    """
+
+    indices = legal_action_indices(game)
+    return is_paired_age_deal_root(game) and all(
+        [spec.kind for spec in chance_signature(game, decode_action(game, index))]
+        == [ChanceKind.AGE_DEAL]
+        for index in indices
+    )
 
 
 class _DecodingFlatAdapter:
@@ -295,17 +312,19 @@ def test_f4_r1_forced_rows_are_chunked_coalesced_and_accounted():
 def test_f4_r0_paired_age_deal_samples_are_deterministic_and_globally_evaluated():
     import seven_wonders_rust as swr
 
-    _, actions, library = random_game(3, 0)
-    py = new_game(3, first_player=0)
+    # Seed 1 rather than 3: seed 3 never reaches a pairable root, because both
+    # of its Age-ending takes have a single legal action.
+    _, actions, library = random_game(1, 0)
+    py = new_game(1, first_player=0)
     rust = swr.RustGame(
         library_draws=[list(draw) for draw in library], **extract_setup(py)
     )
     for action in actions:
-        if py.phase is Phase.CHOOSE_NEXT_START_PLAYER:
+        if _pairable_age_deal_root(py):
             break
         apply_action(py, decode_action(py, action))
         rust.apply_index(action)
-    assert py.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    assert _pairable_age_deal_root(py)
 
     def run(samples):
         return swr.search_many_flat_net(
@@ -392,17 +411,17 @@ def test_f4_r0_fixed_support_edges_never_grow_and_keep_unit_mass():
 
     import seven_wonders_rust as swr
 
-    _, actions, library = random_game(3, 0)
-    py = new_game(3, first_player=0)
+    _, actions, library = random_game(1, 0)
+    py = new_game(1, first_player=0)
     rust = swr.RustGame(
         library_draws=[list(draw) for draw in library], **extract_setup(py)
     )
     for action in actions:
-        if py.phase is Phase.CHOOSE_NEXT_START_PLAYER:
+        if _pairable_age_deal_root(py):
             break
         apply_action(py, decode_action(py, action))
         rust.apply_index(action)
-    assert py.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    assert _pairable_age_deal_root(py)
 
     samples = 4
     sims = 64

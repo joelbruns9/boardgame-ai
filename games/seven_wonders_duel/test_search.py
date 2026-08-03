@@ -404,10 +404,15 @@ def test_age_deal_key_coalesces_equivalent_hidden_arrangements():
 def test_age_three_deal_samples_have_exactly_three_guilds():
     from games.seven_wonders_duel.search import sample_outcomes, ChanceSpec
 
+    # The last take of Age II is where the Age III deal is now sampled: at the
+    # CHOOSE_NEXT_START_PLAYER that follows, it has already happened.
     game = _play_random(
-        11, until=lambda g: g.phase is Phase.CHOOSE_NEXT_START_PLAYER and g.age == 2
+        11,
+        until=lambda g: g.phase is Phase.PLAY_AGE
+        and g.age == 2
+        and _present_count(g) == 1,
     )
-    assert game.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    assert game.age == 2
     specs = (ChanceSpec(ChanceKind.AGE_DEAL, (3,)),)
     rng = random.Random(0)
     for _ in range(10):
@@ -435,19 +440,32 @@ def test_closed_search_samples_hidden_boundaries_instead_of_reading_them(evaluat
     assert deal_edges
     assert max(len(edge.children) for edge in deal_edges) >= 2  # sampled worlds
 
-    # Age boundary (next-age chooser).
-    boundary = _play_random(
-        11, until=lambda g: g.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    # Age boundary: the deal fires on the take that empties the pyramid, so
+    # the chooser is asked with the new Age already on the table.
+    last_take = _play_random(
+        11,
+        until=lambda g: g.phase is Phase.PLAY_AGE
+        and g.age < 3
+        and _present_count(g) == 1,
     )
     mcts = GumbelMCTS(evaluator, SearchConfig(sims=24, top_k=4, mode="closed", seed=1))
-    result = mcts.search(boundary)
-    assert result.action_index in set(legal_action_indices(boundary))
+    result = mcts.search(last_take)
+    assert result.action_index in set(legal_action_indices(last_take))
     deal_edges = [
         edge
         for edge in mcts._closed_root.edges
         if any(spec.kind is ChanceKind.AGE_DEAL for spec in edge.specs)
     ]
+    assert deal_edges
     assert max(len(edge.children) for edge in deal_edges) >= 2
+
+    # ... and the chooser itself now fires no chance at all.
+    boundary = _play_random(
+        11, until=lambda g: g.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    )
+    mcts = GumbelMCTS(evaluator, SearchConfig(sims=24, top_k=4, mode="closed", seed=1))
+    mcts.search(boundary)
+    assert all(not edge.specs for edge in mcts._closed_root.edges)
 
 
 def test_force_expand_root_chance_materializes_all_enumerable_children(evaluator):

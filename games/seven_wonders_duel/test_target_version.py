@@ -18,9 +18,11 @@ from .buffer import (
     SPEC_VERSION,
     TARGET_VERSION,
     GameRecord,
+    StaleSpecVersionError,
     StaleTargetsError,
     check_target_versions,
     from_json_line,
+    replay,
     target_version_census,
     to_json_line,
 )
@@ -110,3 +112,21 @@ def test_stale_records_pass_when_explicitly_allowed(capsys):
 def test_census_reports_every_definition_present():
     records = [_record(), _record(1), _record(1)]
     assert target_version_census(records) == {TARGET_VERSION: 1, 1: 2}
+
+
+def test_a_record_from_an_older_codec_spec_is_refused_before_replay():
+    """A spec bump means the seed now produces a different game.
+
+    Replay would fail on a digest eventually; it must fail on the VERSION
+    immediately, or the reason looks like corruption instead of a rules change.
+    """
+
+    payload = json.loads(to_json_line(_record()))
+    payload["spec_version"] = "codec-1"
+    stale = from_json_line(json.dumps(payload))  # reading stays permissive
+    assert stale.spec_version == "codec-1"
+
+    with pytest.raises(StaleSpecVersionError) as excinfo:
+        replay(stale)
+    assert "codec-1" in str(excinfo.value)
+    assert SPEC_VERSION in str(excinfo.value)

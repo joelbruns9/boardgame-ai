@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from games.seven_wonders_duel.data import CARDS_BY_NAME, Cost
@@ -9,7 +11,12 @@ from games.seven_wonders_duel.engine import (
     minimum_payment,
     resolve_pending_choice,
 )
-from games.seven_wonders_duel.game import PendingChoiceKind, Phase, new_game
+from games.seven_wonders_duel.game import (
+    ChanceKind,
+    PendingChoiceKind,
+    Phase,
+    new_game,
+)
 from games.seven_wonders_duel.rules import Resource
 
 
@@ -222,6 +229,38 @@ def test_mausoleum_revival_can_chain_into_a_science_pair_pending():
     assert chained.player == 1
     resolve_pending_choice(game, chained.options[0])
     assert game.pending_choice is None
+
+
+def test_the_next_age_is_dealt_before_the_chooser_is_asked():
+    """The chooser looks at the new pyramid, as in the physical game and BGA.
+
+    The AGE_DEAL therefore fires on the take that empties the old Age, and the
+    choice itself fires nothing.
+    """
+
+    game = new_game(7)
+    rng = random.Random(7)
+    result = None
+    while game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        result = apply_action(game, rng.choice(legal_actions(game)))
+
+    deals = [e for e in result.events if e.kind is ChanceKind.AGE_DEAL]
+    assert [e.context for e in deals] == [(2,)]
+
+    observation = game.observation(game.active_player)
+    assert observation.age == 2
+    assert len(observation.tableau) == 20
+    assert all(slot.present for slot in observation.tableau)
+    assert sum(slot.revealed for slot in observation.tableau) == 12  # Age II layout
+
+    choice = apply_action(
+        game, Action(None, ActionUse.CHOOSE_NEXT_START_PLAYER, starting_player=0)
+    )
+    assert choice.events == ()
+    assert game.phase is Phase.PLAY_AGE
+    assert game.active_player == 0
+    # The layout the chooser saw is the one that gets played.
+    assert game.observation(0).tableau == observation.tableau
 
 
 def test_illegal_or_malformed_action_does_not_mutate_tableau():

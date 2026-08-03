@@ -596,6 +596,10 @@ impl GameState {
         } else if self.age == 3 {
             self.resolve_civilian_endgame();
         } else {
+            // The next Age is laid out BEFORE the chooser is asked, as in the
+            // physical game and on BGA: the choice is made looking at the
+            // pyramid. Mirrors Python `_deal_next_age`.
+            self.deal_next_age();
             self.phase = Phase::ChooseNextStartPlayer;
             self.active_player = if self.conflict_position > 0 {
                 1
@@ -762,6 +766,18 @@ impl GameState {
         }
     }
 
+    /// Lay out the next Age from the locked deck (the AGE_DEAL chance event).
+    /// Fires when the current Age is exhausted, before the military chooser is
+    /// asked who starts it. Port of Python `_deal_next_age`.
+    fn deal_next_age(&mut self) {
+        self.age += 1;
+        let deck = self.age_decks[self.age as usize].clone();
+        self.tableau = crate::state::TableauState::from_deck(self.age, &deck);
+    }
+
+    /// Resolve the military chooser's decision. Fires no chance event: the Age
+    /// was dealt when the previous one ran out, so the chooser has already seen
+    /// the layout.
     pub fn start_next_age(&mut self, starting_player: usize) {
         assert_eq!(
             self.phase,
@@ -769,9 +785,6 @@ impl GameState {
             "current age not complete"
         );
         assert!(starting_player < 2, "starting player must be 0 or 1");
-        self.age += 1;
-        let deck = self.age_decks[self.age as usize].clone();
-        self.tableau = crate::state::TableauState::from_deck(self.age, &deck);
         self.active_player = starting_player;
         self.phase = Phase::PlayAge;
     }

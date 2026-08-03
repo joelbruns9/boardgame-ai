@@ -234,10 +234,18 @@ def test_wonder_flip_barrier_and_override():
 
 
 def test_age_transition_emits_age_deal_and_respects_barrier():
+    # The next Age is dealt by the take that empties the pyramid, before the
+    # chooser is asked who starts it — so that is the action carrying AGE_DEAL.
     game = _playing_game(11)
     _advance_until(
         game,
-        lambda g: g.phase in (Phase.CHOOSE_NEXT_START_PLAYER, Phase.COMPLETE),
+        lambda g: g.phase is Phase.COMPLETE
+        or (
+            g.phase is Phase.PLAY_AGE
+            and g.age < 3
+            and g.pending_choice is None
+            and sum(1 for c in g.tableau.cards.values() if c.present) == 1
+        ),
     )
     if game.phase is Phase.COMPLETE:
         pytest.skip("seed ended during Age I")

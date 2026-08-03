@@ -124,6 +124,20 @@ largely evaporate. **Sequence F after the engine change.** No retraining is
 forced by F itself: the two actions already occupy indices 1200/1201 of the
 trained action space and appear 2.0 times per self-play game.
 
+**The engine change SHIPPED 2026-08-03**, so F is unblocked and the three
+mechanisms above are indeed gone: `age_decks[next_age]` is dealt on entry to the
+phase, the AGE_DEAL has already been resolved by the time the chooser is asked,
+and `resample_hidden` no longer has a future age to throw away here. Note two
+things when picking F up:
+
+* **`game.age` during `CHOOSE_NEXT_START_PLAYER` is now the NEW age**, and the
+  tableau is the new pyramid — the paragraph below about an exhausted tableau
+  with all 20 slots `present=False` describes the *old* engine and no longer
+  applies. The reconstruction target is simply the layout BGA already shows.
+* The advisor still serves `laptop_training_03_w7/current_best.pt`, which was
+  trained under the old ordering, so its prior for this decision stays
+  layout-blind. Search partly compensates; the fix arrives with the cloud run.
+
 ### G. Wonder art in the panel (small)
 
 Draft rows render the dashed placeholder instead of the wonder. `content.js:150`

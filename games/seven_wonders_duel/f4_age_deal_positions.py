@@ -6,8 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
+from .f4_corpus import is_paired_age_deal_root
 from .f4_quality import CONTRACT_PATH, _read_jsonl
-from .game import Phase
 from .phase_e import load_evaluator, reconstruct
 from .rust_bridge import rust_flat_batch_adapter, rust_game_from_prefix
 
@@ -19,14 +19,14 @@ def run(args) -> dict:
     prepared = []
     for position in positions:
         state = reconstruct(position)
-        if state.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        if not is_paired_age_deal_root(state):
             continue
         _, rust = rust_game_from_prefix(
             position["game_seed"], position["first_player"], position["prefix"]
         )
         prepared.append((position, rust))
     if not prepared:
-        raise ValueError("corpus contains no choose-next-start-player AgeDeal roots")
+        raise ValueError("corpus contains no pairable AgeDeal roots")
 
     evaluator = load_evaluator(str(args.checkpoint), args.device)
     evaluator.max_batch = args.global_batch_cap

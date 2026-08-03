@@ -61,6 +61,30 @@ def chance_tags(state) -> list[str]:
     return sorted(tags)
 
 
+def is_paired_age_deal_root(state) -> bool:
+    """Can the paired AgeDeal sampler act at this root?
+
+    It pairs sibling actions that all deal the next Age under one common set of
+    deals. Since the deal moved ahead of the starter choice
+    (``ENGINE_AGE_DEAL_ORDERING.md``) that root is the take which empties the
+    pyramid, not ``CHOOSE_NEXT_START_PLAYER``, which now fires no chance at all.
+
+    Mirrors the filter in ``tree_resumable::materialize_paired_age_deals``: at
+    least two actions whose ONLY chance event is the deal. An action that also
+    draws (the Great Library built with the last card) cannot share the sampled
+    outcomes and is left to ordinary sampling.
+    """
+
+    indices = legal_action_indices(state)
+    pairable = sum(
+        1
+        for index in indices
+        if [spec.kind for spec in chance_signature(state, decode_action(state, index))]
+        == [ChanceKind.AGE_DEAL]
+    )
+    return pairable >= 2
+
+
 def build(args) -> dict:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     corpus_cfg = contract["fast_search_quality_gate"]["corpus"]

@@ -197,7 +197,7 @@ Consumers (single source of truth for all three):
 | CARD_REVEAL | a face-down slot becomes accessible after a take | one card id from `pool(back)` | ≤ 11 | uniform `1/|pool|` (exchangeability: face-down-elsewhere vs removed is indistinguishable) |
 | GREAT_LIBRARY_DRAW | Great Library built | unordered 3-subset of the 5 off-board tokens | **C(5,3) = 10** | uniform 1/10 |
 | WONDER_GROUP_REVEAL | 4th pick of draft round 0 | unordered 4-subset of the 8 unseen wonders | C(8,4) = 70 | uniform 1/70 |
-| AGE_DEAL | `start_next_age` (and initial Age I deal) | assignment of unseen cards to the new layout | not enumerable | closed mode: **sample k children**, keyed by observable signature (face-up identities + back-type pattern); open mode: per-descent sample |
+| AGE_DEAL | the take that exhausts an Age (and the 8th draft pick, for Age I) | assignment of unseen cards to the new layout | not enumerable | closed mode: **sample k children**, keyed by observable signature (face-up identities + back-type pattern); open mode: per-descent sample |
 
 Notes:
 - Multiple cards uncovered by one take emit an **ordered list** of CARD_REVEAL
@@ -215,6 +215,15 @@ Notes:
   child. Search across an age boundary normally defers to the NN at the boundary
   (plan §10); the event exists so open-loop determinization and boundary sampling
   are well-defined.
+- **The deal happens BEFORE the starter choice**, matching the physical game and
+  BGA: the player with the weaker military chooses who begins the new Age while
+  looking at its pyramid (`ENGINE_AGE_DEAL_ORDERING.md`, 2026-08-03). So
+  `CHOOSE_NEXT_START_PLAYER` fires no chance event at all, and AGE_DEAL rides on
+  the take that empties the previous Age — or, when that take defers into a
+  pending choice, on the RESOLVE_PENDING_CHOICE that finishes the turn.
+  Whether a given take ends the Age also depends on victories and deferred
+  choices, so `chance_signature` settles it by a precondition-gated dry run
+  rather than by re-deriving the rules (`_exhausts_the_age`).
 
 ### 4.3 Engine API additions (the anti-leak contract)
 

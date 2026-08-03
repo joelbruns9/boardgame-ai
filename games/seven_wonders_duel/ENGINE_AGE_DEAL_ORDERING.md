@@ -4,7 +4,9 @@
 run. The laptop model keeps the current behaviour; this is a pre-run engine
 correction, not a fix to an existing checkpoint.**
 
-Written to be picked up cold. Decided 2026-08-02.
+Written to be picked up cold. Decided 2026-08-02. **SHIPPED 2026-08-03** — see
+"What shipped" at the end, including the two things this plan did not
+anticipate.
 
 ---
 
@@ -123,14 +125,79 @@ handling.
 4. **Bump `SPEC_VERSION`** and confirm old records are refused, not misread.
 5. **Then** advisor item F, which becomes mostly plumbing.
 
-## 6. Open questions
+## 6. Open questions — all three answered
 
-* **Who chooses, and is that already right?** This document only moves the deal.
-  Confirm the chooser is selected per the rules (weaker military; tie → the
-  player who would otherwise start) and that it is unaffected.
+* **Who chooses, and is that already right?** Yes, and untouched.
+  `_finish_turn` picks the player behind on the military track (`conflict_position
+  > 0` means player 0 leads, so player 1 chooses), and on a tie the player who
+  took the last card of the Age. That is the rule.
 * **Does anything else read `tableau` during `CHOOSE_NEXT_START_PLAYER`** and
-  assume it is empty? `advisor_scrape` currently reconstructs that phase not at
-  all, so the risk is inside the engine/encoder only — worth one grep.
-* **`age_deal_samples`** (`SearchConfig`, default 0) controls forced expansion of
-  the age-deal chance node. With the deal happening before the decision, check
-  whether that knob still means the same thing.
+  assume it is empty? No. The encoder already read `obs.tableau` generically;
+  the bots score the *child* state; `advisor_scrape` refuses the phase outright.
+  What did move is the meaning of `game.age` **during** that phase — it is now
+  the new Age, not the exhausted one. One test read it the old way and silently
+  changed subject (see below).
+* **`age_deal_samples`** — the knob's *root* moved, and it had to be retargeted;
+  see below.
+
+## 7. What shipped (2026-08-03)
+
+Both engines moved together, as designed: the AGE_DEAL now fires inside
+`_finish_turn` / `finish_turn` via `_deal_next_age` / `deal_next_age`, and
+`start_next_age` is reduced to setting the active player and the phase.
+`test_rust_engine_equiv` was the gate and is green.
+
+Two consequences this plan did not anticipate, both structural rather than
+incidental:
+
+**1. Predicting the event got harder, and the fix is a dry run.**
+`chance_signature` has to say — from public information, before applying —
+which events an action fires. The starter choice was trivially predictable; the
+take that empties the pyramid is not, because whether it *ends the Age* depends
+on whether the same action wins the game (military or scientific) or defers into
+a pending choice, in which case the deal rides on the later
+RESOLVE_PENDING_CHOICE instead. Re-deriving those rules in the searcher would be
+a second copy of the engine to keep in sync, in two languages.
+
+So `_exhausts_the_age` (and Rust `exhausts_the_age`) applies the action to a
+throwaway clone and reads the resulting phase. A cheap public precondition —
+one present slot for a take, none for a pending resolution — gates the clone, so
+it runs on the one take per Age that can empty the pyramid and never in the hot
+path. The result is still a function of public information, which is what the
+leak-free contract requires: the last card is face up, and so is everything that
+decides whether taking it ends the game.
+
+**2. The paired AgeDeal sampler had to be retargeted or it became a no-op.**
+`materialize_paired_age_deals` keyed off `phase == ChooseNextStartPlayer` — a
+root that now carries no chance at all, so `age_deal_samples` would have
+silently stopped doing anything. It now selects edges whose *only* chance event
+is the deal, requiring at least two of them. That keeps the intent (compare
+sibling actions under one common set of deals), moves it to the root where the
+deal actually happens, and drops the "root AgeDeal actions do not share one
+chance signature" hard error for the case that can now arise legitimately: the
+Great Library built with the last card of an Age draws as well as deals, so it
+cannot share the sampled outcomes and is left to ordinary sampling.
+`is_paired_age_deal_root` in `f4_corpus.py` is the one definition of that
+filter, used by the diagnostic generator and the tests.
+
+**Re-baselined by regeneration, never by loosening** — as §4.1 required:
+
+* `test_search.py::test_closed_search_samples_hidden_boundaries_...` searches
+  the last take, and additionally asserts the chooser root now has no specs.
+* `test_search.py::test_age_three_deal_samples_...` moved to the last take of
+  Age II. It had been passing for the wrong reason: it selected on
+  `age == 2` at the boundary phase, which used to mean the Age II→III
+  transition and now means Age I→II.
+* `test_chance.py::test_age_transition_emits_age_deal_and_respects_barrier`
+  moved to the exhausting take.
+* `test_f4_boundary.py`'s two paired-sampler tests moved to a pairable root, on
+  seed 1 — seed 3 has a single legal action at both of its Age-ending takes.
+
+`SPEC_VERSION` is `codec-2`, and `replay` refuses an older record up front with
+`StaleSpecVersionError` rather than letting it fail confusingly on a digest.
+The only casualty in the tree is `test_bf16_real_position_fidelity`, which reads
+run-03's buffers for 512 real positions; it now skips on that refusal, since its
+subject is bf16 numerics and not engine semantics.
+
+**Still to do:** advisor item F (`ADVISOR_IMPLEMENTATION_PLAN.md`), which this
+change was sequenced ahead of.

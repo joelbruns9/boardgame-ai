@@ -653,26 +653,27 @@ fn materialize_paired_age_deals(
         ));
     }
     let root_id = arena.root_id;
-    // The paired sampler exists to compare the two choices for who starts the
-    // next age.  The eighth wonder-draft pick also carries an AgeDeal chance
-    // spec, but Age I's starter is fixed and that root has no starter choice.
-    // Treat it like ordinary sampled chance instead of evaluating a pointless
-    // common-deal set for its sole action.
-    if arena.nodes[root_id].state.phase != Phase::ChooseNextStartPlayer {
-        return Ok(ForcedRows::default());
-    }
+    // The paired sampler exists to compare sibling actions that all deal the
+    // next age, under one common set of deals.  Since the deal moved ahead of
+    // the starter choice (ENGINE_AGE_DEAL_ORDERING.md) that root is the take
+    // which empties the pyramid, not the starter choice itself.
+    //
+    // Pair only edges whose sole chance event IS the deal.  An action that also
+    // draws (the Great Library built with the last card) has a different
+    // signature and cannot share the sampled outcomes, so it is left to
+    // ordinary sampling rather than made an error.  With fewer than two such
+    // edges there is nothing to pair: that covers the eighth wonder-draft pick,
+    // whose sole action deals Age I.
     let age_edges: Vec<_> = arena.nodes[root_id]
         .edges
         .iter()
         .enumerate()
         .filter(|(_, edge)| {
-            edge.specs
-                .iter()
-                .any(|spec| spec.kind == ChanceKind::AgeDeal)
+            edge.specs.len() == 1 && edge.specs[0].kind == ChanceKind::AgeDeal
         })
         .map(|(index, _)| index)
         .collect();
-    if age_edges.is_empty() {
+    if age_edges.len() < 2 {
         return Ok(ForcedRows::default());
     }
     let signature = |specs: &[ChanceSpec]| -> Vec<_> {

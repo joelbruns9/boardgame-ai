@@ -99,6 +99,37 @@ def _newly_accessible_after_take(observation, taken) -> list[tuple]:
     return sorted(exposed)
 
 
+def _exhausts_the_age(state: GameState, action: Action) -> bool:
+    """Does this action empty the tableau, so the next Age is dealt?
+
+    Decided by applying the action to a throwaway clone rather than by
+    re-deriving the rules here: whether the last take actually ends the Age
+    depends on victories and deferred choices that only the engine knows, and
+    duplicating that in the searcher would be a second copy to keep in sync.
+    A cheap public precondition gates the clone, so it happens only on the one
+    take per Age that can empty the pyramid.
+
+    The result is still a function of public information — the last card is
+    face-up, and so is everything that decides whether taking it ends the
+    game — which is what the leak-free contract requires. The clone is
+    unbarred so its own chance draws resolve from the locked deal; nothing is
+    read back from it but the phase.
+    """
+
+    if state.age >= 3:
+        return False
+    present = sum(1 for card in state.tableau.cards.values() if card.present)
+    if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
+        if present:
+            return False
+    elif present != 1:
+        return False
+    clone = state.clone()
+    clone.search_barrier = False
+    apply_action(clone, action)
+    return clone.phase is Phase.CHOOSE_NEXT_START_PLAYER
+
+
 def chance_signature(state: GameState, action: Action) -> tuple[ChanceSpec, ...]:
     """Predict the chance events an action fires, from public information only
     (implemented against the observation; gated exactly vs engine events)."""
@@ -113,8 +144,12 @@ def chance_signature(state: GameState, action: Action) -> tuple[ChanceSpec, ...]
             specs.append(ChanceSpec(ChanceKind.AGE_DEAL, (1,)))
         return tuple(specs)
     if action.use is ActionUse.CHOOSE_NEXT_START_PLAYER:
-        return (ChanceSpec(ChanceKind.AGE_DEAL, (observation.age + 1,)),)
+        # The Age was dealt when the previous one ran out; the choice itself
+        # fires nothing.
+        return ()
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
+        if _exhausts_the_age(state, action):
+            return (ChanceSpec(ChanceKind.AGE_DEAL, (observation.age + 1,)),)
         return ()
     specs = [
         ChanceSpec(ChanceKind.CARD_REVEAL, (slot_id, back))
@@ -124,6 +159,8 @@ def chance_signature(state: GameState, action: Action) -> tuple[ChanceSpec, ...]
         offboard = unseen_pool(observation).offboard_progress
         if offboard:
             specs.append(ChanceSpec(ChanceKind.GREAT_LIBRARY_DRAW))
+    if _exhausts_the_age(state, action):
+        specs.append(ChanceSpec(ChanceKind.AGE_DEAL, (observation.age + 1,)))
     return tuple(specs)
 
 

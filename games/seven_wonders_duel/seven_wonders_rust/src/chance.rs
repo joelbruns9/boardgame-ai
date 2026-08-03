@@ -8,7 +8,7 @@ use crate::data::{back_type_of, card, layout, wonder_id};
 use crate::engine::{Action, ActionUse};
 use crate::pool::{unseen_pool, UnseenPool};
 use crate::rng::Rng;
-use crate::state::{coverers, GameState};
+use crate::state::{coverers, GameState, Phase};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChanceKind {
@@ -53,6 +53,30 @@ fn newly_accessible_after_take(g: &GameState, taken: usize) -> Vec<(i32, i32, i3
     out
 }
 
+/// Does this action empty the tableau, so the next Age is dealt?
+///
+/// Decided by applying the action to a throwaway clone rather than by
+/// re-deriving the rules here: whether the last take actually ends the Age
+/// depends on victories and deferred choices that only the engine knows. A
+/// cheap public precondition gates the clone, so it happens only on the one
+/// take per Age that can empty the pyramid. Port of Python `_exhausts_the_age`.
+fn exhausts_the_age(g: &GameState, action: &Action) -> bool {
+    if g.age >= 3 {
+        return false;
+    }
+    let present = g.tableau.slots.iter().filter(|s| s.present).count();
+    if action.use_ == ActionUse::ResolvePendingChoice {
+        if present != 0 {
+            return false;
+        }
+    } else if present != 1 {
+        return false;
+    }
+    let mut clone = g.clone();
+    clone.apply_action(action);
+    clone.phase == Phase::ChooseNextStartPlayer
+}
+
 pub fn chance_signature(g: &GameState, action: &Action) -> Vec<ChanceSpec> {
     match action.use_ {
         ActionUse::DraftWonder => {
@@ -72,11 +96,19 @@ pub fn chance_signature(g: &GameState, action: &Action) -> Vec<ChanceSpec> {
             }
             specs
         }
-        ActionUse::ChooseNextStartPlayer => vec![ChanceSpec {
-            kind: ChanceKind::AgeDeal,
-            context: vec![g.age as i32 + 1],
-        }],
-        ActionUse::ResolvePendingChoice => vec![],
+        // The Age was dealt when the previous one ran out; the choice itself
+        // fires nothing.
+        ActionUse::ChooseNextStartPlayer => vec![],
+        ActionUse::ResolvePendingChoice => {
+            if exhausts_the_age(g, action) {
+                vec![ChanceSpec {
+                    kind: ChanceKind::AgeDeal,
+                    context: vec![g.age as i32 + 1],
+                }]
+            } else {
+                vec![]
+            }
+        }
         _ => {
             let taken = action.slot.expect("primary action missing slot");
             let mut specs: Vec<ChanceSpec> = newly_accessible_after_take(g, taken)
@@ -93,6 +125,12 @@ pub fn chance_signature(g: &GameState, action: &Action) -> Vec<ChanceSpec> {
                 specs.push(ChanceSpec {
                     kind: ChanceKind::GreatLibraryDraw,
                     context: vec![],
+                });
+            }
+            if exhausts_the_age(g, action) {
+                specs.push(ChanceSpec {
+                    kind: ChanceKind::AgeDeal,
+                    context: vec![g.age as i32 + 1],
                 });
             }
             specs

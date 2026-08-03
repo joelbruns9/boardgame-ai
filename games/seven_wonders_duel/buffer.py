@@ -20,7 +20,17 @@ from .engine import apply_action
 from .game import GameState, Phase, ResolvedChance, new_game
 
 SCHEMA_VERSION = 1
-SPEC_VERSION = "codec-1"
+SPEC_VERSION = "codec-2"
+"""Version of what a state and an action MEAN, for replay.
+
+1. through 2026-08-02.
+2. the next Age is dealt when the previous one is exhausted, before the
+   military chooser is asked who starts it, instead of as a consequence of that
+   choice (``ENGINE_AGE_DEAL_ORDERING.md``).  The AGE_DEAL chance event moves
+   one move earlier, so the same seed produces a different game and every
+   record written under spec 1 -- including the 84k-game laptop run -- is
+   unreplayable rather than merely stale.
+"""
 
 TARGET_VERSION = 2
 """Version of the TRAINING TARGET definition, independent of the codec.
@@ -86,6 +96,15 @@ class GameRecord:
 
 class ReplayMismatchError(RuntimeError):
     """A recorded game no longer reproduces under the current engine."""
+
+
+class StaleSpecVersionError(ReplayMismatchError):
+    """A record predates a change to what a state or an action MEANS.
+
+    Distinct from an ordinary mismatch: nothing is corrupt, the record simply
+    describes a different game than this engine plays. Raised before replay
+    starts so the reason is the version, not a downstream digest.
+    """
 
 
 OPPONENT_TYPES = ("current_best", "hof", "bot", "hof_bot")
@@ -312,8 +331,17 @@ def replay(record: GameRecord, on_state=None) -> GameState:
     integrity checks pass and BEFORE the move is applied — the hook consumers
     (featurization, reanalyze) use so they can never read from an unverified
     replay.
+
+    A record written under a different ``spec_version`` is refused up front:
+    the digests would fail anyway, but confusingly and only at the end.
     """
 
+    if record.spec_version != SPEC_VERSION:
+        raise StaleSpecVersionError(
+            f"record was written under spec {record.spec_version!r}, this "
+            f"engine is {SPEC_VERSION!r} — the game a seed produces has "
+            "changed, so the record cannot be replayed"
+        )
     game = new_game(record.seed, first_player=record.first_player)
     log_position = 0
     trajectory = hashlib.sha256()

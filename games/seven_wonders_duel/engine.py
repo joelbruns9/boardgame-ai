@@ -466,7 +466,9 @@ def _after_building_constructed(game: GameState, player: int, card: CardData) ->
         _apply_science_building(game, player, card)
 
 
-def _finish_turn(game: GameState, player: int, extra_turn: bool) -> None:
+def _finish_turn(
+    game: GameState, player: int, extra_turn: bool, ctx: _ChanceCtx
+) -> None:
     if game.phase is Phase.COMPLETE:
         return
     if game.pending_choice is not None:
@@ -477,6 +479,9 @@ def _finish_turn(game: GameState, player: int, extra_turn: bool) -> None:
     elif game.age == 3:
         _resolve_civilian_endgame(game)
     else:
+        # The next Age is laid out BEFORE the chooser is asked, as in the
+        # physical game and on BGA: the choice is made looking at the pyramid.
+        _deal_next_age(game, ctx)
         game.phase = Phase.CHOOSE_NEXT_START_PLAYER
         if game.conflict_position > 0:
             game.active_player = 1
@@ -608,7 +613,7 @@ def apply_action(
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
         if action.choice is None:
             raise AssertionError("malformed pending-choice action")
-        resolve_pending_choice(game, action.choice)
+        resolve_pending_choice(game, action.choice, _ctx=ctx)
         return ctx.result()
     if action.use is ActionUse.CHOOSE_NEXT_START_PLAYER:
         if action.starting_player is None:
@@ -627,7 +632,7 @@ def apply_action(
         game.discard_pile.append(card_name)
         yellow_count = _count_color(game, player, CardColor.YELLOW)
         game.cities[player].coins += discard_income(yellow_count)
-        _finish_turn(game, player, False)
+        _finish_turn(game, player, False, ctx)
         return ctx.result()
 
     if action.use is ActionUse.CONSTRUCT_BUILDING:
@@ -639,7 +644,7 @@ def apply_action(
         _after_building_constructed(game, player, card)
         if payment.used_chain and "Urbanism" in game.cities[player].progress_tokens:
             game.cities[player].coins += 4
-        _finish_turn(game, player, False)
+        _finish_turn(game, player, False, ctx)
         return ctx.result()
 
     if action.use is not ActionUse.CONSTRUCT_WONDER or action.wonder_name is None:
@@ -673,11 +678,25 @@ def apply_action(
         game.pending_shields = wonder.shields
     elif wonder.shields:
         _apply_military(game, player, wonder.shields)
-    _finish_turn(game, player, extra_turn)
+    _finish_turn(game, player, extra_turn, ctx)
     return ctx.result()
 
 
-def resolve_pending_choice(game: GameState, choice: str) -> None:
+def resolve_pending_choice(
+    game: GameState,
+    choice: str,
+    *,
+    chance_outcomes=None,
+    _ctx: _ChanceCtx | None = None,
+) -> StepResult:
+    """Resolve the choice a card or Wonder effect is waiting on.
+
+    Takes a chance context because the resolution finishes the deferred turn,
+    which can exhaust the Age and so fire an AGE_DEAL (see
+    :func:`_deal_next_age`).
+    """
+
+    ctx = _ctx if _ctx is not None else _ChanceCtx(game, chance_outcomes)
     pending = game.pending_choice
     if pending is None:
         raise ValueError("there is no pending choice")
@@ -722,12 +741,12 @@ def resolve_pending_choice(game: GameState, choice: str) -> None:
         raise AssertionError(f"unhandled pending choice kind: {pending.kind}")
 
     if game.phase is Phase.COMPLETE:
-        return
+        return ctx.result() if _ctx is None else StepResult()
     if pending_shields:
         _apply_military(game, player, pending_shields)
-    if game.phase is Phase.COMPLETE:
-        return
-    _finish_turn(game, player, extra_turn)
+    if game.phase is not Phase.COMPLETE:
+        _finish_turn(game, player, extra_turn, ctx)
+    return ctx.result() if _ctx is None else StepResult()
 
 
 def _military_victory_points(game: GameState, player: int) -> int:
@@ -870,25 +889,15 @@ def back_type_of_age(age: int) -> BackType:
     return {1: BackType.AGE_I, 2: BackType.AGE_II, 3: BackType.AGE_III}[age]
 
 
-def start_next_age(
-    game: GameState,
-    starting_player: int,
-    *,
-    chance_outcomes=None,
-    _ctx: _ChanceCtx | None = None,
-) -> StepResult:
-    """Prepare the next Age after the military chooser is resolved.
+def _deal_next_age(game: GameState, ctx: _ChanceCtx) -> None:
+    """Lay out the next Age, as an AGE_DEAL chance event.
 
-    Dealing the new tableau is an AGE_DEAL chance event: the simulator uses the
+    Fires when the current Age is exhausted, *before* the military chooser is
+    asked who starts — the chooser sees the new pyramid. The simulator uses the
     deck locked at setup; a searcher supplies a full arrangement (from
     ``pool.resample_hidden`` / a determinizer) via ``chance_outcomes``.
     """
 
-    if game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
-        raise ValueError("the current Age is not complete")
-    if starting_player not in (0, 1):
-        raise ValueError("starting_player must be 0 or 1")
-    ctx = _ctx if _ctx is not None else _ChanceCtx(game, chance_outcomes)
     game.age += 1
     supplied = ctx.draw(ChanceKind.AGE_DEAL)
     if supplied is not None:
@@ -899,6 +908,26 @@ def start_next_age(
     ctx.events.append(
         ResolvedChance(kind=ChanceKind.AGE_DEAL, context=(game.age,), outcome=deal)
     )
+
+
+def start_next_age(
+    game: GameState,
+    starting_player: int,
+    *,
+    chance_outcomes=None,
+    _ctx: _ChanceCtx | None = None,
+) -> StepResult:
+    """Resolve the military chooser's decision and begin the new Age.
+
+    Fires no chance event: the Age was dealt by :func:`_deal_next_age` when the
+    previous one ran out, so the chooser has already seen the layout.
+    """
+
+    if game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        raise ValueError("the current Age is not complete")
+    if starting_player not in (0, 1):
+        raise ValueError("starting_player must be 0 or 1")
+    ctx = _ctx if _ctx is not None else _ChanceCtx(game, chance_outcomes)
     game.active_player = starting_player
     game.phase = Phase.PLAY_AGE
-    return StepResult(events=tuple(ctx.events)) if _ctx is None else StepResult()
+    return ctx.result() if _ctx is None else StepResult()
