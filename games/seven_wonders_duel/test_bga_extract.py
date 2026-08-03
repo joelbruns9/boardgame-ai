@@ -122,8 +122,10 @@ def test_expansion_rejected():
 
 def test_non_play_state_rejected():
     data = _load()
+    # Not a real BGA state name -- the draft is "selectWonder". An unknown
+    # state must still be refused rather than guessed at.
     data["gamestate"]["name"] = "wonderDraft"
-    with pytest.raises(UnsupportedBgaState, match="not a supported PLAY_AGE"):
+    with pytest.raises(UnsupportedBgaState, match="not a supported decision"):
         wire_from_bga(data)
 
 
@@ -144,7 +146,7 @@ def test_military_sign_and_capture_off_center():
 def test_select_start_player_rejected():
     # The real Age III fixture is captured at the between-age start-player choice,
     # which the scrape codec does not cover -- the mapper must refuse it.
-    with pytest.raises(UnsupportedBgaState, match="not a supported PLAY_AGE"):
+    with pytest.raises(UnsupportedBgaState, match="not a supported decision"):
         wire_from_bga(_load_age3())
 
 

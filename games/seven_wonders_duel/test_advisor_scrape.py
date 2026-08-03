@@ -18,7 +18,7 @@ from .advisor_scrape import (
     observation_to_wire,
 )
 from .codec import decode_action, legal_action_indices
-from .engine import apply_action
+from .engine import apply_action, legal_actions
 from .game import Phase, new_game
 
 
@@ -94,10 +94,28 @@ def test_determinization_is_seed_varied_but_public_stable(samples):
     assert a.setup_fingerprint() != b.setup_fingerprint()
 
 
-def test_draft_phase_is_rejected():
+def test_draft_phase_is_supported():
+    """The draft used to be rejected as "not reconstructable from a single public
+    observation". It is: the hidden part is a uniform 4-of-8 partition, which is
+    the same kind of thing the age-deck determinizer already samples. Covered in
+    depth by test_advisor_draft.py."""
     obs = new_game(9).observation(0)
-    with pytest.raises(ValueError, match="PLAY_AGE"):
-        determinize_observation(obs, random.Random(0))
+    state = determinize_observation(obs, random.Random(0))
+    assert state.phase is Phase.WONDER_DRAFT
+    assert state.observation(0) == obs
+
+
+def test_between_age_start_player_phase_is_still_rejected():
+    """Supporting the draft must not widen the codec's scope by accident."""
+    game = new_game(9)
+    rng = random.Random(0)
+    while game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        actions = legal_actions(game)
+        if not actions:
+            pytest.skip("no start-player choice reached")
+        apply_action(game, rng.choice(actions))
+    with pytest.raises(ValueError, match="WONDER_DRAFT/PLAY_AGE/COMPLETE"):
+        determinize_observation(game.observation(0), random.Random(0))
 
 
 def test_adapter_scrape_path_recommends(samples):

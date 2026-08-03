@@ -17,19 +17,38 @@ BGA ships an update, re-check rather than assume.
 | ~~B~~ | ~~Fresh board state without a page reload~~ | **DONE 2026-08-02** | verified live against table 892846644 |
 | ~~C~~ | ~~Host `{"bga": …}` branch~~ | **DONE 2026-08-02** | adapter accepts `{"bga","args","dom","log"}` |
 | ~~D~~ | ~~Browser extension~~ | **BUILT 2026-08-02** | `extension_7wd/`, ran against a live game |
-| A | Wonder-draft support in the scrape codec + BGA mapper | 1–2 days | yes — the advisor is silent for 6 real decisions a game |
+| ~~A~~ | ~~Wonder-draft support in the scrape codec + BGA mapper~~ | **DONE 2026-08-02** | draft advice live; see below |
+| ~~stats~~ | ~~Panel victory-type outlook~~ | **DONE 2026-08-02** | `state_to_public.victory_outlook` |
 | E | Draft-preference extraction | ~half day | no — analysis, not play |
 
 **What is actually left**
 
-1. **Item A — the wonder draft.** The only unbuilt feature of consequence.
-2. **Panel statistics.** `joint7`, `wdl`, `margin`, `military` and `science` are
-   computed on every evaluation and discarded. For 7WD "how am I winning" is
-   usually more actionable than the win percentage — the captured position was a
-   −1 VP margin with a 93% *scientific* win.
-3. **Re-test the extension.** It last ran before the Rust searcher, the batched
-   evaluation boundary and the job idle-timeout landed.
-4. **Item E**, which needs A.
+1. **Re-test the extension.** It last ran before the Rust searcher, the batched
+   evaluation boundary, the victory-type outlook and the draft landed.
+2. **Item E** — draft-preference extraction, now unblocked by A.
+
+**Item A shipped 2026-08-02.** The draft was long assumed unreconstructable from
+a public observation; it is not. BGA reveals only the current group, so the
+hidden part is a uniform 4-of-8 partition into (group 2 | never-dealt box) — 70
+equally likely splits, the same kind of object the age-deck determinizer already
+samples. It needs its own branch only because no age is dealt yet, so there is no
+tableau to reconstruct.
+
+Two things that were not obvious:
+
+* **`first_player` must be derived, and it is load-bearing.** `pick_wonder`
+  asserts `active_player == _draft_order(round)[pick_index]`, and the skeleton
+  state starts at `first_player = 0`, so a wrong derivation fires that assertion
+  rather than quietly misplaying.
+* **Pick order is not the concatenation of the two players' lists.** That
+  interleaves rounds the moment round 1 starts, and `taken[:4]` stops being
+  group 0. It *is* recoverable: the draft sequence is fixed once `first_player`
+  is known, so replay it and pop from each player's list.
+
+On the real captured draft (`testdata/bga_892846644_draft.json`), aggregated over
+6 determinizations, the net wants **The Sphinx** (87.8% of visits, Q +0.15) and
+ranks **The Great Library last** (0.4%) — the wonder actually taken first in that
+game. That disagreement is item E's whole subject.
 
 Play advice works end to end today: capture without reload, streaming search,
 ranked moves with card art. The searcher moved to Rust and is ~19× faster than

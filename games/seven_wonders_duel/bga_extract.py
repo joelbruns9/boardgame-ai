@@ -21,8 +21,8 @@ already exposes in ``buildings[id].name`` / ``wonders[id].name`` / token
 ``type``).
 
 Scope (mirrors the scrape codec it feeds):
-  * PLAY_AGE only -- the position a human actually asks about. Wonder draft,
-    the between-age start-player choice, and mid-move pending choices raise
+  * WONDER_DRAFT and PLAY_AGE, plus the four mid-move pending choices. The
+    between-age start-player choice and both expansions raise
     ``UnsupportedBgaState`` rather than emit a wrong position.
   * Base game only. Agora/Pantheon expansions raise (the trained net's action
     space doesn't include them).
@@ -193,13 +193,28 @@ def _assert_fresh(gamedatas: dict) -> None:
 
 def _phase(gamedatas: dict) -> Phase:
     name = gamedatas["gamestate"]["name"]
+    if name == _DRAFT_STATE:
+        return Phase.WONDER_DRAFT
     if name != _MAIN_TURN_STATE and name not in _PENDING_STATES:
         raise UnsupportedBgaState(
-            f"game state {name!r} is not a supported PLAY_AGE decision; "
-            "the scrape wire covers the main age-card turn and its mid-move "
-            "pending choices only"
+            f"game state {name!r} is not a supported decision; the scrape wire "
+            "covers the wonder draft, the main age-card turn, and its mid-move "
+            "pending choices"
         )
     return Phase.PLAY_AGE  # pending choices are resolved within the PLAY_AGE turn
+
+
+def _wonder_offer(gamedatas: dict) -> list[str]:
+    """Wonders still on offer this draft round, in BGA's display order.
+
+    `wondersSituation.selection` holds only `selection{round}` -- BGA never
+    reveals the second group during the first round (`Wonders::getSituation`,
+    modules/php/Wonders.php:24-30), which is exactly the hidden information the
+    determinizer samples.
+    """
+    wlookup = gamedatas["wonders"]
+    selection = gamedatas["wondersSituation"].get("selection") or []
+    return [wlookup[str(row["id"])]["name"] for row in selection]
 
 
 def _destroy_color(gamedatas: dict) -> CardColor:
@@ -592,8 +607,13 @@ def wire_from_bga(
     emits a plausible-but-wrong wire.
     """
     _require_base_game(gamedatas)
-    _assert_fresh(gamedatas)
     phase = _phase(gamedatas)
+    if phase is not Phase.WONDER_DRAFT:
+        # Blind during the draft anyway -- it compares science-card counts, and
+        # both players have none. Freshness there rests on the DOM patch, which
+        # rewrites wondersSituation (stale for the whole draft; see
+        # ADVISOR_IMPLEMENTATION_PLAN.md "the fifth stale field").
+        _assert_fresh(gamedatas)
     p0, p1 = _seat_order(gamedatas)
 
     active_id = _sid(gamedatas["gamestate"], "active_player")
@@ -601,14 +621,18 @@ def wire_from_bga(
 
     # getAllDatas only fills draftpool once the wonder selection is empty
     # (sevenwondersduel.game.php:685-688), so during the draft it arrives as
-    # `[]`. _phase already rejects that state; guard anyway so a future caller
-    # gets the typed error rather than a TypeError on list indices.
+    # `[]`. That is expected there -- no age has been dealt -- and a hard error
+    # anywhere else.
     draftpool = gamedatas["draftpool"]
-    if not isinstance(draftpool, dict):
+    drafting = phase is Phase.WONDER_DRAFT
+    if drafting:
+        age = 1  # the first age is dealt when the draft ends
+    elif not isinstance(draftpool, dict):
         raise UnsupportedBgaState(
-            "draftpool is empty -- no age has been dealt yet (wonder draft)"
+            "draftpool is empty but the game is past the wonder draft"
         )
-    age = int(draftpool["age"])
+    else:
+        age = int(draftpool["age"])
     board_tokens = [t["type"] for t in gamedatas["progressTokensSituation"].get("board", [])]
     discard_pile = [_card_name(d["type"]) for d in gamedatas.get("discardedBuildings", [])]
     conflict_position, military = _military(gamedatas)
@@ -631,8 +655,9 @@ def wire_from_bga(
         "age": age,
         "cities": [_city(gamedatas, p0), _city(gamedatas, p1)],
         "available_progress_tokens": board_tokens,
-        "wonder_offer": [],  # empty outside WONDER_DRAFT
-        "tableau": _tableau(gamedatas, age),
+        "wonder_offer": _wonder_offer(gamedatas) if drafting else [],
+        # No age is dealt during the draft, so there is no structure to read.
+        "tableau": [] if drafting else _tableau(gamedatas, age),
         "discard_pile": discard_pile,
         "buried_cards": [],       # Pantheon-only; base game empty
         "wonder_burials": [list(pair) for pair in burials],

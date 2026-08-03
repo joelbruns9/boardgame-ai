@@ -16,11 +16,17 @@ Strategy (leaning on the existing determinizer):
      reshuffles the current age within the multiset from step 2, producing a
      valid, uniformly-random determinization.
 
-Supported: ``PLAY_AGE`` (the position a human actually asks about) and, for
-state-building only, ``COMPLETE`` (terminal -> no search).  ``WONDER_DRAFT`` and
-the between-age ``CHOOSE_NEXT_START_PLAYER`` transition are rejected: their
-hidden structure is not reconstructable from a single public observation, and
-the seed+prefix wire covers local analysis of those.
+Supported: ``WONDER_DRAFT`` and ``PLAY_AGE`` (the positions a human actually asks
+about) and, for state-building only, ``COMPLETE`` (terminal -> no search).  The
+between-age ``CHOOSE_NEXT_START_PLAYER`` transition is still rejected; the
+seed+prefix wire covers local analysis of it.
+
+The draft was long assumed unreconstructable. It is not: BGA shows only the
+current group, so the hidden part is a uniform 4-of-8 partition into
+(group 2 | never-dealt box) -- 70 equally likely splits -- which is the same kind
+of object the age-deck determinizer already samples. It needs its own branch
+because no age is dealt yet, so there is no tableau at all. See
+``_determinize_draft``.
 """
 
 from __future__ import annotations
@@ -53,7 +59,7 @@ from .game import (
 )
 from .pool import BACK_UNIVERSES, unseen_pool
 
-_SUPPORTED = (Phase.PLAY_AGE, Phase.COMPLETE)
+_SUPPORTED = (Phase.WONDER_DRAFT, Phase.PLAY_AGE, Phase.COMPLETE)
 
 
 def determinize_observation(
@@ -79,8 +85,8 @@ def determinize_observation(
 
     if obs.phase not in _SUPPORTED:
         raise ValueError(
-            f"scrape codec supports PLAY_AGE/COMPLETE, not {obs.phase.name}; "
-            "use the seed+prefix wire for that position"
+            f"scrape codec supports WONDER_DRAFT/PLAY_AGE/COMPLETE, not "
+            f"{obs.phase.name}; use the seed+prefix wire for that position"
         )
 
     state = new_game(0, 0)
@@ -113,6 +119,9 @@ def determinize_observation(
     state.winner = obs.winner
     state.victory_type = obs.victory_type
     state.final_scores = obs.final_scores
+    # A finished draft is the right default for PLAY_AGE/COMPLETE: round 1
+    # (0-indexed: the second group), all four taken. The draft branch below
+    # overwrites all three.
     state.wonder_offer = []
     state.wonder_round = 1
     state.wonder_pick_index = 4
@@ -122,6 +131,10 @@ def determinize_observation(
         sorted(pool.offboard_progress, key=PROGRESS_IDS.__getitem__)
     )
     state.unused_wonders = tuple(sorted(pool.wonders, key=WONDER_IDS.__getitem__))
+
+    if obs.phase is Phase.WONDER_DRAFT:
+        _determinize_draft(state, obs, pool, rng)
+        return state
 
     # 2. current-age tableau + hidden multiset ------------------------------
     layout = TABLEAU_LAYOUTS[obs.age]
@@ -218,6 +231,82 @@ def determinize_observation(
 
     resample_hidden(state, rng)
     return state
+
+
+def _determinize_draft(state, obs, pool, rng: random.Random) -> None:
+    """Fill a WONDER_DRAFT position.
+
+    Nothing here touches the tableau: at draft time no age has been dealt, so the
+    PLAY_AGE block's assumption of a live structure with face-down slots does not
+    hold. `resample_hidden` deals all three ages from scratch for a draft state.
+
+    The hidden information is a partition, not a deck. In round 0 BGA shows only
+    the current group (`Wonders::getSituation` returns just `selection{round}`),
+    so the unknown is which 4 of the 8 unseen wonders form group 2 and which 4
+    are the never-dealt box -- C(8,4) = 70 equally likely partitions. In round 1
+    group 2 is visible and only the 4 box wonders remain hidden, which can no
+    longer affect play.
+    """
+
+    picked = sum(len(city.wonders) + len(city.built_wonders) for city in obs.cities)
+    state.wonder_round = picked // 4  # 0-indexed: 0 is the first group
+    state.wonder_pick_index = picked % 4
+    state.wonder_offer = list(obs.wonder_offer)
+
+    # `pick_wonder` asserts active_player == _draft_order(round)[pick_index], and
+    # new_game(0, 0) leaves first_player = 0, so a draft state MUST set it or
+    # that assertion fires. _draft_order is (f, 1-f, 1-f, f) for round 0 and
+    # (1-f, f, f, 1-f) for round 1 -- BGA's "A-B-B-A, then B-A-A-B"
+    # (WonderSelectedTrait.php:10) -- so the seat that picks at index 0 or 3 of
+    # round 0 is the first player, and round 1 mirrors it.
+    at_ends = state.wonder_pick_index in (0, 3)
+    if state.wonder_round == 0:
+        state.first_player = obs.active_player if at_ends else 1 - obs.active_player
+    else:
+        state.first_player = 1 - obs.active_player if at_ends else obs.active_player
+
+    # wonder_groups must be reconstructed because pick_wonder reads
+    # wonder_groups[1] when it flips the second group face-up.
+    #
+    # This needs picks in CHRONOLOGICAL order, and the observation only gives
+    # them per player. Concatenating the two lists is wrong the moment round 1
+    # starts -- it interleaves rounds and `taken[:4]` stops being group 0. The
+    # global order is recoverable though: the draft sequence is fixed once
+    # first_player is known, so replay it and pop from each player's list, which
+    # `pick_wonder` appends to in pick order.
+    def _order(round_index: int) -> tuple[int, int, int, int]:
+        first = state.first_player if round_index == 0 else 1 - state.first_player
+        return (first, 1 - first, 1 - first, first)
+
+    queues = [
+        list(city.wonders) + list(city.built_wonders) for city in obs.cities
+    ]
+    sequence: list[str] = []
+    for seat in (_order(0) + _order(1))[:picked]:
+        sequence.append(queues[seat].pop(0))
+
+    taken = sequence
+    if state.wonder_round == 0:
+        # Everything picked so far came out of group 0, and the rest of group 0
+        # is still on offer. Group 1 is a uniform 4-subset of the unseen 8.
+        group0 = list(taken) + list(state.wonder_offer)
+        hidden = sorted(pool.wonders, key=WONDER_IDS.__getitem__)
+        rng.shuffle(hidden)
+        group1 = hidden[:4]
+        state.unused_wonders = tuple(hidden[4:])
+    else:
+        # Group 0 is exactly the first four picks; group 1 is the rest plus what
+        # is still on offer. Only the 4 box wonders stay hidden.
+        group0 = list(taken[:4])
+        group1 = list(taken[4:]) + list(state.wonder_offer)
+    state.wonder_groups = (tuple(group0), tuple(group1))
+
+    # No age is dealt yet, so there is no tableau and no current-age multiset.
+    state.tableau = TableauState(age=obs.age, cards={})
+
+    from .pool import resample_hidden
+
+    resample_hidden(state, rng)
 
 
 # --------------------------------------------------------------------------
