@@ -21,13 +21,15 @@
   const TAG = "swd-advisor";
 
   // States where the advisor has something to say. Mirrors _DRAFT_STATE,
-  // _MAIN_TURN_STATE and _PENDING_STATES in bga_extract.py; anything else is
-  // skipped rather than sent, so the Python side never has to reject a routine
-  // transition. BGA auto-picks the last wonder of each round
-  // (SelectWonderTrait.php:31-41), so only 6 of the 8 picks ever reach us.
+  // _MAIN_TURN_STATE, _START_PLAYER_STATE and _PENDING_STATES in
+  // bga_extract.py; anything else is skipped rather than sent, so the Python
+  // side never has to reject a routine transition. BGA auto-picks the last
+  // wonder of each round (SelectWonderTrait.php:31-41), so only 6 of the 8
+  // picks ever reach us. selectStartPlayer reaches us twice a game.
   const ADVISABLE = new Set([
     "selectWonder",
     "playerTurn",
+    "selectStartPlayer",
     "chooseProgressToken",
     "chooseOpponentBuilding",
     "chooseDiscardedBuilding",

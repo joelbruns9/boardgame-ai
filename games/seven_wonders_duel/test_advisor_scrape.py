@@ -105,8 +105,16 @@ def test_draft_phase_is_supported():
     assert state.observation(0) == obs
 
 
-def test_between_age_start_player_phase_is_still_rejected():
-    """Supporting the draft must not widen the codec's scope by accident."""
+def test_between_age_start_player_position_reconstructs():
+    """The position this codec used to refuse (advisor item F).
+
+    It was refused because the engine dealt the next Age as a *consequence* of
+    the choice, so there was no pyramid in the observation to reconstruct and a
+    faithful model would have answered a different question from the one on
+    screen. The engine now deals first, so the ordinary PLAY_AGE path covers it
+    with no branch of its own.
+    """
+
     game = new_game(9)
     rng = random.Random(0)
     while game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
@@ -114,8 +122,48 @@ def test_between_age_start_player_phase_is_still_rejected():
         if not actions:
             pytest.skip("no start-player choice reached")
         apply_action(game, rng.choice(actions))
-    with pytest.raises(ValueError, match="WONDER_DRAFT/PLAY_AGE/COMPLETE"):
-        determinize_observation(game.observation(0), random.Random(0))
+
+    obs = game.observation(game.active_player)
+    state = determinize_observation(obs, random.Random(0))
+    assert state.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    assert state.observation(game.active_player) == obs  # public-exact
+    # The new Age is on the table and is what the chooser is choosing about.
+    assert state.age == game.age
+    assert sum(1 for card in state.tableau.cards.values() if card.present) == 20
+    assert {
+        decode_action(state, index).starting_player
+        for index in legal_action_indices(state)
+    } == {0, 1}
+
+
+def test_a_search_runs_on_a_reconstructed_start_player_position():
+    """Wire-level round-tripping is not enough, and has missed a crash before.
+
+    The mid-move CARD_REVEAL bug passed every wire test and died one ply into a
+    real search, so this position gets searched rather than merely rebuilt.
+    """
+
+    from .inference import Evaluator
+    from .search import GumbelMCTS, SearchConfig
+    from .train import build_model
+
+    game = new_game(9)
+    rng = random.Random(0)
+    while game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        actions = legal_actions(game)
+        if not actions:
+            pytest.skip("no start-player choice reached")
+        apply_action(game, rng.choice(actions))
+
+    state = determinize_observation(game.observation(game.active_player), random.Random(0))
+    state.search_barrier = True  # search must never read a hidden identity
+    mcts = GumbelMCTS(
+        Evaluator(build_model("transformer", 32, 1), "cpu"),
+        SearchConfig(sims=120, top_k=2, mode="closed", seed=0),
+    )
+    result = mcts.search(state)
+    assert result.action_index in set(legal_action_indices(state))
+    assert sum(result.visits.values()) > 0
 
 
 def test_adapter_scrape_path_recommends(samples):

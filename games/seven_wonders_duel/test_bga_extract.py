@@ -143,11 +143,50 @@ def test_military_sign_and_capture_off_center():
     assert sorted(obs["military_tokens_remaining"]) == [[-7, 5], [7, 5]]
 
 
-def test_select_start_player_rejected():
-    # The real Age III fixture is captured at the between-age start-player choice,
-    # which the scrape codec does not cover -- the mapper must refuse it.
+def test_select_start_player_maps_the_dealt_age():
+    """Advisor item F, on the real capture that was taken at that very state.
+
+    Every other test in this file rewrites this fixture's state name to
+    `playerTurn` to borrow its board; here it is used as itself. BGA deals the
+    Age before asking who starts it, so `draftpool` already holds all 20 Age III
+    cards and the mapper needs no special case beyond recognising the state.
+    """
+
+    wire = wire_from_bga(_load_age3())
+    obs = wire["observation"]
+    assert obs["phase"] == Phase.CHOOSE_NEXT_START_PLAYER.value
+    assert obs["age"] == 3
+    assert sum(1 for slot in obs["tableau"] if slot["present"]) == 20
+    assert sum(1 for slot in obs["tableau"] if slot["revealed"]) == 12
+    assert obs["pending_choice"] is None
+
+
+def test_select_start_player_reconstructs_and_offers_both_choices():
+    """The end-to-end proof for item F: live gamedatas -> ranked decision."""
+
+    from .codec import decode_action, legal_action_indices
+
+    wire = wire_from_bga(_load_age3())
+    state = determinize_observation(
+        observation_from_wire(wire["observation"]),
+        random.Random(0),
+        unknown_burial_ages=tuple(wire.get("unknown_burial_ages", ())),
+    )
+    assert state.phase is Phase.CHOOSE_NEXT_START_PLAYER
+    assert state.age == 3
+    assert {
+        decode_action(state, index).starting_player
+        for index in legal_action_indices(state)
+    } == {0, 1}
+
+
+def test_an_unknown_game_state_is_still_refused():
+    """Item F must not widen the supported set by accident."""
+
+    data = _load_age3()
+    data["gamestate"]["name"] = "someFutureExpansionState"
     with pytest.raises(UnsupportedBgaState, match="not a supported decision"):
-        wire_from_bga(_load_age3())
+        wire_from_bga(data)
 
 
 def test_stale_snapshot_detected():

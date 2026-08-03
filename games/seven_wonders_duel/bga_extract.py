@@ -70,6 +70,13 @@ _MAIN_TURN_STATE = "playerTurn"
 # and nowhere else.
 _DRAFT_STATE = "selectWonder"
 
+# BGA asks the player behind on the military track who begins the next Age. BGA
+# deals that Age BEFORE asking, so `draftpool` already holds the new pyramid and
+# the position reads exactly like a main turn -- which is why supporting it is
+# mapping, not modelling. The engine agreed to this ordering on 2026-08-03; see
+# ENGINE_AGE_DEAL_ORDERING.md.
+_START_PLAYER_STATE = "selectStartPlayer"
+
 # BGA mid-move pending-choice states -> engine PendingChoiceKind. All occur while
 # the engine phase is still PLAY_AGE (a pending_choice is set on the same turn),
 # so the scrape codec already handles them; only the mapping was missing.
@@ -211,11 +218,13 @@ def _phase(gamedatas: dict) -> Phase:
     name = gamedatas["gamestate"]["name"]
     if name == _DRAFT_STATE:
         return Phase.WONDER_DRAFT
+    if name == _START_PLAYER_STATE:
+        return Phase.CHOOSE_NEXT_START_PLAYER
     if name != _MAIN_TURN_STATE and name not in _PENDING_STATES:
         raise UnsupportedBgaState(
             f"game state {name!r} is not a supported decision; the scrape wire "
-            "covers the wonder draft, the main age-card turn, and its mid-move "
-            "pending choices"
+            "covers the wonder draft, the main age-card turn and its mid-move "
+            "pending choices, and the between-age start-player choice"
         )
     return Phase.PLAY_AGE  # pending choices are resolved within the PLAY_AGE turn
 

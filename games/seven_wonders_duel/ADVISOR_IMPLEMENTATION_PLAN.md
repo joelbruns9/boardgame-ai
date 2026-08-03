@@ -25,7 +25,7 @@ BGA ships an update, re-check rather than assume.
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| F | Start-player choice for the next age | ~1 day | a decision you are asked and get nothing for |
+| ~~F~~ | ~~Start-player choice for the next age~~ | **DONE 2026-08-03** | verified on the real `selectStartPlayer` capture |
 | G | Wonder art in the panel | ~15 min | draft rows show a placeholder |
 | H | Follow-up move in the panel (Mausoleum et al.) | ~half day | advice is correct but incomplete |
 | E | Draft-preference extraction | ~half day | analysis, not play |
@@ -64,7 +64,46 @@ independent track that neither blocks nor is blocked by this one.
 
 ## Remaining work
 
-### F. Start-player choice for the next age (`selectStartPlayer`)
+### F. Start-player choice for the next age — DONE 2026-08-03
+
+**It came out as four lines of mapping plus tests**, exactly as predicted once
+the engine dealt before asking. No branch was needed in the determinizer: the
+observation now carries the new Age's pyramid, so the ordinary PLAY_AGE path
+reconstructs it. What shipped:
+
+* `bga_extract._START_PLAYER_STATE = "selectStartPlayer"` mapped in `_phase`.
+* `advisor_scrape._SUPPORTED` gained `CHOOSE_NEXT_START_PLAYER`, and the refusal
+  message now lists the supported set rather than hardcoding it.
+* `page_bridge.js` `ADVISABLE` gained `selectStartPlayer`, or the panel would
+  never have asked — the mapper alone is not enough.
+* The action label is actor-framed like everything else the host renders:
+  "You start Age 3" / "Opponent starts Age 3", naming the Age because it is now
+  dealt and on screen.
+
+**Verified on the real capture, not a synthetic one.**
+`testdata/bga_887892216_ageiii.json` was taken at this very state; every other
+test in `test_bga_extract.py` rewrites its state name to `playerTurn` to borrow
+its board, and it is now also used as itself. End to end: `gamedatas` → wire
+(age 3, 20 present, 12 revealed) → determinize (public-exact) → both starter
+choices legal → a 200-sim search through the adapter's Rust path returns a
+ranked recommendation. A synthetic-position test also searches the
+reconstruction under a barrier, because wire-level round-tripping has missed a
+crash before (see the mid-move CARD_REVEAL item below).
+
+**The freshness question this rested on is settled structurally**, not just
+empirically: `notif_nextAgeDraftpoolReveal` (`sevenwondersduel.js:4227`) calls
+`updateDraftpool`, which writes `this.gamedatas.draftpool = draftpool` whenever
+`draftpool.age >= currentAge` (`:1018-1021`). So the new pyramid is a field BGA
+actively refreshes, unlike the five stale ones the DOM patch covers — and the
+patch correctly leaves it alone.
+
+**Known gap, deliberately left:** the two rows render with the dashed art
+placeholder, since a starter choice has neither `card_name` nor `wonder_name`.
+That is item G's territory.
+
+The original analysis follows.
+
+### F (original analysis)
 
 Two decisions a game (Age I→II, II→III) and the advisor is silent for both:
 `Phase.CHOOSE_NEXT_START_PLAYER` is still refused by the scrape codec, with a

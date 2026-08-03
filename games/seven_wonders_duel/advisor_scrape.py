@@ -16,10 +16,18 @@ Strategy (leaning on the existing determinizer):
      reshuffles the current age within the multiset from step 2, producing a
      valid, uniformly-random determinization.
 
-Supported: ``WONDER_DRAFT`` and ``PLAY_AGE`` (the positions a human actually asks
-about) and, for state-building only, ``COMPLETE`` (terminal -> no search).  The
-between-age ``CHOOSE_NEXT_START_PLAYER`` transition is still rejected; the
-seed+prefix wire covers local analysis of it.
+Supported: every position a human is actually asked about -- ``WONDER_DRAFT``,
+``PLAY_AGE``, and ``CHOOSE_NEXT_START_PLAYER`` -- plus, for state-building only,
+``COMPLETE`` (terminal -> no search).
+
+``CHOOSE_NEXT_START_PLAYER`` needs no branch of its own. It used to be refused
+because the engine dealt the next Age as a *consequence* of the choice, so a
+faithful reconstruction would have had to average over deals that never happen
+and answer a different question from the one on screen. Since the engine deals
+before asking (2026-08-03, ``ENGINE_AGE_DEAL_ORDERING.md``) the observation
+carries the new Age's full pyramid, and the ``PLAY_AGE`` path below reconstructs
+it unchanged: ``obs.age`` is the new age, its face-down slots are sampled the
+usual way, and ``resample_hidden`` re-deals only ages *after* it.
 
 The draft was long assumed unreconstructable. It is not: BGA shows only the
 current group, so the hidden part is a uniform 4-of-8 partition into
@@ -59,7 +67,12 @@ from .game import (
 )
 from .pool import BACK_UNIVERSES, unseen_pool
 
-_SUPPORTED = (Phase.WONDER_DRAFT, Phase.PLAY_AGE, Phase.COMPLETE)
+_SUPPORTED = (
+    Phase.WONDER_DRAFT,
+    Phase.PLAY_AGE,
+    Phase.CHOOSE_NEXT_START_PLAYER,
+    Phase.COMPLETE,
+)
 
 
 def determinize_observation(
@@ -85,7 +98,7 @@ def determinize_observation(
 
     if obs.phase not in _SUPPORTED:
         raise ValueError(
-            f"scrape codec supports WONDER_DRAFT/PLAY_AGE/COMPLETE, not "
+            f"scrape codec supports {'/'.join(p.name for p in _SUPPORTED)}, not "
             f"{obs.phase.name}; use the seed+prefix wire for that position"
         )
 

@@ -84,7 +84,14 @@ def _label(action: Action, game=None) -> str:
     if action.use is ActionUse.RESOLVE_PENDING_CHOICE:
         return f"Resolve choice: {action.choice}"
     if action.use is ActionUse.CHOOSE_NEXT_START_PLAYER:
-        return f"Start next age: player {action.starting_player}"
+        # Actor-framed like every other number the host renders. The Age is
+        # already dealt by the time this is asked, so name the one being started
+        # rather than "the next age" -- it is the pyramid on screen.
+        if game is None:
+            return f"Start next age: player {action.starting_player}"
+        if action.starting_player == state_actor(game):
+            return f"You start Age {game.age}"
+        return f"Opponent starts Age {game.age}"
     return action.use.name
 
 
