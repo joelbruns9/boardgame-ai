@@ -1581,6 +1581,41 @@ pub fn begin_search_from_root(
     leaf_batch: usize,
     root_evaluation: (f64, Vec<f64>),
 ) -> PyResult<SearchSession> {
+    begin_search_from_root_inner(state, cfg, leaf_batch, root_evaluation, false)
+}
+
+/// `begin_search_from_root` with a batched PUCT root allowed.
+///
+/// Batching a PUCT root makes the root select with in-flight counts folded in —
+/// plain count-based virtual loss, which `Arena::select` already implements, so
+/// no new selection code is involved. What it costs is exactness: the root's
+/// visit distribution is the advisor's *output*, so a perturbation there moves
+/// the answer rather than just the path to it.
+///
+/// This is standard practice in parallel MCTS (Leela, KataGo and most
+/// AlphaZero implementations batch the root this way), and the alternative,
+/// `conflict_free_waves`, is exact but caps realized width at the number of
+/// distinct root candidates in flight — and PUCT concentrates hard, so that
+/// width collapses (1.19 measured; see `search.py`).
+///
+/// Deliberately a separate entry point: every existing caller, including all of
+/// self-play, keeps the strict behaviour without changing a line.
+pub fn begin_search_from_root_virtual_loss(
+    state: &GameState,
+    cfg: &SearchConfig,
+    leaf_batch: usize,
+    root_evaluation: (f64, Vec<f64>),
+) -> PyResult<SearchSession> {
+    begin_search_from_root_inner(state, cfg, leaf_batch, root_evaluation, true)
+}
+
+fn begin_search_from_root_inner(
+    state: &GameState,
+    cfg: &SearchConfig,
+    leaf_batch: usize,
+    root_evaluation: (f64, Vec<f64>),
+    allow_virtual_loss_root: bool,
+) -> PyResult<SearchSession> {
     if cfg.sims < 1 || cfg.top_k < 1 || leaf_batch < 1 {
         return Err(PyValueError::new_err(
             "sims, top_k, and leaf_batch must be positive",
@@ -1591,13 +1626,11 @@ pub fn begin_search_from_root(
             "cooperative force expansion requires the F4.5 forced-child cache",
         ));
     }
-    if cfg.puct_root && leaf_batch > 1 {
-        // With leaf_batch > 1 the root would select under WU virtual loss --
-        // a different algorithm, not a throughput setting, exactly as the
-        // leaf_batch policy says. Evaluation runs leaf_batch=1.
+    if cfg.puct_root && leaf_batch > 1 && !allow_virtual_loss_root {
         return Err(PyValueError::new_err(
-            "puct_root requires leaf_batch=1; WU-UCT root selection is a \
-             separate algorithm needing its own quality approval",
+            "puct_root with leaf_batch > 1 selects the root under virtual loss; \
+             use begin_search_from_root_virtual_loss to opt in, or \
+             conflict_free_waves for exact (but narrow) batching",
         ));
     }
     let root = Node::make(state.clone());

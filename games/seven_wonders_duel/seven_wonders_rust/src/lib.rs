@@ -262,7 +262,7 @@ impl RustPuctSearch {
     /// Open a search over `game`'s position. Evaluates the root immediately
     /// (one call through `adapter`) and expands it; runs no simulations.
     #[staticmethod]
-    #[pyo3(signature = (game, adapter, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16))]
+    #[pyo3(signature = (game, adapter, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16, leaf_batch=1))]
     fn open(
         game: &RustGame,
         adapter: Py<PyAny>,
@@ -272,6 +272,7 @@ impl RustPuctSearch {
         c_visit: f64,
         c_scale: f64,
         top_k: usize,
+        leaf_batch: usize,
     ) -> PyResult<Self> {
         let cfg = tree::SearchConfig {
             sims: max_sims.max(1),
@@ -289,7 +290,18 @@ impl RustPuctSearch {
         };
         let evaluator = eval::PyEval::new(adapter);
         let root_evaluation = evaluator.evaluate(&game.state)?;
-        let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
+        // leaf_batch > 1 opts the root into virtual-loss selection; see
+        // begin_search_from_root_virtual_loss for what that trades away.
+        let session = if leaf_batch > 1 {
+            tree_resumable::begin_search_from_root_virtual_loss(
+                &game.state,
+                &cfg,
+                leaf_batch,
+                root_evaluation,
+            )?
+        } else {
+            tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?
+        };
         Ok(RustPuctSearch {
             session,
             evaluator: Some(evaluator),
