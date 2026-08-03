@@ -333,9 +333,16 @@
     try {
       started = await post("/api/recommend/start", {
         state,
-        // Effectively unbounded: the tree is cumulative and we stop on the next
-        // position, so this is "keep thinking until the board changes".
-        max_sims: 1000000,
+        // "Keep thinking until the board changes" -- but bounded, because the
+        // tree is cumulative in MEMORY too: on a wide root it allocates a node
+        // per simulation, each holding a cloned game state (~4.4 KB). At a
+        // million this reached 4+ GB and froze the machine. The advisor also
+        // applies its own 512 MB arena budget and will report stopping early;
+        // this is the second bound, in the unit the panel controls.
+        //
+        // Nothing is lost: on that position the root value had converged by
+        // ~15k sims and the ranking was stable at every depth.
+        max_sims: 200000,
         chunk_sims: 50,
         top_k: TOP_N,
       });

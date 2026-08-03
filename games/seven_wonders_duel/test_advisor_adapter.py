@@ -420,3 +420,54 @@ def test_a_forced_follow_up_is_reported_for_the_move_that_forces_it(search_impl)
     ]
     assert plain, "the position must contain a plain move to contrast against"
     assert all(snapshot.entries[action_id].follow_up is None for action_id in plain)
+
+
+@pytest.mark.parametrize("search_impl", ["rust", "python"])
+def test_the_arena_budget_stops_a_long_search(adapter, search_impl):
+    """The advisor must not grow its tree without a ceiling.
+
+    The panel asks for "keep thinking until the board changes". On a wide root
+    the closed tree allocates a node per simulation, each owning a cloned
+    GameState, so that request was unbounded in MEMORY: measured at ~4.4 KB a
+    node, 400k sims cost 1.7 GB and a long think froze a real machine.
+
+    A 1 MB budget here trips almost immediately, which keeps the test quick; the
+    shipped default is DEFAULT_ARENA_BUDGET_MB.
+    """
+
+    position = _pos(adapter, prefix=())
+    request = RecommendRequest(
+        max_sims=100_000,
+        chunk_sims=200,
+        options={"search_impl": search_impl, "arena_budget_mb": 1},
+    )
+    handle = adapter.open_search(position, request)
+    try:
+        stop = threading.Event()
+        snapshot = handle.advance(200, stop)
+        for _ in range(50):  # bounded: it must stop on its own well before this
+            if snapshot.stop_reason:
+                break
+            snapshot = handle.advance(200, stop)
+    finally:
+        handle.close()
+
+    assert snapshot.stop_reason is not None, "the budget never tripped"
+    assert "budget 1 MB" in snapshot.stop_reason
+    assert snapshot.sims_done < 100_000, "must stop short of the sim target"
+    assert snapshot.entries, "the work already done is still the answer"
+
+
+def test_no_budget_means_no_ceiling(adapter):
+    """0 disables it, so the training/analysis paths are unaffected."""
+
+    request = RecommendRequest(
+        max_sims=400, chunk_sims=400, options={"arena_budget_mb": 0}
+    )
+    handle = adapter.open_search(_pos(adapter), request)
+    try:
+        snapshot = handle.advance(400, threading.Event())
+    finally:
+        handle.close()
+    assert snapshot.stop_reason is None
+    assert snapshot.sims_done == 400

@@ -127,6 +127,11 @@ class ActionStats:
 class SearchSnapshot:
     """The current state of an in-flight search.
 
+    ``stop_reason`` (below) is set when the handle will not deepen further even
+    though ``sims_target`` has not been reached -- a resource ceiling rather
+    than a cancellation. The host stops the loop and surfaces the text as a
+    warning; ``None`` means "still growing".
+
     Returned by every ``advance``.  ``entries`` is the raw per-action tree
     readout; the host turns it into ranked :class:`Recommendation` objects.
 
@@ -143,6 +148,12 @@ class SearchSnapshot:
     root_value: float  # actor-frame edge in [-1, 1]
     entries: dict[str, ActionStats]
     partial: bool = False
+    stop_reason: str | None = None
+    """Why this search will not deepen further, short of its target.
+
+    A resource ceiling, not a cancellation: the numbers already published stand
+    and are the search's final answer. Human-readable, because the host shows it
+    to the person waiting rather than branching on it."""
 
 
 @runtime_checkable

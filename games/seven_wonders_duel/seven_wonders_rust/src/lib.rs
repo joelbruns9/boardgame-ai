@@ -421,6 +421,15 @@ impl RustPuctSearch {
     fn arena_nodes(&self) -> usize {
         self.session.arena_nodes()
     }
+
+    /// Approximate resident bytes of this search's arena. The advisor stops
+    /// deepening when this passes its budget: on a wide root the tree grows a
+    /// node per simulation and each node owns a cloned `GameState`, so an
+    /// unbounded "think until the board changes" search is unbounded in memory
+    /// too (measured: 400k sims -> 1.7 GB).
+    fn arena_deep_bytes(&self) -> usize {
+        self.session.arena_deep_bytes()
+    }
 }
 
 /// A 7WD game state driven from Python by codec action index.

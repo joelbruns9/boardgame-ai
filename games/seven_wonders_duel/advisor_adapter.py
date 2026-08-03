@@ -124,21 +124,65 @@ def _python_follow_up(edge) -> str | None:
     return _follow_up_label(best.action_index) if best.visits else None
 
 
+DEFAULT_ARENA_BUDGET_MB = 512
+"""How much memory one advisor search may grow its tree to.
+
+The panel asks for an effectively unbounded search -- "keep thinking until the
+board changes" -- and on a wide root the closed tree allocates a node per
+simulation, each owning a cloned ``GameState``. Measured on a 12-action Age II
+turn: node count tracks simulations 1:1 at ~4.4 KB apiece, so 400k sims cost
+1.7 GB and a long think froze the machine that reported it.
+
+512 MB is ~120k simulations on such a root, about two minutes of thinking at the
+~930 sims/s measured there. That costs nothing in advice: the same position's
+root value had converged by ~15k sims and the ranking was stable at every depth.
+Narrow roots never come close -- a three-action pending choice reached only
+2,589 nodes in 41k sims.
+"""
+
+_MEASURED_BYTES_PER_NODE = 4_444
+"""Resident bytes per closed-tree node, measured as an RSS delta (so allocator
+overhead is included) over 400k simulations. Only the Python searcher needs it:
+Rust reports its arena size exactly via ``arena_deep_bytes``."""
+
+
+def _budget_bytes(req) -> int:
+    mb = req.options.get("arena_budget_mb", DEFAULT_ARENA_BUDGET_MB)
+    return max(0, int(mb)) * 1024 * 1024
+
+
+def _budget_reached(used_bytes: int, budget_bytes: int) -> str | None:
+    if not budget_bytes or used_bytes < budget_bytes:
+        return None
+    return (
+        f"stopped growing the tree at {used_bytes / 2**20:.0f} MB "
+        f"(budget {budget_bytes // 2**20} MB); the numbers shown are final"
+    )
+
+
 class _ClosedHandle:
     """SearchHandle over a closed-mode Gumbel tree, driven one PUCT sim at a
     time.  Values are converted p0 -> actor frame via ``sign`` here, so the
     host only ever sees the asking player's edge."""
 
-    def __init__(self, mcts: GumbelMCTS, root, actor: int, target: int):
+    def __init__(self, mcts: GumbelMCTS, root, actor: int, target: int, budget: int = 0):
         self._mcts = mcts
         self._root = root
         self._sign = 1.0 if actor == 0 else -1.0
         self._target = int(target)
         self._done = 0
+        self._budget = int(budget)
+
+    def _stop_reason(self) -> str | None:
+        # Estimated from the node count, since a Python tree cannot be weighed
+        # directly. Rust measures its arena instead.
+        return _budget_reached(
+            self._mcts.closed_nodes_created * _MEASURED_BYTES_PER_NODE, self._budget
+        )
 
     def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
         for _ in range(int(chunk_sims)):
-            if stop_event.is_set():
+            if stop_event.is_set() or self._stop_reason():
                 break
             self._mcts.descend(self._root)
             self._done += 1
@@ -157,6 +201,7 @@ class _ClosedHandle:
             root_value=self._sign * self._root.value_p0,
             entries=entries,
             partial=stop_event.is_set(),
+            stop_reason=self._stop_reason(),
         )
 
     def close(self) -> None:  # tree is GC'd with the handle
@@ -179,16 +224,20 @@ class _RustClosedHandle:
     crosses into Python alone and leaf_batch buys nothing (1.00x-1.07x).
     """
 
-    def __init__(self, search, actor: int, target: int):
+    def __init__(self, search, actor: int, target: int, budget: int = 0):
         self._search = search
         self._sign = 1.0 if actor == 0 else -1.0
         self._target = int(target)
+        self._budget = int(budget)
+
+    def _stop_reason(self) -> str | None:
+        return _budget_reached(self._search.arena_deep_bytes(), self._budget)
 
     def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
         # Rust only checks the chunk boundary between evaluation requests, so a
         # position whose simulations mostly terminate can overshoot. Harmless
         # for streaming; it means "at least this many", not "exactly".
-        if not stop_event.is_set():
+        if not stop_event.is_set() and not self._stop_reason():
             self._search.advance(int(chunk_sims))
         sims_done, root_visits, root_value_sum, _actor, edges = self._search.snapshot()
         follow_ups = {
@@ -215,6 +264,7 @@ class _RustClosedHandle:
             * (root_value_sum / root_visits if root_visits else 0.0),
             entries=entries,
             partial=stop_event.is_set(),
+            stop_reason=self._stop_reason(),
         )
 
     def close(self) -> None:  # the Rust arena is freed with the handle
@@ -469,7 +519,9 @@ class SevenWondersAdvisor:
             16,
             leaf_batch,
         )
-        return _RustClosedHandle(search, state_actor(state.game), req.max_sims)
+        return _RustClosedHandle(
+            search, state_actor(state.game), req.max_sims, _budget_bytes(req)
+        )
 
     def open_search(self, state: _Position, req):
         engine = "nn" if req.engine in ("auto", "nn") else req.engine
@@ -506,7 +558,9 @@ class SevenWondersAdvisor:
         )
         mcts = GumbelMCTS(self._evaluator(req), config)
         root = mcts.make_root(state.game)  # expands root; runs NO sims
-        return _ClosedHandle(mcts, root, state_actor(state.game), req.max_sims)
+        return _ClosedHandle(
+            mcts, root, state_actor(state.game), req.max_sims, _budget_bytes(req)
+        )
 
     # -- discovery ----------------------------------------------------------
 

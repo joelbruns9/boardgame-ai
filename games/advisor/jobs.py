@@ -249,6 +249,11 @@ class JobManager:
                 self._publish(job, snap, views, started, final=False)
                 if snap.partial:
                     break
+                if snap.stop_reason:
+                    # A resource ceiling, not a cancellation: what is already
+                    # published IS the answer, so settle on it rather than
+                    # spinning against a handle that will not grow.
+                    break
             else:
                 # Loop fell through on the target/stop condition with the last
                 # published snapshot already final; nothing more to do.
@@ -282,6 +287,9 @@ class JobManager:
             engine=job._req.engine,  # type: ignore[union-attr]
             top_k=job._req.top_k,  # type: ignore[union-attr]
             search_ms=int((time.perf_counter() - started) * 1000),
+            # The person waiting is entitled to know the search stopped early
+            # and why; silently capping would look like a stalled counter.
+            warnings=[snapshot.stop_reason] if snapshot.stop_reason else None,
         )
         with self._lock:
             job.sims_done = snapshot.sims_done

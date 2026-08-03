@@ -282,3 +282,39 @@ def test_a_follow_up_survives_ranking_into_the_response():
     ]
     ranked = build_recommendations(snapshot, views, top_k=8)
     assert [r.follow_up for r in ranked] == ["then Laboratory", None]
+
+
+def test_a_resource_ceiling_ends_the_search_and_is_reported():
+    """`stop_reason` is a ceiling, not a cancellation.
+
+    The host must stop looping (the handle will not grow, so continuing spins),
+    keep the numbers already published as the answer, and tell the person
+    waiting -- a silent cap looks like a stalled counter.
+    """
+
+    class _CappedHandle(_FakeHandle):
+        def advance(self, chunk_sims, stop_event):
+            snap = super().advance(chunk_sims, stop_event)
+            if snap.sims_done < 60:
+                return snap
+            return SearchSnapshot(
+                sims_done=snap.sims_done,
+                sims_target=snap.sims_target,
+                root_value=snap.root_value,
+                entries=snap.entries,
+                stop_reason="stopped growing the tree at 512 MB",
+            )
+
+    class _CappedAdapter(_FakeAdapter):
+        def open_search(self, state, req):
+            return _CappedHandle(state.n_actions, req.max_sims)
+
+    manager = JobManager(_CappedAdapter())
+    response = manager.run_blocking(
+        _FakeState("capped", 3),
+        RecommendRequest(engine="auto", max_sims=100_000, chunk_sims=20),
+    )
+    assert response.ok
+    assert 60 <= response.sims_done < 100_000, "must stop well short of the target"
+    assert response.warnings == ["stopped growing the tree at 512 MB"]
+    assert response.recommendations, "the work already done is still the answer"

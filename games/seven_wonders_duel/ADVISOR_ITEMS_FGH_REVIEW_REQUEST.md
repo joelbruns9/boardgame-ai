@@ -19,6 +19,11 @@ written as claims to attack, most load-bearing first. Where I have measured
 something I say so; where I have not, I say that too. After this review and its
 fixes, this branch goes to `main`.
 
+**§0 and §0b are defects found after the four commits landed** — one while
+writing this document, one from the user's live testing. Both are fixed here;
+read them first, since they are the only places where advice could have been
+wrong or the host unusable.
+
 **State:** 826 passed / 1 skipped (7WD + advisor), `cargo test` 17 passed. The
 skip is the run-03 bf16 test, refused by the `codec-2` spec bump.
 
@@ -54,6 +59,61 @@ with an exhausted tableau) into a *representable* one, and it is precisely the
 old engine's shape, so it looks legitimate to every check we have.
 
 ---
+
+## 0b. Post-review finding: the search tree had no memory ceiling
+
+Raised by the user's live testing, after this document was written. Fixed;
+please review the fix.
+
+**The panel asked for `max_sims: 1_000_000`** — "keep thinking until the board
+changes". That bounded CPU and nothing else. On a wide root the closed searcher
+allocates a node per simulation, each owning a cloned `GameState`, so the tree
+grows without limit for as long as a human sits on a position. Measured on a
+12-action Age II turn with the real 128x4 checkpoint:
+
+| sims | arena nodes | RSS over baseline |
+|---|---|---|
+| 10k | 9,982 | 67 MB |
+| 100k | 99,931 | 441 MB |
+| 400k | 399,855 | **1,695 MB** |
+
+Node count tracks simulations **1:1** at ~4.4 KB apiece. Narrow roots never come
+close — a three-action pending choice reached 2,589 nodes in 41k sims — which is
+why a sim cap alone is the wrong instrument and the budget is in bytes.
+
+**Fix.** A 512 MB arena budget (`arena_budget_mb`; 0 disables, so training and
+analysis paths are untouched), plus `max_sims` 1,000,000 → 200,000 in the panel
+as a second bound. Rust reports its arena exactly through a newly exposed
+`arena_deep_bytes()`; the Python reference path estimates from a node counter at
+the measured 4.4 KB, documented as an estimate. Measured after: peak RSS
+1,087 MB (505 torch + 582 arena), stopping at ~132k sims.
+
+**The stop is visible, not silent.** `SearchSnapshot.stop_reason` (new on the
+shared contract) ends the host loop and surfaces as a warning, so a capped
+search reads as "stopped growing the tree at 617 MB (budget 512 MB); the numbers
+shown are final" rather than a stalled counter.
+
+**Claims to attack:**
+
+25. **Nothing is lost in advice quality.** The budget trips around 130k sims on
+    that root; the same position's root value had converged by ~15k and the
+    ranking was stable at every depth. An order of magnitude of headroom.
+26. **The byte figure is capacity-based, so it overshoots** — it reported
+    617 MB against a 512 MB budget, because `arena_deep_bytes` sums `capacity()`
+    and Vec capacity doubles. Erring high is the safe direction for a budget,
+    but the effective ceiling is ~1.2x the number configured.
+27. **The Python path's estimate is a single measured constant** (4.4 KB/node,
+    an RSS delta so allocator overhead is included). It will drift if the state
+    grows. Rust, the default and the one that runs live, is exact.
+28. **`stop_reason` is the right shape for the shared contract** — a
+    human-readable string the host transports and shows, rather than a typed
+    reason it branches on.
+
+**What this was NOT.** The user's 3 GB reading and the freeze that prompted this
+were almost certainly my own concurrent test runs, not the advisor: the pytest
+process peaks at **5,039 MB on its own**, and a one-minute think costs ~730 MB
+all-in. The arena defect is real and measured, but it was not the thing that
+froze the machine, and this document should not be read as saying it was.
 
 ## 1. Item F — start-player choice
 

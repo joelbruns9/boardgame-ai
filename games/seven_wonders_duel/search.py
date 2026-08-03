@@ -450,6 +450,7 @@ class GumbelMCTS:
         self.evaluator = evaluator
         self.config = config or SearchConfig()
         self.rng = PortableRng(self.config.seed)
+        self.closed_nodes_created = 0
 
     # ---- shared -----------------------------------------------------------
 
@@ -614,6 +615,12 @@ class GumbelMCTS:
     # ---- closed mode ------------------------------------------------------
 
     def _make_closed_node(self, state: GameState) -> ClosedNode:
+        # Counted because every node owns a cloned GameState, so on a wide root
+        # the tree costs memory linearly in simulations. The advisor reads this
+        # to stop deepening; nothing else depends on it. (Rust measures its
+        # arena in bytes directly -- `arena_deep_bytes` -- which is exact; this
+        # side has only the count.)
+        self.closed_nodes_created += 1
         terminal = state.phase is Phase.COMPLETE
         node = ClosedNode(
             state=state,
