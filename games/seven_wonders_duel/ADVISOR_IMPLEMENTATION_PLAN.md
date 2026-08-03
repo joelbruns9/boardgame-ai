@@ -30,9 +30,20 @@ BGA ships an update, re-check rather than assume.
 | ~~H~~ | ~~Follow-up move in the panel (Mausoleum et al.)~~ | **DONE 2026-08-03** | both searchers, gated to agree |
 | E | Draft-preference extraction | ~half day | analysis, not play |
 
-Each is written up under "Remaining work" below. Also outstanding: **re-test the
-extension**, which last ran before the Rust searcher, the batched evaluation
-boundary, the victory-type outlook and the draft landed.
+Each is written up under "Remaining work" below.
+
+**The extension re-test is DONE (2026-08-03).** It had been outstanding since
+before the Rust searcher, the batched evaluation boundary, the victory-type
+outlook and the draft, and by the time it ran it also covered items F, G and H
+and the 512 MB arena ceiling. Live against a real table: the panel rendered and
+the session produced no errors, which clears the whole stack in one go.
+
+Read that for what it is. It establishes that the pipeline holds on live
+positions and nothing raises; it does not measure whether the advice is *good*
+(the served checkpoint predates the age-deal correction and its strength gate
+was deferred), and one session need not reach every surface — the start-player
+choice arises twice a game, and H's follow-up needs a Mausoleum, a Zeus/Circus
+or a science pair on the board.
 
 **Item A shipped 2026-08-02.** The draft was long assumed unreconstructable from
 a public observation; it is not. BGA reveals only the current group, so the

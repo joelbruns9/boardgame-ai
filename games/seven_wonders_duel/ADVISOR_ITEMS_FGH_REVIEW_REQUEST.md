@@ -310,14 +310,23 @@ cannot resolve, and reporting them to the panel.
     review was deliberately deferred by the user, so its last-card-of-Age play is
     **unverified, not verified-fine**. Nothing in these four commits depends on
     it, but the live session will.
-24. **Nothing visual has been rendered.** G's art, H's follow-up line and F's new
-    decision row have never been seen in a browser. The extension last ran
-    before the Rust searcher, batched evaluation, the victory outlook and the
-    draft landed.
+24. ~~**Nothing visual has been rendered.**~~ **Ran live 2026-08-03**, against a
+    real table, after the memory ceiling landed: the panel rendered and the
+    session produced no errors. That was the first run since the Rust searcher,
+    batched evaluation, the victory outlook and the draft, so it clears the
+    whole stack at once, not just F/G/H.
+
+    What that does and does not establish, since "no errors" is easy to
+    over-read: it confirms the panel renders, the capture/mapper/determinizer
+    pipeline holds on live positions, and nothing raises. It does **not**
+    measure advice quality (see claim 23), and a single session does not
+    necessarily reach every new surface — the start-player choice arises twice a
+    game, and H's follow-up needs a Mausoleum, a Zeus/Circus or a science pair
+    to be on the board at all. Treat unexercised surfaces as untested rather
+    than passing.
 
 ## What I did not do
 
-* No live session (the extension re-test is the next task after this review).
 * No benchmark of `follow_ups()` per publish (claim 16).
 * Item E (draft-preference extraction) is untouched.
 
