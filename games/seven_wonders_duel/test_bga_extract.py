@@ -766,3 +766,60 @@ def test_dom_behind_science_count_is_still_stale():
         payload["dom"]["playerBuildings"][pid] = []
     with pytest.raises(StaleGamedata):
         wire_from_bga_payload(payload)
+
+
+def test_bga_names_cover_every_wonder_and_progress_token():
+    """The panel's art lookup keys on names, and a miss is SILENT.
+
+    `content.js` matches an advisor recommendation to a BGA spritesheet cell by
+    name (case-insensitively -- BGA title-cases some of them). A name that does
+    not line up costs the row its picture with no error anywhere, so the
+    alignment is pinned here rather than discovered on a live table.
+    """
+
+    from .data import PROGRESS_IDS, WONDER_IDS
+
+    gamedatas = _load_age3()
+    for key, engine_names in (
+        ("wonders", WONDER_IDS),
+        ("progressTokens", PROGRESS_IDS),
+    ):
+        bga_names = {
+            str(entry["name"]).lower() for entry in gamedatas[key].values()
+        }
+        missing = [name for name in engine_names if name.lower() not in bga_names]
+        assert not missing, f"{key} unknown to BGA: {missing}"
+
+
+def test_wonder_and_token_sprite_cells_are_derived_not_read():
+    """Only buildings carry `spriteXY`; the other two sheets are id-indexed.
+
+    `Building.php:24,73` is the sole server-side source of a sprite cell. BGA
+    computes a wonder's from its id (`getWonderDivHtml`, sevenwondersduel.js:838)
+    and a token's likewise (`getProgressTokenDivHtml`, :1307), and
+    `page_bridge.js` now mirrors exactly that. This test pins the arithmetic and
+    the column counts, which are the spritesheet's own
+    (--wonder-spritesheet-columns: 5, --progress-token-spritesheet-columns: 4).
+
+    An earlier revision of ADVISOR_IMPLEMENTATION_PLAN.md said the bridge
+    already "captures art.wonders", and it did -- with `spriteXY: undefined` in
+    every entry, so wonder art could never have rendered.
+    """
+
+    def cell(identifier: int, columns: int) -> tuple[int, int]:
+        return ((identifier - 1) % columns, (identifier - 1) // columns)
+
+    gamedatas = _load_age3()
+    wonder_ids = sorted(int(k) for k in gamedatas["wonders"])
+    token_ids = sorted(int(k) for k in gamedatas["progressTokens"])
+    assert wonder_ids == list(range(1, 13))  # 12 base-game wonders, 1-indexed
+    assert token_ids == list(range(1, 11))   # 10 progress tokens
+
+    # Every id lands in a distinct cell inside its sheet's grid (5x4 and 4x4).
+    wonder_cells = [cell(i, 5) for i in wonder_ids]
+    token_cells = [cell(i, 4) for i in token_ids]
+    assert len(set(wonder_cells)) == len(wonder_cells)
+    assert len(set(token_cells)) == len(token_cells)
+    assert max(x for x, _ in wonder_cells) < 5 and max(y for _, y in wonder_cells) < 4
+    assert max(x for x, _ in token_cells) < 4 and max(y for _, y in token_cells) < 4
+    assert cell(1, 5) == (0, 0) and cell(6, 5) == (0, 1) and cell(12, 5) == (1, 2)

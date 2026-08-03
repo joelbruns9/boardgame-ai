@@ -63,16 +63,43 @@
   opacity: 0.45;
 }
 
+/* Every art box is one age-card tall, so a list mixing cards, wonders and
+   progress tokens still reads as rows. BGA sizes each sprite from `--scale`
+   times its OWN small-scale factor, and those differ, so one `--scale` would
+   give three different heights. Each is therefore set to whatever makes its
+   height match the age card's.
+
+   Derivation, from the `:root` block of sevenwondersduel.css -- redo it if BGA
+   reships a spritesheet:
+     age card    (2048/8 * 1.253) * 0.5 * 0.30  = 48.1px   <- the target
+     wonder             (960/4)   * 0.58 * S    = 48.1 -> S = 0.346
+     progress token     (800/4)   * 0.3175 * S  = 48.1 -> S = 0.758
+   Widths follow each sprite's own aspect: 31px, 74px and 48px respectively. */
 #swd_advisor_panel .swd-adv-art {
-  --scale: 0.30;
   flex: 0 0 auto;
   border-radius: 4px;
 }
 
+#swd_advisor_panel .swd-adv-card {
+  --scale: 0.30;
+}
+
+#swd_advisor_panel .swd-adv-wonder {
+  --scale: 0.346;
+}
+
+#swd_advisor_panel .swd-adv-token {
+  --scale: 0.758;
+}
+
+/* Sized from the same variables as the age card rather than in pixels, so it
+   stays the same box as the art it stands in for. Only the start-of-Age player
+   choice reaches this now. */
 #swd_advisor_panel .swd-adv-noart {
+  --scale: 0.30;
   flex: 0 0 auto;
-  width: 74px;
-  height: 115px;
+  width: var(--building-small-width);
+  height: var(--building-small-height);
   border: 1px dashed #ffffff2e;
   border-radius: 4px;
 }

@@ -89,15 +89,24 @@
     // Sprite coordinates for the panel. Presentation only -- a miss costs an
     // image, never a wrong position, which is why this mapping may live in the
     // browser at all.
+    //
+    // Only BUILDINGS carry spriteXY: it is a server field (Building.php:24,73)
+    // and no other class has one. BGA derives a wonder's and a token's cell
+    // from its id instead (getWonderDivHtml :838-839,
+    // getProgressTokenDivHtml :1307-1308), so we do the same rather than read a
+    // field that does not exist. The column counts are the spritesheet's own,
+    // matching --wonder-spritesheet-columns and
+    // --progress-token-spritesheet-columns in sevenwondersduel.css.
+    const cell = (id, columns) => [(id - 1) % columns, Math.floor((id - 1) / columns)];
     const art = { buildings: {}, wonders: {}, progressTokens: {} };
     for (const [id, b] of Object.entries(g.buildings || {})) {
       art.buildings[String(id)] = { name: b.name, spriteXY: b.spriteXY };
     }
     for (const [id, x] of Object.entries(g.wonders || {})) {
-      art.wonders[String(id)] = { name: x.name, spriteXY: x.spriteXY };
+      art.wonders[String(id)] = { name: x.name, spriteXY: cell(Number(id), 5) };
     }
     for (const [id, t] of Object.entries(g.progressTokens || {})) {
-      art.progressTokens[String(id)] = { name: t.name, spriteXY: t.spriteXY };
+      art.progressTokens[String(id)] = { name: t.name, spriteXY: cell(Number(id), 4) };
     }
     return { state, art, quality: document.getElementById("swd")?.dataset?.quality || "1x" };
   }

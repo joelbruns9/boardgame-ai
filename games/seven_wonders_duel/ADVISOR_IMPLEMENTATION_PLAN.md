@@ -26,7 +26,7 @@ BGA ships an update, re-check rather than assume.
 | # | Item | Size | Notes |
 |---|---|---|---|
 | ~~F~~ | ~~Start-player choice for the next age~~ | **DONE 2026-08-03** | verified on the real `selectStartPlayer` capture |
-| G | Wonder art in the panel | ~15 min | draft rows show a placeholder |
+| ~~G~~ | ~~Wonder art in the panel~~ | **DONE 2026-08-03** | + progress tokens; the plan's premise was wrong, see below |
 | H | Follow-up move in the panel (Mausoleum et al.) | ~half day | advice is correct but incomplete |
 | E | Draft-preference extraction | ~half day | analysis, not play |
 
@@ -177,21 +177,44 @@ things when picking F up:
   trained under the old ordering, so its prior for this decision stays
   layout-blind. Search partly compensates; the fix arrives with the cloud run.
 
-### G. Wonder art in the panel (small)
+### G. Wonder art in the panel — DONE 2026-08-03
 
-Draft rows render the dashed placeholder instead of the wonder. `content.js:150`
-passes only `r.fields.card_name` to `cardArt`, and a draft action has
-`wonder_name` with `card_name = None`.
+Wonders **and** progress tokens now render. `cardArt` became `rowArt`, driven by
+an ordered `ART_SOURCES` table: `card_name`→buildings, `wonder_name`→wonders,
+`choice`→progress tokens, `choice`→buildings. The last entry matters because a
+pending choice names a token (science pair, Great Library) *or* a card
+(Mausoleum revival, a Zeus/Circus destroy target). Card-before-wonder is
+deliberate and as originally specified: a wonder row already names both in its
+label, and the card it consumes is the part a human misreads.
 
-Everything needed is already in place: the bridge captures `art.wonders`
-(`page_bridge.js:95`) and `ActionView.fields` carries `wonder_name`. BGA styles a
-wonder as `div.wonder.wonder_small` against `img/wonders_v3.jpg`, exactly
-parallel to `div.building.building_small` -- so the same trick works, still with
-nothing bundled.
+**The premise below was wrong, and it is the reason this was never 15 minutes.**
+"the bridge captures `art.wonders`" was true of the code and false of the data:
+`spriteXY` is a **server** field on `Building` only (`modules/php/Building.php:24,73`
+— the sole `spriteXY` in the whole PHP tree). `gamedatas.wonders` and
+`gamedatas.progressTokens` carry a name and nothing else, so every captured
+wonder entry held `spriteXY: undefined` and wonder art could never have appeared
+no matter what the panel did with it.
 
-Fall back to the wonder sprite when `card_name` is absent. Progress tokens
-(`img/progress_tokens_v3.jpg`, also already captured) would give pending-choice
-rows their art too.
+BGA does not read a cell for those two sheets, it **derives** one from the id:
+`(id-1) % columns, floor((id-1) / columns)` with 5 columns for wonders
+(`getWonderDivHtml`, `sevenwondersduel.js:838-839`) and 4 for progress tokens
+(`getProgressTokenDivHtml`, `:1307-1308`). `page_bridge.js` now does exactly
+that. Still nothing bundled, and the column counts are the spritesheet's own
+(`--wonder-spritesheet-columns`, `--progress-token-spritesheet-columns`).
+
+**Sizing needed real numbers.** Each sheet has its own small-scale factor, so
+one `--scale` gives three different heights. Each art class sets the `--scale`
+that makes its height match an age card's (48.1px), with the derivation written
+into `panel.css` so it can be rechecked if BGA reships a sheet. The dashed
+placeholder was 74x115 against 31x48 art -- a leftover from before the scale was
+tuned -- and is now sized from the same variables as the age card. Only the
+start-of-Age player choice reaches it, which names no component at all.
+
+**Two tests guard the silent failure mode**, since a name that does not line up
+costs a row its picture with no error anywhere: one pins that every engine
+wonder and progress-token name is known to BGA case-insensitively (12/12 and
+10/10 on the real capture), the other pins the id→cell arithmetic and its column
+counts. The selection ordering was exercised directly against the six row kinds.
 
 ### H. Show the follow-up move (Mausoleum and friends)
 

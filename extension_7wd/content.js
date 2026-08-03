@@ -111,15 +111,35 @@
     return null;
   }
 
-  function cardArt(cardName) {
-    const xy = spriteFor(art && art.buildings, cardName);
+  // Which identity a row's art comes from, in priority order: [field on
+  // ActionView.fields, captured sprite table, BGA's own class pair]. All three
+  // spritesheets are already loaded by the page and all three templates
+  // position them the same way (`-X00% -Y00%`, see jstpl_wonder /
+  // jstpl_progress_token / jstpl_wonder_age_card), so nothing is bundled and no
+  // geometry is hard-coded.
+  //
+  // `choice` is tried against both tables because a pending choice names a
+  // token (science pair, Great Library) OR a card (Mausoleum revival, a
+  // Zeus/Circus destroy target). A miss just falls through to the next entry.
+  const ART_SOURCES = [
+    ["card_name", "buildings", "building building_small swd-adv-card"],
+    ["wonder_name", "wonders", "wonder wonder_small swd-adv-wonder"],
+    ["choice", "progressTokens", "progress_token progress_token_small swd-adv-token"],
+    ["choice", "buildings", "building building_small swd-adv-card"],
+  ];
+
+  function rowArt(fields) {
     const box = document.createElement("div");
-    if (!xy) {
-      box.className = "swd-adv-noart";
+    for (const [field, table, className] of ART_SOURCES) {
+      const xy = spriteFor(art && art[table], fields && fields[field]);
+      if (!xy) continue;
+      box.className = className + " swd-adv-art";
+      box.style.backgroundPosition = `-${xy[0]}00% -${xy[1]}00%`;
       return box;
     }
-    box.className = "building building_small swd-adv-art";
-    box.style.backgroundPosition = `-${xy[0]}00% -${xy[1]}00%`;
+    // Genuinely artless: the start-of-Age player choice, which names no
+    // component at all.
+    box.className = "swd-adv-noart";
     return box;
   }
 
@@ -147,7 +167,7 @@
       const row = document.createElement("div");
       row.className = "swd-adv-row";
       if ((r.visit_frac || 0) < LOW_VISIT_FRAC) row.classList.add("swd-adv-thin");
-      row.appendChild(cardArt(r.fields && r.fields.card_name));
+      row.appendChild(rowArt(r.fields));
       const text = document.createElement("div");
       text.className = "swd-adv-text";
       const q = document.createElement("div");
