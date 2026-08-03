@@ -186,3 +186,63 @@ def test_between_age_start_player_choice_is_still_rejected():
     payload["bga"]["gamestate"] = dict(payload["bga"]["gamestate"], name="selectStartPlayer")
     with pytest.raises(UnsupportedBgaState):
         wire_from_bga_payload(payload)
+
+
+def test_draft_captured_between_rounds_is_refused():
+    """The failure a live draft actually hit.
+
+    BGA empties `#wonder_selection_container` when the last wonder of a round is
+    taken and renders the next group a moment later. A capture in that gap has
+    a WONDER_DRAFT phase with an empty offer -- a non-terminal position with no
+    legal move. The engine has no answer for that, and the symptom surfaced far
+    from the cause: the Rust root evaluation is a one-row batch, so it read
+    "batch net row 0 returned a zero mass policy".
+
+    Refused at the mapper instead, where the cause is visible. It is transient,
+    and the extension retries a rejected position.
+    """
+    import copy
+
+    from .bga_extract import UnsupportedBgaState, wire_from_bga_payload
+
+    payload = copy.deepcopy(_live_draft())
+    payload["dom"]["wonderSelection"] = []
+    with pytest.raises(UnsupportedBgaState, match="no wonders on offer"):
+        wire_from_bga_payload(payload)
+
+
+def test_every_draft_position_survives_a_deep_search():
+    """All eight (round, pick) states, through the default batched Rust path.
+
+    A zero-mass policy anywhere in the tree fails the whole search, so this
+    covers the reconstruction at every point in the draft rather than only at
+    the root.
+    """
+    import threading
+    from types import SimpleNamespace
+
+    pytest.importorskip("seven_wonders_rust")
+    from .advisor_adapter import SevenWondersAdvisor, _Position
+    from .inference import Evaluator
+    from .train import build_model
+
+    advisor = SevenWondersAdvisor(
+        evaluator=Evaluator(build_model("transformer", 32, 1), "cpu")
+    )
+    seen: set[tuple[int, int]] = set()
+    for seed, step, game in _draft_positions(seeds=range(4)):
+        state = determinize_observation(game.observation(0), random.Random(seed * 5 + step))
+        seen.add((state.wonder_round, state.wonder_pick_index))
+        handle = advisor.open_search(
+            _Position(game=state, first_player=state.first_player, key=f"d{seed}{step}"),
+            SimpleNamespace(
+                engine="nn", seed=0, options={}, max_sims=99999,
+                checkpoint_path=None, device="cpu", top_k=4, temperature=0.0,
+            ),
+        )
+        try:
+            snapshot = handle.advance(400, threading.Event())
+            assert snapshot.entries
+        finally:
+            handle.close()
+    assert seen == {(r, p) for r in (0, 1) for p in range(4)}, seen

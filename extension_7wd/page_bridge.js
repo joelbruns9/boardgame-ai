@@ -65,7 +65,17 @@
       (n, list) => n + (list ? list.length : 0),
       0
     );
-    return [state, active, moveNo, cards, built].join("|");
+    // The draft needs its own progress signal, read from the DOM. Every
+    // gamedatas field above is constant through it: the state name never
+    // changes, draftpool is [] until an age is dealt, playerBuildings is empty,
+    // and wondersSituation is stale for the whole draft. `active` is not enough
+    // either -- the order is A-B-B-A, so picks 2 and 3 are the same player and
+    // would collide on one signature, leaving the panel showing the previous
+    // pick's advice.
+    const offered = w.document.querySelectorAll(
+      "#wonder_selection_container [data-wonder-id]"
+    ).length;
+    return [state, active, moveNo, cards, built, offered].join("|");
   }
 
   function capture() {

@@ -214,7 +214,19 @@ def _wonder_offer(gamedatas: dict) -> list[str]:
     """
     wlookup = gamedatas["wonders"]
     selection = gamedatas["wondersSituation"].get("selection") or []
-    return [wlookup[str(row["id"])]["name"] for row in selection]
+    offer = [wlookup[str(row["id"])]["name"] for row in selection]
+    if not offer:
+        # Caught between rounds: BGA has emptied #wonder_selection_container but
+        # has not rendered the next group yet. The engine would treat this as a
+        # non-terminal position with no legal move, which surfaces far away as
+        # "batch net row 0 returned a zero mass policy" from the root
+        # evaluation. Refuse it here instead -- it is transient, and the
+        # extension retries a rejected position.
+        raise UnsupportedBgaState(
+            "wonder draft has no wonders on offer -- captured between rounds, "
+            "before BGA rendered the next group; retry in a moment"
+        )
+    return offer
 
 
 def _destroy_color(gamedatas: dict) -> CardColor:
