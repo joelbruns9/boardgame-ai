@@ -46,6 +46,15 @@
     try {
       return typeof findGameWindow === "function" ? findGameWindow() : null;
     } catch (e) {
+      // "gamedatas not found" is the ordinary answer in every frame that is not
+      // the board, and this bridge runs in all of them -- staying quiet there is
+      // correct. An AMBIGUOUS or unseated board is different: swallowing it
+      // leaves the panel dead with no reason given, which is how a wrong-seat
+      // capture used to present. Report it once, from the top frame, since
+      // every frame walks the same tree and would otherwise all report it.
+      if (e && e.swdAmbiguous && window === window.top) {
+        post("capture_error", { signature: null, message: String(e.message) });
+      }
       return null;
     }
   }

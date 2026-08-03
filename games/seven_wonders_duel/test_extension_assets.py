@@ -105,3 +105,85 @@ def test_only_the_background_script_makes_network_calls():
     assert "fetch(" not in bridge, "the page world must never reach the advisor"
     background = _code_only((_EXTENSION / "background.js").read_text(encoding="utf-8"))
     assert "fetch(" in background
+
+
+def _run_node(script: str) -> str:
+    """Execute a Node snippet, or skip when Node is unavailable.
+
+    The frame-selection logic can only run in a browser-shaped world, which is
+    exactly why its one real bug was found on a live table rather than here.
+    Node is close enough: `findGameWindow` touches only `frames`,
+    `location.href` and `gameui.gamedatas`, all of which a plain object can
+    provide.
+    """
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; frame-selection cases not exercised")
+    done = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+_FRAME_HARNESS = r"""
+const fs = require("fs");
+const src = fs.readFileSync(%(snippet)s, "utf8").replace(/\r/g, "");
+const grab = (name) => {
+  const start = src.indexOf("function " + name + "(");
+  let depth = 0;
+  for (let j = src.indexOf("{", start); j < src.length; j++) {
+    if (src[j] === "{") depth++;
+    else if (src[j] === "}") { depth--; if (!depth) return src.slice(start, j + 1); }
+  }
+};
+const fns = grab("findGameWindows") + "\n" + grab("findGameWindow") + "\n";
+const win = (url, me, players, frames = []) => ({
+  frames,
+  location: { href: url },
+  gameui: me === null ? undefined
+    : { gamedatas: { me_id: me, players, wondersSituation: {} } },
+});
+const PLAYERS = { "111": {}, "222": {} };
+const run = (top) => {
+  const find = new Function("window", fns + "; return findGameWindow;")({ top });
+  try { return "seat:" + find().gameui.gamedatas.me_id; }
+  catch (e) { return (e.swdAmbiguous ? "loud" : "quiet"); }
+};
+const U = "https://boardgamearena.com/9/sevenwondersduel?table=1";
+console.log([
+  run(win(U, "111", PLAYERS)),
+  run(win(U, "111", PLAYERS, [win(U + "&testuser=222", "222", PLAYERS)])),
+  run(win(U, "111", PLAYERS, [win(U + "&x=2", "222", PLAYERS)])),
+  run(win(U, "999", PLAYERS)),
+  run(win("https://example.com", null, {})),
+].join(","));
+"""
+
+
+def test_frame_selection_picks_the_seat_and_is_loud_when_it_cannot():
+    """The wrong-seat hazard, which cost a Great Library position on a live table.
+
+    A BGA table can expose more than one `gameui`: a nested `...&testuser=<id>`
+    frame renders the OPPONENT's seat. Public data is identical in both, so the
+    reconstructed position looks fine -- but per-seat private args are not sent
+    to the wrong frame, and the Great Library's box tokens live there. Picking
+    wrong therefore surfaces far away as an `UnsupportedBgaState` refusal.
+
+    Dropping `testuser=` frames handles the observed case. The two additions
+    here are about the cases that convention CANNOT resolve: they now raise a
+    tagged error instead of silently taking the shallowest frame. "quiet" is
+    correct for a page with no board, because this bridge runs in every frame
+    and most of them are not the game.
+    """
+    script = _FRAME_HARNESS % {"snippet": json.dumps(str(_CANONICAL))}
+    assert _run_node(script).strip().split(",") == [
+        "seat:111",  # ordinary table: one board frame
+        "seat:111",  # the observed hazard: opponent frame ignored
+        "loud",      # two unmarked frames on different seats: unknowable
+        "loud",      # spectator: reads the board, gets no private args
+        "quiet",     # not a game page at all
+    ]

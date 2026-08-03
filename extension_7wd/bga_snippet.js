@@ -65,13 +65,54 @@ function findGameWindows() {
 //
 // So: drop `testuser=` frames, then prefer the shallowest. In an ordinary table
 // there is exactly one frame and this is a no-op.
+//
+// The `testuser=` URL is the only discriminator that has actually been
+// observed, and it is a BGA convention rather than something we can derive:
+// inside a frame, `me_id` and `gameui.player_id` both describe the seat that
+// frame renders, so neither can tell an impersonated seat from a real one. The
+// two checks below therefore do not try to be cleverer -- they make the cases
+// this cannot resolve LOUD instead of silently picking the shallowest frame.
 function findGameWindow() {
   const all = findGameWindows();
   if (!all.length) {
     throw new Error("7WD gamedatas not found; open the game table first");
   }
   const real = all.filter((f) => !/[?&]testuser=/.test(f.url));
-  const chosen = (real.length ? real : all)[0];
+  const candidates = real.length ? real : all;
+
+  const seatOf = (f) => String(((f.win.gameui || {}).gamedatas || {}).me_id || "");
+  const seats = new Set(candidates.map(seatOf));
+  if (seats.size > 1) {
+    // Several frames, none marked testuser=, rendering different seats. Which
+    // one is the human? Unknowable here, and guessing wrong costs the per-seat
+    // private args -- which surfaces much later, and misleadingly, as an
+    // UnsupportedBgaState on a Great Library position.
+    const err = new Error(
+      "several 7WD frames render different seats (" +
+        [...seats].join(", ") +
+        ") and none is marked testuser=; cannot tell which seat to advise"
+    );
+    err.swdAmbiguous = true;
+    throw err;
+  }
+
+  const chosen = candidates[0];
+  const gamedatas = chosen.win.gameui.gamedatas;
+  const me = seatOf(chosen);
+  if (!me || !Object.prototype.hasOwnProperty.call(gamedatas.players || {}, me)) {
+    // A spectator frame reads the whole public board and none of the private
+    // args, so it would advise happily right up until a Great Library position
+    // refused. Without this it also fails silently in the extension, because
+    // the panel only wakes when the active player is `me_id`.
+    const err = new Error(
+      "this frame is not seated at the table (me_id " +
+        (me || "missing") +
+        "); the advisor needs the playing seat -- per-seat private data, such " +
+        "as the Great Library's box tokens, is sent only to it"
+    );
+    err.swdAmbiguous = true;
+    throw err;
+  }
   return chosen.win;
 }
 

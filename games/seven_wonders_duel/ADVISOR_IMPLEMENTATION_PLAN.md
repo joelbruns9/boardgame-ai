@@ -343,8 +343,8 @@ for, and it is now a committed test.
    `findGameWindow` walks a frame stack and can return either. `wire_from_bga`
    survives (it keys on `startPlayerId`, identical in both), but per-seat private
    data does not — notably Great Library's `_private.progressTokensFromBox`,
-   which would be absent and turn a workable position into a refusal. **Open: make
-   `findGameWindow` pick the frame whose `me_id` is the logged-in user.**
+   which would be absent and turn a workable position into a refusal.
+   **FIXED**; see "Frame selection" below.
 
 **Confirmed, no change needed:** the guild card backs. The Age III capture has
 10 revealed age-III, 2 revealed guild, 7 face-down age-III and 1 face-down guild
@@ -379,8 +379,36 @@ second table.
 **The two-frame hazard is now demonstrated, not theoretical.** The opponent-seat
 frame (`...&testuser=<id>`) reported `hasPrivate: False` at the same moment the
 real seat had the Great Library tokens. Capturing from the wrong frame turns a
-workable position into an `UnsupportedBgaState` refusal. Fix `findGameWindow`
-before item A.
+workable position into an `UnsupportedBgaState` refusal.
+
+### Frame selection — FIXED
+
+`findGameWindow` drops any frame whose URL carries `testuser=` and prefers the
+shallowest of the rest, which resolves the observed case. Note what it does
+*not* do, since an earlier revision of this document proposed it: it cannot pick
+"the frame whose `me_id` is the logged-in user", because inside a frame both
+`me_id` and `gameui.player_id` describe the seat **that frame renders**, so an
+impersonated seat looks exactly like a real one. Nor does the client expose a
+logged-in-user id anywhere in the source dump. The URL convention is the only
+discriminator that has actually been observed.
+
+Hardened 2026-08-03 to make what it *cannot* resolve loud rather than silent:
+
+* **several unmarked frames on different seats** → raise, instead of taking the
+  shallowest and hoping;
+* **a frame whose `me_id` is not a seated player** (a spectator) → raise, since
+  it reads the whole public board and none of the private args, so it would
+  advise happily until a Great Library position refused.
+
+Both carry `err.swdAmbiguous`, and `page_bridge.js` reports those to the panel
+from the top frame only. Plain "no gamedatas here" stays silent, because the
+bridge runs in every frame and most are not the board — swallowing *that* is
+correct, and swallowing the other two is what made a wrong-seat capture present
+as a dead panel with no reason given.
+
+`test_frame_selection_picks_the_seat_and_is_loud_when_it_cannot` drives the real
+function under Node against five frame trees (ordinary, the observed hazard, two
+unmarked seats, spectator, no board). It skips if Node is absent.
 
 ### FIXED 2026-08-02: base-game wonder burials (two tiers)
 
@@ -932,11 +960,11 @@ the five fields re-read from the DOM, and overwrite them in Python before
 * the browser's game knowledge is confined to eight selectors, not the whole
   position.
 
-While you are in `bga_snippet.js`: `findGameWindow` (line 35) identifies the
-7WD frame by `gamedatas.draftpool` being truthy. During the draft `draftpool` is
-`[]` (`sevenwondersduel.game.php:685-688`), which is truthy in JS, so this
-happens to survive — but only by luck, and it would break the moment BGA emitted
-`null` or omitted the key. **Switch the marker to `gamedatas.wondersSituation`**,
+While you are in `bga_snippet.js`: `findGameWindow` identified the 7WD frame by
+`gamedatas.draftpool` being truthy. During the draft `draftpool` is `[]`
+(`sevenwondersduel.game.php:685-688`), which is truthy in JS, so this happened
+to survive — but only by luck, and it would break the moment BGA emitted `null`
+or omitted the key. **DONE:** the marker is now `gamedatas.wondersSituation`,
 which is present in every 7WD state.
 
 ## Alternative if the DOM proves unreadable
