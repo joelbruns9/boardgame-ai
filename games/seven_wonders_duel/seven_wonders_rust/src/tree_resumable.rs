@@ -1373,6 +1373,41 @@ impl SearchSession {
         (root.visits, root.value_sum_p0, root.actor, edges)
     }
 
+    /// Per root action, the forced remainder of that same move:
+    /// `[(root_action_index, follow_up_action_index, follow_up_visits)]`.
+    ///
+    /// Building the Mausoleum, Zeus or the Circus does not finish a turn -- it
+    /// raises a pending choice, and *which* card or token you then take is most
+    /// of the move's value. The search already has the answer as its principal
+    /// variation; nothing downstream could see it, because `root_stats` returns
+    /// root edges only.
+    ///
+    /// Walks one ply: the edge's most-sampled chance child, then that node's
+    /// most-visited edge. Reported ONLY when the child still holds a pending
+    /// choice, which is exactly "this move is not over". An extra turn
+    /// (Theology) is a fresh decision rather than a forced remainder, so it is
+    /// deliberately not reported here -- it would read as part of the move.
+    pub fn follow_ups(&self) -> Vec<(usize, usize, u32)> {
+        let root = &self.arena.nodes[self.arena.root_id()];
+        let mut out = Vec::new();
+        for edge in &root.edges {
+            let Some(child) = edge.children.iter().map(|(_, c)| c).max_by_key(|c| c.samples)
+            else {
+                continue;
+            };
+            let node = &self.arena.nodes[child.node_id];
+            if node.state.pending_choice.is_none() {
+                continue;
+            }
+            if let Some(best) = node.edges.iter().max_by_key(|e| e.visits) {
+                if best.visits > 0 {
+                    out.push((edge.action_index, best.action_index, best.visits));
+                }
+            }
+        }
+        out
+    }
+
     pub fn arena_nodes(&self) -> usize {
         self.arena.nodes.len()
     }

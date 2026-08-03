@@ -113,6 +113,16 @@
   font-weight: 500;
 }
 
+/* The forced remainder of the move. Subordinate to the label it continues, but
+   brighter than the visit count -- it is advice, not metadata. */
+#swd_advisor_panel .swd-adv-follow {
+  font-size: 12px;
+  opacity: 0.8;
+  margin-top: 1px;
+  padding-left: 8px;
+  border-left: 2px solid #ffffff26;
+}
+
 #swd_advisor_panel .swd-adv-meta {
   font-size: 11px;
   opacity: 0.55;

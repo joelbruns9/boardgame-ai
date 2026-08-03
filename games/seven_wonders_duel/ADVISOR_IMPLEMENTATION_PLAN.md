@@ -27,7 +27,7 @@ BGA ships an update, re-check rather than assume.
 |---|---|---|---|
 | ~~F~~ | ~~Start-player choice for the next age~~ | **DONE 2026-08-03** | verified on the real `selectStartPlayer` capture |
 | ~~G~~ | ~~Wonder art in the panel~~ | **DONE 2026-08-03** | + progress tokens; the plan's premise was wrong, see below |
-| H | Follow-up move in the panel (Mausoleum et al.) | ~half day | advice is correct but incomplete |
+| ~~H~~ | ~~Follow-up move in the panel (Mausoleum et al.)~~ | **DONE 2026-08-03** | both searchers, gated to agree |
 | E | Draft-preference extraction | ~half day | analysis, not play |
 
 Each is written up under "Remaining work" below. Also outstanding: **re-test the
@@ -216,20 +216,54 @@ wonder and progress-token name is known to BGA case-insensitively (12/12 and
 10/10 on the real capture), the other pins the id→cell arithmetic and its column
 counts. The selection ordering was exercised directly against the six row kinds.
 
-### H. Show the follow-up move (Mausoleum and friends)
+### H. Show the follow-up move (Mausoleum and friends) — DONE 2026-08-03
 
-The panel says `Wonder: The Mausoleum (using X)` and stops, but building the
-Mausoleum immediately forces a second decision -- *which discarded card to take
-for free* -- and that is most of the move's value. Same for any wonder that
-triggers a choice.
+Shipped as described: a one-ply PV walk per root edge — most-sampled chance
+child, then that node's most-visited edge — surfaced as
+`Recommendation.follow_up` and rendered under the label. Generic, so it covers
+Zeus/Circus destroy targets and the science-pair token pick as well as the
+Mausoleum.
 
-The search already knows: it is the principal variation. Nothing downstream can
-see it because `RustPuctSearch.snapshot` returns **root edges only**.
+**Reported only while a pending choice is open.** That is the exact test for
+"this move is not over", and it is narrower than "the child node has the same
+actor": a Theology extra turn also keeps the actor, but it is a *fresh
+decision*, not a forced remainder, and labelling it "then ..." would read as
+part of the move. An opponent reply is likewise excluded — the panel would be
+claiming your move includes their answer.
 
-Needs a PV readout -- from the root's best edge, walk to the most-visited child
-and report its best action -- surfaced as an extra field per recommendation.
-Worth doing generically rather than special-casing the Mausoleum: it also covers
-Zeus/Circus destroy targets and the science-pair token pick.
+**What made it cheap: the action space is identity-indexed.** The follow-up
+comes from a child node the adapter never reconstructs, so its action index has
+to be readable without a state — and it is, because the four pending-choice
+blocks encode *what* is chosen rather than its position in an option list.
+`codec.pending_choice_name` is that reader, and it is the whole reason no state
+has to cross the boundary.
+
+**Both searchers implement it, and both are asserted against the same literal
+string** on a constructed Mausoleum position — that is the cross-engine gate,
+since they are separate walks over separate structures and a divergence would
+make the panel say different things depending on which searcher is on. Plain
+moves must report nothing.
+
+**The first version of that test was flaky, and the reason generalises.** It
+drove a randomly initialised net and asserted only that the two engines agreed.
+Under a random net every revival is worth about the same, so the follow-up
+argmax is a coin flip between near-ties and the two descents break them
+differently: measured over six torch seeds they disagreed on three, and on a
+fourth neither expanded the child at all. It passed when the file was run alone
+and failed in the full suite, because the net's weights depend on global torch
+RNG state and therefore on what ran before it. The fix was to remove the noise
+rather than weaken the assertion — a `_PeakedEvaluator` with a prior peaked on
+the intended line, so the PV is forced and the expected string can be written
+down. This is the same lesson as the note on
+`test_rust_and_python_searchers_produce_the_same_snapshot_shape`: **never assert
+a ranking under an untrained net.**
+
+**Seam note:** `ActionStats.follow_up` / `Recommendation.follow_up` are new on
+the *shared host* contract, carried verbatim. Naming a move is game knowledge,
+so the adapter renders the string and the host only transports it; a game with
+no such moves never sets it. `RustPuctSearch.follow_ups()` is deliberately a
+separate call rather than a wider `snapshot` tuple, which leaves that tuple's
+shape and its tests alone.
 
 ## The BGA source dump
 

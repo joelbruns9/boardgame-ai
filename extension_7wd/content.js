@@ -179,7 +179,18 @@
       const meta = document.createElement("div");
       meta.className = "swd-adv-meta";
       meta.textContent = (r.visits || 0).toLocaleString() + " visits";
-      text.append(lab, meta);
+      text.append(lab);
+      // The rest of the move, when making it forces a second decision: which
+      // card the Mausoleum revives, which building Zeus destroys, which token a
+      // science pair takes. Usually most of the move's value, and the label
+      // alone cannot say it.
+      if (r.follow_up) {
+        const followUp = document.createElement("div");
+        followUp.className = "swd-adv-follow";
+        followUp.textContent = r.follow_up;
+        text.append(followUp);
+      }
+      text.append(meta);
       row.append(text, q);
       rows.appendChild(row);
     }

@@ -26,7 +26,7 @@ from typing import Any
 
 from games.advisor import ActionStats, ActionView, EngineSpec, SearchSnapshot
 
-from .codec import decode_action, legal_action_indices
+from .codec import decode_action, legal_action_indices, pending_choice_name
 from .engine import Action, ActionUse, apply_action
 from .game import GameState, Phase, new_game
 from .search import GumbelMCTS, SearchConfig, state_actor
@@ -95,6 +95,35 @@ def _label(action: Action, game=None) -> str:
     return action.use.name
 
 
+def _follow_up_label(action_index: int) -> str | None:
+    """Render the forced remainder of a move for the panel.
+
+    Reads the identity out of the action index alone (`pending_choice_name`),
+    because the child node it came from is inside the searcher and is never
+    reconstructed here. Anything that is not a pending-choice index has no
+    remainder to show.
+    """
+
+    name = pending_choice_name(int(action_index))
+    return None if name is None else f"then {name}"
+
+
+def _python_follow_up(edge) -> str | None:
+    """The Python searcher's half of the PV walk (`_RustPuctSearch.follow_ups`
+    is the Rust half). Most-sampled chance child, then its most-visited edge,
+    and only while a pending choice is still open -- an extra turn is a fresh
+    decision, not the rest of this move."""
+
+    children = list(getattr(edge, "children", {}).values())
+    if not children:
+        return None
+    node = max(children, key=lambda child: child.samples).node
+    if node.state.pending_choice is None or not node.edges:
+        return None
+    best = max(node.edges, key=lambda inner: inner.visits)
+    return _follow_up_label(best.action_index) if best.visits else None
+
+
 class _ClosedHandle:
     """SearchHandle over a closed-mode Gumbel tree, driven one PUCT sim at a
     time.  Values are converted p0 -> actor frame via ``sign`` here, so the
@@ -118,6 +147,7 @@ class _ClosedHandle:
                 visits=int(edge.visits),
                 q_value=self._sign * edge.q_p0,
                 prior=float(edge.prior),
+                follow_up=_python_follow_up(edge),
             )
             for edge in self._root.edges
         }
@@ -161,11 +191,20 @@ class _RustClosedHandle:
         if not stop_event.is_set():
             self._search.advance(int(chunk_sims))
         sims_done, root_visits, root_value_sum, _actor, edges = self._search.snapshot()
+        follow_ups = {
+            int(root_action): int(follow_action)
+            for root_action, follow_action, _visits in self._search.follow_ups()
+        }
         entries = {
             str(action_index): ActionStats(
                 visits=int(visits),
                 q_value=self._sign * (value_sum / visits if visits else 0.0),
                 prior=float(prior),
+                follow_up=(
+                    _follow_up_label(follow_ups[action_index])
+                    if action_index in follow_ups
+                    else None
+                ),
             )
             for action_index, visits, value_sum, prior in edges
         }

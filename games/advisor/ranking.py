@@ -46,6 +46,7 @@ def build_recommendations(
                 q_value=stats.q_value,
                 prior=stats.prior,
                 is_legal=view is not None,
+                follow_up=stats.follow_up,
                 fields=dict(view.fields) if view is not None else {},
             )
         )

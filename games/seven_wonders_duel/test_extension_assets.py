@@ -76,12 +76,21 @@ def test_extension_scripts_declare_no_browser_specific_globals(name):
 def test_page_bridge_states_match_the_mapper():
     """The bridge only wakes on states bga_extract actually supports, so a
     routine BGA transition never reaches Python just to be rejected."""
-    from .bga_extract import _DRAFT_STATE, _MAIN_TURN_STATE, _PENDING_STATES
+    from .bga_extract import (
+        _DRAFT_STATE,
+        _MAIN_TURN_STATE,
+        _PENDING_STATES,
+        _START_PLAYER_STATE,
+    )
 
     source = (_EXTENSION / "page_bridge.js").read_text(encoding="utf-8")
     block = source.split("const ADVISABLE = new Set([", 1)[1].split("]);", 1)[0]
     declared = set(re.findall(r'"([^"]+)"', block))
-    assert declared == {_DRAFT_STATE, _MAIN_TURN_STATE} | set(_PENDING_STATES)
+    assert declared == {
+        _DRAFT_STATE,
+        _MAIN_TURN_STATE,
+        _START_PLAYER_STATE,
+    } | set(_PENDING_STATES)
 
 
 def test_only_the_background_script_makes_network_calls():

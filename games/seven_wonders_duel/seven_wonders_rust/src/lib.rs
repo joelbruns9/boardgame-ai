@@ -409,6 +409,15 @@ impl RustPuctSearch {
         (self.session.sims_done(), visits, value_sum, actor, edges)
     }
 
+    /// `[(root_action_index, follow_up_action_index, follow_up_visits)]` for
+    /// the root actions whose move is not over -- see `follow_ups` in
+    /// `tree_resumable.rs`. Absent from `snapshot` on purpose: it is a separate
+    /// walk, and keeping it out leaves that tuple's shape (and its tests)
+    /// alone.
+    fn follow_ups(&self) -> Vec<(usize, usize, u32)> {
+        self.session.follow_ups()
+    }
+
     fn arena_nodes(&self) -> usize {
         self.session.arena_nodes()
     }

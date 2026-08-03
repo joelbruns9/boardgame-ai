@@ -121,6 +121,30 @@ def encode_action(game: GameState, action: Action) -> int:
     raise ValueError(f"cannot encode action: {action}")
 
 
+def pending_choice_name(index: int) -> str | None:
+    """The card or Progress token a pending-choice index names, without a state.
+
+    The action space is identity-indexed, so the four pending-choice blocks
+    encode *what* is chosen rather than its position in an option list. That
+    makes an index from one position readable in another -- which is what lets
+    the advisor label the forced remainder of a move (the Mausoleum's revival,
+    a Zeus/Circus target, a science-pair token) from a child node it never
+    reconstructs.
+
+    Returns None for any index outside those blocks.
+    """
+
+    if DESTROY_BASE <= index < MAUSOLEUM_BASE:
+        return _CARD_NAMES[index - DESTROY_BASE]
+    if MAUSOLEUM_BASE <= index < PROGRESS_BOARD_BASE:
+        return _CARD_NAMES[index - MAUSOLEUM_BASE]
+    if PROGRESS_BOARD_BASE <= index < PROGRESS_LIBRARY_BASE:
+        return _PROGRESS_NAMES[index - PROGRESS_BOARD_BASE]
+    if PROGRESS_LIBRARY_BASE <= index < NEXT_AGE_BASE:
+        return _PROGRESS_NAMES[index - PROGRESS_LIBRARY_BASE]
+    return None
+
+
 def decode_action(game: GameState, index: int) -> Action:
     """Map a codec index back to an engine action in the context of ``game``.
 

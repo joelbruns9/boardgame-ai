@@ -285,3 +285,138 @@ def test_victory_outlook_is_absent_without_an_evaluator():
     public = bare.state_to_public(_scraped_state(bare))
     assert public["victory_outlook"] is None
     assert public["legal_actions"], "the rest of the payload must be unaffected"
+
+
+def _mausoleum_position():
+    """A position where the Mausoleum is affordable and the discard is stocked.
+
+    Constructed rather than searched for: random play almost never leaves the
+    Mausoleum unbuilt, affordable, and facing a discard pile worth reviving
+    from.
+    """
+
+    from .advisor_adapter import _Position
+    from .codec import decode_action, legal_action_indices
+    from .engine import ActionUse, apply_action
+    from .game import Phase, new_game
+
+    for seed in range(400):
+        game = new_game(seed, first_player=0)
+        while game.phase is Phase.WONDER_DRAFT:
+            game.pick_wonder(game.legal_wonder_choices()[0])
+        for city in game.cities:
+            if "The Mausoleum" in city.wonders:
+                city.wonders.remove("The Mausoleum")
+        game.cities[game.active_player].wonders.insert(0, "The Mausoleum")
+        for _ in range(6):  # stock the discard pile
+            if game.phase is not Phase.PLAY_AGE:
+                break
+            discards = [
+                index
+                for index in legal_action_indices(game)
+                if decode_action(game, index).use is ActionUse.DISCARD_FOR_COINS
+            ]
+            apply_action(game, decode_action(game, discards[0]))
+        if game.phase is not Phase.PLAY_AGE or len(game.discard_pile) < 3:
+            continue
+        game.cities[game.active_player].coins = 100
+        builds = [
+            index
+            for index in legal_action_indices(game)
+            if decode_action(game, index).wonder_name == "The Mausoleum"
+        ]
+        if builds:
+            return _Position(game=game), builds[0]
+    raise AssertionError("no Mausoleum position found")
+
+
+class _PeakedEvaluator:
+    """Deterministic evaluator that makes one line strictly best.
+
+    The obvious version of the test below drove a randomly initialised net and
+    asserted the two searchers reported the SAME follow-up. That was testing
+    noise: under a random net every revival from the discard pile is worth about
+    the same, so the follow-up argmax is a coin flip between near-ties, and the
+    Rust and Python descents legitimately break ties differently. Measured over
+    six torch seeds they disagreed on three, and on a fourth neither expanded
+    the child at all, so `follow_up` was None on both.
+
+    Peaking the prior removes the tie: the principal variation is forced, both
+    searchers must find it, and the expected string can be written down. Values
+    are constant, so nothing here depends on model weights at all.
+    """
+
+    def __init__(self, preferred):
+        self._preferred = {int(index) for index in preferred}
+
+    def evaluate(self, encodings, legal_lists):
+        import numpy as np
+
+        from .inference import Evaluation
+
+        out = []
+        for _encoding, legal in zip(encodings, legal_lists):
+            policy = np.ones(len(legal), dtype=np.float32)
+            for position, index in enumerate(legal):
+                if int(index) in self._preferred:
+                    policy[position] = 200.0
+            out.append(
+                Evaluation(
+                    policy=policy / policy.sum(),
+                    wdl=np.asarray([0.5, 0.2, 0.3], dtype=np.float32),
+                    joint7=np.full(7, 1.0 / 7.0, dtype=np.float32),
+                    margin=0.0,
+                    military=0.0,
+                    science=np.zeros(2, dtype=np.float32),
+                )
+            )
+        return out
+
+
+@pytest.mark.parametrize("search_impl", ["rust", "python"])
+def test_a_forced_follow_up_is_reported_for_the_move_that_forces_it(search_impl):
+    """Advisor item H: `Wonder: The Mausoleum (using X)` is not the whole move.
+
+    Building it immediately forces a second decision -- which discarded card to
+    take for free -- and that is most of the move's value. The search knows it
+    as the principal variation; before this, nothing downstream could see it,
+    because the root readout returned root edges only.
+
+    Both searchers are asserted against the same literal string, which is the
+    cross-engine gate: they are separate walks over separate structures, so a
+    divergence would make the panel say different things depending on which
+    searcher is on.
+    """
+
+    from .codec import MAUSOLEUM_BASE, decode_action
+    from .data import CARD_IDS
+    from .engine import ActionUse
+
+    position, mausoleum = _mausoleum_position()
+    revived = position.game.discard_pile[0]
+    adapter = SevenWondersAdvisor(
+        evaluator=_PeakedEvaluator({mausoleum, MAUSOLEUM_BASE + CARD_IDS[revived]})
+    )
+    request = RecommendRequest(
+        max_sims=400,
+        chunk_sims=400,
+        options={"search_impl": search_impl, "force_expand_root_chance": False},
+    )
+    handle = adapter.open_search(position, request)
+    try:
+        snapshot = handle.advance(400, threading.Event())
+    finally:
+        handle.close()
+
+    assert snapshot.entries[str(mausoleum)].follow_up == f"then {revived}"
+
+    # ...and an ordinary move, which simply ends the turn, must stay silent
+    # rather than report the opponent's reply as if it were part of your move.
+    plain = [
+        action_id
+        for action_id, stats in snapshot.entries.items()
+        if decode_action(position.game, int(action_id)).use
+        is ActionUse.DISCARD_FOR_COINS
+    ]
+    assert plain, "the position must contain a plain move to contrast against"
+    assert all(snapshot.entries[action_id].follow_up is None for action_id in plain)

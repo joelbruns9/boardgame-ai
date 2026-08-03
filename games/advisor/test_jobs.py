@@ -254,3 +254,31 @@ def test_blocking_job_is_never_idle_reaped():
     )
     assert response.ok
     assert response.sims_done == 40
+
+
+def test_a_follow_up_survives_ranking_into_the_response():
+    """`ActionStats.follow_up` is the search's word about the rest of a move.
+
+    The host must carry it verbatim and never invent one: naming a move is game
+    knowledge, so the string is produced by the adapter and only transported
+    here. An action without a remainder keeps `None` rather than an empty
+    string, so a renderer can test truthiness.
+    """
+    from games.advisor.ranking import build_recommendations
+
+    snapshot = SearchSnapshot(
+        sims_done=10,
+        sims_target=10,
+        root_value=0.0,
+        entries={
+            "0": ActionStats(10, 0.5, 0.5, follow_up="then Laboratory"),
+            "1": ActionStats(5, 0.1, 0.5),
+        },
+        partial=False,
+    )
+    views = [
+        ActionView(action_id="0", label="Wonder: The Mausoleum", kind="w", fields={}),
+        ActionView(action_id="1", label="Build: Baths", kind="b", fields={}),
+    ]
+    ranked = build_recommendations(snapshot, views, top_k=8)
+    assert [r.follow_up for r in ranked] == ["then Laboratory", None]

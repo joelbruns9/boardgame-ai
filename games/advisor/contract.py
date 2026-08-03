@@ -107,6 +107,17 @@ class ActionStats:
     visits: int
     q_value: float  # actor-frame edge in [-1, 1]
     prior: float
+    follow_up: str | None = None
+    """Short description of the FORCED REMAINDER of this move, if any.
+
+    Some moves do not end a turn: they raise a second decision the same player
+    must immediately make, and that decision can be most of the move's value.
+    The search knows it as its principal variation, so the adapter reads it off
+    the tree and renders it; the host only carries the string, because naming a
+    move is game knowledge.
+
+    ``None`` whenever the move simply ends, which is the common case. A game
+    with no such moves never sets it."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,6 +225,9 @@ class Recommendation:
     q_value: float
     prior: float
     is_legal: bool = True
+    follow_up: str | None = None
+    """Carried through from :attr:`ActionStats.follow_up` -- the rest of this
+    move, when making it raises a second decision for the same player."""
     fields: dict[str, Any] = field(default_factory=dict)
     annotations: dict[str, Any] = field(default_factory=dict)
 
