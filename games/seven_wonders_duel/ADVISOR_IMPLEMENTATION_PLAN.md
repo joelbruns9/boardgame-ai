@@ -23,9 +23,16 @@ BGA ships an update, re-check rather than assume.
 
 **What is actually left**
 
-1. **Re-test the extension.** It last ran before the Rust searcher, the batched
-   evaluation boundary, the victory-type outlook and the draft landed.
-2. **Item E** — draft-preference extraction, now unblocked by A.
+| # | Item | Size | Notes |
+|---|---|---|---|
+| F | Start-player choice for the next age | ~1 day | a decision you are asked and get nothing for |
+| G | Wonder art in the panel | ~15 min | draft rows show a placeholder |
+| H | Follow-up move in the panel (Mausoleum et al.) | ~half day | advice is correct but incomplete |
+| E | Draft-preference extraction | ~half day | analysis, not play |
+
+Each is written up under "Remaining work" below. Also outstanding: **re-test the
+extension**, which last ran before the Rust searcher, the batched evaluation
+boundary, the victory-type outlook and the draft landed.
 
 **Item A shipped 2026-08-02.** The draft was long assumed unreconstructable from
 a public observation; it is not. BGA reveals only the current group, so the
@@ -54,6 +61,87 @@ Play advice works end to end today: capture without reload, streaming search,
 ranked moves with card art. The searcher moved to Rust and is ~19× faster than
 when the extension was first tried — see `ADVISOR_RUST_UNIFICATION.md`, an
 independent track that neither blocks nor is blocked by this one.
+
+## Remaining work
+
+### F. Start-player choice for the next age (`selectStartPlayer`)
+
+Two decisions a game (Age I→II, II→III) and the advisor is silent for both:
+`Phase.CHOOSE_NEXT_START_PLAYER` is still refused by the scrape codec, with a
+test asserting it stays refused so that supporting the draft did not widen the
+scope by accident.
+
+**The hard part is a genuine modelling mismatch, not the plumbing.** BGA and the
+engine disagree about *when* the next age is dealt:
+
+* **BGA deals first, then asks.** Confirmed on the committed capture
+  `testdata/bga_887892216_ageiii.json`, which is taken at `selectStartPlayer`
+  and already carries **age 3 with all 20 cards** in `draftpool`. A human chooses
+  while looking at the pyramid.
+* **The engine deals as a consequence of the choice** (`engine.py:887-899`):
+  `game.age += 1`, then an `AGE_DEAL` chance event, then
+  `TableauState.from_deck`. At choice time the next age does not exist.
+
+That difference is not cosmetic — the layout is exactly what makes the choice
+worth making. Reconstructing the engine's model faithfully would average over
+deals that never happen and answer a different question from the one on screen.
+
+So the observed deal has to be seeded, which fights three mechanisms:
+
+1. `age_decks[next_age]` must carry the observed cards **in slot order**, since
+   `from_deck` places them positionally.
+2. The `AGE_DEAL` chance node must resolve to that deal rather than sampling.
+   `age_deal_samples` defaults to 0, so this may already hold — verify, do not
+   assume.
+3. `resample_hidden` re-deals every age `> state.age` and would throw the seeded
+   deal away.
+
+**The test is the fixture, and one assertion pins all three:** after applying
+either choice to the reconstructed state, the resulting tableau must equal what
+BGA shows in `draftpool`. `_tableau(gamedatas, next_age)` already reads that
+structure, and face-down slots there are sampled exactly as in PLAY_AGE.
+
+Note the engine keeps `age` at the age that just *ended* during this phase, with
+an exhausted tableau (all 20 slots present=False). Absent slots retain their
+`card_name` on both sides -- see the injection work in
+`ADVISOR_RUST_UNIFICATION.md` -- but at an age boundary every card has already
+gone to a city, the discard or under a wonder, so the pool arithmetic works out
+even though the old structure cannot be read back from BGA.
+
+**Do not ship the cheap version.** Following the engine's model is easy and
+quietly worse: advice that looks authoritative while ignoring information the
+player can see is worse than no advice.
+
+### G. Wonder art in the panel (small)
+
+Draft rows render the dashed placeholder instead of the wonder. `content.js:150`
+passes only `r.fields.card_name` to `cardArt`, and a draft action has
+`wonder_name` with `card_name = None`.
+
+Everything needed is already in place: the bridge captures `art.wonders`
+(`page_bridge.js:95`) and `ActionView.fields` carries `wonder_name`. BGA styles a
+wonder as `div.wonder.wonder_small` against `img/wonders_v3.jpg`, exactly
+parallel to `div.building.building_small` -- so the same trick works, still with
+nothing bundled.
+
+Fall back to the wonder sprite when `card_name` is absent. Progress tokens
+(`img/progress_tokens_v3.jpg`, also already captured) would give pending-choice
+rows their art too.
+
+### H. Show the follow-up move (Mausoleum and friends)
+
+The panel says `Wonder: The Mausoleum (using X)` and stops, but building the
+Mausoleum immediately forces a second decision -- *which discarded card to take
+for free* -- and that is most of the move's value. Same for any wonder that
+triggers a choice.
+
+The search already knows: it is the principal variation. Nothing downstream can
+see it because `RustPuctSearch.snapshot` returns **root edges only**.
+
+Needs a PV readout -- from the root's best edge, walk to the most-visited child
+and report its best action -- surfaced as an extra field per recommendation.
+Worth doing generically rather than special-casing the Mausoleum: it also covers
+Zeus/Circus destroy targets and the science-pair token pick.
 
 ## The BGA source dump
 
