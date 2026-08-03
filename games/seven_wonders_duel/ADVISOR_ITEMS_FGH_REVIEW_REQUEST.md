@@ -24,6 +24,65 @@ writing this document, one from the user's live testing. Both are fixed here;
 read them first, since they are the only places where advice could have been
 wrong or the host unusable.
 
+---
+
+## REVIEWED 2026-08-03 — outcome
+
+Five findings, **all five upheld and fixed**, plus one improvement the review
+prompted. No finding was disputed. The reviewer explicitly cleared item G's
+sprite arithmetic and priority order, and the start-player determinization.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 (P1) | Great Library follow-up could name an unavailable token | **ranked top 3**, aggregated across every sampled draw |
+| 2 (P2) | a `testuser=`-only frame set was still accepted | refused, with an explicit opt-in override |
+| 3 (P2) | start-player `victory_outlook` is out-of-distribution | suppressed at that phase |
+| 4 (P2) | the memory-ceiling warning never reached the user | panel renders warnings, and says "capped" not "converged" |
+| 5 (P2) | arena accounting was O(N²) and ran at zero budget | latching, amortised, short-circuited |
+| — | publishes were built and thrown away 13-in-14 | adaptive chunk toward a publish target |
+
+**Finding 1 was fixed better than either option the reviewer offered.** They
+suggested suppressing the specific token or showing outcome-contingent advice.
+The user's insight was sharper: the draw takes 3 of the 5 off-board tokens, so
+it *removes exactly two* — name three and at least one always survives. So the
+panel now renders a preference order, "then best offered: Economy > Masonry >
+Urbanism", which is **100% actionable** where naming one was right 60% of the
+time (C(4,2)/C(5,3)) and naming two 90%.
+
+Getting there needed the walk to change, not just the wording: it now pools each
+option's visits and value across **every** chance child and ranks by mean value
+in the chooser's frame, instead of reading the most-sampled child's favourite.
+That also improves the deterministic choices (Mausoleum, Zeus, Circus, the
+science-pair token), which keep the exact single "then X" because their options
+are already on the table — the contingent rendering keys on the root edge
+carrying a `GREAT_LIBRARY_DRAW` spec. Verified: both searchers produce the same
+three names in the same order on a real Great Library position.
+
+**Finding 5's numbers.** The reviewer measured 2,498 → 2,104 sims/s (−16%) from
+the accounting. After the fix, measured on the same shape: **918 sims/s with the
+budget on versus 914 with it off** — indistinguishable. Node count is O(1) and
+now gates the O(nodes+edges) weighing, the gate grows with the tree so scans are
+geometric (total O(N), not O(N²)), the answer latches once tripped, and a zero
+budget returns before touching any of it.
+
+**On finding 3**, I fixed it by phase rather than by "legacy checkpoint" as
+suggested: there is no clean way to detect a legacy checkpoint, and the
+out-of-distribution-ness is a property of `CHOOSE_NEXT_START_PLAYER` itself. A
+checkpoint trained under the corrected ordering can delete the branch.
+
+**The timed refresh** was not a review finding but came out of the same
+discussion. `chunk_sims` is now a floor and the host grows the step toward
+`publish_target_ms` (300ms default). The panel polls every 700ms and was being
+served a publish every ~54ms, so roughly thirteen of every fourteen were built,
+ranked and discarded; it also makes the refresh rate independent of machine
+speed and position width. It compounds with finding 5, since fewer publishes
+means fewer gate checks.
+
+**One test re-baselined:** `test_polling_keeps_a_streaming_job_alive` guaranteed
+a long-running job by asking for `chunk_sims=1`, which adaptive pacing races
+through. Its subject is reaping, not pacing, so it now pins
+`publish_target_ms=0` and says why.
+
 **State:** 826 passed / 1 skipped (7WD + advisor), `cargo test` 17 passed. The
 skip is the run-03 bf16 test, refused by the `codec-2` spec bump.
 

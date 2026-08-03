@@ -1382,28 +1382,77 @@ impl SearchSession {
     /// variation; nothing downstream could see it, because `root_stats` returns
     /// root edges only.
     ///
-    /// Walks one ply: the edge's most-sampled chance child, then that node's
-    /// most-visited edge. Reported ONLY when the child still holds a pending
-    /// choice, which is exactly "this move is not over". An extra turn
-    /// (Theology) is a fresh decision rather than a forced remainder, so it is
-    /// deliberately not reported here -- it would read as part of the move.
-    pub fn follow_ups(&self) -> Vec<(usize, usize, u32)> {
+    /// Returns `[(root_action, ranked_follow_ups, contingent)]`, best first.
+    /// Reported ONLY while the child still holds a pending choice, which is
+    /// exactly "this move is not over". An extra turn (Theology) is a fresh
+    /// decision rather than a forced remainder, so it is deliberately excluded
+    /// -- "then ..." would read as part of the move.
+    ///
+    /// **Aggregated across every chance child, not read off the most-sampled
+    /// one.** The first version picked one sampled child and printed its
+    /// favourite, which is wrong whenever the option set is itself random: the
+    /// Great Library's three tokens are drawn from five, so a single named
+    /// token is the one actually offered only 60% of the time (C(4,2)/C(5,3)).
+    /// Averaging each option's Q over the children that offered it gives a
+    /// ranking over the whole pool, and `contingent` tells the caller to render
+    /// it as a preference order ("take the best one offered") rather than as a
+    /// single forced move. Naming three is enough to always be actionable: the
+    /// draw removes exactly two of the five, so any three contain a survivor.
+    ///
+    /// Aggregation helps the deterministic choices too -- Mausoleum, Zeus,
+    /// Circus, the science-pair token -- whose options are the same in every
+    /// child, so it simply pools more evidence than one child holds.
+    pub fn follow_ups(&self) -> Vec<(usize, Vec<usize>, bool)> {
         let root = &self.arena.nodes[self.arena.root_id()];
         let mut out = Vec::new();
         for edge in &root.edges {
-            let Some(child) = edge.children.iter().map(|(_, c)| c).max_by_key(|c| c.samples)
-            else {
-                continue;
-            };
-            let node = &self.arena.nodes[child.node_id];
-            if node.state.pending_choice.is_none() {
-                continue;
-            }
-            if let Some(best) = node.edges.iter().max_by_key(|e| e.visits) {
-                if best.visits > 0 {
-                    out.push((edge.action_index, best.action_index, best.visits));
+            // Visits and p0-value pooled per option across every child.
+            let mut totals: Vec<(usize, u32, f64)> = Vec::new();
+            let mut actor = 0usize;
+            for (_, child) in &edge.children {
+                let node = &self.arena.nodes[child.node_id];
+                if node.state.pending_choice.is_none() {
+                    continue;
+                }
+                actor = node.actor;
+                for inner in &node.edges {
+                    if inner.visits == 0 {
+                        continue;
+                    }
+                    match totals.iter_mut().find(|(a, _, _)| *a == inner.action_index) {
+                        Some(slot) => {
+                            slot.1 += inner.visits;
+                            slot.2 += inner.value_sum_p0;
+                        }
+                        None => totals.push((
+                            inner.action_index,
+                            inner.visits,
+                            inner.value_sum_p0,
+                        )),
+                    }
                 }
             }
+            if totals.is_empty() {
+                continue;
+            }
+            // Rank by mean value in the CHOOSER's frame, not by visits: an
+            // option offered alongside strong rivals earns few visits without
+            // being worse. Ties break on the action index so the order is
+            // stable across runs.
+            let sign = if actor == 0 { 1.0 } else { -1.0 };
+            totals.sort_by(|a, b| {
+                let qa = sign * a.2 / a.1 as f64;
+                let qb = sign * b.2 / b.1 as f64;
+                qb.partial_cmp(&qa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            let contingent = edge
+                .specs
+                .iter()
+                .any(|spec| spec.kind == ChanceKind::GreatLibraryDraw);
+            let ranked = totals.iter().take(5).map(|(a, _, _)| *a).collect();
+            out.push((edge.action_index, ranked, contingent));
         }
         out
     }

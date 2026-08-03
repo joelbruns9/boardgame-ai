@@ -146,7 +146,7 @@
   // `job` is the /poll envelope: {job_id, status, sims_done, error, snapshot},
   // where `snapshot` is the RecommendResponse and is null until the first chunk
   // has been published.
-  function render(job) {
+  function render(job, warnings) {
     const el = ensurePanel();
     const rows = el.querySelector('[data-role="rows"]');
     const sub = el.querySelector('[data-role="sub"]');
@@ -161,6 +161,11 @@
       (sims >= MIN_SIMS_FOR_WIN_PCT
         ? "  ·  win " + pct.toFixed(1) + "%"
         : "  ·  win % settling…");
+    // Anything the host warns about belongs on screen. Today that is the arena
+    // ceiling; a silent cap looks like a counter that stalled.
+    for (const warning of warnings || []) {
+      sub.textContent += "  ·  " + warning;
+    }
 
     rows.textContent = "";
     for (const r of recs) {
@@ -389,8 +394,17 @@
       pollTimer = null;
       return;
     }
-    setStatus(resp.status === "done" ? "converged" : "thinking");
-    render(resp);
+    // "done" covers two different endings and they must not read alike. A
+    // search that hit the arena ceiling stopped because it ran out of memory
+    // budget, not because it converged -- calling that "converged" is exactly
+    // the misleading status the ceiling was added to avoid.
+    const warnings = (resp.snapshot && resp.snapshot.warnings) || [];
+    if (resp.status === "done") {
+      setStatus(warnings.length ? "capped" : "converged");
+    } else {
+      setStatus("thinking");
+    }
+    render(resp, warnings);
   }
 
   // -- bridge ---------------------------------------------------------------

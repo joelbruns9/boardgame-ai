@@ -242,6 +242,21 @@ decision*, not a forced remainder, and labelling it "then ..." would read as
 part of the move. An opponent reply is likewise excluded — the panel would be
 claiming your move includes their answer.
 
+**Amended 2026-08-03 after review: a contingent option set gets a ranked top 3,
+not one name.** The first version read the most-sampled chance child and printed
+its favourite. That is right for the Mausoleum, Zeus, the Circus and the
+science-pair token, whose options are already on the table — but wrong for the
+Great Library, whose three tokens are themselves drawn from five, so a single
+named token is the one actually offered only 60% of the time. Three is the
+number that always works: the draw removes exactly two of the five, so any three
+contain a survivor. The panel renders "then best offered: A > B > C".
+
+The ranking pools each option's visits and value across **every** chance child
+and orders by mean value in the chooser's frame, rather than trusting one
+child — which also gives the deterministic choices more evidence than any single
+child holds. Contingency is detected by the root edge carrying a
+`GREAT_LIBRARY_DRAW` spec.
+
 **What made it cheap: the action space is identity-indexed.** The follow-up
 comes from a child node the adapter never reconstructs, so its action index has
 to be readable without a state — and it is, because the four pending-choice

@@ -409,12 +409,14 @@ impl RustPuctSearch {
         (self.session.sims_done(), visits, value_sum, actor, edges)
     }
 
-    /// `[(root_action_index, follow_up_action_index, follow_up_visits)]` for
-    /// the root actions whose move is not over -- see `follow_ups` in
-    /// `tree_resumable.rs`. Absent from `snapshot` on purpose: it is a separate
-    /// walk, and keeping it out leaves that tuple's shape (and its tests)
-    /// alone.
-    fn follow_ups(&self) -> Vec<(usize, usize, u32)> {
+    /// `[(root_action_index, ranked_follow_up_indices, contingent)]` for the
+    /// root actions whose move is not over -- see `follow_ups` in
+    /// `tree_resumable.rs`. `contingent` marks an option set that is itself
+    /// random (the Great Library's draw), where the caller must render a
+    /// preference order rather than one forced move. Absent from `snapshot` on
+    /// purpose: it is a separate walk, and keeping it out leaves that tuple's
+    /// shape (and its tests) alone.
+    fn follow_ups(&self) -> Vec<(usize, Vec<usize>, bool)> {
         self.session.follow_ups()
     }
 

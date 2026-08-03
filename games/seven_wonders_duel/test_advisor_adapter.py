@@ -471,3 +471,45 @@ def test_no_budget_means_no_ceiling(adapter):
         handle.close()
     assert snapshot.stop_reason is None
     assert snapshot.sims_done == 400
+
+
+def test_the_start_player_outlook_is_suppressed():
+    """A calibration hole, not a missing feature.
+
+    Until 2026-08-03 the engine dealt the next Age *after* asking who begins it,
+    so every checkpoint trained before that saw CHOOSE_NEXT_START_PLAYER only
+    with an exhausted tableau. Item F now hands it a full pyramid. The ranked
+    moves survive -- search plays forward into ordinary positions -- but this is
+    a single raw read of the root, whose aux heads carry 0.2 loss weight and no
+    search correction. Confident-looking noise is worse than nothing.
+    """
+
+    import random
+
+    from .advisor_adapter import _Position
+    from .codec import decode_action, legal_action_indices
+    from .engine import apply_action, legal_actions
+    from .game import Phase, new_game
+    from .inference import Evaluator
+    from .train import build_model
+
+    game = new_game(9)
+    rng = random.Random(0)
+    while game.phase is not Phase.CHOOSE_NEXT_START_PLAYER:
+        actions = legal_actions(game)
+        if not actions:
+            pytest.skip("no start-player choice reached")
+        apply_action(game, rng.choice(actions))
+
+    advisor = SevenWondersAdvisor(
+        evaluator=Evaluator(build_model("transformer", 32, 1), "cpu")
+    )
+    public = advisor.state_to_public(_Position(game=game))
+    assert public["victory_outlook"] is None
+    assert public["legal_actions"], "the rest of the payload is unaffected"
+
+    # ...and an ordinary turn still reports one, so this is targeted rather
+    # than a blanket disable.
+    apply_action(game, decode_action(game, legal_action_indices(game)[0]))
+    assert game.phase is Phase.PLAY_AGE
+    assert advisor.state_to_public(_Position(game=game))["victory_outlook"] is not None

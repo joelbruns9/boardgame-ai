@@ -160,6 +160,7 @@ console.log([
   run(win(U, "111", PLAYERS, [win(U + "&x=2", "222", PLAYERS)])),
   run(win(U, "999", PLAYERS)),
   run(win("https://example.com", null, {})),
+  run(win(U + "&testuser=222", "222", PLAYERS)),
 ].join(","));
 """
 
@@ -186,4 +187,5 @@ def test_frame_selection_picks_the_seat_and_is_loud_when_it_cannot():
         "loud",      # two unmarked frames on different seats: unknowable
         "loud",      # spectator: reads the board, gets no private args
         "quiet",     # not a game page at all
+        "loud",      # ONLY impersonated frames: refuse, do not fall back
     ]

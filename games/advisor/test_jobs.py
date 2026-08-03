@@ -227,6 +227,13 @@ def test_polling_keeps_a_streaming_job_alive():
     manager = JobManager(
         adapter,
         chunk_default=1,
+        # Pin the chunk. This test needs a job that is STILL RUNNING for the
+        # whole polling window, and it gets one by asking for tiny steps; with
+        # adaptive pacing on, the fake handle (which just increments a counter)
+        # grows its chunk and finishes ten million of them well inside 0.9s.
+        # The subject here is reaping, not pacing, so say so rather than rely on
+        # the default happening to be slow.
+        publish_target_ms=0,
         idle_timeout_secs=0.3,
         sweep_interval_secs=0.05,
     )
@@ -318,3 +325,41 @@ def test_a_resource_ceiling_ends_the_search_and_is_reported():
     assert 60 <= response.sims_done < 100_000, "must stop well short of the target"
     assert response.warnings == ["stopped growing the tree at 512 MB"]
     assert response.recommendations, "the work already done is still the answer"
+
+
+def test_the_chunk_grows_toward_the_publish_target():
+    """Simulations are the wrong unit for a refresh rate.
+
+    Their cost varies by position width and by machine, neither of which the
+    caller knows: a 7WD panel polling every 700ms was being served a publish
+    every ~54ms, so thirteen of every fourteen were built, ranked and discarded.
+    The caller's `chunk_sims` becomes a floor and the loop grows toward
+    `publish_target_ms` of work per publish.
+
+    The fake handle is instant, so every chunk here undershoots the target and
+    the step should climb to the cap rather than stay at the floor.
+    """
+
+    manager = JobManager(_FakeAdapter(), publish_target_ms=50.0, max_chunk=4096)
+    response = manager.run_blocking(
+        _FakeState("adaptive", 3),
+        RecommendRequest(engine="auto", max_sims=40_000, chunk_sims=10),
+    )
+    assert response.sims_done == 40_000, "the target is still reached exactly"
+
+    # Growth is capped per step (never more than doubling), so from a floor of
+    # 10 it takes ~9 doublings to reach 4096 -- far fewer than the 4,000
+    # publishes a fixed step of 10 would have produced.
+    steps = manager._next_chunk(10, 10, 0.0001)
+    assert steps == 20, "a single fast chunk may at most double the next one"
+    assert manager._next_chunk(4096, 10, 0.0001) == 4096, "capped at max_chunk"
+    assert manager._next_chunk(1000, 10, 10.0) == 500, "an overrun halves it"
+    assert manager._next_chunk(20, 50, 10.0) == 50, "never below the caller's floor"
+
+
+def test_publish_target_zero_keeps_the_caller_s_chunk():
+    """Some callers want exact steps -- tests that need a long-running job, and
+    anything measuring per-chunk behaviour."""
+
+    manager = JobManager(_FakeAdapter(), publish_target_ms=0)
+    assert manager._next_chunk(10, 10, 0.0001) == 10

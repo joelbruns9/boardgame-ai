@@ -95,33 +95,80 @@ def _label(action: Action, game=None) -> str:
     return action.use.name
 
 
-def _follow_up_label(action_index: int) -> str | None:
-    """Render the forced remainder of a move for the panel.
+FOLLOW_UP_CHOICES_SHOWN = 3
+"""How many options a contingent follow-up names.
 
-    Reads the identity out of the action index alone (`pending_choice_name`),
-    because the child node it came from is inside the searcher and is never
-    reconstructed here. Anything that is not a pending-choice index has no
-    remainder to show.
+Exactly enough to always be usable. The Great Library offers 3 of the 5
+off-board tokens, so the draw removes exactly two -- name three and at least one
+survives, every time. Naming one is right only 60% of the time (C(4,2)/C(5,3)),
+which is what this replaced; two would be 90%.
+"""
+
+
+def _follow_up_label(action_indices, contingent: bool) -> str | None:
+    """Render the remainder of a move for the panel.
+
+    Identities come out of the action indices alone (`pending_choice_name`),
+    because the child nodes they came from live inside the searcher and are
+    never reconstructed here.
+
+    ``contingent`` means the option set is itself random -- the Great Library
+    draws its three tokens from five -- so the honest rendering is a preference
+    order over the pool rather than a single forced move. Everything else
+    (Mausoleum, Zeus, Circus, the science-pair token) chooses from a set that is
+    already on the table, where one name is exact.
     """
 
-    name = pending_choice_name(int(action_index))
-    return None if name is None else f"then {name}"
-
-
-def _python_follow_up(edge) -> str | None:
-    """The Python searcher's half of the PV walk (`_RustPuctSearch.follow_ups`
-    is the Rust half). Most-sampled chance child, then its most-visited edge,
-    and only while a pending choice is still open -- an extra turn is a fresh
-    decision, not the rest of this move."""
-
-    children = list(getattr(edge, "children", {}).values())
-    if not children:
+    names = [
+        name
+        for name in (pending_choice_name(int(index)) for index in action_indices)
+        if name is not None
+    ]
+    if not names:
         return None
-    node = max(children, key=lambda child: child.samples).node
-    if node.state.pending_choice is None or not node.edges:
+    if not contingent:
+        return f"then {names[0]}"
+    shown = names[:FOLLOW_UP_CHOICES_SHOWN]
+    if len(shown) == 1:
+        return f"then {shown[0]}"
+    return "then best offered: " + " > ".join(shown)
+
+
+def _python_follow_up(edge) -> tuple[list[int], bool] | None:
+    """The Python searcher's half of the PV walk (`RustPuctSearch.follow_ups`
+    is the Rust half), aggregated the same way.
+
+    Pools each option's visits and value across EVERY chance child rather than
+    reading the most-sampled one, then ranks by mean value in the chooser's
+    frame. Only while a pending choice is open -- an extra turn is a fresh
+    decision, not the rest of this move.
+    """
+
+    from .search import ChanceKind
+
+    totals: dict[int, list] = {}
+    actor = 0
+    for child in getattr(edge, "children", {}).values():
+        node = child.node
+        if node.state.pending_choice is None:
+            continue
+        actor = node.actor
+        for inner in node.edges:
+            if not inner.visits:
+                continue
+            slot = totals.setdefault(inner.action_index, [0, 0.0])
+            slot[0] += inner.visits
+            slot[1] += inner.value_sum_p0
+    if not totals:
         return None
-    best = max(node.edges, key=lambda inner: inner.visits)
-    return _follow_up_label(best.action_index) if best.visits else None
+    sign = 1.0 if actor == 0 else -1.0
+    ranked = sorted(
+        totals.items(), key=lambda item: (-sign * item[1][1] / item[1][0], item[0])
+    )
+    contingent = any(
+        spec.kind is ChanceKind.GREAT_LIBRARY_DRAW for spec in getattr(edge, "specs", ())
+    )
+    return [index for index, _ in ranked[:5]], contingent
 
 
 DEFAULT_ARENA_BUDGET_MB = 512
@@ -160,6 +207,44 @@ def _budget_reached(used_bytes: int, budget_bytes: int) -> str | None:
     )
 
 
+class _ArenaBudget:
+    """Latching, amortised check that a search's tree has stopped growing.
+
+    Weighing the arena is O(nodes + edges), and the tree gains a node per
+    simulation, so measuring on every chunk made the accounting O(N^2) in total
+    -- measured at 2.03 ms per scan around 20k nodes, costing ~16% throughput
+    over a 30k-simulation run.
+
+    Two things fix that. Node count is O(1) (a `Vec` length), so it gates the
+    expensive weighing; and the gate grows with the tree, which makes the scans
+    geometric and their total cost O(N) rather than O(N^2). Once tripped the
+    answer latches, because a tree that has stopped growing does not shrink.
+
+    A zero budget short-circuits before any of it, so the training and analysis
+    paths pay nothing at all.
+    """
+
+    __slots__ = ("_budget", "_reason", "_next_scan")
+
+    def __init__(self, budget_bytes: int):
+        self._budget = int(budget_bytes)
+        self._reason: str | None = None
+        self._next_scan = 0
+
+    def reason(self, node_count, weigh) -> str | None:
+        if not self._budget or self._reason is not None:
+            return self._reason
+        nodes = node_count()
+        if nodes < self._next_scan:
+            return None
+        # Re-check after another eighth of the current tree. The overshoot that
+        # buys is bounded and reported honestly, since the message carries the
+        # size actually measured.
+        self._next_scan = nodes + max(2_000, nodes // 8)
+        self._reason = _budget_reached(weigh(), self._budget)
+        return self._reason
+
+
 class _ClosedHandle:
     """SearchHandle over a closed-mode Gumbel tree, driven one PUCT sim at a
     time.  Values are converted p0 -> actor frame via ``sign`` here, so the
@@ -171,14 +256,14 @@ class _ClosedHandle:
         self._sign = 1.0 if actor == 0 else -1.0
         self._target = int(target)
         self._done = 0
-        self._budget = int(budget)
+        self._budget = _ArenaBudget(budget)
 
     def _stop_reason(self) -> str | None:
         # Estimated from the node count, since a Python tree cannot be weighed
-        # directly. Rust measures its arena instead.
-        return _budget_reached(
-            self._mcts.closed_nodes_created * _MEASURED_BYTES_PER_NODE, self._budget
-        )
+        # directly; Rust measures its arena instead. Both sides are O(1) here,
+        # so the amortisation in _ArenaBudget costs nothing extra.
+        nodes = lambda: self._mcts.closed_nodes_created
+        return self._budget.reason(nodes, lambda: nodes() * _MEASURED_BYTES_PER_NODE)
 
     def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
         for _ in range(int(chunk_sims)):
@@ -191,7 +276,11 @@ class _ClosedHandle:
                 visits=int(edge.visits),
                 q_value=self._sign * edge.q_p0,
                 prior=float(edge.prior),
-                follow_up=_python_follow_up(edge),
+                follow_up=(
+                    _follow_up_label(*aggregated)
+                    if (aggregated := _python_follow_up(edge)) is not None
+                    else None
+                ),
             )
             for edge in self._root.edges
         }
@@ -228,10 +317,14 @@ class _RustClosedHandle:
         self._search = search
         self._sign = 1.0 if actor == 0 else -1.0
         self._target = int(target)
-        self._budget = int(budget)
+        self._budget = _ArenaBudget(budget)
 
     def _stop_reason(self) -> str | None:
-        return _budget_reached(self._search.arena_deep_bytes(), self._budget)
+        # arena_nodes is a Vec length; arena_deep_bytes walks every node and its
+        # owned vectors, so it runs only when the gate opens.
+        return self._budget.reason(
+            self._search.arena_nodes, self._search.arena_deep_bytes
+        )
 
     def advance(self, chunk_sims: int, stop_event) -> SearchSnapshot:
         # Rust only checks the chunk boundary between evaluation requests, so a
@@ -241,8 +334,8 @@ class _RustClosedHandle:
             self._search.advance(int(chunk_sims))
         sims_done, root_visits, root_value_sum, _actor, edges = self._search.snapshot()
         follow_ups = {
-            int(root_action): int(follow_action)
-            for root_action, follow_action, _visits in self._search.follow_ups()
+            int(root_action): (ranked, bool(contingent))
+            for root_action, ranked, contingent in self._search.follow_ups()
         }
         entries = {
             str(action_index): ActionStats(
@@ -250,7 +343,7 @@ class _RustClosedHandle:
                 q_value=self._sign * (value_sum / visits if visits else 0.0),
                 prior=float(prior),
                 follow_up=(
-                    _follow_up_label(follow_ups[action_index])
+                    _follow_up_label(*follow_ups[action_index])
                     if action_index in follow_ups
                     else None
                 ),
@@ -410,9 +503,26 @@ class SevenWondersAdvisor:
 
         Returns None when no evaluator is configured; the caller renders what it
         gets.
+
+        **Also None at the start-player choice**, which is a calibration hole
+        rather than a missing feature. Until 2026-08-03 the engine dealt the
+        next Age *after* asking who begins it, so every checkpoint trained
+        before that -- including the one being served -- only ever saw
+        ``CHOOSE_NEXT_START_PLAYER`` with an exhausted tableau. Item F now hands
+        it a full pyramid at that phase, which is an input the net has never
+        seen.
+
+        The ranked moves survive that, because search plays forward into
+        ordinary positions and evaluates those. This does not: it is a single
+        raw read of the root, and the aux heads behind it carry 0.2 loss weight
+        and no search correction, so its win/type split here would be
+        confident-looking noise. Showing nothing beats showing that. A
+        checkpoint trained under the corrected ordering can drop this branch.
         """
         game = state.game
         if game.phase is Phase.COMPLETE:
+            return None
+        if game.phase is Phase.CHOOSE_NEXT_START_PLAYER:
             return None
         evaluator = self._injected
         if evaluator is None:

@@ -73,6 +73,14 @@ class JobManager:
     ``chunk_default`` bounds a single ``advance`` and therefore the latency of
     both progress updates and cancellation.  ``ttl_secs`` is how long a
     finished job stays pollable before the reaper drops it.
+
+    ``publish_target_ms`` turns the caller's ``chunk_sims`` into a *floor*
+    rather than a fixed step: the loop grows the chunk until a publish costs
+    about this long.  Simulations are the wrong unit for a refresh rate --
+    their cost varies by position width and by machine, and the caller cannot
+    know either.  A 7WD panel polling every 700ms was being served a publish
+    every ~54ms, so roughly thirteen of every fourteen were built, ranked and
+    thrown away.  Set to 0 to keep the exact chunk the caller asked for.
     """
 
     def __init__(
@@ -80,12 +88,16 @@ class JobManager:
         adapter: AdvisorAdapter,
         *,
         chunk_default: int = 200,
+        publish_target_ms: float = 300.0,
+        max_chunk: int = 20_000,
         ttl_secs: float = 60.0,
         idle_timeout_secs: float = 120.0,
         sweep_interval_secs: float = 15.0,
     ):
         self._adapter = adapter
         self._chunk_default = chunk_default
+        self._publish_target_ms = float(publish_target_ms)
+        self._max_chunk = int(max_chunk)
         self._ttl_secs = ttl_secs
         self._idle_timeout_secs = idle_timeout_secs
         self._jobs: dict[str, SearchJob] = {}
@@ -231,7 +243,8 @@ class JobManager:
         state = job._state
         views = self._adapter.action_views(state)
         target = int(req.max_sims)
-        chunk = int(req.chunk_sims) or self._chunk_default
+        floor = int(req.chunk_sims) or self._chunk_default
+        chunk = floor
         started = time.perf_counter()
         handle: SearchHandle | None = None
         try:
@@ -240,7 +253,9 @@ class JobManager:
             job.status = "running"
             while job.sims_done < target and not job._stop.is_set():
                 step = min(chunk, target - job.sims_done)
+                chunk_started = time.perf_counter()
                 snap = handle.advance(step, job._stop)
+                chunk = self._next_chunk(chunk, floor, time.perf_counter() - chunk_started)
                 if snap.sims_done <= job.sims_done:
                     # No forward progress (terminal tree / immediate cancel):
                     # publish once and stop rather than spin the budget.
@@ -271,6 +286,22 @@ class JobManager:
                     pass
             job._handle = None
             job.updated_at = time.time()
+
+    def _next_chunk(self, chunk: int, floor: int, elapsed_secs: float) -> int:
+        """Grow the chunk toward ``publish_target_ms`` of work per publish.
+
+        Never below what the caller asked for -- that is their granularity for
+        cancellation and progress -- and never more than doubling per step, so a
+        single fast chunk (a terminal-heavy sample, a cold cache) cannot launch
+        the next one into a multi-second stall. Shrinks the same way when a
+        chunk overruns.
+        """
+
+        if self._publish_target_ms <= 0 or elapsed_secs <= 0:
+            return chunk
+        scale = (self._publish_target_ms / 1000.0) / elapsed_secs
+        scaled = int(chunk * max(0.5, min(2.0, scale)))
+        return max(floor, min(self._max_chunk, scaled))
 
     def _publish(
         self,

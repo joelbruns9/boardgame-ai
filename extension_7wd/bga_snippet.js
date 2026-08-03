@@ -78,6 +78,26 @@ function findGameWindow() {
     throw new Error("7WD gamedatas not found; open the game table first");
   }
   const real = all.filter((f) => !/[?&]testuser=/.test(f.url));
+  if (!real.length) {
+    // EVERY board frame is impersonated. Falling back to them used to recreate
+    // the exact wrong-seat failure this function exists to prevent: a lone
+    // testuser frame passes the seat checks below, because its me_id really is
+    // a seated player -- just not the human's. The URL is the only
+    // discriminator we have, and here it says every candidate is wrong.
+    //
+    // BGA Studio genuinely works this way, so there is an opt-in: set
+    // window.SWD_ALLOW_TESTUSER = true in the page to accept it anyway.
+    if (!window.SWD_ALLOW_TESTUSER) {
+      const err = new Error(
+        "every 7WD frame on this page is a testuser= impersonation (" +
+          all.length +
+          " found); refusing rather than advise a seat that is not yours. Set " +
+          "window.SWD_ALLOW_TESTUSER = true to override."
+      );
+      err.swdAmbiguous = true;
+      throw err;
+    }
+  }
   const candidates = real.length ? real : all;
 
   const seatOf = (f) => String(((f.win.gameui || {}).gamedatas || {}).me_id || "");
