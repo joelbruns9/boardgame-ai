@@ -15,13 +15,26 @@ BGA ships an update, re-check rather than assume.
 | # | Item | Size | Blocks live play? |
 |---|---|---|---|
 | ~~B~~ | ~~Fresh board state without a page reload~~ | **DONE 2026-08-02** | verified live against table 892846644 |
-| ~~C~~ | ~~Host `{"bga": …}` branch~~ | **DONE 2026-08-02** | adapter accepts `{"bga","args","dom"}` |
-| A | Wonder-draft support in the scrape codec + BGA mapper | 1–2 days | yes — draft is 8 of ~78 decisions and shapes the whole game |
-| D | Browser extension | 1–2 days | yes |
+| ~~C~~ | ~~Host `{"bga": …}` branch~~ | **DONE 2026-08-02** | adapter accepts `{"bga","args","dom","log"}` |
+| ~~D~~ | ~~Browser extension~~ | **BUILT 2026-08-02** | `extension_7wd/`, ran against a live game |
+| A | Wonder-draft support in the scrape codec + BGA mapper | 1–2 days | yes — the advisor is silent for 6 real decisions a game |
 | E | Draft-preference extraction | ~half day | no — analysis, not play |
 
-**Remaining order: A → D → E.** B and C shipped together on 2026-08-02; see
-"What the live captures settled" below for what that cost and what it found.
+**What is actually left**
+
+1. **Item A — the wonder draft.** The only unbuilt feature of consequence.
+2. **Panel statistics.** `joint7`, `wdl`, `margin`, `military` and `science` are
+   computed on every evaluation and discarded. For 7WD "how am I winning" is
+   usually more actionable than the win percentage — the captured position was a
+   −1 VP margin with a 93% *scientific* win.
+3. **Re-test the extension.** It last ran before the Rust searcher, the batched
+   evaluation boundary and the job idle-timeout landed.
+4. **Item E**, which needs A.
+
+Play advice works end to end today: capture without reload, streaming search,
+ranked moves with card art. The searcher moved to Rust and is ~19× faster than
+when the extension was first tried — see `ADVISOR_RUST_UNIFICATION.md`, an
+independent track that neither blocks nor is blocked by this one.
 
 ## The BGA source dump
 

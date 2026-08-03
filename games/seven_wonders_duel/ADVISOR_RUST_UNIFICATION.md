@@ -11,6 +11,12 @@ elsewhere in the repo, this file is the later measurement.
 
 Companion document: `ADVISOR_IMPLEMENTATION_PLAN.md` covers the BGA capture and
 extension work (items A–E). This file covers only the Python↔Rust question.
+**The two tracks are independent — neither blocks the other.**
+
+**STATUS 2026-08-02: all five steps done.** The advisor now searches with the
+same engine, encoder and searcher as self-play, 9.8× faster than the Python
+path, agreeing with it on the answer. Remaining: CUDA for the larger model
+(§5 step 5) and `force_expand_root_chance` on the Rust path (§5 step 4).
 
 ---
 
@@ -293,7 +299,28 @@ injected with `library_draws` empty, searches as-is.
 Verified on both scraped fixtures. On the Age III position Rust's mock search
 picks **action 61** -- the same "Build: Study" the Python advisor chose.
 
-### Step 4 — scoped 2026-08-02, TWO CONSTRAINTS FOUND
+### Step 4 — DONE 2026-08-02 (`c155848`, `b87f054`)
+
+`RustPuctSearch` is a pyclass holding a `SearchSession` across calls, so one tree
+deepens over many `advance()` calls — the property the streaming panel depends
+on. Fixed at `puct_root=true`.
+
+Gated by `test_resumable_handle_matches_the_one_shot_puct_search`: visits per
+legal action and total sims across 4 games × 2 seeds × 3 chunking patterns,
+including `(1, 47)`, so **chunk boundaries provably do not change the tree**.
+The narrower gate was the right one — `test_rust_puct_root_matches_python`
+already gates Rust `puct_root` against Python, so equivalence follows by
+transitivity without re-deriving it.
+
+Needed `RustPuctSearch.open_mock`: the one-shot search runs Rust's internal
+`MockEval`, which a Python adapter cannot reproduce byte-for-byte.
+
+Still open: `force=False` only. The resumable path cannot force-expand the root
+chance layer without the F4.5 forced-child cache, so that half of the one-shot
+gate has no resumable counterpart, and an explicit `force_expand_root_chance`
+request falls back to the Python searcher.
+
+#### The two constraints, and what became of them
 
 Feasible: `SearchSession` (`tree_resumable.rs:799`) is **owned** -- no lifetime
 parameters, it owns its `Arena` -- so it can live in a `#[pyclass]` across calls.
@@ -333,7 +360,51 @@ and `puct_root: true`. This is what preserves streaming. Without it, do not
 migrate the advisor — a non-streaming advisor is a worse product regardless of
 throughput.
 
-### Step 5 — Performance, once correctness is nailed down
+### Step 5 — DONE 2026-08-02 (`ca6f6b7`, `7e9c77a`)
+
+**9.8× over the Python searcher.** Same net, same position, same process:
+
+```
+python searcher                980 sims/s   1.00x
+rust  searcher leaf_batch=1   2732 sims/s   2.79x
+rust  searcher leaf_batch=32  9610 sims/s   9.81x
+```
+
+Through the adapter fully wired: 1,829 → 18,513 sims/s.
+
+**The scaling is all in the evaluation boundary, not the tree.** Two changes were
+needed and only the pair works:
+
+1. *Relaxing the PUCT-root batching guard* (`ca6f6b7`). It was our own guard, not
+   a missing algorithm: `Arena::select` already folds in-flight counts into both
+   PUCT terms, and it is the same function the root calls under `puct_root`.
+   Gumbel is not entangled either — under `puct_root` the gumbel vector is
+   hard-zeroed and sequential halving is bypassed. Opt-in via
+   `begin_search_from_root_virtual_loss`, a separate entry point so all of
+   self-play keeps the strict behaviour untouched.
+2. *A batched evaluation boundary* (`7e9c77a`). `eval::PyBatchEval` already
+   existed (F4.4) but was reachable only through a threaded worker.
+   `rust_bridge.rust_batched_net_adapter` is the Python counterpart: one crossing
+   and one forward pass per wave.
+
+**On its own, (1) buys nothing** — `PyEval` does not override `evaluate_batch`,
+so a wave was evaluated one state at a time. Measured across `leaf_batch` 1..16
+on the scalar bridge: 1.00×–1.07×, pure noise. With the batched adapter the same
+sweep gives 1.00 / 1.57 / 2.16 / 2.68 / 3.53 / 3.93× at 1/2/4/8/16/32.
+
+**Quality held** — the evidence the guard was written without. Across
+`leaf_batch` 1..32 the top action never changed and its visit share moved
+0.941 → 0.930. Q on the top action agrees to three decimals across the Python
+searcher, Rust unbatched and Rust batched (+0.9801 / +0.9810 / +0.9811).
+
+Defaults: `leaf_batch=16`; `options={"leaf_batch": 1}` restores unperturbed root
+selection, `search_impl="python"` the old searcher.
+
+**Not done:** CUDA. At 1.0M parameters CPU and CUDA tie (§2.4); this must be
+re-measured when the 11.4M model lands, where CUDA was 10.2× at batch 32 — and
+batching now actually reaches the net, so that figure should finally transfer.
+
+### Step 5 (original plan) — Performance, once correctness is nailed down
 
 Only now: batched leaf evaluation (`closed_search_batched_net` already exists),
 CUDA for the target model, and the encoder — which comes along for free rather
