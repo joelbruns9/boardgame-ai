@@ -184,3 +184,73 @@ def test_annotators_decorate_settled_recommendations():
     resp = mgr.run_blocking(state, RecommendRequest(max_sims=60, chunk_sims=20, top_k=3))
     assert all(r.annotations.get("tag") == {"seen": True} for r in resp.recommendations)
     assert resp.summary.get("tag") == {"count": 3}
+
+
+# --- abandoned streaming searches -------------------------------------------
+
+
+def test_streaming_job_is_stopped_when_no_client_polls():
+    """A closed browser tab stops polling and never calls the API again. Without
+    a sweeper the search runs to max_sims regardless -- observed live as an
+    advisor host burning 2,199 CPU-seconds on a position nobody was watching.
+    """
+    import time
+
+    adapter = _FakeAdapter()
+    manager = JobManager(
+        adapter,
+        chunk_default=1,
+        idle_timeout_secs=0.15,
+        sweep_interval_secs=0.05,
+    )
+    job = manager.start(
+        _FakeState("idle", 4), RecommendRequest(max_sims=10_000_000, chunk_sims=1)
+    )
+    assert job.streaming
+
+    deadline = time.time() + 5.0
+    while job.active and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert not job.active, "abandoned search was never stopped"
+    assert job.sims_done < 10_000_000
+    assert "abandoned" in (job.error or "")
+
+
+def test_polling_keeps_a_streaming_job_alive():
+    """The timeout must key on client interest, not on the worker's own
+    progress: `updated_at` is bumped by every publish and so never goes stale
+    while a search is running."""
+    import time
+
+    adapter = _FakeAdapter()
+    manager = JobManager(
+        adapter,
+        chunk_default=1,
+        idle_timeout_secs=0.3,
+        sweep_interval_secs=0.05,
+    )
+    job = manager.start(
+        _FakeState("idle", 4), RecommendRequest(max_sims=10_000_000, chunk_sims=1)
+    )
+    deadline = time.time() + 0.9
+    while time.time() < deadline:
+        time.sleep(0.1)
+        manager.poll(job.job_id)
+    assert job.active, "a polled job must not be reaped"
+    manager.stop(job.job_id)
+
+
+def test_blocking_job_is_never_idle_reaped():
+    """run_blocking holds its caller for the whole search and cannot be
+    abandoned, so it must be exempt -- otherwise a slow blocking request would
+    cancel itself."""
+    adapter = _FakeAdapter()
+    manager = JobManager(
+        adapter, chunk_default=4, idle_timeout_secs=0.0001, sweep_interval_secs=0.05
+    )
+    response = manager.run_blocking(
+        _FakeState("blocking", 4), RecommendRequest(max_sims=40, chunk_sims=4)
+    )
+    assert response.ok
+    assert response.sims_done == 40

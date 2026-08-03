@@ -49,6 +49,13 @@ class SearchJob:
     error: str | None
     started_at: float
     updated_at: float
+    #: Last time a CLIENT asked about this job. Distinct from ``updated_at``,
+    #: which the worker bumps on every publish and so never goes stale while a
+    #: search runs. Only this field detects an abandoned search.
+    polled_at: float = 0.0
+    #: Streaming jobs are the only ones a client can abandon; a blocking request
+    #: holds the caller for its whole duration and must never be idle-reaped.
+    streaming: bool = False
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     _handle: SearchHandle | None = None
@@ -74,13 +81,33 @@ class JobManager:
         *,
         chunk_default: int = 200,
         ttl_secs: float = 60.0,
+        idle_timeout_secs: float = 120.0,
+        sweep_interval_secs: float = 15.0,
     ):
         self._adapter = adapter
         self._chunk_default = chunk_default
         self._ttl_secs = ttl_secs
+        self._idle_timeout_secs = idle_timeout_secs
         self._jobs: dict[str, SearchJob] = {}
         self._by_key: dict[tuple[str, str], str] = {}
         self._lock = threading.RLock()
+        # A browser tab that closes stops polling and never calls the API again,
+        # so reaping only on request would leave the search running forever --
+        # observed live as an advisor host burning 2,199 CPU-seconds on a
+        # position nobody was looking at. A sweeper is the only thing that can
+        # notice the absence of calls.
+        self._sweeper = threading.Thread(
+            target=self._sweep_forever, args=(sweep_interval_secs,), daemon=True
+        )
+        self._sweeper.start()
+
+    def _sweep_forever(self, interval: float) -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                self._reap()
+            except Exception:  # a sweeper that dies silently is worse than noisy
+                continue
 
     # -- keys ---------------------------------------------------------------
 
@@ -132,7 +159,7 @@ class JobManager:
                 existing = self._jobs.get(existing_id)
                 if existing is not None and existing.active:
                     return existing
-            job = self._new_job(state, req, register_key=key)
+            job = self._new_job(state, req, register_key=key, streaming=True)
             if not views:
                 job.snapshot = terminal_response(
                     engine=req.engine, root_value=self._root_value_if_known(state)
@@ -151,7 +178,10 @@ class JobManager:
     def poll(self, job_id: str) -> SearchJob | None:
         self._reap()
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.polled_at = time.time()  # proof a client still cares
+            return job
 
     def stop(self, job_id: str) -> bool:
         with self._lock:
@@ -169,6 +199,7 @@ class JobManager:
         req: RecommendRequest,
         *,
         register_key: tuple[str, str] | None = None,
+        streaming: bool = False,
     ) -> SearchJob:
         now = time.time()
         job = SearchJob(
@@ -183,6 +214,8 @@ class JobManager:
             error=None,
             started_at=now,
             updated_at=now,
+            polled_at=now,
+            streaming=streaming,
             _state=state,
             _req=req,
         )
@@ -302,6 +335,19 @@ class JobManager:
     def _reap(self) -> None:
         now = time.time()
         with self._lock:
+            # Stop abandoned streaming searches. Signalling _stop lets the
+            # worker finish its chunk and release the handle; the job is then
+            # dropped by the ttl rule below on a later pass.
+            for job in self._jobs.values():
+                if (
+                    job.active
+                    and job.streaming
+                    and self._idle_timeout_secs > 0
+                    and (now - max(job.polled_at, job.started_at))
+                    > self._idle_timeout_secs
+                ):
+                    job.error = job.error or "abandoned: no client poll"
+                    job._stop.set()
             drop = [
                 job_id
                 for job_id, job in self._jobs.items()
