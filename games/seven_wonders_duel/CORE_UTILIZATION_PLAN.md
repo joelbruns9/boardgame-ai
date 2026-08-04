@@ -62,19 +62,43 @@ profile. Phase 0 exists to confirm or kill it before anything is built.
 
 ## 2. The read
 
-One scheduler thread walks the games, packs leaves, and calls Python. The Python
-call builds tensors, runs the forward, and gathers results. The Rust side
-releases the GIL for tree work, but **packing and the forward both need the
-interpreter**, so they cannot overlap each other. That single mechanism explains
-all three nulls at once:
+**Not the GIL.** An earlier draft of this plan blamed GIL contention between
+packing and the forward. That is wrong: `lib.rs:2313` runs the whole scheduler
+under `py.detach`, and `eval.rs:601` states the discipline -- Rust scheduling
+runs detached, only the worker thread attaches to Python. Packing and the forward
+already overlap. Recorded because it is a plausible-sounding story that survives
+until someone greps for `detach`.
 
-* **more slots** widen batches but do not add a second packer;
-* **`inflight > 1`** cannot build batch N+1 while batch N holds the GIL;
-* **more OMP threads** speed up something that is not the bottleneck.
+What the evidence actually supports:
 
-And it explains why the 5090 is only ~1.6× the laptop 3070 at this width when
-W0's arithmetic predicted 3-4×: the GPU is idle most of the cycle, so a faster
-GPU buys proportionally little.
+**Why `inflight > 1` is null.** With `leaf_batch = 1`, every active game
+contributes at most one leaf per cycle, and slots (96-192) sit far below the cap
+(1024-2048). So a single batch already contains *every* leaf that is waiting, and
+no game can produce another until that batch's results come back. Batch N+1 has
+nothing to pack. Pipelining depth only pays when ready work exceeds one batch,
+which is precisely the regime the cap was widened out of.
+
+**Why more slots stop paying.** If a fixed per-batch cost dominated, doubling the
+rows per batch would nearly double throughput. Measured, 48 → 96 slots at cap
+1024 bought **7%** (3,899 → 4,187), and 144 was worse. So at these widths the
+cycle is dominated by **per-row** cost, not per-batch overhead.
+
+**Where per-row cost lives, and why it is serial.** Every row is one MCTS leaf:
+a PUCT descent, a make/unmake, a legality mask over 1,202 actions, an expansion
+and a backprop -- plus `encode_pack` -- all on **one scheduler thread**. Slots
+add games to that thread's queue; they do not add threads. That is the serial
+resource, and it is the one thing none of the three levers touched.
+
+This also explains the 5090 being only ~1.6× the laptop 3070 when W0's
+arithmetic predicted 3-4×: if the cycle is CPU-side per-row work at ~18% GPU
+utilisation, a faster GPU buys proportionally little.
+
+**The correction this implies for §1.** "~90% of the cycle is boundary cost" was
+derived by comparing the cycle time against an *idealised forward*, which
+silently attributes everything non-GPU to the boundary. The slot-scaling evidence
+says much of it is per-row Rust work instead. Both readings agree the GPU is not
+the limit; they disagree about what is, and they imply different fixes -- §3
+decides between them with a profile instead of arithmetic.
 
 `--rust-scheduler-workers` would add packers -- `run_many_pipelined_sharded`
 already spawns one scheduler thread per worker -- but it is pinned to 1 because
@@ -112,9 +136,18 @@ and reads far too low. Any Phase 0 measurement must run with diagnostic sync on,
 or the forward will look free and the conclusion will be wrong in exactly the
 direction that flatters this plan.
 
-**Gate:** if the breakdown shows the forward dominating, or a large unaccounted
-remainder, stop -- the model in §2 is wrong and Phases 1-2 are aimed at nothing.
-If packing plus the Python call dominate, proceed.
+**The gate, and what each outcome implies.** The two candidate bottlenecks want
+different fixes, so this measurement chooses the phase that follows:
+
+| dominant term | fix | phase |
+|---|---|---|
+| scheduler-side per-row work (descent, make/unmake, masks, `encode_pack`) | more scheduler threads | 1 + 2 |
+| `py_call_ns` (tensor build + H2D) | build tensors in Rust; more threads will not help | 3a |
+| the forward itself | nothing here helps; the model is simply expensive | stop |
+| a large unaccounted remainder | the model in §2 is wrong; re-derive before building | stop |
+
+Phases 1-2 and 3a are **not** interchangeable, and the ordering below assumes the
+first row. If Phase 0 says otherwise, reorder rather than proceeding by habit.
 
 ---
 
@@ -270,9 +303,11 @@ starting.**
 
 * **`OMP_NUM_THREADS` tuning** -- measured null on the box (4,032 vs 4,187, and
   the noise band is ~4%). Torch's pool is not the bottleneck.
-* **`max_inflight_batches > 1`** -- measured null (1.03× at 2, 0.99× at 4), and
-  §2 explains why: the GIL prevents the overlap it exists to create. Revisit only
-  *after* Phase 1, when packing may no longer hold the interpreter.
+* **`max_inflight_batches > 1`** -- measured null (1.03× at 2, 0.99× at 4). §2
+  explains why: at `leaf_batch = 1` with slots well under the cap, one batch
+  drains every waiting leaf and there is nothing to pack for the next one.
+  Revisit only if `leaf_batch` rises or slots approach the cap, which are the
+  conditions that create surplus ready work.
 * **More slots at a fixed cap** -- 144 slots underperformed 96 at cap 1024. Slots
   only pay alongside a cap that can carry them.
 * **Multi-box sharding** -- out of scope in `CLOUD_TRAINING_PLAN.md` and still
