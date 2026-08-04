@@ -116,6 +116,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.games <= 0 or args.games % 2:
         parser.error("--games must be a positive even number (seat pairs)")
+    if not args.checkpoint.is_file():
+        # argparse exits 2, which is what lets a caller tell "could not run" from
+        # this tool's exit 1, "ran and the precisions disagreed". They are
+        # opposite conclusions and must not share an exit code.
+        parser.error(f"--checkpoint {args.checkpoint} does not exist")
     args.work_dir.mkdir(parents=True, exist_ok=True)
     report = run(
         args.checkpoint,

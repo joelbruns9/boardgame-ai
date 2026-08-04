@@ -199,6 +199,47 @@ def test_a_crashing_preflight_is_not_reported_as_a_refusal(setup_text):
     assert "rent a bigger one" not in crash
 
 
+def test_operator_supplied_paths_are_checked_before_anything_is_built(setup_text):
+    """A missing scp costs seconds, not an hour of toolchain build.
+
+    Every one of these paths arrives from another machine, so "not uploaded
+    yet" is the ordinary failure -- and it used to surface at the stage that
+    consumed it, after rustup, torch and the crate build had all completed.
+    """
+
+    common = COMMON.read_text(encoding="utf-8")
+    assert "common::require_operator_files()" in common
+
+    call = setup_text.index("common::require_operator_files")
+    assert call < setup_text.index('stage 1 "Rust toolchain'), (
+        "operator files are checked after the build has already started"
+    )
+    for name in (
+        "PRECISION_ARENA_CHECKPOINT",
+        "SWEEP_CHECKPOINT",
+        "LAUNCH_FLAGS_JSON",
+    ):
+        assert f'"{name}=${{{name}:-}}"' in setup_text
+
+
+def test_an_arena_that_could_not_run_is_not_reported_as_a_verdict(setup_text):
+    """Exit 1 means bf16 really differs; anything else means the check broke.
+
+    `precision_arena` exits 1 when the precisions disagree and 2 (argparse) when
+    it cannot run at all, so the two conclusions are distinguishable -- they were
+    not when a missing checkpoint printed "bf16 differs from fp32".
+    """
+
+    stage = setup_text[
+        setup_text.index("STAGE 8:") : setup_text.index("stage_done 8")
+    ]
+    assert '_arena_status" -eq 1' in stage
+    verdict, broke = stage.split("elif", 1)
+    assert "bf16 differs from fp32" in verdict
+    assert "PRECISION=fp32" not in broke
+    assert "not a verdict on bf16" in broke
+
+
 def test_the_smoke_can_run_the_launch_geometry(setup_text):
     """`--plumbing-smoke` must survive the width the launch actually uses.
 

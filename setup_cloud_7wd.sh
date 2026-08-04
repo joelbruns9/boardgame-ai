@@ -151,6 +151,14 @@ CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
 common::require_python
 
+# Operator-supplied paths, checked before anything is built. These arrive by scp
+# from the laptop, so "not uploaded yet" is the normal failure and it should cost
+# seconds rather than the whole toolchain build.
+common::require_operator_files \
+  "PRECISION_ARENA_CHECKPOINT=${PRECISION_ARENA_CHECKPOINT:-}" \
+  "SWEEP_CHECKPOINT=${SWEEP_CHECKPOINT:-}" \
+  "LAUNCH_FLAGS_JSON=${LAUNCH_FLAGS_JSON:-}"
+
 stage 1 "Rust toolchain (rustup)"
 common::rust_toolchain
 stage_done 1
@@ -216,7 +224,12 @@ if [ -n "${PRECISION_ARENA_CHECKPOINT:-}" ]; then
     --work-dir "$REPO_DIR/$RUN_DIR_REL/precision_arena" \
     --output "$REPO_DIR/$RUN_DIR_REL/precision_arena.json" \
     --games "${PRECISION_ARENA_GAMES:-400}" \
-    || die "bf16 differs from fp32 beyond its interval — relaunch with PRECISION=fp32."
+    && _arena_status=0 || _arena_status=$?
+  if [ "$_arena_status" -eq 1 ]; then
+    die "bf16 differs from fp32 beyond its interval — relaunch with PRECISION=fp32."
+  elif [ "$_arena_status" -ne 0 ]; then
+    die "Precision arena could not run (exit $_arena_status) — that is not a verdict on bf16. Fix the invocation above and re-run."
+  fi
 else
   warn "PRECISION_ARENA_CHECKPOINT unset; skipping W6.2b. The shipped precision "
   warn "has then never played a scored game — set it to a W0 L checkpoint."
