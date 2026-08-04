@@ -4735,6 +4735,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def smoke_config(config: PhaseDConfig) -> PhaseDConfig:
+    """Shrink a configuration to plumbing-smoke budgets (`--plumbing-smoke`).
+
+    The point of the smoke is to run the *launch* flag set cheaply, so it must
+    survive every flag a launch passes. That includes ``--heads``: the shipped
+    configuration is 384x8x6 and 6 does not divide the smoke's 32-wide model, so
+    an explicit head count has to be dropped along with the width it belonged to
+    -- otherwise the check dies in ``build_model`` before any plumbing runs.
+    """
+
+    return replace(
+        config,
+        games_per_iteration=2,
+        seed_games=8,
+        workers=2,
+        d_model=32,
+        layers=1,
+        heads=None,
+        cheap_sims_min=1,
+        cheap_sims_max=1,
+        full_sims_min=1,
+        full_sims_max=1,
+        full_search_fraction=1.0,
+        train_steps=2,
+        train_warmup_steps=0,
+        validate_every=1,
+        train_batch_size=64,
+        gate_sims=1,
+        gate_max_games=2,
+        anchor_gate_every_promotions=1,
+    )
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -4841,26 +4874,7 @@ def main(argv=None) -> int:
         device=args.device,
     )
     if args.plumbing_smoke:
-        config = replace(
-            config,
-            games_per_iteration=2,
-            seed_games=8,
-            workers=2,
-            d_model=32,
-            layers=1,
-            cheap_sims_min=1,
-            cheap_sims_max=1,
-            full_sims_min=1,
-            full_sims_max=1,
-            full_search_fraction=1.0,
-            train_steps=2,
-            train_warmup_steps=0,
-            validate_every=1,
-            train_batch_size=64,
-            gate_sims=1,
-            gate_max_games=2,
-            anchor_gate_every_promotions=1,
-        )
+        config = smoke_config(config)
     run_log_path = args.run_log or str(Path(config.run_dir) / "run.log")
     header = {
         "Run directory": Path(config.run_dir).resolve(),

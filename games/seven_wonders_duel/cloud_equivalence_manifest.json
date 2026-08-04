@@ -5,6 +5,7 @@
     "test_balanced_double_reveal_support_shrinks_the_forced_tree",
     "test_buffer_games_equivalent",
     "test_chance_signature_and_chains_equivalent",
+    "test_chance_signature_survives_a_last_card_great_library_from_an_injected_state",
     "test_closed_search_age_deal_coverage",
     "test_closed_search_force_expansion_coverage",
     "test_closed_search_matches_python",

@@ -138,6 +138,36 @@ def test_the_run03_lifecycle_defaults_match_the_documented_command(setup_text):
     assert "--gate-ladder-games 200 600 1000 1500" in parameters
 
 
+def test_the_smoke_can_run_the_launch_geometry(setup_text):
+    """`--plumbing-smoke` must survive the width the launch actually uses.
+
+    The smoke shrinks the model to 32x1, so an explicit `--heads 6` -- the
+    shipped value, which does not divide 32 -- used to abort in `build_model`.
+    The box's own smoke stage passes no width and so never saw it; anyone
+    smoking the real launch flag set did.
+    """
+
+    from dataclasses import replace
+
+    from .phase_d import PhaseDConfig, smoke_config
+    from .train import build_model
+
+    def default(name: str) -> int:
+        return int(re.search(rf'{name}="\$\{{{name}:-(\d+)\}}"', setup_text).group(1))
+
+    launch = replace(
+        PhaseDConfig(),
+        d_model=default("D_MODEL"),
+        layers=default("LAYERS"),
+        heads=default("HEADS"),
+    )
+    assert (launch.d_model, launch.layers, launch.heads) == (384, 8, 6)
+
+    smoked = smoke_config(launch)
+    assert smoked.heads is None, "the smoke must drop the launch head count"
+    build_model("transformer", smoked.d_model, smoked.layers, smoked.heads)
+
+
 def test_the_common_library_defines_every_stage_the_game_script_calls(setup_text):
     common = COMMON.read_text(encoding="utf-8")
     called = set(re.findall(r"common::[a-z_]+", setup_text))

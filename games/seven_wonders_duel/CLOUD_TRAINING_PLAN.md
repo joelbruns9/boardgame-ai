@@ -3,8 +3,14 @@
 **Status:** **Every launch blocker is complete (W0-W3, W5-W7). What remains is
 box-side: W5.7's per-rung gate-cost fit, the equivalence smoke, the precision
 arena, and the throughput sweep all run on the RTX 5090 at first launch.**
-Revision 12.
-**Revision history:** r12 closes W7: a games-indexed self-anchor whose null is
+Revision 13.
+**Revision history:** r13 (2026-08-03) is pre-rental housekeeping after the
+age-deal reordering shipped: the equivalence corpus regenerated under codec-2
+(it was codec-1, so the box-side gate was checking parity over trajectories this
+engine no longer produces), the gate ladder corrected to the shipped
+200/600/1000/1500 with the run-03 evidence for it, and the per-rung cost table
+re-derived at `promotion_every = 5` with the share each rung implies. r12 closes
+W7: a games-indexed self-anchor whose null is
 0.500 by construction, a detector that triggers on the interval or a slope but
 never a single point, and the four-rung intervention ladder present but
 disabled. r11 closes W6: a shared `setup_cloud_common.sh` with the
@@ -74,7 +80,7 @@ does not close it -- it makes it **measured every iteration**.
 | schedules | every schedule in **games**; `schedule_basis` pinned per run | W1 **done** |
 | gate statistic | **fixed-N pair-level Wilson three-way rule**: promote LCB > 0.50, revert UCB < 0.48, else probation. No mid-match stopping. Fixed-N anchors | W5.5 **rewritten in r10** |
 | revert cost | **two-stage**: first revert switches the generator only; `revert_reset_after = 2` before any learner reset | W5.5 **r10** |
-| gate budget | **scheduled ladder** 100/200/400/800, +1 rung after 2 probations, -1 after a promotion; `promotion_every` unchanged. Ceiling provisional until the RTX 5090 per-rung fit | W5.8 / W5.7 cloud acceptance |
+| gate budget | **scheduled ladder**, +1 rung after 2 probations, -1 after a promotion; `promotion_every` unchanged. Rungs are **200/600/1000/1500** as shipped -- r10 specified 100/200/400/800 and the run-03 remediation raised them; see the ladder section. Ceiling provisional until the RTX 5090 per-rung fit | W5.8 / W5.7 cloud acceptance |
 | gate cost | persistent rolling worker, concurrent seat legs, cloud-measured per rung | W5.1-5.4 **implemented**, W5.7 pending target host |
 | stagnation | **games-indexed** anchor + metric-triggered intervention ladder | W7 |
 | cloud target | vast.ai, single box | W6 |
@@ -732,6 +738,23 @@ separation the rule is for.
   statistically clean in a way sequential stopping is not: `n` is fixed before
   the games are played, and the candidate is a different net every gate anyway.
 
+> **The shipped rungs are 200/600/1000/1500, not the four above** (run-03
+> remediation, item 1; `GATE_LADDER` in `setup_cloud_7wd.sh` and the command in
+> `training_parameters.md`). `laptop_training_03_w7` is why: at n=200 promotion
+> needs 0.598 and revert needs ~0.402, and *every* real signal in that run lived
+> in between -- 0.565 and 0.580 refused, 0.415/0.435/0.465 waved through. With
+> the ladder on, its two promotions came at 0.577 (n=1000) and 0.536 (n=1500),
+> both below the n=200 bar, so both existed only because the gate got wider. A
+> 100-game bottom rung resolves less than the rung that produced no usable
+> decision in 210 iterations, so the ladder starts where run 03 stopped being
+> able to see. The r10 power tables below are still the right shape -- read
+> their 100-game row as the rung this run does not use.
+>
+> Recorded counter-argument, unsettled: the 0.536 promotion cleared its LCB by
+> 0.0004, so a wide gate promotes any non-zero improvement rather than a
+> *meaningful* one. If that is judged wrong, the fix is a minimum-margin bar,
+> not a narrower gate.
+
 **`promotion_every` stays fixed.** Stretching the cadence as the rung rises would
 hold gate share constant at the cost of promotion latency; spending more of a
 mature run on the decision is the better trade, and it is made deliberately here
@@ -778,27 +801,30 @@ mostly gone and gate cost is now **near-linear in games**. That is what makes th
 W5.8 ladder worth having: a low early rung genuinely costs proportionally less,
 where under the old 193 s fixed cost it would not have.
 
-It also sets the bill for the top rung. Iteration wall time required to keep
-gates at 10% of the run, at `promotion_every = 4` (share = G / (4I + G), so
-I = 2.25 G):
+It also sets the bill for the top rung. At the shipped rungs and the shipped
+`promotion_every = 5`, gate share is G / (5I + G), so a 10% share needs
+I = 1.8 G. Applying the ~50 s + ~3.2 s/game fit above (**estimate on an
+estimate** -- this is exactly what W5.7 replaces):
 
-| rung | gate cost (**estimate**) | iteration time needed for a 10% share |
-|---:|---:|---:|
-| 100 games | ~370 s | ~14 min |
-| 200 games | ~690 s | ~26 min |
-| 400 games | ~1,330 s | ~50 min |
-| 800 games | ~2,610 s | **~98 min** |
+| rung | gate cost (**estimate**) | iteration time for a 10% share | share at a 20-min iteration |
+|---:|---:|---:|---:|
+| 200 games | ~690 s | ~21 min | ~10% |
+| 600 games | ~1,970 s | ~59 min | ~25% |
+| 1,000 games | ~3,250 s | ~98 min | ~35% |
+| 1,500 games | ~4,850 s | **~146 min** | **~45%** |
 
-If iterations land nearer 30-40 minutes, the 800 rung is 30-45% of wall time.
+Unless iterations run to hours, the top rung is a large minority of wall time.
 That is not automatically wrong -- late in a run, where self-play is returning
-+2-3% and the promote decision is the hard part, it may well be the better trade
--- but it is a policy choice to make against a measured number, not one the
-ladder should make silently.
++2-3% and the promote decision is the hard part, it may well be the better trade,
+and run 03's only two real promotions came from rungs that wide -- but it is a
+policy choice to make against a measured number, not one the ladder should make
+silently. **Decide the acceptable share before the box measures the rungs**, so
+W5.7's output is a decision rather than a surprise.
 
 **W5.7** *(S, r4; rescoped in r10)* **Re-measure the gate cost at L's width, per
-rung.** Same method as A5, at **100/200/400/800** so the fit is not a two-point
-extrapolation, plus a **representative ungated iteration wall time** from the
-same host. The deliverable is no longer "the cap" -- the ladder replaces it --
+rung.** Same method as A5, at the shipped **200/600/1000/1500** so the fit is not
+a two-point extrapolation, plus a **representative ungated iteration wall time**
+from the same host. The deliverable is no longer "the cap" -- the ladder replaces it --
 but the **cost of each rung and the share each implies**, which is what sets the
 ladder's ceiling. Do not hard-code the top rung until it lands.
 
