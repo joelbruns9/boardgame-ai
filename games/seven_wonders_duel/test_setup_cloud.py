@@ -391,6 +391,20 @@ def test_the_sweep_invocations_only_use_flags_that_exist(setup_text, module):
     assert not unknown, f"stage 8b passes flags {module} rejects: {unknown}"
 
 
+def test_both_sweeps_measure_at_the_precision_the_run_will_use(setup_text):
+    """A geometry chosen at fp32 is chosen against the wrong cost curve.
+
+    W0 measured bf16 at 1.69x on L, and the cap/slot optimum is a throughput
+    optimum -- so sweeping at a precision the run does not use picks settings
+    for a machine that is not the one being configured. The gate sweep already
+    passed $PRECISION; the generation sweep did not.
+    """
+
+    for module in ("f4_phase_d_sweep", "w5_gate_slots_sweep"):
+        block = _invocation(setup_text, module)
+        assert '--precision "$PRECISION"' in block, f"{module} sweeps at a fixed precision"
+
+
 def test_the_generation_sweep_passes_comma_separated_axes(setup_text):
     """f4_phase_d_sweep takes one string per axis, not a list.
 

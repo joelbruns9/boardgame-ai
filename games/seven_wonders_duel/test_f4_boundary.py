@@ -808,3 +808,40 @@ def test_two_net_arena_plays_the_improved_policy_argmax():
     # If the arena had played `action` (the last legal index) instead of the
     # policy argmax, the game would have followed a different line entirely.
     assert applied, "stub searcher was never consulted"
+
+
+def test_the_generation_sweep_reads_geometry_from_the_checkpoint(tmp_path):
+    """Stage 8b died loading an L checkpoint into a 128x4 default config.
+
+    `PhaseDConfig` defaults to 128x4, whose derived head count is 4, and
+    `_load_model_checkpoint` refuses "trained with heads=6 but this run builds
+    heads=4". Forwarding three more flags from the launcher would have been a
+    fourth thing to keep in sync; the checkpoint already records its own width.
+    """
+
+    import torch
+
+    from .f4_phase_d_sweep import geometry_from_checkpoint
+    from .train import LEGACY_HEADS, build_model, make_checkpoint
+
+    path = tmp_path / "arm.pt"
+    torch.save(
+        make_checkpoint(
+            build_model("transformer", 384, 8, 6),
+            {"model": "transformer", "d_model": 384, "layers": 8, "heads": 6},
+        ),
+        path,
+    )
+    assert geometry_from_checkpoint(path) == {"d_model": 384, "layers": 8, "heads": 6}
+
+    # A checkpoint written before `heads` was recorded keeps the legacy count
+    # rather than the width-derived default -- what heads_from_config is for.
+    legacy = tmp_path / "legacy.pt"
+    torch.save(
+        make_checkpoint(
+            build_model("transformer", 128, 4, LEGACY_HEADS),
+            {"model": "transformer", "d_model": 128, "layers": 4},
+        ),
+        legacy,
+    )
+    assert geometry_from_checkpoint(legacy)["heads"] == LEGACY_HEADS
