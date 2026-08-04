@@ -9,8 +9,24 @@ time**; the other does three jobs strictly in sequence, and only one of those
 three is the GPU. Every previous revision of this plan proposed adding
 parallelism to the *idle* thread.
 
-**Build order:** parallelise the pack → move extract/validation off the worker →
-padding → (only then) reconsider scheduler threads.
+**Build order** (revised 2026-08-04 after external review):
+
+1. Add the missing **worker sub-timers** — payload construction, adapter call,
+   extraction, validation, metrics, reply — and preserve raw artifacts. The
+   14.76 s residual is currently unattributed (§3.2).
+2. Implement and compare **direct-flat serial encoding vs row-parallel
+   encoding** (§3.1). Two independent changes; benchmark separately.
+3. Gate **byte-identical packed buffers**; A/B at laptop S/fp32 with **≥5
+   repetitions**, matched seeds, interleaved.
+4. **Re-profile.** Pursue the return path only if its newly isolated components
+   justify it.
+5. Instrument padding's **linear and quadratic** waste, then benchmark a concrete
+   strategy (§3.3).
+6. Recompute the overlap ceiling from the new profile. **Only then** revisit
+   scheduler shards + request merging — which, having become the only candidate
+   mechanism for creating surplus work, may return (§3.4, §4).
+7. Next 5090 rental: **L/bf16 CUDA-event preflight and a 1/2/4/8/16 pack-thread
+   sweep before starting training.**
 
 This document states the current understanding first. **Appendix A** records how
 it changed and what was wrong, because five of the corrections came from
@@ -90,43 +106,94 @@ Sized against the S fp32 measurement. Each is independent of the others.
 ### 3.1 Parallelise the pack *(largest, and genuinely spends cores)*
 
 `pack_routed` is a `for` loop over rows calling `encoder::encode(state)` on
-independent `GameState`s. **No cross-row dependency exists.** The only thing
-forcing sequence is that rows append into shared output buffers — and each row's
-output size is computable before encoding, so rows can encode in parallel into
-pre-sized slices.
+independent `GameState`s. **No cross-row dependency exists.**
 
-* **Prize: 104.02 s, 28.7% of wall**, on the critical path.
+* **104.02 s, 28.7% of wall** at laptop S/fp32; **25.7% of generation wall** on
+  the real cloud run at L/bf16. Both on the critical path.
 * **This is the first item in this plan's history that uses more than one core.**
   Everything previously proposed added threads to the idle scheduler.
-* **Determinism is the easy kind**: independent rows written into pre-sized
-  slices produce byte-identical output. Gate with a direct comparison of the
-  packed buffers, which is far stronger and cheaper than the search-level
-  equivalence a batch-merging change would need.
-* **It grows in production.** Packing is CPU work, so bf16 does nothing for it,
-  while bf16 roughly halves the device term (§5). The faster the GPU side gets,
-  the more packing dominates.
+* **It grows as the GPU side is fixed.** Packing is CPU work, so bf16 does
+  nothing for it while roughly halving the device term (§5).
 
-### 3.2 Move extract + validation off the worker
+**Two independent changes, to be benchmarked separately — do not assume the win
+is parallelism.**
 
-* **Prize: 14.76 s, 4.1% of wall.** A seventh of the pack, so not worth doing
-  alone — but it is the same refactor and the same thread, so do it in the same
-  pass.
-* Two independent wins available:
-  * **Flatten the return path.** `out.extract::<Vec<(f64, Vec<f64>)>>()`
-    allocates one `Vec<f64>` per row: ~440 per batch × ~9,000 batches ≈ 4 M heap
-    allocations, each filled element-by-element through PyO3's generic
-    conversion. The *outbound* direction already solved this with flat buffers
-    and offsets; the return can mirror it.
-  * **Move validation to the scheduler thread**, which is idle. It is
-    O(total priors) and currently sits on the busiest thread in the system.
-* **Its share grows as the bigger items shrink**: 7.6% of the worker's critical
-  path once packing is parallelised, ~10% once padding is also fixed.
+**(a) Direct flat writer.** `encode()` (`encoder.rs:71`) is not a thin append: it
+builds a dynamic `Vec<Token>`, pushing through eight builders, with a `Vec<f64>`
+per token, and only then flattens and pads every token to the fixed float
+feature width. A writer that emits straight into the flat output, skipping the
+intermediate token and feature vectors, may recover much of the cost **with no
+threading at all** — and it composes with (b).
 
-### 3.3 Padding
+**(b) Row-parallel encoding**, over a persistent bounded pool rather than a
+per-batch spawn.
 
-`padding_ratio` is **0.187-0.263** depending on configuration (§5). It multiplies
-the device term, so at S fp32 it is worth up to ~10% of wall — but see §5 for why
-it must be quoted per configuration rather than as a constant.
+**Structure it as row-local buffers plus a prefix-sum copy**, not as rows writing
+directly into pre-sized global slices. A previous revision asserted the latter
+was safe; it is not obviously so, because token counts are only known *after*
+encoding. Row-local then copy is simpler, keeps output order exact, and is the
+version whose determinism argument is trivial.
+
+**Sweep 1, 2, 4, 8 and 16 physical threads. Do not bake in 8×** — the win depends
+on per-row cost against dispatch overhead at ~440 rows/batch, and is unmeasured.
+
+**Gate: byte-identical packed buffers** against the serial build, mock evaluator,
+single thread. Far stronger and cheaper than the search-level equivalence a
+batch-merging change would need.
+
+### 3.2 The 14.76 s worker residual — **composition unknown, measure it first**
+
+An earlier revision called this "extract + validation" and sized a 4.1% prize
+from it. **Both the label and the prize were wrong**, and external review caught
+it.
+
+**It is a subtraction, not a timer**: `299.13 wait − 104.02 pack − 180.36 call`.
+The only thing actually timed in there is `out.extract()` (`extract_ns`).
+Everything else in `evaluate_batch_prepared_routed` (`eval.rs:484`) falls outside
+all three timers, so the residual is some mixture of:
+
+* outbound `PyByteArray` allocation and copying during payload construction —
+  eleven buffers per batch, built *before* `call_start`;
+* PyO3 result extraction;
+* Rust validation of every prior;
+* the metrics mutex;
+* channel / reply overhead.
+
+**The real cloud run says extraction is not the term.** Over the preserved 30
+iterations: `encode_pack_ns` **6,404.27 s**, `extract_ns` **25.95 s**,
+`queue_wait_ns` **7.55 s**. Extraction is **0.4% of packing** and ~0.10% of
+generation wall. Whatever the residual is, it is almost certainly the outbound
+bytearray copies, not the return path.
+
+**Action, not estimate:** add timers around payload construction, adapter call,
+extraction, validation, metrics lock and reply, then re-read. No prize is claimed
+here until that partition closes.
+
+**Do not "move validation to the scheduler thread".** A previous revision
+proposed this on the grounds that the scheduler is idle. At `inflight = 1` it
+gains nothing: the scheduler waits, receives, scatters, and only then builds the
+next batch, so relocating work from before the reply to after it leaves it on the
+same serial path. **Relocation is not overlap.** Making the work cheaper (or
+removing it) still helps; moving it does not.
+
+### 3.3 Padding — **metric is wrong before the remedy is worth designing**
+
+`padding_ratio` is **0.187-0.263** depending on configuration (§5), and it is
+`1 − ΣL / (N × Lmax)` — a **token-linear** waste measure
+(`f4_throughput_bench.py:553`). But the network (`net.py:355`) has both
+token-linear cost *and* attention cost quadratic in sequence length, so the
+linear ratio understates the compute actually wasted.
+
+**Record both**, then design against the second:
+
+* linear: `1 − ΣL / (N × Lmax)`
+* quadratic: `1 − ΣL² / (N × Lmax²)`
+
+**And benchmark the actual remedy, not the waste.** Length bucketing is the
+obvious fix but it splits one forward into several, trading padding for launch
+overhead and changing batch shapes — which perturbs float reductions and so needs
+a strength argument, not an identity one. No prize is claimed here until a
+concrete strategy is measured end to end.
 
 ### 3.4 Overlap the two threads
 
@@ -136,15 +203,24 @@ Fixing that is worth **at most 1.21×** on its own (362 → 299). Note §6 recor
 there is no surplus ready work to pipeline. Overlap only becomes available
 alongside a change that creates surplus work.
 
-### 3.5 Stacked estimate
+### 3.5 No stacked forecast
 
-At S fp32, with pack parallelised ~8×, extract/validation moved, padding fixed,
-and the threads overlapped: worker ≈ 155 s, scheduler ≈ 78 s, wall ≈ **155 s**
-against today's 362 s — roughly **2.3×**.
+A previous revision projected ~2.3× by stacking an assumed 8× pack speedup, the
+whole residual vanishing, padding falling proportionally, and thread overlap.
+**Removed.** It compounded four unmeasured mechanisms, and the fourth does not
+exist: §3.4 shows nothing in items 3.1-3.3 *creates* surplus work, so overlap
+cannot be assumed to arrive with them.
 
-**This is arithmetic, not a measurement.** Arithmetic has been wrong three times
-in this document's history (Appendix A). Treat it as an ordering argument, not a
-forecast.
+**Two grounding facts to size anything against, both measured:**
+
+* **Packing is 25.7% of generation wall** across all 30 cloud iterations at
+  L/bf16 (23.8% over the late 20). The laptop diagnosis transfers to production.
+* **Generation is only 82.3% of the training loop.** Measured phase shares over
+  the same 30 iterations: generation 82.3%, replay derivation 9.8%, gates 6.0%,
+  training 1.9%. **A generation speedup dilutes**: an 8× pack alone is ~1.29× on
+  generation and ~1.22× on the loop.
+
+Quote loop-level numbers, not generation-level ones, when justifying effort.
 
 ---
 
@@ -155,10 +231,13 @@ Even making the scheduler infinitely fast caps at **1.21×**, and the extra game
 it would activate still queue behind the same single worker. The original plan's
 Phases 1 and 2 were both aimed here.
 
-**The merging eval worker is demoted, not deleted.** Its stated rationale was
-partly latency — but `queue_wait_seconds` is **0.22 s**, so the scheduler never
-waits to hand work over. It becomes relevant only if multiple scheduler threads
-are ever introduced, which §3.4 makes unlikely to be worth it.
+**The merging eval worker is demoted, not deleted — and may return.** Its stated
+rationale was partly latency, and that is dead: `queue_wait_seconds` is **0.22 s**
+on the laptop and **7.55 s across the entire cloud run**, so nothing waits to
+hand work over. But §3.4 leaves overlap unreachable because nothing in items
+3.1-3.3 creates surplus ready work, and **scheduler shards plus request merging
+is the only identified mechanism that would.** So it is deferred behind the pack
+work, not retired: revisit at build-order step 6, once the profile has changed.
 
 **"Build tensors in Rust" (old Phase 3a) is capped at 6.5%** — the measured
 `pyo3_tensor_seconds` share.
@@ -254,17 +333,30 @@ speedups as production speedups.** The throughput number needs a bf16 L box.
 **Instance selection: a fast 8-16 core part with strong single-thread
 performance. The GPU is already ahead of what the pipeline can feed.**
 
-* The GPU is not the bottleneck in any configuration measured: 22% (production,
-  extrapolated) to 42% (box fp32).
+* **On the cloud geometry the GPU is not the dominant component**: ~22%
+  (production, extrapolated) to 42% (box fp32). This is *not* true in general —
+  laptop L runs 69-87% device (§5), which is exactly why laptop L could not
+  answer the question. An earlier revision said "not the bottleneck in any
+  configuration measured", contradicting its own table.
 * **Cores now matter, because §3.1 finally has something to spend them on.**
-  Packing parallelises across rows; how far is an open question (§9).
-* Single-core clock still matters for the serial remainder — the tensor build and
-  extraction are effectively single-threaded, and the Python call is GIL-bound.
+  How far packing parallelises is unmeasured (§9).
+* Single-core clock still matters for whatever remains serial on the worker.
 * Core *count* beyond what packing can use buys nothing.
 
-**Caveat:** production's bf16 device time is extrapolated from a 3070-measured
-2.88× forward speedup, not measured on a 5090. A 5090's bf16 advantage is likely
-larger, which strengthens rather than weakens the case for CPU-side work.
+**Two claims withdrawn as unsupported:**
+
+* ~~"the Python call is GIL-bound"~~ — only the worker attaches to Python and no
+  GIL contention was ever demonstrated; much of that call is Torch C++/CUDA work
+  that releases the GIL anyway.
+* ~~"a 5090's bf16 advantage is likely larger"~~ — direction depends on kernel
+  shapes, launch overhead and the relative fp32/bf16 paths. Unknown, not likely.
+
+**Production's bf16 device time is extrapolated from a 3070-measured 2.88×
+forward speedup, not measured on a 5090**, and the laptop's CUDA runtime cannot
+reproduce the 5090's. Blackwell `sm_120` support begins with CUDA 12.8, so the
+cloud image's cu128 choice is right — but **pin the exact Torch build** rather
+than installing the latest cu128 wheel, or the next rental is not comparable to
+this one.
 
 ---
 
@@ -293,11 +385,26 @@ larger, which strengthens rather than weakens the case for CPU-side work.
   search choices through float ties; the sweep campaign observed 6 distinct
   trajectory sets across 6 geometries. Fingerprint the discrete trajectory and
   report divergence as a measurement.
-* **Beat the ~4% noise band**, established from a repeated 200-game point
-  (4,187 then 4,032).
+* **Statistical acceptance — the single-run habit in §2 and §5 does not meet it.**
+  Two 200-game observations do not establish a noise band, and every profile in
+  this document used `--repetitions 1` while `f4_contract_v2.json` requires
+  **`minimum_repetitions: 5`** at `minimum_measured_games_per_repetition: 100`.
+  Any A/B claim needs **matched seeds, interleaved baseline/treatment, ≥5
+  repetitions, and a confidence interval on the ratio** — not a point estimate
+  against the old ~4% band.
 * **State width and precision** in every claim.
+* **Report CPU topology** alongside throughput: physical cores vs vCPUs,
+  affinity, sustained frequency, NUMA distance to the GPU, context switches, and
+  **per-core** utilisation. The normalised `cpu_utilization` field hides "one
+  busy core among 48", which is the exact condition this plan exists to fix.
+* **Cover both workload regimes on cloud acceptance.** Measured generation fell
+  from 1.56 to ~1.11 games/s across the run as the mix changed, so accept against
+  both early (curriculum/bot-mixed) and late (pure self-play) traffic.
 * **Metrics attribution**: if a counter changes meaning, say so in its doc
   comment, or numbers stop being comparable across the change.
+* **Preserve raw benchmark artifacts** (`rows.jsonl`, manifests), not just
+  summaries. Several corrections in Appendix A were only possible because the raw
+  rows survived.
 
 ---
 
