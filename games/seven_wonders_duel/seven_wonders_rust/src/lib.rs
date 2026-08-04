@@ -1437,6 +1437,10 @@ fn scheduler_result_to_py(
     metrics.set_item("queue_wait_ns", m.queue_wait_ns)?;
     metrics.set_item("py_call_ns", m.py_call_ns)?;
     metrics.set_item("extract_ns", m.extract_ns)?;
+    metrics.set_item("attach_ns", m.attach_ns)?;
+    metrics.set_item("payload_ns", m.payload_ns)?;
+    metrics.set_item("validate_ns", m.validate_ns)?;
+    metrics.set_item("metrics_ns", m.metrics_ns)?;
     metrics.set_item("rust_tree_ns", m.rust_tree_ns)?;
     metrics.set_item("rust_chance_ns", m.rust_chance_ns)?;
     metrics.set_item("rust_record_ns", m.rust_record_ns)?;
@@ -2350,6 +2354,10 @@ fn self_play_many_flat_net(
             output.metrics.queue_wait_ns = counters.queue_wait_ns;
             output.metrics.py_call_ns = counters.py_call_ns;
             output.metrics.extract_ns = counters.extract_ns;
+            output.metrics.attach_ns = counters.attach_ns;
+            output.metrics.payload_ns = counters.payload_ns;
+            output.metrics.validate_ns = counters.validate_ns;
+            output.metrics.metrics_ns = counters.metrics_ns;
         }
         result
     })?;

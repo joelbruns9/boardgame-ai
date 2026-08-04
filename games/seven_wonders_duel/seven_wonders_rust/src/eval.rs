@@ -331,6 +331,21 @@ pub struct BoundaryMetrics {
     pub queue_wait_ns: u64,
     pub py_call_ns: u64,
     pub extract_ns: u64,
+    // --- Worker sub-partition (CORE_UTILIZATION_PLAN.md build-order step 1) ---
+    // `encode_pack_ns`, `py_call_ns` and `extract_ns` do not tile this function,
+    // so `sched_wait_ns - pack - call` left a 14.76 s residual that an earlier
+    // revision of the plan mislabelled "extract + validation" and sized a prize
+    // from. The real cloud run says extraction cannot be it: 25.95 s of
+    // `extract_ns` against 6,404 s of `encode_pack_ns`. These four close the gap.
+    /// Acquiring the GIL (`Python::attach`).
+    pub attach_ns: u64,
+    /// Building the payload dict: eleven `PyByteArray` allocations and copies,
+    /// all of it *before* `py_call_ns` starts. The leading suspect.
+    pub payload_ns: u64,
+    /// Validating every returned prior is finite, non-negative and positive-mass.
+    pub validate_ns: u64,
+    /// Taking the metrics mutex and updating it.
+    pub metrics_ns: u64,
 }
 
 #[derive(Default)]
@@ -492,7 +507,10 @@ impl Eval for PyFlatBatchEval {
         let rows = scratch.rows;
         let tokens = scratch.tokens;
         let max_tokens = scratch.max_tokens;
-        let (raw, call_ns, extract_ns) = Python::attach(|py| {
+        let attach_start = Instant::now();
+        let (raw, call_ns, extract_ns, attach_ns, payload_ns) = Python::attach(|py| {
+            let attach_ns = attach_start.elapsed().as_nanos() as u64;
+            let payload_start = Instant::now();
             let payload = PyDict::new(py);
             payload.set_item("rows", rows)?;
             payload.set_item("tokens", tokens)?;
@@ -521,13 +539,14 @@ impl Eval for PyFlatBatchEval {
                 "legal_actions",
                 checked_bytearray(py, &scratch.legal_actions)?,
             )?;
+            let payload_ns = payload_start.elapsed().as_nanos() as u64;
             let call_start = Instant::now();
             let out = self.adapter.bind(py).call1((payload,))?;
             let call_ns = call_start.elapsed().as_nanos() as u64;
             let extract_start = Instant::now();
             let raw: Vec<(f64, Vec<f64>)> = out.extract()?;
             let extract_ns = extract_start.elapsed().as_nanos() as u64;
-            Ok::<_, PyErr>((raw, call_ns, extract_ns))
+            Ok::<_, PyErr>((raw, call_ns, extract_ns, attach_ns, payload_ns))
         })?;
         drop(scratch);
         if raw.len() != states.len() {
@@ -537,6 +556,7 @@ impl Eval for PyFlatBatchEval {
                 states.len()
             )));
         }
+        let validate_start = Instant::now();
         let mut validated = Vec::with_capacity(raw.len());
         for (row, (value_actor, priors)) in raw.into_iter().enumerate() {
             if states[row].phase == Phase::Complete {
@@ -568,6 +588,8 @@ impl Eval for PyFlatBatchEval {
                 priors,
             ));
         }
+        let validate_ns = validate_start.elapsed().as_nanos() as u64;
+        let metrics_start = Instant::now();
         let mut metrics = self
             .metrics
             .lock()
@@ -580,6 +602,12 @@ impl Eval for PyFlatBatchEval {
         metrics.encode_pack_ns += pack_ns;
         metrics.py_call_ns += call_ns;
         metrics.extract_ns += extract_ns;
+        metrics.attach_ns += attach_ns;
+        metrics.payload_ns += payload_ns;
+        metrics.validate_ns += validate_ns;
+        // Excludes its own store, which is a handful of adds under a lock this
+        // thread is the only writer of.
+        metrics.metrics_ns += metrics_start.elapsed().as_nanos() as u64;
         Ok(validated)
     }
 }

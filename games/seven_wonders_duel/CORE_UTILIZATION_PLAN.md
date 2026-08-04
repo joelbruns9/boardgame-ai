@@ -11,11 +11,18 @@ parallelism to the *idle* thread.
 
 **Build order** (revised 2026-08-04 after external review):
 
-1. Add the missing **worker sub-timers** — payload construction, adapter call,
-   extraction, validation, metrics, reply — and preserve raw artifacts. The
-   14.76 s residual is currently unattributed (§3.2).
-2. Implement and compare **direct-flat serial encoding vs row-parallel
-   encoding** (§3.1). Two independent changes; benchmark separately.
+1. ~~Add the missing worker sub-timers.~~ **DONE 2026-08-04.** Partition closes
+   to 99.7%; the residual was `payload` (bytearray copies) at 3.7% of wall, and
+   the return path is retired at 0.27% (§3.2).
+2. **Rust→Python data movement, 32.2% of wall.** Three changes, benchmarked
+   separately — do not assume the win is parallelism:
+   **(a)** direct flat writer, skipping `encode()`'s intermediate `Vec<Token>`
+   and per-token `Vec<f64>`;
+   **(b)** row-parallel encoding over a persistent bounded pool, sweeping
+   1/2/4/8/16 physical threads;
+   **(c)** avoid the `PyByteArray` copy — reuse buffers across batches, or hand
+   Python a view over Rust-owned memory that lives for the call.
+   **Establish a ≥5-repetition baseline first** (see below).
 3. Gate **byte-identical packed buffers**; A/B at laptop S/fp32 with **≥5
    repetitions**, matched seeds, interleaved.
 4. **Re-profile.** Pursue the return path only if its newly isolated components
@@ -141,7 +148,40 @@ on per-row cost against dispatch overhead at ~440 rows/batch, and is unmeasured.
 single thread. Far stronger and cheaper than the search-level equivalence a
 batch-merging change would need.
 
-### 3.2 The 14.76 s worker residual — **composition unknown, measure it first**
+### 3.2 The worker residual — **measured 2026-08-04, and it retires a target**
+
+Build-order step 1 is done: `attach_ns`, `payload_ns`, `validate_ns` and
+`metrics_ns` were added, and the worker partition now closes to **99.7%**.
+
+| region | s | % wall | % of wait |
+|---|---:|---:|---:|
+| pack | 105.92 | 28.5% | 34.5% |
+| Python call (device 152.64, tensor build 24.12) | 185.67 | 49.9% | 60.4% |
+| **payload — `PyByteArray` copies** | **13.88** | **3.7%** | 4.5% |
+| extract | 0.79 | 0.2% | 0.3% |
+| validate | 0.21 | 0.1% | 0.1% |
+| attach (GIL) | 0.05 | 0.0% | — |
+| metrics lock | 0.00 | 0.0% | — |
+| unpartitioned (channel/reply) | 0.87 | 0.2% | 0.3% |
+
+**`payload_ns` is 13.88 s of the 14.76 s residual — 94% of it.** The outbound
+bytearray copying was the answer.
+
+**The return path is retired as a target.** Extract plus validate is **1.0 s,
+0.27% of wall**, and the laptop now agrees with the cloud log (`extract_ns`
+25.95 s against `encode_pack_ns` 6,404 s). Flattening it would be unmeasurable.
+An earlier revision proposed both relocating validation *and* flattening the
+return; both are dead — the first because relocation is not overlap, the second
+because there is nothing there to win.
+
+**`payload` folds into §3.1 rather than standing alone.** `pack` builds flat
+`Vec<u8>` buffers and `payload` copies those into Python-owned `PyByteArray`s:
+the same problem, Rust→Python data movement, **119.8 s / 32.2% of wall combined.**
+Scope the §3.1 work to the whole path, not just `encode()`.
+
+<details><summary>Superseded: the reasoning before it was measured</summary>
+
+### The 14.76 s worker residual — composition unknown, measure it first
 
 An earlier revision called this "extract + validation" and sized a 4.1% prize
 from it. **Both the label and the prize were wrong**, and external review caught
@@ -175,6 +215,8 @@ gains nothing: the scheduler waits, receives, scatters, and only then builds the
 next batch, so relocating work from before the reply to after it leaves it on the
 same serial path. **Relocation is not overlap.** Making the work cheaper (or
 removing it) still helps; moving it does not.
+
+</details>
 
 ### 3.3 Padding — **metric is wrong before the remedy is worth designing**
 
@@ -300,10 +342,19 @@ speedups as production speedups.** The throughput number needs a bf16 L box.
 
 ## 7. Instrumentation: what is trustworthy and what is not
 
-**Trustworthy.** The Phase 1a scheduler timers (`sched_refill_ns`,
-`sched_collect_ns`, `sched_retire_ns`, `sched_assemble_ns`, `sched_submit_ns`,
-`sched_wait_ns`) are all taken on one thread and partition the loop to 100.2%.
-`--cuda-events` gives true device time without perturbing the pipeline.
+**Trustworthy.** The scheduler timers (`sched_refill_ns`, `sched_collect_ns`,
+`sched_retire_ns`, `sched_assemble_ns`, `sched_submit_ns`, `sched_wait_ns`)
+partition the scheduler thread to 100.2%; the worker timers (`attach_ns`,
+`payload_ns`, `validate_ns`, `metrics_ns`, with `encode_pack_ns`, `py_call_ns`,
+`extract_ns`) partition the worker to 99.7%. Both are single-thread partitions —
+never add across the two. `--cuda-events` gives true device time without
+perturbing the pipeline.
+
+**Instrumentation is not free, and single runs cannot price it.** Wall on the
+same S/fp32 configuration went 360.7 → 362.2 → 372.2 s across the two
+instrumentation rounds, ~3.2%. That is inside the old ~4% band but trending, and
+one run cannot separate the two. **Establish a ≥5-repetition baseline on the
+current build before any A/B**, per §10.
 
 **Three traps, each of which produced a confident wrong answer here:**
 

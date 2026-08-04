@@ -530,6 +530,11 @@ pub struct SchedulerMetrics {
     pub queue_wait_ns: u64,
     pub py_call_ns: u64,
     pub extract_ns: u64,
+    /// Worker sub-partition, mirrored from `eval::BoundaryMetrics`.
+    pub attach_ns: u64,
+    pub payload_ns: u64,
+    pub validate_ns: u64,
+    pub metrics_ns: u64,
     pub rust_tree_ns: u64,
     pub rust_chance_ns: u64,
     pub rust_record_ns: u64,
@@ -640,6 +645,10 @@ impl SchedulerMetrics {
         self.queue_wait_ns += other.queue_wait_ns;
         self.py_call_ns += other.py_call_ns;
         self.extract_ns += other.extract_ns;
+        self.attach_ns += other.attach_ns;
+        self.payload_ns += other.payload_ns;
+        self.validate_ns += other.validate_ns;
+        self.metrics_ns += other.metrics_ns;
         self.rust_tree_ns += other.rust_tree_ns;
         self.rust_chance_ns += other.rust_chance_ns;
         self.rust_record_ns += other.rust_record_ns;

@@ -506,6 +506,14 @@ def _run_rust(
         name: sum(float(row[f"sched_{name}_ns"]) for row in raw_metrics) / 1e9
         for name in ("refill", "collect", "retire", "assemble", "submit", "wait")
     }
+    # Worker sub-partition. With encode_pack, py_call and extract these tile
+    # `evaluate_batch_prepared_routed`, so `sched_wait - sum(worker)` is channel
+    # and reply overhead rather than the unattributed 14.76 s an earlier revision
+    # of the plan mislabelled "extract + validation".
+    worker = {
+        name: sum(float(row[f"{name}_ns"]) for row in raw_metrics) / 1e9
+        for name in ("attach", "payload", "validate", "metrics")
+    }
     ready_cycles = sum(float(row["scheduler_ready_slot_cycles"]) for row in raw_metrics)
     waiting_cycles = sum(float(row["scheduler_waiting_slot_cycles"]) for row in raw_metrics)
     idle_cycles = sum(float(row["scheduler_idle_slot_cycles"]) for row in raw_metrics)
@@ -566,6 +574,21 @@ def _run_rust(
         "gather_d2h_seconds": boundary["gather_seconds"] + boundary["d2h_seconds"],
         "scatter_seconds": scatter_seconds + extract_seconds,
         # --- Phase 1a: scheduler-thread partition ---
+        # --- Worker sub-partition ---
+        "worker_attach_seconds": worker["attach"],
+        "worker_payload_seconds": worker["payload"],
+        "worker_validate_seconds": worker["validate"],
+        "worker_metrics_seconds": worker["metrics"],
+        "worker_extract_seconds": extract_seconds,
+        # sched_wait minus everything the worker accounts for. Small means the
+        # worker partition is complete; what is left is channel + reply.
+        "worker_unpartitioned_seconds": (
+            sched["wait"]
+            - pack_seconds
+            - py_call_seconds
+            - extract_seconds
+            - sum(worker.values())
+        ),
         "sched_refill_seconds": sched["refill"],
         "sched_collect_seconds": sched["collect"],
         "sched_retire_seconds": sched["retire"],
