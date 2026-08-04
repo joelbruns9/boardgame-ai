@@ -365,6 +365,8 @@ struct FlatBatchBuilder {
     rows: usize,
     tokens: usize,
     max_tokens: usize,
+    /// Retained across batches so the encoder allocates nothing after warmup.
+    token_buf: crate::encoder::TokenBuf,
 }
 
 fn push_u32(out: &mut Vec<u8>, value: usize) {
@@ -402,7 +404,8 @@ impl FlatBatchBuilder {
         for (row, ((state, &actor), legal)) in
             states.iter().zip(actors).zip(legals).enumerate()
         {
-            let tokens = crate::encoder::encode(state);
+            crate::encoder::encode_into(state, &mut self.token_buf);
+            let tokens = self.token_buf.tokens();
             self.actors.push(actor as u8);
             self.net_ids
                 .push(net_ids.get(row).copied().unwrap_or(0));

@@ -57,6 +57,66 @@ pub struct Token {
     pub features: Vec<f64>,
 }
 
+/// Reusable token buffer (CORE_UTILIZATION_PLAN.md step 2a).
+///
+/// The encoder used to allocate one feature vector per token -- often for a
+/// single float, since FEATURE_COUNTS is [130, 1, 26, 1, 8, 4, 1, 79, 14] --
+/// which is ~200 M allocations in a six-minute generation run. This retains the
+/// token vector and every token's feature buffer across calls, so after the
+/// first row an encode allocates nothing.
+///
+/// Values and their order are unchanged; the encoder bit-exactness gate in
+/// test_encoder.py is what proves it.
+#[derive(Default)]
+pub struct TokenBuf {
+    tokens: Vec<Token>,
+    len: usize,
+}
+
+impl TokenBuf {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&mut self) {
+        self.len = 0;
+    }
+
+    /// Reserve the next token and hand back its cleared feature buffer.
+    #[inline]
+    fn emit(&mut self, type_id: usize, entity_id: i32, aux_id: i32) -> &mut Vec<f64> {
+        if self.len == self.tokens.len() {
+            self.tokens.push(Token {
+                type_id,
+                entity_id,
+                aux_id,
+                features: Vec::new(),
+            });
+        } else {
+            let t = &mut self.tokens[self.len];
+            t.type_id = type_id;
+            t.entity_id = entity_id;
+            t.aux_id = aux_id;
+            t.features.clear();
+        }
+        let i = self.len;
+        self.len += 1;
+        &mut self.tokens[i].features
+    }
+
+    /// Patch the last emitted token's entity id, for callers that only learn it
+    /// while building features.
+    #[inline]
+    fn set_entity(&mut self, entity_id: i32) {
+        self.tokens[self.len - 1].entity_id = entity_id;
+    }
+
+    /// Tokens emitted since begin(). Retained spare capacity stays hidden.
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens[..self.len]
+    }
+}
+
 /// Per-encode derived cache + the state/actor/pool the builders share.
 struct Enc<'a> {
     g: &'a GameState,
@@ -68,7 +128,17 @@ struct Enc<'a> {
     obtainable: Vec<usize>,
 }
 
+/// Allocating wrapper for cold callers (tests, single-state paths). The hot
+/// batch path uses encode_into with a retained buffer.
 pub fn encode(g: &GameState) -> Vec<Token> {
+    let mut buf = TokenBuf::new();
+    encode_into(g, &mut buf);
+    buf.tokens.truncate(buf.len);
+    buf.tokens
+}
+
+pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
+    out.begin();
     let actor = g
         .pending_choice
         .as_ref()
@@ -82,23 +152,21 @@ pub fn encode(g: &GameState) -> Vec<Token> {
         symbols: [compute_symbols(g, 0), compute_symbols(g, 1)],
         obtainable,
     };
-    let mut tokens = Vec::new();
-    tokens.push(e.global_token());
-    e.draft_offer_tokens(&mut tokens);
-    e.tableau_tokens(&mut tokens);
-    e.city_card_tokens(&mut tokens);
-    e.wonder_tokens(&mut tokens);
-    e.progress_tokens(&mut tokens);
-    e.discard_tokens(&mut tokens);
-    e.pool_tokens(&mut tokens);
-    e.pool_wonder_token(&mut tokens);
+    e.global_token(out);
+    e.draft_offer_tokens(out);
+    e.tableau_tokens(out);
+    e.city_card_tokens(out);
+    e.wonder_tokens(out);
+    e.progress_tokens(out);
+    e.discard_tokens(out);
+    e.pool_tokens(out);
+    e.pool_wonder_token(out);
     debug_assert!(
-        tokens
+        out.tokens()
             .iter()
             .all(|t| t.features.len() == FEATURE_COUNTS[t.type_id]),
         "encoder token feature count disagrees with FEATURE_COUNTS"
     );
-    tokens
 }
 
 // --- shared derived quantities ------------------------------------------------
@@ -340,7 +408,7 @@ impl Enc<'_> {
         v
     }
 
-    fn global_token(&self) -> Token {
+    fn global_token(&self, out: &mut TokenBuf) {
         let g = self.g;
         let decision = decision_index(g);
         let (present, face_down) = if g.phase == Phase::WonderDraft {
@@ -362,7 +430,7 @@ impl Enc<'_> {
         let my_token = next_token(g, self.actor);
         let opp_token = next_token(g, 1 - self.actor);
 
-        let mut v = Vec::new();
+        let v = out.emit(T_GLOBAL, 0, -1);
         for d in 0..9 {
             v.push(if d == decision { 1.0 } else { 0.0 });
         }
@@ -389,12 +457,6 @@ impl Enc<'_> {
         v.push(if g.pending_extra_turn { 1.0 } else { 0.0 });
         v.extend(self.per_player_values(self.actor));
         v.extend(self.per_player_values(1 - self.actor));
-        Token {
-            type_id: T_GLOBAL,
-            entity_id: 0,
-            aux_id: -1,
-            features: v,
-        }
     }
 
     // --- tableau -------------------------------------------------------------
@@ -432,7 +494,7 @@ impl Enc<'_> {
         ]
     }
 
-    fn tableau_tokens(&self, out: &mut Vec<Token>) {
+    fn tableau_tokens(&self, out: &mut TokenBuf) {
         let g = self.g;
         if g.phase == Phase::WonderDraft {
             return; // observation tableau is empty during the draft
@@ -466,7 +528,8 @@ impl Enc<'_> {
             let face_up = crate::data::layout(g.age)[i].face_up;
             let accessible = g.tableau.is_accessible(i);
 
-            let mut v = vec![
+            let v = out.emit(T_TABLEAU, 0, -1);
+            v.extend_from_slice(&[
                 row as f64,
                 row as f64 / 6.0,
                 x as f64,
@@ -475,7 +538,7 @@ impl Enc<'_> {
                 if accessible { 1.0 } else { 0.0 },
                 coverers as f64,
                 covers_hidden as f64,
-            ];
+            ]);
             let entity;
             if slot_card.revealed {
                 entity = slot_card.card_id as i32;
@@ -485,18 +548,13 @@ impl Enc<'_> {
                 entity = 73 + back_type_of(slot_card.card_id) as i32;
                 v.extend(std::iter::repeat(0.0).take(2 * 9));
             }
-            out.push(Token {
-                type_id: T_TABLEAU,
-                entity_id: entity,
-                aux_id: -1,
-                features: v,
-            });
+            out.set_entity(entity);
         }
     }
 
     // --- remaining token types -----------------------------------------------
 
-    fn draft_offer_tokens(&self, out: &mut Vec<Token>) {
+    fn draft_offer_tokens(&self, out: &mut TokenBuf) {
         let g = self.g;
         if g.phase != Phase::WonderDraft {
             return;
@@ -506,29 +564,19 @@ impl Enc<'_> {
         let mut offer = g.wonder_offer.clone();
         offer.sort_unstable(); // wonder ids == WONDER_IDS order
         for wid in offer {
-            out.push(Token {
-                type_id: T_DRAFT_OFFER,
-                entity_id: wid as i32,
-                aux_id: -1,
-                features: vec![second_round],
-            });
+            out.emit(T_DRAFT_OFFER, wid as i32, -1).push(second_round);
         }
     }
 
-    fn city_card_tokens(&self, out: &mut Vec<Token>) {
+    fn city_card_tokens(&self, out: &mut TokenBuf) {
         for (mine, seat) in [(1.0, self.actor), (0.0, 1 - self.actor)] {
             for &cid in &self.g.cities[seat].buildings {
-                out.push(Token {
-                    type_id: T_CITY_CARD,
-                    entity_id: cid as i32,
-                    aux_id: -1,
-                    features: vec![mine],
-                });
+                out.emit(T_CITY_CARD, cid as i32, -1).push(mine);
             }
         }
     }
 
-    fn wonder_tokens(&self, out: &mut Vec<Token>) {
+    fn wonder_tokens(&self, out: &mut TokenBuf) {
         let g = self.g;
         for (mine, seat) in [(1.0, self.actor), (0.0, 1 - self.actor)] {
             let city = &g.cities[seat];
@@ -558,11 +606,7 @@ impl Enc<'_> {
                     .iter()
                     .find(|&&(bw, _)| bw == wid)
                     .map_or(-1, |&(_, cid)| cid as i32);
-                out.push(Token {
-                    type_id: T_WONDER,
-                    entity_id: wid as i32,
-                    aux_id,
-                    features: vec![
+                out.emit(T_WONDER, wid as i32, aux_id).extend_from_slice(&[
                         mine,
                         if built { 1.0 } else { 0.0 },
                         if retired { 1.0 } else { 0.0 },
@@ -571,30 +615,21 @@ impl Enc<'_> {
                         cost as f64 / 10.0,
                         if grants_extra { 1.0 } else { 0.0 },
                         w.shields as f64,
-                    ],
-                });
+                    ]);
             }
         }
     }
 
-    fn progress_tokens(&self, out: &mut Vec<Token>) {
+    fn progress_tokens(&self, out: &mut TokenBuf) {
         let g = self.g;
         for &pid in &g.available_progress_tokens {
-            out.push(Token {
-                type_id: T_PROGRESS,
-                entity_id: pid as i32,
-                aux_id: -1,
-                features: vec![1.0, 0.0, 0.0, 0.0],
-            });
+            out.emit(T_PROGRESS, pid as i32, -1)
+                .extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
         }
         for (mine, seat) in [(1.0, self.actor), (0.0, 1 - self.actor)] {
             for &pid in &g.cities[seat].progress_tokens {
-                out.push(Token {
-                    type_id: T_PROGRESS,
-                    entity_id: pid as i32,
-                    aux_id: -1,
-                    features: vec![0.0, mine, 1.0 - mine, 0.0],
-                });
+                out.emit(T_PROGRESS, pid as i32, -1)
+                    .extend_from_slice(&[0.0, mine, 1.0 - mine, 0.0]);
             }
         }
         if let Some(p) = &g.pending_choice {
@@ -602,34 +637,26 @@ impl Enc<'_> {
                 let mut candidates = p.options.clone();
                 candidates.sort_unstable(); // progress ids == PROGRESS_IDS order
                 for pid in candidates {
-                    out.push(Token {
-                        type_id: T_PROGRESS,
-                        entity_id: pid as i32,
-                        aux_id: -1,
-                        features: vec![0.0, 0.0, 0.0, 1.0],
-                    });
+                    out.emit(T_PROGRESS, pid as i32, -1)
+                        .extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
                 }
             }
         }
     }
 
-    fn discard_tokens(&self, out: &mut Vec<Token>) {
+    fn discard_tokens(&self, out: &mut TokenBuf) {
         let g = self.g;
         let mausoleum = g
             .pending_choice
             .as_ref()
             .map_or(false, |p| p.kind == PendingChoiceKind::BuildFromDiscardFree);
         for &cid in &g.discard_pile {
-            out.push(Token {
-                type_id: T_DISCARD,
-                entity_id: cid as i32,
-                aux_id: -1,
-                features: vec![if mausoleum { 1.0 } else { 0.0 }],
-            });
+            out.emit(T_DISCARD, cid as i32, -1)
+                .push(if mausoleum { 1.0 } else { 0.0 });
         }
     }
 
-    fn pool_tokens(&self, out: &mut Vec<Token>) {
+    fn pool_tokens(&self, out: &mut TokenBuf) {
         for back in 0..4 {
             let members = &self.pool.cards[back];
             if members.is_empty() {
@@ -662,27 +689,23 @@ impl Enc<'_> {
             let n = members.len();
             let sum_my: i32 = my_costs.iter().sum();
             let sum_opp: i32 = opp_costs.iter().sum();
-            let mut v = vec![
+            let v = out.emit(T_POOL, back as i32, -1);
+            v.extend_from_slice(&[
                 n as f64,
                 n as f64 / 23.0,
                 sum_my as f64 / n as f64,
                 *my_costs.iter().min().unwrap() as f64,
                 sum_opp as f64 / n as f64,
                 *opp_costs.iter().min().unwrap() as f64,
-            ];
+            ]);
             for cid in 0..NUM_CARDS {
                 v.push(if is_member[cid] { 1.0 } else { 0.0 });
             }
-            out.push(Token {
-                type_id: T_POOL,
-                entity_id: back as i32,
-                aux_id: -1,
-                features: v,
-            });
+
         }
     }
 
-    fn pool_wonder_token(&self, out: &mut Vec<Token>) {
+    fn pool_wonder_token(&self, out: &mut TokenBuf) {
         let g = self.g;
         if g.phase != Phase::WonderDraft {
             return;
@@ -696,16 +719,12 @@ impl Enc<'_> {
             is_member[wid] = true;
         }
         let n = self.pool.wonders.len();
-        let mut v = vec![n as f64, n as f64 / 12.0];
+        let v = out.emit(T_POOL_WONDER, 0, -1);
+        v.extend_from_slice(&[n as f64, n as f64 / 12.0]);
         for wid in 0..NUM_WONDERS {
             v.push(if is_member[wid] { 1.0 } else { 0.0 });
         }
-        out.push(Token {
-            type_id: T_POOL_WONDER,
-            entity_id: 0,
-            aux_id: -1,
-            features: v,
-        });
+
     }
 }
 

@@ -161,7 +161,39 @@ allocations rather than make them cheaper, and the two partly overlap. Not
 mutually exclusive, but the restructure's marginal value is now unknown rather
 than assumed.
 
-### Still open: remove the allocations rather than speed them up
+### Result: `TokenBuf` adds 1.0351× on top. Mostly redundant, slightly additive.
+
+`TokenBuf` retains the token vector and every token's feature buffer across
+calls, so after the first row an encode allocates nothing. All 13 construction
+sites now write into it; `encode()` survives as an allocating wrapper for cold
+callers. **S/fp32, 5 repetitions, measured against the mimalloc build:**
+
+| metric | mimalloc | + `TokenBuf` | Δ |
+|---|---:|---:|---:|
+| **games/s** | 1.290 | 1.336 | **+3.5%** |
+| pack | 37.79 s | 34.20 s | −9.5% |
+| wall | 155.04 s | 149.77 s | −3.4% |
+| `sched_collect` | 9.23 s | 9.31 s | +0.8% |
+
+**Speedup 1.0351×, 95% CI [+1.23%, +5.79%].** Real, but small. Work identical
+again on both sides (batches 5546.2, simulations 659,521.2, moves 14,044.8), and
+the encoder bit-exactness gate passes — 49 tests.
+
+**Cumulative: 1.2592× (1.061 → 1.336 games/s).**
+
+**The honest reading.** An earlier revision argued removing allocations "should
+beat making them cheaper". Directionally true — it is additive and outside
+noise — but mimalloc had already captured ~85% of the available win, and
+`TokenBuf` cost ~80 lines across 13 sites for the remaining 3.5%. On its own
+merits it was marginal.
+
+**What justifies it is what comes next.** Packing is still **34.20 s / 22.8% of
+wall**, and the remaining cost is now genuine encoder computation —
+`unseen_pool`, `obtainable_cards`, `compute_symbols`, `minimum_payment` per row —
+not allocator traffic. That is the case for parallelism, and per-row reusable
+buffers are exactly the structure row-parallel encoding needs.
+
+### Still open: parallelism
 
 **Benchmark separately — do not assume the win is parallelism.**
 
