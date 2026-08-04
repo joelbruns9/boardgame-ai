@@ -3,8 +3,16 @@
 **Status:** **Every launch blocker is complete (W0-W3, W5-W7). What remains is
 box-side: W5.7's per-rung gate-cost fit, the equivalence smoke, the precision
 arena, and the throughput sweep all run on the RTX 5090 at first launch.**
-Revision 13.
-**Revision history:** r13 (2026-08-03) is pre-rental housekeeping after the
+Revision 14.
+**Revision history:** r14 (2026-08-03) sizes the run for **200k games**: the
+launcher now derives `--train-steps` from games per iteration instead of
+inheriting the parser's 300 (which would have trained at ~8-16x sample reuse
+against the ~5x this loop is tuned for), runs 200 x 1,000 rather than 60 x 500,
+raises the self-anchor to 400 games so the stopping rule can still resolve
+anything near parity, and gives the preflight a **disk** budget -- 200
+iterations write ~24 GB of never-pruned checkpoints, and disk is the one
+resource that cannot be lowered by a flag after the instance is rented.
+r13 is pre-rental housekeeping after the
 age-deal reordering shipped: the equivalence corpus regenerated under codec-2
 (it was codec-1, so the box-side gate was checking parity over trajectories this
 engine no longer produces), the gate ladder corrected to the shipped
@@ -84,6 +92,10 @@ does not close it -- it makes it **measured every iteration**.
 | gate cost | persistent rolling worker, concurrent seat legs, cloud-measured per rung | W5.1-5.4 **implemented**, W5.7 pending target host |
 | stagnation | **games-indexed** anchor + metric-triggered intervention ladder | W7 |
 | cloud target | vast.ai, single box | W6 |
+| run length | **200 iterations x 1,000 games = 200k games**, stopped on the self-anchor rather than on a games budget | launcher defaults |
+| iteration size | **1,000 games**, because every per-iteration cost (two unpruned checkpoints, a gate cycle, a replay-derivation pass, a log row) is paid per iteration and none of the schedules depend on it | W1.2 |
+| training pressure | **`train_steps = 0.19 x games/iteration`**, derived by the launcher, never the parser default | see below |
+| disk | **~36 GiB for the 200k run**; a third budget in the preflight, because disk is fixed when the instance is rented | W6.4 |
 
 ---
 

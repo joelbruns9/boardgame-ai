@@ -755,13 +755,33 @@ samples_per_new_position
     / (games-per-iteration * positions-per-game * recorded-fraction)
 ```
 
-Measured on run 02: **71.9 positions per game**. For the recommended run at 300
-games and 300 steps this gives 7.1x, and lifetime presentations work out to
-~8.5x for a position generated early in the run, ~7.1x on average.
+Measured on run 02 with `--record-fast-moves` on: **71.9 positions per game**.
+With it off, which is now the default, it is **19.4** -- so the same step budget
+is ~3.7x hotter than that arithmetic suggests, and `train-steps ≈ 0.19 x games`
+is what holds reuse near 5x.
+
+#### The cloud launcher derives this flag rather than defaulting it
+
+`setup_cloud_7wd.sh` computes `TRAIN_STEPS = 0.19 x GAMES_PER_ITERATION` (190 at
+the shipped 1,000) and `TRAIN_WARMUP_STEPS = TRAIN_STEPS / 3`, and passes both.
+Leaving `--train-steps` unset would take the parser's 300 whatever the iteration
+size is: ~8x reuse at 1,000 games, ~16x at 500. The measured basis is **19.4
+recorded positions per game** with `--record-fast-moves` off, which puts 0.19 x
+games at ~5x. Run 03 used 76 steps at 400 games and logged 5.6x.
+
+The warmup fraction is not cosmetic: the parser default of 100 exceeds the whole
+step budget below ~530 games an iteration, so a cold optimizer would spend its
+entire first iteration warming up.
 
 #### `recorded-fraction`: we deviate from KataGo here, deliberately
 
-That term is currently **1.0** -- every position is recorded. Cheap-search
+> **Superseded below.** `--record-fast-moves` now defaults **off**, i.e. this
+> project follows KataGo after all, and the ~4x shrink the last paragraph of
+> this section treats as hypothetical has already happened: 19.4 recorded
+> positions per game, not 71.9. The reasoning is kept because it is why the
+> default flipped; the arithmetic in this subsection is not current.
+
+That term was **1.0** -- every position is recorded. Cheap-search
 moves are stored with `policy_excluded=True`, so they carry no policy target
 but still supply value and auxiliary targets.
 
@@ -1603,7 +1623,16 @@ search algorithm. Safe laptop throughput tuning should first vary
 | Short CUDA validation | 2 | 50 | 250 | 20 | 128 × 4 | Checks records, losses, resume, and gates |
 | Laptop pilot | 5 | 250 | 500 | 100 | 128 × 4 | Recommended first meaningful run |
 | Longer laptop run | 30 | 400 | 2,000 | ladder 100–800 | 128 × 4 | ~8.4 min/iteration measured; add ~7.7 min per gate |
-| Cloud launch | 60+ | re-sweep | 5,000+ | ladder, ceiling from the per-rung fit | 384 × 8 × 6, bf16 | See `CLOUD_TRAINING_PLAN.md`; scheduler geometry from that box's sweep |
+| Cloud launch | 200 | 1,000 | 5,000 | ladder 200–1500, ceiling from the per-rung fit | 384 × 8 × 6, bf16 | 200k games; `setup_cloud_7wd.sh` defaults. See `CLOUD_TRAINING_PLAN.md`; scheduler geometry from that box's sweep |
+
+**Why the cloud row runs 1,000-game iterations.** Under the games basis nothing
+schedule-shaped depends on `--games-per-iteration` (W1.2), while several costs
+are strictly per *iteration*: two unpruned checkpoints (`candidate_NNNN.pt` and
+the anchor's `learner_NNNN.pt`, 59.7 MB each at this width), one gate cycle every
+`--promotion-every`, one replay-derivation pass, one log row. For a fixed games
+budget, larger iterations are pure savings — 200 × 1,000 spends ~24 GB on
+checkpoints where 400 × 500 spends ~48 GB for the same games. `--train-steps`
+must be re-sized with it; see below.
 
 Here `128 × 4` means `d-model=128` and `layers=4`, not channels and residual
 blocks. Before a cloud run, re-sweep scheduler geometry on that hardware and

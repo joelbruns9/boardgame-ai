@@ -52,32 +52,15 @@ def test_every_training_flag_exists_on_the_phase_d_parser(setup_text):
 
 
 def test_every_preflight_flag_exists_on_the_preflight_parser(setup_text):
-    import argparse
-
-    from . import cloud_preflight
+    from .cloud_preflight import build_parser
 
     invocation = setup_text[
         setup_text.index("cloud_preflight") : setup_text.index("stage_done 6")
     ]
-    parser = argparse.ArgumentParser()
-    # Rebuild the preflight parser through its own main() definition.
-    with pytest.raises(SystemExit):
-        cloud_preflight.main(["--help"])
     used = _long_flags(invocation)
-    known = {
-        "--d-model",
-        "--layers",
-        "--heads",
-        "--device",
-        "--replay-window-cap-games",
-        "--example-cache-gb",
-        "--example-cache-examples",
-        "--memory-budget-gb",
-        "--memory-headroom-gb",
-        "--output",
-    }
-    assert not sorted(used - known), sorted(used - known)
-    del parser
+    assert len(used) > 5, f"only extracted {used} from the preflight invocation"
+    unknown = sorted(used - _parser_options(build_parser()))
+    assert not unknown, f"setup_cloud_7wd.sh passes unknown preflight flags: {unknown}"
 
 
 def test_the_launch_uses_the_rust_engine_on_both_paths(setup_text):
@@ -136,6 +119,65 @@ def test_the_run03_lifecycle_defaults_match_the_documented_command(setup_text):
     ):
         assert f"{flag} {value}" in parameters
     assert "--gate-ladder-games 200 600 1000 1500" in parameters
+
+
+def test_train_steps_are_derived_from_games_per_iteration(setup_text):
+    """`--train-steps` must be passed, and must track games per iteration.
+
+    The parser default is 300 regardless of how many games an iteration
+    produces. At the shipped 1,000 games that is ~8x sample reuse and at 500 it
+    is ~16x, against the ~5x this loop is tuned for -- and, like the lifecycle
+    flags before the run-03 remediation, a flag the launcher does not pass is a
+    default nobody chose.
+    """
+
+    command = _block(setup_text, "TRAIN_CMD=(")
+    for flag in ("--train-steps", "--train-warmup-steps", "--train-batch-size"):
+        assert flag in command, f"the launch command does not pass {flag}"
+
+    # Derived in the script, not hard-coded: changing GAMES_PER_ITERATION must
+    # carry the step budget with it.
+    assert 'TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 19 + 99) / 100 ))}"' in setup_text
+    assert 'TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-$(( TRAIN_STEPS / 3 ))}"' in setup_text
+
+    games = int(re.search(r'GAMES_PER_ITERATION="\$\{GAMES_PER_ITERATION:-(\d+)\}"', setup_text).group(1))
+    steps = (games * 19 + 99) // 100
+    # ~19.4 recorded positions a game at batch 512: between 4x and 6x reuse.
+    reuse = steps * 512 / (games * 19.4)
+    assert 4.0 <= reuse <= 6.0, f"{steps} steps at {games} games is {reuse:.1f}x reuse"
+    # The parser's warmup default would otherwise exceed the whole budget.
+    assert steps // 3 < steps
+
+
+def test_the_launch_is_sized_for_the_two_hundred_thousand_game_run(setup_text):
+    defaults = {
+        "ITERATIONS": "200",
+        "GAMES_PER_ITERATION": "1000",
+        "SELF_ANCHOR_GAMES": "400",
+    }
+    for name, value in defaults.items():
+        assert f'{name}="${{{name}:-{value}}}"' in setup_text
+
+
+def test_the_preflight_is_told_the_length_of_the_run(setup_text):
+    """The disk budget is only meaningful if the preflight knows the plan.
+
+    Checkpoints are written per iteration and never pruned, so disk scales with
+    the run's length -- and disk is fixed when the instance is rented.
+    """
+
+    invocation = setup_text[
+        setup_text.index("cloud_preflight") : setup_text.index("stage_done 6")
+    ]
+    for flag in (
+        "--iterations",
+        "--games-per-iteration",
+        "--seed-games",
+        "--promotion-every",
+        "--run-dir",
+        "--disk-budget-gb",
+    ):
+        assert flag in invocation, f"the preflight is not told {flag}"
 
 
 def test_the_smoke_can_run_the_launch_geometry(setup_text):

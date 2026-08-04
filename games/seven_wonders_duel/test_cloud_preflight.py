@@ -10,6 +10,7 @@ from .cloud_preflight import (
     L_MIN_VRAM_BYTES,
     RECORD_BYTES,
     device_floor_bytes,
+    disk_sizing,
     evaluate,
     host_sizing,
 )
@@ -120,5 +121,80 @@ def test_a_deliberate_cpu_run_is_not_subject_to_the_vram_floor():
 
 def test_report_records_the_model_it_sized_for():
     report, _ = evaluate(_args(memory_budget_gb=64.0), _device(24))
-    assert report["model"] == {"d_model": 384, "layers": 8, "heads": 6}
+    assert report["model"]["d_model"] == 384
+    assert report["model"]["layers"] == 8
+    assert report["model"]["heads"] == 6
     assert report["device"]["required_bytes"] == L_MIN_VRAM_BYTES
+
+
+def _disk(free_gib: float):
+    return {"path": "/run", "available": True, "free_bytes": int(free_gib * GIB)}
+
+
+def _plan(**overrides):
+    base = dict(
+        iterations=200,
+        games_per_iteration=1_000,
+        seed_games=5_000,
+        parameters=14_900_000,
+        promotion_every=5,
+        disk_budget_bytes=0,
+        headroom_bytes=5 * GIB,
+    )
+    base.update(overrides)
+    return disk_sizing(**base)
+
+
+def test_the_disk_estimate_is_dominated_by_unpruned_per_iteration_checkpoints():
+    sizing = _plan()
+    # 200 iterations x 2 files x ~60 MB is ~24 GB; game records over the same
+    # run are ~6.6 GB. If that ordering ever inverts, the advice attached to
+    # this budget ("rent a bigger disk") is aimed at the wrong term.
+    assert sizing.checkpoint_bytes > 2 * sizing.buffer_bytes
+    assert 20 * GIB < sizing.checkpoint_bytes < 25 * GIB
+    assert 30 * GIB < sizing.required_bytes < 40 * GIB
+
+
+def test_halving_the_iteration_size_doubles_the_checkpoint_bill():
+    """Why the launcher runs 1,000-game iterations rather than 500.
+
+    Checkpoints are per iteration and records are per game, so the same 200k
+    games cost twice the checkpoints when split into twice as many iterations.
+    """
+
+    big = _plan(iterations=200, games_per_iteration=1_000)
+    small = _plan(iterations=400, games_per_iteration=500)
+    assert small.total_games == big.total_games
+    assert small.checkpoint_bytes == 2 * big.checkpoint_bytes
+    assert small.required_bytes > big.required_bytes + 20 * GIB
+
+
+def test_a_box_with_too_little_disk_is_refused_before_the_run_starts():
+    args = _args(
+        memory_budget_gb=64.0,
+        iterations=200,
+        games_per_iteration=1_000,
+        seed_games=5_000,
+        promotion_every=5,
+        parameters=14_900_000,
+        disk_budget_gb=0.0,
+        disk_headroom_gb=5.0,
+        run_dir="/run",
+    )
+    _report, failures = evaluate(args, _device(24), _disk(30))
+    assert any("disk:" in failure for failure in failures)
+    assert any("Nothing here is prunable at runtime" in failure for failure in failures)
+
+    _report, failures = evaluate(args, _device(24), _disk(120))
+    assert not failures
+
+
+def test_an_unsized_run_makes_no_disk_claim():
+    """`--iterations 0` (the default) must not refuse a box on headroom alone."""
+
+    sizing = _plan(iterations=0)
+    assert sizing.required_bytes == 0
+    assert sizing.fits
+
+    _report, failures = evaluate(_args(memory_budget_gb=64.0), _device(24), _disk(1))
+    assert not failures

@@ -33,14 +33,19 @@
 #   bash ~/boardgame-ai/setup_cloud_7wd.sh
 #
 # Knobs (env vars):
-#   ITERATIONS=60 GAMES_PER_ITERATION=500 SEED_GAMES=5000 WORKERS=8
+#   ITERATIONS=200 GAMES_PER_ITERATION=1000 SEED_GAMES=5000 WORKERS=8
+#                   (200k games; --iterations always means "N more" on a resume)
 #   D_MODEL=384 LAYERS=8 HEADS=6 PRECISION=bf16 LEARNING_RATE=5e-5
+#   TRAIN_STEPS=<0.19 x games/iteration>  TRAIN_WARMUP_STEPS=<steps/3>
+#                   derived, not defaulted — see the note beside them below
+#   TRAIN_BATCH_SIZE=512
 #   HOF_FRACTION=0.15 GATE_LADDER="200 600 1000 1500"
 #   PROMOTION_EVERY=5 BOOTSTRAP_POLICY=auto_first_trained
 #   PROBATION_RESET_AFTER=4 REVERT_RESET_AFTER=3
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
-#   SELF_ANCHOR_GAMES=200 SELF_ANCHOR_LAG_GAMES=20000   W7a stagnation anchor
+#   SELF_ANCHOR_GAMES=400 SELF_ANCHOR_LAG_GAMES=20000   W7a stagnation anchor
+#   DISK_BUDGET_GB=0 DISK_HEADROOM_GB=5   0 = measure this box's free space
 #   INTERVENTION_LADDER=0                                W7b response (off)
 #   MEMORY_BUDGET_GB / VRAM_BUDGET_GB / MEMORY_HEADROOM_GB
 #   RUN_DIR_REL=runs/seven_wonders_duel/cloud
@@ -84,8 +89,12 @@ else
 fi
 
 RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/cloud}"
-ITERATIONS="${ITERATIONS:-60}"
-GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-500}"
+# Sized for a 200k-game run: 200 x 1,000. Games per iteration is deliberately
+# absent from the schedule identity (W1.2), so it is free to change on a resume
+# and larger iterations are pure savings -- half the checkpoint pairs, gate
+# cycles, replay-derivation passes and log rows for the same games.
+ITERATIONS="${ITERATIONS:-200}"
+GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-1000}"
 SEED_GAMES="${SEED_GAMES:-5000}"
 WORKERS="${WORKERS:-8}"
 PROCESS_WORKERS="${PROCESS_WORKERS:-$(nproc)}"
@@ -94,6 +103,19 @@ LAYERS="${LAYERS:-8}"
 HEADS="${HEADS:-6}"
 PRECISION="${PRECISION:-bf16}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
+# Train steps are COUPLED to games per iteration and must be derived, never
+# defaulted: `--train-steps` defaults to 300 in the parser, which at 1,000 games
+# an iteration is ~8x sample reuse and at 500 is ~16x, against the ~5x this loop
+# is tuned for (run 03 used 76 steps at 400 games). Leaving it unset means the
+# paid run trains at whatever the parser happens to say -- the same failure as
+# the lifecycle flags the run-03 remediation had to add.
+#
+# 0.19 x games: ~19.4 recorded positions per game (measured with
+# --record-fast-moves off), 5 passes each, at batch 512. Warmup is a third of
+# the budget because the parser's default 100 can exceed the whole of it.
+TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 19 + 99) / 100 ))}"
+TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-$(( TRAIN_STEPS / 3 ))}"
 HOF_FRACTION="${HOF_FRACTION:-0.15}"
 HOF_START_GAMES="${HOF_START_GAMES:-10000}"
 GATE_LADDER="${GATE_LADDER:-200 600 1000 1500}"
@@ -103,7 +125,10 @@ BOOTSTRAP_POLICY="${BOOTSTRAP_POLICY:-auto_first_trained}"
 PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-4}"
 REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-3}"
 ANCHOR_GAMES="${ANCHOR_GAMES:-200}"
-SELF_ANCHOR_GAMES="${SELF_ANCHOR_GAMES:-200}"
+# 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
+# resolve a lagged advantage of 0.60+ easily but clear LCB > 0.50 only ~13% of
+# the time at 0.55 -- blind exactly where "am I still improving" gets decided.
+SELF_ANCHOR_GAMES="${SELF_ANCHOR_GAMES:-400}"
 SELF_ANCHOR_LAG_GAMES="${SELF_ANCHOR_LAG_GAMES:-20000}"
 SELF_ANCHOR_EVERY_GAMES="${SELF_ANCHOR_EVERY_GAMES:-10000}"
 INTERVENTION_LADDER="${INTERVENTION_LADDER:-0}"
@@ -147,10 +172,17 @@ common::gpu_gate
 stage_done 5
 
 # ── STAGE 6: W6.4 preflight — size the run at its cap, not its first iteration
-stage 6 "Launch preflight (host memory at the window cap, VRAM floor)"
+stage 6 "Launch preflight (host memory at the window cap, VRAM floor, disk)"
 "$PY" -m games.seven_wonders_duel.cloud_preflight \
   --d-model "$D_MODEL" --layers "$LAYERS" --heads "$HEADS" \
   --device cuda \
+  --iterations "$ITERATIONS" \
+  --games-per-iteration "$GAMES_PER_ITERATION" \
+  --seed-games "$SEED_GAMES" \
+  --promotion-every "$PROMOTION_EVERY" \
+  --run-dir "$REPO_DIR/$RUN_DIR_REL" \
+  --disk-budget-gb "${DISK_BUDGET_GB:-0}" \
+  --disk-headroom-gb "${DISK_HEADROOM_GB:-5}" \
   --replay-window-cap-games "$REPLAY_WINDOW_CAP_GAMES" \
   --example-cache-gb "$EXAMPLE_CACHE_GB" \
   --memory-budget-gb "$MEMORY_BUDGET_GB" \
@@ -339,6 +371,9 @@ TRAIN_CMD=(
   --d-model "$D_MODEL" --layers "$LAYERS" --heads "$HEADS"
   --precision "$PRECISION"
   --learning-rate "$LEARNING_RATE"
+  --train-steps "$TRAIN_STEPS"
+  --train-warmup-steps "$TRAIN_WARMUP_STEPS"
+  --train-batch-size "$TRAIN_BATCH_SIZE"
   --schedule-basis games
   --generation-backend rust --gate-backend rust
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"

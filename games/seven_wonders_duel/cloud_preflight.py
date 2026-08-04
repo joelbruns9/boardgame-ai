@@ -1,6 +1,6 @@
 """W6.4: refuse an unrunnable box at setup rather than at 3 a.m.
 
-Two independent budgets, both sized against what the run will *become* rather
+Three independent budgets, all sized against what the run will *become* rather
 than what it starts as:
 
 * **Host RSS.** The replay window grows on a schedule (W1.1), so the number that
@@ -11,9 +11,16 @@ than what it starts as:
 * **Device VRAM.** W0 measured L at 7,978 of 8,192 MiB physical on an 8 GB
   laptop -- it fits, barely, with no room for the gate's second model. For
   vast.ai this is a hard instance filter, not a preference.
+* **Disk.** Every iteration writes two checkpoints that are never pruned --
+  ``candidate_NNNN.pt`` and the anchor's ``learner_NNNN.pt`` -- and an L
+  checkpoint is 59.7 MB measured. A 200-iteration run therefore spends ~24 GB on
+  checkpoints before a single game record is written. Disk is chosen when the
+  instance is rented and is the one budget here that cannot be lowered by a
+  flag afterwards.
 
 The sizing is a pure function so it can be tested without a GPU; only
-:func:`device_report` touches CUDA.
+:func:`device_report` touches CUDA and only :func:`disk_report` touches the
+filesystem.
 """
 
 from __future__ import annotations
@@ -44,6 +51,27 @@ L_MIN_VRAM_BYTES = 16 * GIB
 """W6.4's hard floor for the shipped 384x8x6 model."""
 
 L_D_MODEL = 384
+
+CHECKPOINT_BYTES_PER_PARAMETER = 4.03
+"""Measured on both shipped widths: 4.15 MB at 1.03 M params, 59.66 MB at 14.9 M.
+
+fp32 weights plus a small constant of config and metadata; the ratio is stable
+enough across a 14x span that a per-parameter figure beats a hard-coded size.
+"""
+
+CHECKPOINTS_PER_ITERATION = 2
+"""``candidate_NNNN.pt`` and ``learner_NNNN.pt``, neither of which is pruned.
+
+The learner snapshot is the self-anchor's reference series (W7c), so it cannot
+simply be deleted; the candidate is what makes an interrupted iteration
+restartable. Both are kept for the life of the run.
+"""
+
+RECORD_DISK_BYTES = 32 * 1024
+"""On-disk JSONL bytes per game record: 2,613 MB over 84,000 games in run 03."""
+
+LOG_ROW_BYTES = 457 * 1024
+"""One `training_log.jsonl` row: 96 MB over 210 rows in run 03."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +128,134 @@ def host_sizing(
     )
 
 
+@dataclass(frozen=True)
+class DiskSizing:
+    iterations: int
+    total_games: int
+    parameters: int
+    checkpoint_bytes: int
+    hof_bytes: int
+    buffer_bytes: int
+    log_bytes: int
+    headroom_bytes: int
+    required_bytes: int
+    budget_bytes: int
+
+    @property
+    def fits(self) -> bool:
+        return self.budget_bytes <= 0 or self.required_bytes <= self.budget_bytes
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "iterations": self.iterations,
+            "total_games": self.total_games,
+            "parameters": self.parameters,
+            "checkpoint_bytes": self.checkpoint_bytes,
+            "hof_bytes": self.hof_bytes,
+            "buffer_bytes": self.buffer_bytes,
+            "log_bytes": self.log_bytes,
+            "headroom_bytes": self.headroom_bytes,
+            "required_bytes": self.required_bytes,
+            "budget_bytes": self.budget_bytes,
+            "fits": self.fits,
+        }
+
+
+def parameter_count(d_model: int, layers: int, heads: int) -> int:
+    """Parameters of the model this run will build.
+
+    Counted rather than assumed: W0 lost a run to a checkpoint whose width was
+    inferred instead of read, and every disk figure here scales with it.
+    """
+
+    from .train import build_model
+
+    model = build_model("transformer", d_model, layers, heads)
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def disk_sizing(
+    *,
+    iterations: int,
+    games_per_iteration: int,
+    seed_games: int,
+    parameters: int,
+    promotion_every: int,
+    disk_budget_bytes: int,
+    headroom_bytes: int,
+) -> DiskSizing:
+    """Bytes the run will have written by its last iteration.
+
+    Nothing in the run deletes anything, so this is a total rather than a peak.
+    The HOF term assumes every scheduled gate promotes -- the archive keeps one
+    checkpoint per promotion and prunes none, and being wrong in the cheap
+    direction here costs a few GB of stated requirement rather than a dead run
+    on day three.
+    """
+
+    iterations = max(0, int(iterations))
+    if iterations == 0:
+        # No planned length, no claim: an unsized disk check that failed on
+        # headroom alone would refuse boxes for a run it knows nothing about.
+        return DiskSizing(
+            iterations=0,
+            total_games=0,
+            parameters=int(parameters),
+            checkpoint_bytes=0,
+            hof_bytes=0,
+            buffer_bytes=0,
+            log_bytes=0,
+            headroom_bytes=0,
+            required_bytes=0,
+            budget_bytes=int(disk_budget_bytes),
+        )
+    total_games = max(0, int(seed_games)) + iterations * max(0, int(games_per_iteration))
+    checkpoint = int(parameters * CHECKPOINT_BYTES_PER_PARAMETER)
+    checkpoint_bytes = iterations * CHECKPOINTS_PER_ITERATION * checkpoint
+    gates = iterations // max(1, int(promotion_every))
+    hof_bytes = gates * checkpoint
+    buffer_bytes = total_games * RECORD_DISK_BYTES
+    log_bytes = iterations * LOG_ROW_BYTES
+    required = (
+        checkpoint_bytes
+        + hof_bytes
+        + buffer_bytes
+        + log_bytes
+        + int(headroom_bytes)
+    )
+    return DiskSizing(
+        iterations=iterations,
+        total_games=total_games,
+        parameters=int(parameters),
+        checkpoint_bytes=checkpoint_bytes,
+        hof_bytes=hof_bytes,
+        buffer_bytes=buffer_bytes,
+        log_bytes=log_bytes,
+        headroom_bytes=int(headroom_bytes),
+        required_bytes=required,
+        budget_bytes=int(disk_budget_bytes),
+    )
+
+
+def disk_report(path: str) -> dict[str, object]:
+    """Free bytes on the filesystem the run directory will live on."""
+
+    import os
+    import shutil
+
+    probe = os.path.abspath(path)
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        usage = shutil.disk_usage(probe)
+    except OSError:
+        return {"path": probe, "available": False, "free_bytes": 0}
+    return {"path": probe, "available": True, "free_bytes": int(usage.free)}
+
+
 def device_floor_bytes(d_model: int) -> int:
     """The VRAM this width may not launch below."""
 
@@ -127,7 +283,9 @@ def device_report(device: str) -> dict[str, object]:
 
 
 def evaluate(
-    args, device_info: dict[str, object] | None = None
+    args,
+    device_info: dict[str, object] | None = None,
+    disk_info: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     cache_bytes = (
         int(args.example_cache_gb * GIB)
@@ -149,6 +307,27 @@ def evaluate(
         headroom_bytes=int(args.memory_headroom_gb * GIB),
     )
     device = device_info if device_info is not None else device_report(args.device)
+    disk = (
+        disk_info
+        if disk_info is not None
+        else disk_report(getattr(args, "run_dir", ".") or ".")
+    )
+    disk_budget = int(getattr(args, "disk_budget_gb", 0.0) * GIB)
+    if disk_budget <= 0 and disk.get("available"):
+        disk_budget = int(disk["free_bytes"])
+    planned_iterations = int(getattr(args, "iterations", 0) or 0)
+    parameters = int(getattr(args, "parameters", 0) or 0)
+    if not parameters and planned_iterations > 0:
+        parameters = parameter_count(args.d_model, args.layers, args.heads)
+    disk_sizing_result = disk_sizing(
+        iterations=planned_iterations,
+        games_per_iteration=getattr(args, "games_per_iteration", 0),
+        seed_games=getattr(args, "seed_games", 0),
+        parameters=parameters,
+        promotion_every=getattr(args, "promotion_every", 5),
+        disk_budget_bytes=disk_budget,
+        headroom_bytes=int(getattr(args, "disk_headroom_gb", 5.0) * GIB),
+    )
     # The floor is about the GPU the run will actually use. A deliberate CPU run
     # is not subject to it; a CUDA run that cannot see a device is.
     floor = device_floor_bytes(args.d_model) if args.device.startswith("cuda") else 0
@@ -180,17 +359,44 @@ def evaluate(
                 "This is an instance filter, not a preference -- destroy this "
                 "instance and rent one with more VRAM."
             )
+    if not disk_sizing_result.fits:
+        failures.append(
+            f"disk: the run will write about "
+            f"{disk_sizing_result.required_bytes / GIB:.0f} GiB over "
+            f"{disk_sizing_result.iterations} iterations "
+            f"({disk_sizing_result.checkpoint_bytes / GIB:.0f} GiB of "
+            f"per-iteration checkpoints + "
+            f"{disk_sizing_result.hof_bytes / GIB:.0f} GiB of HOF archive + "
+            f"{disk_sizing_result.buffer_bytes / GIB:.0f} GiB of game records + "
+            f"{disk_sizing_result.log_bytes / GIB:.1f} GiB of log + "
+            f"{disk_sizing_result.headroom_bytes / GIB:.0f} GiB headroom) but "
+            f"only {disk_sizing_result.budget_bytes / GIB:.0f} GiB is available "
+            f"at {disk.get('path')}. Nothing here is prunable at runtime -- rent "
+            "a bigger disk, or lower --iterations and resume for more."
+        )
     report = {
         "host": sizing.as_dict(),
         "device": {**device, "required_bytes": floor},
-        "model": {"d_model": args.d_model, "layers": args.layers, "heads": args.heads},
+        "disk": {**disk, **disk_sizing_result.as_dict()},
+        "model": {
+            "d_model": args.d_model,
+            "layers": args.layers,
+            "heads": args.heads,
+            "parameters": parameters,
+        },
         "passed": not failures,
         "failures": failures,
     }
     return report, failures
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Every preflight flag, inspectable without running the preflight.
+
+    The launcher's flags are checked against this rather than against a copy of
+    the list kept in a test, so adding one here cannot leave the check behind.
+    """
+
     parser = argparse.ArgumentParser(description="W6.4 launch preflight")
     parser.add_argument("--d-model", type=int, default=384)
     parser.add_argument("--layers", type=int, default=8)
@@ -201,8 +407,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--example-cache-examples", type=int, default=250_000)
     parser.add_argument("--memory-budget-gb", type=float, default=0.0)
     parser.add_argument("--memory-headroom-gb", type=float, default=2.0)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="planned iterations; 0 skips the disk budget entirely",
+    )
+    parser.add_argument("--games-per-iteration", type=int, default=0)
+    parser.add_argument("--seed-games", type=int, default=0)
+    parser.add_argument("--promotion-every", type=int, default=5)
+    parser.add_argument(
+        "--run-dir",
+        default=".",
+        help="the run directory, to pick the filesystem whose free space counts",
+    )
+    parser.add_argument(
+        "--disk-budget-gb",
+        type=float,
+        default=0.0,
+        help="0 measures this box's free space",
+    )
+    parser.add_argument("--disk-headroom-gb", type=float, default=5.0)
+    parser.add_argument(
+        "--parameters",
+        type=int,
+        default=0,
+        help="parameter count; 0 builds the model and counts them",
+    )
     parser.add_argument("--output", help="write the report as JSON")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     report, failures = evaluate(args)
     if args.output:
@@ -224,6 +461,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print(f"device: {device['device']} not available")
+    disk = report["disk"]
+    if disk["iterations"]:
+        print(
+            f"disk: needs {disk['required_bytes'] / GIB:.0f} GiB for "
+            f"{disk['iterations']} iterations / {disk['total_games']:,} games, "
+            f"available {disk['budget_bytes'] / GIB:.0f} GiB"
+        )
     if failures:
         print("\nPREFLIGHT FAILED")
         for failure in failures:
