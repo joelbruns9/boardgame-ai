@@ -122,8 +122,48 @@ independent `GameState`s. **No cross-row dependency exists.**
 * **It grows as the GPU side is fixed.** Packing is CPU work, so bf16 does
   nothing for it while roughly halving the device term (§5).
 
-**Two independent changes, to be benchmarked separately — do not assume the win
-is parallelism.**
+### Result: allocator throughput was the cost. **1.2165× measured.**
+
+Before restructuring anything, the allocation hypothesis was probed by swapping
+the global allocator to mimalloc — three lines, no logic change, no
+bit-exactness risk. **S/fp32, 5 repetitions each side, 200 games per rep:**
+
+| metric | baseline | mimalloc | Δ |
+|---|---:|---:|---:|
+| **games/s** | **1.061** | **1.290** | **+21.6%** |
+| pack | 53.14 s | 37.79 s | −28.9% |
+| `sched_collect` (tree search) | 15.12 s | 9.23 s | **−39.0%** |
+| wall | 188.58 s | 155.04 s | −17.8% |
+| payload | 6.36 s | 6.99 s | +9.9% |
+
+**Speedup 1.2165×, 95% CI [+19.2%, +24.1%]** — far outside the 1.63% CV.
+
+**The work is identical**, which is the check that makes this trustworthy:
+`global_batches` 5546.2, `global_batch_leaves_mean` 247.2, `simulations`
+659,521.2 and `moves` 14,044.8 are unchanged to the decimal on both sides. Only
+the rate moved. 49 tests pass, including the encoder bit-exactness suite.
+
+**Two things this revealed beyond the hypothesis:**
+
+* **Allocation pressure is not confined to the encoder.** `sched_collect` — tree
+  search on the *scheduler* thread — fell 39%, more than packing did. The MCTS
+  node and mask allocations were costing as much proportionally.
+* **`device_forward` fell 9.3% on identical GPU work.** Not a measurement error
+  and not less work: a GPU fed faster holds higher boost clocks. A consequence of
+  the speedup, not a cause.
+* **`payload` got 9.9% *worse*** — mimalloc is not better for the eleven large
+  `PyByteArray` allocations per batch. Small in absolute terms (0.6 s).
+
+**Open decision: keep the dependency or spend the restructure.** This crate has
+deliberately carried only `pyo3` (see the Cargo.toml comment). mimalloc buys
+1.22× for three lines; the `TokenBuf` restructure below would *remove* the
+allocations rather than make them cheaper, and the two partly overlap. Not
+mutually exclusive, but the restructure's marginal value is now unknown rather
+than assumed.
+
+### Still open: remove the allocations rather than speed them up
+
+**Benchmark separately — do not assume the win is parallelism.**
 
 **(a) Direct flat writer.** `encode()` (`encoder.rs:71`) is not a thin append: it
 builds a dynamic `Vec<Token>`, pushing through eight builders, with a `Vec<f64>`

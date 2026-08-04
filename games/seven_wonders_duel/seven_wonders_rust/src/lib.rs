@@ -6,6 +6,9 @@
 //! indices. See `state.rs` for why no Python RNG is modelled and why the
 //! fingerprint is the equivalence surface.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod bots;
 mod chance;
 mod codec;

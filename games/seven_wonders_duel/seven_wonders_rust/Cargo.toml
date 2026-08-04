@@ -9,6 +9,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
+# Probe for CORE_UTILIZATION_PLAN.md step 2(a): the encoder allocates one
+# Vec<f64> per token -- ~200M allocations in a 6-minute run, most holding
+# between 1 and 26 values. If allocator throughput is the cost, this shows it
+# with no logic change and no bit-exactness risk. Revert if the A/B is flat.
+mimalloc = { version = "0.1", default-features = false }
 
 # Phase F1 is engine-only: no numpy/rayon/rand yet. The batched-inference and
 # Gumbel searcher dependencies arrive with F3/F4. Keeping the dependency set
