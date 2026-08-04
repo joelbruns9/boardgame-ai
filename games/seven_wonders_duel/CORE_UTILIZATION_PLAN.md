@@ -193,7 +193,59 @@ wall**, and the remaining cost is now genuine encoder computation —
 not allocator traffic. That is the case for parallelism, and per-row reusable
 buffers are exactly the structure row-parallel encoding needs.
 
-### Still open: parallelism
+### Result: row-parallel packing, 1.189× at 16 threads
+
+`RowPack` holds one row's packed bytes and its own `TokenBuf`. Rows encode in
+parallel (`par_iter_mut`), then are **concatenated serially in row order**, so
+the flat buffers are byte-identical regardless of thread count or completion
+order. Token counts are only known after encoding, which is why this is
+row-local buffers plus an ordered copy rather than rows writing into pre-sized
+global slices. Thread count is rayon's global pool, so `RAYON_NUM_THREADS`
+sweeps it without a rebuild.
+
+**S/fp32, 3 repetitions per rung:**
+
+| threads | games/s | vs serial | pack s | wall s |
+|---:|---:|---:|---:|---:|
+| serial | 1.336 | 1.000× | 34.20 | 149.8 |
+| 1 | 1.297 | **0.971×** | 38.65 | 154.2 |
+| 2 | 1.460 | 1.093× | 22.10 | 137.0 |
+| 4 | 1.515 | 1.134× | 14.72 | 132.0 |
+| 8 | 1.537 | 1.151× | 10.09 | 130.1 |
+| 16 | 1.588 | **1.189×** | 8.17 | 126.0 |
+
+**Packing scales 4.73×** (38.65 → 8.17 s) across 16 logical CPUs. End-to-end is
+only 1.189× because packing was 22.8% of wall — Amdahl, not a scaling failure.
+
+**Verified identical per repetition**: simulations, moves and batches match
+exactly between serial and 16 threads on every rep. (Averaging a 5-rep reference
+against a 3-rep sweep makes them *look* different — different seed sets — which
+is a trap worth not falling into twice.) 49 tests pass.
+
+**One-thread guard shipped.** rayon at one thread is **0.971× the serial loop** —
+dispatch costs ~13% of pack time with nothing to parallelise. `pack_routed` now
+takes the serial path when `rayon::current_num_threads() <= 1`, so
+`RAYON_NUM_THREADS=1` is no longer a silent 3% regression.
+
+**The curve has not flattened at 16**, and this laptop has 16 logical CPUs
+against the box's 48. Re-sweep on the next rental (build-order step 7).
+
+**Caveat: the global pool.** Thread count is rayon's process-wide pool. Nothing
+else in this crate uses rayon today; if that changes, move to a dedicated
+`ThreadPool` so packing and the new consumer cannot starve each other.
+
+### Cumulative
+
+| step | gain | cumulative (generation) |
+|---|---:|---:|
+| mimalloc | 1.2165× | 1.2165× |
+| + `TokenBuf` | 1.0351× | 1.2592× |
+| + row-parallel pack (16 threads) | 1.189× | **1.497×** |
+
+**1.061 → 1.588 games/s.** At the loop level, with generation at 82.3% of
+measured phase time, that is **~1.38×** overall — quote this number, not 1.497×.
+
+### Still open: further parallelism
 
 **Benchmark separately — do not assume the win is parallelism.**
 

@@ -14,6 +14,10 @@ pyo3 = { version = "0.28.3", features = ["extension-module"] }
 # between 1 and 26 values. If allocator throughput is the cost, this shows it
 # with no logic change and no bit-exactness risk. Revert if the A/B is flat.
 mimalloc = { version = "0.1", default-features = false }
+# Row-parallel encoding (CORE_UTILIZATION_PLAN.md step 2b). Packing is the
+# largest CPU term on the critical path and its rows are independent. Thread
+# count is rayon's global pool, so RAYON_NUM_THREADS sweeps it without a rebuild.
+rayon = "1"
 
 # Phase F1 is engine-only: no numpy/rayon/rand yet. The batched-inference and
 # Gumbel searcher dependencies arrive with F3/F4. Keeping the dependency set

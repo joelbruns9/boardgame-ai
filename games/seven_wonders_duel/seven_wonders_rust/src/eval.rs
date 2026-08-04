@@ -11,6 +11,7 @@ use crate::codec::legal_action_indices;
 use crate::state::{GameState, Phase};
 use pyo3::exceptions::{PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use pyo3::types::{PyByteArray, PyDict};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -365,8 +366,9 @@ struct FlatBatchBuilder {
     rows: usize,
     tokens: usize,
     max_tokens: usize,
-    /// Retained across batches so the encoder allocates nothing after warmup.
-    token_buf: crate::encoder::TokenBuf,
+    /// Per-row scratch, retained across batches and grown to the widest batch
+    /// seen, so a steady-state run allocates nothing here either.
+    row_scratch: Vec<RowPack>,
 }
 
 fn push_u32(out: &mut Vec<u8>, value: usize) {
@@ -401,29 +403,41 @@ impl FlatBatchBuilder {
         self.clear();
         push_u32(&mut self.token_offsets, 0);
         push_u32(&mut self.legal_offsets, 0);
-        for (row, ((state, &actor), legal)) in
-            states.iter().zip(actors).zip(legals).enumerate()
+        let n = states.len();
+        // Moved out so the ordered copy below can borrow the output buffers
+        // mutably while reading the scratch.
+        let mut scratch = std::mem::take(&mut self.row_scratch);
+        if scratch.len() < n {
+            scratch.resize_with(n, RowPack::default);
+        }
+        // Rows are independent: `encode` reads only its own `GameState`.
+        //
+        // Measured: rayon's dispatch costs ~13% of pack time, so a one-thread
+        // pool is 0.971x the serial loop -- a silent regression for anyone who
+        // sets RAYON_NUM_THREADS=1. Take the serial path when there is nothing
+        // to parallelise.
+        if rayon::current_num_threads() <= 1 {
+            for (row_pack, state) in scratch[..n].iter_mut().zip(states.iter()) {
+                row_pack.fill(state);
+            }
+        } else {
+            scratch[..n]
+                .par_iter_mut()
+                .zip(states.par_iter())
+                .for_each(|(row_pack, state)| row_pack.fill(state));
+        }
+        for (row, ((row_pack, &actor), legal)) in
+            scratch[..n].iter().zip(actors).zip(legals).enumerate()
         {
-            crate::encoder::encode_into(state, &mut self.token_buf);
-            let tokens = self.token_buf.tokens();
             self.actors.push(actor as u8);
             self.net_ids
                 .push(net_ids.get(row).copied().unwrap_or(0));
-            self.max_tokens = self.max_tokens.max(tokens.len());
-            for token in tokens {
-                self.type_ids.push(token.type_id as u8);
-                self.entity_ids
-                    .extend_from_slice(&(token.entity_id as i16).to_le_bytes());
-                self.aux_ids
-                    .extend_from_slice(&((token.aux_id + 1) as i16).to_le_bytes());
-                for index in 0..FLAT_FEATURE_WIDTH {
-                    // The flat Python/Torch boundary is explicitly f32; keeping
-                    // this cast here permits a zero-copy tensor view of the bytes.
-                    let value = token.features.get(index).copied().unwrap_or(0.0) as f32;
-                    self.features.extend_from_slice(&value.to_le_bytes());
-                }
-                self.tokens += 1;
-            }
+            self.max_tokens = self.max_tokens.max(row_pack.tokens);
+            self.type_ids.extend_from_slice(&row_pack.type_ids);
+            self.entity_ids.extend_from_slice(&row_pack.entity_ids);
+            self.aux_ids.extend_from_slice(&row_pack.aux_ids);
+            self.features.extend_from_slice(&row_pack.features);
+            self.tokens += row_pack.tokens;
             push_u32(&mut self.token_offsets, self.tokens);
             for &action in legal {
                 self.legal_actions
@@ -432,7 +446,57 @@ impl FlatBatchBuilder {
             let legal_total = self.legal_actions.len() / 2;
             push_u32(&mut self.legal_offsets, legal_total);
         }
-        self.rows = states.len();
+        self.row_scratch = scratch;
+        self.rows = n;
+    }
+}
+
+
+/// One row's packed bytes, encoded independently so rows can run in parallel.
+///
+/// Rows are concatenated afterwards **in row order**, so the flat buffers are
+/// byte-identical to the serial build regardless of thread count or completion
+/// order. Token counts are only known after encoding, which is why this is
+/// row-local buffers plus an ordered copy rather than rows writing into
+/// pre-sized global slices.
+#[derive(Default)]
+struct RowPack {
+    token_buf: crate::encoder::TokenBuf,
+    type_ids: Vec<u8>,
+    entity_ids: Vec<u8>,
+    aux_ids: Vec<u8>,
+    features: Vec<u8>,
+    tokens: usize,
+}
+
+impl RowPack {
+    fn fill(&mut self, state: &GameState) {
+        let Self {
+            token_buf,
+            type_ids,
+            entity_ids,
+            aux_ids,
+            features,
+            tokens,
+        } = self;
+        type_ids.clear();
+        entity_ids.clear();
+        aux_ids.clear();
+        features.clear();
+        crate::encoder::encode_into(state, token_buf);
+        let encoded = token_buf.tokens();
+        *tokens = encoded.len();
+        for token in encoded {
+            type_ids.push(token.type_id as u8);
+            entity_ids.extend_from_slice(&(token.entity_id as i16).to_le_bytes());
+            aux_ids.extend_from_slice(&((token.aux_id + 1) as i16).to_le_bytes());
+            for index in 0..FLAT_FEATURE_WIDTH {
+                // The flat Python/Torch boundary is explicitly f32; keeping this
+                // cast here permits a zero-copy tensor view of the bytes.
+                let value = token.features.get(index).copied().unwrap_or(0.0) as f32;
+                features.extend_from_slice(&value.to_le_bytes());
+            }
+        }
     }
 }
 
