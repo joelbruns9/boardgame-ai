@@ -47,28 +47,6 @@ common::require_python() {
   ok "python: $("$PY" --version 2>&1)"
 }
 
-common::require_operator_files() {
-  # Check operator-supplied paths BEFORE the toolchain build, not at the stage
-  # that consumes them. Every one of these arrives by scp from another machine,
-  # so a typo or a missed upload is the common case -- and paying an hour of
-  # rustup, torch and crate build to discover it is the expensive way to find
-  # out. Each argument is "NAME=path"; an empty path is skipped, since these
-  # are optional knobs.
-  local entry name path missing=0
-  for entry in "$@"; do
-    name="${entry%%=*}"
-    path="${entry#*=}"
-    [ -z "$path" ] && continue
-    if [ -r "$path" ]; then
-      ok "$name: $path"
-    else
-      warn "$name points at $path, which does not exist or is not readable."
-      missing=1
-    fi
-  done
-  [ "$missing" -eq 0 ] || die "Upload the missing file(s) and re-run; nothing has been built yet."
-}
-
 common::rust_toolchain() {
   if ! command -v cargo >/dev/null 2>&1; then
     log "Installing Rust via rustup (apt's rustc is too old for edition 2024)"

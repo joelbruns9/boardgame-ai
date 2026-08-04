@@ -207,10 +207,7 @@ def test_operator_supplied_paths_are_checked_before_anything_is_built(setup_text
     consumed it, after rustup, torch and the crate build had all completed.
     """
 
-    common = COMMON.read_text(encoding="utf-8")
-    assert "common::require_operator_files()" in common
-
-    call = setup_text.index("common::require_operator_files")
+    call = setup_text.index("require_operator_files \\")
     assert call < setup_text.index('stage 1 "Rust toolchain'), (
         "operator files are checked after the build has already started"
     )
@@ -220,6 +217,29 @@ def test_operator_supplied_paths_are_checked_before_anything_is_built(setup_text
         "LAUNCH_FLAGS_JSON",
     ):
         assert f'"{name}=${{{name}:-}}"' in setup_text
+
+
+def test_nothing_before_the_clone_depends_on_the_shared_library(setup_text):
+    """The common library comes from the checkout stage 2 has not updated yet.
+
+    This script is curl'd fresh every run, but on a box with an existing clone
+    the library beside it is whatever the last run left there. So a new
+    `common::` function called before stage 2 is "command not found" on exactly
+    the boxes that have run this before -- which is where it was found.
+
+    The allowlist is pinned rather than derived: a test cannot know what is
+    deployed on some box, but it can make *adding* to this set a deliberate act
+    rather than an accident. Both entries predate every copy in the field.
+    """
+
+    deployed_everywhere = {"common::require_python", "common::rust_toolchain"}
+    prologue = setup_text[: setup_text.index('stage 2 "Clone repo')]
+    called = set(re.findall(r"^\s*(common::[a-z_]+)", prologue, re.MULTILINE))
+    assert called <= deployed_everywhere, (
+        "called before the clone is updated, so an old checkout's library will "
+        f"not have it: {sorted(called - deployed_everywhere)}. Define it in "
+        "setup_cloud_7wd.sh instead, which is curl'd fresh."
+    )
 
 
 def test_an_arena_that_could_not_run_is_not_reported_as_a_verdict(setup_text):

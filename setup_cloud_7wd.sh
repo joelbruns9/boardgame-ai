@@ -151,10 +151,33 @@ CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
 common::require_python
 
-# Operator-supplied paths, checked before anything is built. These arrive by scp
-# from the laptop, so "not uploaded yet" is the normal failure and it should cost
-# seconds rather than the whole toolchain build.
-common::require_operator_files \
+# Deliberately NOT a common:: helper, and this is the reason: on a box that
+# already has a checkout, the common library is sourced from THAT checkout --
+# which stage 2 has not updated yet. So anything this script calls before stage 2
+# must be defined in this file, or a freshly curl'd script will call a function
+# the deployed library does not have. (It did: "command not found", first run
+# after the helper was added.)
+require_operator_files() {
+  # Operator-supplied paths, checked before anything is built. These arrive by
+  # scp from another machine, so "not uploaded yet" is the ordinary failure and
+  # it should cost seconds rather than rustup, torch and a crate build. Each
+  # argument is "NAME=path"; an empty path is skipped, since all are optional.
+  local entry name path missing=0
+  for entry in "$@"; do
+    name="${entry%%=*}"
+    path="${entry#*=}"
+    [ -z "$path" ] && continue
+    if [ -r "$path" ]; then
+      ok "$name: $path"
+    else
+      warn "$name points at $path, which does not exist or is not readable."
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || die "Upload the missing file(s) and re-run; nothing has been built yet."
+}
+
+require_operator_files \
   "PRECISION_ARENA_CHECKPOINT=${PRECISION_ARENA_CHECKPOINT:-}" \
   "SWEEP_CHECKPOINT=${SWEEP_CHECKPOINT:-}" \
   "LAUNCH_FLAGS_JSON=${LAUNCH_FLAGS_JSON:-}"
