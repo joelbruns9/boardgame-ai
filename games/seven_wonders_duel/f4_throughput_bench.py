@@ -499,6 +499,13 @@ def _run_rust(
     chance_seconds = sum(float(row["rust_chance_ns"]) for row in raw_metrics) / 1e9
     record_seconds = sum(float(row["rust_record_ns"]) for row in raw_metrics) / 1e9
     scatter_seconds = sum(float(row["scatter_ns"]) for row in raw_metrics) / 1e9
+    # Phase 1a: scheduler-thread partition. These are the regions that were
+    # untimed when the 18-25% residual was measured; with `scatter_seconds` they
+    # tile the loop. `sched_collect` is INCLUSIVE of tree/chance/encode_pack.
+    sched = {
+        name: sum(float(row[f"sched_{name}_ns"]) for row in raw_metrics) / 1e9
+        for name in ("refill", "collect", "retire", "assemble", "submit", "wait")
+    }
     ready_cycles = sum(float(row["scheduler_ready_slot_cycles"]) for row in raw_metrics)
     waiting_cycles = sum(float(row["scheduler_waiting_slot_cycles"]) for row in raw_metrics)
     idle_cycles = sum(float(row["scheduler_idle_slot_cycles"]) for row in raw_metrics)
@@ -558,6 +565,21 @@ def _run_rust(
         "gpu_forward_seconds": boundary["forward_seconds"],
         "gather_d2h_seconds": boundary["gather_seconds"] + boundary["d2h_seconds"],
         "scatter_seconds": scatter_seconds + extract_seconds,
+        # --- Phase 1a: scheduler-thread partition ---
+        "sched_refill_seconds": sched["refill"],
+        "sched_collect_seconds": sched["collect"],
+        "sched_retire_seconds": sched["retire"],
+        "sched_assemble_seconds": sched["assemble"],
+        "sched_submit_seconds": sched["submit"],
+        "sched_wait_seconds": sched["wait"],
+        # Everything in the loop that none of the regions above covers. Unlike
+        # the old `wall - (rust + py_call)` residual this is a true leftover on
+        # one thread, so a small value here means the partition is complete.
+        "sched_unpartitioned_seconds": (
+            sum(float(row["scheduler_wall_ns"]) for row in raw_metrics) / 1e9
+            - sum(sched.values())
+            - scatter_seconds
+        ),
         "cpu_utilization": cpu / wall / max(1, os.cpu_count() or 1),
         # Contract-required, and a host timer: `forward_seconds` measures kernel
         # dispatch, so this fraction is NOT evidence of a GPU-bound pipeline.

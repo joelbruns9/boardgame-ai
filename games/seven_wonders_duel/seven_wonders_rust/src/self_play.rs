@@ -572,6 +572,33 @@ pub struct SchedulerMetrics {
     /// cannot be inferred from `top_k` or `leaf_batch`.
     pub wave_width_histogram: [usize; tree_resumable::WAVE_WIDTH_BUCKETS],
     pub conflict_cuts: usize,
+    // --- Phase 1a: partition the scheduler thread ---
+    // `CORE_UTILIZATION_PLAN.md` §11/§13/§14 measured a residual of 18-25% of
+    // non-device time, stable across two machines, three widths and two
+    // precisions. It was computed as `wall - (rust terms + py_call_ns)`, which
+    // is not a partition of anything: `py_call_ns` is measured on the *worker*
+    // thread while the rest are the scheduler's. These six are all taken on the
+    // scheduler thread and together with `scatter_ns` they tile the loop, so the
+    // leftover is real bookkeeping rather than an artifact of mixing threads.
+    //
+    // The 2.01x/3.0x Phase 1+2 estimates assume the residual parallelises with
+    // the rest of the thread. That is what these settle.
+    /// `pool.refill`: activating queued games, i.e. game construction.
+    pub sched_refill_ns: u64,
+    /// `collect_ready_groups`. **Inclusive** of the per-slot tree, chance and
+    /// encode_pack work already counted separately -- subtract those to get the
+    /// collection overhead itself.
+    pub sched_collect_ns: u64,
+    /// `pool.retire`: finishing games and building records.
+    pub sched_retire_ns: u64,
+    /// Cloning every row's states/actors/legals/net_ids into the batch vectors.
+    /// Untimed until now and a prime suspect: it copies the whole batch.
+    pub sched_assemble_ns: u64,
+    /// Handing the assembled batch to the worker.
+    pub sched_submit_ns: u64,
+    /// `ticket.wait()`: what the scheduler thread actually spends blocked on the
+    /// forward. This, not `py_call_ns`, is the serialisation Phase 1 removes.
+    pub sched_wait_ns: u64,
 }
 
 pub struct SchedulerResult {
@@ -617,6 +644,14 @@ impl SchedulerMetrics {
         self.rust_chance_ns += other.rust_chance_ns;
         self.rust_record_ns += other.rust_record_ns;
         self.scatter_ns += other.scatter_ns;
+        // Per-thread durations, so they sum across shards exactly like the other
+        // `*_ns` work counters. Only `scheduler_wall_ns` is an envelope.
+        self.sched_refill_ns += other.sched_refill_ns;
+        self.sched_collect_ns += other.sched_collect_ns;
+        self.sched_retire_ns += other.sched_retire_ns;
+        self.sched_assemble_ns += other.sched_assemble_ns;
+        self.sched_submit_ns += other.sched_submit_ns;
+        self.sched_wait_ns += other.sched_wait_ns;
         self.scheduler_ready_slot_cycles += other.scheduler_ready_slot_cycles;
         self.scheduler_waiting_slot_cycles += other.scheduler_waiting_slot_cycles;
         self.scheduler_idle_slot_cycles += other.scheduler_idle_slot_cycles;
@@ -1880,10 +1915,12 @@ pub fn run_many_pipelined(
     let local_capacity = budget.total() / budget.shards().max(1);
 
     loop {
+        let refill_started = Instant::now();
         if let Err(err) = pool.refill(budget) {
             pool.abort(&budget);
             return Err(err);
         }
+        metrics.sched_refill_ns += refill_started.elapsed().as_nanos() as u64;
         occupancy.tick(&mut metrics, &pool, &outstanding, local_capacity);
         metrics.scheduler_cycles += 1;
         for slot_index in pool.active_indices() {
@@ -1896,6 +1933,7 @@ pub fn run_many_pipelined(
         metrics.scheduler_idle_slot_cycles +=
             local_capacity.saturating_sub(pool.active_count()) as u64;
         let mut finished = Vec::new();
+        let collect_started = Instant::now();
         if let Err(err) = collect_ready_groups(
             &mut pool,
             &mut outstanding,
@@ -1906,12 +1944,15 @@ pub fn run_many_pipelined(
             pool.abort(&budget);
             return Err(err);
         }
+        metrics.sched_collect_ns += collect_started.elapsed().as_nanos() as u64;
+        let retire_started = Instant::now();
         for slot_index in finished {
             if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
                 pool.abort(&budget);
                 return Err(err);
             }
         }
+        metrics.sched_retire_ns += retire_started.elapsed().as_nanos() as u64;
 
         while inflight.len() < max_inflight_batches && !pending.is_empty() {
             let (groups, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
@@ -1921,6 +1962,7 @@ pub fn run_many_pipelined(
                     return Err(err);
                 }
             };
+            let assemble_started = Instant::now();
             let owned_states = groups
                 .iter()
                 .flat_map(|group| group.states.iter().cloned())
@@ -1945,6 +1987,8 @@ pub fn run_many_pipelined(
             } else {
                 Vec::new()
             };
+            metrics.sched_assemble_ns += assemble_started.elapsed().as_nanos() as u64;
+            let submit_started = Instant::now();
             let ticket = match worker.submit_prepared_routed(
                 owned_states,
                 actors,
@@ -1957,6 +2001,7 @@ pub fn run_many_pipelined(
                     return Err(err);
                 }
             };
+            metrics.sched_submit_ns += submit_started.elapsed().as_nanos() as u64;
             metrics.global_batches += 1;
             metrics.global_rows += row_count;
             metrics.max_batch_rows = metrics.max_batch_rows.max(row_count);
@@ -1985,6 +2030,7 @@ pub fn run_many_pipelined(
                 "pipelined scheduler made no progress with live slots",
             ));
         };
+        let wait_started = Instant::now();
         let evaluations = match flight.ticket.wait() {
             Ok(rows) => rows,
             Err(err) => {
@@ -1992,6 +2038,7 @@ pub fn run_many_pipelined(
                 return Err(err);
             }
         };
+        metrics.sched_wait_ns += wait_started.elapsed().as_nanos() as u64;
         if evaluations.len() != flight.row_count {
             pool.abort(&budget);
             return Err(PyValueError::new_err(format!(

@@ -1441,6 +1441,15 @@ fn scheduler_result_to_py(
     metrics.set_item("rust_chance_ns", m.rust_chance_ns)?;
     metrics.set_item("rust_record_ns", m.rust_record_ns)?;
     metrics.set_item("scatter_ns", m.scatter_ns)?;
+    // Phase 1a: scheduler-thread partition. Together with `scatter_ns` these
+    // tile the loop, so `scheduler_wall_ns` minus their sum is loop bookkeeping.
+    // `sched_collect_ns` is inclusive of rust_tree/rust_chance/encode_pack.
+    metrics.set_item("sched_refill_ns", m.sched_refill_ns)?;
+    metrics.set_item("sched_collect_ns", m.sched_collect_ns)?;
+    metrics.set_item("sched_retire_ns", m.sched_retire_ns)?;
+    metrics.set_item("sched_assemble_ns", m.sched_assemble_ns)?;
+    metrics.set_item("sched_submit_ns", m.sched_submit_ns)?;
+    metrics.set_item("sched_wait_ns", m.sched_wait_ns)?;
     metrics.set_item("scheduler_ready_slot_cycles", m.scheduler_ready_slot_cycles)?;
     metrics.set_item(
         "scheduler_waiting_slot_cycles",
