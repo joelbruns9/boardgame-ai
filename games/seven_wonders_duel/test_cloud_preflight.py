@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from .cloud_preflight import (
     EXAMPLE_BYTES,
@@ -125,6 +126,32 @@ def test_report_records_the_model_it_sized_for():
     assert report["model"]["layers"] == 8
     assert report["model"]["heads"] == 6
     assert report["device"]["required_bytes"] == L_MIN_VRAM_BYTES
+
+
+def test_the_report_can_be_written_before_the_run_directory_exists(tmp_path):
+    """The preflight runs *before* anything creates the run directory.
+
+    Its natural output path is inside that directory, so writing the report
+    raised FileNotFoundError on every fresh box -- and the launcher reported it
+    as "Preflight refused this box. Destroy the instance and rent a bigger one."
+    """
+
+    from .cloud_preflight import main
+
+    output = tmp_path / "runs" / "seven_wonders_duel" / "cloud" / "preflight.json"
+    assert not output.parent.exists()
+    status = main(
+        [
+            "--device",
+            "cpu",
+            "--memory-budget-gb",
+            "64",
+            "--output",
+            str(output),
+        ]
+    )
+    assert status == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["passed"]
 
 
 def _disk(free_gib: float):

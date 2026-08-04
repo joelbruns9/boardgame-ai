@@ -443,6 +443,16 @@ def main(argv: list[str] | None = None) -> int:
 
     report, failures = evaluate(args)
     if args.output:
+        # The preflight runs before anything creates the run directory, and its
+        # natural output path is inside it. Writing the report must not be the
+        # thing that fails -- on a fresh box that surfaced as a FileNotFoundError
+        # wearing the "refused this box" message, which is the opposite of what
+        # this check is for.
+        import os
+
+        parent = os.path.dirname(os.path.abspath(args.output))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
             handle.write("\n")

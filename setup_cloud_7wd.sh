@@ -188,7 +188,14 @@ stage 6 "Launch preflight (host memory at the window cap, VRAM floor, disk)"
   --memory-budget-gb "$MEMORY_BUDGET_GB" \
   --memory-headroom-gb "$MEMORY_HEADROOM_GB" \
   --output "$REPO_DIR/$RUN_DIR_REL/preflight.json" \
-  || die "Preflight refused this box. Destroy the instance and rent a bigger one."
+  && _preflight_status=0 || _preflight_status=$?
+# A refusal (exit 1) and a crash are different events and must not share a
+# message: "rent a bigger box" is terrible advice for a bug in the check.
+if [ "$_preflight_status" -eq 1 ]; then
+  die "Preflight REFUSED this box — see the failures above. Fix the flagged budget or destroy the instance and rent a bigger one."
+elif [ "$_preflight_status" -ne 0 ]; then
+  die "Preflight CRASHED (exit $_preflight_status). That is a bug in the check, not a verdict on this box; nothing here says the hardware is wrong."
+fi
 stage_done 6
 
 # ── STAGE 7: W6.2 engine equivalence — must run, must not skip ───────────────

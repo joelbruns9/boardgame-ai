@@ -180,6 +180,25 @@ def test_the_preflight_is_told_the_length_of_the_run(setup_text):
         assert flag in invocation, f"the preflight is not told {flag}"
 
 
+def test_a_crashing_preflight_is_not_reported_as_a_refusal(setup_text):
+    """Exit 1 means "this box is too small"; anything else means the check broke.
+
+    They shared one `die` message, so a FileNotFoundError writing the report
+    told the operator to destroy the instance and rent a bigger one.
+    """
+
+    stage = setup_text[
+        setup_text.index("STAGE 6") : setup_text.index("stage_done 6")
+    ]
+    assert '_preflight_status" -eq 1' in stage, "refusal is not distinguished by exit code"
+    assert "CRASHED" in stage
+    assert "not a verdict on this box" in stage
+    # The advice that only makes sense for a real refusal must stay on that branch.
+    refusal, crash = stage.split("elif", 1)
+    assert "rent a bigger one" in refusal
+    assert "rent a bigger one" not in crash
+
+
 def test_the_smoke_can_run_the_launch_geometry(setup_text):
     """`--plumbing-smoke` must survive the width the launch actually uses.
 
