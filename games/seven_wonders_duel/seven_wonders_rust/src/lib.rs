@@ -2367,10 +2367,24 @@ fn self_play_many_flat_net(
     scheduler_result_to_py(py, result)
 }
 
+#[pyfunction]
+/// Time `pack_routed` over the supplied games. See `eval::bench_pack_routed`.
+fn bench_pack_routed(
+    games: Vec<PyRef<RustGame>>,
+    iterations: usize,
+    threads: usize,
+) -> PyResult<f64> {
+    let states: Vec<&crate::state::GameState> = games.iter().map(|g| &g.state).collect();
+    eval::bench_pack_routed(&states, iterations, threads)
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
     use super::RustGame;
+
+    #[pymodule_export]
+    use super::bench_pack_routed;
 
     #[pymodule_export]
     use super::RustPuctSearch;

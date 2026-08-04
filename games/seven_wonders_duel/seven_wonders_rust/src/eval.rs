@@ -500,6 +500,37 @@ impl RowPack {
     }
 }
 
+/// Packing-only benchmark for CORE_UTILIZATION_PLAN.md step 2b.
+///
+/// Times `pack_routed` with no GPU, no search and no Python round trip, so a
+/// threads x rows surface costs seconds instead of minutes of generation. The
+/// thread count is a **scoped** pool rather than the global one, so a single
+/// process can sweep every rung -- `RAYON_NUM_THREADS` is read once at first
+/// use and could not.
+///
+/// Returns seconds for `iterations` packs of the supplied rows, excluding a
+/// warmup pack that fills the retained buffers.
+pub fn bench_pack_routed(states: &[&GameState], iterations: usize, threads: usize) -> PyResult<f64> {
+    let actors: Vec<usize> = states.iter().map(|s| crate::tree::state_actor(s)).collect();
+    let legals: Vec<Vec<usize>> = states
+        .iter()
+        .map(|s| crate::codec::legal_action_indices(s))
+        .collect();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| PyValueError::new_err(format!("rayon pool: {e}")))?;
+    let mut builder = FlatBatchBuilder::default();
+    pool.install(|| {
+        builder.pack_routed(states, &actors, &legals, &[]);
+        let started = Instant::now();
+        for _ in 0..iterations {
+            builder.pack_routed(states, &actors, &legals, &[]);
+        }
+        Ok(started.elapsed().as_secs_f64())
+    })
+}
+
 pub struct PyFlatBatchEval {
     adapter: Py<PyAny>,
     scratch: Mutex<FlatBatchBuilder>,
