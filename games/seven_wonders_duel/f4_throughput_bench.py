@@ -770,6 +770,12 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
     }
 
 
+_TORCH_PRECISION = {"fp32": "float32", "bf16": "bfloat16"}
+"""Lock spelling for each --inference-precision value, kept verbose because the
+manifest field is compared across runs and "bf16" vs "bfloat16" would read as a
+change of regime rather than of vocabulary."""
+
+
 def run(args) -> dict:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     frozen = contract["laptop_comparative_benchmark"]
@@ -780,7 +786,12 @@ def run(args) -> dict:
             "contract_sha256": _sha256(CONTRACT_PATH),
             "leaf_batch": 1,
             "force_expand_root_chance": True,
-            "inference_precision": "float32",
+            # Records what the run actually used. This was hard-coded to
+            # "float32" and was pure documentation -- the forward precision comes
+            # from `load_evaluator(..., precision=)`, which the bench never
+            # passed, so every exploratory run was fp32 while production is
+            # bf16. Now both are driven by --inference-precision.
+            "inference_precision": _TORCH_PRECISION[args.inference_precision],
             "production_search": frozen["search"],
             "age_deal_sampler": {
                 "method": "paired_common_outcome_sampling",
@@ -836,7 +847,9 @@ def run(args) -> dict:
         raise ValueError("quality lock production search differs from the registered schedule")
     if not search.get("force_expand_root_chance") or lock["force_expand_root_chance"] is not True:
         raise ValueError("production throughput requires forced root chance")
-    evaluator = load_evaluator(str(args.checkpoint), args.device)
+    evaluator = load_evaluator(
+        str(args.checkpoint), args.device, precision=args.inference_precision
+    )
     evaluator.max_batch = args.global_batch_cap
     # `Evaluator` fuses by default; this only has to honour an explicit opt-out
     # and then confirm the state actually in force, since the cache
@@ -1106,6 +1119,15 @@ def main():
         "Changes every search output (a different, equally valid sample), so it "
         "needs a strength justification, not an identity one -- but it is what "
         "lets conflict-free waves actually widen. See test_f4_round_robin.py.",
+    )
+    parser.add_argument(
+        "--inference-precision",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="forward precision. Default fp32 preserves every figure measured "
+        "before 2026-08-04; production runs bf16, so a throughput number meant "
+        "to predict production must say bf16. Applies only on CUDA -- "
+        "`Evaluator.autocast` (inference.py:71) is a no-op on CPU by design.",
     )
     parser.add_argument("--diagnostic-sync", action="store_true")
     parser.add_argument(

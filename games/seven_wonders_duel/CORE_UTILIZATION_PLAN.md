@@ -1,9 +1,15 @@
 # Spending the cores: a throughput plan for the cloud box
 
-**Status:** **Phase 0 done and gated (§11, §13); Phases 1-2 confirmed as the
-build, ceiling 2.41×, realistic 2.01×.** Nothing else built. Written 2026-08-04
-after the first cloud sweep campaign on a rented RTX 5090 / EPYC 9654 slice;
-§10-§13 added the same day.
+**Status:** **Phase 0 done and gated (§11, §13, §14); Phases 1-2 confirmed as the
+build. In production's actual precision (bf16): realistic ~3.0×, ceiling ~4.5×.**
+Nothing else built. Written 2026-08-04 after the first cloud sweep campaign on a
+rented RTX 5090 / EPYC 9654 slice; §10-§14 added the same day.
+
+> **Read §14 before citing any number in §11 or §13.** Every Phase 0 figure in
+> those sections is **fp32**, because `load_evaluator` defaulted to it and the
+> bench never passed a precision. Production runs **bf16**, which is 2.19× faster
+> end to end at L and shifts every share. §11's 2.01× and 2.41× are the *fp32*
+> figures and understate the case for Phases 1-2.
 **Trigger:** the box is 48 cores and generation uses about one of them, because
 every scheduler axis available today is exhausted at **1.18×** end to end.
 
@@ -386,7 +392,19 @@ not close the gap. Device-to-Rust ratios, measured:
 | laptop L | 9.2 |
 
 S is a further 3.27× cheaper than M, putting laptop S at ≈**1.06** -- the box's
-regime. **Develop Phases 1-2 at S width; verify at L on the next rental.**
+regime. Measured at S: **1.05**, with Amdahl 2.00× and ceiling 2.42× against the
+box's 2.01× and 2.41×. The prediction held to 0.01×.
+
+**But §14 narrows what that licenses.** That match is fp32-to-fp32. Production is
+bf16, where the box's ratio falls to ≈**0.47** while laptop S stays at 1.05 --
+bf16 is a null at S, because a 1.03 M model cannot occupy tensor cores.
+**No laptop configuration reproduces production's balance**; S is the smallest
+model available and its forward is already too cheap to shrink further.
+
+**So: develop and correctness-gate Phases 1-2 at S on the laptop -- the
+serialisation structure is identical and the determinism gates do not care about
+balance -- but do not quote laptop speedups as production speedups.** The
+throughput number needs a bf16 L box.
 
 This also explains why the cloud run *felt* slower than the laptop pilots despite
 better hardware: the pilots ran S and the cloud run ran L. Measured at identical
@@ -443,15 +461,29 @@ should land first.**
   below the 164.7 s device floor. Paying a premium for clock buys a benefit the
   software work is about to make redundant.
 
-  **Instance selection, revised: GPU first, and little else matters.** After
-  Phase 1+2 the device time *is* the wall (164.7 s / 400 games → ~8,700 games/h;
-  ~11,800 with the padding fixed), so every further gain is GPU. Cores: enough
-  for 2-4 scheduler threads, so 8-16. Clock: do not pay for it.
+  ~~**Instance selection, revised: GPU first, and little else matters.** After
+  Phase 1+2 the device time *is* the wall, so every further gain is GPU. Cores:
+  enough for 2-4 scheduler threads, so 8-16. Clock: do not pay for it.~~
 
-  **The one thing that would overturn this** is the 14.5% unaccounted (§11). If
-  it is serial CPU work, Rust-side totals ~199 s -- *above* the device floor --
-  and clock keeps mattering after Phase 1+2. Resolve it before buying hardware on
-  the strength of this bullet.
+  **INVERTED by §14 -- CPU matters after all.** That advice was computed in
+  fp32, where device (164.7 s) exceeded Rust-side work (199 s) closely enough to
+  act as the floor. In bf16, which is what production runs, the box's device time
+  falls to **~66 s** while the Rust side is unchanged at **~199 s** -- **3× the
+  device time.** So:
+
+  * **The scheduler thread, not the GPU, is the wall in production.** Reaching
+    the device floor needs ~4 scheduler threads, not 2.
+  * **Single-core clock buys ~1.29× today** (up from 1.14× in fp32), and unlike
+    the fp32 case it keeps paying after Phase 1+2, because the Rust side stays
+    above the device floor until it is divided ~4 ways.
+  * **Instance selection: a fast 8-16 core part with good single-thread
+    performance, and the GPU is already ahead of what the pipeline can feed.**
+
+  **Caveat before spending money:** the box is destroyed, so the bf16 device time
+  is *extrapolated* from a 3070-measured 2.88× forward speedup, not measured on a
+  5090. A 5090's bf16 advantage is likely larger, which would push device time
+  lower still and strengthen this bullet rather than weaken it -- but re-measure
+  on the next rental before treating it as settled.
 
 ---
 
@@ -677,3 +709,86 @@ i.e. 0.298 → 0.285 s/game) while `rust_tree` did not move much per game. Both 
 nominally width-independent CPU work, so **treat per-game normalisation as the
 comparison unit here, not per-run totals** -- §10 ran 200 games and §11/§13 ran
 400, and comparing raw seconds across them is a trap.
+
+---
+
+## 14. Precision: the confound that was moving everything -- 2026-08-04
+
+§11 caveat 4 flagged that every Phase 0 figure was fp32 while production is bf16,
+direction known and magnitude unknown. Measured now. **The magnitude is 2.19×,
+and it depends entirely on model width.**
+
+### The defect
+
+`load_evaluator` (`phase_e.py:503`) declares `precision: str = "fp32"`, and
+`f4_throughput_bench.py` called it with only path and device. So **the forward
+was always fp32**, including the box run against `current_best.pt`, whose own
+config says `bf16`. The checkpoint's precision was read for architecture and
+ignored for dtype. The lock meanwhile wrote `"inference_precision": "float32"`
+into the manifest -- true, but as an assertion rather than an observation.
+
+Same failure class as the two pre-rental defects: a parameter nobody passed
+taking a default nobody chose, with a manifest field asserting instead of
+recording. **`load_evaluator`'s default is not bench-specific -- audit other
+callers relying on a checkpoint's `precision` to carry through.**
+
+Fixed by `--inference-precision {fp32,bf16}` (default fp32, so every prior figure
+reproduces), plumbed to `load_evaluator` and recorded in the lock.
+
+### Measured, 192 slots / cap 2048 / inflight 1, `--cuda-events`
+
+| | S fp32 | S bf16 | L fp32 | L bf16 |
+|---|---:|---:|---:|---:|
+| wall | 360.7 s | 356.9 s | 774.2 s | **353.1 s** |
+| games/s | 1.109 | 1.121 | 0.258 | **0.566** |
+| device forward | 126.3 s | 122.5 s | 661.1 s | **229.9 s** |
+| device share | 41.3% | 41.4% | 87.1% | 68.8% |
+| device / Rust | 1.05 | 1.05 | 10.31 | 3.29 |
+| `padding_ratio` | 0.259 | 0.263 | 0.187 | 0.192 |
+
+S runs 400 games, L runs 200; compare shares and ratios, not raw seconds.
+
+**bf16 is a 2.19× end-to-end win at L (2.88× on the forward alone) and a 1.01×
+null at S.** A 1.03 M model does not occupy tensor cores; a 14.9 M one does. The
+answer depended entirely on which width was asked, which is why the first attempt
+-- at S -- returned a null that would have been reported as "precision does not
+matter" had it stopped there.
+
+**Verified before believing the null:** the manifest records `bfloat16`,
+`Evaluator.autocast()` returns a real `torch.amp.autocast` rather than a
+`nullcontext`, and `rust_bridge.py:390` wraps the forward in it. An inert flag
+produces exactly the same reading as a genuine null.
+
+### The box, extrapolated to bf16
+
+Scaling the box's 151.4 s forward by the measured 2.88×: forward ~52.6 s, device
+total **~65.9 s**, wall **~297 s**, device share **~22%**.
+
+**That independently corroborates the ~23% GPU seen on the live dashboard** --
+the discrepancy §11 caveat 3 blamed on the sims difference (46.6 vs 39.1, far too
+small to carry it). It was the precision.
+
+On those figures, with the Rust side unchanged at ~199 s (it is CPU work and
+precision-independent):
+
+* **Phase 1+2 is worth ~3.0×**, not §11's 2.01×.
+* **Ceiling ~4.5×**, not 2.41×.
+* **The Rust side is ~3× the device time**, which inverts §9's hardware advice.
+
+*Extrapolated, not measured:* the 2.88× forward ratio comes from a 3070. A 5090's
+bf16 advantage is likely larger, so this understates rather than overstates.
+
+### Correction: padding is not a constant
+
+§13 recorded `padding_ratio` ~0.26 at S, M and the box, and called it
+model-independent. **The L runs give 0.187 / 0.192.** It varies with the
+games-per-call to slots ratio: 200 games on 192 slots keeps games phase-aligned
+and token lengths uniform, while 400 games spreads them across phases. **Padding
+is a property of the generation geometry, not only of the encoder**, so its
+payoff must be quoted per configuration rather than as a flat ~10% of wall.
+
+### Unchanged by any of this
+
+The unaccounted remainder: **17.9-18.2% of non-device time** in all four runs
+here, against 18.0 / 19.5 / 24.8 previously. Seven measurements, two machines,
+three widths, two precisions.
