@@ -361,9 +361,24 @@ against L 4,356, a **7.4×** spread across a **14.5×** parameter range
 expensive forward, and dropping to **M** collapses the device share and
 reproduces the box's regime locally.
 
-**Develop Phases 1-2 at M width on the laptop; verify at L on the next rental.**
-Throughput claims must state their width, because the same code is CPU-bound at
-S and GPU-bound at L on identical hardware.
+~~**Develop Phases 1-2 at M width on the laptop; verify at L on the next
+rental.**~~ Throughput claims must state their width, because the same code is
+CPU-bound at S and GPU-bound at L on identical hardware.
+
+**Corrected 2026-08-04 by measuring it (§13): M is not enough -- use S.** The M
+run came back at **66.9% device** against the box's 41.6%, so it does not
+reproduce the regime. The error was using the S-vs-L ratio (7.4×) to justify M:
+M-vs-L is only **2.26×**, and the 3070 is 4.4× slower than the 5090, so M does
+not close the gap. Device-to-Rust ratios, measured:
+
+| run | device / Rust |
+|---|---:|
+| box L | **1.16** |
+| laptop M | 3.47 |
+| laptop L | 9.2 |
+
+S is a further 3.27× cheaper than M, putting laptop S at ≈**1.06** -- the box's
+regime. **Develop Phases 1-2 at S width; verify at L on the next rental.**
 
 This also explains why the cloud run *felt* slower than the laptop pilots despite
 better hardware: the pilots ran S and the cloud run ran L. Measured at identical
@@ -538,16 +553,38 @@ than tree work (43.7 s) as the largest thing that thread does.
 
 ### Caveats, not to be dropped when this is cited
 
-1. **14.5% unaccounted**, five times the laptop's 2.7%. The gate's own last row
-   calls a large remainder grounds to re-derive. It does not overturn the read,
-   but it is the difference between a 1.56× and a ~1.8× estimate, and the next
-   person to touch this should find out what it is.
+1. ~~**14.5% unaccounted**, five times the laptop's 2.7%.~~ **Resolved by §13:
+   it is not box-specific and it is not noise.** Normalised against *non-device*
+   time it is a consistent **18-25% on both machines at both widths** (laptop L
+   19.5%, laptop M 17.9%, box L 24.8%). It tracks the Rust side, not the GPU, so
+   it is scheduler-thread work the existing timers do not cover. **Folding it in
+   raises the Phase 1+2 estimate from 1.56× to 2.01×** (Rust-side total 199.0 s =
+   50.2% of wall; 396.1 → 197.1 s). The 2.41× ceiling is unchanged, being set by
+   device time. *Measured:* the three-point ratio. *Inferred:* that it is
+   scheduler-thread work -- timers would settle it, and Phase 1 should add them.
 2. **One unreplicated point.** The 4% noise band from §1 was established on
    200-game runs; this is a single 400-game run.
 3. **Geometry is near but not identical to the run's.** The lock forced 128 sims
    where production uses 39; effective sims/move landed at 46.6 vs 39.1 and
-   sims/s at 3,315 vs ~3,044, so NN load is close. `device_forward_fraction` 0.38
-   against the ~23% seen on the live dashboard is partly this.
+   sims/s at 3,315 vs ~3,044, so NN load is close.
+
+4. **OPEN, and it moves the numbers: every Phase 0 figure here is fp32, while
+   production is bf16.** `f4_throughput_bench.py:783` hard-codes
+   `"inference_precision": "float32"` into the `--exploratory-leaf1` lock with no
+   CLI override, and both sweep checkpoints carry `precision: fp32`; the cloud
+   run's `current_best.pt` is `bf16`. This is the better explanation for
+   `device_forward_fraction` 0.38 here against the ~23% observed on the live
+   dashboard -- bf16 uses tensor cores and fp32 largely does not.
+
+   **Direction of the error is known, magnitude is not.** A cheaper forward moves
+   device share down and scheduler share up -- the same direction as caveat 1 --
+   so both corrections make the scheduler thread *more* dominant than the table
+   above says. **What it does not change: Phases 1+2 remain the build under
+   either precision.** What it could change is §9's hardware advice (if the Rust
+   side exceeds the device floor after parallelising, clock and cores start
+   mattering again) and whether padding still deserves to go first, since padding
+   only pays on the device share. Measuring it needs a patch letting the lock
+   record a precision instead of asserting one.
 
 ---
 
@@ -588,3 +625,47 @@ checkpoints already on disk and can be replayed offline at any time. With the
 schedule-cliff diagnosis (all four scaffolds annealing out at 10,000 games)
 calling for staggered knots, and `_refuse_changed_code` blocking a resume across
 the throughput work anyway, the next run is a fresh one rather than a resume.
+
+---
+
+## 13. Phase 0 at M width, laptop -- 2026-08-04
+
+Run to test two things §11 left open: whether the unaccounted remainder was
+box-specific, and whether dropping model width reproduces the box's regime on the
+laptop. Identical to §11 in every parameter except the checkpoint
+(`sweep_M_lr5e-05_seed0`, 256x6x4, 5.21 M params): 192 slots / cap 2048 /
+inflight 1, `--games-per-call 400`, `--cuda-events`, 400 games, 1 repetition.
+
+Wall **765.8 s**, 400 games, **0.522 games/s**, `device_forward_fraction` 0.669
+against `nvml_utilization_mean` 0.680.
+
+| term | s | % wall |
+|---|---:|---:|
+| device total (forward 512.3, h2d 13.2, gather 10.3, d2h 1.3) | 537.2 | 70.2% |
+| Rust scheduler thread (`encode_pack` 113.8, `tree` 32.2, `scatter` 8.3, rest 0.3) | 154.7 | 20.2% |
+| Python tensor build | 24.3 | 3.2% |
+| unaccounted | 40.9 | 5.3% |
+
+### What it settled
+
+**The unaccounted is structural, not a box artifact.** See §11 caveat 1: 18-25%
+of non-device time across both machines and both widths. Phase 1+2's estimate
+rises to **2.01×**.
+
+**M does not reproduce the box's regime; S should.** See the correction in §7.
+
+**Two things transfer exactly, which is what licenses laptop development at all:**
+
+* `padding_ratio` **0.2606** here vs **0.2608** on the box. Model-independent, so
+  it is a property of the encoder and can be fixed at any width on any machine.
+* Batch geometry at matched slots: `steady_rows_per_batch` **435** vs the box's
+  **430**, mean rows 289 vs 295. The batching regime transfers even though the
+  device balance does not.
+
+### Method note
+
+`encode_pack` scaled with width (59.6 s at L/200 games → 113.8 s at M/400 games,
+i.e. 0.298 → 0.285 s/game) while `rust_tree` did not move much per game. Both are
+nominally width-independent CPU work, so **treat per-game normalisation as the
+comparison unit here, not per-run totals** -- §10 ran 200 games and §11/§13 ran
+400, and comparing raw seconds across them is a trap.
