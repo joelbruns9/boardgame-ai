@@ -1,15 +1,23 @@
 # Spending the cores: a throughput plan for the cloud box
 
-**Status:** **Phase 0 done and gated (§11); Phases 1-2 confirmed as the build,
-ceiling 2.41×, realistic 1.5-1.8×.** Nothing else built. Written 2026-08-04 after
-the first cloud sweep campaign on a rented RTX 5090 / EPYC 9654 slice; §10-§12
-added the same day.
+**Status:** **Phase 0 done and gated (§11, §13); Phases 1-2 confirmed as the
+build, ceiling 2.41×, realistic 2.01×.** Nothing else built. Written 2026-08-04
+after the first cloud sweep campaign on a rented RTX 5090 / EPYC 9654 slice;
+§10-§13 added the same day.
 **Trigger:** the box is 48 cores and generation uses about one of them, because
 every scheduler axis available today is exhausted at **1.18×** end to end.
 
-**Build order, revised by §11:** padding (26% of tokens, ~10% of wall, no
-determinism exposure) first, then Phase 1's merging worker, then the Phase 2
-sweep. 3a is not the fallback -- it is capped at 6.9% of wall.
+**Build order: Phase 1's merging worker, then the Phase 2 sweep, then padding.**
+3a is not the fallback -- it is capped at 6.9% of wall. Develop at **S** width on
+the laptop (§7), verify at L on the next rental.
+
+*An earlier revision put padding first, on the strength of its 26% of tokens
+against a device share of 41.6%. Two later corrections both moved share away from
+the device and onto the scheduler thread -- the unaccounted remainder (§11 caveat
+1) and the fp32/bf16 confound (§11 caveat 4) -- so padding's ~10%-of-wall payoff
+is an upper bound that shrinks under bf16, while Phase 1+2's grew from 1.56× to
+2.01×. Padding is still worth doing and still carries no determinism risk; it is
+simply no longer the best first move.*
 
 **The constraint that shaped the original plan no longer binds.** It said none of
 this could land in the run that was starting, because `_refuse_changed_code`
