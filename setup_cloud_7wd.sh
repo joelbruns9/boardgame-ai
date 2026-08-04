@@ -310,7 +310,8 @@ else
     --caps "${SWEEP_CAPS_CSV:-256,1024}" \
     --inflight "${SWEEP_INFLIGHT_CSV:-1}" \
     --device cuda \
-    || die "Generation sweep failed - do not launch on unmeasured settings."
+    --precision "$PRECISION" \
+    || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
   ok "Generation sweep: $SWEEP_DIR/generation/phase_d_sweep.json"
 
   # Sweep the ladder's *lowest* rung: the gate optimum measured stable across

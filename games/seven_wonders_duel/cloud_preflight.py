@@ -256,6 +256,106 @@ def disk_report(path: str) -> dict[str, object]:
     return {"path": probe, "available": True, "free_bytes": int(usage.free)}
 
 
+def _read_first_int(paths: tuple[str, ...]) -> int | None:
+    """First readable file among `paths`, parsed as an integer.
+
+    Returns None for "max"/unset/unparseable, which cgroup uses for no limit.
+    """
+
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = handle.read().strip().split()[0]
+        except (OSError, IndexError):
+            continue
+        if raw in ("max", "-1"):
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # cgroup v1 writes a sentinel near 2^63 rather than "max".
+        return None if value <= 0 or value >= 1 << 62 else value
+    return None
+
+
+def container_limits() -> dict[str, object]:
+    """The cgroup's memory ceiling and CPU quota, when there is one.
+
+    A rented box is usually a *slice* of a host: vast.ai sells "48 of 192 cores
+    and 64 GB", and inside the container `psutil.virtual_memory().total` and
+    `nproc` both report the **host's** figures. Sizing against those makes this
+    check believe it has four times the memory the cgroup will actually allow,
+    which disables the refusal on exactly the machines it exists to protect.
+    """
+
+    memory = _read_first_int(
+        (
+            "/sys/fs/cgroup/memory.max",  # v2
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # v1
+        )
+    )
+    cpu_quota = None
+    for path, period_path in (
+        ("/sys/fs/cgroup/cpu.max", None),  # v2: "quota period" on one line
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+    ):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                fields = handle.read().strip().split()
+        except OSError:
+            continue
+        if not fields or fields[0] in ("max", "-1"):
+            break
+        try:
+            quota = int(fields[0])
+            if period_path is None:
+                period = int(fields[1]) if len(fields) > 1 else 100_000
+            else:
+                with open(period_path, "r", encoding="utf-8") as handle:
+                    period = int(handle.read().strip())
+        except (ValueError, OSError, IndexError):
+            break
+        if quota > 0 and period > 0:
+            cpu_quota = quota / period
+        break
+    return {"memory_bytes": memory, "cpus": cpu_quota}
+
+
+def thread_oversubscription_note(
+    visible_cpus: int, allowed_cpus: float | None
+) -> str | None:
+    """Warn when torch will size its thread pool from cores this run cannot use.
+
+    Not a failure: oversubscription costs throughput, it does not stop a run.
+    But it is invisible from inside the container -- `nproc` and `os.cpu_count()`
+    both report the host -- so nothing else will ever tell the operator.
+    """
+
+    if not allowed_cpus or not visible_cpus or visible_cpus <= allowed_cpus * 1.5:
+        return None
+    return (
+        f"cpu: {visible_cpus} threads are visible but this container may use "
+        f"{allowed_cpus:.0f}. torch sizes its thread pool from the visible count, "
+        f"so it will oversubscribe by ~{visible_cpus / allowed_cpus:.1f}x. Consider "
+        f"OMP_NUM_THREADS={max(1, int(allowed_cpus // 4))} and measure it in the sweep."
+    )
+
+
+def effective_memory_bytes(host_bytes: int, cgroup_bytes: int | None) -> int:
+    """What this process may actually use: the smaller of the two, when both exist.
+
+    A cgroup limit above host memory is a no-op, not a promise, so `min` is
+    right in both directions.
+    """
+
+    if not cgroup_bytes:
+        return int(host_bytes)
+    if not host_bytes:
+        return int(cgroup_bytes)
+    return int(min(host_bytes, cgroup_bytes))
+
+
 def device_floor_bytes(d_model: int) -> int:
     """The VRAM this width may not launch below."""
 
@@ -286,7 +386,9 @@ def evaluate(
     args,
     device_info: dict[str, object] | None = None,
     disk_info: dict[str, object] | None = None,
+    limits: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
+    limits = container_limits() if limits is None else limits
     cache_bytes = (
         int(args.example_cache_gb * GIB)
         if args.example_cache_gb > 0
@@ -297,7 +399,16 @@ def evaluate(
         try:
             import psutil
 
-            budget_bytes = int(psutil.virtual_memory().total * 0.85)
+            # `virtual_memory().total` reads /proc/meminfo, which inside a
+            # container is the HOST's memory. On a rented slice of a shared box
+            # that overstates the budget several-fold, so the cgroup ceiling --
+            # the number that will actually OOM-kill this process -- wins.
+            budget_bytes = int(
+                effective_memory_bytes(
+                    psutil.virtual_memory().total, limits["memory_bytes"]
+                )
+                * 0.85
+            )
         except ImportError:
             budget_bytes = 0
     sizing = host_sizing(
@@ -374,8 +485,21 @@ def evaluate(
             f"at {disk.get('path')}. Nothing here is prunable at runtime -- rent "
             "a bigger disk, or lower --iterations and resume for more."
         )
+    import os
+
+    visible_cpus = os.cpu_count() or 0
+    allowed_cpus = limits.get("cpus")
+    note = thread_oversubscription_note(visible_cpus, allowed_cpus)
+    advice: list[str] = [note] if note else []
+
     report = {
         "host": sizing.as_dict(),
+        "limits": {
+            "cgroup_memory_bytes": limits.get("memory_bytes"),
+            "cgroup_cpus": allowed_cpus,
+            "visible_cpus": visible_cpus,
+        },
+        "advice": advice,
         "device": {**device, "required_bytes": floor},
         "disk": {**disk, **disk_sizing_result.as_dict()},
         "model": {
@@ -457,10 +581,13 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(report, handle, indent=2, sort_keys=True)
             handle.write("\n")
     host = report["host"]
+    limits = report["limits"]
+    cgroup = limits["cgroup_memory_bytes"]
     print(
         f"host: needs {host['required_bytes'] / GIB:.1f} GiB at the "
         f"{host['max_window_games']:,}-game window cap, budget "
         f"{host['budget_bytes'] / GIB:.1f} GiB"
+        + (f" (cgroup limit {cgroup / GIB:.0f} GiB)" if cgroup else "")
     )
     device = report["device"]
     if device["available"]:
@@ -478,6 +605,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{disk['iterations']} iterations / {disk['total_games']:,} games, "
             f"available {disk['budget_bytes'] / GIB:.0f} GiB"
         )
+    for note in report["advice"]:
+        print(f"note: {note}")
     if failures:
         print("\nPREFLIGHT FAILED")
         for failure in failures:

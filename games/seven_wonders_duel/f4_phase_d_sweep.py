@@ -36,6 +36,7 @@ from pathlib import Path
 import torch
 
 from . import phase_d as pd
+from .train import heads_from_config
 
 
 def timed_scheduler_calls():
@@ -76,6 +77,24 @@ def timed_scheduler_calls():
 
     swr.self_play_many_flat_net = wrapper
     return calls, (lambda: setattr(swr, "self_play_many_flat_net", real))
+
+
+def geometry_from_checkpoint(path) -> dict[str, int]:
+    """The model width the checkpoint was trained at.
+
+    Read, never assumed or passed as a flag. `_load_model_checkpoint` refuses a
+    width mismatch -- W0 lost a run to a checkpoint whose width was inferred --
+    so a sweep left on `PhaseDConfig`'s 128x4 defaults cannot load an L
+    checkpoint at all, which is how this stage died on its first cloud box.
+    `w5_gate_slots_sweep` and `w5_gate_bench` already do exactly this.
+    """
+
+    stored = torch.load(path, map_location="cpu", weights_only=False).get("config", {})
+    return {
+        "d_model": int(stored.get("d_model", 384)),
+        "layers": int(stored.get("layers", 8)),
+        "heads": heads_from_config(stored),
+    }
 
 
 def run_point(loop, model, iteration, jobs, destination, slots, cap, inflight):
@@ -145,6 +164,13 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--warmup-games", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="must match the run being configured: bf16 is 1.69x on L, so a "
+        "geometry chosen at fp32 is chosen against the wrong cost curve",
+    )
     parser.add_argument("--slots", default="16,32,48")
     parser.add_argument("--caps", default="256,512")
     parser.add_argument("--inflight", default="1,2")
@@ -157,12 +183,15 @@ def main() -> None:
         itertools.product(numbers(args.slots), numbers(args.caps), numbers(args.inflight))
     )
 
+    geometry = geometry_from_checkpoint(args.checkpoint)
     config = pd.PhaseDConfig(
         run_dir=str(output / "run"),
         device=args.device,
         games_per_iteration=args.games,
         seed_games=0,
         iterations=1,
+        precision=args.precision,
+        **geometry,
     )
     loop = pd.PhaseDLoop(config)
     loop.buffer_dir.mkdir(parents=True, exist_ok=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from .cloud_preflight import (
     EXAMPLE_BYTES,
@@ -12,6 +13,7 @@ from .cloud_preflight import (
     RECORD_BYTES,
     device_floor_bytes,
     disk_sizing,
+    effective_memory_bytes,
     evaluate,
     host_sizing,
 )
@@ -152,6 +154,71 @@ def test_the_report_can_be_written_before_the_run_directory_exists(tmp_path):
     )
     assert status == 0
     assert json.loads(output.read_text(encoding="utf-8"))["passed"]
+
+
+def test_a_rented_slice_is_sized_by_its_cgroup_not_by_the_host():
+    """vast.ai sells "48 of 192 cores and 64 GB"; the container sees 192/251 GB.
+
+    `psutil.virtual_memory().total` reads /proc/meminfo, which is the host's, so
+    a check written against it believes it has ~4x the memory the cgroup will
+    actually allow -- disabling the refusal on precisely the machines it exists
+    to protect.
+    """
+
+    host = 251 * GIB
+    slice_limit = 64 * GIB
+    assert effective_memory_bytes(host, slice_limit) == slice_limit
+    # A cgroup ceiling above host memory is a no-op, not a promise.
+    assert effective_memory_bytes(host, 512 * GIB) == host
+    # No cgroup at all (a bare-metal box, or Windows) keeps the host figure.
+    assert effective_memory_bytes(host, None) == host
+
+
+def test_oversubscribed_threads_are_reported_without_failing_the_run():
+    """Costs throughput, does not stop a run -- and `nproc` cannot reveal it."""
+
+    from .cloud_preflight import thread_oversubscription_note
+
+    # The real case: 192 threads visible, 48 sold.
+    note = thread_oversubscription_note(192, 48.0)
+    assert note is not None
+    assert "192" in note and "48" in note and "~4.0x" in note
+    assert "OMP_NUM_THREADS=12" in note
+
+    # Dedicated box, or a quota close enough that the pool is not silly.
+    assert thread_oversubscription_note(48, 48.0) is None
+    assert thread_oversubscription_note(48, 40.0) is None
+    # No cgroup quota at all: nothing is knowable, so say nothing.
+    assert thread_oversubscription_note(192, None) is None
+
+
+def test_the_oversubscription_note_reaches_the_report_and_fails_nothing():
+    args = _args(memory_budget_gb=64.0)
+    limits = {"memory_bytes": 64 * GIB, "cpus": 0.5}  # far below any real host
+    report, failures = evaluate(args, _device(24), _disk(200), limits)
+    assert any("oversubscribe" in note for note in report["advice"])
+    assert not failures
+    assert report["passed"]
+
+
+def test_cgroup_files_are_parsed_and_sentinels_mean_no_limit(tmp_path, monkeypatch):
+    from . import cloud_preflight
+
+    unlimited = tmp_path / "unlimited"
+    unlimited.write_text("max\n", encoding="utf-8")
+    limited = tmp_path / "limited"
+    limited.write_text(f"{64 * GIB}\n", encoding="utf-8")
+    v1_sentinel = tmp_path / "v1"
+    # cgroup v1 writes a value near 2^63 instead of "max".
+    v1_sentinel.write_text("9223372036854771712\n", encoding="utf-8")
+
+    read = cloud_preflight._read_first_int
+    assert read((str(unlimited),)) is None
+    assert read((str(v1_sentinel),)) is None
+    assert read((str(limited),)) == 64 * GIB
+    assert read((str(tmp_path / "absent"),)) is None
+    # Falls through to the second path when the first is missing.
+    assert read((str(tmp_path / "absent"), str(limited))) == 64 * GIB
 
 
 def _disk(free_gib: float):
