@@ -597,12 +597,31 @@ def rust_searcher_routed_flat_batch_adapter(
                     with self.autocasts[net]():
                         outputs = model(net_batch)
                 if combined is None:
+                    # Under mixed precision the two nets return different
+                    # dtypes -- that IS the treatment -- so the merged buffer
+                    # cannot inherit whichever net happened to be evaluated
+                    # first. It is float32 (the wider of the two), and each
+                    # net's rows are widened into it below. Widening a bf16
+                    # result is exact and changes nothing about the comparison:
+                    # the treatment is the precision the forward pass ran at,
+                    # not the dtype its answer is stored in.
+                    #
+                    # `None` keeps the single-precision path allocating exactly
+                    # as before, since W1's routing equivalence was verified
+                    # against it.
+                    merge_dtype = torch.float32 if self.autocasts is not None else None
                     combined = {
-                        key: value.new_empty((len(net_ids), *value.shape[1:]))
+                        key: value.new_empty(
+                            (len(net_ids), *value.shape[1:]),
+                            **({} if merge_dtype is None else {"dtype": merge_dtype}),
+                        )
                         for key, value in outputs.items()
                     }
                 for key, value in outputs.items():
-                    combined[key].index_copy_(0, indices, value)
+                    target = combined[key]
+                    if value.dtype != target.dtype:
+                        value = value.to(target.dtype)
+                    target.index_copy_(0, indices, value)
             if combined is None:
                 raise ValueError("searcher-routed batch cannot be empty")
             return combined

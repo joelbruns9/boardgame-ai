@@ -25,6 +25,15 @@ from games.az_loop import hardware_identity, wilson_interval
 from .phase_d import PhaseDConfig, PhaseDLoop
 from .train import heads_from_config
 
+DISAGREEMENT_EXIT_CODE = 3
+"""Exit code for "the arena ran, and the precisions disagree".
+
+Deliberately not 1: an uncaught exception exits 1 too, and "bf16 differs from
+fp32" is the opposite conclusion from "the arena never got a verdict". A caller
+that cannot separate them reports crashes as findings -- which is exactly what
+the cloud launcher did before this existed.
+"""
+
 
 def run(
     checkpoint: Path,
@@ -143,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         f"[{wilson['lower']:.3f}, {wilson['upper']:.3f}] against a null of 0.500"
     )
     print(report["verdict"])
-    return 0 if report["passed"] else 1
+    return 0 if report["passed"] else DISAGREEMENT_EXIT_CODE
 
 
 if __name__ == "__main__":

@@ -253,11 +253,15 @@ def test_an_arena_that_could_not_run_is_not_reported_as_a_verdict(setup_text):
     stage = setup_text[
         setup_text.index("STAGE 8:") : setup_text.index("stage_done 8")
     ]
-    assert '_arena_status" -eq 1' in stage
+    from .precision_arena import DISAGREEMENT_EXIT_CODE
+
+    assert f'_arena_status" -eq {DISAGREEMENT_EXIT_CODE}' in stage, (
+        "the launcher does not use the arena's own disagreement exit code"
+    )
     verdict, broke = stage.split("elif", 1)
     assert "bf16 differs from fp32" in verdict
     assert "PRECISION=fp32" not in broke
-    assert "not a verdict on bf16" in broke
+    assert "NOT a verdict on bf16" in broke
 
 
 def test_the_smoke_can_run_the_launch_geometry(setup_text):

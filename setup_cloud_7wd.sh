@@ -248,10 +248,13 @@ if [ -n "${PRECISION_ARENA_CHECKPOINT:-}" ]; then
     --output "$REPO_DIR/$RUN_DIR_REL/precision_arena.json" \
     --games "${PRECISION_ARENA_GAMES:-400}" \
     && _arena_status=0 || _arena_status=$?
-  if [ "$_arena_status" -eq 1 ]; then
+  # 3 is the arena's own "ran, and the precisions disagree". Every other
+  # non-zero exit (including 1, which is what an uncaught exception gives) means
+  # it never reached a verdict.
+  if [ "$_arena_status" -eq 3 ]; then
     die "bf16 differs from fp32 beyond its interval — relaunch with PRECISION=fp32."
   elif [ "$_arena_status" -ne 0 ]; then
-    die "Precision arena could not run (exit $_arena_status) — that is not a verdict on bf16. Fix the invocation above and re-run."
+    die "Precision arena could not run (exit $_arena_status) — that is NOT a verdict on bf16. See the error above; the box is not implicated."
   fi
 else
   warn "PRECISION_ARENA_CHECKPOINT unset; skipping W6.2b. The shipped precision "
