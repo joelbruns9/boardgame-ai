@@ -159,6 +159,32 @@ def test_the_launch_is_sized_for_the_two_hundred_thousand_game_run(setup_text):
         assert f'{name}="${{{name}:-{value}}}"' in setup_text
 
 
+def test_every_budget_the_preflight_sizes_is_also_given_to_the_run(setup_text):
+    """A budget checked at setup but not passed to training checks nothing.
+
+    `EXAMPLE_CACHE_GB` was in the preflight invocation and absent from
+    TRAIN_CMD, so the preflight sized host memory against a cache ceiling the
+    run never received -- it used the parser default instead. Same shape as the
+    lifecycle flags and `--train-steps` before them.
+    """
+
+    preflight = setup_text[
+        setup_text.index("cloud_preflight") : setup_text.index("stage_done 6")
+    ]
+    command = _block(setup_text, "TRAIN_CMD=(")
+    for flag in ("--example-cache-gb", "--memory-budget-gb"):
+        assert flag in preflight
+        assert flag in command, f"{flag} is sized by the preflight but never passed"
+
+
+def test_process_workers_does_not_default_to_a_many_core_box_count(setup_text):
+    """192 processes, each importing torch, for a stage the Rust path skips."""
+
+    assert 'PROCESS_WORKERS="${PROCESS_WORKERS:-$(nproc)}"' not in setup_text
+    assert "PROCESS_WORKERS" in setup_text
+    assert "-gt 16" in setup_text
+
+
 def test_the_preflight_is_told_the_length_of_the_run(setup_text):
     """The disk budget is only meaningful if the preflight knows the plan.
 

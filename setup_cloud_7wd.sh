@@ -97,7 +97,11 @@ ITERATIONS="${ITERATIONS:-200}"
 GAMES_PER_ITERATION="${GAMES_PER_ITERATION:-1000}"
 SEED_GAMES="${SEED_GAMES:-5000}"
 WORKERS="${WORKERS:-8}"
-PROCESS_WORKERS="${PROCESS_WORKERS:-$(nproc)}"
+# Capped, not $(nproc): process workers only do anything on the PYTHON
+# generation backend, and this launch is Rust on both paths. On a 192-thread
+# EPYC the bare core count would spawn 192 processes that each import torch, for
+# a stage that is either inert or a seed buffer.
+PROCESS_WORKERS="${PROCESS_WORKERS:-$(n=$(nproc); [ "$n" -gt 16 ] && echo 16 || echo "$n")}"
 D_MODEL="${D_MODEL:-384}"
 LAYERS="${LAYERS:-8}"
 HEADS="${HEADS:-6}"
@@ -438,6 +442,7 @@ TRAIN_CMD=(
   --self-anchor-every-games "$SELF_ANCHOR_EVERY_GAMES"
   --intervention-window-games "$INTERVENTION_WINDOW_GAMES"
   --replay-window-cap-games "$REPLAY_WINDOW_CAP_GAMES"
+  --example-cache-gb "$EXAMPLE_CACHE_GB"
   --memory-budget-gb "$MEMORY_BUDGET_GB"
   --vram-budget-gb "$VRAM_BUDGET_GB"
   --memory-headroom-gb "$MEMORY_HEADROOM_GB"
