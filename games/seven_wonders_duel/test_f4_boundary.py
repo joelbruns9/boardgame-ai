@@ -845,3 +845,55 @@ def test_the_generation_sweep_reads_geometry_from_the_checkpoint(tmp_path):
         legacy,
     )
     assert geometry_from_checkpoint(legacy)["heads"] == LEGACY_HEADS
+
+
+def test_the_throughput_harnesses_call_generation_with_its_current_signature():
+    """Both F4 harnesses went stale when W1 added the games clock.
+
+    `_generate_iteration_rust` gained a required `schedules` argument on
+    2026-07-29; `f4_phase_d_sweep` and `f4_phase_d_ab` were written before that
+    and kept calling it with four. Nothing caught it because the throughput
+    programme finished two days earlier, so neither harness ran again until a
+    rented box tried to sweep -- where it surfaced as a TypeError one line past
+    the width guard that had just been fixed.
+    """
+
+    import inspect
+    from types import SimpleNamespace
+
+    from .f4_phase_d_sweep import run_point, steady_state_schedules
+    from .phase_d import PhaseDLoop, ResolvedSchedules
+
+    seen = {}
+
+    class _Loop:
+        config = SimpleNamespace(
+            rust_slots=0, rust_global_batch_cap=0, rust_max_inflight_batches=0
+        )
+
+        def _generate_iteration_rust(self, model, iteration, destination, jobs, schedules):
+            seen["schedules"] = schedules
+            return []
+
+    stats, fingerprint = run_point(
+        _Loop(), object(), 0, [], None, slots=4, cap=64, inflight=1
+    )
+
+    assert isinstance(seen["schedules"], ResolvedSchedules)
+    assert stats["games"] == 0 and fingerprint == ()
+
+    # The stub above must keep matching the real method, or this test passes
+    # while production is stale -- which is exactly the failure it exists for.
+    real = inspect.signature(PhaseDLoop._generate_iteration_rust)
+    stub = inspect.signature(_Loop._generate_iteration_rust)
+    assert list(real.parameters) == list(stub.parameters)
+
+
+def test_the_sweep_measures_the_steady_state_not_the_curriculum():
+    """Bot games do not scale with slots, so they dilute the axis being swept."""
+
+    from .f4_phase_d_sweep import steady_state_schedules
+
+    schedules = steady_state_schedules(object())
+    assert schedules.curriculum_mix_fraction == 0.0
+    assert schedules.draft_prior == 0.0

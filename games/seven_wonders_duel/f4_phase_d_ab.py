@@ -23,6 +23,7 @@ from pathlib import Path
 import torch
 
 from . import phase_d as pd
+from .f4_phase_d_sweep import steady_state_schedules
 
 
 _T_CRITICAL_95 = {
@@ -127,7 +128,9 @@ def run_arm(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         started = time.monotonic()
-        records = loop._generate_iteration_rust(model, iteration, destination, jobs)
+        records = loop._generate_iteration_rust(
+            model, iteration, destination, jobs, steady_state_schedules(loop)
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         wall = time.monotonic() - started

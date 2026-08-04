@@ -97,6 +97,19 @@ def geometry_from_checkpoint(path) -> dict[str, int]:
     }
 
 
+def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
+    """Schedules for the part of the run this geometry has to serve.
+
+    Both curriculum bots and the draft prior anneal out over the first ~10k
+    games, so 190 of a 200-iteration run sees neither. Sweeping with a bot mix
+    would measure a different cost curve on purpose: bot games run ~0.52
+    games/s at every slot count while neural games scale, so they dilute exactly
+    the axis being swept.
+    """
+
+    return pd.ResolvedSchedules(curriculum_mix_fraction=0.0, draft_prior=0.0)
+
+
 def run_point(loop, model, iteration, jobs, destination, slots, cap, inflight):
     loop.config.rust_slots = slots
     loop.config.rust_global_batch_cap = cap
@@ -107,7 +120,9 @@ def run_point(loop, model, iteration, jobs, destination, slots, cap, inflight):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         started = time.monotonic()
-        records = loop._generate_iteration_rust(model, iteration, destination, jobs)
+        records = loop._generate_iteration_rust(
+            model, iteration, destination, jobs, steady_state_schedules(loop)
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         wall = time.monotonic() - started
