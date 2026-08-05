@@ -379,6 +379,36 @@ at once. Options, none cheap, all changing the boundary contract:
 terms (pack, copy, tensor build) and a device term (H2D), and their balance is
 what differs between the laptop and production.
 
+#### Tried and reverted: writing the zeros more cheaply
+
+The obvious cheap half — keep the 130-wide format but stop *emitting* the padding
+one float at a time — was implemented and **reverted as unmeasurable**. The old
+inner loop ran all `FLAT_FEATURE_WIDTH` slots through a bounds-checked `Option`
+lookup, a cast and a 4-byte append; the replacement wrote the real prefix and
+bulk-appended a pre-zeroed tail. Byte-identical, 49 tests green.
+
+**No effect could be resolved.** The likely reason is instructive: the buffer is
+still 130 floats wide either way, so the *same bytes reach memory*. Only the
+instruction count fell, and the write appears to be bandwidth-bound rather than
+issue-bound. **That is the argument for §3.3 proper: the lever is sending fewer
+bytes, not producing the same bytes faster.**
+
+#### Method note: `f4_pack_sweep` is not valid for cross-build A/B
+
+Measuring the above exposed a limit in the tool. Its reported `spread` is
+*within-process* (8-11%), but five separate processes on one **unchanged** build
+returned 123,431 / 130,834 / 132,760 / 144,493 / 155,360 rows/s — a **26%
+range**. Samples inside a process share thermal state, boost clocks, page cache
+and allocation layout; separate processes do not.
+
+* **Valid use:** ranking thread counts *within one process*, which is what it
+  does — all rungs share conditions. This is why its plateau finding stands.
+* **Invalid use:** comparing two builds measured minutes apart. That is what
+  produced an apparent +25.6% for a change with no real effect.
+* **For build A/Bs use `f4_throughput_bench` with ≥5 repetitions**, whose CV was
+  1.63% — each repetition is ~190 s rather than ~3 s, so thermal and scheduling
+  noise averages out.
+
 <details><summary>Superseded framing: before the second dimension was measured</summary>
 
 ### Padding — metric is wrong before the remedy is worth designing
