@@ -400,6 +400,8 @@ overhead and changing batch shapes — which perturbs float reductions and so ne
 a strength argument, not an identity one. No prize is claimed here until a
 concrete strategy is measured end to end.
 
+</details>
+
 ### 3.4 Overlap the two threads
 
 With `inflight = 1` the scheduler's ~63 s never overlaps the worker's 299 s.
