@@ -200,6 +200,51 @@ stage_done 3
 
 stage 4 "Build seven_wonders_rust"
 common::build_crate "$CRATE_DIR_REL" seven_wonders_rust
+# A successful import proves the crate loaded, not that its native dependencies
+# work. mimalloc is compile-time (building at all is the gate), but rayon has to
+# spawn threads, and the CPU-limit detection that sizes the pack pool has only
+# ever run on Windows -- where it takes the fallback path. Both are exercised
+# here so a misconfigured slice is visible at provisioning rather than as lost
+# throughput 20 hours in.
+"$PY" - <<'PYNATIVE' || die "native dependency check failed"
+import sys
+
+import seven_wonders_rust as swr
+
+from games.seven_wonders_duel.cloud_preflight import container_limits
+
+limits = container_limits()
+effective = int(limits.get("effective_cpus") or 0)
+print(f"cpu limits: {limits}")
+if effective < 1:
+    sys.exit("effective_cpus resolved to 0; pack pool cannot be sized")
+
+# The visible count is what rayon would have taken by default. Reporting the gap
+# is the point: a slice that sells 12 of 192 cores would otherwise spawn 192
+# packing threads and oversubscribe.
+import os
+
+visible = os.cpu_count() or 1
+if effective < visible:
+    print(f"NOTE: {visible} CPUs visible but only {effective} usable -- "
+          f"pack pool will be sized to {effective}, not {visible}")
+
+actual = swr.set_pack_threads(effective)
+if actual != effective:
+    sys.exit(f"pack pool requested {effective} threads, got {actual}")
+print(f"pack pool: {actual} threads")
+
+# Exercise the pool for real: a pool that builds but cannot run work is a
+# failure mode an import check cannot see.
+from games.seven_wonders_duel.rust_bridge import rust_game_for_self_play
+
+corpus = [rust_game_for_self_play(seed) for seed in range(8)]
+seconds = swr.bench_pack_routed(corpus, 4, actual)
+if not (seconds > 0.0):
+    sys.exit("rayon pack pool produced no measurable work")
+print(f"rayon pack pool OK ({seconds*1000:.1f} ms for 4 x 8 rows)")
+print("native dependencies verified: mimalloc built, rayon runs, limits detected")
+PYNATIVE
 stage_done 4
 
 stage 5 "GPU verification gate"

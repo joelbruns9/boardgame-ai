@@ -47,6 +47,28 @@ common::require_python() {
   ok "python: $("$PY" --version 2>&1)"
 }
 
+# mimalloc compiles a bundled C library, so the crate no longer builds with the
+# Rust toolchain alone. On a minimal image the absence of `cc` surfaces as an
+# opaque linker error inside `cargo build` at the crate stage -- after rustup and
+# a multi-gigabyte torch install have already run, on a box billed by the hour.
+# Check it before any of that.
+common::native_build_deps() {
+  if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+    ok "C toolchain present: $( (cc --version 2>/dev/null || gcc --version) | head -n1 )"
+    return 0
+  fi
+  warn "No C compiler on PATH; mimalloc cannot build. Installing build-essential."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq build-essential >/dev/null 2>&1 || true
+  fi
+  if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+    ok "C toolchain installed: $( (cc --version 2>/dev/null || gcc --version) | head -n1 )"
+    return 0
+  fi
+  die "mimalloc requires a C compiler (cc or gcc) and none could be installed."
+}
+
 common::rust_toolchain() {
   if ! command -v cargo >/dev/null 2>&1; then
     log "Installing Rust via rustup (apt's rustc is too old for edition 2024)"
@@ -57,6 +79,7 @@ common::rust_toolchain() {
   # shellcheck disable=SC1091
   [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
   command -v cargo >/dev/null 2>&1 || die "cargo still not on PATH after rustup."
+  common::native_build_deps
   if ! command -v rustup >/dev/null 2>&1; then
     warn "cargo exists but rustup is missing; installing rustup so Rust can be updated."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
