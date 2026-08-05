@@ -38,10 +38,24 @@ so 1.497× on generation is **~1.38× on the loop**. Quote the loop figure.
   `load_evaluator` (`phase_e.py:503`) defaults `precision="fp32"` and the bench
   never passed one — including against a checkpoint whose own config says bf16.
   bf16 measures **2.19× end-to-end at L** and a **1.01× null at S**.
-* **86.7% of the feature payload is zeros.** `net.py` projects each token type
-  with `nn.Linear(FEATURE_COUNTS[type], d_model)` — counts are
-  `[130, 1, 26, 1, 8, 4, 1, 79, 14]` — but the wire format writes 130 floats per
+* **86.7% of transmitted feature values are zeros.** `FEATURE_COUNTS` is
+  `[130, 1, 26, 1, 8, 4, 1, 79, 14]`, but the wire format writes 130 floats per
   token regardless.
+
+  > **CORRECTED (review finding 3).** An earlier version of this line said the
+  > network "projects each type with `nn.Linear(FEATURE_COUNTS[type], d_model)`
+  > and reads no further". That is the **unfused** path (`net.py:272`).
+  > Production inference uses `_forward_fused` (`net.py:243-247`), which applies
+  > one 130-wide projection producing **all nine type outputs for every token**
+  > and gathers the selected one afterwards. So the network *does* multiply
+  > through the zeros, deliberately, to avoid the per-type loop's host syncs.
+  >
+  > The 86.7% figure stands as **wire, copy and H2D waste**. It does **not**
+  > describe projection arithmetic, and compact-upload-plus-dense-GPU-rebuild
+  > would not remove any of that arithmetic. The stronger avenue is type-aware
+  > projection that never builds the dense rectangle — pre-grouped fixed-slice
+  > GEMMs, or a kernel using per-type width directly — which is plausibly worth
+  > more at L than rebuilding zeros on the device.
 * **Sequence padding is worse than the tracked metric said**: quadratic 0.309
   against the linear 0.180 the plan had been quoting. Attention is quadratic in
   length.
@@ -82,12 +96,27 @@ repetitions, mean and CI on the ratio. Baseline CV is **1.63%**.
 | `--pinned-memory` | not run | Prior negative result in the Kingdomino implementation (user). |
 | `torch.compile` | **cannot be tested on this laptop** | `TritonMissing` — Triton is unavailable on Windows. Linux-only; belongs on the box. |
 
-**Consequence of the waves result:** the overlap ceiling is unreachable by any
-existing knob. The two threads alternate (~22 s scheduler, ~104 s blocked), so
-wall is their sum and overlapping caps at **1.21×** — but overlap needs surplus
-ready work, and waves were the only remaining mechanism that could create it at
-`leaf_batch = 1` (more slots was already null past 96). The cap is algorithmic,
-not hardware, so it will not differ on the box.
+**Consequence of the waves result — CORRECTED (review finding 2).** The earlier
+claim that this "closes the overlap avenue" and that the 1.21× cap is
+"algorithmic, not hardware" was wrong on both halves:
+
+* **Waves only test surplus leaves *within one search tree*.**
+  `run_many_pipelined_sharded` already spawns one scheduler thread per worker, so
+  **independent games across shards can produce concurrent requests at
+  `leaf_batch = 1`.** `--rust-scheduler-workers` is an existing knob that creates
+  surplus work, and it remains **unmeasured**.
+* **1.21× is not a fixed bound.** It is
+  `(scheduler + worker) / max(scheduler, worker)` for one measured timing split,
+  and it moves whenever packing, GPU time or scheduler time moves — all three of
+  which this work changed.
+* **Perfect-overlap arithmetic assumes independent resources.** After
+  row-parallel packing, scheduler shards and rayon contend for the same cores, so
+  the attainable gain is likely below the arithmetic ceiling.
+
+**Correct conclusion:** conflict-free waves are a laptop-regime regression and
+should be retired. **Scheduler sharding is untested and must be swept jointly
+with pack-thread count and inflight depth**, since all three contend for the same
+CPUs.
 
 ---
 
@@ -114,11 +143,14 @@ The "~22% device share on the box" comes from scaling the box's fp32 forward by 
 **3070-measured 2.88×**. It matches the ~23% seen on the live dashboard, which is
 corroboration but not measurement. Every production-regime statement rests on it.
 
-### 4.4 Thread-count conclusions rest on unknown topology
+### 4.4 Thread-count conclusions rest on partially-known topology
 
 `os.cpu_count()` = 16 **logical**; physical cores were never checked. I inferred
 SMT from the 8→16 efficiency drop (62% vs 73%), which is a curve-shape argument,
-not a measurement — 8P+8E would look similar for a different reason. The box's
+not a measurement — 8P+8E would look similar for a different reason.
+**RESOLVED by review:** the laptop is an i7-11800H, **8 physical / 16 logical**,
+so the 8→16 falloff is SMT as inferred. The inference was right; it was still an
+inference. The box's
 topology and cgroup quota are unknown, and `f4_pack_sweep`'s cgroup path **has
 never executed** (it fell back to `os.cpu_count()` on Windows).
 
@@ -162,11 +194,66 @@ but that is an inference.
 
 ---
 
+### 4.11 The measured pack thread count does not control production (review finding 1)
+
+**`f4_pack_sweep` installs a *scoped* pool; production packing uses rayon's
+*global* pool** (`eval.rs:427`). Nothing converts the sweep's recommendation into
+a production setting, and `RAYON_NUM_THREADS` is not recorded in the benchmark
+manifest. The laptop happens to expose 16 CPUs so the default matched the winning
+rung — **coincidence, not control.** A rental exposing 192 host CPUs while
+selling a smaller quota would oversubscribe badly and erase the gain.
+
+`container_limits` (`cloud_preflight.py:282-322`) compounds this: it reads CFS
+quota but **not `cpuset.cpus.effective` or the process affinity mask**. A
+cpuset-limited container with no CFS quota falls back to the host count.
+Effective parallelism should be the minimum of quota, cpuset/affinity count and
+visible count.
+
+**Fix:** a persistent explicitly-sized pack pool behind `--pack-threads`, with
+requested *and actual* thread count, affinity, quota and cpuset recorded per run.
+
+### 4.12 Packing still has a serial duplicate-copy tail (review finding 4)
+
+Only `RowPack::fill` is parallel. Every row-local buffer is then copied into the
+global payload by a **serial** loop (`eval.rs:447-468`), which holds both copies
+simultaneously and puts a one-thread memory-bandwidth ceiling on scaling as cores
+rise. A two-pass design — parallel encode into retained `TokenBuf`s, prefix-sum
+the token counts, pre-size the final buffers, then flatten in parallel into
+disjoint slices — removes both the row-local buffers and the serial copy.
+
+---
+
 ## 5. Open, in priority order
 
-1. **GPU-side reassembly of the compact format.** Savings measured (≈8.5 s,
-   6-7% of wall); only the CPU-side reconstruction sank it. Needs
-   `build_device_batch` restructured to upload compact and expand on device.
+**Re-ordered after review.** The five items below were raised by the reviewer and
+are cheaper and better-founded than what this document originally ranked first.
+
+1. **Transmit features as fp16.** Rust writes f32 and `rust_bridge.py:322`
+   immediately does `f32 → fp16 → f32` — **the extra precision is discarded
+   anyway**. Packing IEEE fp16 directly halves the dominant buffer, removes a
+   conversion, and keeps the format rectangular. Laptop-testable now; gate exact
+   rounding against the current path. *This is the best remaining laptop item.*
+2. **Fix pack-thread control** (§4.11): persistent sized pool, `--pack-threads`,
+   cpuset/affinity-aware detection, thread count in the manifest. Correctness of
+   every future sweep depends on it.
+3. **Sweep `pack_threads × scheduler_workers × inflight` jointly** (§ waves
+   correction). Scheduler sharding is untested and is the live route to overlap.
+4. **Remove the `PyByteArray` copy** — ~4-5% of wall. Lifetime-safe view over the
+   locked Rust scratch, or reusable Python-owned staging.
+5. **Keep removing encoder allocations.** `TokenBuf` took the per-token feature
+   vectors; each row still allocates `UnseenPool` vectors, obtainable/relevant
+   lists, per-player vectors, tableau feature vectors and two cost vectors per
+   pool. Fixed arrays / `SmallVec` / retained row scratch.
+6. **Build with `-C target-cpu=native`** and compare against the generic release
+   build. Do not assume the rented build uses available SIMD. PGO later.
+7. **Reusable pinned staging slabs** — the Kingdomino negative was
+   `pin_memory=True` allocating fresh tensors per batch, which does not rule out
+   persistent slabs for this payload and batch regime.
+8. **Parallelise the serial flatten tail** (§4.12).
+9. **GPU-side reassembly of the compact format.** Savings measured (≈8.5 s,
+   6-7% of wall); only the CPU-side reconstruction sank it. **Demoted:** per the
+   §1 correction it removes wire/copy/H2D waste but *not* fused projection
+   arithmetic, so type-aware projection is the stronger version of this idea.
 2. **Scheduler shards + merging worker** — the only mechanism that reaches the
    **1.21×** overlap ceiling. Correctly sized now; the plan originally hoped 2-3×.
 3. **`sched_collect`, 8.1%** — MCTS descent, masks, expansion. Never examined. On
@@ -180,7 +267,25 @@ but that is an inference.
 
 ---
 
-## 6. Process notes worth keeping
+## 6. Required measurements before this is a cloud plan (from review)
+
+* Rerun serial vs final row-parallel packing on the **same five seed sets** and
+  report a **paired** CI — this retires §4.6.
+* Save a **representative corpus of real self-play states** for the pack sweep,
+  replacing the synthetic walk (§4.5).
+* Add a **full record/trajectory digest** to A/B gates. Aggregate simulations,
+  moves and batch counts prove equal work *quantity*, not identical work.
+* Record pack-thread count, physical/logical topology, affinity/cpuset, NUMA
+  placement, CPU frequency, CPU time, RSS and per-stage timing in every run.
+* Measure `pack_threads × scheduler_workers × inflight` **jointly**.
+* On the first rental, run a short L/bf16 matrix and **recompute the overlap
+  ceiling from that profile** rather than carrying 1.21× forward.
+* **Add a Linux CI build now** for mimalloc/rayon. A rental is needed for
+  performance, not for catching a provisioning-time compile failure (§4.2).
+
+---
+
+## 7. Process notes worth keeping
 
 Three false results were produced and caught during this work, all from the same
 error class — **comparing runs whose conditions differed**:
