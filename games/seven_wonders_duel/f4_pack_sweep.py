@@ -51,13 +51,23 @@ def effective_cpus() -> tuple[int, dict]:
     """
 
     host = os.cpu_count() or 1
-    detail = {"host_cpu_count": host, "cgroup_cpus": None}
+    detail = {"host_cpu_count": host}
     try:
         limits = container_limits()
-        quota = limits.get("cpus")
-        if quota:
-            detail["cgroup_cpus"] = quota
-            return max(1, int(math.floor(quota))), detail
+        # `effective_cpus` is the minimum of CFS quota, cpuset and affinity.
+        # Reading quota alone missed cpuset-limited containers entirely, which
+        # is the common shape on a rented slice and exactly the case where
+        # oversubscription costs throughput.
+        detail.update(
+            {
+                "cgroup_cpus": limits.get("cpus"),
+                "cpuset_cpus": limits.get("cpuset_cpus"),
+                "affinity_cpus": limits.get("affinity_cpus"),
+            }
+        )
+        effective = limits.get("effective_cpus")
+        if effective:
+            return max(1, int(effective)), detail
     except Exception as error:  # pragma: no cover - platform dependent
         detail["cgroup_error"] = repr(error)
     return host, detail

@@ -1,8 +1,8 @@
 # CPU throughput work — review request
 
-**Date:** 2026-08-04. **Scope:** generation throughput for 7 Wonders Duel, laptop
-development only. **Outcome:** 1.497× on generation, ~1.38× at the training-loop
-level, all committed and gated.
+**Date:** 2026-08-04, revised 2026-08-05 after review. **Scope:** generation
+throughput for 7 Wonders Duel, laptop development only. **Outcome:** **1.521× on
+generation, ~1.39× at the training-loop level**, all committed and gated.
 
 **What this document is for.** The wins are measured and I believe them. What I
 want checked is §4 — the assumptions and leaps underneath them, several of which
@@ -19,9 +19,15 @@ Detail lives in `CORE_UTILIZATION_PLAN.md`; this is the reviewable summary.
 |---|---:|---|---:|
 | mimalloc global allocator | 1.2165× | [+19.2%, +24.1%] | 1.2165× |
 | `TokenBuf` (remove per-token allocations) | 1.0351× | [+1.23%, +5.79%] | 1.2592× |
-| row-parallel packing, 16 threads | 1.189× | — (see §4.6) | **1.497×** |
+| row-parallel packing, 16 threads | **1.2078×** | [1.1776, 1.2379] | **1.521×** |
 
 **1.061 → 1.588 games/s** at S/fp32, 192 slots, cap 2048.
+
+> **§4.6 RETIRED.** The parallel-packing figure was re-measured paired — one
+> build, `RAYON_NUM_THREADS` 1 vs 16 (the one-thread guard routes to the serial
+> loop), same five seed sets, work identical every repetition. **1.2078×
+> [1.1776, 1.2379]**, so the unpaired 1.189× was *conservative*. Cumulative
+> corrected 1.497× → **1.521×**.
 
 At the loop level: generation was 82.3% of measured phase time across the 30
 preserved cloud iterations (replay derivation 9.8%, gates 6.0%, training 1.9%),
@@ -220,6 +226,35 @@ simultaneously and puts a one-thread memory-bandwidth ceiling on scaling as core
 rise. A two-pass design — parallel encode into retained `TokenBuf`s, prefix-sum
 the token counts, pre-size the final buffers, then flatten in parallel into
 disjoint slices — removes both the row-local buffers and the serial copy.
+
+---
+
+## 4b. Post-review work — four items, two wins and two negatives
+
+| item | result |
+|---|---|
+| **Paired re-measure** (§4.6) | **1.2078× [1.1776, 1.2379]**. Retires the confound; top line up to 1.521×. |
+| **Pack-thread control** (finding 1) | **Landed.** `set_pack_threads()` installs a dedicated sized rayon pool; packing uses it when present, global pool otherwise. Python owns detection — CFS quota, `cpuset.cpus.effective` (v1/v2) and `sched_getaffinity`, combined as a **minimum**. `--pack-threads 0` derives it. Manifest records **requested, actual, and every limit**. Costs nothing: 0.9846×, CI [−5.1%, +2.0%]. |
+| **`scheduler_workers`** (finding 2) | **Negative.** 2 workers flat (1.0176 [0.985, 1.050]); 4 workers **0.8933 [0.852, 0.935]**. Batch width collapses 240.7 → 149 → 84, ~inversely with shard count. Work identical throughout. |
+| **fp16 on the wire** | **Negative, −9.7%.** Savings landed as predicted (payload −37.4%, tensor build −7.6%) but the f32→f16 conversion cost **+41.2%** on pack. Reverted. |
+| **`-C target-cpu=native`** | **Null on the shipped config**: 1.0097× [0.958, 1.062]. Mixed per-term (pack +6.6%, `sched_collect` −8.0%). Not adopted. |
+
+**Sharding needs the merge first — this corrects both sides of the review
+exchange.** My claim that waves "closed the overlap avenue" was wrong: sharding
+*does* create surplus work at `leaf_batch = 1`. But `--rust-scheduler-workers` is
+not a standalone route to overlap either, because N shards produce N proportionally
+narrower batches and that cancels the gain. **The merging worker is the
+prerequisite, not a companion** — merge first, then shard.
+
+**fp16 is dead even with hardware conversion.** `target-cpu=native` did what it
+should — F16C cut the conversion, pack 12.05 → 9.91 s — but fp16+native is still
+**0.8995× [0.879, 0.921]** against fp32+generic. Halving the buffer does not pay
+for converting into it.
+
+**A note on `target-cpu=native` if it is ever revisited:** it bakes the *build*
+machine's ISA into the artifact. Harmless while the cloud script builds on the
+box, but a cached or moved binary would fault on an older CPU — a crash, not a
+slowdown.
 
 ---
 

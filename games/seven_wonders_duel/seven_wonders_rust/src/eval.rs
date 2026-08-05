@@ -434,15 +434,20 @@ impl FlatBatchBuilder {
         // pool is 0.971x the serial loop -- a silent regression for anyone who
         // sets RAYON_NUM_THREADS=1. Take the serial path when there is nothing
         // to parallelise.
-        if rayon::current_num_threads() <= 1 {
-            for (row_pack, state) in scratch[..n].iter_mut().zip(states.iter()) {
-                row_pack.fill(state);
-            }
-        } else {
-            scratch[..n]
+        let encode_rows = |scratch: &mut [RowPack]| {
+            scratch
                 .par_iter_mut()
                 .zip(states.par_iter())
                 .for_each(|(row_pack, state)| row_pack.fill(state));
+        };
+        if pack_threads() <= 1 {
+            for (row_pack, state) in scratch[..n].iter_mut().zip(states.iter()) {
+                row_pack.fill(state);
+            }
+        } else if let Some(pool) = PACK_POOL.get() {
+            pool.install(|| encode_rows(&mut scratch[..n]));
+        } else {
+            encode_rows(&mut scratch[..n]);
         }
         for (row, ((row_pack, &actor), legal)) in
             scratch[..n].iter().zip(actors).zip(legals).enumerate()
@@ -522,6 +527,44 @@ impl RowPack {
             }
         }
     }
+}
+
+/// The pack thread pool, sized explicitly rather than inherited.
+///
+/// Packing used rayon's **global** pool, which defaults to every CPU the process
+/// can see. On a rented slice that is the *host's* count, not the quota sold --
+/// so a 192-core host selling 12 cores would spawn 192 packing threads and
+/// oversubscribe badly, turning a measured win into a loss. It also meant
+/// `f4_pack_sweep`'s recommendation controlled nothing: the sweep installs a
+/// scoped pool, production read the global one, and the two were connected only
+/// by the laptop coincidentally exposing 16 CPUs.
+///
+/// Python owns the detection (cgroup quota, cpuset and affinity -- see
+/// `cloud_preflight.effective_cpu_count`) and calls `set_pack_threads`.
+/// Unset, packing falls back to the global pool exactly as before.
+static PACK_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// Size the pack pool. First call wins; returns the pool's actual thread count
+/// so callers can record what they *got* rather than what they asked for.
+pub fn set_pack_threads(threads: usize) -> PyResult<usize> {
+    let threads = threads.max(1);
+    if PACK_POOL.get().is_none() {
+        let built = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("swd-pack-{i}"))
+            .build()
+            .map_err(|e| PyValueError::new_err(format!("pack pool: {e}")))?;
+        let _ = PACK_POOL.set(built);
+    }
+    Ok(pack_threads())
+}
+
+/// Actual pack parallelism: the dedicated pool's size, or the global pool's.
+pub fn pack_threads() -> usize {
+    PACK_POOL
+        .get()
+        .map(|pool| pool.current_num_threads())
+        .unwrap_or_else(rayon::current_num_threads)
 }
 
 /// Packing-only benchmark for CORE_UTILIZATION_PLAN.md step 2b.

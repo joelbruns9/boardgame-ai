@@ -54,6 +54,11 @@ from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
 from .search import SearchConfig
 
 
+#: Pack-pool size actually installed, and the CPU limits that chose it. Set in
+#: `run()`; the manifest builder is a separate function and needs them by name.
+_PACK_THREADS_ACTUAL: int = 0
+_CPU_LIMITS: dict = {}
+
 SCHEMA = "f4-throughput-row-2"
 GAME_RNG_XOR = 0xC6BC279692B5CC83
 
@@ -790,6 +795,12 @@ def _manifest(args, contract: dict, lock: dict) -> dict:
         "exploratory_leaf1": bool(args.exploratory_leaf1),
         "device": args.device,
         "inference_precision": lock["inference_precision"],
+        # Requested vs actual, plus every limit that fed the decision. A run
+        # that does not record its pack parallelism cannot be compared with one
+        # that had a different one, and the two are not always equal.
+        "pack_threads_requested": args.pack_threads,
+        "pack_threads_actual": _PACK_THREADS_ACTUAL,
+        "cpu_limits": _CPU_LIMITS,
         "python_version": sys.version,
         "rustc_version": _command_output(["rustc", "--version"]),
         "torch_version": torch.__version__,
@@ -909,6 +920,31 @@ def run(args) -> dict:
         raise ValueError("quality lock production search differs from the registered schedule")
     if not search.get("force_expand_root_chance") or lock["force_expand_root_chance"] is not True:
         raise ValueError("production throughput requires forced root chance")
+    import seven_wonders_rust as _swr
+
+    from .cloud_preflight import container_limits
+
+    # Detect unconditionally: an explicit --pack-threads still needs the limits
+    # recorded, or a run that oversubscribed cannot be told apart afterwards
+    # from one that did not.
+    cpu_limits = {}
+    try:
+        cpu_limits = container_limits()
+    except Exception:  # pragma: no cover - platform dependent
+        cpu_limits = {}
+    requested = args.pack_threads
+    if requested <= 0:
+        requested = int(cpu_limits.get("effective_cpus") or 0)
+    if requested <= 0:
+        requested = os.cpu_count() or 1
+    global _PACK_THREADS_ACTUAL, _CPU_LIMITS
+    _PACK_THREADS_ACTUAL = _swr.set_pack_threads(requested)
+    _CPU_LIMITS = {k: v for k, v in cpu_limits.items() if k != "memory_bytes"}
+    print(
+        f"pack pool: requested {requested}, actual {_PACK_THREADS_ACTUAL}"
+        f"  limits={_CPU_LIMITS or 'none detected'}"
+    )
+
     evaluator = load_evaluator(
         str(args.checkpoint), args.device, precision=args.inference_precision
     )
@@ -1190,6 +1226,16 @@ def main():
         "before 2026-08-04; production runs bf16, so a throughput number meant "
         "to predict production must say bf16. Applies only on CUDA -- "
         "`Evaluator.autocast` (inference.py:71) is a no-op on CPU by design.",
+    )
+    parser.add_argument(
+        "--pack-threads",
+        type=int,
+        default=0,
+        help="threads for the dedicated pack pool. 0 = derive from the cgroup "
+        "quota, cpuset and affinity (cloud_preflight.effective_cpu_count). "
+        "Packing previously used rayon's global pool, which defaults to every "
+        "CPU the process can SEE -- on a rented slice that is the host's count, "
+        "not the quota sold. The actual pool size is recorded in the manifest.",
     )
     parser.add_argument("--diagnostic-sync", action="store_true")
     parser.add_argument(

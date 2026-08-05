@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import math
+import os
 import sys
 
 GIB = 1024**3
@@ -319,7 +321,95 @@ def container_limits() -> dict[str, object]:
         if quota > 0 and period > 0:
             cpu_quota = quota / period
         break
-    return {"memory_bytes": memory, "cpus": cpu_quota}
+    cpuset = _cpuset_count()
+    affinity = _affinity_count()
+    return {
+        "memory_bytes": memory,
+        "cpus": cpu_quota,
+        "cpuset_cpus": cpuset,
+        "affinity_cpus": affinity,
+        "effective_cpus": effective_cpu_count(cpu_quota, cpuset, affinity),
+    }
+
+
+def _parse_cpu_list(text: str) -> int | None:
+    """Count CPUs in a cgroup/sysfs list such as ``0-3,8,12-15``."""
+
+    text = text.strip()
+    if not text:
+        return None
+    total = 0
+    for part in text.split(","):
+        if "-" in part:
+            low, _, high = part.partition("-")
+            try:
+                total += int(high) - int(low) + 1
+            except ValueError:
+                return None
+        else:
+            try:
+                int(part)
+            except ValueError:
+                return None
+            total += 1
+    return total or None
+
+
+def _cpuset_count() -> int | None:
+    """CPUs the cgroup's cpuset allows.
+
+    A container constrained by **cpuset** commonly has no CFS quota at all, so
+    reading `cpu.max` alone reports "unlimited" and callers fall back to the
+    host's core count. That is the case this exists to catch.
+    """
+
+    for path in (
+        "/sys/fs/cgroup/cpuset.cpus.effective",  # v2
+        "/sys/fs/cgroup/cpuset/cpuset.effective_cpus",  # v1
+        "/sys/fs/cgroup/cpuset.cpus",
+    ):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                count = _parse_cpu_list(handle.read())
+        except OSError:
+            continue
+        if count:
+            return count
+    return None
+
+
+def _affinity_count() -> int | None:
+    """CPUs this process may actually be scheduled on."""
+
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is None:  # pragma: no cover - not on Windows/macOS
+        return None
+    try:
+        return len(getter(0))
+    except OSError:  # pragma: no cover
+        return None
+
+
+def effective_cpu_count(
+    quota: float | None, cpuset: int | None, affinity: int | None
+) -> int:
+    """Usable parallelism: the **minimum** of every applicable limit.
+
+    Oversubscribing a thread pool past this is the one regime where row-parallel
+    packing loses rather than wins, and each limit can bind independently -- a
+    slice can be quota-limited, cpuset-limited, affinity-limited, or any
+    combination.
+    """
+
+    visible = os.cpu_count() or 1
+    candidates = [visible]
+    if quota:
+        candidates.append(max(1, int(math.floor(quota))))
+    if cpuset:
+        candidates.append(cpuset)
+    if affinity:
+        candidates.append(affinity)
+    return max(1, min(candidates))
 
 
 def thread_oversubscription_note(

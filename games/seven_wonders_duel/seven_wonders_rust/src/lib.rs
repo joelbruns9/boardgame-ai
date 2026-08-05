@@ -2389,6 +2389,18 @@ fn bench_pack_routed(
     eval::bench_pack_routed(&states, iterations, threads)
 }
 
+#[pyfunction]
+/// Size the dedicated pack thread pool. See `eval::set_pack_threads`.
+fn set_pack_threads(threads: usize) -> PyResult<usize> {
+    eval::set_pack_threads(threads)
+}
+
+#[pyfunction]
+/// Actual pack parallelism, for recording in run manifests.
+fn pack_threads() -> usize {
+    eval::pack_threads()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -2396,6 +2408,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::bench_pack_routed;
+
+    #[pymodule_export]
+    use super::set_pack_threads;
+
+    #[pymodule_export]
+    use super::pack_threads;
 
     #[pymodule_export]
     use super::RustPuctSearch;
