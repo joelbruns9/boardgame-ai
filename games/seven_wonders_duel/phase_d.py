@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
@@ -4585,6 +4586,16 @@ def build_parser() -> argparse.ArgumentParser:
         "CHEAP generation moves only (0 = exhaustive, the shipped behaviour; "
         "2 is the value CHANCE_ENUMERATION_PLAN.md recommends sweeping)",
     )
+    parser.add_argument(
+        "--pack-threads",
+        type=int,
+        default=0,
+        help="threads for the Rust feature-packing pool. 0 derives it from the "
+        "cgroup quota, cpuset and process affinity. Packing otherwise uses "
+        "rayon's global pool, which takes every CPU the process can SEE -- on a "
+        "container-limited slice that is the host's count, not the quota sold, "
+        "and oversubscribing turns the measured win into a loss.",
+    )
     parser.add_argument("--anchor-gate-every-promotions", type=int, default=3)
     parser.add_argument(
         "--anchor-games",
@@ -4768,9 +4779,53 @@ def smoke_config(config: PhaseDConfig) -> PhaseDConfig:
     )
 
 
+def _configure_pack_pool(requested: int) -> int:
+    """Size the Rust packing pool before any generation runs.
+
+    Row-parallel packing measured 1.2078x on the laptop, but only if the pool is
+    sized to the cores that are actually usable. Rayon's global pool defaults to
+    every CPU the process can see, which on a rented slice is the *host's* count
+    -- so a 192-core host selling 12 would spawn 192 packing threads. The
+    detection combines cgroup quota, cpuset and affinity and takes the minimum.
+
+    Non-fatal: a run that cannot size its pool should still run, on the global
+    pool, with the reason on stdout.
+    """
+
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - the Python backend needs no pool
+        return 0
+    if not hasattr(swr, "set_pack_threads"):  # pragma: no cover - older build
+        print("pack pool: extension predates --pack-threads; using rayon default")
+        return 0
+    limits: dict = {}
+    if requested <= 0:
+        try:
+            from .cloud_preflight import container_limits
+
+            limits = container_limits()
+            requested = int(limits.get("effective_cpus") or 0)
+        except Exception as error:  # pragma: no cover - platform dependent
+            print(f"pack pool: CPU limit detection failed ({error!r})")
+            requested = 0
+    if requested <= 0:
+        requested = os.cpu_count() or 1
+    try:
+        actual = swr.set_pack_threads(requested)
+    except Exception as error:  # pragma: no cover
+        print(f"pack pool: could not size ({error!r}); using rayon default")
+        return 0
+    visible = os.cpu_count() or 1
+    note = f" ({visible} visible)" if actual != visible else ""
+    print(f"pack pool: {actual} threads{note} limits={limits or 'none detected'}")
+    return actual
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_pack_pool(args.pack_threads)
     config = PhaseDConfig(
         run_dir=args.run_dir,
         seed=args.seed,

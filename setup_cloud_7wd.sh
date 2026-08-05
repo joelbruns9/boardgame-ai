@@ -50,6 +50,7 @@
 #                   ended all four at 10,000 games at once and the value head
 #                   collapsed nine iterations later.
 #   ANCHOR_GATE_EVERY_PROMOTIONS=0  bot anchors off; they saturate by iteration 10
+#   PACK_THREADS=0  pack pool size; 0 = derive from cgroup/cpuset/affinity
 #   DISK_BUDGET_GB=0 DISK_HEADROOM_GB=5   0 = measure this box's free space
 #   INTERVENTION_LADDER=0                                W7b response (off)
 #   MEMORY_BUDGET_GB / VRAM_BUDGET_GB / MEMORY_HEADROOM_GB
@@ -179,6 +180,11 @@ ANCHOR_GAMES="${ANCHOR_GAMES:-200}"
 # Set to 3 to restore the default cadence if out-of-distribution strength ever
 # needs tracking again.
 ANCHOR_GATE_EVERY_PROMOTIONS="${ANCHOR_GATE_EVERY_PROMOTIONS:-0}"
+# Threads for the Rust feature-packing pool. 0 derives it from the cgroup quota,
+# cpuset and affinity. Set it explicitly after running f4_pack_sweep on the box:
+# on a hybrid P/E-core part the plateau measured on a homogeneous laptop does not
+# necessarily transfer, and the sweep costs seconds.
+PACK_THREADS="${PACK_THREADS:-0}"
 # 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
 # resolve a lagged advantage of 0.60+ easily but clear LCB > 0.50 only ~13% of
 # the time at 0.55 -- blind exactly where "am I still improving" gets decided.
@@ -536,6 +542,7 @@ TRAIN_CMD=(
   --draft-prior-games "$DRAFT_PRIOR_GAMES"
   --anchor-games "$ANCHOR_GAMES"
   --anchor-gate-every-promotions "$ANCHOR_GATE_EVERY_PROMOTIONS"
+  --pack-threads "$PACK_THREADS"
   --self-anchor-games "$SELF_ANCHOR_GAMES"
   --self-anchor-lag-games "$SELF_ANCHOR_LAG_GAMES"
   --self-anchor-every-games "$SELF_ANCHOR_EVERY_GAMES"
