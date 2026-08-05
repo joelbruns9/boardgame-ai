@@ -529,6 +529,9 @@ speedups as production speedups.** The throughput number needs a bf16 L box.
 | `max_inflight_batches` 2 / 4 | null: 1.03× / 0.99×. At `leaf_batch = 1` one batch drains every waiting leaf |
 | more slots at fixed cap | 144 slots underperformed 96 at cap 1024 |
 | more scheduler threads | §4: caps at 1.21×, and the single worker still serialises |
+| **conflict-free waves, `leaf_batch` 2/4/8** | **-8 to -9%.** Wave width saturates at **1.18** asking for 8: Gumbel halving narrows the live root-candidate set, giving 425,654 conflict cuts. Batches widen 9%; the bookkeeping costs more. Bit-identity held. **This closes the overlap avenue** -- waves were the last mechanism that could create surplus ready work at `leaf_batch = 1`, and the cap is algorithmic, so it will not differ on the box. |
+| `torch.compile` | **untestable on Windows** (`TritonMissing`). Linux-only; box work. |
+| `--pinned-memory` | not run: prior negative result in the Kingdomino implementation. |
 | build tensors in Rust | capped at 6.5% of wall |
 | multi-box sharding | out of scope; one GPU is not the limit |
 | **renting more cores** | ~~prefer clock over count~~ **see §8** |
