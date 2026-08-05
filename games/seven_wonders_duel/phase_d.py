@@ -4584,7 +4584,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="offsets per first-reveal stratum on pure double card-reveal edges, "
         "CHEAP generation moves only (0 = exhaustive, the shipped behaviour; "
-        "2 is the value CHANCE_ENUMERATION_PLAN.md recommends sweeping)",
+        "3 is the value CHANCE_ENUMERATION_PLAN.md now favours -- its tables "
+        "still show the X=2 it originally guessed, corrected at the top of that "
+        "document). Still ungated: the arena and training A/B remain outstanding, "
+        "which is why this ships off.",
     )
     parser.add_argument(
         "--pack-threads",
