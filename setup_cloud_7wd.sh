@@ -45,6 +45,11 @@
 #   LAUNCH_FLAGS_JSON=<f4_cloud_finalize output>  measured --rust-* flags (W6.3)
 #   PRECISION_ARENA_CHECKPOINT=<path>             runs W6.2b before launching
 #   SELF_ANCHOR_GAMES=400 SELF_ANCHOR_LAG_GAMES=20000   W7a stagnation anchor
+#   DRAFT_PRIOR_GAMES=10000 CURRICULUM_ANNEAL_GAMES=15000 HOF_START_GAMES=50000
+#                   staggered scaffold schedule -- see the block below. Run 04
+#                   ended all four at 10,000 games at once and the value head
+#                   collapsed nine iterations later.
+#   ANCHOR_GATE_EVERY_PROMOTIONS=0  bot anchors off; they saturate by iteration 10
 #   DISK_BUDGET_GB=0 DISK_HEADROOM_GB=5   0 = measure this box's free space
 #   INTERVENTION_LADDER=0                                W7b response (off)
 #   MEMORY_BUDGET_GB / VRAM_BUDGET_GB / MEMORY_HEADROOM_GB
@@ -121,7 +126,46 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 TRAIN_STEPS="${TRAIN_STEPS:-$(( (GAMES_PER_ITERATION * 19 + 99) / 100 ))}"
 TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:-$(( TRAIN_STEPS / 3 ))}"
 HOF_FRACTION="${HOF_FRACTION:-0.15}"
-HOF_START_GAMES="${HOF_START_GAMES:-10000}"
+# ── Scaffold schedule: STAGGERED. Run 04 came off all of these at once.
+#
+# Three supports were removed and one new opponent distribution introduced at
+# exactly 10,000 games -- the curriculum bot mix, the seed corpus's share of
+# training, the wonder-draft prior, and HOF switching on. All four were keyed to
+# the same clock, three of them by parser defaults the launcher never passed.
+# The replay window then smeared the shift over ~7 iterations, so it surfaced at
+# iteration 19 as a value-head collapse (value_acc 0.729 -> 0.639, train/val gap
+# +0.03 -> +0.41) that the gate rejected twice, at 0.360 and 0.350, while
+# policy_top1 kept improving.
+#
+# Each knot now clears the replay window before the next arrives, so a
+# recurrence is attributable to one cause instead of four.
+
+# Earliest and least entangled: it touches search priors, not the opponent
+# distribution, so removing it cannot change what the value head is trained on.
+DRAFT_PRIOR_GAMES="${DRAFT_PRIOR_GAMES:-10000}"
+
+# Also moves seed retention, which shares this duration by design.
+#
+# NOT stretched. The bots are spent by ~10k: run 04's iteration-10 anchor gates
+# scored 0.945-0.985 against all four archetypes and 1.000 against greedy, and
+# the code's own note calls 10,000 "measured, not chosen" for exactly that
+# reason. Holding them open longer would spend 15% of generation on decided
+# games and feed them to training through the seed corpus. 15,000 buys clear
+# separation from the draft prior and nothing more.
+CURRICULUM_ANNEAL_GAMES="${CURRICULUM_ANNEAL_GAMES:-15000}"
+
+# Was 10,000, which put league play against the *bootstrap* checkpoint. Run 04's
+# league opponent was hof_iter_0000 at iterations 10, 11, 13, 14, 15, 16, 17, 19,
+# 21 and 23 -- the pool only held promotions from iterations 0, 5 and 10, so
+# sampling kept returning the weakest. That made 15% of every iteration's games
+# lopsided wins, i.e. value targets pinned near +1, which is a live suspect for
+# the value head degrading while the policy head improved.
+#
+# HOF earns its keep against opponents strong enough to punish forgetting, and
+# the model improves too fast early for a frozen checkpoint to stay relevant.
+# Note the pool is filled by *promotions*: run 04 managed four in thirty
+# iterations, so a late start only helps if promotions have happened by then.
+HOF_START_GAMES="${HOF_START_GAMES:-50000}"
 GATE_LADDER="${GATE_LADDER:-200 600 1000 1500}"
 GATE_LADDER_FLOOR_GAMES="${GATE_LADDER_FLOOR_GAMES:-10000}"
 PROMOTION_EVERY="${PROMOTION_EVERY:-5}"
@@ -129,6 +173,12 @@ BOOTSTRAP_POLICY="${BOOTSTRAP_POLICY:-auto_first_trained}"
 PROBATION_RESET_AFTER="${PROBATION_RESET_AFTER:-4}"
 REVERT_RESET_AFTER="${REVERT_RESET_AFTER:-3}"
 ANCHOR_GAMES="${ANCHOR_GAMES:-200}"
+# Off. The bot anchor suite saturates within a few iterations -- run 04's only
+# firing, at iteration 10, scored 0.945-1.000 across all five opponents -- so it
+# costs five gates x ANCHOR_GAMES per promotion to re-measure a known ceiling.
+# Set to 3 to restore the default cadence if out-of-distribution strength ever
+# needs tracking again.
+ANCHOR_GATE_EVERY_PROMOTIONS="${ANCHOR_GATE_EVERY_PROMOTIONS:-0}"
 # 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
 # resolve a lagged advantage of 0.60+ easily but clear LCB > 0.50 only ~13% of
 # the time at 0.55 -- blind exactly where "am I still improving" gets decided.
@@ -482,7 +532,10 @@ TRAIN_CMD=(
   --gate-ladder-games "${LADDER_RUNGS[@]}"
   --gate-ladder-step-up-after 2
   --gate-ladder-floor-games "$GATE_LADDER_FLOOR_GAMES"
+  --curriculum-anneal-games "$CURRICULUM_ANNEAL_GAMES"
+  --draft-prior-games "$DRAFT_PRIOR_GAMES"
   --anchor-games "$ANCHOR_GAMES"
+  --anchor-gate-every-promotions "$ANCHOR_GATE_EVERY_PROMOTIONS"
   --self-anchor-games "$SELF_ANCHOR_GAMES"
   --self-anchor-lag-games "$SELF_ANCHOR_LAG_GAMES"
   --self-anchor-every-games "$SELF_ANCHOR_EVERY_GAMES"
