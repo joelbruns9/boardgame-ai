@@ -526,6 +526,10 @@ pub struct SchedulerMetrics {
     pub boundary_tokens: usize,
     pub boundary_padded_tokens: usize,
     pub boundary_max_tokens: usize,
+    pub boundary_tokens_sq: usize,
+    pub boundary_padded_tokens_sq: usize,
+    pub boundary_feature_values_used: usize,
+    pub boundary_feature_values_written: usize,
     pub encode_pack_ns: u64,
     pub queue_wait_ns: u64,
     pub py_call_ns: u64,
@@ -641,6 +645,10 @@ impl SchedulerMetrics {
         self.boundary_tokens += other.boundary_tokens;
         self.boundary_padded_tokens += other.boundary_padded_tokens;
         self.boundary_max_tokens = self.boundary_max_tokens.max(other.boundary_max_tokens);
+        self.boundary_tokens_sq += other.boundary_tokens_sq;
+        self.boundary_padded_tokens_sq += other.boundary_padded_tokens_sq;
+        self.boundary_feature_values_used += other.boundary_feature_values_used;
+        self.boundary_feature_values_written += other.boundary_feature_values_written;
         self.encode_pack_ns += other.encode_pack_ns;
         self.queue_wait_ns += other.queue_wait_ns;
         self.py_call_ns += other.py_call_ns;

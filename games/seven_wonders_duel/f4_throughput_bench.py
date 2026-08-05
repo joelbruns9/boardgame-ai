@@ -471,6 +471,10 @@ def _run_rust(
     batch_padded = boundary.pop("batch_padded_tokens")
     total_tokens = sum(batch_tokens)
     total_padded = sum(batch_padded)
+    tokens_sq = sum(int(row["boundary_tokens_sq"]) for row in raw_metrics)
+    padded_tokens_sq = sum(int(row["boundary_padded_tokens_sq"]) for row in raw_metrics)
+    feature_used = sum(int(row["boundary_feature_values_used"]) for row in raw_metrics)
+    feature_written = sum(int(row["boundary_feature_values_written"]) for row in raw_metrics)
     peak_gpu = (
         int(torch.cuda.max_memory_allocated(evaluator.device))
         if evaluator.device != "cpu"
@@ -559,6 +563,19 @@ def _run_rust(
         "global_batch_tokens_p50": _percentile(batch_tokens, 0.50),
         "global_batch_tokens_p95": _percentile(batch_tokens, 0.95),
         "padding_ratio": 1.0 - total_tokens / total_padded if total_padded else 0.0,
+        # Sequence padding, quadratic form: attention cost grows with L^2 while
+        # `padding_ratio` is linear in L, so the linear figure understates the
+        # wasted compute. Quote both.
+        "padding_ratio_quadratic": (
+            1.0 - tokens_sq / padded_tokens_sq if padded_tokens_sq else 0.0
+        ),
+        # Feature-width padding: every token is written at FLAT_FEATURE_WIDTH,
+        # but net.py projects each type with nn.Linear(FEATURE_COUNTS[type], ...)
+        # and reads no further. This waste rides through the pack, the bytearray
+        # copy, H2D and the tensor build -- none of which `padding_ratio` sees.
+        "feature_padding_ratio": (
+            1.0 - feature_used / feature_written if feature_written else 0.0
+        ),
         "scheduler_ready_fraction": ready_cycles / slot_cycles if slot_cycles else 0.0,
         "scheduler_waiting_fraction": waiting_cycles / slot_cycles if slot_cycles else 0.0,
         "scheduler_idle_fraction": idle_cycles / slot_cycles if slot_cycles else 0.0,

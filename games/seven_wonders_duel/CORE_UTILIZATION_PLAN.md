@@ -342,7 +342,46 @@ removing it) still helps; moving it does not.
 
 </details>
 
-### 3.3 Padding — **metric is wrong before the remedy is worth designing**
+### 3.3 Padding — measured 2026-08-04. **There are two dimensions and the plan tracked the smaller one.**
+
+| dimension | ratio |
+|---|---:|
+| sequence padding, linear (`padding_ratio`) | 0.180 |
+| sequence padding, **quadratic** | **0.309** |
+| **feature-width padding** | **0.867** |
+
+**Only 17.3 of every 130 floats per token are read.** `net.py:50-54` projects each
+type with `nn.Linear(FEATURE_COUNTS[type], d_model)` and `FEATURE_COUNTS` is
+`[130, 1, 26, 1, 8, 4, 1, 79, 14]`; the wire format writes `FLAT_FEATURE_WIDTH`
+= 130 for every token regardless of type, and most tokens are 1-26 wide. The
+remaining 112.7 floats are zeros that are **written by the pack, copied into the
+`PyByteArray`, transferred H2D, and materialised in the tensor build** — four of
+the terms this plan has been chipping at individually.
+
+The sequence-padding figure also matters: attention is quadratic in length, so
+the linear 0.180 understates the wasted compute against the true 0.309. Quote
+both.
+
+**This is now the largest single lever left**, and it is not "optimise the copy".
+The three CPU items below (pack 6.5%, payload 5.3%, tensor build 10.2%) all
+carry the same 86.7% of dead weight; shrinking the payload shrinks all of them
+at once. Options, none cheap, all changing the boundary contract:
+
+* ship compact rows (`FEATURE_COUNTS[type]` floats plus offsets) and expand to
+  the dense `[rows, tokens, 130]` tensor **on the device**, so H2D carries ~1/7.5
+  the bytes;
+* group tokens by type and project per type at its true width, which the
+  unfused path in `net.py` already does — this removes the dense tensor rather
+  than moving it;
+* keep the dense tensor but build it on the GPU from a compact upload.
+
+**Do not start this without the box profile.** The prize is split across CPU
+terms (pack, copy, tensor build) and a device term (H2D), and their balance is
+what differs between the laptop and production.
+
+<details><summary>Superseded framing: before the second dimension was measured</summary>
+
+### Padding — metric is wrong before the remedy is worth designing
 
 `padding_ratio` is **0.187-0.263** depending on configuration (§5), and it is
 `1 − ΣL / (N × Lmax)` — a **token-linear** waste measure

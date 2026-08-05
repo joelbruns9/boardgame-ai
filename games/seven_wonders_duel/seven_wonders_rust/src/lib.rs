@@ -1436,6 +1436,13 @@ fn scheduler_result_to_py(
     metrics.set_item("boundary_tokens", m.boundary_tokens)?;
     metrics.set_item("boundary_padded_tokens", m.boundary_padded_tokens)?;
     metrics.set_item("boundary_max_tokens", m.boundary_max_tokens)?;
+    metrics.set_item("boundary_tokens_sq", m.boundary_tokens_sq)?;
+    metrics.set_item("boundary_padded_tokens_sq", m.boundary_padded_tokens_sq)?;
+    metrics.set_item("boundary_feature_values_used", m.boundary_feature_values_used)?;
+    metrics.set_item(
+        "boundary_feature_values_written",
+        m.boundary_feature_values_written,
+    )?;
     metrics.set_item("encode_pack_ns", m.encode_pack_ns)?;
     metrics.set_item("queue_wait_ns", m.queue_wait_ns)?;
     metrics.set_item("py_call_ns", m.py_call_ns)?;
@@ -2352,6 +2359,10 @@ fn self_play_many_flat_net(
                 .clone();
             output.metrics.boundary_tokens = counters.tokens;
             output.metrics.boundary_padded_tokens = counters.padded_tokens;
+            output.metrics.boundary_tokens_sq = counters.tokens_sq;
+            output.metrics.boundary_padded_tokens_sq = counters.padded_tokens_sq;
+            output.metrics.boundary_feature_values_used = counters.feature_values_used;
+            output.metrics.boundary_feature_values_written = counters.feature_values_written;
             output.metrics.boundary_max_tokens = counters.max_tokens;
             output.metrics.encode_pack_ns = counters.encode_pack_ns;
             output.metrics.queue_wait_ns = counters.queue_wait_ns;

@@ -328,6 +328,20 @@ pub struct BoundaryMetrics {
     pub tokens: usize,
     pub padded_tokens: usize,
     pub max_tokens: usize,
+    /// Sequence-length padding, quadratic form. The network's attention cost is
+    /// quadratic in sequence length while `padded_tokens` is linear, so the
+    /// linear ratio understates the compute actually wasted.
+    /// `1 - tokens_sq / padded_tokens_sq` is the quadratic waste.
+    pub tokens_sq: usize,
+    pub padded_tokens_sq: usize,
+    /// **Feature-width** padding, a second and previously untracked dimension.
+    /// Every token is written at `FLAT_FEATURE_WIDTH` floats, but `net.py`
+    /// projects each type with `nn.Linear(FEATURE_COUNTS[type], d_model)` and
+    /// reads no further. FEATURE_COUNTS is [130, 1, 26, 1, 8, 4, 1, 79, 14], so
+    /// most tokens carry mostly zeros -- through the pack, the bytearray copy,
+    /// H2D, and the tensor build.
+    pub feature_values_used: usize,
+    pub feature_values_written: usize,
     pub encode_pack_ns: u64,
     pub queue_wait_ns: u64,
     pub py_call_ns: u64,
@@ -366,6 +380,8 @@ struct FlatBatchBuilder {
     rows: usize,
     tokens: usize,
     max_tokens: usize,
+    tokens_sq: usize,
+    feature_values_used: usize,
     /// Per-row scratch, retained across batches and grown to the widest batch
     /// seen, so a steady-state run allocates nothing here either.
     row_scratch: Vec<RowPack>,
@@ -389,6 +405,8 @@ impl FlatBatchBuilder {
         self.rows = 0;
         self.tokens = 0;
         self.max_tokens = 0;
+        self.tokens_sq = 0;
+        self.feature_values_used = 0;
     }
 
     /// `net_ids` may be empty, meaning "one network for every row". Anything
@@ -438,6 +456,8 @@ impl FlatBatchBuilder {
             self.aux_ids.extend_from_slice(&row_pack.aux_ids);
             self.features.extend_from_slice(&row_pack.features);
             self.tokens += row_pack.tokens;
+            self.tokens_sq += row_pack.tokens * row_pack.tokens;
+            self.feature_values_used += row_pack.feature_values_used;
             push_u32(&mut self.token_offsets, self.tokens);
             for &action in legal {
                 self.legal_actions
@@ -467,6 +487,7 @@ struct RowPack {
     aux_ids: Vec<u8>,
     features: Vec<u8>,
     tokens: usize,
+    feature_values_used: usize,
 }
 
 impl RowPack {
@@ -478,6 +499,7 @@ impl RowPack {
             aux_ids,
             features,
             tokens,
+            feature_values_used,
         } = self;
         type_ids.clear();
         entity_ids.clear();
@@ -486,7 +508,9 @@ impl RowPack {
         crate::encoder::encode_into(state, token_buf);
         let encoded = token_buf.tokens();
         *tokens = encoded.len();
+        *feature_values_used = 0;
         for token in encoded {
+            *feature_values_used += crate::encoder::FEATURE_COUNTS[token.type_id];
             type_ids.push(token.type_id as u8);
             entity_ids.extend_from_slice(&(token.entity_id as i16).to_le_bytes());
             aux_ids.extend_from_slice(&((token.aux_id + 1) as i16).to_le_bytes());
@@ -605,6 +629,8 @@ impl Eval for PyFlatBatchEval {
         let rows = scratch.rows;
         let tokens = scratch.tokens;
         let max_tokens = scratch.max_tokens;
+        let tokens_sq = scratch.tokens_sq;
+        let feature_values_used = scratch.feature_values_used;
         let attach_start = Instant::now();
         let (raw, call_ns, extract_ns, attach_ns, payload_ns) = Python::attach(|py| {
             let attach_ns = attach_start.elapsed().as_nanos() as u64;
@@ -696,6 +722,10 @@ impl Eval for PyFlatBatchEval {
         metrics.rows += rows;
         metrics.tokens += tokens;
         metrics.padded_tokens += rows * max_tokens;
+        metrics.tokens_sq += tokens_sq;
+        metrics.padded_tokens_sq += rows * max_tokens * max_tokens;
+        metrics.feature_values_used += feature_values_used;
+        metrics.feature_values_written += tokens * FLAT_FEATURE_WIDTH;
         metrics.max_tokens = metrics.max_tokens.max(max_tokens);
         metrics.encode_pack_ns += pack_ns;
         metrics.py_call_ns += call_ns;
