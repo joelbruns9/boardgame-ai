@@ -53,6 +53,7 @@ def compute_losses(
     batch: dict[str, torch.Tensor],
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
+    value_bootstrap: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -65,7 +66,21 @@ def compute_losses(
     policy_loss = (
         per_row[has_policy].mean() if has_policy.any() else per_row.new_zeros(())
     )
-    value_loss = F.cross_entropy(outputs["value"], batch["value_class"])
+    if value_bootstrap > 0.0 and "value_soft" in batch:
+        # Blend the realised outcome with the search's own estimate. The outcome
+        # is one sample of a probability; fitting it hard produces a head that is
+        # confidently wrong off-distribution (cloud3: holdout value loss tripled
+        # while accuracy moved 4 points -- pure overconfidence). Rows without a
+        # search keep the hard label, so nothing is invented for them.
+        hard = F.one_hot(batch["value_class"], num_classes=3).float()
+        blended = torch.where(
+            batch["value_soft_valid"].unsqueeze(1),
+            (1.0 - value_bootstrap) * hard + value_bootstrap * batch["value_soft"],
+            hard,
+        )
+        value_loss = F.cross_entropy(outputs["value"], blended)
+    else:
+        value_loss = F.cross_entropy(outputs["value"], batch["value_class"])
     joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
     margin_valid = batch["margin_valid"]
     if margin_valid.any():
@@ -126,6 +141,7 @@ def evaluate(
     batch_size: int = 512,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
+    value_bootstrap: float = 0.0,
     precision: str = "fp32",
 ):
     model.eval()
@@ -139,7 +155,7 @@ def evaluate(
         batch = collate(examples[start : start + batch_size], device)
         with _evaluation_autocast(device, precision):
             outputs = model(batch)
-            _, parts = compute_losses(outputs, batch, aux_weight, value_weight)
+            _, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
             sums[key] = sums.get(key, 0.0) + value * rows
@@ -398,6 +414,7 @@ def train_loop(
     weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
+    value_bootstrap: float = 0.0,
     patience: int = 8,
     precision: str = "fp32",
     log=print,
@@ -447,7 +464,7 @@ def train_loop(
             optimizer.zero_grad(set_to_none=True)
             with _training_autocast(device, precision):
                 outputs = model(batch)
-                total, parts = compute_losses(outputs, batch, aux_weight, value_weight)
+                total, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
             scaler.scale(total).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -458,6 +475,10 @@ def train_loop(
         train_parts = {k: v / batches for k, v in running.items()}
         row = {"epoch": epoch, "train": train_parts, "secs": time.time() - start_time}
         if val_examples:
+            # `value_bootstrap` is deliberately NOT forwarded: validation must
+            # score against the real game outcome, not the blended target the
+            # arm trains on. Passing it here would make any soft-target run look
+            # better by grading itself on its own softened labels.
             val_metrics = evaluate(
                 model,
                 val_examples,
@@ -514,6 +535,7 @@ def train_steps(
     weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
+    value_bootstrap: float = 0.0,
     validate_every: int = 100,
     optimizer_state: dict | None = None,
     restore_best_val: bool = False,
@@ -603,7 +625,7 @@ def train_steps(
         optimizer.zero_grad(set_to_none=True)
         with _training_autocast(device, precision):
             outputs = model(batch)
-            total, parts = compute_losses(outputs, batch, aux_weight, value_weight)
+            total, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
         if grad_clip > 0:
@@ -649,6 +671,10 @@ def train_steps(
         overflow_steps = 0
         window_steps = 0
         if val_examples:
+            # `value_bootstrap` is deliberately NOT forwarded: validation must
+            # score against the real game outcome, not the blended target the
+            # arm trains on. Passing it here would make any soft-target run look
+            # better by grading itself on its own softened labels.
             val_metrics = evaluate(
                 model,
                 val_examples,

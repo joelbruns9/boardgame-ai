@@ -105,6 +105,7 @@ def run_arm(
     precision: str,
     grad_clip: float,
     optimizer_name: str,
+    value_bootstrap: float,
     seed: int,
     log=print,
 ) -> list[dict]:
@@ -144,6 +145,7 @@ def run_arm(
             value_weight=value_weight,
             grad_clip=grad_clip,
             optimizer_name=optimizer_name,
+            value_bootstrap=value_bootstrap,
             optimizer_state=optimizer_state,
             seed=seed + index,
             precision=precision,
@@ -233,6 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--value-arm", type=float, default=0.4)
     parser.add_argument(
+        "--bootstrap-arm",
+        type=float,
+        default=0.5,
+        help="lambda for the bootstrap arm: the value target becomes "
+        "(1-lambda)*outcome + lambda*search_root_value. 0 is the historical hard "
+        "label; 1 is pure self-distillation, with the game result no longer "
+        "constraining the head at all.",
+    )
+    parser.add_argument(
         "--clip-arm",
         type=float,
         default=1.0,
@@ -251,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--arms",
         nargs="+",
         default=["baseline", "decay", "value"],
-        choices=["baseline", "decay", "value", "clip", "adam"],
+        choices=["baseline", "decay", "value", "clip", "adam", "bootstrap", "both"],
     )
     parser.add_argument("--out", type=Path, default=Path("ablation.json"))
     return parser
@@ -266,7 +277,15 @@ def main(argv: list[str] | None = None) -> int:
     # it is cached against the pool's size and newest file rather than repeated
     # on each invocation.
     newest = max(path.stat().st_mtime_ns for path in args.buffer_dir.glob("*.jsonl"))
-    cache = args.buffer_dir / f".derived_{len(records)}_{newest}.pkl"
+    # The Example schema is part of the key. Without it, adding a field (as
+    # --value-bootstrap did with root_value) silently reloads objects built
+    # before that field existed.
+    import dataclasses
+
+    from .dataset import Example
+
+    schema = abs(hash(tuple(f.name for f in dataclasses.fields(Example)))) % 10**8
+    cache = args.buffer_dir / f".derived_{len(records)}_{newest}_{schema}.pkl"
     derive_started = time.monotonic()
     if cache.exists():
         import pickle
@@ -304,22 +323,41 @@ def main(argv: list[str] | None = None) -> int:
     # 5e-7 per step. Both are regressions from a configuration with two working
     # projects behind it, and neither has been tested here.
     settings = {
-        "baseline": (args.baseline_weight_decay, 1.0, 0.0, "adamw"),
-        "decay": (args.decay_arm, 1.0, 0.0, "adamw"),
-        "value": (args.baseline_weight_decay, args.value_arm, 0.0, "adamw"),
-        "clip": (args.baseline_weight_decay, 1.0, args.clip_arm, "adamw"),
-        "adam": (args.adam_weight_decay, 1.0, 0.0, "adam"),
+        "baseline": (args.baseline_weight_decay, 1.0, 0.0, "adamw", 0.0),
+        "decay": (args.decay_arm, 1.0, 0.0, "adamw", 0.0),
+        "value": (args.baseline_weight_decay, args.value_arm, 0.0, "adamw", 0.0),
+        "clip": (args.baseline_weight_decay, 1.0, args.clip_arm, "adamw", 0.0),
+        "adam": (args.adam_weight_decay, 1.0, 0.0, "adam", 0.0),
+        # bootstrap fixes the value head but lets the policy head overfit
+        # faster -- the value head's difficulty was regularising the shared
+        # trunk. decay is the arm that best restrains the policy head. Neither
+        # alone fixes both; this asks whether together they do.
+        "both": (args.decay_arm, 1.0, 0.0, "adamw", args.bootstrap_arm),
+        "bootstrap": (
+            args.baseline_weight_decay,
+            1.0,
+            0.0,
+            "adamw",
+            args.bootstrap_arm,
+        ),
     }
 
     results: dict[str, list[dict]] = {}
     for name in args.arms:
-        weight_decay, value_weight, grad_clip, optimizer_name = settings[name]
+        (
+            weight_decay,
+            value_weight,
+            grad_clip,
+            optimizer_name,
+            value_bootstrap,
+        ) = settings[name]
         shrink = 1.0 - (1.0 - args.learning_rate * weight_decay) ** (
             args.rounds * args.train_steps
         )
         print(
             f"arm {name}: optimizer={optimizer_name} weight_decay={weight_decay} "
-            f"value_weight={value_weight} grad_clip={grad_clip or 'off'}"
+            f"value_weight={value_weight} grad_clip={grad_clip or 'off'} "
+            f"value_bootstrap={value_bootstrap or 'off'}"
             + (f" (cumulative shrink {shrink:.1%})" if optimizer_name == "adamw" else "")
         )
         results[name] = run_arm(
@@ -339,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             precision=args.precision,
             grad_clip=grad_clip,
             optimizer_name=optimizer_name,
+            value_bootstrap=value_bootstrap,
             seed=args.seed,
         )
         args.out.write_text(json.dumps(results, indent=2), encoding="utf-8")

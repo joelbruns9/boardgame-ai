@@ -88,6 +88,15 @@ class Example:
     sci_final_opp: float
     game_key: int  # for game-honest splits
     iteration: int | None  # for iteration-honest splits (Phase D)
+    #: The search's backed-up root value at this position, actor-relative in
+    #: [-1, +1], or None for rows without a search (bot moves).
+    #:
+    #: `value_class` is a per-GAME label: all ~16.5 rows of a game carry the same
+    #: outcome, which the network can fit by recognising the game and emitting
+    #: its result. `root_value` differs at every position -- early ones are
+    #: uncertain, late ones decided -- so blending it in makes the target
+    #: position-specific and removes that shortcut. See `--value-bootstrap`.
+    root_value: float | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -243,6 +252,7 @@ def examples_from_record(
                 policy,
                 not move.policy_excluded and actor not in archive_seats,
                 actor,
+                move.root_value,
             )
         )
 
@@ -282,6 +292,7 @@ def examples_from_record(
         policy,
         has_policy,
         actor,
+        root_value,
     ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
@@ -299,6 +310,7 @@ def examples_from_record(
                 policy_target=policy,
                 has_policy=has_policy,
                 value_class=_actor_value_class(game.winner, actor),
+                root_value=root_value,
                 joint7_class=_joint7_class(game.winner, game.victory_type, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -377,6 +389,12 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
     policy = torch.zeros(size, NUM_ACTIONS)
     has_policy = torch.zeros(size, dtype=torch.bool)
     value_class = torch.zeros(size, dtype=torch.long)
+    # Actor-relative win probability implied by the search, as a distribution
+    # over (win, draw, loss). Draw mass stays at zero: shared-civilian endings
+    # are ~0.1% of games and the search value carries no signal about them, so
+    # the outcome term remains their only source of supervision.
+    value_soft = torch.zeros((size, 3), dtype=torch.float32)
+    value_soft_valid = torch.zeros(size, dtype=torch.bool)
     joint7 = torch.zeros(size, dtype=torch.long)
     margin = torch.zeros(size)
     margin_valid = torch.zeros(size, dtype=torch.bool)
@@ -399,6 +417,12 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         )
         has_policy[row] = example.has_policy
         value_class[row] = example.value_class
+        if example.root_value is not None:
+            probability = (1.0 + float(example.root_value)) / 2.0
+            probability = min(1.0, max(0.0, probability))
+            value_soft[row, 0] = probability
+            value_soft[row, 2] = 1.0 - probability
+            value_soft_valid[row] = True
         joint7[row] = example.joint7_class
         margin[row] = example.margin
         margin_valid[row] = example.margin_valid
@@ -415,6 +439,8 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         "policy": policy,
         "has_policy": has_policy,
         "value_class": value_class,
+        "value_soft": value_soft,
+        "value_soft_valid": value_soft_valid,
         "joint7": joint7,
         "margin": margin,
         "margin_valid": margin_valid,
