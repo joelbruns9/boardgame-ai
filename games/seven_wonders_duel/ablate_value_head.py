@@ -103,6 +103,8 @@ def run_arm(
     value_weight: float,
     aux_weight: float,
     precision: str,
+    grad_clip: float,
+    optimizer_name: str,
     seed: int,
     log=print,
 ) -> list[dict]:
@@ -140,6 +142,8 @@ def run_arm(
             weight_decay=weight_decay,
             aux_weight=aux_weight,
             value_weight=value_weight,
+            grad_clip=grad_clip,
+            optimizer_name=optimizer_name,
             optimizer_state=optimizer_state,
             seed=seed + index,
             precision=precision,
@@ -229,10 +233,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--value-arm", type=float, default=0.4)
     parser.add_argument(
+        "--clip-arm",
+        type=float,
+        default=1.0,
+        help="global gradient-norm clip for the clip arm. 1.0 is Kingdomino's "
+        "setting; 7WD does not clip at all and its gnorm runs 2-4.",
+    )
+    parser.add_argument(
+        "--adam-weight-decay",
+        type=float,
+        default=1e-4,
+        help="weight decay for the adam arm. 1e-4 is Kingdomino's, and it is NOT "
+        "comparable to an AdamW lambda: Adam's L2 enters the gradient and passes "
+        "through the adaptive denominator rather than scaling with lr.",
+    )
+    parser.add_argument(
         "--arms",
         nargs="+",
         default=["baseline", "decay", "value"],
-        choices=["baseline", "decay", "value"],
+        choices=["baseline", "decay", "value", "clip", "adam"],
     )
     parser.add_argument("--out", type=Path, default=Path("ablation.json"))
     return parser
@@ -276,21 +295,32 @@ def main(argv: list[str] | None = None) -> int:
         f"-- {passes:.2f} passes per round\n"
     )
 
+    # (weight_decay, value_weight, grad_clip, optimizer)
+    #
+    # `clip` and `adam` restore what the Kingdomino loop does and 7WD does not:
+    # KD clips global gradient norm at 1.0 every step and uses Adam's coupled
+    # L2. 7WD clips nothing -- while its gnorm ran 1.44 -> 3.40 -- and uses
+    # AdamW's decoupled decay at a learning rate 20x lower, where `lr*lambda` is
+    # 5e-7 per step. Both are regressions from a configuration with two working
+    # projects behind it, and neither has been tested here.
     settings = {
-        "baseline": (args.baseline_weight_decay, 1.0),
-        "decay": (args.decay_arm, 1.0),
-        "value": (args.baseline_weight_decay, args.value_arm),
+        "baseline": (args.baseline_weight_decay, 1.0, 0.0, "adamw"),
+        "decay": (args.decay_arm, 1.0, 0.0, "adamw"),
+        "value": (args.baseline_weight_decay, args.value_arm, 0.0, "adamw"),
+        "clip": (args.baseline_weight_decay, 1.0, args.clip_arm, "adamw"),
+        "adam": (args.adam_weight_decay, 1.0, 0.0, "adam"),
     }
 
     results: dict[str, list[dict]] = {}
     for name in args.arms:
-        weight_decay, value_weight = settings[name]
+        weight_decay, value_weight, grad_clip, optimizer_name = settings[name]
         shrink = 1.0 - (1.0 - args.learning_rate * weight_decay) ** (
             args.rounds * args.train_steps
         )
         print(
-            f"arm {name}: weight_decay={weight_decay} value_weight={value_weight} "
-            f"(cumulative shrink {shrink:.1%})"
+            f"arm {name}: optimizer={optimizer_name} weight_decay={weight_decay} "
+            f"value_weight={value_weight} grad_clip={grad_clip or 'off'}"
+            + (f" (cumulative shrink {shrink:.1%})" if optimizer_name == "adamw" else "")
         )
         results[name] = run_arm(
             name=name,
@@ -307,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
             value_weight=value_weight,
             aux_weight=args.aux_weight,
             precision=args.precision,
+            grad_clip=grad_clip,
+            optimizer_name=optimizer_name,
             seed=args.seed,
         )
         args.out.write_text(json.dumps(results, indent=2), encoding="utf-8")

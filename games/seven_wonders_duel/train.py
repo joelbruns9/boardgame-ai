@@ -414,7 +414,20 @@ def train_loop(
     """
 
     model.to(device).train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # AdamW decouples decay (`w -= lr*lambda*w`, a fixed fractional shrink);
+    # Adam folds it into the gradient as L2, so it passes through the adaptive
+    # denominator and its RELATIVE strength grows as gradients shrink. The
+    # Kingdomino loop uses Adam, and never showed 7WD's late-run gap climb.
+    if optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+    else:
+        raise ValueError(f"unknown optimizer: {optimizer_name!r}")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = device.startswith("cuda")
     _validate_precision(precision)
@@ -507,6 +520,8 @@ def train_steps(
     seed: int = 0,
     precision: str = "fp32",
     cosine_decay: bool = False,
+    grad_clip: float = 0.0,
+    optimizer_name: str = "adamw",
     batch_getter=None,
     log=print,
 ) -> tuple[list[dict], dict]:
@@ -591,6 +606,8 @@ def train_steps(
             total, parts = compute_losses(outputs, batch, aux_weight, value_weight)
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         grad_norm_sq = sum(
             float(parameter.grad.detach().float().norm(2).item()) ** 2
             for parameter in model.parameters()
