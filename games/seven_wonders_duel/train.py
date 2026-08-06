@@ -33,11 +33,26 @@ from .net import LEGACY_HEADS, SWDNet, masked_policy_log_softmax
 
 AUX_WEIGHT_DEFAULT = 0.2
 
+#: Multiplier on every head that fits a per-GAME label rather than a
+#: per-position one: value, joint7, margin, military, science.
+#:
+#: Those five share one label per game across all ~16 of its rows, so an
+#: iteration that produces ~16,500 policy labels produces only ~1,000
+#: independent outcome labels -- and at the defaults they carry
+#: 1.0 + 0.2*4 = 1.8 of the loss weight against the policy head's 1.0. That is
+#: the side of the objective best placed to memorise, and on a shared trunk
+#: memorising it drags the representation the policy head depends on.
+#:
+#: 1.0 is the historical behaviour. Lower it to test whether the outcome heads
+#: are what stalls a run; see ablate_value_head.py.
+VALUE_WEIGHT_DEFAULT = 1.0
+
 
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     aux_weight: float = AUX_WEIGHT_DEFAULT,
+    value_weight: float = VALUE_WEIGHT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -63,8 +78,10 @@ def compute_losses(
     science_loss = F.mse_loss(outputs["science"], batch["sci_final"])
     total = (
         policy_loss
-        + value_loss
-        + aux_weight * (joint7_loss + margin_loss + military_loss + science_loss)
+        + value_weight * value_loss
+        + value_weight
+        * aux_weight
+        * (joint7_loss + margin_loss + military_loss + science_loss)
     )
     return total, {
         "total": float(total.detach()),
@@ -108,6 +125,7 @@ def evaluate(
     device: str,
     batch_size: int = 512,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
+    value_weight: float = VALUE_WEIGHT_DEFAULT,
     precision: str = "fp32",
 ):
     model.eval()
@@ -121,7 +139,7 @@ def evaluate(
         batch = collate(examples[start : start + batch_size], device)
         with _evaluation_autocast(device, precision):
             outputs = model(batch)
-            _, parts = compute_losses(outputs, batch, aux_weight)
+            _, parts = compute_losses(outputs, batch, aux_weight, value_weight)
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
             sums[key] = sums.get(key, 0.0) + value * rows
@@ -379,6 +397,7 @@ def train_loop(
     lr: float = 2e-4,
     weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
+    value_weight: float = VALUE_WEIGHT_DEFAULT,
     patience: int = 8,
     precision: str = "fp32",
     log=print,
@@ -415,7 +434,7 @@ def train_loop(
             optimizer.zero_grad(set_to_none=True)
             with _training_autocast(device, precision):
                 outputs = model(batch)
-                total, parts = compute_losses(outputs, batch, aux_weight)
+                total, parts = compute_losses(outputs, batch, aux_weight, value_weight)
             scaler.scale(total).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -481,6 +500,7 @@ def train_steps(
     warmup_steps: int = 0,
     weight_decay: float = 1e-4,
     aux_weight: float = AUX_WEIGHT_DEFAULT,
+    value_weight: float = VALUE_WEIGHT_DEFAULT,
     validate_every: int = 100,
     optimizer_state: dict | None = None,
     restore_best_val: bool = False,
@@ -568,7 +588,7 @@ def train_steps(
         optimizer.zero_grad(set_to_none=True)
         with _training_autocast(device, precision):
             outputs = model(batch)
-            total, parts = compute_losses(outputs, batch, aux_weight)
+            total, parts = compute_losses(outputs, batch, aux_weight, value_weight)
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
         grad_norm_sq = sum(

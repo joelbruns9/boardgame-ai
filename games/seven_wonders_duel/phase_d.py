@@ -284,6 +284,7 @@ class PhaseDConfig:
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     aux_weight: float = 0.2
+    value_weight: float = 1.0
     validate_every: int = 100
     restore_best_val: bool = False
     val_fraction: float = 0.05
@@ -3285,6 +3286,7 @@ class PhaseDLoop:
             warmup_steps=self.config.train_warmup_steps,
             weight_decay=self.config.weight_decay,
             aux_weight=self.config.aux_weight,
+            value_weight=self.config.value_weight,
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -4643,6 +4645,16 @@ def build_parser() -> argparse.ArgumentParser:
         "which is why this ships off.",
     )
     parser.add_argument(
+        "--value-weight",
+        type=float,
+        default=1.0,
+        help="multiplier on every head that fits a per-game label (value, "
+        "joint7, margin, military, science). Those five share one label across "
+        "all ~16 rows of a game, so an iteration yielding ~16,500 policy labels "
+        "yields only ~1,000 independent outcome labels -- while carrying 1.8 of "
+        "the loss weight against the policy head's 1.0. 1.0 is historical.",
+    )
+    parser.add_argument(
         "--cheap-top-k",
         type=int,
         default=0,
@@ -4962,6 +4974,7 @@ def main(argv=None) -> int:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
+        value_weight=args.value_weight,
         validate_every=args.validate_every,
         restore_best_val=args.restore_best_val,
         val_fraction=args.val_fraction,

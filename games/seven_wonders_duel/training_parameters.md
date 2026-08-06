@@ -520,6 +520,27 @@ noise but add CPU/search work at those two transitions. `0` disables the paired
 AgeDeal sampling treatment. The current default is 32 because lower exploratory
 calibrations did not meet the action-agreement target.
 
+### `--value-weight`
+
+**Default:** `1.0` (historical). **Value:** positive float
+
+Multiplier on every head that fits a per-game label -- value, joint7, margin,
+military, science. Those five share one outcome across all ~16 rows of a game,
+so an iteration producing ~16,500 policy labels produces only ~1,000 independent
+outcome labels, while carrying `1.0 + aux_weight*4 = 1.8` of the loss weight
+against the policy head's `1.0`.
+
+**Measured to make things worse. Do not lower it without new evidence.** The
+hypothesis was that the outcome heads memorise first -- which is true, they
+overfit about five times faster than the policy head -- and drag the shared
+trunk. `ablate_value_head.py` against cloud3 iteration 30 says the causation
+runs the other way: at `0.4` the value gap barely improved (-9%) while the
+*policy* gap slope got 51% steeper and final top-1 came out lowest of the three
+arms. The outcome heads act as a multi-task regulariser on the trunk; removing
+their pull lets it specialise on policy and memorise faster.
+
+Raising it above 1.0 is untested.
+
 ### `--cheap-top-k`
 
 **Default:** `0` (reuse `--top-k`). **Value:** non-negative integer
