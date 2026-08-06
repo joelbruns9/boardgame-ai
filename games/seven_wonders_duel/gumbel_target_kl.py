@@ -43,7 +43,12 @@ import math
 from pathlib import Path
 
 from .phase_e import load_evaluator
-from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
+from .rust_bridge import (
+    rust_flat_batch_adapter,
+    rust_game_from_prefix,
+    rust_games_for_self_play,
+    rust_scalar_net_adapter,
+)
 
 
 def _kl(target: list[float], prior: list[float]) -> float:
@@ -167,6 +172,152 @@ def measure(
     return out
 
 
+def _argmax(values: list[float]) -> int:
+    return max(range(len(values)), key=values.__getitem__)
+
+
+def reference_compare(
+    *,
+    evaluator,
+    games: int,
+    seed_base: int,
+    search: dict,
+    cheap_sims: tuple[int, int],
+    deep_sims: int,
+    samples: int,
+    slots: int,
+    batch_cap: int,
+) -> dict:
+    """Is the cheap policy target closer to a deep search than the prior is?
+
+    KL(target || prior) measures how far the search moved the policy, not
+    whether it moved it anywhere useful -- and `sigma_vector` min-max normalises
+    completed Q across root actions, stretching it over ~5 logits whether or not
+    the underlying Q differences mean anything. So a large cheap-move KL is
+    equally consistent with an informative search and with noise amplified to
+    fill the range.
+
+    A deep search on the same position breaks the tie. Treating it as the best
+    available stand-in for the truth:
+
+        KL(deep || cheap) < KL(deep || prior)  ->  the cheap search moved the
+                                                   policy toward the truth
+        KL(deep || cheap) > KL(deep || prior)  ->  it moved it away, and the
+                                                   half-nat is damage
+
+    The deep search runs with an independent Gumbel seed, so agreement is not
+    manufactured by sharing noise with the cheap search.
+    """
+
+    import seven_wonders_rust as swr
+
+    swr.set_cheap_top_k(0)
+    seeds = [seed_base + index for index in range(games)]
+    first_players = [index % 2 for index in range(games)]
+
+    records, _ = swr.self_play_many_flat_net(
+        adapter=rust_flat_batch_adapter(evaluator),
+        games=rust_games_for_self_play(seeds, first_players),
+        game_seeds=seeds,
+        global_batch_cap=batch_cap,
+        leaf_batch=1,
+        cheap_sims_min=cheap_sims[0],
+        cheap_sims_max=cheap_sims[1],
+        full_sims_min=search["full_sims_min"],
+        full_sims_max=search["full_sims_max"],
+        full_search_fraction=search["full_search_fraction"],
+        top_k=search["top_k"],
+        draft_prior=0.0,
+        iteration=-1,
+        force=True,
+        age_deal_samples=search["age_deal_samples"],
+        cheap_double_reveal_offsets=0,
+        max_active_slots=slots,
+    )
+
+    # Positions to re-examine, strided across games and game stages rather than
+    # taken from the front of the corpus -- the opening is the most stereotyped
+    # part of a 7WD game and would flatter any search.
+    wanted: list[dict] = []
+    for record in records:
+        moves = record["moves"]
+        for position, move in enumerate(moves):
+            if not move.get("policy_target") or not move.get("prior"):
+                continue
+            wanted.append(
+                {
+                    "seed": record["seed"],
+                    "first_player": record["first_player"],
+                    "prefix": [m["action"] for m in moves[:position]],
+                    "cheap": move["policy_target"],
+                    "prior": move["prior"],
+                    "legal": move["legal"],
+                    "budget": "full" if move.get("full_search") else "cheap",
+                    "sims": int(move.get("sims", 0)),
+                }
+            )
+    stride = max(1, len(wanted) // max(1, samples))
+    wanted = wanted[::stride][:samples]
+
+    # `self_play_many_flat_net` cannot be asked for a single move -- max_moves=1
+    # raises rather than returning a partial record -- so the reference search
+    # runs per position through the single-search entry point. That path takes a
+    # scalar adapter, so it is one evaluation per simulation rather than batched;
+    # at a few hundred positions that is minutes, which is the right trade for
+    # not playing every position out to the end of the game at the deep budget.
+    adapter = rust_scalar_net_adapter(evaluator)
+    acc: dict[str, dict[str, list]] = {
+        budget: {"kl_target": [], "kl_prior": [], "agree_target": [], "agree_prior": [], "sims": []}
+        for budget in ("cheap", "full")
+    }
+
+    for index, item in enumerate(wanted):
+        try:
+            _, rust_state = rust_game_from_prefix(
+                item["seed"], item["first_player"], item["prefix"]
+            )
+        except Exception:  # pragma: no cover - a position we cannot replay
+            continue
+        result = rust_state.closed_search_resumable_net(
+            adapter,
+            deep_sims,
+            search["top_k"],
+            (item["seed"] ^ 0x5DEE) + index,
+            force=True,
+        )
+        target = list(result[4])
+        # The rebuilt root must present the same legal set, or we would be
+        # comparing distributions over different action spaces.
+        if len(target) != len(item["cheap"]):
+            continue
+        from_target = _kl(target, item["cheap"])
+        from_prior = _kl(target, item["prior"])
+        if math.isnan(from_target) or math.isnan(from_prior):
+            continue
+        bucket = acc[item["budget"]]
+        bucket["kl_target"].append(from_target)
+        bucket["kl_prior"].append(from_prior)
+        bucket["sims"].append(item["sims"])
+        deep_best = _argmax(target)
+        bucket["agree_target"].append(int(_argmax(item["cheap"]) == deep_best))
+        bucket["agree_prior"].append(int(_argmax(item["prior"]) == deep_best))
+
+    def _mean(values):
+        return sum(values) / len(values) if values else None
+
+    out = {"deep_sims": deep_sims, "positions_sampled": len(wanted)}
+    for budget, bucket in acc.items():
+        out[budget] = {
+            "positions_compared": len(bucket["kl_target"]),
+            "mean_sims": _mean(bucket["sims"]),
+            "kl_deep_from_target": _mean(bucket["kl_target"]),
+            "kl_deep_from_prior": _mean(bucket["kl_prior"]),
+            "agree_target_with_deep": _mean(bucket["agree_target"]),
+            "agree_prior_with_deep": _mean(bucket["agree_prior"]),
+        }
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -203,6 +354,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--age-deal-samples", type=int, default=32)
     parser.add_argument("--slots", type=int, default=32)
     parser.add_argument("--global-batch-cap", type=int, default=512)
+    parser.add_argument(
+        "--deep-sims",
+        type=int,
+        default=0,
+        help="run the reference comparison instead of the width sweep: re-search sampled cheap-move positions at this budget and ask whether the cheap target sits closer to it than the prior does. 0 disables.",
+    )
+    parser.add_argument("--deep-samples", type=int, default=200)
     parser.add_argument("--out", type=Path)
     return parser
 
@@ -221,6 +379,45 @@ def main(argv: list[str] | None = None) -> int:
         "top_k": args.top_k,
         "age_deal_samples": args.age_deal_samples,
     }
+
+    if args.deep_sims:
+        row = reference_compare(
+            evaluator=evaluator,
+            games=args.games,
+            seed_base=args.seed_base,
+            search=search,
+            cheap_sims=tuple(args.cheap_sims),
+            deep_sims=args.deep_sims,
+            samples=args.deep_samples,
+            slots=args.slots,
+            batch_cap=args.global_batch_cap,
+        )
+        print(f"reference search: {args.deep_sims} sims\n")
+        print(
+            f"{'budget':>8} {'sims':>6} {'n':>5} {'agree(target,deep)':>19} "
+            f"{'agree(prior,deep)':>18} {'lift':>7}"
+        )
+        for budget in ("cheap", "full"):
+            cell = row[budget]
+            if not cell["positions_compared"]:
+                continue
+            lift = cell["agree_target_with_deep"] - cell["agree_prior_with_deep"]
+            print(
+                f"{budget:>8} {cell['mean_sims']:>6.0f} "
+                f"{cell['positions_compared']:>5} "
+                f"{cell['agree_target_with_deep']:>19.3f} "
+                f"{cell['agree_prior_with_deep']:>18.3f} {lift:>+7.3f}"
+            )
+        print(
+            "\n  agree(target,deep) is the fraction of positions where the "
+            "training target's\n  best move matches a "
+            f"{args.deep_sims}-simulation reference. 1 - that value is the\n"
+            "  label noise the network is being asked to fit."
+        )
+        if args.out:
+            args.out.write_text(json.dumps(row, indent=2), encoding="utf-8")
+            print(f"wrote {args.out}")
+        return 0
 
     results = []
     print(
