@@ -773,8 +773,45 @@ def resolve_anneal_iterations(configured: int, iterations: int) -> int:
     return max(1, iterations // 2)
 
 
+#: Self-play move-selection temperature schedule: anneals 1.0 -> floor over
+#: `_TEMPERATURE_ANNEAL_MOVES` moves, then holds. Set by `--temperature-floor`
+#: and `--temperature-anneal-moves`; the defaults reproduce every run before
+#: 2026-08-05, when these were hard-coded here and in `self_play.rs`.
+#:
+#: This is the main diversity lever in self-play. Sampling is proportional to
+#: visits ** (1 / temperature), so the historical floor of 0.25 is visits**4 --
+#: a converged policy plays its favourite near-deterministically, and with a
+#: 20-move anneal that covers roughly 70% of a ~70-move game.
+_TEMPERATURE_FLOOR = 0.25
+_TEMPERATURE_ANNEAL_MOVES = 20.0
+
+
+def set_temperature_schedule(floor: float, anneal_moves: float) -> None:
+    """Set the schedule for both generators, which must agree.
+
+    The Rust backend keeps its own copy of these, so setting one without the
+    other would make the two paths diverge on move selection while still
+    passing every structural equivalence check.
+    """
+
+    global _TEMPERATURE_FLOOR, _TEMPERATURE_ANNEAL_MOVES
+    if not 0.0 < floor <= 1.0:
+        raise ValueError("temperature floor must be in (0, 1]")
+    if anneal_moves < 1:
+        raise ValueError("temperature anneal moves must be >= 1")
+    _TEMPERATURE_FLOOR = float(floor)
+    _TEMPERATURE_ANNEAL_MOVES = float(anneal_moves)
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return
+    swr.set_temperature_schedule(float(floor), float(anneal_moves))
+
+
 def temperature_for_move(move_index: int) -> float:
-    return LinearSchedule(1.0, 0.25, 20).value(move_index)
+    return LinearSchedule(1.0, _TEMPERATURE_FLOOR, _TEMPERATURE_ANNEAL_MOVES).value(
+        move_index
+    )
 
 
 def should_run_anchor_gate(
@@ -4590,6 +4627,25 @@ def build_parser() -> argparse.ArgumentParser:
         "which is why this ships off.",
     )
     parser.add_argument(
+        "--temperature-floor",
+        type=float,
+        default=0.25,
+        help="self-play move-selection temperature after annealing (0.25 = the "
+        "historical hard-coded value). Sampling is proportional to "
+        "visits ** (1/T), so 0.25 is visits**4 -- near-deterministic once the "
+        "policy converges. Raising it widens the late-game distribution and is "
+        "the main diversity lever in self-play. Evaluation paths are unaffected: "
+        "they take the argmax.",
+    )
+    parser.add_argument(
+        "--temperature-anneal-moves",
+        type=float,
+        default=20.0,
+        help="moves over which temperature falls from 1.0 to --temperature-floor "
+        "(20 = historical). Games run ~70 moves, so 20 leaves ~70%% of each game "
+        "at the floor.",
+    )
+    parser.add_argument(
         "--pack-threads",
         type=int,
         default=0,
@@ -4829,6 +4885,7 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_pack_pool(args.pack_threads)
+    set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     config = PhaseDConfig(
         run_dir=args.run_dir,
         seed=args.seed,

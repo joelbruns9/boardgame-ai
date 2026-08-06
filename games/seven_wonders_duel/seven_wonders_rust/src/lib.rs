@@ -2401,6 +2401,27 @@ fn pack_threads() -> usize {
     eval::pack_threads()
 }
 
+#[pyfunction]
+/// Set the self-play temperature schedule. See `self_play::set_temperature_schedule`.
+fn set_temperature_schedule(floor: f64, anneal_moves: f64) -> PyResult<()> {
+    if !(floor > 0.0 && floor <= 1.0) {
+        return Err(PyValueError::new_err(
+            "temperature floor must be in (0, 1]",
+        ));
+    }
+    if !(anneal_moves >= 1.0) {
+        return Err(PyValueError::new_err("temperature anneal moves must be >= 1"));
+    }
+    self_play::set_temperature_schedule(floor, anneal_moves);
+    Ok(())
+}
+
+#[pyfunction]
+/// The `(floor, anneal_moves)` in force, for run manifests.
+fn temperature_schedule() -> (f64, f64) {
+    self_play::temperature_schedule()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -2414,6 +2435,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::pack_threads;
+
+    #[pymodule_export]
+    use super::set_temperature_schedule;
+
+    #[pymodule_export]
+    use super::temperature_schedule;
 
     #[pymodule_export]
     use super::RustPuctSearch;

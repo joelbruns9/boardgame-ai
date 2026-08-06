@@ -5,6 +5,7 @@
 //! move/result recording.  Python is entered only by `PyEval` while a search
 //! needs neural evaluations; it does not regain control between moves.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::bots::{self, BotKind};
 use crate::chance::{self, ChanceKind};
 use crate::codec::{decode_action, legal_action_indices};
@@ -349,9 +350,49 @@ fn actual_chance_outcomes(
         .collect()
 }
 
+/// Defaults, matching `phase_d.temperature_for_move`. Every run before
+/// 2026-08-05 hard-coded these, so leaving them unset reproduces it exactly.
+pub const DEFAULT_TEMPERATURE_FLOOR: f64 = 0.25;
+pub const DEFAULT_TEMPERATURE_ANNEAL_MOVES: f64 = 20.0;
+
+static TEMPERATURE_CONFIGURED: AtomicBool = AtomicBool::new(false);
+static TEMPERATURE_FLOOR_BITS: AtomicU64 = AtomicU64::new(0);
+static TEMPERATURE_ANNEAL_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Set the self-play move-selection temperature schedule, process-wide.
+///
+/// Global rather than per-`SelfPlayConfig` deliberately: temperature applies
+/// only to self-play move *selection*, and every evaluation path -- gates,
+/// arenas, anchors -- sets `deterministic_actions` and takes the argmax
+/// instead, so there is no caller that needs a different value at the same
+/// time. Threading it through every construction site would touch a dozen
+/// signatures to express something no caller varies.
+///
+/// The floor is the strongest diversity lever in self-play: at the historical
+/// 0.25 the selection probability is proportional to visits^4, so a converged
+/// policy plays a ~94% favourite as good as deterministically, and roughly 70%
+/// of a ~70-move game is decided that way.
+pub fn set_temperature_schedule(floor: f64, anneal_moves: f64) {
+    TEMPERATURE_FLOOR_BITS.store(floor.to_bits(), Ordering::Relaxed);
+    TEMPERATURE_ANNEAL_BITS.store(anneal_moves.to_bits(), Ordering::Relaxed);
+    TEMPERATURE_CONFIGURED.store(true, Ordering::Relaxed);
+}
+
+/// `(floor, anneal_moves)` in force, for recording in run manifests.
+pub fn temperature_schedule() -> (f64, f64) {
+    if !TEMPERATURE_CONFIGURED.load(Ordering::Relaxed) {
+        return (DEFAULT_TEMPERATURE_FLOOR, DEFAULT_TEMPERATURE_ANNEAL_MOVES);
+    }
+    (
+        f64::from_bits(TEMPERATURE_FLOOR_BITS.load(Ordering::Relaxed)),
+        f64::from_bits(TEMPERATURE_ANNEAL_BITS.load(Ordering::Relaxed)),
+    )
+}
+
 fn temperature(move_index: usize) -> f64 {
-    let progress = (move_index as f64 / 20.0).min(1.0);
-    1.0 + (0.25 - 1.0) * progress
+    let (floor, anneal) = temperature_schedule();
+    let progress = (move_index as f64 / anneal).min(1.0);
+    1.0 + (floor - 1.0) * progress
 }
 
 /// The action to PLAY in a competitive game: argmax of the improved policy.

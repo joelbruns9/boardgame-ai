@@ -520,6 +520,32 @@ noise but add CPU/search work at those two transitions. `0` disables the paired
 AgeDeal sampling treatment. The current default is 32 because lower exploratory
 calibrations did not meet the action-agreement target.
 
+### `--temperature-floor`, `--temperature-anneal-moves`
+
+**Default:** `0.25` and `20`. **Value:** floor in `(0, 1]`, anneal moves `>= 1`
+
+Self-play move-*selection* temperature. It falls linearly from `1.0` at move 0
+to the floor over `--temperature-anneal-moves` moves, then holds. Selection is
+proportional to `visits ** (1 / T)`, so the floor is the exponent applied to the
+visit counts: `0.25` means `visits ** 4`, under which a converged policy plays
+its favourite close to deterministically.
+
+This is the main diversity lever in self-play. With the default 20-move anneal,
+roughly 70% of a ~70-move game runs at the floor, so almost the whole game is
+near-greedy once the net is confident -- which narrows what reaches the replay
+buffer. Raise the floor (`0.35`-`0.40`) or lengthen the anneal (`30`) if games
+are becoming repetitive; the recognisable symptom is the train/val gap widening
+while `policy_top1` keeps improving.
+
+Both generators read the same schedule, and `phase_d` sets both at startup --
+the Rust backend keeps its own copy, so setting only one would make the paths
+diverge on move selection while still passing every structural equivalence
+check. Evaluation is unaffected either way: gates, arenas and anchors set
+`deterministic_actions` and take the argmax, so temperature cannot move a gate
+result.
+
+Defaults reproduce every run before 2026-08-05, when these were hard-coded.
+
 ### `--leaf-batch`
 
 **Default:** `1`. **Value:** positive integer no larger than the global cap
@@ -610,6 +636,22 @@ but also increase queueing, memory use, and scheduling variability.
 Number of persistent Rust scheduler shards. These are scoped standard-library
 threads, not Rayon workers and not reserved or pinned CPU cores. Each shard owns
 game slots while sharing the evaluator. The laptop sweep selected one worker.
+
+### `--pack-threads`
+
+**Default:** `0` (auto: the effective CPU count). **Value:** non-negative integer
+
+Threads in the row-packing pool that assembles evaluation batches on the
+boundary between the Rust scheduler and Python. Packing is pure CPU work and
+scales with rows per batch, so on a box with many cores it is worth splitting;
+past the point where per-batch rows run out, more threads only add contention.
+
+Set it explicitly on any box where the process does not own every visible core.
+Auto-detection takes the minimum of cgroup quota, cpuset, affinity mask and
+visible CPUs (`cloud_preflight.effective_cpu_count`), but a wrong answer here
+oversubscribes silently. `f4_pack_sweep.py` ranks thread counts -- and note
+that it is only valid *within* one process: process-to-process variance on the
+same unchanged build has been measured at 26%, so never use it to A/B builds.
 
 ### `--inference-batch`
 
