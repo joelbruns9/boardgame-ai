@@ -352,12 +352,31 @@ pub struct SearchConfig {
     pub conflict_free_waves: bool,
 }
 
+/// Root prior over the legal set, renormalised. Edge priors are already
+/// restricted to legal actions, but they are not guaranteed to sum to one.
+pub fn root_prior_from(priors: impl Iterator<Item = f64>) -> Vec<f64> {
+    let priors: Vec<f64> = priors.collect();
+    let mass: f64 = priors.iter().sum();
+    if mass > 0.0 {
+        priors.iter().map(|p| p / mass).collect()
+    } else {
+        let uniform = 1.0 / (priors.len().max(1) as f64);
+        vec![uniform; priors.len()]
+    }
+}
+
 pub struct SearchResult {
     pub action_index: usize,
     pub action_value: f64,
     pub root_value: f64,
     pub visits: Vec<u32>,        // aligned to root.legal
     pub policy_target: Vec<f64>, // aligned to root.legal
+    /// The network's root policy over `root.legal`, renormalised over the legal
+    /// set. Recorded so the improvement the search actually produced --
+    /// KL(policy_target || prior) -- is measurable rather than assumed: at a
+    /// small budget the Gumbel guarantee bounds that quantity below by zero and
+    /// says nothing about its size.
+    pub prior: Vec<f64>,
     pub gumbel_topk: Vec<usize>, // action indices
     pub sims: usize,
 }
@@ -508,6 +527,7 @@ fn puct_root<E: Eval>(
         root_value: sign * root.value_p0(),
         visits,
         policy_target,
+        prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
         // No Gumbel top-k exists here; an invented one would let a buffer row
         // claim a candidate set that never happened.
         gumbel_topk: Vec::new(),
@@ -646,6 +666,7 @@ pub fn search_closed<E: Eval>(
         root_value: sign * root.value_p0(),
         visits,
         policy_target,
+        prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
         gumbel_topk: topk,
         sims: sims_used,
     };

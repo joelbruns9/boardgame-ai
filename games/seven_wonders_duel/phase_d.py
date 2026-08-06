@@ -786,6 +786,22 @@ _TEMPERATURE_FLOOR = 0.25
 _TEMPERATURE_ANNEAL_MOVES = 20.0
 
 
+def _configure_cheap_top_k(width: int) -> None:
+    """Apply the cheap-move root width to the Rust generator.
+
+    A no-op for the Python backend, which has no separate cheap width; runs that
+    want the split must use --generation-backend rust.
+    """
+
+    if width < 0:
+        raise ValueError("--cheap-top-k must be non-negative")
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return
+    swr.set_cheap_top_k(int(width))
+
+
 def set_temperature_schedule(floor: float, anneal_moves: float) -> None:
     """Set the schedule for both generators, which must agree.
 
@@ -4627,6 +4643,20 @@ def build_parser() -> argparse.ArgumentParser:
         "which is why this ships off.",
     )
     parser.add_argument(
+        "--cheap-top-k",
+        type=int,
+        default=0,
+        help="root candidate width on CHEAP self-play moves; 0 reuses --top-k "
+        "(the historical behaviour). Sequential halving gives every candidate "
+        "the same first-round allocation, so width and budget are not "
+        "independent: 7WD's ~10 legal actions at 16-24 sims leave each candidate "
+        "one simulation, and a one-simulation Q is the value head's static "
+        "opinion with no opponent reply. Halving the width doubles that floor at "
+        "no throughput cost. Full-search moves always use --top-k, so their "
+        "targets stay comparable across runs; gates and anchors are unaffected. "
+        "Measure the effect with gumbel_target_kl.py before choosing a value.",
+    )
+    parser.add_argument(
         "--temperature-floor",
         type=float,
         default=0.25,
@@ -4886,6 +4916,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
+    _configure_cheap_top_k(args.cheap_top_k)
     config = PhaseDConfig(
         run_dir=args.run_dir,
         seed=args.seed,

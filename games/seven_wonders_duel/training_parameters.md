@@ -520,6 +520,30 @@ noise but add CPU/search work at those two transitions. `0` disables the paired
 AgeDeal sampling treatment. The current default is 32 because lower exploratory
 calibrations did not meet the action-agreement target.
 
+### `--cheap-top-k`
+
+**Default:** `0` (reuse `--top-k`). **Value:** non-negative integer
+
+Root candidate width on cheap self-play moves only. Full-search moves always use
+`--top-k`, and evaluation is unaffected.
+
+**Measured to be a no-op; left in place as a measurement tool, not a lever.**
+The theory was that sequential halving gives every candidate the same first-round
+allocation, so 7WD's ~10 legal actions at 16-24 simulations leave each candidate
+one simulation -- and a one-simulation Q is the value head's static opinion with
+no opponent reply. Narrowing the width should have doubled that floor for free.
+
+`gumbel_target_kl.py` says it does not. Against cloud3 checkpoints, dropping the
+cheap width from 16 to 4 moved `KL(policy_target || prior)` by less than the
+noise between checkpoints and left top-1 agreement unchanged. The reason is the
+`.max(1)` floor in `tree.rs`: every candidate already receives a visit, so
+narrowing does not redistribute simulations to survivors -- it only pushes more
+legal actions onto the `completed_q` fallback, which adds distortion rather than
+depth.
+
+Measure before setting this. It is documented so the negative result is not
+rediscovered.
+
 ### `--temperature-floor`, `--temperature-anneal-moves`
 
 **Default:** `0.25` and `20`. **Value:** floor in `(0, 1]`, anneal moves `>= 1`

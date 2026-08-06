@@ -1604,6 +1604,12 @@ impl SearchSession {
             root_value,
             visits: self.visits,
             policy_target,
+            prior: crate::tree::root_prior_from(
+                self.arena.nodes[self.arena.root_id]
+                    .edges
+                    .iter()
+                    .map(|e| e.prior),
+            ),
             gumbel_topk: Vec::new(),
             sims: self.sims_completed,
         };
@@ -1649,6 +1655,12 @@ impl SearchSession {
             root_value,
             visits: self.visits,
             policy_target,
+            prior: crate::tree::root_prior_from(
+                self.arena.nodes[self.arena.root_id]
+                    .edges
+                    .iter()
+                    .map(|e| e.prior),
+            ),
             gumbel_topk: self.topk,
             sims: self.sims_completed,
         };

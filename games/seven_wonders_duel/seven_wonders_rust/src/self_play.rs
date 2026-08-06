@@ -5,7 +5,7 @@
 //! move/result recording.  Python is entered only by `PyEval` while a search
 //! needs neural evaluations; it does not regain control between moves.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::bots::{self, BotKind};
 use crate::chance::{self, ChanceKind};
 use crate::codec::{decode_action, legal_action_indices};
@@ -24,6 +24,39 @@ const GAME_RNG_XOR: u64 = 0xC6BC_2796_92B5_CC83;
 /// Chance capping is a cheap-move economy: a full-search move keeps the exact
 /// root expectation, so its policy target is bit-identical to an uncapped run's
 /// at the same state and seed.
+/// Root candidate width, by search budget.
+///
+/// Sequential halving spends its first round giving every candidate the same
+/// allocation, so `m` and `n` are not independent: at `n = 20` with `m = 10`
+/// (7WD's typical legal count, which is what `top_k = 16` clips to) every
+/// candidate gets exactly one simulation, and a one-simulation Q is the value
+/// head's static opinion of the position after the move -- no opponent reply.
+/// In 7WD that is the whole game: what you take determines what you expose.
+///
+/// Halving `m` doubles the floor. `cheap_top_k = 0` keeps the single shared
+/// width, which is the pre-2026-08-06 behaviour.
+static CHEAP_TOP_K: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the cheap-move root width, process-wide. Global for the same reason the
+/// temperature schedule is: only self-play generation reads it -- gates, arenas
+/// and anchors run full-search width -- so no two callers need different values
+/// at once, and threading it through would touch ten pyo3 signatures.
+pub fn set_cheap_top_k(width: usize) {
+    CHEAP_TOP_K.store(width, Ordering::Relaxed);
+}
+
+pub fn cheap_top_k() -> usize {
+    CHEAP_TOP_K.load(Ordering::Relaxed)
+}
+
+fn search_top_k(top_k: usize, cheap_top_k: usize, full: bool) -> usize {
+    if full || cheap_top_k == 0 {
+        top_k
+    } else {
+        cheap_top_k
+    }
+}
+
 fn cheap_offsets(configured: usize, full: bool) -> usize {
     if full {
         0
@@ -147,6 +180,9 @@ pub struct MoveRecord {
     pub legal: Vec<usize>,
     pub visits: Vec<u32>,
     pub policy_target: Vec<f64>,
+    /// Root prior over `legal`. Paired with `policy_target` it makes the search's
+    /// actual policy improvement measurable per row.
+    pub prior: Vec<f64>,
     pub root_value: f64,
     pub sims: usize,
     pub gumbel_topk: Vec<usize>,
@@ -478,7 +514,7 @@ pub fn run<E: Eval>(
         let search_seed = rng.next_u64() & ((1_u64 << 63) - 1);
         let search_cfg = SearchConfig {
             sims,
-            top_k: cfg.top_k,
+            top_k: search_top_k(cfg.top_k, cheap_top_k(), full),
             c_puct: cfg.c_puct,
             c_visit: cfg.c_visit,
             c_scale: cfg.c_scale,
@@ -513,6 +549,7 @@ pub fn run<E: Eval>(
             legal,
             visits: result.visits,
             policy_target: result.policy_target,
+            prior: result.prior,
             root_value: result.root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
@@ -1321,7 +1358,7 @@ impl GameSlot {
             search_seed,
             search_cfg: SearchConfig {
                 sims,
-                top_k: self.cfg.top_k,
+                top_k: search_top_k(self.cfg.top_k, cheap_top_k(), full),
                 c_puct: self.cfg.c_puct,
                 c_visit: self.cfg.c_visit,
                 c_scale: self.cfg.c_scale,
@@ -1540,6 +1577,7 @@ impl GameSlot {
             legal: meta.legal,
             visits: result.visits,
             policy_target: result.policy_target,
+            prior: result.prior,
             root_value: result.root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
@@ -1585,6 +1623,7 @@ impl GameSlot {
             legal: meta.legal,
             visits: Vec::new(),
             policy_target: Vec::new(),
+            prior: Vec::new(),
             root_value: 0.0,
             sims: 0,
             gumbel_topk: Vec::new(),

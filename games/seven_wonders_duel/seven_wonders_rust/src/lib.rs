@@ -93,6 +93,14 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
             },
         )?;
         item.set_item(
+            "prior",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.prior)
+            },
+        )?;
+        item.set_item(
             "root_value",
             if row.is_bot {
                 None
@@ -2402,6 +2410,18 @@ fn pack_threads() -> usize {
 }
 
 #[pyfunction]
+/// Set the cheap-move root width. See `self_play::set_cheap_top_k`.
+fn set_cheap_top_k(width: usize) {
+    self_play::set_cheap_top_k(width);
+}
+
+#[pyfunction]
+/// The cheap-move root width in force; `0` means "reuse top_k".
+fn cheap_top_k() -> usize {
+    self_play::cheap_top_k()
+}
+
+#[pyfunction]
 /// Set the self-play temperature schedule. See `self_play::set_temperature_schedule`.
 fn set_temperature_schedule(floor: f64, anneal_moves: f64) -> PyResult<()> {
     if !(floor > 0.0 && floor <= 1.0) {
@@ -2435,6 +2455,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::pack_threads;
+
+    #[pymodule_export]
+    use super::set_cheap_top_k;
+
+    #[pymodule_export]
+    use super::cheap_top_k;
 
     #[pymodule_export]
     use super::set_temperature_schedule;
