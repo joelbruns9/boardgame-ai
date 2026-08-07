@@ -4667,8 +4667,8 @@ def build_parser() -> argparse.ArgumentParser:
         "a game, which the network fits by recognising the game and emitting its "
         "result; root_value differs at every position, so blending it makes the "
         "target position-specific and removes that shortcut. Measured at 0.5 "
-        "against cloud3 iteration 30: holdout value loss rose 8.6% over 15 "
-        "training rounds instead of 174%, with value_acc HIGHER throughout. "
+        "against cloud3 iteration 30: holdout value loss rose 8.6%% over 15 "
+        "training rounds instead of 174%%, with value_acc HIGHER throughout. "
         "1.0 would be pure self-distillation, with the game result no longer "
         "constraining the head at all.",
     )
