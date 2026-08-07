@@ -520,6 +520,42 @@ noise but add CPU/search work at those two transitions. `0` disables the paired
 AgeDeal sampling treatment. The current default is 32 because lower exploratory
 calibrations did not meet the action-agreement target.
 
+### `--value-bootstrap`
+
+**Default:** `0.0` (historical hard label). **Value:** float in [0, 1)
+
+Blends the search's backed-up root value into the value target:
+
+```
+target = (1 - lambda) * one_hot(outcome) + lambda * [(1+v)/2, 0, (1-v)/2]
+```
+
+where `v` is the actor-relative root value already recorded per move.
+
+**The strongest measured result in this codebase's training work.** The game
+outcome is a per-GAME label: all ~16 rows of a game carry it, so the network can
+fit it by recognising the game and emitting its result. `root_value` differs at
+every position -- early ones uncertain, late ones decided -- so blending makes
+the target position-specific and removes the shortcut.
+
+At `0.5` against cloud3 iteration 30, over 15 training rounds on a fixed pool:
+
+| | holdout value loss | value_acc | gap_value slope |
+|---|---|---|---|
+| `0.0` (baseline) | 0.582 -> **1.594** | 0.676 -> 0.631 | +0.11521 |
+| `0.5` | 0.571 -> **0.620** | 0.682 -> 0.672 | +0.00985 |
+
+A 92% reduction in the gap slope with `value_acc` *higher*, so this is not a
+target made smooth by being made uninformative. Validation is always scored
+against the hard outcome -- `evaluate` is deliberately not passed this lambda.
+
+The cost lands on the other head: the policy gap slope worsens (+0.0357 against
++0.0247), because the value head's difficulty was regularising the shared trunk.
+Pair it with a `--weight-decay` that actually acts.
+
+Values at or near 1.0 are pure self-distillation and remove the only ground
+truth the head has. Untested above 0.5.
+
 ### `--value-weight`
 
 **Default:** `1.0` (historical). **Value:** positive float

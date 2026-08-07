@@ -207,6 +207,10 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         "policy": torch.zeros(rows, NUM_ACTIONS, dtype=torch.float32),
         "has_policy": torch.zeros(rows, dtype=torch.bool),
         "value_class": torch.zeros(rows, dtype=torch.int8),
+        # Mirrors `collate`: the audit asserts this path is value-identical to
+        # it, so a target added there has to be added here too.
+        "value_soft": torch.zeros(rows, 3, dtype=torch.float32),
+        "value_soft_valid": torch.zeros(rows, dtype=torch.bool),
         "joint7": torch.zeros(rows, dtype=torch.int8),
         "margin": torch.zeros(rows, dtype=torch.float32),
         "margin_valid": torch.zeros(rows, dtype=torch.bool),
@@ -232,6 +236,12 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         )
         storage["has_policy"][row] = example.has_policy
         storage["value_class"][row] = example.value_class
+        if example.root_value is not None:
+            probability = (1.0 + float(example.root_value)) / 2.0
+            probability = min(1.0, max(0.0, probability))
+            storage["value_soft"][row, 0] = probability
+            storage["value_soft"][row, 2] = 1.0 - probability
+            storage["value_soft_valid"][row] = True
         storage["joint7"][row] = example.joint7_class
         storage["margin"][row] = example.margin
         storage["margin_valid"][row] = example.margin_valid

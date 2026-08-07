@@ -285,6 +285,7 @@ class PhaseDConfig:
     weight_decay: float = 1e-4
     aux_weight: float = 0.2
     value_weight: float = 1.0
+    value_bootstrap: float = 0.0
     validate_every: int = 100
     restore_best_val: bool = False
     val_fraction: float = 0.05
@@ -3287,6 +3288,7 @@ class PhaseDLoop:
             weight_decay=self.config.weight_decay,
             aux_weight=self.config.aux_weight,
             value_weight=self.config.value_weight,
+            value_bootstrap=self.config.value_bootstrap,
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -4645,6 +4647,21 @@ def build_parser() -> argparse.ArgumentParser:
         "which is why this ships off.",
     )
     parser.add_argument(
+        "--value-bootstrap",
+        type=float,
+        default=0.0,
+        help="blend the search's root value into the value target: "
+        "(1-lambda)*outcome + lambda*[(1+v)/2, 0, (1-v)/2]. 0 is the historical "
+        "hard label. The outcome is a per-GAME label shared by all ~16 rows of "
+        "a game, which the network fits by recognising the game and emitting its "
+        "result; root_value differs at every position, so blending it makes the "
+        "target position-specific and removes that shortcut. Measured at 0.5 "
+        "against cloud3 iteration 30: holdout value loss rose 8.6% over 15 "
+        "training rounds instead of 174%, with value_acc HIGHER throughout. "
+        "1.0 would be pure self-distillation, with the game result no longer "
+        "constraining the head at all.",
+    )
+    parser.add_argument(
         "--value-weight",
         type=float,
         default=1.0,
@@ -4975,6 +4992,7 @@ def main(argv=None) -> int:
         weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
         value_weight=args.value_weight,
+        value_bootstrap=args.value_bootstrap,
         validate_every=args.validate_every,
         restore_best_val=args.restore_best_val,
         val_fraction=args.val_fraction,
