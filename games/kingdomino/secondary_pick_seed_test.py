@@ -107,6 +107,20 @@ def root_q_by_pick(
         rep_idx = int(encode_action(representative, state))
         group_idxs = [int(encode_action(action, state)) for action in actions]
         domino_id = None if pick == -1 else int(pick)
+        # Placement-estimator diagnostics.  The forced reference takes a MAX
+        # over its placement shortlist within a pick group (denial_search
+        # _backup), while root_q is the Q of the MOST-VISITED placement.  The
+        # two agree when a group is well searched and diverge when it is
+        # starved -- exactly the secondary-pick condition -- so the gap between
+        # them measures how much of the measured fragility is estimator
+        # asymmetry rather than genuine overvaluation.  root_q is unchanged:
+        # these fields are additive so every existing comparison still holds.
+        scored = [(float(info[idx][1]), idx) for idx in group_idxs
+                  if idx in info and info[idx][1] is not None]
+        if scored:
+            best_q, best_idx = max(scored, key=lambda item: (item[0], -item[1]))
+        else:
+            best_q, best_idx = None, None
         rows[domino_id] = {
             "pick_domino_id": domino_id,
             "representative_action_idx": rep_idx,
@@ -115,6 +129,10 @@ def root_q_by_pick(
                 sum(visits.get(idx, 0.0) for idx in group_idxs) / total_visits),
             "raw_prior": float(sum(policy.get(idx, 0.0) for idx in group_idxs)),
             "root_q": info.get(rep_idx, (0.0, None))[1],
+            "group_max_root_q": best_q,
+            "group_max_root_q_action_idx": best_idx,
+            "group_scored_actions": len(scored),
+            "group_legal_actions": len(group_idxs),
         }
     return rows
 
@@ -179,7 +197,16 @@ def tie_guarded_flip(
     }
 
 
-def _config(*, seed: int, sims: int = 3200, chance_k: int = 16) -> SearchConfig:
+def _config(*, seed: int, sims: int = 3200, chance_k: int = 16,
+            pick_floor_frac: float = 0.0, pick_floor_min_depth: int = 0,
+            pick_floor_max_depth: int = 0) -> SearchConfig:
+    """Search config for the reference trees and the root ladder.
+
+    The pick-floor arguments default to off, so every existing caller keeps the
+    pure-PUCT root search it was validated against.  They are set only by the
+    Phase A allocation arms, and they affect root_Q alone — the forced 8-ply
+    reference tree does not route through the root search.
+    """
     return SearchConfig(
         pick_plies=8,
         chance_k=int(chance_k),
@@ -189,6 +216,9 @@ def _config(*, seed: int, sims: int = 3200, chance_k: int = 16) -> SearchConfig:
         policy_temperature=0.10,
         tie_tolerance=1e-6,
         uncertainty_z=1.0,
+        pick_floor_frac=float(pick_floor_frac),
+        pick_floor_min_depth=int(pick_floor_min_depth),
+        pick_floor_max_depth=int(pick_floor_max_depth),
     )
 
 

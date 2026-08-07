@@ -4851,13 +4851,22 @@ impl OLNode {
 /// Prior-guided PUCT compounds starvation with depth (measured: a game-losing
 /// opponent reply at 4.7% prior received 0.6% of 3200 sims); the floor gives
 /// each pick branch enough visits to reveal its value, after which normal
-/// PUCT takes over on merit. Applied at node depths 1..=max_depth, NEVER the
-/// root (root pick-groups are never starved at training sim counts, and the
-/// root heals itself once child Q values are accurate — so policy targets
-/// need no forced-visit subtraction).
+/// PUCT takes over on merit. Applied at node depths min_depth..=max_depth.
+///
+/// TRAINING (BatchedMCTS) always sets min_depth=1, i.e. NEVER the root: root
+/// visit counts BECOME the policy target, so forcing there would teach the
+/// policy that every forced pick is good (root pick-groups are also not
+/// starved at training sim counts, and the root heals itself once child Q
+/// values are accurate — so policy targets need no forced-visit subtraction).
+///
+/// The ADVISOR path may set min_depth=0 to include the root. It records no
+/// training targets, so the objection above does not apply, and the Phase A
+/// allocation study needs a root-level arm to localize whether secondary-pick
+/// overvaluation comes from starvation at the root or inside the reply nodes.
 #[derive(Clone, Copy)]
 struct PickFloor {
     frac: f64,
+    min_depth: usize,
     max_depth: usize,
     min_visits: i32, // don't force below this node visit count (too noisy)
 }
@@ -5031,15 +5040,16 @@ fn ol_descend(
             break;
         }
         let actor = state.actor()?;
-        // Pick-group visit floor: at node depths 1..=max_depth (NEVER the root:
-        // path.len()-1 == 0 there), if a pick-group is starved below its floor
-        // share, restrict this selection to that group (best child within it
-        // still chosen by PUCT).  If the forced group has no legal action under
-        // this determinization, fall through to normal unfiltered selection.
+        // Pick-group visit floor: at node depths min_depth..=max_depth (the
+        // root is path.len()-1 == 0, included only when min_depth == 0 — see
+        // PickFloor), if a pick-group is starved below its floor share,
+        // restrict this selection to that group (best child within it still
+        // chosen by PUCT).  If the forced group has no legal action under this
+        // determinization, fall through to normal unfiltered selection.
         let depth = path.len() - 1;
         let mut selected: Option<Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>> = None;
         if let Some(pf) = &pick_floor {
-            if depth >= 1 && depth <= pf.max_depth {
+            if depth >= pf.min_depth && depth <= pf.max_depth {
                 if let Some(g) = ol_pick_floor_group(arena, node_id, pf) {
                     let missing_before = *missing_child_count;
                     let r = ol_select_child(
@@ -5333,6 +5343,7 @@ fn advisor_open_loop_search_impl(
     score_scale: f64,
     margin_gain: f64,
     alpha_param: f64,
+    pick_floor: Option<PickFloor>,
 ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
@@ -5369,7 +5380,11 @@ fn advisor_open_loop_search_impl(
                 cpuct,
                 &mut fallback_count,
                 &mut missing_child_count,
-                None, // pick floors are a TRAINING device; the advisor stays pure PUCT
+                // Normally None: the advisor is pure PUCT.  The Phase A
+                // allocation study passes a floor to test whether forced
+                // pick-group coverage closes the secondary-pick fragility gap
+                // at equal budget.  Off by default (frac=0 => None).
+                pick_floor,
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -8549,6 +8564,10 @@ impl BatchedMCTS {
         let pick_floor = if pick_floor_frac > 0.0 && pick_floor_depth > 0 {
             Some(PickFloor {
                 frac: pick_floor_frac,
+                // Training NEVER floors the root: root visits become the policy
+                // target.  Pinned explicitly so the advisor's min_depth=0 option
+                // cannot leak into training via a shared default.
+                min_depth: 1,
                 max_depth: pick_floor_depth,
                 min_visits: 16,
             })
@@ -10686,7 +10705,9 @@ mod kingdomino_rust {
     #[pyfunction]
     #[pyo3(signature = (state, evaluator, n_sims, dirichlet_alpha=0.3, dirichlet_eps=0.0,
                         fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
-                        score_scale=160.0, margin_gain=2.0, alpha=0.0))]
+                        score_scale=160.0, margin_gain=2.0, alpha=0.0,
+                        pick_floor_frac=0.0, pick_floor_min_depth=0,
+                        pick_floor_max_depth=0, pick_floor_min_visits=16))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_open_loop_search<'py>(
         py: Python<'py>,
@@ -10703,10 +10724,41 @@ mod kingdomino_rust {
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
+        pick_floor_frac: f64,
+        pick_floor_min_depth: usize,
+        pick_floor_max_depth: usize,
+        pick_floor_min_visits: i32,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
         }
+        // Wider than the BatchedMCTS bound (which stops well under 1/5 to keep
+        // policy targets meritocratic).  The advisor records no targets, so the
+        // Phase A study is free to run a near-uniform root arm; 0.25 still
+        // guarantees a group cannot be floored above an even 4-way split.
+        if !(0.0..=0.25).contains(&pick_floor_frac) {
+            return Err(PyValueError::new_err(format!(
+                "pick_floor_frac must be in [0, 0.25], got {}",
+                pick_floor_frac
+            )));
+        }
+        if pick_floor_frac > 0.0 && pick_floor_min_depth > pick_floor_max_depth {
+            return Err(PyValueError::new_err(format!(
+                "pick_floor_min_depth ({}) must be <= pick_floor_max_depth ({})",
+                pick_floor_min_depth, pick_floor_max_depth
+            )));
+        }
+        // frac == 0 => None => byte-identical to the pre-Phase-A path.
+        let pick_floor = if pick_floor_frac > 0.0 {
+            Some(super::PickFloor {
+                frac: pick_floor_frac,
+                min_depth: pick_floor_min_depth,
+                max_depth: pick_floor_max_depth,
+                min_visits: pick_floor_min_visits,
+            })
+        } else {
+            None
+        };
         let root_state = state.cloned();
         let ev: Py<PyAny> = evaluator.unbind();
         py.detach(move || {
@@ -10724,6 +10776,7 @@ mod kingdomino_rust {
                 score_scale,
                 margin_gain,
                 alpha,
+                pick_floor,
             )
         })
     }

@@ -355,6 +355,29 @@ class SearchConfig:
     policy_temperature: float = 0.10
     tie_tolerance: float = 1e-6
     uncertainty_z: float = 1.0
+    # Phase A allocation study: pick-group visit floors in the root search only.
+    # frac=0.0 disables them and the search is byte-identical to the pre-Phase-A
+    # path.  min_depth=0 includes the root (a "parent floor"); min_depth=1 floors
+    # only the opponent-reply level and below.  These affect ONLY root_Q — the
+    # forced 8-ply reference tree does not use the root search.
+    pick_floor_frac: float = 0.0
+    pick_floor_min_depth: int = 0
+    pick_floor_max_depth: int = 0
+
+
+def pick_floor_signature(
+    *, pick_floor_frac: float, pick_floor_min_depth: int, pick_floor_max_depth: int,
+) -> str:
+    """Cache/provenance tag for a root-search pick-floor config.
+
+    Module-level so callers can tag an artifact before a search exists.
+    Returns "off" when floors are disabled, so pre-Phase-A cache keys and
+    manifests read unchanged.
+    """
+    frac = float(pick_floor_frac)
+    if frac <= 0.0:
+        return "off"
+    return f"frac{frac:.6f}_d{int(pick_floor_min_depth)}-{int(pick_floor_max_depth)}"
 
 
 class DenialSearch:
@@ -370,7 +393,7 @@ class DenialSearch:
             raise ValueError("pick_plies and chance_k must be >= 1")
         self._chance_cache: dict[tuple[Any, ...], tuple[list[tuple[int, ...]], str]] = {}
         self._rust_evaluator = None
-        self._root_search_cache: dict[tuple[str, str], Any] = {}
+        self._root_search_cache: dict[tuple[str, str, str], Any] = {}
         self._node_tt: dict[tuple[Any, ...], Node] = {}
         self._node_tt_max = 250_000
 
@@ -387,6 +410,13 @@ class DenialSearch:
         digest = bytes.fromhex(public_state_key(state))
         mixed = int.from_bytes(hashlib.blake2b(digest, digest_size=8).digest(), "little")
         return (int(self.config.seed) + mixed) & 0xFFFF_FFFF_FFFF_FFFF
+
+    def _pick_floor_signature(self) -> str:
+        return pick_floor_signature(
+            pick_floor_frac=self.config.pick_floor_frac,
+            pick_floor_min_depth=self.config.pick_floor_min_depth,
+            pick_floor_max_depth=self.config.pick_floor_max_depth,
+        )
 
     def clear_root_search_cache(self) -> None:
         self._root_search_cache.clear()
@@ -410,7 +440,10 @@ class DenialSearch:
         if self.config.root_search_sims <= 0:
             return None
         state_key = public_state_key(state)
-        cache_key = (str(cache_namespace), state_key)
+        # The floor config is part of the key: two Phase A arms differ ONLY in
+        # these numbers, so a key without them would silently serve arm 1's Q
+        # values to arm 2 and produce a plausible-looking null.
+        cache_key = (str(cache_namespace), state_key, self._pick_floor_signature())
         if use_cache and cache_key in self._root_search_cache:
             self.evaluator.stats.root_search_cache_hits += 1
             return self._root_search_cache[cache_key]
@@ -434,6 +467,9 @@ class DenialSearch:
             int(self.config.root_search_sims), dirichlet_eps=0.0, cpuct=1.5,
             seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
             leaf_batch=8, alpha=self.evaluator.alpha,
+            pick_floor_frac=float(self.config.pick_floor_frac),
+            pick_floor_min_depth=int(self.config.pick_floor_min_depth),
+            pick_floor_max_depth=int(self.config.pick_floor_max_depth),
         )
         by_idx = {int(encode_action(a, state)): a for a in state.legal_actions()}
         visits: dict[int, float] = {}
