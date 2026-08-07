@@ -520,6 +520,29 @@ noise but add CPU/search work at those two transitions. `0` disables the paired
 AgeDeal sampling treatment. The current default is 32 because lower exploratory
 calibrations did not meet the action-agreement target.
 
+### `--init-checkpoint`
+
+**Default:** `""` (random initialisation). **Value:** path to a checkpoint
+
+Start a **new** run from existing weights. Ignored on resume.
+
+**This is the only way to seed a run.** Copying a checkpoint into
+`<run-dir>/checkpoints/` before launching does not work: a fresh soft-gate run
+calls `initialize_learner` and installs the result over *both* `latest.pt` and
+`current_best.pt` (`az_loop/run_controller.py:155`), destroying anything placed
+there. The legacy guard in `phase_d` that skips bootstrap when `current_best`
+exists belongs to the strict-gate path and does not protect a soft-gate run.
+
+Model dimensions must match `--d-model`, `--layers` and `--heads`, and the
+checkpoint's head set must match what the run builds, or startup raises rather
+than silently training a different network.
+
+Seeded weights are installed as UNTRAINED at iteration -1 regardless of origin,
+so the first trained learner is what gets promoted -- the seed plus one
+iteration of training. That is intended.
+
+Use `seed_run.py` to carry a Hall of Fame across at the same time.
+
 ### `--value-bootstrap`
 
 **Default:** `0.0` (historical hard label). **Value:** float in [0, 1)

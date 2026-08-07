@@ -233,10 +233,29 @@ class SevenWondersDuelLifecycleAdapter:
         self._pending_game_stats: tuple[int, _GameSpecificCollector] | None = None
 
     def initialize_learner(self, *, seed: int):
+        """The network a fresh run starts from.
+
+        A fresh soft-gate run calls this and then installs the result over BOTH
+        latest.pt and current_best.pt (`run_controller._bootstrap_checkpoints`),
+        so files placed in the checkpoint directory beforehand are destroyed
+        rather than used. `--init-checkpoint` is therefore the only way to start
+        a new run from existing weights: it is honoured here, before the
+        overwrite, instead of hoping the controller notices what is on disk.
+
+        The result is still marked UNTRAINED at iteration -1 whatever its
+        origin, which is correct: the first trained learner is what gets
+        promoted, and that will be the seeded weights plus one iteration.
+        """
+
         loop = self.loop
         path = loop.checkpoint_dir / "_bootstrap_init.pt"
-        torch.manual_seed(seed)
-        model = loop._new_model()
+        source = getattr(loop.config, "init_checkpoint", "")
+        if source:
+            model = loop.load_model(source)
+            print(f"init: learner seeded from {source}")
+        else:
+            torch.manual_seed(seed)
+            model = loop._new_model()
         checkpoint = make_checkpoint(
             model,
             {

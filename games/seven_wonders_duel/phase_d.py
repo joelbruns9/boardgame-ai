@@ -436,6 +436,7 @@ class PhaseDConfig:
     anchor_every_iterations: int = 0
     selfplay_generator_mode: str = "strict_gate"
     bootstrap_policy: str = "gate"
+    init_checkpoint: str = ""
     promotion_every: int = 4
     revert_reset_after: int = 0
     probation_reset_after: int = 0
@@ -2161,10 +2162,20 @@ class PhaseDLoop:
         selection = self.window_selection(iteration)
         if selection is None:
             return self.config.replay_window
-        if selection.iterations:
-            return len(selection.iterations)
         target = self.config.growing_window().games(self.training_clock(iteration))
-        return max(1, target // max(1, self.config.games_per_iteration))
+        target_iterations = max(1, target // max(1, self.config.games_per_iteration))
+        # The TARGET, not the realised count. Early in a run the ledger holds
+        # only a handful of the run's own iterations, so `len(selection)` is
+        # tiny -- and using it here throttles the warm buffer to match a history
+        # that does not exist yet, which is the one thing a warm buffer is for.
+        # cloud3 loaded 21,000 warm games and trained iteration 0 on 2,000;
+        # cloud4 loaded 40,000 and trained on 2,000, at 3.16 passes. Taking the
+        # larger of the two keeps the steady-state behaviour identical, since
+        # the realised count reaches the target once the run has generated
+        # enough of its own iterations.
+        if selection.iterations:
+            return max(len(selection.iterations), target_iterations)
+        return target_iterations
 
     def schedule_state(self, iteration: int) -> dict[str, Any]:
         """Every schedule's value and realised effect, for the stats row (W1.5).
@@ -4737,6 +4748,17 @@ def build_parser() -> argparse.ArgumentParser:
         "cumulative rolling learner with promotion protection",
     )
     parser.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="start a NEW run from these weights instead of a random "
+        "initialisation. Required to seed a run: a fresh soft-gate run installs "
+        "its freshly initialised learner over both latest.pt and "
+        "current_best.pt, so copying checkpoints into the run directory "
+        "beforehand does not work -- they are overwritten before iteration 0. "
+        "Model dimensions must match --d-model/--layers/--heads. Ignored on "
+        "resume, which reads the run's own checkpoints.",
+    )
+    parser.add_argument(
         "--bootstrap-policy",
         choices=tuple(policy.value for policy in BootstrapPolicy),
         default="gate",
@@ -5042,6 +5064,7 @@ def main(argv=None) -> int:
         anchor_every_iterations=args.anchor_every_iterations,
         selfplay_generator_mode=args.selfplay_generator_mode,
         bootstrap_policy=args.bootstrap_policy,
+        init_checkpoint=args.init_checkpoint,
         promotion_every=args.promotion_every,
         revert_reset_after=args.revert_reset_after,
         probation_reset_after=args.probation_reset_after,
