@@ -192,7 +192,8 @@ class SelfPlayConfig:
     # value and chosen move are exact in every mode):
     #   "exact"       — every child solved full-window (historical; ~11x the
     #                   work of a value-only solve on the real fallback tail);
-    #   "soft_clamp"  — children within exact_clamp_delta raw points of the
+    #   "soft_clamp"  — children within exact_clamp_delta solver-utility points
+    #                   (raw margin except at official score tiebreaks) of the
     #                   best are exact, the rest only PROVEN >= delta worse and
     #                   recorded at the clamp value (label error one-sided and
     #                   bounded);
@@ -248,7 +249,9 @@ class SelfPlayConfig:
     promotion_games: int = 384
     promotion_sims: int = 100
     soft_gate_revert_win_rate: float = 0.48
-    promotion_min_win_rate: float = 0.55
+    # Compatibility knob for old manifests. Zero disables the raw point-estimate
+    # floor; the fixed-N, seat-pair Wilson LCB is the promotion authority.
+    promotion_min_win_rate: float = 0.0
     promotion_min_lcb: float = 0.50
     promotion_confidence_z: float = 1.96
     promotion_seed: int = 20260630
@@ -1732,15 +1735,10 @@ def play_selfplay_game_rust(
     s0, s1 = rs.scores()
     z0 = math.tanh((s0 - s1) / 30.0)   # = compute_target_z(player=0), sigma=30
     own0, opp0 = float(s0), float(s1)
-    # LIMITATION: RustGameState does not expose tiebreaker data (largest
-    # territory, total crowns). Score ties fall through to draw (win_target=0.5).
-    # The Python path (play_selfplay_game) correctly routes through determine_winner.
-    if s0 > s1:
-        win0 = 1.0
-    elif s1 > s0:
-        win0 = 0.0
-    else:
-        win0 = 0.5  # score tie → call it a draw (cascade unavailable)
+    # SearchEngine exposes Rust's official score -> largest territory -> crowns
+    # cascade. Keep the serial Rust path aligned with Python and BatchedMCTS.
+    outcome0 = int(kingdomino_rust.SearchEngine(rs).official_outcome())
+    win0 = 1.0 if outcome0 > 0 else (0.0 if outcome0 < 0 else 0.5)
     examples = []
     for (mb, ob, flat, pidx, pval, lidx, actor) in records:
         if actor == 0:
@@ -1761,9 +1759,8 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
     """Convert BatchedMCTS's sparse training tuple to the existing buffer type.
 
     Phase 3R: the tuple is now 10 elements — the Rust engine fills own_score,
-    opp_score, win_target at game end (score-only win; no tiebreaker cascade in
-    Rust, matching play_selfplay_game_rust's documented limitation).  The Rust
-    tuple carries no iteration field, so the caller passes it in.
+    opp_score, and the official-cascade win_target at game end. The Rust tuple
+    carries no iteration field, so the caller passes it in.
     """
     if len(tup) == 12:
         # Current format: root_stats + trailing actor (0/1). The actor is only
@@ -4513,7 +4510,11 @@ if __name__ == "__main__":
     p.add_argument("--soft_gate_revert_win_rate", type=float, default=0.48,
                    help="with soft_gate, revert generator to current_best when "
                         "latest scores below this raw win rate")
-    p.add_argument("--promotion_min_win_rate", type=float, default=0.55)
+    p.add_argument(
+        "--promotion_min_win_rate", type=float, default=0.0,
+        help=("Deprecated compatibility floor; 0 disables it so the fixed-N "
+              "seat-pair Wilson LCB is authoritative."),
+    )
     p.add_argument("--promotion_min_lcb", type=float, default=0.50)
     p.add_argument("--promotion_confidence_z", type=float, default=1.96)
     p.add_argument("--promotion_seed", type=int, default=20260630)
@@ -4700,7 +4701,7 @@ if __name__ == "__main__":
                         "historical full-window per child. Root value and chosen "
                         "move are exact in every mode.")
     p.add_argument("--exact_clamp_delta", type=float, default=10.0,
-                   help="soft_clamp threshold in raw margin points: children "
+                   help="soft_clamp threshold in solver-utility points: children "
                         "proven at least this far below the best child are "
                         "recorded at the clamp value instead of solved exactly.")
     p.add_argument("--exact_fallback_positions", default="",

@@ -36,6 +36,7 @@ import itertools
 import json
 import math
 import random
+import struct
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -94,6 +95,170 @@ def chance_rows(
         return list(itertools.combinations(bag, drew)), "enumerated"
     rng = random.Random(_stable_seed(seed, bag, drew))
     return [tuple(sorted(rng.sample(bag, drew))) for _ in range(k)], "sampled"
+
+
+@dataclass(frozen=True)
+class ChancePanel:
+    """Fixed-support chance outcomes for one public pre-reveal bag.
+
+    ``cycle_ids`` identify dependent rows produced by the same shuffled
+    permutation. IID and exact-enumeration rows each receive their own cluster.
+    This keeps chance probabilities separate from downstream search visits and
+    gives the contingency probe the correct uncertainty unit.
+    """
+
+    rows: tuple[tuple[int, ...], ...]
+    cycle_ids: tuple[int, ...]
+    mode: str
+    tile_exposure: Optional[int] = None
+
+
+def tile_balanced_chance_panel(
+    remaining_bag: Sequence[int],
+    exposure: int,
+    *,
+    seed: int,
+    drew: int = 4,
+) -> ChancePanel:
+    """Partition ``exposure`` shuffled bags into uniformly marginal rows.
+
+    Each permutation cycle contributes ``len(bag) / drew`` rows and contains
+    every public-bag tile exactly once. Therefore every tile appears exactly
+    ``exposure`` times in the complete panel. Rows are equally weighted; rows
+    within a cycle are dependent and share a ``cycle_id``.
+    """
+    if exposure < 1:
+        raise ValueError(f"exposure must be >= 1, got {exposure}")
+    if drew < 1:
+        raise ValueError(f"drew must be >= 1, got {drew}")
+    bag = tuple(sorted(int(x) for x in remaining_bag))
+    if len(bag) % drew != 0:
+        raise ValueError(
+            f"pre-reveal bag size must be divisible by {drew}, got {len(bag)}"
+        )
+    if not bag:
+        return ChancePanel((), (), "balanced", int(exposure))
+
+    rng = random.Random(_stable_seed(seed, bag, drew))
+    rows: list[tuple[int, ...]] = []
+    cycle_ids: list[int] = []
+    for cycle in range(int(exposure)):
+        permutation = list(bag)
+        rng.shuffle(permutation)
+        for start in range(0, len(permutation), drew):
+            rows.append(tuple(sorted(permutation[start:start + drew])))
+            cycle_ids.append(cycle)
+    return ChancePanel(tuple(rows), tuple(cycle_ids), "balanced", int(exposure))
+
+
+def chance_panel(
+    remaining_bag: Sequence[int],
+    *,
+    sampling: str,
+    seed: int,
+    k: int,
+    exposure: int,
+    drew: int = 4,
+) -> ChancePanel:
+    """Construct an IID/enumerated or tile-balanced fixed-support panel."""
+    if sampling == "balanced":
+        return tile_balanced_chance_panel(
+            remaining_bag, exposure, seed=seed, drew=drew)
+    if sampling == "iid_exposure":
+        if len(remaining_bag) % drew != 0:
+            raise ValueError(
+                f"pre-reveal bag size must be divisible by {drew}, "
+                f"got {len(remaining_bag)}"
+            )
+        k = len(remaining_bag) * int(exposure) // drew
+    elif sampling != "iid":
+        raise ValueError(
+            "chance sampling must be 'iid', 'iid_exposure', or 'balanced', "
+            f"got {sampling!r}"
+        )
+    rows, mode = chance_rows(remaining_bag, k, seed=seed, drew=drew)
+    return ChancePanel(tuple(rows), tuple(range(len(rows))), mode, None)
+
+
+def _clustered_mean_stderr(
+    values: Sequence[float], cluster_ids: Sequence[int],
+) -> Optional[float]:
+    """Standard error of an equal-cycle mean, clustering dependent rows."""
+    if len(values) != len(cluster_ids):
+        raise ValueError("values and cluster_ids must have equal length")
+    by_cluster: dict[int, list[float]] = {}
+    for value, cluster in zip(values, cluster_ids):
+        by_cluster.setdefault(int(cluster), []).append(float(value))
+    means = [statistics.fmean(rows) for rows in by_cluster.values()]
+    if len(means) < 2:
+        return None
+    return float(statistics.stdev(means) / math.sqrt(len(means)))
+
+
+def contingency_values(
+    row_action_values_p0: Sequence[dict[int, float]],
+    *,
+    actor: int,
+    weights: Optional[Sequence[float]] = None,
+    cluster_ids: Optional[Sequence[int]] = None,
+) -> dict[str, Any]:
+    """Compare reveal-adaptive choice with one action aliased across rows.
+
+    Action identifiers must have the same meaning in every row (for example a
+    slot-relative pick rank or a full joint codec index). Only actions legal in
+    every sampled observation are eligible for the aliased choice. Returned
+    values and gaps are in the acting player's frame.
+    """
+    if actor not in (0, 1):
+        raise ValueError(f"actor must be 0 or 1, got {actor}")
+    if not row_action_values_p0 or any(not row for row in row_action_values_p0):
+        return {"status": "insufficient_actions"}
+    n_rows = len(row_action_values_p0)
+    if weights is None:
+        norm_weights = [1.0 / n_rows] * n_rows
+    else:
+        if len(weights) != n_rows or any(float(w) < 0.0 for w in weights):
+            raise ValueError("weights must be non-negative and aligned with rows")
+        total = math.fsum(float(w) for w in weights)
+        if total <= 0.0:
+            raise ValueError("weights must have positive total mass")
+        norm_weights = [float(w) / total for w in weights]
+    common = set(row_action_values_p0[0])
+    for row in row_action_values_p0[1:]:
+        common.intersection_update(row)
+    if not common:
+        return {"status": "no_common_action"}
+
+    sign = 1.0 if actor == 0 else -1.0
+    adaptive_by_row = [max(sign * float(v) for v in row.values())
+                       for row in row_action_values_p0]
+    aliased_by_action = {
+        int(action): math.fsum(
+            weight * sign * float(row[action])
+            for row, weight in zip(row_action_values_p0, norm_weights)
+        )
+        for action in sorted(common)
+    }
+    aliased_action = max(aliased_by_action, key=lambda a: (aliased_by_action[a], -a))
+    aliased_by_row = [sign * float(row[aliased_action]) for row in row_action_values_p0]
+    adaptive = math.fsum(w * v for w, v in zip(norm_weights, adaptive_by_row))
+    aliased = math.fsum(w * v for w, v in zip(norm_weights, aliased_by_row))
+    regret_by_row = [a - b for a, b in zip(adaptive_by_row, aliased_by_row)]
+    clusters = list(range(n_rows)) if cluster_ids is None else list(cluster_ids)
+    return {
+        "status": "ok",
+        "rows": n_rows,
+        "common_actions": len(common),
+        "adaptive_value_actor": float(adaptive),
+        "aliased_value_actor": float(aliased),
+        "contingency_gap_actor": float(adaptive - aliased),
+        "contingency_gap_stderr": _clustered_mean_stderr(regret_by_row, clusters),
+        "aliased_action": int(aliased_action),
+        "adaptive_actions": [
+            int(max(row, key=lambda a: (sign * float(row[a]), -int(a))))
+            for row in row_action_values_p0
+        ],
+    }
 
 
 def denial_policy_target(
@@ -192,6 +357,64 @@ def public_state_key(state: GameState) -> str:
         cached = _public_state_key_uncached(state)
         setattr(state, "_denial_public_state_key", cached)
     return str(cached)
+
+
+CHANCE_PUBLIC_STATE_KEY_VERSION = 1
+
+
+def chance_public_state_key_v1(state: GameState) -> bytes:
+    """Canonical cross-language public-state identity for chance-correct search.
+
+    Unlike the legacy denial-search digest, this key deliberately excludes the
+    Python-only ``Board.domino_id`` display/history array.  Future legality,
+    scoring, network inference, and the Rust engine depend on terrain and crowns,
+    not on which historical domino supplied an occupied cell.  The byte layout is
+    versioned and mirrored by ``RustGameState.chance_public_state_key_v1``.
+
+    Hidden deck *membership* is public and included in sorted order.  Hidden deck
+    order is not public and therefore cannot affect these bytes.
+    """
+    out = bytearray(b"KD-PUBLIC\x01")
+
+    def u8(value: int) -> None:
+        if not 0 <= int(value) <= 0xFF:
+            raise ValueError(f"public-state u8 field out of range: {value}")
+        out.append(int(value))
+
+    def u16(value: int) -> None:
+        if not 0 <= int(value) <= 0xFFFF:
+            raise ValueError(f"public-state u16 field out of range: {value}")
+        out.extend(struct.pack("<H", int(value)))
+
+    def sequence(values: Sequence[int], *, sort: bool = False) -> None:
+        items = [int(value) for value in values]
+        if sort:
+            items.sort()
+        u8(len(items))
+        for value in items:
+            u16(value)
+
+    def claims(values: Sequence[Any]) -> None:
+        u8(len(values))
+        for claim in values:
+            u8(int(claim.player))
+            u16(int(claim.domino_id))
+
+    u8(int(state.phase))
+    u8(int(state.actor_index))
+    u8(int(state.initial_pick_count))
+    u8(int(state.start_player))
+    u8(bool(state.config.harmony))
+    u8(bool(state.config.middle_kingdom))
+    out.extend(struct.pack("<II", int(state.discards[0]), int(state.discards[1])))
+    sequence(state.deck, sort=True)
+    sequence(state.current_row, sort=True)
+    claims(state.pending_claims)
+    claims(state.next_claims)
+    for board in state.boards:
+        out.extend(np.asarray(board.terrain, dtype=np.uint8).tobytes(order="C"))
+        out.extend(np.asarray(board.crowns, dtype=np.uint8).tobytes(order="C"))
+    return bytes(out)
 
 
 def _replace_draw(child: GameState, pre_deal_bag: Sequence[int], row: Sequence[int]) -> GameState:
@@ -330,6 +553,7 @@ class Edge:
     action_record: dict[str, Any]
     children: list[tuple["Node", float]]
     chance_mode: Optional[str] = None
+    chance_cycle_ids: Optional[list[int]] = None
     value: float = 0.0
     stderr: float = 0.0
 
@@ -349,9 +573,18 @@ class Node:
 class SearchConfig:
     pick_plies: int = 8
     chance_k: int = 8
+    chance_sampling: str = "iid"
+    chance_exposure: int = 1
+    contingency_audit: bool = False
     seed: int = 0
     placement_top_k: int = 2
     root_search_sims: int = 128
+    # A1: opt-in production-shaped one-reveal split inside the Rust root search.
+    # Zero preserves the incumbent stateless open-loop tree exactly. Small bags
+    # are exhaustive when C(n,4) <= root_chance_enum_max_rows; larger bags use
+    # this many tile-balanced permutation cycles.
+    root_chance_exposure: int = 0
+    root_chance_enum_max_rows: int = 70
     policy_temperature: float = 0.10
     tie_tolerance: float = 1e-6
     uncertainty_z: float = 1.0
@@ -391,19 +624,38 @@ class DenialSearch:
         self.config = config or SearchConfig()
         if self.config.pick_plies < 1 or self.config.chance_k < 1:
             raise ValueError("pick_plies and chance_k must be >= 1")
-        self._chance_cache: dict[tuple[Any, ...], tuple[list[tuple[int, ...]], str]] = {}
+        if self.config.chance_sampling not in ("iid", "iid_exposure", "balanced"):
+            raise ValueError(
+                "chance_sampling must be 'iid', 'iid_exposure', or 'balanced'"
+            )
+        if self.config.chance_exposure < 1:
+            raise ValueError("chance_exposure must be >= 1")
+        if self.config.root_chance_exposure < 0:
+            raise ValueError("root_chance_exposure must be >= 0")
+        if (self.config.root_chance_exposure > 0
+                and self.config.root_chance_enum_max_rows < 1):
+            raise ValueError("root_chance_enum_max_rows must be >= 1 when A1 is enabled")
+        self._chance_cache: dict[tuple[Any, ...], ChancePanel] = {}
         self._rust_evaluator = None
         self._root_search_cache: dict[tuple[str, str, str], Any] = {}
         self._node_tt: dict[tuple[Any, ...], Node] = {}
         self._node_tt_max = 250_000
 
-    def _chance_rows(self, bag: Sequence[int]) -> tuple[list[tuple[int, ...]], str]:
+    def _chance_panel(self, bag: Sequence[int]) -> ChancePanel:
         key = (tuple(sorted(int(x) for x in bag)), int(self.config.chance_k),
+               str(self.config.chance_sampling), int(self.config.chance_exposure),
                int(self.config.seed), 4)
         if key not in self._chance_cache:
-            self._chance_cache[key] = chance_rows(
-                bag, self.config.chance_k, seed=self.config.seed, drew=4)
+            self._chance_cache[key] = chance_panel(
+                bag, sampling=self.config.chance_sampling,
+                k=self.config.chance_k, exposure=self.config.chance_exposure,
+                seed=self.config.seed, drew=4)
         return self._chance_cache[key]
+
+    def _chance_rows(self, bag: Sequence[int]) -> tuple[list[tuple[int, ...]], str]:
+        """Compatibility view used by the Rust forced-tree probe."""
+        panel = self._chance_panel(bag)
+        return list(panel.rows), panel.mode
 
     def _root_seed(self, state: GameState) -> int:
         """Call-order-independent seed derived from the public root and base."""
@@ -443,7 +695,14 @@ class DenialSearch:
         # The floor config is part of the key: two Phase A arms differ ONLY in
         # these numbers, so a key without them would silently serve arm 1's Q
         # values to arm 2 and produce a plausible-looking null.
-        cache_key = (str(cache_namespace), state_key, self._pick_floor_signature())
+        chance_signature = (
+            f"a1-x{int(self.config.root_chance_exposure)}"
+            f"-e{int(self.config.root_chance_enum_max_rows)}"
+        )
+        cache_key = (
+            str(cache_namespace), state_key,
+            f"{self._pick_floor_signature()}:{chance_signature}",
+        )
         if use_cache and cache_key in self._root_search_cache:
             self.evaluator.stats.root_search_cache_hits += 1
             return self._root_search_cache[cache_key]
@@ -470,6 +729,8 @@ class DenialSearch:
             pick_floor_frac=float(self.config.pick_floor_frac),
             pick_floor_min_depth=int(self.config.pick_floor_min_depth),
             pick_floor_max_depth=int(self.config.pick_floor_max_depth),
+            chance_exposure=int(self.config.root_chance_exposure),
+            chance_enum_max_rows=int(self.config.root_chance_enum_max_rows),
         )
         by_idx = {int(encode_action(a, state)): a for a in state.legal_actions()}
         visits: dict[int, float] = {}
@@ -521,7 +782,8 @@ class DenialSearch:
     def _node_key(self, state: GameState, depth: int, crossings: int, root_actor: int):
         return (public_state_key(state), int(depth), int(crossings), int(root_actor),
                 int(self.config.pick_plies), int(self.config.placement_top_k),
-                int(self.config.chance_k), int(self.config.seed))
+                int(self.config.chance_k), str(self.config.chance_sampling),
+                int(self.config.chance_exposure), int(self.config.seed))
 
     def _get_node(self, state: GameState, depth: int, crossings: int,
                   root_actor: int) -> Node:
@@ -571,6 +833,7 @@ class DenialSearch:
                         dealt = len(state.deck) - len(child.deck) == 4
                         children: list[tuple[Node, float]] = []
                         mode: Optional[str] = None
+                        cycle_ids: Optional[list[int]] = None
                         if dealt and next_depth >= self.config.pick_plies:
                             leaf_state = _as_pre_reveal_leaf(child, state.deck)
                             target = self._get_node(leaf_state, next_depth, node.chance_crossings,
@@ -580,8 +843,10 @@ class DenialSearch:
                         elif dealt:
                             if node.chance_crossings >= 1:
                                 raise RuntimeError("8-ply denial search attempted a second interior chance node")
-                            rows, mode = self._chance_rows(state.deck)
-                            chance_modes[mode] += 1
+                            panel = self._chance_panel(state.deck)
+                            rows, mode = list(panel.rows), panel.mode
+                            cycle_ids = list(panel.cycle_ids)
+                            chance_modes[mode] = chance_modes.get(mode, 0) + 1
                             weight = 1.0 / max(1, len(rows))
                             for row in rows:
                                 drawn = _replace_draw(child, state.deck, row)
@@ -593,7 +858,8 @@ class DenialSearch:
                                                     int(root.state.current_actor))
                             children = [(target, 1.0)]
                         node.edges.append(Edge(
-                            int(pick), action, action_json(state, action), children, mode))
+                            int(pick), action, action_json(state, action), children,
+                            chance_mode=mode, chance_cycle_ids=cycle_ids))
                         for target, _weight in children:
                             bucket = levels.setdefault(next_depth, [])
                             keys = seen_level.setdefault(next_depth, set())
@@ -628,8 +894,12 @@ class DenialSearch:
                 edge.value = float(np.dot(child_values, weights))
                 propagated_var = sum((float(w) * float(c.stderr)) ** 2 for c, w in edge.children)
                 sample_var = 0.0
-                if edge.chance_mode == "sampled" and len(child_values) > 1:
-                    sample_var = float(np.var(child_values, ddof=1) / len(child_values))
+                if edge.chance_mode in ("sampled", "balanced") and len(child_values) > 1:
+                    clusters = (edge.chance_cycle_ids if edge.chance_cycle_ids is not None
+                                else list(range(len(child_values))))
+                    sample_stderr = _clustered_mean_stderr(child_values, clusters)
+                    if sample_stderr is not None:
+                        sample_var = sample_stderr * sample_stderr
                 edge.stderr = math.sqrt(max(0.0, propagated_var + sample_var))
                 by_pick.setdefault(edge.pick, []).append(edge)
             actor = int(node.state.current_actor)
@@ -640,6 +910,171 @@ class DenialSearch:
             choose = max if actor == 0 else min
             selected = choose(pick_edges, key=lambda e: e.value)
             node.value, node.stderr = selected.value, selected.stderr
+
+    @staticmethod
+    def _revealed_action_maps(node: Node) -> tuple[dict[int, float], dict[int, float]]:
+        """Return full-joint and pick-rank action values at one revealed row."""
+        actor = int(node.state.current_actor)
+        joint: dict[int, float] = {}
+        by_rank: dict[int, list[float]] = {}
+        for edge in node.edges:
+            action_idx = int(edge.action_record["action_idx"])
+            joint[action_idx] = float(edge.value)
+            by_rank.setdefault(action_idx % 5, []).append(float(edge.value))
+        choose = max if actor == 0 else min
+        pick_rank = {rank: float(choose(values)) for rank, values in by_rank.items()}
+        return joint, pick_rank
+
+    def _contingency_audit(self, nodes: Sequence[Node], root: Node) -> dict[str, Any]:
+        """Back up one-reveal adaptive and action-aliased counterfactuals.
+
+        The ordinary graph value is the adaptive quantity: each revealed public
+        node chooses its own best action. The counterfactuals require either one
+        pick rank or one full joint codec action to be used across every row in
+        the panel, then propagate that constrained value back to the root.
+        """
+        node_alt: dict[str, dict[tuple[Any, ...], float]] = {
+            "pick_rank": {}, "joint_action": {},
+        }
+        edge_alt: dict[str, dict[tuple[tuple[Any, ...], int], float]] = {
+            "pick_rank": {}, "joint_action": {},
+        }
+        events: list[dict[str, Any]] = []
+
+        for node in sorted(nodes, key=lambda item: item.depth, reverse=True):
+            if not node.edges:
+                value = float(node.value)
+                node_alt["pick_rank"][node.key] = value
+                node_alt["joint_action"][node.key] = value
+                continue
+            for edge_index, edge in enumerate(node.edges):
+                edge_key = (node.key, edge_index)
+                if edge.chance_mode is None:
+                    for arm in node_alt:
+                        edge_alt[arm][edge_key] = math.fsum(
+                            float(weight) * node_alt[arm][child.key]
+                            for child, weight in edge.children
+                        )
+                    continue
+
+                weights = [float(weight) for _child, weight in edge.children]
+                clusters = (edge.chance_cycle_ids if edge.chance_cycle_ids is not None
+                            else list(range(len(edge.children))))
+                joint_rows: list[dict[int, float]] = []
+                pick_rows: list[dict[int, float]] = []
+                revealed_actor: Optional[int] = None
+                for child, _weight in edge.children:
+                    if not child.edges or child.state.phase == Phase.GAME_OVER:
+                        continue
+                    actor = int(child.state.current_actor)
+                    if revealed_actor is None:
+                        revealed_actor = actor
+                    elif actor != revealed_actor:
+                        raise RuntimeError("chance panel changed the post-reveal actor")
+                    joint, pick = self._revealed_action_maps(child)
+                    joint_rows.append(joint)
+                    pick_rows.append(pick)
+
+                if (revealed_actor is None or len(joint_rows) != len(edge.children)
+                        or len(pick_rows) != len(edge.children)):
+                    for arm in node_alt:
+                        edge_alt[arm][edge_key] = float(edge.value)
+                    continue
+
+                pick_result = contingency_values(
+                    pick_rows, actor=revealed_actor, weights=weights,
+                    cluster_ids=clusters)
+                joint_result = contingency_values(
+                    joint_rows, actor=revealed_actor, weights=weights,
+                    cluster_ids=clusters)
+                if edge.chance_mode == "enumerated":
+                    if pick_result.get("status") == "ok":
+                        pick_result["contingency_gap_stderr"] = 0.0
+                    if joint_result.get("status") == "ok":
+                        joint_result["contingency_gap_stderr"] = 0.0
+                sign = 1.0 if revealed_actor == 0 else -1.0
+                edge_alt["pick_rank"][edge_key] = (
+                    float(edge.value) if pick_result["status"] != "ok"
+                    else sign * float(pick_result["aliased_value_actor"])
+                )
+                edge_alt["joint_action"][edge_key] = (
+                    float(edge.value) if joint_result["status"] != "ok"
+                    else sign * float(joint_result["aliased_value_actor"])
+                )
+                events.append({
+                    "parent_depth": int(node.depth),
+                    "parent_action": edge.action_record,
+                    "chance_mode": edge.chance_mode,
+                    "tile_exposure": self.config.chance_exposure
+                    if self.config.chance_sampling != "iid" else None,
+                    "rows": len(edge.children),
+                    "cycles": len(set(int(x) for x in clusters)),
+                    "revealed_actor": int(revealed_actor),
+                    "pick_rank": pick_result,
+                    "joint_action": joint_result,
+                })
+
+            actor = int(node.state.current_actor)
+            choose = max if actor == 0 else min
+            for arm in node_alt:
+                node_alt[arm][node.key] = float(choose(
+                    edge_alt[arm][(node.key, edge_index)]
+                    for edge_index in range(len(node.edges))
+                ))
+
+        root_actor = int(root.state.current_actor)
+        sign = 1.0 if root_actor == 0 else -1.0
+        per_pick: dict[int, dict[str, float]] = {}
+        for edge_index, edge in enumerate(root.edges):
+            row = per_pick.setdefault(edge.pick, {
+                "adaptive": float("-inf"),
+                "pick_rank_aliased": float("-inf"),
+                "joint_action_aliased": float("-inf"),
+            })
+            row["adaptive"] = max(row["adaptive"], sign * float(edge.value))
+            row["pick_rank_aliased"] = max(
+                row["pick_rank_aliased"],
+                sign * edge_alt["pick_rank"][(root.key, edge_index)],
+            )
+            row["joint_action_aliased"] = max(
+                row["joint_action_aliased"],
+                sign * edge_alt["joint_action"][(root.key, edge_index)],
+            )
+
+        def best_pick(field: str) -> Optional[int]:
+            if not per_pick:
+                return None
+            return int(max(per_pick, key=lambda pick: (per_pick[pick][field], -pick)))
+
+        adaptive_best = best_pick("adaptive")
+        pick_best = best_pick("pick_rank_aliased")
+        joint_best = best_pick("joint_action_aliased")
+        adaptive_value = (None if adaptive_best is None
+                          else per_pick[adaptive_best]["adaptive"])
+        return {
+            "status": "ok" if events else "no_interior_reveal",
+            "sampling": self.config.chance_sampling,
+            "tile_exposure": (self.config.chance_exposure
+                              if self.config.chance_sampling != "iid" else None),
+            "events": events,
+            "per_pick": [
+                {"pick_domino_id": None if pick == -1 else int(pick), **values}
+                for pick, values in sorted(per_pick.items())
+            ],
+            "adaptive_best_pick": None if adaptive_best == -1 else adaptive_best,
+            "pick_rank_aliased_best_pick": None if pick_best == -1 else pick_best,
+            "joint_action_aliased_best_pick": None if joint_best == -1 else joint_best,
+            "pick_rank_root_changed": pick_best != adaptive_best,
+            "joint_action_root_changed": joint_best != adaptive_best,
+            "pick_rank_adaptive_regret": (
+                None if adaptive_value is None or pick_best is None else
+                float(adaptive_value - per_pick[pick_best]["adaptive"])
+            ),
+            "joint_action_adaptive_regret": (
+                None if adaptive_value is None or joint_best is None else
+                float(adaptive_value - per_pick[joint_best]["adaptive"])
+            ),
+        }
 
     def search_position(self, state: GameState, *, root_result=None) -> dict[str, Any]:
         started = time.perf_counter()
@@ -670,6 +1105,10 @@ class DenialSearch:
             nodes, structure = self._expand(root, root_candidates)
             self._backup(nodes, root)
             structure["tt_root_reuse"] = False
+        contingency_audit = (
+            self._contingency_audit(nodes, root)
+            if self.config.contingency_audit else None
+        )
 
         root_edges: dict[int, Edge] = {}
         for edge in root.edges:
@@ -719,6 +1158,8 @@ class DenialSearch:
             "structure": structure,
             "provenance": self._provenance(structure, time.perf_counter() - started),
         }
+        if contingency_audit is not None:
+            output["contingency_audit"] = contingency_audit
         return output
 
     def extract_reply_labels(
@@ -1108,9 +1549,14 @@ class DenialSearch:
         if built_reps != wanted_reps:
             old = self.config
             self.config = SearchConfig(
-                pick_plies=4, chance_k=old.chance_k, seed=old.seed,
+                pick_plies=4, chance_k=old.chance_k,
+                chance_sampling=old.chance_sampling,
+                chance_exposure=old.chance_exposure,
+                contingency_audit=old.contingency_audit, seed=old.seed,
                 placement_top_k=old.placement_top_k,
                 root_search_sims=old.root_search_sims,
+                root_chance_exposure=old.root_chance_exposure,
+                root_chance_enum_max_rows=old.root_chance_enum_max_rows,
                 policy_temperature=old.policy_temperature,
                 tie_tolerance=old.tie_tolerance,
                 uncertainty_z=old.uncertainty_z,
@@ -1225,7 +1671,31 @@ class DenialSearch:
         provenance["pick_plies"] = 4
         headline_value = root_edges[headline_pick][0]
         headline_actor_value = headline_value if root_actor == 0 else -headline_value
-        return {
+        best_pick = picks[best_i]
+        contingency_audit = {
+            "status": "no_interior_reveal",
+            "sampling": self.config.chance_sampling,
+            "tile_exposure": (self.config.chance_exposure
+                              if self.config.chance_sampling != "iid" else None),
+            "events": [],
+            "per_pick": [
+                {
+                    "pick_domino_id": None if pick == -1 else int(pick),
+                    "adaptive": float(actor_value),
+                    "pick_rank_aliased": float(actor_value),
+                    "joint_action_aliased": float(actor_value),
+                }
+                for pick, actor_value in zip(picks, actor_values)
+            ],
+            "adaptive_best_pick": None if best_pick == -1 else int(best_pick),
+            "pick_rank_aliased_best_pick": None if best_pick == -1 else int(best_pick),
+            "joint_action_aliased_best_pick": None if best_pick == -1 else int(best_pick),
+            "pick_rank_root_changed": False,
+            "joint_action_root_changed": False,
+            "pick_rank_adaptive_regret": 0.0,
+            "joint_action_adaptive_regret": 0.0,
+        }
+        output = {
             "status": "ok",
             "state_key": public_state_key(state),
             "actor": root_actor,
@@ -1241,6 +1711,9 @@ class DenialSearch:
             "structure": structure,
             "provenance": provenance,
         }
+        if self.config.contingency_audit:
+            output["contingency_audit"] = contingency_audit
+        return output
 
     @staticmethod
     def _reachable(root: Node):
@@ -1253,7 +1726,7 @@ class DenialSearch:
             stack.extend(c for e in node.edges for c, _w in e.children)
 
     def _provenance(self, structure: dict[str, Any], elapsed: float) -> dict[str, Any]:
-        return {
+        provenance = {
             "engine": "offline-pick-denial-expectiminimax-v1",
             "checkpoint_path": self.checkpoint_path,
             "checkpoint_sha256": self.checkpoint_sha256,
@@ -1274,6 +1747,19 @@ class DenialSearch:
             "completed_structure": bool(structure.get("completed", False)),
             "elapsed_seconds": float(elapsed),
         }
+        if self.config.chance_sampling in ("balanced", "iid_exposure"):
+            provenance.update({
+                "chance_sampling": self.config.chance_sampling,
+                "chance_exposure": int(self.config.chance_exposure),
+                "chance_handling": (
+                    "X shuffled-bag cycles; every tile appears exactly X times"
+                    if self.config.chance_sampling == "balanced" else
+                    "IID rows with per-position K = len(public_bag)*X/4"
+                ),
+            })
+        if self.config.contingency_audit:
+            provenance["contingency_audit_version"] = "one-reveal-adaptive-vs-aliased-v1"
+        return provenance
 
 
 def load_checkpoint_network(path: str | Path, device: str):
@@ -1438,13 +1924,26 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         margin_gain=float(checkpoint_cfg.get("margin_gain", 2.0)),
         alpha=float(checkpoint_cfg.get("alpha", 0.5)))
     config = SearchConfig(
-        pick_plies=8, chance_k=args.chance_k, seed=args.seed,
+        pick_plies=8, chance_k=args.chance_k,
+        chance_sampling=args.chance_sampling,
+        chance_exposure=args.chance_exposure,
+        contingency_audit=args.contingency_audit, seed=args.seed,
         placement_top_k=2, root_search_sims=args.search_sims,
+        root_chance_exposure=args.root_chance_exposure,
+        root_chance_enum_max_rows=args.root_chance_enum_max_rows,
         policy_temperature=args.policy_temperature)
     search = DenialSearch(evaluator, checkpoint_path=str(checkpoint), config=config)
-    positions = generate_az_midgame_positions(
-        search, count=args.positions, seed=args.seed,
-        min_deck=args.min_deck, max_deck=args.max_deck)
+    if args.positions_path:
+        from games.kingdomino.denial_signal_sweep import load_frozen_positions
+        positions = load_frozen_positions(args.positions_path)
+        if args.positions > 0:
+            positions = positions[:args.positions]
+        if not positions:
+            raise ValueError(f"no frozen positions loaded from {args.positions_path}")
+    else:
+        positions = generate_az_midgame_positions(
+            search, count=args.positions, seed=args.seed,
+            min_deck=args.min_deck, max_deck=args.max_deck)
 
     # The throughput timer excludes trajectory acquisition.  Reset counters at
     # the same boundary so reuse metrics describe label/ablation/advisor work,
@@ -1559,6 +2058,19 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             "interpretation": "This is an 8-ply versus identical 4-ply structural ablation. The only added public event is the shared next-round draw followed by claim-order play, so the delta cannot come only from the currently visible tile.",
         }
 
+    contingency_audits = [x.get("contingency_audit", {}) for x in ok]
+    contingency_events = [
+        event for audit in contingency_audits for event in audit.get("events", [])
+    ]
+    pick_gaps = [
+        float(event["pick_rank"]["contingency_gap_actor"])
+        for event in contingency_events if event["pick_rank"].get("status") == "ok"
+    ]
+    joint_gaps = [
+        float(event["joint_action"]["contingency_gap_actor"])
+        for event in contingency_events if event["joint_action"].get("status") == "ok"
+    ]
+
     leaf_batches = evaluator.stats.leaf_batch_sizes
     root_requests = evaluator.stats.root_search_calls + evaluator.stats.root_search_cache_hits
     invariant_gate = None
@@ -1585,7 +2097,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         if not invariant_gate["passed"]:
             raise RuntimeError(f"throughput invariant gate failed: {checks}")
     report = {
-        "schema_version": 1,
+        "schema_version": (2 if args.contingency_audit
+                           or args.chance_sampling != "iid" else 1),
         "created_at_unix": time.time(),
         "scope": "labels and validation only; no retraining or mixture construction",
         "invariant_gate": invariant_gate,
@@ -1595,6 +2108,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_config": checkpoint_cfg, "actor_frame": ACTOR_FRAME,
             "official_cascade_version": CASCADE_VERSION,
             "trajectory": "greedy current-best AZ open-loop MCTS",
+            "root_search_topology": (
+                "one_reveal_fixed_support"
+                if args.root_chance_exposure > 0 else "incumbent_open_loop"
+            ),
+            "positions_path": args.positions_path or None,
             "target_band": {"min_deck": args.min_deck, "max_deck": args.max_deck,
                             "opening_excluded": True, "exact_tail_excluded": True},
         },
@@ -1624,12 +2142,42 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         },
         "chance_and_turn_order": {
             "order_blind_sorted_bag": True, "common_random_numbers": True,
+            "sampling": args.chance_sampling,
+            "tile_exposure": (args.chance_exposure
+                              if args.chance_sampling != "iid" else None),
             "exact_rule": "C(remaining,4) <= k", "interior_chance_nodes": 1,
             "four_ply_structural_ablation": cross_chance,
             "corrected_best_changed_vs_four_ply": sum(c["best_changed"] for c in cross_chance),
             "mean_abs_value_delta_vs_four_ply": statistics.fmean(
                 abs(c["value_delta_actor"]) for c in cross_chance),
             "hand_checked_cases": hand_cases,
+            "contingency_audit": {
+                "definition": "adaptive E_R[max_y Q] minus aliased max_y E_R[Q]",
+                "positions": len(contingency_audits),
+                "events": len(contingency_events),
+                "pick_rank_gap": {
+                    "count": len(pick_gaps),
+                    "mean": statistics.fmean(pick_gaps) if pick_gaps else None,
+                    "median": _percentile(pick_gaps, 50),
+                    "p90": _percentile(pick_gaps, 90),
+                    "max": max(pick_gaps, default=None),
+                },
+                "joint_action_gap": {
+                    "count": len(joint_gaps),
+                    "mean": statistics.fmean(joint_gaps) if joint_gaps else None,
+                    "median": _percentile(joint_gaps, 50),
+                    "p90": _percentile(joint_gaps, 90),
+                    "max": max(joint_gaps, default=None),
+                },
+                "pick_rank_root_changes": sum(
+                    bool(audit.get("pick_rank_root_changed"))
+                    for audit in contingency_audits
+                ),
+                "joint_action_root_changes": sum(
+                    bool(audit.get("joint_action_root_changed"))
+                    for audit in contingency_audits
+                ),
+            },
         },
         "incremental_over_one_round": {
             "baseline": "existing games.kingdomino.web_app._draft_matrix",
@@ -1689,6 +2237,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         "four_ply_labels": pre_chance_labels,
         "one_round_labels": one_round_labels,
     }
+    if not args.contingency_audit:
+        report["chance_and_turn_order"].pop("contingency_audit", None)
+    if args.chance_sampling == "iid":
+        report["chance_and_turn_order"].pop("sampling", None)
+        report["chance_and_turn_order"].pop("tile_exposure", None)
     return report
 
 
@@ -1697,9 +2250,18 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=str(DEFAULT_CURRENT_BEST))
     parser.add_argument("--output", default="runs/kingdomino/denial_search/validation.json")
     parser.add_argument("--positions", type=int, default=50)
+    parser.add_argument("--positions-path", default="")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--search-sims", type=int, default=64)
+    parser.add_argument("--root-chance-exposure", type=int, default=0)
+    parser.add_argument("--root-chance-enum-max-rows", type=int, default=70)
     parser.add_argument("--chance-k", type=int, default=8)
+    parser.add_argument(
+        "--chance-sampling", choices=("iid", "iid_exposure", "balanced"),
+        default="iid",
+    )
+    parser.add_argument("--chance-exposure", type=int, default=1)
+    parser.add_argument("--contingency-audit", action="store_true")
     parser.add_argument("--leaf-batch-size", type=int, default=512)
     parser.add_argument("--draft-search-sims", type=int, default=50)
     parser.add_argument("--draft-budget-seconds", type=float, default=2.0)

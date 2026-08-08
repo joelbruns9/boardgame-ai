@@ -11,10 +11,13 @@ from games.kingdomino.promotion import (
     MatchStats,
     compare_fixed_suite,
     decide_promotion,
+    match_stats_from_pair,
+    pair_scores_from_games,
     promote_current_best,
     promotion_payload,
     wilson_lower_bound,
 )
+from games.kingdomino.round_robin_eval import GameResult, PairResult
 from games.kingdomino.self_play import (
     SelfPlayConfig,
     _generator_action_after_promotion_check,
@@ -95,6 +98,58 @@ def _soft_gate_smoke_config(tmp_path: Path, current_best: Path) -> SelfPlayConfi
 def test_wilson_lcb_is_conservative_for_noisy_small_samples() -> None:
     assert wilson_lower_bound(11.0, 20) < 0.50
     assert wilson_lower_bound(240.0, 400) > 0.50
+
+
+def test_match_stats_use_complete_seat_pairs_as_wilson_observations() -> None:
+    games = [
+        # Seed 10: candidate wins both orientations -> pair win.
+        GameResult(10, "candidate", "current_best", 70, 60, "candidate", 0),
+        GameResult(10, "current_best", "candidate", 60, 70, "candidate", 0),
+        # Seed 11: one win each -> pair draw.
+        GameResult(11, "candidate", "current_best", 70, 60, "candidate", 0),
+        GameResult(11, "current_best", "candidate", 70, 60, "current_best", 0),
+        # Seed 12: candidate loses both -> pair loss.
+        GameResult(12, "candidate", "current_best", 60, 70, "current_best", 0),
+        GameResult(12, "current_best", "candidate", 70, 60, "current_best", 0),
+        # Seed 13: win plus game draw -> pair win.
+        GameResult(13, "candidate", "current_best", 70, 60, "candidate", 0),
+        GameResult(13, "current_best", "candidate", 65, 65, None, 0),
+    ]
+    pair = PairResult(
+        a="candidate", b="current_best", games=8,
+        a_wins=4, b_wins=3, draws=1,
+    )
+
+    assert pair_scores_from_games(games, "candidate") == [1.0, 0.5, 0.0, 1.0]
+    stats = match_stats_from_pair(pair, games, candidate_name="candidate")
+    assert stats.games == 8
+    assert stats.win_rate == pytest.approx(4.5 / 8)
+    assert stats.pairs == 4
+    assert (stats.pair_wins, stats.pair_draws, stats.pair_losses) == (2, 1, 1)
+    assert stats.pair_score_rate == pytest.approx(2.5 / 4)
+    assert stats.lower_confidence_bound == pytest.approx(
+        wilson_lower_bound(2.5, 4)
+    )
+
+
+def test_pair_scoring_rejects_incomplete_or_unmirrored_seeds() -> None:
+    incomplete = [
+        GameResult(10, "candidate", "current_best", 70, 60, "candidate", 0),
+    ]
+    with pytest.raises(ValueError, match="expected one seat pair"):
+        pair_scores_from_games(incomplete, "candidate")
+
+
+def test_default_promotion_rule_is_pair_lcb_only() -> None:
+    fixed = FixedSuiteComparison(
+        checked=True, passed=True, tolerance=0.05,
+        reason="no fixed-suite regression",
+    )
+    match = _match_stats(0.501, 0.5001, games=1000)
+    decision = decide_promotion(match, fixed)
+    assert decision.passed
+    assert decision.min_win_rate == 0.0
+    assert any("pair LCB is authoritative" in reason for reason in decision.reasons)
 
 
 def test_promotion_requires_win_rate_lcb_and_fixed_suite() -> None:

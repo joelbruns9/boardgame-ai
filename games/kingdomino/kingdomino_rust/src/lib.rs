@@ -3117,6 +3117,60 @@ impl RustGameState {
         self.deck.clone()
     }
 
+    /// Versioned canonical public-state identity used by the chance-correct
+    /// Python/Rust parity gate. The bytes deliberately exclude hidden deck order
+    /// and Python's display-only board domino-id history. See
+    /// `denial_search.chance_public_state_key_v1` for the mirrored layout.
+    fn chance_public_state_key_v1(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1024);
+        chance_public_state_key_v1_bytes(self, &mut out);
+        out
+    }
+
+    /// Expose the production expectiminimax chance distribution for parity
+    /// tests and the forthcoming observation-split search. Rows are enumerated
+    /// exactly when C(n,4) <= enum_cap, otherwise IID sampled; all returned
+    /// weights are the actual backup probabilities.
+    #[pyo3(signature = (enum_cap=4096, chance_samples=16, seed=0))]
+    fn chance_outcomes(
+        &self,
+        enum_cap: u64,
+        chance_samples: usize,
+        seed: u64,
+    ) -> PyResult<Vec<(Vec<u16>, f64)>> {
+        if self.deck.len() < 4 || self.deck.len() % 4 != 0 {
+            return Err(PyValueError::new_err(format!(
+                "chance_outcomes requires a non-empty pre-reveal bag divisible by four, got {}",
+                self.deck.len()
+            )));
+        }
+        if enum_cap == 0 || chance_samples == 0 {
+            return Err(PyValueError::new_err(
+                "chance_outcomes requires enum_cap > 0 and chance_samples > 0",
+            ));
+        }
+        let cfg = search::SearchConfig {
+            depth: 1,
+            chance_samples,
+            enum_cap,
+            margin_weight: 0.0,
+            seed,
+        };
+        let outcomes = <Kingdomino as search::Game>::chance_children(self, (None, None), &cfg);
+        let total = outcomes.iter().map(|(_, weight)| *weight).sum::<f64>();
+        if outcomes.is_empty()
+            || outcomes
+                .iter()
+                .any(|(row, weight)| row.len() != 4 || !weight.is_finite() || *weight <= 0.0)
+            || (total - 1.0).abs() > 1e-12
+        {
+            return Err(PyValueError::new_err(
+                "chance_outcomes produced an invalid probability distribution",
+            ));
+        }
+        Ok(outcomes)
+    }
+
     /// Per-player forced-discard counts (player0, player1).
     fn discards(&self) -> (u32, u32) {
         (self.discards[0], self.discards[1])
@@ -3242,8 +3296,8 @@ impl RustGameState {
             solve_endgame_ab(self, deadline, MARGIN_LO, MARGIN_HI, mode, 0)?
         };
         let (value, solved) = match raw {
-            Some(raw_margin) => (
-                margin_to_training_value(raw_margin, score_scale, margin_gain, alpha),
+            Some(solver_utility) => (
+                solver_utility_to_training_value(solver_utility, score_scale, margin_gain, alpha),
                 true,
             ),
             None => (0.0, false),
@@ -3296,7 +3350,7 @@ impl Node {
 /// non-terminal leaf values (Fix 1).  Replaces mcts_compute_target_z (whose
 /// tanh(margin/30) scale was inconsistent with the non-terminal estimates).
 ///
-///     win_value  = +1 win / 0 draw / -1 loss   (from final scores)
+///     win_value  = +1 win / 0 draw / -1 loss   (official outcome cascade)
 ///     win_gate   = win_value^4  (= 1 for a decided game, 0 for a draw)
 ///     value      = (1 - alpha) * win_value + alpha * win_gate * margin_value
 ///
@@ -3314,23 +3368,16 @@ fn terminal_search_value(
     let own_norm = s0 as f64 / score_scale;
     let opp_norm = s1 as f64 / score_scale;
     let margin_value = ((own_norm - opp_norm) * margin_gain).tanh();
-    let win_value = if s0 > s1 {
-        1.0
-    } else if s1 > s0 {
-        -1.0
-    } else {
-        0.0
-    };
+    let win_value = state.official_outcome_i8() as f64;
     let win_gate = win_value * win_value;
     let win_gate = win_gate * win_gate; // win_value^4 (n=4 win-certainty gate)
     (1.0 - alpha) * win_value + alpha * win_gate * margin_value
 }
 
 /// Convert a raw score margin (s0 - s1, player-0 frame) into the training value.
-/// Called AFTER the alpha-beta solve — the search itself runs on raw margins for
-/// tightest pruning, and this is a monotone transform of the margin, so the
-/// minimax-optimal move is unchanged. Bit-identical to `terminal_search_value`
-/// evaluated on the same final scores (which is why values match the old solver).
+/// Kept as the score-margin formula helper and Python test export. Exact solving
+/// uses `solver_utility_to_training_value`, which additionally preserves the
+/// official tiebreak outcome at a zero raw margin.
 fn margin_to_training_value(margin: f64, score_scale: f64, margin_gain: f64, alpha: f64) -> f64 {
     let win_value = if margin > 0.0 {
         1.0
@@ -3345,9 +3392,49 @@ fn margin_to_training_value(margin: f64, score_scale: f64, margin_gain: f64, alp
     (1.0 - alpha) * win_value + alpha * win_gate * margin_value
 }
 
-/// Full-window sentinel for the raw-margin solver. Margins live in ~[-80, 80], so
-/// ±200 brackets every possible value with room to spare; callers use these as the
-/// "exact, untightened" alpha-beta bounds (replacing ±∞).
+/// Solver-only scalar that preserves the official lexicographic outcome.
+///
+/// Non-zero integer score margins retain their ordinary value. On an equal raw
+/// score, +/-0.25 orders an official tiebreak win/loss around a true draw while
+/// remaining strictly between the adjacent integer margins (-1 and +1). This
+/// lets the existing scalar alpha-beta and transposition machinery optimize the
+/// official cascade without pretending that the tiebreak is a score margin.
+const OFFICIAL_TIEBREAK_UTILITY: f64 = 0.25;
+
+fn terminal_solver_utility(state: &RustGameState) -> f64 {
+    let (s0, s1) = state.scores();
+    let margin = s0 - s1;
+    if margin != 0 {
+        margin as f64
+    } else {
+        state.official_outcome_i8() as f64 * OFFICIAL_TIEBREAK_UTILITY
+    }
+}
+
+/// Convert the solver ordering scalar back to the training value. A +/-0.25
+/// tiebreak result has a decisive official outcome but a zero raw-score margin.
+fn solver_utility_to_training_value(
+    utility: f64,
+    score_scale: f64,
+    margin_gain: f64,
+    alpha: f64,
+) -> f64 {
+    let win_value = if utility > 0.0 {
+        1.0
+    } else if utility < 0.0 {
+        -1.0
+    } else {
+        0.0
+    };
+    let raw_margin = if utility.abs() < 0.5 { 0.0 } else { utility };
+    let margin_value = (raw_margin / score_scale * margin_gain).tanh();
+    let win_gate = win_value * win_value;
+    let win_gate = win_gate * win_gate;
+    (1.0 - alpha) * win_value + alpha * win_gate * margin_value
+}
+
+/// Full-window sentinel for the solver utility. Raw margins live in ~[-80, 80]
+/// and the tie sentinels in [-0.25, 0.25], so ±200 brackets every value.
 const MARGIN_LO: f64 = -200.0;
 const MARGIN_HI: f64 = 200.0;
 
@@ -3810,11 +3897,12 @@ fn order_legal_for_solver_at_depth(
 /// count-then-solve pair it replaces, it never traverses the tree twice and
 /// prunes subtrees that cannot affect the result.
 ///
-/// Correctness of pruning: `terminal_search_value` is monotone non-decreasing in
-/// (score0 - score1), so the position value is a standard min/max over a scalar
-/// in [-1, 1]; alpha-beta applies without modification.  The max/min layers need
-/// not strictly alternate — each node is typed by `actor()` and the (alpha, beta)
-/// window stays valid through any sequence of max and min nodes.
+/// Correctness of pruning: terminal solver utility is a total ordering over the
+/// official result: integer raw margins, with -0.25/0/+0.25 representing a
+/// score-tied tiebreak loss/true draw/tiebreak win. The position value remains a
+/// standard scalar min/max, so alpha-beta applies without modification. The
+/// max/min layers need not strictly alternate — each node is typed by `actor()`
+/// and the (alpha, beta) window stays valid through any sequence of nodes.
 ///
 /// Caller guarantees `state` is a no-chance endgame state (deck ∈ {0, 4} in a
 /// turn phase, or GAME_OVER); descendants of such states are likewise no-chance,
@@ -3828,18 +3916,16 @@ fn solve_endgame_ab(
     mode: SolverOrderMode,
     depth: u32,
 ) -> PyResult<Option<f64>> {
-    // The search runs on the RAW integer score margin (s0 - s1), player-0 frame,
-    // range ~[-80, 80]. Integer margins give the widest spread and therefore the
-    // tightest alpha-beta bounds, and contain no training hyperparameters. The
-    // training value is a monotone transform applied AFTER the solve, so the
-    // minimax-optimal move is identical to the old value-space search.
+    // The search runs on a player-0-frame ordering scalar: the raw integer score
+    // margin except at score ties, where +/-0.25 encodes the official territory/
+    // crowns tiebreak around a true draw. It contains no training hyperparameters.
+    // The training value is reconstructed only AFTER the solve.
     //
     // GAME_OVER returns a value with zero further work, so resolve it before the
     // deadline check — a timed-out search should still return exact terminal leaves
     // it has already reached rather than abort on them.
     if state.phase == GAME_OVER {
-        let (s0, s1) = state.scores();
-        return Ok(Some((s0 - s1) as f64));
+        return Ok(Some(terminal_solver_utility(state)));
     }
     // Wall-clock budget (replaces the old node-count budget). Per-node
     // Instant::now() is ~5ns — negligible against the ~1μs+ of step()+ordering
@@ -3925,11 +4011,10 @@ fn solve_endgame_ab_parallel(
     deadline: std::time::Instant,
     mode: SolverOrderMode,
 ) -> PyResult<Option<f64>> {
-    // Returns the RAW score margin (s0 - s1); callers convert to the training value
-    // via `margin_to_training_value`. See `solve_endgame_ab`.
+    // Returns the official-cascade solver utility; callers convert it to the
+    // training value via `solver_utility_to_training_value`.
     if state.phase == GAME_OVER {
-        let (s0, s1) = state.scores();
-        return Ok(Some((s0 - s1) as f64));
+        return Ok(Some(terminal_solver_utility(state)));
     }
     let actor = state.actor()?;
     let mut legal = state.legal_actions_indexed();
@@ -4181,8 +4266,7 @@ fn solve_endgame_ab_tt(
     buf: &mut Vec<u8>,
 ) -> PyResult<Option<f64>> {
     if state.phase == GAME_OVER {
-        let (s0, s1) = state.scores();
-        return Ok(Some((s0 - s1) as f64));
+        return Ok(Some(terminal_solver_utility(state)));
     }
     if std::time::Instant::now() >= deadline {
         return Ok(None);
@@ -4307,8 +4391,7 @@ fn solve_endgame_ab_transpo(
 ) -> PyResult<Option<f64>> {
     if state.phase == GAME_OVER {
         stats.terminals += 1;
-        let (s0, s1) = state.scores();
-        return Ok(Some((s0 - s1) as f64));
+        return Ok(Some(terminal_solver_utility(state)));
     }
     if std::time::Instant::now() >= deadline {
         return Ok(None);
@@ -4824,6 +4907,24 @@ struct OLNode {
     children: Vec<(u16, u32)>,
     action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
     is_expanded: bool,
+    // A non-empty support makes this node the afterstate/chance node for the
+    // action stored in it.  The child identity is the revealed PUBLIC state;
+    // probabilities are fixed when the support is created and never inferred
+    // from downstream visit allocation.
+    chance_children: Vec<OLChanceChild>,
+}
+
+struct OLChanceChild {
+    public_key: Vec<u8>,
+    probability: f64,
+    node_id: u32,
+}
+
+#[derive(Clone)]
+struct OLChancePanelRow {
+    row: Vec<u16>,
+    probability: f64,
+    multiplicity: usize,
 }
 
 impl OLNode {
@@ -4835,8 +4936,174 @@ impl OLNode {
             children: Vec::new(),
             action,
             is_expanded: false,
+            chance_children: Vec::new(),
         }
     }
+}
+
+/// Player-0 value of a closed one-reveal chance support.  Each observation
+/// subtree contributes its own conditional mean, but its chance mass remains
+/// the pre-registered probability even when PUCT spends unequal work below it.
+fn ol_chance_value_p0(arena: &[OLNode], node_id: u32, unvisited_value0: f64) -> f64 {
+    let node = &arena[node_id as usize];
+    debug_assert!(!node.chance_children.is_empty());
+    node.chance_children
+        .iter()
+        .map(|outcome| {
+            let child = &arena[outcome.node_id as usize];
+            let value0 = if child.visit_count > 0 {
+                child.value_sum / child.visit_count as f64
+            } else {
+                unvisited_value0
+            };
+            outcome.probability * value0
+        })
+        .sum()
+}
+
+fn comb4(n: usize) -> u64 {
+    if n < 4 {
+        0
+    } else {
+        (n as u64 * (n - 1) as u64 * (n - 2) as u64 * (n - 3) as u64) / 24
+    }
+}
+
+/// Fixed public-row support for the A1 one-reveal probe. Small bags are
+/// exhaustive; larger bags use X shuffled permutation cycles, so every tile is
+/// exposed exactly X times. Duplicate rows across cycles are coalesced while
+/// retaining their total probability mass.
+fn ol_one_reveal_panel(
+    deck: &[u16],
+    exposure: usize,
+    enum_max_rows: u64,
+    seed: u64,
+) -> PyResult<Vec<OLChancePanelRow>> {
+    if exposure == 0 {
+        return Ok(Vec::new());
+    }
+    if deck.is_empty() {
+        // No future reveal exists. Keeping the treatment a no-op here makes the
+        // probe safe on terminal-adjacent roots that bypass the exact router.
+        return Ok(Vec::new());
+    }
+    if deck.len() < 4 || deck.len() % 4 != 0 {
+        return Err(PyValueError::new_err(format!(
+            "one-reveal support requires a non-empty bag divisible by four, got {}",
+            deck.len()
+        )));
+    }
+    let mut bag = deck.to_vec();
+    bag.sort_unstable();
+    let rows = comb4(bag.len());
+    let raw: Vec<Vec<u16>> = if rows <= enum_max_rows {
+        let mut out = Vec::with_capacity(rows as usize);
+        for i in 0..bag.len() {
+            for j in (i + 1)..bag.len() {
+                for k in (j + 1)..bag.len() {
+                    for l in (k + 1)..bag.len() {
+                        out.push(vec![bag[i], bag[j], bag[k], bag[l]]);
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity(deck.len() / 4 * exposure);
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..exposure {
+            let mut permutation = bag.clone();
+            permutation.shuffle(&mut rng);
+            for chunk in permutation.chunks_exact(4) {
+                let mut row = chunk.to_vec();
+                row.sort_unstable();
+                out.push(row);
+            }
+        }
+        out
+    };
+    let total = raw.len();
+    let mut counts: HashMap<Vec<u16>, usize> = HashMap::new();
+    for row in raw {
+        *counts.entry(row).or_insert(0) += 1;
+    }
+    let mut support: Vec<OLChancePanelRow> = counts
+        .into_iter()
+        .map(|(row, count)| OLChancePanelRow {
+            row,
+            probability: count as f64 / total as f64,
+            multiplicity: count,
+        })
+        .collect();
+    support.sort_by(|a, b| a.row.cmp(&b.row));
+    let mass: f64 = support.iter().map(|x| x.probability).sum();
+    debug_assert!((mass - 1.0).abs() < 1e-12);
+    Ok(support)
+}
+
+/// Redeterminize while pinning only the next public reveal. The row is sampled
+/// outside the action-selection path; remaining hidden order is independently
+/// shuffled and therefore stays unavailable to the tree/network.
+fn redeterminize_with_first_row(
+    state: &RustGameState,
+    row: &[u16],
+    seed: u64,
+) -> PyResult<RustGameState> {
+    if row.len() != 4 {
+        return Err(PyValueError::new_err(
+            "a Kingdomino reveal row must contain four tiles",
+        ));
+    }
+    let mut remaining = state.deck.clone();
+    for &tile in row {
+        let Some(index) = remaining.iter().position(|&candidate| candidate == tile) else {
+            return Err(PyValueError::new_err(format!(
+                "forced reveal tile {tile} is not in the public bag"
+            )));
+        };
+        remaining.swap_remove(index);
+    }
+    remaining.shuffle(&mut StdRng::seed_from_u64(seed));
+    let mut out = state.cloned();
+    out.deck = row.to_vec();
+    out.deck.extend(remaining);
+    Ok(out)
+}
+
+fn ol_materialize_chance_support(
+    arena: &mut Vec<OLNode>,
+    chance_node_id: u32,
+    pre_state: &RustGameState,
+    action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
+    panel: &[OLChancePanelRow],
+) -> PyResult<()> {
+    if !arena[chance_node_id as usize].chance_children.is_empty() {
+        return Ok(());
+    }
+    let mut children = Vec::with_capacity(panel.len());
+    for outcome in panel {
+        // Remaining order is irrelevant to the public key. Use a fixed seed so
+        // materialization cannot accidentally introduce action-dependent noise.
+        let forced = redeterminize_with_first_row(pre_state, &outcome.row, 0)?;
+        let revealed = forced.step(action.0, action.1)?;
+        let mut public_key = Vec::with_capacity(1024);
+        chance_public_state_key_v1_bytes(&revealed, &mut public_key);
+        let node_id = arena.len() as u32;
+        arena.push(OLNode::new(1.0, (None, None)));
+        children.push(OLChanceChild {
+            public_key,
+            probability: outcome.probability,
+            node_id,
+        });
+    }
+    let mass: f64 = children.iter().map(|x| x.probability).sum();
+    if children.is_empty() || (mass - 1.0).abs() > 1e-9 {
+        return Err(PyValueError::new_err(format!(
+            "one-reveal fixed support has probability mass {mass}, expected 1"
+        )));
+    }
+    arena[chance_node_id as usize].chance_children = children;
+    Ok(())
 }
 
 /// PUCT child selection for the open-loop tree.  Considers only children whose
@@ -4928,12 +5195,15 @@ fn ol_select_child(
             // the strict-`>` tie-break selects the SAME child: bit-identical.
             let cid = children[ci].1;
             let child = &arena[cid as usize];
-            let q = if child.visit_count > 0 {
-                let q0 = child.value_sum / child.visit_count as f64;
-                if actor == 0 { q0 } else { -q0 }
+            let unvisited_value0 = if actor == 0 { fpu } else { -fpu };
+            let q0 = if !child.chance_children.is_empty() {
+                ol_chance_value_p0(arena, cid, unvisited_value0)
+            } else if child.visit_count > 0 {
+                child.value_sum / child.visit_count as f64
             } else {
-                fpu
+                unvisited_value0
             };
+            let q = if actor == 0 { q0 } else { -q0 };
             let u = cpuct * child.prior * sqrt_n / (1.0 + child.visit_count as f64);
             let score = q + u;
             if score > best_score {
@@ -5019,7 +5289,7 @@ fn ol_pick_floor_group(arena: &[OLNode], node_id: u32, floor: &PickFloor) -> Opt
 }
 
 fn ol_descend(
-    arena: &[OLNode],
+    arena: &mut Vec<OLNode>,
     root_id: u32,
     mut state: RustGameState, // owned: the caller's `det` is moved in, not cloned
     fpu: f64,
@@ -5027,10 +5297,12 @@ fn ol_descend(
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
-) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState)> {
+    one_reveal_panel: Option<&[OLChancePanelRow]>,
+) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<(usize, u8)>)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
     let mut node_id = root_id;
+    let mut chance_step: Option<(usize, u8)> = None;
     // `state` is already owned (moved in); no clone needed — it is stepped in
     // place as we descend and returned as the leaf state.
     loop {
@@ -5087,14 +5359,54 @@ fn ol_descend(
         match step {
             None => break, // dead-end / missing children: re-evaluate this node as the leaf
             Some((child_id, placement, pick)) => {
+                let split_here = chance_step.is_none()
+                    && one_reveal_panel.is_some()
+                    && <Kingdomino as search::Game>::is_stochastic(&state, (placement, pick));
+                let pre_state = if split_here {
+                    Some(state.cloned())
+                } else {
+                    None
+                };
                 actors.push(actor);
                 state = state.step(placement, pick)?;
                 path.push(child_id);
                 node_id = child_id;
+                if split_here {
+                    let panel = one_reveal_panel.expect("split_here requires a chance panel");
+                    ol_materialize_chance_support(
+                        arena,
+                        child_id,
+                        pre_state
+                            .as_ref()
+                            .expect("split_here requires the pre-state"),
+                        (placement, pick),
+                        panel,
+                    )?;
+                    let mut public_key = Vec::with_capacity(1024);
+                    chance_public_state_key_v1_bytes(&state, &mut public_key);
+                    let observation_id = arena[child_id as usize]
+                        .chance_children
+                        .iter()
+                        .find(|outcome| outcome.public_key == public_key)
+                        .map(|outcome| outcome.node_id)
+                        .ok_or_else(|| {
+                            PyValueError::new_err(
+                                "sampled reveal is absent from its closed one-reveal support",
+                            )
+                        })?;
+                    let chance_index = path.len() - 1;
+                    // This is a stochastic edge, not a player choice. The actor is
+                    // used only to frame reversible virtual loss on the observation
+                    // node; final backup remains in the player-0 frame.
+                    actors.push(state.actor()?);
+                    path.push(observation_id);
+                    node_id = observation_id;
+                    chance_step = Some((chance_index, actor));
+                }
             }
         }
     }
-    Ok((path, actors, state))
+    Ok((path, actors, state, chance_step))
 }
 
 /// Issue 2: add to `node_id` any child whose legal joint index is not already
@@ -5172,6 +5484,40 @@ fn ol_apply_virtual_loss(arena: &mut [OLNode], path: &[u32], actors: &[u8], sign
             let vl_value0 = if chooser == 0 { -1.0 } else { 1.0 };
             arena[path[i] as usize].value_sum += (sign * n_vl) as f64 * vl_value0;
         }
+    }
+}
+
+fn ol_backup_path(
+    arena: &mut [OLNode],
+    path: &[u32],
+    sampled_value0: f64,
+    chance_step: Option<(usize, u8)>,
+    fpu: f64,
+) {
+    let Some((chance_index, pre_chance_actor)) = chance_step else {
+        for &node_id in path {
+            let node = &mut arena[node_id as usize];
+            node.visit_count += 1;
+            node.value_sum += sampled_value0;
+        }
+        return;
+    };
+
+    // First update the conditional observation subtree with this row's sample.
+    for &node_id in &path[(chance_index + 1)..] {
+        let node = &mut arena[node_id as usize];
+        node.visit_count += 1;
+        node.value_sum += sampled_value0;
+    }
+    // Then propagate the fixed-probability expectation through the chance
+    // afterstate and every earlier decision node. This is deliberately not the
+    // empirical mean of row visits.
+    let unvisited_value0 = if pre_chance_actor == 0 { fpu } else { -fpu };
+    let expected_value0 = ol_chance_value_p0(arena, path[chance_index], unvisited_value0);
+    for &node_id in &path[..=chance_index] {
+        let node = &mut arena[node_id as usize];
+        node.visit_count += 1;
+        node.value_sum += expected_value0;
     }
 }
 
@@ -5344,11 +5690,19 @@ fn advisor_open_loop_search_impl(
     margin_gain: f64,
     alpha_param: f64,
     pick_floor: Option<PickFloor>,
+    chance_exposure: usize,
+    chance_enum_max_rows: u64,
 ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
     let mut fallback_count = 0u32;
     let mut missing_child_count = 0u32;
+    let one_reveal_panel = ol_one_reveal_panel(
+        &root_state.deck,
+        chance_exposure,
+        chance_enum_max_rows,
+        seed ^ 0xA1C0_77EC_7A11_5EED,
+    )?;
 
     // Root: expand on the REAL state — the root's public information (boards,
     // row, claims) is determinization-independent; only the deck order below
@@ -5368,12 +5722,32 @@ fn advisor_open_loop_search_impl(
         let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
         let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
         let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
+        let mut chance_steps: Vec<Option<(usize, u8)>> = Vec::with_capacity(wave);
         let mut evals: Vec<AdvisorPendingEval> = Vec::new();
 
         for _ in 0..wave {
-            let det = root_state.redeterminize(Some(rng.r#gen::<u64>()));
-            let (path, actors, leaf_state) = ol_descend(
-                &arena,
+            let det_seed = rng.r#gen::<u64>();
+            let det = if one_reveal_panel.is_empty() {
+                root_state.redeterminize(Some(det_seed))
+            } else {
+                // Derive the chance draw from this simulation seed instead of
+                // consuming another value from the search RNG. Thus treatment
+                // and incumbent use the identical per-simulation seed stream;
+                // enabling A1 cannot perturb every later determinization.
+                let mut chance_rng = StdRng::seed_from_u64(det_seed ^ 0xC0A1_5EED_5EED_C0A1);
+                let target = chance_rng.r#gen::<f64>();
+                let mut cumulative = 0.0;
+                let selected = one_reveal_panel
+                    .iter()
+                    .find(|outcome| {
+                        cumulative += outcome.probability;
+                        target < cumulative
+                    })
+                    .unwrap_or_else(|| one_reveal_panel.last().unwrap());
+                redeterminize_with_first_row(root_state, &selected.row, det_seed)?
+            };
+            let (path, actors, leaf_state, chance_step) = ol_descend(
+                &mut arena,
                 0,
                 det,
                 fpu,
@@ -5385,6 +5759,11 @@ fn advisor_open_loop_search_impl(
                 // pick-group coverage closes the secondary-pick fragility gap
                 // at equal budget.  Off by default (frac=0 => None).
                 pick_floor,
+                if one_reveal_panel.is_empty() {
+                    None
+                } else {
+                    Some(one_reveal_panel.as_slice())
+                },
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -5405,6 +5784,7 @@ fn advisor_open_loop_search_impl(
             paths.push(path);
             path_actors.push(actors);
             leaf_states.push(leaf_state);
+            chance_steps.push(chance_step);
         }
 
         // One evaluator call for the whole wave's non-terminal leaves.
@@ -5489,11 +5869,7 @@ fn advisor_open_loop_search_impl(
             } else {
                 path_v0[pi].expect("non-terminal path must have an eval value")
             };
-            for &n in path {
-                let node = &mut arena[n as usize];
-                node.visit_count += 1;
-                node.value_sum += v0;
-            }
+            ol_backup_path(&mut arena, path, v0, chance_steps[pi], fpu);
         }
         sims_done += paths.len();
     }
@@ -5642,8 +6018,8 @@ impl AdvisorSearchHandle {
             let mut evals: Vec<AdvisorPendingEval> = Vec::new();
             for _ in 0..wave {
                 let det = self.root_state.redeterminize(Some(self.rng.r#gen::<u64>()));
-                let (path, actors, leaf_state) = ol_descend(
-                    &self.arena,
+                let (path, actors, leaf_state, chance_step) = ol_descend(
+                    &mut self.arena,
                     0,
                     det,
                     self.fpu,
@@ -5651,7 +6027,9 @@ impl AdvisorSearchHandle {
                     &mut self.fallback_count,
                     &mut self.missing_child_count,
                     None,
+                    None,
                 )?;
+                debug_assert!(chance_step.is_none());
                 ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
                 let leaf = *path.last().unwrap();
                 if leaf_state.phase != GAME_OVER {
@@ -6023,6 +6401,54 @@ struct MoveRecord {
     win_target: f32, // 1.0 win / 0.5 draw / 0.0 loss, actor frame (filled at end)
 }
 
+/// Canonical public-state bytes shared with Python chance-correct search.
+/// Keep this layout byte-for-byte aligned with
+/// `denial_search.chance_public_state_key_v1`; changing it requires a version
+/// bump rather than an in-place edit.
+fn chance_public_state_key_v1_bytes(state: &RustGameState, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.extend_from_slice(b"KD-PUBLIC\x01");
+    buf.push(state.phase);
+    buf.push(state.actor_index as u8);
+    buf.push(state.initial_pick_count as u8);
+    buf.push(state.start_player);
+    buf.push(state.harmony as u8);
+    buf.push(state.middle_kingdom as u8);
+    buf.extend_from_slice(&state.discards[0].to_le_bytes());
+    buf.extend_from_slice(&state.discards[1].to_le_bytes());
+
+    let mut deck = state.deck.clone();
+    deck.sort_unstable();
+    buf.push(deck.len() as u8);
+    for value in deck {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut row = state.current_row.clone();
+    row.sort_unstable();
+    buf.push(row.len() as u8);
+    for value in row {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    buf.push(state.pending_claims.len() as u8);
+    for &(player, domino_id) in &state.pending_claims {
+        buf.push(player);
+        buf.extend_from_slice(&domino_id.to_le_bytes());
+    }
+    buf.push(state.next_claims.len() as u8);
+    for &(player, domino_id) in &state.next_claims {
+        buf.push(player);
+        buf.extend_from_slice(&domino_id.to_le_bytes());
+    }
+    for board in &state.boards {
+        buf.extend_from_slice(&board.terrain);
+        buf.extend_from_slice(&board.crowns);
+    }
+}
+
+/// Completed game payload kept inside Rust until conversion to Python.
+/// The final i8 is the official player-0 outcome (+1/0/-1).
+type FinishedGame = (u64, Vec<MoveRecord>, (i32, i32), i8);
+
 #[derive(Clone, Copy)]
 struct MoveSearchProfile {
     target_sims: usize,
@@ -6087,8 +6513,8 @@ enum SlotState {
 ///   Since the clamp can only raise a bad child's value, the label error is
 ///   one-sided (dominated moves slightly overweighted) and bounded by the
 ///   softmax weight at delta (~e^-3 relative when delta spans the range).
-/// - `ArgmaxTies`: integer margins let a 1-point window prove exact ties with
-///   the best; the label is uniform over the tied-best children, zero
+/// - `ArgmaxTies`: quarter-point-separated solver utilities let a 0.25 window
+///   prove exact ties with the best; the label is uniform over tied-best children
 ///   elsewhere. Cheapest mode — and the PRODUCTION DEFAULT since the
 ///   2026-07-05 label-shape ablation, where it beat soft_clamp 231-162-7 in a
 ///   400-game head-to-head between matched training runs.
@@ -6447,7 +6873,7 @@ impl SearchSlot {
         temp_moves: usize,
         fast_move_temp_moves: usize,
         seat_override: Option<SeatSearchOverride>,
-    ) -> PyResult<Option<(u64, Vec<MoveRecord>, (i32, i32))>> {
+    ) -> PyResult<Option<FinishedGame>> {
         // Training record: encode the REAL (public) state + policy target.
         let actor = self.real_state.actor()?;
 
@@ -6625,6 +7051,7 @@ impl SearchSlot {
 
         if self.real_state.phase == GAME_OVER {
             let (s0, s1) = self.real_state.scores();
+            let outcome0 = self.real_state.official_outcome_i8();
             // Fill the per-move targets now that the game is over.  win_target
             // uses the OFFICIAL outcome cascade (total score → largest single
             // territory → total crowns); score-ties resolved by the cascade are
@@ -6632,7 +7059,7 @@ impl SearchSlot {
             // (own_score/opp_score below remain the raw scores for the margin
             // head.)  actor attribution uses the recorded rec.actor, not ply
             // parity — Kingdomino does not alternate seats reliably.
-            let win0: f32 = match self.real_state.official_outcome_i8() {
+            let win0: f32 = match outcome0 {
                 1 => 1.0,
                 -1 => 0.0,
                 _ => 0.5,
@@ -6651,6 +7078,7 @@ impl SearchSlot {
                 self.game_seed,
                 std::mem::take(&mut self.records),
                 (s0, s1),
+                outcome0,
             )))
         } else {
             // Next move: reset the active tree to a bare root.  Closed-loop
@@ -6765,8 +7193,8 @@ fn exact_policy_target(child_values: &[(u16, f64)], actor: u8) -> (Vec<i32>, Vec
 
 /// ArgmaxTies policy target: uniform over the children whose value exactly
 /// equals the best, zero elsewhere. Exact f64 equality is sound here because
-/// tied children share the same integer raw margin, and
-/// `margin_to_training_value` maps identical inputs to identical bits.
+/// solver utilities are integer score margins or exact quarter-point tiebreak
+/// sentinels, and identical inputs map to identical training-value bits.
 fn exact_policy_target_ties(
     child_values: &[(u16, f64)],
     actor: u8,
@@ -6835,8 +7263,8 @@ fn solve_endgame_ab_value_cached(
     mode: SolverOrderMode,
     value_cache: &mut HashMap<EndgameKey, f64>,
 ) -> PyResult<Option<f64>> {
-    // Cache only full-window solves (exact raw margins). ±200 brackets every real
-    // margin, so any window at least that wide is "full" and its result is exact.
+    // Cache only full-window solves (exact solver utilities). ±200 brackets
+    // every raw margin and tiebreak sentinel, so such a window is exact.
     let full_window = alpha <= MARGIN_LO && beta >= MARGIN_HI;
     let key = if full_window {
         Some(endgame_key(state))
@@ -6928,7 +7356,9 @@ fn solve_root_exact(
     if std::time::Instant::now() >= deadline {
         return Ok(None);
     }
-    let ttv = |raw: f64| margin_to_training_value(raw, score_scale, margin_gain, alpha_param);
+    let ttv = |utility: f64| {
+        solver_utility_to_training_value(utility, score_scale, margin_gain, alpha_param)
+    };
     // One transposition table for the WHOLE root solve: sibling subtrees
     // overlap heavily (62-86% duplicate interior visits measured on the real
     // fallback corpus), so sharing it across children attacks the same
@@ -6946,7 +7376,7 @@ fn solve_root_exact(
                     match solve_endgame_ab_tt(
                         &next, deadline, MARGIN_LO, MARGIN_HI, order_mode, 0, &tt, &mut buf,
                     )? {
-                        Some(raw_margin) => Ok(Some((joint_idx, ttv(raw_margin)))),
+                        Some(solver_utility) => Ok(Some((joint_idx, ttv(solver_utility)))),
                         None => Ok(None),
                     }
                 },
@@ -6968,9 +7398,9 @@ fn solve_root_exact(
 
     let actor = state.actor()?;
     let delta = if policy_mode == ExactPolicyMode::ArgmaxTies {
-        // Integer raw margins: a 1-point window separates exact ties from
-        // strictly-worse children.
-        1.0
+        // Solver utilities differ by at least one quarter point: raw margins
+        // are integers and equal-score official outcomes are -0.25/0/+0.25.
+        OFFICIAL_TIEBREAK_UTILITY
     } else {
         clamp_delta
     };
@@ -7070,8 +7500,8 @@ struct SolveJob {
 }
 
 enum SolveResult {
-    /// The endgame solved to GAME_OVER: the full finished game (seed, records, scores).
-    Finished((u64, Vec<MoveRecord>, (i32, i32))),
+    /// The endgame solved to GAME_OVER: full game plus official P0 outcome.
+    Finished(FinishedGame),
     /// Deadline exceeded (or solve error): the slot must resume MCTS in place.
     Fallback,
 }
@@ -7176,7 +7606,7 @@ fn play_out_exact_endgame(
     mut records: Vec<MoveRecord>,
     game_seed: u64,
     plan: Vec<ExactPlanItem>,
-) -> PyResult<(u64, Vec<MoveRecord>, (i32, i32))> {
+) -> PyResult<FinishedGame> {
     for item in plan {
         let exact = item.result;
         let actor = state.actor()?;
@@ -7222,7 +7652,8 @@ fn play_out_exact_endgame(
     // OFFICIAL outcome cascade (matching finalize_move); own_score/opp_score
     // stay raw for the margin head; actor attribution uses recorded rec.actor.
     let (s0, s1) = state.scores();
-    let win0: f32 = match state.official_outcome_i8() {
+    let outcome0 = state.official_outcome_i8();
+    let win0: f32 = match outcome0 {
         1 => 1.0,
         -1 => 0.0,
         _ => 0.5,
@@ -7237,7 +7668,7 @@ fn play_out_exact_endgame(
         rec.opp_score = opp_s;
         rec.win_target = win_t;
     }
-    Ok((game_seed, records, (s0, s1)))
+    Ok((game_seed, records, (s0, s1), outcome0))
 }
 
 fn solve_exact_plan(
@@ -7287,6 +7718,60 @@ fn solve_exact_plan(
         cur = cur.step(placement, pick)?;
     }
     Ok(Some(plan))
+}
+
+#[cfg(test)]
+mod terminal_tiebreak_tests {
+    use super::*;
+
+    #[test]
+    fn training_conversion_keeps_tiebreak_outcome_but_zero_raw_margin() {
+        let alpha = 0.8;
+        let expected = 1.0 - alpha;
+        assert_eq!(
+            solver_utility_to_training_value(OFFICIAL_TIEBREAK_UTILITY, 100.0, 2.0, alpha,),
+            expected,
+        );
+        assert_eq!(
+            solver_utility_to_training_value(-OFFICIAL_TIEBREAK_UTILITY, 100.0, 2.0, alpha,),
+            -expected,
+        );
+        assert_eq!(
+            solver_utility_to_training_value(0.0, 100.0, 2.0, alpha),
+            0.0
+        );
+    }
+
+    #[test]
+    fn terminal_backup_and_solver_utility_use_official_tiebreak() -> PyResult<()> {
+        let mut found = None;
+        for seed in 0..600u64 {
+            let mut state = new_game(seed, true, true);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(7).wrapping_add(3));
+            while state.phase != GAME_OVER {
+                let legal = state.legal_actions_indexed();
+                let &(_idx, placement, pick) = legal
+                    .choose(&mut rng)
+                    .ok_or_else(|| PyValueError::new_err("non-terminal state has no action"))?;
+                state = state.step(placement, pick)?;
+            }
+            let (s0, s1) = state.scores();
+            let outcome = state.official_outcome_i8();
+            if s0 == s1 && outcome != 0 {
+                found = Some((state, outcome));
+                break;
+            }
+        }
+        let (state, outcome) = found.expect("no tiebreak-decided raw-score tie in 600 games");
+        assert_eq!(
+            terminal_solver_utility(&state),
+            outcome as f64 * OFFICIAL_TIEBREAK_UTILITY,
+        );
+        assert!(
+            (terminal_search_value(&state, 100.0, 2.0, 0.8) - outcome as f64 * 0.2).abs() < 1e-12,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -8212,8 +8697,8 @@ struct BatchedMCTS {
     // How exact roots price dominated children for the policy label (see
     // ExactPolicyMode). Root value + chosen move are exact in every mode.
     exact_policy_mode: ExactPolicyMode,
-    // SoftClamp threshold in raw margin points: children proven at least this
-    // far below the best are recorded at the clamp value instead of solved.
+    // SoftClamp threshold in solver-utility points (raw margin except at an
+    // official score tiebreak); dominated children are recorded at the clamp.
     exact_clamp_delta: f64,
     cum_exact_solve_count: u64,      // root moves solved exactly
     cum_exact_tree_solve_count: u64, // expensive exact continuation plans built
@@ -8234,7 +8719,7 @@ struct BatchedMCTS {
     cum_exact_recorded_move_count: u64,
     // Games finished entirely inside resolve_exact_slots during step(); drained
     // by update() into the finished-games list it returns.
-    pending_exact: Vec<(u64, Vec<MoveRecord>, (i32, i32))>,
+    pending_exact: Vec<FinishedGame>,
     // Async endgame solver (Step 1.5). When async_solve, step() dispatches
     // ExactSolving slots to the background thread and harvests results instead of
     // solving synchronously; inflight_solves counts dispatched-not-yet-harvested.
@@ -8925,7 +9410,7 @@ impl BatchedMCTS {
         // solves to GAME_OVER, so the playout always finishes the game. Finished
         // games are collected with their slot index so recycling (which needs
         // &mut self) happens after, like update() does.
-        let mut finished: Vec<(usize, (u64, Vec<MoveRecord>, (i32, i32)))> = Vec::new();
+        let mut finished: Vec<(usize, FinishedGame)> = Vec::new();
         for si in 0..self.slots.len() {
             if self.slots[si].state != SlotState::ExactSolving {
                 continue;
@@ -9301,8 +9786,8 @@ impl BatchedMCTS {
                                 (0..chunk).map(|_| slot.rng.r#gen::<u64>()).collect();
                             for &seed in &sim_seeds {
                                 let det = slot.real_state.redeterminize(Some(seed));
-                                let (path, actors, leaf_state) = ol_descend(
-                                    &slot.ol_arena,
+                                let (path, actors, leaf_state, chance_step) = ol_descend(
+                                    &mut slot.ol_arena,
                                     0,
                                     det,
                                     fpu,
@@ -9310,7 +9795,9 @@ impl BatchedMCTS {
                                     &mut slot.fallback_count,
                                     &mut slot.missing_child_count,
                                     pick_floor,
+                                    None,
                                 )?;
+                                debug_assert!(chance_step.is_none());
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
                                 paths.push(path);
                                 ol_actors.push(actors);
@@ -9525,8 +10012,8 @@ impl BatchedMCTS {
     /// advance state machines, recycle finished games.  Returns finished games as
     /// [(game_seed,
     ///   [(mb,ob,flat,pidx,pval,lidx,root_stats,z,own_score,opp_score,win_target,actor)],
-    ///  (score0,score1))].  `actor` (0/1) is the seat that made the move; used by
-    /// the two-net HOF self-play path to keep only the learner-searched moves.
+    ///  (score0,score1,official_outcome0))]. `actor` (0/1) is the seat that made
+    /// the move; used by the two-net HOF path to retain learner-searched moves.
     fn update<'py>(
         &mut self,
         py: Python<'py>,
@@ -9593,7 +10080,12 @@ impl BatchedMCTS {
             pending_by_slot[si] = Some(tick);
         }
 
-        let finished_by_slot: PyResult<Vec<(usize, Option<(u64, Vec<MoveRecord>, (i32, i32))>)>> =
+        // Keep this closure's established indentation stable; rustfmt otherwise
+        // rewrites the entire ~200-line hot path when only its payload alias changes.
+        #[rustfmt::skip]
+        let finished_by_slot: PyResult<
+            Vec<(usize, Option<(u64, Vec<MoveRecord>, (i32, i32), i8)>)>,
+        > =
             self.slots
                 .par_iter_mut()
                 .zip(pending_by_slot.into_par_iter())
@@ -9798,8 +10290,7 @@ impl BatchedMCTS {
         // Games finished by the exact endgame solver during step() (their slots
         // were already recycled there) are returned alongside the MCTS-finished
         // games of this tick.
-        let mut finished_rust: Vec<(u64, Vec<MoveRecord>, (i32, i32))> =
-            std::mem::take(&mut self.pending_exact);
+        let mut finished_rust: Vec<FinishedGame> = std::mem::take(&mut self.pending_exact);
         for (si, finished_game) in finished_by_slot {
             if let Some(fg) = finished_game {
                 finished_rust.push(fg);
@@ -9841,7 +10332,7 @@ impl BatchedMCTS {
 
         // Convert finished games' records to numpy + return.
         let out = PyList::empty(py);
-        for (seed, records, (s0, s1)) in finished_rust {
+        for (seed, records, (s0, s1), outcome0) in finished_rust {
             let z0 = ((s0 - s1) as f64 / 30.0).tanh();
             let examples = PyList::empty(py);
             for r in records {
@@ -9868,7 +10359,7 @@ impl BatchedMCTS {
                 );
                 examples.append(tup)?;
             }
-            out.append((seed, examples, (s0, s1)))?;
+            out.append((seed, examples, (s0, s1, outcome0)))?;
         }
         Ok(out)
     }
@@ -10342,6 +10833,106 @@ mod ol_tests {
         let again = ol_add_missing_children(&mut arena, 0, &legal, &priors);
         assert_eq!(again, 0, "no new children on a second pass");
     }
+
+    #[test]
+    fn one_reveal_balanced_panel_exposes_every_tile_x_times() -> PyResult<()> {
+        let deck: Vec<u16> = (1..=12).collect();
+        let exposure = 4usize;
+        let panel = ol_one_reveal_panel(&deck, exposure, 1, 20260808)?;
+        let mut counts = HashMap::<u16, usize>::new();
+        let raw_rows: usize = panel.iter().map(|x| x.multiplicity).sum();
+        assert_eq!(raw_rows, deck.len() / 4 * exposure);
+        for outcome in &panel {
+            for &tile in &outcome.row {
+                *counts.entry(tile).or_insert(0) += outcome.multiplicity;
+            }
+        }
+        for tile in deck {
+            assert_eq!(counts.get(&tile), Some(&exposure));
+        }
+        let mass: f64 = panel.iter().map(|x| x.probability).sum();
+        assert!((mass - 1.0).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn one_reveal_deck8_support_is_exact_and_closed() -> PyResult<()> {
+        let deck: Vec<u16> = (1..=8).collect();
+        let panel = ol_one_reveal_panel(&deck, 1, 70, 9)?;
+        assert_eq!(panel.len(), 70);
+        assert!(panel.iter().all(|x| x.multiplicity == 1));
+        assert!(
+            panel
+                .iter()
+                .all(|x| (x.probability - 1.0 / 70.0).abs() < 1e-12)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_reveal_chance_value_uses_probability_not_visit_share() {
+        let mut arena = vec![
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+        ];
+        arena[1].visit_count = 100;
+        arena[1].value_sum = 100.0;
+        arena[2].visit_count = 1;
+        arena[2].value_sum = -1.0;
+        arena[0].chance_children = vec![
+            OLChanceChild {
+                public_key: vec![1],
+                probability: 0.25,
+                node_id: 1,
+            },
+            OLChanceChild {
+                public_key: vec![2],
+                probability: 0.75,
+                node_id: 2,
+            },
+        ];
+        assert!((ol_chance_value_p0(&arena, 0, 0.0) + 0.5).abs() < 1e-12);
+        // The empirical visit-weighted mean would be strongly positive; pin the
+        // discriminator so a future refactor cannot silently revert to it.
+        assert!((arena[0].chance_children[0].probability - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_reveal_materialization_uses_distinct_public_observation_nodes() -> PyResult<()> {
+        let mut state = new_game(17, true, true);
+        for _ in 0..3 {
+            let (_idx, placement, pick) = state.legal_actions_indexed()[0];
+            state = state.step(placement, pick)?;
+        }
+        let action = {
+            let (_idx, placement, pick) = state.legal_actions_indexed()[0];
+            (placement, pick)
+        };
+        assert!(<Kingdomino as search::Game>::is_stochastic(&state, action));
+        let panel = ol_one_reveal_panel(&state.deck, 1, 1, 123)?;
+        assert_eq!(panel.iter().map(|x| x.multiplicity).sum::<usize>(), 11);
+        let mut arena = vec![OLNode::new(1.0, action)];
+        ol_materialize_chance_support(&mut arena, 0, &state, action, &panel)?;
+        assert_eq!(arena[0].chance_children.len(), panel.len());
+        let keys: HashSet<Vec<u8>> = arena[0]
+            .chance_children
+            .iter()
+            .map(|x| x.public_key.clone())
+            .collect();
+        assert_eq!(keys.len(), panel.len());
+        assert!(
+            (arena[0]
+                .chance_children
+                .iter()
+                .map(|x| x.probability)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-12
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -10487,8 +11078,8 @@ mod kingdomino_rust {
         super::new_game(seed, harmony, middle_kingdom)
     }
 
-    /// Convert a raw score margin (s0 - s1) to the training value formula. Exposed
-    /// for tests: the raw-margin alpha-beta solver applies this AFTER the solve.
+    /// Convert a raw score margin (s0 - s1) to the training value formula.
+    /// Exposed for formula tests; exact solving uses the tiebreak-aware converter.
     #[pyfunction]
     #[pyo3(signature = (margin, score_scale=160.0, margin_gain=2.0, alpha=0.5))]
     fn margin_to_training_value(
@@ -10537,9 +11128,13 @@ mod kingdomino_rust {
             deadline,
             super::SolverOrderMode::Lookahead2Clustered,
         )? {
-            Some(raw_margin) => {
-                let value =
-                    super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha);
+            Some(solver_utility) => {
+                let value = super::solver_utility_to_training_value(
+                    solver_utility,
+                    score_scale,
+                    margin_gain,
+                    alpha,
+                );
                 Ok((value, true, start.elapsed().as_secs_f64()))
             }
             None => Ok((0.0, false, start.elapsed().as_secs_f64())),
@@ -10707,7 +11302,8 @@ mod kingdomino_rust {
                         fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
                         score_scale=160.0, margin_gain=2.0, alpha=0.0,
                         pick_floor_frac=0.0, pick_floor_min_depth=0,
-                        pick_floor_max_depth=0, pick_floor_min_visits=16))]
+                        pick_floor_max_depth=0, pick_floor_min_visits=16,
+                        chance_exposure=0, chance_enum_max_rows=70))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_open_loop_search<'py>(
         py: Python<'py>,
@@ -10728,6 +11324,8 @@ mod kingdomino_rust {
         pick_floor_min_depth: usize,
         pick_floor_max_depth: usize,
         pick_floor_min_visits: i32,
+        chance_exposure: usize,
+        chance_enum_max_rows: u64,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -10747,6 +11345,11 @@ mod kingdomino_rust {
                 "pick_floor_min_depth ({}) must be <= pick_floor_max_depth ({})",
                 pick_floor_min_depth, pick_floor_max_depth
             )));
+        }
+        if chance_exposure > 0 && chance_enum_max_rows == 0 {
+            return Err(PyValueError::new_err(
+                "chance_enum_max_rows must be > 0 when chance_exposure is enabled",
+            ));
         }
         // frac == 0 => None => byte-identical to the pre-Phase-A path.
         let pick_floor = if pick_floor_frac > 0.0 {
@@ -10777,6 +11380,8 @@ mod kingdomino_rust {
                 margin_gain,
                 alpha,
                 pick_floor,
+                chance_exposure,
+                chance_enum_max_rows,
             )
         })
     }
@@ -10873,9 +11478,13 @@ mod kingdomino_rust {
             super::solve_endgame_ab(state, deadline, super::MARGIN_LO, super::MARGIN_HI, mode, 0)?
         };
         match raw {
-            Some(raw_margin) => {
-                let value =
-                    super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha);
+            Some(solver_utility) => {
+                let value = super::solver_utility_to_training_value(
+                    solver_utility,
+                    score_scale,
+                    margin_gain,
+                    alpha,
+                );
                 Ok((value, true, start.elapsed().as_secs_f64()))
             }
             None => Ok((0.0, false, start.elapsed().as_secs_f64())),
@@ -10893,9 +11502,14 @@ mod kingdomino_rust {
         margin_gain: f64,
         alpha: f64,
     ) -> PyResult<(f64, bool)> {
-        match super::deck0_draft_dp::solve_deck0_final_placement_separable_raw_margin(state)? {
-            Some(raw_margin) => Ok((
-                super::margin_to_training_value(raw_margin as f64, score_scale, margin_gain, alpha),
+        match super::deck0_draft_dp::solve_deck0_final_placement_separable_utility(state)? {
+            Some(solver_utility) => Ok((
+                super::solver_utility_to_training_value(
+                    solver_utility,
+                    score_scale,
+                    margin_gain,
+                    alpha,
+                ),
                 true,
             )),
             None => Ok((0.0, false)),
@@ -10926,15 +11540,20 @@ mod kingdomino_rust {
         let deadline = start + std::time::Duration::from_secs_f64(max_secs);
         let mut cache: HashMap<EndgameKey, Option<f64>> = HashMap::new();
         let mut stats = super::deck0_draft_dp::Deck0DraftDpStats::default();
-        match super::deck0_draft_dp::solve_deck0_draft_dp_raw_margin(
+        match super::deck0_draft_dp::solve_deck0_draft_dp_utility(
             state,
             max_current_row_len,
             deadline,
             &mut cache,
             &mut stats,
         )? {
-            Some(raw_margin) => Ok((
-                super::margin_to_training_value(raw_margin, score_scale, margin_gain, alpha),
+            Some(solver_utility) => Ok((
+                super::solver_utility_to_training_value(
+                    solver_utility,
+                    score_scale,
+                    margin_gain,
+                    alpha,
+                ),
                 true,
                 start.elapsed().as_secs_f64(),
                 stats.nodes,
@@ -11011,8 +11630,8 @@ mod kingdomino_rust {
 
         for _ in 0..n_sims {
             let det = state.redeterminize(Some(rng.r#gen::<u64>()));
-            let (path, _actors, leaf_state) = super::ol_descend(
-                &arena,
+            let (path, _actors, leaf_state, chance_step) = super::ol_descend(
+                &mut arena,
                 0,
                 det,
                 fpu,
@@ -11020,7 +11639,9 @@ mod kingdomino_rust {
                 &mut fallback_count,
                 &mut missing_child_count,
                 None,
+                None,
             )?;
+            debug_assert!(chance_step.is_none());
             let leaf = *path.last().unwrap();
 
             let v0 = if leaf_state.phase == GAME_OVER {
@@ -11041,9 +11662,9 @@ mod kingdomino_rust {
                     let key = super::endgame_key(&leaf_state);
                     if let Some(cached) = exact_cache.get(&key) {
                         deck0_cache_hits += 1;
-                        if let Some(raw_margin) = cached {
-                            super::margin_to_training_value(
-                                *raw_margin,
+                        if let Some(solver_utility) = cached {
+                            super::solver_utility_to_training_value(
+                                *solver_utility,
                                 score_scale,
                                 margin_gain,
                                 alpha,
@@ -11060,7 +11681,7 @@ mod kingdomino_rust {
                             let deadline =
                                 solve_start + std::time::Duration::from_secs_f64(leaf_max_secs);
                             let mut dp_stats = super::deck0_draft_dp::Deck0DraftDpStats::default();
-                            let result = super::deck0_draft_dp::solve_deck0_draft_dp_raw_margin(
+                            let result = super::deck0_draft_dp::solve_deck0_draft_dp_utility(
                                 &leaf_state,
                                 draft_k.max(0) as usize,
                                 deadline,
@@ -11073,10 +11694,10 @@ mod kingdomino_rust {
                             dp_stats_total.deadline_hits += dp_stats.deadline_hits;
                             result
                         } else {
-                            if let Some(raw_margin) =
-                                super::deck0_draft_dp::solve_deck0_final_placement_separable_raw_margin(&leaf_state)?
+                            if let Some(solver_utility) =
+                                super::deck0_draft_dp::solve_deck0_final_placement_separable_utility(&leaf_state)?
                             {
-                                Some(raw_margin as f64)
+                                Some(solver_utility)
                             } else {
                                 let deadline = solve_start
                                     + std::time::Duration::from_secs_f64(leaf_max_secs);
@@ -11098,9 +11719,9 @@ mod kingdomino_rust {
                         if !dp_enabled {
                             exact_cache.insert(key, raw);
                         }
-                        if let Some(raw_margin) = raw {
-                            super::margin_to_training_value(
-                                raw_margin,
+                        if let Some(solver_utility) = raw {
+                            super::solver_utility_to_training_value(
+                                solver_utility,
                                 score_scale,
                                 margin_gain,
                                 alpha,

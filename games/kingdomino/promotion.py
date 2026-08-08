@@ -40,6 +40,13 @@ class MatchStats:
     win_rate: float
     lower_confidence_bound: float
     mean_margin: float
+    pairs: int = 0
+    pair_wins: int = 0
+    pair_losses: int = 0
+    pair_draws: int = 0
+    pair_points: float = 0.0
+    pair_score_rate: float = 0.0
+    observation_unit: str = "seat_pair"
 
 
 @dataclass
@@ -76,32 +83,99 @@ def sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
-def wilson_lower_bound(points: float, games: int, z: float = 1.96) -> float:
-    """Wilson lower bound for a binomial score where draws count as 0.5."""
-    games = int(games)
-    if games <= 0:
-        return 0.0
-    p = max(0.0, min(1.0, float(points) / games))
+def wilson_interval(points: float, observations: int,
+                    z: float = 1.96) -> tuple[float, float]:
+    """Wilson interval for scores in ``{0, 0.5, 1}``.
+
+    Promotion observations are complete same-seed seat pairs, not individual
+    games. Treating the two games as independent makes the interval
+    anti-conservative because they share the deck.
+    """
+    observations = int(observations)
+    if observations <= 0:
+        return 0.0, 1.0
+    p = max(0.0, min(1.0, float(points) / observations))
     z2 = z * z
-    denom = 1.0 + z2 / games
-    centre = p + z2 / (2.0 * games)
-    margin = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * games)) / games)
-    return max(0.0, (centre - margin) / denom)
+    denom = 1.0 + z2 / observations
+    centre = p + z2 / (2.0 * observations)
+    margin = z * math.sqrt(
+        (p * (1.0 - p) + z2 / (4.0 * observations)) / observations
+    )
+    return (
+        max(0.0, (centre - margin) / denom),
+        min(1.0, (centre + margin) / denom),
+    )
 
 
-def match_stats_from_pair(pair, *, z: float = 1.96) -> MatchStats:
+def wilson_lower_bound(points: float, observations: int,
+                       z: float = 1.96) -> float:
+    return wilson_interval(points, observations, z=z)[0]
+
+
+def _game_points_for(game, candidate_name: str) -> float:
+    if game.winner is None:
+        return 0.5
+    return 1.0 if game.winner == candidate_name else 0.0
+
+
+def pair_scores_from_games(games, candidate_name: str) -> list[float]:
+    """Collapse same-seed, seat-swapped games to independent pair outcomes.
+
+    This mirrors 7WD: candidate pair points above 1 are a pair win, exactly 1
+    is a pair draw, and below 1 is a pair loss. Every seed must contain exactly
+    one game with the candidate in each seat.
+    """
+    by_seed: dict[int, list] = {}
+    for game in games:
+        if candidate_name not in (game.p0, game.p1):
+            raise ValueError(
+                f"candidate {candidate_name!r} absent from seed {game.seed}"
+            )
+        by_seed.setdefault(int(game.seed), []).append(game)
+
+    scores: list[float] = []
+    for seed in sorted(by_seed):
+        seed_games = by_seed[seed]
+        if len(seed_games) != 2:
+            raise ValueError(
+                f"seed {seed} has {len(seed_games)} games; expected one seat pair"
+            )
+        candidate_seats = {
+            0 if game.p0 == candidate_name else 1 for game in seed_games
+        }
+        if candidate_seats != {0, 1}:
+            raise ValueError(
+                f"seed {seed} does not contain both candidate seat orientations"
+            )
+        points = sum(_game_points_for(game, candidate_name) for game in seed_games)
+        scores.append(1.0 if points > 1.0 else (0.5 if points == 1.0 else 0.0))
+    return scores
+
+
+def match_stats_from_pair(pair, games, *, candidate_name: str | None = None,
+                          z: float = 1.96) -> MatchStats:
+    candidate_name = str(candidate_name or pair.a)
+    pair_scores = pair_scores_from_games(games, candidate_name)
+    pair_points = float(sum(pair_scores))
+    pairs = len(pair_scores)
     points = float(pair.a_wins) + 0.5 * float(pair.draws)
-    games = int(pair.games)
-    win_rate = points / games if games else 0.0
+    game_count = int(pair.games)
+    win_rate = points / game_count if game_count else 0.0
     return MatchStats(
-        games=games,
+        games=game_count,
         wins=int(pair.a_wins),
         losses=int(pair.b_wins),
         draws=int(pair.draws),
         points=points,
         win_rate=win_rate,
-        lower_confidence_bound=wilson_lower_bound(points, games, z=z),
+        lower_confidence_bound=wilson_lower_bound(pair_points, pairs, z=z),
         mean_margin=float(pair.avg_margin_a),
+        pairs=pairs,
+        pair_wins=sum(score == 1.0 for score in pair_scores),
+        pair_losses=sum(score == 0.0 for score in pair_scores),
+        pair_draws=sum(score == 0.5 for score in pair_scores),
+        pair_points=pair_points,
+        pair_score_rate=(pair_points / pairs if pairs else 0.0),
     )
 
 
@@ -140,12 +214,14 @@ def evaluate_network_match(
     )
     candidate_net = candidate_net.to(device).eval()
     baseline_net = baseline_net.to(device).eval()
-    pair, _games = play_rating_games(
+    pair, game_results = play_rating_games(
         candidate_net, baseline_net,
         "candidate", "current_best",
         paired_seeds, int(seed), cfg,
     )
-    return match_stats_from_pair(pair, z=z)
+    return match_stats_from_pair(
+        pair, game_results, candidate_name="candidate", z=z
+    )
 
 
 def _net_from_checkpoint(path: str | Path, device: str) -> KingdominoNet:
@@ -270,7 +346,7 @@ def decide_promotion(
     match: MatchStats | None,
     fixed_suite: FixedSuiteComparison | None,
     *,
-    min_win_rate: float = 0.55,
+    min_win_rate: float = 0.0,
     min_lcb: float = 0.50,
     bootstrap: bool = False,
 ) -> PromotionDecision:
@@ -284,13 +360,18 @@ def decide_promotion(
             passed = False
             reasons.append("missing head-to-head match stats")
         else:
-            if match.win_rate < min_win_rate:
-                passed = False
-                reasons.append(
-                    f"win_rate {match.win_rate:.3f} < required {min_win_rate:.3f}")
+            if min_win_rate > 0.0:
+                if match.win_rate < min_win_rate:
+                    passed = False
+                    reasons.append(
+                        f"win_rate {match.win_rate:.3f} < required "
+                        f"{min_win_rate:.3f}")
+                else:
+                    reasons.append(
+                        f"win_rate {match.win_rate:.3f} >= required "
+                        f"{min_win_rate:.3f}")
             else:
-                reasons.append(
-                    f"win_rate {match.win_rate:.3f} >= required {min_win_rate:.3f}")
+                reasons.append("raw win-rate floor disabled; pair LCB is authoritative")
             if match.lower_confidence_bound <= min_lcb:
                 passed = False
                 reasons.append(

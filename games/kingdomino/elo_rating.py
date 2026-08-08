@@ -287,12 +287,12 @@ def _make_batched(n_games: int, seed_start: int, cfg: EloConfig):
 
 def _run_batched_orientation(eval_seat0, eval_seat1, n_games: int,
                              seed_start: int, cfg: EloConfig
-                             ) -> List[Tuple[int, int, int]]:
+                             ) -> List[Tuple[int, int, int, int]]:
     """Play n_games complete open-loop games; seat 0's leaves go to eval_seat0,
     seat 1's to eval_seat1, routed by row_search_actors (searcher-owns-network).
-    Returns [(seed, score0, score1)]."""
+    Returns [(seed, score0, score1, official_outcome0)]."""
     batched = _make_batched(n_games, seed_start, cfg)
-    results: List[Tuple[int, int, int]] = []
+    results: List[Tuple[int, int, int, int]] = []
     ticks = 0
     while not batched.done():
         mb, ob, flat, idxs_list = batched.step()
@@ -316,7 +316,9 @@ def _run_batched_orientation(eval_seat0, eval_seat1, n_games: int,
             if gathered[r] is None:
                 gathered[r] = np.zeros(len(idxs_list[r]), dtype=np.float32)
         for seed, examples, scores in batched.update(values, gathered):
-            results.append((int(seed), int(scores[0]), int(scores[1])))
+            results.append((
+                int(seed), int(scores[0]), int(scores[1]), int(scores[2])
+            ))
         ticks += 1
         if ticks > 2_000_000:
             raise RuntimeError("Batched rating exceeded tick guard")
@@ -324,12 +326,10 @@ def _run_batched_orientation(eval_seat0, eval_seat1, n_games: int,
     return results
 
 
-def _winner_by_score(p0: str, p1: str, s0: int, s1: int) -> Optional[str]:
-    # The Rust BatchedMCTS path returns only final score totals (no tiebreaker
-    # data), so genuine score ties become draws. Rare; worth 0.5 in Elo either way.
-    if s0 > s1:
+def _winner_by_outcome(p0: str, p1: str, outcome0: int) -> Optional[str]:
+    if outcome0 > 0:
         return p0
-    if s1 > s0:
+    if outcome0 < 0:
         return p1
     return None
 
@@ -350,13 +350,15 @@ def play_rating_games(net_a, net_b, name_a: str, name_b: str,
     games: List[GameResult] = []
 
     # Orientation 0 — A in seat 0, B in seat 1.
-    for seed, s0, s1 in _run_batched_orientation(eval_a, eval_b, n_seeds, seed_start, cfg):
+    for seed, s0, s1, outcome0 in _run_batched_orientation(
+            eval_a, eval_b, n_seeds, seed_start, cfg):
         games.append(GameResult(seed, name_a, name_b, s0, s1,
-                                _winner_by_score(name_a, name_b, s0, s1), steps=0))
+                                _winner_by_outcome(name_a, name_b, outcome0), steps=0))
     # Orientation 1 — B in seat 0, A in seat 1 (same decks).
-    for seed, s0, s1 in _run_batched_orientation(eval_b, eval_a, n_seeds, seed_start, cfg):
+    for seed, s0, s1, outcome0 in _run_batched_orientation(
+            eval_b, eval_a, n_seeds, seed_start, cfg):
         games.append(GameResult(seed, name_b, name_a, s0, s1,
-                                _winner_by_score(name_b, name_a, s0, s1), steps=0))
+                                _winner_by_outcome(name_b, name_a, outcome0), steps=0))
 
     for g in games:
         update_pair(pair, g, name_a, name_b)

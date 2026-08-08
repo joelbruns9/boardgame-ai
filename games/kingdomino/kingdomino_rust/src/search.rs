@@ -1230,6 +1230,23 @@ mod tests {
     }
 
     #[test]
+    fn chance_backup_uses_explicit_weights_not_child_count() {
+        // The unweighted mean is 0, but the declared expectation is
+        // 0.25*(+1) + 0.75*(-1) = -0.5. This pins the chance/visit separation
+        // required by observation-split search.
+        let tree = vec![
+            Node::Decision {
+                player: 0,
+                edges: vec![Edge::Chance(vec![(1, 0.25), (2, 0.75)])],
+            },
+            Node::Terminal(1.0),
+            Node::Terminal(-1.0),
+        ];
+        let mut s = st(tree);
+        assert_eq!(deep_value(&mut s, &ZeroEval).unwrap(), -0.5);
+    }
+
+    #[test]
     fn nonterminal_without_actions_errors() {
         // value() must error (not silently return +-inf); choose_action returns None
         // (the pyclass wrapper turns that into an error).

@@ -826,14 +826,10 @@ def evaluate_batched_orientation(
         finished = batched.update(values, gathered)
         for seed, examples, scores in finished:
             score0, score1 = int(scores[0]), int(scores[1])
-            # The Rust BatchedMCTS path returns only final score totals — no
-            # Python GameState or per-board tiebreaker quantities — so the full
-            # cascade (determine_winner) can't run here without out-of-scope Rust
-            # engine work. Genuine score ties fall through to a draw. The serial
-            # engine (default) routes through determine_winner in play_game.
-            if score0 > score1:
+            outcome0 = int(scores[2])
+            if outcome0 > 0:
                 winner = p0.name
-            elif score1 > score0:
+            elif outcome0 < 0:
                 winner = p1.name
             else:
                 winner = None

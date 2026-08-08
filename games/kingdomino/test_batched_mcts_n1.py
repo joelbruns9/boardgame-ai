@@ -127,7 +127,7 @@ def _run_batched(seed: int, n_sims: int):
     game_seed, examples, scores = finished[0]
     if int(game_seed) != seed:
         raise AssertionError(f"finished seed mismatch: got {game_seed}, expected {seed}")
-    return list(examples), tuple(int(x) for x in scores), ticks
+    return list(examples), tuple(int(x) for x in scores[:2]), ticks
 
 
 def _example_policy(example):

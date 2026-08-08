@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import itertools
 import json
 import math
@@ -14,9 +15,12 @@ from games.kingdomino.denial_search import (
     SearchConfig,
     _as_pre_reveal_leaf,
     _public_state_key_uncached,
+    chance_panel,
     chance_rows,
+    contingency_values,
     denial_policy_target,
     public_state_key,
+    tile_balanced_chance_panel,
 )
 from games.kingdomino.game import Claim, GameState, Phase
 from games.kingdomino.denial_signal_sweep import (
@@ -46,6 +50,75 @@ def test_exact_when_combination_count_is_at_most_k():
     assert rows == list(itertools.combinations(bag, 4))
     # Once exact, changing the seed cannot change the distribution.
     assert chance_rows(bag, k + 10, seed=999)[0] == rows
+
+
+def test_tile_balanced_panel_has_exact_exposure_and_cycle_clusters():
+    bag = list(range(1, 13))
+    panel = tile_balanced_chance_panel(bag, 3, seed=1234)
+    assert panel.mode == "balanced"
+    assert panel.tile_exposure == 3
+    assert len(panel.rows) == len(bag) * 3 // 4
+    assert Counter(tile for row in panel.rows for tile in row) == Counter({tile: 3 for tile in bag})
+    assert panel == tile_balanced_chance_panel(list(reversed(bag)), 3, seed=1234)
+    for cycle in range(3):
+        cycle_rows = [row for row, cid in zip(panel.rows, panel.cycle_ids) if cid == cycle]
+        assert sorted(tile for row in cycle_rows for tile in row) == bag
+
+
+def test_tile_balanced_panel_rejects_invalid_pre_reveal_bag():
+    with pytest.raises(ValueError, match="divisible"):
+        tile_balanced_chance_panel(range(10), 2, seed=7)
+
+
+def test_iid_exposure_matches_balanced_panel_width_per_deck():
+    for size in (8, 16, 24, 44):
+        bag = list(range(1, size + 1))
+        for exposure in (1, 2, 4):
+            iid = chance_panel(
+                bag, sampling="iid_exposure", seed=11, k=999,
+                exposure=exposure,
+            )
+            balanced = chance_panel(
+                bag, sampling="balanced", seed=11, k=1,
+                exposure=exposure,
+            )
+            assert len(iid.rows) == len(balanced.rows) == size * exposure // 4
+
+
+def test_tile_balanced_rows_are_marginally_uniform_over_many_seeds():
+    bag = list(range(1, 9))
+    counts = Counter()
+    panels = 700
+    for seed in range(panels):
+        counts.update(tile_balanced_chance_panel(bag, 1, seed=seed).rows)
+    expected = panels * 2 / math.comb(8, 4)
+    assert set(counts) == set(itertools.combinations(bag, 4))
+    assert max(abs(count - expected) for count in counts.values()) < 0.65 * expected
+
+
+def test_contingency_values_detect_reveal_dependent_best_action():
+    result = contingency_values(
+        [{0: 0.9, 1: 0.1}, {0: 0.2, 1: 0.8}], actor=0,
+        cluster_ids=[0, 1],
+    )
+    assert result["status"] == "ok"
+    assert result["adaptive_actions"] == [0, 1]
+    assert result["adaptive_value_actor"] == pytest.approx(0.85)
+    assert result["aliased_action"] == 0
+    assert result["aliased_value_actor"] == pytest.approx(0.55)
+    assert result["contingency_gap_actor"] == pytest.approx(0.30)
+
+
+def test_contingency_values_respects_minimising_player_and_common_legality():
+    result = contingency_values(
+        [{0: -0.9, 1: -0.1, 2: 1.0}, {0: -0.2, 1: -0.8}], actor=1,
+    )
+    assert result["status"] == "ok"
+    assert result["common_actions"] == 2
+    assert result["adaptive_actions"] == [0, 1]
+    assert result["adaptive_value_actor"] == pytest.approx(0.85)
+    assert result["aliased_action"] == 0
+    assert result["contingency_gap_actor"] == pytest.approx(0.30)
 
 
 def test_policy_target_is_valid_and_uncertain_ties_share_mass():
@@ -108,6 +181,33 @@ def test_forced_pick_search_emits_single_legal_pick(tmp_path):
     assert label["legal_pick_ids"] == [state.current_row[0]]
     assert label["policy_target"] == [1.0]
     assert label["structure"]["completed"]
+    assert "contingency_audit" not in label
+
+
+def test_balanced_one_reveal_search_emits_contingency_audit(tmp_path):
+    state = _round_start(seed=41)
+    checkpoint = tmp_path / "fixture.pt"
+    checkpoint.write_bytes(b"fixture")
+    search = DenialSearch(
+        _ConstantEvaluator(), checkpoint_path=str(checkpoint),
+        config=SearchConfig(
+            pick_plies=5, chance_k=1, chance_sampling="balanced",
+            chance_exposure=1, contingency_audit=True,
+            root_search_sims=0, placement_top_k=1,
+        ),
+    )
+    label = search.search_position(state)
+    audit = label["contingency_audit"]
+    assert label["structure"]["chance_events"]["balanced"] > 0
+    assert audit["status"] == "ok"
+    assert audit["sampling"] == "balanced"
+    assert audit["tile_exposure"] == 1
+    assert audit["events"]
+    assert all(event["cycles"] == 1 for event in audit["events"])
+    assert all(event["pick_rank"]["contingency_gap_actor"] >= -1e-12
+               for event in audit["events"])
+    assert all(event["joint_action"]["contingency_gap_actor"] >= -1e-12
+               for event in audit["events"])
 
 
 def test_extract_reply_labels_are_grouped_complete_and_opponent_only(tmp_path):

@@ -103,7 +103,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from games.kingdomino.game import GameState, Phase
+from games.kingdomino.game import GameState, Phase, determine_winner
 from games.kingdomino.encoder import encode_state, compute_target_z, redeterminize
 from games.kingdomino.endgame_solver import exact_endgame_value
 from games.kingdomino.action_codec import (
@@ -156,27 +156,25 @@ def terminal_search_value(
       own_norm  = score0 / score_scale
       opp_norm  = score1 / score_scale
       margin    = tanh((own_norm - opp_norm) * margin_gain)
-      win_value = +1.0 win / 0.0 draw / -1.0 loss   (exact, from final scores)
+      win_value = +1.0 win / 0.0 draw / -1.0 loss   (official outcome cascade)
       win_gate  = win_value ** 4  (= 1 for a decided game, 0 for a draw)
       result    = (1 - alpha) * win_value + alpha * win_gate * margin
 
-    win_value uses the score-only cascade (same limitation as Rust finalize_move
-    — no territory/crowns tiebreaker); a score tie → 0.0.  Always returns the
-    player-0 frame value (positive = good for player 0), matching compute_target_z's
-    convention and the player-0-frame backup logic; `player` is accepted for call-
-    site symmetry but the result is not reframed (caller negates if needed).
+    ``win_value`` uses the official score -> largest territory -> total crowns
+    cascade. The margin term deliberately remains the raw score difference, so
+    a tiebreak win at equal score receives the decisive outcome component but no
+    invented fractional score margin. Always returns the player-0 frame value
+    (positive = good for player 0), matching compute_target_z's convention and
+    the player-0-frame backup logic; ``player`` is accepted for call-site
+    symmetry but the result is not reframed (caller negates if needed).
     """
     scores = state.scores()
     s0, s1 = float(scores[0]), float(scores[1])
     own_norm = s0 / score_scale
     opp_norm = s1 / score_scale
     margin_value = math.tanh((own_norm - opp_norm) * margin_gain)
-    if s0 > s1:
-        win_value = 1.0
-    elif s1 > s0:
-        win_value = -1.0
-    else:
-        win_value = 0.0        # score tie → neutral (no tiebreaker cascade)
+    winner = determine_winner(state)
+    win_value = 0.0 if winner is None else (1.0 if winner == 0 else -1.0)
     win_gate = win_value * win_value
     win_gate = win_gate * win_gate          # win_value**4 (n=4 win-certainty gate)
     return (1.0 - alpha) * win_value + alpha * win_gate * margin_value

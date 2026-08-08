@@ -747,6 +747,8 @@ def test_win_target_perspective():
     decisive_checked = 0
     for seed, examples, scores in games:
         s0, s1 = int(scores[0]), int(scores[1])
+        outcome0 = int(scores[2])
+        assert outcome0 in (-1, 0, 1)
         owns = set()
         for ex in examples:
             own, opp, win = float(ex[8]), float(ex[9]), float(ex[10])
@@ -762,6 +764,12 @@ def test_win_target_perspective():
                 # crowns) decides, so win may be a decisive 0.0/1.0, not 0.5.
                 assert win in (0.0, 0.5, 1.0), f"own==opp but win={win}"
             owns.add(own)
+        p0_targets = {float(ex[10]) for ex in examples if int(ex[11]) == 0}
+        expected_p0 = 1.0 if outcome0 > 0 else (0.0 if outcome0 < 0 else 0.5)
+        assert p0_targets == {expected_p0}, (
+            f"seed {seed}: exported outcome {outcome0} disagrees with "
+            f"P0 win targets {p0_targets}"
+        )
         if s0 != s1:
             # Decisive game: both perspectives must be present with complementary
             # win targets (one actor's examples win=1.0, the other's win=0.0).

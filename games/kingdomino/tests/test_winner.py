@@ -19,6 +19,7 @@ from games.kingdomino.game import (
     Phase,
     determine_winner,
 )
+from games.kingdomino.mcts_az import terminal_search_value
 
 
 # ─── test fixtures ─────────────────────────────────────────────────────────
@@ -204,11 +205,40 @@ def test_compute_target_win_requires_terminal_state():
         )
 
 
+def test_terminal_search_value_uses_official_cascade_and_raw_margin() -> None:
+    kwargs = dict(score_scale=100.0, margin_gain=2.0, alpha=0.8)
+
+    score_win = terminal_search_value(case_score_decided(), player=0, **kwargs)
+    assert score_win > 0.2  # outcome plus a positive raw-margin component
+
+    # Equal raw scores: the tiebreak determines the outcome component, while
+    # the raw-margin component stays exactly zero.
+    expected_tiebreak_win = 1.0 - kwargs["alpha"]
+    for state in (case_territory_decided(), case_crowns_decided()):
+        assert_eq(
+            terminal_search_value(state, player=0, **kwargs),
+            expected_tiebreak_win,
+            "tiebreak win terminal value",
+        )
+        assert_eq(
+            terminal_search_value(swapped(state), player=0, **kwargs),
+            -expected_tiebreak_win,
+            "tiebreak loss terminal value",
+        )
+
+    assert_eq(
+        terminal_search_value(case_draw(), player=0, **kwargs),
+        0.0,
+        "true draw terminal value",
+    )
+
+
 def main():
     test_determine_winner_cascade_levels()
     test_determine_winner_symmetry()
     test_compute_target_win_values()
     test_compute_target_win_requires_terminal_state()
+    test_terminal_search_value_uses_official_cascade_and_raw_margin()
     print("All winner-determination tests passed")
 
 

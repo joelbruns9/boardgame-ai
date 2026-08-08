@@ -72,7 +72,7 @@ def _run_batched_many(
 
 def _compare_game(seed: int, examples, scores, n_sims: int, verbose: bool) -> bool:
     expected, expected_scores = _reference_policies(seed, n_sims)
-    scores = tuple(int(x) for x in scores)
+    scores = tuple(int(x) for x in scores[:2])
     if scores != tuple(int(x) for x in expected_scores):
         print(f"    seed={seed}: score mismatch {scores} vs {expected_scores}")
         return False
@@ -192,7 +192,7 @@ def _production_smoke(verbose: bool) -> bool:
         if len(examples) == 0:
             print(f"  smoke seed={seed}: no examples")
             ok = False
-        scores = tuple(int(x) for x in scores)
+        scores = tuple(int(x) for x in scores[:2])
         if not all(math.isfinite(x) for x in scores):
             print(f"  smoke seed={seed}: non-finite scores {scores}")
             ok = False
