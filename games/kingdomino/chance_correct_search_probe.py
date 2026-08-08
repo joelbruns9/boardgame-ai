@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from games.kingdomino.action_codec import PICK_AXIS_SIZE
 from games.kingdomino.denial_search import load_checkpoint_network
 from games.kingdomino.denial_signal_sweep import (
     file_sha256,
@@ -26,6 +27,9 @@ from games.kingdomino.denial_signal_sweep import (
 from games.kingdomino.endgame_solver import _rust_state_from_python
 from games.kingdomino.promotion import DEFAULT_CURRENT_BEST, sha256_file
 from games.kingdomino.self_play import make_rust_evaluator
+
+
+REFERENCE_SEED_XOR = 0xD1B5_4A32_D192_ED03
 
 
 def _arm(
@@ -51,7 +55,7 @@ def _arm(
         return evaluator(my_board, opp_board, flat, legal_indices)
 
     started = time.perf_counter()
-    children, root_value0, chance_diagnostics = kr.advisor_one_reveal_search(
+    children, root_value0, raw_chance_diagnostics = kr.advisor_one_reveal_search(
         _rust_state_from_python(state),
         counted_evaluator,
         int(sims),
@@ -65,13 +69,26 @@ def _arm(
         chance_exposure=int(exposure),
         chance_enum_max_rows=int(enum_max_rows),
     )
+    chance_diagnostics = {
+        str(key): float(value) for key, value in raw_chance_diagnostics.items()
+    }
+    panel_rows = int(chance_diagnostics.get("chance_panel_rows", 0.0))
+    panel_mode = (
+        "disabled"
+        if exposure == 0
+        else (
+            "exhaustive"
+            if chance_diagnostics.get("chance_panel_exhaustive", 0.0) == 1.0
+            else "sampled_balanced"
+        )
+    )
     actor = int(state.current_actor)
     rows = []
     for action_idx, visits, value_sum0, prior in children:
         q0 = None if not visits else float(value_sum0) / int(visits)
         rows.append({
             "action_idx": int(action_idx),
-            "pick_rank": int(action_idx) % 5,
+            "pick_rank": int(action_idx) % PICK_AXIS_SIZE,
             "visits": int(visits),
             "q_actor": None if q0 is None else (q0 if actor == 0 else -q0),
             "prior": float(prior),
@@ -81,11 +98,11 @@ def _arm(
         "sims": int(sims),
         "chance_exposure": int(exposure),
         "chance_enum_max_rows": int(enum_max_rows),
+        "chance_panel_mode": panel_mode,
+        "chance_panel_rows": panel_rows,
         "root_value_player0": float(root_value0),
         "nn_evaluations": int(nn_evaluations),
-        "chance_diagnostics": {
-            str(key): float(value) for key, value in chance_diagnostics.items()
-        },
+        "chance_diagnostics": chance_diagnostics,
         "top_action_idx": top["action_idx"],
         "top_pick_rank": top["pick_rank"],
         "elapsed_seconds": time.perf_counter() - started,
@@ -199,6 +216,55 @@ def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence
     }
 
 
+def _deck_size_summary(
+    records: Sequence[dict[str, Any]], arm_names: Sequence[str]
+) -> dict[str, Any]:
+    """Descriptive search metrics stratified by the pre-reveal bag size."""
+    output: dict[str, Any] = {}
+    for deck_size in sorted({int(record["deck_size"]) for record in records}):
+        selected = [record for record in records if int(record["deck_size"]) == deck_size]
+        runs = [run for record in selected for run in record["seed_runs"]]
+        arms: dict[str, Any] = {}
+        for name in arm_names:
+            arm_runs = [run["arms"][name] for run in runs]
+            references: dict[str, Any] = {}
+            for reference_name in ("openloop", "hybrid"):
+                metrics = [run["metrics"][reference_name][name] for run in runs]
+                regrets = [
+                    metric["regret_actor"]
+                    for metric in metrics
+                    if metric["regret_actor"] is not None
+                ]
+                references[reference_name] = {
+                    "top1_agreement": statistics.fmean(
+                        metric["top1_agrees"] for metric in metrics
+                    ),
+                    "pick_agreement": statistics.fmean(
+                        metric["pick_agrees"] for metric in metrics
+                    ),
+                    "mean_regret_actor": (
+                        None if not regrets else statistics.fmean(regrets)
+                    ),
+                }
+            arms[name] = {
+                "panel_modes": sorted({arm["chance_panel_mode"] for arm in arm_runs}),
+                "panel_rows": sorted({int(arm["chance_panel_rows"]) for arm in arm_runs}),
+                "mean_seconds": statistics.fmean(
+                    arm["elapsed_seconds"] for arm in arm_runs
+                ),
+                "mean_nn_evaluations": statistics.fmean(
+                    arm["nn_evaluations"] for arm in arm_runs
+                ),
+                "references": references,
+            }
+        output[str(deck_size)] = {
+            "positions": len(selected),
+            "searches": len(runs),
+            "arms": arms,
+        }
+    return output
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = Path(args.checkpoint)
     all_positions = load_frozen_positions(args.positions_path)
@@ -251,6 +317,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 + 104729 * (position_index + 1)
                 + 1_000_003 * seed_index
             )
+            # Candidate arms share one common-random-number stream. References
+            # share a second paired stream, disjoint from the candidates, so an
+            # arm is never a literal prefix of its stronger reference.
+            reference_seed = seed ^ REFERENCE_SEED_XOR
             arms = {
                 f"x{exposure}": _arm(
                     state,
@@ -272,7 +342,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 sims=args.reference_sims,
                 exposure=0,
                 enum_max_rows=args.enum_max_rows,
-                seed=seed,
+                seed=reference_seed,
                 margin_gain=margin_gain,
                 alpha=alpha,
                 fpu=args.fpu,
@@ -284,7 +354,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 sims=args.reference_sims,
                 exposure=args.reference_exposure,
                 enum_max_rows=args.enum_max_rows,
-                seed=seed,
+                seed=reference_seed,
                 margin_gain=margin_gain,
                 alpha=alpha,
                 fpu=args.fpu,
@@ -304,6 +374,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             seed_runs.append({
                 "seed_index": seed_index,
                 "seed": seed,
+                "reference_seed": reference_seed,
                 "arms": arms,
                 "references": references,
                 "reference_agreement": {
@@ -392,8 +463,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             field: statistics.fmean(row.get(field, 0.0) for row in diagnostics)
             for field in fields
         }
+    aggregate["by_deck_size"] = _deck_size_summary(records, arm_names)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "scope": "A1 equal-compute frozen-position probe; no training or promotion",
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
@@ -404,7 +476,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "seed runs are paired repeats clustered within position; aggregate "
             "search-level rates are descriptive and are not independent-position confidence intervals"
         ),
-        "reference_label": "separate larger incumbent and one-reveal searches; neither is exact",
+        "reference_label": (
+            "larger incumbent and one-reveal searches use a paired stream disjoint "
+            "from candidate arms; neither reference is exact"
+        ),
         "aggregate": aggregate,
         "positions": records,
     }

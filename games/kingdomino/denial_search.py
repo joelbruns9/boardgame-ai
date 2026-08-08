@@ -45,7 +45,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
-from games.kingdomino.action_codec import encode_action
+from games.kingdomino.action_codec import PICK_AXIS_SIZE, encode_action
 from games.kingdomino.encoder import encode_state
 from games.kingdomino.game import (
     GameState,
@@ -783,7 +783,10 @@ class DenialSearch:
         return (public_state_key(state), int(depth), int(crossings), int(root_actor),
                 int(self.config.pick_plies), int(self.config.placement_top_k),
                 int(self.config.chance_k), str(self.config.chance_sampling),
-                int(self.config.chance_exposure), int(self.config.seed))
+                int(self.config.chance_exposure),
+                int(self.config.root_chance_exposure),
+                int(self.config.root_chance_enum_max_rows),
+                int(self.config.seed))
 
     def _get_node(self, state: GameState, depth: int, crossings: int,
                   root_actor: int) -> Node:
@@ -920,7 +923,7 @@ class DenialSearch:
         for edge in node.edges:
             action_idx = int(edge.action_record["action_idx"])
             joint[action_idx] = float(edge.value)
-            by_rank.setdefault(action_idx % 5, []).append(float(edge.value))
+            by_rank.setdefault(action_idx % PICK_AXIS_SIZE, []).append(float(edge.value))
         choose = max if actor == 0 else min
         pick_rank = {rank: float(choose(values)) for rank, values in by_rank.items()}
         return joint, pick_rank

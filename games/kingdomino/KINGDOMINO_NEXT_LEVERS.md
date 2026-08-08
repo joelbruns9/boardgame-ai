@@ -461,8 +461,8 @@ unchanged until A1/A2 pass.
 Focused executable gates cover exact tile exposure, exhaustive 70-row deck=8
 support, closed public observation identities, probability-weighted Q under
 deliberately unequal child visits, exact disabled-path equivalence and a live
-equal-simulation search. Seven Rust open-loop tests and the combined 27-test
-A1/denial Python suite pass. The companion
+equal-simulation search. Ten Rust open-loop tests and the expanded 54-test
+A1/denial Python suite pass (with one unrelated skip). The companion
 `chance_correct_search_probe.py` runs equal-simulation incumbent/X arms on the
 frozen corpus and reports action/pick agreement, visit- and Q-pairwise ordering,
 regret and latency against separate stronger incumbent and hybrid references.
@@ -527,7 +527,7 @@ unvisited outcomes the actor-framed FPU value (`-0.2` in this probe). Therefore
 chance estimate. The exact deck=8 oracle remains a separate operation that must
 actually evaluate/solve every conditioned row.
 
-Before using this topology for self-play, add an A1b search-semantics comparison:
+This finding defined the initial A1b search-semantics review:
 
 1. At each visited chance node, traverse the frozen support in probability-
    balanced randomized cycles before repeating outcomes. For sampled panels this
@@ -549,6 +549,41 @@ This A1b comparison precedes exact adjudication of the deck=8 placement and any
 `BatchedMCTS` integration. It tests whether the observed treatment effect comes
 from preserving public observations or from the arbitrary value assigned to
 unvisited chance outcomes.
+
+**Review correction, 2026-08-08.** The FPU-filled estimator was removed before
+any further strength claim. Chance Q now omits outcomes with no real evaluation
+and renormalizes the registered probabilities over visited mass; once every row
+has been visited it becomes the fixed-panel expectation. Observation-child
+virtual loss is excluded from that base estimate, while a separate chance-node
+in-flight overlay supplies the full-strength virtual-loss penalty to ancestor
+PUCT. Returned root-child Q is reconstructed from the current chance estimate
+rather than accumulated stale expectation snapshots. Consequently, all action
+comparisons reported above describe the superseded FPU-filled implementation
+and are useful only as evidence that the old experiment was confounded.
+
+The probe now uses a paired reference seed stream disjoint from the candidate
+arms, records `disabled|sampled_balanced|exhaustive` plus panel row count, and
+stratifies metrics by deck size. The disabled path has a nontrivial frozen
+golden-vector test. Fixed-support registration is lazy: a deck=8 4,800-simulation
+probe registered 24,710 chance outcomes but allocated only 1,897 observation
+subtrees, avoiding 22,813 unused arena nodes. This reduced memory/allocation
+work but did not produce a clear wall-time win in the GPU-dominated single-root
+measurement; treatment arms remained within roughly 0-8% of the incumbent in
+that run at identical 4,801 NN evaluations.
+
+The corrected one-seed smoke changed selected actions materially (including the
+deck=8 pick), confirming that the old dual-reference result is invalid as a
+strength gate. Do not reuse it. The next A1b comparison is now:
+
+1. IID support traversal versus probability-balanced randomized cycles at each
+   chance node, so local outcome coverage—not only global panel composition—is
+   controlled.
+2. The current visited-mass-renormalized estimator versus realized sampled-value
+   backup at fixed NN evaluations.
+3. Fully initialized/exact conditioned-row evaluation on the selected deck=8
+   oracle roots.
+
+Only after this comparison should the five-root paired-seed probe be rerun.
 
 The implementation should reuse the public-state/chance machinery in
 `denial_search.py` and port the fixed-support semantics already reviewed in the
