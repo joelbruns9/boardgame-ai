@@ -1,15 +1,21 @@
 """Buffer-schema gates: bit-exact replay, chance-log cross-check, JSON
 round-trip stability (CODEC_SPEC.md §6)."""
 
+from dataclasses import replace
+import hashlib
+import json
 import random
 
 import pytest
 
 from games.seven_wonders_duel.buffer import (
+    LEGACY_DIGEST_VERSION,
+    LOGIC_DIGEST_VERSION,
     GameRecorder,
     OPPONENT_TYPES,
     ReplayMismatchError,
     from_json_line,
+    logic_state_digest,
     read_records,
     replay,
     resolve_opponent_type,
@@ -46,7 +52,8 @@ def test_replay_reproduces_games_bit_exactly():
     for seed in range(25):
         record = _record_random_game(seed)
         final = replay(record)  # raises on any mask/chance/digest divergence
-        assert state_digest(final) == record.final_digest
+        assert logic_state_digest(final) == record.final_digest
+        assert record.digest_version == LOGIC_DIGEST_VERSION
         assert final.winner == record.winner
         assert (final.victory_type.value if final.victory_type else None) == (
             record.victory_type
@@ -64,6 +71,33 @@ def test_json_round_trip_is_byte_stable():
     assert recovered == record
     assert to_json_line(recovered) == line
     assert replay(recovered).phase is Phase.COMPLETE
+
+
+def test_legacy_rng_digest_records_remain_replayable_and_missing_field_defaults():
+    recorder = GameRecorder(
+        17,
+        first_player=1,
+        digest_version=LEGACY_DIGEST_VERSION,
+    )
+    rng = random.Random(17)
+    while recorder.game.phase is not Phase.COMPLETE:
+        recorder.play(rng.choice(legal_action_indices(recorder.game)))
+    record = recorder.finish()
+    assert replay(record).phase is Phase.COMPLETE
+    payload = json.loads(to_json_line(record))
+    payload.pop("digest_version")
+    legacy_line = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    recovered = from_json_line(legacy_line)
+    assert recovered.digest_version == LEGACY_DIGEST_VERSION
+    assert replay(recovered).phase is Phase.COMPLETE
+
+
+def test_parsing_memoizes_content_digest_and_mutation_invalidates_it():
+    record = _record_random_game(3, with_stats=True)
+    line = to_json_line(record)
+    recovered = from_json_line(line)
+    assert recovered.source_digest == hashlib.sha256(line.encode("utf-8")).hexdigest()
+    assert replace(recovered, iteration=999).source_digest is None
 
 
 @pytest.mark.parametrize(
@@ -135,5 +169,13 @@ def test_replay_detects_tampered_chance_log():
     kind, outcome = log[0]
     log[0] = (kind, "Lumber Yard" if outcome != "Lumber Yard" else "Clay Pool")
     tampered = dataclasses.replace(record, chance_log=tuple(log))
+    with pytest.raises(ReplayMismatchError):
+        replay(tampered)
+
+
+@pytest.mark.parametrize("field", ["final_digest", "trajectory_digest"])
+def test_python_reference_remains_the_rng_inclusive_digest_audit(field):
+    record = _record_random_game(9)
+    tampered = replace(record, **{field: "sha256:" + "0" * 64})
     with pytest.raises(ReplayMismatchError):
         replay(tampered)

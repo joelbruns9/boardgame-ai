@@ -210,6 +210,9 @@ pub struct GameRecord {
     pub moves: Vec<MoveRecord>,
     pub chance_log: Vec<ChanceRecord>,
     pub final_fingerprint: Vec<i32>,
+    pub digest_version: &'static str,
+    pub final_digest: String,
+    pub trajectory_digest: String,
     pub agent_names: [String; 2],
 }
 
@@ -346,7 +349,7 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
     }
 }
 
-fn actual_chance_outcomes(
+pub(crate) fn actual_chance_outcomes(
     state: &GameState,
     action_index: usize,
     move_index: usize,
@@ -494,6 +497,7 @@ pub fn run<E: Eval>(
     };
     let mut moves = Vec::new();
     let mut chance_log = Vec::new();
+    let mut trajectory = crate::digest::TrajectoryDigest::new();
 
     while state.phase != Phase::Complete {
         let i = moves.len();
@@ -540,6 +544,7 @@ pub fn run<E: Eval>(
         } else {
             sample_policy(&legal, &result.policy_target, temperature(i), &mut rng)
         };
+        trajectory.update(&state);
         chance_log.extend(actual_chance_outcomes(&state, action, i)?);
         state.apply_action(&decode_action(&state, action));
         moves.push(MoveRecord {
@@ -560,6 +565,8 @@ pub fn run<E: Eval>(
         });
     }
 
+    let final_digest = crate::digest::state_digest(&state);
+    trajectory.update(&state);
     Ok(GameRecord {
         seed: cfg.game_seed,
         first_player: initial.first_player,
@@ -570,6 +577,9 @@ pub fn run<E: Eval>(
         moves,
         chance_log,
         final_fingerprint: state.fingerprint(),
+        digest_version: crate::digest::VERSION,
+        final_digest,
+        trajectory_digest: trajectory.finish(),
         agent_names: agent_names(&cfg),
     })
 }
@@ -1247,6 +1257,7 @@ struct GameSlot {
     cfg: SelfPlayConfig,
     moves: Vec<MoveRecord>,
     chance_log: Vec<ChanceRecord>,
+    trajectory: crate::digest::TrajectoryDigest,
     stage: SlotStage,
     simulations: usize,
     requested_nn_leaves: usize,
@@ -1299,6 +1310,7 @@ impl GameSlot {
             cfg,
             moves: Vec::new(),
             chance_log: Vec::new(),
+            trajectory: crate::digest::TrajectoryDigest::new(),
             stage: SlotStage::Complete,
             simulations: 0,
             requested_nn_leaves: 0,
@@ -1564,6 +1576,9 @@ impl GameSlot {
                 &mut self.rng,
             )
         };
+        let digest_started = Instant::now();
+        self.trajectory.update(&self.state);
+        self.record_ns += digest_started.elapsed().as_nanos() as u64;
         let chance_started = Instant::now();
         self.chance_log
             .extend(actual_chance_outcomes(&self.state, action, i)?);
@@ -1611,6 +1626,9 @@ impl GameSlot {
             &mut self.bot_rngs[meta.actor],
             self.cfg.bot_exploration,
         );
+        let digest_started = Instant::now();
+        self.trajectory.update(&self.state);
+        self.record_ns += digest_started.elapsed().as_nanos() as u64;
         let chance_started = Instant::now();
         self.chance_log
             .extend(actual_chance_outcomes(&self.state, action, i)?);
@@ -1665,12 +1683,14 @@ impl GameSlot {
         }
     }
 
-    fn into_record(self) -> PyResult<GameRecord> {
+    fn into_record(mut self) -> PyResult<GameRecord> {
         if self.state.phase != Phase::Complete || !matches!(self.stage, SlotStage::Complete) {
             return Err(PyRuntimeError::new_err(
                 "scheduler attempted to emit an incomplete game",
             ));
         }
+        let final_digest = crate::digest::state_digest(&self.state);
+        self.trajectory.update(&self.state);
         Ok(GameRecord {
             seed: self.cfg.game_seed,
             first_player: self.state.first_player,
@@ -1681,6 +1701,9 @@ impl GameSlot {
             moves: self.moves,
             chance_log: self.chance_log,
             final_fingerprint: self.state.fingerprint(),
+            digest_version: crate::digest::VERSION,
+            final_digest,
+            trajectory_digest: self.trajectory.finish(),
             agent_names: agent_names(&self.cfg),
         })
     }

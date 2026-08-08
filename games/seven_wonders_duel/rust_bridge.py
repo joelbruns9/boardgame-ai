@@ -10,7 +10,14 @@ from __future__ import annotations
 import contextlib
 import time
 
-from .buffer import GameRecord, GameRecorder, replay, resolve_opponent_type
+from .buffer import (
+    LOGIC_DIGEST_VERSION,
+    GameRecord,
+    MoveRecord,
+    legal_mask_hash,
+    replay,
+    resolve_opponent_type,
+)
 from .codec import decode_action, legal_action_indices
 from .data import (
     CARD_IDS,
@@ -101,6 +108,30 @@ def rust_game_for_self_play(seed: int, first_player: int = 0):
     if count:
         draw = game.rng.sample(game.unused_progress_tokens, count)
         draws.append(sorted(draw, key=PROGRESS_IDS.__getitem__))
+    return swr.RustGame(library_draws=draws, **rust_setup(game))
+
+
+def rust_game_for_record(record: GameRecord):
+    """Construct the locked initial Rust state for a durable buffer record.
+
+    Unlike self-play, derivation already has the resolved Great Library draws,
+    so the recorded outcomes are supplied directly rather than sampled again.
+    The rest of setup is deterministic from ``(seed, first_player)``.
+    """
+
+    try:
+        import seven_wonders_rust as swr
+    except ImportError as exc:  # pragma: no cover - environment diagnostic
+        raise RuntimeError(
+            "seven_wonders_rust is not installed; run maturin develop in seven_wonders_rust/"
+        ) from exc
+
+    game = new_game(record.seed, first_player=record.first_player)
+    draws = [
+        list(outcome) if isinstance(outcome, tuple) else [outcome]
+        for kind, outcome in record.chance_log
+        if kind == "great_library_draw"
+    ]
     return swr.RustGame(library_draws=draws, **rust_setup(game))
 
 
@@ -755,84 +786,102 @@ _CHANCE_KIND = {
     3: "age_deal",
 }
 
+_RUST_SELF_PLAY_WIRE_VERSION = "self-play-record-v1"
+
 
 def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
     """Materialize a Phase-D ``GameRecord`` from one completed Rust game.
 
-    This is deliberately cold-path work: Rust has already selected and applied
-    every move and recorded all search/chance data. Python replays the finished
-    action list once to compute the existing RNG-inclusive digests and mask
-    hashes, preserving buffer schema 1 without putting Python between moves.
+    Rust supplies language-neutral digests accumulated while it plays. The
+    conversion is structural only: mask hashes come from Rust's recorded legal
+    lists and no Python game is constructed unless ``validate`` requests the
+    independent replay gate. Production generation uses ``validate=False``;
+    parity tests keep it true.
     """
 
-    if raw.get("schema") != 1 or raw.get("spec_version") != "codec-1":
-        raise ValueError("unsupported Rust self-play record schema")
+    if (
+        raw.get("schema") != 1
+        or raw.get("wire_version") != _RUST_SELF_PLAY_WIRE_VERSION
+    ):
+        raise ValueError("unsupported Rust self-play record wire format")
     agents = dict(raw["agents"])
     agents["opponent_type"] = resolve_opponent_type(agents)
-    recorder = GameRecorder(
-        int(raw["seed"]),
-        first_player=int(raw["first_player"]),
-        agents=agents,
-        iteration=raw.get("iteration"),
-    )
-    expected_events: dict[int, list[tuple[str, str | tuple[str, ...]]]] = {}
+    if raw.get("digest_version") != LOGIC_DIGEST_VERSION:
+        raise ValueError(
+            f"unsupported Rust digest version: {raw.get('digest_version')!r}"
+        )
+    chance_log: list[tuple[str, str | tuple[str, ...]]] = []
+    last_move_index = -1
     for event in raw["chance_log"]:
+        move_index = int(event["move_index"])
+        if move_index < last_move_index:
+            raise ValueError("Rust chance log is not ordered by move")
+        last_move_index = move_index
         kind = _CHANCE_KIND[int(event["kind_id"])]
         names = list(event["outcome"])
         outcome: str | tuple[str, ...]
         outcome = names[0] if kind == "card_reveal" else tuple(names)
-        expected_events.setdefault(int(event["move_index"]), []).append((kind, outcome))
+        chance_log.append((kind, outcome))
 
+    moves: list[MoveRecord] = []
     for row in raw["moves"]:
         i = int(row["i"])
-        if i != len(recorder._moves):
+        if i != len(moves):
             raise ValueError(f"non-contiguous Rust move index {i}")
-        legal = list(legal_action_indices(recorder.game))
-        if legal != list(row["legal"]):
-            raise ValueError(f"Rust/Python legal mask diverged at move {i}")
+        legal = [int(action) for action in row["legal"]]
+        visits_raw = list(row["visits"])
+        if visits_raw and len(visits_raw) != len(legal):
+            raise ValueError(f"Rust visits are not legal-aligned at move {i}")
         visits = {action: int(count) for action, count in zip(legal, row["visits"])}
+        policy_raw = row["policy_target"]
+        if policy_raw is not None and len(policy_raw) != len(legal):
+            raise ValueError(f"Rust policy is not legal-aligned at move {i}")
         policy = (
             {
                 action: float(probability)
-                for action, probability in zip(legal, row["policy_target"])
+                for action, probability in zip(legal, policy_raw)
             }
-            if row["policy_target"] is not None
+            if policy_raw is not None
             else None
         )
-        before_events = len(recorder._chance_log)
-        recorder.play(
-            int(row["action"]),
-            visits=visits,
-            policy_target=policy,
-            root_value=(
-                float(row["root_value"]) if row["root_value"] is not None else None
-            ),
-            sims=int(row["sims"]),
-            mode=str(row["mode"]),
-            gumbel_topk=(
-                tuple(int(x) for x in row["gumbel_topk"])
-                if row["gumbel_topk"] is not None
-                else None
-            ),
-            policy_excluded=bool(row["policy_excluded"]),
-        )
-        actual_events = recorder._chance_log[before_events:]
-        expected = expected_events.pop(i, [])
-        if actual_events != expected:
-            raise ValueError(
-                f"Rust/Python chance log diverged at move {i}: "
-                f"{actual_events!r} != {expected!r}"
+        moves.append(
+            MoveRecord(
+                i=i,
+                actor=int(row["actor"]),
+                action=int(row["action"]),
+                mask_hash=legal_mask_hash(legal),
+                visits=visits,
+                policy_target=policy,
+                root_value=(
+                    float(row["root_value"])
+                    if row["root_value"] is not None
+                    else None
+                ),
+                sims=int(row["sims"]),
+                mode=str(row["mode"]),
+                gumbel_topk=(
+                    tuple(int(x) for x in row["gumbel_topk"])
+                    if row["gumbel_topk"] is not None
+                    else None
+                ),
+                policy_excluded=bool(row["policy_excluded"]),
             )
-    if expected_events:
-        raise ValueError(f"Rust chance log has unconsumed move entries: {sorted(expected_events)}")
+        )
 
-    record = recorder.finish()
-    if (
-        record.winner != raw["winner"]
-        or record.victory_type != raw["victory_type"]
-        or record.scores != (tuple(raw["scores"]) if raw["scores"] is not None else None)
-    ):
-        raise ValueError("Rust/Python final result diverged")
+    record = GameRecord(
+        seed=int(raw["seed"]),
+        first_player=int(raw["first_player"]),
+        agents=agents,
+        iteration=raw.get("iteration"),
+        winner=raw["winner"],
+        victory_type=raw["victory_type"],
+        scores=tuple(raw["scores"]) if raw["scores"] is not None else None,
+        chance_log=tuple(chance_log),
+        moves=tuple(moves),
+        final_digest=str(raw["final_digest"]),
+        trajectory_digest=str(raw["trajectory_digest"]),
+        digest_version=str(raw["digest_version"]),
+    )
     if validate:
         replay(record)
     return record

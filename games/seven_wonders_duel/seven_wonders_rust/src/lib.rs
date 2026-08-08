@@ -13,6 +13,8 @@ mod bots;
 mod chance;
 mod codec;
 mod data;
+mod derive;
+mod digest;
 mod encoder;
 mod engine;
 mod eval;
@@ -45,7 +47,9 @@ fn progress_ids(names: &[String]) -> Vec<usize> {
 fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
     out.set_item("schema", 1)?;
-    out.set_item("spec_version", "codec-1")?;
+    // This versions only the ephemeral Rust -> Python dictionary shape. The
+    // durable JSONL GameRecord has its own codec/spec version in buffer.py.
+    out.set_item("wire_version", "self-play-record-v1")?;
     out.set_item("seed", record.seed)?;
     out.set_item("first_player", record.first_player)?;
     out.set_item("iteration", record.iteration)?;
@@ -143,6 +147,9 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
     }
     out.set_item("chance_log", chance_log)?;
     out.set_item("final_fingerprint", record.final_fingerprint)?;
+    out.set_item("digest_version", record.digest_version)?;
+    out.set_item("final_digest", record.final_digest)?;
+    out.set_item("trajectory_digest", record.trajectory_digest)?;
     Ok(out.unbind())
 }
 
@@ -2410,6 +2417,68 @@ fn pack_threads() -> usize {
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    games, actions, actors, include, chance_logs, expected_results, expected_digests
+))]
+/// Validate, replay, and encode complete buffer records in parallel.
+fn derive_records(
+    py: Python<'_>,
+    games: Vec<Py<RustGame>>,
+    actions: Vec<Vec<usize>>,
+    actors: Vec<Vec<usize>>,
+    include: Vec<Vec<bool>>,
+    chance_logs: Vec<Vec<(u8, Vec<usize>)>>,
+    expected_results: Vec<(Option<usize>, Option<u8>, Option<(i32, i32)>)>,
+    expected_digests: Vec<(Option<String>, Option<String>)>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let count = games.len();
+    if actions.len() != count
+        || actors.len() != count
+        || include.len() != count
+        || chance_logs.len() != count
+        || expected_results.len() != count
+        || expected_digests.len() != count
+    {
+        return Err(PyValueError::new_err(
+            "derive record batches are not game-aligned",
+        ));
+    }
+    let states: Vec<GameState> = games
+        .iter()
+        .map(|game| game.borrow(py).state.clone())
+        .collect();
+    let specs = states
+        .into_iter()
+        .zip(actions)
+        .zip(actors)
+        .zip(include)
+        .zip(chance_logs)
+        .zip(expected_results)
+        .zip(expected_digests)
+        .map(
+            |((((((state, actions), actors), include), chance_log), result), digests)| {
+                derive::DeriveSpec {
+                    state,
+                    actions,
+                    actors,
+                    include,
+                    chance_log,
+                    winner: result.0,
+                    victory_type: result.1,
+                    scores: result.2,
+                    final_digest: digests.0,
+                    trajectory_digest: digests.1,
+                }
+            },
+        )
+        .collect();
+    let derived = py
+        .detach(move || derive::derive_batch(specs))
+        .map_err(PyValueError::new_err)?;
+    derive::to_python(py, derived)
+}
+
+#[pyfunction]
 /// Set the cheap-move root width. See `self_play::set_cheap_top_k`.
 fn set_cheap_top_k(width: usize) {
     self_play::set_cheap_top_k(width);
@@ -2455,6 +2524,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::pack_threads;
+
+    #[pymodule_export]
+    use super::derive_records;
 
     #[pymodule_export]
     use super::set_cheap_top_k;

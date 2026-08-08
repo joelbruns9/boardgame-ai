@@ -1266,11 +1266,11 @@ def test_resume_on_a_different_commit_is_refused(tmp_path):
         loop._refuse_changed_code(payload)
 
 
-def test_resume_override_downgrades_the_refusal_to_a_warning(tmp_path):
+def test_resume_override_warns_that_parity_must_be_rerun(tmp_path):
     loop = PhaseDLoop(
         _soft_gate_config(tmp_path, allow_resume_code_drift=True)
     )
-    with pytest.warns(UserWarning, match="resuming on different code"):
+    with pytest.warns(UserWarning, match="derive parity gate was rerun"):
         loop._refuse_changed_code({"git": {"commit": "0" * 40}})
 
 

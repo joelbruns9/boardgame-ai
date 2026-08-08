@@ -68,6 +68,7 @@ from .bots import (
     ScienceEconomyBot,
 )
 from .buffer import (
+    LEGACY_DIGEST_VERSION,
     GameRecord,
     GameRecorder,
     check_target_versions,
@@ -79,6 +80,7 @@ from .codec import decode_action, encode_action
 from .dataset import (
     Example,
     GameDerivationStats,
+    derive_records_rust,
     examples_from_record,
     examples_from_records,
     is_fast_search_move,
@@ -317,6 +319,9 @@ class PhaseDConfig:
     quadruples buffer size, so ``--train-steps`` must rise with it to keep
     ``samples_per_new_position`` in range.
     """
+
+    derive_backend: str = "rust"
+    """Replay/encoding implementation: production Rust or Python reference."""
 
     example_cache_examples: int = 250_000
     """Vectorized examples held in memory across iterations (0 disables).
@@ -714,6 +719,8 @@ class PhaseDConfig:
             raise ValueError("gate_backend must be rust or python")
         if self.generation_backend not in ("rust", "python"):
             raise ValueError("generation_backend must be rust or python")
+        if self.derive_backend not in ("rust", "python"):
+            raise ValueError("derive_backend must be rust or python")
         if min(
             self.rust_slots,
             self.rust_global_batch_cap,
@@ -1053,7 +1060,8 @@ def _write_records(path: Path, records: Sequence[GameRecord]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         for record in records:
-            handle.write(to_json_line(record) + "\n")
+            line = to_json_line(record)
+            handle.write(line + "\n")
     temporary.replace(path)
 
 
@@ -1195,7 +1203,7 @@ def generate_seed_buffer(
                 )
                 for raw in raw_records:
                     raw["agents"]["kind"] = "curriculum_seed"
-                converted = phase_d_records_from_rust(raw_records)
+                converted = phase_d_records_from_rust(raw_records, validate=False)
                 indexed.update(
                     {job.index: record for job, record in zip(chunk, converted)}
                 )
@@ -1591,6 +1599,10 @@ class PhaseDLoop:
         self.manifest = RunManifest(self.run_dir, Path(__file__).resolve().parents[2])
         self.training_log = self.run_dir / "training_log.jsonl"
         self.warm_records: list[GameRecord] = []
+        # Rust cannot reproduce the CPython-RNG component of legacy durable
+        # digests. Keep production on Rust, but make that deliberate gap loud
+        # once when legacy persisted data first enters this process.
+        self._legacy_digest_warning_emitted = False
         # Per-game vectorized examples, keyed by the game's own content digest.
         # Ordered so eviction can be least-recently-used: the games that fall out
         # are the iterations that have left the replay window.
@@ -2381,6 +2393,32 @@ class PhaseDLoop:
             < window_iterations
         ]
 
+    def _warn_unverifiable_legacy_digests(
+        self,
+        records: Sequence[GameRecord],
+        *,
+        source: str,
+    ) -> None:
+        """Warn once when Rust will skip legacy RNG-inclusive digest fields."""
+
+        if self.config.derive_backend != "rust" or self._legacy_digest_warning_emitted:
+            return
+        legacy = sum(
+            record.digest_version == LEGACY_DIGEST_VERSION for record in records
+        )
+        if not legacy:
+            return
+        self._legacy_digest_warning_emitted = True
+        warnings.warn(
+            f"{legacy} of {len(records)} records in {source} carry legacy "
+            "RNG-inclusive digests; the Rust derive path cannot verify their "
+            "stored trajectory and final digests. Structural runtime checks "
+            "still apply. Run --derive-backend python once for a full preflight "
+            "if provenance is uncertain.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     def _save_replay_buffer(self) -> None:
         """Atomically export the replay set available at the latest generation."""
 
@@ -2418,6 +2456,10 @@ class PhaseDLoop:
         )
         self.warm_records, self.last_warm_stats = filter_warm_records_by_staleness(
             records, max_staleness
+        )
+        self._warn_unverifiable_legacy_digests(
+            self.warm_records,
+            source=f"warm buffer {warm_path}",
         )
         stats = self.last_warm_stats
         print(
@@ -2512,8 +2554,9 @@ class PhaseDLoop:
         if self.config.warm_buffer:
             self._load_warm_buffer(Path(self.config.warm_buffer))
         if self.config.seed_games:
+            seed_path = self.buffer_dir / "curriculum_seed.jsonl"
             generate_seed_buffer(
-                self.buffer_dir / "curriculum_seed.jsonl",
+                seed_path,
                 games=self.config.seed_games,
                 seed=self.config.seed,
                 workers=self.config.workers,
@@ -2559,7 +2602,8 @@ class PhaseDLoop:
             warnings.warn(
                 f"resuming on different code ({detail}); "
                 "--allow-resume-code-drift was passed, so the run continues and "
-                "its rows now span more than one engine",
+                "its rows now span more than one engine. Confirm the Rust/Python "
+                "derive parity gate was rerun for this code before continuing",
                 stacklevel=2,
             )
             return
@@ -2926,7 +2970,7 @@ class PhaseDLoop:
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
         )
-        records = phase_d_records_from_rust(raw_records)
+        records = phase_d_records_from_rust(raw_records, validate=False)
         if league is not None:
             records = _tag_league_opponents(records, league)
         rust_metrics.append(metrics)
@@ -2963,16 +3007,28 @@ class PhaseDLoop:
                 self.games_ledger.path_for(known) for known in selection.iterations
             ]
         live = self._warm_records_for_iteration(iteration)
-        live.extend(record for path in paths for record in read_records(path))
+        iteration_records = [
+            record for path in paths for record in read_records(path)
+        ]
+        live.extend(iteration_records)
         seed_fraction = self.seed_retain_fraction(iteration)
         seed_path = self.buffer_dir / "curriculum_seed.jsonl"
         if seed_fraction <= 0.0 or not seed_path.exists():
+            self._warn_unverifiable_legacy_digests(
+                live,
+                source=f"iteration {iteration} replay window",
+            )
             return live
         seed_records = read_records(seed_path)
         desired = round(len(seed_records) * seed_fraction)
         rng = random.Random(self.config.seed + iteration)
         rng.shuffle(seed_records)
-        return live + seed_records[: min(desired, len(seed_records))]
+        selected = live + seed_records[: min(desired, len(seed_records))]
+        self._warn_unverifiable_legacy_digests(
+            selected,
+            source=f"iteration {iteration} replay window",
+        )
+        return selected
 
     @property
     def optimizer_state_path(self) -> Path:
@@ -3100,11 +3156,13 @@ class PhaseDLoop:
         re-derives them; 7WD stores compact, verifiable game *records* and
         rebuilds, which costs the whole replay window every iteration. This
         keeps 7WD's records as the durable source of truth and pays their
-        verification once per process.
+        replay/encoding once per process.
 
-        Keyed on a sha256 of the record's own canonical serialization -- the same
-        `to_json_line` that wrote it -- so the key covers every field the examples
-        depend on and every field replay verifies.
+        Keyed on a sha256 of the record's serialized payload, computed once while
+        parsing JSONL. In-memory/generated records fall back to hashing the same
+        canonical `to_json_line` that writes them. The key therefore covers every
+        field the examples depend on without reserializing the entire 40k-game
+        replay window on every iteration.
 
         `trajectory_digest` is not sufficient and was the first version of this
         key. It chains the *replayed states*, so it says nothing about
@@ -3115,8 +3173,9 @@ class PhaseDLoop:
         imports produce, would have shared an entry. It is also a *stored* field,
         so keying on it let a record whose actions were altered without updating
         it hit the cache and skip the replay that would have caught the
-        alteration. Hashing the whole record costs ~0.74 ms per game (~3.6 s over
-        a 4,800-game window, ~1% of an iteration) and removes both.
+        alteration. The old implementation paid that full serialization and hash
+        on every lookup: ~0.74 ms per game is ~30 s at the cloud run's 40k-game
+        window even when every game is a cache hit.
         """
 
         cache = self._example_cache
@@ -3125,36 +3184,80 @@ class PhaseDLoop:
         raw_before, _estimated_before = self._cache_totals()
         derived_games = 0
         derived_examples = 0
+        python_derived_games = 0
+        rust_derived_games = 0
         used: set[tuple] = set()
         out: list[Example] = []
+        keyed_records: list[tuple[tuple[str, bool], GameRecord]] = []
+        missing: OrderedDict[tuple[str, bool], GameRecord] = OrderedDict()
         for record in records:
-            key = (
-                hashlib.sha256(to_json_line(record).encode("utf-8")).hexdigest(),
-                fast,
+            digest = record.source_digest
+            if digest is None:
+                digest = hashlib.sha256(
+                    to_json_line(record).encode("utf-8")
+                ).hexdigest()
+            key = (digest, fast)
+            keyed_records.append((key, record))
+            if key not in cache or key not in self._example_cache_game_stats:
+                missing.setdefault(key, record)
+
+        missing_items = list(missing.items())
+        python_items = [
+            (key, record)
+            for key, record in missing_items
+            if self.config.derive_backend == "python"
+        ]
+        rust_items = [
+            (key, record)
+            for key, record in missing_items
+            if self.config.derive_backend == "rust"
+        ]
+        derived_by_key: dict[
+            tuple[str, bool], tuple[list[Example], GameDerivationStats]
+        ] = {}
+        for key, record in python_items:
+            summaries: list[GameDerivationStats] = []
+            examples = examples_from_record(
+                record,
+                record_fast_moves=fast,
+                on_derived=summaries.append,
             )
-            cached = cache.get(key)
-            game_stats = self._example_cache_game_stats.get(key)
-            if cached is None or game_stats is None:
-                derived: list[GameDerivationStats] = []
-                cached = examples_from_record(
-                    record,
-                    record_fast_moves=fast,
-                    on_derived=derived.append,
+            if len(summaries) != 1:
+                raise AssertionError(
+                    "example derivation must produce one game-stat summary"
                 )
-                if len(derived) != 1:
-                    raise AssertionError(
-                        "example derivation must produce one game-stat summary"
-                    )
-                game_stats = derived[0]
-                cache[key] = cached
-                self._example_cache_game_stats[key] = game_stats
-                self._example_cache_raw_bytes[key] = self._examples_raw_array_bytes(
-                    cached
-                )
-                derived_games += 1
-                derived_examples += len(cached)
-            else:
-                cache.move_to_end(key)
+            derived_by_key[key] = (examples, summaries[0])
+            python_derived_games += 1
+        if rust_items:
+            rust_rows = derive_records_rust(
+                [record for _key, record in rust_items],
+                record_fast_moves=fast,
+            )
+            if len(rust_rows) != len(rust_items):
+                raise AssertionError("Rust example derivation lost record alignment")
+            derived_by_key.update(
+                (key, row) for (key, _record), row in zip(rust_items, rust_rows)
+            )
+            rust_derived_games += len(rust_items)
+        derived_rows = [derived_by_key[key] for key, _record in missing_items]
+
+        if len(derived_rows) != len(missing_items):
+            raise AssertionError("example derivation lost record alignment")
+        for ((key, _record), (examples, game_stats)) in zip(
+            missing_items, derived_rows
+        ):
+            cache[key] = examples
+            self._example_cache_game_stats[key] = game_stats
+            self._example_cache_raw_bytes[key] = self._examples_raw_array_bytes(
+                examples
+            )
+            derived_games += 1
+            derived_examples += len(examples)
+
+        for key, record in keyed_records:
+            cached = cache[key]
+            game_stats = self._example_cache_game_stats[key]
+            cache.move_to_end(key)
             if on_record_derived is not None:
                 on_record_derived(record, game_stats)
             used.add(key)
@@ -3198,6 +3301,8 @@ class PhaseDLoop:
             "examples": len(out),
             "replayed_games": derived_games,
             "replayed_examples": derived_examples,
+            "python_derived_games": python_derived_games,
+            "rust_derived_games": rust_derived_games,
             "cached_games": len(cache),
             "cached_examples": held_examples,
             "evicted_games": evicted,
@@ -4816,6 +4921,13 @@ def build_parser() -> argparse.ArgumentParser:
         "so --train-steps must rise with it",
     )
     parser.add_argument(
+        "--derive-backend",
+        choices=("rust", "python"),
+        default="rust",
+        help="buffer replay/encoding backend. Rust is the production default; "
+        "Python is the independently implemented reference/fallback",
+    )
+    parser.add_argument(
         "--min-buffer-positions",
         type=int,
         default=0,
@@ -5027,6 +5139,7 @@ def main(argv=None) -> int:
         vram_budget_gb=args.vram_budget_gb,
         memory_headroom_gb=args.memory_headroom_gb,
         record_fast_moves=args.record_fast_moves,
+        derive_backend=args.derive_backend,
         eval_search_mode=args.eval_search_mode,
         generation_backend=args.generation_backend,
         gate_backend=args.gate_backend,

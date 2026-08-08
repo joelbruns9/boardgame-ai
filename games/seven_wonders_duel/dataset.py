@@ -23,8 +23,19 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .buffer import GameRecord, archive_policy_seats, replay
+from .buffer import (
+    LEGACY_DIGEST_VERSION,
+    LOGIC_DIGEST_VERSION,
+    SPEC_VERSION,
+    GameRecord,
+    ReplayMismatchError,
+    StaleSpecVersionError,
+    archive_policy_seats,
+    legal_mask_hash,
+    replay,
+)
 from .codec import NUM_ACTIONS, legal_action_indices
+from .data import CARD_IDS, PROGRESS_IDS, WONDER_IDS
 from .encoder import _FEATURE_COUNTS, _SCHEMA, Encoding, TokenType, encode
 from .engine import _science_symbols
 from .game import VictoryType
@@ -161,6 +172,38 @@ def is_fast_search_move(move) -> bool:
     return move.policy_excluded and move.sims > 0
 
 
+def _policy_for_move(move, legal: np.ndarray) -> np.ndarray:
+    """Build the sparse-on-legal policy label shared by both derivation paths."""
+
+    policy = np.zeros(len(legal), dtype=np.float32)
+    index_of = {int(action): index for index, action in enumerate(legal)}
+    if move.policy_target:
+        for action, probability in move.policy_target.items():
+            if int(action) not in index_of:
+                raise ValueError(
+                    f"move {move.i}: policy target on illegal action {action}"
+                )
+            policy[index_of[int(action)]] = probability
+        total = float(policy.sum())
+        if not 0.999 <= total <= 1.001:
+            raise ValueError(f"move {move.i}: policy target sums to {total:.4f}")
+        policy /= total
+    elif move.visits:
+        total = float(sum(move.visits.values()))
+        if total <= 0:
+            raise ValueError(f"move {move.i}: visit counts sum to zero")
+        for action, visits in move.visits.items():
+            if int(action) not in index_of:
+                raise ValueError(f"move {move.i}: visit on illegal action {action}")
+            policy[index_of[int(action)]] = visits / total
+    else:
+        position = int(np.searchsorted(legal, move.action))
+        if position >= len(legal) or int(legal[position]) != move.action:
+            raise ValueError(f"move {move.i}: played action is illegal")
+        policy[position] = 1.0
+    return policy
+
+
 def examples_from_record(
     record: GameRecord,
     *,
@@ -207,35 +250,7 @@ def examples_from_record(
         if encoding.actor != actor:
             raise AssertionError("encoder actor disagrees with replay actor")
         legal = np.asarray(legal_action_indices(game), dtype=np.int16)
-        policy = np.zeros(len(legal), dtype=np.float32)
-        index_of = {int(a): i for i, a in enumerate(legal)}
-        if move.policy_target:
-            # Preferred: the improved completed-Q distribution from Gumbel
-            # search (visits stay as raw evidence for reanalyze).
-            for action, probability in move.policy_target.items():
-                if int(action) not in index_of:
-                    raise ValueError(
-                        f"move {move.i}: policy target on illegal action {action}"
-                    )
-                policy[index_of[int(action)]] = probability
-            total = float(policy.sum())
-            if not 0.999 <= total <= 1.001:
-                raise ValueError(
-                    f"move {move.i}: policy target sums to {total:.4f}"
-                )
-            policy /= total
-        elif move.visits:
-            total = float(sum(move.visits.values()))
-            if total <= 0:
-                raise ValueError(f"move {move.i}: visit counts sum to zero")
-            for action, visits in move.visits.items():
-                if int(action) not in index_of:
-                    raise ValueError(
-                        f"move {move.i}: visit on illegal action {action}"
-                    )
-                policy[index_of[int(action)]] = visits / total
-        else:
-            policy[int(np.searchsorted(legal, move.action))] = 1.0
+        policy = _policy_for_move(move, legal)
         type_ids, entity_ids, aux_ids, features = vectorize(encoding)
         # Inputs only: the outcome labels are unknown until the replay finishes,
         # so the Example is built once, complete, below. It used to be built here
@@ -322,6 +337,241 @@ def examples_from_record(
             )
         )
     return examples
+
+
+_CHANCE_KIND_IDS = {
+    "card_reveal": 0,
+    "great_library_draw": 1,
+    "wonder_group_reveal": 2,
+    "age_deal": 3,
+}
+_VICTORY_IDS = {
+    "military": 0,
+    "scientific": 1,
+    "civilian": 2,
+    "shared_civilian": 3,
+}
+
+
+def _rust_chance_log(record: GameRecord) -> list[tuple[int, list[int]]]:
+    converted: list[tuple[int, list[int]]] = []
+    for kind, outcome in record.chance_log:
+        try:
+            kind_id = _CHANCE_KIND_IDS[kind]
+        except KeyError as error:
+            raise ReplayMismatchError(f"unknown chance kind {kind!r}") from error
+        names = list(outcome) if isinstance(outcome, tuple) else [outcome]
+        ids = {
+            0: CARD_IDS,
+            1: PROGRESS_IDS,
+            2: WONDER_IDS,
+            3: CARD_IDS,
+        }[kind_id]
+        try:
+            converted.append((kind_id, [ids[name] for name in names]))
+        except KeyError as error:
+            raise ReplayMismatchError(
+                f"unknown {kind} outcome {error.args[0]!r}"
+            ) from error
+    return converted
+
+
+def _examples_from_rust_payload(
+    record: GameRecord, payload: dict
+) -> tuple[list[Example], GameDerivationStats]:
+    """Turn one packed Rust replay into the exact public ``Example`` objects."""
+
+    if int(payload["feature_width"]) != MAX_FEATURES:
+        raise AssertionError("Rust/Python feature width differs")
+    moves = record.moves
+    move_offsets = np.frombuffer(payload["move_legal_offsets"], dtype="<u4")
+    move_legal = np.frombuffer(payload["move_legal_actions"], dtype="<i2")
+    move_actors = np.frombuffer(payload["move_actors"], dtype=np.uint8)
+    if len(move_offsets) != len(moves) + 1 or len(move_actors) != len(moves):
+        raise ReplayMismatchError("Rust replay move count differs from record")
+    for index, move in enumerate(moves):
+        if move.i != index:
+            raise ReplayMismatchError(
+                f"non-contiguous recorded move index {move.i} at position {index}"
+            )
+        start, stop = int(move_offsets[index]), int(move_offsets[index + 1])
+        legal = move_legal[start:stop]
+        current_hash = legal_mask_hash([int(action) for action in legal])
+        if current_hash != move.mask_hash:
+            raise ReplayMismatchError(
+                f"move {move.i}: mask hash {current_hash} != recorded {move.mask_hash}"
+            )
+        if int(move_actors[index]) != move.actor:
+            raise ReplayMismatchError(
+                f"move {move.i}: actor {int(move_actors[index])} != recorded {move.actor}"
+            )
+
+    token_offsets = np.frombuffer(payload["token_offsets"], dtype="<u4")
+    row_moves = np.frombuffer(payload["row_move_indices"], dtype="<u4")
+    type_ids = np.frombuffer(payload["type_ids"], dtype=np.int8)
+    entity_ids = np.frombuffer(payload["entity_ids"], dtype="<i2")
+    aux_ids = np.frombuffer(payload["aux_ids"], dtype="<i2")
+    features_f64 = np.frombuffer(payload["features_f64"], dtype="<f8")
+    if len(token_offsets) != len(row_moves) + 1:
+        raise ReplayMismatchError("Rust replay row offsets are not aligned")
+    if features_f64.size != type_ids.size * MAX_FEATURES:
+        raise ReplayMismatchError("Rust replay feature payload has the wrong size")
+    features = features_f64.reshape(-1, MAX_FEATURES).astype(np.float16)
+    archive_seats = archive_policy_seats(record.agents)
+    stats_payload = payload["stats"]
+    final_position = int(stats_payload["final_conflict_position"])
+    science_counts = (
+        int(stats_payload["science_count_0"]),
+        int(stats_payload["science_count_1"]),
+    )
+    victory = VictoryType(record.victory_type) if record.victory_type else None
+
+    examples: list[Example] = []
+    for row, move_index_raw in enumerate(row_moves):
+        move_index = int(move_index_raw)
+        if move_index >= len(moves):
+            raise ReplayMismatchError(f"Rust replay returned bad move {move_index}")
+        move = moves[move_index]
+        actor = move.actor
+        token_start = int(token_offsets[row])
+        token_stop = int(token_offsets[row + 1])
+        legal_start = int(move_offsets[move_index])
+        legal_stop = int(move_offsets[move_index + 1])
+        legal = move_legal[legal_start:legal_stop]
+        policy = _policy_for_move(move, legal)
+        if record.scores is not None:
+            mine, theirs = record.scores[actor], record.scores[1 - actor]
+            margin, margin_valid = (mine - theirs) / 20.0, True
+        else:
+            margin, margin_valid = 0.0, False
+        relative_position = final_position if actor == 0 else -final_position
+        examples.append(
+            Example(
+                type_ids=type_ids[token_start:token_stop],
+                entity_ids=entity_ids[token_start:token_stop],
+                aux_ids=aux_ids[token_start:token_stop],
+                features=features[token_start:token_stop],
+                legal=legal,
+                policy_target=policy,
+                has_policy=not move.policy_excluded and actor not in archive_seats,
+                value_class=_actor_value_class(record.winner, actor),
+                root_value=move.root_value,
+                joint7_class=_joint7_class(record.winner, victory, actor),
+                margin=margin,
+                margin_valid=margin_valid,
+                military_final=relative_position / 9.0,
+                sci_final_my=science_counts[actor] / 6.0,
+                sci_final_opp=science_counts[1 - actor] / 6.0,
+                game_key=record.seed,
+                iteration=record.iteration,
+            )
+        )
+
+    stats = GameDerivationStats(
+        ending_age=int(stats_payload["ending_age"]),
+        max_absolute_track=int(stats_payload["max_absolute_track"]),
+        sixth_science_symbol=bool(stats_payload["sixth_science_symbol"]),
+        progress_tokens=int(stats_payload["progress_tokens"]),
+        science_pairs=int(stats_payload["science_pairs"]),
+        military_tokens_triggered=int(stats_payload["military_tokens_triggered"]),
+        military_gold_pillaged=int(stats_payload["military_gold_pillaged"]),
+        wonders_built=int(stats_payload["wonders_built"]),
+        wonders_discarded=int(stats_payload["wonders_discarded"]),
+    )
+    return examples, stats
+
+
+def derive_records_rust(
+    records: list[GameRecord],
+    *,
+    record_fast_moves: bool = False,
+    batch_games: int = 32,
+) -> list[tuple[list[Example], GameDerivationStats]]:
+    """Rust-default replay/encode path, aligned one result per input game.
+
+    The small game batch bounds transient f64 packing memory during a cold
+    40k-game buffer rebuild.  NumPy converts each batch to the durable float16
+    representation before the next batch is submitted.
+
+    Rust validates every action/legal mask, actor, resolved chance outcome, game
+    completion, recorded result, and current language-neutral digest. Legacy
+    records retain RNG-inclusive digests that Rust cannot reproduce, so the Rust
+    path validates their structural witnesses but not those two stored digest
+    fields. Select ``derive_backend='python'`` for an explicit legacy digest
+    audit; warm imports and resumes otherwise remain on the production Rust
+    path.
+    """
+
+    try:
+        import seven_wonders_rust as swr
+    except ImportError as error:  # pragma: no cover - environment diagnostic
+        raise RuntimeError(
+            "seven_wonders_rust is not installed; use derive_backend='python' "
+            "or run maturin develop"
+        ) from error
+    from .rust_bridge import rust_game_for_record
+
+    if batch_games < 1:
+        raise ValueError("batch_games must be positive")
+    output: list[tuple[list[Example], GameDerivationStats]] = []
+    for batch_start in range(0, len(records), batch_games):
+        batch = records[batch_start : batch_start + batch_games]
+        for record in batch:
+            if record.spec_version != SPEC_VERSION:
+                raise StaleSpecVersionError(
+                    f"record was written under spec {record.spec_version!r}, this "
+                    f"engine is {SPEC_VERSION!r}"
+                )
+        games = [rust_game_for_record(record) for record in batch]
+        actions = [[move.action for move in record.moves] for record in batch]
+        actors = [[move.actor for move in record.moves] for record in batch]
+        include = [
+            [record_fast_moves or not is_fast_search_move(move) for move in record.moves]
+            for record in batch
+        ]
+        chance_logs = [_rust_chance_log(record) for record in batch]
+        expected_results = [
+            (
+                record.winner,
+                _VICTORY_IDS[record.victory_type]
+                if record.victory_type is not None
+                else None,
+                record.scores,
+            )
+            for record in batch
+        ]
+        expected_digests = []
+        for record in batch:
+            if record.digest_version == LOGIC_DIGEST_VERSION:
+                expected_digests.append(
+                    (record.final_digest, record.trajectory_digest)
+                )
+            elif record.digest_version == LEGACY_DIGEST_VERSION:
+                expected_digests.append((None, None))
+            else:
+                raise ValueError(
+                    "unsupported buffer digest version: "
+                    f"{record.digest_version!r}"
+                )
+        try:
+            payloads = swr.derive_records(
+                games,
+                actions,
+                actors,
+                include,
+                chance_logs,
+                expected_results,
+                expected_digests,
+            )
+        except ValueError as error:
+            raise ReplayMismatchError(str(error)) from error
+        if len(payloads) != len(batch):
+            raise ReplayMismatchError("Rust derivation returned the wrong game count")
+        output.extend(
+            _examples_from_rust_payload(record, payload)
+            for record, payload in zip(batch, payloads)
+        )
+    return output
 
 
 def examples_from_records(records, *, record_fast_moves: bool = False) -> list[Example]:

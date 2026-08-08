@@ -15,7 +15,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from .buffer import GameRecord, replay
+from .buffer import (
+    LEGACY_DIGEST_VERSION,
+    GameRecord,
+    GameRecorder,
+    ReplayMismatchError,
+    append_records,
+    from_json_line,
+    replay,
+    to_json_line,
+)
 from .dataset import examples_from_record, examples_from_records
 from .phase_d import (
     DEFAULT_CACHE_CALIBRATION_FACTOR,
@@ -50,6 +59,28 @@ def _loop(tmp_path, **overrides) -> PhaseDLoop:
     loop = PhaseDLoop(config)
     loop.buffer_dir.mkdir(parents=True, exist_ok=True)
     return loop
+
+
+def _legacy_record(record: GameRecord) -> GameRecord:
+    recorder = GameRecorder(
+        record.seed,
+        first_player=record.first_player,
+        agents=record.agents,
+        iteration=record.iteration,
+        digest_version=LEGACY_DIGEST_VERSION,
+    )
+    for move in record.moves:
+        recorder.play(
+            move.action,
+            visits=move.visits,
+            policy_target=move.policy_target,
+            root_value=move.root_value,
+            sims=move.sims,
+            mode=move.mode,
+            gumbel_topk=move.gumbel_topk,
+            policy_excluded=move.policy_excluded,
+        )
+    return recorder.finish()
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +133,75 @@ def test_cache_returns_exactly_what_the_uncached_path_returns(tmp_path, records)
     assert len(warm) == len(expected)
     assert all(_same(a, b) for a, b in zip(warm, expected))
     assert loop.last_example_cache_stats["replayed_games"] == 0, "second pass replayed"
+
+
+def test_loaded_record_cache_key_does_not_reserialize(tmp_path, records, monkeypatch):
+    loaded = from_json_line(to_json_line(records[0]))
+    loop = _loop(tmp_path, derive_backend="python")
+
+    def fail(_record):
+        raise AssertionError("loaded records must use their parse-time digest")
+
+    monkeypatch.setattr("games.seven_wonders_duel.phase_d.to_json_line", fail)
+    loop._cached_examples([loaded])
+
+
+def test_imported_warm_record_uses_rust_default(tmp_path, records):
+    warm_path = tmp_path / "warm.jsonl"
+    append_records(warm_path, [_legacy_record(records[0])])
+    loop = _loop(tmp_path)
+    with pytest.warns(UserWarning, match="1 of 1 records.*legacy"):
+        loop._load_warm_buffer(warm_path)
+    loaded = loop.warm_records[0]
+
+    loop._cached_examples([loaded])
+    assert loop.last_example_cache_stats["python_derived_games"] == 0
+    assert loop.last_example_cache_stats["rust_derived_games"] == 1
+
+    loop._cached_examples([loaded])
+    assert loop.last_example_cache_stats["python_derived_games"] == 0
+    assert loop.last_example_cache_stats["rust_derived_games"] == 0
+
+
+def test_explicit_python_backend_audits_legacy_trajectory_digest(
+    tmp_path, records
+):
+    from dataclasses import replace
+
+    corrupt = replace(
+        _legacy_record(records[0]),
+        trajectory_digest="sha256:" + "0" * 64,
+    )
+    warm_path = tmp_path / "corrupt-warm.jsonl"
+    append_records(warm_path, [corrupt])
+    loop = _loop(tmp_path, derive_backend="python")
+    loop._load_warm_buffer(warm_path)
+    loaded = loop.warm_records[0]
+
+    with pytest.raises(ReplayMismatchError, match="trajectory digest"):
+        loop._cached_examples([loaded])
+
+
+def test_resume_and_existing_curriculum_records_use_rust_default(
+    tmp_path, records
+):
+    loop = _loop(tmp_path)
+    append_records(
+        loop.buffer_dir / "iter_0000.jsonl",
+        [_legacy_record(records[0])],
+    )
+    append_records(
+        loop.buffer_dir / "curriculum_seed.jsonl",
+        [_legacy_record(records[1])],
+    )
+
+    with pytest.warns(UserWarning, match="2 of 2 records.*legacy"):
+        loaded = loop.training_records(0)
+    assert len(loaded) == 2
+
+    loop._cached_examples(loaded)
+    assert loop.last_example_cache_stats["python_derived_games"] == 0
+    assert loop.last_example_cache_stats["rust_derived_games"] == 2
 
 
 def test_example_derivation_collects_game_stats_from_the_same_replay(records):

@@ -567,6 +567,21 @@ pub fn pack_threads() -> usize {
         .unwrap_or_else(rayon::current_num_threads)
 }
 
+/// Run CPU packing/encoding work on the same explicitly sized pool used by the
+/// search boundary. Derivation is a separate phase, so sharing the pool avoids
+/// another host-sized Rayon pool and cannot contend with live inference.
+pub(crate) fn with_pack_pool<F, R>(operation: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    if let Some(pool) = PACK_POOL.get() {
+        pool.install(operation)
+    } else {
+        operation()
+    }
+}
+
 /// Packing-only benchmark for CORE_UTILIZATION_PLAN.md step 2b.
 ///
 /// Times `pack_routed` with no GPU, no search and no Python round trip, so a

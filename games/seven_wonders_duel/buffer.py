@@ -1,12 +1,13 @@
 """Replayable game-buffer schema (CODEC_SPEC.md §6, plan A4).
 
 One JSONL record per game. The defining invariant: ``replay(record)``
-reproduces every state bit-exactly from ``(setup.seed, actions)`` — verified
-per move against ``mask_hash`` and at the end against ``final_digest`` — so
-reanalyze, exact relabeling, and trap harvesting are derived queries, never
-migrations. The ``chance_log`` is deliberately redundant with the seed: any
-change to engine RNG consumption breaks replay loudly instead of silently
-corrupting old buffers.
+reproduces every game-logic state from ``(setup.seed, actions)`` — verified per
+move against ``mask_hash`` and at the end against versioned final/trajectory
+digests — so reanalyze, exact relabeling, and trap harvesting are derived
+queries, never migrations. The ``chance_log`` is deliberately redundant with
+the seed: a change to chance resolution breaks replay loudly instead of
+silently corrupting old buffers. Legacy digests additionally include CPython's
+RNG internals; current digests use the cross-language logic fingerprint.
 """
 
 from __future__ import annotations
@@ -14,13 +15,24 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import struct
 
 from .codec import decode_action, legal_action_indices
+from .data import CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
 from .engine import apply_action
-from .game import GameState, Phase, ResolvedChance, new_game
+from .game import (
+    GameState,
+    PendingChoiceKind,
+    Phase,
+    ResolvedChance,
+    VictoryType,
+    new_game,
+)
 
 SCHEMA_VERSION = 1
 SPEC_VERSION = "codec-2"
+LEGACY_DIGEST_VERSION = "python-rng-v1"
+LOGIC_DIGEST_VERSION = "logic-sha256-v1"
 """Version of what a state and an action MEAN, for replay.
 
 1. through 2026-08-02.
@@ -92,6 +104,23 @@ class GameRecord:
     schema: int = SCHEMA_VERSION
     spec_version: str = SPEC_VERSION
     target_version: int = TARGET_VERSION
+    digest_version: str = LOGIC_DIGEST_VERSION
+    _source_digest: str | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+    """SHA-256 of the JSONL payload this object was parsed from.
+
+    This is provenance, not part of the durable schema.  Training rereads the
+    replay window every iteration, so retaining the digest computed while
+    parsing avoids rebuilding and hashing the complete nested payload merely to
+    look it up in the in-memory example cache.  ``dataclasses.replace`` does not
+    copy ``init=False`` fields, which deliberately invalidates the provenance
+    when any record field is changed.
+    """
+
+    @property
+    def source_digest(self) -> str | None:
+        return self._source_digest
 
 
 class ReplayMismatchError(RuntimeError):
@@ -169,9 +198,13 @@ def resolve_opponent_type(agents: dict[str, str]) -> str:
     return "current_best"
 
 
-def mask_hash(game: GameState) -> str:
-    payload = json.dumps(legal_action_indices(game)).encode()
+def legal_mask_hash(legal: list[int] | tuple[int, ...]) -> str:
+    payload = json.dumps(list(legal)).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()[:16]
+
+
+def mask_hash(game: GameState) -> str:
+    return legal_mask_hash(legal_action_indices(game))
 
 
 def state_digest(game: GameState) -> str:
@@ -239,6 +272,154 @@ def state_digest(game: GameState) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(payload).encode()).hexdigest()
 
 
+_SCIENCE_ORDER = {symbol: index for index, symbol in enumerate(ScienceSymbol)}
+_PHASE_ORDER = {member: index for index, member in enumerate(Phase)}
+_VICTORY_ORDER = {member: index for index, member in enumerate(VictoryType)}
+_PENDING_ORDER = {
+    member: index for index, member in enumerate(PendingChoiceKind)
+}
+_PROGRESS_PENDING = {
+    PendingChoiceKind.CHOOSE_UNUSED_PROGRESS,
+    PendingChoiceKind.CHOOSE_AVAILABLE_PROGRESS,
+}
+
+
+def logic_fingerprint(game: GameState) -> list[int]:
+    """Language-neutral integer serialization of all game-logic state.
+
+    This is byte-for-byte identical to Rust ``GameState::fingerprint``. Python's
+    RNG internals are deliberately excluded: all resolved randomness is already
+    locked by setup plus ``chance_log``, while this surface covers the state that
+    can affect subsequent game logic and encoded training positions.
+    """
+
+    out: list[int] = []
+
+    def push_list(names, id_map) -> None:
+        ids = [id_map[name] for name in names]
+        out.append(len(ids))
+        out.extend(ids)
+
+    out.extend(
+        (
+            _PHASE_ORDER[game.phase],
+            game.first_player,
+            game.active_player,
+            game.age,
+            game.wonder_round,
+            game.wonder_pick_index,
+        )
+    )
+    for city in game.cities:
+        out.append(city.coins)
+        push_list(city.wonders, WONDER_IDS)
+        push_list(city.built_wonders, WONDER_IDS)
+        push_list(city.buildings, CARD_IDS)
+        push_list(city.progress_tokens, PROGRESS_IDS)
+        pairs = sorted(_SCIENCE_ORDER[symbol] for symbol in city.claimed_science_pairs)
+        out.append(len(pairs))
+        out.extend(pairs)
+
+    push_list(game.available_progress_tokens, PROGRESS_IDS)
+    push_list(game.unused_progress_tokens, PROGRESS_IDS)
+    push_list(game.wonder_groups[0], WONDER_IDS)
+    push_list(game.wonder_groups[1], WONDER_IDS)
+    push_list(game.unused_wonders, WONDER_IDS)
+    push_list(game.wonder_offer, WONDER_IDS)
+    for age in (1, 2, 3):
+        push_list(game.age_decks[age], CARD_IDS)
+    for age in (1, 2, 3):
+        push_list(game.removed_age_cards[age], CARD_IDS)
+    push_list(game.selected_guilds, CARD_IDS)
+    push_list(game.unused_guilds, CARD_IDS)
+
+    slots = sorted(game.tableau.cards.items())
+    out.append(len(slots))
+    for (row, x), card in slots:
+        out.extend(
+            (
+                row,
+                x,
+                CARD_IDS[card.card_name],
+                int(card.present),
+                int(card.present and card.revealed),
+            )
+        )
+    push_list(game.discard_pile, CARD_IDS)
+    push_list(game.buried_cards, CARD_IDS)
+
+    burials = sorted(
+        (WONDER_IDS[wonder], CARD_IDS[card])
+        for wonder, card in game.wonder_burials.items()
+    )
+    out.append(len(burials))
+    for wonder, card in burials:
+        out.extend((wonder, card))
+    retired = sorted(WONDER_IDS[wonder] for wonder in game.retired_wonders)
+    out.append(len(retired))
+    out.extend(retired)
+
+    pending = game.pending_choice
+    if pending is None:
+        out.append(-1)
+    else:
+        out.extend(
+            (
+                _PENDING_ORDER[pending.kind],
+                pending.player,
+                int(pending.consume_all_options),
+            )
+        )
+        id_map = PROGRESS_IDS if pending.kind in _PROGRESS_PENDING else CARD_IDS
+        push_list(pending.options, id_map)
+    out.extend((int(game.pending_extra_turn), game.pending_shields))
+
+    out.append(game.conflict_position)
+    military = sorted(game.military_tokens_remaining.items())
+    out.append(len(military))
+    for position, penalty in military:
+        out.extend((position, penalty))
+    out.append(-1 if game.winner is None else game.winner)
+    out.append(
+        -1 if game.victory_type is None else _VICTORY_ORDER[game.victory_type]
+    )
+    if game.final_scores is None:
+        out.append(-1)
+    else:
+        out.extend((1, game.final_scores[0], game.final_scores[1]))
+    return out
+
+
+def _logic_frame(game: GameState) -> bytes:
+    fingerprint = logic_fingerprint(game)
+    return struct.pack(f"<I{len(fingerprint)}i", len(fingerprint), *fingerprint)
+
+
+def logic_state_digest(game: GameState) -> str:
+    return "sha256:" + hashlib.sha256(_logic_frame(game)).hexdigest()
+
+
+def _update_trajectory(
+    trajectory,
+    game: GameState,
+    digest_version: str,
+) -> None:
+    if digest_version == LOGIC_DIGEST_VERSION:
+        trajectory.update(_logic_frame(game))
+    elif digest_version == LEGACY_DIGEST_VERSION:
+        trajectory.update(state_digest(game).encode())
+    else:
+        raise ValueError(f"unknown buffer digest version: {digest_version!r}")
+
+
+def _final_digest(game: GameState, digest_version: str) -> str:
+    if digest_version == LOGIC_DIGEST_VERSION:
+        return logic_state_digest(game)
+    if digest_version == LEGACY_DIGEST_VERSION:
+        return state_digest(game)
+    raise ValueError(f"unknown buffer digest version: {digest_version!r}")
+
+
 def _log_entry(event: ResolvedChance) -> tuple[str, str | tuple[str, ...]]:
     return (event.kind.value, event.outcome)
 
@@ -256,11 +437,15 @@ class GameRecorder:
         first_player: int = 0,
         agents: dict[str, str] | None = None,
         iteration: int | None = None,
+        digest_version: str = LOGIC_DIGEST_VERSION,
     ):
         self.seed = seed
         self.first_player = first_player
         self.agents = dict(agents) if agents is not None else {}
         self.iteration = iteration
+        if digest_version not in (LOGIC_DIGEST_VERSION, LEGACY_DIGEST_VERSION):
+            raise ValueError(f"unknown buffer digest version: {digest_version!r}")
+        self.digest_version = digest_version
         self.game = new_game(seed, first_player=first_player)
         self._moves: list[MoveRecord] = []
         self._chance_log: list[tuple[str, str | tuple[str, ...]]] = []
@@ -284,7 +469,7 @@ class GameRecorder:
             if game.pending_choice is not None
             else game.active_player
         )
-        self._trajectory.update(state_digest(game).encode())
+        _update_trajectory(self._trajectory, game, self.digest_version)
         move = MoveRecord(
             i=len(self._moves),
             actor=actor,
@@ -306,8 +491,8 @@ class GameRecorder:
         game = self.game
         if game.phase is not Phase.COMPLETE:
             raise ValueError("cannot finish a record before the game is complete")
-        final_digest = state_digest(game)
-        self._trajectory.update(final_digest.encode())
+        final_digest = _final_digest(game, self.digest_version)
+        _update_trajectory(self._trajectory, game, self.digest_version)
         return GameRecord(
             seed=self.seed,
             first_player=self.first_player,
@@ -320,6 +505,7 @@ class GameRecorder:
             moves=tuple(self._moves),
             final_digest=final_digest,
             trajectory_digest="sha256:" + self._trajectory.hexdigest(),
+            digest_version=self.digest_version,
         )
 
 
@@ -346,7 +532,10 @@ def replay(record: GameRecord, on_state=None) -> GameState:
     log_position = 0
     trajectory = hashlib.sha256()
     for move in record.moves:
-        trajectory.update(state_digest(game).encode())
+        try:
+            _update_trajectory(trajectory, game, record.digest_version)
+        except ValueError as error:
+            raise ReplayMismatchError(str(error)) from error
         current_hash = mask_hash(game)
         if current_hash != move.mask_hash:
             raise ReplayMismatchError(
@@ -379,12 +568,15 @@ def replay(record: GameRecord, on_state=None) -> GameState:
         raise ReplayMismatchError("recorded chance log has unconsumed entries")
     if game.phase is not Phase.COMPLETE:
         raise ReplayMismatchError("replayed game did not complete")
-    digest = state_digest(game)
+    try:
+        digest = _final_digest(game, record.digest_version)
+    except ValueError as error:
+        raise ReplayMismatchError(str(error)) from error
     if digest != record.final_digest:
         raise ReplayMismatchError(
             f"final digest {digest} != recorded {record.final_digest}"
         )
-    trajectory.update(digest.encode())
+    _update_trajectory(trajectory, game, record.digest_version)
     trajectory_digest = "sha256:" + trajectory.hexdigest()
     if trajectory_digest != record.trajectory_digest:
         raise ReplayMismatchError(
@@ -402,6 +594,7 @@ def to_json_line(record: GameRecord) -> str:
         "schema": record.schema,
         "spec_version": record.spec_version,
         "target_version": record.target_version,
+        "digest_version": record.digest_version,
         "setup": {"seed": record.seed, "first_player": record.first_player},
         "agents": record.agents,
         "iteration": record.iteration,
@@ -443,11 +636,12 @@ def to_json_line(record: GameRecord) -> str:
 
 
 def from_json_line(line: str) -> GameRecord:
-    payload = json.loads(line)
+    serialized = line.rstrip("\r\n")
+    payload = json.loads(serialized)
     if payload["schema"] != SCHEMA_VERSION:
         raise ValueError(f"unsupported buffer schema: {payload['schema']}")
     result = payload["result"]
-    return GameRecord(
+    record = GameRecord(
         schema=payload["schema"],
         spec_version=payload["spec_version"],
         # Absent means the file predates target versioning, which can only be
@@ -455,6 +649,7 @@ def from_json_line(line: str) -> GameRecord:
         # reanalyze must be able to open stale buffers to re-derive targets
         # from them.  Enforcement belongs at the training boundary.
         target_version=payload.get("target_version", 1),
+        digest_version=payload.get("digest_version", LEGACY_DIGEST_VERSION),
         seed=payload["setup"]["seed"],
         first_player=payload["setup"]["first_player"],
         agents=dict(payload["agents"]),
@@ -496,6 +691,12 @@ def from_json_line(line: str) -> GameRecord:
         final_digest=payload["final_digest"],
         trajectory_digest=payload["trajectory_digest"],
     )
+    object.__setattr__(
+        record,
+        "_source_digest",
+        hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    )
+    return record
 
 
 def append_records(path, records) -> None:

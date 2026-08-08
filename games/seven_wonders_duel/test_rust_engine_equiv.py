@@ -11,7 +11,8 @@ sequence and assert bit-for-bit agreement of a language-neutral fingerprint at
 - **F1b** — make/unmake: `RustGame.roundtrip_ok(index)` (apply then undo)
   restores the fingerprint at every decision.
 
-`logic_fingerprint` mirrors `state.rs::GameState::fingerprint` exactly: the same
+Production `buffer.logic_fingerprint` mirrors
+`state.rs::GameState::fingerprint` exactly: the same
 field order, numeric-id sorts, and length prefixes, and it excludes Python's RNG
 internal state (Rust models no RNG — see PHASE_F.md). Both sides map component
 names to ids through the identical `data.py` tables, so id agreement is implied.
@@ -23,9 +24,9 @@ import math
 import os
 import random
 
-from .buffer import from_json_line
+from .buffer import from_json_line, logic_fingerprint
 from .codec import decode_action, legal_action_indices
-from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS, ScienceSymbol
+from .data import BackType, CARD_IDS, PROGRESS_IDS, WONDER_IDS
 from .encoder import Encoding, Token, encode as py_encode, TokenType
 from .engine import apply_action
 from .game import ChanceKind
@@ -1065,139 +1066,12 @@ def _assert_encoding_equal(seed, move, expected, actual):
 from .game import (
     ChanceKind,
     Phase,
-    PendingChoiceKind,
-    VictoryType,
     new_game,
 )
 
 import seven_wonders_rust as swr
 
 from .rust_bridge import rust_game_from_state
-
-_SCIENCE_ORDER = {s: i for i, s in enumerate(ScienceSymbol)}
-_PHASE_ORD = {
-    Phase.WONDER_DRAFT: 0,
-    Phase.PLAY_AGE: 1,
-    Phase.CHOOSE_NEXT_START_PLAYER: 2,
-    Phase.COMPLETE: 3,
-}
-_VICTORY_ORD = {
-    VictoryType.MILITARY: 0,
-    VictoryType.SCIENTIFIC: 1,
-    VictoryType.CIVILIAN: 2,
-    VictoryType.SHARED_CIVILIAN: 3,
-}
-_PENDING_ORD = {
-    PendingChoiceKind.DESTROY_OPPONENT_BROWN: 0,
-    PendingChoiceKind.DESTROY_OPPONENT_GREY: 1,
-    PendingChoiceKind.BUILD_FROM_DISCARD_FREE: 2,
-    PendingChoiceKind.CHOOSE_UNUSED_PROGRESS: 3,
-    PendingChoiceKind.CHOOSE_AVAILABLE_PROGRESS: 4,
-}
-_PROGRESS_PENDING = {
-    PendingChoiceKind.CHOOSE_UNUSED_PROGRESS,
-    PendingChoiceKind.CHOOSE_AVAILABLE_PROGRESS,
-}
-
-
-def logic_fingerprint(game) -> list[int]:
-    """Language-neutral integer fingerprint of all game-logic state.
-
-    Byte-for-byte identical to `state.rs::GameState::fingerprint`.
-    """
-
-    out: list[int] = []
-
-    def push_list(names, id_map):
-        ids = [id_map[n] for n in names]
-        out.append(len(ids))
-        out.extend(ids)
-
-    out.append(_PHASE_ORD[game.phase])
-    out.append(game.first_player)
-    out.append(game.active_player)
-    out.append(game.age)
-    out.append(game.wonder_round)
-    out.append(game.wonder_pick_index)
-
-    for city in game.cities:
-        out.append(city.coins)
-        push_list(city.wonders, WONDER_IDS)
-        push_list(city.built_wonders, WONDER_IDS)
-        push_list(city.buildings, CARD_IDS)
-        push_list(city.progress_tokens, PROGRESS_IDS)
-        pairs = sorted(_SCIENCE_ORDER[s] for s in city.claimed_science_pairs)
-        out.append(len(pairs))
-        out.extend(pairs)
-
-    push_list(game.available_progress_tokens, PROGRESS_IDS)
-    push_list(game.unused_progress_tokens, PROGRESS_IDS)
-    push_list(game.wonder_groups[0], WONDER_IDS)
-    push_list(game.wonder_groups[1], WONDER_IDS)
-    push_list(game.unused_wonders, WONDER_IDS)
-    push_list(game.wonder_offer, WONDER_IDS)
-    for age in (1, 2, 3):
-        push_list(game.age_decks[age], CARD_IDS)
-    for age in (1, 2, 3):
-        push_list(game.removed_age_cards[age], CARD_IDS)
-    push_list(game.selected_guilds, CARD_IDS)
-    push_list(game.unused_guilds, CARD_IDS)
-
-    slots = sorted(game.tableau.cards.items())  # by (row, x)
-    out.append(len(slots))
-    for (row, x), card in slots:
-        out.append(row)
-        out.append(x)
-        out.append(CARD_IDS[card.card_name])
-        out.append(int(card.present))
-        out.append(int(card.present and card.revealed))
-
-    push_list(game.discard_pile, CARD_IDS)
-    push_list(game.buried_cards, CARD_IDS)
-
-    burials = sorted(
-        (WONDER_IDS[w], CARD_IDS[c]) for w, c in game.wonder_burials.items()
-    )
-    out.append(len(burials))
-    for w, c in burials:
-        out.append(w)
-        out.append(c)
-
-    retired = sorted(WONDER_IDS[w] for w in game.retired_wonders)
-    out.append(len(retired))
-    out.extend(retired)
-
-    pending = game.pending_choice
-    if pending is None:
-        out.append(-1)
-    else:
-        out.append(_PENDING_ORD[pending.kind])
-        out.append(pending.player)
-        out.append(int(pending.consume_all_options))
-        id_map = PROGRESS_IDS if pending.kind in _PROGRESS_PENDING else CARD_IDS
-        ids = [id_map[o] for o in pending.options]
-        out.append(len(ids))
-        out.extend(ids)
-    out.append(int(game.pending_extra_turn))
-    out.append(game.pending_shields)
-
-    out.append(game.conflict_position)
-    mil = sorted(game.military_tokens_remaining.items())
-    out.append(len(mil))
-    for pos, pen in mil:
-        out.append(pos)
-        out.append(pen)
-
-    out.append(-1 if game.winner is None else game.winner)
-    out.append(-1 if game.victory_type is None else _VICTORY_ORD[game.victory_type])
-    if game.final_scores is None:
-        out.append(-1)
-    else:
-        out.append(1)
-        out.append(game.final_scores[0])
-        out.append(game.final_scores[1])
-    return out
-
 
 def extract_setup(game) -> dict:
     """Constructor kwargs for `RustGame` from a fresh Python `GameState`."""

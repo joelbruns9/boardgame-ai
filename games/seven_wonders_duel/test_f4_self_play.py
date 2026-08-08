@@ -193,6 +193,31 @@ def test_f4_3_record_is_deterministic_and_captures_great_library_draw():
     assert replay(record).phase is Phase.COMPLETE
 
 
+def test_production_record_conversion_does_not_construct_or_replay_python_game(
+    monkeypatch,
+):
+    seed = 2026072201
+    raw = rust_game_for_self_play(seed, 1).self_play_mock(
+        game_seed=seed,
+        leaf_batch=1,
+        cheap_sims_min=1,
+        cheap_sims_max=1,
+        full_sims_min=1,
+        full_sims_max=1,
+        full_search_fraction=0.0,
+        top_k=2,
+        draft_prior=0.0,
+    )
+
+    def fail(_record):
+        raise AssertionError("production conversion must not enter Python replay")
+
+    monkeypatch.setattr("games.seven_wonders_duel.rust_bridge.replay", fail)
+    record = phase_d_record_from_rust(raw, validate=False)
+    assert record.final_digest == raw["final_digest"]
+    assert record.trajectory_digest == raw["trajectory_digest"]
+
+
 def test_f4_3_rejects_bad_config_and_evaluator_failure():
     rust = rust_game_for_self_play(99, 0)
     with pytest.raises(ValueError, match="simulation range"):
