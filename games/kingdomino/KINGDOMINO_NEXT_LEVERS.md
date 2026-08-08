@@ -578,12 +578,38 @@ strength gate. Do not reuse it. The next A1b comparison is now:
 1. IID support traversal versus probability-balanced randomized cycles at each
    chance node, so local outcome coverage—not only global panel composition—is
    controlled.
-2. The current visited-mass-renormalized estimator versus realized sampled-value
-   backup at fixed NN evaluations.
+2. Realized sampled-value backup as the null versus the current visited-mass-
+   renormalized estimator as the treatment, at fixed NN evaluations. The
+   observation split is the structural intervention; renormalization is an
+   additional Hájek-estimator assumption that may add bias/noise at low
+   coverage. If they tie, prefer sampled-value backup.
 3. Fully initialized/exact conditioned-row evaluation on the selected deck=8
    oracle roots.
 
-Only after this comparison should the five-root paired-seed probe be rerun.
+Entry and interpretation must use realized evaluated probability mass rather
+than nominal `X`. Report exhaustive deck<=8 panels separately from truncated
+deck>=12 panels, and measure whether chance-action visit count correlates with Q
+rank before treating the renormalized arm as a strength result. Only after this
+comparison should the five-root paired-seed probe be rerun.
+
+**Second review hardening, 2026-08-08.** The selection hot path no longer scans
+every registered chance outcome for every candidate action. Each chance node
+maintains visited probability mass and probability-weighted observation value
+incrementally, making chance-Q lookup O(1); end-of-search diagnostics recompute
+the values in debug builds to guard the cache. Virtual-only bookkeeping is now
+restricted to chance nodes, so the disabled path and ordinary decision nodes do
+not pay those extra writes.
+
+The Rust path also asserts the three assumptions on which lazy row routing
+depends: strictly sorted support, a stable post-reveal actor, and a one-to-one
+mapping from `(chance node, sorted row)` to the full public information state.
+The probe reports running-root and current-child root estimates under separate
+names, emits null rather than fake consensus for one-seed runs, includes
+position-clustered ordering metrics, and requires a recorded reason for targeted
+position subsets. Its artifact now labels exhaustive references separately from
+independently truncated panel estimates. Disabled-path regression coverage now
+includes a deterministic deck=12, 512-simulation search in addition to the
+opening smoke.
 
 The implementation should reuse the public-state/chance machinery in
 `denial_search.py` and port the fixed-support semantics already reviewed in the

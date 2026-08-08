@@ -4910,6 +4910,11 @@ struct OLNode {
     // separate fields to retain a full-strength virtual-loss penalty.
     virtual_visit_count: i32,
     virtual_value_sum: f64,
+    // O(1) Hájek estimate over observation children with at least one real
+    // visit. Updated incrementally when an observation mean changes.
+    chance_visited_mass: f64,
+    chance_weighted_value: f64,
+    chance_post_actor: Option<u8>,
     children: Vec<(u16, u32)>,
     action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
     is_expanded: bool,
@@ -4927,6 +4932,8 @@ struct OLChanceChild {
     // Registering a fixed support must not clone+step every counterfactual
     // state, especially for 70-row deck=8 chance nodes.
     node_id: Option<u32>,
+    #[cfg(debug_assertions)]
+    public_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -4950,6 +4957,9 @@ impl OLNode {
             value_sum: 0.0,
             virtual_visit_count: 0,
             virtual_value_sum: 0.0,
+            chance_visited_mass: 0.0,
+            chance_weighted_value: 0.0,
+            chance_post_actor: None,
             children: Vec::new(),
             action,
             is_expanded: false,
@@ -4961,32 +4971,25 @@ impl OLNode {
 /// Player-0 value of the visited portion of a one-reveal chance support.
 ///
 /// Outcome probability remains fixed, but unvisited outcomes are omitted and
-/// the visited probability mass is renormalized. This avoids treating FPU (a
-/// chooser-exploration device) as evidence about unseen chance outcomes. Once
-/// every outcome has a real visit this is the exact fixed-panel expectation.
+/// the visited probability mass is renormalized. This is a Hájek estimator.
+/// Its load-bearing assumption is that inclusion in the visited set is
+/// value-independent: the reveal is drawn before traversal from a seed hidden
+/// from every pre-chance decision. If chance outcomes ever become PUCT-selected,
+/// this estimator is invalid. Once every outcome has a real visit this is the
+/// exact fixed-panel expectation.
 /// A separate chance-node virtual-loss overlay keeps batched traversal from
 /// repeatedly selecting the same pre-reveal action while evaluations are in
 /// flight; observation-child virtual loss is excluded from the base estimate.
 fn ol_chance_value_p0(arena: &[OLNode], node_id: u32) -> f64 {
     let node = &arena[node_id as usize];
     debug_assert!(!node.chance_children.is_empty());
-    let mut visited_mass = 0.0;
-    let mut weighted_value = 0.0;
-    for outcome in &node.chance_children {
-        let Some(child_id) = outcome.node_id else {
-            continue;
-        };
-        let child = &arena[child_id as usize];
-        let real_visits = child.visit_count - child.virtual_visit_count;
-        if real_visits <= 0 {
-            continue;
-        }
-        let real_value_sum = child.value_sum - child.virtual_value_sum;
-        visited_mass += outcome.probability;
-        weighted_value += outcome.probability * real_value_sum / real_visits as f64;
-    }
-    let base_value0 = if visited_mass > 0.0 {
-        weighted_value / visited_mass
+    let real_visits = node.visit_count - node.virtual_visit_count;
+    debug_assert!(
+        real_visits <= 0 || node.chance_visited_mass > 0.0,
+        "a real chance-node visit must have a real observation visit"
+    );
+    let base_value0 = if node.chance_visited_mass > 0.0 {
+        node.chance_weighted_value / node.chance_visited_mass
     } else {
         0.0
     };
@@ -4994,7 +4997,7 @@ fn ol_chance_value_p0(arena: &[OLNode], node_id: u32) -> f64 {
     if virtual_visits == 0 {
         return base_value0;
     }
-    let real_visits = (node.visit_count - virtual_visits).max(0);
+    let real_visits = real_visits.max(0);
     let total = real_visits + virtual_visits;
     if total == 0 {
         base_value0
@@ -5021,6 +5024,7 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
         let node_visits = node.visit_count.max(0) as i64;
         chance_node_visits += node_visits;
         let mut node_visited_mass = 0.0;
+        let mut node_weighted_value = 0.0;
         let mut node_fully_visited = true;
         for outcome in &node.chance_children {
             if outcome.node_id.is_some() {
@@ -5037,10 +5041,18 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
                 visited_outcomes += 1;
                 visited_mass_sum += outcome.probability;
                 node_visited_mass += outcome.probability;
+                let child_id = outcome
+                    .node_id
+                    .expect("a visited chance outcome must have an observation node");
+                let child = &arena[child_id as usize];
+                node_weighted_value +=
+                    outcome.probability * child.value_sum / child.visit_count as f64;
             } else {
                 node_fully_visited = false;
             }
         }
+        debug_assert!((node.chance_visited_mass - node_visited_mass).abs() < 1e-9);
+        debug_assert!((node.chance_weighted_value - node_weighted_value).abs() < 1e-9);
         visit_weighted_visited_mass_sum += node_visits as f64 * node_visited_mass;
         if node_fully_visited {
             fully_visited_chance_nodes += 1;
@@ -5263,9 +5275,15 @@ fn ol_register_chance_support(
                 row,
                 probability: outcome.probability,
                 node_id: None,
+                #[cfg(debug_assertions)]
+                public_key: None,
             }
         })
         .collect();
+    debug_assert!(
+        children.windows(2).all(|pair| pair[0].row < pair[1].row),
+        "one-reveal chance support must be strictly sorted by row"
+    );
     let mass: f64 = children.iter().map(|x| x.probability).sum();
     if children.is_empty() || (mass - 1.0).abs() > 1e-9 {
         return Err(PyValueError::new_err(format!(
@@ -5279,25 +5297,58 @@ fn ol_register_chance_support(
 fn ol_route_chance_observation(
     arena: &mut Vec<OLNode>,
     chance_node_id: u32,
-    revealed_row: &[u16],
-) -> PyResult<u32> {
-    let mut row: [u16; 4] = revealed_row.try_into().map_err(|_| {
-        PyValueError::new_err("a routed Kingdomino reveal row must contain four tiles")
-    })?;
+    revealed_state: &RustGameState,
+    post_actor: u8,
+) -> PyResult<(u32, f64)> {
+    let mut row: [u16; 4] = revealed_state
+        .current_row
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            PyValueError::new_err("a routed Kingdomino reveal row must contain four tiles")
+        })?;
     row.sort_unstable();
+    match arena[chance_node_id as usize].chance_post_actor {
+        Some(expected) if expected != post_actor => {
+            return Err(PyValueError::new_err(format!(
+                "chance panel changed post-reveal actor from {expected} to {post_actor}"
+            )));
+        }
+        None => arena[chance_node_id as usize].chance_post_actor = Some(post_actor),
+        _ => {}
+    }
     let outcome_index = arena[chance_node_id as usize]
         .chance_children
         .binary_search_by(|outcome| outcome.row.cmp(&row))
         .map_err(|_| {
             PyValueError::new_err("sampled reveal is absent from its closed one-reveal support")
         })?;
+    #[cfg(debug_assertions)]
+    let public_key = {
+        let mut key = Vec::with_capacity(1024);
+        chance_public_state_key_v1_bytes(revealed_state, &mut key);
+        key
+    };
+    let probability = arena[chance_node_id as usize].chance_children[outcome_index].probability;
     if let Some(node_id) = arena[chance_node_id as usize].chance_children[outcome_index].node_id {
-        return Ok(node_id);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            arena[chance_node_id as usize].chance_children[outcome_index]
+                .public_key
+                .as_ref(),
+            Some(&public_key),
+            "the same chance node and row must route to one public information state"
+        );
+        return Ok((node_id, probability));
     }
     let node_id = arena.len() as u32;
     arena.push(OLNode::new(1.0, (None, None)));
     arena[chance_node_id as usize].chance_children[outcome_index].node_id = Some(node_id);
-    Ok(node_id)
+    #[cfg(debug_assertions)]
+    {
+        arena[chance_node_id as usize].chance_children[outcome_index].public_key = Some(public_key);
+    }
+    Ok((node_id, probability))
 }
 
 /// PUCT child selection for the open-loop tree.  Considers only children whose
@@ -5491,11 +5542,11 @@ fn ol_descend(
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
     one_reveal_panel: Option<&[OLChancePanelRow]>,
-) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<usize>)> {
+) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<(usize, f64)>)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
     let mut node_id = root_id;
-    let mut chance_step: Option<usize> = None;
+    let mut chance_step: Option<(usize, f64)> = None;
     // `state` is already owned (moved in); no clone needed — it is stepped in
     // place as we descend and returned as the leaf state.
     loop {
@@ -5562,16 +5613,17 @@ fn ol_descend(
                 if split_here {
                     let panel = one_reveal_panel.expect("split_here requires a chance panel");
                     ol_register_chance_support(arena, child_id, panel)?;
-                    let observation_id =
-                        ol_route_chance_observation(arena, child_id, &state.current_row)?;
+                    let post_actor = state.actor()?;
+                    let (observation_id, outcome_probability) =
+                        ol_route_chance_observation(arena, child_id, &state, post_actor)?;
                     let chance_index = path.len() - 1;
                     // This is a stochastic edge, not a player choice. The actor is
                     // used only to frame reversible virtual loss on the observation
                     // node; final backup remains in the player-0 frame.
-                    actors.push(state.actor()?);
+                    actors.push(post_actor);
                     path.push(observation_id);
                     node_id = observation_id;
-                    chance_step = Some(chance_index);
+                    chance_step = Some((chance_index, outcome_probability));
                 }
             }
         }
@@ -5653,8 +5705,14 @@ fn ol_apply_virtual_loss(arena: &mut [OLNode], path: &[u32], actors: &[u8], sign
             let chooser = actors[i - 1];
             let vl_value0 = if chooser == 0 { -1.0 } else { 1.0 };
             arena[path[i] as usize].value_sum += (sign * n_vl) as f64 * vl_value0;
-            arena[path[i] as usize].virtual_visit_count += sign * n_vl;
-            arena[path[i] as usize].virtual_value_sum += (sign * n_vl) as f64 * vl_value0;
+            // Only chance nodes reconstruct Q independently of their own
+            // value_sum. Ordinary decision nodes already consume the standard
+            // visit/value mutations above, so extra bookkeeping there is dead
+            // hot-path work (and would penalize the disabled path).
+            if !arena[path[i] as usize].chance_children.is_empty() {
+                arena[path[i] as usize].virtual_visit_count += sign * n_vl;
+                arena[path[i] as usize].virtual_value_sum += (sign * n_vl) as f64 * vl_value0;
+            }
         }
     }
 }
@@ -5663,9 +5721,9 @@ fn ol_backup_path(
     arena: &mut [OLNode],
     path: &[u32],
     sampled_value0: f64,
-    chance_step: Option<usize>,
+    chance_step: Option<(usize, f64)>,
 ) {
-    let Some(chance_index) = chance_step else {
+    let Some((chance_index, outcome_probability)) = chance_step else {
         for &node_id in path {
             let node = &mut arena[node_id as usize];
             node.visit_count += 1;
@@ -5674,12 +5732,27 @@ fn ol_backup_path(
         return;
     };
 
+    let observation_id = path[chance_index + 1];
+    let old_observation_visits = arena[observation_id as usize].visit_count;
+    let old_observation_mean = if old_observation_visits > 0 {
+        arena[observation_id as usize].value_sum / old_observation_visits as f64
+    } else {
+        0.0
+    };
     // First update the conditional observation subtree with this row's sample.
     for &node_id in &path[(chance_index + 1)..] {
         let node = &mut arena[node_id as usize];
         node.visit_count += 1;
         node.value_sum += sampled_value0;
     }
+    let observation = &arena[observation_id as usize];
+    let new_observation_mean = observation.value_sum / observation.visit_count as f64;
+    let chance_node = &mut arena[path[chance_index] as usize];
+    if old_observation_visits == 0 {
+        chance_node.chance_visited_mass += outcome_probability;
+    }
+    chance_node.chance_weighted_value +=
+        outcome_probability * (new_observation_mean - old_observation_mean);
     // Then propagate the registered-probability expectation over outcomes with
     // real evaluations through the chance afterstate and earlier decision nodes.
     // Unvisited mass is omitted and the visited mass is renormalized.
@@ -5892,7 +5965,7 @@ fn advisor_open_loop_search_impl(
         let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
         let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
         let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
-        let mut chance_steps: Vec<Option<usize>> = Vec::with_capacity(wave);
+        let mut chance_steps: Vec<Option<(usize, f64)>> = Vec::with_capacity(wave);
         let mut evals: Vec<AdvisorPendingEval> = Vec::new();
 
         for _ in 0..wave {
@@ -6054,16 +6127,11 @@ fn advisor_open_loop_search_impl(
             (idx, c.visit_count, reported_value_sum, c.prior)
         })
         .collect();
-    let root_value0 = if one_reveal_panel.is_empty() {
-        // Preserve the incumbent return contract bit-for-bit when A1 is off.
-        incumbent_root_value0
+    let root_child_visits: i32 = children.iter().map(|row| row.1).sum();
+    let current_children_root_value0 = if root_child_visits > 0 {
+        children.iter().map(|row| row.2).sum::<f64>() / root_child_visits as f64
     } else {
-        let visits: i32 = children.iter().map(|row| row.1).sum();
-        if visits > 0 {
-            children.iter().map(|row| row.2).sum::<f64>() / visits as f64
-        } else {
-            root_v0
-        }
+        root_v0
     };
     let mut diagnostics = ol_chance_diagnostics(&arena);
     let exhaustive_panel =
@@ -6077,9 +6145,19 @@ fn advisor_open_loop_search_impl(
         if exhaustive_panel { 1.0 } else { 0.0 },
     );
     diagnostics.insert("arena_nodes".to_string(), arena.len() as f64);
+    diagnostics.insert(
+        "root_value_running_mean_player0".to_string(),
+        incumbent_root_value0,
+    );
+    diagnostics.insert(
+        "root_value_current_children_player0".to_string(),
+        current_children_root_value0,
+    );
     Ok(AdvisorOpenLoopOutput {
         children,
-        root_value0,
+        // Keep one stable legacy meaning for the 2-tuple advisor API. The
+        // diagnostic API exposes both estimators under explicit names.
+        root_value0: incumbent_root_value0,
         diagnostics,
     })
 }
@@ -10943,6 +11021,33 @@ mod augment_tests {
 mod ol_tests {
     use super::*;
 
+    fn test_chance_child(row: [u16; 4], probability: f64, node_id: u32) -> OLChanceChild {
+        OLChanceChild {
+            row,
+            probability,
+            node_id: Some(node_id),
+            #[cfg(debug_assertions)]
+            public_key: None,
+        }
+    }
+
+    fn refresh_test_chance_cache(arena: &mut [OLNode], node_id: u32) {
+        let mut mass = 0.0;
+        let mut weighted = 0.0;
+        for outcome in &arena[node_id as usize].chance_children {
+            let Some(child_id) = outcome.node_id else {
+                continue;
+            };
+            let child = &arena[child_id as usize];
+            if child.visit_count > 0 {
+                mass += outcome.probability;
+                weighted += outcome.probability * child.value_sum / child.visit_count as f64;
+            }
+        }
+        arena[node_id as usize].chance_visited_mass = mass;
+        arena[node_id as usize].chance_weighted_value = weighted;
+    }
+
     #[test]
     fn issue1_per_path_value_mapping() {
         // Issue 1: with de-dup removed, two simulations can end at the SAME OLNode
@@ -11079,17 +11184,10 @@ mod ol_tests {
         arena[2].visit_count = 1;
         arena[2].value_sum = -1.0;
         arena[0].chance_children = vec![
-            OLChanceChild {
-                row: [1, 2, 3, 4],
-                probability: 0.25,
-                node_id: Some(1),
-            },
-            OLChanceChild {
-                row: [5, 6, 7, 8],
-                probability: 0.75,
-                node_id: Some(2),
-            },
+            test_chance_child([1, 2, 3, 4], 0.25, 1),
+            test_chance_child([5, 6, 7, 8], 0.75, 2),
         ];
+        refresh_test_chance_cache(&mut arena, 0);
         assert!((ol_chance_value_p0(&arena, 0) + 0.5).abs() < 1e-12);
         // The empirical visit-weighted mean would be strongly positive; pin the
         // discriminator so a future refactor cannot silently revert to it.
@@ -11107,17 +11205,10 @@ mod ol_tests {
         arena[1].value_sum = 1.0;
         arena[0].visit_count = 2;
         arena[0].chance_children = vec![
-            OLChanceChild {
-                row: [1, 2, 3, 4],
-                probability: 0.01,
-                node_id: Some(1),
-            },
-            OLChanceChild {
-                row: [5, 6, 7, 8],
-                probability: 0.99,
-                node_id: Some(2),
-            },
+            test_chance_child([1, 2, 3, 4], 0.01, 1),
+            test_chance_child([5, 6, 7, 8], 0.99, 2),
         ];
+        refresh_test_chance_cache(&mut arena, 0);
         // The unseen 99% contributes no arbitrary constant. The only observed
         // conditional estimate is +0.5, irrespective of its chance mass.
         assert!((ol_chance_value_p0(&arena, 0) - 0.5).abs() < 1e-12);
@@ -11133,11 +11224,8 @@ mod ol_tests {
         arena[1].visit_count = 100;
         arena[1].value_sum = 50.0;
         arena[0].visit_count = 100;
-        arena[0].chance_children = vec![OLChanceChild {
-            row: [1, 2, 3, 4],
-            probability: 0.01,
-            node_id: Some(1),
-        }];
+        arena[0].chance_children = vec![test_chance_child([1, 2, 3, 4], 0.01, 1)];
+        refresh_test_chance_cache(&mut arena, 0);
         assert!((ol_chance_value_p0(&arena, 0) - 0.5).abs() < 1e-12);
 
         // A player-0 in-flight traversal applies a -1 virtual result to the
@@ -11159,13 +11247,37 @@ mod ol_tests {
         arena[0].value_sum = -40.0; // deliberately stale expectation snapshots
         arena[1].visit_count = 2;
         arena[1].value_sum = 1.0;
-        arena[0].chance_children = vec![OLChanceChild {
-            row: [1, 2, 3, 4],
-            probability: 1.0,
-            node_id: Some(1),
-        }];
+        arena[0].chance_children = vec![test_chance_child([1, 2, 3, 4], 1.0, 1)];
+        refresh_test_chance_cache(&mut arena, 0);
         assert!((ol_chance_value_p0(&arena, 0) - 0.5).abs() < 1e-12);
         assert!((ol_reported_value_sum(&arena, 0) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_reveal_backup_updates_cached_hajek_estimate_incrementally() {
+        let mut arena = vec![
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+        ];
+        arena[0].chance_children = vec![
+            test_chance_child([1, 2, 3, 4], 0.25, 1),
+            OLChanceChild {
+                row: [5, 6, 7, 8],
+                probability: 0.75,
+                node_id: None,
+                #[cfg(debug_assertions)]
+                public_key: None,
+            },
+        ];
+        ol_backup_path(&mut arena, &[0, 1], 0.8, Some((0, 0.25)));
+        assert!((arena[0].chance_visited_mass - 0.25).abs() < 1e-12);
+        assert!((arena[0].chance_weighted_value - 0.2).abs() < 1e-12);
+        assert!((ol_chance_value_p0(&arena, 0) - 0.8).abs() < 1e-12);
+
+        ol_backup_path(&mut arena, &[0, 1], -0.2, Some((0, 0.25)));
+        assert!((arena[0].chance_visited_mass - 0.25).abs() < 1e-12);
+        assert!((arena[0].chance_weighted_value - 0.075).abs() < 1e-12);
+        assert!((ol_chance_value_p0(&arena, 0) - 0.3).abs() < 1e-12);
     }
 
     #[test]
@@ -11178,17 +11290,10 @@ mod ol_tests {
         arena[0].visit_count = 3;
         arena[2].visit_count = 3;
         arena[0].chance_children = vec![
-            OLChanceChild {
-                row: [1, 2, 3, 4],
-                probability: 0.25,
-                node_id: Some(1),
-            },
-            OLChanceChild {
-                row: [5, 6, 7, 8],
-                probability: 0.75,
-                node_id: Some(2),
-            },
+            test_chance_child([1, 2, 3, 4], 0.25, 1),
+            test_chance_child([5, 6, 7, 8], 0.75, 2),
         ];
+        refresh_test_chance_cache(&mut arena, 0);
         let diagnostics = ol_chance_diagnostics(&arena);
         assert_eq!(diagnostics["chance_nodes"], 1.0);
         assert_eq!(diagnostics["support_outcomes"], 2.0);
@@ -11228,14 +11333,23 @@ mod ol_tests {
         );
         let rows: HashSet<[u16; 4]> = arena[0].chance_children.iter().map(|x| x.row).collect();
         assert_eq!(rows.len(), panel.len());
-        let first_id = ol_route_chance_observation(&mut arena, 0, &panel[0].row)?;
+        let first_state =
+            redeterminize_with_first_row(&state, &panel[0].row, 1)?.step(action.0, action.1)?;
+        let first_actor = first_state.actor()?;
+        let (first_id, first_probability) =
+            ol_route_chance_observation(&mut arena, 0, &first_state, first_actor)?;
+        assert!((first_probability - panel[0].probability).abs() < 1e-12);
         assert_eq!(arena.len(), 2);
         assert_eq!(
-            ol_route_chance_observation(&mut arena, 0, &panel[0].row)?,
+            ol_route_chance_observation(&mut arena, 0, &first_state, first_actor)?.0,
             first_id,
             "the same public row must reuse its observation subtree"
         );
-        let second_id = ol_route_chance_observation(&mut arena, 0, &panel[1].row)?;
+        let second_state =
+            redeterminize_with_first_row(&state, &panel[1].row, 2)?.step(action.0, action.1)?;
+        let second_actor = second_state.actor()?;
+        let (second_id, _) =
+            ol_route_chance_observation(&mut arena, 0, &second_state, second_actor)?;
         assert_ne!(first_id, second_id);
         assert_eq!(arena.len(), 3);
         assert!(

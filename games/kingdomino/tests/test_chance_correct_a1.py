@@ -1,5 +1,7 @@
 """Focused gates for the opt-in A1 one-reveal search topology."""
 
+import hashlib
+
 import numpy as np
 
 from games.kingdomino.endgame_solver import _rust_state_from_python
@@ -8,6 +10,8 @@ from games.kingdomino.chance_correct_search_probe import (
     REFERENCE_SEED_XOR,
     _arm,
     _mode_summary,
+    _parse_args,
+    _position_consensus,
 )
 from games.kingdomino.denial_search import DenialSearch, SearchConfig
 
@@ -31,6 +35,13 @@ def _golden_evaluator(my_board, opp_board, flat, legal_indices):
         for row in range(len(legal_indices))
     ]
     return values, logits
+
+
+def _midgame_state() -> GameState:
+    state = GameState.new(seed=29)
+    while len(state.deck) > 12:
+        state = state.step(state.legal_actions()[0])
+    return state
 
 
 def _search(state, **overrides):
@@ -81,7 +92,8 @@ def test_a1_disabled_is_exactly_the_incumbent_search():
     assert implicit == explicit
 
 
-def test_a1_disabled_matches_frozen_incumbent_golden_vector():
+def test_a1_disabled_stable_opening_regression_vector():
+    """Regression lock only; this is not proof of pre-A1 equivalence."""
     import kingdomino_rust as kr
 
     state = GameState.new(seed=17)
@@ -112,7 +124,44 @@ def test_a1_disabled_matches_frozen_incumbent_golden_vector():
         rtol=0.0,
         atol=1e-12,
     )
-    assert root_value == -0.13125014666355017
+    np.testing.assert_allclose(
+        root_value,
+        -0.13125014666355017,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_a1_disabled_stable_midgame_regression_vector():
+    """Lock the incumbent path through a deeper deck-12, 512-sim search."""
+    import kingdomino_rust as kr
+
+    children, root_value = kr.advisor_open_loop_search(
+        _rust_state_from_python(_midgame_state()),
+        _golden_evaluator,
+        512,
+        dirichlet_eps=0.0,
+        fpu=0.0,
+        cpuct=1.5,
+        seed=20260809,
+        leaf_batch=8,
+        virtual_loss=1,
+        alpha=0.5,
+        chance_exposure=0,
+        chance_enum_max_rows=70,
+    )
+    child_bytes = np.asarray(children, dtype="<f8").tobytes()
+    assert len(children) == 20
+    assert sum(row[1] for row in children) == 512
+    assert hashlib.sha256(child_bytes).hexdigest() == (
+        "318fceed1df48a73da969923a5acfa1107b131283ebeb7e10fea78ec6e3a9d9d"
+    )
+    np.testing.assert_allclose(
+        root_value,
+        -0.12609254337890805,
+        rtol=0.0,
+        atol=1e-12,
+    )
 
 
 def test_a1_one_reveal_path_runs_at_equal_simulation_budget():
@@ -149,6 +198,8 @@ def test_a1_diagnostics_measure_realized_support_coverage():
     assert 0.0 <= enabled["visit_weighted_unvisited_probability_mass"] < 1.0
     assert enabled["chance_panel_rows"] > 0.0
     assert enabled["chance_panel_exhaustive"] in (0.0, 1.0)
+    assert "root_value_running_mean_player0" in enabled
+    assert "root_value_current_children_player0" in enabled
 
 
 def test_probe_records_exhaustive_panel_mode_and_rows():
@@ -170,6 +221,9 @@ def test_probe_records_exhaustive_panel_mode_and_rows():
     )
     assert result["chance_panel_mode"] == "exhaustive"
     assert result["chance_panel_rows"] == 70
+    assert "root_value_player0" not in result
+    assert np.isfinite(result["root_value_running_mean_player0"])
+    assert np.isfinite(result["root_value_current_children_player0"])
 
 
 def test_denial_node_cache_key_includes_root_chance_configuration():
@@ -193,6 +247,22 @@ def test_multiseed_mode_summary_keeps_seed_repeats_clustered():
         "mode_fraction": 0.6,
         "unanimous": False,
     }
+
+
+def test_single_seed_does_not_serialize_trivial_consensus():
+    consensus = _position_consensus([{"unused": True}], ["x0"])
+    assert consensus["seed_count"] == 1
+    assert consensus["selectors"] is None
+    assert consensus["reference_mode_agreement"] is None
+
+
+def test_probe_parses_targeted_subset_selection_reason():
+    args = _parse_args([
+        "--position-indices", "2,7",
+        "--selection-reason", "previous reference disagreements",
+    ])
+    assert args.position_indices == "2,7"
+    assert args.selection_reason == "previous reference disagreements"
 
 
 def test_reference_seed_stream_is_disjoint_from_candidate_stream():

@@ -100,7 +100,10 @@ def _arm(
         "chance_enum_max_rows": int(enum_max_rows),
         "chance_panel_mode": panel_mode,
         "chance_panel_rows": panel_rows,
-        "root_value_player0": float(root_value0),
+        "root_value_running_mean_player0": float(root_value0),
+        "root_value_current_children_player0": chance_diagnostics[
+            "root_value_current_children_player0"
+        ],
         "nn_evaluations": int(nn_evaluations),
         "chance_diagnostics": chance_diagnostics,
         "top_action_idx": top["action_idx"],
@@ -183,6 +186,14 @@ def _mode_summary(values: Sequence[int]) -> dict[str, Any]:
 
 
 def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence[str]) -> dict[str, Any]:
+    if len(seed_runs) < 2:
+        return {
+            "seed_count": len(seed_runs),
+            "selectors": None,
+            "reference_mode_agreement": None,
+            "reference_same_seed_agreement": None,
+            "reason": "consensus requires at least two paired seed runs",
+        }
     selectors: dict[str, list[dict[str, Any]]] = {
         name: [run["arms"][name] for run in seed_runs] for name in arm_names
     }
@@ -200,6 +211,7 @@ def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence
     open_summary = summaries["reference_openloop"]
     hybrid_summary = summaries["reference_hybrid"]
     return {
+        "seed_count": len(seed_runs),
         "selectors": summaries,
         "reference_mode_agreement": {
             "top1": open_summary["action"]["mode"] == hybrid_summary["action"]["mode"],
@@ -272,6 +284,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     requested_indices = [
         int(value) for value in args.position_indices.split(",") if value.strip()
     ]
+    targeted_subset = bool(requested_indices)
+    if targeted_subset and not args.selection_reason.strip():
+        raise ValueError(
+            "--selection-reason is required when --position-indices selects a targeted subset"
+        )
     if requested_indices:
         if len(set(requested_indices)) != len(requested_indices):
             raise ValueError("--position-indices contains duplicates")
@@ -421,16 +438,62 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             visit_pair_total = sum(m["visit_pairwise_pairs"] for m in metrics)
             elapsed = [run["arms"][name]["elapsed_seconds"] for run in all_seed_runs]
             nn_evals = [run["arms"][name]["nn_evaluations"] for run in all_seed_runs]
+            position_top1 = []
+            position_pick = []
+            position_q_pairwise = []
+            position_visit_pairwise = []
+            for record in records:
+                position_metrics = [
+                    run["metrics"][reference_name][name]
+                    for run in record["seed_runs"]
+                ]
+                position_top1.append(
+                    statistics.fmean(metric["top1_agrees"] for metric in position_metrics)
+                )
+                position_pick.append(
+                    statistics.fmean(metric["pick_agrees"] for metric in position_metrics)
+                )
+                position_q_total = sum(
+                    metric["q_pairwise_pairs"] for metric in position_metrics
+                )
+                if position_q_total:
+                    position_q_pairwise.append(
+                        sum(metric["q_pairwise_correct"] for metric in position_metrics)
+                        / position_q_total
+                    )
+                position_visit_total = sum(
+                    metric["visit_pairwise_pairs"] for metric in position_metrics
+                )
+                if position_visit_total:
+                    position_visit_pairwise.append(
+                        sum(
+                            metric["visit_pairwise_correct"]
+                            for metric in position_metrics
+                        )
+                        / position_visit_total
+                    )
             aggregate[reference_name][name] = {
                 "positions": len(records),
                 "searches": len(metrics),
                 "top1_agreement": statistics.fmean(m["top1_agrees"] for m in metrics),
                 "pick_agreement": statistics.fmean(m["pick_agrees"] for m in metrics),
+                "top1_agreement_by_position": statistics.fmean(position_top1),
+                "pick_agreement_by_position": statistics.fmean(position_pick),
                 "q_pairwise_accuracy": (
                     None if not q_pair_total else q_pair_correct / q_pair_total
                 ),
+                "q_pairwise_accuracy_by_position": (
+                    None
+                    if not position_q_pairwise
+                    else statistics.fmean(position_q_pairwise)
+                ),
                 "visit_pairwise_accuracy": (
                     None if not visit_pair_total else visit_pair_correct / visit_pair_total
+                ),
+                "visit_pairwise_accuracy_by_position": (
+                    None
+                    if not position_visit_pairwise
+                    else statistics.fmean(position_visit_pairwise)
                 ),
                 "mean_regret_actor": None if not regrets else statistics.fmean(regrets),
                 "p90_regret_actor": (
@@ -439,6 +502,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "mean_seconds": statistics.fmean(elapsed),
                 "mean_nn_evaluations": statistics.fmean(nn_evals),
             }
+    consensus_records = [
+        record for record in records
+        if record["consensus"]["reference_mode_agreement"] is not None
+    ]
     aggregate["reference_agreement"] = {
         "same_seed_top1": statistics.fmean(
             run["reference_agreement"]["top1"] for run in all_seed_runs
@@ -446,13 +513,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "same_seed_pick": statistics.fmean(
             run["reference_agreement"]["pick"] for run in all_seed_runs
         ),
-        "position_consensus_top1": statistics.fmean(
-            record["consensus"]["reference_mode_agreement"]["top1"]
-            for record in records
+        "position_consensus_top1": (
+            None
+            if not consensus_records
+            else statistics.fmean(
+                record["consensus"]["reference_mode_agreement"]["top1"]
+                for record in consensus_records
+            )
         ),
-        "position_consensus_pick": statistics.fmean(
-            record["consensus"]["reference_mode_agreement"]["pick"]
-            for record in records
+        "position_consensus_pick": (
+            None
+            if not consensus_records
+            else statistics.fmean(
+                record["consensus"]["reference_mode_agreement"]["pick"]
+                for record in consensus_records
+            )
         ),
     }
     aggregate["chance_coverage"] = {}
@@ -465,13 +540,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     aggregate["by_deck_size"] = _deck_size_summary(records, arm_names)
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "scope": "A1 equal-compute frozen-position probe; no training or promotion",
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
         "positions_path": str(args.positions_path),
         "positions_sha256": file_sha256(args.positions_path),
         "configuration": vars(args),
+        "targeted_subset": targeted_subset,
+        "selection_reason": args.selection_reason.strip() or None,
         "sampling_unit_note": (
             "seed runs are paired repeats clustered within position; aggregate "
             "search-level rates are descriptive and are not independent-position confidence intervals"
@@ -480,6 +557,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "larger incumbent and one-reveal searches use a paired stream disjoint "
             "from candidate arms; neither reference is exact"
         ),
+        "reference_interpretation": {
+            "exhaustive_panels": (
+                "when C(deck,4) <= enum_max_rows, the hybrid support is the true "
+                "one-reveal distribution, though downstream search remains approximate"
+            ),
+            "sampled_panels": (
+                "for larger decks, candidate and hybrid references are independent "
+                "draws from the same truncated-panel estimator family; agreement is "
+                "weak evidence and is not an oracle"
+            ),
+            "reference_pairing": (
+                "open-loop and hybrid references share common random numbers with "
+                "each other, but their stream is disjoint from candidate arms"
+            ),
+        },
         "aggregate": aggregate,
         "positions": records,
     }
@@ -498,6 +590,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--position-indices",
         default="",
         help="comma-separated zero-based frozen-corpus indices; overrides --positions",
+    )
+    parser.add_argument(
+        "--selection-reason",
+        default="",
+        help="required provenance note when --position-indices targets a subset",
     )
     parser.add_argument("--seed-count", type=int, default=1)
     parser.add_argument("--sims", type=int, default=128)
