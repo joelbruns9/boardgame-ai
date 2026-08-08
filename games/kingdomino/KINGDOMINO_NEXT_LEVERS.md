@@ -461,7 +461,7 @@ unchanged until A1/A2 pass.
 Focused executable gates cover exact tile exposure, exhaustive 70-row deck=8
 support, closed public observation identities, probability-weighted Q under
 deliberately unequal child visits, exact disabled-path equivalence and a live
-equal-simulation search. Six Rust open-loop tests and the combined 27-test
+equal-simulation search. Seven Rust open-loop tests and the combined 27-test
 A1/denial Python suite pass. The companion
 `chance_correct_search_probe.py` runs equal-simulation incumbent/X arms on the
 frozen corpus and reports action/pick agreement, visit- and Q-pairwise ordering,
@@ -496,6 +496,59 @@ selected deck=8 reveal-boundary cases with the exhaustive chance oracle, and
 expand only after the reference consensus rate is adequate. The earlier
 50-position 128-sim `FPU=0` run remains a topology/fragmentation smoke, not a
 training-target result.
+
+**Paired-seed follow-up, 2026-08-08.** The five disagreement roots were rerun
+with eight paired seeds per root, four equal-budget 4,800-simulation arms and
+separate 10,000-simulation open-loop and one-reveal references. Positions 3 and
+6 were joint-placement search noise: every 4,800-simulation arm had the same
+unanimous modal action. Position 2 retained a placement disagreement but both
+reference families picked rank 2 on 8/8 seeds. Position 11 (deck=8) also retained
+only a placement disagreement; both references picked rank 2 on 8/8 seeds. The
+only persistent tile-pick disagreement was position 7 (deck=24): the incumbent
+reference picked rank 3 on 8/8 seeds while the one-reveal reference picked rank
+2 on 5/8. This narrows the substantive early/midgame discriminator to position
+7, but 5/8 is not a sufficiently stable hybrid reference to declare it correct.
+
+The follow-up added realized-support diagnostics and exposed an important
+qualification. `X` fixes the composition of the chance support; it does not by
+itself force every support row to be evaluated below every materialized chance
+node. On representative 4,800-simulation reruns of positions 2, 7 and 11, the
+visit-weighted evaluated probability mass was 71.1%, 65.6% and 63.3% for
+`X={1,2,4}` respectively. The corresponding unweighted means, which give fringe
+and principal actions equal weight, were 40.2%, 28.6% and 20.5%. Position 7 was
+better covered (96.6%, 93.1%, 90.0% visit-weighted), so its pick disagreement is
+not explained by broad support starvation. Position 2 fell to 64.3% at `X=4`.
+
+Most importantly, the deck=8 root materialized all 70 unordered rows per chance
+node but evaluated only 35.6% of visit-weighted probability mass; no materialized
+chance node visited all 70 outcomes. The current closed-mean backup assigns
+unvisited outcomes the actor-framed FPU value (`-0.2` in this probe). Therefore
+"exhaustive support" must not be described as exhaustive evaluation or an exact
+chance estimate. The exact deck=8 oracle remains a separate operation that must
+actually evaluate/solve every conditioned row.
+
+Before using this topology for self-play, add an A1b search-semantics comparison:
+
+1. At each visited chance node, traverse the frozen support in probability-
+   balanced randomized cycles before repeating outcomes. For sampled panels this
+   realizes the promised per-tile exposure locally, rather than only in the
+   global panel definition.
+2. Compare the current FPU-filled closed expectation with a sampled-chance backup
+   that propagates the realized conditional value. The latter is an unbiased
+   Monte Carlo estimate under probability-balanced traversal while preserving a
+   distinct public subtree for every observed row.
+3. Where affordable, add a fully initialized closed-mean arm that evaluates every
+   support row once before revisiting it. Deck=8 exhaustive-oracle positions are
+   the primary correctness anchor; wider early-game panels may make this arm
+   intentionally impractical.
+4. Hold total NN evaluations fixed, report visit-weighted unobserved probability
+   mass, and reject any claimed strength gain that disappears when the backup's
+   missing-mass treatment changes.
+
+This A1b comparison precedes exact adjudication of the deck=8 placement and any
+`BatchedMCTS` integration. It tests whether the observed treatment effect comes
+from preserving public observations or from the arbitrary value assigned to
+unvisited chance outcomes.
 
 The implementation should reuse the public-state/chance machinery in
 `denial_search.py` and port the fixed-support semantics already reviewed in the

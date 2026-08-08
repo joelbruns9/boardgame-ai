@@ -4927,6 +4927,12 @@ struct OLChancePanelRow {
     multiplicity: usize,
 }
 
+struct AdvisorOpenLoopOutput {
+    children: Vec<(u16, i32, f64, f64)>,
+    root_value0: f64,
+    diagnostics: HashMap<String, f64>,
+}
+
 impl OLNode {
     fn new(prior: f64, action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>)) -> Self {
         OLNode {
@@ -4959,6 +4965,116 @@ fn ol_chance_value_p0(arena: &[OLNode], node_id: u32, unvisited_value0: f64) -> 
             outcome.probability * value0
         })
         .sum()
+}
+
+fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
+    let chance_nodes: Vec<&OLNode> = arena
+        .iter()
+        .filter(|node| !node.chance_children.is_empty())
+        .collect();
+    let mut visits = Vec::<i32>::new();
+    let mut visited_outcomes = 0usize;
+    let mut observation_visits = 0i64;
+    let mut visited_mass_sum = 0.0;
+    let mut visit_weighted_visited_mass_sum = 0.0;
+    let mut chance_node_visits = 0i64;
+    let mut fully_visited_chance_nodes = 0usize;
+    let mut outcome_count = 0usize;
+    for node in &chance_nodes {
+        let node_visits = node.visit_count.max(0) as i64;
+        chance_node_visits += node_visits;
+        let mut node_visited_mass = 0.0;
+        let mut node_fully_visited = true;
+        for outcome in &node.chance_children {
+            let count = arena[outcome.node_id as usize].visit_count.max(0);
+            outcome_count += 1;
+            observation_visits += count as i64;
+            visits.push(count);
+            if count > 0 {
+                visited_outcomes += 1;
+                visited_mass_sum += outcome.probability;
+                node_visited_mass += outcome.probability;
+            } else {
+                node_fully_visited = false;
+            }
+        }
+        visit_weighted_visited_mass_sum += node_visits as f64 * node_visited_mass;
+        if node_fully_visited {
+            fully_visited_chance_nodes += 1;
+        }
+    }
+    visits.sort_unstable();
+    let percentile = |q: f64| -> f64 {
+        if visits.is_empty() {
+            return 0.0;
+        }
+        let index = ((visits.len() - 1) as f64 * q).ceil() as usize;
+        visits[index] as f64
+    };
+    let n_chance = chance_nodes.len();
+    let mut out = HashMap::new();
+    out.insert("chance_nodes".to_string(), n_chance as f64);
+    out.insert("support_outcomes".to_string(), outcome_count as f64);
+    out.insert("visited_outcomes".to_string(), visited_outcomes as f64);
+    out.insert("observation_visits".to_string(), observation_visits as f64);
+    out.insert("chance_node_visits".to_string(), chance_node_visits as f64);
+    out.insert(
+        "fully_visited_chance_nodes".to_string(),
+        fully_visited_chance_nodes as f64,
+    );
+    out.insert(
+        "fully_visited_chance_node_fraction".to_string(),
+        if n_chance == 0 {
+            0.0
+        } else {
+            fully_visited_chance_nodes as f64 / n_chance as f64
+        },
+    );
+    out.insert(
+        "mean_support_outcomes_per_chance_node".to_string(),
+        if n_chance == 0 {
+            0.0
+        } else {
+            outcome_count as f64 / n_chance as f64
+        },
+    );
+    out.insert(
+        "mean_visited_probability_mass".to_string(),
+        if n_chance == 0 {
+            0.0
+        } else {
+            visited_mass_sum / n_chance as f64
+        },
+    );
+    out.insert(
+        "mean_unvisited_probability_mass".to_string(),
+        if n_chance == 0 {
+            0.0
+        } else {
+            1.0 - visited_mass_sum / n_chance as f64
+        },
+    );
+    out.insert(
+        "visit_weighted_visited_probability_mass".to_string(),
+        if chance_node_visits == 0 {
+            0.0
+        } else {
+            visit_weighted_visited_mass_sum / chance_node_visits as f64
+        },
+    );
+    out.insert(
+        "visit_weighted_unvisited_probability_mass".to_string(),
+        if chance_node_visits == 0 {
+            0.0
+        } else {
+            1.0 - visit_weighted_visited_mass_sum / chance_node_visits as f64
+        },
+    );
+    out.insert("min_visits_per_outcome".to_string(), percentile(0.0));
+    out.insert("median_visits_per_outcome".to_string(), percentile(0.5));
+    out.insert("p90_visits_per_outcome".to_string(), percentile(0.9));
+    out.insert("max_visits_per_outcome".to_string(), percentile(1.0));
+    out
 }
 
 fn comb4(n: usize) -> u64 {
@@ -5692,7 +5808,7 @@ fn advisor_open_loop_search_impl(
     pick_floor: Option<PickFloor>,
     chance_exposure: usize,
     chance_enum_max_rows: u64,
-) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
+) -> PyResult<AdvisorOpenLoopOutput> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
     let mut fallback_count = 0u32;
@@ -5883,7 +5999,12 @@ fn advisor_open_loop_search_impl(
             (idx, c.visit_count, c.value_sum, c.prior)
         })
         .collect();
-    Ok((children, root_value0))
+    let diagnostics = ol_chance_diagnostics(&arena);
+    Ok(AdvisorOpenLoopOutput {
+        children,
+        root_value0,
+        diagnostics,
+    })
 }
 
 /// Hash one advisor information-set state. Hidden deck order is canonicalized;
@@ -10899,6 +11020,42 @@ mod ol_tests {
     }
 
     #[test]
+    fn one_reveal_diagnostics_report_unvisited_probability_mass() {
+        let mut arena = vec![
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+        ];
+        arena[0].visit_count = 3;
+        arena[2].visit_count = 3;
+        arena[0].chance_children = vec![
+            OLChanceChild {
+                public_key: vec![1],
+                probability: 0.25,
+                node_id: 1,
+            },
+            OLChanceChild {
+                public_key: vec![2],
+                probability: 0.75,
+                node_id: 2,
+            },
+        ];
+        let diagnostics = ol_chance_diagnostics(&arena);
+        assert_eq!(diagnostics["chance_nodes"], 1.0);
+        assert_eq!(diagnostics["support_outcomes"], 2.0);
+        assert_eq!(diagnostics["visited_outcomes"], 1.0);
+        assert_eq!(diagnostics["observation_visits"], 3.0);
+        assert_eq!(diagnostics["chance_node_visits"], 3.0);
+        assert_eq!(diagnostics["fully_visited_chance_nodes"], 0.0);
+        assert!((diagnostics["mean_visited_probability_mass"] - 0.75).abs() < 1e-12);
+        assert!((diagnostics["mean_unvisited_probability_mass"] - 0.25).abs() < 1e-12);
+        assert!((diagnostics["visit_weighted_visited_probability_mass"] - 0.75).abs() < 1e-12);
+        assert!((diagnostics["visit_weighted_unvisited_probability_mass"] - 0.25).abs() < 1e-12);
+        assert_eq!(diagnostics["min_visits_per_outcome"], 0.0);
+        assert_eq!(diagnostics["max_visits_per_outcome"], 3.0);
+    }
+
+    #[test]
     fn one_reveal_materialization_uses_distinct_public_observation_nodes() -> PyResult<()> {
         let mut state = new_game(17, true, true);
         for _ in 0..3 {
@@ -11364,7 +11521,7 @@ mod kingdomino_rust {
         };
         let root_state = state.cloned();
         let ev: Py<PyAny> = evaluator.unbind();
-        py.detach(move || {
+        let output = py.detach(move || {
             super::advisor_open_loop_search_impl(
                 &root_state,
                 &ev,
@@ -11383,7 +11540,66 @@ mod kingdomino_rust {
                 chance_exposure,
                 chance_enum_max_rows,
             )
-        })
+        })?;
+        Ok((output.children, output.root_value0))
+    }
+
+    /// Diagnostic A1 entry point. It uses the same advisor open-loop engine but
+    /// also reports realized fixed-support coverage. The incumbent is exposure
+    /// zero; positive exposure splits only the first future reveal.
+    #[pyfunction]
+    #[pyo3(signature = (state, evaluator, n_sims, chance_exposure=0,
+                        chance_enum_max_rows=70, fpu=0.0, cpuct=1.5, seed=0,
+                        leaf_batch=8, virtual_loss=1, score_scale=160.0,
+                        margin_gain=2.0, alpha=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn advisor_one_reveal_search<'py>(
+        py: Python<'py>,
+        state: &RustGameState,
+        evaluator: Bound<'py, PyAny>,
+        n_sims: usize,
+        chance_exposure: usize,
+        chance_enum_max_rows: u64,
+        fpu: f64,
+        cpuct: f64,
+        seed: u64,
+        leaf_batch: usize,
+        virtual_loss: i32,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
+        if state.phase == GAME_OVER {
+            return Err(PyValueError::new_err("Cannot search from a terminal state"));
+        }
+        if chance_exposure > 0 && chance_enum_max_rows == 0 {
+            return Err(PyValueError::new_err(
+                "chance_enum_max_rows must be > 0 when chance_exposure is enabled",
+            ));
+        }
+        let root_state = state.cloned();
+        let ev: Py<PyAny> = evaluator.unbind();
+        let output = py.detach(move || {
+            super::advisor_open_loop_search_impl(
+                &root_state,
+                &ev,
+                n_sims,
+                0.3,
+                0.0,
+                fpu,
+                cpuct,
+                seed,
+                leaf_batch,
+                virtual_loss,
+                score_scale,
+                margin_gain,
+                alpha,
+                None,
+                chance_exposure,
+                chance_enum_max_rows,
+            )
+        })?;
+        Ok((output.children, output.root_value0, output.diagnostics))
     }
 
     /// Count exact minimax nodes for a no-chance endgame, with the same

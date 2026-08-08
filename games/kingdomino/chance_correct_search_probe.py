@@ -51,11 +51,10 @@ def _arm(
         return evaluator(my_board, opp_board, flat, legal_indices)
 
     started = time.perf_counter()
-    children, root_value0 = kr.advisor_open_loop_search(
+    children, root_value0, chance_diagnostics = kr.advisor_one_reveal_search(
         _rust_state_from_python(state),
         counted_evaluator,
         int(sims),
-        dirichlet_eps=0.0,
         fpu=float(fpu),
         cpuct=float(cpuct),
         seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
@@ -84,6 +83,9 @@ def _arm(
         "chance_enum_max_rows": int(enum_max_rows),
         "root_value_player0": float(root_value0),
         "nn_evaluations": int(nn_evaluations),
+        "chance_diagnostics": {
+            str(key): float(value) for key, value in chance_diagnostics.items()
+        },
         "top_action_idx": top["action_idx"],
         "top_pick_rank": top["pick_rank"],
         "elapsed_seconds": time.perf_counter() - started,
@@ -147,13 +149,78 @@ def _reference_metrics(candidate: dict[str, Any], reference: dict[str, Any]) -> 
     }
 
 
+def _mode_summary(values: Sequence[int]) -> dict[str, Any]:
+    counts: dict[int, int] = {}
+    for value in values:
+        counts[int(value)] = counts.get(int(value), 0) + 1
+    modal_value, modal_count = min(
+        counts.items(), key=lambda item: (-item[1], item[0])
+    )
+    return {
+        "counts": {str(key): counts[key] for key in sorted(counts)},
+        "mode": int(modal_value),
+        "mode_count": int(modal_count),
+        "mode_fraction": modal_count / len(values),
+        "unanimous": len(counts) == 1,
+    }
+
+
+def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence[str]) -> dict[str, Any]:
+    selectors: dict[str, list[dict[str, Any]]] = {
+        name: [run["arms"][name] for run in seed_runs] for name in arm_names
+    }
+    selectors.update({
+        "reference_openloop": [run["references"]["openloop"] for run in seed_runs],
+        "reference_hybrid": [run["references"]["hybrid"] for run in seed_runs],
+    })
+    summaries = {
+        name: {
+            "action": _mode_summary([row["top_action_idx"] for row in rows]),
+            "pick": _mode_summary([row["top_pick_rank"] for row in rows]),
+        }
+        for name, rows in selectors.items()
+    }
+    open_summary = summaries["reference_openloop"]
+    hybrid_summary = summaries["reference_hybrid"]
+    return {
+        "selectors": summaries,
+        "reference_mode_agreement": {
+            "top1": open_summary["action"]["mode"] == hybrid_summary["action"]["mode"],
+            "pick": open_summary["pick"]["mode"] == hybrid_summary["pick"]["mode"],
+        },
+        "reference_same_seed_agreement": {
+            "top1": statistics.fmean(
+                run["reference_agreement"]["top1"] for run in seed_runs
+            ),
+            "pick": statistics.fmean(
+                run["reference_agreement"]["pick"] for run in seed_runs
+            ),
+        },
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = Path(args.checkpoint)
-    positions = load_frozen_positions(args.positions_path)
-    if args.positions > 0:
-        positions = positions[:args.positions]
+    all_positions = load_frozen_positions(args.positions_path)
+    indexed_positions = list(enumerate(all_positions))
+    requested_indices = [
+        int(value) for value in args.position_indices.split(",") if value.strip()
+    ]
+    if requested_indices:
+        if len(set(requested_indices)) != len(requested_indices):
+            raise ValueError("--position-indices contains duplicates")
+        invalid = [i for i in requested_indices if i < 0 or i >= len(indexed_positions)]
+        if invalid:
+            raise ValueError(f"position indices out of range: {invalid}")
+        positions = [indexed_positions[i] for i in requested_indices]
+    elif args.positions > 0:
+        positions = indexed_positions[:args.positions]
+    else:
+        positions = indexed_positions
     if not positions:
         raise ValueError("the frozen position set is empty")
+    if args.seed_count < 1:
+        raise ValueError("--seed-count must be >= 1")
     exposures = [int(x) for x in args.exposures.split(",")]
     if not exposures or exposures[0] != 0 or any(x < 0 for x in exposures):
         raise ValueError("--exposures must start with the incumbent 0 arm")
@@ -169,20 +236,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     alpha = float(checkpoint_cfg.get("alpha", 0.5))
     # Exclude one-time CUDA/kernel initialization from the first arm's latency.
     _arm(
-        positions[0][0], evaluator, sims=1, exposure=0,
+        positions[0][1][0], evaluator, sims=1, exposure=0,
         enum_max_rows=args.enum_max_rows, seed=args.seed,
         margin_gain=margin_gain, alpha=alpha,
         fpu=args.fpu, cpuct=args.cpuct,
     )
     records = []
-    for index, (state, source) in enumerate(positions):
-        seed = int(args.seed) + 104729 * (index + 1)
-        arms = {
-            f"x{exposure}": _arm(
+    arm_names = [f"x{exposure}" for exposure in exposures]
+    for ordinal, (position_index, (state, source)) in enumerate(positions):
+        seed_runs = []
+        for seed_index in range(args.seed_count):
+            seed = (
+                int(args.seed)
+                + 104729 * (position_index + 1)
+                + 1_000_003 * seed_index
+            )
+            arms = {
+                f"x{exposure}": _arm(
+                    state,
+                    evaluator,
+                    sims=args.sims,
+                    exposure=exposure,
+                    enum_max_rows=args.enum_max_rows,
+                    seed=seed,
+                    margin_gain=margin_gain,
+                    alpha=alpha,
+                    fpu=args.fpu,
+                    cpuct=args.cpuct,
+                )
+                for exposure in exposures
+            }
+            reference_openloop = _arm(
                 state,
                 evaluator,
-                sims=args.sims,
-                exposure=exposure,
+                sims=args.reference_sims,
+                exposure=0,
                 enum_max_rows=args.enum_max_rows,
                 seed=seed,
                 margin_gain=margin_gain,
@@ -190,85 +278,81 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 fpu=args.fpu,
                 cpuct=args.cpuct,
             )
-            for exposure in exposures
-        }
-        reference_openloop = _arm(
-            state,
-            evaluator,
-            sims=args.reference_sims,
-            exposure=0,
-            enum_max_rows=args.enum_max_rows,
-            seed=seed,
-            margin_gain=margin_gain,
-            alpha=alpha,
-            fpu=args.fpu,
-            cpuct=args.cpuct,
-        )
-        reference_hybrid = _arm(
-            state,
-            evaluator,
-            sims=args.reference_sims,
-            exposure=args.reference_exposure,
-            enum_max_rows=args.enum_max_rows,
-            seed=seed,
-            margin_gain=margin_gain,
-            alpha=alpha,
-            fpu=args.fpu,
-            cpuct=args.cpuct,
-        )
-        references = {
-            "openloop": reference_openloop,
-            "hybrid": reference_hybrid,
-        }
-        metrics = {
-            reference_name: {
-                name: _reference_metrics(arm, reference)
-                for name, arm in arms.items()
+            reference_hybrid = _arm(
+                state,
+                evaluator,
+                sims=args.reference_sims,
+                exposure=args.reference_exposure,
+                enum_max_rows=args.enum_max_rows,
+                seed=seed,
+                margin_gain=margin_gain,
+                alpha=alpha,
+                fpu=args.fpu,
+                cpuct=args.cpuct,
+            )
+            references = {
+                "openloop": reference_openloop,
+                "hybrid": reference_hybrid,
             }
-            for reference_name, reference in references.items()
-        }
+            metrics = {
+                reference_name: {
+                    name: _reference_metrics(arm, reference)
+                    for name, arm in arms.items()
+                }
+                for reference_name, reference in references.items()
+            }
+            seed_runs.append({
+                "seed_index": seed_index,
+                "seed": seed,
+                "arms": arms,
+                "references": references,
+                "reference_agreement": {
+                    "top1": (
+                        reference_openloop["top_action_idx"]
+                        == reference_hybrid["top_action_idx"]
+                    ),
+                    "pick": (
+                        reference_openloop["top_pick_rank"]
+                        == reference_hybrid["top_pick_rank"]
+                    ),
+                },
+                "metrics": metrics,
+            })
         records.append({
-            "position_index": index,
+            "position_index": position_index,
             "source": source,
             "deck_size": len(state.deck),
             "actor": int(state.current_actor),
-            "arms": arms,
-            "references": references,
-            "reference_agreement": {
-                "top1": (
-                    reference_openloop["top_action_idx"]
-                    == reference_hybrid["top_action_idx"]
-                ),
-                "pick": (
-                    reference_openloop["top_pick_rank"]
-                    == reference_hybrid["top_pick_rank"]
-                ),
-            },
-            "metrics": metrics,
+            "seed_runs": seed_runs,
+            "consensus": _position_consensus(seed_runs, arm_names),
         })
+        final_run = seed_runs[-1]
         print(
-            f"A1 {index + 1}/{len(positions)} deck={len(state.deck)} "
+            f"A1 {ordinal + 1}/{len(positions)} index={position_index} "
+            f"deck={len(state.deck)} seeds={args.seed_count} "
             + " ".join(
                 f"{name}:a{arm['top_action_idx']}/p{arm['top_pick_rank']}"
-                for name, arm in arms.items()
+                for name, arm in final_run["arms"].items()
             )
         )
 
+    all_seed_runs = [run for record in records for run in record["seed_runs"]]
     aggregate = {}
     for reference_name in ("openloop", "hybrid"):
         aggregate[reference_name] = {}
         for exposure in exposures:
             name = f"x{exposure}"
-            metrics = [record["metrics"][reference_name][name] for record in records]
+            metrics = [run["metrics"][reference_name][name] for run in all_seed_runs]
             regrets = [m["regret_actor"] for m in metrics if m["regret_actor"] is not None]
             q_pair_correct = sum(m["q_pairwise_correct"] for m in metrics)
             q_pair_total = sum(m["q_pairwise_pairs"] for m in metrics)
             visit_pair_correct = sum(m["visit_pairwise_correct"] for m in metrics)
             visit_pair_total = sum(m["visit_pairwise_pairs"] for m in metrics)
-            elapsed = [record["arms"][name]["elapsed_seconds"] for record in records]
-            nn_evals = [record["arms"][name]["nn_evaluations"] for record in records]
+            elapsed = [run["arms"][name]["elapsed_seconds"] for run in all_seed_runs]
+            nn_evals = [run["arms"][name]["nn_evaluations"] for run in all_seed_runs]
             aggregate[reference_name][name] = {
                 "positions": len(records),
+                "searches": len(metrics),
                 "top1_agreement": statistics.fmean(m["top1_agrees"] for m in metrics),
                 "pick_agreement": statistics.fmean(m["pick_agrees"] for m in metrics),
                 "q_pairwise_accuracy": (
@@ -285,17 +369,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "mean_nn_evaluations": statistics.fmean(nn_evals),
             }
     aggregate["reference_agreement"] = {
-        "top1": statistics.fmean(r["reference_agreement"]["top1"] for r in records),
-        "pick": statistics.fmean(r["reference_agreement"]["pick"] for r in records),
+        "same_seed_top1": statistics.fmean(
+            run["reference_agreement"]["top1"] for run in all_seed_runs
+        ),
+        "same_seed_pick": statistics.fmean(
+            run["reference_agreement"]["pick"] for run in all_seed_runs
+        ),
+        "position_consensus_top1": statistics.fmean(
+            record["consensus"]["reference_mode_agreement"]["top1"]
+            for record in records
+        ),
+        "position_consensus_pick": statistics.fmean(
+            record["consensus"]["reference_mode_agreement"]["pick"]
+            for record in records
+        ),
     }
+    aggregate["chance_coverage"] = {}
+    for name in arm_names:
+        diagnostics = [run["arms"][name]["chance_diagnostics"] for run in all_seed_runs]
+        fields = sorted({field for row in diagnostics for field in row})
+        aggregate["chance_coverage"][name] = {
+            field: statistics.fmean(row.get(field, 0.0) for row in diagnostics)
+            for field in fields
+        }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": "A1 equal-compute frozen-position probe; no training or promotion",
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
         "positions_path": str(args.positions_path),
         "positions_sha256": file_sha256(args.positions_path),
         "configuration": vars(args),
+        "sampling_unit_note": (
+            "seed runs are paired repeats clustered within position; aggregate "
+            "search-level rates are descriptive and are not independent-position confidence intervals"
+        ),
         "reference_label": "separate larger incumbent and one-reveal searches; neither is exact",
         "aggregate": aggregate,
         "positions": records,
@@ -311,6 +419,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--output", default="runs/kingdomino/chance_correct_a1/search_probe.json")
     parser.add_argument("--positions", type=int, default=12)
+    parser.add_argument(
+        "--position-indices",
+        default="",
+        help="comma-separated zero-based frozen-corpus indices; overrides --positions",
+    )
+    parser.add_argument("--seed-count", type=int, default=1)
     parser.add_argument("--sims", type=int, default=128)
     parser.add_argument("--exposures", default="0,1,2,4")
     parser.add_argument("--enum-max-rows", type=int, default=70)
