@@ -408,6 +408,32 @@ class SearchConfig:
     # mctx's `value_scale`; pairs with the [0, 1] min-max rescale in `_sigma`.
     # Was 1.0 against a raw q in [-1, 1], which made sigma swamp the prior.
     c_scale: float = 0.1
+
+    dirichlet_epsilon: float = 0.0
+    """Root exploration noise, applied ONLY under ``root_selection="puct"``.
+
+    Zero (the default) is off. The Gumbel root carries its own exploration in
+    the Gumbel keys, so noise there would double up; PUCT has no such source and
+    without it self-play collapses toward deterministic lines. Kingdomino's
+    settled values are the reference: 0.25 for the learner's full-search moves,
+    0.0 for evaluation, 0.0 for fast moves, 0.0 for archived HOF opponents.
+
+    Noise perturbs which actions get SEARCHED. It never reaches the recorded
+    policy target, which ``_puct_root`` builds from visit counts, nor the
+    recorded ``prior``, which is snapshotted before the blend.
+    """
+
+    dirichlet_alpha: float = 1.8
+    """Concentration. The AlphaZero convention is ``alpha ~ 10 / branching``:
+    0.3 for chess (~35 moves), 0.15 for shogi (~92), 0.03 for Go (~250).
+
+    7WD measures a MEDIAN of 4 legal actions and a mean of 5.6, which puts it
+    near 1.8 -- six times Kingdomino's 0.3. Copying 0.3 here would be a real
+    error, not a nitpick: at alpha well below 1 over ~5 actions the draw is
+    extremely peaked, dumping nearly all the noise mass on one arbitrary action
+    instead of spreading a mild perturbation across the root.
+    """
+
     seed: int = 0
     force_expand_root_chance: bool = False
     """Closed mode: exhaustively materialize and evaluate every enumerable
@@ -715,6 +741,36 @@ class GumbelMCTS:
         node.value_sum_p0 += value
         return value
 
+    def _add_dirichlet_noise(self, root: ClosedNode) -> None:
+        """Blend Dirichlet noise into the root edges' priors, in place.
+
+        ``prior <- (1 - eps) * prior + eps * noise`` over the root's edges, the
+        AlphaZero form and a direct port of Kingdomino's ``_add_dirichlet_noise``
+        (``mcts_az.py:729``) -- with one deliberate difference. Kingdomino draws
+        from numpy, whose values Rust cannot reproduce, so its equivalence gate
+        has to run at eps=0 and its production self-play is not bit-comparable
+        across the two implementations. 7WD's Gumbel keys come from
+        ``PortableRng``, so its self-play IS bit-comparable *with exploration on*
+        today; drawing this noise from anywhere else would give that up. Hence
+        ``PortableRng.dirichlet``, sharing the searcher's existing stream.
+
+        No-op unless the PUCT root is selected and eps > 0. Applied after the
+        clean prior is snapshotted, so only search behaviour changes.
+        """
+
+        config = self.config
+        if config.root_selection != "puct" or config.dirichlet_epsilon <= 0.0:
+            return
+        if not root.edges:
+            return
+        epsilon = config.dirichlet_epsilon
+        noise = self.rng.dirichlet(config.dirichlet_alpha, len(root.edges))
+        # Standard AlphaZero blend; priors are expected normalised (production
+        # normalises in `blend_priors`). Scaling by observed mass would hide a
+        # malformed prior rather than surface it.
+        for edge, sample in zip(root.edges, noise):
+            edge.prior = (1.0 - epsilon) * edge.prior + epsilon * sample
+
     def _puct_root(self, root: ClosedNode, sign: float, root_value: float):
         """Plain PUCT from the root — the search the advisor actually runs.
 
@@ -844,7 +900,12 @@ class GumbelMCTS:
             self._force_expand_root(root)
         sign = 1.0 if root.actor == 0 else -1.0
         edges_by_action = {edge.action_index: edge for edge in root.edges}
+        # Snapshot BEFORE any noise: this is the network's opinion, and it is
+        # what `_gumbel_root` scores against and what the buffer records as
+        # `prior`. Blending noise into it would corrupt every KL diagnostic and
+        # silently redefine what a recorded row means.
         priors = {edge.action_index: edge.prior for edge in root.edges}
+        self._add_dirichlet_noise(root)
 
         def simulate(action_index: int):
             edge = edges_by_action[action_index]

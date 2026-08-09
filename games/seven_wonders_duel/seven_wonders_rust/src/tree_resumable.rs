@@ -803,6 +803,8 @@ enum PendingEvaluation {
 /// leaf wave is always drained before a halving-round reduction.
 pub struct SearchSession {
     arena: Arena,
+    /// Root priors as the network gave them, before Dirichlet noise.
+    clean_priors: Vec<f64>,
     cfg: SearchConfig,
     leaf_batch: usize,
     rng: Rng,
@@ -832,13 +834,17 @@ pub struct SearchSession {
 }
 
 impl SearchSession {
-    fn new(arena: Arena, cfg: &SearchConfig, leaf_batch: usize, forced_nodes: Vec<NodeId>) -> Self {
+    fn new(mut arena: Arena, cfg: &SearchConfig, leaf_batch: usize, forced_nodes: Vec<NodeId>) -> Self {
         let root = &arena.nodes[arena.root_id];
         let sign = if root.actor == 0 { 1.0 } else { -1.0 };
         let root_value = sign * root.value_p0();
         let legal = root.legal.clone();
         let n = root.edges.len();
         let log_prior: Vec<f64> = root.edges.iter().map(|e| e.prior.max(1e-12).ln()).collect();
+        // The network's opinion, captured before any noise: this is what the
+        // buffer records as `prior` and what every KL diagnostic scores
+        // against, so the blend below must not reach it.
+        let clean_priors: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
         let initial_q: Vec<Option<f64>> = root
             .edges
             .iter()
@@ -852,6 +858,19 @@ impl SearchSession {
             })
             .collect();
         let mut rng = Rng::new(cfg.seed);
+        // Root exploration noise, drawn FIRST from this stream so the position
+        // matches `tree::puct_root`, which blends before any descent. This is the
+        // searcher production self-play actually runs -- `tree::puct_root` is the
+        // scalar reference path, and noise applied only there is inert in a run.
+        {
+            let root_id = arena.root_id;
+            let mut priors: Vec<f64> =
+                arena.nodes[root_id].edges.iter().map(|e| e.prior).collect();
+            crate::tree::blend_dirichlet(&mut priors, cfg, &mut rng);
+            for (edge, prior) in arena.nodes[root_id].edges.iter_mut().zip(priors) {
+                edge.prior = prior;
+            }
+        }
         // A PUCT root draws no Gumbel keys, and must not CONSUME them either:
         // the same rng samples chance outcomes, so drawing here would offset
         // the whole stream against the scalar port and against Python.
@@ -876,6 +895,7 @@ impl SearchSession {
         let per_action = (cfg.sims / (rounds_total * candidates.len())).max(1);
         Self {
             arena,
+            clean_priors,
             cfg: SearchConfig {
                 sims: cfg.sims,
                 top_k: cfg.top_k,
@@ -885,6 +905,8 @@ impl SearchSession {
                 seed: cfg.seed,
                 force_expand_root_chance: cfg.force_expand_root_chance,
                 puct_root: cfg.puct_root,
+                dirichlet_epsilon: 0.0,
+                dirichlet_alpha: 1.8,
                 age_deal_samples: cfg.age_deal_samples,
                 double_reveal_offsets: cfg.double_reveal_offsets,
                 conflict_free_waves: cfg.conflict_free_waves,
@@ -1583,9 +1605,10 @@ impl SearchSession {
             self.visits.iter().map(|&v| v as f64 / total).collect()
         } else {
             let root = &self.arena.nodes[self.arena.root_id];
-            let mass: f64 = root.edges.iter().fold(0.0_f64, |a, e| a + e.prior);
+            // Clean priors, not the noised edges: this is a training LABEL.
+            let mass: f64 = self.clean_priors.iter().fold(0.0_f64, |a, &p| a + p);
             let mass = if mass > 0.0 { mass } else { 1.0 };
-            root.edges.iter().map(|e| e.prior / mass).collect()
+            self.clean_priors.iter().map(|p| p / mass).collect()
         };
         // First maximum in legal order, matching Python's `max`.
         let mut best = 0usize;
@@ -1604,12 +1627,8 @@ impl SearchSession {
             root_value,
             visits: self.visits,
             policy_target,
-            prior: crate::tree::root_prior_from(
-                self.arena.nodes[self.arena.root_id]
-                    .edges
-                    .iter()
-                    .map(|e| e.prior),
-            ),
+            // The network's opinion, snapshotted before the Dirichlet blend.
+            prior: crate::tree::root_prior_from(self.clean_priors.iter().copied()),
             gumbel_topk: Vec::new(),
             sims: self.sims_completed,
         };

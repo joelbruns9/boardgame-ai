@@ -306,6 +306,21 @@ class PhaseDConfig:
     means -- results are not comparable across the two.
     """
 
+    selfplay_search_mode: str = "gumbel"
+    """Root selection for SELF-PLAY. ``puct`` plays argmax visits and records the
+    visit distribution as the policy target; ``gumbel`` is the historical target
+    generator. Switching resets what every gate number means, exactly as
+    ``eval_search_mode`` does."""
+
+    dirichlet_epsilon: float = 0.0
+    """Root exploration noise. Inert under the Gumbel root, which carries its own
+    exploration in the Gumbel keys; REQUIRED under PUCT, which has no other
+    source and collapses toward deterministic lines without it."""
+
+    dirichlet_alpha: float = 1.8
+    """``alpha ~ 10 / branching``. 7WD measures median 4 / mean 5.6 legal actions,
+    so 1.8 -- six times Kingdomino's 0.3, whose branching differs."""
+
     record_fast_moves: bool = False
     """Emit training examples for cheap-search moves.
 
@@ -758,6 +773,10 @@ class PhaseDConfig:
             raise ValueError("validate_every must be positive")
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("val_fraction must lie in [0, 1)")
+        if not math.isfinite(self.dirichlet_alpha) or self.dirichlet_alpha <= 0:
+            raise ValueError("dirichlet_alpha must be finite and positive")
+        if not 0.0 <= self.dirichlet_epsilon <= 1.0:
+            raise ValueError("dirichlet_epsilon must lie in [0, 1]")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
 
@@ -1435,6 +1454,13 @@ def _search_move(
             top_k=config.top_k,
             mode=config.search_mode,
             seed=rng.getrandbits(63),
+            root_selection=config.selfplay_search_mode,
+            # Full-search learner moves only, matching the Rust generator
+            # (`self_play.rs`): cheap moves emit no targets, so noise there
+            # only perturbs the trajectory. This backend has no archived
+            # opponent, so there is no net-id term.
+            dirichlet_epsilon=config.dirichlet_epsilon if full else 0.0,
+            dirichlet_alpha=config.dirichlet_alpha,
         ),
         draft_amount,
     )
@@ -2969,6 +2995,9 @@ class PhaseDLoop:
             nets_p1=list(league.nets_p1) if league is not None else None,
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
+            puct_root=self.config.selfplay_search_mode == "puct",
+            dirichlet_epsilon=self.config.dirichlet_epsilon,
+            dirichlet_alpha=self.config.dirichlet_alpha,
         )
         records = phase_d_records_from_rust(raw_records, validate=False)
         if league is not None:
@@ -4752,6 +4781,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--age-deal-samples", type=int, choices=(0, 4, 8, 16, 32), default=32)
     parser.add_argument(
+        "--selfplay-search-mode",
+        choices=("gumbel", "puct"),
+        default="gumbel",
+        help="root selection for SELF-PLAY. 'puct' records visit-count policy "
+        "targets and needs --dirichlet-epsilon > 0 for exploration. Gate numbers "
+        "are not comparable across the two.",
+    )
+    parser.add_argument(
+        "--dirichlet-epsilon",
+        type=float,
+        default=0.0,
+        help="root exploration noise, PUCT root only. Kingdomino's settled value "
+        "is 0.25 for the learner and 0.0 for evaluation.",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=1.8,
+        help="Dirichlet concentration. Convention is 10/branching; 7WD's mean 5.6 "
+        "legal actions give ~1.8. Do NOT copy Kingdomino's 0.3 -- over ~5 actions "
+        "it puts most of the noise mass on one arbitrary move.",
+    )
+    parser.add_argument(
         "--cheap-double-reveal-offsets",
         type=int,
         default=0,
@@ -5171,6 +5223,9 @@ def main(argv=None) -> int:
         leaf_batch=args.leaf_batch,
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
+        selfplay_search_mode=args.selfplay_search_mode,
+        dirichlet_epsilon=args.dirichlet_epsilon,
+        dirichlet_alpha=args.dirichlet_alpha,
         cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
         anchor_games=args.anchor_games,

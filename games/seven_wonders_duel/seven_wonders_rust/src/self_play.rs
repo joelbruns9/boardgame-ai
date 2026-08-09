@@ -85,6 +85,9 @@ pub struct SelfPlayConfig {
     pub force_expand_root_chance: bool,
     /// PUCT root selection; evaluation only. Self-play must stay Gumbel.
     pub puct_root: bool,
+    /// Root exploration noise for the PUCT root; inert under Gumbel.
+    pub dirichlet_epsilon: f64,
+    pub dirichlet_alpha: f64,
     pub age_deal_samples: usize,
     pub age_deal_samples_by_player: Option<[usize; 2]>,
     /// Offsets per first-reveal stratum for the balanced double-reveal support,
@@ -131,6 +134,21 @@ impl SelfPlayConfig {
         {
             return Err(PyValueError::new_err(
                 "leaf_batch, top_k, and max_moves must be positive",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.dirichlet_epsilon)
+        {
+            return Err(PyValueError::new_err(
+                "dirichlet_epsilon must lie in [0, 1]",
+            ));
+        }
+        // `NaN <= 0.0` is false, so a bare positivity test admits NaN, which
+        // then panics in `Rng::gamma`. Infinity is quieter and worse: every
+        // draw returns inf, inf/inf makes the Dirichlet vector NaN, and NaN
+        // comparisons pin PUCT selection to the first edge with no error.
+        if !self.dirichlet_alpha.is_finite() || self.dirichlet_alpha <= 0.0 {
+            return Err(PyValueError::new_err(
+                "dirichlet_alpha must be finite and positive",
             ));
         }
         if self.age_deal_samples > 32
@@ -525,6 +543,13 @@ pub fn run<E: Eval>(
             seed: search_seed,
             force_expand_root_chance: cfg.force_expand_root_chance,
             puct_root: cfg.puct_root,
+            // Learner-only and full-search-only; see make_search_meta.
+            dirichlet_epsilon: if full && cfg.net_by_player[actor] == 0 {
+                cfg.dirichlet_epsilon
+            } else {
+                0.0
+            },
+            dirichlet_alpha: cfg.dirichlet_alpha,
             age_deal_samples: cfg.age_deal_samples,
             double_reveal_offsets: cheap_offsets(
                 cfg.cheap_double_reveal_offsets_by_player
@@ -1377,6 +1402,25 @@ impl GameSlot {
                 seed: search_seed,
                 force_expand_root_chance: self.cfg.force_expand_root_chance,
                 puct_root: self.cfg.puct_root,
+                // Only network 0 -- the learner -- explores. An archived
+                // opponent must play noise-free: handicapping it inflates the
+                // learner's league win rate, and league games are ~15% of the
+                // training data, so their value labels would skew optimistic.
+                // Same predicate the buffer already uses to drop an archived
+                // net's policy targets (`policy_excluded`, below).
+                // Learner-only AND full-search-only. An archived opponent must
+                // play clean (league games are ~15% of training data, so a
+                // handicapped opponent skews their value labels optimistic), and
+                // cheap moves emit no targets at all -- noise there buys no
+                // exploration of the label space and only degrades the
+                // trajectory. Kingdomino settles both the same way
+                // (`hof_dirichlet_epsilon` / `fast_move_dirichlet_epsilon` = 0).
+                dirichlet_epsilon: if full && self.cfg.net_by_player[actor] == 0 {
+                    self.cfg.dirichlet_epsilon
+                } else {
+                    0.0
+                },
+                dirichlet_alpha: self.cfg.dirichlet_alpha,
                 age_deal_samples: self
                     .cfg
                     .age_deal_samples_by_player
@@ -2390,6 +2434,8 @@ mod budget_tests {
             c_scale: 1.0,
             force_expand_root_chance: false,
             puct_root: false,
+            dirichlet_epsilon: 0.0,
+            dirichlet_alpha: 1.8,
             age_deal_samples: 0,
             age_deal_samples_by_player: None,
             cheap_double_reveal_offsets: 0,

@@ -323,6 +323,16 @@ pub struct SearchConfig {
     /// training-target generator), true = plain PUCT at the root with argmax
     /// visits (what the advisor runs, and what evaluation should measure).
     pub puct_root: bool,
+    /// Root exploration noise, applied ONLY when `puct_root` is set
+    /// (`search.py::SearchConfig.dirichlet_epsilon`). Zero is off. The Gumbel
+    /// root carries exploration in its keys, so noise there would double up;
+    /// PUCT has no other source and without it self-play collapses toward
+    /// deterministic lines.
+    pub dirichlet_epsilon: f64,
+    /// Dirichlet concentration. Convention is `alpha ~ 10 / branching`; 7WD's
+    /// median 4 / mean 5.6 legal actions put it near 1.8, six times
+    /// Kingdomino's 0.3. See `search.py::SearchConfig.dirichlet_alpha`.
+    pub dirichlet_alpha: f64,
     /// Common root AgeDeal samples per legal action. Zero preserves the legacy
     /// independently-sampled behavior.
     pub age_deal_samples: usize,
@@ -476,6 +486,48 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E, cfg: &SearchConfig) -> 
 /// Gumbel keys perturb which candidates get searched at all, so competitive
 /// play selects at the root by PUCT like every node below it and plays argmax
 /// visits.
+/// Blend Dirichlet noise into the root edges' priors, in place.
+///
+/// Mirrors `search.py::GumbelMCTS._add_dirichlet_noise`, and draws from the same
+/// `PortableRng` stream so a noise-on search stays bit-comparable with Python --
+/// the property Kingdomino gave up by drawing from numpy, which forced its
+/// equivalence gate to run at eps=0.
+///
+/// The unit-sum noise is scaled to the priors' existing mass so `eps` means
+/// "fraction of prior mass replaced" whatever that mass is, and so the total
+/// PUCT sees is unchanged.
+///
+/// `tree` and `tree_resumable` define separate `Node`/`Edge` types, so the blend
+/// itself lives here over a bare prior slice and each searcher passes its own
+/// edges in. One implementation, two thin adapters -- duplicating the arithmetic
+/// is exactly how the two paths would drift apart.
+pub(crate) fn blend_dirichlet(priors: &mut [f64], cfg: &SearchConfig, rng: &mut Rng) {
+    if !cfg.puct_root || cfg.dirichlet_epsilon <= 0.0 || priors.is_empty() {
+        return;
+    }
+    // Standard AlphaZero blend. Priors are expected to be a distribution:
+    // production self-play normalises them in `blend_priors` before they ever
+    // reach a root. An earlier version scaled the noise by the observed prior
+    // mass so `eps` would keep its meaning on unnormalised input -- that was a
+    // mistake. It bought nothing in production and, on a mock evaluator whose
+    // priors summed to 2.53, it preserved a 2.53x inflated `c_puct * prior`
+    // exploration term, concealing the contract violation instead of exposing
+    // it.
+    let eps = cfg.dirichlet_epsilon;
+    let noise = rng.dirichlet(cfg.dirichlet_alpha, priors.len());
+    for (prior, sample) in priors.iter_mut().zip(noise) {
+        *prior = (1.0 - eps) * *prior + eps * sample;
+    }
+}
+
+fn add_dirichlet_noise(root: &mut Node, cfg: &SearchConfig, rng: &mut Rng) {
+    let mut priors: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
+    blend_dirichlet(&mut priors, cfg, rng);
+    for (edge, prior) in root.edges.iter_mut().zip(priors) {
+        edge.prior = prior;
+    }
+}
+
 fn puct_root<E: Eval>(
     mut root: Node,
     eval: &E,
@@ -486,6 +538,12 @@ fn puct_root<E: Eval>(
 ) -> PyResult<(SearchResult, Node)> {
     let n = root.edges.len();
     let mut rng = Rng::new(cfg.seed);
+    // Snapshot BEFORE noise. `prior` is recorded as the network's opinion and is
+    // what every KL diagnostic scores against; blending noise into what gets
+    // reported would silently redefine what a buffer row means. The terminal
+    // policy-target fallback below uses the same clean copy.
+    let clean_priors: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
+    add_dirichlet_noise(&mut root, cfg, &mut rng);
     for _ in 0..cfg.sims {
         descend(&mut root, None, eval, &mut rng, cfg.c_puct)?;
     }
@@ -506,10 +564,11 @@ fn puct_root<E: Eval>(
     let policy_target: Vec<f64> = if total > 0.0 {
         visits.iter().map(|&v| v as f64 / total).collect()
     } else {
-        // Every simulation hit a terminal root edge; fall back to the prior.
-        let mass: f64 = root.edges.iter().fold(0.0_f64, |a, e| a + e.prior);
+        // Every simulation hit a terminal root edge; fall back to the prior --
+        // the CLEAN one, so a rare fallback never emits a noise-shaped label.
+        let mass: f64 = clean_priors.iter().fold(0.0_f64, |a, &p| a + p);
         let mass = if mass > 0.0 { mass } else { 1.0 };
-        root.edges.iter().map(|e| e.prior / mass).collect()
+        clean_priors.iter().map(|p| p / mass).collect()
     };
     // Python's `max` returns the FIRST maximum in legal order; a strict `>`
     // over the same order agrees on ties.
@@ -527,7 +586,7 @@ fn puct_root<E: Eval>(
         root_value: sign * root.value_p0(),
         visits,
         policy_target,
-        prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
+        prior: root_prior_from(clean_priors.iter().copied()),
         // No Gumbel top-k exists here; an invented one would let a buffer row
         // claim a candidate set that never happened.
         gumbel_topk: Vec::new(),

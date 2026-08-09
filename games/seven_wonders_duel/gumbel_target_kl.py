@@ -91,6 +91,7 @@ def measure(
     search: dict,
     cheap_top_k: int,
     cheap_sims: tuple[int, int],
+    cheap_double_reveal_offsets: int,
     slots: int,
     batch_cap: int,
 ) -> dict:
@@ -120,7 +121,7 @@ def measure(
         iteration=-1,
         force=True,
         age_deal_samples=search["age_deal_samples"],
-        cheap_double_reveal_offsets=0,
+        cheap_double_reveal_offsets=cheap_double_reveal_offsets,
         max_active_slots=slots,
     )
 
@@ -183,6 +184,7 @@ def reference_compare(
     seed_base: int,
     search: dict,
     cheap_sims: tuple[int, int],
+    cheap_double_reveal_offsets: int,
     deep_sims: int,
     samples: int,
     slots: int,
@@ -231,7 +233,7 @@ def reference_compare(
         iteration=-1,
         force=True,
         age_deal_samples=search["age_deal_samples"],
-        cheap_double_reveal_offsets=0,
+        cheap_double_reveal_offsets=cheap_double_reveal_offsets,
         max_active_slots=slots,
     )
 
@@ -352,6 +354,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-search-fraction", type=float, default=0.25)
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--age-deal-samples", type=int, default=32)
+    parser.add_argument(
+        "--cheap-double-reveal-offsets",
+        type=int,
+        default=0,
+        help="fixed-support cap X on pure double card-reveal edges, CHEAP "
+        "moves only; 0 is the exhaustive shipped behaviour",
+    )
     parser.add_argument("--slots", type=int, default=32)
     parser.add_argument("--global-batch-cap", type=int, default=512)
     parser.add_argument(
@@ -387,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
             seed_base=args.seed_base,
             search=search,
             cheap_sims=tuple(args.cheap_sims),
+            cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
             deep_sims=args.deep_sims,
             samples=args.deep_samples,
             slots=args.slots,
@@ -432,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
             search=search,
             cheap_top_k=width,
             cheap_sims=tuple(args.cheap_sims),
+            cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
             slots=args.slots,
             batch_cap=args.global_batch_cap,
         )

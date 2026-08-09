@@ -44,6 +44,72 @@ impl Rng {
             seq.swap(i, j);
         }
     }
+
+    /// Standard normal by the Marsaglia POLAR method, mirroring
+    /// `PortableRng.normal`.
+    ///
+    /// Polar rather than Box-Muller because Box-Muller needs `cos`, which has no
+    /// correct-rounding guarantee and is where a cross-runtime last-bit
+    /// disagreement would hide. This path uses only multiplication, `ln` (already
+    /// proven across the boundary by `gumbel_golden_matches_python`) and `sqrt`
+    /// (IEEE-754 requires correct rounding). The second variate is discarded
+    /// rather than cached, so the state stays a single u64.
+    pub fn normal(&mut self) -> f64 {
+        loop {
+            let u = 2.0 * self.next_float() - 1.0;
+            let v = 2.0 * self.next_float() - 1.0;
+            let s = u * u + v * v;
+            if s >= 1.0 || s == 0.0 {
+                continue;
+            }
+            return u * (-2.0 * s.ln() / s).sqrt();
+        }
+    }
+
+    /// Gamma(alpha, 1) by Marsaglia-Tsang, mirroring `PortableRng.gamma`.
+    ///
+    /// Every arithmetic expression is written in the same association order as
+    /// the Python so the two round identically. `alpha >= 1` is the golden-tested
+    /// path and the only one production uses; below 1 the boost introduces `powf`,
+    /// which carries no correct-rounding guarantee.
+    pub fn gamma(&mut self, alpha: f64) -> f64 {
+        assert!(alpha.is_finite() && alpha > 0.0, "gamma requires a finite alpha > 0");
+        if alpha < 1.0 {
+            let boosted = self.gamma(alpha + 1.0);
+            return boosted * self.next_float().max(1e-12).powf(1.0 / alpha);
+        }
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.normal();
+            let v = 1.0 + c * x;
+            if v <= 0.0 {
+                continue;
+            }
+            let v = v * v * v;
+            let u = self.next_float();
+            // Squeeze: pure arithmetic, short-circuits most draws.
+            if u < 1.0 - 0.0331 * (x * x) * (x * x) {
+                return d * v;
+            }
+            if u.max(1e-12).ln() < 0.5 * x * x + d * (1.0 - v + v.max(1e-12).ln()) {
+                return d * v;
+            }
+        }
+    }
+
+    /// Symmetric Dirichlet over `n` categories, mirroring `PortableRng.dirichlet`.
+    /// Falls back to uniform if every draw underflows, so the caller's convex
+    /// blend stays well-formed.
+    pub fn dirichlet(&mut self, alpha: f64, n: usize) -> Vec<f64> {
+        assert!(n > 0, "dirichlet requires n > 0");
+        let draws: Vec<f64> = (0..n).map(|_| self.gamma(alpha)).collect();
+        let total: f64 = draws.iter().sum();
+        if total <= 0.0 {
+            return vec![1.0 / n as f64; n];
+        }
+        draws.into_iter().map(|draw| draw / total).collect()
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +139,54 @@ mod tests {
         let mut seq: Vec<u32> = (0..8).collect();
         r.shuffle(&mut seq);
         assert_eq!(seq, [3, 1, 6, 2, 4, 0, 7, 5]);
+    }
+
+    #[test]
+    fn normal_golden_matches_python() {
+        // Pinned `PortableRng(7).normal()` stream. Equality, not approx: the
+        // polar method was chosen over Box-Muller precisely so this can be exact.
+        let mut r = Rng::new(7);
+        let seq: Vec<f64> = (0..3).map(|_| r.normal()).collect();
+        assert_eq!(
+            seq,
+            [
+                -0.04174152338145233,
+                0.8764814690994567,
+                -0.3059911682027957
+            ]
+        );
+    }
+
+    #[test]
+    fn gamma_golden_matches_python() {
+        // alpha >= 1 is the production path (7WD's branching puts alpha ~1.8).
+        let mut r = Rng::new(7);
+        let seq: Vec<f64> = (0..3).map(|_| r.gamma(1.8)).collect();
+        assert_eq!(
+            seq,
+            [1.4166937321647761, 6.169133592343606, 1.0571680637635033]
+        );
+        // The sub-1 boost path uses powf and is not guaranteed correctly rounded;
+        // pinned anyway so a divergence is caught rather than discovered later.
+        let mut r = Rng::new(11);
+        let seq: Vec<f64> = (0..2).map(|_| r.gamma(0.3)).collect();
+        assert_eq!(seq, [0.03449253441949256, 0.0832407704142125]);
+    }
+
+    #[test]
+    fn dirichlet_golden_matches_python() {
+        // The vector self-play actually consumes as root noise.
+        let mut r = Rng::new(42);
+        assert_eq!(
+            r.dirichlet(1.8, 5),
+            [
+                0.18213062727984705,
+                0.11420377943148874,
+                0.07221738027724044,
+                0.1832397608630785,
+                0.44820845214834526
+            ]
+        );
     }
 
     #[test]
