@@ -12,6 +12,7 @@ chance traversal while retaining one incumbent arm.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import statistics
@@ -192,21 +193,25 @@ def _mode_summary(values: Sequence[int]) -> dict[str, Any]:
     }
 
 
-def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence[str]) -> dict[str, Any]:
+def _position_consensus(
+    seed_runs: Sequence[dict[str, Any]],
+    arm_names: Sequence[str],
+    reference_names: Sequence[str] = ("openloop", "hybrid"),
+) -> dict[str, Any]:
     if len(seed_runs) < 2:
         return {
             "seed_count": len(seed_runs),
             "selectors": None,
-            "reference_mode_agreement": None,
-            "reference_same_seed_agreement": None,
+            "reference_pairwise_mode_agreement": None,
+            "reference_pairwise_same_seed_agreement": None,
             "reason": "consensus requires at least two paired seed runs",
         }
     selectors: dict[str, list[dict[str, Any]]] = {
         name: [run["arms"][name] for run in seed_runs] for name in arm_names
     }
     selectors.update({
-        "reference_openloop": [run["references"]["openloop"] for run in seed_runs],
-        "reference_hybrid": [run["references"]["hybrid"] for run in seed_runs],
+        f"reference_{name}": [run["references"][name] for run in seed_runs]
+        for name in reference_names
     })
     summaries = {
         name: {
@@ -215,28 +220,35 @@ def _position_consensus(seed_runs: Sequence[dict[str, Any]], arm_names: Sequence
         }
         for name, rows in selectors.items()
     }
-    open_summary = summaries["reference_openloop"]
-    hybrid_summary = summaries["reference_hybrid"]
+    pairwise_mode = {}
+    pairwise_same_seed = {}
+    for left, right in itertools.combinations(reference_names, 2):
+        pair_name = f"{left}__{right}"
+        left_summary = summaries[f"reference_{left}"]
+        right_summary = summaries[f"reference_{right}"]
+        pairwise_mode[pair_name] = {
+            "top1": left_summary["action"]["mode"] == right_summary["action"]["mode"],
+            "pick": left_summary["pick"]["mode"] == right_summary["pick"]["mode"],
+        }
+        pairwise_same_seed[pair_name] = {
+            metric: statistics.fmean(
+                run["reference_agreement"][pair_name][metric]
+                for run in seed_runs
+            )
+            for metric in ("top1", "pick")
+        }
     return {
         "seed_count": len(seed_runs),
         "selectors": summaries,
-        "reference_mode_agreement": {
-            "top1": open_summary["action"]["mode"] == hybrid_summary["action"]["mode"],
-            "pick": open_summary["pick"]["mode"] == hybrid_summary["pick"]["mode"],
-        },
-        "reference_same_seed_agreement": {
-            "top1": statistics.fmean(
-                run["reference_agreement"]["top1"] for run in seed_runs
-            ),
-            "pick": statistics.fmean(
-                run["reference_agreement"]["pick"] for run in seed_runs
-            ),
-        },
+        "reference_pairwise_mode_agreement": pairwise_mode,
+        "reference_pairwise_same_seed_agreement": pairwise_same_seed,
     }
 
 
 def _deck_size_summary(
-    records: Sequence[dict[str, Any]], arm_names: Sequence[str]
+    records: Sequence[dict[str, Any]],
+    arm_names: Sequence[str],
+    reference_names: Sequence[str] = ("openloop", "hybrid"),
 ) -> dict[str, Any]:
     """Descriptive search metrics stratified by the pre-reveal bag size."""
     output: dict[str, Any] = {}
@@ -247,7 +259,7 @@ def _deck_size_summary(
         for name in arm_names:
             arm_runs = [run["arms"][name] for run in runs]
             references: dict[str, Any] = {}
-            for reference_name in ("openloop", "hybrid"):
+            for reference_name in reference_names:
                 metrics = [run["metrics"][reference_name][name] for run in runs]
                 regrets = [
                     metric["regret_actor"]
@@ -372,14 +384,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         allowed={"iid", "balanced"},
         option="--traversal-modes",
     )
-    if args.reference_backup not in {"sampled", "hajek"}:
-        raise ValueError("--reference-backup must be sampled or hajek")
+    reference_backups = (
+        _choice_list(
+            args.reference_backups,
+            allowed={"sampled", "hajek"},
+            option="--reference-backups",
+        )
+        if args.reference_backups.strip()
+        else [args.reference_backup]
+    )
+    if any(value not in {"sampled", "hajek"} for value in reference_backups):
+        raise ValueError("hybrid reference backups must be sampled or hajek")
     if args.reference_traversal not in {"iid", "balanced"}:
         raise ValueError("--reference-traversal must be iid or balanced")
     if not 0.0 <= args.min_realized_mass <= 1.0:
         raise ValueError("--min-realized-mass must be in [0, 1]")
     arm_specs = _a1b_arm_specs(exposures, backup_modes, traversal_modes)
     arm_names = [spec["name"] for spec in arm_specs]
+    hybrid_reference_specs = [
+        {
+            "name": (
+                f"hybrid_{backup}" if len(reference_backups) > 1 else "hybrid"
+            ),
+            "backup": backup,
+            "traversal": args.reference_traversal,
+        }
+        for backup in reference_backups
+    ]
+    reference_names = ["openloop", *[spec["name"] for spec in hybrid_reference_specs]]
 
     net, checkpoint_cfg = load_checkpoint_network(checkpoint, args.device)
     evaluator = make_rust_evaluator(
@@ -438,27 +470,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 alpha=alpha,
                 fpu=args.fpu,
                 cpuct=args.cpuct,
-                backup=args.reference_backup,
+                backup=reference_backups[0],
                 traversal=args.reference_traversal,
             )
-            reference_hybrid = _arm(
-                state,
-                evaluator,
-                sims=args.reference_sims,
-                exposure=args.reference_exposure,
-                enum_max_rows=args.enum_max_rows,
-                seed=reference_seed,
-                margin_gain=margin_gain,
-                alpha=alpha,
-                fpu=args.fpu,
-                cpuct=args.cpuct,
-                backup=args.reference_backup,
-                traversal=args.reference_traversal,
-            )
-            references = {
-                "openloop": reference_openloop,
-                "hybrid": reference_hybrid,
-            }
+            references = {"openloop": reference_openloop}
+            references.update({
+                spec["name"]: _arm(
+                    state,
+                    evaluator,
+                    sims=args.reference_sims,
+                    exposure=args.reference_exposure,
+                    enum_max_rows=args.enum_max_rows,
+                    seed=reference_seed,
+                    margin_gain=margin_gain,
+                    alpha=alpha,
+                    fpu=args.fpu,
+                    cpuct=args.cpuct,
+                    backup=spec["backup"],
+                    traversal=spec["traversal"],
+                )
+                for spec in hybrid_reference_specs
+            })
             metrics = {
                 reference_name: {
                     name: _reference_metrics(arm, reference)
@@ -466,22 +498,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 for reference_name, reference in references.items()
             }
+            reference_agreement = {}
+            for left, right in itertools.combinations(reference_names, 2):
+                pair_name = f"{left}__{right}"
+                reference_agreement[pair_name] = {
+                    "top1": (
+                        references[left]["top_action_idx"]
+                        == references[right]["top_action_idx"]
+                    ),
+                    "pick": (
+                        references[left]["top_pick_rank"]
+                        == references[right]["top_pick_rank"]
+                    ),
+                }
             seed_runs.append({
                 "seed_index": seed_index,
                 "seed": seed,
                 "reference_seed": reference_seed,
                 "arms": arms,
                 "references": references,
-                "reference_agreement": {
-                    "top1": (
-                        reference_openloop["top_action_idx"]
-                        == reference_hybrid["top_action_idx"]
-                    ),
-                    "pick": (
-                        reference_openloop["top_pick_rank"]
-                        == reference_hybrid["top_pick_rank"]
-                    ),
-                },
+                "reference_agreement": reference_agreement,
                 "metrics": metrics,
             })
         records.append({
@@ -490,7 +526,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "deck_size": len(state.deck),
             "actor": int(state.current_actor),
             "seed_runs": seed_runs,
-            "consensus": _position_consensus(seed_runs, arm_names),
+            "consensus": _position_consensus(
+                seed_runs, arm_names, reference_names
+            ),
         })
         final_run = seed_runs[-1]
         print(
@@ -504,7 +542,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     all_seed_runs = [run for record in records for run in record["seed_runs"]]
     aggregate = {}
-    for reference_name in ("openloop", "hybrid"):
+    for reference_name in reference_names:
         aggregate[reference_name] = {}
         for name in arm_names:
             metrics = [run["metrics"][reference_name][name] for run in all_seed_runs]
@@ -519,6 +557,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             position_pick = []
             position_q_pairwise = []
             position_visit_pairwise = []
+            position_regret = []
             for record in records:
                 position_metrics = [
                     run["metrics"][reference_name][name]
@@ -530,6 +569,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 position_pick.append(
                     statistics.fmean(metric["pick_agrees"] for metric in position_metrics)
                 )
+                record_regrets = [
+                    metric["regret_actor"]
+                    for metric in position_metrics
+                    if metric["regret_actor"] is not None
+                ]
+                if record_regrets:
+                    position_regret.append(statistics.fmean(record_regrets))
                 position_q_total = sum(
                     metric["q_pairwise_pairs"] for metric in position_metrics
                 )
@@ -573,6 +619,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     else statistics.fmean(position_visit_pairwise)
                 ),
                 "mean_regret_actor": None if not regrets else statistics.fmean(regrets),
+                "mean_regret_actor_by_position": (
+                    None if not position_regret else statistics.fmean(position_regret)
+                ),
                 "p90_regret_actor": (
                     None if not regrets else sorted(regrets)[math.ceil(0.9 * len(regrets)) - 1]
                 ),
@@ -580,33 +629,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "mean_nn_evaluations": statistics.fmean(nn_evals),
             }
     consensus_records = [
-        record for record in records
-        if record["consensus"]["reference_mode_agreement"] is not None
+        record
+        for record in records
+        if record["consensus"]["reference_pairwise_mode_agreement"] is not None
     ]
-    aggregate["reference_agreement"] = {
-        "same_seed_top1": statistics.fmean(
-            run["reference_agreement"]["top1"] for run in all_seed_runs
-        ),
-        "same_seed_pick": statistics.fmean(
-            run["reference_agreement"]["pick"] for run in all_seed_runs
-        ),
-        "position_consensus_top1": (
-            None
-            if not consensus_records
-            else statistics.fmean(
-                record["consensus"]["reference_mode_agreement"]["top1"]
-                for record in consensus_records
-            )
-        ),
-        "position_consensus_pick": (
-            None
-            if not consensus_records
-            else statistics.fmean(
-                record["consensus"]["reference_mode_agreement"]["pick"]
-                for record in consensus_records
-            )
-        ),
-    }
+    aggregate["reference_agreement"] = {}
+    for left, right in itertools.combinations(reference_names, 2):
+        pair_name = f"{left}__{right}"
+        aggregate["reference_agreement"][pair_name] = {
+            "same_seed_top1": statistics.fmean(
+                run["reference_agreement"][pair_name]["top1"]
+                for run in all_seed_runs
+            ),
+            "same_seed_pick": statistics.fmean(
+                run["reference_agreement"][pair_name]["pick"]
+                for run in all_seed_runs
+            ),
+            "position_consensus_top1": (
+                None
+                if not consensus_records
+                else statistics.fmean(
+                    record["consensus"]["reference_pairwise_mode_agreement"]
+                    [pair_name]["top1"]
+                    for record in consensus_records
+                )
+            ),
+            "position_consensus_pick": (
+                None
+                if not consensus_records
+                else statistics.fmean(
+                    record["consensus"]["reference_pairwise_mode_agreement"]
+                    [pair_name]["pick"]
+                    for record in consensus_records
+                )
+            ),
+        }
     aggregate["chance_coverage"] = {}
     arm_spec_by_name = {spec["name"]: spec for spec in arm_specs}
     for name in arm_names:
@@ -632,10 +689,125 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "all_pass": all(passed),
             }
         aggregate["chance_coverage"][name] = summary
-    aggregate["by_deck_size"] = _deck_size_summary(records, arm_names)
+
+    headline_fields = (
+        "top1_agreement_by_position",
+        "pick_agreement_by_position",
+        "q_pairwise_accuracy_by_position",
+        "visit_pairwise_accuracy_by_position",
+        "mean_regret_actor_by_position",
+        "p90_regret_actor",
+    )
+    eligible = {
+        name: (
+            arm_spec_by_name[name]["exposure"] == 0
+            or aggregate["chance_coverage"][name]["realized_mass_gate"]["all_pass"]
+        )
+        for name in arm_names
+    }
+    aggregate["headline"] = {}
+    for reference_name in reference_names:
+        aggregate["headline"][reference_name] = {}
+        for name in arm_names:
+            aggregate["headline"][reference_name][name] = {
+                "interpretable": eligible[name],
+                "reason": (
+                    None
+                    if eligible[name]
+                    else "one or more searches failed the realized-mass threshold"
+                ),
+                "metrics": (
+                    {
+                        field: aggregate[reference_name][name][field]
+                        for field in headline_fields
+                    }
+                    if eligible[name]
+                    else None
+                ),
+            }
+
+    aggregate["matched_spearman_contrasts"] = {}
+    for exposure in exposures:
+        if exposure == 0:
+            continue
+        for traversal in traversal_modes:
+            sampled = next((
+                spec["name"]
+                for spec in arm_specs
+                if spec["exposure"] == exposure
+                and spec["backup"] == "sampled"
+                and spec["traversal"] == traversal
+            ), None)
+            hajek = next((
+                spec["name"]
+                for spec in arm_specs
+                if spec["exposure"] == exposure
+                and spec["backup"] == "hajek"
+                and spec["traversal"] == traversal
+            ), None)
+            if sampled is None or hajek is None:
+                continue
+            differences = []
+            for run in all_seed_runs:
+                sampled_diag = run["arms"][sampled]["chance_diagnostics"]
+                hajek_diag = run["arms"][hajek]["chance_diagnostics"]
+                if (
+                    sampled_diag.get("chance_action_visit_q_rank_parent_groups", 0.0) > 0
+                    and hajek_diag.get("chance_action_visit_q_rank_parent_groups", 0.0) > 0
+                ):
+                    differences.append(
+                        hajek_diag["chance_action_visit_q_rank_spearman_mean"]
+                        - sampled_diag["chance_action_visit_q_rank_spearman_mean"]
+                    )
+            aggregate["matched_spearman_contrasts"][
+                f"x{exposure}_{traversal}"
+            ] = {
+                "definition": "hajek minus sampled under matched exposure/traversal",
+                "negative_is_hajek_bias_signature": True,
+                "eligible_for_interpretation": eligible[sampled] and eligible[hajek],
+                "paired_searches": len(differences),
+                "mean": None if not differences else statistics.fmean(differences),
+                "median": None if not differences else statistics.median(differences),
+            }
+
+    hybrid_reference_names = [spec["name"] for spec in hybrid_reference_specs]
+    aggregate["hybrid_reference_ranking_stability"] = {
+        "metric": "mean_regret_actor_by_position (ascending)",
+        "requires_all_arms_to_pass_realized_mass_gate": True,
+        "all_arms_eligible": all(eligible.values()),
+        "orders": {},
+        "winner_stable": None,
+        "full_order_stable": None,
+    }
+    if all(eligible.values()):
+        orders = {
+            reference_name: sorted(
+                arm_names,
+                key=lambda name: (
+                    aggregate[reference_name][name]["mean_regret_actor_by_position"]
+                    if aggregate[reference_name][name]["mean_regret_actor_by_position"]
+                    is not None
+                    else math.inf,
+                    name,
+                ),
+            )
+            for reference_name in hybrid_reference_names
+        }
+        aggregate["hybrid_reference_ranking_stability"]["orders"] = orders
+        if len(orders) >= 2:
+            order_values = list(orders.values())
+            aggregate["hybrid_reference_ranking_stability"]["winner_stable"] = (
+                len({order[0] for order in order_values}) == 1
+            )
+            aggregate["hybrid_reference_ranking_stability"]["full_order_stable"] = all(
+                order == order_values[0] for order in order_values[1:]
+            )
+    aggregate["by_deck_size"] = _deck_size_summary(
+        records, arm_names, reference_names
+    )
     is_a1b_matrix = len(backup_modes) > 1 or len(traversal_modes) > 1
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "scope": (
             "A1b backup/traversal frozen-position probe; no training or promotion"
             if is_a1b_matrix
@@ -654,9 +826,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "search-level rates are descriptive and are not independent-position confidence intervals"
         ),
         "reference_label": (
-            "larger incumbent and one-reveal searches use a paired stream disjoint "
-            "from candidate arms; neither reference is exact"
+            "larger incumbent and hybrid searches use a paired stream disjoint "
+            "from candidate arms; sampled and Hajek hybrid references are both "
+            "required to adjudicate the A1b backup axis"
         ),
+        "a1b_interpretation": {
+            "coverage_scope": (
+                "a low enum_max_rows intentionally tests estimator/traversal behavior "
+                "at attainable realized coverage; it does not establish panel fidelity"
+            ),
+            "fidelity_scope": (
+                "closeness to the true chance distribution remains an A1 question "
+                "anchored by separately exhaustive deck<=8 positions"
+            ),
+            "interaction_preregistered": (
+                "read hajek_balanced as the theoretically relevant interaction cell; "
+                "do not rely on backup or traversal main effects alone"
+            ),
+        },
         "reference_interpretation": {
             "exhaustive_panels": (
                 "when C(deck,4) <= enum_max_rows, the hybrid support is the true "
@@ -668,8 +855,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "weak evidence and is not an oracle"
             ),
             "reference_pairing": (
-                "open-loop and hybrid references share common random numbers with "
-                "each other, but their stream is disjoint from candidate arms"
+                "all references share a paired seed stream disjoint from candidate arms; "
+                "the two hybrid backups share traversal and panel method but not estimator"
+            ),
+            "candidate_pairing": (
+                "IID arms share row draws through det_seed; balanced arms share search "
+                "seeds but use node-local schedules, so they have no row-level CRN with "
+                "x0 or IID arms and may be noisier"
+            ),
+            "balanced_schedule_identity": (
+                "probe schedules are keyed partly by arena allocation index and are "
+                "reproducible only for the same seed/configuration, not stable position "
+                "identities across different simulation budgets"
             ),
         },
         "aggregate": aggregate,
@@ -713,6 +910,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reference-sims", type=int, default=512)
     parser.add_argument("--reference-exposure", type=int, default=4)
     parser.add_argument("--reference-backup", default="hajek")
+    parser.add_argument(
+        "--reference-backups",
+        default="",
+        help="optional comma-separated hybrid reference backups; overrides singular option",
+    )
     parser.add_argument("--reference-traversal", default="iid")
     parser.add_argument(
         "--min-realized-mass",

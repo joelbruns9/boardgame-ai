@@ -5094,6 +5094,7 @@ fn ol_rank_values(values: &[f64]) -> Vec<f64> {
 }
 
 fn ol_pearson(left: &[f64], right: &[f64]) -> Option<f64> {
+    // Called on rank vectors above; Pearson(rank(x), rank(y)) is Spearman rho.
     debug_assert_eq!(left.len(), right.len());
     if left.len() < 2 {
         return None;
@@ -5280,7 +5281,9 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
             action_visits.push(child.visit_count as f64);
             action_q.push(if chooser == 0 { q0 } else { -q0 });
         }
-        if action_visits.len() < 2 {
+        // Two-action Spearman values are necessarily ±1 and turn the aggregate
+        // into a sign vote. Require at least three siblings for a useful shape.
+        if action_visits.len() < 3 {
             continue;
         }
         let visit_ranks = ol_rank_values(&action_visits);
@@ -5290,13 +5293,41 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
             visit_q_rank_correlations.push(correlation);
         }
     }
+    let spearman_mean = if visit_q_rank_correlations.is_empty() {
+        0.0
+    } else {
+        // Fisher-z averaging avoids biasing the mean correlation toward zero.
+        let mean_z = visit_q_rank_correlations
+            .iter()
+            .map(|&value| value.clamp(-1.0 + 1e-12, 1.0 - 1e-12).atanh())
+            .sum::<f64>()
+            / visit_q_rank_correlations.len() as f64;
+        mean_z.tanh()
+    };
+    let mut sorted_correlations = visit_q_rank_correlations.clone();
+    sorted_correlations.sort_by(f64::total_cmp);
+    let correlation_percentile = |q: f64| -> f64 {
+        if sorted_correlations.is_empty() {
+            return 0.0;
+        }
+        let index = ((sorted_correlations.len() - 1) as f64 * q).ceil() as usize;
+        sorted_correlations[index]
+    };
     out.insert(
         "chance_action_visit_q_rank_spearman_mean".to_string(),
-        if visit_q_rank_correlations.is_empty() {
-            0.0
-        } else {
-            visit_q_rank_correlations.iter().sum::<f64>() / visit_q_rank_correlations.len() as f64
-        },
+        spearman_mean,
+    );
+    out.insert(
+        "chance_action_visit_q_rank_spearman_p10".to_string(),
+        correlation_percentile(0.1),
+    );
+    out.insert(
+        "chance_action_visit_q_rank_spearman_median".to_string(),
+        correlation_percentile(0.5),
+    );
+    out.insert(
+        "chance_action_visit_q_rank_spearman_p90".to_string(),
+        correlation_percentile(0.9),
     );
     out.insert(
         "chance_action_visit_q_rank_parent_groups".to_string(),
@@ -5493,6 +5524,10 @@ fn ol_register_chance_support(
 /// Consequently neither IID nor locally balanced routing leaks the row into
 /// that action choice. Balanced mode consumes a shuffled multiplicity-expanded
 /// cycle local to this chance node before reshuffling for the next cycle.
+/// Conditional on the number of times the node is reached, that prefix is a
+/// value-independent uniform sample of the expanded panel: PUCT controls only
+/// prefix length, never schedule order. This is the load-bearing condition that
+/// keeps the Hájek visited-set estimator valid under balanced traversal.
 fn ol_select_chance_row(arena: &mut [OLNode], chance_node_id: u32, iid_seed: u64) -> [u16; 4] {
     let node = &mut arena[chance_node_id as usize];
     match node.chance_traversal {
@@ -5949,6 +5984,12 @@ fn ol_apply_virtual_loss(arena: &mut [OLNode], path: &[u32], actors: &[u8], sign
             // visit/value mutations above, so extra bookkeeping there is dead
             // hot-path work (and would penalize the disabled path).
             if !arena[path[i] as usize].chance_children.is_empty() {
+                if sign < 0 {
+                    debug_assert!(
+                        arena[path[i] as usize].virtual_visit_count >= n_vl,
+                        "chance-node status and VL bookkeeping must survive apply/revert"
+                    );
+                }
                 arena[path[i] as usize].virtual_visit_count += sign * n_vl;
                 arena[path[i] as usize].virtual_value_sum += (sign * n_vl) as f64 * vl_value0;
             }
@@ -6191,6 +6232,9 @@ fn advisor_open_loop_search_impl(
         chance_enum_max_rows,
         seed ^ 0xA1C0_77EC_7A11_5EED,
     )?;
+    // A one-row panel (deck=4) has no uncertainty or strategy-fusion risk.
+    // Keep its support metadata, but avoid a pointless chance/observation layer.
+    let chance_split_enabled = one_reveal_panel.len() > 1;
 
     // Root: expand on the REAL state — the root's public information (boards,
     // row, claims) is determinization-independent; only the deck order below
@@ -6215,7 +6259,7 @@ fn advisor_open_loop_search_impl(
 
         for _ in 0..wave {
             let det_seed = rng.r#gen::<u64>();
-            let det = if one_reveal_panel.is_empty() {
+            let det = if !chance_split_enabled {
                 root_state.redeterminize(Some(det_seed))
             } else {
                 // The first reveal is pinned only after PUCT chooses the
@@ -6223,7 +6267,7 @@ fn advisor_open_loop_search_impl(
                 // order, so cloning the root here is information-set safe.
                 root_state.cloned()
             };
-            let chance_config = if one_reveal_panel.is_empty() {
+            let chance_config = if !chance_split_enabled {
                 None
             } else {
                 Some(OLChanceConfig {
@@ -11635,25 +11679,48 @@ mod ol_tests {
             OLNode::new(1.0, (None, None)),
             OLNode::new(1.0, (None, None)),
             OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
         ];
-        arena[0].children = vec![(1, 1), (2, 2)];
+        arena[0].children = vec![(1, 1), (2, 2), (3, 3)];
         arena[1].visit_count = 10;
         arena[1].chance_chooser_actor = Some(1);
-        arena[1].chance_children = vec![test_chance_child([1, 2, 3, 4], 1.0, 3)];
-        arena[3].visit_count = 10;
-        arena[3].value_sum = -10.0;
+        arena[1].chance_children = vec![test_chance_child([1, 2, 3, 4], 1.0, 4)];
+        arena[4].visit_count = 10;
+        arena[4].value_sum = -10.0;
         refresh_test_chance_cache(&mut arena, 1);
-        arena[2].visit_count = 1;
+        arena[2].visit_count = 5;
         arena[2].chance_chooser_actor = Some(1);
-        arena[2].chance_children = vec![test_chance_child([5, 6, 7, 8], 1.0, 4)];
-        arena[4].visit_count = 1;
-        arena[4].value_sum = 0.0;
+        arena[2].chance_children = vec![test_chance_child([5, 6, 7, 8], 1.0, 5)];
+        arena[5].visit_count = 5;
+        arena[5].value_sum = -2.5;
         refresh_test_chance_cache(&mut arena, 2);
+        arena[3].visit_count = 1;
+        arena[3].chance_chooser_actor = Some(1);
+        arena[3].chance_children = vec![test_chance_child([9, 10, 11, 12], 1.0, 6)];
+        arena[6].visit_count = 1;
+        arena[6].value_sum = 0.0;
+        refresh_test_chance_cache(&mut arena, 3);
 
         let diagnostics = ol_chance_diagnostics(&arena);
         assert_eq!(diagnostics["chance_action_visit_q_rank_parent_groups"], 1.0);
-        assert_eq!(diagnostics["chance_action_visit_q_rank_actions"], 2.0);
+        assert_eq!(diagnostics["chance_action_visit_q_rank_actions"], 3.0);
         assert!((diagnostics["chance_action_visit_q_rank_spearman_mean"] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_reveal_encoder_is_bit_identical_under_hidden_deck_permutation() -> PyResult<()> {
+        let state = new_game(20260808, true, true);
+        let actor = state.actor()?;
+        let (my_before, opp_before, flat_before) = state.encode_arrays(actor)?;
+        let mut permuted = state.cloned();
+        permuted.deck.reverse();
+        assert_ne!(state.deck, permuted.deck);
+        let (my_after, opp_after, flat_after) = permuted.encode_arrays(actor)?;
+        assert_eq!(my_before.as_slice(), my_after.as_slice());
+        assert_eq!(opp_before.as_slice(), opp_after.as_slice());
+        assert_eq!(flat_before.as_slice(), flat_after.as_slice());
+        Ok(())
     }
 
     #[test]

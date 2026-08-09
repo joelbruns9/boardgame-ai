@@ -7,6 +7,7 @@ import pytest
 
 from games.kingdomino.endgame_solver import _rust_state_from_python
 from games.kingdomino.game import GameState
+from games.kingdomino.chance_correct_a1b_probe import A1B_DEFAULT_ARGS
 from games.kingdomino.chance_correct_search_probe import (
     REFERENCE_SEED_XOR,
     _a1b_arm_specs,
@@ -43,6 +44,13 @@ def _golden_evaluator(my_board, opp_board, flat, legal_indices):
 def _midgame_state() -> GameState:
     state = GameState.new(seed=29)
     while len(state.deck) > 12:
+        state = state.step(state.legal_actions()[0])
+    return state
+
+
+def _deck4_state() -> GameState:
+    state = GameState.new(seed=31)
+    while len(state.deck) > 4:
         state = state.step(state.legal_actions()[0])
     return state
 
@@ -207,6 +215,19 @@ def test_a1_diagnostics_measure_realized_support_coverage():
     assert "chance_action_visit_q_rank_parent_groups" in enabled
 
 
+def test_a1b_deterministic_deck4_deal_skips_chance_layer():
+    _children, _value, diagnostics = _diagnostic_search(
+        _deck4_state(),
+        chance_exposure=4,
+        chance_enum_max_rows=12,
+        chance_backup="sampled",
+        chance_traversal="balanced",
+    )
+    assert diagnostics["chance_panel_rows"] == 1.0
+    assert diagnostics["chance_panel_exhaustive"] == 1.0
+    assert diagnostics["chance_nodes"] == 0.0
+
+
 def test_probe_records_exhaustive_panel_mode_and_rows():
     state = GameState.new(seed=17)
     # Initial deck is sampled at the default cap; force a deck=8 public bag so
@@ -346,7 +367,34 @@ def test_single_seed_does_not_serialize_trivial_consensus():
     consensus = _position_consensus([{"unused": True}], ["x0"])
     assert consensus["seed_count"] == 1
     assert consensus["selectors"] is None
-    assert consensus["reference_mode_agreement"] is None
+    assert consensus["reference_pairwise_mode_agreement"] is None
+
+
+def test_multiseed_consensus_tracks_every_dual_reference_pair():
+    reference_names = ["openloop", "hybrid_sampled", "hybrid_hajek"]
+    pair_names = [
+        "openloop__hybrid_sampled",
+        "openloop__hybrid_hajek",
+        "hybrid_sampled__hybrid_hajek",
+    ]
+    seed_runs = []
+    for _ in range(2):
+        seed_runs.append({
+            "arms": {"x0": {"top_action_idx": 1, "top_pick_rank": 2}},
+            "references": {
+                name: {"top_action_idx": 1, "top_pick_rank": 2}
+                for name in reference_names
+            },
+            "reference_agreement": {
+                name: {"top1": True, "pick": True} for name in pair_names
+            },
+        })
+    consensus = _position_consensus(seed_runs, ["x0"], reference_names)
+    assert set(consensus["reference_pairwise_mode_agreement"]) == set(pair_names)
+    assert all(
+        result == {"top1": True, "pick": True}
+        for result in consensus["reference_pairwise_mode_agreement"].values()
+    )
 
 
 def test_probe_parses_targeted_subset_selection_reason():
@@ -363,7 +411,20 @@ def test_probe_preserves_incumbent_a1_mode_defaults():
     assert args.backup_modes == "hajek"
     assert args.traversal_modes == "iid"
     assert args.reference_backup == "hajek"
+    assert args.reference_backups == ""
     assert args.reference_traversal == "iid"
+
+
+def test_a1b_preset_uses_dual_references_and_training_scale_budget():
+    args = _parse_args(A1B_DEFAULT_ARGS)
+    assert args.backup_modes == "sampled,hajek"
+    assert args.traversal_modes == "iid,balanced"
+    assert args.reference_backups == "sampled,hajek"
+    assert args.reference_traversal == "balanced"
+    assert args.enum_max_rows == 12
+    assert args.sims == 4800
+    assert args.reference_sims == 10000
+    assert args.min_realized_mass == 0.5
 
 
 def test_reference_seed_stream_is_disjoint_from_candidate_stream():

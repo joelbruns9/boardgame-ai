@@ -636,6 +636,31 @@ backup arithmetic receive review. After review, start with the selected roots
 and equal NN budgets; an arm failing the realized-mass gate remains a coverage
 diagnostic, not strength evidence.
 
+**A1b review correction.** The matrix uses `chance_enum_max_rows=12` as the
+exhaustive-enumeration threshold, rather than materializing the 70-row deck=8
+panel. This deliberately makes the 50% realized-mass threshold attainable and
+asks whether estimator/traversal choice helps once coverage is adequate. It is
+not evidence that the small panel approximates the
+true reveal distribution; panel fidelity remains a separate A1 question using
+exhaustive deck<=8 adjudication.
+
+A CPU smoke on the real deck=8 position showed that the lower cap alone is not
+enough at 128 simulations: balanced x4 reached only 0.36-0.39 visit-weighted
+mass. The A1b preset therefore uses the established 4,800-simulation candidate
+budget and 10,000-simulation references. The gate, rather than that expectation,
+remains authoritative; if 4,800 still misses 0.5 on any search, its headline is
+withheld.
+
+The strong hybrid reference is evaluated twice under the same balanced panel:
+once with sampled backup and once with Hájek backup. A result is actionable only
+if the arm winner is stable across both reference estimators. Headline metrics
+are now withheld for any arm with a search below the realized-mass threshold;
+raw metrics remain diagnostic. The visit/Q-rank check is read only as the
+matched `Hájek - sampled` contrast at equal `X` and traversal, using Fisher-z
+aggregation and parent groups with at least three chance actions. The
+theoretically important result is the `hajek_balanced` interaction cell, not an
+isolated main effect.
+
 The implementation should reuse the public-state/chance machinery in
 `denial_search.py` and port the fixed-support semantics already reviewed in the
 7 Wonders Duel search. The latter is a design reference, not a drop-in tree:
