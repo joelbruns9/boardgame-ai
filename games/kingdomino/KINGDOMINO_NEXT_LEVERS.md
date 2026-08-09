@@ -611,6 +611,31 @@ independently truncated panel estimates. Disabled-path regression coverage now
 includes a deterministic deck=12, 512-simulation search in addition to the
 opening smoke.
 
+**A1b development checkpoint, 2026-08-08 — ready for logic review, not yet a
+strength result.** The one-reveal engine now exposes the preregistered
+`sampled|hajek` backup and `iid|balanced` traversal axes while leaving all
+production defaults unchanged. In both traversal modes PUCT commits to the
+pre-reveal action before a row is selected, so local balancing cannot reveal a
+row through legality, priors or Q. Balanced routing maintains a separately
+shuffled, multiplicity-expanded cycle at each materialized chance node; every
+raw panel slot is consumed locally before that node repeats a cycle.
+
+Sampled backup propagates the realized leaf value through the chance afterstate
+and ancestors, while retaining the row-specific observation subtree. Hájek
+backup uses the same topology but substitutes the incrementally cached
+registered-probability mean over evaluated rows. The probe records both mode
+labels, per-arm realized-mass eligibility at a configurable threshold, local
+balanced-route/cycle counts, and the mean within-parent Spearman correlation
+between chance-action visits and actor-framed Q rank. Schema-v5 artifacts carry
+the complete arm matrix; `chance_correct_a1b_probe.py` preconfigures one x0
+incumbent plus the `sampled,hajek × iid,balanced` cross-product for every
+positive `X`.
+
+Do not begin the longer frozen-position run until this boundary and the sampled
+backup arithmetic receive review. After review, start with the selected roots
+and equal NN budgets; an arm failing the realized-mass gate remains a coverage
+diagnostic, not strength evidence.
+
 The implementation should reuse the public-state/chance machinery in
 `denial_search.py` and port the fixed-support semantics already reviewed in the
 7 Wonders Duel search. The latter is a design reference, not a drop-in tree:

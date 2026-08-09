@@ -3,12 +3,15 @@
 import hashlib
 
 import numpy as np
+import pytest
 
 from games.kingdomino.endgame_solver import _rust_state_from_python
 from games.kingdomino.game import GameState
 from games.kingdomino.chance_correct_search_probe import (
     REFERENCE_SEED_XOR,
+    _a1b_arm_specs,
     _arm,
+    _choice_list,
     _mode_summary,
     _parse_args,
     _position_consensus,
@@ -200,6 +203,8 @@ def test_a1_diagnostics_measure_realized_support_coverage():
     assert enabled["chance_panel_exhaustive"] in (0.0, 1.0)
     assert "root_value_running_mean_player0" in enabled
     assert "root_value_current_children_player0" in enabled
+    assert "chance_action_visit_q_rank_spearman_mean" in enabled
+    assert "chance_action_visit_q_rank_parent_groups" in enabled
 
 
 def test_probe_records_exhaustive_panel_mode_and_rows():
@@ -224,6 +229,94 @@ def test_probe_records_exhaustive_panel_mode_and_rows():
     assert "root_value_player0" not in result
     assert np.isfinite(result["root_value_running_mean_player0"])
     assert np.isfinite(result["root_value_current_children_player0"])
+
+
+def test_a1b_arm_matrix_keeps_one_incumbent_and_crosses_treatments():
+    specs = _a1b_arm_specs(
+        [0, 2],
+        ["sampled", "hajek"],
+        ["iid", "balanced"],
+    )
+    assert [spec["name"] for spec in specs] == [
+        "x0",
+        "x2_sampled_iid",
+        "x2_sampled_balanced",
+        "x2_hajek_iid",
+        "x2_hajek_balanced",
+    ]
+
+
+def test_a1b_choice_lists_reject_duplicates_and_unknown_modes():
+    assert _choice_list(
+        "sampled,hajek", allowed={"sampled", "hajek"}, option="--backup-modes"
+    ) == ["sampled", "hajek"]
+    with pytest.raises(ValueError, match="unique"):
+        _choice_list(
+            "sampled,sampled",
+            allowed={"sampled", "hajek"},
+            option="--backup-modes",
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        _choice_list(
+            "closed_mean",
+            allowed={"sampled", "hajek"},
+            option="--backup-modes",
+        )
+
+
+def test_a1b_balanced_routing_is_local_and_preserves_nn_budget():
+    state = GameState.new(seed=17)
+    sampled_iid = _arm(
+        state,
+        _zero_evaluator,
+        sims=96,
+        exposure=2,
+        enum_max_rows=70,
+        seed=20260808,
+        margin_gain=2.0,
+        alpha=0.5,
+        fpu=-0.2,
+        cpuct=1.5,
+        backup="sampled",
+        traversal="iid",
+    )
+    sampled_balanced = _arm(
+        state,
+        _zero_evaluator,
+        sims=96,
+        exposure=2,
+        enum_max_rows=70,
+        seed=20260808,
+        margin_gain=2.0,
+        alpha=0.5,
+        fpu=-0.2,
+        cpuct=1.5,
+        backup="sampled",
+        traversal="balanced",
+    )
+    assert sampled_iid["nn_evaluations"] == sampled_balanced["nn_evaluations"]
+    assert sampled_iid["chance_diagnostics"]["balanced_route_count"] == 0.0
+    assert sampled_balanced["chance_diagnostics"]["balanced_route_count"] == (
+        sampled_balanced["chance_diagnostics"]["chance_node_visits"]
+    )
+    assert sampled_balanced["chance_backup"] == "sampled"
+    assert sampled_balanced["chance_traversal"] == "balanced"
+
+
+def test_a1b_rust_boundary_rejects_unknown_modes():
+    state = GameState.new(seed=17)
+    with pytest.raises(ValueError, match="chance_backup"):
+        _diagnostic_search(
+            state,
+            chance_exposure=1,
+            chance_backup="closed_mean",
+        )
+    with pytest.raises(ValueError, match="chance_traversal"):
+        _diagnostic_search(
+            state,
+            chance_exposure=1,
+            chance_traversal="value_selected",
+        )
 
 
 def test_denial_node_cache_key_includes_root_chance_configuration():
@@ -263,6 +356,14 @@ def test_probe_parses_targeted_subset_selection_reason():
     ])
     assert args.position_indices == "2,7"
     assert args.selection_reason == "previous reference disagreements"
+
+
+def test_probe_preserves_incumbent_a1_mode_defaults():
+    args = _parse_args([])
+    assert args.backup_modes == "hajek"
+    assert args.traversal_modes == "iid"
+    assert args.reference_backup == "hajek"
+    assert args.reference_traversal == "iid"
 
 
 def test_reference_seed_stream_is_disjoint_from_candidate_stream():

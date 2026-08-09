@@ -4900,6 +4900,31 @@ fn add_dirichlet_noise(arena: &mut [Node], root_id: u32, alpha: f64, eps: f64, s
 /// Open-loop search-tree node. Stateless: no concrete GameState is stored.
 /// children: Vec<(joint_index: u16, child_id: u32)> ascending by index.
 /// value_sum / visit_count in PLAYER-0 frame, same convention as Node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OLChanceBackup {
+    /// Unbiased Monte Carlo backup of the row actually realized this visit.
+    Sampled,
+    /// Registered-probability mean over observation rows with real visits.
+    Hajek,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OLChanceTraversal {
+    /// Draw independently from the registered row probabilities each visit.
+    Iid,
+    /// Visit a shuffled multiplicity-expanded panel once before repeating it.
+    Balanced,
+}
+
+#[derive(Clone, Copy)]
+struct OLChanceConfig<'a> {
+    panel: &'a [OLChancePanelRow],
+    backup: OLChanceBackup,
+    traversal: OLChanceTraversal,
+    schedule_seed: u64,
+    draw_seed: u64,
+}
+
 struct OLNode {
     prior: f64,
     visit_count: i32,
@@ -4915,6 +4940,15 @@ struct OLNode {
     chance_visited_mass: f64,
     chance_weighted_value: f64,
     chance_post_actor: Option<u8>,
+    chance_chooser_actor: Option<u8>,
+    chance_backup: OLChanceBackup,
+    chance_traversal: OLChanceTraversal,
+    // Balanced traversal expands coalesced row multiplicities into one local
+    // cycle. The schedule is shuffled at each cycle boundary and consumed when
+    // the chance node is reached, after its parent action has been selected.
+    chance_schedule: Vec<usize>,
+    chance_route_count: u64,
+    chance_schedule_seed: u64,
     children: Vec<(u16, u32)>,
     action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
     is_expanded: bool,
@@ -4928,6 +4962,7 @@ struct OLNode {
 struct OLChanceChild {
     row: [u16; 4],
     probability: f64,
+    multiplicity: usize,
     // Observation subtrees are allocated only when their row is sampled.
     // Registering a fixed support must not clone+step every counterfactual
     // state, especially for 70-row deck=8 chance nodes.
@@ -4960,6 +4995,12 @@ impl OLNode {
             chance_visited_mass: 0.0,
             chance_weighted_value: 0.0,
             chance_post_actor: None,
+            chance_chooser_actor: None,
+            chance_backup: OLChanceBackup::Hajek,
+            chance_traversal: OLChanceTraversal::Iid,
+            chance_schedule: Vec::new(),
+            chance_route_count: 0,
+            chance_schedule_seed: 0,
             children: Vec::new(),
             action,
             is_expanded: false,
@@ -4968,14 +5009,34 @@ impl OLNode {
     }
 }
 
-/// Player-0 value of the visited portion of a one-reveal chance support.
+fn ol_parse_chance_backup(value: &str) -> PyResult<OLChanceBackup> {
+    match value {
+        "sampled" => Ok(OLChanceBackup::Sampled),
+        "hajek" | "renormalized" => Ok(OLChanceBackup::Hajek),
+        _ => Err(PyValueError::new_err(format!(
+            "chance_backup must be 'sampled' or 'hajek', got {value:?}"
+        ))),
+    }
+}
+
+fn ol_parse_chance_traversal(value: &str) -> PyResult<OLChanceTraversal> {
+    match value {
+        "iid" => Ok(OLChanceTraversal::Iid),
+        "balanced" => Ok(OLChanceTraversal::Balanced),
+        _ => Err(PyValueError::new_err(format!(
+            "chance_traversal must be 'iid' or 'balanced', got {value:?}"
+        ))),
+    }
+}
+
+/// Player-0 value used by selection for a one-reveal chance node.
 ///
-/// Outcome probability remains fixed, but unvisited outcomes are omitted and
-/// the visited probability mass is renormalized. This is a Hájek estimator.
-/// Its load-bearing assumption is that inclusion in the visited set is
-/// value-independent: the reveal is drawn before traversal from a seed hidden
-/// from every pre-chance decision. If chance outcomes ever become PUCT-selected,
-/// this estimator is invalid. Once every outcome has a real visit this is the
+/// Sampled mode is the ordinary Monte Carlo running mean. Hájek mode omits
+/// unvisited outcomes and renormalizes registered probability over visited
+/// mass. Its load-bearing assumption is that inclusion in the visited set is
+/// value-independent: the reveal is chosen only after the pre-chance action and
+/// is never PUCT-selected. If chance outcomes ever become value-selected, the
+/// Hájek estimator is invalid. Once every outcome has a real visit it is the
 /// exact fixed-panel expectation.
 /// A separate chance-node virtual-loss overlay keeps batched traversal from
 /// repeatedly selecting the same pre-reveal action while evaluations are in
@@ -4983,6 +5044,13 @@ impl OLNode {
 fn ol_chance_value_p0(arena: &[OLNode], node_id: u32) -> f64 {
     let node = &arena[node_id as usize];
     debug_assert!(!node.chance_children.is_empty());
+    if node.chance_backup == OLChanceBackup::Sampled {
+        return if node.visit_count > 0 {
+            node.value_sum / node.visit_count as f64
+        } else {
+            0.0
+        };
+    }
     let real_visits = node.visit_count - node.virtual_visit_count;
     debug_assert!(
         real_visits <= 0 || node.chance_visited_mass > 0.0,
@@ -5006,6 +5074,49 @@ fn ol_chance_value_p0(arena: &[OLNode], node_id: u32) -> f64 {
     }
 }
 
+fn ol_rank_values(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+    let mut ranks = vec![0.0; values.len()];
+    let mut start = 0usize;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let rank = (start + end - 1) as f64 / 2.0;
+        for &index in &order[start..end] {
+            ranks[index] = rank;
+        }
+        start = end;
+    }
+    ranks
+}
+
+fn ol_pearson(left: &[f64], right: &[f64]) -> Option<f64> {
+    debug_assert_eq!(left.len(), right.len());
+    if left.len() < 2 {
+        return None;
+    }
+    let left_mean = left.iter().sum::<f64>() / left.len() as f64;
+    let right_mean = right.iter().sum::<f64>() / right.len() as f64;
+    let mut covariance = 0.0;
+    let mut left_ss = 0.0;
+    let mut right_ss = 0.0;
+    for (&x, &y) in left.iter().zip(right) {
+        let dx = x - left_mean;
+        let dy = y - right_mean;
+        covariance += dx * dy;
+        left_ss += dx * dx;
+        right_ss += dy * dy;
+    }
+    if left_ss == 0.0 || right_ss == 0.0 {
+        None
+    } else {
+        Some(covariance / (left_ss * right_ss).sqrt())
+    }
+}
+
 fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
     let chance_nodes: Vec<&OLNode> = arena
         .iter()
@@ -5020,9 +5131,19 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
     let mut chance_node_visits = 0i64;
     let mut fully_visited_chance_nodes = 0usize;
     let mut outcome_count = 0usize;
+    let mut balanced_route_count = 0u64;
+    let mut balanced_completed_cycles = 0u64;
     for node in &chance_nodes {
         let node_visits = node.visit_count.max(0) as i64;
         chance_node_visits += node_visits;
+        if node.chance_traversal == OLChanceTraversal::Balanced {
+            debug_assert_eq!(node.chance_route_count, node_visits as u64);
+            balanced_route_count += node.chance_route_count;
+            if !node.chance_schedule.is_empty() {
+                balanced_completed_cycles +=
+                    node.chance_route_count / node.chance_schedule.len() as u64;
+            }
+        }
         let mut node_visited_mass = 0.0;
         let mut node_weighted_value = 0.0;
         let mut node_fully_visited = true;
@@ -5079,6 +5200,14 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
     out.insert("observation_visits".to_string(), observation_visits as f64);
     out.insert("chance_node_visits".to_string(), chance_node_visits as f64);
     out.insert(
+        "balanced_route_count".to_string(),
+        balanced_route_count as f64,
+    );
+    out.insert(
+        "balanced_completed_cycles".to_string(),
+        balanced_completed_cycles as f64,
+    );
+    out.insert(
         "fully_visited_chance_nodes".to_string(),
         fully_visited_chance_nodes as f64,
     );
@@ -5134,6 +5263,49 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
     out.insert("median_visits_per_outcome".to_string(), percentile(0.5));
     out.insert("p90_visits_per_outcome".to_string(), percentile(0.9));
     out.insert("max_visits_per_outcome".to_string(), percentile(1.0));
+    let mut visit_q_rank_correlations = Vec::new();
+    let mut ranked_chance_actions = 0usize;
+    for parent in arena {
+        let mut action_visits = Vec::new();
+        let mut action_q = Vec::new();
+        for &(_, child_id) in &parent.children {
+            let child = &arena[child_id as usize];
+            if child.chance_children.is_empty() || child.visit_count <= 0 {
+                continue;
+            }
+            let chooser = child
+                .chance_chooser_actor
+                .expect("registered chance node must retain its chooser actor");
+            let q0 = ol_chance_value_p0(arena, child_id);
+            action_visits.push(child.visit_count as f64);
+            action_q.push(if chooser == 0 { q0 } else { -q0 });
+        }
+        if action_visits.len() < 2 {
+            continue;
+        }
+        let visit_ranks = ol_rank_values(&action_visits);
+        let q_ranks = ol_rank_values(&action_q);
+        if let Some(correlation) = ol_pearson(&visit_ranks, &q_ranks) {
+            ranked_chance_actions += action_visits.len();
+            visit_q_rank_correlations.push(correlation);
+        }
+    }
+    out.insert(
+        "chance_action_visit_q_rank_spearman_mean".to_string(),
+        if visit_q_rank_correlations.is_empty() {
+            0.0
+        } else {
+            visit_q_rank_correlations.iter().sum::<f64>() / visit_q_rank_correlations.len() as f64
+        },
+    );
+    out.insert(
+        "chance_action_visit_q_rank_parent_groups".to_string(),
+        visit_q_rank_correlations.len() as f64,
+    );
+    out.insert(
+        "chance_action_visit_q_rank_actions".to_string(),
+        ranked_chance_actions as f64,
+    );
     out
 }
 
@@ -5258,12 +5430,18 @@ fn redeterminize_with_first_row(
 fn ol_register_chance_support(
     arena: &mut Vec<OLNode>,
     chance_node_id: u32,
-    panel: &[OLChancePanelRow],
+    config: OLChanceConfig<'_>,
+    chooser_actor: u8,
 ) -> PyResult<()> {
     if !arena[chance_node_id as usize].chance_children.is_empty() {
+        let node = &arena[chance_node_id as usize];
+        debug_assert_eq!(node.chance_backup, config.backup);
+        debug_assert_eq!(node.chance_traversal, config.traversal);
+        debug_assert_eq!(node.chance_chooser_actor, Some(chooser_actor));
         return Ok(());
     }
-    let children: Vec<OLChanceChild> = panel
+    let children: Vec<OLChanceChild> = config
+        .panel
         .iter()
         .map(|outcome| {
             let row: [u16; 4] = outcome
@@ -5274,6 +5452,7 @@ fn ol_register_chance_support(
             OLChanceChild {
                 row,
                 probability: outcome.probability,
+                multiplicity: outcome.multiplicity,
                 node_id: None,
                 #[cfg(debug_assertions)]
                 public_key: None,
@@ -5290,8 +5469,61 @@ fn ol_register_chance_support(
             "one-reveal fixed support has probability mass {mass}, expected 1"
         )));
     }
-    arena[chance_node_id as usize].chance_children = children;
+    let mut schedule = Vec::new();
+    if config.traversal == OLChanceTraversal::Balanced {
+        schedule.reserve(children.iter().map(|child| child.multiplicity).sum());
+        for (index, child) in children.iter().enumerate() {
+            schedule.extend(std::iter::repeat_n(index, child.multiplicity));
+        }
+        debug_assert!(!schedule.is_empty());
+    }
+    let node = &mut arena[chance_node_id as usize];
+    node.chance_children = children;
+    node.chance_chooser_actor = Some(chooser_actor);
+    node.chance_backup = config.backup;
+    node.chance_traversal = config.traversal;
+    node.chance_schedule = schedule;
+    node.chance_route_count = 0;
+    node.chance_schedule_seed =
+        config.schedule_seed ^ (chance_node_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     Ok(())
+}
+
+/// Select the row only after PUCT has committed to the pre-reveal action.
+/// Consequently neither IID nor locally balanced routing leaks the row into
+/// that action choice. Balanced mode consumes a shuffled multiplicity-expanded
+/// cycle local to this chance node before reshuffling for the next cycle.
+fn ol_select_chance_row(arena: &mut [OLNode], chance_node_id: u32, iid_seed: u64) -> [u16; 4] {
+    let node = &mut arena[chance_node_id as usize];
+    match node.chance_traversal {
+        OLChanceTraversal::Iid => {
+            let mut rng = StdRng::seed_from_u64(iid_seed ^ 0xC0A1_5EED_5EED_C0A1);
+            let target = rng.r#gen::<f64>();
+            let mut cumulative = 0.0;
+            node.chance_children
+                .iter()
+                .find(|outcome| {
+                    cumulative += outcome.probability;
+                    target < cumulative
+                })
+                .unwrap_or_else(|| node.chance_children.last().unwrap())
+                .row
+        }
+        OLChanceTraversal::Balanced => {
+            let cycle_len = node.chance_schedule.len();
+            debug_assert!(cycle_len > 0);
+            let offset = node.chance_route_count as usize % cycle_len;
+            if offset == 0 {
+                let cycle = node.chance_route_count / cycle_len as u64;
+                node.chance_schedule.shuffle(&mut StdRng::seed_from_u64(
+                    node.chance_schedule_seed ^ cycle.wrapping_mul(0xD1B5_4A32_D192_ED03),
+                ));
+            }
+            let outcome_index = node.chance_schedule[offset];
+            node.chance_route_count += 1;
+            node.chance_children[outcome_index].row
+        }
+    }
 }
 
 fn ol_route_chance_observation(
@@ -5541,7 +5773,7 @@ fn ol_descend(
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
-    one_reveal_panel: Option<&[OLChancePanelRow]>,
+    chance_config: Option<OLChanceConfig<'_>>,
 ) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<(usize, f64)>)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
@@ -5604,15 +5836,22 @@ fn ol_descend(
             None => break, // dead-end / missing children: re-evaluate this node as the leaf
             Some((child_id, placement, pick)) => {
                 let split_here = chance_step.is_none()
-                    && one_reveal_panel.is_some()
+                    && chance_config.is_some()
                     && <Kingdomino as search::Game>::is_stochastic(&state, (placement, pick));
+                if split_here {
+                    let config = chance_config.expect("split_here requires chance config");
+                    ol_register_chance_support(arena, child_id, config, actor)?;
+                    // PUCT has already committed to child_id. Pinning the row at
+                    // this point prevents both IID and local balancing from
+                    // changing the preceding action's legality or score.
+                    let row = ol_select_chance_row(arena, child_id, config.draw_seed);
+                    state = redeterminize_with_first_row(&state, &row, config.draw_seed)?;
+                }
                 actors.push(actor);
                 state = state.step(placement, pick)?;
                 path.push(child_id);
                 node_id = child_id;
                 if split_here {
-                    let panel = one_reveal_panel.expect("split_here requires a chance panel");
-                    ol_register_chance_support(arena, child_id, panel)?;
                     let post_actor = state.actor()?;
                     let (observation_id, outcome_probability) =
                         ol_route_chance_observation(arena, child_id, &state, post_actor)?;
@@ -5753,14 +5992,18 @@ fn ol_backup_path(
     }
     chance_node.chance_weighted_value +=
         outcome_probability * (new_observation_mean - old_observation_mean);
-    // Then propagate the registered-probability expectation over outcomes with
-    // real evaluations through the chance afterstate and earlier decision nodes.
-    // Unvisited mass is omitted and the visited mass is renormalized.
-    let expected_value0 = ol_chance_value_p0(arena, path[chance_index]);
+    let backup = chance_node.chance_backup;
+    // Both arms retain separate public observation subtrees. Sampled backup
+    // propagates this visit's realized return; Hájek additionally replaces it
+    // with the registered-probability estimate over rows evaluated so far.
+    let propagated_value0 = match backup {
+        OLChanceBackup::Sampled => sampled_value0,
+        OLChanceBackup::Hajek => ol_chance_value_p0(arena, path[chance_index]),
+    };
     for &node_id in &path[..=chance_index] {
         let node = &mut arena[node_id as usize];
         node.visit_count += 1;
-        node.value_sum += expected_value0;
+        node.value_sum += propagated_value0;
     }
 }
 
@@ -5935,6 +6178,8 @@ fn advisor_open_loop_search_impl(
     pick_floor: Option<PickFloor>,
     chance_exposure: usize,
     chance_enum_max_rows: u64,
+    chance_backup: OLChanceBackup,
+    chance_traversal: OLChanceTraversal,
 ) -> PyResult<AdvisorOpenLoopOutput> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
@@ -5973,21 +6218,21 @@ fn advisor_open_loop_search_impl(
             let det = if one_reveal_panel.is_empty() {
                 root_state.redeterminize(Some(det_seed))
             } else {
-                // Derive the chance draw from this simulation seed instead of
-                // consuming another value from the search RNG. Thus treatment
-                // and incumbent use the identical per-simulation seed stream;
-                // enabling A1 cannot perturb every later determinization.
-                let mut chance_rng = StdRng::seed_from_u64(det_seed ^ 0xC0A1_5EED_5EED_C0A1);
-                let target = chance_rng.r#gen::<f64>();
-                let mut cumulative = 0.0;
-                let selected = one_reveal_panel
-                    .iter()
-                    .find(|outcome| {
-                        cumulative += outcome.probability;
-                        target < cumulative
-                    })
-                    .unwrap_or_else(|| one_reveal_panel.last().unwrap());
-                redeterminize_with_first_row(root_state, &selected.row, det_seed)?
+                // The first reveal is pinned only after PUCT chooses the
+                // pre-reveal action. No operation before that split reads deck
+                // order, so cloning the root here is information-set safe.
+                root_state.cloned()
+            };
+            let chance_config = if one_reveal_panel.is_empty() {
+                None
+            } else {
+                Some(OLChanceConfig {
+                    panel: one_reveal_panel.as_slice(),
+                    backup: chance_backup,
+                    traversal: chance_traversal,
+                    schedule_seed: seed ^ 0xBA1A_4CED_C1C1_E5E5,
+                    draw_seed: det_seed,
+                })
             };
             let (path, actors, leaf_state, chance_step) = ol_descend(
                 &mut arena,
@@ -6002,11 +6247,7 @@ fn advisor_open_loop_search_impl(
                 // pick-group coverage closes the secondary-pick fragility gap
                 // at equal budget.  Off by default (frac=0 => None).
                 pick_floor,
-                if one_reveal_panel.is_empty() {
-                    None
-                } else {
-                    Some(one_reveal_panel.as_slice())
-                },
+                chance_config,
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -11025,6 +11266,7 @@ mod ol_tests {
         OLChanceChild {
             row,
             probability,
+            multiplicity: 1,
             node_id: Some(node_id),
             #[cfg(debug_assertions)]
             public_key: None,
@@ -11264,6 +11506,7 @@ mod ol_tests {
             OLChanceChild {
                 row: [5, 6, 7, 8],
                 probability: 0.75,
+                multiplicity: 1,
                 node_id: None,
                 #[cfg(debug_assertions)]
                 public_key: None,
@@ -11278,6 +11521,81 @@ mod ol_tests {
         assert!((arena[0].chance_visited_mass - 0.25).abs() < 1e-12);
         assert!((arena[0].chance_weighted_value - 0.075).abs() < 1e-12);
         assert!((ol_chance_value_p0(&arena, 0) - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_reveal_sampled_backup_is_the_realized_monte_carlo_mean() {
+        let mut arena = vec![
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+        ];
+        arena[0].chance_backup = OLChanceBackup::Sampled;
+        arena[0].chance_children = vec![
+            test_chance_child([1, 2, 3, 4], 0.99, 1),
+            test_chance_child([5, 6, 7, 8], 0.01, 2),
+        ];
+        ol_backup_path(&mut arena, &[0, 1], 0.0, Some((0, 0.99)));
+        ol_backup_path(&mut arena, &[0, 2], 1.0, Some((0, 0.01)));
+
+        assert_eq!(arena[0].visit_count, 2);
+        assert!((arena[0].value_sum - 1.0).abs() < 1e-12);
+        assert!((ol_chance_value_p0(&arena, 0) - 0.5).abs() < 1e-12);
+        // The cache still records the counterfactual Hájek quantity for
+        // diagnostics, but sampled selection/backup deliberately does not use it.
+        assert!((arena[0].chance_visited_mass - 1.0).abs() < 1e-12);
+        assert!((arena[0].chance_weighted_value - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_reveal_balanced_routing_completes_local_multiplicity_cycles() -> PyResult<()> {
+        let panel = vec![
+            OLChancePanelRow {
+                row: vec![1, 2, 3, 4],
+                probability: 2.0 / 3.0,
+                multiplicity: 2,
+            },
+            OLChancePanelRow {
+                row: vec![5, 6, 7, 8],
+                probability: 1.0 / 3.0,
+                multiplicity: 1,
+            },
+        ];
+        let mut arena = vec![OLNode::new(1.0, (None, None))];
+        ol_register_chance_support(
+            &mut arena,
+            0,
+            OLChanceConfig {
+                panel: &panel,
+                backup: OLChanceBackup::Sampled,
+                traversal: OLChanceTraversal::Balanced,
+                schedule_seed: 20260808,
+                draw_seed: 7,
+            },
+            0,
+        )?;
+
+        let first_cycle: Vec<[u16; 4]> = (0..3)
+            .map(|seed| ol_select_chance_row(&mut arena, 0, seed))
+            .collect();
+        assert_eq!(
+            first_cycle
+                .iter()
+                .filter(|&&row| row == [1, 2, 3, 4])
+                .count(),
+            2
+        );
+        assert_eq!(
+            first_cycle
+                .iter()
+                .filter(|&&row| row == [5, 6, 7, 8])
+                .count(),
+            1
+        );
+        assert_eq!(arena[0].chance_route_count, 3);
+        let _first_of_next_cycle = ol_select_chance_row(&mut arena, 0, 99);
+        assert_eq!(arena[0].chance_route_count, 4);
+        Ok(())
     }
 
     #[test]
@@ -11310,6 +11628,35 @@ mod ol_tests {
     }
 
     #[test]
+    fn one_reveal_visit_q_rank_diagnostic_uses_chooser_frame() {
+        let mut arena = vec![
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+            OLNode::new(1.0, (None, None)),
+        ];
+        arena[0].children = vec![(1, 1), (2, 2)];
+        arena[1].visit_count = 10;
+        arena[1].chance_chooser_actor = Some(1);
+        arena[1].chance_children = vec![test_chance_child([1, 2, 3, 4], 1.0, 3)];
+        arena[3].visit_count = 10;
+        arena[3].value_sum = -10.0;
+        refresh_test_chance_cache(&mut arena, 1);
+        arena[2].visit_count = 1;
+        arena[2].chance_chooser_actor = Some(1);
+        arena[2].chance_children = vec![test_chance_child([5, 6, 7, 8], 1.0, 4)];
+        arena[4].visit_count = 1;
+        arena[4].value_sum = 0.0;
+        refresh_test_chance_cache(&mut arena, 2);
+
+        let diagnostics = ol_chance_diagnostics(&arena);
+        assert_eq!(diagnostics["chance_action_visit_q_rank_parent_groups"], 1.0);
+        assert_eq!(diagnostics["chance_action_visit_q_rank_actions"], 2.0);
+        assert!((diagnostics["chance_action_visit_q_rank_spearman_mean"] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn one_reveal_materialization_uses_distinct_public_observation_nodes() -> PyResult<()> {
         let mut state = new_game(17, true, true);
         for _ in 0..3 {
@@ -11324,7 +11671,18 @@ mod ol_tests {
         let panel = ol_one_reveal_panel(&state.deck, 1, 1, 123)?;
         assert_eq!(panel.iter().map(|x| x.multiplicity).sum::<usize>(), 11);
         let mut arena = vec![OLNode::new(1.0, action)];
-        ol_register_chance_support(&mut arena, 0, &panel)?;
+        ol_register_chance_support(
+            &mut arena,
+            0,
+            OLChanceConfig {
+                panel: &panel,
+                backup: OLChanceBackup::Hajek,
+                traversal: OLChanceTraversal::Iid,
+                schedule_seed: 9,
+                draw_seed: 10,
+            },
+            state.actor()?,
+        )?;
         assert_eq!(arena[0].chance_children.len(), panel.len());
         assert_eq!(
             arena.len(),
@@ -11734,7 +12092,8 @@ mod kingdomino_rust {
                         score_scale=160.0, margin_gain=2.0, alpha=0.0,
                         pick_floor_frac=0.0, pick_floor_min_depth=0,
                         pick_floor_max_depth=0, pick_floor_min_visits=16,
-                        chance_exposure=0, chance_enum_max_rows=70))]
+                        chance_exposure=0, chance_enum_max_rows=70,
+                        chance_backup="hajek", chance_traversal="iid"))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_open_loop_search<'py>(
         py: Python<'py>,
@@ -11757,6 +12116,8 @@ mod kingdomino_rust {
         pick_floor_min_visits: i32,
         chance_exposure: usize,
         chance_enum_max_rows: u64,
+        chance_backup: &str,
+        chance_traversal: &str,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -11782,6 +12143,8 @@ mod kingdomino_rust {
                 "chance_enum_max_rows must be > 0 when chance_exposure is enabled",
             ));
         }
+        let chance_backup = super::ol_parse_chance_backup(chance_backup)?;
+        let chance_traversal = super::ol_parse_chance_traversal(chance_traversal)?;
         // frac == 0 => None => byte-identical to the pre-Phase-A path.
         let pick_floor = if pick_floor_frac > 0.0 {
             Some(super::PickFloor {
@@ -11813,6 +12176,8 @@ mod kingdomino_rust {
                 pick_floor,
                 chance_exposure,
                 chance_enum_max_rows,
+                chance_backup,
+                chance_traversal,
             )
         })?;
         Ok((output.children, output.root_value0))
@@ -11825,7 +12190,8 @@ mod kingdomino_rust {
     #[pyo3(signature = (state, evaluator, n_sims, chance_exposure=0,
                         chance_enum_max_rows=70, fpu=0.0, cpuct=1.5, seed=0,
                         leaf_batch=8, virtual_loss=1, score_scale=160.0,
-                        margin_gain=2.0, alpha=0.0))]
+                        margin_gain=2.0, alpha=0.0, chance_backup="hajek",
+                        chance_traversal="iid"))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_one_reveal_search<'py>(
         py: Python<'py>,
@@ -11842,6 +12208,8 @@ mod kingdomino_rust {
         score_scale: f64,
         margin_gain: f64,
         alpha: f64,
+        chance_backup: &str,
+        chance_traversal: &str,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -11851,6 +12219,8 @@ mod kingdomino_rust {
                 "chance_enum_max_rows must be > 0 when chance_exposure is enabled",
             ));
         }
+        let chance_backup = super::ol_parse_chance_backup(chance_backup)?;
+        let chance_traversal = super::ol_parse_chance_traversal(chance_traversal)?;
         let root_state = state.cloned();
         let ev: Py<PyAny> = evaluator.unbind();
         let output = py.detach(move || {
@@ -11871,6 +12241,8 @@ mod kingdomino_rust {
                 None,
                 chance_exposure,
                 chance_enum_max_rows,
+                chance_backup,
+                chance_traversal,
             )
         })?;
         Ok((output.children, output.root_value0, output.diagnostics))

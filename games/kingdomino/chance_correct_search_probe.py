@@ -1,11 +1,12 @@
-"""Equal-compute A1 probe for the one-reveal fixed-support search.
+"""Equal-compute A1/A1b probe for the one-reveal fixed-support search.
 
 This is deliberately narrower than self-play: it compares root selections from
 the incumbent open-loop search and opt-in one-reveal arms on frozen public
 positions. Every candidate arm receives the same simulation budget and the
 artifact records actual NN rows so terminal-leaf differences cannot be hidden.
 A larger reference search is reported separately and is not called an exact
-oracle.
+oracle. Optional mode lists cross sampled/Hájek backup with IID/local-balanced
+chance traversal while retaining one incumbent arm.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ def _arm(
     alpha: float,
     fpu: float,
     cpuct: float,
+    backup: str = "hajek",
+    traversal: str = "iid",
 ) -> dict[str, Any]:
     import kingdomino_rust as kr
 
@@ -68,6 +71,8 @@ def _arm(
         alpha=float(alpha),
         chance_exposure=int(exposure),
         chance_enum_max_rows=int(enum_max_rows),
+        chance_backup=str(backup),
+        chance_traversal=str(traversal),
     )
     chance_diagnostics = {
         str(key): float(value) for key, value in raw_chance_diagnostics.items()
@@ -79,7 +84,7 @@ def _arm(
         else (
             "exhaustive"
             if chance_diagnostics.get("chance_panel_exhaustive", 0.0) == 1.0
-            else "sampled_balanced"
+            else "sampled_panel"
         )
     )
     actor = int(state.current_actor)
@@ -100,6 +105,8 @@ def _arm(
         "chance_enum_max_rows": int(enum_max_rows),
         "chance_panel_mode": panel_mode,
         "chance_panel_rows": panel_rows,
+        "chance_backup": "disabled" if exposure == 0 else str(backup),
+        "chance_traversal": "disabled" if exposure == 0 else str(traversal),
         "root_value_running_mean_player0": float(root_value0),
         "root_value_current_children_player0": chance_diagnostics[
             "root_value_current_children_player0"
@@ -277,6 +284,52 @@ def _deck_size_summary(
     return output
 
 
+def _choice_list(raw: str, *, allowed: set[str], option: str) -> list[str]:
+    values = [value.strip() for value in raw.split(",") if value.strip()]
+    if not values or len(set(values)) != len(values):
+        raise ValueError(f"{option} must contain one or more unique values")
+    invalid = [value for value in values if value not in allowed]
+    if invalid:
+        raise ValueError(f"{option} contains invalid values: {invalid}")
+    return values
+
+
+def _a1b_arm_specs(
+    exposures: Sequence[int],
+    backups: Sequence[str],
+    traversals: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Build one incumbent plus the requested A1b cross-product."""
+    matrix = len(backups) > 1 or len(traversals) > 1
+    specs: list[dict[str, Any]] = []
+    for exposure in exposures:
+        if exposure == 0:
+            specs.append({
+                "name": "x0",
+                "exposure": 0,
+                "backup": "hajek",
+                "traversal": "iid",
+            })
+            continue
+        for backup in backups:
+            for traversal in traversals:
+                name = (
+                    f"x{exposure}_{backup}_{traversal}"
+                    if matrix
+                    else f"x{exposure}"
+                )
+                specs.append({
+                    "name": name,
+                    "exposure": int(exposure),
+                    "backup": backup,
+                    "traversal": traversal,
+                })
+    names = [spec["name"] for spec in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"A1b arm names are not unique: {names}")
+    return specs
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = Path(args.checkpoint)
     all_positions = load_frozen_positions(args.positions_path)
@@ -307,6 +360,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     exposures = [int(x) for x in args.exposures.split(",")]
     if not exposures or exposures[0] != 0 or any(x < 0 for x in exposures):
         raise ValueError("--exposures must start with the incumbent 0 arm")
+    if len(set(exposures)) != len(exposures):
+        raise ValueError("--exposures must not contain duplicates")
+    backup_modes = _choice_list(
+        args.backup_modes,
+        allowed={"sampled", "hajek"},
+        option="--backup-modes",
+    )
+    traversal_modes = _choice_list(
+        args.traversal_modes,
+        allowed={"iid", "balanced"},
+        option="--traversal-modes",
+    )
+    if args.reference_backup not in {"sampled", "hajek"}:
+        raise ValueError("--reference-backup must be sampled or hajek")
+    if args.reference_traversal not in {"iid", "balanced"}:
+        raise ValueError("--reference-traversal must be iid or balanced")
+    if not 0.0 <= args.min_realized_mass <= 1.0:
+        raise ValueError("--min-realized-mass must be in [0, 1]")
+    arm_specs = _a1b_arm_specs(exposures, backup_modes, traversal_modes)
+    arm_names = [spec["name"] for spec in arm_specs]
 
     net, checkpoint_cfg = load_checkpoint_network(checkpoint, args.device)
     evaluator = make_rust_evaluator(
@@ -325,7 +398,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         fpu=args.fpu, cpuct=args.cpuct,
     )
     records = []
-    arm_names = [f"x{exposure}" for exposure in exposures]
     for ordinal, (position_index, (state, source)) in enumerate(positions):
         seed_runs = []
         for seed_index in range(args.seed_count):
@@ -339,19 +411,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # arm is never a literal prefix of its stronger reference.
             reference_seed = seed ^ REFERENCE_SEED_XOR
             arms = {
-                f"x{exposure}": _arm(
+                spec["name"]: _arm(
                     state,
                     evaluator,
                     sims=args.sims,
-                    exposure=exposure,
+                    exposure=spec["exposure"],
                     enum_max_rows=args.enum_max_rows,
                     seed=seed,
                     margin_gain=margin_gain,
                     alpha=alpha,
                     fpu=args.fpu,
                     cpuct=args.cpuct,
+                    backup=spec["backup"],
+                    traversal=spec["traversal"],
                 )
-                for exposure in exposures
+                for spec in arm_specs
             }
             reference_openloop = _arm(
                 state,
@@ -364,6 +438,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 alpha=alpha,
                 fpu=args.fpu,
                 cpuct=args.cpuct,
+                backup=args.reference_backup,
+                traversal=args.reference_traversal,
             )
             reference_hybrid = _arm(
                 state,
@@ -376,6 +452,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 alpha=alpha,
                 fpu=args.fpu,
                 cpuct=args.cpuct,
+                backup=args.reference_backup,
+                traversal=args.reference_traversal,
             )
             references = {
                 "openloop": reference_openloop,
@@ -428,8 +506,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     aggregate = {}
     for reference_name in ("openloop", "hybrid"):
         aggregate[reference_name] = {}
-        for exposure in exposures:
-            name = f"x{exposure}"
+        for name in arm_names:
             metrics = [run["metrics"][reference_name][name] for run in all_seed_runs]
             regrets = [m["regret_actor"] for m in metrics if m["regret_actor"] is not None]
             q_pair_correct = sum(m["q_pairwise_correct"] for m in metrics)
@@ -531,22 +608,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
     }
     aggregate["chance_coverage"] = {}
+    arm_spec_by_name = {spec["name"]: spec for spec in arm_specs}
     for name in arm_names:
         diagnostics = [run["arms"][name]["chance_diagnostics"] for run in all_seed_runs]
         fields = sorted({field for row in diagnostics for field in row})
-        aggregate["chance_coverage"][name] = {
+        summary = {
             field: statistics.fmean(row.get(field, 0.0) for row in diagnostics)
             for field in fields
         }
+        if arm_spec_by_name[name]["exposure"] == 0:
+            summary["realized_mass_gate"] = None
+        else:
+            realized = [
+                row.get("visit_weighted_visited_probability_mass", 0.0)
+                for row in diagnostics
+            ]
+            passed = [value >= args.min_realized_mass for value in realized]
+            summary["realized_mass_gate"] = {
+                "threshold": float(args.min_realized_mass),
+                "searches_passing": sum(passed),
+                "searches_total": len(passed),
+                "fraction_passing": statistics.fmean(passed),
+                "all_pass": all(passed),
+            }
+        aggregate["chance_coverage"][name] = summary
     aggregate["by_deck_size"] = _deck_size_summary(records, arm_names)
+    is_a1b_matrix = len(backup_modes) > 1 or len(traversal_modes) > 1
     return {
-        "schema_version": 4,
-        "scope": "A1 equal-compute frozen-position probe; no training or promotion",
+        "schema_version": 5,
+        "scope": (
+            "A1b backup/traversal frozen-position probe; no training or promotion"
+            if is_a1b_matrix
+            else "A1 equal-compute frozen-position probe; no training or promotion"
+        ),
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
         "positions_path": str(args.positions_path),
         "positions_sha256": file_sha256(args.positions_path),
         "configuration": vars(args),
+        "arm_specifications": arm_specs,
         "targeted_subset": targeted_subset,
         "selection_reason": args.selection_reason.strip() or None,
         "sampling_unit_note": (
@@ -599,9 +699,27 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed-count", type=int, default=1)
     parser.add_argument("--sims", type=int, default=128)
     parser.add_argument("--exposures", default="0,1,2,4")
+    parser.add_argument(
+        "--backup-modes",
+        default="hajek",
+        help="comma-separated A1b treatment modes: sampled,hajek",
+    )
+    parser.add_argument(
+        "--traversal-modes",
+        default="iid",
+        help="comma-separated A1b routing modes: iid,balanced",
+    )
     parser.add_argument("--enum-max-rows", type=int, default=70)
     parser.add_argument("--reference-sims", type=int, default=512)
     parser.add_argument("--reference-exposure", type=int, default=4)
+    parser.add_argument("--reference-backup", default="hajek")
+    parser.add_argument("--reference-traversal", default="iid")
+    parser.add_argument(
+        "--min-realized-mass",
+        type=float,
+        default=0.5,
+        help="minimum visit-weighted evaluated probability mass for interpretation",
+    )
     parser.add_argument("--fpu", type=float, default=-0.2)
     parser.add_argument("--cpuct", type=float, default=1.5)
     parser.add_argument("--device", default="cuda")
