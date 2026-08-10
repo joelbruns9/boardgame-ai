@@ -116,6 +116,100 @@ at least 0.10.  This threshold is an interpretation aid, not a promotion gate.
 
 No result from this diagnostic alone enables the feature or changes self-play.
 
+## Results (2026-08-10)
+
+The sweep completed all 1,280 preregistered cells (64 positions × 4 budgets ×
+5 arms).  Frozen-position SHA-256:
+`dad379d2a350cf74a73b2f804269cba2199ee46c8a5526cf0fa5c5a35f6276bd`.
+Checkpoint SHA-256:
+`4bf07b0ca14e5452e6533a9232967e89bb0ab0df88c99e9928a65f402b1f04b3`.
+
+### Reach result
+
+The reach-bottleneck hypothesis is rejected for these roots and search
+settings.  All 64 control roots reached a reveal action even at B=800 (Wilson
+95% interval for the reach rate: 94.3%–100%).  Across budgets, median first
+reach was simulation 29, p90 was 90.4, and the maximum was 194.  The mean
+fraction of paths which crossed a reveal rose from 66.4% at B=800 to 90.2% at
+B=6,400.  Mean unique root branches which reached a reveal rose from 9.3 to
+14.0.  Search therefore has ample post-reach budget; the prior concern that
+1,000+ simulations barely get beyond a few plies does not describe this
+current first-selection/deck=8 configuration with FPU=-0.2.
+
+### Root-policy effects versus control
+
+The table reports mean total-variation distance between root visit
+distributions, with the paired position-bootstrap 95% interval in parentheses.
+`Top` and `Pick` are the fractions of positions whose top joint action or pick
+changed.
+
+| B | Arm | Visit TV (95% CI) | Top | Pick |
+|---:|---|---:|---:|---:|
+| 800 | pulse +1 | 0.049 (0.031–0.071) | 9.4% | 0.0% |
+| 800 | pulse −1 | 0.042 (0.028–0.059) | 3.1% | 1.6% |
+| 800 | panel charged | 0.163 (0.130–0.198) | 20.3% | 9.4% |
+| 800 | panel extra | 0.165 (0.133–0.200) | 21.9% | 10.9% |
+| 1,600 | pulse +1 | 0.068 (0.039–0.106) | 10.9% | 1.6% |
+| 1,600 | pulse −1 | 0.064 (0.045–0.087) | 10.9% | 0.0% |
+| 1,600 | panel charged | 0.230 (0.184–0.278) | 34.4% | 14.1% |
+| 1,600 | panel extra | 0.231 (0.184–0.281) | 34.4% | 14.1% |
+| 3,200 | pulse +1 | 0.066 (0.046–0.091) | 14.1% | 3.1% |
+| 3,200 | pulse −1 | 0.082 (0.052–0.118) | 17.2% | 1.6% |
+| 3,200 | panel charged | 0.311 (0.255–0.370) | 50.0% | 20.3% |
+| 3,200 | panel extra | 0.312 (0.255–0.369) | 50.0% | 20.3% |
+| 6,400 | pulse +1 | 0.093 (0.061–0.131) | 18.8% | 4.7% |
+| 6,400 | pulse −1 | 0.108 (0.072–0.149) | 18.8% | 4.7% |
+| 6,400 | panel charged | 0.381 (0.318–0.445) | 51.6% | 25.0% |
+| 6,400 | panel extra | 0.381 (0.318–0.447) | 51.6% | 25.0% |
+
+The single-node pulses have real but modest leverage, increasing with budget.
+At B=6,400 they changed the top action on 12/64 roots and the top pick on 3/64.
+This is inconsistent with “the deep node can never affect the root,” but it
+also shows that changing one first-reached reveal action is not usually enough
+to dominate the root decision.
+
+The production-like chance-aware arms change the root much more.  At B=6,400
+they changed the top action on 33/64 roots and the top pick on 16/64.  This is a
+mechanism effect, not evidence that those changes improve play; the prior
+playing-strength A/B was weak-negative/null.
+
+### Compute-displacement result
+
+Compute displacement is not the explanation at these budgets.  Charged and
+extra-budget panels were nearly identical:
+
+| B | Charged-vs-extra visit TV | Top-action differences | Pick differences |
+|---:|---:|---:|---:|
+| 800 | 0.0176 | 3/64 | 1/64 |
+| 1,600 | 0.0091 | 0/64 | 0/64 |
+| 3,200 | 0.0047 | 0/64 | 0/64 |
+| 6,400 | 0.0026 | 0/64 | 0/64 |
+
+Every panel arm admitted exactly one 70-row panel.  The charged arms consumed
+exactly B realized work units; extra arms consumed B+70.  The difference
+between the two treatments shrank as B grew.
+
+### Important attribution limit
+
+The large panel effect cannot yet be attributed solely to the 70 network
+values.  The production-like arm creates explicit public-observation subtrees
+at every reached reveal action; only the first target receives the exhaustive
+bootstrap.  The pulse arm changes one target Q but leaves the incumbent aliased
+tree topology intact.  The gap between panel and pulse effects may therefore
+come from explicit chance-node separation, the exhaustive bootstrap, or both.
+
+The highest-value next ablation is consequently:
+
+1. incumbent aliased open loop;
+2. explicit sampled chance splits with identical support/traversal but **no**
+   exhaustive bootstrap;
+3. the same split tree plus the 70-row bootstrap.
+
+Run this on the same frozen roots and budgets.  Comparing (1)→(2) isolates the
+topology/strategy-fusion effect; comparing (2)→(3) isolates the exhaustive
+panel's incremental information.  Given the completed A/B result, another
+larger gameplay match should wait until this attribution is resolved.
+
 ## Reproduction
 
 From the repository root, using the project virtual environment and CUDA:
