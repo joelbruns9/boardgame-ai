@@ -4954,6 +4954,10 @@ struct A1cChanceConfig<'a> {
     n_init: usize,
     widening_c: f64,
     max_initialization_fraction: f64,
+    // Diagnostic full-panel probes mirror production's 70-row batch exactly,
+    // including the row just sampled by the path which triggered admission.
+    // Ordinary A1c widening reuses already-estimated observations.
+    force_re_evaluate_existing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4962,6 +4966,28 @@ struct A1cSearchOptions {
     n_init: usize,
     widening_c: f64,
     max_initialization_fraction: f64,
+}
+
+/// Diagnostic-only intervention at the first selected action which triggers a
+/// reveal.  `Pulse` clamps that action afterstate's Q in the root actor's frame
+/// without adding inference work.  `FullPanel` admits one exhaustive deck=8
+/// panel at the first reached reveal node.  Neither mode is used by self-play.
+#[derive(Clone, Copy)]
+enum ChanceLeverageProbeMode {
+    Pulse(f64),
+    FullPanel { charge_to_sim_budget: bool },
+}
+
+#[derive(Clone, Copy)]
+struct OLStochasticTrace {
+    chance_node_id: u32,
+    root_child_id: u32,
+    child_depth: usize,
+}
+
+struct OLDescendDiagnostics {
+    decision_actions: usize,
+    first_stochastic: Option<OLStochasticTrace>,
 }
 
 struct A1cRuntime<'a> {
@@ -6030,10 +6056,11 @@ fn a1c_admit_next_cycle(
             .binary_search_by(|outcome| outcome.row.cmp(&row))
             .ok()
             .and_then(|index| arena[chance_node_id as usize].chance_children[index].node_id);
-        let already_estimated = existing_node.is_some_and(|node_id| {
-            let node = &arena[node_id as usize];
-            node.visit_count > 0 || node.bootstrap_value0.is_some()
-        });
+        let already_estimated = !a1c.force_re_evaluate_existing
+            && existing_node.is_some_and(|node_id| {
+                let node = &arena[node_id as usize];
+                node.visit_count > 0 || node.bootstrap_value0.is_some()
+            });
         if already_estimated {
             continue;
         }
@@ -6347,12 +6374,15 @@ fn ol_descend(
     RustGameState,
     Option<(usize, f64)>,
     Option<A1cAdmissionRequest>,
+    OLDescendDiagnostics,
 )> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
     let mut node_id = root_id;
     let mut chance_step: Option<(usize, f64)> = None;
     let mut a1c_admission_request: Option<A1cAdmissionRequest> = None;
+    let mut decision_actions = 0usize;
+    let mut first_stochastic: Option<OLStochasticTrace> = None;
     // `state` is already owned (moved in); no clone needed — it is stepped in
     // place as we descend and returned as the leaf state.
     loop {
@@ -6409,9 +6439,20 @@ fn ol_descend(
         match step {
             None => break, // dead-end / missing children: re-evaluate this node as the leaf
             Some((child_id, placement, pick)) => {
-                let split_here = chance_step.is_none()
-                    && chance_config.is_some()
-                    && <Kingdomino as search::Game>::is_stochastic(&state, (placement, pick));
+                decision_actions += 1;
+                let stochastic_here =
+                    <Kingdomino as search::Game>::is_stochastic(&state, (placement, pick));
+                if first_stochastic.is_none() && stochastic_here {
+                    first_stochastic = Some(OLStochasticTrace {
+                        chance_node_id: child_id,
+                        root_child_id: if path.len() > 1 { path[1] } else { child_id },
+                        // One-based game-action depth.  At a deck=8 first-
+                        // selection root the reveal-triggering action is depth 4.
+                        child_depth: decision_actions,
+                    });
+                }
+                let split_here =
+                    chance_step.is_none() && chance_config.is_some() && stochastic_here;
                 if split_here {
                     let config = chance_config.expect("split_here requires chance config");
                     let row = if let Some(a1c) = config.a1c {
@@ -6477,7 +6518,17 @@ fn ol_descend(
             }
         }
     }
-    Ok((path, actors, state, chance_step, a1c_admission_request))
+    Ok((
+        path,
+        actors,
+        state,
+        chance_step,
+        a1c_admission_request,
+        OLDescendDiagnostics {
+            decision_actions,
+            first_stochastic,
+        },
+    ))
 }
 
 /// Issue 2: add to `node_id` any child whose legal joint index is not already
@@ -6801,16 +6852,31 @@ fn advisor_open_loop_search_impl(
     chance_traversal: OLChanceTraversal,
     a1c_options: Option<A1cSearchOptions>,
     nn_eval_budget: Option<usize>,
+    leverage_probe: Option<ChanceLeverageProbeMode>,
 ) -> PyResult<AdvisorOpenLoopOutput> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
     let mut fallback_count = 0u32;
     let mut missing_child_count = 0u32;
+    let full_panel_probe = matches!(
+        leverage_probe,
+        Some(ChanceLeverageProbeMode::FullPanel { .. })
+    );
+    let full_panel_charged = matches!(
+        leverage_probe,
+        Some(ChanceLeverageProbeMode::FullPanel {
+            charge_to_sim_budget: true
+        })
+    );
     let one_reveal_panel = if a1c_options.is_none() {
         ol_one_reveal_panel(
             &root_state.deck,
-            chance_exposure,
-            chance_enum_max_rows,
+            if full_panel_probe { 1 } else { chance_exposure },
+            if full_panel_probe {
+                70
+            } else {
+                chance_enum_max_rows
+            },
             seed ^ 0xA1C0_77EC_7A11_5EED,
         )?
     } else {
@@ -6828,7 +6894,9 @@ fn advisor_open_loop_search_impl(
     };
     // A one-row panel (deck=4) has no uncertainty or strategy-fusion risk.
     // Keep its support metadata, but avoid a pointless chance/observation layer.
-    let chance_split_enabled = if a1c_options.is_some() {
+    let chance_split_enabled = if full_panel_probe {
+        one_reveal_panel.len() > 1
+    } else if a1c_options.is_some() {
         root_state.deck.len() > 4 && !a1c_cycles.is_empty()
     } else {
         one_reveal_panel.len() > 1
@@ -6861,7 +6929,56 @@ fn advisor_open_loop_search_impl(
     let vl = virtual_loss.max(0);
     let mut sims_done = 0usize;
     let mut search_waves = 0usize;
-    while sims_done < n_sims && nn_eval_budget.is_none_or(|budget| total_nn_evals < budget) {
+    let root_actor = root_state.actor()?;
+    let pulse_value0 = match leverage_probe {
+        Some(ChanceLeverageProbeMode::Pulse(value_actor)) => Some(if root_actor == 0 {
+            value_actor
+        } else {
+            -value_actor
+        }),
+        _ => None,
+    };
+    let full_panel_cycle: Vec<[u16; 4]> = if full_panel_probe {
+        one_reveal_panel
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .row
+                    .as_slice()
+                    .try_into()
+                    .expect("deck=8 exhaustive rows contain four tiles")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let full_panel_cycles = if full_panel_probe {
+        vec![full_panel_cycle]
+    } else {
+        Vec::new()
+    };
+    let mut probe_paths_reaching_reveal = 0usize;
+    let mut probe_first_reveal_sim: Option<usize> = None;
+    let mut probe_first_reveal_depth: Option<usize> = None;
+    let mut probe_reveal_nodes = HashSet::<u32>::new();
+    let mut probe_reveal_root_children = HashSet::<u32>::new();
+    let mut probe_max_decision_depth = 0usize;
+    let mut probe_decision_depth_sum = 0usize;
+    let mut probe_target: Option<OLStochasticTrace> = None;
+    let mut probe_target_admission_sim: Option<usize> = None;
+    let mut probe_intervention_applied_after_sim: Option<usize> = None;
+    let mut probe_target_visits_at_admission = 0usize;
+    let mut probe_panel_committed = false;
+    let mut probe_panel_bootstrap_rows = 0usize;
+    while sims_done
+        + if full_panel_charged && probe_panel_committed {
+            70
+        } else {
+            0
+        }
+        < n_sims
+        && nn_eval_budget.is_none_or(|budget| total_nn_evals < budget)
+    {
         let remaining_nn_budget = nn_eval_budget
             .map(|budget| budget.saturating_sub(total_nn_evals))
             .unwrap_or(usize::MAX);
@@ -6869,7 +6986,14 @@ fn advisor_open_loop_search_impl(
         // the wave by the remaining budget prevents an evaluator batch from
         // overshooting the hard cap; terminal paths simply leave capacity for
         // a later wave.
-        let wave = wave_cap.min(n_sims - sims_done).min(remaining_nn_budget);
+        let charged_rows = if full_panel_charged && probe_panel_committed {
+            70
+        } else {
+            0
+        };
+        let wave = wave_cap
+            .min(n_sims - sims_done - charged_rows)
+            .min(remaining_nn_budget);
         debug_assert!(wave > 0);
         let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
         let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
@@ -6902,25 +7026,43 @@ fn advisor_open_loop_search_impl(
                         n_init: options.n_init,
                         widening_c: options.widening_c,
                         max_initialization_fraction: options.max_initialization_fraction,
+                        force_re_evaluate_existing: false,
                     }),
-                    bootstrap_full_panel: false,
+                    bootstrap_full_panel: full_panel_probe,
                 })
             };
-            let (path, actors, leaf_state, chance_step, a1c_admission_request) = ol_descend(
-                &mut arena,
-                0,
-                det,
-                fpu,
-                cpuct,
-                &mut fallback_count,
-                &mut missing_child_count,
-                // Normally None: the advisor is pure PUCT.  The Phase A
-                // allocation study passes a floor to test whether forced
-                // pick-group coverage closes the secondary-pick fragility gap
-                // at equal budget.  Off by default (frac=0 => None).
-                pick_floor,
-                chance_config,
-            )?;
+            let (path, actors, leaf_state, chance_step, a1c_admission_request, descend_diag) =
+                ol_descend(
+                    &mut arena,
+                    0,
+                    det,
+                    fpu,
+                    cpuct,
+                    &mut fallback_count,
+                    &mut missing_child_count,
+                    // Normally None: the advisor is pure PUCT.  The Phase A
+                    // allocation study passes a floor to test whether forced
+                    // pick-group coverage closes the secondary-pick fragility gap
+                    // at equal budget.  Off by default (frac=0 => None).
+                    pick_floor,
+                    chance_config,
+                )?;
+            let path_index = paths.len();
+            probe_max_decision_depth = probe_max_decision_depth.max(descend_diag.decision_actions);
+            probe_decision_depth_sum += descend_diag.decision_actions;
+            if let Some(trace) = descend_diag.first_stochastic {
+                probe_paths_reaching_reveal += 1;
+                probe_reveal_nodes.insert(trace.chance_node_id);
+                probe_reveal_root_children.insert(trace.root_child_id);
+                if probe_first_reveal_sim.is_none() {
+                    probe_first_reveal_sim = Some(sims_done + path_index + 1);
+                    probe_first_reveal_depth = Some(trace.child_depth);
+                }
+                if probe_target.is_none() {
+                    probe_target = Some(trace);
+                    probe_target_admission_sim = Some(sims_done + path_index + 1);
+                }
+            }
             if let Some(request) = a1c_admission_request {
                 a1c_admission_requests.push(request);
             }
@@ -7034,6 +7176,74 @@ fn advisor_open_loop_search_impl(
             ol_backup_path(&mut arena, path, v0, chance_steps[pi]);
         }
 
+        // The free pulse is a deliberately maximal causal intervention: once
+        // the first reveal-triggering action is reached, keep its Q clamped for
+        // all later PUCT selections.  Admission happens after a complete wave,
+        // preserving the same virtual-loss/back-up boundary as real panels.
+        if let (Some(value0), Some(target)) = (pulse_value0, probe_target) {
+            let node = &mut arena[target.chance_node_id as usize];
+            if probe_intervention_applied_after_sim.is_none() {
+                probe_intervention_applied_after_sim = Some(sims_done + paths.len());
+                probe_target_visits_at_admission = node.visit_count.max(0) as usize;
+            }
+            node.value_sum = value0 * node.visit_count.max(0) as f64;
+        }
+
+        // The real-panel arms admit exactly one exhaustive C(8,4)=70 panel at
+        // the first reached reveal node.  Python controls whether those 70 rows
+        // displace ordinary paths (charged) or are additional work (extra).
+        if full_panel_probe && !probe_panel_committed {
+            if let Some(target) = probe_target {
+                if let Some(request) = a1c_admission_requests
+                    .iter()
+                    .find(|request| request.chance_node_id == target.chance_node_id)
+                {
+                    // Charged mode mirrors production's atomic reservation: a
+                    // panel which no longer fits is skipped and the ordinary
+                    // search is allowed to consume the complete budget.
+                    if !(full_panel_charged && sims_done + paths.len() + 70 > n_sims) {
+                        let before = initialization_nn_evals;
+                        let mut runtime = A1cRuntime {
+                            evaluator: ev,
+                            initialization_nn_evals: &mut initialization_nn_evals,
+                            total_nn_evals: &mut total_nn_evals,
+                            initialization_blocked_cycles: &mut initialization_blocked_cycles,
+                            nn_eval_budget: None,
+                            nn_budget_blocked_cycles: &mut initialization_nn_budget_blocked_cycles,
+                            nn_budget_blocked_rows: &mut initialization_nn_budget_blocked_rows,
+                            evaluator_calls: &mut nn_evaluator_calls,
+                            max_batch_size: &mut nn_max_batch_size,
+                            initialization_evaluator_calls: &mut initialization_evaluator_calls,
+                            initialization_max_batch_size: &mut initialization_max_batch_size,
+                        };
+                        let committed = a1c_admit_next_cycle(
+                            &mut arena,
+                            request.chance_node_id,
+                            &request.pre_reveal_state,
+                            request.placement,
+                            request.pick,
+                            request.draw_seed,
+                            A1cChanceConfig {
+                                cycles: full_panel_cycles.as_slice(),
+                                n_init: 0,
+                                widening_c: 1.0,
+                                max_initialization_fraction: 1.0,
+                                force_re_evaluate_existing: true,
+                            },
+                            &mut runtime,
+                        )?;
+                        if committed {
+                            probe_panel_committed = true;
+                            probe_intervention_applied_after_sim = Some(sims_done + paths.len());
+                            probe_panel_bootstrap_rows = initialization_nn_evals - before;
+                            probe_target_visits_at_admission =
+                                arena[target.chance_node_id as usize].visit_count.max(0) as usize;
+                        }
+                    }
+                }
+            }
+        }
+
         // Only now may a chance node change estimators. Every path in the wave
         // has removed virtual loss and backed up under the semantics it saw
         // during descent. Deduplicate nodes so at most one whole cycle is
@@ -7061,6 +7271,7 @@ fn advisor_open_loop_search_impl(
                 n_init: options.n_init,
                 widening_c: options.widening_c,
                 max_initialization_fraction: options.max_initialization_fraction,
+                force_re_evaluate_existing: false,
             };
             for request in a1c_admission_requests {
                 let node = &arena[request.chance_node_id as usize];
@@ -7341,6 +7552,134 @@ fn advisor_open_loop_search_impl(
         "root_value_current_children_player0".to_string(),
         current_children_root_value0,
     );
+    let probe_target_final_visits = probe_target
+        .map(|trace| arena[trace.chance_node_id as usize].visit_count.max(0) as usize)
+        .unwrap_or(0);
+    let probe_target_root_action_idx = probe_target.and_then(|trace| {
+        arena[0]
+            .children
+            .iter()
+            .find(|(_, child_id)| *child_id == trace.root_child_id)
+            .map(|(action_idx, _)| *action_idx)
+    });
+    diagnostics.insert(
+        "probe_enabled".to_string(),
+        if leverage_probe.is_some() { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "probe_paths_reaching_first_reveal".to_string(),
+        probe_paths_reaching_reveal as f64,
+    );
+    diagnostics.insert(
+        "probe_paths_reaching_first_reveal_fraction".to_string(),
+        probe_paths_reaching_reveal as f64 / sims_done.max(1) as f64,
+    );
+    diagnostics.insert(
+        "probe_first_reveal_reached".to_string(),
+        if probe_first_reveal_sim.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    diagnostics.insert(
+        "probe_first_reveal_simulation".to_string(),
+        probe_first_reveal_sim.unwrap_or(0) as f64,
+    );
+    diagnostics.insert(
+        "probe_first_reveal_child_depth".to_string(),
+        probe_first_reveal_depth.unwrap_or(0) as f64,
+    );
+    diagnostics.insert(
+        "probe_unique_reveal_nodes".to_string(),
+        probe_reveal_nodes.len() as f64,
+    );
+    diagnostics.insert(
+        "probe_unique_root_children_reaching_reveal".to_string(),
+        probe_reveal_root_children.len() as f64,
+    );
+    diagnostics.insert(
+        "probe_max_decision_depth".to_string(),
+        probe_max_decision_depth as f64,
+    );
+    diagnostics.insert(
+        "probe_mean_decision_depth".to_string(),
+        probe_decision_depth_sum as f64 / sims_done.max(1) as f64,
+    );
+    diagnostics.insert(
+        "probe_target_node_id".to_string(),
+        probe_target
+            .map(|trace| trace.chance_node_id as f64)
+            .unwrap_or(-1.0),
+    );
+    diagnostics.insert(
+        "probe_target_root_child_id".to_string(),
+        probe_target
+            .map(|trace| trace.root_child_id as f64)
+            .unwrap_or(-1.0),
+    );
+    diagnostics.insert(
+        "probe_target_root_action_idx".to_string(),
+        probe_target_root_action_idx.map(f64::from).unwrap_or(-1.0),
+    );
+    diagnostics.insert(
+        "probe_target_admission_simulation".to_string(),
+        probe_target_admission_sim.unwrap_or(0) as f64,
+    );
+    diagnostics.insert(
+        "probe_target_visits_at_admission".to_string(),
+        probe_target_visits_at_admission as f64,
+    );
+    diagnostics.insert(
+        "probe_target_final_visits".to_string(),
+        probe_target_final_visits as f64,
+    );
+    diagnostics.insert(
+        "probe_target_post_admission_visits".to_string(),
+        probe_target_final_visits.saturating_sub(probe_target_visits_at_admission) as f64,
+    );
+    diagnostics.insert(
+        "probe_simulations_after_admission".to_string(),
+        probe_intervention_applied_after_sim
+            .map(|sim| {
+                n_sims
+                    .saturating_sub(sim)
+                    .saturating_sub(if full_panel_charged { 70 } else { 0 }) as f64
+            })
+            .unwrap_or(0.0),
+    );
+    diagnostics.insert(
+        "probe_intervention_applied_after_simulation".to_string(),
+        probe_intervention_applied_after_sim.unwrap_or(0) as f64,
+    );
+    diagnostics.insert(
+        "probe_pulse_value_actor".to_string(),
+        match leverage_probe {
+            Some(ChanceLeverageProbeMode::Pulse(value)) => value,
+            _ => 0.0,
+        },
+    );
+    diagnostics.insert(
+        "probe_full_panel_requested".to_string(),
+        if full_panel_probe { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "probe_full_panel_charged".to_string(),
+        if full_panel_charged { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert("probe_configured_work_units".to_string(), n_sims as f64);
+    diagnostics.insert(
+        "probe_realized_work_units".to_string(),
+        (sims_done + probe_panel_bootstrap_rows) as f64,
+    );
+    diagnostics.insert(
+        "probe_full_panel_committed".to_string(),
+        if probe_panel_committed { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "probe_full_panel_bootstrap_rows".to_string(),
+        probe_panel_bootstrap_rows as f64,
+    );
     Ok(AdvisorOpenLoopOutput {
         children,
         // Keep one stable legacy meaning for the 2-tuple advisor API. The
@@ -7482,17 +7821,18 @@ impl AdvisorSearchHandle {
             let mut evals: Vec<AdvisorPendingEval> = Vec::new();
             for _ in 0..wave {
                 let det = self.root_state.redeterminize(Some(self.rng.r#gen::<u64>()));
-                let (path, actors, leaf_state, chance_step, a1c_admission_request) = ol_descend(
-                    &mut self.arena,
-                    0,
-                    det,
-                    self.fpu,
-                    self.cpuct,
-                    &mut self.fallback_count,
-                    &mut self.missing_child_count,
-                    None,
-                    None,
-                )?;
+                let (path, actors, leaf_state, chance_step, a1c_admission_request, _diagnostics) =
+                    ol_descend(
+                        &mut self.arena,
+                        0,
+                        det,
+                        self.fpu,
+                        self.cpuct,
+                        &mut self.fallback_count,
+                        &mut self.missing_child_count,
+                        None,
+                        None,
+                    )?;
                 debug_assert!(chance_step.is_none());
                 debug_assert!(a1c_admission_request.is_none());
                 ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
@@ -11427,18 +11767,24 @@ impl BatchedMCTS {
                                     a1c: None,
                                     bootstrap_full_panel: true,
                                 });
-                                let (path, actors, leaf_state, chance_step, a1c_admission_request) =
-                                    ol_descend(
-                                        &mut slot.ol_arena,
-                                        0,
-                                        det,
-                                        fpu,
-                                        cpuct, // det moved in (no clone)
-                                        &mut slot.fallback_count,
-                                        &mut slot.missing_child_count,
-                                        pick_floor,
-                                        chance_config,
-                                    )?;
+                                let (
+                                    path,
+                                    actors,
+                                    leaf_state,
+                                    chance_step,
+                                    a1c_admission_request,
+                                    _diagnostics,
+                                ) = ol_descend(
+                                    &mut slot.ol_arena,
+                                    0,
+                                    det,
+                                    fpu,
+                                    cpuct, // det moved in (no clone)
+                                    &mut slot.fallback_count,
+                                    &mut slot.missing_child_count,
+                                    pick_floor,
+                                    chance_config,
+                                )?;
                                 if let Some(request) = a1c_admission_request {
                                     if considered_chance_nodes.insert(request.chance_node_id) {
                                         // The first admitted action gets the exact
@@ -13177,7 +13523,7 @@ mod ol_tests {
         };
         let mut fallback_count = 0;
         let mut missing_child_count = 0;
-        let (path, _actors, _leaf, chance_step, request) = ol_descend(
+        let (path, _actors, _leaf, chance_step, request, _diagnostics) = ol_descend(
             &mut arena,
             0,
             state.cloned(),
@@ -13707,6 +14053,7 @@ mod kingdomino_rust {
                 chance_traversal,
                 None,
                 None,
+                None,
             )
         })?;
         Ok((output.children, output.root_value0))
@@ -13817,6 +14164,98 @@ mod kingdomino_rust {
                 chance_traversal,
                 a1c_options,
                 (nn_eval_budget > 0).then_some(nn_eval_budget),
+                None,
+            )
+        })?;
+        Ok((output.children, output.root_value0, output.diagnostics))
+    }
+
+    /// Causal reach/leverage probe for deck=8 first-selection roots.
+    ///
+    /// Modes:
+    /// - control: incumbent open-loop search plus reach/depth diagnostics
+    /// - pulse_positive / pulse_negative: free persistent Q=+/-1 intervention
+    ///   at the first reached reveal-triggering action afterstate
+    /// - full_panel_charged: panel rows displace ordinary paths only if admitted
+    /// - full_panel_extra: panel rows are additional to all requested paths
+    ///
+    /// The caller implements charged-vs-extra compute by subtracting 70 from
+    /// n_sims for the charged arm.  This function reports actual ordinary and
+    /// initialization NN rows so that accounting remains independently checkable.
+    #[pyfunction]
+    #[pyo3(signature = (state, evaluator, n_sims, mode="control", fpu=0.0,
+                        cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
+                        score_scale=160.0, margin_gain=2.0, alpha=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn advisor_chance_leverage_probe<'py>(
+        py: Python<'py>,
+        state: &RustGameState,
+        evaluator: Bound<'py, PyAny>,
+        n_sims: usize,
+        mode: &str,
+        fpu: f64,
+        cpuct: f64,
+        seed: u64,
+        leaf_batch: usize,
+        virtual_loss: i32,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+    ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
+        if state.phase != PLACE_AND_SELECT || state.actor_index != 0 || state.deck.len() != 8 {
+            return Err(PyValueError::new_err(format!(
+                "chance leverage probe requires a PLACE_AND_SELECT deck=8 actor_index=0 root; got phase={}, deck={}, actor_index={}",
+                state.phase,
+                state.deck.len(),
+                state.actor_index,
+            )));
+        }
+        if n_sims == 0 {
+            return Err(PyValueError::new_err(
+                "chance leverage probe requires n_sims > 0",
+            ));
+        }
+        let leverage_probe = match mode {
+            "control" => None,
+            "pulse_positive" => Some(super::ChanceLeverageProbeMode::Pulse(1.0)),
+            "pulse_negative" => Some(super::ChanceLeverageProbeMode::Pulse(-1.0)),
+            "full_panel" | "full_panel_extra" => Some(super::ChanceLeverageProbeMode::FullPanel {
+                charge_to_sim_budget: false,
+            }),
+            "full_panel_charged" => Some(super::ChanceLeverageProbeMode::FullPanel {
+                charge_to_sim_budget: true,
+            }),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "mode must be control, pulse_positive, pulse_negative, full_panel_charged, or full_panel_extra; got {mode:?}"
+                )));
+            }
+        };
+        let root_state = state.cloned();
+        let ev: Py<PyAny> = evaluator.unbind();
+        let output = py.detach(move || {
+            super::advisor_open_loop_search_impl(
+                &root_state,
+                &ev,
+                n_sims,
+                0.3,
+                0.0,
+                fpu,
+                cpuct,
+                seed,
+                leaf_batch,
+                virtual_loss,
+                score_scale,
+                margin_gain,
+                alpha,
+                None,
+                0,
+                70,
+                super::OLChanceBackup::Sampled,
+                super::OLChanceTraversal::Balanced,
+                None,
+                None,
+                leverage_probe,
             )
         })?;
         Ok((output.children, output.root_value0, output.diagnostics))
@@ -14140,7 +14579,7 @@ mod kingdomino_rust {
 
         for _ in 0..n_sims {
             let det = state.redeterminize(Some(rng.r#gen::<u64>()));
-            let (path, _actors, leaf_state, chance_step, a1c_admission_request) =
+            let (path, _actors, leaf_state, chance_step, a1c_admission_request, _diagnostics) =
                 super::ol_descend(
                     &mut arena,
                     0,
