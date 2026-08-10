@@ -97,6 +97,27 @@ def test_real_panel_commits_all_70_rows_once_without_fake_visits():
     assert diagnostics["probe_target_post_admission_visits"] > 0
 
 
+def test_sampled_split_uses_explicit_support_without_bootstrap_work():
+    import kingdomino_rust as kr
+
+    state = _deck8_first_selection_state()
+    children, _value, diagnostics = kr.advisor_chance_leverage_probe(
+        state, _zero_evaluator, 800, mode="sampled_split", fpu=-0.2,
+        seed=20260820, leaf_batch=8
+    )
+
+    assert sum(row[1] for row in children) == 800
+    assert diagnostics["probe_first_reveal_child_depth"] == 4.0
+    assert diagnostics["probe_sampled_split_requested"] == 1.0
+    assert diagnostics["probe_full_panel_requested"] == 0.0
+    assert diagnostics["probe_full_panel_committed"] == 0.0
+    assert diagnostics["probe_full_panel_bootstrap_rows"] == 0.0
+    assert diagnostics["initialization_nn_evaluations"] == 0.0
+    assert diagnostics["chance_nodes"] > 0.0
+    assert diagnostics["support_outcomes"] >= 70.0
+    assert diagnostics["probe_realized_work_units"] == 800.0
+
+
 def test_charged_panel_reserves_rows_only_after_it_is_admitted():
     import kingdomino_rust as kr
 

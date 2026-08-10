@@ -4975,6 +4975,7 @@ struct A1cSearchOptions {
 #[derive(Clone, Copy)]
 enum ChanceLeverageProbeMode {
     Pulse(f64),
+    SampledSplit,
     FullPanel { charge_to_sim_budget: bool },
 }
 
@@ -6858,10 +6859,12 @@ fn advisor_open_loop_search_impl(
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
     let mut fallback_count = 0u32;
     let mut missing_child_count = 0u32;
+    let sampled_split_probe = matches!(leverage_probe, Some(ChanceLeverageProbeMode::SampledSplit));
     let full_panel_probe = matches!(
         leverage_probe,
         Some(ChanceLeverageProbeMode::FullPanel { .. })
     );
+    let explicit_split_probe = sampled_split_probe || full_panel_probe;
     let full_panel_charged = matches!(
         leverage_probe,
         Some(ChanceLeverageProbeMode::FullPanel {
@@ -6871,8 +6874,12 @@ fn advisor_open_loop_search_impl(
     let one_reveal_panel = if a1c_options.is_none() {
         ol_one_reveal_panel(
             &root_state.deck,
-            if full_panel_probe { 1 } else { chance_exposure },
-            if full_panel_probe {
+            if explicit_split_probe {
+                1
+            } else {
+                chance_exposure
+            },
+            if explicit_split_probe {
                 70
             } else {
                 chance_enum_max_rows
@@ -6894,7 +6901,7 @@ fn advisor_open_loop_search_impl(
     };
     // A one-row panel (deck=4) has no uncertainty or strategy-fusion risk.
     // Keep its support metadata, but avoid a pointless chance/observation layer.
-    let chance_split_enabled = if full_panel_probe {
+    let chance_split_enabled = if explicit_split_probe {
         one_reveal_panel.len() > 1
     } else if a1c_options.is_some() {
         root_state.deck.len() > 4 && !a1c_cycles.is_empty()
@@ -7658,6 +7665,10 @@ fn advisor_open_loop_search_impl(
             Some(ChanceLeverageProbeMode::Pulse(value)) => value,
             _ => 0.0,
         },
+    );
+    diagnostics.insert(
+        "probe_sampled_split_requested".to_string(),
+        if sampled_split_probe { 1.0 } else { 0.0 },
     );
     diagnostics.insert(
         "probe_full_panel_requested".to_string(),
@@ -14176,6 +14187,8 @@ mod kingdomino_rust {
     /// - control: incumbent open-loop search plus reach/depth diagnostics
     /// - pulse_positive / pulse_negative: free persistent Q=+/-1 intervention
     ///   at the first reached reveal-triggering action afterstate
+    /// - sampled_split: explicit 70-row support and sampled balanced traversal,
+    ///   with no exhaustive bootstrap
     /// - full_panel_charged: panel rows displace ordinary paths only if admitted
     /// - full_panel_extra: panel rows are additional to all requested paths
     ///
@@ -14219,6 +14232,7 @@ mod kingdomino_rust {
             "control" => None,
             "pulse_positive" => Some(super::ChanceLeverageProbeMode::Pulse(1.0)),
             "pulse_negative" => Some(super::ChanceLeverageProbeMode::Pulse(-1.0)),
+            "sampled_split" => Some(super::ChanceLeverageProbeMode::SampledSplit),
             "full_panel" | "full_panel_extra" => Some(super::ChanceLeverageProbeMode::FullPanel {
                 charge_to_sim_budget: false,
             }),
@@ -14227,7 +14241,7 @@ mod kingdomino_rust {
             }),
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "mode must be control, pulse_positive, pulse_negative, full_panel_charged, or full_panel_extra; got {mode:?}"
+                    "mode must be control, pulse_positive, pulse_negative, sampled_split, full_panel_charged, or full_panel_extra; got {mode:?}"
                 )));
             }
         };
