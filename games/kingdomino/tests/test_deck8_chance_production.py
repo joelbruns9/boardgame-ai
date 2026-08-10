@@ -24,6 +24,17 @@ def _state_sensitive_values(my, opp, flat):
     return np.tanh(signal).astype(np.float32)
 
 
+def _finish_with_zero_evaluator(mcts):
+    finished = []
+    while not mcts.done():
+        my, _opp, _flat, legal_indices = mcts.step()
+        values = np.zeros(len(my), dtype=np.float32)
+        gathered = [np.zeros(len(indices), dtype=np.float32)
+                    for indices in legal_indices]
+        finished.extend(mcts.update(values, gathered))
+    return finished
+
+
 def test_batched_open_loop_commits_complete_deck8_panels_without_target_changes():
     """Drive real games over step/update with a deterministic mock evaluator.
 
@@ -177,3 +188,28 @@ def test_hof_rejects_closed_loop_and_forces_chance_mode_off(monkeypatch):
     )
     assert constructor_args
     assert all(args["deck8_chance_enumeration"] is False for args in constructor_args)
+
+
+def test_evaluation_seat_filter_partitions_the_both_seats_panel_count():
+    def run(selector):
+        mcts = kingdomino_rust.BatchedMCTS(
+            1,
+            1,
+            20260812,
+            100,
+            leaf_batch=2,
+            open_loop=True,
+            dirichlet_eps=0.0,
+            exact_endgame_max_secs=0.0,
+            deck8_chance_enumeration=True,
+            deck8_chance_enumeration_seat=selector,
+        )
+        assert len(_finish_with_zero_evaluator(mcts)) == 1
+        return int(mcts.deck8_chance_panel_count)
+
+    both = run(-1)
+    seat0 = run(0)
+    seat1 = run(1)
+    assert seat0 > 0
+    assert seat1 > 0
+    assert both == seat0 + seat1

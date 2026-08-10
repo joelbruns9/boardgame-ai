@@ -10178,6 +10178,9 @@ struct BatchedMCTS {
     // dominoes, enumerate all C(8,4)=70 next public rows at each admitted
     // stochastic action node and use their exact probability mean for Q.
     deck8_chance_enumeration: bool,
+    // Evaluation-only seat filter: None applies the mode to both seats; Some
+    // applies it only when that player owns the current root search.
+    deck8_chance_enumeration_seat: Option<u8>,
     cum_deck8_chance_panel_count: u64,
     cum_deck8_chance_bootstrap_rows: u64,
     cum_deck8_chance_budget_blocked_count: u64,
@@ -10461,7 +10464,8 @@ impl BatchedMCTS {
                         random_opening_fraction=0.0, random_opening_plies_min=0,
                         random_opening_plies_max=0,
                         pick_floor_frac=0.0, pick_floor_depth=2,
-                        deck8_chance_enumeration=false))]
+                        deck8_chance_enumeration=false,
+                        deck8_chance_enumeration_seat=-1))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -10501,6 +10505,7 @@ impl BatchedMCTS {
         pick_floor_frac: f64,
         pick_floor_depth: usize,
         deck8_chance_enumeration: bool,
+        deck8_chance_enumeration_seat: i64,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -10593,6 +10598,13 @@ impl BatchedMCTS {
             !deck8_chance_enumeration || open_loop,
             "BatchedMCTS: deck8_chance_enumeration requires open_loop=true"
         );
+        assert!(
+            (-1..=1).contains(&deck8_chance_enumeration_seat),
+            "BatchedMCTS: deck8_chance_enumeration_seat must be -1 (both), 0, or 1, got {}",
+            deck8_chance_enumeration_seat
+        );
+        let deck8_chance_enumeration_seat =
+            (deck8_chance_enumeration_seat >= 0).then_some(deck8_chance_enumeration_seat as u8);
         let mut slots = Vec::with_capacity(n_slots);
         let mut games_started = 0usize;
         for _ in 0..n_slots {
@@ -10684,6 +10696,7 @@ impl BatchedMCTS {
             pending: Vec::new(),
             open_loop,
             deck8_chance_enumeration,
+            deck8_chance_enumeration_seat,
             cum_deck8_chance_panel_count: 0,
             cum_deck8_chance_bootstrap_rows: 0,
             cum_deck8_chance_budget_blocked_count: 0,
@@ -11271,7 +11284,16 @@ impl BatchedMCTS {
             self.resolve_exact_slots(py)?;
         }
 
-        let (fpu, cpuct, leaf_batch, vl, open_loop, pick_floor, deck8_chance_enumeration) = (
+        let (
+            fpu,
+            cpuct,
+            leaf_batch,
+            vl,
+            open_loop,
+            pick_floor,
+            deck8_chance_enumeration,
+            deck8_chance_enumeration_seat,
+        ) = (
             self.fpu,
             self.cpuct,
             self.leaf_batch,
@@ -11279,6 +11301,7 @@ impl BatchedMCTS {
             self.open_loop,
             self.pick_floor,
             self.deck8_chance_enumeration,
+            self.deck8_chance_enumeration_seat,
         );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
@@ -11359,8 +11382,12 @@ impl BatchedMCTS {
                                 Vec::with_capacity(path_cap);
                             let mut chance_steps: Vec<Option<(usize, f64)>> =
                                 Vec::with_capacity(path_cap);
+                            let root_actor = slot.real_state.actor()?;
+                            let chance_enabled_for_seat = deck8_chance_enumeration
+                                && deck8_chance_enumeration_seat
+                                    .map_or(true, |seat| seat == root_actor);
                             let panel =
-                                if deck8_chance_enumeration && slot.real_state.deck.len() == 8 {
+                                if chance_enabled_for_seat && slot.real_state.deck.len() == 8 {
                                     ol_one_reveal_panel(
                                         &slot.real_state.deck,
                                         1,
