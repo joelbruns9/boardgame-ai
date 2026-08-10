@@ -5267,6 +5267,30 @@ fn ol_chance_value_p0(arena: &[OLNode], node_id: u32) -> f64 {
     }
 }
 
+/// Probability-weighted conditional estimate for a fully materialized panel.
+/// Real searched observations take precedence over their network bootstraps.
+fn ol_panel_weighted_value(arena: &[OLNode], chance_node_id: u32) -> f64 {
+    arena[chance_node_id as usize]
+        .chance_children
+        .iter()
+        .filter(|outcome| outcome.probability > 0.0)
+        .map(|outcome| {
+            let observation_id = outcome
+                .node_id
+                .expect("every active panel outcome must have an observation node");
+            let observation = &arena[observation_id as usize];
+            let estimate = if observation.visit_count > 0 {
+                observation.value_sum / observation.visit_count as f64
+            } else {
+                observation
+                    .bootstrap_value0
+                    .expect("every unvisited active panel outcome must be bootstrapped")
+            };
+            outcome.probability * estimate
+        })
+        .sum()
+}
+
 fn ol_rank_values(values: &[f64]) -> Vec<f64> {
     let mut order: Vec<usize> = (0..values.len()).collect();
     order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
@@ -6098,24 +6122,7 @@ fn a1c_admit_next_cycle(
     {
         schedule.extend(std::iter::repeat_n(index, outcome.multiplicity));
     }
-    let mut weighted = 0.0;
-    for outcome in &arena[chance_node_id as usize].chance_children {
-        if outcome.probability == 0.0 {
-            continue;
-        }
-        let node_id = outcome
-            .node_id
-            .expect("every active A1c outcome must have an observation node");
-        let observation = &arena[node_id as usize];
-        let estimate = if observation.visit_count > 0 {
-            observation.value_sum / observation.visit_count as f64
-        } else {
-            observation
-                .bootstrap_value0
-                .expect("every unvisited active A1c outcome must be bootstrapped")
-        };
-        weighted += outcome.probability * estimate;
-    }
+    let weighted = ol_panel_weighted_value(arena, chance_node_id);
     let chance_node = &mut arena[chance_node_id as usize];
     if current_cycles == 0 {
         chance_node.chance_preinit_visits =
@@ -8118,6 +8125,9 @@ struct SearchSlot {
     deck8_chance_panel_count: u32,
     deck8_chance_bootstrap_rows: u32,
     deck8_chance_budget_blocked_count: u32,
+    // Per-tree admission guard. Reset after the real move is played, so at
+    // most one sibling action receives an exhaustive panel in each search.
+    deck8_chance_panel_admitted_this_move: bool,
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
     exact_plan: Vec<ExactPlanItem>,         // chosen-line plan for the deterministic endgame
     // Set once the exact solver times out on this game's deck=4 endgame. This
@@ -8223,6 +8233,7 @@ impl SearchSlot {
             deck8_chance_panel_count: 0,
             deck8_chance_bootstrap_rows: 0,
             deck8_chance_budget_blocked_count: 0,
+            deck8_chance_panel_admitted_this_move: false,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8256,6 +8267,7 @@ impl SearchSlot {
             deck8_chance_panel_count: 0,
             deck8_chance_bootstrap_rows: 0,
             deck8_chance_budget_blocked_count: 0,
+            deck8_chance_panel_admitted_this_move: false,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8563,6 +8575,7 @@ impl SearchSlot {
                 self.arena[0].state = Some(root_state);
             }
             self.sims_done = 0;
+            self.deck8_chance_panel_admitted_this_move = false;
             self.choose_move_profile(
                 playout_cap_randomization,
                 full_search_fraction,
@@ -10103,11 +10116,6 @@ struct SlotTick {
     // value + terminal detection in update, since the leaf node stores no state).
     ol_actors: Vec<Vec<u8>>,
     ol_leaf_states: Vec<RustGameState>,
-    // Open-loop only: the per-simulation deck-shuffle seeds for this tick,
-    // pre-generated from the slot RNG before descent.  Carried for debugging and
-    // as the prerequisite for future cross-simulation parallelism; update()
-    // ignores it.  Empty for closed-loop and root-eval ticks.
-    sim_seeds: Vec<u64>,
     // Open-loop Searching only: eval_path_indices[ei] = pi means evals[ei] is the
     // leaf of paths[pi].  With Issue-1 de-dup removed, multiple evals may share an
     // OLNode id; this lets update() back up each path with its OWN eval value.
@@ -10377,6 +10385,7 @@ impl BatchedMCTS {
                 slot.exact_plan.clear();
                 slot.state = SlotState::NeedsRootEval;
                 slot.sims_done = 0;
+                slot.deck8_chance_panel_admitted_this_move = false;
                 if open_loop {
                     slot.ol_arena.clear();
                     slot.ol_arena.push(OLNode::new(1.0, (None, None)));
@@ -10968,6 +10977,7 @@ impl BatchedMCTS {
                     self.slots[si].exact_plan.clear();
                     self.slots[si].state = SlotState::NeedsRootEval;
                     self.slots[si].sims_done = 0;
+                    self.slots[si].deck8_chance_panel_admitted_this_move = false;
                     if open_loop {
                         self.slots[si].ol_arena.clear();
                         self.slots[si].ol_arena.push(OLNode::new(1.0, (None, None)));
@@ -11147,6 +11157,31 @@ impl BatchedMCTS {
         Ok(n.children.len())
     }
 
+    /// Value-sensitive production test hook: committed exhaustive panel nodes
+    /// in one slot as (node_id, player-0 Q, real/virtual visit count, support).
+    fn debug_ol_panel_values(&self, slot: usize) -> PyResult<Vec<(u32, f64, i32, usize)>> {
+        let search_slot = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| PyValueError::new_err("slot out of range"))?;
+        Ok(search_slot
+            .ol_arena
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.chance_backup == OLChanceBackup::PanelMean && !node.chance_children.is_empty()
+            })
+            .map(|(node_id, node)| {
+                (
+                    node_id as u32,
+                    ol_chance_value_p0(&search_slot.ol_arena, node_id as u32),
+                    node.visit_count,
+                    node.chance_children.len(),
+                )
+            })
+            .collect())
+    }
+
     /// Number of slots still working on a game.
     fn n_active(&self) -> usize {
         self.slots
@@ -11310,7 +11345,6 @@ impl BatchedMCTS {
                                 evals: vec![ev],
                                 ol_actors: Vec::new(),
                                 ol_leaf_states: Vec::new(),
-                                sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
                                 chance_steps: Vec::new(),
                                 chance_bootstrap_rows: 0,
@@ -11343,10 +11377,6 @@ impl BatchedMCTS {
                             let mut bootstrap_requests: Vec<A1cAdmissionRequest> = Vec::new();
                             let mut considered_chance_nodes: HashSet<u32> = HashSet::new();
                             let mut reserved_bootstrap_rows = 0usize;
-                            // Retain per-path seeds in issue order for replay and
-                            // debugging. Panel reservation may stop the wave early,
-                            // so generate exactly one seed per issued path.
-                            let mut sim_seeds: Vec<u64> = Vec::with_capacity(path_cap);
                             while paths.len() < path_cap
                                 && slot.sims_done + paths.len() + reserved_bootstrap_rows
                                     < slot.move_profile.target_sims
@@ -11384,21 +11414,29 @@ impl BatchedMCTS {
                                     )?;
                                 if let Some(request) = a1c_admission_request {
                                     if considered_chance_nodes.insert(request.chance_node_id) {
-                                        let projected = slot.sims_done
-                                            + paths.len()
-                                            + 1
-                                            + reserved_bootstrap_rows
-                                            + panel.len();
-                                        if projected <= slot.move_profile.target_sims {
-                                            reserved_bootstrap_rows += panel.len();
-                                            bootstrap_requests.push(request);
-                                        } else {
-                                            slot.deck8_chance_budget_blocked_count += 1;
+                                        // The first admitted action gets the exact
+                                        // panel; siblings remain on unbiased sampled
+                                        // backup. This bounds the midgame tax at 70
+                                        // rows and makes the A/B attributable.
+                                        if !slot.deck8_chance_panel_admitted_this_move
+                                            && bootstrap_requests.is_empty()
+                                        {
+                                            let projected = slot.sims_done
+                                                + paths.len()
+                                                + 1
+                                                + reserved_bootstrap_rows
+                                                + panel.len();
+                                            if projected <= slot.move_profile.target_sims {
+                                                reserved_bootstrap_rows += panel.len();
+                                                slot.deck8_chance_panel_admitted_this_move = true;
+                                                bootstrap_requests.push(request);
+                                            } else {
+                                                slot.deck8_chance_budget_blocked_count += 1;
+                                            }
                                         }
                                     }
                                 }
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
-                                sim_seeds.push(seed);
                                 paths.push(path);
                                 ol_actors.push(actors);
                                 ol_leaf_states.push(leaf_state);
@@ -11515,7 +11553,6 @@ impl BatchedMCTS {
                                 evals,
                                 ol_actors,
                                 ol_leaf_states,
-                                sim_seeds,
                                 eval_path_indices,
                                 chance_steps,
                                 chance_bootstrap_rows: reserved_bootstrap_rows,
@@ -11572,7 +11609,6 @@ impl BatchedMCTS {
                                 evals: vec![ev],
                                 ol_actors: Vec::new(),
                                 ol_leaf_states: Vec::new(),
-                                sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
                                 chance_steps: Vec::new(),
                                 chance_bootstrap_rows: 0,
@@ -11615,7 +11651,6 @@ impl BatchedMCTS {
                                 evals,
                                 ol_actors: Vec::new(),
                                 ol_leaf_states: Vec::new(),
-                                sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
                                 chance_steps: Vec::new(),
                                 chance_bootstrap_rows: 0,
@@ -11819,7 +11854,10 @@ impl BatchedMCTS {
                         // Validate the complete inference result for every admitted
                         // deck=8 panel before mutating any panel Q.  Each group must
                         // be the closed C(8,4)=70 support with unit probability mass.
-                        let mut bootstrap_groups: HashMap<u32, Vec<(usize, f64, Vec<f64>)>> =
+                        let mut bootstrap_groups: HashMap<
+                            u32,
+                            Vec<(usize, f64, Vec<f64>, f64)>,
+                        > =
                             HashMap::new();
                         for ev in tick
                             .evals
@@ -11841,17 +11879,20 @@ impl BatchedMCTS {
                             bootstrap_groups
                                 .entry(meta.chance_node)
                                 .or_default()
-                                .push((ev.row, value0, priors));
+                                .push((ev.row, value0, priors, meta.probability));
                         }
                         for (&chance_node, results) in &bootstrap_groups {
                             let support = &slot.ol_arena[chance_node as usize].chance_children;
                             let mass: f64 = support.iter().map(|outcome| outcome.probability).sum();
+                            let result_mass: f64 =
+                                results.iter().map(|(_, _, _, probability)| probability).sum();
                             if results.len() != 70
                                 || support.len() != 70
                                 || (mass - 1.0).abs() > 1e-9
+                                || (result_mass - 1.0).abs() > 1e-9
                             {
                                 return Err(PyValueError::new_err(format!(
-                                    "deck=8 chance panel must commit atomically as 70 rows with unit mass; got results={}, support={}, mass={mass}",
+                                    "deck=8 chance panel must commit atomically as 70 rows with unit mass; got results={}, support={}, support_mass={mass}, result_mass={result_mass}",
                                     results.len(),
                                     support.len(),
                                 )));
@@ -11859,9 +11900,9 @@ impl BatchedMCTS {
                         }
 
                         // All groups validated: install conditional policy/value
-                        // bootstraps, then publish the exact probability mean in one
-                        // commit per chance node. Bootstrap rows never receive visits.
-                        let mut weighted_by_chance: HashMap<u32, f64> = HashMap::new();
+                        // bootstraps. The panel mean is published only after current
+                        // virtual loss is removed, so any earlier real observation
+                        // visits can safely supersede their bootstrap values.
                         for ev in tick
                             .evals
                             .iter()
@@ -11869,9 +11910,9 @@ impl BatchedMCTS {
                         {
                             let meta = ev.chance_bootstrap.unwrap();
                             let results = &bootstrap_groups[&meta.chance_node];
-                            let (_, value0, priors) = results
+                            let (_, value0, priors, _) = results
                                 .iter()
-                                .find(|(result_row, _, _)| *result_row == ev.row)
+                                .find(|(result_row, _, _, _)| *result_row == ev.row)
                                 .expect("validated bootstrap result row");
                             if !slot.ol_arena[ev.leaf as usize].is_expanded {
                                 for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
@@ -11892,17 +11933,6 @@ impl BatchedMCTS {
                                 );
                             }
                             slot.ol_arena[ev.leaf as usize].bootstrap_value0 = Some(*value0);
-                            *weighted_by_chance.entry(meta.chance_node).or_default() +=
-                                meta.probability * *value0;
-                        }
-                        for (chance_node, weighted) in weighted_by_chance {
-                            let node = &mut slot.ol_arena[chance_node as usize];
-                            node.chance_backup = OLChanceBackup::PanelMean;
-                            node.chance_visited_mass = 1.0;
-                            node.chance_weighted_value = weighted;
-                            node.chance_initialized_cycles = 1;
-                            slot.deck8_chance_panel_count += 1;
-                            slot.deck8_chance_bootstrap_rows += 70;
                         }
 
                         // Issue 1 fix: per-PATH value (not per-node).  evals are now
@@ -11956,6 +11986,11 @@ impl BatchedMCTS {
                             path_v0[tick.eval_path_indices[search_eval_index]] = Some(value0);
                             search_eval_index += 1;
                         }
+                        debug_assert_eq!(
+                            search_eval_index,
+                            tick.eval_path_indices.len(),
+                            "every open-loop search eval must map to exactly one path",
+                        );
                         // Remove VL using each path's recorded per-node actors.
                         for (pi, path) in tick.paths.iter().enumerate() {
                             ol_apply_virtual_loss(
@@ -11965,6 +12000,18 @@ impl BatchedMCTS {
                                 -1,
                                 vl,
                             );
+                        }
+                        // Match A1c admission semantics: an observation with real
+                        // visits contributes its searched conditional mean; only an
+                        // unvisited row contributes the new network bootstrap.
+                        for &chance_node in bootstrap_groups.keys() {
+                            let weighted = ol_panel_weighted_value(&slot.ol_arena, chance_node);
+                            let node = &mut slot.ol_arena[chance_node as usize];
+                            node.chance_backup = OLChanceBackup::PanelMean;
+                            node.chance_visited_mass = 1.0;
+                            node.chance_weighted_value = weighted;
+                            slot.deck8_chance_panel_count += 1;
+                            slot.deck8_chance_bootstrap_rows += 70;
                         }
                         // Backup: terminal value from each path's own concrete leaf
                         // state (deck-dependent), else this path's own eval value.
@@ -13147,6 +13194,24 @@ mod ol_tests {
                 .iter()
                 .all(|outcome| arena[outcome.node_id.unwrap() as usize].visit_count == 0)
         );
+
+        // The shared A1c/production commit helper must preserve an observation
+        // that was already searched instead of overwriting it with bootstrap.
+        let path_observation = path.last().copied().unwrap();
+        let (prior_observation, prior_probability) = arena[action_node as usize]
+            .chance_children
+            .iter()
+            .map(|outcome| (outcome.node_id.unwrap(), outcome.probability))
+            .find(|(node_id, _)| *node_id != path_observation)
+            .expect("the 70-row panel has an observation outside the test path");
+        let prior_bootstrap = arena[prior_observation as usize].bootstrap_value0.unwrap();
+        arena[prior_observation as usize].visit_count = 2;
+        arena[prior_observation as usize].value_sum = -0.5;
+        let expected_with_prior = expected + prior_probability * (-0.25 - prior_bootstrap);
+        assert!((ol_panel_weighted_value(&arena, action_node) - expected_with_prior).abs() < 1e-12);
+        arena[prior_observation as usize].visit_count = 0;
+        arena[prior_observation as usize].value_sum = 0.0;
+        assert!((ol_panel_weighted_value(&arena, action_node) - expected).abs() < 1e-12);
 
         // A real simulation backup creates exactly one visit and replaces only
         // its realized row's bootstrap estimate inside the exact panel mean.

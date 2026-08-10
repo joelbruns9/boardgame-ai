@@ -1395,10 +1395,17 @@ def play_hof_games_batched(
     shallow no-record profile: sims=--hof_sims, temp_moves=--hof_temp_moves,
     dirichlet_eps=--hof_dirichlet_epsilon.  Its role is steering the learner
     into diverse positions, not labelling them.  (--hof_current_sims applies
-    only to the legacy serial path and is ignored here.)
+    only to the legacy serial path and is ignored here.)  Exhaustive deck=8
+    panels are deliberately disabled in these mixed-budget games even when the
+    training flag is enabled, so learner and HOF seats use the same search
+    method and differ only in their configured simulation budgets.
 
     Returns (per_game_learner_examples, per_game_scores_seat0_frame, stats) where
     stats has trainable_examples and mean_diff (learner-frame score margin)."""
+    if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
+        raise ValueError(
+            "deck8_chance_enumeration requires engine='batched_open_loop'"
+        )
     import kingdomino_rust
 
     effective_solver_cpus, _game_cpus, _total = _resolve_async_solver_cpus(cfg)
@@ -1451,7 +1458,10 @@ def play_hof_games_batched(
             hof_opponent_temp_moves=int(cfg.hof_temp_moves),
             pick_floor_frac=float(cfg.pick_floor_frac),
             pick_floor_depth=int(cfg.pick_floor_depth),
-            deck8_chance_enumeration=bool(cfg.deck8_chance_enumeration),
+            # Keep mixed-budget HOF/gate games method-neutral. hof_sims is often
+            # below the 71-unit admission threshold and otherwise pays a
+            # different budget fraction from the learner seat.
+            deck8_chance_enumeration=False,
         )
 
     all_examples: List[List[Example]] = []
