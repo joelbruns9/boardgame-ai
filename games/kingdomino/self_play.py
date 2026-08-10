@@ -146,6 +146,12 @@ class SelfPlayConfig:
     dirichlet_epsilon: float = 0.25
     fpu: float = 0.0              # first-play-urgency value for unvisited children
     virtual_loss: int = 1        # leaf-parallel / batched virtual loss magnitude
+    # Opt-in production chance correction for batched_open_loop. At roots with
+    # exactly eight hidden dominoes, each admitted stochastic action evaluates
+    # all C(8,4)=70 public next rows atomically. The 70 rows count against the
+    # move's simulation budget; nodes that cannot afford a full panel retain the
+    # unbiased sampled backup.
+    deck8_chance_enumeration: bool = False
     allow_tf32: bool = True       # speed up CUDA float32 conv/linear inference
     inference_amp: bool = False   # optional autocast for self-play inference
     eval_pad_to_batch: int = 0     # pad inference batches to fixed size (CUDA graphs)
@@ -1047,6 +1053,12 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
             int(s.get("exact_fallback_deck4_retry_count", 0)) for s in stats_list),
         "exact_fallback_deck0_count": sum(
             int(s.get("exact_fallback_deck0_count", 0)) for s in stats_list),
+        "deck8_chance_panel_count": sum(
+            int(s.get("deck8_chance_panel_count", 0)) for s in stats_list),
+        "deck8_chance_bootstrap_rows": sum(
+            int(s.get("deck8_chance_bootstrap_rows", 0)) for s in stats_list),
+        "deck8_chance_budget_blocked_count": sum(
+            int(s.get("deck8_chance_budget_blocked_count", 0)) for s in stats_list),
         "pf_minshare_mean": (
             sum(float(s.get("pf_minshare_mean", 0.0))
                 * int(s.get("pf_minshare_count", 0)) for s in stats_list)
@@ -1439,6 +1451,7 @@ def play_hof_games_batched(
             hof_opponent_temp_moves=int(cfg.hof_temp_moves),
             pick_floor_frac=float(cfg.pick_floor_frac),
             pick_floor_depth=int(cfg.pick_floor_depth),
+            deck8_chance_enumeration=bool(cfg.deck8_chance_enumeration),
         )
 
     all_examples: List[List[Example]] = []
@@ -2005,6 +2018,14 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
                 "exact_fallback_deck4_initial_count": exact_fallback_deck4_initial_count,
                 "exact_fallback_deck4_retry_count": exact_fallback_deck4_retry_count,
                 "exact_fallback_deck0_count": exact_fallback_deck0_count,
+                "deck8_chance_panel_count": (
+                    int(A.deck8_chance_panel_count) + int(B.deck8_chance_panel_count)),
+                "deck8_chance_bootstrap_rows": (
+                    int(A.deck8_chance_bootstrap_rows)
+                    + int(B.deck8_chance_bootstrap_rows)),
+                "deck8_chance_budget_blocked_count": (
+                    int(A.deck8_chance_budget_blocked_count)
+                    + int(B.deck8_chance_budget_blocked_count)),
                 "pf_minshare_mean": pf_mean,
                 "pf_minshare_count": pf_n,
             },
@@ -2036,6 +2057,10 @@ def play_selfplay_games_batched(
     game_seed_start + i) and the same stats keys as the single-buffer path."""
     if cfg.n_determinizations != 1:
         raise ValueError("--engine batched currently requires --determinizations 1")
+    if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
+        raise ValueError(
+            "deck8_chance_enumeration requires engine='batched_open_loop'"
+        )
 
     import kingdomino_rust
 
@@ -2087,6 +2112,7 @@ def play_selfplay_games_batched(
             random_opening_plies_max=int(cfg.random_opening_plies_max),
             pick_floor_frac=float(cfg.pick_floor_frac),
             pick_floor_depth=int(cfg.pick_floor_depth),
+            deck8_chance_enumeration=bool(cfg.deck8_chance_enumeration),
         )
 
     use_db = bool(double_buffer)
@@ -2106,6 +2132,9 @@ def play_selfplay_games_batched(
         "exact_fallback_deck4_initial_count": 0,
         "exact_fallback_deck4_retry_count": 0,
         "exact_fallback_deck0_count": 0,
+        "deck8_chance_panel_count": 0,
+        "deck8_chance_bootstrap_rows": 0,
+        "deck8_chance_budget_blocked_count": 0,
     }
     exact_solver_secs = 0.0
     fast_move_count = 0
@@ -2155,6 +2184,11 @@ def play_selfplay_games_batched(
             "exact_fallback_deck4_retry_count": int(
                 batched.exact_fallback_deck4_retry_count),
             "exact_fallback_deck0_count": int(batched.exact_fallback_deck0_count),
+            "deck8_chance_panel_count": int(batched.deck8_chance_panel_count),
+            "deck8_chance_bootstrap_rows": int(
+                batched.deck8_chance_bootstrap_rows),
+            "deck8_chance_budget_blocked_count": int(
+                batched.deck8_chance_budget_blocked_count),
             "pf_minshare_mean": float(batched.pick_floor_min_share_mean),
             "pf_minshare_count": int(batched.pick_floor_min_share_count),
         }
@@ -2196,7 +2230,14 @@ def play_selfplay_games_batched(
 
     nonzero_batches = [b for b in batch_sizes if b > 0]
     total_evals = int(sum(batch_sizes))
-    cap = n_slots * lb
+    # A panel adds 70 inference rows and costs 70 budget units in addition to
+    # the real path that discovered it. At most leaf_batch distinct panels can
+    # be encountered in one wave.
+    panels_per_slot_cap = (
+        min(lb, int(cfg.n_simulations) // 71)
+        if cfg.deck8_chance_enumeration else 0
+    )
+    cap = n_slots * (lb + 70 * panels_per_slot_cap)
     mean_batch = float(np.mean(nonzero_batches)) if nonzero_batches else 0.0
     stats = {
         "ticks": ticks,
@@ -3614,6 +3655,15 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         f"deck4_retry={batched_stats.get('exact_fallback_deck4_retry_count', 0)} "
                         f"deck0={batched_stats.get('exact_fallback_deck0_count', 0)}"
                     )
+                    if iter_cfg.deck8_chance_enumeration:
+                        print(
+                            f"  deck8 chance: panels="
+                            f"{batched_stats.get('deck8_chance_panel_count', 0)} "
+                            f"bootstrap_rows="
+                            f"{batched_stats.get('deck8_chance_bootstrap_rows', 0)} "
+                            f"budget_blocked_attempts="
+                            f"{batched_stats.get('deck8_chance_budget_blocked_count', 0)}"
+                        )
                     if iter_cfg.playout_cap_randomization:
                         print(
                             f"  playout cap: full={batched_stats.get('full_move_count', 0)} "
@@ -4235,6 +4285,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "exact_fallback_deck0_count": (
                     batched_stats.get("exact_fallback_deck0_count", 0)
                     if batched_stats else None),
+                "deck8_chance_enumeration": iter_cfg.deck8_chance_enumeration,
+                "deck8_chance_panel_count": (
+                    batched_stats.get("deck8_chance_panel_count", 0)
+                    if batched_stats else None),
+                "deck8_chance_bootstrap_rows": (
+                    batched_stats.get("deck8_chance_bootstrap_rows", 0)
+                    if batched_stats else None),
+                "deck8_chance_budget_blocked_count": (
+                    batched_stats.get("deck8_chance_budget_blocked_count", 0)
+                    if batched_stats else None),
                 "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
                                       if batched_stats else None),
                 "pf_minshare_mean": (batched_stats.get("pf_minshare_mean", 0.0)
@@ -4401,6 +4461,10 @@ if __name__ == "__main__":
                    help="leaf-parallel batch for self-play search (1=serial). "
                         "Validate divergence with policy_compare before using >1; "
                         "applies to the serial in-process generation path.")
+    p.add_argument("--deck8_chance_enumeration", action="store_true",
+                   help="With --engine batched_open_loop, atomically evaluate all "
+                        "70 C(8,4) next-row outcomes at admitted deck=8 chance "
+                        "nodes. Panel rows count against the per-move search budget.")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--sample_workers", type=int, default=1,
                    help="threads for ReplayBuffer.sample_batch densify+augment "
@@ -4729,6 +4793,7 @@ if __name__ == "__main__":
         train_steps_per_iteration=a.train_steps, n_simulations=a.sims,
         n_determinizations=a.determinizations, leaf_batch=a.leaf_batch,
         batch_slots=a.batch_slots,
+        deck8_chance_enumeration=a.deck8_chance_enumeration,
         batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
         lr_schedule=a.lr_schedule, alpha_schedule=a.alpha_schedule,
         sims_schedule=a.sims_schedule,

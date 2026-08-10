@@ -4942,6 +4942,10 @@ struct OLChanceConfig<'a> {
     schedule_seed: u64,
     draw_seed: u64,
     a1c: Option<A1cChanceConfig<'a>>,
+    // Production BatchedMCTS can ask the caller to evaluate the complete fixed
+    // panel over the normal step()/update() inference boundary.  The advisor
+    // performs its own synchronous admission and therefore leaves this false.
+    bootstrap_full_panel: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -6428,6 +6432,17 @@ fn ol_descend(
                         }
                     } else {
                         ol_register_chance_support(arena, child_id, config, actor)?;
+                        if config.bootstrap_full_panel
+                            && arena[child_id as usize].chance_backup != OLChanceBackup::PanelMean
+                        {
+                            a1c_admission_request = Some(A1cAdmissionRequest {
+                                chance_node_id: child_id,
+                                pre_reveal_state: state.cloned(),
+                                placement,
+                                pick,
+                                draw_seed: config.draw_seed,
+                            });
+                        }
                         ol_select_chance_row(arena, child_id, config.draw_seed)
                     };
                     // PUCT has already committed to child_id. Pinning the row at
@@ -6881,6 +6896,7 @@ fn advisor_open_loop_search_impl(
                         widening_c: options.widening_c,
                         max_initialization_fraction: options.max_initialization_fraction,
                     }),
+                    bootstrap_full_panel: false,
                 })
             };
             let (path, actors, leaf_state, chance_step, a1c_admission_request) = ol_descend(
@@ -8099,8 +8115,11 @@ struct SearchSlot {
     records: Vec<MoveRecord>,
     fallback_count: u32, // open-loop: deep-node legal-filter fallbacks (diagnostic)
     missing_child_count: u32, // open-loop: descents stopped to add newly-legal children (diagnostic)
+    deck8_chance_panel_count: u32,
+    deck8_chance_bootstrap_rows: u32,
+    deck8_chance_budget_blocked_count: u32,
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
-    exact_plan: Vec<ExactPlanItem>, // chosen-line plan for the deterministic endgame
+    exact_plan: Vec<ExactPlanItem>,         // chosen-line plan for the deterministic endgame
     // Set once the exact solver times out on this game's deck=4 endgame. This
     // suppresses retrying the same expensive full-row root, but deck=0 remains
     // eligible and one deck=4 retry is allowed after the current row has shrunk
@@ -8201,6 +8220,9 @@ impl SearchSlot {
             records: Vec::new(),
             fallback_count: 0,
             missing_child_count: 0,
+            deck8_chance_panel_count: 0,
+            deck8_chance_bootstrap_rows: 0,
+            deck8_chance_budget_blocked_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8231,6 +8253,9 @@ impl SearchSlot {
             records: Vec::new(),
             fallback_count: 0,
             missing_child_count: 0,
+            deck8_chance_panel_count: 0,
+            deck8_chance_bootstrap_rows: 0,
+            deck8_chance_budget_blocked_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -10056,6 +10081,15 @@ struct EvalLeaf {
     row: usize,
     actor: u8,
     legal: Vec<(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>,
+    // Present only for one row in an atomic deck=8 exhaustive chance panel.
+    // `leaf` is then the public observation node for this reveal.
+    chance_bootstrap: Option<ChanceBootstrapEval>,
+}
+
+#[derive(Clone, Copy)]
+struct ChanceBootstrapEval {
+    chance_node: u32,
+    probability: f64,
 }
 
 /// Per-slot bookkeeping for one tick, set by step() and consumed by update().
@@ -10079,6 +10113,12 @@ struct SlotTick {
     // OLNode id; this lets update() back up each path with its OWN eval value.
     // Empty for closed-loop and root-eval ticks.
     eval_path_indices: Vec<usize>,
+    // One entry per simulation path.  Some((path index of the chance node,
+    // outcome probability)) activates probability-aware chance backup.
+    chance_steps: Vec<Option<(usize, f64)>>,
+    // Exhaustive bootstrap rows admitted in this tick.  These are charged to
+    // the move budget in addition to ordinary simulation paths.
+    chance_bootstrap_rows: usize,
 }
 
 struct SlotStepOutput {
@@ -10126,6 +10166,13 @@ struct BatchedMCTS {
     games_target: usize,
     pending: Vec<SlotTick>,
     open_loop: bool,
+    // Opt-in production vertical slice: at roots with exactly eight hidden
+    // dominoes, enumerate all C(8,4)=70 next public rows at each admitted
+    // stochastic action node and use their exact probability mean for Q.
+    deck8_chance_enumeration: bool,
+    cum_deck8_chance_panel_count: u64,
+    cum_deck8_chance_bootstrap_rows: u64,
+    cum_deck8_chance_budget_blocked_count: u64,
     // Cumulative open-loop diagnostics rolled in from finished slots (so the
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
@@ -10239,6 +10286,10 @@ impl BatchedMCTS {
         self.cum_exact_recorded_move_count += self.slots[si].exact_recorded_move_count as u64;
         self.cum_pf_minshare_sum += self.slots[si].pf_minshare_sum;
         self.cum_pf_minshare_count += self.slots[si].pf_minshare_count as u64;
+        self.cum_deck8_chance_panel_count += self.slots[si].deck8_chance_panel_count as u64;
+        self.cum_deck8_chance_bootstrap_rows += self.slots[si].deck8_chance_bootstrap_rows as u64;
+        self.cum_deck8_chance_budget_blocked_count +=
+            self.slots[si].deck8_chance_budget_blocked_count as u64;
     }
 
     /// Async path (Step 1.5): drain every completed background solve and apply it.
@@ -10304,6 +10355,9 @@ impl BatchedMCTS {
                     self.slots[si].state = SlotState::Idle;
                     self.slots[si].fallback_count = 0;
                     self.slots[si].missing_child_count = 0;
+                    self.slots[si].deck8_chance_panel_count = 0;
+                    self.slots[si].deck8_chance_bootstrap_rows = 0;
+                    self.slots[si].deck8_chance_budget_blocked_count = 0;
                 }
             }
             SolveResult::Fallback => {
@@ -10397,7 +10451,8 @@ impl BatchedMCTS {
                         hof_opponent_dirichlet_eps=0.0, hof_opponent_temp_moves=0,
                         random_opening_fraction=0.0, random_opening_plies_min=0,
                         random_opening_plies_max=0,
-                        pick_floor_frac=0.0, pick_floor_depth=2))]
+                        pick_floor_frac=0.0, pick_floor_depth=2,
+                        deck8_chance_enumeration=false))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -10436,6 +10491,7 @@ impl BatchedMCTS {
         random_opening_plies_max: usize,
         pick_floor_frac: f64,
         pick_floor_depth: usize,
+        deck8_chance_enumeration: bool,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -10523,6 +10579,10 @@ impl BatchedMCTS {
             leaf_batch > 0,
             "BatchedMCTS: leaf_batch must be > 0, got {}",
             leaf_batch
+        );
+        assert!(
+            !deck8_chance_enumeration || open_loop,
+            "BatchedMCTS: deck8_chance_enumeration requires open_loop=true"
         );
         let mut slots = Vec::with_capacity(n_slots);
         let mut games_started = 0usize;
@@ -10614,6 +10674,10 @@ impl BatchedMCTS {
             games_target: n_games,
             pending: Vec::new(),
             open_loop,
+            deck8_chance_enumeration,
+            cum_deck8_chance_panel_count: 0,
+            cum_deck8_chance_bootstrap_rows: 0,
+            cum_deck8_chance_budget_blocked_count: 0,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
             cum_pf_minshare_sum: 0.0,
@@ -10953,6 +11017,9 @@ impl BatchedMCTS {
                 self.slots[si].state = SlotState::Idle;
                 self.slots[si].fallback_count = 0;
                 self.slots[si].missing_child_count = 0;
+                self.slots[si].deck8_chance_panel_count = 0;
+                self.slots[si].deck8_chance_bootstrap_rows = 0;
+                self.slots[si].deck8_chance_budget_blocked_count = 0;
             }
         }
         Ok(())
@@ -10981,6 +11048,40 @@ impl BatchedMCTS {
                 .slots
                 .iter()
                 .map(|s| s.missing_child_count as u64)
+                .sum::<u64>()
+    }
+
+    /// Complete C(8,4) panels atomically admitted into production searches.
+    #[getter]
+    fn deck8_chance_panel_count(&self) -> u64 {
+        self.cum_deck8_chance_panel_count
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.deck8_chance_panel_count as u64)
+                .sum::<u64>()
+    }
+
+    /// NN rows spent on admitted exhaustive deck=8 chance panels.
+    #[getter]
+    fn deck8_chance_bootstrap_rows(&self) -> u64 {
+        self.cum_deck8_chance_bootstrap_rows
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.deck8_chance_bootstrap_rows as u64)
+                .sum::<u64>()
+    }
+
+    /// Atomic-panel admission attempts blocked because fewer than 70 move-budget
+    /// units remained. A sampled node can be counted again on a later wave.
+    #[getter]
+    fn deck8_chance_budget_blocked_count(&self) -> u64 {
+        self.cum_deck8_chance_budget_blocked_count
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.deck8_chance_budget_blocked_count as u64)
                 .sum::<u64>()
     }
 
@@ -11135,13 +11236,14 @@ impl BatchedMCTS {
             self.resolve_exact_slots(py)?;
         }
 
-        let (fpu, cpuct, leaf_batch, vl, open_loop, pick_floor) = (
+        let (fpu, cpuct, leaf_batch, vl, open_loop, pick_floor, deck8_chance_enumeration) = (
             self.fpu,
             self.cpuct,
             self.leaf_batch,
             self.virtual_loss,
             self.open_loop,
             self.pick_floor,
+            self.deck8_chance_enumeration,
         );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
@@ -11199,6 +11301,7 @@ impl BatchedMCTS {
                                 row,
                                 actor,
                                 legal,
+                                chance_bootstrap: None,
                             };
                             SlotTick {
                                 slot: si,
@@ -11209,25 +11312,64 @@ impl BatchedMCTS {
                                 ol_leaf_states: Vec::new(),
                                 sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
+                                chance_steps: Vec::new(),
+                                chance_bootstrap_rows: 0,
                             }
                         }
                         SlotState::Searching => {
-                            let chunk =
-                                leaf_batch.min(slot.move_profile.target_sims - slot.sims_done);
-                            let mut paths: Vec<Vec<u32>> = Vec::with_capacity(chunk);
-                            let mut ol_actors: Vec<Vec<u8>> = Vec::with_capacity(chunk);
-                            let mut ol_leaf_states: Vec<RustGameState> = Vec::with_capacity(chunk);
-                            // Pre-generate all per-simulation deck-shuffle seeds from
-                            // the slot RNG BEFORE descent begins.  Materialising the
-                            // sequence up front keeps it deterministic (identical to
-                            // calling rng.gen() inside the loop — same count, same
-                            // order) and makes the seeds independent inputs, the
-                            // prerequisite for future rayon parallelism across the
-                            // simulations within this slot.
-                            let sim_seeds: Vec<u64> =
-                                (0..chunk).map(|_| slot.rng.r#gen::<u64>()).collect();
-                            for &seed in &sim_seeds {
-                                let det = slot.real_state.redeterminize(Some(seed));
+                            let remaining = slot.move_profile.target_sims - slot.sims_done;
+                            let path_cap = leaf_batch.min(remaining);
+                            let mut paths: Vec<Vec<u32>> = Vec::with_capacity(path_cap);
+                            let mut ol_actors: Vec<Vec<u8>> = Vec::with_capacity(path_cap);
+                            let mut ol_leaf_states: Vec<RustGameState> =
+                                Vec::with_capacity(path_cap);
+                            let mut chance_steps: Vec<Option<(usize, f64)>> =
+                                Vec::with_capacity(path_cap);
+                            let panel =
+                                if deck8_chance_enumeration && slot.real_state.deck.len() == 8 {
+                                    ol_one_reveal_panel(
+                                        &slot.real_state.deck,
+                                        1,
+                                        70,
+                                        slot.game_seed
+                                            ^ (slot.move_num as u64)
+                                                .wrapping_mul(0xA1C0_77EC_7A11_5EED),
+                                    )?
+                                } else {
+                                    Vec::new()
+                                };
+                            debug_assert!(panel.is_empty() || panel.len() == 70);
+                            let chance_enabled = panel.len() == 70;
+                            let mut bootstrap_requests: Vec<A1cAdmissionRequest> = Vec::new();
+                            let mut considered_chance_nodes: HashSet<u32> = HashSet::new();
+                            let mut reserved_bootstrap_rows = 0usize;
+                            // Retain per-path seeds in issue order for replay and
+                            // debugging. Panel reservation may stop the wave early,
+                            // so generate exactly one seed per issued path.
+                            let mut sim_seeds: Vec<u64> = Vec::with_capacity(path_cap);
+                            while paths.len() < path_cap
+                                && slot.sims_done + paths.len() + reserved_bootstrap_rows
+                                    < slot.move_profile.target_sims
+                            {
+                                let seed = slot.rng.r#gen::<u64>();
+                                let det = if chance_enabled {
+                                    // Hidden order remains unread until PUCT has
+                                    // selected the action that triggers the reveal.
+                                    slot.real_state.cloned()
+                                } else {
+                                    slot.real_state.redeterminize(Some(seed))
+                                };
+                                let chance_config = chance_enabled.then_some(OLChanceConfig {
+                                    panel: panel.as_slice(),
+                                    backup: OLChanceBackup::Sampled,
+                                    traversal: OLChanceTraversal::Balanced,
+                                    schedule_seed: slot.game_seed
+                                        ^ (slot.move_num as u64)
+                                            .wrapping_mul(0xBA1A_4CED_C1C1_E5E5),
+                                    draw_seed: seed,
+                                    a1c: None,
+                                    bootstrap_full_panel: true,
+                                });
                                 let (path, actors, leaf_state, chance_step, a1c_admission_request) =
                                     ol_descend(
                                         &mut slot.ol_arena,
@@ -11238,14 +11380,29 @@ impl BatchedMCTS {
                                         &mut slot.fallback_count,
                                         &mut slot.missing_child_count,
                                         pick_floor,
-                                        None,
+                                        chance_config,
                                     )?;
-                                debug_assert!(chance_step.is_none());
-                                debug_assert!(a1c_admission_request.is_none());
+                                if let Some(request) = a1c_admission_request {
+                                    if considered_chance_nodes.insert(request.chance_node_id) {
+                                        let projected = slot.sims_done
+                                            + paths.len()
+                                            + 1
+                                            + reserved_bootstrap_rows
+                                            + panel.len();
+                                        if projected <= slot.move_profile.target_sims {
+                                            reserved_bootstrap_rows += panel.len();
+                                            bootstrap_requests.push(request);
+                                        } else {
+                                            slot.deck8_chance_budget_blocked_count += 1;
+                                        }
+                                    }
+                                }
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
+                                sim_seeds.push(seed);
                                 paths.push(path);
                                 ol_actors.push(actors);
                                 ol_leaf_states.push(leaf_state);
+                                chance_steps.push(chance_step);
                             }
                             // Issue 1 fix: NO de-dup by OLNode id.  The same node
                             // can be reached by different determinizations whose
@@ -11289,9 +11446,67 @@ impl BatchedMCTS {
                                     row,
                                     actor,
                                     legal,
+                                    chance_bootstrap: None,
                                 });
                                 eval_path_indices.push(pi);
                                 row += 1;
+                            }
+                            // Cross-node and cross-slot batching happens naturally:
+                            // each accepted panel is appended to this SlotStepOutput,
+                            // then the outer gather concatenates every slot before the
+                            // single Python/GPU evaluator call.
+                            for request in &bootstrap_requests {
+                                for outcome in &panel {
+                                    let row_tiles: [u16; 4] = outcome
+                                        .row
+                                        .as_slice()
+                                        .try_into()
+                                        .expect("deck=8 panel rows contain four tiles");
+                                    let row_seed = request.draw_seed
+                                        ^ row_tiles
+                                            .iter()
+                                            .fold(0xD8C8_C1E0_0000_0001u64, |hash, &tile| {
+                                                hash.rotate_left(11) ^ tile as u64
+                                            });
+                                    let forced = redeterminize_with_first_row(
+                                        &request.pre_reveal_state,
+                                        &row_tiles,
+                                        row_seed,
+                                    )?;
+                                    let revealed = forced.step(request.placement, request.pick)?;
+                                    let actor = revealed.actor()?;
+                                    let legal = revealed.legal_actions_indexed();
+                                    let (observation_id, probability) =
+                                        ol_route_chance_observation(
+                                            &mut slot.ol_arena,
+                                            request.chance_node_id,
+                                            &revealed,
+                                            actor,
+                                        )?;
+                                    mb_data.resize((row + 1) * board_sz, 0.0);
+                                    ob_data.resize((row + 1) * board_sz, 0.0);
+                                    flat_data.resize((row + 1) * FLAT_SIZE, 0.0);
+                                    revealed.encode_arrays_into(
+                                        actor,
+                                        &mut mb_data,
+                                        &mut ob_data,
+                                        &mut flat_data,
+                                        row,
+                                    )?;
+                                    idxs_per
+                                        .push(legal.iter().map(|action| action.0 as i64).collect());
+                                    evals.push(EvalLeaf {
+                                        leaf: observation_id,
+                                        row,
+                                        actor,
+                                        legal,
+                                        chance_bootstrap: Some(ChanceBootstrapEval {
+                                            chance_node: request.chance_node_id,
+                                            probability,
+                                        }),
+                                    });
+                                    row += 1;
+                                }
                             }
                             SlotTick {
                                 slot: si,
@@ -11302,6 +11517,8 @@ impl BatchedMCTS {
                                 ol_leaf_states,
                                 sim_seeds,
                                 eval_path_indices,
+                                chance_steps,
+                                chance_bootstrap_rows: reserved_bootstrap_rows,
                             }
                         }
                     }
@@ -11326,6 +11543,7 @@ impl BatchedMCTS {
                             row,
                             actor,
                             legal,
+                            chance_bootstrap: None,
                         };
                         row += 1;
                         Ok(ev)
@@ -11356,6 +11574,8 @@ impl BatchedMCTS {
                                 ol_leaf_states: Vec::new(),
                                 sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
+                                chance_steps: Vec::new(),
+                                chance_bootstrap_rows: 0,
                             }
                         }
                         SlotState::Searching => {
@@ -11397,6 +11617,8 @@ impl BatchedMCTS {
                                 ol_leaf_states: Vec::new(),
                                 sim_seeds: Vec::new(),
                                 eval_path_indices: Vec::new(),
+                                chance_steps: Vec::new(),
+                                chance_bootstrap_rows: 0,
                             }
                         }
                     }
@@ -11594,12 +11816,106 @@ impl BatchedMCTS {
 
                     // Searching tick: expand eval leaves, remove VL, back up, advance.
                     if open_loop {
+                        // Validate the complete inference result for every admitted
+                        // deck=8 panel before mutating any panel Q.  Each group must
+                        // be the closed C(8,4)=70 support with unit probability mass.
+                        let mut bootstrap_groups: HashMap<u32, Vec<(usize, f64, Vec<f64>)>> =
+                            HashMap::new();
+                        for ev in tick
+                            .evals
+                            .iter()
+                            .filter(|ev| ev.chance_bootstrap.is_some())
+                        {
+                            let meta = ev.chance_bootstrap.unwrap();
+                            let priors = softmax_f64(&gvecs[ev.row]);
+                            if priors.len() != ev.legal.len() {
+                                return Err(PyValueError::new_err(
+                                    "deck=8 bootstrap policy length mismatch",
+                                ));
+                            }
+                            let value0 = if ev.actor == 0 {
+                                vals[ev.row]
+                            } else {
+                                -vals[ev.row]
+                            };
+                            bootstrap_groups
+                                .entry(meta.chance_node)
+                                .or_default()
+                                .push((ev.row, value0, priors));
+                        }
+                        for (&chance_node, results) in &bootstrap_groups {
+                            let support = &slot.ol_arena[chance_node as usize].chance_children;
+                            let mass: f64 = support.iter().map(|outcome| outcome.probability).sum();
+                            if results.len() != 70
+                                || support.len() != 70
+                                || (mass - 1.0).abs() > 1e-9
+                            {
+                                return Err(PyValueError::new_err(format!(
+                                    "deck=8 chance panel must commit atomically as 70 rows with unit mass; got results={}, support={}, mass={mass}",
+                                    results.len(),
+                                    support.len(),
+                                )));
+                            }
+                        }
+
+                        // All groups validated: install conditional policy/value
+                        // bootstraps, then publish the exact probability mean in one
+                        // commit per chance node. Bootstrap rows never receive visits.
+                        let mut weighted_by_chance: HashMap<u32, f64> = HashMap::new();
+                        for ev in tick
+                            .evals
+                            .iter()
+                            .filter(|ev| ev.chance_bootstrap.is_some())
+                        {
+                            let meta = ev.chance_bootstrap.unwrap();
+                            let results = &bootstrap_groups[&meta.chance_node];
+                            let (_, value0, priors) = results
+                                .iter()
+                                .find(|(result_row, _, _)| *result_row == ev.row)
+                                .expect("validated bootstrap result row");
+                            if !slot.ol_arena[ev.leaf as usize].is_expanded {
+                                for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
+                                    let cid = slot.ol_arena.len() as u32;
+                                    slot.ol_arena.push(OLNode::new(
+                                        priors[i],
+                                        (placement, pick),
+                                    ));
+                                    slot.ol_arena[ev.leaf as usize].children.push((idx, cid));
+                                }
+                                slot.ol_arena[ev.leaf as usize].is_expanded = true;
+                            } else {
+                                ol_add_missing_children(
+                                    &mut slot.ol_arena,
+                                    ev.leaf,
+                                    &ev.legal,
+                                    priors,
+                                );
+                            }
+                            slot.ol_arena[ev.leaf as usize].bootstrap_value0 = Some(*value0);
+                            *weighted_by_chance.entry(meta.chance_node).or_default() +=
+                                meta.probability * *value0;
+                        }
+                        for (chance_node, weighted) in weighted_by_chance {
+                            let node = &mut slot.ol_arena[chance_node as usize];
+                            node.chance_backup = OLChanceBackup::PanelMean;
+                            node.chance_visited_mass = 1.0;
+                            node.chance_weighted_value = weighted;
+                            node.chance_initialized_cycles = 1;
+                            slot.deck8_chance_panel_count += 1;
+                            slot.deck8_chance_bootstrap_rows += 70;
+                        }
+
                         // Issue 1 fix: per-PATH value (not per-node).  evals are now
                         // one-per-non-terminal-simulation (no de-dup), so each path
                         // backs up its OWN concrete eval.  path_v0[pi] is the value
                         // for paths[pi]; terminal paths fill it from their leaf state.
                         let mut path_v0: Vec<Option<f64>> = vec![None; tick.paths.len()];
-                        for (ei, ev) in tick.evals.iter().enumerate() {
+                        let mut search_eval_index = 0usize;
+                        for ev in tick
+                            .evals
+                            .iter()
+                            .filter(|ev| ev.chance_bootstrap.is_none())
+                        {
                             let priors = softmax_f64(&gvecs[ev.row]);
                             let value0 = if ev.actor == 0 {
                                 vals[ev.row]
@@ -11637,7 +11953,8 @@ impl BatchedMCTS {
                                 );
                             }
                             // Always record THIS eval's value for its own path.
-                            path_v0[tick.eval_path_indices[ei]] = Some(value0);
+                            path_v0[tick.eval_path_indices[search_eval_index]] = Some(value0);
+                            search_eval_index += 1;
                         }
                         // Remove VL using each path's recorded per-node actors.
                         for (pi, path) in tick.paths.iter().enumerate() {
@@ -11658,13 +11975,14 @@ impl BatchedMCTS {
                             } else {
                                 path_v0[pi].expect("non-terminal path must have an eval value")
                             };
-                            for &n in path {
-                                let node = &mut slot.ol_arena[n as usize];
-                                node.visit_count += 1;
-                                node.value_sum += v0;
-                            }
+                            ol_backup_path(
+                                &mut slot.ol_arena,
+                                path,
+                                v0,
+                                tick.chance_steps[pi],
+                            );
                         }
-                        slot.sims_done += tick.paths.len();
+                        slot.sims_done += tick.paths.len() + tick.chance_bootstrap_rows;
                     } else {
                         let mut leaf_v0: HashMap<u32, f64> = HashMap::new();
                         for ev in &tick.evals {
@@ -11770,6 +12088,9 @@ impl BatchedMCTS {
                     self.slots[si].state = SlotState::Idle;
                     self.slots[si].fallback_count = 0;
                     self.slots[si].missing_child_count = 0;
+                    self.slots[si].deck8_chance_panel_count = 0;
+                    self.slots[si].deck8_chance_bootstrap_rows = 0;
+                    self.slots[si].deck8_chance_budget_blocked_count = 0;
                 }
             }
         }
@@ -12554,6 +12875,7 @@ mod ol_tests {
                 schedule_seed: 20260808,
                 draw_seed: 7,
                 a1c: None,
+                bootstrap_full_panel: false,
             },
             0,
         )?;
@@ -12687,6 +13009,7 @@ mod ol_tests {
                 schedule_seed: 9,
                 draw_seed: 10,
                 a1c: None,
+                bootstrap_full_panel: false,
             },
             state.actor()?,
         )?;
@@ -12727,6 +13050,111 @@ mod ol_tests {
                 .abs()
                 < 1e-12
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deck8_exhaustive_panel_is_closed_and_bootstraps_without_fake_visits() -> PyResult<()> {
+        // Drive a legal game to the last action before the deck=8 reveal. Using
+        // legal_actions_indexed keeps this independent of hand-written board data.
+        let mut state = new_game(20260810, true, true);
+        let action = loop {
+            let actions = state.legal_actions_indexed();
+            assert!(!actions.is_empty());
+            if state.deck.len() == 8
+                && <Kingdomino as search::Game>::is_stochastic(&state, (actions[0].1, actions[0].2))
+            {
+                break (actions[0].1, actions[0].2);
+            }
+            state = state.step(actions[0].1, actions[0].2)?;
+        };
+
+        let panel = ol_one_reveal_panel(&state.deck, 1, 70, 99)?;
+        assert_eq!(panel.len(), 70);
+        assert!(
+            panel
+                .iter()
+                .all(|outcome| (outcome.probability - 1.0 / 70.0).abs() < 1e-12)
+        );
+
+        let mut arena = vec![OLNode::new(1.0, (None, None))];
+        arena[0].is_expanded = true;
+        arena[0].visit_count = 1;
+        let mut action_node = 0;
+        for (i, &(action_index, placement, pick)) in
+            state.legal_actions_indexed().iter().enumerate()
+        {
+            let child_id = arena.len() as u32;
+            arena.push(OLNode::new(1.0, (placement, pick)));
+            arena[0].children.push((action_index, child_id));
+            if i == 0 {
+                action_node = child_id;
+            }
+        }
+
+        let config = OLChanceConfig {
+            panel: &panel,
+            backup: OLChanceBackup::Sampled,
+            traversal: OLChanceTraversal::Balanced,
+            schedule_seed: 123,
+            draw_seed: 456,
+            a1c: None,
+            bootstrap_full_panel: true,
+        };
+        let mut fallback_count = 0;
+        let mut missing_child_count = 0;
+        let (path, _actors, _leaf, chance_step, request) = ol_descend(
+            &mut arena,
+            0,
+            state.cloned(),
+            0.0,
+            1.5,
+            &mut fallback_count,
+            &mut missing_child_count,
+            None,
+            Some(config),
+        )?;
+        let request = request.expect("production descent must request panel admission");
+        assert_eq!(request.chance_node_id, action_node);
+        assert_eq!(arena[action_node as usize].chance_children.len(), 70);
+        assert_eq!(arena[action_node as usize].visit_count, 0);
+
+        // Install synthetic conditional bootstrap values in row order. This is
+        // the same probability mean BatchedMCTS::update publishes after it has
+        // validated all 70 inference results.
+        let mut expected = 0.0;
+        for (i, outcome) in panel.iter().enumerate() {
+            let revealed = redeterminize_with_first_row(&state, &outcome.row, i as u64 + 1)?
+                .step(action.0, action.1)?;
+            let actor = revealed.actor()?;
+            let (observation_id, probability) =
+                ol_route_chance_observation(&mut arena, action_node, &revealed, actor)?;
+            let value = i as f64 / 69.0;
+            arena[observation_id as usize].bootstrap_value0 = Some(value);
+            expected += probability * value;
+        }
+        {
+            let chance = &mut arena[action_node as usize];
+            chance.chance_backup = OLChanceBackup::PanelMean;
+            chance.chance_visited_mass = 1.0;
+            chance.chance_weighted_value = expected;
+        }
+        assert!((ol_chance_value_p0(&arena, action_node) - 0.5).abs() < 1e-12);
+        assert_eq!(arena[action_node as usize].visit_count, 0);
+        assert!(
+            arena[action_node as usize]
+                .chance_children
+                .iter()
+                .all(|outcome| arena[outcome.node_id.unwrap() as usize].visit_count == 0)
+        );
+
+        // A real simulation backup creates exactly one visit and replaces only
+        // its realized row's bootstrap estimate inside the exact panel mean.
+        ol_backup_path(&mut arena, &path, -0.25, chance_step);
+        assert_eq!(arena[action_node as usize].visit_count, 1);
+        let visited = path.last().copied().unwrap();
+        assert_eq!(arena[visited as usize].visit_count, 1);
+        assert_eq!(arena[0].visit_count, 2);
         Ok(())
     }
 }
