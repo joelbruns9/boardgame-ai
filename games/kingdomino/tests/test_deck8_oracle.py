@@ -19,6 +19,7 @@ from games.kingdomino.deck8_oracle import (
 )
 from games.kingdomino.deck8_oracle_compare import (
     exact_separation,
+    require_exhausted_nn_budget,
     run as run_oracle_compare,
     score_arm_against_oracle,
 )
@@ -183,9 +184,23 @@ def test_compare_gap_skips_all_tied_best_actions():
     assert all_tied["all_actions_tied"] is True
 
 
-def test_a1c_oracle_comparison_is_disabled_until_nn_work_is_matched():
-    with pytest.raises(RuntimeError, match="disabled until the harness matches total NN work"):
-        run_oracle_compare(argparse.Namespace(include_a1c=True))
+def test_a1c_oracle_comparison_requires_a_positive_nn_work_budget():
+    with pytest.raises(ValueError, match="requires --nn-eval-budget > 0"):
+        run_oracle_compare(argparse.Namespace(include_a1c=True, nn_eval_budget=0))
+
+
+def test_equal_work_gate_rejects_a_simulation_ceiling_before_budget():
+    complete = {
+        "nn_evaluations": 33,
+        "chance_diagnostics": {"nn_eval_budget_hit": 1.0},
+    }
+    incomplete = {
+        "nn_evaluations": 25,
+        "chance_diagnostics": {"nn_eval_budget_hit": 0.0},
+    }
+    require_exhausted_nn_budget("complete", complete, 33)
+    with pytest.raises(RuntimeError, match="increase --sims"):
+        require_exhausted_nn_budget("incomplete", incomplete, 33)
 
 
 def test_boundary_screen_requires_stable_disagreement():

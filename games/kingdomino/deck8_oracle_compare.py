@@ -16,8 +16,23 @@ from games.kingdomino.promotion import DEFAULT_CURRENT_BEST, sha256_file
 from games.kingdomino.self_play import make_rust_evaluator
 
 
-SCHEMA_VERSION = "kd-deck8-oracle-compare-v2"
-A1C_COMPARISON_READY = False
+SCHEMA_VERSION = "kd-deck8-oracle-compare-v3"
+
+
+def require_exhausted_nn_budget(
+    name: str, arm: dict[str, Any], nn_eval_budget: int
+) -> None:
+    """Reject an arm that stopped before the preregistered equal-work budget."""
+    if nn_eval_budget <= 0:
+        return
+    diagnostics = arm["chance_diagnostics"]
+    if int(arm["nn_evaluations"]) != nn_eval_budget or not bool(
+        diagnostics["nn_eval_budget_hit"]
+    ):
+        raise RuntimeError(
+            f"arm {name} did not exhaust the NN budget "
+            f"({arm['nn_evaluations']}/{nn_eval_budget}); increase --sims"
+        )
 
 
 def exact_separation(exact_actor_values: dict[int, float]) -> dict[str, Any]:
@@ -88,6 +103,7 @@ def score_arm_against_oracle(
         and value > selected_value
         for value in exact_actor_values.values()
     )
+    diagnostics = arm.get("chance_diagnostics", {})
     return {
         "selected_action_idx": selected,
         "exact_best_action_idx": best_action,
@@ -106,6 +122,16 @@ def score_arm_against_oracle(
             None if visit_pairs == 0 else visit_correct / visit_pairs
         ),
         "nn_evaluations": int(arm["nn_evaluations"]),
+        "simulations_completed": int(
+            diagnostics.get("simulations_completed", arm.get("sims", 0))
+        ),
+        "initialization_nn_evaluations": int(
+            diagnostics.get("initialization_nn_evaluations", 0)
+        ),
+        "initialization_nn_fraction": float(
+            diagnostics.get("initialization_nn_fraction", 0.0)
+        ),
+        "nn_eval_budget_hit": bool(diagnostics.get("nn_eval_budget_hit", False)),
         "elapsed_seconds": float(arm["elapsed_seconds"]),
     }
 
@@ -156,16 +182,26 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_nn_evaluations": statistics.fmean(
             float(row["nn_evaluations"]) for row in rows
         ),
+        "mean_simulations_completed": statistics.fmean(
+            float(row["simulations_completed"]) for row in rows
+        ),
+        "mean_initialization_nn_evaluations": statistics.fmean(
+            float(row["initialization_nn_evaluations"]) for row in rows
+        ),
+        "mean_initialization_nn_fraction": statistics.fmean(
+            float(row["initialization_nn_fraction"]) for row in rows
+        ),
+        "all_nn_eval_budgets_hit": all(bool(row["nn_eval_budget_hit"]) for row in rows),
         "mean_seconds": statistics.fmean(float(row["elapsed_seconds"]) for row in rows),
     }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    if bool(getattr(args, "include_a1c", False)) and not A1C_COMPARISON_READY:
-        raise RuntimeError(
-            "A1c oracle comparison is disabled until the harness matches total NN "
-            "work; wave-safe admission and leaf_batch parity alone do not make equal "
-            "simulations an equal-compute comparison"
+    nn_eval_budget = int(getattr(args, "nn_eval_budget", 0))
+    if bool(getattr(args, "include_a1c", False)) and nn_eval_budget <= 0:
+        raise ValueError(
+            "--include-a1c requires --nn-eval-budget > 0 for the primary "
+            "equal-work oracle comparison"
         )
     oracle_path = Path(args.oracle_summary)
     oracle = json.loads(oracle_path.read_text(encoding="utf-8"))
@@ -268,7 +304,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 widening_c=float(args.a1c_widening_c),
                 init_max_fraction=float(args.a1c_init_max_fraction),
                 leaf_batch=int(spec["leaf_batch"]),
+                nn_eval_budget=nn_eval_budget,
             )
+            require_exhausted_nn_budget(name, arm, nn_eval_budget)
             arm_rows[name] = score_arm_against_oracle(arm, exact_actor_values)
         records.append({"seed_index": seed_index, "seed": seed, "arms": arm_rows})
 
@@ -290,7 +328,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "checkpoint_sha256": sha256_file(args.checkpoint),
         "configuration": {
-            "sims": int(args.sims), "seed": int(args.seed),
+            "simulation_ceiling": int(args.sims),
+            "nn_eval_budget": nn_eval_budget,
+            "comparison_basis": "equal_nn_work" if nn_eval_budget > 0 else "equal_simulations",
+            "seed": int(args.seed),
             "seed_count": int(args.seed_count), "fpu": float(args.fpu),
             "cpuct": float(args.cpuct), "device": str(args.device), "arms": specs,
         },
@@ -322,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-reason", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sims", type=int, default=4800)
+    parser.add_argument(
+        "--nn-eval-budget",
+        type=int,
+        default=0,
+        help="Hard per-search NN-row budget; 0 disables it. Required with --include-a1c.",
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--seed-count", type=int, default=8)
     parser.add_argument("--fpu", type=float, default=-0.2)

@@ -148,6 +148,7 @@ def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
     assert diagnostics["initialization_nn_evaluations"] > 0
     assert diagnostics["initialization_nn_evaluations"] < diagnostics["nn_evaluations"]
     assert diagnostics["a1c_wave_safe_admission"] == 1.0
+    assert diagnostics["a1c_visit_prioritized_admission"] == 1.0
     assert diagnostics["a1c_admission_requested_paths"] >= diagnostics[
         "a1c_admission_unique_nodes"
     ]
@@ -253,3 +254,159 @@ def test_a1c_search_admits_panels_only_at_parallel_wave_boundaries():
     # Initialization changes the estimator only after the whole wave has
     # completed, so all observations still correspond to backed-up chance visits.
     assert diagnostics["chance_node_visits"] == diagnostics["observation_visits"]
+
+
+def test_hard_nn_budget_stops_incumbent_without_overshoot():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        128,
+        chance_exposure=0,
+        seed=20260813,
+        leaf_batch=8,
+        nn_eval_budget=33,
+    )
+    assert diagnostics["nn_evaluations"] == 33
+    assert diagnostics["ordinary_nn_evaluations"] == 33
+    assert diagnostics["initialization_nn_evaluations"] == 0
+    assert diagnostics["nn_eval_budget_hit"] == 1.0
+    assert diagnostics["nn_eval_budget_unused"] == 0.0
+    assert diagnostics["simulations_completed"] == 32
+    assert diagnostics["simulation_limit_hit"] == 0.0
+    assert diagnostics["nn_evaluator_calls"] == 5
+    assert diagnostics["nn_max_batch_size"] == 8
+    assert sum(row[1] for row in children) == 32
+
+
+def test_hard_nn_budget_charges_a1c_bootstraps_and_then_ordinary_work():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(_deck8_boundary_state())
+    _children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        128,
+        chance_exposure=4,
+        chance_enum_max_rows=1,
+        seed=20260814,
+        leaf_batch=8,
+        chance_panel_mode="a1c",
+        chance_panel_sampling="balanced",
+        chance_init_visits=1,
+        chance_widening_c=0.1,
+        chance_init_max_fraction=1.0,
+        nn_eval_budget=33,
+    )
+    assert diagnostics["nn_evaluations"] == 33
+    assert diagnostics["nn_eval_budget_hit"] == 1.0
+    assert diagnostics["initialization_nn_evaluations"] > 0
+    assert diagnostics["ordinary_nn_evaluations"] > 1
+    assert diagnostics["ordinary_nn_evaluations"] + diagnostics[
+        "initialization_nn_evaluations"
+    ] == diagnostics["nn_evaluations"]
+    assert diagnostics["initialization_nn_budget_blocked_cycles"] > 0
+    assert diagnostics["initialization_nn_budget_blocked_rows"] > 0
+    assert diagnostics["a1c_admission_committed_cycles"] == diagnostics[
+        "a1c_initialized_cycles"
+    ]
+
+
+def test_hard_nn_budget_never_partially_initializes_a_cycle_that_does_not_fit():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(_deck8_boundary_state())
+    _children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        128,
+        chance_exposure=4,
+        chance_enum_max_rows=1,
+        seed=20260815,
+        leaf_batch=8,
+        chance_panel_mode="a1c",
+        chance_panel_sampling="balanced",
+        chance_init_visits=1,
+        chance_widening_c=0.1,
+        chance_init_max_fraction=1.0,
+        nn_eval_budget=10,
+    )
+    assert diagnostics["nn_evaluations"] == 10
+    assert diagnostics["initialization_nn_evaluations"] == 0
+    assert diagnostics["a1c_initialized_cycles"] == 0
+    assert diagnostics["a1c_admission_committed_cycles"] == 0
+    assert diagnostics["initialization_nn_budget_blocked_cycles"] > 0
+    assert diagnostics["initialization_nn_budget_blocked_rows"] >= 11
+
+
+def test_zero_nn_budget_preserves_the_unbudgeted_search_path():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    common = dict(
+        chance_exposure=0,
+        seed=20260816,
+        leaf_batch=8,
+        virtual_loss=1,
+    )
+    unbudgeted = kr.advisor_one_reveal_search(
+        state, _zero_evaluator, 64, **common
+    )
+    explicit_zero = kr.advisor_one_reveal_search(
+        state, _zero_evaluator, 64, nn_eval_budget=0, **common
+    )
+    assert explicit_zero == unbudgeted
+
+
+def test_simulation_ceiling_reports_unspent_nn_budget():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    _children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        8,
+        chance_exposure=0,
+        seed=20260817,
+        leaf_batch=8,
+        nn_eval_budget=100,
+    )
+    assert diagnostics["nn_evaluations"] == 9
+    assert diagnostics["nn_eval_budget_hit"] == 0.0
+    assert diagnostics["nn_eval_budget_unused"] == 91
+    assert diagnostics["simulations_completed"] == 8
+    assert diagnostics["simulation_limit_hit"] == 1.0
+
+
+def test_probe_arm_independently_confirms_rust_nn_accounting():
+    from games.kingdomino.chance_correct_search_probe import _arm
+
+    arm = _arm(
+        _deck8_boundary_state(),
+        _zero_evaluator,
+        sims=128,
+        exposure=4,
+        enum_max_rows=1,
+        seed=20260818,
+        margin_gain=2.0,
+        alpha=0.5,
+        fpu=-0.2,
+        cpuct=1.5,
+        panel_mode="a1c",
+        panel_sampling="balanced",
+        init_visits=1,
+        widening_c=0.1,
+        init_max_fraction=1.0,
+        leaf_batch=8,
+        nn_eval_budget=33,
+    )
+    assert arm["nn_evaluations"] == 33
+    assert arm["chance_diagnostics"]["nn_eval_budget_hit"] == 1.0
+    assert arm["evaluator_calls"] == arm["chance_diagnostics"][
+        "nn_evaluator_calls"
+    ]
+    assert arm["evaluator_max_batch_size"] == arm["chance_diagnostics"][
+        "nn_max_batch_size"
+    ]

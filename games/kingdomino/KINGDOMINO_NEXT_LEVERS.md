@@ -790,13 +790,26 @@ cycle per node is committed before the next wave. Diagnostics report requested
 paths, unique requested nodes, committed cycles and admission waves; functional
 tests pin visit conservation through the transition.
 
-The deck-8 oracle comparison harness contains the future A1c `X=4,8`
-balanced/IID specifications at the same `leaf_batch=8` as its controls, but it
-still hard-rejects `--include-a1c`. Equal simulations remain unequal NN work
-because A1c charges additional bootstrap rows. Add a hard total-NN-work budget
-to the search and harness, then validate its accounting before enabling that
-comparison. No GPU comparison has been run and this checkpoint is not evidence
-of stronger play.
+The advisor diagnostic search now also accepts an optional hard total-NN-work
+budget. It charges the root, ordinary leaves and every A1c bootstrap row; shortens
+ordinary waves before they can overshoot; and refuses a whole initialization
+cycle when it cannot fit rather than partially committing it. Diagnostics report
+ordinary/initialization work, evaluator calls and batch sizes, completed
+simulations/waves, budget exhaustion, unused budget and separately blocked A1c
+cycles. When several nodes request admission together, constrained work goes to
+the highest real-visit nodes first; equal-visit ties use a seeded permutation
+rather than action/node insertion order. The Python probe independently counts
+actual evaluator rows and fails on any Rust/Python accounting mismatch.
+
+The deck-8 oracle harness now enables A1c `X=4,8` balanced/IID specifications at
+the same `leaf_batch=8` as their controls only with a positive hard NN budget. It
+rejects the artifact if any arm hits its simulation ceiling before exhausting
+that budget. This makes equal-NN work a diagnostic of search efficiency, not the
+final strength objective. Retain separate later comparisons at equal wall time
+and at each search family's strongest feasible configuration; a slower A1c arm
+can still advance if its oracle decisions and paired game strength justify the
+cost. No GPU comparison has yet been run, so this checkpoint is not evidence of
+stronger play.
 
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
@@ -1430,8 +1443,9 @@ it is not a substitute for correct chance topology or better state coverage.
    in sampled mode, atomically
    initializes its first balanced cycle only after `N_init`, caps initialization
    at 25% of NN work, then widens in whole balanced cycles. Wave-safe advisor
-   admission and `leaf_batch=8` are complete; next add matched total-NN-work
-   stopping/accounting before opening the deck-8 A1c oracle comparison. Preserve
+   admission, `leaf_batch=8` and matched total-NN-work stopping/accounting are
+   complete. The deck-8 A1c oracle comparison is now mechanically enabled but
+   has not been run. Preserve
    incumbent and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
    search screen nor A2a alone is an A1c target-quality gate.
 6. Freeze the 120-position tuning and 120-position confirmation split before

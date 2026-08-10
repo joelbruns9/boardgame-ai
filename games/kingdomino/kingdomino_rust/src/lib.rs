@@ -4965,6 +4965,13 @@ struct A1cRuntime<'a> {
     initialization_nn_evals: &'a mut usize,
     total_nn_evals: &'a mut usize,
     initialization_blocked_cycles: &'a mut usize,
+    nn_eval_budget: Option<usize>,
+    nn_budget_blocked_cycles: &'a mut usize,
+    nn_budget_blocked_rows: &'a mut usize,
+    evaluator_calls: &'a mut usize,
+    max_batch_size: &'a mut usize,
+    initialization_evaluator_calls: &'a mut usize,
+    initialization_max_batch_size: &'a mut usize,
 }
 
 struct A1cAdmissionRequest {
@@ -5175,6 +5182,18 @@ fn a1c_target_cycles(visits: usize, n_init: usize, max_cycles: usize, c: f64) ->
     }
     let scheduled = (c * (visits as f64).sqrt()).ceil() as usize;
     scheduled.max(1).min(max_cycles)
+}
+
+/// Stable seeded tie-break for admission requests with equal real visits.
+/// Node ids alone track root action insertion order, so using them directly
+/// would spend a tight initialization budget preferentially on low action ids.
+fn a1c_admission_tiebreak(seed: u64, wave: usize, chance_node_id: u32) -> u64 {
+    let mut value = seed
+        ^ (wave as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (chance_node_id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 /// Admit a complete cycle only if doing all of its missing network rows keeps
@@ -6014,6 +6033,14 @@ fn a1c_admit_next_cycle(
             flat,
         });
     }
+    if runtime
+        .nn_eval_budget
+        .is_some_and(|budget| runtime.total_nn_evals.saturating_add(requests.len()) > budget)
+    {
+        *runtime.nn_budget_blocked_cycles += 1;
+        *runtime.nn_budget_blocked_rows += requests.len();
+        return Ok(false);
+    }
     if !a1c_initialization_within_budget(
         *runtime.initialization_nn_evals,
         *runtime.total_nn_evals,
@@ -6024,6 +6051,13 @@ fn a1c_admit_next_cycle(
         return Ok(false);
     }
     let evaluated = a1c_evaluate_bootstraps(runtime.evaluator, &requests)?;
+    if !requests.is_empty() {
+        *runtime.evaluator_calls += 1;
+        *runtime.initialization_evaluator_calls += 1;
+        *runtime.max_batch_size = (*runtime.max_batch_size).max(requests.len());
+        *runtime.initialization_max_batch_size =
+            (*runtime.initialization_max_batch_size).max(requests.len());
+    }
 
     // Commit only after the whole evaluator batch succeeds. This keeps cycle
     // admission atomic even if Python raises or returns a malformed batch.
@@ -6744,6 +6778,7 @@ fn advisor_open_loop_search_impl(
     chance_backup: OLChanceBackup,
     chance_traversal: OLChanceTraversal,
     a1c_options: Option<A1cSearchOptions>,
+    nn_eval_budget: Option<usize>,
 ) -> PyResult<AdvisorOpenLoopOutput> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
@@ -6784,6 +6819,12 @@ fn advisor_open_loop_search_impl(
     let mut total_nn_evals = 1usize;
     let mut initialization_nn_evals = 0usize;
     let mut initialization_blocked_cycles = 0usize;
+    let mut initialization_nn_budget_blocked_cycles = 0usize;
+    let mut initialization_nn_budget_blocked_rows = 0usize;
+    let mut nn_evaluator_calls = 1usize;
+    let mut nn_max_batch_size = 1usize;
+    let mut initialization_evaluator_calls = 0usize;
+    let mut initialization_max_batch_size = 0usize;
     let mut a1c_admission_requested_paths = 0usize;
     let mut a1c_admission_unique_nodes = 0usize;
     let mut a1c_admission_committed_cycles = 0usize;
@@ -6797,8 +6838,17 @@ fn advisor_open_loop_search_impl(
     let wave_cap = leaf_batch.max(1);
     let vl = virtual_loss.max(0);
     let mut sims_done = 0usize;
-    while sims_done < n_sims {
-        let wave = wave_cap.min(n_sims - sims_done);
+    let mut search_waves = 0usize;
+    while sims_done < n_sims && nn_eval_budget.is_none_or(|budget| total_nn_evals < budget) {
+        let remaining_nn_budget = nn_eval_budget
+            .map(|budget| budget.saturating_sub(total_nn_evals))
+            .unwrap_or(usize::MAX);
+        // A simulation produces at most one ordinary leaf evaluation. Limiting
+        // the wave by the remaining budget prevents an evaluator batch from
+        // overshooting the hard cap; terminal paths simply leave capacity for
+        // a later wave.
+        let wave = wave_cap.min(n_sims - sims_done).min(remaining_nn_budget);
+        debug_assert!(wave > 0);
         let mut paths: Vec<Vec<u32>> = Vec::with_capacity(wave);
         let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
         let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
@@ -6877,6 +6927,8 @@ fn advisor_open_loop_search_impl(
         let mut path_v0: Vec<Option<f64>> = vec![None; paths.len()];
         if !evals.is_empty() {
             total_nn_evals += evals.len();
+            nn_evaluator_calls += 1;
+            nn_max_batch_size = nn_max_batch_size.max(evals.len());
             let idxs_per: Vec<Vec<i64>> = evals
                 .iter()
                 .map(|e| e.legal.iter().map(|t| t.0 as i64).collect())
@@ -6968,6 +7020,18 @@ fn advisor_open_loop_search_impl(
             a1c_admission_requests.sort_by_key(|request| request.chance_node_id);
             a1c_admission_requests.dedup_by_key(|request| request.chance_node_id);
             a1c_admission_unique_nodes += a1c_admission_requests.len();
+            // Spend constrained initialization work on the most-visited chance
+            // nodes first. Equal-visit requests use a seeded permutation rather
+            // than node/action insertion order, avoiding a low-action-id bias.
+            a1c_admission_requests.sort_by(|left, right| {
+                let left_visits = arena[left.chance_node_id as usize].visit_count.max(0);
+                let right_visits = arena[right.chance_node_id as usize].visit_count.max(0);
+                right_visits.cmp(&left_visits).then_with(|| {
+                    a1c_admission_tiebreak(seed, search_waves, left.chance_node_id).cmp(
+                        &a1c_admission_tiebreak(seed, search_waves, right.chance_node_id),
+                    )
+                })
+            });
             let mut committed_this_wave = 0usize;
             let a1c = A1cChanceConfig {
                 cycles: a1c_cycles.as_slice(),
@@ -6992,6 +7056,13 @@ fn advisor_open_loop_search_impl(
                     initialization_nn_evals: &mut initialization_nn_evals,
                     total_nn_evals: &mut total_nn_evals,
                     initialization_blocked_cycles: &mut initialization_blocked_cycles,
+                    nn_eval_budget,
+                    nn_budget_blocked_cycles: &mut initialization_nn_budget_blocked_cycles,
+                    nn_budget_blocked_rows: &mut initialization_nn_budget_blocked_rows,
+                    evaluator_calls: &mut nn_evaluator_calls,
+                    max_batch_size: &mut nn_max_batch_size,
+                    initialization_evaluator_calls: &mut initialization_evaluator_calls,
+                    initialization_max_batch_size: &mut initialization_max_batch_size,
                 };
                 if a1c_admit_next_cycle(
                     &mut arena,
@@ -7012,6 +7083,7 @@ fn advisor_open_loop_search_impl(
             }
         }
         sims_done += paths.len();
+        search_waves += 1;
     }
 
     let incumbent_root_value0 = arena[0].value_sum / arena[0].visit_count.max(1) as f64;
@@ -7074,6 +7146,45 @@ fn advisor_open_loop_search_impl(
     diagnostics.insert("arena_nodes".to_string(), arena.len() as f64);
     diagnostics.insert("nn_evaluations".to_string(), total_nn_evals as f64);
     diagnostics.insert(
+        "ordinary_nn_evaluations".to_string(),
+        total_nn_evals.saturating_sub(initialization_nn_evals) as f64,
+    );
+    diagnostics.insert("nn_evaluator_calls".to_string(), nn_evaluator_calls as f64);
+    diagnostics.insert(
+        "nn_mean_batch_size".to_string(),
+        total_nn_evals as f64 / nn_evaluator_calls.max(1) as f64,
+    );
+    diagnostics.insert("nn_max_batch_size".to_string(), nn_max_batch_size as f64);
+    diagnostics.insert(
+        "nn_eval_budget_enabled".to_string(),
+        if nn_eval_budget.is_some() { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "nn_eval_budget".to_string(),
+        nn_eval_budget.unwrap_or(0) as f64,
+    );
+    diagnostics.insert(
+        "nn_eval_budget_hit".to_string(),
+        if nn_eval_budget.is_some_and(|budget| total_nn_evals >= budget) {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    diagnostics.insert(
+        "nn_eval_budget_unused".to_string(),
+        nn_eval_budget
+            .map(|budget| budget.saturating_sub(total_nn_evals))
+            .unwrap_or(0) as f64,
+    );
+    diagnostics.insert("simulations_requested".to_string(), n_sims as f64);
+    diagnostics.insert("simulations_completed".to_string(), sims_done as f64);
+    diagnostics.insert("search_waves".to_string(), search_waves as f64);
+    diagnostics.insert(
+        "simulation_limit_hit".to_string(),
+        if sims_done >= n_sims { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
         "initialization_nn_evaluations".to_string(),
         initialization_nn_evals as f64,
     );
@@ -7084,6 +7195,22 @@ fn advisor_open_loop_search_impl(
     diagnostics.insert(
         "initialization_blocked_cycles".to_string(),
         initialization_blocked_cycles as f64,
+    );
+    diagnostics.insert(
+        "initialization_nn_budget_blocked_cycles".to_string(),
+        initialization_nn_budget_blocked_cycles as f64,
+    );
+    diagnostics.insert(
+        "initialization_nn_budget_blocked_rows".to_string(),
+        initialization_nn_budget_blocked_rows as f64,
+    );
+    diagnostics.insert(
+        "initialization_evaluator_calls".to_string(),
+        initialization_evaluator_calls as f64,
+    );
+    diagnostics.insert(
+        "initialization_max_batch_size".to_string(),
+        initialization_max_batch_size as f64,
     );
     diagnostics.insert(
         "a1c_admission_requested_paths".to_string(),
@@ -7103,6 +7230,10 @@ fn advisor_open_loop_search_impl(
     );
     diagnostics.insert(
         "a1c_wave_safe_admission".to_string(),
+        if a1c_options.is_some() { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "a1c_visit_prioritized_admission".to_string(),
         if a1c_options.is_some() { 1.0 } else { 0.0 },
     );
     diagnostics.insert(
@@ -13005,6 +13136,7 @@ mod kingdomino_rust {
                 chance_backup,
                 chance_traversal,
                 None,
+                None,
             )
         })?;
         Ok((output.children, output.root_value0))
@@ -13019,9 +13151,9 @@ mod kingdomino_rust {
                         leaf_batch=8, virtual_loss=1, score_scale=160.0,
                         margin_gain=2.0, alpha=0.0, chance_backup="hajek",
                         chance_traversal="iid", chance_panel_mode="lazy",
-                        chance_panel_sampling="balanced", chance_init_visits=32,
-                        chance_widening_c=0.25,
-                        chance_init_max_fraction=0.25))]
+                         chance_panel_sampling="balanced", chance_init_visits=32,
+                         chance_widening_c=0.25,
+                         chance_init_max_fraction=0.25, nn_eval_budget=0))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_one_reveal_search<'py>(
         py: Python<'py>,
@@ -13045,6 +13177,7 @@ mod kingdomino_rust {
         chance_init_visits: usize,
         chance_widening_c: f64,
         chance_init_max_fraction: f64,
+        nn_eval_budget: usize,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -13113,6 +13246,7 @@ mod kingdomino_rust {
                 chance_backup,
                 chance_traversal,
                 a1c_options,
+                (nn_eval_budget > 0).then_some(nn_eval_budget),
             )
         })?;
         Ok((output.children, output.root_value0, output.diagnostics))

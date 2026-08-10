@@ -2,8 +2,9 @@
 
 This is deliberately narrower than self-play: it compares root selections from
 the incumbent open-loop search and opt-in one-reveal arms on frozen public
-positions. Every candidate arm receives the same simulation budget and the
-artifact records actual NN rows so terminal-leaf differences cannot be hidden.
+positions. Candidate arms may use the same simulation ceiling or an optional
+hard NN-row budget; the artifact records both so terminal-leaf and A1c bootstrap
+differences cannot be hidden.
 A larger reference search is reported separately and is not called an exact
 oracle. Optional mode lists cross sampled/Hájek backup with IID/local-balanced
 chance traversal while retaining one incumbent arm.
@@ -54,14 +55,18 @@ def _arm(
     widening_c: float = 0.25,
     init_max_fraction: float = 0.25,
     leaf_batch: int = 8,
+    nn_eval_budget: int = 0,
 ) -> dict[str, Any]:
     import kingdomino_rust as kr
 
     nn_evaluations = 0
+    evaluator_batch_sizes: list[int] = []
 
     def counted_evaluator(my_board, opp_board, flat, legal_indices):
         nonlocal nn_evaluations
-        nn_evaluations += int(my_board.shape[0])
+        batch_size = int(my_board.shape[0])
+        nn_evaluations += batch_size
+        evaluator_batch_sizes.append(batch_size)
         return evaluator(my_board, opp_board, flat, legal_indices)
 
     started = time.perf_counter()
@@ -85,10 +90,17 @@ def _arm(
         chance_init_visits=int(init_visits),
         chance_widening_c=float(widening_c),
         chance_init_max_fraction=float(init_max_fraction),
+        nn_eval_budget=int(nn_eval_budget),
     )
     chance_diagnostics = {
         str(key): float(value) for key, value in raw_chance_diagnostics.items()
     }
+    rust_nn_evaluations = int(chance_diagnostics["nn_evaluations"])
+    if rust_nn_evaluations != nn_evaluations:
+        raise RuntimeError(
+            "Rust/Python NN evaluation accounting mismatch: "
+            f"rust={rust_nn_evaluations}, python={nn_evaluations}"
+        )
     panel_rows = int(chance_diagnostics.get("chance_panel_rows", 0.0))
     panel_mode = (
         "disabled"
@@ -125,11 +137,14 @@ def _arm(
         "chance_widening_c": float(widening_c),
         "chance_init_max_fraction": float(init_max_fraction),
         "leaf_batch": int(leaf_batch),
+        "nn_eval_budget": int(nn_eval_budget),
         "root_value_running_mean_player0": float(root_value0),
         "root_value_current_children_player0": chance_diagnostics[
             "root_value_current_children_player0"
         ],
         "nn_evaluations": int(nn_evaluations),
+        "evaluator_calls": len(evaluator_batch_sizes),
+        "evaluator_max_batch_size": max(evaluator_batch_sizes, default=0),
         "chance_diagnostics": chance_diagnostics,
         "top_action_idx": top["action_idx"],
         "top_pick_rank": top["pick_rank"],
