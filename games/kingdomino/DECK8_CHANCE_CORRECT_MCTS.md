@@ -1,7 +1,8 @@
 # Deck=8 chance-correct MCTS
 
 Status: implemented behind the opt-in `--deck8_chance_enumeration` flag for
-`--engine batched_open_loop`.
+`--engine batched_open_loop`. The first paired whole-game screen was weak
+negative, so the flag remains off for training.
 
 ## Goal
 
@@ -170,17 +171,21 @@ new focused regression was run directly.
   - Both production `BatchedMCTS` construction paths.
   - Single-buffer, double-buffer, merged stats, console output, and history.
 
-## Deliberate limitations / next experiment
+## Deliberate limitations and A/B outcome
 
 - Deck sizes above eight retain the existing open-loop sampled search.
 - Deck=4 remains handled by the existing exact deterministic endgame route.
 - This change makes the admitted chance expectation exact with respect to the
   current network leaf evaluator; it does not enumerate the rest of the game.
-- Strength and throughput should next be measured in a matched self-play A/B at
-  400 budget units per move, comparing the flag off and on with identical game
-  seeds, model, search settings, and total configured budget. Report decisive
-  win rate / score margin with uncertainty, panels per game, bootstrap rows,
-  positions per second, wall time, peak GPU memory, and batch-size distribution.
-  The implementation tests above establish correctness and integration, not an
-  Elo claim. Only after that clean A/B should alternatives such as blending or
-  broader sibling admission be considered.
+- The preregistered 400-unit paired A/B completed 64 paired seeds / 128 games:
+  treatment went 63-65, with 49.22% paired points (95% bootstrap interval
+  46.88%-51.56%) and -0.766 raw-score margin (-1.625 to +0.055). Both point
+  estimates favored control but both intervals included the null: a valid weak
+  negative screen, not proof of harm or equivalence.
+- The all-on throughput cohort ran at 89.1% of all-off games/second and used
+  about 713 MB versus 70 MB peak allocated GPU memory. Panel accounting was
+  exact and no admission was budget-blocked.
+- Full design, raw-artifact hash, seat breakdown, and decision are recorded in
+  `DECK8_CHANCE_AB_TEST.md`. The mechanism remains opt-in and off for training.
+  Any blending or separate-budget redesign requires a new preregistration and
+  disjoint seeds; this completed sample must not be extended adaptively.

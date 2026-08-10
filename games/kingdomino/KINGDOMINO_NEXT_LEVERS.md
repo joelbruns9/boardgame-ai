@@ -1044,6 +1044,33 @@ separate stratum. Include an incumbent arm with enough extra simulations to
 match treatment wall time so the result cannot be explained by budget accounting
 alone.
 
+**A2b production deck=8 training-budget screen, 2026-08-10 — valid weak
+negative.** The first integrated treatment enumerated one complete 70-row panel
+per move at deck=8, capped at one panel and charged inside a shared 400-unit
+budget. A frozen-current-best match used 64 disjoint paired deck seeds with
+seats swapped. Treatment went 63-65 with no draws: paired points were 49.22%
+(95% paired-seed bootstrap interval 46.88%-51.56%) and paired raw-score margin
+was -0.766 (-1.625 to +0.055). Both preregistered point estimates favored
+control, while neither interval excluded the null. This is a weak negative
+screen, not a confident-harm or equivalence claim.
+
+Mechanism accounting was clean: each treatment-seat orientation committed 128
+panels / 8,960 bootstrap rows, no admission was blocked, both orientations used
+exactly 1,029,768 evaluator rows, and exact-solver counts/fallbacks matched. In
+the separate 16-game identical-seed throughput cohorts, all-on was 12.2% slower
+(89.1% games/second), maximum inference batch rose from 96 to 1,216, and peak
+allocated GPU memory rose from about 70 MB to 713 MB. The atomic raw artifact is
+`runs/kingdomino/chance_correct_a1/deck8_production_ab_v1.json` (SHA-256
+`9bb989d9f29cc72591de16f238ca2f27cfea83b06e6383c6433e0f457945df5c`);
+the frozen design and full interpretation are in `DECK8_CHANCE_AB_TEST.md`.
+
+Decision: do not enable this treatment in self-play and do not extend the
+viewed sample. It supplies no positive low-simulation training-search verdict.
+The separate deployed-advisor question at 10,000 simulations and a wall-time-
+matched control remain untested, but the current one-panel design has not earned
+that larger experiment. Any blend or separate-budget redesign needs a new
+preregistration and disjoint seeds.
+
 Keep two verdicts separate:
 
 - **advisor verdict:** the treatment must improve frozen-net selection or game
