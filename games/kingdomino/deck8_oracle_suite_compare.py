@@ -567,6 +567,10 @@ def classify_result(
             ]["wins"]
             + versus_x0["position_win_tie_loss"]["ties"]
             > len(versus_x0["position_deltas"]) / 2,
+            "gains_not_concentrated_in_one_or_two_positions": versus_x0[
+                "position_win_tie_loss"
+            ]["wins"]
+            >= 3,
             "gain_not_confined_to_never_initialized_searches": not versus_x0[
                 "all_regret_gain_positions_never_initialized"
             ],

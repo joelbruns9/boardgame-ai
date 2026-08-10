@@ -850,6 +850,75 @@ NN work, and unused work instead of always prescribing more simulations. The
 aggregate `all_nn_eval_budgets_hit` field remains as artifact provenance even
 though incomplete searches fail before aggregation.
 
+**A1c sealed eight-position screen, 2026-08-09 — valid, weak signal, final
+classification inconclusive.** Commit `3cf5c98` added the frozen six-arm suite,
+strict oracle/cell validation, global arm rotation, atomic position-level resume,
+position-clustered aggregation and schema-v5 diagnostics. R0 reconstructed all
+eight boundaries and all 4,760 solved reveal cells, verified the frozen
+checkpoint/position hashes and derived all 64 common-seed cases before CUDA was
+loaded. The resolved manifest SHA-256 is
+`70cde462b10eec9c7068de1d31e3921364b6680ad54ce1a377f57277240c55db`.
+
+The fresh one-position R1 smoke used one common seed, 513 NN rows and a
+1,024-simulation ceiling. Every arm consumed exactly 513 rows, avoided the
+ceiling and matched Python/Rust accounting. Each A1c arm preserved nine reached
+node rows, with two initialized and seven never initialized, and recorded 6-8
+small initialization calls. The atomic schema-v5 artifact is
+`runs/kingdomino/chance_correct_a1/deck8_oracle_a1c_suite_v1_smoke_513_v5/position_05.json`
+(SHA-256 `7e054a411e8a62933708d007a062c040feef70dc9ac7e8c2fab6fffaec925f76`).
+
+R2 completed all 384 searches in 961 seconds. Every search consumed exactly
+4,801 NN rows, avoided the 9,600-simulation ceiling and passed independent
+Python/Rust row accounting. Primary position-clustered point estimates were:
+
+| arm | exact-best | mean regret | p90 regret | exact pairwise |
+|---|---:|---:|---:|---:|
+| `x0` | 68.75% | 0.005153 | 0.014127 | 81.42% |
+| lazy `X=1` | 62.50% | 0.006970 | 0.018488 | 76.87% |
+| A1c `X=4` balanced | 70.31% | 0.004698 | 0.013094 | 79.75% |
+| A1c `X=4` IID | 71.88% | 0.004243 | 0.013094 | 78.12% |
+| A1c `X=8` balanced | 62.50% | 0.006970 | 0.018488 | 77.96% |
+| A1c `X=8` IID | 62.50% | 0.006970 | 0.018488 | 79.03% |
+
+Against `x0`, balanced/IID `X=4` mean-regret deltas were -0.000455 and
+-0.000910, exact-best deltas were +1.56 and +3.13 percentage points, and the
+position-clustered 95% regret-delta intervals were [-0.001366, 0] and
+[-0.002729, 0]. Both results were 1 win / 7 ties / 0 losses by position. All
+regret and exact-best improvement came from position 5; the other seven
+positions tied, while aggregate exact-pairwise accuracy regressed by 1.65 and
+3.30 points. Both `X=8` arms regressed versus `x0` (+0.001817 mean regret,
+-6.25 exact-best points, 0/7/1 position W/T/L).
+
+The original mechanical checklist called both `X=4` arms target-positive
+because seven ties satisfy its majority non-regression clause. Section 10 also
+explicitly assigns gains concentrated in one or two positions to the
+inconclusive category. The conservative final review therefore classifies this
+as **inconclusive/weak signal**, recorded in
+`deck8_oracle_a1c_suite_v1/classification_review.json` (SHA-256
+`e907b188bb2adc954b34787ca33f1eca9f50cfe1c01ad2c6c3fe9fac5042ea3c`); the code now requires
+regret gains on at least three independent positions before using the positive
+label. The sealed summary itself is preserved unchanged for audit (SHA-256
+`29053c69e0bf1835727473a1dcd8cea28309a25c0861017474343fcd4d1483d8`).
+
+Mechanically, `X=4` initialized about 3.9 of 8.0 reached nodes/search, left about
+4.0 never initialized, spent only 15.8-16.2 rows (0.33%-0.34%) on initialization
+and made about 11.1 extra small initialization calls. Mean latency was 2.51 s,
+essentially the 2.50 s `x0` latency at this diagnostic scale. These diagnostics
+do not rescue the one-position target gain. Per Section 11.3, do not optimize
+cross-node batching or integrate A1c yet.
+
+The broader-corpus scaffold is now fail-closed: it requires an immutable
+120-position tuning / 120-position confirmation split, every reachable bag-size
+stratum, all four strategic source/tag families, unique public-state identities,
+hidden-order invariance and explicit BGA provenance before tuning access opens.
+The current inventory has only 50 ordinary self-play positions (bag sizes
+28/24/20/16/12/8); bag sizes 44/40/36/32/4 and advisor/BGA-loss,
+flexibility/draft-order and defensive-blocking sources are missing. The single
+next action is to collect those independent strata and seal the split; do not
+add more seeds to these eight calibration positions. The inventory artifact is
+`runs/kingdomino/chance_correct_a1/chance_position_corpus_inventory_v1.json`
+(SHA-256 `624d442ba69974419683fce55561121b00c26b59e7a103d2ebaf939368232cf7`).
+
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
 the available theory does not cover its adaptive use inside this PUCT tree; it
@@ -1473,8 +1542,8 @@ it is not a substitute for correct chance topology or better state coverage.
    `X=0`, with a 95% interval of 40.47%-52.60%. Do not add games adaptively.
    This does not support the existing lazy one-reveal treatment, while leaving
    A1c's distinct initialization hypothesis unresolved.
-5. **Deck-8 boundary oracle and fixed eight-position calibration corpus
-   completed 2026-08-09.** Exact position-11 root solving is millions of tails
+5. **Deck-8 boundary oracle and fixed eight-position A1c screen completed
+   2026-08-09: valid but inconclusive.** Exact position-11 root solving is millions of tails
    and is not the laptop oracle. Boundary oracles show `X=1` is light,
    `X=4`-`X=8` captures most exact-tail sampling benefit, matched IID is at least
    competitive with balance, and the existing lazy treatment does not improve
@@ -1483,17 +1552,18 @@ it is not a substitute for correct chance topology or better state coverage.
    initializes its first balanced cycle only after `N_init`, caps initialization
    at 25% of NN work, then widens in whole balanced cycles. Wave-safe advisor
    admission, `leaf_batch=8` and matched total-NN-work stopping/accounting are
-   complete. The 513-row rotated-order preflight passed accounting and batching
-   checks without distinguishing action choice. The larger deck-8 A1c oracle
-   comparison has not been run. Preserve
+   complete. The fresh 513-row schema-v5 smoke passed accounting and node
+   reconciliation. The sealed 384-search screen found small `X=4` point-estimate
+   gains, but all target improvement came from one of eight positions; `X=8`
+   regressed. Preserve
    incumbent and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
    search screen nor A2a alone is an A1c target-quality gate.
-6. Freeze the 120-position tuning and 120-position confirmation split before
-   schedule tuning. On the laptop, run A1c correctness smokes and per-deck
-   width/depth curves on tuning positions only, then exercise the real
-   `BatchedMCTS` self-play path. Measure batched initialization throughput,
-   initialization-budget fraction and peak memory. Do not launch a large global
-   `X=8` sweep.
+6. **Corpus scaffold complete; collection and sealing remain.** The current
+   inventory has 50 ordinary self-play positions and deliberately assigns none
+   to a split. Collect the missing bag-size and strategic-source strata, then
+   freeze the 120-position tuning and 120-position confirmation split before
+   any schedule tuning. Do not optimize batching, exercise `BatchedMCTS`, open
+   confirmation or launch a global `X=8` sweep on the current evidence.
 7. Start B0 passive collection from advisor-logged games and add the versioned
    Rust start-from-public-state path. Run reconstruction, redeterminization and
    legal-completion tests; the first training comparison is 0% versus 5% BGA

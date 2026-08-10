@@ -14,6 +14,7 @@ from games.kingdomino.deck8_oracle_suite_compare import (
     EXPECTED_ARM_NAMES,
     POSITION_SCHEMA,
     aggregate_suite,
+    classify_result,
     clustered_bootstrap_interval,
     derive_seed,
     global_arm_order,
@@ -300,6 +301,42 @@ def test_bootstrap_resamples_position_values_not_repeat_cells():
     assert interval["unit"].startswith("position cluster")
     assert interval["lower_95"] == 0.0
     assert interval["upper_95"] == 10.0
+
+
+def test_classification_treats_one_position_gain_as_inconclusive():
+    arms = {
+        name: {
+            "mean_exact_regret_actor": 0.02,
+            "exact_best_selection_rate": 0.5,
+            "p90_exact_regret_actor": 0.03,
+            "exact_pairwise_ordering_accuracy": 0.7,
+        }
+        for name in EXPECTED_ARM_NAMES
+    }
+    arms["a1c_x4_balanced"] = {
+        "mean_exact_regret_actor": 0.01,
+        "exact_best_selection_rate": 0.6,
+        "p90_exact_regret_actor": 0.02,
+        "exact_pairwise_ordering_accuracy": 0.8,
+    }
+    paired = {}
+    for candidate in EXPECTED_ARM_NAMES[2:]:
+        paired[candidate] = {}
+        for control in CONTROL_NAMES:
+            paired[candidate][control] = {
+                "position_deltas": [{} for _ in range(8)],
+                "position_win_tie_loss": {
+                    "wins": 1 if candidate == "a1c_x4_balanced" else 0,
+                    "ties": 7 if candidate == "a1c_x4_balanced" else 8,
+                    "losses": 0,
+                },
+                "all_regret_gain_positions_never_initialized": False,
+            }
+    result = classify_result(arms, paired, [])
+    assert result["classification"] == "inconclusive/weak-signal"
+    assert result["arm_checks"]["a1c_x4_balanced"][
+        "gains_not_concentrated_in_one_or_two_positions"
+    ] is False
 
 
 def test_unmet_nn_budget_invalidates_resume(tmp_path):

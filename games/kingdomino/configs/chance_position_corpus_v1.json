@@ -1,0 +1,45 @@
+{
+  "schema_version": "kd-chance-position-corpus-config-v1",
+  "status": "inventory-only-unsealed",
+  "target": {
+    "total_positions": 240,
+    "split_counts": {"tuning": 120, "confirmation": 120},
+    "reachable_pre_reveal_bag_sizes": [44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4],
+    "required_tags": [
+      "ordinary_self_play",
+      "advisor_or_bga_loss",
+      "flexibility_or_draft_order",
+      "defensive_blocking"
+    ]
+  },
+  "split_policy": {
+    "assignment_seed": 20260809,
+    "immutable_after_seal": true,
+    "confirmation_hidden_during_tuning": true,
+    "stratify_each_split_by_every_reachable_bag_size": true,
+    "repeated_search_seeds_do_not_count_as_positions": true
+  },
+  "sources": [
+    {
+      "source_id": "denial_signal_positions_v1",
+      "path": "runs/kingdomino/denial_search/signal_positions.jsonl",
+      "expected_sha256": "d38ebb5f1e0430f2f78dfaa7998a1cb48ece0584b27ebb42ba8d144737768f9a",
+      "source_kind": "ordinary_self_play",
+      "default_tags": ["ordinary_self_play"],
+      "provenance": {
+        "generator": "games.kingdomino.denial_search frozen signal positions",
+        "note": "Small existing self-play diagnostic source; not sufficient to populate the 240-position corpus."
+      }
+    }
+  ],
+  "entries": [],
+  "seal_requirements": {
+    "exact_target_counts": true,
+    "unique_public_state_identity": true,
+    "hidden_deck_order_invariant": true,
+    "all_required_tags_represented_in_each_split": true,
+    "all_reachable_bag_sizes_represented_in_each_split": true,
+    "bga_entries_require_game_and_source_provenance": true
+  },
+  "inventory_note": "The only currently frozen public-state source has 50 ordinary self-play positions at bag sizes 28,24,20,16,12,8. Bag sizes 44,40,36,32,4 and all advisor/BGA-loss, flexibility/draft-order, and defensive-blocking strata remain unfilled. Do not seal, tune, or inspect confirmation until independent sources are collected."
+}
