@@ -48,11 +48,13 @@ def require_exhausted_nn_budget(
         )
 
 
-def rotated_arm_order(arm_names: list[str], seed_index: int) -> list[str]:
+def rotated_arm_order(
+    arm_names: list[str], seed_index: int, rotation_offset: int = 0
+) -> list[str]:
     """Cycle timing position without changing an arm's search seed."""
     if not arm_names:
         return []
-    rotation = seed_index % len(arm_names)
+    rotation = (rotation_offset + seed_index) % len(arm_names)
     return arm_names[rotation:] + arm_names[:rotation]
 
 
@@ -173,6 +175,11 @@ def score_arm_against_oracle(
             None if visit_pairs == 0 else visit_correct / visit_pairs
         ),
         "nn_evaluations": int(arm["nn_evaluations"]),
+        "rust_nn_evaluations": int(
+            diagnostics.get("nn_evaluations", arm["nn_evaluations"])
+        ),
+        "python_rust_nn_accounting_match": int(arm["nn_evaluations"])
+        == int(diagnostics.get("nn_evaluations", arm["nn_evaluations"])),
         "simulations_completed": int(
             diagnostics.get("simulations_completed", arm.get("sims", 0))
         ),
@@ -191,6 +198,13 @@ def score_arm_against_oracle(
         "nn_max_batch_size": int(
             diagnostics.get(
                 "nn_max_batch_size", arm.get("evaluator_max_batch_size", 0)
+            )
+        ),
+        "nn_mean_batch_size": float(
+            diagnostics.get(
+                "nn_mean_batch_size",
+                int(arm["nn_evaluations"])
+                / max(1, int(diagnostics.get("nn_evaluator_calls", 0))),
             )
         ),
         "initialization_evaluator_calls": int(
@@ -214,6 +228,9 @@ def score_arm_against_oracle(
         ),
         "a1c_reached_chance_nodes": int(
             diagnostics.get("a1c_reached_chance_nodes", 0)
+        ),
+        "a1c_initialized_chance_nodes": int(
+            diagnostics.get("a1c_initialized_chance_nodes", 0)
         ),
         "a1c_uninitialized_chance_nodes": int(
             diagnostics.get("a1c_uninitialized_chance_nodes", 0)
@@ -294,6 +311,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_nn_max_batch_size": statistics.fmean(
             float(row["nn_max_batch_size"]) for row in rows
         ),
+        "mean_nn_mean_batch_size": statistics.fmean(
+            float(row["nn_mean_batch_size"]) for row in rows
+        ),
         "mean_initialization_evaluator_calls": statistics.fmean(
             float(row["initialization_evaluator_calls"]) for row in rows
         ),
@@ -309,6 +329,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_a1c_reached_chance_nodes": statistics.fmean(
             float(row["a1c_reached_chance_nodes"]) for row in rows
         ),
+        "mean_a1c_initialized_chance_nodes": statistics.fmean(
+            float(row["a1c_initialized_chance_nodes"]) for row in rows
+        ),
         "mean_a1c_uninitialized_chance_nodes": statistics.fmean(
             float(row["a1c_uninitialized_chance_nodes"]) for row in rows
         ),
@@ -319,6 +342,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             int(row["a1c_uninitialized_chance_nodes"] > 0) for row in rows
         ),
         "all_nn_eval_budgets_hit": all(bool(row["nn_eval_budget_hit"]) for row in rows),
+        "all_python_rust_nn_accounting_match": all(
+            bool(row["python_rust_nn_accounting_match"]) for row in rows
+        ),
         "all_simulation_limits_avoided": all(
             not bool(row["simulation_limit_hit"]) for row in rows
         ),
@@ -332,6 +358,138 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             int(row["initialization_nn_budget_blocked_rows"]) for row in rows
         ),
         "mean_seconds": statistics.fmean(float(row["elapsed_seconds"]) for row in rows),
+    }
+
+
+def build_arm_specs(
+    *,
+    include_a1c: bool,
+    a1c_exposures: str = "4,8",
+    a1c_sampling: str = "balanced,iid",
+) -> dict[str, dict[str, Any]]:
+    """Build the legacy CLI arm matrix without changing its ordering."""
+    specs: dict[str, dict[str, Any]] = {
+        "x0": {
+            "exposure": 0,
+            "backup": "hajek",
+            "traversal": "balanced",
+            "panel_mode": "lazy",
+            "panel_sampling": "balanced",
+            "enum_max_rows": 70,
+            "leaf_batch": 8,
+        },
+        "x1_hajek_balanced": {
+            "exposure": 1,
+            "backup": "hajek",
+            "traversal": "balanced",
+            "panel_mode": "lazy",
+            "panel_sampling": "balanced",
+            "enum_max_rows": 70,
+            "leaf_batch": 8,
+        },
+    }
+    if include_a1c:
+        exposures = [int(value) for value in str(a1c_exposures).split(",")]
+        samplings = [value.strip() for value in str(a1c_sampling).split(",")]
+        if any(exposure <= 0 for exposure in exposures):
+            raise ValueError("--a1c-exposures must contain positive integers")
+        if any(sampling not in {"balanced", "iid"} for sampling in samplings):
+            raise ValueError("--a1c-sampling must contain balanced and/or iid")
+        for exposure in exposures:
+            for sampling in samplings:
+                specs[f"a1c_x{exposure}_{sampling}"] = {
+                    "exposure": exposure,
+                    "backup": "sampled",
+                    "traversal": "balanced",
+                    "panel_mode": "a1c",
+                    "panel_sampling": sampling,
+                    # Force sampled panels at deck=8; the exact 70-row oracle is
+                    # the external target, not a counterfactual search arm.
+                    "enum_max_rows": 1,
+                    "leaf_batch": 8,
+                }
+    return specs
+
+
+def compare_boundary(
+    boundary: Any,
+    evaluator: Any,
+    exact_actor_values: dict[int, float],
+    specs: dict[str, dict[str, Any]],
+    *,
+    simulation_ceiling: int,
+    nn_eval_budget: int,
+    seed: int,
+    seed_count: int,
+    fpu: float,
+    cpuct: float,
+    margin_gain: float,
+    alpha: float,
+    a1c_init_visits: int,
+    a1c_widening_c: float,
+    a1c_init_max_fraction: float,
+    rotation_offset: int = 0,
+    warm: bool = True,
+) -> dict[str, Any]:
+    """Run and score one boundary with a caller-owned loaded evaluator."""
+    if any(spec.get("panel_mode") == "a1c" for spec in specs.values()) and nn_eval_budget <= 0:
+        raise ValueError("A1c comparisons require a positive NN evaluation budget")
+    if warm:
+        # Warm the evaluator outside measured arms.
+        _arm(
+            boundary, evaluator, sims=1, exposure=0, enum_max_rows=70,
+            seed=int(seed), margin_gain=margin_gain, alpha=alpha,
+            fpu=float(fpu), cpuct=float(cpuct), backup="hajek",
+            traversal="balanced",
+        )
+    records = []
+    arm_names = list(specs)
+    for seed_index in range(int(seed_count)):
+        search_seed = int(seed) + seed_index
+        arm_rows = {}
+        execution_order = rotated_arm_order(
+            arm_names, seed_index, rotation_offset=rotation_offset
+        )
+        for name in execution_order:
+            spec = specs[name]
+            arm = _arm(
+                boundary,
+                evaluator,
+                sims=int(simulation_ceiling),
+                exposure=int(spec["exposure"]),
+                enum_max_rows=int(spec["enum_max_rows"]),
+                seed=search_seed,
+                margin_gain=margin_gain,
+                alpha=alpha,
+                fpu=float(fpu),
+                cpuct=float(cpuct),
+                backup=str(spec["backup"]),
+                traversal=str(spec["traversal"]),
+                panel_mode=str(spec["panel_mode"]),
+                panel_sampling=str(spec["panel_sampling"]),
+                init_visits=int(a1c_init_visits),
+                widening_c=float(a1c_widening_c),
+                init_max_fraction=float(a1c_init_max_fraction),
+                leaf_batch=int(spec["leaf_batch"]),
+                nn_eval_budget=int(nn_eval_budget),
+            )
+            require_exhausted_nn_budget(name, arm, int(nn_eval_budget))
+            arm_rows[name] = score_arm_against_oracle(arm, exact_actor_values)
+        records.append(
+            {
+                "seed_index": seed_index,
+                "seed": search_seed,
+                "arm_execution_order": execution_order,
+                "arms": arm_rows,
+            }
+        )
+    return {
+        "records": records,
+        "aggregate": {
+            name: _aggregate([record["arms"][name] for record in records])
+            for name in specs
+        },
+        "exact": exact_separation(exact_actor_values),
     }
 
 
@@ -371,98 +529,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         margin_gain=margin_gain,
         alpha=alpha,
     )
-
-    specs = {
-        "x0": {
-            "exposure": 0,
-            "backup": "hajek",
-            "traversal": "balanced",
-            "panel_mode": "lazy",
-            "panel_sampling": "balanced",
-            "enum_max_rows": 70,
-            "leaf_batch": 8,
-        },
-        "x1_hajek_balanced": {
-            "exposure": 1,
-            "backup": "hajek",
-            "traversal": "balanced",
-            "panel_mode": "lazy",
-            "panel_sampling": "balanced",
-            "enum_max_rows": 70,
-            "leaf_batch": 8,
-        },
-    }
-    if getattr(args, "include_a1c", False):
-        exposures = [int(value) for value in str(args.a1c_exposures).split(",")]
-        samplings = [value.strip() for value in str(args.a1c_sampling).split(",")]
-        if any(exposure <= 0 for exposure in exposures):
-            raise ValueError("--a1c-exposures must contain positive integers")
-        if any(sampling not in {"balanced", "iid"} for sampling in samplings):
-            raise ValueError("--a1c-sampling must contain balanced and/or iid")
-        for exposure in exposures:
-            for sampling in samplings:
-                specs[f"a1c_x{exposure}_{sampling}"] = {
-                    "exposure": exposure,
-                    "backup": "sampled",
-                    "traversal": "balanced",
-                    "panel_mode": "a1c",
-                    "panel_sampling": sampling,
-                    # Force sampled panels at deck=8; the exact 70-row oracle is
-                    # the external target, not a counterfactual search arm.
-                    "enum_max_rows": 1,
-                    "leaf_batch": 8,
-                }
-    # Warm the evaluator outside measured arms.
-    _arm(
-        boundary, evaluator, sims=1, exposure=0, enum_max_rows=70,
-        seed=int(args.seed), margin_gain=margin_gain, alpha=alpha,
-        fpu=float(args.fpu), cpuct=float(args.cpuct), backup="hajek",
-        traversal="balanced",
+    specs = build_arm_specs(
+        include_a1c=bool(getattr(args, "include_a1c", False)),
+        a1c_exposures=str(args.a1c_exposures),
+        a1c_sampling=str(args.a1c_sampling),
     )
-    records = []
-    arm_names = list(specs)
-    for seed_index in range(int(args.seed_count)):
-        seed = int(args.seed) + seed_index
-        arm_rows = {}
-        execution_order = rotated_arm_order(arm_names, seed_index)
-        for name in execution_order:
-            spec = specs[name]
-            arm = _arm(
-                boundary,
-                evaluator,
-                sims=int(args.sims),
-                exposure=int(spec["exposure"]),
-                enum_max_rows=int(spec["enum_max_rows"]),
-                seed=seed,
-                margin_gain=margin_gain,
-                alpha=alpha,
-                fpu=float(args.fpu),
-                cpuct=float(args.cpuct),
-                backup=str(spec["backup"]),
-                traversal=str(spec["traversal"]),
-                panel_mode=str(spec["panel_mode"]),
-                panel_sampling=str(spec["panel_sampling"]),
-                init_visits=int(args.a1c_init_visits),
-                widening_c=float(args.a1c_widening_c),
-                init_max_fraction=float(args.a1c_init_max_fraction),
-                leaf_batch=int(spec["leaf_batch"]),
-                nn_eval_budget=nn_eval_budget,
-            )
-            require_exhausted_nn_budget(name, arm, nn_eval_budget)
-            arm_rows[name] = score_arm_against_oracle(arm, exact_actor_values)
-        records.append(
-            {
-                "seed_index": seed_index,
-                "seed": seed,
-                "arm_execution_order": execution_order,
-                "arms": arm_rows,
-            }
-        )
-
-    aggregate = {
-        name: _aggregate([record["arms"][name] for record in records])
-        for name in specs
-    }
+    comparison = compare_boundary(
+        boundary,
+        evaluator,
+        exact_actor_values,
+        specs,
+        simulation_ceiling=int(args.sims),
+        nn_eval_budget=nn_eval_budget,
+        seed=int(args.seed),
+        seed_count=int(args.seed_count),
+        fpu=float(args.fpu),
+        cpuct=float(args.cpuct),
+        margin_gain=margin_gain,
+        alpha=alpha,
+        a1c_init_visits=int(args.a1c_init_visits),
+        a1c_widening_c=float(args.a1c_widening_c),
+        a1c_init_max_fraction=float(args.a1c_init_max_fraction),
+        rotation_offset=int(getattr(args, "arm_order_rotation_offset", 0)),
+    )
+    records = comparison["records"]
+    aggregate = comparison["aggregate"]
     exact_order = sorted(exact_actor_values, key=lambda x: (-exact_actor_values[x], x))
     exact_summary = exact_separation(exact_actor_values)
     result = {
@@ -480,7 +571,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "simulation_ceiling": int(args.sims),
             "nn_eval_budget": nn_eval_budget,
             "comparison_basis": "equal_nn_work" if nn_eval_budget > 0 else "equal_simulations",
-            "arm_ordering": "cyclic_rotation_by_seed_index",
+            "arm_ordering": "cyclic_rotation_by_seed_index_plus_offset",
+            "arm_order_rotation_offset": int(
+                getattr(args, "arm_order_rotation_offset", 0)
+            ),
             "seed": int(args.seed),
             "seed_count": int(args.seed_count), "fpu": float(args.fpu),
             "cpuct": float(args.cpuct), "device": str(args.device), "arms": specs,
@@ -521,6 +615,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--seed-count", type=int, default=8)
+    parser.add_argument(
+        "--arm-order-rotation-offset",
+        type=int,
+        default=0,
+        help="Added to the per-seed cyclic arm-order rotation (default preserves legacy behavior).",
+    )
     parser.add_argument("--fpu", type=float, default=-0.2)
     parser.add_argument("--cpuct", type=float, default=1.5)
     parser.add_argument("--include-a1c", action="store_true")
