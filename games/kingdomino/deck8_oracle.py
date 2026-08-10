@@ -16,7 +16,6 @@ import argparse
 import hashlib
 import json
 import math
-import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,7 +24,11 @@ from typing import Any, Callable, Iterable
 from games.kingdomino.action_codec import encode_action
 from games.kingdomino.denial_search import chance_public_state_key_v1, public_state_key
 from games.kingdomino.denial_signal_sweep import file_sha256, load_frozen_positions
-from games.kingdomino.endgame_solver import _step_public_futures, exact_endgame_value
+from games.kingdomino.endgame_solver import (
+    _is_rust_no_chance_state,
+    _rust_state_from_python,
+    _step_public_futures,
+)
 from games.kingdomino.game import GameState, Phase
 
 
@@ -41,6 +44,7 @@ class UtilitySpec:
 
 
 TailSolver = Callable[[GameState], tuple[float, bool]]
+RUST_SOLVER_BACKEND = "rust_exact_no_chance"
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -122,7 +126,9 @@ def conditioned_tails(state: GameState, action: object) -> list[tuple[GameState,
             )
         if not math.isclose(float(probability), expected_p, rel_tol=0.0, abs_tol=1e-15):
             raise ValueError(f"non-uniform deck-8 row probability {probability}")
-    if not math.isclose(sum(float(p) for _, p in futures), 1.0, abs_tol=1e-12):
+    if not math.isclose(
+        sum(float(p) for _, p in futures), 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
         raise ValueError("conditioned row probabilities do not sum to one")
     return futures
 
@@ -157,13 +163,57 @@ def _cell_path(cells_dir: Path, action_idx: int, row: tuple[int, ...]) -> Path:
     return cells_dir / f"action_{action_idx:04d}__row_{row_label}.json"
 
 
-def _read_cell(path: Path, expected_key: str) -> dict[str, Any] | None:
+def _solve_rust_tail(
+    state: GameState,
+    *,
+    max_secs: float,
+    score_scale: float,
+    margin_gain: float,
+    alpha: float,
+) -> tuple[float, bool, str]:
+    """Run the required Rust deck-4 solver without a silent Python fallback."""
+    if not _is_rust_no_chance_state(state):
+        raise RuntimeError("deck-8 oracle tail is not Rust no-chance eligible")
+    rust_state = _rust_state_from_python(state)
+    if rust_state is None:
+        raise RuntimeError(
+            "deck-8 oracle requires a working kingdomino_rust state conversion"
+        )
+    try:
+        import kingdomino_rust
+
+        value0, solved, _elapsed = kingdomino_rust.exact_endgame_value_no_chance(
+            rust_state,
+            float(max_secs),
+            float(score_scale),
+            float(margin_gain),
+            float(alpha),
+        )
+    except Exception as exc:
+        raise RuntimeError("deck-8 oracle Rust solver invocation failed") from exc
+    return float(value0), bool(solved), RUST_SOLVER_BACKEND
+
+
+def _read_cell(
+    path: Path,
+    expected_key: str,
+    *,
+    expected_oracle_id: str,
+    expected_action_idx: int,
+    expected_row: tuple[int, ...],
+) -> dict[str, Any] | None:
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"cell schema mismatch: {path}")
-    if payload.get("tail_state_key") != expected_key or payload.get("solved") is not True:
+    if (
+        payload.get("oracle_id") != expected_oracle_id
+        or int(payload.get("action_idx", -1)) != expected_action_idx
+        or tuple(int(x) for x in payload.get("row", [])) != expected_row
+        or payload.get("tail_state_key") != expected_key
+        or payload.get("solved") is not True
+    ):
         raise ValueError(f"cell identity/solve mismatch: {path}")
     value = float(payload["value_player0"])
     if not math.isfinite(value):
@@ -234,15 +284,22 @@ def run_oracle(args: argparse.Namespace) -> dict[str, Any]:
     timeouts: list[dict[str, Any]] = []
     actor = int(boundary.current_actor)
     action_rows: list[dict[str, Any]] = []
+    solver_backend_counts: dict[str, int] = {}
     stop = False
 
     for action_idx, action in sorted(_legal_action_map(boundary).items()):
         cells = []
-        for ordinal, (tail, probability) in enumerate(conditioned_tails(boundary, action)):
+        for tail, probability in conditioned_tails(boundary, action):
             row = tuple(int(x) for x in tail.current_row)
             tail_key = public_state_key(tail)
             cell_path = _cell_path(cells_dir, action_idx, row)
-            cell = _read_cell(cell_path, tail_key)
+            cell = _read_cell(
+                cell_path,
+                tail_key,
+                expected_oracle_id=identity["oracle_id"],
+                expected_action_idx=action_idx,
+                expected_row=row,
+            )
             if cell is None:
                 elapsed_total = time.perf_counter() - started
                 if (max_cells > 0 and solved_this_run >= max_cells) or (
@@ -251,10 +308,9 @@ def run_oracle(args: argparse.Namespace) -> dict[str, Any]:
                     stop = True
                     break
                 call_started = time.perf_counter()
-                value0, solved = exact_endgame_value(
+                value0, solved, solver_backend = _solve_rust_tail(
                     tail,
                     max_secs=float(args.max_secs_per_tail),
-                    rng=random.Random(int(args.seed) + 1009 * ordinal + action_idx),
                     score_scale=utility.score_scale,
                     margin_gain=utility.margin_gain,
                     alpha=utility.alpha,
@@ -265,6 +321,7 @@ def run_oracle(args: argparse.Namespace) -> dict[str, Any]:
                         "action_idx": action_idx,
                         "row": list(row),
                         "elapsed_seconds": elapsed,
+                        "solver_backend": solver_backend,
                     })
                     stop = bool(args.stop_on_timeout)
                     if stop:
@@ -282,10 +339,13 @@ def run_oracle(args: argparse.Namespace) -> dict[str, Any]:
                     "solved": True,
                     "elapsed_seconds": elapsed,
                     "max_secs_per_tail": float(args.max_secs_per_tail),
+                    "solver_backend": solver_backend,
                 }
                 _atomic_json(cell_path, cell)
                 solved_this_run += 1
             cells.append(cell)
+            backend = str(cell.get("solver_backend", "legacy_unverified"))
+            solver_backend_counts[backend] = solver_backend_counts.get(backend, 0) + 1
         complete = len(cells) == EXPECTED_ROWS
         expected0 = None
         if complete:
@@ -327,6 +387,7 @@ def run_oracle(args: argparse.Namespace) -> dict[str, Any]:
         "solved_cells_this_run": solved_this_run,
         "timeouts_this_run": timeouts,
         "run_elapsed_seconds": time.perf_counter() - started,
+        "solver_backend_counts": solver_backend_counts,
         "actions": action_rows,
         "ranking": ranking,
     }

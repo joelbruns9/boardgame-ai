@@ -1,0 +1,214 @@
+"""Logic gates for the A1c cycle planner and initialization budget."""
+
+from collections import Counter
+
+import pytest
+
+from games.kingdomino.endgame_solver import _rust_state_from_python
+from games.kingdomino.game import GameState
+
+
+def _zero_evaluator(my_board, opp_board, flat, legal_indices):
+    import numpy as np
+
+    batch = int(np.asarray(my_board).shape[0])
+    return np.zeros(batch, dtype=np.float32), [
+        np.zeros(len(indices), dtype=np.float32) for indices in legal_indices
+    ]
+
+
+def _deck8_boundary_state():
+    state = GameState.new(seed=17)
+    while not state.pending_claims:
+        state = state.step(state.legal_actions()[0])
+    state.deck = state.deck[:8]
+    while state.actor_index < len(state.pending_claims) - 1:
+        state = state.step(state.legal_actions()[0])
+    return state
+
+
+def test_balanced_cycles_expose_every_tile_once_per_cycle():
+    import kingdomino_rust as kr
+
+    deck = list(range(1, 29))
+    cycles = kr.debug_a1c_panel_cycles(
+        deck, max_cycles=4, sampling="balanced", seed=20260809
+    )
+    assert len(cycles) == 4
+    for cycle in cycles:
+        assert len(cycle) == 7
+        assert Counter(tile for row in cycle for tile in row) == Counter(deck)
+        assert all(row == sorted(row) and len(set(row)) == 4 for row in cycle)
+
+
+def test_iid_cycles_match_width_without_claiming_tile_balance():
+    import kingdomino_rust as kr
+
+    deck = list(range(1, 29))
+    cycles = kr.debug_a1c_panel_cycles(
+        deck, max_cycles=4, sampling="iid", seed=20260809
+    )
+    assert [len(cycle) for cycle in cycles] == [7, 7, 7, 7]
+    assert all(
+        row == sorted(row) and len(set(row)) == 4 and set(row) <= set(deck)
+        for cycle in cycles
+        for row in cycle
+    )
+    assert Counter(tile for row in cycles[0] for tile in row) != Counter(deck)
+
+
+def test_panel_plans_are_seed_stable_and_sampling_modes_are_distinct():
+    import kingdomino_rust as kr
+
+    deck = list(range(1, 13))
+    balanced = kr.debug_a1c_panel_cycles(deck, 3, "balanced", 17)
+    assert balanced == kr.debug_a1c_panel_cycles(deck, 3, "balanced", 17)
+    assert balanced != kr.debug_a1c_panel_cycles(deck, 3, "balanced", 18)
+    assert balanced != kr.debug_a1c_panel_cycles(deck, 3, "iid", 17)
+
+
+def test_width_and_guard_charge_a_whole_proposed_batch():
+    import kingdomino_rust as kr
+
+    target, admitted = kr.debug_a1c_admission(
+        visits=16,
+        n_init=16,
+        max_cycles=8,
+        widening_c=0.25,
+        initialization_nn_evals=0,
+        total_nn_evals=33,
+        additional_nn_evals=11,
+        max_initialization_fraction=0.25,
+    )
+    assert target == 1
+    assert admitted is True
+
+    target, admitted = kr.debug_a1c_admission(
+        visits=15,
+        n_init=16,
+        max_cycles=8,
+        widening_c=0.25,
+        initialization_nn_evals=0,
+        total_nn_evals=32,
+        additional_nn_evals=11,
+        max_initialization_fraction=0.25,
+    )
+    assert target == 0
+    assert admitted is False
+
+
+@pytest.mark.parametrize("sampling", ["", "stratified", "IID"])
+def test_invalid_panel_sampling_is_rejected(sampling):
+    import kingdomino_rust as kr
+
+    with pytest.raises(ValueError, match="balanced.*iid"):
+        kr.debug_a1c_panel_cycles(list(range(1, 9)), 1, sampling, 0)
+
+
+def test_invalid_admission_parameters_are_rejected():
+    import kingdomino_rust as kr
+
+    with pytest.raises(ValueError, match="widening_c"):
+        kr.debug_a1c_admission(16, 16, 4, 0.0, 0, 33, 11)
+    with pytest.raises(ValueError, match="max_initialization_fraction"):
+        kr.debug_a1c_admission(16, 16, 4, 0.25, 0, 33, 11, 1.1)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        kr.debug_a1c_admission(16, 16, 4, 0.25, 34, 33, 11)
+
+
+@pytest.mark.parametrize("sampling", ["balanced", "iid"])
+def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        96,
+        chance_exposure=4,
+        chance_enum_max_rows=1,
+        seed=20260809,
+        leaf_batch=1,
+        virtual_loss=1,
+        chance_panel_mode="a1c",
+        chance_panel_sampling=sampling,
+        chance_init_visits=1,
+        chance_widening_c=0.1,
+        chance_init_max_fraction=1.0,
+    )
+    assert sum(row[1] for row in children) == 96
+    assert diagnostics["a1c_initialized_chance_nodes"] > 0
+    assert diagnostics["a1c_enabled"] == 1.0
+    assert diagnostics["a1c_max_cycles"] == 4.0
+    assert diagnostics["a1c_raw_planned_rows"] == 44.0
+    assert 0 < diagnostics["a1c_unique_planned_rows"] <= 44.0
+    assert diagnostics["a1c_initialized_cycles"] >= diagnostics[
+        "a1c_initialized_chance_nodes"
+    ]
+    assert diagnostics["initialization_nn_evaluations"] > 0
+    assert diagnostics["initialization_nn_evaluations"] < diagnostics["nn_evaluations"]
+    # Bootstrap rows influence the panel mean but are not search visits.
+    assert diagnostics["chance_node_visits"] == diagnostics["observation_visits"]
+
+
+def test_a1c_search_never_exceeds_initialization_fraction_guard():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    _children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        128,
+        chance_exposure=4,
+        chance_enum_max_rows=1,
+        seed=20260810,
+        leaf_batch=1,
+        chance_panel_mode="a1c",
+        chance_panel_sampling="balanced",
+        chance_init_visits=1,
+        chance_widening_c=0.25,
+        chance_init_max_fraction=0.25,
+    )
+    assert diagnostics["initialization_nn_fraction"] <= 0.25 + 1e-12
+    assert diagnostics["initialization_blocked_cycles"] > 0
+
+
+def test_a1c_reports_sampled_visits_that_predate_panel_admission():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(_deck8_boundary_state())
+    _children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        _zero_evaluator,
+        256,
+        chance_exposure=4,
+        chance_enum_max_rows=1,
+        seed=20260811,
+        leaf_batch=1,
+        chance_panel_mode="a1c",
+        chance_panel_sampling="balanced",
+        chance_init_visits=4,
+        chance_widening_c=0.1,
+        chance_init_max_fraction=1.0,
+    )
+    assert diagnostics["a1c_initialized_chance_nodes"] > 0
+    assert diagnostics["a1c_preinit_visits"] > 0
+    assert diagnostics["a1c_initialized_node_visits"] > diagnostics[
+        "a1c_preinit_visits"
+    ]
+    assert 0.0 < diagnostics["a1c_preinit_visit_fraction"] < 1.0
+
+
+def test_a1c_search_rejects_parallel_leaf_waves_until_admission_is_wave_safe():
+    import kingdomino_rust as kr
+
+    state = _rust_state_from_python(GameState.new(seed=17))
+    with pytest.raises(ValueError, match="leaf_batch=1"):
+        kr.advisor_one_reveal_search(
+            state,
+            _zero_evaluator,
+            8,
+            chance_exposure=1,
+            chance_panel_mode="a1c",
+            leaf_batch=8,
+        )

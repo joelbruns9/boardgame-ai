@@ -48,6 +48,12 @@ def _arm(
     cpuct: float,
     backup: str = "hajek",
     traversal: str = "iid",
+    panel_mode: str = "lazy",
+    panel_sampling: str = "balanced",
+    init_visits: int = 32,
+    widening_c: float = 0.25,
+    init_max_fraction: float = 0.25,
+    leaf_batch: int = 8,
 ) -> dict[str, Any]:
     import kingdomino_rust as kr
 
@@ -66,7 +72,7 @@ def _arm(
         fpu=float(fpu),
         cpuct=float(cpuct),
         seed=int(seed) & 0xFFFF_FFFF_FFFF_FFFF,
-        leaf_batch=8,
+        leaf_batch=int(leaf_batch),
         virtual_loss=1,
         margin_gain=float(margin_gain),
         alpha=float(alpha),
@@ -74,6 +80,11 @@ def _arm(
         chance_enum_max_rows=int(enum_max_rows),
         chance_backup=str(backup),
         chance_traversal=str(traversal),
+        chance_panel_mode=str(panel_mode),
+        chance_panel_sampling=str(panel_sampling),
+        chance_init_visits=int(init_visits),
+        chance_widening_c=float(widening_c),
+        chance_init_max_fraction=float(init_max_fraction),
     )
     chance_diagnostics = {
         str(key): float(value) for key, value in raw_chance_diagnostics.items()
@@ -108,6 +119,12 @@ def _arm(
         "chance_panel_rows": panel_rows,
         "chance_backup": "disabled" if exposure == 0 else str(backup),
         "chance_traversal": "disabled" if exposure == 0 else str(traversal),
+        "chance_panel_search_mode": "disabled" if exposure == 0 else str(panel_mode),
+        "chance_panel_sampling": "disabled" if exposure == 0 else str(panel_sampling),
+        "chance_init_visits": int(init_visits),
+        "chance_widening_c": float(widening_c),
+        "chance_init_max_fraction": float(init_max_fraction),
+        "leaf_batch": int(leaf_batch),
         "root_value_running_mean_player0": float(root_value0),
         "root_value_current_children_player0": chance_diagnostics[
             "root_value_current_children_player0"

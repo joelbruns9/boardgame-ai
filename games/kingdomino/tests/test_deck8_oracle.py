@@ -2,24 +2,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 
 import pytest
 
 from games.kingdomino.action_codec import encode_action
 from games.kingdomino.deck8_oracle import (
     EXPECTED_ROWS,
+    RUST_SOLVER_BACKEND,
+    _solve_rust_tail,
     apply_prefix_actions,
     conditioned_tails,
     evaluate_boundary_in_memory,
     run_oracle,
     validate_boundary_state,
 )
-from games.kingdomino.deck8_oracle_compare import score_arm_against_oracle
+from games.kingdomino.deck8_oracle_compare import (
+    exact_separation,
+    run as run_oracle_compare,
+    score_arm_against_oracle,
+)
 from games.kingdomino.deck8_boundary_screen import (
     disagreement_verdict,
     selection_summary,
 )
-from games.kingdomino.deck8_oracle_corpus import balanced_panel, iid_panel
+from games.kingdomino.deck8_oracle_corpus import (
+    _choose,
+    balanced_panel,
+    exhaustive_panel,
+    iid_panel,
+)
 from games.kingdomino.denial_signal_sweep import write_frozen_positions
 from games.kingdomino.game import GameState
 
@@ -98,9 +110,9 @@ def test_run_oracle_persists_and_resumes_solved_cells(tmp_path, monkeypatch):
     def fake_exact(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        return 0.25, True
+        return 0.25, True, RUST_SOLVER_BACKEND
 
-    monkeypatch.setattr("games.kingdomino.deck8_oracle.exact_endgame_value", fake_exact)
+    monkeypatch.setattr("games.kingdomino.deck8_oracle._solve_rust_tail", fake_exact)
     common = dict(
         positions_path=str(corpus), position_index=0, prefix_actions="",
         output_dir=str(output), selection_reason="unit test", score_scale=160.0,
@@ -139,6 +151,43 @@ def test_compare_scores_top1_regret_and_pairwise_ordering():
     assert scored["visit_pairwise_accuracy"] == pytest.approx(2 / 3)
 
 
+def test_compare_treats_all_exact_ties_as_rank_one():
+    exact = {10: 0.3, 20: 0.3, 30: -0.1}
+    arm = {
+        "top_action_idx": 20,
+        "nn_evaluations": 10,
+        "elapsed_seconds": 0.1,
+        "children": [
+            {"action_idx": 10, "q_actor": 0.2, "visits": 5},
+            {"action_idx": 20, "q_actor": 0.2, "visits": 6},
+            {"action_idx": 30, "q_actor": -0.2, "visits": 1},
+        ],
+    }
+    scored = score_arm_against_oracle(arm, exact)
+    assert scored["exact_best_action_indices"] == [10, 20]
+    assert scored["top1_exact"] is True
+    assert scored["selected_exact_rank"] == 1
+    assert scored["exact_regret_actor"] == 0.0
+
+
+def test_compare_gap_skips_all_tied_best_actions():
+    summary = exact_separation({10: 0.3, 20: 0.3, 30: 0.1, 40: -0.2})
+    assert summary["best_action_indices"] == [10, 20]
+    assert summary["runner_up_action_idx"] == 30
+    assert summary["top_gap_actor"] == pytest.approx(0.2)
+    assert summary["all_actions_tied"] is False
+
+    all_tied = exact_separation({10: 0.3, 20: 0.3})
+    assert all_tied["runner_up_action_idx"] is None
+    assert all_tied["top_gap_actor"] is None
+    assert all_tied["all_actions_tied"] is True
+
+
+def test_a1c_oracle_comparison_is_disabled_until_leaf_batch_is_restored():
+    with pytest.raises(RuntimeError, match="disabled until panel admission is wave-safe"):
+        run_oracle_compare(argparse.Namespace(include_a1c=True))
+
+
 def test_boundary_screen_requires_stable_disagreement():
     assert selection_summary([20, 20, 20])["unanimous"] is True
     stable = {
@@ -166,3 +215,111 @@ def test_corpus_panels_match_width_and_balanced_exposure():
     counts = {tile: sum(tile in row for row in balanced) for tile in bag}
     assert counts == {tile: 4 for tile in bag}
     assert all(len(row) == 4 and tuple(sorted(row)) == row for row in balanced + iid)
+
+
+def test_corpus_ties_use_absolute_tolerance_only():
+    values = {10: 0.5, 20: 0.5 + 3e-10}
+    assert _choose(values, random.Random(1)) == 20
+
+
+def test_exposure_35_is_sampled_width_not_exhaustive_support():
+    bag = list(range(1, 9))
+    sampled = balanced_panel(bag, 35, random.Random(7))
+    exhaustive = exhaustive_panel(bag)
+    assert len(sampled) == len(exhaustive) == 70
+    assert len(set(sampled)) < 70
+    assert len(set(exhaustive)) == 70
+
+
+def test_timeout_is_excluded_from_action_expectation(tmp_path, monkeypatch):
+    state = _boundary_state()
+    corpus = tmp_path / "positions.jsonl"
+    write_frozen_positions([(state, {"fixture": True})], corpus)
+    calls = 0
+
+    def fail_then_solve(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 0.0, False, RUST_SOLVER_BACKEND
+        return 0.25, True, RUST_SOLVER_BACKEND
+
+    monkeypatch.setattr(
+        "games.kingdomino.deck8_oracle._solve_rust_tail", fail_then_solve
+    )
+    summary = run_oracle(
+        argparse.Namespace(
+            positions_path=str(corpus),
+            position_index=0,
+            prefix_actions="",
+            output_dir=str(tmp_path / "oracle"),
+            selection_reason="timeout exclusion test",
+            score_scale=160.0,
+            margin_gain=2.0,
+            alpha=0.5,
+            max_secs_per_tail=1.0,
+            max_total_secs=0.0,
+            max_cells=1,
+            seed=7,
+            stop_on_timeout=False,
+        )
+    )
+    first_action = summary["actions"][0]
+    assert first_action["complete"] is False
+    assert first_action["rows_solved"] == 1
+    assert first_action["expected_value_player0"] is None
+    assert all(row["action_idx"] != first_action["action_idx"] for row in summary["ranking"])
+    assert summary["timeouts_this_run"][0]["solver_backend"] == RUST_SOLVER_BACKEND
+
+
+@pytest.mark.parametrize("stale_field", ["action_idx", "tail_state_key", "oracle_id"])
+def test_resume_rejects_stale_cell_payload_identity(
+    tmp_path, monkeypatch, stale_field
+):
+    state = _boundary_state()
+    corpus = tmp_path / "positions.jsonl"
+    write_frozen_positions([(state, {"fixture": True})], corpus)
+
+    monkeypatch.setattr(
+        "games.kingdomino.deck8_oracle._solve_rust_tail",
+        lambda *_args, **_kwargs: (0.25, True, RUST_SOLVER_BACKEND),
+    )
+    args = argparse.Namespace(
+        positions_path=str(corpus),
+        position_index=0,
+        prefix_actions="",
+        output_dir=str(tmp_path / "oracle"),
+        selection_reason="stale cell test",
+        score_scale=160.0,
+        margin_gain=2.0,
+        alpha=0.5,
+        max_secs_per_tail=1.0,
+        max_total_secs=0.0,
+        max_cells=1,
+        seed=7,
+        stop_on_timeout=True,
+    )
+    run_oracle(args)
+    cell_path = next((tmp_path / "oracle" / "cells").glob("*.json"))
+    payload = json.loads(cell_path.read_text(encoding="utf-8"))
+    if stale_field == "action_idx":
+        payload[stale_field] += 1
+    else:
+        payload[stale_field] = "stale-identity"
+    cell_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="cell identity/solve mismatch"):
+        run_oracle(args)
+
+
+def test_oracle_refuses_silent_python_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "games.kingdomino.deck8_oracle._rust_state_from_python", lambda _state: None
+    )
+    with pytest.raises(RuntimeError, match="requires a working kingdomino_rust"):
+        _solve_rust_tail(
+            _boundary_state().step(_boundary_state().legal_actions()[0]),
+            max_secs=1.0,
+            score_scale=160.0,
+            margin_gain=2.0,
+            alpha=0.5,
+        )

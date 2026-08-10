@@ -769,6 +769,31 @@ widening addresses the width/depth tradeoff: at fixed work, larger `X` splits
 visits across more observation subtrees and can make the search shallower. Full
 initialization guarantees coverage of the active panel, not unlimited width.
 
+**A1c implementation checkpoint, 2026-08-09 — serial prototype in progress.**
+The opt-in advisor diagnostic path now preserves whole panel cycles, separates
+balanced panel construction from the matched-width IID ablation, delays the
+first cycle until `N_init`, admits at most one complete cycle per chance-node
+encounter, batch-evaluates every missing row before committing the cycle, and
+uses bootstrap values without incrementing MCTS visits. The cumulative
+initialization guard charges the proposed batch before admission and reports
+initialized/blocked cycles, NN rows and initialization fraction. It also reports
+the real sampled-backup visits that predate first-panel admission and their
+fraction of visits to initialized chance nodes; those earlier contributions
+remain in ancestor running means and can dilute a finite-budget A1c effect. The
+incumbent and lazy modes retain their prior defaults and regression vectors.
+
+The prototype currently requires `leaf_batch=1`. This is a correctness lock:
+an in-flight sampled path must not be backed up after another path changes the
+same chance node to complete-panel probabilities. Before throughput measurement,
+make admission wave-safe (or end a wave before committing a cycle), restore
+leaf batching, and add an invariant test for the transition. The deck-8 oracle
+comparison harness contains the future A1c `X=4,8` balanced/IID specifications,
+but hard-rejects `--include-a1c` until that leaf-batch transition is fixed.
+Comparing prototype `leaf_batch=1` against control `leaf_batch=8` at equal
+simulations would confound batching, virtual-loss collisions and additional
+initialization NN rows. No GPU comparison has been run and this checkpoint is
+not evidence of stronger play.
+
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
 the available theory does not cover its adaptive use inside this PUCT tree; it
@@ -1215,6 +1240,14 @@ its transposition/caching support inside the Rust solver rather than above it in
 Python. This remains an offline oracle; it does not need advisor latency or
 self-play throughput.
 
+Drive conditioned tails serially. Each no-chance call already uses the Rust
+solver's Lookahead2Clustered ordering, root-level YBW parallelism and a shared
+bound-flagged transposition table; concurrently launching many internally
+parallel tails risks CPU oversubscription and deadline-induced fallbacks. The
+remaining possible optimization is cross-tail reuse of exact solve results.
+Measure the existing transposition-rate diagnostic first; do not build a shared
+cross-tail cache unless it shows meaningful overlap.
+
 **Boundary-oracle checkpoint, 2026-08-09.** `deck8_oracle.py` implements the
 guarded final-pre-reveal boundary described above. It requires exactly eight bag
 tiles, the last current-round actor and one remaining public pick; enumerates 70
@@ -1249,7 +1282,12 @@ the screen outcome: the `X=0`-derived boundary from every frozen root. All eight
 positions, 68 legal placements and 4,760 `(placement, row)` tails solved exactly
 with no timeout; total exact wall time was about 37.5 minutes. The original
 position-11 result was reused. Cell means are now checked to reproduce every
-stored oracle action expectation before analysis.
+stored oracle action expectation before analysis. A review subsequently found
+that the generic solver API could silently fall back to Python if Rust state
+conversion failed. New oracle cells now require and record the Rust no-chance
+backend, while these already-completed cells are labeled `legacy_unverified`;
+their zero-timeout completion is strong operational evidence but not explicit
+per-cell backend provenance.
 
 Against these oracles, three-seed 4,800-sim `X=0` search selected an exact-best
 placement on 66.7% of nested searches with mean position regret 0.00576. Lazy
@@ -1261,14 +1299,15 @@ a game-strength result.
 Exact-tail panel resampling used common rows across actions and 2,000 trials per
 position, scheme and exposure. Top-1 recovery and mean exact regret were:
 
-| Exposure | Rows | Balanced top-1 / regret | Matched IID top-1 / regret |
+| Exposure | Rows | Balanced top-1 / regret / unique support | Matched IID top-1 / regret / unique support |
 |---:|---:|---:|---:|
-| `X=1` | 2 | 81.1% / 0.00116 | 82.6% / 0.00094 |
-| `X=2` | 4 | 87.8% / 0.00060 | 88.5% / 0.00053 |
-| `X=4` | 8 | 92.6% / 0.00029 | 93.4% / 0.00023 |
-| `X=8` | 16 | 96.1% / 0.00011 | 96.3% / 0.00009 |
-| `X=16` | 32 | 98.4% / 0.00003 | 98.2% / 0.00003 |
-| `X=35` | 70 sampled | 99.4% / 0.00001 | 99.4% / 0.00001 |
+| `X=1` | 2 | 81.1% / 0.00116 / 2.9% | 82.6% / 0.00094 / 2.8% |
+| `X=2` | 4 | 87.8% / 0.00060 / 5.6% | 88.5% / 0.00053 / 5.6% |
+| `X=4` | 8 | 92.6% / 0.00029 / 10.9% | 93.4% / 0.00023 / 10.9% |
+| `X=8` | 16 | 96.1% / 0.00011 / 20.7% | 96.3% / 0.00009 / 20.6% |
+| `X=16` | 32 | 98.4% / 0.00003 / 37.1% | 98.2% / 0.00003 / 36.9% |
+| `X=35` | 70 sampled | 99.4% / 0.00001 / 63.8% | 99.4% / 0.00001 / 63.4% |
+| exhaustive | 70 unique | 100% / 0 / 100% | 100% / 0 / 100% |
 
 `X=35` above is still a 70-row random panel, not enumeration of every unique
 combination; the full oracle is 100% by definition. This isolates chance-panel

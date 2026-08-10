@@ -4906,6 +4906,9 @@ enum OLChanceBackup {
     Sampled,
     /// Registered-probability mean over observation rows with real visits.
     Hajek,
+    /// Direct probability mean over a fully bootstrapped A1c active panel.
+    /// Bootstrap evaluations affect Q but never visit or policy-target counts.
+    PanelMean,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4916,6 +4919,21 @@ enum OLChanceTraversal {
     Balanced,
 }
 
+/// How A1c constructs each fixed-width cycle of candidate public reveals.
+/// This is deliberately separate from traversal: panel design controls which
+/// counterfactual worlds are represented, while traversal controls which
+/// already-active world receives the next search visit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum A1cPanelSampling {
+    /// One shuffled bag partition per cycle. Every hidden tile appears exactly
+    /// once among that cycle's hypothetical first reveals.
+    Balanced,
+    /// The same number of uniform 4-of-n rows, sampled independently with
+    /// replacement. This is the matched-width ablation required by the deck-8
+    /// oracle result; it is not the existing IID traversal over a balanced set.
+    Iid,
+}
+
 #[derive(Clone, Copy)]
 struct OLChanceConfig<'a> {
     panel: &'a [OLChancePanelRow],
@@ -4923,6 +4941,30 @@ struct OLChanceConfig<'a> {
     traversal: OLChanceTraversal,
     schedule_seed: u64,
     draw_seed: u64,
+    a1c: Option<A1cChanceConfig<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct A1cChanceConfig<'a> {
+    cycles: &'a [Vec<[u16; 4]>],
+    n_init: usize,
+    widening_c: f64,
+    max_initialization_fraction: f64,
+}
+
+#[derive(Clone, Copy)]
+struct A1cSearchOptions {
+    sampling: A1cPanelSampling,
+    n_init: usize,
+    widening_c: f64,
+    max_initialization_fraction: f64,
+}
+
+struct A1cRuntime<'a> {
+    evaluator: &'a Py<PyAny>,
+    initialization_nn_evals: &'a mut usize,
+    total_nn_evals: &'a mut usize,
+    initialization_blocked_cycles: &'a mut usize,
 }
 
 struct OLNode {
@@ -4948,7 +4990,15 @@ struct OLNode {
     // the chance node is reached, after its parent action has been selected.
     chance_schedule: Vec<usize>,
     chance_route_count: u64,
+    chance_balanced_start_visits: u64,
     chance_schedule_seed: u64,
+    // A1c admits complete cycles atomically. Zero means the node is still in
+    // unbiased sampled-backup mode below its initialization threshold.
+    chance_initialized_cycles: usize,
+    // Real sampled-backup visits already propagated before the first complete
+    // panel was admitted. These remain in ancestors' running means, so report
+    // them explicitly as a finite-budget dilution diagnostic.
+    chance_preinit_visits: usize,
     children: Vec<(u16, u32)>,
     action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
     is_expanded: bool,
@@ -4957,6 +5007,10 @@ struct OLNode {
     // probabilities are fixed when the support is created and never inferred
     // from downstream visit allocation.
     chance_children: Vec<OLChanceChild>,
+    // Network estimate installed without a real MCTS visit when A1c completes
+    // a panel. It supplies the conditional row value until that public subtree
+    // receives search visits, and it must never enter visit-based targets.
+    bootstrap_value0: Option<f64>,
 }
 
 struct OLChanceChild {
@@ -5000,11 +5054,15 @@ impl OLNode {
             chance_traversal: OLChanceTraversal::Iid,
             chance_schedule: Vec::new(),
             chance_route_count: 0,
+            chance_balanced_start_visits: 0,
             chance_schedule_seed: 0,
+            chance_initialized_cycles: 0,
+            chance_preinit_visits: 0,
             children: Vec::new(),
             action,
             is_expanded: false,
             chance_children: Vec::new(),
+            bootstrap_value0: None,
         }
     }
 }
@@ -5027,6 +5085,110 @@ fn ol_parse_chance_traversal(value: &str) -> PyResult<OLChanceTraversal> {
             "chance_traversal must be 'iid' or 'balanced', got {value:?}"
         ))),
     }
+}
+
+fn a1c_parse_panel_sampling(value: &str) -> PyResult<A1cPanelSampling> {
+    match value {
+        "balanced" => Ok(A1cPanelSampling::Balanced),
+        "iid" => Ok(A1cPanelSampling::Iid),
+        _ => Err(PyValueError::new_err(format!(
+            "A1c panel sampling must be 'balanced' or 'iid', got {value:?}"
+        ))),
+    }
+}
+
+/// Preserve cycle identity for A1c. The lazy A1/A1b support builder below
+/// intentionally coalesces duplicate rows, but A1c needs whole-cycle admission
+/// so it can widen atomically and cluster diagnostics by cycle.
+fn a1c_one_reveal_cycles(
+    deck: &[u16],
+    max_cycles: usize,
+    sampling: A1cPanelSampling,
+    seed: u64,
+) -> PyResult<Vec<Vec<[u16; 4]>>> {
+    if max_cycles == 0 {
+        return Ok(Vec::new());
+    }
+    if deck.is_empty() || deck.len() < 4 || deck.len() % 4 != 0 {
+        return Err(PyValueError::new_err(format!(
+            "A1c one-reveal cycles require a non-empty bag divisible by four, got {}",
+            deck.len()
+        )));
+    }
+    let mut bag = deck.to_vec();
+    bag.sort_unstable();
+    if bag.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PyValueError::new_err(
+            "A1c one-reveal cycles require distinct domino ids",
+        ));
+    }
+    let rows_per_cycle = bag.len() / 4;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut cycles = Vec::with_capacity(max_cycles);
+    for _ in 0..max_cycles {
+        let mut cycle = Vec::with_capacity(rows_per_cycle);
+        match sampling {
+            A1cPanelSampling::Balanced => {
+                let mut permutation = bag.clone();
+                permutation.shuffle(&mut rng);
+                for chunk in permutation.chunks_exact(4) {
+                    let mut row: [u16; 4] = chunk
+                        .try_into()
+                        .expect("chunks_exact(4) always yields four tiles");
+                    row.sort_unstable();
+                    cycle.push(row);
+                }
+            }
+            A1cPanelSampling::Iid => {
+                for _ in 0..rows_per_cycle {
+                    let mut permutation = bag.clone();
+                    permutation.shuffle(&mut rng);
+                    let mut row = [
+                        permutation[0],
+                        permutation[1],
+                        permutation[2],
+                        permutation[3],
+                    ];
+                    row.sort_unstable();
+                    cycle.push(row);
+                }
+            }
+        }
+        cycles.push(cycle);
+    }
+    Ok(cycles)
+}
+
+/// Visit-controlled A1c width. `n_init` gates the first complete cycle; after
+/// that, the preregistered sqrt schedule may request additional whole cycles.
+fn a1c_target_cycles(visits: usize, n_init: usize, max_cycles: usize, c: f64) -> usize {
+    if visits < n_init || max_cycles == 0 || !(c > 0.0 && c.is_finite()) {
+        return 0;
+    }
+    let scheduled = (c * (visits as f64).sqrt()).ceil() as usize;
+    scheduled.max(1).min(max_cycles)
+}
+
+/// Admit a complete cycle only if doing all of its missing network rows keeps
+/// cumulative initialization work within the preregistered fraction. `total`
+/// is the number of NN rows already evaluated, including prior initialization.
+fn a1c_initialization_within_budget(
+    initialization_nn_evals: usize,
+    total_nn_evals: usize,
+    additional_nn_evals: usize,
+    max_fraction: f64,
+) -> bool {
+    if additional_nn_evals == 0 {
+        return true;
+    }
+    if initialization_nn_evals > total_nn_evals
+        || !(max_fraction > 0.0 && max_fraction <= 1.0 && max_fraction.is_finite())
+    {
+        return false;
+    }
+    let next_initialization = initialization_nn_evals.saturating_add(additional_nn_evals);
+    let next_total = total_nn_evals.saturating_add(additional_nn_evals);
+    (next_initialization as f64) <= max_fraction * next_total as f64 + 1e-12
 }
 
 /// Player-0 value used by selection for a one-reveal chance node.
@@ -5138,7 +5300,10 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
         let node_visits = node.visit_count.max(0) as i64;
         chance_node_visits += node_visits;
         if node.chance_traversal == OLChanceTraversal::Balanced {
-            debug_assert_eq!(node.chance_route_count, node_visits as u64);
+            debug_assert_eq!(
+                node.chance_route_count + node.chance_balanced_start_visits,
+                node_visits as u64
+            );
             balanced_route_count += node.chance_route_count;
             if !node.chance_schedule.is_empty() {
                 balanced_completed_cycles +=
@@ -5173,8 +5338,31 @@ fn ol_chance_diagnostics(arena: &[OLNode]) -> HashMap<String, f64> {
                 node_fully_visited = false;
             }
         }
-        debug_assert!((node.chance_visited_mass - node_visited_mass).abs() < 1e-9);
-        debug_assert!((node.chance_weighted_value - node_weighted_value).abs() < 1e-9);
+        if node.chance_backup == OLChanceBackup::PanelMean {
+            let mut panel_weighted_value = 0.0;
+            for outcome in &node.chance_children {
+                if outcome.probability == 0.0 {
+                    continue;
+                }
+                let child_id = outcome
+                    .node_id
+                    .expect("an active A1c outcome must have an observation node");
+                let child = &arena[child_id as usize];
+                let estimate = if child.visit_count > 0 {
+                    child.value_sum / child.visit_count as f64
+                } else {
+                    child
+                        .bootstrap_value0
+                        .expect("an unvisited active A1c outcome must be bootstrapped")
+                };
+                panel_weighted_value += outcome.probability * estimate;
+            }
+            debug_assert!((node.chance_visited_mass - 1.0).abs() < 1e-9);
+            debug_assert!((node.chance_weighted_value - panel_weighted_value).abs() < 1e-9);
+        } else {
+            debug_assert!((node.chance_visited_mass - node_visited_mass).abs() < 1e-9);
+            debug_assert!((node.chance_weighted_value - node_weighted_value).abs() < 1e-9);
+        }
         visit_weighted_visited_mass_sum += node_visits as f64 * node_visited_mass;
         if node_fully_visited {
             fully_visited_chance_nodes += 1;
@@ -5515,6 +5703,7 @@ fn ol_register_chance_support(
     node.chance_traversal = config.traversal;
     node.chance_schedule = schedule;
     node.chance_route_count = 0;
+    node.chance_balanced_start_visits = 0;
     node.chance_schedule_seed =
         config.schedule_seed ^ (chance_node_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     Ok(())
@@ -5618,6 +5807,288 @@ fn ol_route_chance_observation(
     Ok((node_id, probability))
 }
 
+fn a1c_uniform_row(deck: &[u16], seed: u64) -> [u16; 4] {
+    debug_assert!(deck.len() >= 4);
+    let mut permutation = deck.to_vec();
+    permutation.shuffle(&mut StdRng::seed_from_u64(seed ^ 0xA1C1_1D5A_7EED_0001));
+    let mut row = [
+        permutation[0],
+        permutation[1],
+        permutation[2],
+        permutation[3],
+    ];
+    row.sort_unstable();
+    row
+}
+
+fn a1c_ensure_outcome(arena: &mut Vec<OLNode>, chance_node_id: u32, row: [u16; 4]) -> usize {
+    match arena[chance_node_id as usize]
+        .chance_children
+        .binary_search_by(|outcome| outcome.row.cmp(&row))
+    {
+        Ok(index) => index,
+        Err(index) => {
+            arena[chance_node_id as usize].chance_children.insert(
+                index,
+                OLChanceChild {
+                    row,
+                    probability: 0.0,
+                    multiplicity: 0,
+                    node_id: None,
+                    #[cfg(debug_assertions)]
+                    public_key: None,
+                },
+            );
+            index
+        }
+    }
+}
+
+fn a1c_prepare_sampled_node(
+    arena: &mut Vec<OLNode>,
+    chance_node_id: u32,
+    chooser_actor: u8,
+    schedule_seed: u64,
+) {
+    let node = &mut arena[chance_node_id as usize];
+    if node.chance_chooser_actor.is_none() {
+        node.chance_chooser_actor = Some(chooser_actor);
+        node.chance_backup = OLChanceBackup::Sampled;
+        node.chance_traversal = OLChanceTraversal::Iid;
+        node.chance_schedule_seed =
+            schedule_seed ^ (chance_node_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    } else {
+        debug_assert_eq!(node.chance_chooser_actor, Some(chooser_actor));
+    }
+}
+
+struct A1cBootstrapRequest {
+    row: [u16; 4],
+    state: RustGameState,
+    actor: u8,
+    legal: Vec<(u16, Option<(i8, i8, i8, i8, bool)>, Option<u16>)>,
+    my: Array3<f32>,
+    opp: Array3<f32>,
+    flat: Array1<f32>,
+}
+
+fn a1c_evaluate_bootstraps(
+    ev: &Py<PyAny>,
+    requests: &[A1cBootstrapRequest],
+) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let idxs_per: Vec<Vec<i64>> = requests
+        .iter()
+        .map(|request| request.legal.iter().map(|action| action.0 as i64).collect())
+        .collect();
+    Python::attach(|py| -> PyResult<Vec<(f64, Vec<f64>)>> {
+        let my_views: Vec<_> = requests.iter().map(|request| request.my.view()).collect();
+        let opp_views: Vec<_> = requests.iter().map(|request| request.opp.view()).collect();
+        let flat_views: Vec<_> = requests.iter().map(|request| request.flat.view()).collect();
+        let my = numpy::ndarray::stack(Axis(0), &my_views)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let opp = numpy::ndarray::stack(Axis(0), &opp_views)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let flat = numpy::ndarray::stack(Axis(0), &flat_views)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let index_arrays: Vec<_> = idxs_per
+            .iter()
+            .map(|indices| indices.clone().into_pyarray(py))
+            .collect();
+        let index_list = PyList::new(py, index_arrays)?;
+        let result = ev.bind(py).call1((
+            my.into_pyarray(py),
+            opp.into_pyarray(py),
+            flat.into_pyarray(py),
+            index_list,
+        ))?;
+        let tuple = result.downcast::<PyTuple>()?;
+        let values: Vec<f32> = tuple
+            .get_item(0)?
+            .downcast::<PyArray1<f32>>()?
+            .readonly()
+            .as_slice()?
+            .to_vec();
+        let logits_item = tuple.get_item(1)?;
+        let logits = logits_item.downcast::<PyList>()?;
+        if values.len() != requests.len() || logits.len() != requests.len() {
+            return Err(PyValueError::new_err(
+                "A1c bootstrap evaluator returned the wrong batch length",
+            ));
+        }
+        let mut output = Vec::with_capacity(requests.len());
+        for index in 0..requests.len() {
+            let gathered: Vec<f64> = logits
+                .get_item(index)?
+                .downcast::<PyArray1<f32>>()?
+                .readonly()
+                .as_slice()?
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            if gathered.len() != requests[index].legal.len() {
+                return Err(PyValueError::new_err(
+                    "A1c bootstrap evaluator returned the wrong policy length",
+                ));
+            }
+            let value0 = if requests[index].actor == 0 {
+                values[index] as f64
+            } else {
+                -(values[index] as f64)
+            };
+            output.push((value0, softmax_f64(&gathered)));
+        }
+        Ok(output)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn a1c_admit_next_cycle(
+    arena: &mut Vec<OLNode>,
+    chance_node_id: u32,
+    pre_reveal_state: &RustGameState,
+    placement: Option<(i8, i8, i8, i8, bool)>,
+    pick: Option<u16>,
+    config: OLChanceConfig<'_>,
+    a1c: A1cChanceConfig<'_>,
+    runtime: &mut A1cRuntime<'_>,
+) -> PyResult<bool> {
+    let current_cycles = arena[chance_node_id as usize].chance_initialized_cycles;
+    if current_cycles >= a1c.cycles.len() {
+        return Ok(false);
+    }
+    let next_cycles = current_cycles + 1;
+    let mut counts = HashMap::<[u16; 4], usize>::new();
+    for cycle in &a1c.cycles[..next_cycles] {
+        for &row in cycle {
+            *counts.entry(row).or_insert(0) += 1;
+        }
+    }
+    let mut rows: Vec<[u16; 4]> = counts.keys().copied().collect();
+    rows.sort_unstable();
+    let mut requests = Vec::new();
+    for &row in &rows {
+        let existing_node = arena[chance_node_id as usize]
+            .chance_children
+            .binary_search_by(|outcome| outcome.row.cmp(&row))
+            .ok()
+            .and_then(|index| arena[chance_node_id as usize].chance_children[index].node_id);
+        let already_estimated = existing_node.is_some_and(|node_id| {
+            let node = &arena[node_id as usize];
+            node.visit_count > 0 || node.bootstrap_value0.is_some()
+        });
+        if already_estimated {
+            continue;
+        }
+        let row_seed = config.draw_seed
+            ^ row.iter().fold(0xA1C1_C1E0_0000_0001u64, |hash, &tile| {
+                hash.rotate_left(11) ^ tile as u64
+            });
+        let forced = redeterminize_with_first_row(pre_reveal_state, &row, row_seed)?;
+        let revealed = forced.step(placement, pick)?;
+        if revealed.phase == GAME_OVER {
+            return Err(PyValueError::new_err(
+                "A1c bootstrap unexpectedly reached a terminal state",
+            ));
+        }
+        let actor = revealed.actor()?;
+        let legal = revealed.legal_actions_indexed();
+        let (my, opp, flat) = revealed.encode_arrays(actor)?;
+        requests.push(A1cBootstrapRequest {
+            row,
+            state: revealed,
+            actor,
+            legal,
+            my,
+            opp,
+            flat,
+        });
+    }
+    if !a1c_initialization_within_budget(
+        *runtime.initialization_nn_evals,
+        *runtime.total_nn_evals,
+        requests.len(),
+        a1c.max_initialization_fraction,
+    ) {
+        *runtime.initialization_blocked_cycles += 1;
+        return Ok(false);
+    }
+    let evaluated = a1c_evaluate_bootstraps(runtime.evaluator, &requests)?;
+
+    // Commit only after the whole evaluator batch succeeds. This keeps cycle
+    // admission atomic even if Python raises or returns a malformed batch.
+    for (request, (value0, priors)) in requests.iter().zip(evaluated) {
+        a1c_ensure_outcome(arena, chance_node_id, request.row);
+        let (observation_id, _) =
+            ol_route_chance_observation(arena, chance_node_id, &request.state, request.actor)?;
+        if arena[observation_id as usize].is_expanded {
+            ol_add_missing_children(arena, observation_id, &request.legal, &priors);
+        } else {
+            for (index, &(action_index, placement, pick)) in request.legal.iter().enumerate() {
+                let child_id = arena.len() as u32;
+                arena.push(OLNode::new(priors[index], (placement, pick)));
+                arena[observation_id as usize]
+                    .children
+                    .push((action_index, child_id));
+            }
+            arena[observation_id as usize].is_expanded = true;
+        }
+        arena[observation_id as usize].bootstrap_value0 = Some(value0);
+    }
+
+    let raw_rows: usize = counts.values().sum();
+    let mut schedule = Vec::with_capacity(raw_rows);
+    for outcome in &mut arena[chance_node_id as usize].chance_children {
+        let multiplicity = counts.get(&outcome.row).copied().unwrap_or(0);
+        outcome.multiplicity = multiplicity;
+        outcome.probability = multiplicity as f64 / raw_rows as f64;
+    }
+    for (index, outcome) in arena[chance_node_id as usize]
+        .chance_children
+        .iter()
+        .enumerate()
+    {
+        schedule.extend(std::iter::repeat_n(index, outcome.multiplicity));
+    }
+    let mut weighted = 0.0;
+    for outcome in &arena[chance_node_id as usize].chance_children {
+        if outcome.probability == 0.0 {
+            continue;
+        }
+        let node_id = outcome
+            .node_id
+            .expect("every active A1c outcome must have an observation node");
+        let observation = &arena[node_id as usize];
+        let estimate = if observation.visit_count > 0 {
+            observation.value_sum / observation.visit_count as f64
+        } else {
+            observation
+                .bootstrap_value0
+                .expect("every unvisited active A1c outcome must be bootstrapped")
+        };
+        weighted += outcome.probability * estimate;
+    }
+    let chance_node = &mut arena[chance_node_id as usize];
+    if current_cycles == 0 {
+        chance_node.chance_preinit_visits =
+            (chance_node.visit_count - chance_node.virtual_visit_count).max(0) as usize;
+    }
+    chance_node.chance_schedule = schedule;
+    chance_node.chance_route_count = 0;
+    chance_node.chance_balanced_start_visits =
+        (chance_node.visit_count - chance_node.virtual_visit_count).max(0) as u64;
+    chance_node.chance_traversal = OLChanceTraversal::Balanced;
+    chance_node.chance_backup = OLChanceBackup::PanelMean;
+    chance_node.chance_visited_mass = 1.0;
+    chance_node.chance_weighted_value = weighted;
+    chance_node.chance_initialized_cycles = next_cycles;
+    *runtime.initialization_nn_evals += requests.len();
+    *runtime.total_nn_evals += requests.len();
+    Ok(true)
+}
+
 /// PUCT child selection for the open-loop tree.  Considers only children whose
 /// joint index is legal in THIS simulation's concrete state (at deep nodes the
 /// concrete current_row differs across determinizations).  Returns the chosen
@@ -5678,7 +6149,15 @@ fn ol_select_child(
     );
 
     let actor = state.actor().expect("non-terminal node has an actor");
-    let sqrt_n = (node.visit_count as f64).sqrt();
+    // A bootstrapped A1c observation has policy priors but intentionally has no
+    // real visit. Give those priors one unit of selection scale without
+    // fabricating a visit that could leak into a training target.
+    let selection_visits = if node.visit_count == 0 && node.bootstrap_value0.is_some() {
+        1
+    } else {
+        node.visit_count
+    };
+    let sqrt_n = (selection_visits.max(0) as f64).sqrt();
 
     let mut best_score = f64::NEG_INFINITY;
     let mut best_cid: Option<u32> = None;
@@ -5809,6 +6288,7 @@ fn ol_descend(
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
     chance_config: Option<OLChanceConfig<'_>>,
+    mut a1c_runtime: Option<&mut A1cRuntime<'_>>,
 ) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<(usize, f64)>)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
@@ -5875,11 +6355,53 @@ fn ol_descend(
                     && <Kingdomino as search::Game>::is_stochastic(&state, (placement, pick));
                 if split_here {
                     let config = chance_config.expect("split_here requires chance config");
-                    ol_register_chance_support(arena, child_id, config, actor)?;
+                    let row = if let Some(a1c) = config.a1c {
+                        a1c_prepare_sampled_node(arena, child_id, actor, config.schedule_seed);
+                        let real_visits = (arena[child_id as usize].visit_count
+                            - arena[child_id as usize].virtual_visit_count)
+                            .max(0) as usize;
+                        let scheduled_target = a1c_target_cycles(
+                            real_visits + 1,
+                            a1c.n_init,
+                            a1c.cycles.len(),
+                            a1c.widening_c,
+                        );
+                        // Crossing N_init admits exactly the first complete
+                        // cycle. Even when c*sqrt(N_init) is already wider,
+                        // later visits must earn later cycles separately.
+                        let target = scheduled_target.min(
+                            arena[child_id as usize]
+                                .chance_initialized_cycles
+                                .saturating_add(1),
+                        );
+                        while arena[child_id as usize].chance_initialized_cycles < target {
+                            let runtime = a1c_runtime.as_deref_mut().ok_or_else(|| {
+                                PyValueError::new_err(
+                                    "A1c search requires initialization accounting",
+                                )
+                            })?;
+                            if !a1c_admit_next_cycle(
+                                arena, child_id, &state, placement, pick, config, a1c, runtime,
+                            )? {
+                                break;
+                            }
+                        }
+                        if arena[child_id as usize].chance_initialized_cycles > 0 {
+                            ol_select_chance_row(arena, child_id, config.draw_seed)
+                        } else {
+                            let sampled = a1c_uniform_row(&state.deck, config.draw_seed);
+                            let outcome = a1c_ensure_outcome(arena, child_id, sampled);
+                            arena[child_id as usize].chance_children[outcome].probability =
+                                1.0 / comb4(state.deck.len()) as f64;
+                            sampled
+                        }
+                    } else {
+                        ol_register_chance_support(arena, child_id, config, actor)?;
+                        ol_select_chance_row(arena, child_id, config.draw_seed)
+                    };
                     // PUCT has already committed to child_id. Pinning the row at
-                    // this point prevents both IID and local balancing from
+                    // this point prevents panel construction or traversal from
                     // changing the preceding action's legality or score.
-                    let row = ol_select_chance_row(arena, child_id, config.draw_seed);
                     state = redeterminize_with_first_row(&state, &row, config.draw_seed)?;
                 }
                 actors.push(actor);
@@ -6017,7 +6539,9 @@ fn ol_backup_path(
     let old_observation_mean = if old_observation_visits > 0 {
         arena[observation_id as usize].value_sum / old_observation_visits as f64
     } else {
-        0.0
+        arena[observation_id as usize]
+            .bootstrap_value0
+            .unwrap_or(0.0)
     };
     // First update the conditional observation subtree with this row's sample.
     for &node_id in &path[(chance_index + 1)..] {
@@ -6028,7 +6552,7 @@ fn ol_backup_path(
     let observation = &arena[observation_id as usize];
     let new_observation_mean = observation.value_sum / observation.visit_count as f64;
     let chance_node = &mut arena[path[chance_index] as usize];
-    if old_observation_visits == 0 {
+    if old_observation_visits == 0 && chance_node.chance_backup != OLChanceBackup::PanelMean {
         chance_node.chance_visited_mass += outcome_probability;
     }
     chance_node.chance_weighted_value +=
@@ -6040,6 +6564,7 @@ fn ol_backup_path(
     let propagated_value0 = match backup {
         OLChanceBackup::Sampled => sampled_value0,
         OLChanceBackup::Hajek => ol_chance_value_p0(arena, path[chance_index]),
+        OLChanceBackup::PanelMean => ol_chance_value_p0(arena, path[chance_index]),
     };
     for &node_id in &path[..=chance_index] {
         let node = &mut arena[node_id as usize];
@@ -6221,25 +6746,47 @@ fn advisor_open_loop_search_impl(
     chance_enum_max_rows: u64,
     chance_backup: OLChanceBackup,
     chance_traversal: OLChanceTraversal,
+    a1c_options: Option<A1cSearchOptions>,
 ) -> PyResult<AdvisorOpenLoopOutput> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
     let mut fallback_count = 0u32;
     let mut missing_child_count = 0u32;
-    let one_reveal_panel = ol_one_reveal_panel(
-        &root_state.deck,
-        chance_exposure,
-        chance_enum_max_rows,
-        seed ^ 0xA1C0_77EC_7A11_5EED,
-    )?;
+    let one_reveal_panel = if a1c_options.is_none() {
+        ol_one_reveal_panel(
+            &root_state.deck,
+            chance_exposure,
+            chance_enum_max_rows,
+            seed ^ 0xA1C0_77EC_7A11_5EED,
+        )?
+    } else {
+        Vec::new()
+    };
+    let a1c_cycles = if let Some(options) = a1c_options {
+        a1c_one_reveal_cycles(
+            &root_state.deck,
+            chance_exposure,
+            options.sampling,
+            seed ^ 0xA1C0_77EC_7A11_5EED,
+        )?
+    } else {
+        Vec::new()
+    };
     // A one-row panel (deck=4) has no uncertainty or strategy-fusion risk.
     // Keep its support metadata, but avoid a pointless chance/observation layer.
-    let chance_split_enabled = one_reveal_panel.len() > 1;
+    let chance_split_enabled = if a1c_options.is_some() {
+        root_state.deck.len() > 4 && !a1c_cycles.is_empty()
+    } else {
+        one_reveal_panel.len() > 1
+    };
 
     // Root: expand on the REAL state — the root's public information (boards,
     // row, claims) is determinization-independent; only the deck order below
     // it varies per simulation.
     let root_v0 = ol_expand_with_evaluator(&mut arena, 0, root_state, ev)?;
+    let mut total_nn_evals = 1usize;
+    let mut initialization_nn_evals = 0usize;
+    let mut initialization_blocked_cycles = 0usize;
     arena[0].visit_count = 1;
     arena[0].value_sum = root_v0;
     if dirichlet_eps > 0.0 {
@@ -6276,7 +6823,24 @@ fn advisor_open_loop_search_impl(
                     traversal: chance_traversal,
                     schedule_seed: seed ^ 0xBA1A_4CED_C1C1_E5E5,
                     draw_seed: det_seed,
+                    a1c: a1c_options.map(|options| A1cChanceConfig {
+                        cycles: a1c_cycles.as_slice(),
+                        n_init: options.n_init,
+                        widening_c: options.widening_c,
+                        max_initialization_fraction: options.max_initialization_fraction,
+                    }),
                 })
+            };
+            let mut a1c_runtime = A1cRuntime {
+                evaluator: ev,
+                initialization_nn_evals: &mut initialization_nn_evals,
+                total_nn_evals: &mut total_nn_evals,
+                initialization_blocked_cycles: &mut initialization_blocked_cycles,
+            };
+            let a1c_runtime = if a1c_options.is_some() {
+                Some(&mut a1c_runtime)
+            } else {
+                None
             };
             let (path, actors, leaf_state, chance_step) = ol_descend(
                 &mut arena,
@@ -6292,6 +6856,7 @@ fn advisor_open_loop_search_impl(
                 // at equal budget.  Off by default (frac=0 => None).
                 pick_floor,
                 chance_config,
+                a1c_runtime,
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -6318,6 +6883,7 @@ fn advisor_open_loop_search_impl(
         // One evaluator call for the whole wave's non-terminal leaves.
         let mut path_v0: Vec<Option<f64>> = vec![None; paths.len()];
         if !evals.is_empty() {
+            total_nn_evals += evals.len();
             let idxs_per: Vec<Vec<i64>> = evals
                 .iter()
                 .map(|e| e.legal.iter().map(|t| t.0 as i64).collect())
@@ -6421,15 +6987,82 @@ fn advisor_open_loop_search_impl(
     let mut diagnostics = ol_chance_diagnostics(&arena);
     let exhaustive_panel =
         !one_reveal_panel.is_empty() && comb4(root_state.deck.len()) <= chance_enum_max_rows;
+    let a1c_raw_panel_rows: usize = a1c_cycles.iter().map(Vec::len).sum();
+    let a1c_unique_panel_rows: HashSet<[u16; 4]> = a1c_cycles.iter().flatten().copied().collect();
+    let a1c_initialized_nodes = arena
+        .iter()
+        .filter(|node| node.chance_initialized_cycles > 0);
+    let a1c_initialized_chance_nodes = a1c_initialized_nodes.clone().count();
+    let a1c_preinit_visits = a1c_initialized_nodes
+        .clone()
+        .map(|node| node.chance_preinit_visits)
+        .sum::<usize>();
+    let a1c_initialized_node_visits = a1c_initialized_nodes
+        .map(|node| node.visit_count.max(0) as usize)
+        .sum::<usize>();
     diagnostics.insert(
         "chance_panel_rows".to_string(),
-        one_reveal_panel.len() as f64,
+        if a1c_options.is_some() {
+            a1c_unique_panel_rows.len() as f64
+        } else {
+            one_reveal_panel.len() as f64
+        },
     );
     diagnostics.insert(
         "chance_panel_exhaustive".to_string(),
         if exhaustive_panel { 1.0 } else { 0.0 },
     );
+    diagnostics.insert(
+        "a1c_enabled".to_string(),
+        if a1c_options.is_some() { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert("a1c_max_cycles".to_string(), a1c_cycles.len() as f64);
+    diagnostics.insert(
+        "a1c_raw_planned_rows".to_string(),
+        a1c_raw_panel_rows as f64,
+    );
+    diagnostics.insert(
+        "a1c_unique_planned_rows".to_string(),
+        a1c_unique_panel_rows.len() as f64,
+    );
     diagnostics.insert("arena_nodes".to_string(), arena.len() as f64);
+    diagnostics.insert("nn_evaluations".to_string(), total_nn_evals as f64);
+    diagnostics.insert(
+        "initialization_nn_evaluations".to_string(),
+        initialization_nn_evals as f64,
+    );
+    diagnostics.insert(
+        "initialization_nn_fraction".to_string(),
+        initialization_nn_evals as f64 / total_nn_evals.max(1) as f64,
+    );
+    diagnostics.insert(
+        "initialization_blocked_cycles".to_string(),
+        initialization_blocked_cycles as f64,
+    );
+    diagnostics.insert(
+        "a1c_initialized_chance_nodes".to_string(),
+        a1c_initialized_chance_nodes as f64,
+    );
+    diagnostics.insert(
+        "a1c_initialized_cycles".to_string(),
+        arena
+            .iter()
+            .map(|node| node.chance_initialized_cycles)
+            .sum::<usize>() as f64,
+    );
+    diagnostics.insert("a1c_preinit_visits".to_string(), a1c_preinit_visits as f64);
+    diagnostics.insert(
+        "a1c_initialized_node_visits".to_string(),
+        a1c_initialized_node_visits as f64,
+    );
+    diagnostics.insert(
+        "a1c_preinit_visit_fraction".to_string(),
+        if a1c_initialized_node_visits == 0 {
+            0.0
+        } else {
+            a1c_preinit_visits as f64 / a1c_initialized_node_visits as f64
+        },
+    );
     diagnostics.insert(
         "root_value_running_mean_player0".to_string(),
         incumbent_root_value0,
@@ -6587,6 +7220,7 @@ impl AdvisorSearchHandle {
                     self.cpuct,
                     &mut self.fallback_count,
                     &mut self.missing_child_count,
+                    None,
                     None,
                     None,
                 )?;
@@ -10357,6 +10991,7 @@ impl BatchedMCTS {
                                     &mut slot.missing_child_count,
                                     pick_floor,
                                     None,
+                                    None,
                                 )?;
                                 debug_assert!(chance_step.is_none());
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
@@ -11445,6 +12080,61 @@ mod ol_tests {
     }
 
     #[test]
+    fn a1c_balanced_plan_preserves_complete_cycle_identity() -> PyResult<()> {
+        let deck: Vec<u16> = (1..=28).collect();
+        let cycles = a1c_one_reveal_cycles(&deck, 4, A1cPanelSampling::Balanced, 20260809)?;
+        assert_eq!(cycles.len(), 4);
+        for cycle in cycles {
+            assert_eq!(cycle.len(), 7);
+            let mut exposed: Vec<u16> = cycle.into_iter().flatten().collect();
+            exposed.sort_unstable();
+            assert_eq!(exposed, deck);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a1c_iid_plan_is_matched_width_without_balance_promise() -> PyResult<()> {
+        let deck: Vec<u16> = (1..=28).collect();
+        let cycles = a1c_one_reveal_cycles(&deck, 4, A1cPanelSampling::Iid, 20260809)?;
+        assert_eq!(cycles.len(), 4);
+        assert!(cycles.iter().all(|cycle| cycle.len() == 7));
+        for row in cycles.iter().flatten() {
+            assert!(row.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(row.iter().all(|tile| deck.contains(tile)));
+        }
+        // This fixed seed is intentionally not tile-balanced. The assertion
+        // catches an accidental implementation that merely relabels balanced
+        // partitions as IID while still matching its row count.
+        let first_cycle: Vec<u16> = cycles[0].iter().flatten().copied().collect();
+        let unique: std::collections::HashSet<u16> = first_cycle.iter().copied().collect();
+        assert!(unique.len() < deck.len());
+        Ok(())
+    }
+
+    #[test]
+    fn a1c_width_waits_for_init_and_adds_whole_cycles() {
+        assert_eq!(a1c_target_cycles(15, 16, 8, 0.25), 0);
+        assert_eq!(a1c_target_cycles(16, 16, 8, 0.25), 1);
+        assert_eq!(a1c_target_cycles(64, 16, 8, 0.25), 2);
+        assert_eq!(a1c_target_cycles(1024, 16, 4, 0.25), 4);
+        assert_eq!(a1c_target_cycles(1024, 16, 0, 0.25), 0);
+    }
+
+    #[test]
+    fn a1c_initialization_guard_charges_the_proposed_batch() {
+        // 11 new rows after 33 ordinary rows is exactly 25% of the resulting
+        // 44 NN rows and is admissible. One fewer ordinary row is not.
+        assert!(a1c_initialization_within_budget(0, 33, 11, 0.25));
+        assert!(!a1c_initialization_within_budget(0, 32, 11, 0.25));
+        // Cumulative accounting includes prior initialization work.
+        assert!(a1c_initialization_within_budget(11, 55, 7, 0.30));
+        assert!(!a1c_initialization_within_budget(11, 55, 7, 0.25));
+        assert!(a1c_initialization_within_budget(11, 55, 0, 0.25));
+        assert!(!a1c_initialization_within_budget(56, 55, 1, 0.25));
+    }
+
+    #[test]
     fn one_reveal_deck8_support_is_exact_and_closed() -> PyResult<()> {
         let deck: Vec<u16> = (1..=8).collect();
         let panel = ol_one_reveal_panel(&deck, 1, 70, 9)?;
@@ -11615,6 +12305,7 @@ mod ol_tests {
                 traversal: OLChanceTraversal::Balanced,
                 schedule_seed: 20260808,
                 draw_seed: 7,
+                a1c: None,
             },
             0,
         )?;
@@ -11747,6 +12438,7 @@ mod ol_tests {
                 traversal: OLChanceTraversal::Iid,
                 schedule_seed: 9,
                 draw_seed: 10,
+                a1c: None,
             },
             state.actor()?,
         )?;
@@ -12245,6 +12937,7 @@ mod kingdomino_rust {
                 chance_enum_max_rows,
                 chance_backup,
                 chance_traversal,
+                None,
             )
         })?;
         Ok((output.children, output.root_value0))
@@ -12258,7 +12951,10 @@ mod kingdomino_rust {
                         chance_enum_max_rows=70, fpu=0.0, cpuct=1.5, seed=0,
                         leaf_batch=8, virtual_loss=1, score_scale=160.0,
                         margin_gain=2.0, alpha=0.0, chance_backup="hajek",
-                        chance_traversal="iid"))]
+                        chance_traversal="iid", chance_panel_mode="lazy",
+                        chance_panel_sampling="balanced", chance_init_visits=32,
+                        chance_widening_c=0.25,
+                        chance_init_max_fraction=0.25))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_one_reveal_search<'py>(
         py: Python<'py>,
@@ -12277,6 +12973,11 @@ mod kingdomino_rust {
         alpha: f64,
         chance_backup: &str,
         chance_traversal: &str,
+        chance_panel_mode: &str,
+        chance_panel_sampling: &str,
+        chance_init_visits: usize,
+        chance_widening_c: f64,
+        chance_init_max_fraction: f64,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -12288,6 +12989,45 @@ mod kingdomino_rust {
         }
         let chance_backup = super::ol_parse_chance_backup(chance_backup)?;
         let chance_traversal = super::ol_parse_chance_traversal(chance_traversal)?;
+        let a1c_options = match chance_panel_mode {
+            "lazy" => None,
+            "a1c" => {
+                if chance_exposure == 0 {
+                    return Err(PyValueError::new_err(
+                        "A1c panel mode requires chance_exposure > 0",
+                    ));
+                }
+                if !(chance_widening_c > 0.0 && chance_widening_c.is_finite()) {
+                    return Err(PyValueError::new_err(
+                        "chance_widening_c must be finite and greater than zero",
+                    ));
+                }
+                if !(chance_init_max_fraction > 0.0
+                    && chance_init_max_fraction <= 1.0
+                    && chance_init_max_fraction.is_finite())
+                {
+                    return Err(PyValueError::new_err(
+                        "chance_init_max_fraction must be finite and in (0, 1]",
+                    ));
+                }
+                if leaf_batch != 1 {
+                    return Err(PyValueError::new_err(
+                        "A1c prototype currently requires leaf_batch=1 so panel admission cannot overtake in-flight sampled paths",
+                    ));
+                }
+                Some(super::A1cSearchOptions {
+                    sampling: super::a1c_parse_panel_sampling(chance_panel_sampling)?,
+                    n_init: chance_init_visits,
+                    widening_c: chance_widening_c,
+                    max_initialization_fraction: chance_init_max_fraction,
+                })
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "chance_panel_mode must be 'lazy' or 'a1c', got {chance_panel_mode:?}"
+                )));
+            }
+        };
         let root_state = state.cloned();
         let ev: Py<PyAny> = evaluator.unbind();
         let output = py.detach(move || {
@@ -12310,9 +13050,84 @@ mod kingdomino_rust {
                 chance_enum_max_rows,
                 chance_backup,
                 chance_traversal,
+                a1c_options,
             )
         })?;
         Ok((output.children, output.root_value0, output.diagnostics))
+    }
+
+    /// Test seam for the A1c panel planner. Production search integration uses
+    /// the same helper, but keeping this deterministic export makes cycle
+    /// balance, IID width matching and seed stability reviewable from Python.
+    #[pyfunction]
+    #[pyo3(signature = (deck, max_cycles, sampling="balanced", seed=0))]
+    fn debug_a1c_panel_cycles(
+        deck: Vec<u16>,
+        max_cycles: usize,
+        sampling: &str,
+        seed: u64,
+    ) -> PyResult<Vec<Vec<Vec<u16>>>> {
+        let sampling = super::a1c_parse_panel_sampling(sampling)?;
+        Ok(
+            super::a1c_one_reveal_cycles(&deck, max_cycles, sampling, seed)?
+                .into_iter()
+                .map(|cycle| cycle.into_iter().map(|row| row.to_vec()).collect())
+                .collect(),
+        )
+    }
+
+    /// Test seam for A1c's visit-width schedule and cumulative NN-work guard.
+    /// The returned decision charges the entire proposed batch before testing
+    /// the cap, matching the atomic admission rule used by the search design.
+    #[pyfunction]
+    #[pyo3(signature = (
+        visits,
+        n_init,
+        max_cycles,
+        widening_c,
+        initialization_nn_evals,
+        total_nn_evals,
+        additional_nn_evals,
+        max_initialization_fraction=0.25
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn debug_a1c_admission(
+        visits: usize,
+        n_init: usize,
+        max_cycles: usize,
+        widening_c: f64,
+        initialization_nn_evals: usize,
+        total_nn_evals: usize,
+        additional_nn_evals: usize,
+        max_initialization_fraction: f64,
+    ) -> PyResult<(usize, bool)> {
+        if !(widening_c > 0.0 && widening_c.is_finite()) {
+            return Err(PyValueError::new_err(
+                "widening_c must be finite and greater than zero",
+            ));
+        }
+        if !(max_initialization_fraction > 0.0
+            && max_initialization_fraction <= 1.0
+            && max_initialization_fraction.is_finite())
+        {
+            return Err(PyValueError::new_err(
+                "max_initialization_fraction must be finite and in (0, 1]",
+            ));
+        }
+        if initialization_nn_evals > total_nn_evals {
+            return Err(PyValueError::new_err(
+                "initialization_nn_evals cannot exceed total_nn_evals",
+            ));
+        }
+        Ok((
+            super::a1c_target_cycles(visits, n_init, max_cycles, widening_c),
+            super::a1c_initialization_within_budget(
+                initialization_nn_evals,
+                total_nn_evals,
+                additional_nn_evals,
+                max_initialization_fraction,
+            ),
+        ))
     }
 
     /// Count exact minimax nodes for a no-chance endgame, with the same
@@ -12567,6 +13382,7 @@ mod kingdomino_rust {
                 cpuct,
                 &mut fallback_count,
                 &mut missing_child_count,
+                None,
                 None,
                 None,
             )?;
