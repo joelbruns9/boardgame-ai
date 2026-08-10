@@ -57,6 +57,51 @@ changes and deterministic position-bootstrap intervals for mean TV.
 This remains a search-behavior diagnosis.  It does not establish playing
 strength and does not enable the feature in self-play.
 
+## Results
+
+The run completed all 256 preregistered cells: 64 frozen positions at each of
+the four budgets. Every sampled-split cell satisfied the implementation
+invariants: the search reached explicit chance nodes, performed exactly B
+ordinary simulation paths, and reported zero bootstrap and initialization
+network rows.
+
+| Sims | Control to sampled mean TV | Top action changes | Top pick changes | Sampled to panel-extra mean TV | Panel-extra top action changes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 800 | 0.166 | 15/64 (23.4%) | 7/64 (10.9%) | 0.015 | 3/64 (4.7%) |
+| 1,600 | 0.235 | 21/64 (32.8%) | 9/64 (14.1%) | 0.014 | 1/64 (1.6%) |
+| 3,200 | 0.313 | 32/64 (50.0%) | 14/64 (21.9%) | 0.016 | 1/64 (1.6%) |
+| 6,400 | 0.383 | 33/64 (51.6%) | 17/64 (26.6%) | 0.015 | 1/64 (1.6%) |
+
+The paired bootstrap 95% intervals for control-to-sampled mean TV were
+[0.133, 0.202], [0.187, 0.284], [0.255, 0.371], and [0.319, 0.448] in ascending
+budget order. The corresponding sampled-to-panel-extra intervals were only
+[0.011, 0.019], [0.010, 0.020], [0.010, 0.024], and [0.009, 0.023].
+
+The production-budget comparison led to the same conclusion. Mean TV between
+sampled split and `panel_charged` was 0.024, 0.018, 0.017, and 0.016; at 6,400
+sims it changed the top action and top tile pick in only one of 64 positions.
+
+### Conclusion
+
+The result matches the first preregistered interpretation: almost all of the
+previous panel effect is reproduced without evaluating all 70 reveal rows.
+The operative change is therefore the explicit public-observation split (and
+the removal of open-loop aliasing/strategy fusion), not the exhaustive
+network-value bootstrap. Increasing the simulation budget makes the explicit
+split diverge further from control, while its policy remains very close to the
+fully enumerated panel.
+
+This does not prove that the network is unbiased. It shows that enumerating 70
+counterfactual network evaluations does not overcome any such bias or add a
+material root-policy effect in this setup. A sampled explicit split is the more
+efficient search primitive to carry forward. Because its root decisions nearly
+duplicate the panel whose gameplay A/B was weakly negative/null, another
+current-checkpoint gameplay A/B is unlikely to answer the remaining question.
+The higher-value next experiment is chance-aware training or fine-tuning with
+sampled split, followed by a crossed evaluation of old versus new network and
+open-loop versus sampled-split search. That directly tests whether the model
+and search need to be trained together.
+
 ## Artifacts and command
 
 Base artifact:
@@ -72,3 +117,14 @@ Output:
 The output is atomically rewritten after every completed position/budget cell
 and refuses to mix a changed base artifact, checkpoint, position set, or search
 configuration.
+
+Completed artifact facts:
+
+- 256/256 unique sampled-split cells; no errors;
+- 64 positions at each of 800, 1,600, 3,200, and 6,400 simulations;
+- frozen-position SHA-256:
+  `dad379d2a350cf74a73b2f804269cba2199ee46c8a5526cf0fa5c5a35f6276bd`;
+- checkpoint SHA-256:
+  `4bf07b0ca14e5452e6533a9232967e89bb0ab0df88c99e9928a65f402b1f04b3`;
+- paired base-artifact SHA-256:
+  `c4b77147a2b09e65cd53ee6d6f067808535f63f2a9e2cfbf3b2e03fb287c8d60`.
