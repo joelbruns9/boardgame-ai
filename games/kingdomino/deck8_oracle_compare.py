@@ -163,9 +163,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if bool(getattr(args, "include_a1c", False)) and not A1C_COMPARISON_READY:
         raise RuntimeError(
-            "A1c oracle comparison is disabled until panel admission is wave-safe "
-            "and leaf_batch matches the control; equal simulations in the current "
-            "prototype are not an equal-compute comparison"
+            "A1c oracle comparison is disabled until the harness matches total NN "
+            "work; wave-safe admission and leaf_batch parity alone do not make equal "
+            "simulations an equal-compute comparison"
         )
     oracle_path = Path(args.oracle_summary)
     oracle = json.loads(oracle_path.read_text(encoding="utf-8"))
@@ -235,9 +235,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     # Force sampled panels at deck=8; the exact 70-row oracle is
                     # the external target, not a counterfactual search arm.
                     "enum_max_rows": 1,
-                    # The current prototype forbids in-flight paths while a
-                    # node changes from sampled to complete-panel semantics.
-                    "leaf_batch": 1,
+                    "leaf_batch": 8,
                 }
     # Warm the evaluator outside measured arms.
     _arm(

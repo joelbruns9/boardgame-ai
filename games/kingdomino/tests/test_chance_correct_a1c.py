@@ -128,7 +128,7 @@ def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
         chance_exposure=4,
         chance_enum_max_rows=1,
         seed=20260809,
-        leaf_batch=1,
+        leaf_batch=8,
         virtual_loss=1,
         chance_panel_mode="a1c",
         chance_panel_sampling=sampling,
@@ -147,6 +147,16 @@ def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
     ]
     assert diagnostics["initialization_nn_evaluations"] > 0
     assert diagnostics["initialization_nn_evaluations"] < diagnostics["nn_evaluations"]
+    assert diagnostics["a1c_wave_safe_admission"] == 1.0
+    assert diagnostics["a1c_admission_requested_paths"] >= diagnostics[
+        "a1c_admission_unique_nodes"
+    ]
+    assert diagnostics["a1c_admission_committed_cycles"] == diagnostics[
+        "a1c_initialized_cycles"
+    ]
+    assert 0 < diagnostics["a1c_admission_waves"] <= diagnostics[
+        "a1c_admission_committed_cycles"
+    ]
     # Bootstrap rows influence the panel mean but are not search visits.
     assert diagnostics["chance_node_visits"] == diagnostics["observation_visits"]
 
@@ -162,7 +172,7 @@ def test_a1c_search_never_exceeds_initialization_fraction_guard():
         chance_exposure=4,
         chance_enum_max_rows=1,
         seed=20260810,
-        leaf_batch=1,
+        leaf_batch=8,
         chance_panel_mode="a1c",
         chance_panel_sampling="balanced",
         chance_init_visits=1,
@@ -184,7 +194,7 @@ def test_a1c_reports_sampled_visits_that_predate_panel_admission():
         chance_exposure=4,
         chance_enum_max_rows=1,
         seed=20260811,
-        leaf_batch=1,
+        leaf_batch=8,
         chance_panel_mode="a1c",
         chance_panel_sampling="balanced",
         chance_init_visits=4,
@@ -199,16 +209,47 @@ def test_a1c_reports_sampled_visits_that_predate_panel_admission():
     assert 0.0 < diagnostics["a1c_preinit_visit_fraction"] < 1.0
 
 
-def test_a1c_search_rejects_parallel_leaf_waves_until_admission_is_wave_safe():
+def test_a1c_search_admits_panels_only_at_parallel_wave_boundaries():
     import kingdomino_rust as kr
+    import numpy as np
 
-    state = _rust_state_from_python(GameState.new(seed=17))
-    with pytest.raises(ValueError, match="leaf_batch=1"):
-        kr.advisor_one_reveal_search(
-            state,
-            _zero_evaluator,
-            8,
-            chance_exposure=1,
-            chance_panel_mode="a1c",
-            leaf_batch=8,
-        )
+    state = _rust_state_from_python(_deck8_boundary_state())
+    evaluator_batch_sizes = []
+
+    def recording_evaluator(my_board, opp_board, flat, legal_indices):
+        batch = int(np.asarray(my_board).shape[0])
+        evaluator_batch_sizes.append(batch)
+        return np.zeros(batch, dtype=np.float32), [
+            np.zeros(len(indices), dtype=np.float32) for indices in legal_indices
+        ]
+
+    children, _value, diagnostics = kr.advisor_one_reveal_search(
+        state,
+        recording_evaluator,
+        64,
+        chance_exposure=2,
+        chance_enum_max_rows=1,
+        seed=20260812,
+        leaf_batch=8,
+        virtual_loss=1,
+        chance_panel_mode="a1c",
+        chance_panel_sampling="balanced",
+        chance_init_visits=1,
+        chance_widening_c=0.1,
+        chance_init_max_fraction=1.0,
+    )
+    assert sum(row[1] for row in children) == 64
+    assert diagnostics["a1c_wave_safe_admission"] == 1.0
+    assert diagnostics["a1c_admission_requested_paths"] >= diagnostics[
+        "a1c_admission_unique_nodes"
+    ]
+    assert diagnostics["a1c_admission_committed_cycles"] > 0
+    assert 0 < diagnostics["a1c_admission_waves"] <= 64 / 8
+    # Root evaluation, then the entire first search wave, then any two-row
+    # deck=8 cycle bootstrap. Admission during descent would put a size-2 call
+    # before the size-8 wave evaluation.
+    assert evaluator_batch_sizes[:2] == [1, 8]
+    assert 2 in evaluator_batch_sizes[2:]
+    # Initialization changes the estimator only after the whole wave has
+    # completed, so all observations still correspond to backed-up chance visits.
+    assert diagnostics["chance_node_visits"] == diagnostics["observation_visits"]

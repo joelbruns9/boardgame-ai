@@ -183,8 +183,8 @@ def test_compare_gap_skips_all_tied_best_actions():
     assert all_tied["all_actions_tied"] is True
 
 
-def test_a1c_oracle_comparison_is_disabled_until_leaf_batch_is_restored():
-    with pytest.raises(RuntimeError, match="disabled until panel admission is wave-safe"):
+def test_a1c_oracle_comparison_is_disabled_until_nn_work_is_matched():
+    with pytest.raises(RuntimeError, match="disabled until the harness matches total NN work"):
         run_oracle_compare(argparse.Namespace(include_a1c=True))
 
 

@@ -769,12 +769,12 @@ widening addresses the width/depth tradeoff: at fixed work, larger `X` splits
 visits across more observation subtrees and can make the search shallower. Full
 initialization guarantees coverage of the active panel, not unlimited width.
 
-**A1c implementation checkpoint, 2026-08-09 — serial prototype in progress.**
+**A1c implementation checkpoint, 2026-08-09 — wave-safe advisor prototype.**
 The opt-in advisor diagnostic path now preserves whole panel cycles, separates
 balanced panel construction from the matched-width IID ablation, delays the
-first cycle until `N_init`, admits at most one complete cycle per chance-node
-encounter, batch-evaluates every missing row before committing the cycle, and
-uses bootstrap values without incrementing MCTS visits. The cumulative
+first cycle until `N_init`, admits at most one complete cycle per chance node and
+leaf-parallel wave, batch-evaluates every missing row before committing the
+cycle, and uses bootstrap values without incrementing MCTS visits. The cumulative
 initialization guard charges the proposed batch before admission and reports
 initialized/blocked cycles, NN rows and initialization fraction. It also reports
 the real sampled-backup visits that predate first-panel admission and their
@@ -782,17 +782,21 @@ fraction of visits to initialized chance nodes; those earlier contributions
 remain in ancestor running means and can dilute a finite-budget A1c effect. The
 incumbent and lazy modes retain their prior defaults and regression vectors.
 
-The prototype currently requires `leaf_batch=1`. This is a correctness lock:
-an in-flight sampled path must not be backed up after another path changes the
-same chance node to complete-panel probabilities. Before throughput measurement,
-make admission wave-safe (or end a wave before committing a cycle), restore
-leaf batching, and add an invariant test for the transition. The deck-8 oracle
-comparison harness contains the future A1c `X=4,8` balanced/IID specifications,
-but hard-rejects `--include-a1c` until that leaf-batch transition is fixed.
-Comparing prototype `leaf_batch=1` against control `leaf_batch=8` at equal
-simulations would confound batching, virtual-loss collisions and additional
-initialization NN rows. No GPU comparison has been run and this checkpoint is
-not evidence of stronger play.
+Panel admission is now wave-safe and `leaf_batch=8` is restored. Descent only
+records an admission request. Every path in the wave then completes evaluation,
+removes virtual loss and backs up under the estimator it traversed. Requests are
+deduplicated by chance node only after those backups, and at most one atomic
+cycle per node is committed before the next wave. Diagnostics report requested
+paths, unique requested nodes, committed cycles and admission waves; functional
+tests pin visit conservation through the transition.
+
+The deck-8 oracle comparison harness contains the future A1c `X=4,8`
+balanced/IID specifications at the same `leaf_batch=8` as its controls, but it
+still hard-rejects `--include-a1c`. Equal simulations remain unequal NN work
+because A1c charges additional bootstrap rows. Add a hard total-NN-work budget
+to the search and harness, then validate its accounting before enabling that
+comparison. No GPU comparison has been run and this checkpoint is not evidence
+of stronger play.
 
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
@@ -1425,8 +1429,10 @@ it is not a substitute for correct chance topology or better state coverage.
    oracle decisions. Review this slice, then specify and implement A1c. It starts
    in sampled mode, atomically
    initializes its first balanced cycle only after `N_init`, caps initialization
-   at 25% of NN work, then widens in whole balanced cycles. Preserve incumbent
-   and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
+   at 25% of NN work, then widens in whole balanced cycles. Wave-safe advisor
+   admission and `leaf_batch=8` are complete; next add matched total-NN-work
+   stopping/accounting before opening the deck-8 A1c oracle comparison. Preserve
+   incumbent and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
    search screen nor A2a alone is an A1c target-quality gate.
 6. Freeze the 120-position tuning and 120-position confirmation split before
    schedule tuning. On the laptop, run A1c correctness smokes and per-deck

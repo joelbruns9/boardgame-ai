@@ -4967,6 +4967,14 @@ struct A1cRuntime<'a> {
     initialization_blocked_cycles: &'a mut usize,
 }
 
+struct A1cAdmissionRequest {
+    chance_node_id: u32,
+    pre_reveal_state: RustGameState,
+    placement: Option<(i8, i8, i8, i8, bool)>,
+    pick: Option<u16>,
+    draw_seed: u64,
+}
+
 struct OLNode {
     prior: f64,
     visit_count: i32,
@@ -5951,7 +5959,7 @@ fn a1c_admit_next_cycle(
     pre_reveal_state: &RustGameState,
     placement: Option<(i8, i8, i8, i8, bool)>,
     pick: Option<u16>,
-    config: OLChanceConfig<'_>,
+    draw_seed: u64,
     a1c: A1cChanceConfig<'_>,
     runtime: &mut A1cRuntime<'_>,
 ) -> PyResult<bool> {
@@ -5982,7 +5990,7 @@ fn a1c_admit_next_cycle(
         if already_estimated {
             continue;
         }
-        let row_seed = config.draw_seed
+        let row_seed = draw_seed
             ^ row.iter().fold(0xA1C1_C1E0_0000_0001u64, |hash, &tile| {
                 hash.rotate_left(11) ^ tile as u64
             });
@@ -6288,12 +6296,18 @@ fn ol_descend(
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
     chance_config: Option<OLChanceConfig<'_>>,
-    mut a1c_runtime: Option<&mut A1cRuntime<'_>>,
-) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState, Option<(usize, f64)>)> {
+) -> PyResult<(
+    Vec<u32>,
+    Vec<u8>,
+    RustGameState,
+    Option<(usize, f64)>,
+    Option<A1cAdmissionRequest>,
+)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
     let mut node_id = root_id;
     let mut chance_step: Option<(usize, f64)> = None;
+    let mut a1c_admission_request: Option<A1cAdmissionRequest> = None;
     // `state` is already owned (moved in); no clone needed — it is stepped in
     // place as we descend and returned as the leaf state.
     loop {
@@ -6357,34 +6371,17 @@ fn ol_descend(
                     let config = chance_config.expect("split_here requires chance config");
                     let row = if let Some(a1c) = config.a1c {
                         a1c_prepare_sampled_node(arena, child_id, actor, config.schedule_seed);
-                        let real_visits = (arena[child_id as usize].visit_count
-                            - arena[child_id as usize].virtual_visit_count)
-                            .max(0) as usize;
-                        let scheduled_target = a1c_target_cycles(
-                            real_visits + 1,
-                            a1c.n_init,
-                            a1c.cycles.len(),
-                            a1c.widening_c,
-                        );
-                        // Crossing N_init admits exactly the first complete
-                        // cycle. Even when c*sqrt(N_init) is already wider,
-                        // later visits must earn later cycles separately.
-                        let target = scheduled_target.min(
-                            arena[child_id as usize]
-                                .chance_initialized_cycles
-                                .saturating_add(1),
-                        );
-                        while arena[child_id as usize].chance_initialized_cycles < target {
-                            let runtime = a1c_runtime.as_deref_mut().ok_or_else(|| {
-                                PyValueError::new_err(
-                                    "A1c search requires initialization accounting",
-                                )
-                            })?;
-                            if !a1c_admit_next_cycle(
-                                arena, child_id, &state, placement, pick, config, a1c, runtime,
-                            )? {
-                                break;
-                            }
+                        if arena[child_id as usize].chance_initialized_cycles < a1c.cycles.len() {
+                            // Admission is deliberately deferred until every
+                            // path in this leaf-parallel wave has removed VL and
+                            // backed up under the estimator it traversed.
+                            a1c_admission_request = Some(A1cAdmissionRequest {
+                                chance_node_id: child_id,
+                                pre_reveal_state: state.cloned(),
+                                placement,
+                                pick,
+                                draw_seed: config.draw_seed,
+                            });
                         }
                         if arena[child_id as usize].chance_initialized_cycles > 0 {
                             ol_select_chance_row(arena, child_id, config.draw_seed)
@@ -6424,7 +6421,7 @@ fn ol_descend(
             }
         }
     }
-    Ok((path, actors, state, chance_step))
+    Ok((path, actors, state, chance_step, a1c_admission_request))
 }
 
 /// Issue 2: add to `node_id` any child whose legal joint index is not already
@@ -6787,6 +6784,10 @@ fn advisor_open_loop_search_impl(
     let mut total_nn_evals = 1usize;
     let mut initialization_nn_evals = 0usize;
     let mut initialization_blocked_cycles = 0usize;
+    let mut a1c_admission_requested_paths = 0usize;
+    let mut a1c_admission_unique_nodes = 0usize;
+    let mut a1c_admission_committed_cycles = 0usize;
+    let mut a1c_admission_waves = 0usize;
     arena[0].visit_count = 1;
     arena[0].value_sum = root_v0;
     if dirichlet_eps > 0.0 {
@@ -6802,6 +6803,7 @@ fn advisor_open_loop_search_impl(
         let mut path_actors: Vec<Vec<u8>> = Vec::with_capacity(wave);
         let mut leaf_states: Vec<RustGameState> = Vec::with_capacity(wave);
         let mut chance_steps: Vec<Option<(usize, f64)>> = Vec::with_capacity(wave);
+        let mut a1c_admission_requests: Vec<A1cAdmissionRequest> = Vec::new();
         let mut evals: Vec<AdvisorPendingEval> = Vec::new();
 
         for _ in 0..wave {
@@ -6831,18 +6833,7 @@ fn advisor_open_loop_search_impl(
                     }),
                 })
             };
-            let mut a1c_runtime = A1cRuntime {
-                evaluator: ev,
-                initialization_nn_evals: &mut initialization_nn_evals,
-                total_nn_evals: &mut total_nn_evals,
-                initialization_blocked_cycles: &mut initialization_blocked_cycles,
-            };
-            let a1c_runtime = if a1c_options.is_some() {
-                Some(&mut a1c_runtime)
-            } else {
-                None
-            };
-            let (path, actors, leaf_state, chance_step) = ol_descend(
+            let (path, actors, leaf_state, chance_step, a1c_admission_request) = ol_descend(
                 &mut arena,
                 0,
                 det,
@@ -6856,8 +6847,10 @@ fn advisor_open_loop_search_impl(
                 // at equal budget.  Off by default (frac=0 => None).
                 pick_floor,
                 chance_config,
-                a1c_runtime,
             )?;
+            if let Some(request) = a1c_admission_request {
+                a1c_admission_requests.push(request);
+            }
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
             if leaf_state.phase != GAME_OVER {
@@ -6965,6 +6958,59 @@ fn advisor_open_loop_search_impl(
             };
             ol_backup_path(&mut arena, path, v0, chance_steps[pi]);
         }
+
+        // Only now may a chance node change estimators. Every path in the wave
+        // has removed virtual loss and backed up under the semantics it saw
+        // during descent. Deduplicate nodes so at most one whole cycle is
+        // admitted per node and wave.
+        if let Some(options) = a1c_options {
+            a1c_admission_requested_paths += a1c_admission_requests.len();
+            a1c_admission_requests.sort_by_key(|request| request.chance_node_id);
+            a1c_admission_requests.dedup_by_key(|request| request.chance_node_id);
+            a1c_admission_unique_nodes += a1c_admission_requests.len();
+            let mut committed_this_wave = 0usize;
+            let a1c = A1cChanceConfig {
+                cycles: a1c_cycles.as_slice(),
+                n_init: options.n_init,
+                widening_c: options.widening_c,
+                max_initialization_fraction: options.max_initialization_fraction,
+            };
+            for request in a1c_admission_requests {
+                let node = &arena[request.chance_node_id as usize];
+                let current_cycles = node.chance_initialized_cycles;
+                let real_visits = node.visit_count.max(0) as usize;
+                let scheduled_target =
+                    a1c_target_cycles(real_visits, a1c.n_init, a1c.cycles.len(), a1c.widening_c);
+                // A node can cross multiple schedule thresholds in one wave,
+                // but admission remains one atomic cycle per wave.
+                let target = scheduled_target.min(current_cycles.saturating_add(1));
+                if current_cycles >= target {
+                    continue;
+                }
+                let mut runtime = A1cRuntime {
+                    evaluator: ev,
+                    initialization_nn_evals: &mut initialization_nn_evals,
+                    total_nn_evals: &mut total_nn_evals,
+                    initialization_blocked_cycles: &mut initialization_blocked_cycles,
+                };
+                if a1c_admit_next_cycle(
+                    &mut arena,
+                    request.chance_node_id,
+                    &request.pre_reveal_state,
+                    request.placement,
+                    request.pick,
+                    request.draw_seed,
+                    a1c,
+                    &mut runtime,
+                )? {
+                    committed_this_wave += 1;
+                }
+            }
+            if committed_this_wave > 0 {
+                a1c_admission_waves += 1;
+                a1c_admission_committed_cycles += committed_this_wave;
+            }
+        }
         sims_done += paths.len();
     }
 
@@ -7038,6 +7084,26 @@ fn advisor_open_loop_search_impl(
     diagnostics.insert(
         "initialization_blocked_cycles".to_string(),
         initialization_blocked_cycles as f64,
+    );
+    diagnostics.insert(
+        "a1c_admission_requested_paths".to_string(),
+        a1c_admission_requested_paths as f64,
+    );
+    diagnostics.insert(
+        "a1c_admission_unique_nodes".to_string(),
+        a1c_admission_unique_nodes as f64,
+    );
+    diagnostics.insert(
+        "a1c_admission_committed_cycles".to_string(),
+        a1c_admission_committed_cycles as f64,
+    );
+    diagnostics.insert(
+        "a1c_admission_waves".to_string(),
+        a1c_admission_waves as f64,
+    );
+    diagnostics.insert(
+        "a1c_wave_safe_admission".to_string(),
+        if a1c_options.is_some() { 1.0 } else { 0.0 },
     );
     diagnostics.insert(
         "a1c_initialized_chance_nodes".to_string(),
@@ -7212,7 +7278,7 @@ impl AdvisorSearchHandle {
             let mut evals: Vec<AdvisorPendingEval> = Vec::new();
             for _ in 0..wave {
                 let det = self.root_state.redeterminize(Some(self.rng.r#gen::<u64>()));
-                let (path, actors, leaf_state, chance_step) = ol_descend(
+                let (path, actors, leaf_state, chance_step, a1c_admission_request) = ol_descend(
                     &mut self.arena,
                     0,
                     det,
@@ -7222,9 +7288,9 @@ impl AdvisorSearchHandle {
                     &mut self.missing_child_count,
                     None,
                     None,
-                    None,
                 )?;
                 debug_assert!(chance_step.is_none());
+                debug_assert!(a1c_admission_request.is_none());
                 ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
                 let leaf = *path.last().unwrap();
                 if leaf_state.phase != GAME_OVER {
@@ -10981,19 +11047,20 @@ impl BatchedMCTS {
                                 (0..chunk).map(|_| slot.rng.r#gen::<u64>()).collect();
                             for &seed in &sim_seeds {
                                 let det = slot.real_state.redeterminize(Some(seed));
-                                let (path, actors, leaf_state, chance_step) = ol_descend(
-                                    &mut slot.ol_arena,
-                                    0,
-                                    det,
-                                    fpu,
-                                    cpuct, // det moved in (no clone)
-                                    &mut slot.fallback_count,
-                                    &mut slot.missing_child_count,
-                                    pick_floor,
-                                    None,
-                                    None,
-                                )?;
+                                let (path, actors, leaf_state, chance_step, a1c_admission_request) =
+                                    ol_descend(
+                                        &mut slot.ol_arena,
+                                        0,
+                                        det,
+                                        fpu,
+                                        cpuct, // det moved in (no clone)
+                                        &mut slot.fallback_count,
+                                        &mut slot.missing_child_count,
+                                        pick_floor,
+                                        None,
+                                    )?;
                                 debug_assert!(chance_step.is_none());
+                                debug_assert!(a1c_admission_request.is_none());
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
                                 paths.push(path);
                                 ol_actors.push(actors);
@@ -13010,11 +13077,6 @@ mod kingdomino_rust {
                         "chance_init_max_fraction must be finite and in (0, 1]",
                     ));
                 }
-                if leaf_batch != 1 {
-                    return Err(PyValueError::new_err(
-                        "A1c prototype currently requires leaf_batch=1 so panel admission cannot overtake in-flight sampled paths",
-                    ));
-                }
                 Some(super::A1cSearchOptions {
                     sampling: super::a1c_parse_panel_sampling(chance_panel_sampling)?,
                     n_init: chance_init_visits,
@@ -13374,19 +13436,20 @@ mod kingdomino_rust {
 
         for _ in 0..n_sims {
             let det = state.redeterminize(Some(rng.r#gen::<u64>()));
-            let (path, _actors, leaf_state, chance_step) = super::ol_descend(
-                &mut arena,
-                0,
-                det,
-                fpu,
-                cpuct,
-                &mut fallback_count,
-                &mut missing_child_count,
-                None,
-                None,
-                None,
-            )?;
+            let (path, _actors, leaf_state, chance_step, a1c_admission_request) =
+                super::ol_descend(
+                    &mut arena,
+                    0,
+                    det,
+                    fpu,
+                    cpuct,
+                    &mut fallback_count,
+                    &mut missing_child_count,
+                    None,
+                    None,
+                )?;
             debug_assert!(chance_step.is_none());
+            debug_assert!(a1c_admission_request.is_none());
             let leaf = *path.last().unwrap();
 
             let v0 = if leaf_state.phase == GAME_OVER {
