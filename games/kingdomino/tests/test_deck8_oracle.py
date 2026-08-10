@@ -18,6 +18,7 @@ from games.kingdomino.deck8_oracle import (
     validate_boundary_state,
 )
 from games.kingdomino.deck8_oracle_compare import (
+    a1c_node_diagnostics,
     exact_separation,
     require_exhausted_nn_budget,
     rotated_arm_order,
@@ -197,11 +198,19 @@ def test_equal_work_gate_rejects_a_simulation_ceiling_before_budget():
     }
     incomplete = {
         "nn_evaluations": 25,
-        "chance_diagnostics": {"nn_eval_budget_hit": 0.0},
+        "chance_diagnostics": {
+            "nn_eval_budget_hit": 0.0,
+            "nn_eval_budget_unused": 8.0,
+            "simulations_completed": 64.0,
+            "simulations_requested": 64.0,
+            "ordinary_nn_evaluations": 20.0,
+        },
     }
     require_exhausted_nn_budget("complete", complete, 33)
-    with pytest.raises(RuntimeError, match="increase --sims"):
+    with pytest.raises(RuntimeError, match="simulations=64/64") as error:
         require_exhausted_nn_budget("incomplete", incomplete, 33)
+    assert "ordinary_nn_evaluations=20" in str(error.value)
+    assert "terminal saturation" in str(error.value)
 
 
 def test_arm_order_rotation_balances_timing_positions():
@@ -209,6 +218,33 @@ def test_arm_order_rotation_balances_timing_positions():
     orders = [rotated_arm_order(names, index) for index in range(len(names))]
     assert [order[0] for order in orders] == names
     assert all(sorted(order) == sorted(names) for order in orders)
+
+
+def test_a1c_node_diagnostics_preserve_admission_timing_per_node():
+    diagnostics = {
+        "a1c_node_19_visits": 40.0,
+        "a1c_node_19_preinit_visits": 8.0,
+        "a1c_node_19_initialized_cycles": 2.0,
+        "a1c_node_7_visits": 12.0,
+        "a1c_node_7_preinit_visits": 0.0,
+        "a1c_node_7_initialized_cycles": 0.0,
+    }
+    assert a1c_node_diagnostics(diagnostics) == [
+        {
+            "node_id": 7,
+            "visits": 12,
+            "preinit_visits": 0,
+            "preinit_visit_fraction": 0.0,
+            "initialized_cycles": 0,
+        },
+        {
+            "node_id": 19,
+            "visits": 40,
+            "preinit_visits": 8,
+            "preinit_visit_fraction": 0.2,
+            "initialized_cycles": 2,
+        },
+    ]
 
 
 def test_boundary_screen_requires_stable_disagreement():

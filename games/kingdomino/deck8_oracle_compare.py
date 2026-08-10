@@ -16,7 +16,7 @@ from games.kingdomino.promotion import DEFAULT_CURRENT_BEST, sha256_file
 from games.kingdomino.self_play import make_rust_evaluator
 
 
-SCHEMA_VERSION = "kd-deck8-oracle-compare-v4"
+SCHEMA_VERSION = "kd-deck8-oracle-compare-v5"
 
 
 def require_exhausted_nn_budget(
@@ -29,9 +29,22 @@ def require_exhausted_nn_budget(
     if int(arm["nn_evaluations"]) != nn_eval_budget or not bool(
         diagnostics["nn_eval_budget_hit"]
     ):
+        simulations_completed = int(diagnostics.get("simulations_completed", 0))
+        simulations_requested = int(diagnostics.get("simulations_requested", 0))
+        ordinary_nn_evaluations = int(diagnostics.get("ordinary_nn_evaluations", 0))
+        unused = int(
+            diagnostics.get(
+                "nn_eval_budget_unused",
+                max(0, nn_eval_budget - int(arm["nn_evaluations"])),
+            )
+        )
         raise RuntimeError(
             f"arm {name} did not exhaust the NN budget "
-            f"({arm['nn_evaluations']}/{nn_eval_budget}); increase --sims"
+            f"({arm['nn_evaluations']}/{nn_eval_budget}, unused={unused}, "
+            f"simulations={simulations_completed}/{simulations_requested}, "
+            f"ordinary_nn_evaluations={ordinary_nn_evaluations}); increase --sims "
+            "only if ordinary leaf evaluations are still being produced, otherwise "
+            "inspect terminal saturation"
         )
 
 
@@ -41,6 +54,35 @@ def rotated_arm_order(arm_names: list[str], seed_index: int) -> list[str]:
         return []
     rotation = seed_index % len(arm_names)
     return arm_names[rotation:] + arm_names[:rotation]
+
+
+def a1c_node_diagnostics(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reconstruct per-chance-node admission evidence from Rust's flat map."""
+    prefix = "a1c_node_"
+    suffix = "_initialized_cycles"
+    node_ids = sorted(
+        int(key[len(prefix) : -len(suffix)])
+        for key in diagnostics
+        if key.startswith(prefix) and key.endswith(suffix)
+    )
+    rows = []
+    for node_id in node_ids:
+        visits = int(diagnostics[f"{prefix}{node_id}_visits"])
+        preinit_visits = int(diagnostics[f"{prefix}{node_id}_preinit_visits"])
+        rows.append(
+            {
+                "node_id": node_id,
+                "visits": visits,
+                "preinit_visits": preinit_visits,
+                "preinit_visit_fraction": (
+                    0.0 if visits == 0 else preinit_visits / visits
+                ),
+                "initialized_cycles": int(
+                    diagnostics[f"{prefix}{node_id}_initialized_cycles"]
+                ),
+            }
+        )
+    return rows
 
 
 def exact_separation(exact_actor_values: dict[int, float]) -> dict[str, Any]:
@@ -112,6 +154,7 @@ def score_arm_against_oracle(
         for value in exact_actor_values.values()
     )
     diagnostics = arm.get("chance_diagnostics", {})
+    node_diagnostics = a1c_node_diagnostics(diagnostics)
     return {
         "selected_action_idx": selected,
         "exact_best_action_idx": best_action,
@@ -169,6 +212,16 @@ def score_arm_against_oracle(
         "a1c_preinit_visit_fraction": float(
             diagnostics.get("a1c_preinit_visit_fraction", 0.0)
         ),
+        "a1c_reached_chance_nodes": int(
+            diagnostics.get("a1c_reached_chance_nodes", 0)
+        ),
+        "a1c_uninitialized_chance_nodes": int(
+            diagnostics.get("a1c_uninitialized_chance_nodes", 0)
+        ),
+        "a1c_uninitialized_node_visits": int(
+            diagnostics.get("a1c_uninitialized_node_visits", 0)
+        ),
+        "a1c_nodes": node_diagnostics,
         "nn_eval_budget_hit": bool(diagnostics.get("nn_eval_budget_hit", False)),
         "nn_eval_budget_unused": int(diagnostics.get("nn_eval_budget_unused", 0)),
         "simulation_limit_hit": bool(diagnostics.get("simulation_limit_hit", False)),
@@ -252,6 +305,18 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "mean_a1c_preinit_visit_fraction": statistics.fmean(
             float(row["a1c_preinit_visit_fraction"]) for row in rows
+        ),
+        "mean_a1c_reached_chance_nodes": statistics.fmean(
+            float(row["a1c_reached_chance_nodes"]) for row in rows
+        ),
+        "mean_a1c_uninitialized_chance_nodes": statistics.fmean(
+            float(row["a1c_uninitialized_chance_nodes"]) for row in rows
+        ),
+        "mean_a1c_uninitialized_node_visits": statistics.fmean(
+            float(row["a1c_uninitialized_node_visits"]) for row in rows
+        ),
+        "searches_with_uninitialized_chance_nodes": sum(
+            int(row["a1c_uninitialized_chance_nodes"] > 0) for row in rows
         ),
         "all_nn_eval_budgets_hit": all(bool(row["nn_eval_budget_hit"]) for row in rows),
         "all_simulation_limits_avoided": all(

@@ -830,6 +830,26 @@ optimized equal-time implementation. Do not use this preflight to claim an A1c
 speed or strength win. The preserved artifact is
 `deck8_oracle_a1c_equal_nn_check_6seeds_513evals_v4.json`.
 
+**Equal-work review follow-up, 2026-08-09.** The no-overshoot and exact-budget
+arguments were independently reviewed and held. The six-seed preflight did not
+exercise only one chance node: A1c initialized means of roughly 7-8 nodes per
+search, which is why it also exposed 5.7-7.3 extra small evaluator calls. That
+validates the equal-row accounting and reveals the per-node call overhead; it
+does not validate an optimized batching design. Before an equal-time claim or
+production `BatchedMCTS` integration, collect all cycle-admission rows requested
+in a wave into as few evaluator calls as practical and measure cross-node batch
+occupancy. This optimization is not a prerequisite for the equal-NN oracle
+target-quality diagnostic.
+
+Comparison schema v5 now preserves admission timing for every reached chance
+node: visits before admission, total visits, initialized cycles, and explicit
+late/never-initialized node counts. A null result can therefore distinguish a
+weak fully admitted panel from one that entered too late or was refused by the
+hard budget. Budget-exhaustion errors also report simulation progress, ordinary
+NN work, and unused work instead of always prescribing more simulations. The
+aggregate `all_nn_eval_budgets_hit` field remains as artifact provenance even
+though incomplete searches fail before aggregation.
+
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
 the available theory does not cover its adaptive use inside this PUCT tree; it

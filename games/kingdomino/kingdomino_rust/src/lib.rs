@@ -7107,16 +7107,37 @@ fn advisor_open_loop_search_impl(
         !one_reveal_panel.is_empty() && comb4(root_state.deck.len()) <= chance_enum_max_rows;
     let a1c_raw_panel_rows: usize = a1c_cycles.iter().map(Vec::len).sum();
     let a1c_unique_panel_rows: HashSet<[u16; 4]> = a1c_cycles.iter().flatten().copied().collect();
-    let a1c_initialized_nodes = arena
+    let a1c_reached_nodes: Vec<(usize, &OLNode)> = if a1c_options.is_some() {
+        arena
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.chance_chooser_actor.is_some() && node.visit_count > 0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let a1c_initialized_nodes: Vec<(usize, &OLNode)> = a1c_reached_nodes
         .iter()
-        .filter(|node| node.chance_initialized_cycles > 0);
-    let a1c_initialized_chance_nodes = a1c_initialized_nodes.clone().count();
+        .copied()
+        .filter(|(_, node)| node.chance_initialized_cycles > 0)
+        .collect();
+    let a1c_initialized_chance_nodes = a1c_initialized_nodes.len();
     let a1c_preinit_visits = a1c_initialized_nodes
-        .clone()
-        .map(|node| node.chance_preinit_visits)
+        .iter()
+        .map(|(_, node)| node.chance_preinit_visits)
         .sum::<usize>();
     let a1c_initialized_node_visits = a1c_initialized_nodes
-        .map(|node| node.visit_count.max(0) as usize)
+        .iter()
+        .map(|(_, node)| node.visit_count.max(0) as usize)
+        .sum::<usize>();
+    let a1c_uninitialized_chance_nodes = a1c_reached_nodes
+        .iter()
+        .filter(|(_, node)| node.chance_initialized_cycles == 0)
+        .count();
+    let a1c_uninitialized_node_visits = a1c_reached_nodes
+        .iter()
+        .filter(|(_, node)| node.chance_initialized_cycles == 0)
+        .map(|(_, node)| node.visit_count.max(0) as usize)
         .sum::<usize>();
     diagnostics.insert(
         "chance_panel_rows".to_string(),
@@ -7241,6 +7262,18 @@ fn advisor_open_loop_search_impl(
         a1c_initialized_chance_nodes as f64,
     );
     diagnostics.insert(
+        "a1c_reached_chance_nodes".to_string(),
+        a1c_reached_nodes.len() as f64,
+    );
+    diagnostics.insert(
+        "a1c_uninitialized_chance_nodes".to_string(),
+        a1c_uninitialized_chance_nodes as f64,
+    );
+    diagnostics.insert(
+        "a1c_uninitialized_node_visits".to_string(),
+        a1c_uninitialized_node_visits as f64,
+    );
+    diagnostics.insert(
         "a1c_initialized_cycles".to_string(),
         arena
             .iter()
@@ -7260,6 +7293,23 @@ fn advisor_open_loop_search_impl(
             a1c_preinit_visits as f64 / a1c_initialized_node_visits as f64
         },
     );
+    // Preserve the per-node transition evidence in the flat diagnostic map.
+    // The Python artifact layer reconstructs these keys into structured rows so
+    // a null result can distinguish late or absent panel admission by node.
+    for (node_id, node) in &a1c_reached_nodes {
+        diagnostics.insert(
+            format!("a1c_node_{node_id}_visits"),
+            node.visit_count.max(0) as f64,
+        );
+        diagnostics.insert(
+            format!("a1c_node_{node_id}_preinit_visits"),
+            node.chance_preinit_visits as f64,
+        );
+        diagnostics.insert(
+            format!("a1c_node_{node_id}_initialized_cycles"),
+            node.chance_initialized_cycles as f64,
+        );
+    }
     diagnostics.insert(
         "root_value_running_mean_player0".to_string(),
         incumbent_root_value0,

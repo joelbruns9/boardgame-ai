@@ -119,6 +119,7 @@ def test_invalid_admission_parameters_are_rejected():
 @pytest.mark.parametrize("sampling", ["balanced", "iid"])
 def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
     import kingdomino_rust as kr
+    from games.kingdomino.deck8_oracle_compare import a1c_node_diagnostics
 
     state = _rust_state_from_python(GameState.new(seed=17))
     children, _value, diagnostics = kr.advisor_one_reveal_search(
@@ -160,6 +161,17 @@ def test_a1c_search_initializes_complete_panels_without_fake_visits(sampling):
     ]
     # Bootstrap rows influence the panel mean but are not search visits.
     assert diagnostics["chance_node_visits"] == diagnostics["observation_visits"]
+    node_rows = a1c_node_diagnostics(diagnostics)
+    assert len(node_rows) == diagnostics["a1c_reached_chance_nodes"]
+    assert sum(row["initialized_cycles"] for row in node_rows) == diagnostics[
+        "a1c_initialized_cycles"
+    ]
+    assert sum(row["initialized_cycles"] == 0 for row in node_rows) == diagnostics[
+        "a1c_uninitialized_chance_nodes"
+    ]
+    assert sum(
+        row["visits"] for row in node_rows if row["initialized_cycles"] == 0
+    ) == diagnostics["a1c_uninitialized_node_visits"]
 
 
 def test_a1c_search_never_exceeds_initialization_fraction_guard():
@@ -316,6 +328,7 @@ def test_hard_nn_budget_charges_a1c_bootstraps_and_then_ordinary_work():
 
 def test_hard_nn_budget_never_partially_initializes_a_cycle_that_does_not_fit():
     import kingdomino_rust as kr
+    from games.kingdomino.deck8_oracle_compare import a1c_node_diagnostics
 
     state = _rust_state_from_python(_deck8_boundary_state())
     _children, _value, diagnostics = kr.advisor_one_reveal_search(
@@ -339,6 +352,13 @@ def test_hard_nn_budget_never_partially_initializes_a_cycle_that_does_not_fit():
     assert diagnostics["a1c_admission_committed_cycles"] == 0
     assert diagnostics["initialization_nn_budget_blocked_cycles"] > 0
     assert diagnostics["initialization_nn_budget_blocked_rows"] >= 11
+    node_rows = a1c_node_diagnostics(diagnostics)
+    assert node_rows
+    assert all(row["initialized_cycles"] == 0 for row in node_rows)
+    assert diagnostics["a1c_uninitialized_chance_nodes"] == len(node_rows)
+    assert diagnostics["a1c_uninitialized_node_visits"] == sum(
+        row["visits"] for row in node_rows
+    )
 
 
 def test_zero_nn_budget_preserves_the_unbudgeted_search_path():

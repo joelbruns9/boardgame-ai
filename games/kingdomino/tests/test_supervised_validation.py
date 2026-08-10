@@ -8,6 +8,13 @@ PLUMBING is correct.
 """
 from __future__ import annotations
 
+import unittest
+
+if __name__ != "__main__":
+    raise unittest.SkipTest(
+        "script-style supervised validation; run this file directly"
+    )
+
 import math
 import random
 import sys

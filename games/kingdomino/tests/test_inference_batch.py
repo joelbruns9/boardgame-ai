@@ -4,6 +4,13 @@
   T3: mixed single + batched traffic, concurrent threads
   T4: MCTS via IPC batched evaluator == MCTS via in-process batched evaluator
 """
+import unittest
+
+if __name__ != "__main__":
+    raise unittest.SkipTest(
+        "script-style inference-batch validation; run this file directly"
+    )
+
 import random, threading
 import numpy as np
 import torch
