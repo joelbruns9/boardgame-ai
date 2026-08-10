@@ -808,8 +808,27 @@ that budget. This makes equal-NN work a diagnostic of search efficiency, not the
 final strength objective. Retain separate later comparisons at equal wall time
 and at each search family's strongest feasible configuration; a slower A1c arm
 can still advance if its oracle decisions and paired game strength justify the
-cost. No GPU comparison has yet been run, so this checkpoint is not evidence of
-stronger play.
+cost. These accounting mechanics alone are not evidence of stronger play.
+
+**Equal-work preflight, 2026-08-09 — accounting passes; strength unresolved.**
+On the exact position-11 deck-8 boundary, a rotated-order six-seed check gave all
+six arms exactly 513 NN rows and every arm stopped on the NN budget before the
+1,024-simulation ceiling. `X=0` and lazy `X=1` completed 512 simulations. A1c
+completed means of 502.0-504.0 simulations while spending means of 8.0-10.0
+rows (1.56%-1.95%) on initialization. Every arm selected exact-best action 275
+on 6/6 repeated seeds, so this easy boundary/budget does not distinguish playing
+strength. Mean exact-Q pairwise accuracy was 77.8% for `X=0`, 87.3% for lazy
+`X=1`, and 86.5%-87.3% for A1c; these are repeated searches of one boundary,
+not independent strategic samples.
+
+The check also measured the current throughput shape. Deck=8 initialization
+used maximum bootstrap batches of two rows and roughly 5.7-7.3 extra evaluator
+calls/search. Rotated-order mean latency was 0.309 s for `X=0`, 0.311 s for lazy
+`X=1`, and 0.322-0.357 s for A1c. This modest overhead does not block the
+equal-NN oracle diagnostic, but current per-node bootstrap calls are not an
+optimized equal-time implementation. Do not use this preflight to claim an A1c
+speed or strength win. The preserved artifact is
+`deck8_oracle_a1c_equal_nn_check_6seeds_513evals_v4.json`.
 
 Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
 Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
@@ -1444,8 +1463,9 @@ it is not a substitute for correct chance topology or better state coverage.
    initializes its first balanced cycle only after `N_init`, caps initialization
    at 25% of NN work, then widens in whole balanced cycles. Wave-safe advisor
    admission, `leaf_batch=8` and matched total-NN-work stopping/accounting are
-   complete. The deck-8 A1c oracle comparison is now mechanically enabled but
-   has not been run. Preserve
+   complete. The 513-row rotated-order preflight passed accounting and batching
+   checks without distinguishing action choice. The larger deck-8 A1c oracle
+   comparison has not been run. Preserve
    incumbent and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
    search screen nor A2a alone is an A1c target-quality gate.
 6. Freeze the 120-position tuning and 120-position confirmation split before

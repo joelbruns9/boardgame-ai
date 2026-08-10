@@ -16,7 +16,7 @@ from games.kingdomino.promotion import DEFAULT_CURRENT_BEST, sha256_file
 from games.kingdomino.self_play import make_rust_evaluator
 
 
-SCHEMA_VERSION = "kd-deck8-oracle-compare-v3"
+SCHEMA_VERSION = "kd-deck8-oracle-compare-v4"
 
 
 def require_exhausted_nn_budget(
@@ -33,6 +33,14 @@ def require_exhausted_nn_budget(
             f"arm {name} did not exhaust the NN budget "
             f"({arm['nn_evaluations']}/{nn_eval_budget}); increase --sims"
         )
+
+
+def rotated_arm_order(arm_names: list[str], seed_index: int) -> list[str]:
+    """Cycle timing position without changing an arm's search seed."""
+    if not arm_names:
+        return []
+    rotation = seed_index % len(arm_names)
+    return arm_names[rotation:] + arm_names[:rotation]
 
 
 def exact_separation(exact_actor_values: dict[int, float]) -> dict[str, Any]:
@@ -131,7 +139,40 @@ def score_arm_against_oracle(
         "initialization_nn_fraction": float(
             diagnostics.get("initialization_nn_fraction", 0.0)
         ),
+        "ordinary_nn_evaluations": int(
+            diagnostics.get("ordinary_nn_evaluations", arm["nn_evaluations"])
+        ),
+        "nn_evaluator_calls": int(
+            diagnostics.get("nn_evaluator_calls", arm.get("evaluator_calls", 0))
+        ),
+        "nn_max_batch_size": int(
+            diagnostics.get(
+                "nn_max_batch_size", arm.get("evaluator_max_batch_size", 0)
+            )
+        ),
+        "initialization_evaluator_calls": int(
+            diagnostics.get("initialization_evaluator_calls", 0)
+        ),
+        "initialization_max_batch_size": int(
+            diagnostics.get("initialization_max_batch_size", 0)
+        ),
+        "initialization_blocked_cycles": int(
+            diagnostics.get("initialization_blocked_cycles", 0)
+        ),
+        "initialization_nn_budget_blocked_cycles": int(
+            diagnostics.get("initialization_nn_budget_blocked_cycles", 0)
+        ),
+        "initialization_nn_budget_blocked_rows": int(
+            diagnostics.get("initialization_nn_budget_blocked_rows", 0)
+        ),
+        "a1c_initialized_cycles": int(diagnostics.get("a1c_initialized_cycles", 0)),
+        "a1c_preinit_visit_fraction": float(
+            diagnostics.get("a1c_preinit_visit_fraction", 0.0)
+        ),
         "nn_eval_budget_hit": bool(diagnostics.get("nn_eval_budget_hit", False)),
+        "nn_eval_budget_unused": int(diagnostics.get("nn_eval_budget_unused", 0)),
+        "simulation_limit_hit": bool(diagnostics.get("simulation_limit_hit", False)),
+        "search_waves": int(diagnostics.get("search_waves", 0)),
         "elapsed_seconds": float(arm["elapsed_seconds"]),
     }
 
@@ -191,7 +232,40 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_initialization_nn_fraction": statistics.fmean(
             float(row["initialization_nn_fraction"]) for row in rows
         ),
+        "mean_ordinary_nn_evaluations": statistics.fmean(
+            float(row["ordinary_nn_evaluations"]) for row in rows
+        ),
+        "mean_nn_evaluator_calls": statistics.fmean(
+            float(row["nn_evaluator_calls"]) for row in rows
+        ),
+        "mean_nn_max_batch_size": statistics.fmean(
+            float(row["nn_max_batch_size"]) for row in rows
+        ),
+        "mean_initialization_evaluator_calls": statistics.fmean(
+            float(row["initialization_evaluator_calls"]) for row in rows
+        ),
+        "mean_initialization_max_batch_size": statistics.fmean(
+            float(row["initialization_max_batch_size"]) for row in rows
+        ),
+        "mean_a1c_initialized_cycles": statistics.fmean(
+            float(row["a1c_initialized_cycles"]) for row in rows
+        ),
+        "mean_a1c_preinit_visit_fraction": statistics.fmean(
+            float(row["a1c_preinit_visit_fraction"]) for row in rows
+        ),
         "all_nn_eval_budgets_hit": all(bool(row["nn_eval_budget_hit"]) for row in rows),
+        "all_simulation_limits_avoided": all(
+            not bool(row["simulation_limit_hit"]) for row in rows
+        ),
+        "total_initialization_blocked_cycles": sum(
+            int(row["initialization_blocked_cycles"]) for row in rows
+        ),
+        "total_initialization_nn_budget_blocked_cycles": sum(
+            int(row["initialization_nn_budget_blocked_cycles"]) for row in rows
+        ),
+        "total_initialization_nn_budget_blocked_rows": sum(
+            int(row["initialization_nn_budget_blocked_rows"]) for row in rows
+        ),
         "mean_seconds": statistics.fmean(float(row["elapsed_seconds"]) for row in rows),
     }
 
@@ -281,10 +355,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         traversal="balanced",
     )
     records = []
+    arm_names = list(specs)
     for seed_index in range(int(args.seed_count)):
         seed = int(args.seed) + seed_index
         arm_rows = {}
-        for name, spec in specs.items():
+        execution_order = rotated_arm_order(arm_names, seed_index)
+        for name in execution_order:
+            spec = specs[name]
             arm = _arm(
                 boundary,
                 evaluator,
@@ -308,7 +385,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             require_exhausted_nn_budget(name, arm, nn_eval_budget)
             arm_rows[name] = score_arm_against_oracle(arm, exact_actor_values)
-        records.append({"seed_index": seed_index, "seed": seed, "arms": arm_rows})
+        records.append(
+            {
+                "seed_index": seed_index,
+                "seed": seed,
+                "arm_execution_order": execution_order,
+                "arms": arm_rows,
+            }
+        )
 
     aggregate = {
         name: _aggregate([record["arms"][name] for record in records])
@@ -331,6 +415,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "simulation_ceiling": int(args.sims),
             "nn_eval_budget": nn_eval_budget,
             "comparison_basis": "equal_nn_work" if nn_eval_budget > 0 else "equal_simulations",
+            "arm_ordering": "cyclic_rotation_by_seed_index",
             "seed": int(args.seed),
             "seed_count": int(args.seed_count), "fpu": float(args.fpu),
             "cpuct": float(args.cpuct), "device": str(args.device), "arms": specs,

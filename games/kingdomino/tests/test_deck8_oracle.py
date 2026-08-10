@@ -20,6 +20,7 @@ from games.kingdomino.deck8_oracle import (
 from games.kingdomino.deck8_oracle_compare import (
     exact_separation,
     require_exhausted_nn_budget,
+    rotated_arm_order,
     run as run_oracle_compare,
     score_arm_against_oracle,
 )
@@ -201,6 +202,13 @@ def test_equal_work_gate_rejects_a_simulation_ceiling_before_budget():
     require_exhausted_nn_budget("complete", complete, 33)
     with pytest.raises(RuntimeError, match="increase --sims"):
         require_exhausted_nn_budget("incomplete", incomplete, 33)
+
+
+def test_arm_order_rotation_balances_timing_positions():
+    names = ["x0", "x1", "a1c_x4_balanced", "a1c_x4_iid"]
+    orders = [rotated_arm_order(names, index) for index in range(len(names))]
+    assert [order[0] for order in orders] == names
+    assert all(sorted(order) == sorted(names) for order in orders)
 
 
 def test_boundary_screen_requires_stable_disagreement():
