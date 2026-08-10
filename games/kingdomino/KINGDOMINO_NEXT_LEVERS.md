@@ -2,7 +2,7 @@
 
 - **Status:** Forward plan; experiments require their own frozen configs and
   preregistered gates before expensive training.
-- **Date:** 2026-08-07
+- **Date:** 2026-08-09
 - **Current model:** `runs/kingdomino/best_checkpoint/current_best.pt`
   (sha `4bf07b0c…`, 80x6), placed **3rd in a three-month BGA arena**.
 - **Goal:** make the strongest Kingdomino player in the world, not merely find
@@ -30,6 +30,23 @@ targets at those roots.
 The design must preserve the lesson that motivated open-loop search in the
 first place: **a decision made before a reveal must not depend on that reveal.**
 The intended change is not a return to a determinized, known-deck tree.
+
+The completed A1b probe gives a narrower implementation direction. Explicit
+observation splitting has useful signal, and locally balanced reveal routing
+improves coverage, but a fixed global exposure `X` fragments conditional search
+depth and the lazy sampled/Hájek arms did not identify one reference-stable
+winner. The next candidate is therefore **fully initialized balanced chance
+panels with visit-controlled progressive widening**:
+
+1. initialize one complete tile-balanced cycle at a visited chance node;
+2. batch-evaluate every row in that active panel;
+3. back up its direct probability-weighted mean; and
+4. add whole independent balanced cycles only as node visits justify more
+   chance width.
+
+This keeps the information-set safety of open loop while giving every revealed
+public row its own adaptive continuation. The lazy sampled and Hájek variants
+remain valuable ablations, not the intended production design.
 
 ## 2. What is already closed, and how firmly
 
@@ -213,18 +230,20 @@ so only the search topology is relevant; no learned dynamics model is needed.
 
 ### 4.4 Controlled random reveals
 
-At a chance node with `n` remaining tiles, generate `X` independent random
-permutations of the public bag and partition each permutation into four-tile
-rows. This produces:
+At a chance node with `n` remaining tiles, one tile-balanced cycle is a random
+permutation of the public bag partitioned into four-tile rows. `X` independent
+cycles produce:
 
 ```text
 K = n * X / 4 sampled rows
 ```
 
-Keep the notation explicit: `X` is the per-tile exposure count and `K` is the
-number of row children. Every tile appears `X` times in one search panel, not
-`2X`; the revealed row is shared by both players, and a seat-swapped evaluation
-game is a separate search rather than extra support for the first one.
+Keep the notation explicit: `X` is the current per-tile exposure count and `K`
+is the number of row children. In the proposed progressive design `X` is
+node-local and increases with chance-node visits; it is not one global search
+setting. Every tile appears `X` times in one search panel, not `2X`; the
+revealed row is shared by both players, and a seat-swapped evaluation game is a
+separate search rather than extra support for the first one.
 
 Properties when `n` is divisible by four:
 
@@ -259,6 +278,14 @@ bag, evaluate all of them against the same sampled row panel. This reduces the
 variance of action differences. Keep chance probability separate from child
 search visits: spending more downstream simulations on a row must not make that
 row more probable.
+
+The first active cycle must be fully initialized before selective refinement:
+evaluate all `n/4` rows, preferably in one NN batch, and form the direct
+probability-weighted panel mean. That removes missing active probability mass
+from the primary estimator. It does **not** make the estimate exact for the full
+game: panel sampling error, network error and downstream search error remain.
+Initialization work must be charged as `n/4` NN evaluations even when GPU
+batching makes its wall time much smaller.
 
 The actual self-play game still receives one ordinary uniform reveal. Balanced
 panels are counterfactual search outcomes, not a modified game rule.
@@ -427,10 +454,9 @@ Do not rewrite the entire production tree first.
 3. At that reveal, create a distinct subtree for each sampled row.
 4. Search one observation-conditioned decision segment, then optionally fall
    back to existing open loop.
-5. At every reachable pre-reveal deck size, sweep tile exposure
-   `X={1, 2, 4, 8, 16}` and extend to 32 only where the curve has not
-   saturated. Compare against IID panels with the same row count
-   `K=nX/4`. Eliminate dominated widths before the game test.
+5. Use static `X={1,2,4}` only to diagnose coverage, estimator and width/depth
+   behavior. The completed A1b result supersedes the proposed global sweep;
+   A1c tests visit-controlled widening instead.
 6. On the selected overnight-solvable deck=8 set, use exhaustive chance search
    as ground truth: enumerate all `C(8,4)=70` unordered first-row outcomes and
    solve after conditioning on each revealed row. Do not label the broader
@@ -489,11 +515,9 @@ informative but not a verdict:
 
 Matching a same-topology reference is not evidence of superiority. These data
 show that the implementation has enough influence to change converged search,
-but the two search families have not supplied a common arbiter. Do not proceed
-to self-play integration from this screen. Next, rerun the five reference-
-disagreement roots with multiple independent chance/search seeds, adjudicate the
-selected deck=8 reveal-boundary cases with the exhaustive chance oracle, and
-expand only after the reference consensus rate is adequate. The earlier
+but the two search families have not supplied a common arbiter. This triggered
+the five-root paired-seed follow-up below; it did not authorize self-play
+integration. The earlier
 50-position 128-sim `FPU=0` run remains a topology/fragmentation smoke, not a
 training-target result.
 
@@ -573,7 +597,7 @@ that run at identical 4,801 NN evaluations.
 
 The corrected one-seed smoke changed selected actions materially (including the
 deck=8 pick), confirming that the old dual-reference result is invalid as a
-strength gate. Do not reuse it. The next A1b comparison is now:
+strength gate. Do not reuse it. The reviewed A1b comparison was defined as:
 
 1. IID support traversal versus probability-balanced randomized cycles at each
    chance node, so local outcome coverage—not only global panel composition—is
@@ -589,8 +613,8 @@ strength gate. Do not reuse it. The next A1b comparison is now:
 Entry and interpretation must use realized evaluated probability mass rather
 than nominal `X`. Report exhaustive deck<=8 panels separately from truncated
 deck>=12 panels, and measure whether chance-action visit count correlates with Q
-rank before treating the renormalized arm as a strength result. Only after this
-comparison should the five-root paired-seed probe be rerun.
+rank before treating the renormalized arm as a strength result. The five-root
+paired-seed probe was then rerun; its completed result is recorded below.
 
 **Second review hardening, 2026-08-08.** The selection hot path no longer scans
 every registered chance outcome for every candidate action. Each chance node
@@ -631,10 +655,10 @@ the complete arm matrix; `chance_correct_a1b_probe.py` preconfigures one x0
 incumbent plus the `sampled,hajek × iid,balanced` cross-product for every
 positive `X`.
 
-Do not begin the longer frozen-position run until this boundary and the sampled
-backup arithmetic receive review. After review, start with the selected roots
-and equal NN budgets; an arm failing the realized-mass gate remains a coverage
-diagnostic, not strength evidence.
+At this checkpoint the longer frozen-position run was held for review of this
+boundary and the sampled-backup arithmetic. The subsequent run started with the
+selected roots and equal NN budgets; an arm failing the realized-mass gate
+remains a coverage diagnostic, not strength evidence.
 
 **A1b review correction.** The matrix uses `chance_enum_max_rows=12` as the
 exhaustive-enumeration threshold, rather than materializing the 70-row deck=8
@@ -666,92 +690,209 @@ The implementation should reuse the public-state/chance machinery in
 7 Wonders Duel search. The latter is a design reference, not a drop-in tree:
 Kingdomino still needs its own action topology, backup frame and Rust path.
 
-##### Deck-specific support saturation
+**A1b GPU result, 2026-08-09 — signal found; static lazy `X` not promoted.** The
+reviewed 12-position screen completed in 10m58s, followed by five targeted roots
+times eight paired seeds in 33m56s. Every treatment used approximately 4,801 NN
+evaluations, and treatment runtime stayed within ±0.7% of `X=0`, so the O(1)
+chance-Q cache removed hot-path throughput as the immediate concern.
 
-Do not ship one global `X`. Freeze representative positions for every reachable
-pre-reveal bag size (`n=44, 40, 36, …, 8, 4`) and measure a separate convergence
-curve. Each `(n, X)` cell must use multiple independently seeded panels, while
-all candidate root actions within a panel share the same rows.
+The five-root result favored balanced routing, but not one estimator/exposure
+combination across both references:
 
-Examples of the balanced support size:
+- against the sampled hybrid reference, `X=1` Hájek/balanced reduced mean regret
+  from 0.013678 to 0.007390, with top-1 0.800 versus 0.625;
+- against the Hájek hybrid reference, `X=2` Hájek/balanced reduced mean regret
+  from 0.014081 to 0.009434, while `X=1` reached 0.009889;
+- `X=1` balanced covered all 40 searches and more visit-weighted probability
+  mass than matched IID; and
+- all `X=4` arms failed the realized-mass gate in 8/40 searches, concentrated in
+  the widest early-game root. `X=2` sampled/IID failed there as well.
 
-| Bag `n` | `X=1` | `X=2` | `X=4` | `X=8` | `X=16` |
-|---:|---:|---:|---:|---:|---:|
-| 44 | 11 | 22 | 44 | 88 | 176 |
-| 32 | 8 | 16 | 32 | 64 | 128 |
-| 24 | 6 | 12 | 24 | 48 | 96 |
-| 16 | 4 | 8 | 16 | 32 | 64 |
-| 8 | 2 | 4 | 8 | 16 | 32 |
+The strict cross-reference winner gate therefore did not pass. Eight seeds show
+search stability, not 40 independent strategic positions: the effective
+generalization sample remains five roots. The two 10,000-simulation references
+agreed on only 3/5 exact actions and 4/5 tile picks. In particular, the deck=8
+position 11 disagreement remains an oracle question, not evidence that either
+search family is correct. These results support observation splitting and local
+balance, but do not yet establish better training targets.
+
+#### A1c — fully initialized, progressively widened chance panels
+
+Do not ship one global `X`, and do not make the lazy Hájek estimator the primary
+path. Implement the following candidate behind an opt-in flag:
+
+1. Below a deck-dependent chance-node threshold `N_init(n)`, traverse one
+   correctly sampled row at a time and use sampled-value backup. Do not pay for
+   a full cycle at a node that may never be revisited.
+2. When `N_init(n)` is crossed, atomically create the rest of one independent
+   tile-balanced cycle, giving `K=n/4` active rows and exposing every remaining
+   tile once. Batch-evaluate the missing rows and only then switch from sampled
+   backup to the complete-panel mean; never treat a partial cycle as complete.
+3. Store each active row's network value, legal policy and public observation
+   identity. Form the direct probability-weighted mean over the complete active
+   panel; no active probability mass is missing.
+4. Keep initialization estimates distinct from MCTS visit counts. A row's
+   bootstrap evaluation contributes to chance value, but must not masquerade as
+   a search visit or inflate its policy-target count.
+5. After initialization, route refinement in randomized balanced cycles and
+   deepen one row-specific public subtree at a time. Chance routing is never
+   selected by row value.
+6. Add another whole independent balanced cycle only when chance-node visits
+   cross a widening boundary such as:
+
+   ```text
+   X(N, n) = min(X_max(n), ceil(c * N^alpha))
+   K(N, n) = n * X(N, n) / 4
+   ```
+
+   The exact schedule is an experiment parameter, not a correctness claim.
+7. Share active panels across competing actions that leave the same public bag
+   (common random support), while keeping the randomized traversal cursor local
+   to each chance node.
+8. Re-randomize all still-hidden order after the sampled row. Hidden order never
+   enters a node key, NN input or training record.
+
+For equal-NN-budget experiments, preregister a hard initialization guardrail:
+
+```text
+initialization_nn_evals / total_nn_evals <= 0.25
+```
+
+If completing another first cycle would exceed that cap, leave that node in
+sampled mode. The 25% value is an engineering safety limit, not a theoretical
+optimum; it may change only between preregistered experiments.
+
+This is analogous to the useful part of the 7WD chance implementation—evaluate
+all active chance expansions and average them—but adds selective MCTS refinement
+because Kingdomino cannot exhaust its early-game chance tree. Progressive
+widening addresses the width/depth tradeoff: at fixed work, larger `X` splits
+visits across more observation subtrees and can make the search shallower. Full
+initialization guarantees coverage of the active panel, not unlimited width.
+
+Retain three ablations: incumbent open loop, lazy sampled/balanced and lazy
+Hájek/balanced. Hájek self-normalization is a finite-sample biased estimator and
+the available theory does not cover its adaptive use inside this PUCT tree; it
+should win empirically before displacing the simpler complete-panel mean.
+
+##### Support and budget validation
+
+Before tuning, freeze 240 independent positions stratified across every
+reachable pre-reveal bag size (`n=44, 40, 36, …, 8, 4`), ordinary self-play,
+BGA failures, flexibility/draft-order cases and defensive-blocking cases. Assign
+120 positions permanently to tuning and 120 to untouched confirmation. Freeze
+the schedule before opening confirmation results; repeated search seeds estimate
+noise but do not increase either position count.
+
+Initially fix `alpha=0.5` and tune only `N_init`, the widening constant and a
+small monotone set of early/mid/late deck-band caps. Do not fit an independent
+`X_max` for every deck size. Target a 95% position-clustered CI half-width no
+larger than 0.0025 for mean regret and five percentage points for
+epsilon-optimal tile-selection rate. If 120 confirmation positions do not reach
+the precision target, add a pre-reserved confirmation tranche without changing
+the schedule.
+
+One fully initialized cycle is 11 rows at deck=44, 7 at deck=28,
+6 at deck=24, 4 at deck=16 and 2 at deck=8. `X={1,2,4,8}` therefore means
+`K={7,14,28,56}` at deck=28. This makes explicit why a larger exposure can lose
+at fixed simulations despite estimating chance more broadly.
 
 Measure two curves rather than conflating chance coverage with search budget:
 
 1. **Chance-estimation curve:** hold downstream work per row approximately
-   fixed, so total compute grows with `X`. This asks whether additional support
+   fixed, so total compute grows with support. This asks whether wider support
    improves the evaluation at all.
 2. **End-to-end search curve:** hold total NN evaluations or deployed wall time
-   fixed, so larger `X` receives fewer downstream visits per row. This asks
-   whether the extra coverage is worth fragmenting the tree.
+   fixed, so wider support receives fewer conditional visits per row. This asks
+   whether coverage is worth the lost depth.
 
-For each cell report root top-1/pairwise agreement, mean and p90 regret, Q and
-ranking variance across panel seeds, visits per row, NN evaluations, latency and
-self-play games/second. Use exact enumeration at deck=4 and on the selected
-deck=8 oracle set; benchmark whether deck=12 (`C(12,4)=495`) is practical before
-calling it an oracle. Larger decks use a frozen high-support, multi-seed
-consensus reference and must not be described as exact.
+Count every initialized row as an NN evaluation even when evaluated in one GPU
+batch. Also record batch size/occupancy, peak arena memory, initialized rows,
+initialization NN evaluations and their fraction of total work, searched visits
+per row, conditional depth by reveal, latency and self-play games/second. The
+laptop establishes logic and scaling curves; an RTX 5090 cloud box is used only
+after the architecture and batching path pass review.
 
-Failure to find a significant `X -> 2X` improvement is not proof of saturation.
-Use an equivalence-style plateau rule: choose the smallest `X` only when the
-upper confidence bound rules out a preregistered meaningful improvement from
-doubling it across selection, regret and seed-stability metrics, then confirm
-with one further doubling where affordable. When uncertainty remains, retain
-the larger support because the objective is strength rather than maximum
-throughput.
+Use epsilon-aware ordering metrics because several placements can be
+strategically equivalent:
 
-The likely result is two versioned lookup tables rather than one compromise:
+- joint-action regret and membership in a preregistered epsilon-optimal set;
+- tile-pick regret after optimizing placement, reported separately from
+  conditional placement regret;
+- pairwise ordering, mean and p90 regret and ranking variance across panel
+  seeds; and
+- clustered intervals by strategic position, not by repeated search seed.
 
-```text
-chance_exposure_training[deck_size]
-chance_exposure_advisor[deck_size]
-```
-
-The advisor can justify a larger support because it runs continuously until its
-top move stabilizes. Training search should pay that throughput cost only if the
-larger support improves targets enough to produce a stronger checkpoint.
-
-Separate bias reduction from budget fragmentation. At both the self-play
-training budget and the 10,000-simulation advisor budget, compare:
-
-- incumbent open loop at its normal budget;
-- incumbent open loop at the hybrid's realized NN-evaluation/wall-time cost;
-- IID observation splitting across the surviving `K` values; and
-- tile-balanced splitting at matched `K` and total NN evaluations.
-
-Keep total evaluations fixed when comparing search algorithms, and also report
-per-observation visits. Otherwise a weak result cannot distinguish an
-unimportant alias from spreading too little search across too many subtrees.
-
-Primary measurements:
-
-- on the solved deck=8 subset, root top-1 and pairwise action agreement with the
-  exhaustive oracle; elsewhere, agreement/regret against a frozen
-  stronger-search reference;
-- mean and p90 root regret;
-- action-ranking variance across chance seeds;
-- policy changes on hand-checked robust-versus-brittle positions;
-- the full contingency measurements from A-1, including rank-change frequency;
-  and
-- NN evaluations, wall time and self-play games/second.
-
-This probe succeeds only if observation splitting improves selection or reduces
-regret at equal compute. A value-MAE improvement alone is insufficient.
+Use exact enumeration at deck=4 and the selected deck=8 oracle set. Larger decks
+use a frozen high-support, multi-seed consensus reference and must not be called
+exact. For deck>=12, same-family or competing-family reference regret is a
+screen, not an arbiter or pass gate. Drop the A1b 50% realized-mass eligibility
+filter from cross-arm strength comparisons: it structurally favors fully
+initialized A1c. Report active-panel completion, unique full-support fraction,
+tile balance, effective panel size, realized mass and conditional depth as
+covariates without withholding regret. A1c passes only on deck=8 oracle evidence
+and/or paired game outcomes at matched work, while retaining feasible depth and
+batched cost. Value MAE or same-topology agreement alone is insufficient.
 
 #### A2 — frozen-net game-strength test
 
-Compare current open loop with the one-reveal hybrid using identical weights,
-equal NN evaluations, paired decks and swapped seats. Include BGA anchor roots
-as a separate stratum. Use the Section 3 `LCB > 50%` procedure for the frozen-net
-search matchup; the paired-seat variance curve forecasts cost but does not
-replace the promotion-strength gate.
+The existing promotion harness is not sufficient: it supplies one shared
+simulation/search configuration to both seats, and the one-reveal path is not
+yet in `BatchedMCTS`. Add these explicit deliverables:
+
+1. an asymmetric paired search-match API with independent immutable `SearchSpec`
+   values for player A and player B, identical deck seeds with seats swapped,
+   official outcome scoring and the Section 3 clustered LCB; and
+2. a serial backend that calls the existing advisor open-loop/one-reveal search
+   on every move, followed later by a `BatchedMCTS` backend using the same specs
+   and cross-checked against fixed serial games.
+
+**A2 harness checkpoint, 2026-08-09 — serial backend complete.**
+`chance_correct_match.py` now provides independent immutable
+`SearchSpec` values, the existing Rust advisor search on every non-forced move,
+paired identical deck seeds with seats swapped, deterministic visit/prior action
+selection, official outcome scoring and the promotion module's pair-clustered
+LCB. It records per-arm search calls, NN evaluations and search time, requires a
+selection reason and refuses to overwrite a completed artifact. Focused unit,
+real Rust-boundary and promotion-statistics tests pass; a tiny random-network
+two-game CPU smoke completed legally with equal 94-evaluation arm counts. This
+validates plumbing only. A2a's simulation budget, fixed pair count, confidence
+level, futility boundary and output path were frozen before the real checkpoint
+match.
+
+**A2a — pre-A1c pulse match.** Before building A1c, use the serial harness to
+compare the already implemented `X=1`, Hájek/balanced treatment against `X=0`
+at one preregistered low-simulation training budget. This is a non-circular game-
+outcome test of whether observation splitting has a playing-strength pulse. Use
+the normal paired `LCB > 50%` success rule plus a preregistered futility boundary.
+A negative result lowers A1c's priority but does not automatically close it,
+because A1c specifically changes lazy missing-mass and initialization behavior.
+
+**A2a result, 2026-08-09 — inconclusive with a negative point estimate.** The
+sealed 256-pair/512-game match used `current_best`, 800 simulations per move and
+seed range beginning at 2026082000. `X=1`, Hájek/balanced scored 119 paired
+points (46.48%) against `X=0`; its pair-clustered 95% Wilson interval was
+40.47%-52.60%. Pair outcomes were 32 wins, 174 draws and 50 losses; game
+outcomes were 238-0-274 with a -1.49 mean treatment margin. It therefore clears
+neither the `LCB > 50%` success gate nor the `UCB < 50%` confidently-harmful
+gate. Do not extend this sample adaptively or reinterpret the point estimate as
+a pass. The result supplies no playing-strength evidence for the existing lazy
+one-reveal treatment and lowers A1c's priority, but it does not adjudicate A1c's
+delayed full-cycle initialization or missing-mass correction.
+
+The run completed in 9,499.8 seconds (2 h 38 m). Treatment and control used
+12,598 and 12,588 search calls, 711.54 and 710.69 NN evaluations per call, and
+0.3754 and 0.3780 search seconds per call. The disjoint four-pair pilot used
+717.11/726.96 evaluations and 0.4437/0.4513 seconds per call. The full run thus
+shows no treatment-side budget or throughput regression; its lower per-call
+times are consistent with amortization relative to the small pilot.
+
+**A2b — candidate frozen-net match.** After A1c clears deck=8 oracle screening
+and is integrated into `BatchedMCTS`, compare current open loop with the fully
+initialized/progressively widened search using identical weights, equal NN
+evaluations, paired decks and swapped seats. Include BGA anchor roots as a
+separate stratum. Include an incumbent arm with enough extra simulations to
+match treatment wall time so the result cannot be explained by budget accounting
+alone.
 
 Keep two verdicts separate:
 
@@ -767,7 +908,8 @@ hidden by averaging the two verdicts.
 
 #### A3 — training-loop treatment
 
-Only after the corresponding A2 advisor or training-search verdict is positive:
+Only after the A1c target-quality gate and corresponding A2 advisor or
+training-search verdict are positive:
 
 - use chance-correct root visits/completed-Q targets for learner moves;
 - retain standard terminal win, own-score and opponent-score targets;
@@ -775,15 +917,26 @@ Only after the corresponding A2 advisor or training-search verdict is positive:
 - stamp the search/target version in replay metadata; and
 - refuse to mix incompatible old and new policy targets silently.
 
-Any resulting checkpoint still promotes only by clearing the Section 3 paired
-`LCB > 50%` gate against `current_best` with equal search settings.
+Before renting the cloud box, require code review, information/probability
+invariants, deck=8 oracle support, a laptop end-to-end `BatchedMCTS` smoke and a
+measured batch/memory scaling curve. Then resume the current best 80x6 network;
+do not start with another capacity change. Use a lower visit-driven support cap
+for self-play and a larger cap for the continuously running advisor only when
+their separate curves justify it.
+
+Evaluate two gates. First compare challenger and incumbent checkpoints under the
+same new search to isolate learning. Then compare the complete new
+model-plus-search system with the currently deployed model-plus-open-loop system.
+Both use paired decks/seats and the Section 3 `LCB > 50%` rule; the first gate is
+the authoritative network-promotion decision.
 
 #### A4 — expand the observation split only if justified
 
-If one reveal helps, extend chance nodes deeper using outcome progressive
-widening or balanced panels. Measure realized child counts by depth. Do not
-materialize all `C(44,4)` rows, and do not assume a full-tree rewrite is better
-than the successful shallow hybrid.
+If one reveal helps, extend the same fully initialized/progressively widened
+semantics to later reveals one boundary at a time. Measure active support,
+conditional depth and memory by reveal depth. Do not materialize all
+`C(44,4)` rows, and do not assume a full-tree rewrite is better than the
+successful shallow hybrid.
 
 ### 4.6 Flexibility-specific audit
 
@@ -961,15 +1114,18 @@ with:
 Add a Rust start-from-public-state path that samples a fresh hidden permutation.
 With the current thin archive, begin only with a pipeline smoke/pilot:
 
-- 15% of self-play games starting from the game-disjoint BGA training split;
-- 85% beginning from the normal opening;
+- 5% of self-play games starting from the game-disjoint BGA training split;
+- 95% beginning from the normal opening;
 - 5-10 independently redeterminized continuations per selected root over time;
 - a per-iteration reuse cap so a thin archive cannot dominate one buffer; and
 - sampling within the archive weighted by regret/rarity, with a nonzero uniform
   floor.
 
-Sweep restart fraction only after a frozen pilot. Reasonable comparison arms are
-0%, 10%, 20% and 30%; do not jump directly to a BGA-majority buffer.
+The first controlled comparison is 0% versus 5%. Expand to 10% only if the 5%
+arm moves the intended held-out strata without degrading normal-opening play;
+larger fractions require new independent source games and a fresh preregistered
+experiment. The point is rare elite-failure coverage, not making a 36-game
+archive numerically comparable with one self-play iteration.
 
 The pilot may establish legality, stability, learning movement and gross
 regressions. Treat its held-out BGA effect estimate as exploratory until passive
@@ -1024,20 +1180,104 @@ the row actually revealed. The solver must optimize the official outcome
 cascade and average chance outcomes; solving a single fixed permutation would
 reintroduce clairvoyance and is not a valid label.
 
+Full row enumeration exposes each of the eight tiles in `C(7,3)=35` rows, so it
+is equivalent to `X=35` first-order exposure, not `X=8`. Average the 70
+conditioned results with exact `1/70` probability. Report an epsilon-optimal
+joint-action set, epsilon-optimal tile set after placement optimization, tile
+regret and conditional placement regret rather than forcing one arbitrary top-1
+when several placements are tied or practically indistinguishable.
+
 Do not implement this as a Python loop around the existing deck-4 Rust solver
-for arbitrary roots. On three frozen bag-8 positions, the current legal tree
-reaches 26,112-41,400 concrete prefixes before the first reveal; multiplying by
-70 rows would require roughly 1.8-2.9 million conditioned tail solves per root.
-The existing fast solver handles only no-chance bag-4/bag-0 states, so that
-wrapper would reproduce the already observed operational failure.
+for arbitrary roots. Earlier measurements found 26,112-41,400 concrete prefixes
+before the first reveal on three bag-8 roots. The explicit position-11 count is
+larger: 105,576 pre-reveal action sequences and 7,390,320 conditioned deck-4
+tail solves. The existing fast solver handles only no-chance bag-4/bag-0 states,
+so that wrapper would reproduce the already observed operational failure.
 
 Start with a modest, strategically selected set at or immediately before the
-reveal boundary, where 70 conditioned tails are tractable. Those cases can
-validate balanced-panel convergence, flexibility rankings and backup semantics.
+reveal boundary, where 70 conditioned tails per legal placement are tractable.
+Those cases can validate balanced-panel convergence, flexibility rankings and
+backup semantics. Freeze candidate boundaries using explicit action prefixes;
+prefer boundaries where frozen search families disagree, then add cases that
+distinguish draft-order flexibility and blocking. This does not exactly
+adjudicate the original position-11 root: it adjudicates the chance-boundary
+values reached by a stated continuation. A few overnight boundaries are useful
+even though the solver is too slow for self-play or the live advisor: their value
+is independent ground truth for architecture and target-quality decisions.
+
+Deck-4 solve time is heavy-tailed and varies with board complexity and play.
+Never estimate a corpus from a small easy prefix alone. Persist every solved
+`(placement, row)` cell, run tiered time caps, and retry only missing cells at a
+higher cap. An action receives an oracle expectation and rank only after all 70
+rows solve; do not average the solved subset or silently replace timed-out rows.
 Exact adjudication of the original earlier roots requires the chance node and
 its transposition/caching support inside the Rust solver rather than above it in
 Python. This remains an offline oracle; it does not need advisor latency or
 self-play throughput.
+
+**Boundary-oracle checkpoint, 2026-08-09.** `deck8_oracle.py` implements the
+guarded final-pre-reveal boundary described above. It requires exactly eight bag
+tiles, the last current-round actor and one remaining public pick; enumerates 70
+unique uniform rows; invokes the no-chance solver on every resulting deck-4
+state; persists identity-checked cells; resumes missing work; and refuses to
+rank incomplete actions. Focused boundary, actor-frame, support and resume tests
+pass.
+
+The first completed position-11 incumbent-aligned boundary froze prefix actions
+`1997,3152,3165`. All 490 tails for seven legal placements solved exactly with
+no timeout in 222.5 seconds. This particular boundary was easier than the known
+tail: median 0.363 s, p90 0.823 s, p99 1.185 s and max 1.654 s per tail. Exact
+action 275 led action 2880 by 0.01737 actor utility. In eight repeated 4,800-sim
+searches, both `X=0` and lazy `X=1` selected action 275 on 8/8 seeds with zero
+oracle regret. `X=0` had 89.3% exact-Q pairwise ordering versus 86.3% for lazy
+`X=1`; both had 81.0% visit ordering. This is one boundary and validates the
+oracle/comparison seam, not A1c. The alternative treatment-aligned position-11
+continuation also produced the same `X=0`/`X=1` boundary choice and was not
+exact-solved. Screen for a genuinely discriminating frozen boundary before the
+next exact run.
+
+**Fixed calibration corpus, 2026-08-09.** The preregistered screen derived both
+`X=0`- and lazy-`X=1`-directed continuations from all eight frozen deck-8 roots,
+deduplicating 16 lines to 15 public boundaries. Across three paired 4,800-sim
+seeds, it found no stable disagreement: 12/15 boundaries had both arms
+unanimous, while three were noisy. Two position-5 boundaries had different
+modal choices but failed the unanimous gate and were not cherry-picked for
+exact solving.
+
+The follow-up therefore froze a separate calibration corpus independently of
+the screen outcome: the `X=0`-derived boundary from every frozen root. All eight
+positions, 68 legal placements and 4,760 `(placement, row)` tails solved exactly
+with no timeout; total exact wall time was about 37.5 minutes. The original
+position-11 result was reused. Cell means are now checked to reproduce every
+stored oracle action expectation before analysis.
+
+Against these oracles, three-seed 4,800-sim `X=0` search selected an exact-best
+placement on 66.7% of nested searches with mean position regret 0.00576. Lazy
+`X=1` scored 62.5% and 0.00697. These are eight independent positions, not 24;
+the repeats estimate search stability. They reinforce A2a's lack of positive
+evidence for the lazy treatment but remain a boundary-placement diagnostic, not
+a game-strength result.
+
+Exact-tail panel resampling used common rows across actions and 2,000 trials per
+position, scheme and exposure. Top-1 recovery and mean exact regret were:
+
+| Exposure | Rows | Balanced top-1 / regret | Matched IID top-1 / regret |
+|---:|---:|---:|---:|
+| `X=1` | 2 | 81.1% / 0.00116 | 82.6% / 0.00094 |
+| `X=2` | 4 | 87.8% / 0.00060 | 88.5% / 0.00053 |
+| `X=4` | 8 | 92.6% / 0.00029 | 93.4% / 0.00023 |
+| `X=8` | 16 | 96.1% / 0.00011 | 96.3% / 0.00009 |
+| `X=16` | 32 | 98.4% / 0.00003 | 98.2% / 0.00003 |
+| `X=35` | 70 sampled | 99.4% / 0.00001 | 99.4% / 0.00001 |
+
+`X=35` above is still a 70-row random panel, not enumeration of every unique
+combination; the full oracle is 100% by definition. This isolates chance-panel
+sampling with exact conditional tails and therefore cannot be compared as if it
+were an equal-compute MCTS arm. It says `X=1` is light, most sampling benefit is
+present by `X=4`-`X=8`, and first-order tile balance has not outperformed
+matched-width IID on this small corpus. Preserve IID as an A1c ablation and do
+not claim a balanced advantage. A1c must still demonstrate that its conditional
+NN/search values retain this oracle ordering under its charged NN budget.
 
 ### 6.3 Paired-seat variance curve
 
@@ -1111,6 +1351,15 @@ it is not a substitute for correct chance topology or better state coverage.
 10. **Promote only on strength.** Offline selection, regret, exact solving and
     BGA anchors screen and explain candidates; only the paired `LCB > 50%`
     match against `current_best` promotes one.
+11. **Never optimize chance.** Row generation and traversal may be balanced or
+    widened by visit count, but never selected from value, policy or legality
+    information that was unavailable before the reveal.
+12. **Charge batched work honestly.** One forward batch over `K` initialized
+    rows is `K` NN evaluations even if it costs much less than `K` separate
+    launches. Report both evaluation count and wall time.
+13. **Do not confuse repeated seeds with new positions.** Seeds estimate search
+    noise for one root. Strategic generalization intervals cluster by frozen
+    position, and BGA intervals cluster by source game.
 
 ## 9. Execution order
 
@@ -1119,34 +1368,53 @@ it is not a substitute for correct chance topology or better state coverage.
    BGA rank as external validation, not a development-loop Elo target.
 2. **Completed 2026-08-07:** measured terminal tie frequency and fixed official
    tiebreak consistency in Python, Rust, exact solving and batched evaluation.
-3. Start B0 passive collection of newly advisor-logged games with the minimal
-   versioned capture/archive schema. Seek written BGA permission for any replay
-   corpus; do not build an automated collector without it.
-4. **Completed initial screen 2026-08-08:** A-1 found stable backed-root
-   contingency changes in matched balanced/IID arms through `X=4`. Expand the
-   confirmation corpus with BGA failures during A1, but do not delay the hybrid
-   build for a larger version of the same headroom probe.
-5. **A0 and the opt-in A1 Rust topology slice completed 2026-08-08.** The first
-   dual-reference training-budget screen is unresolved because the 10,000-sim
-   incumbent and hybrid agree on only 7/12 joint actions (11/12 pick ranks).
-   Next rerun those disagreement roots across independent seeds and adjudicate
-   the selected deck=8 reveal-boundary cases exactly. Only then expand the full
-   corpus and produce separate per-deck training/advisor exposure schedules from
-   `X` saturation curves and width/compute controls. Do not integrate with
-   `BatchedMCTS` self-play or spend on global `X=8` arms before that gate.
-6. Add Rust start-from-public-state and run legal/reconstruction smoke tests.
-   Run a small BGA restart training pilot with the current search once there is
-   a game-disjoint training subset; label BGA-specific effect estimates
-   exploratory while the corpus remains thin.
-7. Run the A2 frozen-net search matchup and BGA restart checkpoint treatment as
-   independent experiments. Preserve separate advisor and training-search
-   verdicts for Workstream A; promote only when the relevant paired match clears
-   the Section 3 lower-confidence-bound gate.
-8. Combine BGA restarts with chance-correct targets only if each component has
-   independent positive evidence.
-9. Port pick-stratified Gumbel as the next low-cost training-efficiency arm.
-10. Reconsider capacity only after a promoted treatment has materially changed
-    the search-generated buffer.
+3. **Completed through A1b, 2026-08-09:** A-1 found contingency headroom; A0
+   locked the information/probability invariants; A1 built the one-reveal Rust
+   topology; and the reviewed GPU probe found balanced-routing signal without a
+   reference-stable static-`X` winner. Do not rerun the same five-root matrix as
+   if more seeds created more strategic evidence.
+4. **A2a completed 2026-08-09: inconclusive, negative point estimate.** The
+   frozen `X=1` Hájek/balanced treatment scored 46.48% paired points versus
+   `X=0`, with a 95% interval of 40.47%-52.60%. Do not add games adaptively.
+   This does not support the existing lazy one-reveal treatment, while leaving
+   A1c's distinct initialization hypothesis unresolved.
+5. **Deck-8 boundary oracle and fixed eight-position calibration corpus
+   completed 2026-08-09.** Exact position-11 root solving is millions of tails
+   and is not the laptop oracle. Boundary oracles show `X=1` is light,
+   `X=4`-`X=8` captures most exact-tail sampling benefit, matched IID is at least
+   competitive with balance, and the existing lazy treatment does not improve
+   oracle decisions. Review this slice, then specify and implement A1c. It starts
+   in sampled mode, atomically
+   initializes its first balanced cycle only after `N_init`, caps initialization
+   at 25% of NN work, then widens in whole balanced cycles. Preserve incumbent
+   and lazy sampled/Hájek paths as ablations. Neither the deck>=12 stronger-
+   search screen nor A2a alone is an A1c target-quality gate.
+6. Freeze the 120-position tuning and 120-position confirmation split before
+   schedule tuning. On the laptop, run A1c correctness smokes and per-deck
+   width/depth curves on tuning positions only, then exercise the real
+   `BatchedMCTS` self-play path. Measure batched initialization throughput,
+   initialization-budget fraction and peak memory. Do not launch a large global
+   `X=8` sweep.
+7. Start B0 passive collection from advisor-logged games and add the versioned
+   Rust start-from-public-state path. Run reconstruction, redeterminization and
+   legal-completion tests; the first training comparison is 0% versus 5% BGA
+   restarts. Seek written permission before any replay corpus automation.
+8. Freeze A1c schedules, open the untouched confirmation set, and run A2b through
+   the asymmetric `BatchedMCTS` harness at matched NN work, plus the wall-time-
+   matched incumbent control. Preserve separate training-budget and advisor-
+   budget verdicts; only deck=8 oracle evidence and paired game outcomes are
+   gates, while deck>=12 reference regret remains diagnostic.
+9. Request final logic/throughput review. Only after the architecture, oracle,
+   laptop smokes, `BatchedMCTS` integration and batch/memory curve pass should an
+   RTX 5090 cloud box be rented.
+10. Resume `current_best` 80x6 for controlled challenger training. First isolate
+    chance-correct targets and the small BGA restart curriculum; do not use a
+    larger net or revive the Q head. Gate the challenger against the incumbent
+    under the same new search, then gate the complete new system against the
+    currently deployed system, both with paired decks/seats and `LCB > 50%`.
+11. Combine BGA restarts with chance-correct targets only if each component has
+    independent positive evidence. Port pick-stratified Gumbel next; reconsider
+    capacity only after a promoted treatment materially changes the buffer.
 
 The combined treatment is not allowed to rescue two individually negative
 components. Each primary workstream must first pass its own selection and
@@ -1169,24 +1437,73 @@ Measured 2026-08-06/07 unless noted, on `current_best` (sha `4bf07b0c…`).
 | BGA deployment: non-top advisor placement selected | <1%, still within top 3 |
 | BGA external result | 3rd in three-month Arena; currently 31st overall |
 | run11a exploiter plateau vs banked net | ~48.5% over 15,000 games |
+| A1b reviewed GPU screen | 12 roots × 1 seed in 10m58s; targeted 5 roots × 8 seeds in 33m56s |
+| A1b treatment NN work / runtime overhead | ~4,801 evaluations; within ±0.7% of `X=0` |
+| A1b best sampled-reference arm | `X=1` Hájek/balanced: regret 0.007390 vs 0.013678 |
+| A1b best Hájek-reference arm | `X=2` Hájek/balanced: regret 0.009434 vs 0.014081 |
+| A1b strong-reference agreement | 3/5 exact actions; 4/5 tile picks |
 
 ## 11. Research references
 
-- Gumbel AlphaZero: <https://openreview.net/forum?id=bERaNdoegnO>
-- POMCP/action-observation histories:
-  <https://papers.nips.cc/paper/2010/hash/edfbe1afcf9246bb0d40eb4d8027d90f-Abstract.html>
-- Stochastic MuZero afterstates/chance outcomes:
-  <https://openreview.net/forum?id=X6D9bAHhBQ1>
-- Sparse sampling for stochastic planning:
-  <https://www.ijcai.org/Proceedings/99-2/Papers/093.pdf>
-- Monte Carlo *-Minimax for stochastic zero-sum games:
-  <https://arxiv.org/abs/1304.6057>
-- Variance reduction and common random numbers in MCTS:
-  <https://papers.neurips.cc/paper_files/paper/2011/hash/d736bb10d83a904aefc1d6ce93dc54b8-Abstract.html>
-- Regret-Guided Search Control:
-  <https://arxiv.org/abs/2602.20809>
-- KataGo auxiliary targets and self-play improvements:
-  <https://arxiv.org/abs/1902.10565>
+The literature backs the architecture class, not the exact Kingdomino recipe.
+In particular, there is no theorem here that directly validates a
+tile-balanced, without-replacement panel combined with neural PUCT, full panel
+initialization and visit-controlled widening. Those details remain empirical
+and are kept behind oracle, equal-compute and playing-strength gates.
+
+- **Information-safe observation branching:** Silver and Veness, *Monte-Carlo
+  Planning in Large POMDPs* (POMCP), indexes search by action-observation
+  histories and uses root sampling. This supports preserving the pre-reveal
+  information set while separating post-reveal public decisions:
+  <https://mlanthology.org/neurips/2010/silver2010neurips-montecarlo/>.
+- **Neural afterstate/chance topology:** Antonoglou et al., *Planning in
+  Stochastic Environments with a Learned Model* (Stochastic MuZero), separates
+  deterministic afterstates from stochastic outcomes and demonstrates neural
+  MCTS in 2048 and backgammon. Kingdomino has an exact simulator, so only the
+  topology—not the learned dynamics—is borrowed:
+  <https://mlanthology.org/iclr/2022/antonoglou2022iclr-planning/>.
+- **Sparse stochastic planning:** Kearns, Mansour and Ng prove that a finite
+  IID sampled successor tree can support near-optimal planning with complexity
+  independent of total state count. Their theorem uses independent generative-
+  model samples; it does not directly justify the balanced panel:
+  <https://www.ijcai.org/Proceedings/99-2/Papers/093.pdf>.
+- **Adversarial stochastic games:** Lanctot et al., *Monte Carlo Star-Minimax
+  Search*, applies with-replacement chance sampling in two-player stochastic
+  games and reports practical gains. The paper explicitly says its proof does
+  not cover sampling without replacement, which is why deck=8 and paired
+  empirical gates remain necessary:
+  <https://www.ijcai.org/Proceedings/13/Papers/093.pdf>.
+- **Progressive widening:** Couëtoux and Doghmen study adding double progressive
+  widening to UCT so stochastic outcome width grows with node visits, directly
+  motivating the proposed width/depth controller while also showing the schedule
+  parameters require tuning:
+  <https://ewrl.wordpress.com/wp-content/uploads/2011/08/ewrl2011_submission_29.pdf>.
+- **Progressive-widening caveat:** Sunberg and Kochenderfer show that naive DPW
+  can converge to a suboptimal policy in continuous-observation POMDPs because
+  its belief particles collapse. Kingdomino's reveal becomes fully public and
+  its outcome set is finite, so the failure is not directly transferable, but it
+  warns against treating widening alone as a correctness proof:
+  <https://arxiv.org/abs/1709.06196>.
+- **Hájek/self-normalized estimation caveat:** Cardoso et al. give modern
+  finite-sample bias, variance and concentration results for self-normalized
+  importance sampling. Self-normalization introduces bias, and their setting is
+  not adaptive PUCT; this supports retaining Hájek as an ablation rather than a
+  presumed-correct primary backup:
+  <https://proceedings.neurips.cc/paper_files/paper/2022/hash/04bd683d5428d91c5fbb5a7d2c27064d-Abstract-Conference.html>.
+- **Locally balanced chance streams—related, not direct:** Li, Chen and Huang's
+  2026 preprint uses persistent correlated chance streams in MCCFR, proves local
+  frequency control and reports lower exploitability. It is recent and studies
+  CFR rather than MCTS, so it is supporting motivation for randomized balanced
+  cycles, not validation of this implementation:
+  <https://arxiv.org/abs/2607.27035>.
+- **Common random numbers in MCTS:** Veness, Lanctot and Bowling:
+  <https://papers.neurips.cc/paper_files/paper/2011/hash/d736bb10d83a904aefc1d6ce93dc54b8-Abstract.html>.
+- **Low-simulation policy improvement:** Gumbel AlphaZero:
+  <https://openreview.net/forum?id=bERaNdoegnO>.
+- **Restart-state search control:** Regret-Guided Search Control:
+  <https://arxiv.org/abs/2602.20809>.
+- **Auxiliary targets and self-play engineering:** KataGo:
+  <https://arxiv.org/abs/1902.10565>.
 
 Related local documents: `SECONDARY_PICK_FRAGILITY_FINDINGS.md`, `RUN10_PLAN.md`,
 and `AZ_TILE_Q_HEAD_PLAN.md` on the `kingdomino-tile-q` branch.
