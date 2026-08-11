@@ -11084,6 +11084,156 @@ impl BatchedMCTS {
         }
     }
 
+    /// Evaluation-only constructor for independent continuations supplied by
+    /// Python. Every supplied state occupies one slot and is played to GAME_OVER
+    /// with the ordinary aliased open-loop engine. No new games are recycled
+    /// into these slots. This is intentionally treatment-agnostic: callers must
+    /// apply any forced root action before constructing the batch.
+    #[staticmethod]
+    #[pyo3(signature = (
+        states,
+        game_seeds,
+        n_sims,
+        leaf_batch=6,
+        virtual_loss=1,
+        cpuct=1.5,
+        fpu=0.0,
+        dirichlet_alpha=0.3,
+        dirichlet_eps=0.0,
+        temp_moves=0,
+        score_scale=160.0,
+        margin_gain=2.0,
+        alpha=0.5,
+        exact_endgame_max_secs=3.0,
+        async_solve=false,
+        solver_cpus=0
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_states(
+        py: Python<'_>,
+        states: Vec<Py<RustGameState>>,
+        game_seeds: Vec<u64>,
+        n_sims: usize,
+        leaf_batch: usize,
+        virtual_loss: i32,
+        cpuct: f64,
+        fpu: f64,
+        dirichlet_alpha: f64,
+        dirichlet_eps: f64,
+        temp_moves: usize,
+        score_scale: f64,
+        margin_gain: f64,
+        alpha: f64,
+        exact_endgame_max_secs: f64,
+        async_solve: bool,
+        solver_cpus: usize,
+    ) -> PyResult<Self> {
+        if states.is_empty() {
+            return Err(PyValueError::new_err(
+                "BatchedMCTS.from_states requires at least one state",
+            ));
+        }
+        if states.len() != game_seeds.len() {
+            return Err(PyValueError::new_err(format!(
+                "BatchedMCTS.from_states state/seed length mismatch: {} vs {}",
+                states.len(),
+                game_seeds.len(),
+            )));
+        }
+        if game_seeds.iter().copied().collect::<HashSet<_>>().len() != game_seeds.len() {
+            return Err(PyValueError::new_err(
+                "BatchedMCTS.from_states requires unique game_seeds within a batch",
+            ));
+        }
+        let supplied: Vec<RustGameState> = states
+            .iter()
+            .map(|state| state.borrow(py).cloned())
+            .collect();
+        let harmony = supplied[0].harmony;
+        let middle_kingdom = supplied[0].middle_kingdom;
+        for state in &supplied {
+            if state.phase == GAME_OVER {
+                return Err(PyValueError::new_err(
+                    "BatchedMCTS.from_states does not accept terminal states",
+                ));
+            }
+            if state.harmony != harmony || state.middle_kingdom != middle_kingdom {
+                return Err(PyValueError::new_err(
+                    "BatchedMCTS.from_states requires identical rule settings",
+                ));
+            }
+        }
+
+        let n_games = supplied.len();
+        let mut batched = Self::new(
+            n_games,
+            n_games,
+            0,
+            n_sims,
+            leaf_batch,
+            virtual_loss,
+            cpuct,
+            fpu,
+            dirichlet_alpha,
+            dirichlet_eps,
+            temp_moves,
+            harmony,
+            middle_kingdom,
+            true,
+            score_scale,
+            margin_gain,
+            alpha,
+            exact_endgame_max_secs,
+            async_solve,
+            solver_cpus,
+            false,
+            0.25,
+            100,
+            false,
+            0.0,
+            0,
+            "argmax_ties",
+            10.0,
+            -1,
+            0,
+            0.0,
+            0,
+            0.0,
+            0,
+            0,
+            0.0,
+            2,
+            false,
+            -1,
+        );
+        batched.slots = supplied
+            .into_iter()
+            .zip(game_seeds)
+            .map(|(state, seed)| {
+                let mut slot = SearchSlot::new_for_game(state, seed, true, None);
+                slot.choose_move_profile(
+                    false,
+                    0.25,
+                    n_sims,
+                    100,
+                    false,
+                    dirichlet_eps,
+                    0.0,
+                    temp_moves,
+                    0,
+                    None,
+                );
+                slot
+            })
+            .collect();
+        // All supplied games are already active. Setting target==started makes
+        // every completed slot go Idle instead of constructing a standard deal.
+        batched.games_started = n_games;
+        batched.games_target = n_games;
+        batched.next_seed = 0;
+        Ok(batched)
+    }
+
     /// Diagnostic: total root moves solved exactly by the endgame solver across
     /// the whole run (deck ∈ {0,4} positions resolved without GPU forwards).
     #[getter]
