@@ -104,6 +104,38 @@ from games.kingdomino.hof import (
 GENERATOR_MODES = ("latest", "current_best", "strict_gate", "soft_gate")
 
 
+def _parse_sampled_chance_split_decks(text: str) -> Tuple[int, ...]:
+    """Parse the opt-in sampled chance-split deck set.
+
+    The first pilot deliberately supports only the two pre-endgame boundaries
+    selected in CHANCE_AWARE_TRAINING_PILOT.md.  Keeping this parser strict
+    prevents a typo from silently turning the treatment off.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ()
+    try:
+        decks = tuple(sorted({int(part.strip()) for part in raw.split(",")
+                              if part.strip()}))
+    except ValueError as exc:
+        raise ValueError(
+            "sampled_chance_split_decks must be a comma-separated list of "
+            "integers (pilot supports only '8,12')"
+        ) from exc
+    unsupported = [deck for deck in decks if deck not in (8, 12)]
+    if unsupported:
+        raise ValueError(
+            "sampled_chance_split_decks pilot supports only deck counts 8 and "
+            f"12; got {unsupported}"
+        )
+    return decks
+
+
+def _sampled_chance_split_deck_mask(text: str) -> int:
+    """Return the Rust bit mask for the configured sampled split deck counts."""
+    return sum(1 << deck for deck in _parse_sampled_chance_split_decks(text))
+
+
 @dataclass
 class SelfPlayConfig:
     """Self-play training config.
@@ -152,6 +184,10 @@ class SelfPlayConfig:
     # move's simulation budget; nodes that cannot afford a full panel retain the
     # unbiased sampled backup.
     deck8_chance_enumeration: bool = False
+    # Opt-in training treatment: sampled explicit chance splits at all
+    # PLACE_AND_SELECT roots with the listed hidden-deck counts.  The pilot
+    # supports "8,12"; empty preserves historical aliased open-loop behavior.
+    sampled_chance_split_decks: str = ""
     allow_tf32: bool = True       # speed up CUDA float32 conv/linear inference
     inference_amp: bool = False   # optional autocast for self-play inference
     eval_pad_to_batch: int = 0     # pad inference batches to fixed size (CUDA graphs)
@@ -216,6 +252,10 @@ class SelfPlayConfig:
     # relative to others. Endgames carry exact minimax labels, so concentrating
     # gradient there is high-value. 1.0 = uniform; 2.0 = endgames drawn 2x.
     endgame_oversample: float = 2.0
+    # Replay sampling weight for examples whose search actually crossed a
+    # sampled explicit chance split.  Combined with endgame weighting by max,
+    # never multiplication.  The first pilot uses 4.0; 1.0 disables weighting.
+    chance_split_oversample: float = 1.0
     # loop
     n_iterations: int = 40
     games_per_iteration: int = 50
@@ -456,6 +496,12 @@ class Example:
     trainable: bool = True
     game_type: str = "self"
     opponent_source: str = ""
+    # Chance-aware training provenance.  `treated` means at least one search
+    # simulation crossed the explicit split; root eligibility alone is not
+    # sufficient. Defaults preserve old replay-pickle compatibility.
+    sampled_chance_split_treated: bool = False
+    root_hidden_deck_count: int = 0
+    root_turn_slot: int = 0
     # Training iteration that generated this example.  Used by
     # ReplayBuffer.mean_age to track buffer staleness.  Defaults to 0 so any
     # construction site that misses the kwarg yields a (stale) age reading
@@ -514,10 +560,15 @@ class ReplayBuffer:
         self._n_workers = int(n_sample_workers)
         self._pool = (ThreadPoolExecutor(max_workers=self._n_workers)
                       if self._n_workers > 1 else None)
-        # Endgame-oversampling weight cache (Change 4). Recomputing per-example
-        # weights every batch is O(buffer); cache and invalidate only on add().
+        # Combined replay-weight cache. Recomputing per-example weights every
+        # batch is O(buffer); cache and invalidate only on add().
         self._weight_cache: Optional[np.ndarray] = None
-        self._weight_cache_oversample: float = 1.0
+        self._weight_cache_endgame_oversample: float = 1.0
+        self._weight_cache_chance_oversample: float = 1.0
+        # Actual draw accounting is reset around each training block so logs can
+        # report what entered optimizer batches rather than an expected rate.
+        self._sampled_draw_count = 0
+        self._sampled_treated_draw_count = 0
 
     def close(self) -> None:
         """Shut down the sample-batch thread pool.  Call at training end."""
@@ -624,43 +675,108 @@ class ReplayBuffer:
             np.mean([ex.iteration for ex in self.data])
         )
 
-    def _endgame_weights(self, oversample: float) -> Optional[np.ndarray]:
-        """Cached per-example sampling probabilities for endgame oversampling.
+    def _sampling_weights(self, endgame_oversample: float,
+                          chance_oversample: float) -> Optional[np.ndarray]:
+        """Cached replay probabilities for endgame and chance treatments.
 
-        Returns None when `oversample == 1.0` (uniform — caller uses fast
-        integers()). Otherwise returns a normalized probability vector that gives
-        endgame examples (game_progress >= 0.75) `oversample`x the weight of
-        others. Cached and invalidated on add() since it is O(buffer) to build.
+        Qualifying weights compose by ``max``, not multiplication. Thus an
+        example qualifying for both treatments receives the larger configured
+        weight rather than their product.
         """
-        if oversample == 1.0:
+        if endgame_oversample <= 0.0 or chance_oversample <= 0.0:
+            raise ValueError("replay oversampling weights must be positive")
+        if endgame_oversample == 1.0 and chance_oversample == 1.0:
             return None
         if (self._weight_cache is None
-                or self._weight_cache_oversample != oversample):
+                or self._weight_cache_endgame_oversample != endgame_oversample
+                or self._weight_cache_chance_oversample != chance_oversample):
             prog_idx = FLAT_LAYOUT['game_progress'].start
+
+            def _weight(ex: Example) -> float:
+                endgame_weight = (
+                    endgame_oversample
+                    if float(ex.flat[prog_idx]) >= 0.75 else 1.0)
+                if bool(getattr(ex, "sampled_chance_split_treated", False)):
+                    return max(endgame_weight, chance_oversample)
+                return endgame_weight
+
             weights = np.array(
-                [oversample if float(ex.flat[prog_idx]) >= 0.75 else 1.0
-                 for ex in self.data],
+                [_weight(ex) for ex in self.data],
                 dtype=np.float32,
             )
             total = weights.sum()
             if total > 0:
                 weights /= total
             self._weight_cache = weights
-            self._weight_cache_oversample = oversample
+            self._weight_cache_endgame_oversample = endgame_oversample
+            self._weight_cache_chance_oversample = chance_oversample
         return self._weight_cache
 
     def _draw_idxs(self, batch_size: int, rng: np.random.Generator,
-                   oversample: float = 1.0) -> np.ndarray:
-        """Draw `batch_size` buffer indices, optionally oversampling endgames."""
-        weights = self._endgame_weights(oversample)
+                   endgame_oversample: float = 1.0,
+                   chance_oversample: float = 1.0, *,
+                   oversample: Optional[float] = None) -> np.ndarray:
+        """Draw indices with the configured, non-multiplicative replay weights."""
+        # Compatibility for focused tests and any local callers written against
+        # the former endgame-only keyword.
+        if oversample is not None:
+            endgame_oversample = float(oversample)
+        weights = self._sampling_weights(endgame_oversample, chance_oversample)
         if weights is not None:
-            return rng.choice(len(self.data), size=batch_size, p=weights,
+            idxs = rng.choice(len(self.data), size=batch_size, p=weights,
                               replace=True)
-        return rng.integers(0, len(self.data), size=batch_size)
+        else:
+            idxs = rng.integers(0, len(self.data), size=batch_size)
+        self._sampled_draw_count += int(len(idxs))
+        self._sampled_treated_draw_count += int(sum(
+            bool(getattr(self.data[int(idx)],
+                         "sampled_chance_split_treated", False))
+            for idx in idxs
+        ))
+        return idxs
+
+    def reset_sampling_stats(self) -> None:
+        """Start a fresh accounting window for actual replay draws."""
+        self._sampled_draw_count = 0
+        self._sampled_treated_draw_count = 0
+
+    def sampling_stats(self) -> dict:
+        """Return actual draw counts since ``reset_sampling_stats``."""
+        total = int(self._sampled_draw_count)
+        treated = int(self._sampled_treated_draw_count)
+        return {
+            "draw_count": total,
+            "treated_draw_count": treated,
+            "treated_draw_fraction": treated / total if total else 0.0,
+        }
+
+    def chance_treatment_stats(self) -> dict:
+        """Return replay treatment prevalence, including per-deck counts."""
+        total = len(self.data)
+        treated = [ex for ex in self.data if bool(getattr(
+            ex, "sampled_chance_split_treated", False))]
+        stats = {
+            "treated_count": len(treated),
+            "treated_fraction": len(treated) / total if total else 0.0,
+            "treated_deck8_count": sum(
+                int(getattr(ex, "root_hidden_deck_count", 0)) == 8
+                for ex in treated),
+            "treated_deck12_count": sum(
+                int(getattr(ex, "root_hidden_deck_count", 0)) == 12
+                for ex in treated),
+        }
+        for deck in (8, 12):
+            stats[f"treated_deck{deck}_by_slot"] = [sum(
+                int(getattr(ex, "root_hidden_deck_count", 0)) == deck
+                and int(getattr(ex, "root_turn_slot", -1)) == slot
+                for ex in treated
+            ) for slot in range(4)]
+        return stats
 
     def sample_batch(self, batch_size: int, rng: np.random.Generator,
                      device: str = "cpu", augment_d4: bool = True,
                      endgame_oversample_weight: float = 1.0,
+                     chance_split_oversample_weight: float = 1.0,
                      return_metadata: bool = False):
         """Return a training batch as tensors:
         (my_board, opp_board, flat, policy, legal_mask, z,
@@ -677,7 +793,9 @@ class ReplayBuffer:
         workers touch CPU numpy only).
         """
         # Pre-draw every random choice in the main thread (rng is not thread-safe).
-        idxs = self._draw_idxs(batch_size, rng, endgame_oversample_weight)
+        idxs = self._draw_idxs(
+            batch_size, rng, endgame_oversample_weight,
+            chance_split_oversample_weight)
         t_ids = (rng.integers(0, NUM_D4_TRANSFORMS, size=batch_size)
                  if augment_d4 else None)
 
@@ -737,6 +855,12 @@ class ReplayBuffer:
                 "buffer_indices": [int(value) for value in idxs],
                 "d4_transform_ids": (
                     None if t_ids is None else [int(value) for value in t_ids]),
+                "sampled_chance_split_treated": [bool(getattr(
+                    self.data[int(value)], "sampled_chance_split_treated", False))
+                    for value in idxs],
+                "root_hidden_deck_counts": [int(getattr(
+                    self.data[int(value)], "root_hidden_deck_count", 0))
+                    for value in idxs],
             }
         return batch
 
@@ -1059,6 +1183,24 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
             int(s.get("deck8_chance_bootstrap_rows", 0)) for s in stats_list),
         "deck8_chance_budget_blocked_count": sum(
             int(s.get("deck8_chance_budget_blocked_count", 0)) for s in stats_list),
+        "sampled_chance_split_search_count_deck8": sum(
+            int(s.get("sampled_chance_split_search_count_deck8", 0))
+            for s in stats_list),
+        "sampled_chance_split_search_count_deck12": sum(
+            int(s.get("sampled_chance_split_search_count_deck12", 0))
+            for s in stats_list),
+        "sampled_chance_split_path_count_deck8": sum(
+            int(s.get("sampled_chance_split_path_count_deck8", 0))
+            for s in stats_list),
+        "sampled_chance_split_path_count_deck12": sum(
+            int(s.get("sampled_chance_split_path_count_deck12", 0))
+            for s in stats_list),
+        "sampled_chance_split_treated_examples_deck8": sum(
+            int(s.get("sampled_chance_split_treated_examples_deck8", 0))
+            for s in stats_list),
+        "sampled_chance_split_treated_examples_deck12": sum(
+            int(s.get("sampled_chance_split_treated_examples_deck12", 0))
+            for s in stats_list),
         "pf_minshare_mean": (
             sum(float(s.get("pf_minshare_mean", 0.0))
                 * int(s.get("pf_minshare_count", 0)) for s in stats_list)
@@ -1083,6 +1225,12 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
         "exact_recorded_move_count": sum(
             int(s.get("exact_recorded_move_count", 0)) for s in stats_list),
     }
+    for deck in (8, 12):
+        for slot in range(4):
+            key = (
+                f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+            )
+            out[key] = sum(int(s.get(key, 0)) for s in stats_list)
     cap = out["max_batch_cap"]
     out["fill_ratio"] = out["mean_batch"] / cap if cap > 0 else 0.0
     for key in ("eval_h2d_sec", "eval_forward_sec", "eval_readback_sec", "eval_calls"):
@@ -1398,13 +1546,28 @@ def play_hof_games_batched(
     only to the legacy serial path and is ignored here.)  Exhaustive deck=8
     panels are deliberately disabled in these mixed-budget games even when the
     training flag is enabled, so learner and HOF seats use the same search
-    method and differ only in their configured simulation budgets.
+    method and differ only in their configured simulation budgets. Sampled
+    chance splits remain enabled because they preserve the ordinary simulation
+    budget and are the training treatment itself.
 
     Returns (per_game_learner_examples, per_game_scores_seat0_frame, stats) where
     stats has trainable_examples and mean_diff (learner-frame score margin)."""
     if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
         raise ValueError(
             "deck8_chance_enumeration requires engine='batched_open_loop'"
+        )
+    sampled_split_decks = _parse_sampled_chance_split_decks(
+        cfg.sampled_chance_split_decks)
+    sampled_split_mask = _sampled_chance_split_deck_mask(
+        cfg.sampled_chance_split_decks)
+    if sampled_split_decks and cfg.engine != "batched_open_loop":
+        raise ValueError(
+            "sampled_chance_split_decks requires engine='batched_open_loop'"
+        )
+    if sampled_split_decks and cfg.deck8_chance_enumeration:
+        raise ValueError(
+            "sampled_chance_split_decks and deck8_chance_enumeration are "
+            "mutually exclusive"
         )
     import kingdomino_rust
 
@@ -1462,11 +1625,18 @@ def play_hof_games_batched(
             # below the 71-unit admission threshold and otherwise pays a
             # different budget fraction from the learner seat.
             deck8_chance_enumeration=False,
+            sampled_chance_split_deck_mask=int(sampled_split_mask),
         )
 
     all_examples: List[List[Example]] = []
     all_scores: List[Tuple[int, int]] = []
     learner_diffs: List[int] = []
+    split_counts = {
+        "sampled_chance_split_search_count_deck8": 0,
+        "sampled_chance_split_search_count_deck12": 0,
+        "sampled_chance_split_path_count_deck8": 0,
+        "sampled_chance_split_path_count_deck12": 0,
+    }
     n0 = int(n_games) // 2                    # orientation 0: learner in seat 0
     n1 = int(n_games) - n0                    # orientation 1: learner in seat 1
     for n_or, learner_seat, seed0 in ((n0, 0, int(game_seed_start)),
@@ -1476,8 +1646,11 @@ def play_hof_games_batched(
         eval0 = eval_learner if learner_seat == 0 else eval_hof
         eval1 = eval_hof if learner_seat == 0 else eval_learner
         game_type = "current_vs_hof" if learner_seat == 0 else "hof_vs_current"
-        for seed, raw_examples, (s0, s1) in _run_hof_orientation(
-                _make(n_or, seed0, 1 - learner_seat), eval0, eval1):
+        batched = _make(n_or, seed0, 1 - learner_seat)
+        orientation_results = _run_hof_orientation(batched, eval0, eval1)
+        for key in split_counts:
+            split_counts[key] += int(getattr(batched, key, 0))
+        for seed, raw_examples, (s0, s1) in orientation_results:
             keep: List[Example] = []
             for tup in raw_examples:
                 if int(tup[-1]) != learner_seat:  # keep only learner-searched moves
@@ -1495,6 +1668,8 @@ def play_hof_games_batched(
     stats = {
         "trainable_examples": int(sum(len(e) for e in all_examples)),
         "mean_diff": float(np.mean(learner_diffs)) if learner_diffs else 0.0,
+        **_chance_treated_example_stats(all_examples),
+        **split_counts,
     }
     return all_examples, all_scores, stats
 
@@ -1781,19 +1956,32 @@ def play_selfplay_game_rust(
 def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
     """Convert BatchedMCTS's sparse training tuple to the existing buffer type.
 
-    Phase 3R: the tuple is now 10 elements — the Rust engine fills own_score,
-    opp_score, and the official-cascade win_target at game end. The Rust tuple
-    carries no iteration field, so the caller passes it in.
+    The outer tuple stays at 12 elements so the actor remains the trailing item
+    used by HOF filtering.  Current Rust nests chance provenance in root_stats;
+    legacy 3-field root_stats and 10-element tuples remain readable.
     """
+    sampled_chance_split_treated = False
+    root_hidden_deck_count = 0
+    root_turn_slot = 0
     if len(tup) == 12:
         # Current format: root_stats + trailing actor (0/1). The actor is only
         # needed by the two-net HOF path (_hof_actor_from_rust_tuple); ignored here.
         (mb, ob, flat, pidx, pval, lidx, root_stats,
          z, own_score, opp_score, win_target, _actor) = tup
-        root_prior_idx, root_prior_val, root_visit_count = root_stats
+        if len(root_stats) == 6:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, root_hidden_deck_count,
+             root_turn_slot) = root_stats
+        else:
+            root_prior_idx, root_prior_val, root_visit_count = root_stats
     elif len(tup) == 11:
         mb, ob, flat, pidx, pval, lidx, root_stats, z, own_score, opp_score, win_target = tup
-        root_prior_idx, root_prior_val, root_visit_count = root_stats
+        if len(root_stats) == 6:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, root_hidden_deck_count,
+             root_turn_slot) = root_stats
+        else:
+            root_prior_idx, root_prior_val, root_visit_count = root_stats
     elif len(tup) == 10:
         mb, ob, flat, pidx, pval, lidx, z, own_score, opp_score, win_target = tup
         root_prior_idx = root_prior_val = root_visit_count = None
@@ -1816,8 +2004,31 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
                         else np.asarray(root_prior_val, dtype=np.float32)),
         root_visit_count=(None if root_visit_count is None
                           else np.asarray(root_visit_count, dtype=np.int32)),
+        sampled_chance_split_treated=bool(sampled_chance_split_treated),
+        root_hidden_deck_count=int(root_hidden_deck_count),
+        root_turn_slot=int(root_turn_slot),
         iteration=iteration,
     )
+
+
+def _chance_treated_example_stats(all_examples) -> dict:
+    """Count treated replay labels by deck boundary and root selection slot."""
+    stats = {}
+    for deck in (8, 12):
+        by_slot = [0, 0, 0, 0]
+        for game in all_examples:
+            for ex in game:
+                if (bool(getattr(ex, "sampled_chance_split_treated", False))
+                        and int(getattr(ex, "root_hidden_deck_count", 0)) == deck):
+                    slot = int(getattr(ex, "root_turn_slot", -1))
+                    if 0 <= slot < len(by_slot):
+                        by_slot[slot] += 1
+        stats[f"sampled_chance_split_treated_examples_deck{deck}"] = sum(by_slot)
+        for slot, count in enumerate(by_slot):
+            stats[
+                f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+            ] = count
+    return stats
 
 
 def _write_exact_fallback_records(path: str, records: list, *, iteration: int,
@@ -2036,6 +2247,18 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
                 "deck8_chance_budget_blocked_count": (
                     int(A.deck8_chance_budget_blocked_count)
                     + int(B.deck8_chance_budget_blocked_count)),
+                "sampled_chance_split_search_count_deck8": (
+                    int(A.sampled_chance_split_search_count_deck8)
+                    + int(B.sampled_chance_split_search_count_deck8)),
+                "sampled_chance_split_search_count_deck12": (
+                    int(A.sampled_chance_split_search_count_deck12)
+                    + int(B.sampled_chance_split_search_count_deck12)),
+                "sampled_chance_split_path_count_deck8": (
+                    int(A.sampled_chance_split_path_count_deck8)
+                    + int(B.sampled_chance_split_path_count_deck8)),
+                "sampled_chance_split_path_count_deck12": (
+                    int(A.sampled_chance_split_path_count_deck12)
+                    + int(B.sampled_chance_split_path_count_deck12)),
                 "pf_minshare_mean": pf_mean,
                 "pf_minshare_count": pf_n,
             },
@@ -2067,9 +2290,22 @@ def play_selfplay_games_batched(
     game_seed_start + i) and the same stats keys as the single-buffer path."""
     if cfg.n_determinizations != 1:
         raise ValueError("--engine batched currently requires --determinizations 1")
+    sampled_split_decks = _parse_sampled_chance_split_decks(
+        cfg.sampled_chance_split_decks)
+    sampled_split_mask = _sampled_chance_split_deck_mask(
+        cfg.sampled_chance_split_decks)
     if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
         raise ValueError(
             "deck8_chance_enumeration requires engine='batched_open_loop'"
+        )
+    if sampled_split_decks and cfg.engine != "batched_open_loop":
+        raise ValueError(
+            "sampled_chance_split_decks requires engine='batched_open_loop'"
+        )
+    if sampled_split_decks and cfg.deck8_chance_enumeration:
+        raise ValueError(
+            "sampled_chance_split_decks and deck8_chance_enumeration are "
+            "mutually exclusive"
         )
 
     import kingdomino_rust
@@ -2123,6 +2359,7 @@ def play_selfplay_games_batched(
             pick_floor_frac=float(cfg.pick_floor_frac),
             pick_floor_depth=int(cfg.pick_floor_depth),
             deck8_chance_enumeration=bool(cfg.deck8_chance_enumeration),
+            sampled_chance_split_deck_mask=int(sampled_split_mask),
         )
 
     use_db = bool(double_buffer)
@@ -2145,6 +2382,10 @@ def play_selfplay_games_batched(
         "deck8_chance_panel_count": 0,
         "deck8_chance_bootstrap_rows": 0,
         "deck8_chance_budget_blocked_count": 0,
+        "sampled_chance_split_search_count_deck8": 0,
+        "sampled_chance_split_search_count_deck12": 0,
+        "sampled_chance_split_path_count_deck8": 0,
+        "sampled_chance_split_path_count_deck12": 0,
     }
     exact_solver_secs = 0.0
     fast_move_count = 0
@@ -2199,6 +2440,14 @@ def play_selfplay_games_batched(
                 batched.deck8_chance_bootstrap_rows),
             "deck8_chance_budget_blocked_count": int(
                 batched.deck8_chance_budget_blocked_count),
+            "sampled_chance_split_search_count_deck8": int(
+                batched.sampled_chance_split_search_count_deck8),
+            "sampled_chance_split_search_count_deck12": int(
+                batched.sampled_chance_split_search_count_deck12),
+            "sampled_chance_split_path_count_deck8": int(
+                batched.sampled_chance_split_path_count_deck8),
+            "sampled_chance_split_path_count_deck12": int(
+                batched.sampled_chance_split_path_count_deck12),
             "pf_minshare_mean": float(batched.pick_floor_min_share_mean),
             "pf_minshare_count": int(batched.pick_floor_min_share_count),
         }
@@ -2237,6 +2486,8 @@ def play_selfplay_games_batched(
         all_examples.append(
             [_example_from_rust_tuple(ex, iteration=iteration) for ex in examples])
         all_scores.append((int(scores[0]), int(scores[1])))
+
+    treatment_example_stats = _chance_treated_example_stats(all_examples)
 
     nonzero_batches = [b for b in batch_sizes if b > 0]
     total_evals = int(sum(batch_sizes))
@@ -2277,6 +2528,7 @@ def play_selfplay_games_batched(
         "recorded_fast_move_count": recorded_fast_move_count,
         "recorded_full_move_count": recorded_full_move_count,
         "exact_recorded_move_count": exact_recorded_move_count,
+        **treatment_example_stats,
     }
     ev_timing = getattr(evaluator, "timing", None)
     if ev_timing:
@@ -3125,6 +3377,19 @@ def _rolling_average_state(checkpoint_dir: str, it: int, k: int):
 
 def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     """Run the serial self-play loop.  Returns the trained net and history."""
+    sampled_split_decks = _parse_sampled_chance_split_decks(
+        cfg.sampled_chance_split_decks)
+    if sampled_split_decks and cfg.engine != "batched_open_loop":
+        raise ValueError(
+            "sampled_chance_split_decks requires engine='batched_open_loop'"
+        )
+    if sampled_split_decks and cfg.deck8_chance_enumeration:
+        raise ValueError(
+            "sampled_chance_split_decks and deck8_chance_enumeration are "
+            "mutually exclusive"
+        )
+    if cfg.endgame_oversample <= 0.0 or cfg.chance_split_oversample <= 0.0:
+        raise ValueError("replay oversampling weights must be positive")
     configure_torch_performance(cfg)
     # Fix 2: the leaf-value blend params (cfg.margin_gain / cfg.alpha) and the
     # terminal-value params (cfg.score_scale) are now bound at MCTS / evaluator /
@@ -3289,6 +3554,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             # this iteration (training skipped / no benchmark).  Filled below.
             trained = False
             n_endgame_in_batch = None  # set on diag iterations (oversample check)
+            train_sampling_stats = {
+                "draw_count": 0,
+                "treated_draw_count": 0,
+                "treated_draw_fraction": 0.0,
+            }
             pol_m = own_m = opp_m = win_m = None
             win_brier_m = baseline_brier_m = None
             gn_pol = gn_win = gn_own = gn_opp = None
@@ -3338,7 +3608,18 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "opponent": None,
                 "opponent_sha256": None,
                 "mean_diff": None,
+                "sampled_chance_split_search_count_deck8": 0,
+                "sampled_chance_split_search_count_deck12": 0,
+                "sampled_chance_split_path_count_deck8": 0,
+                "sampled_chance_split_path_count_deck12": 0,
+                "sampled_chance_split_treated_examples_deck8": 0,
+                "sampled_chance_split_treated_examples_deck12": 0,
             }
+            for deck in (8, 12):
+                for slot in range(4):
+                    hof_stats[
+                        f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+                    ] = 0
             total_games = int(iter_cfg.games_per_iteration)
             hof_games = 0
             hof_entry: Optional[HOFEntry] = None
@@ -3534,6 +3815,21 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         diffs.append(s0 - s1)
                     hof_stats["trainable_examples"] += int(hstats["trainable_examples"])
                     hof_stats["mean_diff"] = float(hstats["mean_diff"])
+                    for key in (
+                            "sampled_chance_split_search_count_deck8",
+                            "sampled_chance_split_search_count_deck12",
+                            "sampled_chance_split_path_count_deck8",
+                            "sampled_chance_split_path_count_deck12",
+                            "sampled_chance_split_treated_examples_deck8",
+                            "sampled_chance_split_treated_examples_deck12"):
+                        hof_stats[key] += int(hstats.get(key, 0))
+                    for deck in (8, 12):
+                        for slot in range(4):
+                            key = (
+                                f"sampled_chance_split_treated_examples_"
+                                f"deck{deck}_slot{slot}"
+                            )
+                            hof_stats[key] += int(hstats.get(key, 0))
                     game_seed += hof_games
                 else:
                     # Legacy serial path (Python OpenLoopMCTS). --hof_current_sims
@@ -3599,6 +3895,16 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             sp_score_diff_std = float(diffs_arr.std()) if len(diffs_arr) else 0.0
             buffer_size = len(buffer)
             buffer_mean_age = buffer.mean_age(it)
+            buffer_treatment_stats = buffer.chance_treatment_stats()
+            def _iteration_split_total(key: str) -> int:
+                return int((batched_stats or {}).get(key, 0)) + int(
+                    hof_stats.get(key, 0))
+            iteration_treated_by_slot = {
+                deck: [_iteration_split_total(
+                    f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+                ) for slot in range(4)]
+                for deck in (8, 12)
+            }
             history["sp_score_diff_mean"].append(sp_score_diff_mean)
             history["sp_score_diff_std"].append(sp_score_diff_std)
             history["games_per_sec"].append(sp_rate)
@@ -3674,6 +3980,24 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             f"budget_blocked_attempts="
                             f"{batched_stats.get('deck8_chance_budget_blocked_count', 0)}"
                         )
+                    if sampled_split_decks:
+                        print(
+                            f"  sampled chance split: decks="
+                            f"{','.join(str(d) for d in sampled_split_decks)}; "
+                            f"treated_examples deck8="
+                            f"{_iteration_split_total('sampled_chance_split_treated_examples_deck8')} "
+                            f"deck12="
+                            f"{_iteration_split_total('sampled_chance_split_treated_examples_deck12')}; "
+                            f"by_slot deck8={iteration_treated_by_slot[8]} "
+                            f"deck12={iteration_treated_by_slot[12]}; "
+                            f"crossed_paths deck8="
+                            f"{_iteration_split_total('sampled_chance_split_path_count_deck8')} "
+                            f"deck12="
+                            f"{_iteration_split_total('sampled_chance_split_path_count_deck12')}; "
+                            f"bootstrap_rows=0; buffer_treated="
+                            f"{buffer_treatment_stats['treated_count']}/{buffer_size} "
+                            f"({buffer_treatment_stats['treated_fraction']:.1%})"
+                        )
                     if iter_cfg.playout_cap_randomization:
                         print(
                             f"  playout cap: full={batched_stats.get('full_move_count', 0)} "
@@ -3705,6 +4029,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 p_sum = o_sum = q_sum = w_sum = 0.0
                 brier_sum = baseline_sum = 0.0
                 gnp_sum = gnw_sum = gno_sum = gnq_sum = 0.0
+                buffer.reset_sampling_stats()
 
                 def _run_train_step(batch):
                     """Run one optimiser step on `batch` and accumulate metrics."""
@@ -3743,7 +4068,9 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     sample_fn = lambda: buffer.sample_batch(
                         iter_cfg.batch_size, prefetch_rng,
                         device=iter_cfg.device, augment_d4=iter_cfg.augment,
-                        endgame_oversample_weight=iter_cfg.endgame_oversample)
+                        endgame_oversample_weight=iter_cfg.endgame_oversample,
+                        chance_split_oversample_weight=(
+                            iter_cfg.chance_split_oversample))
                     executor = ThreadPoolExecutor(max_workers=1)
                     next_batch_future = executor.submit(sample_fn)   # prime
                     try:
@@ -3759,8 +4086,11 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                         batch = buffer.sample_batch(
                             iter_cfg.batch_size, np_rng,
                             device=iter_cfg.device, augment_d4=iter_cfg.augment,
-                            endgame_oversample_weight=iter_cfg.endgame_oversample)
+                            endgame_oversample_weight=iter_cfg.endgame_oversample,
+                            chance_split_oversample_weight=(
+                                iter_cfg.chance_split_oversample))
                         _run_train_step(batch)
+                train_sampling_stats = buffer.sampling_stats()
                 n = iter_cfg.train_steps_per_iteration
                 pol_m, own_m, opp_m, win_m = p_sum/n, o_sum/n, q_sum/n, w_sum/n
                 win_brier_m, baseline_brier_m = brier_sum/n, baseline_sum/n
@@ -3780,6 +4110,14 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     print(f"  train: policy={pol_m:.4f}  own={own_m:.4f}  "
                           f"opp={opp_m:.4f} win={win_m:.4f}  "
                           f"brier={win_brier_m:.4f}  base={baseline_brier_m:.4f}")
+                    if sampled_split_decks:
+                        print(
+                            f"  train chance draw: "
+                            f"{train_sampling_stats['treated_draw_count']}/"
+                            f"{train_sampling_stats['draw_count']} "
+                            f"({train_sampling_stats['treated_draw_fraction']:.1%}), "
+                            f"weight={iter_cfg.chance_split_oversample:g}x"
+                        )
 
                 # ── Diagnostic batch (once per iteration, not per step) ──
                 # policy_entropy + win_brier_diag share a single FIXED probe batch
@@ -4192,7 +4530,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     and len(buffer) >= iter_cfg.min_buffer_to_train):
                 prog_idx = FLAT_LAYOUT['game_progress'].start
                 diag_idxs = buffer._draw_idxs(
-                    iter_cfg.batch_size, diag_rng, iter_cfg.endgame_oversample)
+                    iter_cfg.batch_size, diag_rng, iter_cfg.endgame_oversample,
+                    iter_cfg.chance_split_oversample)
                 n_endgame_in_batch = int(sum(
                     1 for i in diag_idxs
                     if float(buffer.data[int(i)].flat[prog_idx]) >= 0.75))
@@ -4305,6 +4644,49 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "deck8_chance_budget_blocked_count": (
                     batched_stats.get("deck8_chance_budget_blocked_count", 0)
                     if batched_stats else None),
+                "sampled_chance_split_decks": list(sampled_split_decks),
+                "sampled_chance_split_search_count_deck8": (
+                    _iteration_split_total(
+                        "sampled_chance_split_search_count_deck8")),
+                "sampled_chance_split_search_count_deck12": (
+                    _iteration_split_total(
+                        "sampled_chance_split_search_count_deck12")),
+                "sampled_chance_split_path_count_deck8": (
+                    _iteration_split_total(
+                        "sampled_chance_split_path_count_deck8")),
+                "sampled_chance_split_path_count_deck12": (
+                    _iteration_split_total(
+                        "sampled_chance_split_path_count_deck12")),
+                "sampled_chance_split_treated_examples_deck8": (
+                    _iteration_split_total(
+                        "sampled_chance_split_treated_examples_deck8")),
+                "sampled_chance_split_treated_examples_deck12": (
+                    _iteration_split_total(
+                        "sampled_chance_split_treated_examples_deck12")),
+                "sampled_chance_split_treated_examples_deck8_by_slot": (
+                    iteration_treated_by_slot[8]),
+                "sampled_chance_split_treated_examples_deck12_by_slot": (
+                    iteration_treated_by_slot[12]),
+                # Sampled splitting never performs exhaustive panel bootstrap.
+                "sampled_chance_split_bootstrap_rows": 0,
+                "chance_split_oversample": iter_cfg.chance_split_oversample,
+                "buffer_chance_treated_count": (
+                    buffer_treatment_stats["treated_count"]),
+                "buffer_chance_treated_fraction": (
+                    buffer_treatment_stats["treated_fraction"]),
+                "buffer_chance_treated_deck8_count": (
+                    buffer_treatment_stats["treated_deck8_count"]),
+                "buffer_chance_treated_deck12_count": (
+                    buffer_treatment_stats["treated_deck12_count"]),
+                "buffer_chance_treated_deck8_by_slot": (
+                    buffer_treatment_stats["treated_deck8_by_slot"]),
+                "buffer_chance_treated_deck12_by_slot": (
+                    buffer_treatment_stats["treated_deck12_by_slot"]),
+                "train_chance_draw_count": train_sampling_stats["draw_count"],
+                "train_chance_treated_draw_count": (
+                    train_sampling_stats["treated_draw_count"]),
+                "train_chance_treated_draw_fraction": (
+                    train_sampling_stats["treated_draw_fraction"]),
                 "exact_solver_secs": (batched_stats.get("exact_solver_secs", 0.0)
                                       if batched_stats else None),
                 "pf_minshare_mean": (batched_stats.get("pf_minshare_mean", 0.0)
@@ -4475,6 +4857,11 @@ if __name__ == "__main__":
                    help="With --engine batched_open_loop, atomically evaluate all "
                         "70 C(8,4) next-row outcomes at admitted deck=8 chance "
                         "nodes. Panel rows count against the per-move search budget.")
+    p.add_argument("--sampled_chance_split_decks", default="",
+                   help="Opt-in sampled explicit chance splits at every selection "
+                        "root with these hidden-deck counts. Pilot supports "
+                        "'8,12'; requires --engine batched_open_loop and is "
+                        "mutually exclusive with --deck8_chance_enumeration.")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--sample_workers", type=int, default=1,
                    help="threads for ReplayBuffer.sample_batch densify+augment "
@@ -4786,6 +5173,11 @@ if __name__ == "__main__":
                         "0.75) relative to other positions. 1.0 = uniform. 2.0 = "
                         "endgame positions drawn 2x as often as their buffer "
                         "frequency.")
+    p.add_argument("--chance_split_oversample", type=float, default=1.0,
+                   help="Replay sampling weight for examples whose search "
+                        "actually crossed a sampled chance split. Combines with "
+                        "endgame weighting by max, not multiplication. The pilot "
+                        "uses 4.0; 1.0 leaves replay sampling unchanged.")
     a = p.parse_args()
 
     # Default warmup = one full iteration's worth of positions, so training
@@ -4804,6 +5196,7 @@ if __name__ == "__main__":
         n_determinizations=a.determinizations, leaf_batch=a.leaf_batch,
         batch_slots=a.batch_slots,
         deck8_chance_enumeration=a.deck8_chance_enumeration,
+        sampled_chance_split_decks=a.sampled_chance_split_decks,
         batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
         lr_schedule=a.lr_schedule, alpha_schedule=a.alpha_schedule,
         sims_schedule=a.sims_schedule,
@@ -4901,5 +5294,6 @@ if __name__ == "__main__":
         exact_clamp_delta=a.exact_clamp_delta,
         exact_fallback_positions=a.exact_fallback_positions,
         endgame_oversample=a.endgame_oversample,
+        chance_split_oversample=a.chance_split_oversample,
     )
     run_self_play_training(cfg, verbose=True)

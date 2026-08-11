@@ -5627,6 +5627,12 @@ fn comb4(n: usize) -> u64 {
     }
 }
 
+#[inline]
+fn sampled_chance_split_root_enabled(mask: u64, state: &RustGameState) -> bool {
+    let deck_count = state.deck.len();
+    state.phase == PLACE_AND_SELECT && deck_count < 64 && mask & (1u64 << deck_count) != 0
+}
+
 /// Fixed public-row support for the A1 one-reveal probe. Small bags are
 /// exhaustive; larger bags use X shuffled permutation cycles, so every tile is
 /// exposed exactly X times. Duplicate rows across cycles are coalesced while
@@ -8211,6 +8217,12 @@ struct MoveRecord {
     root_prior_idx: Vec<i32>,
     root_prior_val: Vec<f32>,
     root_visit_count: Vec<i32>,
+    // Sampled explicit-chance training provenance. A root is treated only when
+    // at least one ordinary simulation actually crosses the configured split;
+    // eligibility alone is not sufficient.
+    sampled_chance_split_treated: bool,
+    root_hidden_deck_count: u8,
+    root_turn_slot: u8,
     actor: u8,
     own_score: f32,  // raw own final score (filled at game end in finalize_move)
     opp_score: f32,  // raw opponent final score (filled at game end)
@@ -8479,6 +8491,13 @@ struct SearchSlot {
     // Per-tree admission guard. Reset after the real move is played, so at
     // most one sibling action receives an exhaustive panel in each search.
     deck8_chance_panel_admitted_this_move: bool,
+    // Production sampled-split accounting. The per-move path counter is reset
+    // with the tree; per-game counters are absorbed before a slot is recycled.
+    sampled_chance_split_paths_this_move: u32,
+    sampled_chance_split_search_count_deck8: u32,
+    sampled_chance_split_search_count_deck12: u32,
+    sampled_chance_split_path_count_deck8: u64,
+    sampled_chance_split_path_count_deck12: u64,
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
     exact_plan: Vec<ExactPlanItem>,         // chosen-line plan for the deterministic endgame
     // Set once the exact solver times out on this game's deck=4 endgame. This
@@ -8585,6 +8604,11 @@ impl SearchSlot {
             deck8_chance_bootstrap_rows: 0,
             deck8_chance_budget_blocked_count: 0,
             deck8_chance_panel_admitted_this_move: false,
+            sampled_chance_split_paths_this_move: 0,
+            sampled_chance_split_search_count_deck8: 0,
+            sampled_chance_split_search_count_deck12: 0,
+            sampled_chance_split_path_count_deck8: 0,
+            sampled_chance_split_path_count_deck12: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8619,6 +8643,11 @@ impl SearchSlot {
             deck8_chance_bootstrap_rows: 0,
             deck8_chance_budget_blocked_count: 0,
             deck8_chance_panel_admitted_this_move: false,
+            sampled_chance_split_paths_this_move: 0,
+            sampled_chance_split_search_count_deck8: 0,
+            sampled_chance_split_search_count_deck12: 0,
+            sampled_chance_split_path_count_deck8: 0,
+            sampled_chance_split_path_count_deck12: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8706,6 +8735,24 @@ impl SearchSlot {
     ) -> PyResult<Option<FinishedGame>> {
         // Training record: encode the REAL (public) state + policy target.
         let actor = self.real_state.actor()?;
+        let root_hidden_deck_count = self.real_state.deck.len() as u8;
+        let root_turn_slot = self.real_state.actor_index as u8;
+        let sampled_chance_split_treated = self.sampled_chance_split_paths_this_move > 0;
+        if sampled_chance_split_treated {
+            match root_hidden_deck_count {
+                8 => {
+                    self.sampled_chance_split_search_count_deck8 += 1;
+                    self.sampled_chance_split_path_count_deck8 +=
+                        self.sampled_chance_split_paths_this_move as u64;
+                }
+                12 => {
+                    self.sampled_chance_split_search_count_deck12 += 1;
+                    self.sampled_chance_split_path_count_deck12 +=
+                        self.sampled_chance_split_paths_this_move as u64;
+                }
+                _ => {}
+            }
+        }
 
         // Take any exact-solve result for this move (clears it so the next move,
         // if MCTS-driven, never sees a stale value).
@@ -8863,6 +8910,9 @@ impl SearchSlot {
                 root_prior_idx,
                 root_prior_val,
                 root_visit_count,
+                sampled_chance_split_treated,
+                root_hidden_deck_count,
+                root_turn_slot,
                 actor,
                 own_score: 0.0,
                 opp_score: 0.0,
@@ -8927,6 +8977,7 @@ impl SearchSlot {
             }
             self.sims_done = 0;
             self.deck8_chance_panel_admitted_this_move = false;
+            self.sampled_chance_split_paths_this_move = 0;
             self.choose_move_profile(
                 playout_cap_randomization,
                 full_search_fraction,
@@ -9466,6 +9517,9 @@ fn play_out_exact_endgame(
             root_prior_idx: Vec::new(),
             root_prior_val: Vec::new(),
             root_visit_count: Vec::new(),
+            sampled_chance_split_treated: false,
+            root_hidden_deck_count: state.deck.len() as u8,
+            root_turn_slot: state.actor_index as u8,
             actor,
             own_score: 0.0,
             opp_score: 0.0,
@@ -10535,6 +10589,13 @@ struct BatchedMCTS {
     cum_deck8_chance_panel_count: u64,
     cum_deck8_chance_bootstrap_rows: u64,
     cum_deck8_chance_budget_blocked_count: u64,
+    // Sampled explicit split used by chance-aware training. Bit d enables every
+    // PLACE_AND_SELECT root with d hidden dominoes; v1 accepts only d=8 or 12.
+    sampled_chance_split_deck_mask: u64,
+    cum_sampled_chance_split_search_count_deck8: u64,
+    cum_sampled_chance_split_search_count_deck12: u64,
+    cum_sampled_chance_split_path_count_deck8: u64,
+    cum_sampled_chance_split_path_count_deck12: u64,
     // Cumulative open-loop diagnostics rolled in from finished slots (so the
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
@@ -10652,6 +10713,14 @@ impl BatchedMCTS {
         self.cum_deck8_chance_bootstrap_rows += self.slots[si].deck8_chance_bootstrap_rows as u64;
         self.cum_deck8_chance_budget_blocked_count +=
             self.slots[si].deck8_chance_budget_blocked_count as u64;
+        self.cum_sampled_chance_split_search_count_deck8 +=
+            self.slots[si].sampled_chance_split_search_count_deck8 as u64;
+        self.cum_sampled_chance_split_search_count_deck12 +=
+            self.slots[si].sampled_chance_split_search_count_deck12 as u64;
+        self.cum_sampled_chance_split_path_count_deck8 +=
+            self.slots[si].sampled_chance_split_path_count_deck8;
+        self.cum_sampled_chance_split_path_count_deck12 +=
+            self.slots[si].sampled_chance_split_path_count_deck12;
     }
 
     /// Async path (Step 1.5): drain every completed background solve and apply it.
@@ -10720,6 +10789,11 @@ impl BatchedMCTS {
                     self.slots[si].deck8_chance_panel_count = 0;
                     self.slots[si].deck8_chance_bootstrap_rows = 0;
                     self.slots[si].deck8_chance_budget_blocked_count = 0;
+                    self.slots[si].sampled_chance_split_paths_this_move = 0;
+                    self.slots[si].sampled_chance_split_search_count_deck8 = 0;
+                    self.slots[si].sampled_chance_split_search_count_deck12 = 0;
+                    self.slots[si].sampled_chance_split_path_count_deck8 = 0;
+                    self.slots[si].sampled_chance_split_path_count_deck12 = 0;
                 }
             }
             SolveResult::Fallback => {
@@ -10816,7 +10890,8 @@ impl BatchedMCTS {
                         random_opening_plies_max=0,
                         pick_floor_frac=0.0, pick_floor_depth=2,
                         deck8_chance_enumeration=false,
-                        deck8_chance_enumeration_seat=-1))]
+                        deck8_chance_enumeration_seat=-1,
+                        sampled_chance_split_deck_mask=0))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -10857,6 +10932,7 @@ impl BatchedMCTS {
         pick_floor_depth: usize,
         deck8_chance_enumeration: bool,
         deck8_chance_enumeration_seat: i64,
+        sampled_chance_split_deck_mask: u64,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -10948,6 +11024,19 @@ impl BatchedMCTS {
         assert!(
             !deck8_chance_enumeration || open_loop,
             "BatchedMCTS: deck8_chance_enumeration requires open_loop=true"
+        );
+        assert!(
+            sampled_chance_split_deck_mask == 0 || open_loop,
+            "BatchedMCTS: sampled chance splitting requires open_loop=true"
+        );
+        assert!(
+            !deck8_chance_enumeration || sampled_chance_split_deck_mask == 0,
+            "BatchedMCTS: exhaustive deck8 panels and sampled chance splitting are mutually exclusive"
+        );
+        let supported_sampled_split_mask = (1u64 << 8) | (1u64 << 12);
+        assert!(
+            sampled_chance_split_deck_mask & !supported_sampled_split_mask == 0,
+            "BatchedMCTS: sampled chance split v1 supports only deck counts 8 and 12, got mask {sampled_chance_split_deck_mask:#x}"
         );
         assert!(
             (-1..=1).contains(&deck8_chance_enumeration_seat),
@@ -11051,6 +11140,11 @@ impl BatchedMCTS {
             cum_deck8_chance_panel_count: 0,
             cum_deck8_chance_bootstrap_rows: 0,
             cum_deck8_chance_budget_blocked_count: 0,
+            sampled_chance_split_deck_mask,
+            cum_sampled_chance_split_search_count_deck8: 0,
+            cum_sampled_chance_split_search_count_deck12: 0,
+            cum_sampled_chance_split_path_count_deck8: 0,
+            cum_sampled_chance_split_path_count_deck12: 0,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
             cum_pf_minshare_sum: 0.0,
@@ -11205,6 +11299,7 @@ impl BatchedMCTS {
             2,
             false,
             -1,
+            0,
         );
         batched.slots = supplied
             .into_iter()
@@ -11544,6 +11639,11 @@ impl BatchedMCTS {
                 self.slots[si].deck8_chance_panel_count = 0;
                 self.slots[si].deck8_chance_bootstrap_rows = 0;
                 self.slots[si].deck8_chance_budget_blocked_count = 0;
+                self.slots[si].sampled_chance_split_paths_this_move = 0;
+                self.slots[si].sampled_chance_split_search_count_deck8 = 0;
+                self.slots[si].sampled_chance_split_search_count_deck12 = 0;
+                self.slots[si].sampled_chance_split_path_count_deck8 = 0;
+                self.slots[si].sampled_chance_split_path_count_deck12 = 0;
             }
         }
         Ok(())
@@ -11606,6 +11706,46 @@ impl BatchedMCTS {
                 .slots
                 .iter()
                 .map(|slot| slot.deck8_chance_budget_blocked_count as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn sampled_chance_split_search_count_deck8(&self) -> u64 {
+        self.cum_sampled_chance_split_search_count_deck8
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.sampled_chance_split_search_count_deck8 as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn sampled_chance_split_search_count_deck12(&self) -> u64 {
+        self.cum_sampled_chance_split_search_count_deck12
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.sampled_chance_split_search_count_deck12 as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn sampled_chance_split_path_count_deck8(&self) -> u64 {
+        self.cum_sampled_chance_split_path_count_deck8
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.sampled_chance_split_path_count_deck8)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn sampled_chance_split_path_count_deck12(&self) -> u64 {
+        self.cum_sampled_chance_split_path_count_deck12
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.sampled_chance_split_path_count_deck12)
                 .sum::<u64>()
     }
 
@@ -11794,6 +11934,7 @@ impl BatchedMCTS {
             pick_floor,
             deck8_chance_enumeration,
             deck8_chance_enumeration_seat,
+            sampled_chance_split_deck_mask,
         ) = (
             self.fpu,
             self.cpuct,
@@ -11803,6 +11944,7 @@ impl BatchedMCTS {
             self.pick_floor,
             self.deck8_chance_enumeration,
             self.deck8_chance_enumeration_seat,
+            self.sampled_chance_split_deck_mask,
         );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
@@ -11884,24 +12026,41 @@ impl BatchedMCTS {
                             let mut chance_steps: Vec<Option<(usize, f64)>> =
                                 Vec::with_capacity(path_cap);
                             let root_actor = slot.real_state.actor()?;
-                            let chance_enabled_for_seat = deck8_chance_enumeration
+                            let exhaustive_enabled_for_seat = deck8_chance_enumeration
                                 && deck8_chance_enumeration_seat
                                     .map_or(true, |seat| seat == root_actor);
-                            let panel =
-                                if chance_enabled_for_seat && slot.real_state.deck.len() == 8 {
-                                    ol_one_reveal_panel(
-                                        &slot.real_state.deck,
-                                        1,
-                                        70,
-                                        slot.game_seed
-                                            ^ (slot.move_num as u64)
-                                                .wrapping_mul(0xA1C0_77EC_7A11_5EED),
-                                    )?
-                                } else {
-                                    Vec::new()
-                                };
-                            debug_assert!(panel.is_empty() || panel.len() == 70);
-                            let chance_enabled = panel.len() == 70;
+                            let exhaustive_here =
+                                exhaustive_enabled_for_seat && slot.real_state.deck.len() == 8;
+                            let sampled_split_here = sampled_chance_split_root_enabled(
+                                sampled_chance_split_deck_mask,
+                                &slot.real_state,
+                            );
+                            let panel = if exhaustive_here {
+                                ol_one_reveal_panel(
+                                    &slot.real_state.deck,
+                                    1,
+                                    70,
+                                    slot.game_seed
+                                        ^ (slot.move_num as u64)
+                                            .wrapping_mul(0xA1C0_77EC_7A11_5EED),
+                                )?
+                            } else if sampled_split_here {
+                                ol_one_reveal_panel(
+                                    &slot.real_state.deck,
+                                    1,
+                                    comb4(slot.real_state.deck.len()),
+                                    slot.game_seed
+                                        ^ (slot.move_num as u64)
+                                            .wrapping_mul(0xA1C0_77EC_7A11_5EED),
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            debug_assert!(
+                                panel.is_empty()
+                                    || panel.len() == comb4(slot.real_state.deck.len()) as usize
+                            );
+                            let chance_enabled = !panel.is_empty();
                             let mut bootstrap_requests: Vec<A1cAdmissionRequest> = Vec::new();
                             let mut considered_chance_nodes: HashSet<u32> = HashSet::new();
                             let mut reserved_bootstrap_rows = 0usize;
@@ -11926,7 +12085,7 @@ impl BatchedMCTS {
                                             .wrapping_mul(0xBA1A_4CED_C1C1_E5E5),
                                     draw_seed: seed,
                                     a1c: None,
-                                    bootstrap_full_panel: true,
+                                    bootstrap_full_panel: exhaustive_here,
                                 });
                                 let (
                                     path,
@@ -11946,6 +12105,9 @@ impl BatchedMCTS {
                                     pick_floor,
                                     chance_config,
                                 )?;
+                                if sampled_split_here && chance_step.is_some() {
+                                    slot.sampled_chance_split_paths_this_move += 1;
+                                }
                                 if let Some(request) = a1c_admission_request {
                                     if considered_chance_nodes.insert(request.chance_node_id) {
                                         // The first admitted action gets the exact
@@ -12249,6 +12411,8 @@ impl BatchedMCTS {
     ///   [(mb,ob,flat,pidx,pval,lidx,root_stats,z,own_score,opp_score,win_target,actor)],
     ///  (score0,score1,official_outcome0))]. `actor` (0/1) is the seat that made
     /// the move; used by the two-net HOF path to retain learner-searched moves.
+    /// `root_stats` is (prior_idx, prior_val, visit_count,
+    /// sampled_split_treated, root_hidden_deck_count, root_turn_slot).
     fn update<'py>(
         &mut self,
         py: Python<'py>,
@@ -12687,6 +12851,9 @@ impl BatchedMCTS {
                     r.root_prior_idx.into_pyarray(py),
                     r.root_prior_val.into_pyarray(py),
                     r.root_visit_count.into_pyarray(py),
+                    r.sampled_chance_split_treated,
+                    r.root_hidden_deck_count,
+                    r.root_turn_slot,
                 );
                 let actor = r.actor;
                 let tup = (
