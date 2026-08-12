@@ -1,6 +1,6 @@
 """Stable action encoding for classic Kingdomino.
 
-The codec will expose a fixed four-slot draft axis.  The fourth slot is masked
-for three-player games so one network and replay schema can serve both player
-counts.
+The codec exposes a fixed four-slot draft axis in both player counts.  In 3p,
+all four slots can initially be selected and the sole unclaimed domino is
+discarded after the third selection.  In 4p, the fourth selection is forced.
 """

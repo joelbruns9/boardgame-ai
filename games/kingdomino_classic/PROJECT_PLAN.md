@@ -24,7 +24,9 @@ configuration: {players}p-h{0|1}-m{0|1}
 1. Python is the rules oracle until profiling justifies native acceleration.
 2. Three- and four-player games share a fixed four-player tensor layout.
 3. The absent fourth player in 3p is represented by an explicit presence mask.
-4. The action codec has four draft slots; slot four is illegal and masked in 3p.
+4. Every round exposes four draft slots in both player counts. In 3p, three
+   dominoes are selected and the unclaimed fourth domino is discarded. In 4p,
+   all four are selected and the final selection is forced.
 5. Search values are vectors. Multiplayer search never uses two-player sign
    inversion.
 6. Training samples carry their complete rules configuration and are balanced
@@ -37,8 +39,9 @@ configuration: {players}p-h{0|1}-m{0|1}
 
 ### K0 - Rules engine
 
-- Deterministic seeded setup and deck reduction.
-- Three- and four-player draft sequences.
+- Deterministic seeded setup using all 48 dominoes over twelve rounds.
+- Four-tile draft rows, including the 3p unclaimed-tile discard and the 4p
+  forced final selection.
 - 5x5 placement legality, forced discards, bonuses, and tiebreaks.
 - Copy, serialization, terminal-state, and full-game inventory invariants.
 - Scripted rules examples and BGA replay equivalence where available.
@@ -61,7 +64,8 @@ tournaments and becomes a stable evaluation anchor.
 - Four padded player slots with presence masks.
 - Shared per-player board representation.
 - Player count and bonus configuration features.
-- Fixed placement-by-four-pick policy space.
+- Fixed placement-by-four-pick policy space, with all four pick slots available
+  at the start of a 3p or 4p draft.
 - D4 board symmetry and seat-permutation transforms.
 
 Gate: action round trips, legal-mask equivalence, symmetry commutation,

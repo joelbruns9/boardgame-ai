@@ -27,6 +27,7 @@ class ClassicGameConfig:
     board_size: ClassVar[int] = 5
     dominoes_per_player: ClassVar[int] = 12
     max_players: ClassVar[int] = 4
+    total_dominoes: ClassVar[int] = 48
 
     def __post_init__(self) -> None:
         if self.players not in (3, 4):
@@ -37,15 +38,33 @@ class ClassicGameConfig:
 
     @property
     def draft_row_size(self) -> int:
-        """Number of face-up dominoes and kings in each draft."""
+        """Number of face-up dominoes in every three- or four-player draft."""
+
+        return 4
+
+    @property
+    def deck_size(self) -> int:
+        """Number of dominoes used across the twelve draft rounds."""
+
+        return self.total_dominoes
+
+    @property
+    def selections_per_round(self) -> int:
+        """Number of claimed dominoes before a draft row is resolved."""
 
         return self.players
 
     @property
-    def deck_size(self) -> int:
-        """Number of dominoes used after the random setup reduction."""
+    def unclaimed_dominoes_per_round(self) -> int:
+        """Dominoes discarded after all players have selected."""
 
-        return self.players * self.dominoes_per_player
+        return self.draft_row_size - self.selections_per_round
+
+    @property
+    def final_selection_is_forced(self) -> bool:
+        """Whether the final player has only one domino remaining to select."""
+
+        return self.players == 4
 
     @property
     def configuration_key(self) -> str:
@@ -65,4 +84,7 @@ class ClassicGameConfig:
             "board_size": self.board_size,
             "draft_row_size": self.draft_row_size,
             "deck_size": self.deck_size,
+            "selections_per_round": self.selections_per_round,
+            "unclaimed_dominoes_per_round": self.unclaimed_dominoes_per_round,
+            "final_selection_is_forced": self.final_selection_is_forced,
         }
