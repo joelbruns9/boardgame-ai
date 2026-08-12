@@ -66,6 +66,9 @@ tournaments and becomes a stable evaluation anchor.
 
 ### K2 - Encoder and action codec
 
+Status: complete (2026-08-12). See `K2_ENCODER.md` for the versioned tensor,
+fixed action space, and exact S3/S4 x D4 symmetry contract.
+
 - Four padded player slots with presence masks.
 - Shared per-player board representation.
 - Player count and bonus configuration features.

@@ -8,7 +8,7 @@ the castle or matching terrain, and the resulting kingdom fits in a 5x5 box.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .config import ClassicGameConfig
 from .dominoes import Domino, HalfTile, Terrain
@@ -76,6 +76,27 @@ class ClassicBoard:
         board = ClassicBoard()
         board._cells = dict(self._cells)
         board._placed_domino_ids = set(self._placed_domino_ids)
+        return board
+
+    def transformed_coordinates(
+        self, transform: Callable[[Coord], Coord]
+    ) -> "ClassicBoard":
+        """Return a board with every cell moved by a coordinate bijection.
+
+        This is primarily the rules-level oracle for D4 encoder tests.  The
+        caller supplies the geometry; this method preserves cell material and
+        domino ownership while checking that the result remains a valid board.
+        """
+
+        cells = {transform(coord): cell for coord, cell in self._cells.items()}
+        if len(cells) != len(self._cells):
+            raise ValueError("A coordinate transform must be one-to-one.")
+        if (0, 0) not in cells:
+            raise ValueError("A coordinate transform must keep the castle fixed.")
+        board = ClassicBoard()
+        board._cells = cells
+        board._placed_domino_ids = set(self._placed_domino_ids)
+        board.assert_invariants()
         return board
 
     @property
