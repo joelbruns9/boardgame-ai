@@ -495,6 +495,105 @@ def test_soft_gate_training_loop_transitions_and_smart_elo_trigger(
         assert any(Path(cfg.hof_dir).glob("*.pt"))
 
 
+def test_current_best_measurement_is_non_mutating_and_can_stop_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_best, _base_cfg = _write_current_best(tmp_path)
+    original_best = current_best.read_bytes()
+    checkpoint_dir = tmp_path / "measurement_run"
+    cfg = SelfPlayConfig(
+        channels=8,
+        blocks=1,
+        bilinear_dim=8,
+        n_iterations=2,
+        games_per_iteration=1,
+        train_steps_per_iteration=0,
+        min_buffer_to_train=999999,
+        n_simulations=1,
+        engine="open_loop",
+        device="cpu",
+        exact_endgame_max_secs=0.0,
+        benchmark_every=0,
+        elo_every=0,
+        checkpoint_dir=str(checkpoint_dir),
+        log_path=str(checkpoint_dir / "training_log.jsonl"),
+        current_best_path=str(current_best),
+        warm_start_path=str(current_best),
+        selfplay_generator_mode="current_best",
+        measurement_iterations="1",
+        measurement_games=192,
+        measurement_sims=400,
+        measurement_stop_ucb=0.50,
+    )
+    calls = []
+
+    def fake_evaluate_network_match(*args, **kwargs):
+        calls.append(kwargs)
+        return MatchStats(
+            games=192,
+            wins=0,
+            losses=192,
+            draws=0,
+            points=0.0,
+            win_rate=0.0,
+            lower_confidence_bound=0.0,
+            mean_margin=-10.0,
+            pairs=96,
+            pair_losses=96,
+            pair_points=0.0,
+            pair_score_rate=0.0,
+        )
+
+    monkeypatch.setattr(
+        "games.kingdomino.self_play.evaluate_network_match",
+        fake_evaluate_network_match,
+    )
+
+    run_self_play_training(cfg, verbose=False)
+
+    rows = [json.loads(line) for line in Path(cfg.log_path).read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["measurement_checked"] is True
+    assert rows[0]["measurement_stop_requested"] is True
+    assert rows[0]["generator_mode"] == "current_best"
+    assert rows[0]["generator_source"] == str(current_best)
+    assert rows[0]["promotion_checked"] is False
+    assert calls[0]["games"] == 192
+    assert calls[0]["sims"] == 400
+    artifact = json.loads(
+        (checkpoint_dir / "measurement_iter_0001.json").read_text()
+    )
+    assert artifact["mutates_generator"] is False
+    assert artifact["mutates_current_best"] is False
+    assert artifact["stop_requested"] is True
+    assert current_best.read_bytes() == original_best
+
+
+def test_soft_gate_consecutive_revert_circuit_breaker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_best, _base_cfg = _write_current_best(tmp_path)
+    cfg = _soft_gate_smoke_config(tmp_path, current_best)
+    cfg.n_iterations = 4
+    cfg.soft_gate_stop_after_reverts = 2
+    cfg.smart_elo = False
+
+    monkeypatch.setattr(
+        "games.kingdomino.self_play.evaluate_network_match",
+        lambda *args, **kwargs: _match_stats(0.47, 0.40),
+    )
+
+    run_self_play_training(cfg, verbose=False)
+
+    rows = [json.loads(line) for line in Path(cfg.log_path).read_text().splitlines()]
+    assert len(rows) == 2
+    assert [row["promotion_action"] for row in rows] == ["revert", "revert"]
+    assert rows[-1]["consecutive_gate_reverts"] == 2
+    assert rows[-1]["automatic_stop_requested"] is True
+
+
 def test_smart_elo_uses_smart_defaults_and_skips_existing_rating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

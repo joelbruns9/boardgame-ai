@@ -89,6 +89,7 @@ from games.kingdomino.promotion import (
     promote_current_best,
     promotion_payload,
     sha256_file,
+    wilson_interval,
 )
 from games.kingdomino.hof import (
     DEFAULT_HOF_DIR,
@@ -129,6 +130,33 @@ def _parse_sampled_chance_split_decks(text: str) -> Tuple[int, ...]:
             f"12; got {unsupported}"
         )
     return decks
+
+
+def _parse_measurement_iterations(text: str) -> Tuple[int, ...]:
+    """Parse a stable, duplicate-free set of 1-based iteration numbers."""
+    if not str(text).strip():
+        return ()
+    try:
+        iterations = tuple(sorted({
+            int(part.strip()) for part in str(text).split(",")
+            if part.strip()
+        }))
+    except ValueError as exc:
+        raise ValueError(
+            "measurement_iterations must be comma-separated integers"
+        ) from exc
+    if any(iteration <= 0 for iteration in iterations):
+        raise ValueError("measurement_iterations must contain only positive integers")
+    return iterations
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write a small audit artifact without exposing a partial JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _sampled_chance_split_deck_mask(text: str) -> int:
@@ -362,6 +390,19 @@ class SelfPlayConfig:
     promotion_fixed_suite_tolerance: float = 0.05
     promotion_skip_fixed_suite: bool = False
     promotion_update_best: bool = False
+    # Non-mutating, same-engine strength measurements for long control runs.
+    # Comma-separated 1-based iteration numbers (for example "5,8").  These
+    # are deliberately separate from promotion: the learner is compared with
+    # the frozen current_best baseline, an auditable JSON artifact is written,
+    # and no checkpoint/generator state is changed by the result.
+    measurement_iterations: str = ""
+    measurement_games: int = 384
+    measurement_sims: int = 400
+    measurement_seed: int = 20310000
+    measurement_confidence_z: float = 1.96
+    # If positive, stop cleanly when a measurement's Wilson UCB is below this
+    # threshold.  Zero disables the automatic stop.
+    measurement_stop_ucb: float = 0.0
     # Run8: gate a rolling average of the last K iteration checkpoints instead
     # of the raw learner snapshot. Snapshots are noisy samples off the
     # trajectory mean (run7: individual checkpoints measured 43-44% vs the
@@ -376,6 +417,10 @@ class SelfPlayConfig:
     # run7 showed a diverged learner never recovers unaided (9 straight
     # reverts). 0 = never reset (old behavior).
     revert_reset_after: int = 0
+    # Cloud-run circuit breaker: stop cleanly after this many consecutive
+    # soft-gate reverts.  Unlike revert_reset_after, this never mutates learner
+    # weights. Zero preserves historical behavior.
+    soft_gate_stop_after_reverts: int = 0
     # Milestone 7 Hall-of-Fame opponent mixing. Default off. The first
     # implementation samples one HOF opponent per iteration and runs HOF games
     # as a separate mixed-model open-loop block to keep the high-throughput
@@ -3704,6 +3749,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
         cfg.sampled_chance_split_decks)
     progressive_decks = _parse_sampled_chance_split_decks(
         cfg.chance_progressive_decks)
+    measurement_iterations = _parse_measurement_iterations(
+        cfg.measurement_iterations)
     if sampled_split_decks and cfg.engine != "batched_open_loop":
         raise ValueError(
             "sampled_chance_split_decks requires engine='batched_open_loop'"
@@ -3715,6 +3762,30 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
         )
     if cfg.endgame_oversample <= 0.0 or cfg.chance_split_oversample <= 0.0:
         raise ValueError("replay oversampling weights must be positive")
+    if measurement_iterations:
+        if cfg.selfplay_generator_mode != "current_best":
+            raise ValueError(
+                "measurement_iterations requires selfplay_generator_mode="
+                "'current_best' so the comparator stays frozen"
+            )
+        if not cfg.checkpoint_dir:
+            raise ValueError(
+                "measurement_iterations requires checkpoint_dir for audit artifacts"
+            )
+        if cfg.measurement_games <= 0 or cfg.measurement_games % 2:
+            raise ValueError("measurement_games must be a positive even number")
+        if cfg.measurement_sims <= 0:
+            raise ValueError("measurement_sims must be positive")
+        if not (0.0 <= cfg.measurement_stop_ucb <= 1.0):
+            raise ValueError("measurement_stop_ucb must be in [0, 1]")
+    if cfg.soft_gate_stop_after_reverts < 0:
+        raise ValueError("soft_gate_stop_after_reverts cannot be negative")
+    if (cfg.soft_gate_stop_after_reverts > 0
+            and cfg.selfplay_generator_mode != "soft_gate"):
+        raise ValueError(
+            "soft_gate_stop_after_reverts requires selfplay_generator_mode="
+            "'soft_gate'"
+        )
     configure_torch_performance(cfg)
     # Fix 2: the leaf-value blend params (cfg.margin_gain / cfg.alpha) and the
     # terminal-value params (cfg.score_scale) are now bound at MCTS / evaluator /
@@ -3895,6 +3966,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             smart_elo_reason = None
             smart_elo_name = None
             promotion_result = None
+            measurement_result = None
             hof_added_entry = None
 
             # ── 1. Self-play ──
@@ -4597,6 +4669,83 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             if not stop_now and _stop_requested(f"before iteration {it}'s gate"):
                 stop_now = True
 
+            # Phase-A control measurement. This is intentionally not a
+            # promotion gate: current_best remains both the frozen self-play
+            # generator and comparator regardless of the result. The optional
+            # UCB circuit breaker only ends the run at this clean boundary.
+            if not stop_now and it in measurement_iterations:
+                baseline_net = generator_state.baseline_net or generator_state.net
+                if verbose:
+                    print(f"  measurement: learner vs frozen current_best "
+                          f"({iter_cfg.measurement_games} games, "
+                          f"{iter_cfg.measurement_sims} sims)")
+                net.eval()
+                baseline_net.eval()
+                try:
+                    match = evaluate_network_match(
+                        net, baseline_net,
+                        games=iter_cfg.measurement_games,
+                        sims=iter_cfg.measurement_sims,
+                        device=iter_cfg.device,
+                        batch_slots=iter_cfg.batch_slots,
+                        leaf_batch=iter_cfg.leaf_batch,
+                        seed=iter_cfg.measurement_seed + it * 100_000,
+                        c_puct=iter_cfg.c_puct,
+                        fpu=iter_cfg.fpu,
+                        margin_gain=iter_cfg.margin_gain,
+                        alpha=iter_cfg.alpha,
+                        z=iter_cfg.measurement_confidence_z,
+                    )
+                finally:
+                    net.train()
+                measurement_lcb, measurement_ucb = wilson_interval(
+                    match.pair_points,
+                    match.pairs,
+                    z=iter_cfg.measurement_confidence_z,
+                )
+                measurement_result = {
+                    "schema_version": 1,
+                    "iteration": it,
+                    "candidate_checkpoint": checkpoint_path,
+                    "candidate_sha256": (
+                        sha256_file(checkpoint_path) if checkpoint_path else None),
+                    "baseline_checkpoint": str(iter_cfg.current_best_path),
+                    "baseline_sha256": generator_state.baseline_sha256,
+                    "games": match.games,
+                    "pairs": match.pairs,
+                    "wins": match.wins,
+                    "losses": match.losses,
+                    "draws": match.draws,
+                    "pair_points": match.pair_points,
+                    "pair_score_rate": match.pair_score_rate,
+                    "lcb": measurement_lcb,
+                    "ucb": measurement_ucb,
+                    "mean_margin": match.mean_margin,
+                    "sims": int(iter_cfg.measurement_sims),
+                    "seed": int(iter_cfg.measurement_seed + it * 100_000),
+                    "stop_ucb_threshold": float(iter_cfg.measurement_stop_ucb),
+                    "stop_requested": bool(
+                        iter_cfg.measurement_stop_ucb > 0.0
+                        and measurement_ucb < iter_cfg.measurement_stop_ucb
+                    ),
+                    "mutates_generator": False,
+                    "mutates_current_best": False,
+                }
+                artifact_path = (
+                    Path(cfg.checkpoint_dir) / f"measurement_iter_{it:04d}.json"
+                )
+                _atomic_write_json(artifact_path, measurement_result)
+                measurement_result["artifact_path"] = str(artifact_path)
+                if verbose:
+                    print(f"  measurement: score={match.pair_score_rate:.1%} "
+                          f"Wilson=[{measurement_lcb:.1%}, {measurement_ucb:.1%}] "
+                          f"artifact={artifact_path}")
+                if measurement_result["stop_requested"]:
+                    stop_now = True
+                    if verbose:
+                        print("  measurement: UCB below stop threshold; "
+                              "ending cleanly after this iteration")
+
             # Skip gate checks while training hasn't started YET (buffer still
             # warming): the learner is byte-identical to its warm start, so
             # the match is a guaranteed ~50% self-match. Does NOT apply when
@@ -4760,6 +4909,14 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     selfplay_net = generator_state.net
                     selfplay_source = generator_state.source
                     consecutive_reverts += 1
+                    if (int(iter_cfg.soft_gate_stop_after_reverts) > 0
+                            and consecutive_reverts >= int(
+                                iter_cfg.soft_gate_stop_after_reverts)):
+                        stop_now = True
+                        if verbose:
+                            print("  promotion: consecutive-revert circuit "
+                                  f"breaker reached ({consecutive_reverts}); "
+                                  "ending cleanly after this iteration")
                     # Run8: a diverged learner never recovers unaided (run7:
                     # nine straight reverts). After N CONSECUTIVE reverts,
                     # reset the learner's weights to the baseline and clear
@@ -4767,7 +4924,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     # straight back into the diverged basin). One revert alone
                     # never resets — a mid-breakthrough learner gets 5+
                     # iterations of baseline-generated data to recover first.
-                    if (int(iter_cfg.revert_reset_after) > 0
+                    if (not stop_now
+                            and int(iter_cfg.revert_reset_after) > 0
                             and consecutive_reverts >= int(iter_cfg.revert_reset_after)):
                         net.load_state_dict(baseline_net.state_dict())
                         net.to(iter_cfg.device)
@@ -5011,6 +5169,27 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "promotion_fixed_suite_delta_mae": (
                     promotion_result["fixed_suite_delta_mae"]
                     if promotion_result else None),
+                "consecutive_gate_reverts": consecutive_reverts,
+                "soft_gate_stop_after_reverts": (
+                    iter_cfg.soft_gate_stop_after_reverts),
+                "measurement_checked": measurement_result is not None,
+                "measurement_pair_score_rate": (
+                    measurement_result["pair_score_rate"]
+                    if measurement_result else None),
+                "measurement_lcb": (
+                    measurement_result["lcb"] if measurement_result else None),
+                "measurement_ucb": (
+                    measurement_result["ucb"] if measurement_result else None),
+                "measurement_stop_requested": (
+                    measurement_result["stop_requested"]
+                    if measurement_result else False),
+                "measurement_artifact": (
+                    measurement_result["artifact_path"]
+                    if measurement_result else None),
+                "automatic_stop_requested": stop_now,
+                "mcts_total_evals": (
+                    batched_stats.get("total_evals", 0)
+                    if batched_stats else None),
                 # Exact endgame solver stats (batched engines only; None otherwise).
                 "exact_solve_count": (batched_stats.get("exact_solve_count", 0)
                                       if batched_stats else None),
@@ -5098,6 +5277,12 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     "progressive_chance_widening_count"),
                 "progressive_chance_bootstrap_rows": _iteration_split_total(
                     "progressive_chance_bootstrap_rows"),
+                "progressive_chance_init_fraction": (
+                    _iteration_split_total("progressive_chance_bootstrap_rows")
+                    / batched_stats["total_evals"]
+                    if batched_stats and batched_stats.get("total_evals", 0)
+                    else 0.0
+                ),
                 "progressive_chance_budget_blocked_count": _iteration_split_total(
                     "progressive_chance_budget_blocked_count"),
                 "progressive_chance_guardrail_blocked_count": _iteration_split_total(
@@ -5472,6 +5657,20 @@ if __name__ == "__main__":
     p.add_argument("--promotion_update_best", action="store_true",
                    help="if an in-run promotion passes, also copy the saved "
                         "checkpoint to --current_best_path")
+    p.add_argument("--measurement_iterations", default="",
+                   help="comma-separated 1-based iterations for a non-mutating "
+                        "learner-vs-frozen-current_best match")
+    p.add_argument("--measurement_games", type=int, default=384,
+                   help="total seat-swapped games per non-mutating measurement")
+    p.add_argument("--measurement_sims", type=int, default=400)
+    p.add_argument("--measurement_seed", type=int, default=20310000)
+    p.add_argument("--measurement_confidence_z", type=float, default=1.96)
+    p.add_argument("--measurement_stop_ucb", type=float, default=0.0,
+                   help="stop cleanly when measurement Wilson UCB is below this; "
+                        "0 disables")
+    p.add_argument("--soft_gate_stop_after_reverts", type=int, default=0,
+                   help="stop cleanly after N consecutive soft-gate reverts; "
+                        "0 disables")
     p.add_argument("--hof_dir", default=str(DEFAULT_HOF_DIR),
                    help="Hall-of-Fame checkpoint pool directory")
     p.add_argument("--hof_fraction", type=float, default=0.0,
@@ -5729,6 +5928,13 @@ if __name__ == "__main__":
         promotion_average_k=a.promotion_average_k,
         revert_reset_after=a.revert_reset_after,
         promotion_update_best=a.promotion_update_best,
+        measurement_iterations=a.measurement_iterations,
+        measurement_games=a.measurement_games,
+        measurement_sims=a.measurement_sims,
+        measurement_seed=a.measurement_seed,
+        measurement_confidence_z=a.measurement_confidence_z,
+        measurement_stop_ucb=a.measurement_stop_ucb,
+        soft_gate_stop_after_reverts=a.soft_gate_stop_after_reverts,
         hof_dir=a.hof_dir,
         hof_fraction=a.hof_fraction,
         hof_fraction_schedule=a.hof_fraction_schedule,
