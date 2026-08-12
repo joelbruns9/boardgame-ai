@@ -26,6 +26,7 @@ from games.kingdomino_classic.encoder import (
     encode_state,
     inverse_d4_transform_id,
     padded_player_permutation,
+    permute_state_players,
     permute_encoded_players,
     transform_encoded_d4,
     transform_state_d4,
@@ -66,6 +67,7 @@ def _trajectory_snapshots(players: int, seed: int) -> list[ClassicGameState]:
         state = state.step(rng.choice(state.legal_actions()))
         if (
             len(state.history) % 11 == 0
+            or len(state.history) <= players
             or state.phase != previous_phase
             or state.is_terminal
         ):
@@ -112,7 +114,7 @@ def test_shapes_dtype_and_complete_inventory_partition(players: int) -> None:
 
 
 @pytest.mark.parametrize("players", [3, 4])
-def test_every_real_player_uses_the_same_board_and_feature_schema(players: int) -> None:
+def test_every_real_player_uses_the_same_schema(players: int) -> None:
     encoded = encode_state(_progressed_state(players, seed=21))
     castle = BOARD_CHANNEL_NAMES.index("castle")
     centre = CANVAS_RADIUS
@@ -175,6 +177,18 @@ def test_all_real_player_permutations_commute_with_encoding(players: int) -> Non
                 encoded, padded_player_permutation(permutation, players)
             )
             _assert_encoded_equal(direct, transformed)
+
+
+@pytest.mark.parametrize("players", [3, 4])
+def test_rules_level_player_relabeling_commutes_with_encoding(players: int) -> None:
+    for state in _trajectory_snapshots(players, seed=61):
+        encoded = encode_state(state)
+        for permutation in permutations(range(players)):
+            relabeled = encode_state(permute_state_players(state, permutation))
+            transformed = permute_encoded_players(
+                encoded, padded_player_permutation(permutation, players)
+            )
+            _assert_encoded_equal(relabeled, transformed)
 
 
 @pytest.mark.parametrize("players", [3, 4])

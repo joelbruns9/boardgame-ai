@@ -7,6 +7,10 @@ The encoder represents players on one padded axis. It does not create `self`,
 initial-pick priority, and pending-claim priority are attributes attached to a
 player slot. Consequently, relabeling players only permutes that axis.
 
+The rules state stores the initial draft order explicitly rather than deriving
+it from numeric player IDs. This lets arbitrary S3/S4 relabelings move turn
+priority with the player, including partway through the initial draft.
+
 ## Tensor contract
 
 | Tensor | Shape | Role |

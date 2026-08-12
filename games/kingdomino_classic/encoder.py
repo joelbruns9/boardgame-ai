@@ -195,7 +195,7 @@ def _player_features(state: ClassicGameState, player: int) -> np.ndarray:
         features[index["current_actor"]] = 1.0
 
     if state.phase == Phase.INITIAL_DRAFT:
-        order = (player - state.start_player) % state.config.players
+        order = state.initial_player_order.index(player)
         features[index[f"initial_order_{order}"]] = 1.0
 
     for order, claim in enumerate(state.pending_claims):
@@ -347,6 +347,34 @@ def padded_player_permutation(
     ) != set(range(players)):
         raise ValueError("real_player_permutation does not match player count.")
     return (*permutation, *range(players, MAX_PLAYERS))
+
+
+def permute_state_players(
+    state: ClassicGameState, player_order: Sequence[int]
+) -> ClassicGameState:
+    """Relabel a rules state using ``new_player -> old_player`` order."""
+
+    order = _validate_player_order(state, player_order)
+    old_to_new = {old: new for new, old in enumerate(order)}
+    permuted = state.copy()
+    permuted.boards = [state.boards[old].copy() for old in order]
+    permuted.forced_discards = [
+        list(state.forced_discards[old]) for old in order
+    ]
+    permuted.pending_claims = [
+        Claim(old_to_new[claim.player], claim.domino_id)
+        for claim in state.pending_claims
+    ]
+    permuted.next_claims = [
+        Claim(old_to_new[claim.player], claim.domino_id)
+        for claim in state.next_claims
+    ]
+    permuted.start_player = old_to_new[state.start_player]
+    permuted.initial_player_order = [
+        old_to_new[player] for player in state.initial_player_order
+    ]
+    permuted.assert_invariants()
+    return permuted
 
 
 def _d4_element(transform_id: int) -> tuple[int, bool]:

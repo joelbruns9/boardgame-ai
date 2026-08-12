@@ -69,6 +69,7 @@ class ClassicGameState:
     phase: Phase
     initial_pick_count: int = 0
     start_player: int = 0
+    initial_player_order: list[int] = field(default_factory=list)
     history: list[Action] = field(default_factory=list)
 
     @classmethod
@@ -101,6 +102,10 @@ class ClassicGameState:
             forced_discards=[[] for _ in range(config.players)],
             phase=Phase.INITIAL_DRAFT,
             start_player=start_player,
+            initial_player_order=[
+                (start_player + offset) % config.players
+                for offset in range(config.players)
+            ],
         )
         state.assert_invariants()
         return state
@@ -108,7 +113,7 @@ class ClassicGameState:
     @property
     def current_actor(self) -> int:
         if self.phase == Phase.INITIAL_DRAFT:
-            return (self.start_player + self.initial_pick_count) % self.config.players
+            return self.initial_player_order[self.initial_pick_count]
         if self.phase in (Phase.PLACE_AND_DRAFT, Phase.FINAL_PLACEMENT):
             if not self.pending_claims:
                 raise AssertionError("A placement phase requires a pending claim.")
@@ -132,6 +137,7 @@ class ClassicGameState:
             phase=self.phase,
             initial_pick_count=self.initial_pick_count,
             start_player=self.start_player,
+            initial_player_order=list(self.initial_player_order),
             history=list(self.history),
         )
 
@@ -278,6 +284,7 @@ class ClassicGameState:
             self.config.configuration_key,
             int(self.phase),
             self.start_player,
+            tuple(self.initial_player_order),
             self.initial_pick_count,
             tuple(self.deck),
             tuple(self.draft_row),
@@ -300,6 +307,12 @@ class ClassicGameState:
 
     def assert_invariants(self) -> None:
         players = self.config.players
+        if set(self.initial_player_order) != set(range(players)):
+            raise AssertionError(
+                "Initial player order must contain every player once."
+            )
+        if self.start_player != self.initial_player_order[0]:
+            raise AssertionError("Start player must lead the initial player order.")
         if len(self.boards) != players or len(self.forced_discards) != players:
             raise AssertionError("Per-player state does not match player count.")
         if self.draft_row != sorted(self.draft_row):

@@ -81,6 +81,10 @@ seat-permutation equivariance, and 3p padding invariance.
 
 ### K3 - Network and multiplayer MCTS
 
+Status: architecture and search correctness complete (2026-08-12); directional
+strength gate passed versus flexibility in 3p and 4p, but strongest-anchor
+promotion versus denial-aware remains pending. See `K3_NETWORK_MCTS.md`.
+
 - Shared board encoder and player interaction layer.
 - Masked four-player score/rank/win outputs.
 - Vector-valued MCTS backup and actor-component selection.
