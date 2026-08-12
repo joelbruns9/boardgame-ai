@@ -297,6 +297,17 @@ window in unrelated exact-solver tests, so it is not claimed as a pass.
   observed; zero fake visits; init fraction ≤ a few percent; replay/log
   fields present; deck-12 width/depth healthy (this is the first fallback
   checkpoint of section 4.3).
+  **PASSED 2026-08-11** (`runs/kingdomino/chance_progressive_g2_smoke`, 4
+  games, 1,600 sims, current_best warm start): treated examples 16/16 with
+  exact `[4,4,4,4]` slots at both decks; crossed paths 19,178 / 19,322;
+  1,678 admissions, 567 widenings, 7,378 bootstrap rows = **2.9% of evals**
+  (guardrail never tripped, budget blocked once); deck-8 active widths span
+  the full ladder with six searches at active width 70 (and mature 70 —
+  full support searched to `D_min` at 1,600 sims); deck-12 active width
+  never exceeded the 16 cap with 12 searches fully mature at 16 and
+  principal-row medians up to 93 visits; one optimizer step finite; exact
+  solver unaffected (48 solved, 0 fallbacks). Deck-12 fallback NOT
+  triggered.
 - **G3 — frozen quality screen (preregistered, matched 4,801 NN rows).**
   Arms: incumbent `x0`, pilot sampled split, full-ladder `W0=4/D_min=4`,
   full-ladder `W0=4/D_min=8`, and **cap-16 `W0=4/D_min=4`** (deck-8 terminal
@@ -319,6 +330,31 @@ window in unrelated exact-solver tests, so it is not claimed as a pass.
     subtrees.
   This gate rejects broken search; it does not try to prove strength, and no
   whole-game A/B precedes training, per the brief.
+
+  **Harness implementation ready 2026-08-11; G3 not yet run.** The advisor
+  matched-budget path now accepts the production progressive configuration and
+  uses the same transition boundary: after a wave's virtual losses are removed,
+  an exact missing-prefix bootstrap group is validated and committed atomically,
+  the active-set mean is published, and only then is the triggering wave backed
+  up. Bootstrap rows count against the hard 4,801-row budget and create no
+  visits. The original sealed A1c schema/config remains valid and unchanged;
+  G3 has a separate frozen config at
+  `games/kingdomino/configs/deck8_oracle_progressive_g3_v1.json`, separate
+  artifact schemas, and the five preregistered arms in fixed rotation. Position
+  repeats use a new disjoint base seed (`2026085000`) so G3 does not recycle the
+  A1c suite's search randomness while retaining common seeds across arms.
+  Position artifacts fail closed unless every progressive search has an
+  admission, a widening, and at least two distinct observation subtrees with
+  real visits.
+  The summary applies the frozen regret/pairwise gate plus the exact `D_min` and
+  cap-selection rules below. Run (when approved) from repository root with:
+
+  ```powershell
+  C:\Users\joeld\projects\boardgame-ai\.venv\Scripts\python.exe `
+    -m games.kingdomino.deck8_oracle_suite_compare `
+    --config games/kingdomino/configs/deck8_oracle_progressive_g3_v1.json `
+    --output-dir runs/kingdomino/chance_progressive_g3
+  ```
 - **G4 — first-paid-hour cloud probe** (section 9).
 
 `D_min` selection is preregistered exactly: ship `D_min=4` unless `D_min=8`

@@ -34,15 +34,19 @@ from games.kingdomino.denial_search import (
 from games.kingdomino.denial_signal_sweep import file_sha256, load_frozen_positions
 
 
-CONFIG_SCHEMA = "kd-deck8-oracle-a1c-suite-config-v1"
-RESOLVED_SCHEMA = "kd-deck8-oracle-a1c-suite-resolved-v1"
-POSITION_SCHEMA = "kd-deck8-oracle-a1c-suite-position-v1"
-SUMMARY_SCHEMA = "kd-deck8-oracle-a1c-suite-summary-v1"
+A1C_CONFIG_SCHEMA = "kd-deck8-oracle-a1c-suite-config-v1"
+G3_CONFIG_SCHEMA = "kd-deck8-oracle-progressive-g3-config-v1"
+A1C_RESOLVED_SCHEMA = "kd-deck8-oracle-a1c-suite-resolved-v1"
+G3_RESOLVED_SCHEMA = "kd-deck8-oracle-progressive-g3-resolved-v1"
+A1C_POSITION_SCHEMA = "kd-deck8-oracle-a1c-suite-position-v1"
+G3_POSITION_SCHEMA = "kd-deck8-oracle-progressive-g3-position-v1"
+A1C_SUMMARY_SCHEMA = "kd-deck8-oracle-a1c-suite-summary-v1"
+G3_SUMMARY_SCHEMA = "kd-deck8-oracle-progressive-g3-summary-v1"
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "deck8_oracle_a1c_suite_v1.json"
 DEFAULT_OUTPUT = Path(
     "runs/kingdomino/chance_correct_a1/deck8_oracle_a1c_suite_v1"
 )
-EXPECTED_ARM_NAMES = [
+A1C_ARM_NAMES = [
     "x0",
     "x1_hajek_balanced",
     "a1c_x4_balanced",
@@ -50,7 +54,46 @@ EXPECTED_ARM_NAMES = [
     "a1c_x8_balanced",
     "a1c_x8_iid",
 ]
-CONTROL_NAMES = ["x0", "x1_hajek_balanced"]
+G3_ARM_NAMES = [
+    "x0",
+    "pilot_sampled_split",
+    "progressive_full_d4",
+    "progressive_full_d8",
+    "progressive_cap16_d4",
+]
+A1C_CONTROL_NAMES = ["x0", "x1_hajek_balanced"]
+# Backward-compatible public names for the sealed v1 A1c suite and its tests.
+CONFIG_SCHEMA = A1C_CONFIG_SCHEMA
+RESOLVED_SCHEMA = A1C_RESOLVED_SCHEMA
+POSITION_SCHEMA = A1C_POSITION_SCHEMA
+SUMMARY_SCHEMA = A1C_SUMMARY_SCHEMA
+EXPECTED_ARM_NAMES = A1C_ARM_NAMES
+CONTROL_NAMES = A1C_CONTROL_NAMES
+
+
+def _experiment(config: dict[str, Any]) -> str:
+    schema = config.get("schema_version")
+    if schema == A1C_CONFIG_SCHEMA:
+        return "a1c"
+    if schema == G3_CONFIG_SCHEMA:
+        return "g3"
+    raise ValueError("suite configuration schema mismatch")
+
+
+def _schema_for(config: dict[str, Any], artifact: str) -> str:
+    schemas = {
+        "a1c": {
+            "resolved": A1C_RESOLVED_SCHEMA,
+            "position": A1C_POSITION_SCHEMA,
+            "summary": A1C_SUMMARY_SCHEMA,
+        },
+        "g3": {
+            "resolved": G3_RESOLVED_SCHEMA,
+            "position": G3_POSITION_SCHEMA,
+            "summary": G3_SUMMARY_SCHEMA,
+        },
+    }
+    return schemas[_experiment(config)][artifact]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -104,8 +147,7 @@ def global_arm_order(
 
 def validate_config(config: dict[str, Any]) -> None:
     """Validate immutable experiment choices before touching any input files."""
-    if config.get("schema_version") != CONFIG_SCHEMA:
-        raise ValueError("suite configuration schema mismatch")
+    experiment = _experiment(config)
     oracles = config.get("oracles")
     if not isinstance(oracles, list) or len(oracles) != 8:
         raise ValueError("suite must contain exactly eight ordered oracles")
@@ -136,17 +178,45 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(arms, list):
         raise ValueError("search arms must be a list")
     names = [str(row["name"]) for row in arms]
-    if names != EXPECTED_ARM_NAMES:
+    expected_names = A1C_ARM_NAMES if experiment == "a1c" else G3_ARM_NAMES
+    if names != expected_names:
         raise ValueError(f"suite arm order/configuration mismatch: {names}")
     if len(set(names)) != len(names):
         raise ValueError("duplicate arm names")
     for arm in arms:
         if int(arm["leaf_batch"]) != 8:
             raise ValueError("every suite arm must use leaf_batch=8")
-        if str(arm["name"]).startswith("a1c_") and (
+        name = str(arm["name"])
+        if name.startswith("a1c_") and (
             int(arm["enum_max_rows"]) != 1 or str(arm["panel_mode"]) != "a1c"
         ):
             raise ValueError("A1c arms must force sampled deck-8 panels")
+        if name.startswith("progressive_"):
+            if (
+                int(arm["exposure"]) != 1
+                or int(arm["enum_max_rows"]) != 70
+                or str(arm["backup"]) != "sampled"
+                or str(arm["traversal"]) != "progressive"
+                or str(arm["panel_mode"]) != "progressive"
+                or int(arm["init_visits"]) != 2
+                or str(arm["progressive_width_schedule"])
+                != "4,8,16,32,64,70"
+                or float(arm["init_max_fraction"]) != 0.25
+            ):
+                raise ValueError(f"invalid frozen progressive G3 arm: {name}")
+    if experiment == "g3":
+        by_name = {str(arm["name"]): arm for arm in arms}
+        if int(by_name["progressive_full_d4"]["progressive_d_min"]) != 4:
+            raise ValueError("full-ladder D_min=4 arm drifted")
+        if int(by_name["progressive_full_d8"]["progressive_d_min"]) != 8:
+            raise ValueError("full-ladder D_min=8 arm drifted")
+        if int(by_name["progressive_cap16_d4"]["progressive_max_width"]) != 16:
+            raise ValueError("cap-16 arm drifted")
+        if any(
+            int(by_name[name]["progressive_max_width"]) != 70
+            for name in ("progressive_full_d4", "progressive_full_d8")
+        ):
+            raise ValueError("full-ladder arm cap drifted")
     if int(config.get("bootstrap", {}).get("resamples", 0)) < 20000:
         raise ValueError("clustered bootstrap requires at least 20,000 resamples")
 
@@ -345,6 +415,10 @@ def validate_suite_inputs(config_path: str | Path = DEFAULT_CONFIG) -> dict[str,
         / "src"
         / "lib.rs",
     }
+    if _experiment(config) == "g3":
+        source_paths["advisor_probe"] = Path(__file__).with_name(
+            "chance_correct_search_probe.py"
+        ).resolve()
     search = config["search"]
     repeat_count = int(search["repeat_count"])
     arm_names = [str(arm["name"]) for arm in search["arms"]]
@@ -365,7 +439,7 @@ def validate_suite_inputs(config_path: str | Path = DEFAULT_CONFIG) -> dict[str,
                 }
             )
     return {
-        "schema_version": RESOLVED_SCHEMA,
+        "schema_version": _schema_for(config, "resolved"),
         "suite_config_path": str(config_path),
         "suite_config_sha256": file_sha256(config_path),
         "suite_config": config,
@@ -432,7 +506,15 @@ def validate_position_artifact(
     position_index: int,
 ) -> dict[str, Any]:
     artifact = _read_json(artifact_path)
-    if artifact.get("schema_version") != POSITION_SCHEMA:
+    expected_arms = [
+        row["name"]
+        for row in expected_provenance["search_configuration"]["arms"]
+    ]
+    experiment = "g3" if expected_arms == G3_ARM_NAMES else "a1c"
+    expected_schema = (
+        G3_POSITION_SCHEMA if experiment == "g3" else A1C_POSITION_SCHEMA
+    )
+    if artifact.get("schema_version") != expected_schema:
         raise ValueError(f"position artifact schema mismatch: {artifact_path}")
     if artifact.get("provenance") != expected_provenance:
         raise ValueError(f"position artifact provenance mismatch: {artifact_path}")
@@ -444,7 +526,6 @@ def validate_position_artifact(
     if not isinstance(records, list) or len(records) != len(seeds):
         raise ValueError(f"position artifact repeat count mismatch: {artifact_path}")
     budget = int(expected_provenance["search_configuration"]["nn_eval_budget"])
-    expected_arms = [row["name"] for row in expected_provenance["search_configuration"]["arms"]]
     for repeat, record in enumerate(records):
         if int(record.get("seed", -1)) != seeds[repeat] or record.get(
             "arm_execution_order"
@@ -461,8 +542,27 @@ def validate_position_artifact(
                 or row.get("python_rust_nn_accounting_match") is not True
             ):
                 raise ValueError(f"invalid NN budget/accounting for {name}: {artifact_path}")
-            if name in CONTROL_NAMES and row.get("a1c_nodes") != []:
+            if name in A1C_CONTROL_NAMES and row.get("a1c_nodes") != []:
                 raise ValueError(f"control unexpectedly contains A1c nodes: {artifact_path}")
+            if experiment == "g3" and name.startswith("progressive_"):
+                if (
+                    row.get("a1c_nodes") != []
+                    or int(row.get("progressive_admission_count", 0)) <= 0
+                    or int(row.get("progressive_widening_count", 0)) <= 0
+                    or int(row.get("progressive_real_observation_subtrees", 0)) < 2
+                    or not row.get("progressive_nodes")
+                ):
+                    raise ValueError(
+                        f"progressive mechanism inactive for {name}: {artifact_path}"
+                    )
+            elif experiment == "g3" and (
+                row.get("progressive_nodes") != []
+                or int(row.get("progressive_admission_count", 0)) != 0
+                or int(row.get("progressive_widening_count", 0)) != 0
+            ):
+                raise ValueError(
+                    f"non-progressive arm contains progressive evidence for {name}: {artifact_path}"
+                )
     return artifact
 
 
@@ -523,10 +623,10 @@ def _position_arm_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def _mean(rows: list[dict[str, Any]], key: str) -> float:
-    return statistics.fmean(float(row[key]) for row in rows)
+    return statistics.fmean(float(row.get(key, 0.0)) for row in rows)
 
 
-def classify_result(
+def classify_a1c_result(
     arm_summaries: dict[str, dict[str, Any]],
     paired: dict[str, dict[str, dict[str, Any]]],
     violations: list[str],
@@ -536,7 +636,7 @@ def classify_result(
         return {"classification": "invalid", "reasons": violations, "arm_checks": {}}
     checks: dict[str, Any] = {}
     qualifying = []
-    for candidate in EXPECTED_ARM_NAMES[2:]:
+    for candidate in A1C_ARM_NAMES[2:]:
         candidate_metrics = arm_summaries[candidate]
         x0 = arm_summaries["x0"]
         x1 = arm_summaries["x1_hajek_balanced"]
@@ -588,12 +688,12 @@ def classify_result(
     any_lower_regret = any(
         arm_summaries[name]["mean_exact_regret_actor"]
         < arm_summaries["x0"]["mean_exact_regret_actor"]
-        for name in EXPECTED_ARM_NAMES[2:]
+        for name in A1C_ARM_NAMES[2:]
     )
     any_better_best = any(
         arm_summaries[name]["exact_best_selection_rate"]
         > arm_summaries["x0"]["exact_best_selection_rate"]
-        for name in EXPECTED_ARM_NAMES[2:]
+        for name in A1C_ARM_NAMES[2:]
     )
     if not any_lower_regret and not any_better_best:
         label = "target-negative"
@@ -604,10 +704,102 @@ def classify_result(
     return {"classification": label, "reasons": [reason], "arm_checks": checks}
 
 
+# Historical import retained for the original sealed suite.
+classify_result = classify_a1c_result
+
+
+def classify_g3_result(
+    arm_summaries: dict[str, dict[str, Any]],
+    paired: dict[str, dict[str, dict[str, Any]]],
+    violations: list[str],
+    rules: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the frozen G3 gate and parameter-selection rules."""
+    regret_fail = float(rules["max_regret_regression"])
+    pairwise_fail = float(rules["max_pairwise_drop"])
+    min_improvement = float(rules["selection_min_regret_improvement"])
+    min_position_wins = int(rules["selection_min_position_wins"])
+    dmin_pairwise_tolerance = float(rules["dmin_max_pairwise_drop"])
+
+    progressive_names = [name for name in G3_ARM_NAMES if name.startswith("progressive_")]
+    arm_checks: dict[str, Any] = {}
+    for name in progressive_names:
+        versus_incumbent = paired[name]["x0"]
+        pairwise_delta = versus_incumbent["mean_pairwise_accuracy_delta"]
+        arm_checks[name] = {
+            "mean_regret_regression_at_most_threshold": (
+                versus_incumbent["mean_regret_delta"] <= regret_fail
+            ),
+            "pairwise_drop_within_known_a1c_band": (
+                pairwise_delta is None or pairwise_delta >= -pairwise_fail
+            ),
+            "mean_regret_delta_vs_x0": versus_incumbent["mean_regret_delta"],
+            "pairwise_delta_vs_x0": pairwise_delta,
+        }
+
+    d8_vs_d4 = paired["progressive_full_d8"]["progressive_full_d4"]
+    d8_selected = (
+        d8_vs_d4["mean_regret_delta"] <= -min_improvement
+        and d8_vs_d4["position_win_tie_loss"]["wins"] >= min_position_wins
+        and (
+            d8_vs_d4["mean_pairwise_accuracy_delta"] is None
+            or d8_vs_d4["mean_pairwise_accuracy_delta"] >= -dmin_pairwise_tolerance
+        )
+    )
+    full_vs_cap = paired["progressive_full_d4"]["progressive_cap16_d4"]
+    full_selected = (
+        full_vs_cap["mean_regret_delta"] <= -min_improvement
+        and full_vs_cap["position_win_tie_loss"]["wins"] >= min_position_wins
+        and (
+            full_vs_cap["mean_pairwise_accuracy_delta"] is None
+            or full_vs_cap["mean_pairwise_accuracy_delta"] >= 0.0
+        )
+    )
+    gate_pass = not violations and all(
+        all(
+            bool(value)
+            for key, value in checks.items()
+            if key.endswith("threshold") or key.endswith("band")
+        )
+        for checks in arm_checks.values()
+    )
+    quality_failures = [
+        f"{name}: progressive quality gate failed"
+        for name, checks in arm_checks.items()
+        if not (
+            checks["mean_regret_regression_at_most_threshold"]
+            and checks["pairwise_drop_within_known_a1c_band"]
+        )
+    ]
+    return {
+        "classification": "gate-pass" if gate_pass else "gate-fail",
+        "reasons": [*violations, *quality_failures],
+        "arm_checks": arm_checks,
+        "parameter_decisions": {
+            "d_min": 8 if d8_selected else 4,
+            "d_min_8_selected": d8_selected,
+            "d_min_8_comparison": d8_vs_d4,
+            "deck8_cap": (
+                "requires_cap16_d8_followup"
+                if d8_selected
+                else (70 if full_selected else 16)
+            ),
+            "full_ladder_selected": None if d8_selected else full_selected,
+            "full_ladder_comparison": full_vs_cap,
+            "tie_policy": "D_min=4 and cap=16",
+        },
+        "note": (
+            "G3 rejects broken search and freezes search parameters; it is not "
+            "a whole-game strength or promotion claim."
+        ),
+    }
+
+
 def aggregate_suite(
     position_artifacts: list[dict[str, Any]], resolved: dict[str, Any]
 ) -> dict[str, Any]:
     config = resolved["suite_config"]
+    experiment = _experiment(config)
     arm_names = [row["name"] for row in config["search"]["arms"]]
     by_position: dict[int, dict[str, Any]] = {}
     arm_summaries: dict[str, dict[str, Any]] = {}
@@ -636,6 +828,9 @@ def aggregate_suite(
         rows = all_rows[name]
         pos = position_metrics[name]
         node_rows = [node for row in rows for node in row["a1c_nodes"]]
+        progressive_node_rows = [
+            node for row in rows for node in row.get("progressive_nodes", [])
+        ]
         regrets = [entry["mean_regret"] for entry in pos]
         arm_violations = []
         if any(not row["nn_eval_budget_hit"] for row in rows):
@@ -708,13 +903,45 @@ def aggregate_suite(
                 )
             ),
             "late_and_never_initialized_nodes": node_rows,
+            "mean_progressive_admissions": _mean(
+                rows, "progressive_admission_count"
+            ),
+            "mean_progressive_widenings": _mean(
+                rows, "progressive_widening_count"
+            ),
+            "mean_progressive_reached_chance_nodes": _mean(
+                rows, "progressive_reached_chance_nodes"
+            ),
+            "mean_progressive_active_chance_nodes": _mean(
+                rows, "progressive_active_chance_nodes"
+            ),
+            "mean_progressive_real_observation_subtrees": _mean(
+                rows, "progressive_real_observation_subtrees"
+            ),
+            "progressive_active_widths": [
+                int(node["active_width"]) for node in progressive_node_rows
+            ],
+            "progressive_mature_widths": [
+                int(node["mature_width"]) for node in progressive_node_rows
+            ],
             "violations": arm_violations,
         }
 
     paired: dict[str, dict[str, dict[str, Any]]] = {}
-    for candidate_index, candidate in enumerate(arm_names[2:]):
+    if experiment == "a1c":
+        comparison_plan = {
+            candidate: A1C_CONTROL_NAMES for candidate in arm_names[2:]
+        }
+    else:
+        comparison_plan = {
+            "pilot_sampled_split": ["x0"],
+            "progressive_full_d4": ["x0", "progressive_cap16_d4"],
+            "progressive_full_d8": ["x0", "progressive_full_d4"],
+            "progressive_cap16_d4": ["x0"],
+        }
+    for candidate_index, (candidate, controls) in enumerate(comparison_plan.items()):
         paired[candidate] = {}
-        for control_index, control in enumerate(CONTROL_NAMES):
+        for control_index, control in enumerate(controls):
             position_deltas = []
             for artifact in position_artifacts:
                 candidate_rows = [record["arms"][candidate] for record in artifact["records"]]
@@ -736,7 +963,15 @@ def aggregate_suite(
                 ]
                 mean_delta = statistics.fmean(regret_deltas)
                 initialized = any(
-                    int(row["a1c_initialized_chance_nodes"]) > 0 for row in candidate_rows
+                    int(
+                        row[
+                            "progressive_active_chance_nodes"
+                            if experiment == "g3"
+                            else "a1c_initialized_chance_nodes"
+                        ]
+                    )
+                    > 0
+                    for row in candidate_rows
                 )
                 position_deltas.append(
                     {
@@ -799,9 +1034,18 @@ def aggregate_suite(
                 ),
             }
 
-    classification = classify_result(arm_summaries, paired, violations)
+    classification = (
+        classify_a1c_result(arm_summaries, paired, violations)
+        if experiment == "a1c"
+        else classify_g3_result(
+            arm_summaries,
+            paired,
+            violations,
+            config["classification_rules"],
+        )
+    )
     return {
-        "schema_version": SUMMARY_SCHEMA,
+        "schema_version": _schema_for(config, "summary"),
         "status": "complete",
         "provenance": {
             "suite_config_sha256": resolved["suite_config_sha256"],
@@ -914,7 +1158,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         warmed = True
         exact_order = sorted(exact_values, key=lambda idx: (-exact_values[idx], idx))
         artifact = {
-            "schema_version": POSITION_SCHEMA,
+            "schema_version": _schema_for(config, "position"),
             "position_index": int(oracle["position_index"]),
             "legal_actions": int(oracle["legal_actions"]),
             "provenance": provenance,

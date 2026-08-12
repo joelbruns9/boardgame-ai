@@ -54,6 +54,9 @@ def _arm(
     init_visits: int = 32,
     widening_c: float = 0.25,
     init_max_fraction: float = 0.25,
+    progressive_width_schedule: str = "4,8,16,32,64,70",
+    progressive_d_min: int = 4,
+    progressive_max_width: int = 70,
     leaf_batch: int = 8,
     nn_eval_budget: int = 0,
 ) -> dict[str, Any]:
@@ -90,6 +93,9 @@ def _arm(
         chance_init_visits=int(init_visits),
         chance_widening_c=float(widening_c),
         chance_init_max_fraction=float(init_max_fraction),
+        chance_progressive_width_schedule=str(progressive_width_schedule),
+        chance_progressive_d_min=int(progressive_d_min),
+        chance_progressive_max_width=int(progressive_max_width),
         nn_eval_budget=int(nn_eval_budget),
     )
     chance_diagnostics = {
@@ -102,7 +108,7 @@ def _arm(
             f"rust={rust_nn_evaluations}, python={nn_evaluations}"
         )
     panel_rows = int(chance_diagnostics.get("chance_panel_rows", 0.0))
-    panel_mode = (
+    realized_panel_mode = (
         "disabled"
         if exposure == 0
         else (
@@ -127,7 +133,7 @@ def _arm(
         "sims": int(sims),
         "chance_exposure": int(exposure),
         "chance_enum_max_rows": int(enum_max_rows),
-        "chance_panel_mode": panel_mode,
+        "chance_panel_mode": realized_panel_mode,
         "chance_panel_rows": panel_rows,
         "chance_backup": "disabled" if exposure == 0 else str(backup),
         "chance_traversal": "disabled" if exposure == 0 else str(traversal),
@@ -136,6 +142,9 @@ def _arm(
         "chance_init_visits": int(init_visits),
         "chance_widening_c": float(widening_c),
         "chance_init_max_fraction": float(init_max_fraction),
+        "chance_progressive_width_schedule": str(progressive_width_schedule),
+        "chance_progressive_d_min": int(progressive_d_min),
+        "chance_progressive_max_width": int(progressive_max_width),
         "leaf_batch": int(leaf_batch),
         "nn_eval_budget": int(nn_eval_budget),
         "root_value_running_mean_player0": float(root_value0),

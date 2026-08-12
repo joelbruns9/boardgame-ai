@@ -87,6 +87,31 @@ def a1c_node_diagnostics(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def progressive_node_diagnostics(
+    diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Reconstruct per-node active/mature-width evidence for G3."""
+    prefix = "progressive_node_"
+    suffix = "_active_width"
+    node_ids = sorted(
+        int(key[len(prefix) : -len(suffix)])
+        for key in diagnostics
+        if key.startswith(prefix) and key.endswith(suffix)
+    )
+    return [
+        {
+            "node_id": node_id,
+            "visits": int(diagnostics[f"{prefix}{node_id}_visits"]),
+            "active_width": int(diagnostics[f"{prefix}{node_id}_active_width"]),
+            "mature_width": int(diagnostics[f"{prefix}{node_id}_mature_width"]),
+            "real_observation_subtrees": int(
+                diagnostics[f"{prefix}{node_id}_real_observation_subtrees"]
+            ),
+        }
+        for node_id in node_ids
+    ]
+
+
 def exact_separation(exact_actor_values: dict[int, float]) -> dict[str, Any]:
     order = sorted(exact_actor_values, key=lambda idx: (-exact_actor_values[idx], idx))
     best_value = exact_actor_values[order[0]]
@@ -157,6 +182,7 @@ def score_arm_against_oracle(
     )
     diagnostics = arm.get("chance_diagnostics", {})
     node_diagnostics = a1c_node_diagnostics(diagnostics)
+    progressive_nodes = progressive_node_diagnostics(diagnostics)
     return {
         "selected_action_idx": selected,
         "exact_best_action_idx": best_action,
@@ -239,6 +265,22 @@ def score_arm_against_oracle(
             diagnostics.get("a1c_uninitialized_node_visits", 0)
         ),
         "a1c_nodes": node_diagnostics,
+        "progressive_admission_count": int(
+            diagnostics.get("progressive_admission_count", 0)
+        ),
+        "progressive_widening_count": int(
+            diagnostics.get("progressive_widening_count", 0)
+        ),
+        "progressive_reached_chance_nodes": int(
+            diagnostics.get("progressive_reached_chance_nodes", 0)
+        ),
+        "progressive_active_chance_nodes": int(
+            diagnostics.get("progressive_active_chance_nodes", 0)
+        ),
+        "progressive_real_observation_subtrees": int(
+            diagnostics.get("progressive_real_observation_subtrees", 0)
+        ),
+        "progressive_nodes": progressive_nodes,
         "nn_eval_budget_hit": bool(diagnostics.get("nn_eval_budget_hit", False)),
         "nn_eval_budget_unused": int(diagnostics.get("nn_eval_budget_unused", 0)),
         "simulation_limit_hit": bool(diagnostics.get("simulation_limit_hit", False)),
@@ -338,6 +380,21 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_a1c_uninitialized_node_visits": statistics.fmean(
             float(row["a1c_uninitialized_node_visits"]) for row in rows
         ),
+        "mean_progressive_admissions": statistics.fmean(
+            float(row["progressive_admission_count"]) for row in rows
+        ),
+        "mean_progressive_widenings": statistics.fmean(
+            float(row["progressive_widening_count"]) for row in rows
+        ),
+        "mean_progressive_reached_chance_nodes": statistics.fmean(
+            float(row["progressive_reached_chance_nodes"]) for row in rows
+        ),
+        "mean_progressive_active_chance_nodes": statistics.fmean(
+            float(row["progressive_active_chance_nodes"]) for row in rows
+        ),
+        "mean_progressive_real_observation_subtrees": statistics.fmean(
+            float(row["progressive_real_observation_subtrees"]) for row in rows
+        ),
         "searches_with_uninitialized_chance_nodes": sum(
             int(row["a1c_uninitialized_chance_nodes"] > 0) for row in rows
         ),
@@ -432,8 +489,13 @@ def compare_boundary(
     warm: bool = True,
 ) -> dict[str, Any]:
     """Run and score one boundary with a caller-owned loaded evaluator."""
-    if any(spec.get("panel_mode") == "a1c" for spec in specs.values()) and nn_eval_budget <= 0:
-        raise ValueError("A1c comparisons require a positive NN evaluation budget")
+    if any(
+        spec.get("panel_mode") in {"a1c", "progressive"}
+        for spec in specs.values()
+    ) and nn_eval_budget <= 0:
+        raise ValueError(
+            "A1c/progressive comparisons require a positive NN evaluation budget"
+        )
     if warm:
         # Warm the evaluator outside measured arms.
         _arm(
@@ -467,9 +529,16 @@ def compare_boundary(
                 traversal=str(spec["traversal"]),
                 panel_mode=str(spec["panel_mode"]),
                 panel_sampling=str(spec["panel_sampling"]),
-                init_visits=int(a1c_init_visits),
-                widening_c=float(a1c_widening_c),
-                init_max_fraction=float(a1c_init_max_fraction),
+                init_visits=int(spec.get("init_visits", a1c_init_visits)),
+                widening_c=float(spec.get("widening_c", a1c_widening_c)),
+                init_max_fraction=float(
+                    spec.get("init_max_fraction", a1c_init_max_fraction)
+                ),
+                progressive_width_schedule=str(
+                    spec.get("progressive_width_schedule", "4,8,16,32,64,70")
+                ),
+                progressive_d_min=int(spec.get("progressive_d_min", 4)),
+                progressive_max_width=int(spec.get("progressive_max_width", 70)),
                 leaf_batch=int(spec["leaf_batch"]),
                 nn_eval_budget=int(nn_eval_budget),
             )

@@ -1,0 +1,99 @@
+{
+  "schema_version": "kd-deck8-oracle-progressive-g3-config-v1",
+  "checkpoint_path": "runs/kingdomino/best_checkpoint/current_best.pt",
+  "positions_path": "runs/kingdomino/denial_search/signal_positions.jsonl",
+  "oracles": [
+    {
+      "position_index": 5,
+      "legal_actions": 12,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_05_x0/summary.json",
+      "expected_oracle_id": "8148d8357818f13c2adfad9b940d5192cef9e01af0a67bca301f1ae836877907",
+      "expected_sha256": "3e3b525a61f18a69a8541bd3967bf450f2d268cdf01c7e546f09ee6bb9782cce"
+    },
+    {
+      "position_index": 11,
+      "legal_actions": 7,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_pos11_x0_line/summary.json",
+      "expected_oracle_id": "2b2d761f91c7da74077a604e90d55214beaf3cbda3b88aef1f6926e41f6f9d1d",
+      "expected_sha256": "ee230d13cd94c1078c42ad894ea82d62252777073990c3d57d698ac714ad8f8b"
+    },
+    {
+      "position_index": 17,
+      "legal_actions": 9,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_17_x0/summary.json",
+      "expected_oracle_id": "eebc143be64141a29a8f16995170dcd93788e8886d68f57d2e6639815149811c",
+      "expected_sha256": "cd71b8967d094527cfdbee2f646fb8bd72b0c836e43102e015cecab77f74a55c"
+    },
+    {
+      "position_index": 23,
+      "legal_actions": 15,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_23_x0/summary.json",
+      "expected_oracle_id": "5048e6c61f801a01c18c6b305567325eefb9ceb8ad5350f2f2a6146b925431db",
+      "expected_sha256": "48e0eb43b901d45e9e63c009417f0b337e656ca26ae4c0de46f2bfb8f416588a"
+    },
+    {
+      "position_index": 29,
+      "legal_actions": 7,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_29_x0/summary.json",
+      "expected_oracle_id": "fd33612f33951deee12b89908a76dd85f1a5546dc5e6b3f25ebe01813f27ebf4",
+      "expected_sha256": "72a027712126418af699f39cbc00ede5b38c8cfc874a9e9a005aa64b2c736e00"
+    },
+    {
+      "position_index": 35,
+      "legal_actions": 2,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_35_x0/summary.json",
+      "expected_oracle_id": "c7161c36f91df97d0fe3e4ceb77ee7b8f1e900940ee2fb2eb234e2de3bb9cd0b",
+      "expected_sha256": "e35b09e615a448c3c57e9423f70606ea94dee8efe683aad4a7e71c067479ba1e"
+    },
+    {
+      "position_index": 41,
+      "legal_actions": 9,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_41_x0/summary.json",
+      "expected_oracle_id": "08a8db864b9084e9ac3188945c0f61f0a8620b9f42e3c6654a6001499c7e84f9",
+      "expected_sha256": "38bbf7ab1e2e7e35a6fd3e2dd95fc4ccbcdccd572506d3a7f6874f4254fb5348"
+    },
+    {
+      "position_index": 47,
+      "legal_actions": 7,
+      "summary_path": "runs/kingdomino/chance_correct_a1/deck8_oracle_calibration/position_47_x0/summary.json",
+      "expected_oracle_id": "ae81e5cb79504b9b22dc4038f5cb20be372e1106e8cfa1a451e0861517aee0c2",
+      "expected_sha256": "2fd860b0249ef94e5ea7bcb487339373b73ee541d671967f552ba78b0ee48a7a"
+    }
+  ],
+  "search": {
+    "nn_eval_budget": 4801,
+    "simulation_ceiling": 9600,
+    "repeat_count": 8,
+    "fpu": -0.2,
+    "cpuct": 1.5,
+    "device": "cuda",
+    "chance_init_visits": 2,
+    "chance_widening_c": 0.25,
+    "chance_init_max_fraction": 0.25,
+    "arms": [
+      {"name": "x0", "exposure": 0, "backup": "hajek", "traversal": "balanced", "panel_mode": "lazy", "panel_sampling": "balanced", "enum_max_rows": 70, "leaf_batch": 8},
+      {"name": "pilot_sampled_split", "exposure": 1, "backup": "sampled", "traversal": "balanced", "panel_mode": "lazy", "panel_sampling": "balanced", "enum_max_rows": 70, "leaf_batch": 8},
+      {"name": "progressive_full_d4", "exposure": 1, "backup": "sampled", "traversal": "progressive", "panel_mode": "progressive", "panel_sampling": "balanced", "enum_max_rows": 70, "leaf_batch": 8, "init_visits": 2, "init_max_fraction": 0.25, "progressive_width_schedule": "4,8,16,32,64,70", "progressive_d_min": 4, "progressive_max_width": 70},
+      {"name": "progressive_full_d8", "exposure": 1, "backup": "sampled", "traversal": "progressive", "panel_mode": "progressive", "panel_sampling": "balanced", "enum_max_rows": 70, "leaf_batch": 8, "init_visits": 2, "init_max_fraction": 0.25, "progressive_width_schedule": "4,8,16,32,64,70", "progressive_d_min": 8, "progressive_max_width": 70},
+      {"name": "progressive_cap16_d4", "exposure": 1, "backup": "sampled", "traversal": "progressive", "panel_mode": "progressive", "panel_sampling": "balanced", "enum_max_rows": 70, "leaf_batch": 8, "init_visits": 2, "init_max_fraction": 0.25, "progressive_width_schedule": "4,8,16,32,64,70", "progressive_d_min": 4, "progressive_max_width": 16}
+    ]
+  },
+  "seeding": {
+    "base_seed": 2026085000,
+    "derivation": "base_seed + 100 * position_ordinal + repeat",
+    "arm_order_rotation": "(position_ordinal * repeat_count + repeat) mod arm_count"
+  },
+  "bootstrap": {"seed": 20260811, "resamples": 20000, "confidence": 0.95},
+  "selection_reason": "The same sealed eight exact deck-8 boundaries used by the A1c screen; this is a biased calibration screen that gates search correctness and freezes progressive parameters, not an unbiased whole-game strength or promotion sample.",
+  "classification_rules": {
+    "max_regret_regression": 0.001,
+    "max_pairwise_drop": 0.016,
+    "selection_min_regret_improvement": 0.001,
+    "selection_min_position_wins": 3,
+    "dmin_max_pairwise_drop": 0.01,
+    "mechanism_active": "Every progressive search must commit an admission, commit a widening, and give real visits to distinct observation subtrees; artifact validation fails closed otherwise.",
+    "quality_gate": "Each progressive arm must have mean regret delta versus x0 <= +0.001 and exact-pairwise accuracy delta >= -0.016.",
+    "dmin_selection": "D_min=8 ships only if it improves mean regret by at least 0.001 versus D_min=4, wins at least 3/8 positions, and loses at most 0.01 pairwise accuracy; otherwise D_min=4 ships.",
+    "width_selection": "At D_min=4, full width ships only if it improves mean regret by at least 0.001 versus cap16, wins at least 3/8 positions, and has no pairwise loss; otherwise cap16 ships. If D_min=8 wins, cap16/D_min=8 is required before deciding width."
+  }
+}

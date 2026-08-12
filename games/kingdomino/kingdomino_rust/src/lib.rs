@@ -4982,6 +4982,15 @@ struct A1cSearchOptions {
     max_initialization_fraction: f64,
 }
 
+#[derive(Clone)]
+struct ProgressiveAdvisorOptions {
+    widths: Vec<usize>,
+    n_init: usize,
+    d_min: usize,
+    max_width: usize,
+    max_initialization_fraction: f64,
+}
+
 /// Diagnostic-only intervention at the first selected action which triggers a
 /// reveal.  `Pulse` clamps that action afterstate's Q in the root actor's frame
 /// without adding inference work.  `FullPanel` admits one exhaustive deck=8
@@ -5160,8 +5169,9 @@ fn ol_parse_chance_traversal(value: &str) -> PyResult<OLChanceTraversal> {
     match value {
         "iid" => Ok(OLChanceTraversal::Iid),
         "balanced" => Ok(OLChanceTraversal::Balanced),
+        "progressive" => Ok(OLChanceTraversal::Progressive),
         _ => Err(PyValueError::new_err(format!(
-            "chance_traversal must be 'iid' or 'balanced', got {value:?}"
+            "chance_traversal must be 'iid', 'balanced', or 'progressive', got {value:?}"
         ))),
     }
 }
@@ -6140,6 +6150,120 @@ fn progressive_mature_width(node: &OLNode) -> usize {
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn advisor_progressive_admit_width(
+    arena: &mut Vec<OLNode>,
+    request: &A1cAdmissionRequest,
+    ev: &Py<PyAny>,
+    max_initialization_fraction: f64,
+    nn_eval_budget: Option<usize>,
+    initialization_nn_evals: &mut usize,
+    total_nn_evals: &mut usize,
+    initialization_blocked: &mut usize,
+    nn_budget_blocked: &mut usize,
+    nn_budget_blocked_rows: &mut usize,
+    evaluator_calls: &mut usize,
+    max_batch_size: &mut usize,
+    initialization_evaluator_calls: &mut usize,
+    initialization_max_batch_size: &mut usize,
+) -> PyResult<bool> {
+    let chance_node_id = request.chance_node_id;
+    let target_width = request.progressive_target_width;
+    if target_width == 0 || arena[chance_node_id as usize].chance_active_width >= target_width {
+        return Ok(false);
+    }
+    let missing = progressive_missing_outcome_indices(arena, chance_node_id, target_width);
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    if nn_eval_budget.is_some_and(|budget| total_nn_evals.saturating_add(missing.len()) > budget) {
+        *nn_budget_blocked += 1;
+        *nn_budget_blocked_rows += missing.len();
+        return Ok(false);
+    }
+    let within_initialization_guard = if let Some(budget) = nn_eval_budget {
+        initialization_nn_evals.saturating_add(missing.len())
+            <= (budget as f64 * max_initialization_fraction).floor() as usize
+    } else {
+        a1c_initialization_within_budget(
+            *initialization_nn_evals,
+            *total_nn_evals,
+            missing.len(),
+            max_initialization_fraction,
+        )
+    };
+    if !within_initialization_guard {
+        *initialization_blocked += 1;
+        return Ok(false);
+    }
+
+    let mut requests = Vec::with_capacity(missing.len());
+    for &outcome_index in &missing {
+        let row = arena[chance_node_id as usize].chance_children[outcome_index].row;
+        let row_seed = request.draw_seed
+            ^ row.iter().fold(0xD8C8_C1E0_0000_0001u64, |hash, &tile| {
+                hash.rotate_left(11) ^ tile as u64
+            });
+        let forced = redeterminize_with_first_row(&request.pre_reveal_state, &row, row_seed)?;
+        let revealed = forced.step(request.placement, request.pick)?;
+        let actor = revealed.actor()?;
+        let legal = revealed.legal_actions_indexed();
+        let (my, opp, flat) = revealed.encode_arrays(actor)?;
+        requests.push(A1cBootstrapRequest {
+            row,
+            state: revealed,
+            actor,
+            legal,
+            my,
+            opp,
+            flat,
+        });
+    }
+    let evaluated = a1c_evaluate_bootstraps(ev, &requests)?;
+    if evaluated.len() != requests.len() {
+        return Err(PyValueError::new_err(
+            "progressive advisor admission returned a partial bootstrap group",
+        ));
+    }
+
+    // Validate the exact request-time missing prefix again before the first
+    // store. This mirrors production's atomic gather/scatter contract.
+    if progressive_missing_outcome_indices(arena, chance_node_id, target_width) != missing {
+        return Err(PyValueError::new_err(
+            "progressive advisor admission prefix changed before commit",
+        ));
+    }
+    for (request_row, (value0, priors)) in requests.iter().zip(evaluated) {
+        let (observation_id, _) = ol_route_chance_observation(
+            arena,
+            chance_node_id,
+            &request_row.state,
+            request_row.actor,
+        )?;
+        if !arena[observation_id as usize].is_expanded {
+            for (i, &(idx, placement, pick)) in request_row.legal.iter().enumerate() {
+                let child_id = arena.len() as u32;
+                arena.push(OLNode::new(priors[i], (placement, pick)));
+                arena[observation_id as usize]
+                    .children
+                    .push((idx, child_id));
+            }
+            arena[observation_id as usize].is_expanded = true;
+        } else {
+            ol_add_missing_children(arena, observation_id, &request_row.legal, &priors);
+        }
+        arena[observation_id as usize].bootstrap_value0 = Some(value0);
+    }
+    progressive_publish_width(arena, chance_node_id, target_width);
+    *initialization_nn_evals += missing.len();
+    *total_nn_evals += missing.len();
+    *evaluator_calls += 1;
+    *max_batch_size = (*max_batch_size).max(missing.len());
+    *initialization_evaluator_calls += 1;
+    *initialization_max_batch_size = (*initialization_max_batch_size).max(missing.len());
+    Ok(true)
+}
+
 struct A1cBootstrapRequest {
     row: [u16; 4],
     state: RustGameState,
@@ -7087,6 +7211,7 @@ fn advisor_open_loop_search_impl(
     chance_backup: OLChanceBackup,
     chance_traversal: OLChanceTraversal,
     a1c_options: Option<A1cSearchOptions>,
+    progressive_options: Option<ProgressiveAdvisorOptions>,
     nn_eval_budget: Option<usize>,
     leverage_probe: Option<ChanceLeverageProbeMode>,
 ) -> PyResult<AdvisorOpenLoopOutput> {
@@ -7109,13 +7234,13 @@ fn advisor_open_loop_search_impl(
     let one_reveal_panel = if a1c_options.is_none() {
         ol_one_reveal_panel(
             &root_state.deck,
-            if explicit_split_probe {
+            if explicit_split_probe || progressive_options.is_some() {
                 1
             } else {
                 chance_exposure
             },
-            if explicit_split_probe {
-                70
+            if explicit_split_probe || progressive_options.is_some() {
+                comb4(root_state.deck.len())
             } else {
                 chance_enum_max_rows
             },
@@ -7161,6 +7286,10 @@ fn advisor_open_loop_search_impl(
     let mut a1c_admission_unique_nodes = 0usize;
     let mut a1c_admission_committed_cycles = 0usize;
     let mut a1c_admission_waves = 0usize;
+    let mut progressive_admission_count = 0usize;
+    let mut progressive_widening_count = 0usize;
+    let mut progressive_requested_paths = 0usize;
+    let mut progressive_unique_nodes = 0usize;
     arena[0].visit_count = 1;
     arena[0].value_sum = root_v0;
     if dirichlet_eps > 0.0 {
@@ -7270,7 +7399,14 @@ fn advisor_open_loop_search_impl(
                         max_initialization_fraction: options.max_initialization_fraction,
                         force_re_evaluate_existing: false,
                     }),
-                    progressive: None,
+                    progressive: progressive_options.as_ref().map(|options| {
+                        ProgressiveChanceConfig {
+                            widths: options.widths.as_slice(),
+                            n_init: options.n_init,
+                            d_min: options.d_min,
+                            max_width: options.max_width,
+                        }
+                    }),
                     bootstrap_full_panel: full_panel_probe,
                 })
             };
@@ -7409,6 +7545,50 @@ fn advisor_open_loop_search_impl(
         // their concrete state's terminal value — deck-dependent by design).
         for (pi, path) in paths.iter().enumerate() {
             ol_apply_virtual_loss(&mut arena, path, &path_actors[pi], -1, vl);
+        }
+
+        // Match the production update boundary. A progressive transition is
+        // atomic and becomes visible to this triggering wave only after every
+        // virtual loss has been removed, but before any path is backed up.
+        if let Some(options) = progressive_options.as_ref() {
+            progressive_requested_paths += a1c_admission_requests.len();
+            a1c_admission_requests.sort_by_key(|request| request.chance_node_id);
+            a1c_admission_requests.dedup_by_key(|request| request.chance_node_id);
+            progressive_unique_nodes += a1c_admission_requests.len();
+            a1c_admission_requests.sort_by(|left, right| {
+                let left_visits = arena[left.chance_node_id as usize].visit_count.max(0);
+                let right_visits = arena[right.chance_node_id as usize].visit_count.max(0);
+                right_visits.cmp(&left_visits).then_with(|| {
+                    a1c_admission_tiebreak(seed, search_waves, left.chance_node_id).cmp(
+                        &a1c_admission_tiebreak(seed, search_waves, right.chance_node_id),
+                    )
+                })
+            });
+            for request in &a1c_admission_requests {
+                let prior_width = arena[request.chance_node_id as usize].chance_active_width;
+                if advisor_progressive_admit_width(
+                    &mut arena,
+                    request,
+                    ev,
+                    options.max_initialization_fraction,
+                    nn_eval_budget,
+                    &mut initialization_nn_evals,
+                    &mut total_nn_evals,
+                    &mut initialization_blocked_cycles,
+                    &mut initialization_nn_budget_blocked_cycles,
+                    &mut initialization_nn_budget_blocked_rows,
+                    &mut nn_evaluator_calls,
+                    &mut nn_max_batch_size,
+                    &mut initialization_evaluator_calls,
+                    &mut initialization_max_batch_size,
+                )? {
+                    if prior_width == 0 {
+                        progressive_admission_count += 1;
+                    } else {
+                        progressive_widening_count += 1;
+                    }
+                }
+            }
         }
         for (pi, path) in paths.iter().enumerate() {
             let v0 = if leaf_states[pi].phase == GAME_OVER {
@@ -7598,6 +7778,20 @@ fn advisor_open_loop_search_impl(
         .copied()
         .filter(|(_, node)| node.chance_initialized_cycles > 0)
         .collect();
+    let progressive_reached_nodes: Vec<(usize, &OLNode)> = if progressive_options.is_some() {
+        arena
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.chance_progressive && node.visit_count > 0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let progressive_active_nodes: Vec<(usize, &OLNode)> = progressive_reached_nodes
+        .iter()
+        .copied()
+        .filter(|(_, node)| node.chance_active_width > 0)
+        .collect();
     let a1c_initialized_chance_nodes = a1c_initialized_nodes.len();
     let a1c_preinit_visits = a1c_initialized_nodes
         .iter()
@@ -7631,6 +7825,50 @@ fn advisor_open_loop_search_impl(
     diagnostics.insert(
         "a1c_enabled".to_string(),
         if a1c_options.is_some() { 1.0 } else { 0.0 },
+    );
+    diagnostics.insert(
+        "progressive_enabled".to_string(),
+        if progressive_options.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    diagnostics.insert(
+        "progressive_admission_count".to_string(),
+        progressive_admission_count as f64,
+    );
+    diagnostics.insert(
+        "progressive_widening_count".to_string(),
+        progressive_widening_count as f64,
+    );
+    diagnostics.insert(
+        "progressive_admission_requested_paths".to_string(),
+        progressive_requested_paths as f64,
+    );
+    diagnostics.insert(
+        "progressive_admission_unique_nodes".to_string(),
+        progressive_unique_nodes as f64,
+    );
+    diagnostics.insert(
+        "progressive_reached_chance_nodes".to_string(),
+        progressive_reached_nodes.len() as f64,
+    );
+    diagnostics.insert(
+        "progressive_active_chance_nodes".to_string(),
+        progressive_active_nodes.len() as f64,
+    );
+    diagnostics.insert(
+        "progressive_real_observation_subtrees".to_string(),
+        progressive_reached_nodes
+            .iter()
+            .map(|(_, node)| {
+                node.chance_children
+                    .iter()
+                    .filter(|outcome| outcome.real_visits > 0)
+                    .count()
+            })
+            .sum::<usize>() as f64,
     );
     diagnostics.insert("a1c_max_cycles".to_string(), a1c_cycles.len() as f64);
     diagnostics.insert(
@@ -7785,6 +8023,27 @@ fn advisor_open_loop_search_impl(
         diagnostics.insert(
             format!("a1c_node_{node_id}_initialized_cycles"),
             node.chance_initialized_cycles as f64,
+        );
+    }
+    for (node_id, node) in &progressive_reached_nodes {
+        diagnostics.insert(
+            format!("progressive_node_{node_id}_visits"),
+            node.visit_count.max(0) as f64,
+        );
+        diagnostics.insert(
+            format!("progressive_node_{node_id}_active_width"),
+            node.chance_active_width as f64,
+        );
+        diagnostics.insert(
+            format!("progressive_node_{node_id}_mature_width"),
+            progressive_mature_width(node) as f64,
+        );
+        diagnostics.insert(
+            format!("progressive_node_{node_id}_real_observation_subtrees"),
+            node.chance_children
+                .iter()
+                .filter(|outcome| outcome.real_visits > 0)
+                .count() as f64,
         );
     }
     diagnostics.insert(
@@ -15372,6 +15631,7 @@ mod kingdomino_rust {
                 None,
                 None,
                 None,
+                None,
             )
         })?;
         Ok((output.children, output.root_value0))
@@ -15388,7 +15648,10 @@ mod kingdomino_rust {
                         chance_traversal="iid", chance_panel_mode="lazy",
                          chance_panel_sampling="balanced", chance_init_visits=32,
                          chance_widening_c=0.25,
-                         chance_init_max_fraction=0.25, nn_eval_budget=0))]
+                         chance_init_max_fraction=0.25, nn_eval_budget=0,
+                         chance_progressive_width_schedule="4,8,16,32,64,70",
+                         chance_progressive_d_min=4,
+                         chance_progressive_max_width=70))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_one_reveal_search<'py>(
         py: Python<'py>,
@@ -15413,6 +15676,9 @@ mod kingdomino_rust {
         chance_widening_c: f64,
         chance_init_max_fraction: f64,
         nn_eval_budget: usize,
+        chance_progressive_width_schedule: &str,
+        chance_progressive_d_min: usize,
+        chance_progressive_max_width: usize,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64, HashMap<String, f64>)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -15424,6 +15690,7 @@ mod kingdomino_rust {
         }
         let chance_backup = super::ol_parse_chance_backup(chance_backup)?;
         let chance_traversal = super::ol_parse_chance_traversal(chance_traversal)?;
+        let mut progressive_options = None;
         let a1c_options = match chance_panel_mode {
             "lazy" => None,
             "a1c" => {
@@ -15452,9 +15719,54 @@ mod kingdomino_rust {
                     max_initialization_fraction: chance_init_max_fraction,
                 })
             }
+            "progressive" => {
+                if chance_exposure == 0 {
+                    return Err(PyValueError::new_err(
+                        "progressive panel mode requires chance_exposure > 0",
+                    ));
+                }
+                if chance_traversal != super::OLChanceTraversal::Progressive {
+                    return Err(PyValueError::new_err(
+                        "progressive panel mode requires chance_traversal='progressive'",
+                    ));
+                }
+                if chance_init_visits == 0 || chance_progressive_d_min == 0 {
+                    return Err(PyValueError::new_err(
+                        "progressive n_init and d_min must both be greater than zero",
+                    ));
+                }
+                if !(chance_init_max_fraction > 0.0
+                    && chance_init_max_fraction <= 1.0
+                    && chance_init_max_fraction.is_finite())
+                {
+                    return Err(PyValueError::new_err(
+                        "chance_init_max_fraction must be finite and in (0, 1]",
+                    ));
+                }
+                let widths =
+                    super::parse_progressive_width_schedule(chance_progressive_width_schedule)
+                        .map_err(PyValueError::new_err)?;
+                let support_width = super::comb4(state.deck.len()) as usize;
+                if chance_progressive_max_width < widths[0]
+                    || chance_progressive_max_width > support_width
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "progressive max width must be between W0={} and support={}, got {}",
+                        widths[0], support_width, chance_progressive_max_width,
+                    )));
+                }
+                progressive_options = Some(super::ProgressiveAdvisorOptions {
+                    widths,
+                    n_init: chance_init_visits,
+                    d_min: chance_progressive_d_min,
+                    max_width: chance_progressive_max_width,
+                    max_initialization_fraction: chance_init_max_fraction,
+                });
+                None
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "chance_panel_mode must be 'lazy' or 'a1c', got {chance_panel_mode:?}"
+                    "chance_panel_mode must be 'lazy', 'a1c', or 'progressive', got {chance_panel_mode:?}"
                 )));
             }
         };
@@ -15481,6 +15793,7 @@ mod kingdomino_rust {
                 chance_backup,
                 chance_traversal,
                 a1c_options,
+                progressive_options,
                 (nn_eval_budget > 0).then_some(nn_eval_budget),
                 None,
             )
@@ -15574,6 +15887,7 @@ mod kingdomino_rust {
                 70,
                 super::OLChanceBackup::Sampled,
                 super::OLChanceTraversal::Balanced,
+                None,
                 None,
                 None,
                 leverage_probe,
