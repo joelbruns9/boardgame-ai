@@ -70,13 +70,14 @@ mkdir -p runs/kingdomino/chance_progressive_cloud_v1/calibration
   --channels 80 --primary_channels 80 --blocks 6 \
   --sims 200 --selfplay_games 12
 
-# These values are placeholders for syntax/provenance validation only. Replace
-# them with the calibration recommendation when launching G4.
+# This batch size is a placeholder for syntax/provenance validation only.
+# Replace it with the batch-slot sweep winner when launching G4. game_cpus is
+# frozen at 2 so the remaining logical CPUs serve the Rayon exact-solver pool.
 for phase in g4 phase_a phase_b; do
   "$PY" -m games.kingdomino.chance_progressive_cloud run \
     --phase "$phase" \
     --run-root runs/kingdomino/chance_progressive_cloud_v1 \
-    --batch-slots 96 --game-cpus 12
+    --batch-slots 96
 done
 stage_done 4
 

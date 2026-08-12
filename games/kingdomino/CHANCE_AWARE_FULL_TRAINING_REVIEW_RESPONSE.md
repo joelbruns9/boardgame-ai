@@ -564,8 +564,9 @@ is structurally excluded because the candidate rule is fixed before launch.
   then verified against SHA-256 `4bf07b0c…f04b3`; no Elo-anchor syncing
   needed (the rolling gate and final confirmation replace scheduled Elo);
   `--warm_buffer` used only at the Phase A→B continuation.
-- **First paid hour (G4):** setup script, GPU gate, quick `batch_slots` /
-  `game_cpus` calibration, then a 20–40 game end-to-end probe **with the real
+- **First paid hour (G4):** setup script, GPU gate, quick `batch_slots`
+  calibration with `game_cpus=2` frozen (leaving the remaining logical CPUs
+  for Rayon/async exact solving), then a 20–40 game end-to-end probe **with the real
   chance search and exact solver at Phase-B settings**. Decision rule:
   ≥0.30 games/s → proceed (32 iterations ≈ 16–20 h including gates);
   0.20–0.30 → proceed with the owner's several-day envelope acknowledged;

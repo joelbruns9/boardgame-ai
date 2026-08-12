@@ -64,12 +64,13 @@ hash, runs the existing bootstrap calibration, and prints launch commands. It
 does not start training.
 
 Inspect the calibration output under
-`runs/kingdomino/chance_progressive_cloud_v1/calibration`. Choose the best
-measured `batch_slots` and `game_cpus`; do not inherit the dry-run placeholders.
+`runs/kingdomino/chance_progressive_cloud_v1/calibration` and choose the best
+measured `batch_slots`; do not inherit the dry-run placeholder. `game_cpus` is
+frozen at 2: game driving stays light while all remaining logical CPUs are
+assigned to the Rayon/async exact-solver pool.
 
 ```bash
 export BATCH_SLOTS=<calibrated-value>
-export GAME_CPUS=<calibrated-value>
 export RUN_ROOT=runs/kingdomino/chance_progressive_cloud_v1
 ```
 

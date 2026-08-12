@@ -64,6 +64,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
         "sims": 4800,
         "fast_move_sims": 200,
         "full_search_fraction": 0.25,
+        "game_cpus": 2,
         "chance_replay_weight": 1.0,
     }.items():
         if common.get(key) != expected:
@@ -95,14 +96,14 @@ def _path(repo_root: Path, value: str | Path) -> Path:
 
 
 def _common_args(cfg: dict[str, Any], *, python: str, checkpoint_dir: Path,
-                 batch_slots: int, game_cpus: int) -> list[str]:
+                 batch_slots: int) -> list[str]:
     c = cfg["common"]
     return [
         python, "-m", "games.kingdomino.self_play",
         "--engine", "batched_open_loop",
         "--device", "cuda",
         "--async_solve",
-        "--game_cpus", str(game_cpus),
+        "--game_cpus", str(c["game_cpus"]),
         "--sims", str(c["sims"]),
         "--playout_cap_randomization",
         "--full_search_fraction", str(c["full_search_fraction"]),
@@ -161,8 +162,8 @@ def phase_paths(run_root: Path) -> dict[str, Path]:
 
 
 def build_command(cfg: dict[str, Any], phase: str, *, repo_root: Path,
-                  run_root: Path, python: str, batch_slots: int,
-                  game_cpus: int) -> list[str]:
+                  run_root: Path, python: str,
+                  batch_slots: int) -> list[str]:
     if phase not in PHASE_NAMES:
         raise ValueError(f"unknown phase {phase!r}")
     paths = phase_paths(run_root)
@@ -170,7 +171,7 @@ def build_command(cfg: dict[str, Any], phase: str, *, repo_root: Path,
     base_checkpoint = _path(repo_root, cfg["base_checkpoint"]["path"])
     args = _common_args(
         cfg, python=python, checkpoint_dir=out,
-        batch_slots=batch_slots, game_cpus=game_cpus,
+        batch_slots=batch_slots,
     )
     section = cfg[phase]
     common = cfg["common"]
@@ -307,11 +308,11 @@ def _write_launch_manifest(path: Path, *, cfg_path: Path, cfg: dict[str, Any],
 
 def execute_phase(cfg_path: Path, cfg: dict[str, Any], phase: str, *,
                   repo_root: Path, run_root: Path, python: str,
-                  batch_slots: int, game_cpus: int,
+                  batch_slots: int,
                   expected_commit: str | None, execute: bool) -> int:
     command = build_command(
         cfg, phase, repo_root=repo_root, run_root=run_root, python=python,
-        batch_slots=batch_slots, game_cpus=game_cpus,
+        batch_slots=batch_slots,
     )
     print(shlex.join(command))
     if not execute:
@@ -352,6 +353,8 @@ def validate_phase(cfg: dict[str, Any], phase: str, run_root: Path) -> dict[str,
     if not rows:
         errors.append("training log contains no rows")
     for row in rows:
+        if int(row.get("game_cpus") or 0) != 2:
+            errors.append(f"iteration {row.get('iter')}: game_cpus drifted from 2")
         if phase == "phase_a":
             if (row.get("chance_progressive_decks")
                     or row.get("sampled_chance_split_decks")
@@ -448,7 +451,6 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--run-root", type=Path, required=True)
     run.add_argument("--python", default=sys.executable)
     run.add_argument("--batch-slots", type=int, required=True)
-    run.add_argument("--game-cpus", type=int, required=True)
     run.add_argument("--expected-commit")
     run.add_argument("--execute", action="store_true")
     check = sub.add_parser("validate")
@@ -463,12 +465,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     run_root = _path(REPO_ROOT, args.run_root).resolve()
     if args.command == "run":
-        if args.batch_slots <= 0 or args.game_cpus <= 0:
-            raise ValueError("batch-slots and game-cpus must be positive")
+        if args.batch_slots <= 0:
+            raise ValueError("batch-slots must be positive")
         return execute_phase(
             cfg_path, cfg, args.phase, repo_root=REPO_ROOT,
             run_root=run_root, python=args.python,
-            batch_slots=args.batch_slots, game_cpus=args.game_cpus,
+            batch_slots=args.batch_slots,
             expected_commit=args.expected_commit, execute=args.execute,
         )
     result = validate_phase(cfg, args.phase, run_root)

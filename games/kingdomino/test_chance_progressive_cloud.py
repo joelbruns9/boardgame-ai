@@ -24,7 +24,6 @@ def test_frozen_phase_commands_preserve_treatment_boundary(tmp_path: Path) -> No
         run_root=run_root,
         python="python",
         batch_slots=96,
-        game_cpus=12,
     )
 
     phase_a = build_command(cfg, "phase_a", **common)
@@ -41,6 +40,7 @@ def test_frozen_phase_commands_preserve_treatment_boundary(tmp_path: Path) -> No
     assert _option(phase_b, "--chance_deck8_width_cap") == "16"
     assert _option(phase_b, "--chance_deck12_width_cap") == "16"
     assert _option(phase_b, "--chance_split_oversample") == "1.0"
+    assert _option(phase_b, "--game_cpus") == "2"
     assert _option(phase_b, "--selfplay_generator_mode") == "soft_gate"
     assert _option(phase_b, "--promotion_min_win_rate") == "0.55"
     assert _option(phase_b, "--soft_gate_stop_after_reverts") == "2"
@@ -59,6 +59,7 @@ def test_g4_validator_requires_mechanism_and_classifies_speed(tmp_path: Path) ->
     g4.mkdir(parents=True)
     row = {
         "iter": 1,
+        "game_cpus": 2,
         "games_per_sec": 0.31,
         "chance_progressive_decks": [8, 12],
         "chance_progressive_config": {
@@ -103,6 +104,7 @@ def test_phase_a_validator_accepts_preregistered_ucb_stop(tmp_path: Path) -> Non
     for iteration in range(1, 6):
         rows.append({
             "iter": iteration,
+            "game_cpus": 2,
             "chance_progressive_decks": [],
             "generator_mode": "current_best",
             "measurement_stop_requested": iteration == 5,

@@ -17,6 +17,7 @@
     "blocks": 6,
     "bilinear_dim": 64,
     "leaf_batch": 6,
+    "game_cpus": 2,
     "virtual_loss": 1,
     "batch_size": 256,
     "learning_rate": 0.0001,
