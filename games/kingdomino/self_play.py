@@ -136,6 +136,53 @@ def _sampled_chance_split_deck_mask(text: str) -> int:
     return sum(1 << deck for deck in _parse_sampled_chance_split_decks(text))
 
 
+def _parse_chance_progressive_widths(text: str) -> Tuple[int, ...]:
+    """Parse a strictly increasing progressive active-width schedule."""
+    try:
+        widths = tuple(int(part.strip()) for part in str(text).split(",")
+                       if part.strip())
+    except ValueError as exc:
+        raise ValueError(
+            "chance_width_schedule must be a comma-separated list of integers"
+        ) from exc
+    if not widths or any(width <= 0 for width in widths):
+        raise ValueError("chance_width_schedule must contain positive widths")
+    if any(right <= left for left, right in zip(widths, widths[1:])):
+        raise ValueError("chance_width_schedule must be strictly increasing")
+    return widths
+
+
+def _chance_progressive_deck_mask(text: str) -> int:
+    return sum(1 << deck for deck in _parse_sampled_chance_split_decks(text))
+
+
+def _validate_chance_search_config(cfg: "SelfPlayConfig") -> None:
+    sampled = _parse_sampled_chance_split_decks(cfg.sampled_chance_split_decks)
+    progressive = _parse_sampled_chance_split_decks(cfg.chance_progressive_decks)
+    active_modes = int(bool(cfg.deck8_chance_enumeration)) + int(bool(sampled)) + int(bool(progressive))
+    if active_modes and cfg.engine != "batched_open_loop":
+        raise ValueError("chance-aware search mode requires engine='batched_open_loop'")
+    if active_modes > 1:
+        raise ValueError(
+            "deck8_chance_enumeration, sampled_chance_split_decks, and "
+            "chance_progressive_decks are mutually exclusive"
+        )
+    widths = _parse_chance_progressive_widths(cfg.chance_width_schedule)
+    if cfg.chance_w0 != widths[0]:
+        raise ValueError(
+            f"chance_w0 ({cfg.chance_w0}) must equal the first width schedule "
+            f"entry ({widths[0]})"
+        )
+    if cfg.chance_n_init <= 0 or cfg.chance_d_min <= 0:
+        raise ValueError("chance_n_init and chance_d_min must be positive")
+    if not (cfg.chance_w0 <= cfg.chance_deck8_width_cap <= 70):
+        raise ValueError("chance_deck8_width_cap must be between chance_w0 and 70")
+    if not (cfg.chance_w0 <= cfg.chance_deck12_width_cap <= 495):
+        raise ValueError("chance_deck12_width_cap must be between chance_w0 and 495")
+    if not (0.0 < cfg.chance_max_init_fraction <= 1.0):
+        raise ValueError("chance_max_init_fraction must be in (0, 1]")
+
+
 @dataclass
 class SelfPlayConfig:
     """Self-play training config.
@@ -188,6 +235,16 @@ class SelfPlayConfig:
     # PLACE_AND_SELECT roots with the listed hidden-deck counts.  The pilot
     # supports "8,12"; empty preserves historical aliased open-loop behavior.
     sampled_chance_split_decks: str = ""
+    # Reviewed production successor: delayed mini-panel admission followed by
+    # depth-gated widening over an immutable uniform support permutation.
+    chance_progressive_decks: str = ""
+    chance_w0: int = 4
+    chance_n_init: int = 2
+    chance_d_min: int = 4
+    chance_width_schedule: str = "4,8,16,32,64,70"
+    chance_deck8_width_cap: int = 70
+    chance_deck12_width_cap: int = 16
+    chance_max_init_fraction: float = 0.25
     allow_tf32: bool = True       # speed up CUDA float32 conv/linear inference
     inference_amp: bool = False   # optional autocast for self-play inference
     eval_pad_to_batch: int = 0     # pad inference batches to fixed size (CUDA graphs)
@@ -500,6 +557,13 @@ class Example:
     # simulation crossed the explicit split; root eligibility alone is not
     # sufficient. Defaults preserve old replay-pickle compatibility.
     sampled_chance_split_treated: bool = False
+    progressive_chance_treated: bool = False
+    progressive_direct_mean: bool = False
+    progressive_max_active_width: int = 0
+    progressive_max_mature_width: int = 0
+    progressive_principal_min_visits: int = 0
+    progressive_principal_median_visits: float = 0.0
+    progressive_principal_max_visits: int = 0
     root_hidden_deck_count: int = 0
     root_turn_slot: int = 0
     # Training iteration that generated this example.  Used by
@@ -518,6 +582,14 @@ def _validate_example_schema(ex: Example, *, context: str) -> None:
             f"current FLAT_SIZE ({FLAT_SIZE},). Start a fresh replay buffer after "
             "encoder/checkpoint_version migrations."
         )
+
+
+def _is_chance_treated(ex: Example) -> bool:
+    """Whether replay came from any explicit chance-aware search treatment."""
+    return bool(
+        getattr(ex, "sampled_chance_split_treated", False)
+        or getattr(ex, "progressive_chance_treated", False)
+    )
 
 
 def configure_torch_performance(cfg: SelfPlayConfig) -> None:
@@ -696,7 +768,7 @@ class ReplayBuffer:
                 endgame_weight = (
                     endgame_oversample
                     if float(ex.flat[prog_idx]) >= 0.75 else 1.0)
-                if bool(getattr(ex, "sampled_chance_split_treated", False)):
+                if _is_chance_treated(ex):
                     return max(endgame_weight, chance_oversample)
                 return endgame_weight
 
@@ -729,8 +801,7 @@ class ReplayBuffer:
             idxs = rng.integers(0, len(self.data), size=batch_size)
         self._sampled_draw_count += int(len(idxs))
         self._sampled_treated_draw_count += int(sum(
-            bool(getattr(self.data[int(idx)],
-                         "sampled_chance_split_treated", False))
+            _is_chance_treated(self.data[int(idx)])
             for idx in idxs
         ))
         return idxs
@@ -753,8 +824,7 @@ class ReplayBuffer:
     def chance_treatment_stats(self) -> dict:
         """Return replay treatment prevalence, including per-deck counts."""
         total = len(self.data)
-        treated = [ex for ex in self.data if bool(getattr(
-            ex, "sampled_chance_split_treated", False))]
+        treated = [ex for ex in self.data if _is_chance_treated(ex)]
         stats = {
             "treated_count": len(treated),
             "treated_fraction": len(treated) / total if total else 0.0,
@@ -857,6 +927,9 @@ class ReplayBuffer:
                     None if t_ids is None else [int(value) for value in t_ids]),
                 "sampled_chance_split_treated": [bool(getattr(
                     self.data[int(value)], "sampled_chance_split_treated", False))
+                    for value in idxs],
+                "progressive_chance_treated": [bool(getattr(
+                    self.data[int(value)], "progressive_chance_treated", False))
                     for value in idxs],
                 "root_hidden_deck_counts": [int(getattr(
                     self.data[int(value)], "root_hidden_deck_count", 0))
@@ -1195,11 +1268,37 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
         "sampled_chance_split_path_count_deck12": sum(
             int(s.get("sampled_chance_split_path_count_deck12", 0))
             for s in stats_list),
+        "progressive_chance_search_count_deck8": sum(
+            int(s.get("progressive_chance_search_count_deck8", 0)) for s in stats_list),
+        "progressive_chance_search_count_deck12": sum(
+            int(s.get("progressive_chance_search_count_deck12", 0)) for s in stats_list),
+        "progressive_chance_path_count_deck8": sum(
+            int(s.get("progressive_chance_path_count_deck8", 0)) for s in stats_list),
+        "progressive_chance_path_count_deck12": sum(
+            int(s.get("progressive_chance_path_count_deck12", 0)) for s in stats_list),
+        "progressive_chance_admission_count": sum(
+            int(s.get("progressive_chance_admission_count", 0)) for s in stats_list),
+        "progressive_chance_widening_count": sum(
+            int(s.get("progressive_chance_widening_count", 0)) for s in stats_list),
+        "progressive_chance_bootstrap_rows": sum(
+            int(s.get("progressive_chance_bootstrap_rows", 0)) for s in stats_list),
+        "progressive_chance_budget_blocked_count": sum(
+            int(s.get("progressive_chance_budget_blocked_count", 0)) for s in stats_list),
+        "progressive_chance_guardrail_blocked_count": sum(
+            int(s.get("progressive_chance_guardrail_blocked_count", 0)) for s in stats_list),
+        "progressive_chance_width_sample_count": sum(
+            int(s.get("progressive_chance_width_sample_count", 0)) for s in stats_list),
         "sampled_chance_split_treated_examples_deck8": sum(
             int(s.get("sampled_chance_split_treated_examples_deck8", 0))
             for s in stats_list),
         "sampled_chance_split_treated_examples_deck12": sum(
             int(s.get("sampled_chance_split_treated_examples_deck12", 0))
+            for s in stats_list),
+        "progressive_chance_treated_examples_deck8": sum(
+            int(s.get("progressive_chance_treated_examples_deck8", 0))
+            for s in stats_list),
+        "progressive_chance_treated_examples_deck12": sum(
+            int(s.get("progressive_chance_treated_examples_deck12", 0))
             for s in stats_list),
         "pf_minshare_mean": (
             sum(float(s.get("pf_minshare_mean", 0.0))
@@ -1227,10 +1326,32 @@ def _merge_batched_stats(stats_list: list[dict]) -> dict | None:
     }
     for deck in (8, 12):
         for slot in range(4):
-            key = (
-                f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
-            )
-            out[key] = sum(int(s.get(key, 0)) for s in stats_list)
+            for prefix in ("sampled_chance_split", "progressive_chance"):
+                key = f"{prefix}_treated_examples_deck{deck}_slot{slot}"
+                out[key] = sum(int(s.get(key, 0)) for s in stats_list)
+        for label in ("active", "mature"):
+            key = f"progressive_chance_{label}_width_histogram_deck{deck}"
+            merged = {}
+            for source in stats_list:
+                for width, count in source.get(key, {}).items():
+                    merged[str(width)] = merged.get(str(width), 0) + int(count)
+            out[key] = merged
+        visit_key = f"progressive_chance_principal_median_visits_histogram_deck{deck}"
+        merged_visits = {}
+        for source in stats_list:
+            for value, count in source.get(visit_key, {}).items():
+                merged_visits[str(value)] = (
+                    merged_visits.get(str(value), 0) + int(count))
+        out[visit_key] = merged_visits
+    progressive_width_samples = out["progressive_chance_width_sample_count"]
+    for key in ("progressive_chance_mean_active_width",
+                "progressive_chance_mean_mature_width"):
+        out[key] = (
+            sum(float(s.get(key, 0.0))
+                * int(s.get("progressive_chance_width_sample_count", 0))
+                for s in stats_list) / progressive_width_samples
+            if progressive_width_samples else 0.0
+        )
     cap = out["max_batch_cap"]
     out["fill_ratio"] = out["mean_batch"] / cap if cap > 0 else 0.0
     for key in ("eval_h2d_sec", "eval_forward_sec", "eval_readback_sec", "eval_calls"):
@@ -1547,11 +1668,13 @@ def play_hof_games_batched(
     panels are deliberately disabled in these mixed-budget games even when the
     training flag is enabled, so learner and HOF seats use the same search
     method and differ only in their configured simulation budgets. Sampled
-    chance splits remain enabled because they preserve the ordinary simulation
-    budget and are the training treatment itself.
+    chance splits and progressive panels remain enabled because they are the
+    training treatment itself; each seat's initialization rows are charged to
+    that seat's configured move budget.
 
     Returns (per_game_learner_examples, per_game_scores_seat0_frame, stats) where
     stats has trainable_examples and mean_diff (learner-frame score margin)."""
+    _validate_chance_search_config(cfg)
     if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
         raise ValueError(
             "deck8_chance_enumeration requires engine='batched_open_loop'"
@@ -1560,6 +1683,8 @@ def play_hof_games_batched(
         cfg.sampled_chance_split_decks)
     sampled_split_mask = _sampled_chance_split_deck_mask(
         cfg.sampled_chance_split_decks)
+    progressive_mask = _chance_progressive_deck_mask(
+        cfg.chance_progressive_decks)
     if sampled_split_decks and cfg.engine != "batched_open_loop":
         raise ValueError(
             "sampled_chance_split_decks requires engine='batched_open_loop'"
@@ -1621,11 +1746,18 @@ def play_hof_games_batched(
             hof_opponent_temp_moves=int(cfg.hof_temp_moves),
             pick_floor_frac=float(cfg.pick_floor_frac),
             pick_floor_depth=int(cfg.pick_floor_depth),
-            # Keep mixed-budget HOF/gate games method-neutral. hof_sims is often
-            # below the 71-unit admission threshold and otherwise pays a
-            # different budget fraction from the learner seat.
+            # Exhaustive 70-row panels remain unsuitable for mixed budgets;
+            # sampled/progressive search is the self-play treatment itself.
             deck8_chance_enumeration=False,
             sampled_chance_split_deck_mask=int(sampled_split_mask),
+            progressive_chance_deck_mask=int(progressive_mask),
+            progressive_chance_width_schedule=str(cfg.chance_width_schedule),
+            progressive_chance_n_init=int(cfg.chance_n_init),
+            progressive_chance_d_min=int(cfg.chance_d_min),
+            progressive_chance_deck8_cap=int(cfg.chance_deck8_width_cap),
+            progressive_chance_deck12_cap=int(cfg.chance_deck12_width_cap),
+            progressive_chance_max_init_fraction=float(
+                cfg.chance_max_init_fraction),
         )
 
     all_examples: List[List[Example]] = []
@@ -1636,7 +1768,19 @@ def play_hof_games_batched(
         "sampled_chance_split_search_count_deck12": 0,
         "sampled_chance_split_path_count_deck8": 0,
         "sampled_chance_split_path_count_deck12": 0,
+        "progressive_chance_search_count_deck8": 0,
+        "progressive_chance_search_count_deck12": 0,
+        "progressive_chance_path_count_deck8": 0,
+        "progressive_chance_path_count_deck12": 0,
+        "progressive_chance_admission_count": 0,
+        "progressive_chance_widening_count": 0,
+        "progressive_chance_bootstrap_rows": 0,
+        "progressive_chance_budget_blocked_count": 0,
+        "progressive_chance_guardrail_blocked_count": 0,
     }
+    progressive_width_count = 0
+    progressive_active_width_sum = 0.0
+    progressive_mature_width_sum = 0.0
     n0 = int(n_games) // 2                    # orientation 0: learner in seat 0
     n1 = int(n_games) - n0                    # orientation 1: learner in seat 1
     for n_or, learner_seat, seed0 in ((n0, 0, int(game_seed_start)),
@@ -1650,6 +1794,15 @@ def play_hof_games_batched(
         orientation_results = _run_hof_orientation(batched, eval0, eval1)
         for key in split_counts:
             split_counts[key] += int(getattr(batched, key, 0))
+        orientation_width_count = int(
+            getattr(batched, "progressive_chance_width_sample_count", 0))
+        progressive_width_count += orientation_width_count
+        progressive_active_width_sum += (
+            float(getattr(batched, "progressive_chance_mean_active_width", 0.0))
+            * orientation_width_count)
+        progressive_mature_width_sum += (
+            float(getattr(batched, "progressive_chance_mean_mature_width", 0.0))
+            * orientation_width_count)
         for seed, raw_examples, (s0, s1) in orientation_results:
             keep: List[Example] = []
             for tup in raw_examples:
@@ -1670,6 +1823,13 @@ def play_hof_games_batched(
         "mean_diff": float(np.mean(learner_diffs)) if learner_diffs else 0.0,
         **_chance_treated_example_stats(all_examples),
         **split_counts,
+        "progressive_chance_width_sample_count": progressive_width_count,
+        "progressive_chance_mean_active_width": (
+            progressive_active_width_sum / progressive_width_count
+            if progressive_width_count else 0.0),
+        "progressive_chance_mean_mature_width": (
+            progressive_mature_width_sum / progressive_width_count
+            if progressive_width_count else 0.0),
     }
     return all_examples, all_scores, stats
 
@@ -1958,9 +2118,16 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
 
     The outer tuple stays at 12 elements so the actor remains the trailing item
     used by HOF filtering.  Current Rust nests chance provenance in root_stats;
-    legacy 3-field root_stats and 10-element tuples remain readable.
+    legacy 3/6/10-field root_stats and 10-element outer tuples remain readable.
     """
     sampled_chance_split_treated = False
+    progressive_chance_treated = False
+    progressive_direct_mean = False
+    progressive_max_active_width = 0
+    progressive_max_mature_width = 0
+    progressive_principal_min_visits = 0
+    progressive_principal_median_visits = 0.0
+    progressive_principal_max_visits = 0
     root_hidden_deck_count = 0
     root_turn_slot = 0
     if len(tup) == 12:
@@ -1968,7 +2135,23 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
         # needed by the two-net HOF path (_hof_actor_from_rust_tuple); ignored here.
         (mb, ob, flat, pidx, pval, lidx, root_stats,
          z, own_score, opp_score, win_target, _actor) = tup
-        if len(root_stats) == 6:
+        if len(root_stats) == 11:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, progressive_chance_treated,
+             progressive_direct_mean, progressive_max_active_width,
+             progressive_max_mature_width, progressive_visit_summary,
+             root_hidden_deck_count,
+             root_turn_slot) = root_stats
+            (progressive_principal_min_visits,
+             progressive_principal_median_visits,
+             progressive_principal_max_visits) = progressive_visit_summary
+        elif len(root_stats) == 10:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, progressive_chance_treated,
+             progressive_direct_mean, progressive_max_active_width,
+             progressive_max_mature_width, root_hidden_deck_count,
+             root_turn_slot) = root_stats
+        elif len(root_stats) == 6:
             (root_prior_idx, root_prior_val, root_visit_count,
              sampled_chance_split_treated, root_hidden_deck_count,
              root_turn_slot) = root_stats
@@ -1976,7 +2159,23 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
             root_prior_idx, root_prior_val, root_visit_count = root_stats
     elif len(tup) == 11:
         mb, ob, flat, pidx, pval, lidx, root_stats, z, own_score, opp_score, win_target = tup
-        if len(root_stats) == 6:
+        if len(root_stats) == 11:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, progressive_chance_treated,
+             progressive_direct_mean, progressive_max_active_width,
+             progressive_max_mature_width, progressive_visit_summary,
+             root_hidden_deck_count,
+             root_turn_slot) = root_stats
+            (progressive_principal_min_visits,
+             progressive_principal_median_visits,
+             progressive_principal_max_visits) = progressive_visit_summary
+        elif len(root_stats) == 10:
+            (root_prior_idx, root_prior_val, root_visit_count,
+             sampled_chance_split_treated, progressive_chance_treated,
+             progressive_direct_mean, progressive_max_active_width,
+             progressive_max_mature_width, root_hidden_deck_count,
+             root_turn_slot) = root_stats
+        elif len(root_stats) == 6:
             (root_prior_idx, root_prior_val, root_visit_count,
              sampled_chance_split_treated, root_hidden_deck_count,
              root_turn_slot) = root_stats
@@ -2005,6 +2204,14 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
         root_visit_count=(None if root_visit_count is None
                           else np.asarray(root_visit_count, dtype=np.int32)),
         sampled_chance_split_treated=bool(sampled_chance_split_treated),
+        progressive_chance_treated=bool(progressive_chance_treated),
+        progressive_direct_mean=bool(progressive_direct_mean),
+        progressive_max_active_width=int(progressive_max_active_width),
+        progressive_max_mature_width=int(progressive_max_mature_width),
+        progressive_principal_min_visits=int(progressive_principal_min_visits),
+        progressive_principal_median_visits=float(
+            progressive_principal_median_visits),
+        progressive_principal_max_visits=int(progressive_principal_max_visits),
         root_hidden_deck_count=int(root_hidden_deck_count),
         root_turn_slot=int(root_turn_slot),
         iteration=iteration,
@@ -2014,20 +2221,46 @@ def _example_from_rust_tuple(tup, iteration: int = 0) -> Example:
 def _chance_treated_example_stats(all_examples) -> dict:
     """Count treated replay labels by deck boundary and root selection slot."""
     stats = {}
+    treatments = (
+        ("sampled_chance_split", "sampled_chance_split_treated"),
+        ("progressive_chance", "progressive_chance_treated"),
+    )
+    for prefix, attr in treatments:
+        for deck in (8, 12):
+            by_slot = [0, 0, 0, 0]
+            for game in all_examples:
+                for ex in game:
+                    if (bool(getattr(ex, attr, False))
+                            and int(getattr(ex, "root_hidden_deck_count", 0)) == deck):
+                        slot = int(getattr(ex, "root_turn_slot", -1))
+                        if 0 <= slot < len(by_slot):
+                            by_slot[slot] += 1
+            stats[f"{prefix}_treated_examples_deck{deck}"] = sum(by_slot)
+            for slot, count in enumerate(by_slot):
+                stats[f"{prefix}_treated_examples_deck{deck}_slot{slot}"] = count
     for deck in (8, 12):
-        by_slot = [0, 0, 0, 0]
-        for game in all_examples:
-            for ex in game:
-                if (bool(getattr(ex, "sampled_chance_split_treated", False))
-                        and int(getattr(ex, "root_hidden_deck_count", 0)) == deck):
-                    slot = int(getattr(ex, "root_turn_slot", -1))
-                    if 0 <= slot < len(by_slot):
-                        by_slot[slot] += 1
-        stats[f"sampled_chance_split_treated_examples_deck{deck}"] = sum(by_slot)
-        for slot, count in enumerate(by_slot):
-            stats[
-                f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
-            ] = count
+        progressive = [
+            ex for game in all_examples for ex in game
+            if bool(getattr(ex, "progressive_chance_treated", False))
+            and int(getattr(ex, "root_hidden_deck_count", 0)) == deck
+        ]
+        for label, attr in (
+            ("active", "progressive_max_active_width"),
+            ("mature", "progressive_max_mature_width"),
+        ):
+            histogram = {}
+            for ex in progressive:
+                width = str(int(getattr(ex, attr, 0)))
+                histogram[width] = histogram.get(width, 0) + 1
+            stats[f"progressive_chance_{label}_width_histogram_deck{deck}"] = histogram
+        visit_histogram = {}
+        for ex in progressive:
+            value = str(float(getattr(
+                ex, "progressive_principal_median_visits", 0.0)))
+            visit_histogram[value] = visit_histogram.get(value, 0) + 1
+        stats[
+            f"progressive_chance_principal_median_visits_histogram_deck{deck}"
+        ] = visit_histogram
     return stats
 
 
@@ -2259,6 +2492,54 @@ def _double_buffer_loop(make_batched, evaluator, n_games, seed_start):
                 "sampled_chance_split_path_count_deck12": (
                     int(A.sampled_chance_split_path_count_deck12)
                     + int(B.sampled_chance_split_path_count_deck12)),
+                "progressive_chance_search_count_deck8": (
+                    int(A.progressive_chance_search_count_deck8)
+                    + int(B.progressive_chance_search_count_deck8)),
+                "progressive_chance_search_count_deck12": (
+                    int(A.progressive_chance_search_count_deck12)
+                    + int(B.progressive_chance_search_count_deck12)),
+                "progressive_chance_path_count_deck8": (
+                    int(A.progressive_chance_path_count_deck8)
+                    + int(B.progressive_chance_path_count_deck8)),
+                "progressive_chance_path_count_deck12": (
+                    int(A.progressive_chance_path_count_deck12)
+                    + int(B.progressive_chance_path_count_deck12)),
+                "progressive_chance_admission_count": (
+                    int(A.progressive_chance_admission_count)
+                    + int(B.progressive_chance_admission_count)),
+                "progressive_chance_widening_count": (
+                    int(A.progressive_chance_widening_count)
+                    + int(B.progressive_chance_widening_count)),
+                "progressive_chance_bootstrap_rows": (
+                    int(A.progressive_chance_bootstrap_rows)
+                    + int(B.progressive_chance_bootstrap_rows)),
+                "progressive_chance_budget_blocked_count": (
+                    int(A.progressive_chance_budget_blocked_count)
+                    + int(B.progressive_chance_budget_blocked_count)),
+                "progressive_chance_guardrail_blocked_count": (
+                    int(A.progressive_chance_guardrail_blocked_count)
+                    + int(B.progressive_chance_guardrail_blocked_count)),
+                "progressive_chance_width_sample_count": (
+                    int(A.progressive_chance_width_sample_count)
+                    + int(B.progressive_chance_width_sample_count)),
+                "progressive_chance_mean_active_width": (
+                    0.0 if (int(A.progressive_chance_width_sample_count)
+                            + int(B.progressive_chance_width_sample_count)) == 0 else (
+                        float(A.progressive_chance_mean_active_width)
+                        * int(A.progressive_chance_width_sample_count)
+                        + float(B.progressive_chance_mean_active_width)
+                        * int(B.progressive_chance_width_sample_count)
+                    ) / (int(A.progressive_chance_width_sample_count)
+                         + int(B.progressive_chance_width_sample_count))),
+                "progressive_chance_mean_mature_width": (
+                    0.0 if (int(A.progressive_chance_width_sample_count)
+                            + int(B.progressive_chance_width_sample_count)) == 0 else (
+                        float(A.progressive_chance_mean_mature_width)
+                        * int(A.progressive_chance_width_sample_count)
+                        + float(B.progressive_chance_mean_mature_width)
+                        * int(B.progressive_chance_width_sample_count)
+                    ) / (int(A.progressive_chance_width_sample_count)
+                         + int(B.progressive_chance_width_sample_count))),
                 "pf_minshare_mean": pf_mean,
                 "pf_minshare_count": pf_n,
             },
@@ -2288,12 +2569,15 @@ def play_selfplay_games_batched(
     heavy work, so they overlap.  Falls back to the single-buffer loop when
     n_games < 2.  Produces the SAME games (seeding unchanged: game i uses seed
     game_seed_start + i) and the same stats keys as the single-buffer path."""
+    _validate_chance_search_config(cfg)
     if cfg.n_determinizations != 1:
         raise ValueError("--engine batched currently requires --determinizations 1")
     sampled_split_decks = _parse_sampled_chance_split_decks(
         cfg.sampled_chance_split_decks)
     sampled_split_mask = _sampled_chance_split_deck_mask(
         cfg.sampled_chance_split_decks)
+    progressive_mask = _chance_progressive_deck_mask(
+        cfg.chance_progressive_decks)
     if cfg.deck8_chance_enumeration and cfg.engine != "batched_open_loop":
         raise ValueError(
             "deck8_chance_enumeration requires engine='batched_open_loop'"
@@ -2360,6 +2644,14 @@ def play_selfplay_games_batched(
             pick_floor_depth=int(cfg.pick_floor_depth),
             deck8_chance_enumeration=bool(cfg.deck8_chance_enumeration),
             sampled_chance_split_deck_mask=int(sampled_split_mask),
+            progressive_chance_deck_mask=int(progressive_mask),
+            progressive_chance_width_schedule=str(cfg.chance_width_schedule),
+            progressive_chance_n_init=int(cfg.chance_n_init),
+            progressive_chance_d_min=int(cfg.chance_d_min),
+            progressive_chance_deck8_cap=int(cfg.chance_deck8_width_cap),
+            progressive_chance_deck12_cap=int(cfg.chance_deck12_width_cap),
+            progressive_chance_max_init_fraction=float(
+                cfg.chance_max_init_fraction),
         )
 
     use_db = bool(double_buffer)
@@ -2448,6 +2740,30 @@ def play_selfplay_games_batched(
                 batched.sampled_chance_split_path_count_deck8),
             "sampled_chance_split_path_count_deck12": int(
                 batched.sampled_chance_split_path_count_deck12),
+            "progressive_chance_search_count_deck8": int(
+                batched.progressive_chance_search_count_deck8),
+            "progressive_chance_search_count_deck12": int(
+                batched.progressive_chance_search_count_deck12),
+            "progressive_chance_path_count_deck8": int(
+                batched.progressive_chance_path_count_deck8),
+            "progressive_chance_path_count_deck12": int(
+                batched.progressive_chance_path_count_deck12),
+            "progressive_chance_admission_count": int(
+                batched.progressive_chance_admission_count),
+            "progressive_chance_widening_count": int(
+                batched.progressive_chance_widening_count),
+            "progressive_chance_bootstrap_rows": int(
+                batched.progressive_chance_bootstrap_rows),
+            "progressive_chance_budget_blocked_count": int(
+                batched.progressive_chance_budget_blocked_count),
+            "progressive_chance_guardrail_blocked_count": int(
+                batched.progressive_chance_guardrail_blocked_count),
+            "progressive_chance_width_sample_count": int(
+                batched.progressive_chance_width_sample_count),
+            "progressive_chance_mean_active_width": float(
+                batched.progressive_chance_mean_active_width),
+            "progressive_chance_mean_mature_width": float(
+                batched.progressive_chance_mean_mature_width),
             "pf_minshare_mean": float(batched.pick_floor_min_share_mean),
             "pf_minshare_count": int(batched.pick_floor_min_share_count),
         }
@@ -2498,7 +2814,13 @@ def play_selfplay_games_batched(
         min(lb, int(cfg.n_simulations) // 71)
         if cfg.deck8_chance_enumeration else 0
     )
-    cap = n_slots * (lb + 70 * panels_per_slot_cap)
+    progressive_rows_per_slot_cap = (
+        int(math.floor(cfg.n_simulations * cfg.chance_max_init_fraction))
+        if progressive_mask else 0
+    )
+    cap = n_slots * (
+        lb + max(70 * panels_per_slot_cap, progressive_rows_per_slot_cap)
+    )
     mean_batch = float(np.mean(nonzero_batches)) if nonzero_batches else 0.0
     stats = {
         "ticks": ticks,
@@ -3377,8 +3699,11 @@ def _rolling_average_state(checkpoint_dir: str, it: int, k: int):
 
 def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
     """Run the serial self-play loop.  Returns the trained net and history."""
+    _validate_chance_search_config(cfg)
     sampled_split_decks = _parse_sampled_chance_split_decks(
         cfg.sampled_chance_split_decks)
+    progressive_decks = _parse_sampled_chance_split_decks(
+        cfg.chance_progressive_decks)
     if sampled_split_decks and cfg.engine != "batched_open_loop":
         raise ValueError(
             "sampled_chance_split_decks requires engine='batched_open_loop'"
@@ -3614,11 +3939,25 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                 "sampled_chance_split_path_count_deck12": 0,
                 "sampled_chance_split_treated_examples_deck8": 0,
                 "sampled_chance_split_treated_examples_deck12": 0,
+                "progressive_chance_search_count_deck8": 0,
+                "progressive_chance_search_count_deck12": 0,
+                "progressive_chance_path_count_deck8": 0,
+                "progressive_chance_path_count_deck12": 0,
+                "progressive_chance_admission_count": 0,
+                "progressive_chance_widening_count": 0,
+                "progressive_chance_bootstrap_rows": 0,
+                "progressive_chance_budget_blocked_count": 0,
+                "progressive_chance_guardrail_blocked_count": 0,
+                "progressive_chance_treated_examples_deck8": 0,
+                "progressive_chance_treated_examples_deck12": 0,
             }
             for deck in (8, 12):
                 for slot in range(4):
                     hof_stats[
                         f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+                    ] = 0
+                    hof_stats[
+                        f"progressive_chance_treated_examples_deck{deck}_slot{slot}"
                     ] = 0
             total_games = int(iter_cfg.games_per_iteration)
             hof_games = 0
@@ -3821,7 +4160,18 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             "sampled_chance_split_path_count_deck8",
                             "sampled_chance_split_path_count_deck12",
                             "sampled_chance_split_treated_examples_deck8",
-                            "sampled_chance_split_treated_examples_deck12"):
+                            "sampled_chance_split_treated_examples_deck12",
+                            "progressive_chance_search_count_deck8",
+                            "progressive_chance_search_count_deck12",
+                            "progressive_chance_path_count_deck8",
+                            "progressive_chance_path_count_deck12",
+                            "progressive_chance_admission_count",
+                            "progressive_chance_widening_count",
+                            "progressive_chance_bootstrap_rows",
+                            "progressive_chance_budget_blocked_count",
+                            "progressive_chance_guardrail_blocked_count",
+                            "progressive_chance_treated_examples_deck8",
+                            "progressive_chance_treated_examples_deck12"):
                         hof_stats[key] += int(hstats.get(key, 0))
                     for deck in (8, 12):
                         for slot in range(4):
@@ -3830,6 +4180,12 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                                 f"deck{deck}_slot{slot}"
                             )
                             hof_stats[key] += int(hstats.get(key, 0))
+                            progressive_key = (
+                                f"progressive_chance_treated_examples_"
+                                f"deck{deck}_slot{slot}"
+                            )
+                            hof_stats[progressive_key] += int(
+                                hstats.get(progressive_key, 0))
                     game_seed += hof_games
                 else:
                     # Legacy serial path (Python OpenLoopMCTS). --hof_current_sims
@@ -3902,6 +4258,12 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
             iteration_treated_by_slot = {
                 deck: [_iteration_split_total(
                     f"sampled_chance_split_treated_examples_deck{deck}_slot{slot}"
+                ) for slot in range(4)]
+                for deck in (8, 12)
+            }
+            iteration_progressive_by_slot = {
+                deck: [_iteration_split_total(
+                    f"progressive_chance_treated_examples_deck{deck}_slot{slot}"
                 ) for slot in range(4)]
                 for deck in (8, 12)
             }
@@ -3997,6 +4359,48 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             f"bootstrap_rows=0; buffer_treated="
                             f"{buffer_treatment_stats['treated_count']}/{buffer_size} "
                             f"({buffer_treatment_stats['treated_fraction']:.1%})"
+                        )
+                    if progressive_decks:
+                        bootstrap_rows = _iteration_split_total(
+                            "progressive_chance_bootstrap_rows")
+                        init_fraction = (
+                            bootstrap_rows / batched_stats["total_evals"]
+                            if batched_stats.get("total_evals", 0) else 0.0
+                        )
+                        print(
+                            f"  progressive chance: decks="
+                            f"{','.join(str(d) for d in progressive_decks)}; "
+                            f"treated_examples deck8="
+                            f"{_iteration_split_total('progressive_chance_treated_examples_deck8')} "
+                            f"deck12="
+                            f"{_iteration_split_total('progressive_chance_treated_examples_deck12')}; "
+                            f"by_slot deck8={iteration_progressive_by_slot[8]} "
+                            f"deck12={iteration_progressive_by_slot[12]}; "
+                            f"crossed_paths deck8="
+                            f"{_iteration_split_total('progressive_chance_path_count_deck8')} "
+                            f"deck12="
+                            f"{_iteration_split_total('progressive_chance_path_count_deck12')}; "
+                            f"admissions={_iteration_split_total('progressive_chance_admission_count')} "
+                            f"widens={_iteration_split_total('progressive_chance_widening_count')} "
+                            f"bootstrap_rows={bootstrap_rows} ({init_fraction:.1%} evals); "
+                            f"mean_width active="
+                            f"{batched_stats.get('progressive_chance_mean_active_width', 0.0):.2f} "
+                            f"mature="
+                            f"{batched_stats.get('progressive_chance_mean_mature_width', 0.0):.2f}; "
+                            f"blocked budget="
+                            f"{_iteration_split_total('progressive_chance_budget_blocked_count')} "
+                            f"guardrail="
+                            f"{_iteration_split_total('progressive_chance_guardrail_blocked_count')}"
+                        )
+                        print(
+                            "  progressive width histograms: "
+                            f"deck8 active={batched_stats.get('progressive_chance_active_width_histogram_deck8', {})} "
+                            f"mature={batched_stats.get('progressive_chance_mature_width_histogram_deck8', {})}; "
+                            f"deck12 active={batched_stats.get('progressive_chance_active_width_histogram_deck12', {})} "
+                            f"mature={batched_stats.get('progressive_chance_mature_width_histogram_deck12', {})}; "
+                            f"principal-row median visits deck8="
+                            f"{batched_stats.get('progressive_chance_principal_median_visits_histogram_deck8', {})} "
+                            f"deck12={batched_stats.get('progressive_chance_principal_median_visits_histogram_deck12', {})}"
                         )
                     if iter_cfg.playout_cap_randomization:
                         print(
@@ -4669,6 +5073,67 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                     iteration_treated_by_slot[12]),
                 # Sampled splitting never performs exhaustive panel bootstrap.
                 "sampled_chance_split_bootstrap_rows": 0,
+                "chance_progressive_decks": list(progressive_decks),
+                "chance_progressive_config": {
+                    "w0": iter_cfg.chance_w0,
+                    "n_init": iter_cfg.chance_n_init,
+                    "d_min": iter_cfg.chance_d_min,
+                    "width_schedule": _parse_chance_progressive_widths(
+                        iter_cfg.chance_width_schedule),
+                    "deck8_width_cap": iter_cfg.chance_deck8_width_cap,
+                    "deck12_width_cap": iter_cfg.chance_deck12_width_cap,
+                    "max_init_fraction": iter_cfg.chance_max_init_fraction,
+                },
+                "progressive_chance_search_count_deck8": _iteration_split_total(
+                    "progressive_chance_search_count_deck8"),
+                "progressive_chance_search_count_deck12": _iteration_split_total(
+                    "progressive_chance_search_count_deck12"),
+                "progressive_chance_path_count_deck8": _iteration_split_total(
+                    "progressive_chance_path_count_deck8"),
+                "progressive_chance_path_count_deck12": _iteration_split_total(
+                    "progressive_chance_path_count_deck12"),
+                "progressive_chance_admission_count": _iteration_split_total(
+                    "progressive_chance_admission_count"),
+                "progressive_chance_widening_count": _iteration_split_total(
+                    "progressive_chance_widening_count"),
+                "progressive_chance_bootstrap_rows": _iteration_split_total(
+                    "progressive_chance_bootstrap_rows"),
+                "progressive_chance_budget_blocked_count": _iteration_split_total(
+                    "progressive_chance_budget_blocked_count"),
+                "progressive_chance_guardrail_blocked_count": _iteration_split_total(
+                    "progressive_chance_guardrail_blocked_count"),
+                "progressive_chance_mean_active_width": (
+                    batched_stats.get("progressive_chance_mean_active_width", 0.0)
+                    if batched_stats else None),
+                "progressive_chance_mean_mature_width": (
+                    batched_stats.get("progressive_chance_mean_mature_width", 0.0)
+                    if batched_stats else None),
+                "progressive_chance_treated_examples_deck8": _iteration_split_total(
+                    "progressive_chance_treated_examples_deck8"),
+                "progressive_chance_treated_examples_deck12": _iteration_split_total(
+                    "progressive_chance_treated_examples_deck12"),
+                "progressive_chance_treated_examples_deck8_by_slot": (
+                    iteration_progressive_by_slot[8]),
+                "progressive_chance_treated_examples_deck12_by_slot": (
+                    iteration_progressive_by_slot[12]),
+                "progressive_chance_active_width_histogram_deck8": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_active_width_histogram_deck8", {})),
+                "progressive_chance_mature_width_histogram_deck8": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_mature_width_histogram_deck8", {})),
+                "progressive_chance_active_width_histogram_deck12": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_active_width_histogram_deck12", {})),
+                "progressive_chance_mature_width_histogram_deck12": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_mature_width_histogram_deck12", {})),
+                "progressive_chance_principal_median_visits_histogram_deck8": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_principal_median_visits_histogram_deck8", {})),
+                "progressive_chance_principal_median_visits_histogram_deck12": (
+                    (batched_stats or {}).get(
+                        "progressive_chance_principal_median_visits_histogram_deck12", {})),
                 "chance_split_oversample": iter_cfg.chance_split_oversample,
                 "buffer_chance_treated_count": (
                     buffer_treatment_stats["treated_count"]),
@@ -4862,6 +5327,20 @@ if __name__ == "__main__":
                         "root with these hidden-deck counts. Pilot supports "
                         "'8,12'; requires --engine batched_open_loop and is "
                         "mutually exclusive with --deck8_chance_enumeration.")
+    p.add_argument("--chance_progressive_decks", default="",
+                   help="Enable reviewed persistent progressive chance search at "
+                        "hidden deck counts '8', '12', or '8,12'. Requires "
+                        "--engine batched_open_loop and is mutually exclusive "
+                        "with the legacy chance modes.")
+    p.add_argument("--chance_w0", type=int, default=4)
+    p.add_argument("--chance_n_init", type=int, default=2)
+    p.add_argument("--chance_d_min", type=int, default=4)
+    p.add_argument("--chance_width_schedule", default="4,8,16,32,64,70")
+    p.add_argument("--chance_deck8_width_cap", type=int, default=70)
+    p.add_argument("--chance_deck12_width_cap", type=int, default=16)
+    p.add_argument("--chance_max_init_fraction", type=float, default=0.25,
+                   help="Hard maximum fraction of a move's NN-row budget used "
+                        "to initialize or widen progressive chance panels.")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--sample_workers", type=int, default=1,
                    help="threads for ReplayBuffer.sample_batch densify+augment "
@@ -5197,6 +5676,14 @@ if __name__ == "__main__":
         batch_slots=a.batch_slots,
         deck8_chance_enumeration=a.deck8_chance_enumeration,
         sampled_chance_split_decks=a.sampled_chance_split_decks,
+        chance_progressive_decks=a.chance_progressive_decks,
+        chance_w0=a.chance_w0,
+        chance_n_init=a.chance_n_init,
+        chance_d_min=a.chance_d_min,
+        chance_width_schedule=a.chance_width_schedule,
+        chance_deck8_width_cap=a.chance_deck8_width_cap,
+        chance_deck12_width_cap=a.chance_deck12_width_cap,
+        chance_max_init_fraction=a.chance_max_init_fraction,
         batch_size=a.batch_size, sample_workers=a.sample_workers, lr=a.lr,
         lr_schedule=a.lr_schedule, alpha_schedule=a.alpha_schedule,
         sims_schedule=a.sims_schedule,

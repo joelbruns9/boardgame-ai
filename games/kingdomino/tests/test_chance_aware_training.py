@@ -10,7 +10,10 @@ from games.kingdomino.self_play import (
     Example,
     ReplayBuffer,
     SelfPlayConfig,
+    _chance_progressive_deck_mask,
     _example_from_rust_tuple,
+    _merge_batched_stats,
+    _parse_chance_progressive_widths,
     _parse_sampled_chance_split_decks,
     _sampled_chance_split_deck_mask,
     play_selfplay_games_batched,
@@ -18,7 +21,7 @@ from games.kingdomino.self_play import (
 
 
 def _example(*, progress: float = 0.0, treated: bool = False,
-             deck: int = 0) -> Example:
+             progressive: bool = False, deck: int = 0) -> Example:
     flat = np.zeros(FLAT_SIZE, dtype=np.float16)
     flat[FLAT_LAYOUT["game_progress"].start] = progress
     empty_i32 = np.zeros(0, dtype=np.int32)
@@ -34,6 +37,7 @@ def _example(*, progress: float = 0.0, treated: bool = False,
         opp_score=0.0,
         win_target=0.5,
         sampled_chance_split_treated=treated,
+        progressive_chance_treated=progressive,
         root_hidden_deck_count=deck,
         root_turn_slot=0,
     )
@@ -47,6 +51,32 @@ def test_sampled_chance_split_deck_parser_is_strict_and_stable():
         _parse_sampled_chance_split_decks("4,8")
     with pytest.raises(ValueError, match="comma-separated"):
         _parse_sampled_chance_split_decks("eight")
+
+
+def test_progressive_chance_configuration_is_strict_and_stable():
+    assert _parse_chance_progressive_widths("4,8,16,32,64,70") == (
+        4, 8, 16, 32, 64, 70)
+    assert _chance_progressive_deck_mask("8,12") == (1 << 8) | (1 << 12)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _parse_chance_progressive_widths("4,8,8")
+    with pytest.raises(ValueError, match="requires engine"):
+        play_selfplay_games_batched(
+            None,
+            SelfPlayConfig(engine="batched", chance_progressive_decks="8"),
+            n_games=1,
+            game_seed_start=1,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        play_selfplay_games_batched(
+            None,
+            SelfPlayConfig(
+                engine="batched_open_loop",
+                chance_progressive_decks="8",
+                sampled_chance_split_decks="12",
+            ),
+            n_games=1,
+            game_seed_start=1,
+        )
 
 
 def test_sampled_split_configuration_rejects_wrong_engine_and_panels():
@@ -99,6 +129,37 @@ def test_replay_weights_compose_by_max_not_multiplication():
     assert treatment["treated_deck12_by_slot"] == [1, 0, 0, 0]
 
 
+def test_progressive_provenance_uses_same_conservative_replay_weight():
+    buffer = ReplayBuffer(capacity=4)
+    buffer.add([_example(), _example(progressive=True, deck=8)])
+    weights = buffer._sampling_weights(1.0, 2.0)
+    assert weights == pytest.approx(np.asarray([1, 2]) / 3.0)
+    assert buffer.chance_treatment_stats()["treated_deck8_count"] == 1
+
+
+def test_progressive_double_buffer_stats_merge_returns_complete_payload():
+    base = {
+        "ticks": 1, "elapsed": 2.0, "total_evals": 10,
+        "mean_batch": 2.0, "max_batch_cap": 8, "max_batch_seen": 3,
+        "requests_per_sec": 5.0, "step_sec": 0.5, "eval_sec": 1.0,
+        "update_sec": 0.5, "total_cpus": 4, "game_cpus": 2,
+        "solver_cpus": 2, "progressive_chance_width_sample_count": 1,
+        "progressive_chance_mean_active_width": 8.0,
+        "progressive_chance_mean_mature_width": 4.0,
+        "progressive_chance_active_width_histogram_deck8": {"8": 1},
+        "progressive_chance_principal_median_visits_histogram_deck8": {"4.0": 1},
+    }
+    merged = _merge_batched_stats([base, dict(base)])
+    assert merged is not None
+    assert merged["total_evals"] == 20
+    assert merged["fill_ratio"] == pytest.approx(0.25)
+    assert merged["progressive_chance_mean_active_width"] == 8.0
+    assert merged["progressive_chance_active_width_histogram_deck8"] == {"8": 2}
+    assert merged[
+        "progressive_chance_principal_median_visits_histogram_deck8"
+    ] == {"4.0": 2}
+
+
 def test_replay_reports_actual_treated_draws_and_metadata():
     buffer = ReplayBuffer(capacity=4)
     buffer.add([_example(), _example(treated=True, deck=12)])
@@ -143,6 +204,20 @@ def test_rust_tuple_conversion_accepts_current_and_legacy_root_stats():
     assert current.root_hidden_deck_count == 12
     assert current.root_turn_slot == 0
     assert current.iteration == 9
+
+    progressive = _example_from_rust_tuple(
+        base + (priors + (False, True, True, 16, 8, (4, 7.5, 12), 8, 2),) + tail,
+        iteration=10,
+    )
+    assert progressive.progressive_chance_treated is True
+    assert progressive.progressive_direct_mean is True
+    assert progressive.progressive_max_active_width == 16
+    assert progressive.progressive_max_mature_width == 8
+    assert progressive.progressive_principal_min_visits == 4
+    assert progressive.progressive_principal_median_visits == 7.5
+    assert progressive.progressive_principal_max_visits == 12
+    assert progressive.root_hidden_deck_count == 8
+    assert progressive.root_turn_slot == 2
 
     legacy = _example_from_rust_tuple(base + (priors,) + tail)
     assert legacy.sampled_chance_split_treated is False
@@ -205,3 +280,54 @@ def test_rust_sampled_split_smoke_reaches_and_tags_both_decks():
     assert len(treated12) == 4
     assert {ex.root_turn_slot for ex in treated8} == {0, 1, 2, 3}
     assert {ex.root_turn_slot for ex in treated12} == {0, 1, 2, 3}
+
+
+def test_rust_progressive_chance_smoke_bootstraps_and_tags_both_decks():
+    kingdomino_rust = pytest.importorskip("kingdomino_rust")
+    mcts = kingdomino_rust.BatchedMCTS(
+        1,
+        1,
+        20260811,
+        800,
+        leaf_batch=4,
+        open_loop=True,
+        dirichlet_eps=0.0,
+        exact_endgame_max_secs=0.0,
+        progressive_chance_deck_mask=(1 << 8) | (1 << 12),
+        progressive_chance_width_schedule="4,8,16,32,64,70",
+        progressive_chance_n_init=2,
+        progressive_chance_d_min=4,
+        progressive_chance_deck8_cap=16,
+        progressive_chance_deck12_cap=16,
+        progressive_chance_max_init_fraction=0.25,
+    )
+    finished = []
+    ticks = 0
+    while not mcts.done():
+        my, _opp, _flat, legal_indices = mcts.step()
+        values = np.zeros(len(my), dtype=np.float32)
+        gathered = []
+        for indices in legal_indices:
+            logits = np.full(len(indices), -8.0, dtype=np.float32)
+            if len(logits):
+                logits[0] = 8.0
+            gathered.append(logits)
+        finished.extend(mcts.update(values, gathered))
+        ticks += 1
+        assert ticks < 100_000
+
+    assert len(finished) == 1
+    assert int(mcts.progressive_chance_bootstrap_rows) > 0
+    assert int(mcts.progressive_chance_admission_count) > 0
+    assert int(mcts.progressive_chance_search_count_deck8) > 0
+    assert int(mcts.progressive_chance_search_count_deck12) > 0
+    assert float(mcts.progressive_chance_mean_active_width) >= 4.0
+
+    converted = [_example_from_rust_tuple(tup) for tup in finished[0][1]]
+    treated = [ex for ex in converted if ex.progressive_chance_treated]
+    assert any(ex.root_hidden_deck_count == 8 for ex in treated)
+    assert any(ex.root_hidden_deck_count == 12 for ex in treated)
+    assert all(ex.progressive_direct_mean for ex in treated)
+    assert all(ex.progressive_max_active_width >= 4 for ex in treated)
+    assert all(ex.progressive_principal_max_visits >=
+               ex.progressive_principal_min_visits for ex in treated)

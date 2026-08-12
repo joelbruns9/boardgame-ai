@@ -4917,6 +4917,11 @@ enum OLChanceTraversal {
     Iid,
     /// Visit a shuffled multiplicity-expanded panel once before repeating it.
     Balanced,
+    /// Frozen uniform without-replacement support permutation. Before panel
+    /// admission, consume its prefix once; after admission, route to the
+    /// least-searched row in the active prefix without changing probability
+    /// weights or the immutable widening order.
+    Progressive,
 }
 
 /// How A1c constructs each fixed-width cycle of candidate public reveals.
@@ -4942,10 +4947,19 @@ struct OLChanceConfig<'a> {
     schedule_seed: u64,
     draw_seed: u64,
     a1c: Option<A1cChanceConfig<'a>>,
+    progressive: Option<ProgressiveChanceConfig<'a>>,
     // Production BatchedMCTS can ask the caller to evaluate the complete fixed
     // panel over the normal step()/update() inference boundary.  The advisor
     // performs its own synchronous admission and therefore leaves this false.
     bootstrap_full_panel: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressiveChanceConfig<'a> {
+    widths: &'a [usize],
+    n_init: usize,
+    d_min: usize,
+    max_width: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -5011,6 +5025,9 @@ struct A1cAdmissionRequest {
     placement: Option<(i8, i8, i8, i8, bool)>,
     pick: Option<u16>,
     draw_seed: u64,
+    /// Zero identifies the legacy fixed/full-panel and advisor A1c paths.
+    /// Positive values are the progressive active width to publish atomically.
+    progressive_target_width: usize,
 }
 
 struct OLNode {
@@ -5045,6 +5062,14 @@ struct OLNode {
     // panel was admitted. These remain in ancestors' running means, so report
     // them explicitly as a finite-budget dilution diagnostic.
     chance_preinit_visits: usize,
+    // Production progressive chance search. `chance_schedule` is the immutable
+    // uniform permutation of the full support in this mode; active rows are its
+    // prefix and keep equal probability independent of conditional visits.
+    chance_progressive: bool,
+    chance_active_width: usize,
+    chance_n_init: usize,
+    chance_d_min: usize,
+    chance_max_width: usize,
     children: Vec<(u16, u32)>,
     action: (Option<(i8, i8, i8, i8, bool)>, Option<u16>),
     is_expanded: bool,
@@ -5063,6 +5088,9 @@ struct OLChanceChild {
     row: [u16; 4],
     probability: f64,
     multiplicity: usize,
+    // Real conditional descents through this public observation. Bootstrap
+    // evaluations deliberately do not increment it.
+    real_visits: u32,
     // Observation subtrees are allocated only when their row is sampled.
     // Registering a fixed support must not clone+step every counterfactual
     // state, especially for 70-row deck=8 chance nodes.
@@ -5104,6 +5132,11 @@ impl OLNode {
             chance_schedule_seed: 0,
             chance_initialized_cycles: 0,
             chance_preinit_visits: 0,
+            chance_progressive: false,
+            chance_active_width: 0,
+            chance_n_init: 0,
+            chance_d_min: 0,
+            chance_max_width: 0,
             children: Vec::new(),
             action,
             is_expanded: false,
@@ -5633,6 +5666,30 @@ fn sampled_chance_split_root_enabled(mask: u64, state: &RustGameState) -> bool {
     state.phase == PLACE_AND_SELECT && deck_count < 64 && mask & (1u64 << deck_count) != 0
 }
 
+fn parse_progressive_width_schedule(value: &str) -> Result<Vec<usize>, String> {
+    let mut widths = Vec::new();
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let width = raw
+            .parse::<usize>()
+            .map_err(|_| format!("invalid progressive chance width {raw:?}"))?;
+        if width == 0 {
+            return Err("progressive chance widths must be positive".to_string());
+        }
+        if widths.last().is_some_and(|&previous| width <= previous) {
+            return Err("progressive chance widths must be strictly increasing".to_string());
+        }
+        widths.push(width);
+    }
+    if widths.is_empty() {
+        return Err("progressive chance width schedule must not be empty".to_string());
+    }
+    Ok(widths)
+}
+
 /// Fixed public-row support for the A1 one-reveal probe. Small bags are
 /// exhaustive; larger bags use X shuffled permutation cycles, so every tile is
 /// exposed exactly X times. Duplicate rows across cycles are coalesced while
@@ -5742,9 +5799,14 @@ fn ol_register_chance_support(
 ) -> PyResult<()> {
     if !arena[chance_node_id as usize].chance_children.is_empty() {
         let node = &arena[chance_node_id as usize];
-        debug_assert_eq!(node.chance_backup, config.backup);
+        debug_assert!(
+            node.chance_backup == config.backup
+                || (node.chance_backup == OLChanceBackup::PanelMean
+                    && (node.chance_progressive || config.bootstrap_full_panel))
+        );
         debug_assert_eq!(node.chance_traversal, config.traversal);
         debug_assert_eq!(node.chance_chooser_actor, Some(chooser_actor));
+        debug_assert_eq!(node.chance_progressive, config.progressive.is_some());
         return Ok(());
     }
     let children: Vec<OLChanceChild> = config
@@ -5760,6 +5822,7 @@ fn ol_register_chance_support(
                 row,
                 probability: outcome.probability,
                 multiplicity: outcome.multiplicity,
+                real_visits: 0,
                 node_id: None,
                 #[cfg(debug_assertions)]
                 public_key: None,
@@ -5777,12 +5840,19 @@ fn ol_register_chance_support(
         )));
     }
     let mut schedule = Vec::new();
-    if config.traversal == OLChanceTraversal::Balanced {
-        schedule.reserve(children.iter().map(|child| child.multiplicity).sum());
-        for (index, child) in children.iter().enumerate() {
-            schedule.extend(std::iter::repeat_n(index, child.multiplicity));
+    match config.traversal {
+        OLChanceTraversal::Balanced => {
+            schedule.reserve(children.iter().map(|child| child.multiplicity).sum());
+            for (index, child) in children.iter().enumerate() {
+                schedule.extend(std::iter::repeat_n(index, child.multiplicity));
+            }
+            debug_assert!(!schedule.is_empty());
         }
-        debug_assert!(!schedule.is_empty());
+        OLChanceTraversal::Progressive => {
+            schedule.extend(0..children.len());
+            schedule.shuffle(&mut StdRng::seed_from_u64(config.schedule_seed));
+        }
+        OLChanceTraversal::Iid => {}
     }
     let node = &mut arena[chance_node_id as usize];
     node.chance_children = children;
@@ -5794,6 +5864,20 @@ fn ol_register_chance_support(
     node.chance_balanced_start_visits = 0;
     node.chance_schedule_seed =
         config.schedule_seed ^ (chance_node_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if let Some(progressive) = config.progressive {
+        node.chance_progressive = true;
+        node.chance_n_init = progressive.n_init;
+        node.chance_d_min = progressive.d_min;
+        node.chance_max_width = progressive.max_width.min(node.chance_children.len());
+        debug_assert!(!progressive.widths.is_empty());
+        debug_assert!(progressive.widths[0] <= node.chance_max_width);
+        // Before admission, these are true chance probabilities used only by
+        // diagnostics/cache maintenance; sampled backup remains the authority.
+        let support_probability = 1.0 / node.chance_children.len() as f64;
+        for child in &mut node.chance_children {
+            child.probability = support_probability;
+        }
+    }
     Ok(())
 }
 
@@ -5832,6 +5916,32 @@ fn ol_select_chance_row(arena: &mut [OLNode], chance_node_id: u32, iid_seed: u64
                 ));
             }
             let outcome_index = node.chance_schedule[offset];
+            node.chance_route_count += 1;
+            node.chance_children[outcome_index].row
+        }
+        OLChanceTraversal::Progressive => {
+            let support_len = node.chance_schedule.len();
+            debug_assert_eq!(support_len, node.chance_children.len());
+            let prefix = if node.chance_active_width > 0 {
+                node.chance_active_width
+            } else if node.chance_route_count < node.chance_n_init as u64 {
+                // Lazy pre-admission phase: consume the immutable permutation
+                // prefix without replacement.
+                let schedule_pos = node.chance_route_count as usize % support_len;
+                node.chance_route_count += 1;
+                return node.chance_children[node.chance_schedule[schedule_pos]].row;
+            } else {
+                // Admission is evaluated in the same outer tick. Until it is
+                // published, route the triggering path through an already
+                // sampled prefix row so the bootstrap group only contains new
+                // counterfactual rows.
+                node.chance_n_init.min(support_len).max(1)
+            };
+            let outcome_index = node.chance_schedule[..prefix]
+                .iter()
+                .copied()
+                .min_by_key(|&index| node.chance_children[index].real_visits)
+                .expect("progressive active prefix must be non-empty");
             node.chance_route_count += 1;
             node.chance_children[outcome_index].row
         }
@@ -5922,6 +6032,7 @@ fn a1c_ensure_outcome(arena: &mut Vec<OLNode>, chance_node_id: u32, row: [u16; 4
                     row,
                     probability: 0.0,
                     multiplicity: 0,
+                    real_visits: 0,
                     node_id: None,
                     #[cfg(debug_assertions)]
                     public_key: None,
@@ -5948,6 +6059,85 @@ fn a1c_prepare_sampled_node(
     } else {
         debug_assert_eq!(node.chance_chooser_actor, Some(chooser_actor));
     }
+}
+
+fn progressive_next_width(node: &OLNode, widths: &[usize]) -> Option<usize> {
+    debug_assert!(node.chance_progressive);
+    let real_node_visits = (node.visit_count - node.virtual_visit_count).max(0) as usize;
+    if node.chance_active_width == 0 {
+        if real_node_visits < node.chance_n_init {
+            return None;
+        }
+        return widths
+            .iter()
+            .copied()
+            .find(|&width| width <= node.chance_max_width);
+    }
+    let active_is_mature = node.chance_schedule[..node.chance_active_width]
+        .iter()
+        .all(|&index| node.chance_children[index].real_visits as usize >= node.chance_d_min);
+    if !active_is_mature {
+        return None;
+    }
+    widths
+        .iter()
+        .copied()
+        .find(|&width| width > node.chance_active_width && width <= node.chance_max_width)
+        .or_else(|| {
+            (node.chance_active_width < node.chance_max_width).then_some(node.chance_max_width)
+        })
+}
+
+fn progressive_missing_outcome_indices(
+    arena: &[OLNode],
+    chance_node_id: u32,
+    target_width: usize,
+) -> Vec<usize> {
+    let node = &arena[chance_node_id as usize];
+    debug_assert!(node.chance_progressive);
+    debug_assert!(target_width > node.chance_active_width);
+    node.chance_schedule[..target_width]
+        .iter()
+        .copied()
+        .filter(|&index| {
+            let outcome = &node.chance_children[index];
+            outcome.real_visits == 0
+                && outcome
+                    .node_id
+                    .is_none_or(|id| arena[id as usize].bootstrap_value0.is_none())
+        })
+        .collect()
+}
+
+fn progressive_publish_width(arena: &mut [OLNode], chance_node_id: u32, target_width: usize) {
+    {
+        let node = &mut arena[chance_node_id as usize];
+        debug_assert!(node.chance_progressive);
+        debug_assert!(target_width > node.chance_active_width);
+        debug_assert!(target_width <= node.chance_max_width);
+        let probability = 1.0 / target_width as f64;
+        for child in &mut node.chance_children {
+            child.probability = 0.0;
+        }
+        for &index in &node.chance_schedule[..target_width] {
+            node.chance_children[index].probability = probability;
+        }
+        node.chance_active_width = target_width;
+        node.chance_backup = OLChanceBackup::PanelMean;
+        node.chance_visited_mass = 1.0;
+    }
+    let weighted = ol_panel_weighted_value(arena, chance_node_id);
+    arena[chance_node_id as usize].chance_weighted_value = weighted;
+}
+
+fn progressive_mature_width(node: &OLNode) -> usize {
+    if !node.chance_progressive || node.chance_active_width == 0 {
+        return 0;
+    }
+    node.chance_schedule[..node.chance_active_width]
+        .iter()
+        .take_while(|&&index| node.chance_children[index].real_visits as usize >= node.chance_d_min)
+        .count()
 }
 
 struct A1cBootstrapRequest {
@@ -6462,6 +6652,19 @@ fn ol_descend(
                     chance_step.is_none() && chance_config.is_some() && stochastic_here;
                 if split_here {
                     let config = chance_config.expect("split_here requires chance config");
+                    let config = if config.progressive.is_some() {
+                        OLChanceConfig {
+                            schedule_seed: progressive_schedule_seed(
+                                config.schedule_seed,
+                                &state,
+                                placement,
+                                pick,
+                            ),
+                            ..config
+                        }
+                    } else {
+                        config
+                    };
                     let row = if let Some(a1c) = config.a1c {
                         a1c_prepare_sampled_node(arena, child_id, actor, config.schedule_seed);
                         if arena[child_id as usize].chance_initialized_cycles < a1c.cycles.len() {
@@ -6474,6 +6677,7 @@ fn ol_descend(
                                 placement,
                                 pick,
                                 draw_seed: config.draw_seed,
+                                progressive_target_width: 0,
                             });
                         }
                         if arena[child_id as usize].chance_initialized_cycles > 0 {
@@ -6485,6 +6689,21 @@ fn ol_descend(
                                 1.0 / comb4(state.deck.len()) as f64;
                             sampled
                         }
+                    } else if let Some(progressive) = config.progressive {
+                        ol_register_chance_support(arena, child_id, config, actor)?;
+                        if let Some(target_width) =
+                            progressive_next_width(&arena[child_id as usize], progressive.widths)
+                        {
+                            a1c_admission_request = Some(A1cAdmissionRequest {
+                                chance_node_id: child_id,
+                                pre_reveal_state: state.cloned(),
+                                placement,
+                                pick,
+                                draw_seed: config.draw_seed,
+                                progressive_target_width: target_width,
+                            });
+                        }
+                        ol_select_chance_row(arena, child_id, config.draw_seed)
                     } else {
                         ol_register_chance_support(arena, child_id, config, actor)?;
                         if config.bootstrap_full_panel
@@ -6496,6 +6715,7 @@ fn ol_descend(
                                 placement,
                                 pick,
                                 draw_seed: config.draw_seed,
+                                progressive_target_width: 0,
                             });
                         }
                         ol_select_chance_row(arena, child_id, config.draw_seed)
@@ -6636,7 +6856,7 @@ fn ol_backup_path(
     sampled_value0: f64,
     chance_step: Option<(usize, f64)>,
 ) {
-    let Some((chance_index, outcome_probability)) = chance_step else {
+    let Some((chance_index, _traversal_probability)) = chance_step else {
         for &node_id in path {
             let node = &mut arena[node_id as usize];
             node.visit_count += 1;
@@ -6662,7 +6882,16 @@ fn ol_backup_path(
     }
     let observation = &arena[observation_id as usize];
     let new_observation_mean = observation.value_sum / observation.visit_count as f64;
-    let chance_node = &mut arena[path[chance_index] as usize];
+    let chance_node_id = path[chance_index];
+    let outcome_index = arena[chance_node_id as usize]
+        .chance_children
+        .iter()
+        .position(|outcome| outcome.node_id == Some(observation_id))
+        .expect("chance path observation must belong to its chance node");
+    let outcome_probability =
+        arena[chance_node_id as usize].chance_children[outcome_index].probability;
+    let chance_node = &mut arena[chance_node_id as usize];
+    chance_node.chance_children[outcome_index].real_visits += 1;
     if old_observation_visits == 0 && chance_node.chance_backup != OLChanceBackup::PanelMean {
         chance_node.chance_visited_mass += outcome_probability;
     }
@@ -7041,6 +7270,7 @@ fn advisor_open_loop_search_impl(
                         max_initialization_fraction: options.max_initialization_fraction,
                         force_re_evaluate_existing: false,
                     }),
+                    progressive: None,
                     bootstrap_full_panel: full_panel_probe,
                 })
             };
@@ -8221,6 +8451,13 @@ struct MoveRecord {
     // at least one ordinary simulation actually crosses the configured split;
     // eligibility alone is not sufficient.
     sampled_chance_split_treated: bool,
+    progressive_chance_treated: bool,
+    progressive_direct_mean: bool,
+    progressive_max_active_width: u16,
+    progressive_max_mature_width: u16,
+    progressive_principal_min_visits: u32,
+    progressive_principal_median_visits: f32,
+    progressive_principal_max_visits: u32,
     root_hidden_deck_count: u8,
     root_turn_slot: u8,
     actor: u8,
@@ -8271,6 +8508,30 @@ fn chance_public_state_key_v1_bytes(state: &RustGameState, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&board.terrain);
         buf.extend_from_slice(&board.crowns);
     }
+}
+
+fn progressive_schedule_seed(
+    base_seed: u64,
+    state: &RustGameState,
+    placement: Option<(i8, i8, i8, i8, bool)>,
+    pick: Option<u16>,
+) -> u64 {
+    // FNV-1a over public information plus the already-committed action. This
+    // makes the support permutation independent of hidden deck order and of
+    // value-dependent arena allocation order, while remaining node-local.
+    let mut public = Vec::with_capacity(1024);
+    chance_public_state_key_v1_bytes(state, &mut public);
+    if let Some((x, y, dx, dy, horizontal)) = placement {
+        public.extend_from_slice(&[x as u8, y as u8, dx as u8, dy as u8, horizontal as u8]);
+    } else {
+        public.extend_from_slice(&[0xff; 5]);
+    }
+    public.extend_from_slice(&pick.unwrap_or(u16::MAX).to_le_bytes());
+    public
+        .into_iter()
+        .fold(base_seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 /// Completed game payload kept inside Rust until conversion to Python.
@@ -8498,6 +8759,20 @@ struct SearchSlot {
     sampled_chance_split_search_count_deck12: u32,
     sampled_chance_split_path_count_deck8: u64,
     sampled_chance_split_path_count_deck12: u64,
+    progressive_chance_paths_this_move: u32,
+    progressive_bootstrap_rows_this_move: u32,
+    progressive_chance_search_count_deck8: u32,
+    progressive_chance_search_count_deck12: u32,
+    progressive_chance_path_count_deck8: u64,
+    progressive_chance_path_count_deck12: u64,
+    progressive_chance_admission_count: u32,
+    progressive_chance_widening_count: u32,
+    progressive_chance_bootstrap_rows: u32,
+    progressive_chance_budget_blocked_count: u32,
+    progressive_chance_guardrail_blocked_count: u32,
+    progressive_active_width_sum: u64,
+    progressive_mature_width_sum: u64,
+    progressive_width_sample_count: u32,
     exact_result: Option<ExactSolveResult>, // Some only while state == ExactSolving
     exact_plan: Vec<ExactPlanItem>,         // chosen-line plan for the deterministic endgame
     // Set once the exact solver times out on this game's deck=4 endgame. This
@@ -8609,6 +8884,20 @@ impl SearchSlot {
             sampled_chance_split_search_count_deck12: 0,
             sampled_chance_split_path_count_deck8: 0,
             sampled_chance_split_path_count_deck12: 0,
+            progressive_chance_paths_this_move: 0,
+            progressive_bootstrap_rows_this_move: 0,
+            progressive_chance_search_count_deck8: 0,
+            progressive_chance_search_count_deck12: 0,
+            progressive_chance_path_count_deck8: 0,
+            progressive_chance_path_count_deck12: 0,
+            progressive_chance_admission_count: 0,
+            progressive_chance_widening_count: 0,
+            progressive_chance_bootstrap_rows: 0,
+            progressive_chance_budget_blocked_count: 0,
+            progressive_chance_guardrail_blocked_count: 0,
+            progressive_active_width_sum: 0,
+            progressive_mature_width_sum: 0,
+            progressive_width_sample_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8648,6 +8937,20 @@ impl SearchSlot {
             sampled_chance_split_search_count_deck12: 0,
             sampled_chance_split_path_count_deck8: 0,
             sampled_chance_split_path_count_deck12: 0,
+            progressive_chance_paths_this_move: 0,
+            progressive_bootstrap_rows_this_move: 0,
+            progressive_chance_search_count_deck8: 0,
+            progressive_chance_search_count_deck12: 0,
+            progressive_chance_path_count_deck8: 0,
+            progressive_chance_path_count_deck12: 0,
+            progressive_chance_admission_count: 0,
+            progressive_chance_widening_count: 0,
+            progressive_chance_bootstrap_rows: 0,
+            progressive_chance_budget_blocked_count: 0,
+            progressive_chance_guardrail_blocked_count: 0,
+            progressive_active_width_sum: 0,
+            progressive_mature_width_sum: 0,
+            progressive_width_sample_count: 0,
             exact_result: None,
             exact_plan: Vec::new(),
             exact_unsolvable: false,
@@ -8752,6 +9055,71 @@ impl SearchSlot {
                 }
                 _ => {}
             }
+        }
+        let progressive_chance_treated = self.progressive_chance_paths_this_move > 0;
+        let (progressive_max_active_width, progressive_max_mature_width) = if open_loop {
+            self.ol_arena
+                .iter()
+                .filter(|node| node.chance_progressive)
+                .fold((0usize, 0usize), |(active, mature), node| {
+                    (
+                        active.max(node.chance_active_width),
+                        mature.max(progressive_mature_width(node)),
+                    )
+                })
+        } else {
+            (0, 0)
+        };
+        let progressive_direct_mean = progressive_max_active_width > 0;
+        let (
+            progressive_principal_min_visits,
+            progressive_principal_median_visits,
+            progressive_principal_max_visits,
+        ) = if open_loop {
+            self.ol_arena
+                .iter()
+                .filter(|node| node.chance_progressive && node.chance_active_width > 0)
+                .max_by_key(|node| {
+                    node.chance_schedule[..node.chance_active_width]
+                        .iter()
+                        .map(|&index| node.chance_children[index].real_visits as u64)
+                        .sum::<u64>()
+                })
+                .map(|node| {
+                    let mut visits: Vec<u32> = node.chance_schedule[..node.chance_active_width]
+                        .iter()
+                        .map(|&index| node.chance_children[index].real_visits)
+                        .collect();
+                    visits.sort_unstable();
+                    let middle = visits.len() / 2;
+                    let median = if visits.len() % 2 == 0 {
+                        (visits[middle - 1] as f32 + visits[middle] as f32) / 2.0
+                    } else {
+                        visits[middle] as f32
+                    };
+                    (*visits.first().unwrap(), median, *visits.last().unwrap())
+                })
+                .unwrap_or((0, 0.0, 0))
+        } else {
+            (0, 0.0, 0)
+        };
+        if progressive_chance_treated {
+            match root_hidden_deck_count {
+                8 => {
+                    self.progressive_chance_search_count_deck8 += 1;
+                    self.progressive_chance_path_count_deck8 +=
+                        self.progressive_chance_paths_this_move as u64;
+                }
+                12 => {
+                    self.progressive_chance_search_count_deck12 += 1;
+                    self.progressive_chance_path_count_deck12 +=
+                        self.progressive_chance_paths_this_move as u64;
+                }
+                _ => {}
+            }
+            self.progressive_active_width_sum += progressive_max_active_width as u64;
+            self.progressive_mature_width_sum += progressive_max_mature_width as u64;
+            self.progressive_width_sample_count += 1;
         }
 
         // Take any exact-solve result for this move (clears it so the next move,
@@ -8911,6 +9279,13 @@ impl SearchSlot {
                 root_prior_val,
                 root_visit_count,
                 sampled_chance_split_treated,
+                progressive_chance_treated,
+                progressive_direct_mean,
+                progressive_max_active_width: progressive_max_active_width as u16,
+                progressive_max_mature_width: progressive_max_mature_width as u16,
+                progressive_principal_min_visits,
+                progressive_principal_median_visits,
+                progressive_principal_max_visits,
                 root_hidden_deck_count,
                 root_turn_slot,
                 actor,
@@ -8978,6 +9353,8 @@ impl SearchSlot {
             self.sims_done = 0;
             self.deck8_chance_panel_admitted_this_move = false;
             self.sampled_chance_split_paths_this_move = 0;
+            self.progressive_chance_paths_this_move = 0;
+            self.progressive_bootstrap_rows_this_move = 0;
             self.choose_move_profile(
                 playout_cap_randomization,
                 full_search_fraction,
@@ -9518,6 +9895,13 @@ fn play_out_exact_endgame(
             root_prior_val: Vec::new(),
             root_visit_count: Vec::new(),
             sampled_chance_split_treated: false,
+            progressive_chance_treated: false,
+            progressive_direct_mean: false,
+            progressive_max_active_width: 0,
+            progressive_max_mature_width: 0,
+            progressive_principal_min_visits: 0,
+            progressive_principal_median_visits: 0.0,
+            progressive_principal_max_visits: 0,
             root_hidden_deck_count: state.deck.len() as u8,
             root_turn_slot: state.actor_index as u8,
             actor,
@@ -10508,6 +10892,8 @@ struct EvalLeaf {
 struct ChanceBootstrapEval {
     chance_node: u32,
     probability: f64,
+    progressive_target_width: usize,
+    outcome_index: usize,
 }
 
 /// Per-slot bookkeeping for one tick, set by step() and consumed by update().
@@ -10596,6 +10982,27 @@ struct BatchedMCTS {
     cum_sampled_chance_split_search_count_deck12: u64,
     cum_sampled_chance_split_path_count_deck8: u64,
     cum_sampled_chance_split_path_count_deck12: u64,
+    // Production depth-gated progressive chance panels. This is a distinct
+    // opt-in mode from both the pilot sampled split and exhaustive deck-8 panel.
+    progressive_chance_deck_mask: u64,
+    progressive_chance_widths: Vec<usize>,
+    progressive_chance_n_init: usize,
+    progressive_chance_d_min: usize,
+    progressive_chance_deck8_cap: usize,
+    progressive_chance_deck12_cap: usize,
+    progressive_chance_max_init_fraction: f64,
+    cum_progressive_chance_search_count_deck8: u64,
+    cum_progressive_chance_search_count_deck12: u64,
+    cum_progressive_chance_path_count_deck8: u64,
+    cum_progressive_chance_path_count_deck12: u64,
+    cum_progressive_chance_admission_count: u64,
+    cum_progressive_chance_widening_count: u64,
+    cum_progressive_chance_bootstrap_rows: u64,
+    cum_progressive_chance_budget_blocked_count: u64,
+    cum_progressive_chance_guardrail_blocked_count: u64,
+    cum_progressive_active_width_sum: u64,
+    cum_progressive_mature_width_sum: u64,
+    cum_progressive_width_sample_count: u64,
     // Cumulative open-loop diagnostics rolled in from finished slots (so the
     // Python-readable getters survive games being reset in their slots).
     cum_fallback_count: u64,
@@ -10721,6 +11128,28 @@ impl BatchedMCTS {
             self.slots[si].sampled_chance_split_path_count_deck8;
         self.cum_sampled_chance_split_path_count_deck12 +=
             self.slots[si].sampled_chance_split_path_count_deck12;
+        self.cum_progressive_chance_search_count_deck8 +=
+            self.slots[si].progressive_chance_search_count_deck8 as u64;
+        self.cum_progressive_chance_search_count_deck12 +=
+            self.slots[si].progressive_chance_search_count_deck12 as u64;
+        self.cum_progressive_chance_path_count_deck8 +=
+            self.slots[si].progressive_chance_path_count_deck8;
+        self.cum_progressive_chance_path_count_deck12 +=
+            self.slots[si].progressive_chance_path_count_deck12;
+        self.cum_progressive_chance_admission_count +=
+            self.slots[si].progressive_chance_admission_count as u64;
+        self.cum_progressive_chance_widening_count +=
+            self.slots[si].progressive_chance_widening_count as u64;
+        self.cum_progressive_chance_bootstrap_rows +=
+            self.slots[si].progressive_chance_bootstrap_rows as u64;
+        self.cum_progressive_chance_budget_blocked_count +=
+            self.slots[si].progressive_chance_budget_blocked_count as u64;
+        self.cum_progressive_chance_guardrail_blocked_count +=
+            self.slots[si].progressive_chance_guardrail_blocked_count as u64;
+        self.cum_progressive_active_width_sum += self.slots[si].progressive_active_width_sum;
+        self.cum_progressive_mature_width_sum += self.slots[si].progressive_mature_width_sum;
+        self.cum_progressive_width_sample_count +=
+            self.slots[si].progressive_width_sample_count as u64;
     }
 
     /// Async path (Step 1.5): drain every completed background solve and apply it.
@@ -10789,6 +11218,20 @@ impl BatchedMCTS {
                     self.slots[si].deck8_chance_panel_count = 0;
                     self.slots[si].deck8_chance_bootstrap_rows = 0;
                     self.slots[si].deck8_chance_budget_blocked_count = 0;
+                    self.slots[si].progressive_chance_paths_this_move = 0;
+                    self.slots[si].progressive_bootstrap_rows_this_move = 0;
+                    self.slots[si].progressive_chance_search_count_deck8 = 0;
+                    self.slots[si].progressive_chance_search_count_deck12 = 0;
+                    self.slots[si].progressive_chance_path_count_deck8 = 0;
+                    self.slots[si].progressive_chance_path_count_deck12 = 0;
+                    self.slots[si].progressive_chance_admission_count = 0;
+                    self.slots[si].progressive_chance_widening_count = 0;
+                    self.slots[si].progressive_chance_bootstrap_rows = 0;
+                    self.slots[si].progressive_chance_budget_blocked_count = 0;
+                    self.slots[si].progressive_chance_guardrail_blocked_count = 0;
+                    self.slots[si].progressive_active_width_sum = 0;
+                    self.slots[si].progressive_mature_width_sum = 0;
+                    self.slots[si].progressive_width_sample_count = 0;
                     self.slots[si].sampled_chance_split_paths_this_move = 0;
                     self.slots[si].sampled_chance_split_search_count_deck8 = 0;
                     self.slots[si].sampled_chance_split_search_count_deck12 = 0;
@@ -10891,7 +11334,14 @@ impl BatchedMCTS {
                         pick_floor_frac=0.0, pick_floor_depth=2,
                         deck8_chance_enumeration=false,
                         deck8_chance_enumeration_seat=-1,
-                        sampled_chance_split_deck_mask=0))]
+                        sampled_chance_split_deck_mask=0,
+                        progressive_chance_deck_mask=0,
+                        progressive_chance_width_schedule="4,8,16,32,64,70",
+                        progressive_chance_n_init=2,
+                        progressive_chance_d_min=4,
+                        progressive_chance_deck8_cap=70,
+                        progressive_chance_deck12_cap=16,
+                        progressive_chance_max_init_fraction=0.25))]
     fn new(
         n_slots: usize,
         n_games: usize,
@@ -10933,6 +11383,13 @@ impl BatchedMCTS {
         deck8_chance_enumeration: bool,
         deck8_chance_enumeration_seat: i64,
         sampled_chance_split_deck_mask: u64,
+        progressive_chance_deck_mask: u64,
+        progressive_chance_width_schedule: &str,
+        progressive_chance_n_init: usize,
+        progressive_chance_d_min: usize,
+        progressive_chance_deck8_cap: usize,
+        progressive_chance_deck12_cap: usize,
+        progressive_chance_max_init_fraction: f64,
     ) -> Self {
         let exact_policy_mode = ExactPolicyMode::from_str(exact_policy_mode)
             .expect("BatchedMCTS: invalid exact_policy_mode");
@@ -11037,6 +11494,45 @@ impl BatchedMCTS {
         assert!(
             sampled_chance_split_deck_mask & !supported_sampled_split_mask == 0,
             "BatchedMCTS: sampled chance split v1 supports only deck counts 8 and 12, got mask {sampled_chance_split_deck_mask:#x}"
+        );
+        assert!(
+            progressive_chance_deck_mask == 0 || open_loop,
+            "BatchedMCTS: progressive chance search requires open_loop=true"
+        );
+        assert!(
+            progressive_chance_deck_mask & !supported_sampled_split_mask == 0,
+            "BatchedMCTS: progressive chance search supports only deck counts 8 and 12, got mask {progressive_chance_deck_mask:#x}"
+        );
+        assert!(
+            progressive_chance_deck_mask == 0
+                || (sampled_chance_split_deck_mask == 0 && !deck8_chance_enumeration),
+            "BatchedMCTS: progressive, sampled-split, and exhaustive chance modes are mutually exclusive"
+        );
+        let progressive_chance_widths =
+            parse_progressive_width_schedule(progressive_chance_width_schedule)
+                .expect("BatchedMCTS: invalid progressive chance width schedule");
+        assert!(
+            progressive_chance_n_init > 0,
+            "progressive chance n_init must be > 0"
+        );
+        assert!(
+            progressive_chance_d_min > 0,
+            "progressive chance d_min must be > 0"
+        );
+        assert!(
+            progressive_chance_deck8_cap >= progressive_chance_widths[0]
+                && progressive_chance_deck8_cap <= 70,
+            "progressive deck-8 cap must be between W0 and 70"
+        );
+        assert!(
+            progressive_chance_deck12_cap >= progressive_chance_widths[0]
+                && progressive_chance_deck12_cap <= 495,
+            "progressive deck-12 cap must be between W0 and 495"
+        );
+        assert!(
+            progressive_chance_max_init_fraction > 0.0
+                && progressive_chance_max_init_fraction <= 1.0,
+            "progressive chance max init fraction must be in (0, 1]"
         );
         assert!(
             (-1..=1).contains(&deck8_chance_enumeration_seat),
@@ -11145,6 +11641,25 @@ impl BatchedMCTS {
             cum_sampled_chance_split_search_count_deck12: 0,
             cum_sampled_chance_split_path_count_deck8: 0,
             cum_sampled_chance_split_path_count_deck12: 0,
+            progressive_chance_deck_mask,
+            progressive_chance_widths,
+            progressive_chance_n_init,
+            progressive_chance_d_min,
+            progressive_chance_deck8_cap,
+            progressive_chance_deck12_cap,
+            progressive_chance_max_init_fraction,
+            cum_progressive_chance_search_count_deck8: 0,
+            cum_progressive_chance_search_count_deck12: 0,
+            cum_progressive_chance_path_count_deck8: 0,
+            cum_progressive_chance_path_count_deck12: 0,
+            cum_progressive_chance_admission_count: 0,
+            cum_progressive_chance_widening_count: 0,
+            cum_progressive_chance_bootstrap_rows: 0,
+            cum_progressive_chance_budget_blocked_count: 0,
+            cum_progressive_chance_guardrail_blocked_count: 0,
+            cum_progressive_active_width_sum: 0,
+            cum_progressive_mature_width_sum: 0,
+            cum_progressive_width_sample_count: 0,
             cum_fallback_count: 0,
             cum_missing_child_count: 0,
             cum_pf_minshare_sum: 0.0,
@@ -11300,6 +11815,13 @@ impl BatchedMCTS {
             false,
             -1,
             0,
+            0,
+            "4,8,16,32,64,70",
+            2,
+            4,
+            70,
+            16,
+            0.25,
         );
         batched.slots = supplied
             .into_iter()
@@ -11644,6 +12166,20 @@ impl BatchedMCTS {
                 self.slots[si].sampled_chance_split_search_count_deck12 = 0;
                 self.slots[si].sampled_chance_split_path_count_deck8 = 0;
                 self.slots[si].sampled_chance_split_path_count_deck12 = 0;
+                self.slots[si].progressive_chance_paths_this_move = 0;
+                self.slots[si].progressive_bootstrap_rows_this_move = 0;
+                self.slots[si].progressive_chance_search_count_deck8 = 0;
+                self.slots[si].progressive_chance_search_count_deck12 = 0;
+                self.slots[si].progressive_chance_path_count_deck8 = 0;
+                self.slots[si].progressive_chance_path_count_deck12 = 0;
+                self.slots[si].progressive_chance_admission_count = 0;
+                self.slots[si].progressive_chance_widening_count = 0;
+                self.slots[si].progressive_chance_bootstrap_rows = 0;
+                self.slots[si].progressive_chance_budget_blocked_count = 0;
+                self.slots[si].progressive_chance_guardrail_blocked_count = 0;
+                self.slots[si].progressive_active_width_sum = 0;
+                self.slots[si].progressive_mature_width_sum = 0;
+                self.slots[si].progressive_width_sample_count = 0;
             }
         }
         Ok(())
@@ -11746,6 +12282,148 @@ impl BatchedMCTS {
                 .slots
                 .iter()
                 .map(|slot| slot.sampled_chance_split_path_count_deck12)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_search_count_deck8(&self) -> u64 {
+        self.cum_progressive_chance_search_count_deck8
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_search_count_deck8 as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_search_count_deck12(&self) -> u64 {
+        self.cum_progressive_chance_search_count_deck12
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_search_count_deck12 as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_path_count_deck8(&self) -> u64 {
+        self.cum_progressive_chance_path_count_deck8
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_path_count_deck8)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_path_count_deck12(&self) -> u64 {
+        self.cum_progressive_chance_path_count_deck12
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_path_count_deck12)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_admission_count(&self) -> u64 {
+        self.cum_progressive_chance_admission_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_admission_count as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_widening_count(&self) -> u64 {
+        self.cum_progressive_chance_widening_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_widening_count as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_bootstrap_rows(&self) -> u64 {
+        self.cum_progressive_chance_bootstrap_rows
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_bootstrap_rows as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_budget_blocked_count(&self) -> u64 {
+        self.cum_progressive_chance_budget_blocked_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_budget_blocked_count as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_guardrail_blocked_count(&self) -> u64 {
+        self.cum_progressive_chance_guardrail_blocked_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_chance_guardrail_blocked_count as u64)
+                .sum::<u64>()
+    }
+
+    #[getter]
+    fn progressive_chance_mean_active_width(&self) -> f64 {
+        let sum = self.cum_progressive_active_width_sum
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_active_width_sum)
+                .sum::<u64>();
+        let count = self.cum_progressive_width_sample_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_width_sample_count as u64)
+                .sum::<u64>();
+        if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        }
+    }
+
+    #[getter]
+    fn progressive_chance_mean_mature_width(&self) -> f64 {
+        let sum = self.cum_progressive_mature_width_sum
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_mature_width_sum)
+                .sum::<u64>();
+        let count = self.cum_progressive_width_sample_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_width_sample_count as u64)
+                .sum::<u64>();
+        if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        }
+    }
+
+    #[getter]
+    fn progressive_chance_width_sample_count(&self) -> u64 {
+        self.cum_progressive_width_sample_count
+            + self
+                .slots
+                .iter()
+                .map(|s| s.progressive_width_sample_count as u64)
                 .sum::<u64>()
     }
 
@@ -11935,6 +12613,13 @@ impl BatchedMCTS {
             deck8_chance_enumeration,
             deck8_chance_enumeration_seat,
             sampled_chance_split_deck_mask,
+            progressive_chance_deck_mask,
+            progressive_chance_widths,
+            progressive_chance_n_init,
+            progressive_chance_d_min,
+            progressive_chance_deck8_cap,
+            progressive_chance_deck12_cap,
+            progressive_chance_max_init_fraction,
         ) = (
             self.fpu,
             self.cpuct,
@@ -11945,6 +12630,13 @@ impl BatchedMCTS {
             self.deck8_chance_enumeration,
             self.deck8_chance_enumeration_seat,
             self.sampled_chance_split_deck_mask,
+            self.progressive_chance_deck_mask,
+            self.progressive_chance_widths.as_slice(),
+            self.progressive_chance_n_init,
+            self.progressive_chance_d_min,
+            self.progressive_chance_deck8_cap,
+            self.progressive_chance_deck12_cap,
+            self.progressive_chance_max_init_fraction,
         );
 
         let slot_outputs: PyResult<Vec<SlotStepOutput>> = self
@@ -12035,6 +12727,15 @@ impl BatchedMCTS {
                                 sampled_chance_split_deck_mask,
                                 &slot.real_state,
                             );
+                            let progressive_here = sampled_chance_split_root_enabled(
+                                progressive_chance_deck_mask,
+                                &slot.real_state,
+                            );
+                            let progressive_max_width = match slot.real_state.deck.len() {
+                                8 => progressive_chance_deck8_cap,
+                                12 => progressive_chance_deck12_cap,
+                                _ => 0,
+                            };
                             let panel = if exhaustive_here {
                                 ol_one_reveal_panel(
                                     &slot.real_state.deck,
@@ -12044,7 +12745,7 @@ impl BatchedMCTS {
                                         ^ (slot.move_num as u64)
                                             .wrapping_mul(0xA1C0_77EC_7A11_5EED),
                                 )?
-                            } else if sampled_split_here {
+                            } else if sampled_split_here || progressive_here {
                                 ol_one_reveal_panel(
                                     &slot.real_state.deck,
                                     1,
@@ -12079,12 +12780,24 @@ impl BatchedMCTS {
                                 let chance_config = chance_enabled.then_some(OLChanceConfig {
                                     panel: panel.as_slice(),
                                     backup: OLChanceBackup::Sampled,
-                                    traversal: OLChanceTraversal::Balanced,
+                                    traversal: if progressive_here {
+                                        OLChanceTraversal::Progressive
+                                    } else {
+                                        OLChanceTraversal::Balanced
+                                    },
                                     schedule_seed: slot.game_seed
                                         ^ (slot.move_num as u64)
                                             .wrapping_mul(0xBA1A_4CED_C1C1_E5E5),
                                     draw_seed: seed,
                                     a1c: None,
+                                    progressive: progressive_here.then_some(
+                                        ProgressiveChanceConfig {
+                                            widths: progressive_chance_widths,
+                                            n_init: progressive_chance_n_init,
+                                            d_min: progressive_chance_d_min,
+                                            max_width: progressive_max_width,
+                                        },
+                                    ),
                                     bootstrap_full_panel: exhaustive_here,
                                 });
                                 let (
@@ -12108,13 +12821,46 @@ impl BatchedMCTS {
                                 if sampled_split_here && chance_step.is_some() {
                                     slot.sampled_chance_split_paths_this_move += 1;
                                 }
+                                if progressive_here && chance_step.is_some() {
+                                    slot.progressive_chance_paths_this_move += 1;
+                                }
                                 if let Some(request) = a1c_admission_request {
                                     if considered_chance_nodes.insert(request.chance_node_id) {
                                         // The first admitted action gets the exact
                                         // panel; siblings remain on unbiased sampled
                                         // backup. This bounds the midgame tax at 70
                                         // rows and makes the A/B attributable.
-                                        if !slot.deck8_chance_panel_admitted_this_move
+                                        if request.progressive_target_width > 0 {
+                                            let missing = progressive_missing_outcome_indices(
+                                                &slot.ol_arena,
+                                                request.chance_node_id,
+                                                request.progressive_target_width,
+                                            )
+                                            .len();
+                                            let init_cap = (slot.move_profile.target_sims as f64
+                                                * progressive_chance_max_init_fraction)
+                                                .floor()
+                                                as usize;
+                                            let projected = slot.sims_done
+                                                + paths.len()
+                                                + 1
+                                                + reserved_bootstrap_rows
+                                                + missing;
+                                            if projected > slot.move_profile.target_sims {
+                                                slot.progressive_chance_budget_blocked_count += 1;
+                                            } else if slot.progressive_bootstrap_rows_this_move
+                                                as usize
+                                                + reserved_bootstrap_rows
+                                                + missing
+                                                > init_cap
+                                            {
+                                                slot.progressive_chance_guardrail_blocked_count +=
+                                                    1;
+                                            } else {
+                                                reserved_bootstrap_rows += missing;
+                                                bootstrap_requests.push(request);
+                                            }
+                                        } else if !slot.deck8_chance_panel_admitted_this_move
                                             && bootstrap_requests.is_empty()
                                         {
                                             let projected = slot.sims_done
@@ -12190,12 +12936,42 @@ impl BatchedMCTS {
                             // then the outer gather concatenates every slot before the
                             // single Python/GPU evaluator call.
                             for request in &bootstrap_requests {
-                                for outcome in &panel {
-                                    let row_tiles: [u16; 4] = outcome
-                                        .row
-                                        .as_slice()
-                                        .try_into()
-                                        .expect("deck=8 panel rows contain four tiles");
+                                let bootstrap_outcomes: Vec<(usize, [u16; 4], f64)> =
+                                    if request.progressive_target_width > 0 {
+                                        progressive_missing_outcome_indices(
+                                            &slot.ol_arena,
+                                            request.chance_node_id,
+                                            request.progressive_target_width,
+                                        )
+                                        .into_iter()
+                                        .map(|index| {
+                                            (
+                                                index,
+                                                slot.ol_arena[request.chance_node_id as usize]
+                                                    .chance_children[index]
+                                                    .row,
+                                                1.0 / request.progressive_target_width as f64,
+                                            )
+                                        })
+                                        .collect()
+                                    } else {
+                                        panel
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, outcome)| {
+                                                (
+                                                    index,
+                                                    outcome.row.as_slice().try_into().expect(
+                                                        "chance panel rows contain four tiles",
+                                                    ),
+                                                    outcome.probability,
+                                                )
+                                            })
+                                            .collect()
+                                    };
+                                for (outcome_index, row_tiles, target_probability) in
+                                    bootstrap_outcomes
+                                {
                                     let row_seed = request.draw_seed
                                         ^ row_tiles
                                             .iter()
@@ -12210,7 +12986,7 @@ impl BatchedMCTS {
                                     let revealed = forced.step(request.placement, request.pick)?;
                                     let actor = revealed.actor()?;
                                     let legal = revealed.legal_actions_indexed();
-                                    let (observation_id, probability) =
+                                    let (observation_id, _probability) =
                                         ol_route_chance_observation(
                                             &mut slot.ol_arena,
                                             request.chance_node_id,
@@ -12236,7 +13012,10 @@ impl BatchedMCTS {
                                         legal,
                                         chance_bootstrap: Some(ChanceBootstrapEval {
                                             chance_node: request.chance_node_id,
-                                            probability,
+                                            probability: target_probability,
+                                            progressive_target_width: request
+                                                .progressive_target_width,
+                                            outcome_index,
                                         }),
                                     });
                                     row += 1;
@@ -12554,7 +13333,7 @@ impl BatchedMCTS {
                         // be the closed C(8,4)=70 support with unit probability mass.
                         let mut bootstrap_groups: HashMap<
                             u32,
-                            Vec<(usize, f64, Vec<f64>, f64)>,
+                            Vec<(usize, f64, Vec<f64>, f64, usize, usize)>,
                         > =
                             HashMap::new();
                         for ev in tick
@@ -12577,23 +13356,53 @@ impl BatchedMCTS {
                             bootstrap_groups
                                 .entry(meta.chance_node)
                                 .or_default()
-                                .push((ev.row, value0, priors, meta.probability));
+                                .push((
+                                    ev.row,
+                                    value0,
+                                    priors,
+                                    meta.probability,
+                                    meta.progressive_target_width,
+                                    meta.outcome_index,
+                                ));
                         }
                         for (&chance_node, results) in &bootstrap_groups {
                             let support = &slot.ol_arena[chance_node as usize].chance_children;
                             let mass: f64 = support.iter().map(|outcome| outcome.probability).sum();
-                            let result_mass: f64 =
-                                results.iter().map(|(_, _, _, probability)| probability).sum();
-                            if results.len() != 70
-                                || support.len() != 70
-                                || (mass - 1.0).abs() > 1e-9
-                                || (result_mass - 1.0).abs() > 1e-9
-                            {
-                                return Err(PyValueError::new_err(format!(
-                                    "deck=8 chance panel must commit atomically as 70 rows with unit mass; got results={}, support={}, support_mass={mass}, result_mass={result_mass}",
-                                    results.len(),
-                                    support.len(),
-                                )));
+                            let target_width = results[0].4;
+                            if target_width > 0 {
+                                let expected = progressive_missing_outcome_indices(
+                                    &slot.ol_arena,
+                                    chance_node,
+                                    target_width,
+                                );
+                                let mut actual: Vec<usize> =
+                                    results.iter().map(|result| result.5).collect();
+                                actual.sort_unstable();
+                                let mut expected_sorted = expected;
+                                expected_sorted.sort_unstable();
+                                if actual != expected_sorted
+                                    || results.iter().any(|result| result.4 != target_width)
+                                {
+                                    return Err(PyValueError::new_err(format!(
+                                        "progressive chance group must commit the exact missing prefix atomically; target={target_width}, results={}, expected={}",
+                                        results.len(),
+                                        expected_sorted.len(),
+                                    )));
+                                }
+                            } else {
+                                let result_mass: f64 =
+                                    results.iter().map(|result| result.3).sum();
+                                if results.len() != 70
+                                    || support.len() != 70
+                                    || (mass - 1.0).abs() > 1e-9
+                                    || (result_mass - 1.0).abs() > 1e-9
+                                {
+                                    return Err(PyValueError::new_err(format!(
+                                        "deck=8 chance panel must commit atomically as 70 rows with unit mass; got results={}, support={}, support_mass={mass}, result_mass={result_mass}",
+                                        results.len(),
+                                        support.len(),
+                                    )));
+                                }
                             }
                         }
 
@@ -12608,9 +13417,9 @@ impl BatchedMCTS {
                         {
                             let meta = ev.chance_bootstrap.unwrap();
                             let results = &bootstrap_groups[&meta.chance_node];
-                            let (_, value0, priors, _) = results
+                            let (_, value0, priors, _, _, _) = results
                                 .iter()
-                                .find(|(result_row, _, _, _)| *result_row == ev.row)
+                                .find(|(result_row, _, _, _, _, _)| *result_row == ev.row)
                                 .expect("validated bootstrap result row");
                             if !slot.ol_arena[ev.leaf as usize].is_expanded {
                                 for (i, &(idx, placement, pick)) in ev.legal.iter().enumerate() {
@@ -12703,13 +13512,33 @@ impl BatchedMCTS {
                         // visits contributes its searched conditional mean; only an
                         // unvisited row contributes the new network bootstrap.
                         for &chance_node in bootstrap_groups.keys() {
-                            let weighted = ol_panel_weighted_value(&slot.ol_arena, chance_node);
-                            let node = &mut slot.ol_arena[chance_node as usize];
-                            node.chance_backup = OLChanceBackup::PanelMean;
-                            node.chance_visited_mass = 1.0;
-                            node.chance_weighted_value = weighted;
-                            slot.deck8_chance_panel_count += 1;
-                            slot.deck8_chance_bootstrap_rows += 70;
+                            let target_width = bootstrap_groups[&chance_node][0].4;
+                            if target_width > 0 {
+                                let prior_width =
+                                    slot.ol_arena[chance_node as usize].chance_active_width;
+                                progressive_publish_width(
+                                    &mut slot.ol_arena,
+                                    chance_node,
+                                    target_width,
+                                );
+                                if prior_width == 0 {
+                                    slot.progressive_chance_admission_count += 1;
+                                } else {
+                                    slot.progressive_chance_widening_count += 1;
+                                }
+                                slot.progressive_chance_bootstrap_rows +=
+                                    bootstrap_groups[&chance_node].len() as u32;
+                                slot.progressive_bootstrap_rows_this_move +=
+                                    bootstrap_groups[&chance_node].len() as u32;
+                            } else {
+                                let weighted = ol_panel_weighted_value(&slot.ol_arena, chance_node);
+                                let node = &mut slot.ol_arena[chance_node as usize];
+                                node.chance_backup = OLChanceBackup::PanelMean;
+                                node.chance_visited_mass = 1.0;
+                                node.chance_weighted_value = weighted;
+                                slot.deck8_chance_panel_count += 1;
+                                slot.deck8_chance_bootstrap_rows += 70;
+                            }
                         }
                         // Backup: terminal value from each path's own concrete leaf
                         // state (deck-dependent), else this path's own eval value.
@@ -12836,6 +13665,25 @@ impl BatchedMCTS {
                     self.slots[si].deck8_chance_panel_count = 0;
                     self.slots[si].deck8_chance_bootstrap_rows = 0;
                     self.slots[si].deck8_chance_budget_blocked_count = 0;
+                    self.slots[si].sampled_chance_split_paths_this_move = 0;
+                    self.slots[si].sampled_chance_split_search_count_deck8 = 0;
+                    self.slots[si].sampled_chance_split_search_count_deck12 = 0;
+                    self.slots[si].sampled_chance_split_path_count_deck8 = 0;
+                    self.slots[si].sampled_chance_split_path_count_deck12 = 0;
+                    self.slots[si].progressive_chance_paths_this_move = 0;
+                    self.slots[si].progressive_bootstrap_rows_this_move = 0;
+                    self.slots[si].progressive_chance_search_count_deck8 = 0;
+                    self.slots[si].progressive_chance_search_count_deck12 = 0;
+                    self.slots[si].progressive_chance_path_count_deck8 = 0;
+                    self.slots[si].progressive_chance_path_count_deck12 = 0;
+                    self.slots[si].progressive_chance_admission_count = 0;
+                    self.slots[si].progressive_chance_widening_count = 0;
+                    self.slots[si].progressive_chance_bootstrap_rows = 0;
+                    self.slots[si].progressive_chance_budget_blocked_count = 0;
+                    self.slots[si].progressive_chance_guardrail_blocked_count = 0;
+                    self.slots[si].progressive_active_width_sum = 0;
+                    self.slots[si].progressive_mature_width_sum = 0;
+                    self.slots[si].progressive_width_sample_count = 0;
                 }
             }
         }
@@ -12852,6 +13700,15 @@ impl BatchedMCTS {
                     r.root_prior_val.into_pyarray(py),
                     r.root_visit_count.into_pyarray(py),
                     r.sampled_chance_split_treated,
+                    r.progressive_chance_treated,
+                    r.progressive_direct_mean,
+                    r.progressive_max_active_width,
+                    r.progressive_max_mature_width,
+                    (
+                        r.progressive_principal_min_visits,
+                        r.progressive_principal_median_visits,
+                        r.progressive_principal_max_visits,
+                    ),
                     r.root_hidden_deck_count,
                     r.root_turn_slot,
                 );
@@ -13263,6 +14120,7 @@ mod ol_tests {
             row,
             probability,
             multiplicity: 1,
+            real_visits: 0,
             node_id: Some(node_id),
             #[cfg(debug_assertions)]
             public_key: None,
@@ -13558,6 +14416,7 @@ mod ol_tests {
                 row: [5, 6, 7, 8],
                 probability: 0.75,
                 multiplicity: 1,
+                real_visits: 0,
                 node_id: None,
                 #[cfg(debug_assertions)]
                 public_key: None,
@@ -13623,6 +14482,7 @@ mod ol_tests {
                 schedule_seed: 20260808,
                 draw_seed: 7,
                 a1c: None,
+                progressive: None,
                 bootstrap_full_panel: false,
             },
             0,
@@ -13649,6 +14509,134 @@ mod ol_tests {
         let _first_of_next_cycle = ol_select_chance_row(&mut arena, 0, 99);
         assert_eq!(arena[0].chance_route_count, 4);
         Ok(())
+    }
+
+    #[test]
+    fn progressive_width_schedule_is_strict_and_depth_gated() {
+        assert_eq!(
+            parse_progressive_width_schedule("4,8,16,32,64,70").unwrap(),
+            vec![4, 8, 16, 32, 64, 70]
+        );
+        assert!(parse_progressive_width_schedule("4,4,8").is_err());
+        assert!(parse_progressive_width_schedule("8,4").is_err());
+
+        let mut node = OLNode::new(1.0, (None, None));
+        node.chance_progressive = true;
+        node.chance_active_width = 4;
+        node.chance_max_width = 16;
+        node.chance_d_min = 4;
+        node.chance_schedule = (0..16).collect();
+        node.chance_children = (0..16)
+            .map(|i| test_chance_child([i as u16, 1, 2, 3], 1.0 / 16.0, 0))
+            .collect();
+        node.chance_children[0].real_visits = 4;
+        node.chance_children[1].real_visits = 4;
+        node.chance_children[2].real_visits = 4;
+        node.chance_children[3].real_visits = 3;
+        assert_eq!(progressive_next_width(&node, &[4, 8, 16]), None);
+        node.chance_children[3].real_visits = 4;
+        assert_eq!(progressive_next_width(&node, &[4, 8, 16]), Some(8));
+    }
+
+    #[test]
+    fn progressive_schedule_seed_ignores_hidden_order() {
+        let state = new_game(991, false, false);
+        let shuffled = state.redeterminize(Some(12345));
+        assert_ne!(state.deck, shuffled.deck);
+        assert_eq!(
+            progressive_schedule_seed(17, &state, None, Some(3)),
+            progressive_schedule_seed(17, &shuffled, None, Some(3)),
+        );
+        assert_ne!(
+            progressive_schedule_seed(17, &state, None, Some(3)),
+            progressive_schedule_seed(17, &state, None, Some(4)),
+        );
+    }
+
+    #[test]
+    fn progressive_support_prefix_is_immutable_and_published_atomically() -> PyResult<()> {
+        let panel: Vec<OLChancePanelRow> = (0..16)
+            .map(|i| OLChancePanelRow {
+                row: vec![i, 20 + i, 40 + i, 60 + i],
+                probability: 1.0 / 16.0,
+                multiplicity: 1,
+            })
+            .collect();
+        let widths = vec![4, 8, 16];
+        let mut arena = vec![OLNode::new(1.0, (None, None))];
+        ol_register_chance_support(
+            &mut arena,
+            0,
+            OLChanceConfig {
+                panel: &panel,
+                backup: OLChanceBackup::PanelMean,
+                traversal: OLChanceTraversal::Progressive,
+                schedule_seed: 17,
+                draw_seed: 29,
+                a1c: None,
+                progressive: Some(ProgressiveChanceConfig {
+                    widths: &widths,
+                    n_init: 2,
+                    d_min: 4,
+                    max_width: 16,
+                }),
+                bootstrap_full_panel: false,
+            },
+            0,
+        )?;
+        let original = arena[0].chance_schedule.clone();
+        assert_eq!(original.len(), 16);
+        let unique: std::collections::HashSet<usize> = original.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "support permutation may not duplicate outcomes"
+        );
+
+        let missing4 = progressive_missing_outcome_indices(&arena, 0, 4);
+        assert_eq!(missing4.len(), 4);
+        for outcome_idx in &missing4 {
+            let child = arena.len() as u32;
+            let mut observation = OLNode::new(1.0, (None, None));
+            observation.bootstrap_value0 = Some(*outcome_idx as f64 / 16.0);
+            arena.push(observation);
+            arena[0].chance_children[*outcome_idx].node_id = Some(child);
+        }
+        progressive_publish_width(&mut arena, 0, 4);
+        assert_eq!(arena[0].chance_active_width, 4);
+        assert_eq!(arena[0].chance_schedule, original);
+        assert!(
+            arena[0].chance_schedule[..4]
+                .iter()
+                .all(|&idx| (arena[0].chance_children[idx].probability - 0.25).abs() < 1e-12)
+        );
+        assert!(
+            arena[0].chance_schedule[4..]
+                .iter()
+                .all(|&idx| arena[0].chance_children[idx].probability == 0.0)
+        );
+
+        let missing8 = progressive_missing_outcome_indices(&arena, 0, 8);
+        assert_eq!(missing8, original[4..8]);
+        Ok(())
+    }
+
+    #[test]
+    fn progressive_routing_prefers_least_real_visits() {
+        let mut arena = vec![OLNode::new(1.0, (None, None))];
+        arena[0].chance_progressive = true;
+        arena[0].chance_traversal = OLChanceTraversal::Progressive;
+        arena[0].chance_active_width = 4;
+        arena[0].chance_schedule = vec![0, 1, 2, 3];
+        arena[0].chance_children = (0..4)
+            .map(|i| test_chance_child([i, 1, 2, 3], 0.25, 0))
+            .collect();
+        arena[0].chance_children[0].real_visits = 3;
+        arena[0].chance_children[1].real_visits = 1;
+        arena[0].chance_children[2].real_visits = 2;
+        arena[0].chance_children[3].real_visits = 1;
+        let row = ol_select_chance_row(&mut arena, 0, 99);
+        assert!(row == [1, 1, 2, 3] || row == [3, 1, 2, 3]);
     }
 
     #[test]
@@ -13757,6 +14745,7 @@ mod ol_tests {
                 schedule_seed: 9,
                 draw_seed: 10,
                 a1c: None,
+                progressive: None,
                 bootstrap_full_panel: false,
             },
             state.actor()?,
@@ -13847,6 +14836,7 @@ mod ol_tests {
             schedule_seed: 123,
             draw_seed: 456,
             a1c: None,
+            progressive: None,
             bootstrap_full_panel: true,
         };
         let mut fallback_count = 0;
