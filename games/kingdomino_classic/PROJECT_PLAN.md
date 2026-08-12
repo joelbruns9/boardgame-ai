@@ -53,6 +53,9 @@ and every scripted rules example agrees with the oracle.
 
 ### K1 - Baselines
 
+Status: complete (2026-08-12). See `K1_BASELINES.md` for the held-out,
+seat-balanced gate and reproduction commands.
+
 - Random bot.
 - Immediate-score greedy bot.
 - Placement-flexibility bot.
