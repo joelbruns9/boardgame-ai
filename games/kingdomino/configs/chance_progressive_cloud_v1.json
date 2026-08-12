@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "experiment": "chance_progressive_full_training_v1",
   "decision_record": "games/kingdomino/CHANCE_AWARE_FULL_TRAINING_REVIEW_RESPONSE.md",
   "minimum_source_commit": "a16fed8",
@@ -68,9 +68,18 @@
     "measurement_confidence_z": 1.96,
     "measurement_stop_ucb": 0.50
   },
+  "phase_b_prefill": {
+    "iterations": 23,
+    "games_per_iteration": 400,
+    "train_steps_per_iteration": 0,
+    "min_buffer": 999999999,
+    "minimum_buffer_examples": 175000,
+    "seed": 2026081301
+  },
   "phase_b": {
     "iterations": 24,
-    "seed": 2026081301,
+    "train_steps_per_iteration": 192,
+    "seed": 2026081401,
     "promotion_every": 5,
     "promotion_games": 384,
     "promotion_sims": 400,

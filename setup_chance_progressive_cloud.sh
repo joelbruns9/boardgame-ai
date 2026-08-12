@@ -73,7 +73,7 @@ mkdir -p runs/kingdomino/chance_progressive_cloud_v1/calibration
 # This batch size is a placeholder for syntax/provenance validation only.
 # Replace it with the batch-slot sweep winner when launching G4. game_cpus is
 # frozen at 2 so the remaining logical CPUs serve the Rayon exact-solver pool.
-for phase in g4 phase_a phase_b; do
+for phase in g4 phase_a phase_b_prefill phase_b; do
   "$PY" -m games.kingdomino.chance_progressive_cloud run \
     --phase "$phase" \
     --run-root runs/kingdomino/chance_progressive_cloud_v1 \

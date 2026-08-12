@@ -8,8 +8,8 @@ cd "$SCRIPT_DIR"
 
 PHASE="${1:-}"
 case "$PHASE" in
-  g4|phase_a|phase_b) ;;
-  *) echo "usage: $0 {g4|phase_a|phase_b}" >&2; exit 2 ;;
+  g4|phase_a|phase_b_prefill|phase_b) ;;
+  *) echo "usage: $0 {g4|phase_a|phase_b_prefill|phase_b}" >&2; exit 2 ;;
 esac
 
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-}"

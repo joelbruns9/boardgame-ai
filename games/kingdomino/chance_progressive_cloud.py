@@ -22,7 +22,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "chance_progressive_cloud_v1.json"
-PHASE_NAMES = ("g4", "phase_a", "phase_b")
+PHASE_NAMES = ("g4", "phase_a", "phase_b_prefill", "phase_b")
 
 
 def _sha256(path: Path) -> str:
@@ -42,8 +42,8 @@ def _load_config(path: Path) -> dict[str, Any]:
 def validate_config(cfg: dict[str, Any]) -> None:
     """Fail closed if a frozen load-bearing invariant drifts."""
     errors: list[str] = []
-    if cfg.get("schema_version") != 1:
-        errors.append("schema_version must be 1")
+    if cfg.get("schema_version") != 2:
+        errors.append("schema_version must be 2")
     progressive = cfg.get("progressive", {})
     expected_progressive = {
         "decks": "8,12",
@@ -71,8 +71,19 @@ def validate_config(cfg: dict[str, Any]) -> None:
             errors.append(f"common.{key} must be {expected!r}")
     if cfg.get("phase_a", {}).get("measurement_iterations") != "5,8":
         errors.append("phase_a.measurement_iterations must be '5,8'")
+    prefill = cfg.get("phase_b_prefill", {})
+    for key, expected in {
+        "iterations": 23,
+        "games_per_iteration": 400,
+        "train_steps_per_iteration": 0,
+        "minimum_buffer_examples": 175000,
+    }.items():
+        if prefill.get(key) != expected:
+            errors.append(f"phase_b_prefill.{key} must be {expected!r}")
     phase_b = cfg.get("phase_b", {})
     for key, expected in {
+        "iterations": 24,
+        "train_steps_per_iteration": 192,
         "promotion_every": 5,
         "promotion_games": 384,
         "promotion_sims": 400,
@@ -185,7 +196,7 @@ def build_command(cfg: dict[str, Any], phase: str, *, repo_root: Path,
         "--seed", str(section["seed"]),
     ]
 
-    if phase in ("g4", "phase_a"):
+    if phase in ("g4", "phase_a", "phase_b_prefill"):
         args += [
             "--warm_start_current_best",
             "--current_best_path", str(base_checkpoint),
@@ -202,11 +213,13 @@ def build_command(cfg: dict[str, Any], phase: str, *, repo_root: Path,
             "--measurement_confidence_z", str(section["measurement_confidence_z"]),
             "--measurement_stop_ucb", str(section["measurement_stop_ucb"]),
         ]
+    elif phase == "phase_b_prefill":
+        args += _progressive_args(cfg)
     else:
         local_best = out / "run_local_best" / "current_best.pt"
         args += [
-            "--warm_start", str(paths["phase_a"] / "iter_0008.pt"),
-            "--warm_buffer", str(paths["phase_a"] / "buffer_final.pkl"),
+            "--warm_start", str(base_checkpoint),
+            "--warm_buffer", str(paths["phase_b_prefill"] / "buffer_final.pkl"),
             "--current_best_path", str(local_best),
             "--selfplay_generator_mode", "soft_gate",
             "--hof_dir", str(out / "run_local_best" / "hof"),
@@ -266,11 +279,34 @@ def _verify_source(cfg: dict[str, Any], repo_root: Path,
 def _prepare_phase_b(cfg: dict[str, Any], repo_root: Path,
                      run_root: Path) -> None:
     paths = phase_paths(run_root)
-    phase_a_checkpoint = paths["phase_a"] / "iter_0008.pt"
-    phase_a_buffer = paths["phase_a"] / "buffer_final.pkl"
-    for path in (phase_a_checkpoint, phase_a_buffer):
+    prefill_checkpoint = paths["phase_b_prefill"] / "iter_0023.pt"
+    prefill_buffer = paths["phase_b_prefill"] / "buffer_final.pkl"
+    prefill_log = paths["phase_b_prefill"] / "training_log.jsonl"
+    for path in (prefill_checkpoint, prefill_buffer, prefill_log):
         if not path.is_file():
-            raise FileNotFoundError(f"Phase B prerequisite missing: {path}")
+            raise FileNotFoundError(f"Phase B prefill prerequisite missing: {path}")
+    rows = _read_log(prefill_log)
+    expected_rows = int(cfg["phase_b_prefill"]["iterations"])
+    if len(rows) != expected_rows:
+        raise ValueError(
+            f"Phase B prefill has {len(rows)} rows; expected {expected_rows}"
+        )
+    minimum_buffer = int(cfg["phase_b_prefill"]["minimum_buffer_examples"])
+    final_buffer = int(rows[-1].get("buffer_size") or 0)
+    if final_buffer < minimum_buffer:
+        raise ValueError(
+            f"Phase B prefill buffer has {final_buffer} examples; "
+            f"requires at least {minimum_buffer}"
+        )
+    if any(int(row.get("train_steps_per_iteration") or 0) != 0 for row in rows):
+        raise ValueError("Phase B prefill log contains nonzero training steps")
+    prefill_validation = validate_phase(cfg, "phase_b_prefill", run_root)
+    if (not prefill_validation["valid"]
+            or prefill_validation.get("status") != "complete"):
+        raise ValueError(
+            "Phase B prefill failed validation: "
+            + json.dumps(prefill_validation, sort_keys=True)
+        )
     source = _verify_base_checkpoint(cfg, repo_root)
     destination = paths["phase_b"] / "run_local_best" / "current_best.pt"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -380,8 +416,20 @@ def validate_phase(cfg: dict[str, Any], phase: str, run_root: Path) -> dict[str,
                 errors.append(f"iteration {row.get('iter')}: progressive config drifted")
             if float(row.get("chance_split_oversample") or 0.0) != 1.0:
                 errors.append(f"iteration {row.get('iter')}: replay weight drifted")
+            if (phase == "phase_b_prefill"
+                    and row.get("generator_mode") != "current_best"):
+                errors.append(
+                    f"iteration {row.get('iter')}: prefill generator was not current_best")
+            if (phase == "phase_b_prefill"
+                    and int(row.get("train_steps_per_iteration") or 0) != 0):
+                errors.append(
+                    f"iteration {row.get('iter')}: prefill performed training")
             if phase == "phase_b" and row.get("generator_mode") != "soft_gate":
                 errors.append(f"iteration {row.get('iter')}: generator was not soft_gate")
+            if (phase == "phase_b"
+                    and int(row.get("train_steps_per_iteration") or 0) != 192):
+                errors.append(
+                    f"iteration {row.get('iter')}: Phase B train steps drifted from 192")
     result: dict[str, Any] = {
         "phase": phase,
         "rows": len(rows),
@@ -427,6 +475,31 @@ def validate_phase(cfg: dict[str, Any], phase: str, run_root: Path) -> dict[str,
             result["status"] = "stopped_by_measurement_ucb"
         else:
             result["status"] = "partial"
+    elif phase == "phase_b_prefill":
+        final_buffer = int(rows[-1].get("buffer_size") or 0) if rows else 0
+        result["buffer_size"] = final_buffer
+        result["minimum_buffer_examples"] = int(
+            cfg["phase_b_prefill"]["minimum_buffer_examples"])
+        if len(rows) == expected_iterations:
+            result["status"] = "complete"
+            if final_buffer < result["minimum_buffer_examples"]:
+                errors.append("completed prefill buffer is below the frozen minimum")
+        else:
+            result["status"] = "partial"
+        for key in (
+            "progressive_chance_search_count_deck8",
+            "progressive_chance_search_count_deck12",
+            "progressive_chance_admission_count",
+            "progressive_chance_widening_count",
+            "progressive_chance_treated_examples_deck8",
+            "progressive_chance_treated_examples_deck12",
+        ):
+            if sum(int(row.get(key) or 0) for row in rows) <= 0:
+                errors.append(f"prefill mechanism check failed: {key} <= 0")
+        if any(float(row.get("progressive_chance_init_fraction") or 0.0)
+               > cfg["progressive"]["max_init_fraction"] + 1e-12
+               for row in rows):
+            errors.append("prefill initialization fraction exceeded 25%")
     else:
         if rows and rows[-1].get("automatic_stop_requested") \
                 and int(rows[-1].get("consecutive_gate_reverts") or 0) >= 2:
