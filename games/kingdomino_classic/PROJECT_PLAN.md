@@ -10,6 +10,8 @@ Build one player-equivariant model for standard 5x5 Kingdomino across:
 
 Two-player Mighty Duel is explicitly out of scope. It remains in
 `games/kingdomino` with separate engines, checkpoints, replay data, and ratings.
+The Lost Treasures expansion is also out of scope for K0; the first rules oracle
+covers the base game plus the Harmony and Middle Kingdom scoring toggles.
 
 Artifact identity begins with:
 

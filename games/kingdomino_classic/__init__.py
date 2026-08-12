@@ -7,5 +7,15 @@ interfaces are stable.
 """
 
 from .config import GAME_ID, RULES_VERSION, ClassicGameConfig
+from .game import ClassicGameState, GameResult, Phase, PickAction, TurnAction
 
-__all__ = ["ClassicGameConfig", "GAME_ID", "RULES_VERSION"]
+__all__ = [
+    "ClassicGameConfig",
+    "ClassicGameState",
+    "GAME_ID",
+    "GameResult",
+    "Phase",
+    "PickAction",
+    "RULES_VERSION",
+    "TurnAction",
+]
