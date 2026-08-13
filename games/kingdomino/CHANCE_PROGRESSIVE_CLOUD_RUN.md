@@ -174,7 +174,81 @@ The final strength gates use the separately frozen seeds `20330000`,
 `20340000`, and `20350000`. Do not run or reinterpret those until the Phase-B
 artifacts have been synced home and the training trajectory reviewed.
 
-## 8. Safe stop, restart policy, and data recovery
+## 8. Symmetric progressive checkpoint evaluation
+
+`games.kingdomino.symmetric_checkpoint_eval` is the explicit opt-in evaluator
+for comparing two networks under the deployed chance-aware search. It preserves
+the incumbent evaluator's common seeds and seat swaps, but applies the same
+progressive configuration to both networks in both orientations. It does not
+change the shared-open-loop promotion gates.
+
+The hybrid search is deliberately deck-dependent:
+
+- deck counts above 12 use ordinary open-loop search;
+- deck counts exactly 12 and 8 use the frozen progressive treatment;
+- the existing exact endgame routing remains in force at its tail boundary.
+
+The progressive initialization rows count against each search's `--sims`
+budget. Thus a 400-sim progressive match and a 400-sim open-loop match have the
+same NN-row allowance, although progressive search intentionally spends some of
+its allowance resolving chance outcomes and can consequently be shallower.
+
+After the current open-loop evaluation has exited and the cloud checkout has
+been updated to the reviewed implementation commit, run the progressive match
+over the same 1,024 paired seeds:
+
+```bash
+export CANDIDATE="$RUN_ROOT/phase_b/iter_0020.pt"
+export BASELINE="$RUN_ROOT/phase_b/run_local_best/current_best.pt"
+export PROGRESSIVE_EVAL="$RUN_ROOT/eval_iter20_vs_baseline_progressive_2048"
+
+test -f "$CANDIDATE"
+test -f "$BASELINE"
+test ! -e "$PROGRESSIVE_EVAL"
+
+mkdir -p "$PROGRESSIVE_EVAL"
+nohup python3 -m games.kingdomino.symmetric_checkpoint_eval \
+  --candidate "$CANDIDATE" \
+  --baseline "$BASELINE" \
+  --output-dir "$PROGRESSIVE_EVAL" \
+  --games 2048 \
+  --sims 400 \
+  --device cuda \
+  --batch-slots 48 \
+  --leaf-batch 6 \
+  --seed 20330000 \
+  --c-puct 1.5 \
+  --fpu=-0.2 \
+  --margin-gain 2.0 \
+  --alpha 0.5 \
+  --search-mode chance_progressive \
+  --chance-progressive-decks 8,12 \
+  --chance-width-schedule 4,8,16,32,64,70 \
+  --chance-n-init 2 \
+  --chance-d-min 4 \
+  --chance-deck8-cap 16 \
+  --chance-deck12-cap 16 \
+  --chance-max-init-fraction 0.25 \
+  > "$PROGRESSIVE_EVAL/process.log" 2>&1 &
+echo $! | tee "$PROGRESSIVE_EVAL/process.pid"
+```
+
+The command writes a manifest before loading the networks and atomically writes
+`games.jsonl` and `result.json` on completion. A progressive result is marked
+invalid and the process exits nonzero if either requested deck was not searched
+and crossed, or if no admissions, bootstrap rows, or width samples were
+recorded. Inspect it with:
+
+```bash
+tail -f "$PROGRESSIVE_EVAL/process.log"
+cat "$PROGRESSIVE_EVAL/result.json"
+```
+
+For a matched open-loop control, reuse the same command and seeds with a fresh
+output directory and `--search-mode open_loop`. The chance flags are then
+ignored and the mechanism counters are expected to be zero.
+
+## 9. Safe stop, restart policy, and data recovery
 
 To stop without losing the replay buffer, create the phase-local `STOP` file:
 

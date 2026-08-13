@@ -2,8 +2,8 @@
 elo_rating.py — automated Elo rating for Kingdomino AlphaZero checkpoints.
 
 PHASE 1 (minimal viable system): a standalone script that rates any checkpoint
-on a fixed anchor ladder using OPEN-LOOP search — the same search the network
-was trained with — so the rating matches deployment strength.
+on a fixed anchor ladder. Open-loop search remains the default; the paired
+checkpoint API also supports explicit symmetric progressive-chance evaluation.
 
 ENGINE / ROUTING
 ────────────────
@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -76,6 +76,86 @@ class EloConfig:
     alpha: float = 0.8
     seed: int = 42
     verbose: bool = False
+    # Evaluation remains open-loop unless this tuple is explicitly populated.
+    # Production chance-aware training uses exactly the public deck sizes 8 and
+    # 12; deck 4/0 remains the exact-solver boundary outside this search.
+    progressive_chance_decks: Tuple[int, ...] = ()
+    progressive_chance_width_schedule: str = "4,8,16,32,64,70"
+    progressive_chance_n_init: int = 2
+    progressive_chance_d_min: int = 4
+    progressive_chance_deck8_cap: int = 16
+    progressive_chance_deck12_cap: int = 16
+    progressive_chance_max_init_fraction: float = 0.25
+
+
+_PROGRESSIVE_DIAGNOSTIC_FIELDS = (
+    "progressive_chance_search_count_deck8",
+    "progressive_chance_search_count_deck12",
+    "progressive_chance_path_count_deck8",
+    "progressive_chance_path_count_deck12",
+    "progressive_chance_admission_count",
+    "progressive_chance_widening_count",
+    "progressive_chance_bootstrap_rows",
+    "progressive_chance_budget_blocked_count",
+    "progressive_chance_guardrail_blocked_count",
+    "progressive_chance_width_sample_count",
+)
+
+
+def progressive_chance_deck_mask(cfg: EloConfig) -> int:
+    """Validate and encode the explicitly enabled production deck sizes."""
+    decks = tuple(int(deck) for deck in cfg.progressive_chance_decks)
+    unsupported = sorted(set(decks) - {8, 12})
+    if unsupported:
+        raise ValueError(
+            "progressive evaluation supports only deck counts 8 and 12; "
+            f"got {unsupported}"
+        )
+    if len(set(decks)) != len(decks):
+        raise ValueError("progressive_chance_decks contains duplicates")
+    if decks:
+        if int(cfg.progressive_chance_n_init) < 1:
+            raise ValueError("progressive_chance_n_init must be >= 1")
+        if int(cfg.progressive_chance_d_min) < 1:
+            raise ValueError("progressive_chance_d_min must be >= 1")
+        if not (0.0 <= float(cfg.progressive_chance_max_init_fraction) <= 1.0):
+            raise ValueError(
+                "progressive_chance_max_init_fraction must be in [0, 1]"
+            )
+    return sum(1 << deck for deck in decks)
+
+
+def _progressive_diagnostics(batched) -> Dict[str, Any]:
+    """Snapshot auditable counters from one completed BatchedMCTS engine."""
+    out: Dict[str, Any] = {
+        key: int(getattr(batched, key, 0))
+        for key in _PROGRESSIVE_DIAGNOSTIC_FIELDS
+    }
+    out["progressive_chance_mean_active_width"] = float(
+        getattr(batched, "progressive_chance_mean_active_width", 0.0)
+    )
+    out["progressive_chance_mean_mature_width"] = float(
+        getattr(batched, "progressive_chance_mean_mature_width", 0.0)
+    )
+    return out
+
+
+def _merge_progressive_diagnostics(*rows: Dict[str, Any]) -> Dict[str, Any]:
+    """Sum counters and width-sample-weight the two orientation means."""
+    out: Dict[str, Any] = {
+        key: sum(int(row.get(key, 0)) for row in rows)
+        for key in _PROGRESSIVE_DIAGNOSTIC_FIELDS
+    }
+    width_n = int(out["progressive_chance_width_sample_count"])
+    for key in ("progressive_chance_mean_active_width",
+                "progressive_chance_mean_mature_width"):
+        weighted = sum(
+            float(row.get(key, 0.0))
+            * int(row.get("progressive_chance_width_sample_count", 0))
+            for row in rows
+        )
+        out[key] = weighted / width_n if width_n else 0.0
+    return out
 
 
 @dataclass
@@ -265,8 +345,8 @@ def checkpoint_arch(path: str) -> Tuple[int, int, int]:
 # Batched two-network game play (the core engine)
 # ─────────────────────────────────────────────────────────────────────────────
 def _make_batched(n_games: int, seed_start: int, cfg: EloConfig):
-    """One open-loop BatchedMCTS for evaluation: no Dirichlet noise (eps=0),
-    always greedy move selection (temp_moves=0)."""
+    """One deterministic BatchedMCTS with optional progressive chance nodes."""
+    progressive_mask = progressive_chance_deck_mask(cfg)
     return kingdomino_rust.BatchedMCTS(
         cfg.n_slots,
         int(n_games),
@@ -282,15 +362,33 @@ def _make_batched(n_games: int, seed_start: int, cfg: EloConfig):
         open_loop=True,
         margin_gain=float(cfg.margin_gain),
         alpha=float(cfg.alpha),
+        progressive_chance_deck_mask=int(progressive_mask),
+        progressive_chance_width_schedule=str(
+            cfg.progressive_chance_width_schedule),
+        progressive_chance_n_init=int(cfg.progressive_chance_n_init),
+        progressive_chance_d_min=int(cfg.progressive_chance_d_min),
+        progressive_chance_deck8_cap=int(cfg.progressive_chance_deck8_cap),
+        progressive_chance_deck12_cap=int(cfg.progressive_chance_deck12_cap),
+        progressive_chance_max_init_fraction=float(
+            cfg.progressive_chance_max_init_fraction),
     )
 
 
 def _run_batched_orientation(eval_seat0, eval_seat1, n_games: int,
                              seed_start: int, cfg: EloConfig
                              ) -> List[Tuple[int, int, int, int]]:
-    """Play n_games complete open-loop games; seat 0's leaves go to eval_seat0,
+    """Play n_games complete games; seat 0's leaves go to eval_seat0,
     seat 1's to eval_seat1, routed by row_search_actors (searcher-owns-network).
     Returns [(seed, score0, score1, official_outcome0)]."""
+    results, _ = _run_batched_orientation_with_diagnostics(
+        eval_seat0, eval_seat1, n_games, seed_start, cfg)
+    return results
+
+
+def _run_batched_orientation_with_diagnostics(
+        eval_seat0, eval_seat1, n_games: int, seed_start: int, cfg: EloConfig
+        ) -> Tuple[List[Tuple[int, int, int, int]], Dict[str, Any]]:
+    """Run one seat orientation and retain its chance-search diagnostics."""
     batched = _make_batched(n_games, seed_start, cfg)
     results: List[Tuple[int, int, int, int]] = []
     ticks = 0
@@ -323,7 +421,7 @@ def _run_batched_orientation(eval_seat0, eval_seat1, n_games: int,
         if ticks > 2_000_000:
             raise RuntimeError("Batched rating exceeded tick guard")
     results.sort(key=lambda r: r[0])
-    return results
+    return results, _progressive_diagnostics(batched)
 
 
 def _winner_by_outcome(p0: str, p1: str, outcome0: int) -> Optional[str]:
@@ -337,8 +435,23 @@ def _winner_by_outcome(p0: str, p1: str, outcome0: int) -> Optional[str]:
 def play_rating_games(net_a, net_b, name_a: str, name_b: str,
                       n_seeds: int, seed_start: int, cfg: EloConfig
                       ) -> Tuple[PairResult, List[GameResult]]:
-    """Paired open-loop two-network match (both seats searched by their own net).
+    """Paired two-network match (both seats searched by their own net).
     Orientation 0: A is P0; orientation 1: B is P0 — same decks (same base_seed)."""
+    pair, games, _ = play_rating_games_with_diagnostics(
+        net_a, net_b, name_a, name_b, n_seeds, seed_start, cfg)
+    return pair, games
+
+
+def play_rating_games_with_diagnostics(
+        net_a, net_b, name_a: str, name_b: str,
+        n_seeds: int, seed_start: int, cfg: EloConfig
+        ) -> Tuple[PairResult, List[GameResult], Dict[str, Any]]:
+    """Paired symmetric match plus progressive-search audit counters.
+
+    ``cfg`` is applied identically to both networks and both seat orientations.
+    The default empty progressive deck tuple preserves the incumbent open-loop
+    evaluator used by promotion gates.
+    """
     assert net_a is not None and net_b is not None, \
         "play_rating_games requires two networks; GreedyBot uses the serial path"
     eval_a = make_rust_evaluator(net_a, device=cfg.device,
@@ -350,19 +463,23 @@ def play_rating_games(net_a, net_b, name_a: str, name_b: str,
     games: List[GameResult] = []
 
     # Orientation 0 — A in seat 0, B in seat 1.
-    for seed, s0, s1, outcome0 in _run_batched_orientation(
-            eval_a, eval_b, n_seeds, seed_start, cfg):
+    orientation0, diagnostics0 = _run_batched_orientation_with_diagnostics(
+        eval_a, eval_b, n_seeds, seed_start, cfg)
+    for seed, s0, s1, outcome0 in orientation0:
         games.append(GameResult(seed, name_a, name_b, s0, s1,
                                 _winner_by_outcome(name_a, name_b, outcome0), steps=0))
     # Orientation 1 — B in seat 0, A in seat 1 (same decks).
-    for seed, s0, s1, outcome0 in _run_batched_orientation(
-            eval_b, eval_a, n_seeds, seed_start, cfg):
+    orientation1, diagnostics1 = _run_batched_orientation_with_diagnostics(
+        eval_b, eval_a, n_seeds, seed_start, cfg)
+    for seed, s0, s1, outcome0 in orientation1:
         games.append(GameResult(seed, name_b, name_a, s0, s1,
                                 _winner_by_outcome(name_b, name_a, outcome0), steps=0))
 
     for g in games:
         update_pair(pair, g, name_a, name_b)
-    return pair, games
+    diagnostics = _merge_progressive_diagnostics(diagnostics0, diagnostics1)
+    diagnostics["orientations"] = [diagnostics0, diagnostics1]
+    return pair, games, diagnostics
 
 
 def play_rating_games_greedy(ck_net, ck_name: str, n_seeds: int,
