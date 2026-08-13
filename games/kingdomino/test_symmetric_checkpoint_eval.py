@@ -29,6 +29,7 @@ def test_open_loop_remains_default_and_constructor_mask_is_zero(monkeypatch):
 
     assert captured["kwargs"]["open_loop"] is True
     assert captured["kwargs"]["progressive_chance_deck_mask"] == 0
+    assert captured["kwargs"]["progressive_chance_seat"] == -1
 
 
 def test_progressive_constructor_matches_frozen_training_treatment(monkeypatch):
@@ -43,6 +44,7 @@ def test_progressive_constructor_matches_frozen_training_treatment(monkeypatch):
     _make_batched(4, 100, cfg)
 
     assert captured["progressive_chance_deck_mask"] == (1 << 8) | (1 << 12)
+    assert captured["progressive_chance_seat"] == -1
     assert captured["progressive_chance_width_schedule"] == "4,8,16,32,64,70"
     assert captured["progressive_chance_n_init"] == 2
     assert captured["progressive_chance_d_min"] == 4
@@ -55,6 +57,13 @@ def test_progressive_mask_rejects_all_below_twelve_interpretation():
     with pytest.raises(ValueError, match="only deck counts 8 and 12"):
         progressive_chance_deck_mask(
             EloConfig(progressive_chance_decks=(4, 8, 12)))
+
+
+def test_progressive_mask_rejects_invalid_seat_selector():
+    with pytest.raises(ValueError, match="progressive_chance_seat"):
+        progressive_chance_deck_mask(
+            EloConfig(progressive_chance_decks=(8, 12),
+                      progressive_chance_seat=2))
 
 
 def test_symmetric_match_applies_same_config_to_both_orientations(monkeypatch):

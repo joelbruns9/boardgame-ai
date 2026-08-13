@@ -11244,6 +11244,9 @@ struct BatchedMCTS {
     // Production depth-gated progressive chance panels. This is a distinct
     // opt-in mode from both the pilot sampled split and exhaustive deck-8 panel.
     progressive_chance_deck_mask: u64,
+    // Evaluation-only seat filter: None applies progressive search to both
+    // seats; Some applies it only when that player owns the current root.
+    progressive_chance_seat: Option<u8>,
     progressive_chance_widths: Vec<usize>,
     progressive_chance_n_init: usize,
     progressive_chance_d_min: usize,
@@ -11595,6 +11598,7 @@ impl BatchedMCTS {
                         deck8_chance_enumeration_seat=-1,
                         sampled_chance_split_deck_mask=0,
                         progressive_chance_deck_mask=0,
+                        progressive_chance_seat=-1,
                         progressive_chance_width_schedule="4,8,16,32,64,70",
                         progressive_chance_n_init=2,
                         progressive_chance_d_min=4,
@@ -11643,6 +11647,7 @@ impl BatchedMCTS {
         deck8_chance_enumeration_seat: i64,
         sampled_chance_split_deck_mask: u64,
         progressive_chance_deck_mask: u64,
+        progressive_chance_seat: i64,
         progressive_chance_width_schedule: &str,
         progressive_chance_n_init: usize,
         progressive_chance_d_min: usize,
@@ -11800,6 +11805,13 @@ impl BatchedMCTS {
         );
         let deck8_chance_enumeration_seat =
             (deck8_chance_enumeration_seat >= 0).then_some(deck8_chance_enumeration_seat as u8);
+        assert!(
+            (-1..=1).contains(&progressive_chance_seat),
+            "BatchedMCTS: progressive_chance_seat must be -1 (both), 0, or 1, got {}",
+            progressive_chance_seat
+        );
+        let progressive_chance_seat =
+            (progressive_chance_seat >= 0).then_some(progressive_chance_seat as u8);
         let mut slots = Vec::with_capacity(n_slots);
         let mut games_started = 0usize;
         for _ in 0..n_slots {
@@ -11901,6 +11913,7 @@ impl BatchedMCTS {
             cum_sampled_chance_split_path_count_deck8: 0,
             cum_sampled_chance_split_path_count_deck12: 0,
             progressive_chance_deck_mask,
+            progressive_chance_seat,
             progressive_chance_widths,
             progressive_chance_n_init,
             progressive_chance_d_min,
@@ -12075,6 +12088,7 @@ impl BatchedMCTS {
             -1,
             0,
             0,
+            -1,
             "4,8,16,32,64,70",
             2,
             4,
@@ -12873,6 +12887,7 @@ impl BatchedMCTS {
             deck8_chance_enumeration_seat,
             sampled_chance_split_deck_mask,
             progressive_chance_deck_mask,
+            progressive_chance_seat,
             progressive_chance_widths,
             progressive_chance_n_init,
             progressive_chance_d_min,
@@ -12890,6 +12905,7 @@ impl BatchedMCTS {
             self.deck8_chance_enumeration_seat,
             self.sampled_chance_split_deck_mask,
             self.progressive_chance_deck_mask,
+            self.progressive_chance_seat,
             self.progressive_chance_widths.as_slice(),
             self.progressive_chance_n_init,
             self.progressive_chance_d_min,
@@ -12986,10 +13002,13 @@ impl BatchedMCTS {
                                 sampled_chance_split_deck_mask,
                                 &slot.real_state,
                             );
-                            let progressive_here = sampled_chance_split_root_enabled(
-                                progressive_chance_deck_mask,
-                                &slot.real_state,
-                            );
+                            let progressive_enabled_for_seat =
+                                progressive_chance_seat.map_or(true, |seat| seat == root_actor);
+                            let progressive_here = progressive_enabled_for_seat
+                                && sampled_chance_split_root_enabled(
+                                    progressive_chance_deck_mask,
+                                    &slot.real_state,
+                                );
                             let progressive_max_width = match slot.real_state.deck.len() {
                                 8 => progressive_chance_deck8_cap,
                                 12 => progressive_chance_deck12_cap,

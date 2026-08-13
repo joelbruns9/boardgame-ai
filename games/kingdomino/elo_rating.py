@@ -35,7 +35,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,6 +80,9 @@ class EloConfig:
     # Production chance-aware training uses exactly the public deck sizes 8 and
     # 12; deck 4/0 remains the exact-solver boundary outside this search.
     progressive_chance_decks: Tuple[int, ...] = ()
+    # -1 applies progressive search to both seats. Gate-0 search A/B uses 0/1
+    # so identical weights can play progressive versus open-loop search.
+    progressive_chance_seat: int = -1
     progressive_chance_width_schedule: str = "4,8,16,32,64,70"
     progressive_chance_n_init: int = 2
     progressive_chance_d_min: int = 4
@@ -104,6 +107,10 @@ _PROGRESSIVE_DIAGNOSTIC_FIELDS = (
 
 def progressive_chance_deck_mask(cfg: EloConfig) -> int:
     """Validate and encode the explicitly enabled production deck sizes."""
+    if int(cfg.progressive_chance_seat) not in (-1, 0, 1):
+        raise ValueError(
+            "progressive_chance_seat must be -1 (both), 0, or 1"
+        )
     decks = tuple(int(deck) for deck in cfg.progressive_chance_decks)
     unsupported = sorted(set(decks) - {8, 12})
     if unsupported:
@@ -363,6 +370,7 @@ def _make_batched(n_games: int, seed_start: int, cfg: EloConfig):
         margin_gain=float(cfg.margin_gain),
         alpha=float(cfg.alpha),
         progressive_chance_deck_mask=int(progressive_mask),
+        progressive_chance_seat=int(cfg.progressive_chance_seat),
         progressive_chance_width_schedule=str(
             cfg.progressive_chance_width_schedule),
         progressive_chance_n_init=int(cfg.progressive_chance_n_init),
@@ -477,6 +485,63 @@ def play_rating_games_with_diagnostics(
 
     for g in games:
         update_pair(pair, g, name_a, name_b)
+    diagnostics = _merge_progressive_diagnostics(diagnostics0, diagnostics1)
+    diagnostics["orientations"] = [diagnostics0, diagnostics1]
+    return pair, games, diagnostics
+
+
+def play_search_ab_games_with_diagnostics(
+        net, progressive_name: str, open_loop_name: str,
+        n_seeds: int, seed_start: int, cfg: EloConfig
+        ) -> Tuple[PairResult, List[GameResult], Dict[str, Any]]:
+    """Same-network, paired progressive-versus-open-loop search match.
+
+    One evaluator instance supplies every leaf, so the only treatment is the
+    root search configuration. Progressive search follows its player through
+    every move at deck 8/12 and is rotated across seats on the same seed block.
+    """
+    if net is None:
+        raise ValueError("search A/B requires a network")
+    if progressive_name == open_loop_name:
+        raise ValueError("search treatment names must differ")
+    if not cfg.progressive_chance_decks:
+        raise ValueError("search A/B requires progressive_chance_decks")
+    evaluator = make_rust_evaluator(
+        net,
+        device=cfg.device,
+        margin_gain=cfg.margin_gain,
+        alpha=cfg.alpha,
+    )
+
+    pair = PairResult(a=progressive_name, b=open_loop_name)
+    games: List[GameResult] = []
+
+    # Orientation 0: progressive owns P0 roots; P1 remains open loop.
+    cfg0 = replace(cfg, progressive_chance_seat=0)
+    orientation0, diagnostics0 = _run_batched_orientation_with_diagnostics(
+        evaluator, evaluator, n_seeds, seed_start, cfg0)
+    diagnostics0["progressive_chance_seat"] = 0
+    for seed, s0, s1, outcome0 in orientation0:
+        games.append(GameResult(
+            seed, progressive_name, open_loop_name, s0, s1,
+            _winner_by_outcome(progressive_name, open_loop_name, outcome0),
+            steps=0,
+        ))
+
+    # Orientation 1: the same progressive treatment moves to P1.
+    cfg1 = replace(cfg, progressive_chance_seat=1)
+    orientation1, diagnostics1 = _run_batched_orientation_with_diagnostics(
+        evaluator, evaluator, n_seeds, seed_start, cfg1)
+    diagnostics1["progressive_chance_seat"] = 1
+    for seed, s0, s1, outcome0 in orientation1:
+        games.append(GameResult(
+            seed, open_loop_name, progressive_name, s0, s1,
+            _winner_by_outcome(open_loop_name, progressive_name, outcome0),
+            steps=0,
+        ))
+
+    for game in games:
+        update_pair(pair, game, progressive_name, open_loop_name)
     diagnostics = _merge_progressive_diagnostics(diagnostics0, diagnostics1)
     diagnostics["orientations"] = [diagnostics0, diagnostics1]
     return pair, games, diagnostics

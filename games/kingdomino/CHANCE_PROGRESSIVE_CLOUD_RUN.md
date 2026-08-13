@@ -248,6 +248,67 @@ For a matched open-loop control, reuse the same command and seeds with a fresh
 output directory and `--search-mode open_loop`. The chance flags are then
 ignored and the mechanism counters are expected to be zero.
 
+## 9. Gate 0: same network, asymmetric search
+
+Gate 0 isolates the search mechanism before any v2 training work. Both players
+use the identical incumbent checkpoint and the same in-memory evaluator. In the
+first game orientation progressive search controls seat 0; in the second it
+controls seat 1. The open-loop control occupies the opposite seat, and both
+orientations reuse the same deck seed. The 800-row budget matches the intended
+advisor profile.
+
+Seed block `20360000` is fresh relative to the v1 training, promotion, and
+diagnostic blocks. Do not substitute a previously inspected block.
+
+```bash
+cd /workspace/boardgame-ai
+
+export RUN_ROOT=runs/kingdomino/chance_progressive_cloud_v1
+export GATE0="$RUN_ROOT/gate0_incumbent_search_ab_800sims_2048"
+export CHECKPOINT="$RUN_ROOT/phase_b/run_local_best/current_best.pt"
+
+test -f "$CHECKPOINT"
+test ! -e "$GATE0"
+
+mkdir -p "$GATE0"
+nohup python3 -m games.kingdomino.gate0_search_eval \
+  --checkpoint "$CHECKPOINT" \
+  --output-dir "$GATE0" \
+  --games 2048 \
+  --sims 800 \
+  --device cuda \
+  --batch-slots 48 \
+  --leaf-batch 6 \
+  --seed 20360000 \
+  --c-puct 1.5 \
+  --fpu=-0.2 \
+  --margin-gain 2.0 \
+  --alpha 0.5 \
+  --confidence 0.95 \
+  --chance-progressive-decks 8,12 \
+  --chance-width-schedule 4,8,16,32,64,70 \
+  --chance-n-init 2 \
+  --chance-d-min 4 \
+  --chance-deck8-cap 16 \
+  --chance-deck12-cap 16 \
+  --chance-max-init-fraction 0.25 \
+  > "$GATE0/process.log" 2>&1 &
+echo $! | tee "$GATE0/process.pid"
+```
+
+Monitor and inspect the atomic result artifact:
+
+```bash
+tail -f "$GATE0/process.log"
+cat "$GATE0/result.json"
+```
+
+The harness uses actual complete-pair scores in `{0, 0.5, 1}` and a one-sided
+95% paired-score t interval. Its frozen verdict is `proceed` only when the lower
+bound is above 50%, `fail` when the upper bound is at or below 50%, and
+`inconclusive` otherwise. A mechanism-count mismatch marks the run `invalid`
+rather than producing a strength verdict.
+
 ## 9. Safe stop, restart policy, and data recovery
 
 To stop without losing the replay buffer, create the phase-local `STOP` file:

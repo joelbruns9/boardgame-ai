@@ -213,3 +213,37 @@ def test_evaluation_seat_filter_partitions_the_both_seats_panel_count():
     assert seat0 > 0
     assert seat1 > 0
     assert both == seat0 + seat1
+
+
+def test_progressive_evaluation_seat_filter_partitions_searches_by_root_actor():
+    def run(selector):
+        mcts = kingdomino_rust.BatchedMCTS(
+            1,
+            1,
+            20260813,
+            400,
+            leaf_batch=6,
+            open_loop=True,
+            dirichlet_eps=0.0,
+            exact_endgame_max_secs=0.0,
+            progressive_chance_deck_mask=(1 << 8) | (1 << 12),
+            progressive_chance_seat=selector,
+            progressive_chance_width_schedule="4,8,16,32,64,70",
+            progressive_chance_n_init=2,
+            progressive_chance_d_min=4,
+            progressive_chance_deck8_cap=16,
+            progressive_chance_deck12_cap=16,
+            progressive_chance_max_init_fraction=0.25,
+        )
+        assert len(_finish_with_zero_evaluator(mcts)) == 1
+        return (
+            int(mcts.progressive_chance_search_count_deck8),
+            int(mcts.progressive_chance_search_count_deck12),
+        )
+
+    both = run(-1)
+    seat0 = run(0)
+    seat1 = run(1)
+    assert seat0 == (1, 1)
+    assert seat1 == (1, 1)
+    assert both == (2, 2)
