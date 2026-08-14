@@ -522,6 +522,467 @@ fn dom(id: u16) -> (u8, u8, u8, u8) {
     DOMS[(id - 1) as usize]
 }
 
+// Fixed-tile-sequence placement beam used by the offline placement audit.
+// This deliberately lives beside RustBoard so it shares the production
+// legality and scoring implementations rather than maintaining audit-only
+// versions of either rule set.
+type PlacementBeamMove = (i8, i8, i8, i8, bool);
+type PlacementBeamLayerStats = (usize, u16, usize, usize, usize, usize, usize, i32, f64);
+type PlacementBeamOutput = (
+    i32,
+    i32,
+    i32,
+    i32,
+    usize,
+    Vec<Option<PlacementBeamMove>>,
+    Vec<PlacementBeamLayerStats>,
+    f64,
+);
+
+struct PlacementBeamNode {
+    board: RustBoard,
+    discards: usize,
+    placements: [Option<PlacementBeamMove>; 48],
+    placement_count: usize,
+}
+
+#[inline]
+fn placement_board_hash(board: &RustBoard) -> u128 {
+    let mut packed = [0u8; CELLS];
+    for (i, value) in packed.iter_mut().enumerate() {
+        *value = board.terrain[i] | (board.crowns[i] << 3);
+    }
+    xxhash_rust::xxh3::xxh3_128(&packed)
+}
+
+#[inline]
+fn placement_same_board(a: &RustBoard, b: &RustBoard) -> bool {
+    a.terrain == b.terrain && a.crowns == b.crowns
+}
+
+fn placement_insert_unique(
+    unique: &mut HashMap<u128, PlacementBeamNode>,
+    node: PlacementBeamNode,
+) -> PyResult<()> {
+    let hash = placement_board_hash(&node.board);
+    if let Some(existing) = unique.get(&hash) {
+        if placement_same_board(&existing.board, &node.board) {
+            return Ok(());
+        }
+        // Fail closed rather than silently treating a hash collision as an
+        // identical board. This keeps deduplication exact.
+        return Err(PyValueError::new_err(
+            "fixed-sequence beam encountered a 128-bit board-hash collision",
+        ));
+    }
+    unique.insert(hash, node);
+    Ok(())
+}
+
+#[inline]
+fn placement_frontier_count(board: &RustBoard) -> i32 {
+    let mut frontier = [false; CELLS];
+    for y in board.min_y..=board.max_y {
+        for x in board.min_x..=board.max_x {
+            if board.terrain[idx(x, y)] == EMPTY {
+                continue;
+            }
+            for (dx, dy) in DIRS {
+                let nx = x + dx;
+                let ny = y + dy;
+                if in_bounds(nx, ny) && board.terrain[idx(nx, ny)] == EMPTY {
+                    frontier[idx(nx, ny)] = true;
+                }
+            }
+        }
+    }
+    frontier.into_iter().filter(|present| *present).count() as i32
+}
+
+#[inline]
+fn placement_beam_rank(
+    node: &PlacementBeamNode,
+    final_layer: bool,
+    harmony: bool,
+    middle_kingdom: bool,
+) -> (i32, i32, i32) {
+    let (territory, harmony_bonus, middle_bonus) = if final_layer {
+        node.board.score(harmony, middle_kingdom)
+    } else {
+        node.board.score(false, false)
+    };
+    let frontier = placement_frontier_count(&node.board);
+    if final_layer {
+        return (
+            (territory + harmony_bonus + middle_bonus) * 1000,
+            -(node.discards as i32),
+            frontier,
+        );
+    }
+    let bbox_area = i32::from(node.board.max_x - node.board.min_x + 1)
+        * i32::from(node.board.max_y - node.board.min_y + 1);
+    let holes = bbox_area - i32::from(node.board.occupied);
+    // Same scale as the Python reference: one score point dominates the
+    // compactness/frontier tie-breakers.
+    (
+        territory * 1000 - holes * 10 + frontier,
+        -(node.discards as i32),
+        frontier,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (domino_ids, harmony=true, middle_kingdom=true, beam_width=4096))]
+fn fixed_sequence_beam(
+    domino_ids: Vec<u16>,
+    harmony: bool,
+    middle_kingdom: bool,
+    beam_width: usize,
+) -> PyResult<PlacementBeamOutput> {
+    if domino_ids.is_empty() {
+        return Err(PyValueError::new_err("domino_ids must not be empty"));
+    }
+    if domino_ids.len() > 48 {
+        return Err(PyValueError::new_err(
+            "domino_ids cannot contain more than 48 tiles",
+        ));
+    }
+    if domino_ids.iter().any(|id| !(1..=48).contains(id)) {
+        return Err(PyValueError::new_err("domino_ids contains an unknown tile"));
+    }
+    if beam_width == 0 {
+        return Err(PyValueError::new_err("beam_width must be positive"));
+    }
+
+    let started = std::time::Instant::now();
+    let mut nodes = vec![PlacementBeamNode {
+        board: RustBoard::new(7, 7),
+        discards: 0,
+        placements: [None; 48],
+        placement_count: 0,
+    }];
+    let mut layer_stats: Vec<PlacementBeamLayerStats> = Vec::with_capacity(domino_ids.len());
+
+    for (layer_index, &domino_id) in domino_ids.iter().enumerate() {
+        let layer_started = std::time::Instant::now();
+        let incoming_states = nodes.len();
+        let mut expanded_actions = 0usize;
+        let mut forced_discard_parents = 0usize;
+        let (ta, ca, tb, cb) = dom(domino_id);
+        let mut unique: HashMap<u128, PlacementBeamNode> = HashMap::new();
+
+        for node in nodes.into_iter() {
+            let legal = node.board.legal_placements(ta, ca, tb, cb);
+            if legal.is_empty() {
+                forced_discard_parents += 1;
+                expanded_actions += 1;
+                let mut placements = node.placements;
+                placements[node.placement_count] = None;
+                placement_insert_unique(
+                    &mut unique,
+                    PlacementBeamNode {
+                        board: node.board,
+                        discards: node.discards + 1,
+                        placements,
+                        placement_count: node.placement_count + 1,
+                    },
+                )?;
+                continue;
+            }
+
+            expanded_actions += legal.len();
+            for &(x1, y1, x2, y2, flipped) in &legal {
+                let mut board = node.board.copy();
+                // The move came from legal_placements on this exact board.
+                board.place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                let mut placements = node.placements;
+                placements[node.placement_count] = Some((x1, y1, x2, y2, flipped));
+                placement_insert_unique(
+                    &mut unique,
+                    PlacementBeamNode {
+                        board,
+                        discards: node.discards,
+                        placements,
+                        placement_count: node.placement_count + 1,
+                    },
+                )?;
+            }
+        }
+
+        let unique_states = unique.len();
+        let final_layer = layer_index + 1 == domino_ids.len();
+        let mut ranked: Vec<_> = unique
+            .into_iter()
+            .map(|(hash, node)| {
+                let rank = placement_beam_rank(&node, final_layer, harmony, middle_kingdom);
+                (hash, node, rank)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(beam_width);
+        let best_partial_score = ranked
+            .iter()
+            .map(|(_, node, _)| node.board.score(false, false).0)
+            .max()
+            .unwrap_or(0);
+        nodes = ranked.into_iter().map(|(_, node, _)| node).collect();
+        layer_stats.push((
+            layer_index + 1,
+            domino_id,
+            incoming_states,
+            expanded_actions,
+            unique_states,
+            nodes.len(),
+            forced_discard_parents,
+            best_partial_score,
+            layer_started.elapsed().as_secs_f64(),
+        ));
+    }
+
+    let best = nodes
+        .into_iter()
+        .max_by(|a, b| {
+            let score_a = a.board.score(harmony, middle_kingdom);
+            let score_b = b.board.score(harmony, middle_kingdom);
+            let rank_a = (score_a.0 + score_a.1 + score_a.2, -(a.discards as i32));
+            let rank_b = (score_b.0 + score_b.1 + score_b.2, -(b.discards as i32));
+            rank_a
+                .cmp(&rank_b)
+                .then_with(|| placement_board_hash(&b.board).cmp(&placement_board_hash(&a.board)))
+        })
+        .expect("non-empty beam");
+    let score = best.board.score(harmony, middle_kingdom);
+    Ok((
+        score.0 + score.1 + score.2,
+        score.0,
+        score.1,
+        score.2,
+        best.discards,
+        best.placements[..best.placement_count].to_vec(),
+        layer_stats,
+        started.elapsed().as_secs_f64(),
+    ))
+}
+
+type ExactSuffixCountOutput = (bool, Vec<(usize, u16, usize, usize, usize)>, f64);
+
+/// Count exact deduplicated suffix states from an arbitrary actual board.
+/// Returns completed=false as soon as a layer crosses state_limit; no beam
+/// pruning is performed, so completed=true means the suffix state graph was
+/// exhaustively enumerated.
+#[pyfunction]
+#[pyo3(signature = (initial_board, domino_ids, state_limit=100000))]
+fn fixed_sequence_exact_state_counts(
+    initial_board: &RustBoard,
+    domino_ids: Vec<u16>,
+    state_limit: usize,
+) -> PyResult<ExactSuffixCountOutput> {
+    if domino_ids.is_empty() {
+        return Err(PyValueError::new_err("domino_ids must not be empty"));
+    }
+    if domino_ids.len() > 48 {
+        return Err(PyValueError::new_err(
+            "domino_ids cannot contain more than 48 tiles",
+        ));
+    }
+    if domino_ids.iter().any(|id| !(1..=48).contains(id)) {
+        return Err(PyValueError::new_err("domino_ids contains an unknown tile"));
+    }
+    if state_limit == 0 {
+        return Err(PyValueError::new_err("state_limit must be positive"));
+    }
+
+    let started = std::time::Instant::now();
+    let mut nodes = vec![initial_board.copy()];
+    let mut stats = Vec::with_capacity(domino_ids.len());
+    for (layer_index, &domino_id) in domino_ids.iter().enumerate() {
+        let incoming = nodes.len();
+        let (ta, ca, tb, cb) = dom(domino_id);
+        let mut expanded_actions = 0usize;
+        let mut unique: HashMap<u128, RustBoard> = HashMap::new();
+        let mut exceeded = false;
+        for board in nodes.into_iter() {
+            let legal = board.legal_placements(ta, ca, tb, cb);
+            if legal.is_empty() {
+                expanded_actions += 1;
+                let hash = placement_board_hash(&board);
+                if let Some(existing) = unique.get(&hash) {
+                    if !placement_same_board(existing, &board) {
+                        return Err(PyValueError::new_err(
+                            "exact suffix count encountered a 128-bit board-hash collision",
+                        ));
+                    }
+                } else {
+                    unique.insert(hash, board);
+                }
+            } else {
+                expanded_actions += legal.len();
+                for &(x1, y1, x2, y2, flipped) in &legal {
+                    let mut child = board.copy();
+                    child.place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                    let hash = placement_board_hash(&child);
+                    if let Some(existing) = unique.get(&hash) {
+                        if !placement_same_board(existing, &child) {
+                            return Err(PyValueError::new_err(
+                                "exact suffix count encountered a 128-bit board-hash collision",
+                            ));
+                        }
+                    } else {
+                        unique.insert(hash, child);
+                    }
+                    if unique.len() > state_limit {
+                        exceeded = true;
+                        break;
+                    }
+                }
+            }
+            if exceeded || unique.len() > state_limit {
+                exceeded = true;
+                break;
+            }
+        }
+        let unique_count = unique.len();
+        stats.push((
+            layer_index + 1,
+            domino_id,
+            incoming,
+            expanded_actions,
+            unique_count,
+        ));
+        if exceeded {
+            return Ok((false, stats, started.elapsed().as_secs_f64()));
+        }
+        nodes = unique.into_values().collect();
+    }
+    Ok((true, stats, started.elapsed().as_secs_f64()))
+}
+
+/// Exhaustively optimize a fixed suffix from an arbitrary board. Identical
+/// behavioral boards are deduplicated at every layer; exceeding state_limit is
+/// an explicit error rather than silently changing this into a beam search.
+#[pyfunction]
+#[pyo3(signature = (initial_board, domino_ids, harmony=true, middle_kingdom=true, state_limit=1000000))]
+fn fixed_sequence_exact_score(
+    initial_board: &RustBoard,
+    domino_ids: Vec<u16>,
+    harmony: bool,
+    middle_kingdom: bool,
+    state_limit: usize,
+) -> PyResult<PlacementBeamOutput> {
+    if domino_ids.len() > 48 {
+        return Err(PyValueError::new_err(
+            "domino_ids cannot contain more than 48 tiles",
+        ));
+    }
+    if domino_ids.iter().any(|id| !(1..=48).contains(id)) {
+        return Err(PyValueError::new_err("domino_ids contains an unknown tile"));
+    }
+    if state_limit == 0 {
+        return Err(PyValueError::new_err("state_limit must be positive"));
+    }
+
+    let started = std::time::Instant::now();
+    let mut nodes = vec![PlacementBeamNode {
+        board: initial_board.copy(),
+        discards: 0,
+        placements: [None; 48],
+        placement_count: 0,
+    }];
+    let mut layer_stats: Vec<PlacementBeamLayerStats> = Vec::with_capacity(domino_ids.len());
+    for (layer_index, &domino_id) in domino_ids.iter().enumerate() {
+        let layer_started = std::time::Instant::now();
+        let incoming_states = nodes.len();
+        let mut expanded_actions = 0usize;
+        let mut forced_discard_parents = 0usize;
+        let (ta, ca, tb, cb) = dom(domino_id);
+        let mut unique: HashMap<u128, PlacementBeamNode> = HashMap::new();
+        for node in nodes.into_iter() {
+            let legal = node.board.legal_placements(ta, ca, tb, cb);
+            if legal.is_empty() {
+                forced_discard_parents += 1;
+                expanded_actions += 1;
+                let mut placements = node.placements;
+                placements[node.placement_count] = None;
+                placement_insert_unique(
+                    &mut unique,
+                    PlacementBeamNode {
+                        board: node.board,
+                        discards: node.discards + 1,
+                        placements,
+                        placement_count: node.placement_count + 1,
+                    },
+                )?;
+            } else {
+                expanded_actions += legal.len();
+                for &(x1, y1, x2, y2, flipped) in &legal {
+                    let mut board = node.board.copy();
+                    board.place(ta, ca, tb, cb, x1, y1, x2, y2, flipped)?;
+                    let mut placements = node.placements;
+                    placements[node.placement_count] = Some((x1, y1, x2, y2, flipped));
+                    placement_insert_unique(
+                        &mut unique,
+                        PlacementBeamNode {
+                            board,
+                            discards: node.discards,
+                            placements,
+                            placement_count: node.placement_count + 1,
+                        },
+                    )?;
+                }
+            }
+            if unique.len() > state_limit {
+                return Err(PyValueError::new_err(format!(
+                    "exact state limit {state_limit} exceeded at suffix layer {} ({} unique states)",
+                    layer_index + 1,
+                    unique.len(),
+                )));
+            }
+        }
+        let unique_states = unique.len();
+        let best_partial_score = unique
+            .values()
+            .map(|node| node.board.score(false, false).0)
+            .max()
+            .unwrap_or(0);
+        nodes = unique.into_values().collect();
+        layer_stats.push((
+            layer_index + 1,
+            domino_id,
+            incoming_states,
+            expanded_actions,
+            unique_states,
+            unique_states,
+            forced_discard_parents,
+            best_partial_score,
+            layer_started.elapsed().as_secs_f64(),
+        ));
+    }
+
+    let best = nodes
+        .into_iter()
+        .max_by(|a, b| {
+            let score_a = a.board.score(harmony, middle_kingdom);
+            let score_b = b.board.score(harmony, middle_kingdom);
+            let rank_a = (score_a.0 + score_a.1 + score_a.2, -(a.discards as i32));
+            let rank_b = (score_b.0 + score_b.1 + score_b.2, -(b.discards as i32));
+            rank_a
+                .cmp(&rank_b)
+                .then_with(|| placement_board_hash(&b.board).cmp(&placement_board_hash(&a.board)))
+        })
+        .expect("exact suffix has at least the initial board");
+    let score = best.board.score(harmony, middle_kingdom);
+    Ok((
+        score.0 + score.1 + score.2,
+        score.0,
+        score.1,
+        score.2,
+        best.discards,
+        best.placements[..best.placement_count].to_vec(),
+        layer_stats,
+        started.elapsed().as_secs_f64(),
+    ))
+}
+
 // Phase codes — match Python's Phase IntEnum exactly.
 const INITIAL_SELECTION: u8 = 0;
 const PLACE_AND_SELECT: u8 = 1;
@@ -4880,6 +5341,7 @@ fn ol_select_child(
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
     pick_filter: Option<u16>,
+    action_filter: Option<&HashSet<u16>>,
 ) -> Option<(u32, Option<(i8, i8, i8, i8, bool)>, Option<u16>)> {
     let node = &arena[node_id as usize];
     // Both lists are sorted ascending by joint index — legal_actions_indexed()
@@ -4910,6 +5372,12 @@ fn ol_select_child(
     // is what makes the merge O(n+m); resetting it would be O(n*m) and wrong.
     let mut ci = 0usize;
     for &(legal_idx, placement, pick) in &legal {
+        // A root restriction is an experiment contract, not merely an initial
+        // child-pruning hint. Excluded actions must also be invisible to the
+        // missing-child detector or it will immediately restore them.
+        if action_filter.is_some_and(|allowed| !allowed.contains(&legal_idx)) {
+            continue;
+        }
         while ci < children.len() && children[ci].0 < legal_idx {
             ci += 1;
         }
@@ -5027,6 +5495,7 @@ fn ol_descend(
     fallback_count: &mut u32,
     missing_child_count: &mut u32,
     pick_floor: Option<PickFloor>,
+    root_allowed_actions: Option<&HashSet<u16>>,
 ) -> PyResult<(Vec<u32>, Vec<u8>, RustGameState)> {
     let mut path: Vec<u32> = vec![root_id];
     let mut actors: Vec<u8> = Vec::new();
@@ -5040,6 +5509,11 @@ fn ol_descend(
             break;
         }
         let actor = state.actor()?;
+        let action_filter = if path.len() == 1 {
+            root_allowed_actions
+        } else {
+            None
+        };
         // Pick-group visit floor: at node depths min_depth..=max_depth (the
         // root is path.len()-1 == 0, included only when min_depth == 0 — see
         // PickFloor), if a pick-group is starved below its floor share,
@@ -5061,6 +5535,7 @@ fn ol_descend(
                         fallback_count,
                         missing_child_count,
                         Some(g),
+                        action_filter,
                     );
                     if r.is_some() || *missing_child_count > missing_before {
                         // Either a forced-group child was selected, or the node
@@ -5082,6 +5557,7 @@ fn ol_descend(
                 fallback_count,
                 missing_child_count,
                 None,
+                action_filter,
             ),
         };
         match step {
@@ -5344,6 +5820,7 @@ fn advisor_open_loop_search_impl(
     margin_gain: f64,
     alpha_param: f64,
     pick_floor: Option<PickFloor>,
+    root_allowed_actions: Option<&HashSet<u16>>,
 ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut arena: Vec<OLNode> = vec![OLNode::new(1.0, (None, None))];
@@ -5354,6 +5831,36 @@ fn advisor_open_loop_search_impl(
     // row, claims) is determinization-independent; only the deck order below
     // it varies per simulation.
     let root_v0 = ol_expand_with_evaluator(&mut arena, 0, root_state, ev)?;
+    if let Some(allowed) = root_allowed_actions {
+        let retained: Vec<(u16, u32)> = arena[0]
+            .children
+            .iter()
+            .copied()
+            .filter(|(idx, _cid)| allowed.contains(idx))
+            .collect();
+        if retained.is_empty() {
+            return Err(PyValueError::new_err(
+                "root_allowed_actions contains no legal root action",
+            ));
+        }
+        if retained.len() != allowed.len() {
+            return Err(PyValueError::new_err(
+                "root_allowed_actions contains a non-legal root action",
+            ));
+        }
+        let prior_sum: f64 = retained
+            .iter()
+            .map(|&(_idx, cid)| arena[cid as usize].prior)
+            .sum();
+        for &(_idx, cid) in &retained {
+            arena[cid as usize].prior = if prior_sum > 0.0 {
+                arena[cid as usize].prior / prior_sum
+            } else {
+                1.0 / retained.len() as f64
+            };
+        }
+        arena[0].children = retained;
+    }
     arena[0].visit_count = 1;
     arena[0].value_sum = root_v0;
     if dirichlet_eps > 0.0 {
@@ -5385,6 +5892,7 @@ fn advisor_open_loop_search_impl(
                 // pick-group coverage closes the secondary-pick fragility gap
                 // at equal budget.  Off by default (frac=0 => None).
                 pick_floor,
+                root_allowed_actions,
             )?;
             ol_apply_virtual_loss(&mut arena, &path, &actors, 1, vl);
             let leaf = *path.last().unwrap();
@@ -5650,6 +6158,7 @@ impl AdvisorSearchHandle {
                     self.cpuct,
                     &mut self.fallback_count,
                     &mut self.missing_child_count,
+                    None,
                     None,
                 )?;
                 ol_apply_virtual_loss(&mut self.arena, &path, &actors, 1, vl);
@@ -9310,6 +9819,7 @@ impl BatchedMCTS {
                                     &mut slot.fallback_count,
                                     &mut slot.missing_child_count,
                                     pick_floor,
+                                    None,
                                 )?;
                                 ol_apply_virtual_loss(&mut slot.ol_arena, &path, &actors, 1, vl);
                                 paths.push(path);
@@ -10425,6 +10935,15 @@ mod kingdomino_rust {
     use super::RustBoard;
 
     #[pymodule_export]
+    use super::fixed_sequence_beam;
+
+    #[pymodule_export]
+    use super::fixed_sequence_exact_state_counts;
+
+    #[pymodule_export]
+    use super::fixed_sequence_exact_score;
+
+    #[pymodule_export]
     use super::RustGameState;
 
     #[pymodule_export]
@@ -10707,7 +11226,8 @@ mod kingdomino_rust {
                         fpu=0.0, cpuct=1.5, seed=0, leaf_batch=8, virtual_loss=1,
                         score_scale=160.0, margin_gain=2.0, alpha=0.0,
                         pick_floor_frac=0.0, pick_floor_min_depth=0,
-                        pick_floor_max_depth=0, pick_floor_min_visits=16))]
+                        pick_floor_max_depth=0, pick_floor_min_visits=16,
+                        root_allowed_actions=Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn advisor_open_loop_search<'py>(
         py: Python<'py>,
@@ -10728,6 +11248,7 @@ mod kingdomino_rust {
         pick_floor_min_depth: usize,
         pick_floor_max_depth: usize,
         pick_floor_min_visits: i32,
+        root_allowed_actions: Vec<u16>,
     ) -> PyResult<(Vec<(u16, i32, f64, f64)>, f64)> {
         if state.phase == GAME_OVER {
             return Err(PyValueError::new_err("Cannot search from a terminal state"));
@@ -10760,6 +11281,11 @@ mod kingdomino_rust {
             None
         };
         let root_state = state.cloned();
+        let allowed = if root_allowed_actions.is_empty() {
+            None
+        } else {
+            Some(root_allowed_actions.into_iter().collect::<HashSet<_>>())
+        };
         let ev: Py<PyAny> = evaluator.unbind();
         py.detach(move || {
             super::advisor_open_loop_search_impl(
@@ -10777,6 +11303,7 @@ mod kingdomino_rust {
                 margin_gain,
                 alpha,
                 pick_floor,
+                allowed.as_ref(),
             )
         })
     }
@@ -11019,6 +11546,7 @@ mod kingdomino_rust {
                 cpuct,
                 &mut fallback_count,
                 &mut missing_child_count,
+                None,
                 None,
             )?;
             let leaf = *path.last().unwrap();
