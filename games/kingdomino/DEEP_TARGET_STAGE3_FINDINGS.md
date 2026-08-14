@@ -2,107 +2,113 @@
 
 ## Decision
 
-Selective replay reanalysis **did not earn a training pilot**. Even on the 32
-most suspicious development roots, deeper search did not show reproducible
-value improvement over the existing 4,800-simulation tile choices.
+The corrected development audit **passes the predeclared qualification gate**.
+On the frozen 24-root suspicious cohort, deeper tile choices produced a positive
+cross-seed, game-clustered lower confidence bound over the 4,800-simulation
+choices.
 
-Do not:
+This does not yet authorize a training run. The signal is concentrated in two
+positions, and the untouched 460-position confirmation split must now test the
+frozen method. A positive confirmation would earn selective high-simulation
+reanalysis; it would not justify 30,000 simulations on every self-play move or
+put raw search Q values directly into the existing buffer.
 
-- build reconstructable self-play sidecars solely for target refresh;
-- put raw 30,000-sim Q values into the current replay buffer;
-- raise the general self-play search budget above 4,800 on this evidence; or
-- spend the frozen 460-position confirmation split on this failed development
-  gate.
+## Correction to the first run
 
-This closes deep-target qualification unless new independent evidence identifies
-a different, non-overlapping failure region.
+The original 32-root result is invalid and superseded. The Rust
+`root_allowed_actions` mask was applied during initial expansion, but open-loop
+missing-child recovery immediately reintroduced excluded legal actions. As a
+result, no nominal 10,000-simulation matched tile search gave its requested tile
+the full budget. The old negative conclusion was an artifact of comparing
+partially restricted ordinary searches.
 
-## Frozen experiment
+The mask now applies throughout root selection. Regression tests verify that
+only requested actions are returned, all simulations remain inside the mask,
+and mixed valid/invalid masks fail. Audit aggregation also rejects extra root
+actions or a visit total different from the requested budget.
 
-Stage 3 used the 32-root cohort frozen before any 30,000-sim result existed:
+## Corrected frozen experiment
+
+The corrected Stage-2 probe removed all eight starvation-derived roots from the
+old cohort. The resulting cohort was frozen at 24 roots across 14 source games:
 
 | Route | Roots |
 |---|---:|
 | Stable tile consensus changed from 800 to 4,800 | 11 |
 | Two 4,800 searches still disagreed on the tile | 13 |
-| Formerly starved tile within 0.03 Q under matched probing | 8 |
 
-The routes were non-overlapping and covered 16 source games. Every root received:
+Every root used:
 
-- two ordinary 30,000-simulation searches using its two Stage-2 seeds; and
-- two restricted 10,000-simulation searches for **every** available tile, with
+- the two existing ordinary 30,000-simulation searches, which never used the
+  root restriction and remain valid; and
+- two corrected 10,000-simulation searches for every available tile, with
   common seeds within each repeat.
 
-The matched searches give each tile equal conditional search budget. They avoid
-mistaking an ordinary MCTS zero-visit group for a low-value group. Runtime was
-58.8 minutes on the RTX 3070 Laptop GPU. No confirmation root was searched.
+All 136 corrected restricted searches received exactly 10,000 visits in their
+requested tile group. The corrected restricted work took 17.36 minutes on the
+RTX 3070 Laptop GPU. No confirmation root was searched.
 
-## Apparent regret before noise correction
+## Corrected results
 
-For each repeat, the in-sample matched regret was the best restricted tile Q
-minus the restricted Q of that repeat's 4,800 tile:
+In-sample matched regret is the best restricted tile Q minus the restricted Q
+of that repeat's 4,800 tile. It remains winner-biased because the same noisy
+sample selects and scores the maximum.
 
-| Statistic | Result |
+| In-sample matched statistic | Result |
 |---|---:|
-| Mean | 0.00651 Q |
-| Median | 0.00145 Q |
-| At most 0.01 | 52/64 |
-| Greater than 0.03 | 5/64 |
-| Greater than 0.05 | 1/64 |
-| Maximum | 0.05648 Q |
+| Mean regret | 0.00969 Q |
+| Median | 0 |
+| At most 0.01 | 44/48 |
+| Greater than 0.03 | 3/48 |
+| Greater than 0.05 | 3/48 |
+| Maximum | 0.15134 Q |
+| Teacher two-seed tile agreement | 17/24 (70.8%) |
 
-This number is positively biased: it chooses the maximum from several noisy Q
-estimates and scores that maximum on the same sample. Its nominal
-game-clustered interval is therefore not evidence of real improvement. The
-warning is visible directly in teacher stability: the equal-budget teacher chose
-the same tile in both repeats on only 15/32 roots (46.9%).
+The decisive analysis selects a teacher tile on one seed, scores it on the
+other seed, reverses the direction, and bootstraps by source game.
 
-Only one root had apparent regret above 0.03 in both repeats. This isolated tail
-does not support a dataset-level relabeling mechanism.
+| Other-seed evaluator | Decision-weighted mean uplift | Game-weighted mean | Median | Positive / negative | Game-clustered 95% interval |
+|---|---:|---:|---:|---:|---:|
+| Matched 10k-per-tile teacher | +0.00868 Q | +0.00741 Q | 0 | 9 / 10 | **[+0.00038, +0.01847]** |
+| Ordinary 30k search | +0.00888 Q | +0.00746 Q | 0 | 8 / 3 | **[+0.00050, +0.01863]** |
 
-## Cross-seed validation
+The ordinary 30,000-simulation search changed 11/48 paired 4,800 choices. Both
+the matched teacher and ordinary search agreed on the tile across their two
+seeds on 17/24 roots.
 
-The decisive analysis removes the same-sample winner advantage:
+## Concentration and interpretation
 
-1. use repeat A to select the teacher tile;
-2. use independent repeat B to score both that tile and repeat A's 4,800 tile;
-3. reverse A and B; and
-4. bootstrap by source game.
+The mean is not a broad 0.009-Q improvement on typical positions. Three of the
+48 cross-seed comparisons exceeded +0.03, none was below -0.01, and most were
+zero or very small. Two BGA positions dominate:
 
-| Selector evaluated on the other seed | Mean uplift vs 4,800 tile | Median | Positive / negative | Game-clustered 95% interval |
-|---|---:|---:|---:|---:|
-| Matched 10k-per-tile teacher | -0.00002 Q | 0 | 15 / 20 | [-0.00562, +0.00371] |
-| Ordinary 30k search | +0.00094 Q | 0 | 9 / 4 | [-0.000003, +0.00244] |
+- table `883162423`, source decision 11: approximately +0.135 and +0.148 Q;
+- table `881199380`, source decision 32: approximately +0.111 Q in one
+  cross-seed direction.
 
-The matched teacher had one positive and one negative cross-seed result beyond
-0.03. Ordinary 30k search had no cross-seed gain beyond 0.03. Thus the deeper
-choices do not reproduce as better choices under independent determinization.
+The next-largest gain was about +0.016 Q. This is exactly the pattern for which
+selective reanalysis could be useful, but it also makes independent
+confirmation essential: one or two source games can create a positive
+development mean even with game-clustered resampling.
 
-Ordinary 30k search changed 13/64 paired 4,800 choices and agreed between its
-own two seeds on 25/32 roots (78.1%). Those action changes are real, but their
-validated value was negligible. They are predominantly tie-breaking and search
-noise, not demonstrated label headroom.
+The actionable gate is therefore:
 
-## Interpretation
-
-This was an aggressively enriched cohort, only 32/940 development positions,
-selected because earlier search looked least settled. Failure to find
-reproducible regret here is stronger evidence against broad reanalysis than a
-random-root null would have been.
-
-The conclusion is limited to the tested purpose: refreshing current targets by
-spending 20k–30k simulations on selected roots. The 1,400 BGA states can still
-serve a different experiment, such as BGA-seeded self-play to broaden the state
-distribution. That would test distribution coverage, not label depth, and
-should not be described as reanalysis of the current buffer.
+1. keep the selection rules, search budgets, cross-seed statistic, and
+   game-level bootstrap frozen;
+2. run the staged screen and deep qualification on the untouched confirmation
+   games; and
+3. authorize a selective label-generation pilot only if the confirmation lower
+   bound is positive.
 
 ## Artifacts
 
 - Runner: `games/kingdomino/deep_target_stage3.py`
-- Frozen cohort: `runs/kingdomino/placement_audit/deep_target_stage3_cohort_v1.json`
-- Per-root output: `runs/kingdomino/placement_audit/deep_target_stage3_development_s30000_r2.jsonl`
-- Summary: `runs/kingdomino/placement_audit/deep_target_stage3_summary_development_s30000_r2.json`
+- Corrected cohort: `runs/kingdomino/placement_audit/deep_target_stage3_cohort_v2.json`
+- Corrected per-root output: `runs/kingdomino/placement_audit/deep_target_stage3_development_s30000_r3.jsonl`
+- Corrected summary: `runs/kingdomino/placement_audit/deep_target_stage3_summary_development_s30000_r3.json`
 - Tests: `games/kingdomino/tests/test_deep_target_stage3.py`
 
-Per-root output SHA-256:
-`8aed787aaf25904e7d39137b8ef420d4c71dac8ea6f35ff94428dfde704ae04d`.
+SHA-256:
+
+- cohort: `e48e82eea239de1b276b3475a741eb0582c1a3b972c36be17494fa0291891c09`
+- corrected per-root output: `0d01513ae0b8992eeff58b032fa41974faf1509b7d916d6234f6972eed98ca0e`

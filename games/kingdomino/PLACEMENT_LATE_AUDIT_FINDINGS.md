@@ -32,18 +32,26 @@ confirmation split was opened.
 
 ## Results
 
-| Split | Games | Decisions | Human regret | Raw-policy regret | Search regret | Raw − human 95% CI | Search − human 95% CI |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Development | 21 | 112 | 0.581 | 0.817 | 0.662 | [-0.182, 0.725] | [-0.181, 0.371] |
-| Confirmation | 10 | 49 | 1.018 | 0.835 | 0.835 | [-0.713, 0.333] | [-0.711, 0.333] |
+**Correction (2026-08-13):** the human exact-regret and raw-policy columns are
+valid. The searched-placement column is withdrawn because the Rust root-action
+mask used by that audit was bypassed during open-loop missing-child recovery.
+The search therefore was not reliably constrained to the logged next pick. This
+does not change the confirmation conclusion: raw policy itself was no worse
+than the human opponent under the preregistered criterion. Search-specific
+claims below are retained only as superseded provenance and must not be cited as
+results.
+
+| Split | Games | Decisions | Human regret | Raw-policy regret | Raw - human 95% CI |
+|---|---:|---:|---:|---:|---:|
+| Development | 21 | 112 | 0.581 | 0.817 | [-0.182, 0.725] |
+| Confirmation | 10 | 49 | 1.018 | 0.835 | [-0.713, 0.333] |
 
 Regret values are game-weighted mean final-score points per audited decision.
 Intervals are paired whole-game bootstrap intervals; decisions are not treated
 as independent observations.
 
-On confirmation, zero-regret fractions were 71.4% for humans and 77.6% for both
-raw policy and search. Search chose the same exact-valued placements as raw
-policy on every confirmation decision. The largest remaining human errors were
+On confirmation, zero-regret fractions were 71.4% for humans and 77.6% for raw
+policy. The largest remaining human errors were
 not restricted to the final one or two forced moves: confirmation placements
 19–21 still contained meaningful human regret, while placements 22–24 were
 zero-regret in the reconstructable sample.
@@ -51,14 +59,13 @@ zero-regret in the reconstructable sample.
 ## Decision
 
 The pre-registered criterion required a positive lower confidence bound for
-model regret minus human regret. It failed for both raw policy and search; the
-confirmation point estimate favored the model.
+model regret minus human regret. It failed for raw policy; the confirmation
+point estimate favored the model. The former search comparison is invalid and
+is not needed for this placement-representation decision.
 
 **Conclusion:** placements 17–24 are not a demonstrated relative weakness of
 the current-best network. This result does not support a board-auxiliary
-supervision experiment on the basis of late placement. Search appeared to
-repair part of a noisy raw-policy gap on development, but confirmation found no
-gap to repair.
+supervision experiment on the basis of late placement.
 
 This is a regional conclusion, not a claim about placements 3–16. Those earlier
 decisions are the flexibility-setting region the current exact solver cannot
@@ -71,5 +78,6 @@ not earn that larger build.
 - `placement_late_audit_protocol_v1.json`
 - `runs/kingdomino/placement_audit/late_human_regret_{development,confirmation}_p1.jsonl`
 - `runs/kingdomino/placement_audit/late_raw_policy_{development,confirmation}_p1.jsonl`
-- `runs/kingdomino/placement_audit/late_search_{development,confirmation}_p1_s4800.jsonl`
+- superseded invalid search output:
+  `runs/kingdomino/placement_audit/late_search_{development,confirmation}_p1_s4800.jsonl`
 - corresponding `*_summary_*.json` files in the same output directory

@@ -1,11 +1,10 @@
 # Kingdomino: what is left to try
 
-- **Status:** Living decision record. Placement headroom, deep-target
-  reanalysis, and explicit/progressive chance modeling are resolved negative.
-  One low-compute search question remains: whether a compact public-information
-  context can recover post-reveal adaptation without exact-row fragmentation.
-  The next distinct training lever remains BGA-seeded self-play, followed by a
-  capacity bake-off only if better state-distribution data is created.
+- **Status:** Living decision record. Placement headroom and
+  explicit/progressive chance modeling are resolved negative. Corrected
+  deep-target reanalysis passed its development gate and now requires the
+  untouched confirmation split. The contextual open-loop offline gate remains
+  a separate low-compute search question.
 - **Date:** 2026-08-13
 - **Current model:** `runs/kingdomino/best_checkpoint/current_best.pt`
   (sha `4bf07b0c…`, 80x6), placed **3rd in a three-month BGA arena**.
@@ -26,7 +25,7 @@ obvious directions have been tried.
 | run11a — exploiter loop (PSRO-lite) | null: **locally unexploitable at equal capacity** |
 | 2026-08 — tile action-value head (M0-M2.5) | closed, see `AZ_TILE_Q_HEAD_PLAN.md` |
 | 2026-08 — exact late-placement headroom audit | closed: model no worse than strong humans on confirmation; see `PLACEMENT_LATE_AUDIT_FINDINGS.md` |
-| 2026-08 - selective 30k replay-reanalysis qualification | closed: zero cross-seed uplift; see `DEEP_TARGET_STAGE3_FINDINGS.md` |
+| 2026-08 - selective 30k replay-reanalysis qualification | development passed after root-mask correction; confirmation pending; see `DEEP_TARGET_STAGE3_FINDINGS.md` |
 | 2026-08 - exact/progressive post-reveal chance exposure | closed: the production progressive treatment scored 48.24% at 800 simulations and 49.46% at 4,800 against ordinary open loop; see `CHANCE_PROGRESSIVE_GATE0_FINDINGS.md` |
 
 The run11a result is the strongest: an exploiter warm-started as a clone of the
@@ -46,12 +45,12 @@ two-tile bundle; see `BGA_TWO_DISAGREEMENT_CASES.md`.
 
 ## 2. Recommended next measurement
 
-The placement and deep-target measurements are complete and neither earned a
-training experiment. Before changing self-play, one cheap search-mechanic gate
-can reuse existing chance traces: test whether a compact context recovers the
-small observation-conditioned signal without recreating the failed exact-row
-tree. Contextual open loop and CORAL are one abstraction family, not separate
-levers.
+Placement is closed. Deep-target reanalysis has earned its predeclared
+confirmation measurement, but not yet a training experiment. Separately, one
+cheap search-mechanic gate can reuse existing chance traces: test whether a
+compact context recovers the small observation-conditioned signal without
+recreating the failed exact-row tree. Contextual open loop and CORAL are one
+abstraction family, not separate levers.
 
 If that gate fails, the next distinct question is whether starting self-play
 from verified BGA states improves state-distribution coverage. That is not
@@ -113,7 +112,7 @@ earns an equal-wall-time advisor comparison, then a small paired-game gate; it
 does not directly authorize self-play or training. See
 `KINGDOMINO_CONTEXTUAL_OPEN_LOOP_PLAN.md`.
 
-### 2.2 Deep-target qualification — resolved negative
+### 2.2 Deep-target qualification - development positive, confirmation pending
 
 **Question.** On realistic decision states, does the 4,800-sim search choose
 actions with material regret relative to a stable, deeper information-set-safe
@@ -143,24 +142,30 @@ changed a stable two-seed consensus on 11. None of the easy or starvation
 controls changed tile. Thirteen roots still disagreed by seed at 4,800.
 
 A matched forced-pick check searched every tile at the 18 roots where ordinary
-4,800 MCTS still gave a group zero visits. None of the 20 unvisited groups
-ranked best, although 8 were within 0.03 Q. Freeze the next deep cut at 32 roots:
-the 11 stable consensus changes, 13 unresolved 4,800 roots, and 8 non-overlapping
-near-starved alternatives. See `DEEP_TARGET_STAGE2_FINDINGS.md`.
+4,800 MCTS still gave a group zero visits. The first output was invalid because
+the Rust root mask was bypassed during missing-child recovery. After the fix,
+all 144 restricted searches used exactly 800 visits inside the requested group.
+None of the 20 formerly unvisited groups ranked best or was within 0.03 Q; only
+three were within 0.05. The corrected deep cut is therefore 24 roots: 11 stable
+consensus changes and 13 unresolved 4,800 roots. See
+`DEEP_TARGET_STAGE2_FINDINGS.md`.
 
-**Stage-3 qualification closed negative (2026-08-13).** All 32 frozen roots
-received two ordinary 30,000-sim searches plus two matched 10,000-sim searches
-for every available tile. The in-sample matched regret was small (mean 0.00651
-Q; median 0.00145), but even that is winner-biased because the maximum tile Q
-is selected and scored on the same noisy repeat. The matched teacher chose the
-same tile across seeds on only 15/32 roots.
+**Corrected Stage-3 development gate passed (2026-08-13).** Every tile on the
+24 frozen roots received two properly restricted 10,000-simulation searches;
+all 136 searches received the exact requested budget. The ordinary
+30,000-simulation searches were unaffected by the bug and were reused.
 
-Cross-seed validation removed that bias: select on one seed, score on the other.
-Matched-teacher uplift over the 4,800 tile was -0.00002 Q, with a game-clustered
-95% interval of [-0.00562, +0.00371]. Ordinary 30,000-sim choice uplift was
-+0.00094 Q with an interval spanning zero, and no cross-seed gain exceeded 0.03.
-The development gate failed, so confirmation remains frozen. Selective replay
-reanalysis and a higher general self-play budget are **not earned**. See
+Cross-seed validation selected on one seed and scored on the other. Matched
+teacher uplift over the 4,800 tile averaged +0.00868 Q decision-weighted and
++0.00741 game-weighted, with a game-clustered 95% interval of
+[+0.00038, +0.01847]. Ordinary 30,000-simulation choice uplift was similar at
++0.00888 Q, with interval [+0.00050, +0.01863]. Three gains exceeded +0.03 and
+none was below -0.01, but two source positions dominate the signal.
+
+The positive lower bound passes the development gate. The 460 confirmation
+positions remain frozen and must now be tested with the method unchanged.
+Selective reanalysis is qualified for confirmation, **not yet for training**;
+a higher general self-play budget is not implied. See
 `DEEP_TARGET_STAGE3_FINDINGS.md`.
 
 This is a qualification corpus, not training data. The current KD replay buffer
@@ -172,7 +177,8 @@ self-play sidecars and selective relabeling is worth that engineering cost.
 were compared with repeated 30,000-sim searches using common random numbers.
 Every pick group received a matched conditional probe. Cross-seed evaluation
 distinguished stable value improvement from determinization noise. Because the
-development gate failed, the planned confirmation pass was correctly not run.
+corrected development gate passed, the planned confirmation pass is now the
+next decision point and has not yet been run.
 
 The primary statistic is not action disagreement. It is the deep teacher's
 estimated value loss after forcing the 4,800-sim action, with uncertainty
@@ -184,8 +190,9 @@ selective deep-target dataset. Broad material regret earns a compute-matched
 training pilot, but still does not justify 30,000 sims on every self-play move;
 the likely treatment is 4,800-sim self-play plus selective 20k–30k reanalysis.
 
-**Gate result.** Reproducible regret was negligible, closing both broad and
-selective reanalysis. No compute-matched training pilot is warranted.
+**Gate result.** Development found concentrated, reproducible regret and earned
+confirmation. No training pilot is warranted until confirmation independently
+passes.
 
 **Caveat.** BGA positions test real strong-human support, not the full current
 self-play distribution. A positive result qualifies reanalysis; it does not by
@@ -201,8 +208,10 @@ Freezing the actual board after placement 16 made the remaining eight-tile
 suffix exactly enumerable. For every reconstructable placement 17–24 decision,
 the audit held the logged next pick fixed, enumerated every legal placement,
 and exactly optimized the remaining actual claimed-tile suffix. Human, raw
-network, and searched placements were evaluated against the same clairvoyant
-offline reference; the network and search never saw future claims.
+network placements were evaluated against the same clairvoyant offline
+reference; the network never saw future claims. The originally reported
+searched-placement comparison is withdrawn because the root pick restriction
+was not enforced throughout open-loop selection.
 
 Confirmation results (10 games, 49 decisions; game-weighted regret points per
 decision):
@@ -211,13 +220,13 @@ decision):
 |---|---:|---:|
 | Strong-human opponent | 1.018 | 71.4% |
 | `current_best` raw policy | 0.835 | 77.6% |
-| `current_best` search, 4,800 sims | 0.835 | 77.6% |
 
 Raw-policy minus human was -0.183 points with a paired game-clustered 95%
-interval of [-0.713, +0.333]. Search minus human was -0.183 with interval
-[-0.711, +0.333]. The pre-frozen confirmation criterion required a positive
-lower bound, so it failed. Late placement is not a demonstrated relative
-weakness and **does not earn board-auxiliary supervision**.
+interval of [-0.713, +0.333]. The pre-frozen confirmation criterion required a
+positive lower bound, so it failed. Late placement is not a demonstrated
+relative weakness and **does not earn board-auxiliary supervision**. This
+conclusion rests on the valid raw-policy comparison and does not require the
+withdrawn search result.
 
 Placements 3–16 remain technically unmeasured, but that limitation is not a
 reason to keep the lever open after a negative confirmation result in the exact
@@ -237,8 +246,9 @@ redeterminize the unordered hidden bag and predeclare sampling, value targets,
 mixture weight, and whole-game splits. Do not insert one-hot human first claims
 as authoritative labels: Mighty Duel claim order does not identify the final
 two-tile bundle. *Against:* needs start-from-state or masked/root-only training
-support, and the deep-target null says this is a distribution experiment—not a
-reason to pay for 20k-30k labels.
+support. BGA-seeded self-play remains a distribution experiment; the separate
+deep-target result says selected 20k-30k labels may be useful if confirmation
+passes.
 
 **Capacity.** Every null was at 80x6, and run11a's unexploitability was
 explicitly *at equal capacity*. The recorded pivot order already says "rerun

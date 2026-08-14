@@ -11,11 +11,13 @@
 
 ## 1. Decision summary
 
-The BGA audits did not identify a specific playing weakness that earns a new
-head, placement curriculum, or deep relabeling run. Their durable output is a
-1,400-state reconstructable strong-human corpus. If those positions enter
-training, they should do so through production-search targets or BGA-seeded
-self-play, not as unquestioned one-hot human actions.
+The placement audit did not earn a new head or placement curriculum. The
+corrected deep-target audit did identify a concentrated development signal, but
+it must pass the untouched confirmation split before earning selective
+relabeling. The durable data output is a 1,400-state reconstructable
+strong-human corpus. If those positions enter training, they should do so
+through production-search targets or BGA-seeded self-play, not as unquestioned
+one-hot human actions.
 
 The remaining search idea is narrower. Current open-loop MCTS merges all
 concrete states reached by the same slot-relative action history. Legal actions
@@ -45,9 +47,9 @@ samples. Only a strong, stable result earns an advisor-only Rust implementation.
   development and 460 confirmation.
 - The exact late-placement confirmation found `current_best` no worse than the
   strong-human opponents. Placement supervision is closed.
-- Repeated 30,000-sim and matched-pick reanalysis produced no independently
-  validated uplift over 4,800-sim choices. Broad and selective deep relabeling
-  are closed.
+- Corrected repeated 30,000-sim and matched-pick reanalysis produced a positive
+  development lower bound over 4,800-sim choices. Selective relabeling is
+  pending confirmation; broad 30,000-sim self-play is not implied.
 - The two largest raw-policy/human pick disagreements were first-claim-order
   decisions in Mighty Duel. Both humans later received the model-favored tile.
   One human/model ordering pair was exactly equivalent; the other retained only
@@ -276,12 +278,11 @@ Do not insert one-hot human first claims as authoritative labels. In Mighty
 Duel, an isolated first claim does not describe the eventual two-tile bundle,
 and the largest apparent disagreements demonstrated that failure mode.
 
-The previously completed deep-target audit says that 20k-30k labels are not
-better enough to earn broad or selective relabeling. Therefore BGA inclusion is
-about state-distribution coverage, not higher-simulation label quality. A
-separate BGA-seeded self-play plan should specify root sampling, the number of
-continuations per root, value labels, mixture weight, and game-level split
-before a training run.
+The corrected deep-target development audit says that selected 20k-30k labels
+may be better, but confirmation is pending and the effect is concentrated.
+BGA-seeded self-play is still a distinct state-distribution experiment. A
+separate plan should specify root sampling, continuations per root, value
+labels, mixture weight, and game-level split before a training run.
 
 ## 9. Stop conditions
 

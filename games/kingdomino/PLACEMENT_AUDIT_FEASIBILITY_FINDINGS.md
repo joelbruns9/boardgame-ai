@@ -72,7 +72,7 @@ decisions from 21 eligible development games:
 |---|---:|---:|
 | Strong-human opponent | 0.581 | 80.4% |
 | Current-best raw policy, logged pick fixed | 0.817 | 78.6% |
-| Current-best 4,800-sim search, logged pick fixed at root | 0.662 | 80.4% |
+| Current-best 4,800-sim search, logged pick fixed at root | withdrawn: root mask was not enforced throughout selection | withdrawn |
 
 The paired raw-policy-minus-human difference was +0.236 points per decision,
 with a game-clustered 95% bootstrap interval of [-0.182, +0.725]. The searched

@@ -68,8 +68,11 @@ The downstream development/confirmation deep-target audit used it to:
 5. Cluster uncertainty by source game, freeze the method on development games,
    and inspect confirmation once.
 
-That audit is now complete. Cross-seed validation found no independently
-positive improvement from the 30,000-simulation teacher, so broad and selective
-deep relabeling are closed. See `DEEP_TARGET_STAGE3_FINDINGS.md`. The corpus
-remains useful as a source of verified public roots for a separately specified
-BGA-seeded self-play or production-search distillation experiment.
+The corrected development audit found independently positive cross-seed uplift
+from the 30,000-simulation teacher on a concentrated 24-root cohort. Its
+game-clustered 95% lower bound was positive, so the development gate passed.
+The frozen confirmation split is still untouched and must pass before selective
+deep relabeling earns a training pilot. See `DEEP_TARGET_STAGE3_FINDINGS.md`.
+The corpus also remains useful as a source of verified public roots for a
+separately specified BGA-seeded self-play or production-search distillation
+experiment.

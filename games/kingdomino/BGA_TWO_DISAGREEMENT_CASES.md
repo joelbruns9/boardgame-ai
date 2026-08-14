@@ -74,21 +74,16 @@ the raw model's tile 20; the disagreement was about which desired tile had to be
 secured first across an intervening opponent response.
 
 Whole-root exact solving and the counterfactual exact response after taking 20
-first both timed out at 600 seconds. The non-exact equal-budget comparison used
-two ordinary 30,000-sim searches and 30,000 simulations separately for every
-tile group:
+first both timed out at 600 seconds. The non-exact comparison used two ordinary
+30,000-simulation searches. A separately reported matched tile-group comparison
+is withdrawn: the Rust root-action mask was bypassed during missing-child
+recovery, so those searches did not give each requested group the claimed
+isolated budget.
 
-| First claim | Deep actor Q |
-|---|---:|
-| 20 (raw model) | 0.7079 |
-| 7 | 0.7027 |
-| 28 (human) | 0.6925 |
-| 6 | 0.6821 |
-
-Both ordinary 30k search and the matched tile searches preferred 20 first.
-Human-first-28 minus model-first-20 was -0.0154 Q. This comparison gives each
-first claim its best searched placement of the current tile; it does not score
-the human's literal joint placement as ground truth. Final score was 111-106.
+Both ordinary 30k searches preferred 20 first. The former -0.0154 Q matched
+estimate is invalid and must not be cited. Ordinary search still establishes
+the preferred action under its own allocation, but it does not independently
+quantify the regret of taking 28 first. Final score was 111-106.
 
 The evidence therefore does not show that 28 first was better. It does show why
 the raw 29x ratio is misleading: the actual strategic object was an ordered
@@ -110,7 +105,8 @@ scarce tile first” strategy.
 
 - Exact Rabudipabudi case:
   `runs/kingdomino/placement_audit/bga_disagreement_case_studies_v1.json`
-- Deep wishiwas case:
+- Superseded deep wishiwas case (matched-Q fields invalid; ordinary searches
+  remain valid):
   `runs/kingdomino/placement_audit/bga_wishiwas_disagreement_deep_v1.json`
 - Exact case runner: `games/kingdomino/bga_disagreement_case_study.py`
 - Deep case runner: `games/kingdomino/bga_disagreement_deep_case.py`
