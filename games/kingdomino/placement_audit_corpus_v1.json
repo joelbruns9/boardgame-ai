@@ -1,0 +1,62 @@
+{
+  "schema": "kingdomino-placement-corpus/v1",
+  "corpus_id": "kingdomino-bga-placement-v1",
+  "frozen_at": "2026-08-13",
+  "source_schema": "kingdomino-bga-gamelog/v1",
+  "split_policy": {
+    "development_games": 24,
+    "confirmation_games": 12,
+    "method": "Rank SHA-256('kingdomino-placement-audit-v1:' + table_id); lowest 12 hashes are confirmation. No game outcomes or placement results were used."
+  },
+  "notes": [
+    "The 36 clean, single-final logs captured from 2026-07-10 through 2026-07-15 are frozen here before optimizer tuning.",
+    "table_unknown.jsonl and the six later table logs are excluded because they are outside the previously identified clean 36-game corpus."
+  ],
+  "games": [
+    {"table_id":"881060676","path":"runs/kingdomino/bga_game_log/table_881060676.jsonl","sha256":"0ca24cbd91020afcaacf753a385cf0c47b623f26098b4ca99fb9659c9ef7c1e2","split":"development"},
+    {"table_id":"881084494","path":"runs/kingdomino/bga_game_log/table_881084494.jsonl","sha256":"6d54d401c7f018c701c58b18f4a2f654e02ec8ed064561510f7ee226f1da4d51","split":"development"},
+    {"table_id":"881096144","path":"runs/kingdomino/bga_game_log/table_881096144.jsonl","sha256":"66f8d75b03e18da43baa0c665a0495887b5237dee3eb0add1d80694a4850c1dc","split":"confirmation"},
+    {"table_id":"881152305","path":"runs/kingdomino/bga_game_log/table_881152305.jsonl","sha256":"70d68ba39a03eaf5b138674033163f88ae03eef94ed24465db06cf83123f2513","split":"confirmation"},
+    {"table_id":"881159658","path":"runs/kingdomino/bga_game_log/table_881159658.jsonl","sha256":"7b006f231000457900b373df7f86c330df7b19f7e93637968e6494738d68277c","split":"development"},
+    {"table_id":"881170142","path":"runs/kingdomino/bga_game_log/table_881170142.jsonl","sha256":"c8c774695b257adc28e870c1f20d7f6e7a48d7426fbde3d170f491c10265fab1","split":"development"},
+    {"table_id":"881193667","path":"runs/kingdomino/bga_game_log/table_881193667.jsonl","sha256":"68786c2c7c26ee6b44b43f79cd0f008a6fce33419367790cd0725233064bb053","split":"confirmation"},
+    {"table_id":"881199380","path":"runs/kingdomino/bga_game_log/table_881199380.jsonl","sha256":"65af22ae29cd7b9486717b6546318e6f7d4d28378475fc6690599c405f0cdf08","split":"development"},
+    {"table_id":"881620085","path":"runs/kingdomino/bga_game_log/table_881620085.jsonl","sha256":"f63797e07aa1ae728adb3ae7fe50c2cbaa4e20621d6cf3fa520c4b81bcebcd8c","split":"development"},
+    {"table_id":"881629602","path":"runs/kingdomino/bga_game_log/table_881629602.jsonl","sha256":"37aee751a28e8e4db913423055392210e193d044de461ba3593aefe5b7a447ee","split":"development"},
+    {"table_id":"881632995","path":"runs/kingdomino/bga_game_log/table_881632995.jsonl","sha256":"0ee0dee81b2e1891985d2e8233a01206237d7f148bff86bd265e6e6224b05c51","split":"confirmation"},
+    {"table_id":"881647491","path":"runs/kingdomino/bga_game_log/table_881647491.jsonl","sha256":"89064727dcf0995648f53470f3b7fe76fadd83d465285b6c444e2231971caa48","split":"confirmation"},
+    {"table_id":"881648336","path":"runs/kingdomino/bga_game_log/table_881648336.jsonl","sha256":"47c2a484f3e86057fbfcf4d8599857fe221781efadf48eedecb88cf82b1195f5","split":"development"},
+    {"table_id":"881650802","path":"runs/kingdomino/bga_game_log/table_881650802.jsonl","sha256":"a12864bc2f72f6846be15d454ff51223ee6c8dd9be9ab23eb671b4efe73acfe9","split":"development"},
+    {"table_id":"881651578","path":"runs/kingdomino/bga_game_log/table_881651578.jsonl","sha256":"7be2c137d6b0caac792ddecd9dcd30d57d46b29e685521fdbd565eeb16724fd7","split":"development"},
+    {"table_id":"882124089","path":"runs/kingdomino/bga_game_log/table_882124089.jsonl","sha256":"9ed4de17aa875eb2e9f8edafe38770704ecf35cd7c091198c09eb8a2bf785904","split":"development"},
+    {"table_id":"882124255","path":"runs/kingdomino/bga_game_log/table_882124255.jsonl","sha256":"a6eee4e1c87c395f93ad60d375b761dd3f5e8c8949c69bc5560ffa83670291d7","split":"development"},
+    {"table_id":"882132814","path":"runs/kingdomino/bga_game_log/table_882132814.jsonl","sha256":"d5f0861eb1cfb14a3876e97438e2e5c255f201bca3805144af46992f59e826e7","split":"development"},
+    {"table_id":"882132938","path":"runs/kingdomino/bga_game_log/table_882132938.jsonl","sha256":"389d44ab6d7595bc8cdb60ba2ee8b3b8e061778bbbaabd36a99db0746049bd8b","split":"confirmation"},
+    {"table_id":"882147494","path":"runs/kingdomino/bga_game_log/table_882147494.jsonl","sha256":"693f5e46db0ccc83df7241b405cd0b61f3e75131cea135e55ec4661b7c4cb209","split":"confirmation"},
+    {"table_id":"882148358","path":"runs/kingdomino/bga_game_log/table_882148358.jsonl","sha256":"30450014a89d460e2f4f4abb04e885a3d12b53eada7d442e495fdbf165172d8a","split":"development"},
+    {"table_id":"882559864","path":"runs/kingdomino/bga_game_log/table_882559864.jsonl","sha256":"e2aa93b14885baea697bb891ca7a432877e9e36c4a09341effcd581f608b1645","split":"confirmation"},
+    {"table_id":"882560733","path":"runs/kingdomino/bga_game_log/table_882560733.jsonl","sha256":"f81216cbe4abb9117c27c89730e7d817dcc550249ea8eac0677bbe067c6c88ac","split":"development"},
+    {"table_id":"882564258","path":"runs/kingdomino/bga_game_log/table_882564258.jsonl","sha256":"a6e1ecdaa7d8537ec7e3554e81362c934b09857c39c2a85a26acc86b11411f53","split":"development"},
+    {"table_id":"882633196","path":"runs/kingdomino/bga_game_log/table_882633196.jsonl","sha256":"4733485e128b6fc09ea6b538ba26b4378b61d637b8db9f98fb2e0b026bf767ea","split":"development"},
+    {"table_id":"882633263","path":"runs/kingdomino/bga_game_log/table_882633263.jsonl","sha256":"9c06bccc1f7f3ecb0ac60ef8c965f0f1174e53129890fb3088c7ccd49e4f2996","split":"development"},
+    {"table_id":"882658782","path":"runs/kingdomino/bga_game_log/table_882658782.jsonl","sha256":"26770bc1d789f8eb1e2c6cbe9878528a0740959f5f923ddac3823e0a7ee5186c","split":"confirmation"},
+    {"table_id":"882886856","path":"runs/kingdomino/bga_game_log/table_882886856.jsonl","sha256":"d269fd363a79420cf94fd4201f148acef26367196b24fd3c2fef7655a60f130f","split":"development"},
+    {"table_id":"883077657","path":"runs/kingdomino/bga_game_log/table_883077657.jsonl","sha256":"410f4e47a3869a06fe5ff0d8f07b25dd83bdcfb06d9629f5d321c792f3389a37","split":"development"},
+    {"table_id":"883085653","path":"runs/kingdomino/bga_game_log/table_883085653.jsonl","sha256":"4e43e0335661e4a28c29493eff3a0f85bcd5591af55738a3684f32aca49d9eb3","split":"development"},
+    {"table_id":"883138189","path":"runs/kingdomino/bga_game_log/table_883138189.jsonl","sha256":"88dd792f9241aaea238796036e1a3afb90e2cc8987387bd805c061bb4ca0cf0e","split":"confirmation"},
+    {"table_id":"883143298","path":"runs/kingdomino/bga_game_log/table_883143298.jsonl","sha256":"35e7aad181ad72f3051e8f2a6e5029e4e9558fb4882eb3beda0b2a2e3099f9ca","split":"development"},
+    {"table_id":"883145763","path":"runs/kingdomino/bga_game_log/table_883145763.jsonl","sha256":"92ed65978668c67b3507021eb2d078df332de8331c20873fd3f6546df84c8c6b","split":"confirmation"},
+    {"table_id":"883154893","path":"runs/kingdomino/bga_game_log/table_883154893.jsonl","sha256":"4335dc219bd378a379193f57780ea67eef9067b6b2d9490747ed453a964f01fd","split":"confirmation"},
+    {"table_id":"883159259","path":"runs/kingdomino/bga_game_log/table_883159259.jsonl","sha256":"aefca3506559414f3c70d0e1725f6241d5ffbd617b4fa564a3f297b24895edbc","split":"development"},
+    {"table_id":"883162423","path":"runs/kingdomino/bga_game_log/table_883162423.jsonl","sha256":"141e8f53b83df2c5bae7cf53156f5780ee8b042305d6423bd305a37d40689ca5","split":"development"}
+  ],
+  "excluded": [
+    {"path":"runs/kingdomino/bga_game_log/table_unknown.jsonl","reason":"unknown table provenance"},
+    {"table_id":"884614508","reason":"outside clean 36-game corpus; duplicate final record"},
+    {"table_id":"884623488","reason":"outside clean 36-game corpus; repeated snapshots"},
+    {"table_id":"884636859","reason":"outside clean 36-game corpus; missing final record"},
+    {"table_id":"884690241","reason":"outside clean 36-game corpus; repeated snapshots"},
+    {"table_id":"884693585","reason":"outside clean 36-game corpus; repeated snapshots"},
+    {"table_id":"884695259","reason":"outside clean 36-game corpus; repeated snapshots"}
+  ]
+}
