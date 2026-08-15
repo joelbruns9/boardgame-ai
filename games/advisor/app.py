@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .contract import AdvisorAdapter, RecommendRequest, RecommendResponse
+from .game_log import GameLogWriter, UnloggableState, log_dir_for
 from .jobs import JobManager, SearchJob
 
 try:
@@ -70,6 +71,23 @@ class StateBody(BaseModel):
     state: dict[str, Any]
 
 
+class GameLogBody(BaseModel):
+    """One observed position (or final result) from a real game.
+
+    ``state`` is the same wire the recommend endpoints take, so a logged line
+    reloads through ``adapter.state_from_wire`` with no extra codec -- that is
+    what makes the log usable as self-play restart positions, not just as a
+    record. ``kind`` separates ordinary decision points from the terminal
+    record; ``extra`` carries whatever the client wants to keep alongside
+    (what the advisor said, the move actually played, timings).
+    """
+
+    table_id: str | None = None
+    kind: str = "decision"
+    state: dict[str, Any] | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
 class StopBody(BaseModel):
     job_id: str
 
@@ -97,13 +115,19 @@ def create_advisor_app(
     ttl_secs: float = 60.0,
     title: str | None = None,
     static_dir: str | Path | None = None,
+    log_dir: str | Path | None = None,
 ) -> "FastAPI":
     """Build the advisor app for one game adapter.
 
     ``static_dir`` optionally points at a game's ``web_static/`` folder; when it
     exists it is mounted at ``/static`` and its ``index.html`` served at ``/``,
     so a game's UI is drop-in with no per-game transport code.
+
+    ``log_dir`` overrides where ``/api/game_log`` writes; it defaults to
+    ``runs/<game_id>/bga_game_log/``.
     """
+
+    writer = GameLogWriter(log_dir or log_dir_for(adapter.game_id))
 
     app = FastAPI(title=title or f"{adapter.game_id} advisor", version="0.1.0")
     app.add_middleware(
@@ -169,6 +193,33 @@ def create_advisor_app(
     @app.post("/api/recommend/stop")
     def recommend_stop(body: StopBody) -> dict[str, Any]:
         return {"ok": manager.stop(body.job_id)}
+
+    @app.post("/api/game_log")
+    def game_log(body: GameLogBody) -> dict[str, Any]:
+        """Append one real-game position to this game's BGA log.
+
+        Passive capture: the advisor is already handed a faithful position on
+        every turn, and throwing it away is the waste. Two uses, both wanting
+        the same bytes -- real human-play positions to restart self-play from,
+        and a corpus to validate the engine against.
+
+        A position is validated before it is written: a line that cannot be
+        rebuilt is worse than a missing one, because it will be discovered much
+        later by whatever consumes the log.
+        """
+
+        try:
+            return writer.append(
+                adapter,
+                table_id=body.table_id,
+                kind=body.kind,
+                state=body.state,
+                extra=body.extra,
+            )
+        except UnloggableState as exc:
+            raise HTTPException(
+                status_code=400, detail=f"unloggable state: {exc}"
+            ) from exc
 
     app.state.advisor_manager = manager  # exposed for tests/inspection
     return app

@@ -330,10 +330,30 @@
     }
   }
 
+  // BGA puts the table id in the URL of the game frame; it is the only handle
+  // that ties logged positions back to a replayable game.
+  function tableId() {
+    const match = /[?&]table=(\d+)/.exec(location.href);
+    return match ? match[1] : null;
+  }
+
+  // Passive capture. The host already receives a faithful position every turn;
+  // keeping it costs one request and turns ordinary play into both a self-play
+  // restart corpus and an engine-validation corpus. Never blocks the search,
+  // and the host dedupes re-posts of the same position.
+  async function logPosition(state) {
+    try {
+      await post("/api/game_log", { table_id: tableId(), state });
+    } catch (err) {
+      /* logging is best-effort; advice must not depend on it */
+    }
+  }
+
   async function startSearch(state) {
     await stopCurrent();
     setStatus("searching…");
     fetchOutlook(state);
+    logPosition(state);
     let started;
     try {
       started = await post("/api/recommend/start", {
