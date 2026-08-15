@@ -320,7 +320,14 @@ class JobManager:
             search_ms=int((time.perf_counter() - started) * 1000),
             # The person waiting is entitled to know the search stopped early
             # and why; silently capping would look like a stalled counter.
-            warnings=[snapshot.stop_reason] if snapshot.stop_reason else None,
+            # Adapter-level warnings (an adapter serving a stale checkpoint, say)
+            # ride along for the same reason. `warnings()` is optional, so games
+            # that have nothing to say need not implement it.
+            warnings=(
+                ([snapshot.stop_reason] if snapshot.stop_reason else [])
+                + list(getattr(self._adapter, "warnings", list)())
+            )
+            or None,
         )
         with self._lock:
             job.sims_done = snapshot.sims_done

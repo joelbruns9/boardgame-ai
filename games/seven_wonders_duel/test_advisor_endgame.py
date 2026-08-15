@@ -149,11 +149,17 @@ def test_deterministic_annotation_shape(positions):
     assert exactly_one_best == 1
 
 
-def test_host_attaches_endgame_annotation(positions):
+def _adapter(**kwargs):
     from .inference import Evaluator
     from .train import build_model
 
-    adapter = SevenWondersAdvisor(evaluator=Evaluator(build_model("transformer", 32, 1), "cpu"))
+    return SevenWondersAdvisor(
+        evaluator=Evaluator(build_model("transformer", 32, 1), "cpu"), **kwargs
+    )
+
+
+def test_host_attaches_endgame_annotation(positions):
+    adapter = _adapter(exact_endgame=True)
     resp = JobManager(adapter).run_blocking(
         _shim(positions["deterministic"]),
         RecommendRequest(engine="auto", max_sims=40, chunk_sims=20, top_k=4, seed=1),
@@ -161,3 +167,18 @@ def test_host_attaches_endgame_annotation(positions):
     assert resp.ok
     assert "exact_endgame" in resp.summary
     assert any("exact_endgame" in r.annotations for r in resp.recommendations)
+
+
+def test_endgame_solver_is_off_unless_asked_for(positions):
+    """Default OFF: it spends the annotate budget on every in-range position and
+    nothing renders its answer yet, so it must not run by accident."""
+
+    adapter = _adapter()
+    assert adapter.annotators() == []
+    resp = JobManager(adapter).run_blocking(
+        _shim(positions["deterministic"]),
+        RecommendRequest(engine="auto", max_sims=40, chunk_sims=20, top_k=4, seed=1),
+    )
+    assert resp.ok
+    assert "exact_endgame" not in resp.summary
+    assert all("exact_endgame" not in r.annotations for r in resp.recommendations)

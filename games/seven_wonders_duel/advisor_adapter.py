@@ -376,10 +376,22 @@ class SevenWondersAdvisor:
         evaluator: Any = None,
         default_checkpoint: str | None = None,
         device: str = "cpu",
+        allow_encoder_migration: bool = False,
+        exact_endgame: bool = False,
     ):
         self._injected = evaluator
         self._default_checkpoint = default_checkpoint
         self._device = device
+        # Exact endgame annotation is OFF by default. It is not free: it runs
+        # at settle on any position inside `max_present` and can spend the whole
+        # annotate budget before returning None, and nothing renders its answer
+        # yet. Opt in once there is a UI for it.
+        self._exact_endgame = bool(exact_endgame)
+        # Serve a checkpoint whose encoder signature predates the live encoder.
+        # Off by default -- the signature guard exists because a net fed
+        # redefined features is silently wrong. On, every response carries a
+        # warning, because the human reading the numbers needs to know.
+        self._allow_encoder_migration = bool(allow_encoder_migration)
         self._eval_cache: dict[tuple[str | None, str], Any] = {}
 
     # -- evaluator ----------------------------------------------------------
@@ -396,9 +408,22 @@ class SevenWondersAdvisor:
         if cached is None:
             from .phase_e import load_evaluator
 
-            cached = load_evaluator(checkpoint, device)
+            cached = load_evaluator(
+                checkpoint, device, migrate=self._allow_encoder_migration
+            )
             self._eval_cache[key] = cached
         return cached
+
+    def warnings(self) -> list[str]:
+        """Advisor-level warnings the host should surface with every answer."""
+
+        if not self._allow_encoder_migration:
+            return []
+        return [
+            "serving a checkpoint trained under an older encoder "
+            "(SWD_ADVISOR_ALLOW_MIGRATION): the feature schema has the same "
+            "shape but different meaning, so these numbers are off-distribution"
+        ]
 
     # -- state codec --------------------------------------------------------
 
@@ -687,14 +712,23 @@ class SevenWondersAdvisor:
         }
 
     def annotators(self):
+        if not self._exact_endgame:
+            return []
         from .advisor_endgame import ExactEndgameAnnotator
 
         return [ExactEndgameAnnotator()]
 
     def contract(self) -> dict[str, Any]:
+        from .encoder import ENCODER_SIGNATURE
+
         return {
             "game_id": self.game_id,
             "engines": list(self.engines()),
             "default_checkpoint": self._default_checkpoint,
             "wire": "seed+first_player+prefix (exact replay)",
+            # Surfaced so "why is it refusing my checkpoint?" is answerable from
+            # /health instead of by reading the server's environment.
+            "encoder_signature": ENCODER_SIGNATURE,
+            "allow_encoder_migration": self._allow_encoder_migration,
+            "exact_endgame": self._exact_endgame,
         }

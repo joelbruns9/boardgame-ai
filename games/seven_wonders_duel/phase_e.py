@@ -504,7 +504,20 @@ def load_evaluator(
     checkpoint_path: str,
     device: str,
     precision: str = "fp32",
+    *,
+    migrate: bool = False,
 ):
+    """Build an evaluator over a checkpoint.
+
+    ``migrate=True`` accepts a checkpoint whose stored encoder signature no
+    longer matches the live encoder. That is normally refused, and the refusal
+    is the point: a net fed features it was not trained on is silently wrong.
+    Pass it only when the schema SHAPE is unchanged and only the semantics of
+    existing features moved, which `migrate_state_dict` reports by loading every
+    tensor with nothing grown and nothing zeroed. Callers should surface it to
+    the human -- the model is being served off-distribution either way.
+    """
+
     import torch
 
     from .inference import Evaluator
@@ -518,7 +531,16 @@ def load_evaluator(
         config.get("layers", 4),
         heads_from_config(config),
     )
-    load_checkpoint(checkpoint_path, model)
+    load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
+    if migrate and checkpoint.get("migration"):
+        report = checkpoint["migration"]
+        if report.get("grown") or report.get("zeroed"):
+            raise ValueError(
+                "refusing to migrate: the checkpoint needs tensor surgery "
+                f"(grown={report.get('grown')}, zeroed={report.get('zeroed')}), "
+                "which means the schema shape changed, not just its meaning"
+            )
+        model.load_state_dict(checkpoint["model_state"])
     return Evaluator(model, device=device, precision=precision)
 
 
