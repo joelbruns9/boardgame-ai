@@ -58,8 +58,9 @@ def test_military_enters_both_penalty_zones_one_space_at_a_time():
     apply_action(game, Action(slot, ActionUse.CONSTRUCT_BUILDING))
     assert game.conflict_position == 7  # three printed Shields + Strategy
     assert game.cities[1].coins == 3
-    assert 4 not in game.military_tokens_remaining
-    assert 7 not in game.military_tokens_remaining
+    # Tokens are keyed by their band's first space: 3-5 and 6-8.
+    assert 3 not in game.military_tokens_remaining
+    assert 6 not in game.military_tokens_remaining
 
 
 def test_military_penalty_cannot_reduce_coins_below_zero():
@@ -172,14 +173,19 @@ def test_theology_grants_replay_to_future_wonder():
 @pytest.mark.parametrize(
     ("position", "player_zero", "player_one"),
     [
+        # Bands are 1-2 / 3-5 / 6-8 (BGA MilitaryTrack::getVictoryPoints); the
+        # boundary cases 2/3 and 5/6 are the ones the old off-by-one got wrong.
         (0, 0, 0),
         (1, 2, 0),
-        (3, 2, 0),
+        (2, 2, 0),
+        (3, 5, 0),
         (4, 5, 0),
-        (6, 5, 0),
+        (5, 5, 0),
+        (6, 10, 0),
         (7, 10, 0),
         (8, 10, 0),
-        (-4, 0, 5),
+        (-3, 0, 5),
+        (-6, 0, 10),
     ],
 )
 def test_military_civilian_scoring_bands(position, player_zero, player_one):

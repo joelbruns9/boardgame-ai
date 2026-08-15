@@ -18,7 +18,12 @@ from games.seven_wonders_duel.encoder import (
 )
 from games.seven_wonders_duel.codec import legal_action_indices
 from games.seven_wonders_duel.engine import Action, ActionUse, apply_action, legal_actions
-from games.seven_wonders_duel.game import Phase, new_game
+from games.seven_wonders_duel.game import (
+    PendingChoice,
+    PendingChoiceKind,
+    Phase,
+    new_game,
+)
 from games.seven_wonders_duel.pool import resample_hidden
 
 
@@ -139,7 +144,7 @@ def test_mirror_states_encode_identically_across_trajectories():
 def test_mirror_holds_with_military_asymmetry_and_pending():
     game = _playing_game(400)
     game.conflict_position = 5
-    del game.military_tokens_remaining[4]
+    del game.military_tokens_remaining[3]
     _give_wonder(game, 0, "The Great Library")
     game.cities[0].coins = 100
     slot = game.tableau.accessible_slot_ids()[0]
@@ -162,9 +167,9 @@ def test_initial_economy_features():
     for resource in ("wood", "clay", "stone", "glass", "papyrus"):
         assert _global_value(encoding, f"my_trade_price_{resource}") == 2
     assert _global_value(encoding, "my_discard_income") == 2
-    assert _global_value(encoding, "my_next_token_dist") == 4
+    assert _global_value(encoding, "my_next_token_dist") == 3
     assert _global_value(encoding, "my_next_token_penalty") == 2
-    assert _global_value(encoding, "opp_next_token_dist") == 4
+    assert _global_value(encoding, "opp_next_token_dist") == 3
     assert _global_value(encoding, "my_sci_win_feasible") == 1
     assert _global_value(encoding, "my_mil_win_feasible") == 1
     assert _global_value(encoding, "decision_main_turn") == 1
@@ -305,11 +310,127 @@ def test_new_global_fields_token_flags_and_guild_score():
     assert _global_value(encoding, "opp_token_2coin_remaining") == 1
     assert _global_value(encoding, "my_score_guild") == 0
     actor = game.active_player
-    del game.military_tokens_remaining[4 if actor == 0 else -4]
+    del game.military_tokens_remaining[3 if actor == 0 else -3]
     encoding = encode(game.observation(0))
     assert _global_value(encoding, "my_token_2coin_remaining") == 0
-    assert _global_value(encoding, "my_next_token_dist") == 7
+    assert _global_value(encoding, "my_next_token_dist") == 6
     assert _global_value(encoding, "my_next_token_penalty") == 5
+
+
+# --- discard reachable through the Mausoleum --------------------------------
+#
+# The discard pile is out of play for everyone EXCEPT a seat holding an unbuilt
+# Mausoleum, which builds one card from it for free. Leaving it out of the
+# reachability arithmetic made `sci_win_feasible` read 0 against a live science
+# rush -- observed on BGA table 899263451, one move before losing to it.
+
+
+def _age_three_without_wheel(seed=30):
+    """Play to Age III, then make sure the actor does not already hold wheel.
+
+    Age III deals no wheel card (Apothecary is Age I, School is Age II) and
+    guilds carry no science, so once Age III starts the wheel symbol is
+    reachable ONLY out of the discard pile. That makes it a clean probe for
+    discard reachability.
+    """
+
+    rng = random.Random(seed)
+    game = _playing_game(seed)
+    guard = 0
+
+    def arrived():
+        return (
+            game.age == 3
+            and game.phase is Phase.PLAY_AGE
+            and game.pending_choice is None
+        )
+
+    while not arrived() and game.phase is not Phase.COMPLETE and guard < 400:
+        guard += 1
+        apply_action(game, rng.choice(legal_actions(game)))
+    assert arrived(), f"did not reach an Age III main turn (phase={game.phase})"
+    for city in game.cities:
+        city.buildings = [
+            name for name in city.buildings if name not in ("Apothecary", "School")
+        ]
+    return game
+
+
+def test_unbuilt_mausoleum_makes_a_discarded_symbol_reachable():
+    game = _age_three_without_wheel()
+    seat = game.active_player
+    game.discard_pile = ["School"]  # wheel
+
+    before = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+    _give_wonder(game, seat, "The Mausoleum")
+    after = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+
+    assert after == before + 1
+
+
+def test_built_mausoleum_no_longer_reaches_the_discard():
+    game = _age_three_without_wheel()
+    seat = game.active_player
+    game.discard_pile = ["School"]
+    _give_wonder(game, seat, "The Mausoleum")
+
+    unbuilt = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+    game.cities[seat].built_wonders.append("The Mausoleum")
+    built = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+
+    assert built == unbuilt - 1
+
+
+def test_discard_reachability_is_seat_specific():
+    game = _age_three_without_wheel()
+    seat = game.active_player
+    game.discard_pile = ["School"]
+    _give_wonder(game, seat, "The Mausoleum")
+
+    encoding = encode(game.observation(seat))
+    mine = _global_value(encoding, "my_sci_missing_obtainable")
+    theirs = _global_value(encoding, "opp_sci_missing_obtainable")
+    assert mine == theirs + 1  # only the Mausoleum holder can revive it
+
+
+def test_revived_red_cards_count_toward_the_military_bound():
+    game = _playing_game(30)
+    seat = game.active_player
+    game.discard_pile = ["Guard Tower"]  # red, 1 shield
+    # Hand Strategy to the opponent -- off the board AND owned elsewhere, so it
+    # is unobtainable for `seat`. Left reachable, its "+1 shield per reachable
+    # red card" would double the delta and hide what this test is measuring.
+    game.available_progress_tokens = tuple(
+        name for name in game.available_progress_tokens if name != "Strategy"
+    )
+    game.cities[1 - seat].progress_tokens.append("Strategy")
+
+    before = _global_value(encode(game.observation(seat)), "my_mil_shields_obtainable")
+    _give_wonder(game, seat, "The Mausoleum")
+    after = _global_value(encode(game.observation(seat)), "my_mil_shields_obtainable")
+
+    assert after == before + 1
+
+
+def test_pending_mausoleum_choice_counts_as_reachable():
+    """The wonder is already in `built_wonders` while its choice is pending, so
+    the ownership branch cannot see it -- the pending options must."""
+
+    game = _age_three_without_wheel()
+    seat = game.active_player
+    game.discard_pile = ["School"]
+    _give_wonder(game, seat, "The Mausoleum")
+    game.cities[seat].built_wonders.append("The Mausoleum")
+
+    settled = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+    game.pending_choice = PendingChoice(
+        kind=PendingChoiceKind.BUILD_FROM_DISCARD_FREE,
+        player=seat,
+        options=("School",),
+    )
+    pending = _global_value(encode(game.observation(seat)), "my_sci_missing_obtainable")
+
+    assert pending == settled + 1
 
 
 # --- signature + golden -----------------------------------------------------
@@ -319,7 +440,7 @@ def test_encoder_signature_is_pinned():
     # Bump ENCODER_VERSION and this pin together on any schema change (§5.8).
     assert (
         ENCODER_SIGNATURE
-        == "7d68ff20f280700f0c7a04d2411cded734c51b3e312a80578824d7dbb0098be2"
+        == "caa91b527f3d86018b7307674abfaca326c76d54e8aeaf5ea6787e2a666fa4d2"
     )
 
 
@@ -327,7 +448,7 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "3dc18d90782fac2a906eecaa3bf6d8118beee76909f8b1a13b1111ac24772e60"
+        == "39f870e7f49567b02308fad392beb465de271828af281bd2168ae7f1b28b7e45"
     )
 
 
@@ -336,7 +457,7 @@ def test_golden_digests_cover_draft_and_pending_states():
     apply_action(draft, legal_actions(draft)[0])
     assert (
         _digest(encode(draft.observation(0)))
-        == "12c235e52cc19f80430a55ede7f4ec9c3b4a0922d7a031955ad424442bd190c1"
+        == "aac32a3bb960c5b5bd1ed1123a70d83c7707766a2ff4d17a08006ff3b52fc49b"
     )
 
     library = _playing_game(400)
@@ -347,5 +468,5 @@ def test_golden_digests_cover_draft_and_pending_states():
     assert library.pending_choice is not None
     assert (
         _digest(encode(library.observation(0)))
-        == "13d9638d8f1720232eba47c8d9e8987a15fe5f2de45b87c3fb9ed65c50ba4e99"
+        == "3bb5dcc9f89ae987cdfe8a230c46a94195777a1af95b7653e873b649fe473262"
     )

@@ -54,10 +54,20 @@ effects, military movement and one-time coin penalties, science pairs, Progress
 selection, military and scientific supremacy, Age changes, and civilian scoring.
 
 The military track uses signed positions `-9..9`: zero is neutral, positive
-positions favor player 0, and either endpoint is the opposing capital. The 2-coin
-tokens trigger on first entry to `-4` and `4`; the 5-coin tokens trigger on first
-entry to `-7` and `7`. Civilian military points are 2 for distances 1-3, 5 for
-distances 4-6, and 10 for distances 7-8.
+positions favor player 0, and either endpoint is the opposing capital. Each coin
+token covers a **band**, not a single space, and is claimed once on first entry
+to that band: the 2-coin tokens cover distances 3-5, the 5-coin tokens cover
+distances 6-8. Civilian military points are read from the pawn's current
+position: 2 for distances 1-2, 5 for 3-5, and 10 for 6-8.
+
+Corrected 2026-08-14. This paragraph previously described the tokens as sitting
+on the single spaces `±4`/`±7` with point bands 1-3 / 4-6 / 7-8 — one space too
+far out in both cases, which the differential harness caught against BGA
+(`modules/php/MilitaryTrack.php`: `getMilitaryToken` buckets |position| into
+3..5 and 6..8, `getVictoryPoints` scores 1-2 / 3-5 / 6-8). The old model could
+skip a penalty entirely when the pawn touched a band and was pushed back, and
+under-scored military VP at distances 3 and 6. `military_tokens_remaining` is
+keyed by each band's first space, so it still holds one entry per token.
 
 Wonder drafting, primary Age actions, pending choices, and next-Age starter
 selection all use the same structured `Action` API. This is the canonical action

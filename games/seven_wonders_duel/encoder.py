@@ -57,7 +57,12 @@ from .game import (
 from .pool import BACK_UNIVERSES, UnseenPool, unseen_pool
 from .rules import Resource, discard_income
 
-ENCODER_VERSION = "7wd-encoder-2"
+# Bumped to -3 (2026-08-14): `science_missing_obtainable` / `military_bound` now
+# count discard-pile cards a seat can revive with an unbuilt Mausoleum. The
+# feature NAMES are unchanged, so the schema hash would not have moved on its
+# own -- and a silently-resemanticised feature is exactly what the signature
+# exists to prevent, hence the explicit version bump.
+ENCODER_VERSION = "7wd-encoder-3"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)
@@ -347,6 +352,7 @@ class _Derived:
         self.symbols = tuple(self._symbols(seat) for seat in (0, 1))
         self.relevant_backs = self._relevant_backs()
         self.obtainable_cards = self._obtainable_cards()
+        self.revivable_cards = tuple(self._revivable_cards(seat) for seat in (0, 1))
         self.min_costs = {
             seat: {
                 name: minimum_payment(
@@ -388,6 +394,38 @@ class _Derived:
             names.extend(self.pool.cards[back])
         return tuple(names)
 
+    def _revivable_cards(self, seat: int) -> tuple[str, ...]:
+        """Discarded cards ``seat`` can still put into play.
+
+        The discard pile is deliberately *not* in ``obtainable_cards``: a
+        discarded card is out of play for everyone except a player holding an
+        unbuilt Mausoleum, which builds one from the discard for free. That is
+        seat-specific, so it cannot live in the shared set — and leaving it out
+        entirely made ``science_missing_obtainable`` and ``military_bound``
+        blind to a whole route into play. Same shape as the Great Library
+        branch of :meth:`progress_obtainable`, including the pending case: a
+        live ``BUILD_FROM_DISCARD_FREE`` choice is one pick away, and by then
+        the wonder is already in ``built_wonders``.
+        """
+
+        pending = self.obs.pending_choice
+        if (
+            pending is not None
+            and pending.kind is PendingChoiceKind.BUILD_FROM_DISCARD_FREE
+            and pending.player == seat
+        ):
+            return tuple(pending.options)
+        city = self.obs.cities[seat]
+        for name in city.wonders:
+            if name in city.built_wonders or name in self.obs.retired_wonders:
+                continue
+            if any(
+                effect.kind is EffectKind.BUILD_FROM_DISCARD_FREE
+                for effect in WONDERS_BY_NAME[name].effects
+            ):
+                return tuple(self.obs.discard_pile)
+        return ()
+
     # military ---------------------------------------------------------------
 
     def rel_position(self, seat: int) -> int:
@@ -403,9 +441,10 @@ class _Derived:
 
         remaining = dict(self.obs.military_tokens_remaining)
         sign = 1 if seat == 0 else -1
+        # Tokens are keyed by the first space of their band (3-5, 6-8).
         return (
-            1.0 if sign * 4 in remaining else 0.0,
-            1.0 if sign * 7 in remaining else 0.0,
+            1.0 if sign * 3 in remaining else 0.0,
+            1.0 if sign * 6 in remaining else 0.0,
         )
 
     def next_token(self, seat: int) -> tuple[int, int]:
@@ -456,8 +495,15 @@ class _Derived:
             shields += 1
         return shields
 
+    def reachable_cards(self, seat: int) -> tuple[str, ...]:
+        """Every card ``seat`` can still get into play: the shared obtainable
+        set plus whatever that seat can revive out of the discard."""
+
+        return self.obtainable_cards + self.revivable_cards[seat]
+
     def military_bound(self, seat: int) -> int:
-        total = sum(CARDS_BY_NAME[name].shields for name in self.obtainable_cards)
+        reachable = self.reachable_cards(seat)
+        total = sum(CARDS_BY_NAME[name].shields for name in reachable)
         city = self.obs.cities[seat]
         for name in city.wonders:
             if name not in city.built_wonders and name not in self.obs.retired_wonders:
@@ -465,7 +511,7 @@ class _Derived:
         if self.progress_obtainable(seat, "Strategy"):
             total += sum(
                 1
-                for name in self.obtainable_cards
+                for name in reachable
                 if CARDS_BY_NAME[name].color is CardColor.RED
             )
         return total
@@ -473,7 +519,7 @@ class _Derived:
     def science_missing_obtainable(self, seat: int) -> int:
         have = self.symbols[seat]
         obtainable: set[ScienceSymbol] = set()
-        for name in self.obtainable_cards:
+        for name in self.reachable_cards(seat):
             if CARDS_BY_NAME[name].science is not None:
                 obtainable.add(CARDS_BY_NAME[name].science)
         if self.progress_obtainable(seat, "Law"):

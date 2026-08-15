@@ -442,14 +442,38 @@ def _apply_science_building(game: GameState, player: int, card: CardData) -> Non
         )
 
 
+def military_token_band(position: int) -> int | None:
+    """The coin token whose BAND ``position`` sits in, keyed by the band's first
+    space, or None between bands.
+
+    A military token is not on a single space: it is claimed on first entry to
+    a whole band, and claimed only once (BGA ``MilitaryTrack::getMilitaryToken``
+    buckets |position| into 3..5 and 6..8, then ``takeMilitaryToken`` zeroes the
+    token it returns). Keying the remaining-token map by the band's first space
+    keeps one entry per token, so "is it still there" stays a dict lookup and
+    the distance-to-next-token features keep working.
+    """
+
+    distance = abs(position)
+    if 3 <= distance <= 5:
+        band = 3
+    elif 6 <= distance <= 8:
+        band = 6
+    else:
+        return None
+    return band if position > 0 else -band
+
+
 def _apply_military(game: GameState, player: int, shields: int) -> None:
     direction = 1 if player == 0 else -1
     opponent = game.cities[1 - player]
     for _ in range(shields):
         game.conflict_position += direction
-        penalty = game.military_tokens_remaining.pop(game.conflict_position, None)
-        if penalty is not None:
-            opponent.coins = max(0, opponent.coins - penalty)
+        band = military_token_band(game.conflict_position)
+        if band is not None:
+            penalty = game.military_tokens_remaining.pop(band, None)
+            if penalty is not None:
+                opponent.coins = max(0, opponent.coins - penalty)
         if abs(game.conflict_position) == 9:
             _declare_victory(game, player, VictoryType.MILITARY)
             return
@@ -753,10 +777,14 @@ def _military_victory_points(game: GameState, player: int) -> int:
     position = game.conflict_position
     if position == 0 or (position > 0) != (player == 0):
         return 0
+    # Bands are 1-2 / 3-5 / 6-8, matching the printed track: each coin token
+    # sits on the first space of a higher band (BGA
+    # MilitaryTrack::getVictoryPoints). Read from the CURRENT pawn position --
+    # nothing about this is latched when the pawn passes through.
     distance = abs(position)
-    if distance <= 3:
+    if distance <= 2:
         return 2
-    if distance <= 6:
+    if distance <= 5:
         return 5
     return 10
 

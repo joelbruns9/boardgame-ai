@@ -28,7 +28,7 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "7d68ff20f280700f0c7a04d2411cded734c51b3e312a80578824d7dbb0098be2";
+    "caa91b527f3d86018b7307674abfaca326c76d54e8aeaf5ea6787e2a666fa4d2";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
@@ -126,6 +126,9 @@ struct Enc<'a> {
     /// card ids obtainable by either side (revealed board cards + relevant-back
     /// pool), computed once.
     obtainable: Vec<usize>,
+    /// per-seat discard cards that seat can still revive (unbuilt Mausoleum).
+    /// Seat-specific, so it cannot join `obtainable`.
+    revivable: [Vec<usize>; 2],
 }
 
 /// Allocating wrapper for cold callers (tests, single-state paths). The hot
@@ -145,12 +148,14 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
         .map_or(g.active_player, |p| p.player);
     let pool = unseen_pool(g);
     let obtainable = obtainable_cards(g, &pool);
+    let revivable = [revivable_cards(g, 0), revivable_cards(g, 1)];
     let e = Enc {
         g,
         actor,
         pool,
         symbols: [compute_symbols(g, 0), compute_symbols(g, 1)],
         obtainable,
+        revivable,
     };
     e.global_token(out);
     e.draft_offer_tokens(out);
@@ -207,6 +212,34 @@ fn obtainable_cards(g: &GameState, pool: &UnseenPool) -> Vec<usize> {
     names
 }
 
+/// Discarded cards `seat` can still put into play (mirror of
+/// `encoder.py::_Derived._revivable_cards`).
+///
+/// The discard pile is not in `obtainable_cards`: it is out of play for
+/// everyone except a player holding an unbuilt Mausoleum, which builds one from
+/// it for free. A live `BuildFromDiscardFree` choice counts too — by then the
+/// wonder is already in `built_wonders`.
+fn revivable_cards(g: &GameState, seat: usize) -> Vec<usize> {
+    if let Some(p) = &g.pending_choice {
+        if p.kind == PendingChoiceKind::BuildFromDiscardFree && p.player == seat {
+            return p.options.clone();
+        }
+    }
+    for &wid in &g.cities[seat].wonders {
+        if g.cities[seat].built_wonders.contains(&wid) || g.retired_wonders.contains(&wid) {
+            continue;
+        }
+        if wonder(wid)
+            .effects
+            .iter()
+            .any(|e| e.kind == EffectKind::BuildFromDiscardFree)
+        {
+            return g.discard_pile.clone();
+        }
+    }
+    Vec::new()
+}
+
 fn rel_position(g: &GameState, seat: usize) -> i32 {
     if seat == 0 {
         g.conflict_position
@@ -233,9 +266,10 @@ fn next_token(g: &GameState, seat: usize) -> (i32, i32) {
 fn tokens_remaining(g: &GameState, seat: usize) -> (f64, f64) {
     let sign = if seat == 0 { 1 } else { -1 };
     let has = |p: i32| g.military_tokens_remaining.iter().any(|&(pos, _)| pos == p);
+    // Tokens are keyed by the first space of their band (3-5, 6-8).
     (
-        if has(sign * 4) { 1.0 } else { 0.0 },
-        if has(sign * 7) { 1.0 } else { 0.0 },
+        if has(sign * 3) { 1.0 } else { 0.0 },
+        if has(sign * 6) { 1.0 } else { 0.0 },
     )
 }
 
@@ -278,9 +312,18 @@ fn progress_obtainable(g: &GameState, seat: usize, token_name: &str) -> bool {
 }
 
 impl Enc<'_> {
+    /// Every card `seat` can still get into play: the shared obtainable set
+    /// plus whatever that seat can revive out of the discard.
+    fn reachable_cards(&self, seat: usize) -> impl Iterator<Item = usize> + '_ {
+        self.obtainable
+            .iter()
+            .copied()
+            .chain(self.revivable[seat].iter().copied())
+    }
+
     fn military_bound(&self, seat: usize) -> i32 {
         let g = self.g;
-        let mut total: i32 = self.obtainable.iter().map(|&cid| card(cid).shields).sum();
+        let mut total: i32 = self.reachable_cards(seat).map(|cid| card(cid).shields).sum();
         for &wid in &g.cities[seat].wonders {
             if !g.cities[seat].built_wonders.contains(&wid) && !g.retired_wonders.contains(&wid) {
                 total += wonder(wid).shields;
@@ -288,9 +331,8 @@ impl Enc<'_> {
         }
         if progress_obtainable(g, seat, "Strategy") {
             total += self
-                .obtainable
-                .iter()
-                .filter(|&&cid| card(cid).color == CardColor::Red)
+                .reachable_cards(seat)
+                .filter(|&cid| card(cid).color == CardColor::Red)
                 .count() as i32;
         }
         total
@@ -298,7 +340,7 @@ impl Enc<'_> {
 
     fn science_missing_obtainable(&self, seat: usize) -> i32 {
         let mut obtainable = [false; NUM_SYMBOLS];
-        for &cid in &self.obtainable {
+        for cid in self.reachable_cards(seat) {
             if let Some(s) = card(cid).science {
                 obtainable[s as usize] = true;
             }

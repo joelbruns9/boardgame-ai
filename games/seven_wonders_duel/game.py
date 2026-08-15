@@ -341,7 +341,9 @@ class GameState:
             pending_extra_turn=False,
             pending_shields=0,
             conflict_position=0,
-            military_tokens_remaining={-7: 5, -4: 2, 4: 2, 7: 5},
+            # Keyed by the first space of each token's BAND (3-5 and 6-8), not
+            # by a single space: the token is claimed on first entry to the band.
+            military_tokens_remaining={-6: 5, -3: 2, 3: 2, 6: 5},
             winner=None,
             victory_type=None,
             final_scores=None,

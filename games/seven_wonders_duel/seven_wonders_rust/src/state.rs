@@ -263,7 +263,8 @@ impl GameState {
             pending_extra_turn: false,
             pending_shields: 0,
             conflict_position: 0,
-            military_tokens_remaining: vec![(-7, 5), (-4, 2), (4, 2), (7, 5)],
+            // Keyed by the first space of each token's BAND (3-5, 6-8).
+            military_tokens_remaining: vec![(-6, 5), (-3, 2), (3, 2), (6, 5)],
             winner: None,
             victory_type: None,
             final_scores: None,

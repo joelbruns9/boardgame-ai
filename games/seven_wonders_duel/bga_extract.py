@@ -99,7 +99,11 @@ _PENDING_STATES = frozenset({
 # opponent's tokens there -- engine._apply_military). BGA zeroes a slot's value
 # when its token is captured, so remaining tokens are read from the slot dict,
 # not reconstructed from the pawn (which oscillates and can revisit 0).
-_MILITARY_SLOT_TO_POS = {1: -7, 2: -4, 3: 4, 4: 7}
+#
+# Positions are each token's BAND START, matching the engine's key and BGA's
+# own bucketing (MilitaryTrack::getMilitaryToken: slot 1 covers -8..-6, slot 2
+# -5..-3, slot 3 3..5, slot 4 6..8).
+_MILITARY_SLOT_TO_POS = {1: -6, 2: -3, 3: 3, 4: 6}
 
 # Age III face-down card backs, keyed by BGA card-back sprite (spriteXY). Two
 # distinct backs exist; a face-down age-III card is one or the other.

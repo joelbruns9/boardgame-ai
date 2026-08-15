@@ -67,7 +67,7 @@ def test_board_and_military():
     assert obs["conflict_position"] == 0
     # pawn at 0 -> all four tokens present, engine positions
     assert sorted(obs["military_tokens_remaining"]) == [
-        [-7, 5], [-4, 2], [4, 2], [7, 5],
+        [-6, 5], [-3, 2], [3, 2], [6, 5],
     ]
     assert set(obs["discard_pile"]) == {
         "Palisade", "Theater", "Workshop", "Altar", "Stable",
@@ -140,7 +140,7 @@ def test_military_sign_and_capture_off_center():
                              "conflictPawn": "-5"}
     obs = wire_from_bga(data)["observation"]
     assert obs["conflict_position"] == -5  # negative == player 1 ahead, engine frame
-    assert sorted(obs["military_tokens_remaining"]) == [[-7, 5], [7, 5]]
+    assert sorted(obs["military_tokens_remaining"]) == [[-6, 5], [6, 5]]
 
 
 def test_select_start_player_maps_the_dealt_age():
@@ -327,8 +327,8 @@ def test_age3_tableau_backs_and_end_to_end():
     revealed_guild = [c for c in present.values() if c["card_name"] == "Builders Guild"]
     assert len(revealed_guild) == 1 and revealed_guild[0]["back"] == "guild"
 
-    # captured military token (+4, slot 3 zeroed) is gone; three remain
-    assert sorted(obs["military_tokens_remaining"]) == [[-7, 5], [-4, 2], [7, 5]]
+    # captured military token (slot 3, the +3..+5 band, zeroed) is gone; three remain
+    assert sorted(obs["military_tokens_remaining"]) == [[-6, 5], [-3, 2], [6, 5]]
 
     # feeds the scrape codec: guild/age-III pool split must reconcile
     parsed = observation_from_wire(obs)

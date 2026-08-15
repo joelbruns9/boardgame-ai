@@ -172,7 +172,10 @@ def test_f4_3_net_boundary_completes_without_python_move_control():
 
 
 def test_f4_3_record_is_deterministic_and_captures_great_library_draw():
-    seed = 2026072200
+    # Seed chosen because its trajectory reaches a Great Library draw. It is
+    # trajectory-dependent, so a rules change can retire it: 2026072200 stopped
+    # drawing one when the military token bands were corrected (2026-08-14).
+    seed = 2026072202
     kwargs = dict(
         game_seed=seed,
         leaf_batch=1,

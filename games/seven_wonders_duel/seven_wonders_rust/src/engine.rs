@@ -297,6 +297,25 @@ fn can_afford(g: &GameState, player: usize, p: &Payment) -> bool {
     g.cities[player].coins >= p.total_coins
 }
 
+/// Mirror of `engine.py::military_token_band`: the coin token whose BAND this
+/// position sits in, keyed by the band's first space, or None between bands.
+///
+/// A military token is not on a single space. It is claimed on first entry to
+/// a whole band and claimed only once -- BGA's `MilitaryTrack::getMilitaryToken`
+/// buckets |position| into 3..5 and 6..8, then `takeMilitaryToken` zeroes the
+/// token it returns.
+fn military_token_band(position: i32) -> Option<i32> {
+    let distance = position.abs();
+    let band = if (3..=5).contains(&distance) {
+        3
+    } else if (6..=8).contains(&distance) {
+        6
+    } else {
+        return None;
+    };
+    Some(if position > 0 { band } else { -band })
+}
+
 fn unbuilt_wonders(g: &GameState, player: usize) -> Vec<usize> {
     g.cities[player]
         .wonders
@@ -552,11 +571,12 @@ impl GameState {
         let direction = if player == 0 { 1 } else { -1 };
         for _ in 0..shields {
             self.conflict_position += direction;
-            if let Some(pos) = self
-                .military_tokens_remaining
-                .iter()
-                .position(|&(p, _)| p == self.conflict_position)
-            {
+            let band = military_token_band(self.conflict_position);
+            if let Some(pos) = band.and_then(|b| {
+                self.military_tokens_remaining
+                    .iter()
+                    .position(|&(p, _)| p == b)
+            }) {
                 let (_, penalty) = self.military_tokens_remaining.remove(pos);
                 let opp = &mut self.cities[1 - player];
                 opp.coins = (opp.coins - penalty).max(0);
@@ -796,10 +816,12 @@ impl GameState {
         if position == 0 || (position > 0) != (player == 0) {
             return 0;
         }
+        // Bands 1-2 / 3-5 / 6-8, read from the CURRENT pawn position
+        // (BGA MilitaryTrack::getVictoryPoints).
         let distance = position.abs();
-        if distance <= 3 {
+        if distance <= 2 {
             2
-        } else if distance <= 6 {
+        } else if distance <= 5 {
             5
         } else {
             10

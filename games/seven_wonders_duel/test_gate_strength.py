@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from .encoder import ENCODER_SIGNATURE
 from .eval_suite import ArenaSettings, run_model_match
 
 # Iteration 11 of the 10h laptop run against the random-init bootstrap net.  A
@@ -50,6 +51,16 @@ MAX_EROSION = 0.10
 
 SIMS = (2, 8, 32)
 GAMES = 32
+
+
+def _checkpoint_signature(path: Path) -> str | None:
+    import torch
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:  # unreadable is a different problem; let the load report it
+        return ENCODER_SIGNATURE
+    return blob.get("encoder_signature")
 
 
 def _checkpoints() -> tuple[Path, Path]:
@@ -96,6 +107,16 @@ def scores(tmp_path_factory) -> dict[int, float]:
     for path in (strong, weak):
         if not path.is_file():
             pytest.skip(f"no checkpoint at {path}; set SEVEN_WD_STRENGTH_CKPTS")
+        # A checkpoint trained under an older encoder cannot be loaded at all,
+        # and that is a stale fixture rather than a strength regression -- skip
+        # with the reason instead of erroring the module. Retrain, or point
+        # SEVEN_WD_STRENGTH_CKPTS at a current pair.
+        signature = _checkpoint_signature(path)
+        if signature != ENCODER_SIGNATURE:
+            pytest.skip(
+                f"{path.name} was trained under encoder signature "
+                f"{signature[:12]}..., live encoder is {ENCODER_SIGNATURE[:12]}..."
+            )
     root = tmp_path_factory.mktemp("gate_strength")
     measured = {sims: _score(sims, root / str(sims)) for sims in SIMS}
     # A pass/fail alone cannot tell you whether the margin is comfortable or a
