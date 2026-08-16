@@ -85,6 +85,7 @@ pub struct Solve {
     pub per_action: Vec<(usize, f64)>,
     pub saw_chance: bool,
     pub nodes: u64,
+    pub nodes_under_chance: u64,
     pub exact_per_action: bool,
 }
 
@@ -99,6 +100,11 @@ struct Ctx {
     /// nodes ignored it completely, and `max_secs = 0` still returned complete
     /// answers. The budget is a contract with the caller, not a hint.
     since_clock_check: u32,
+    /// Depth in chance subtrees, and the nodes visited inside them. Reported so
+    /// the value of pruning at chance nodes can be judged from data rather than
+    /// from a feeling about how often 7WD endgames contain chance.
+    chance_depth: u32,
+    nodes_under_chance: u64,
 }
 
 const CLOCK_CHECK_EVERY: u32 = 1024;
@@ -106,6 +112,9 @@ const CLOCK_CHECK_EVERY: u32 = 1024;
 impl Ctx {
     fn tick(&mut self) -> Result<(), SolveStop> {
         self.nodes += 1;
+        if self.chance_depth > 0 {
+            self.nodes_under_chance += 1;
+        }
         if self.nodes > self.max_nodes {
             return Err(SolveStop::Budget);
         }
@@ -244,11 +253,20 @@ fn edge_value_p0(
         let undo = state.snapshot();
         // A chance child is averaged in, so no bound on the running sum is
         // available: it must be solved on the full window, not [alpha, beta].
+        // Full window, NOT [alpha, beta]: a chance child is averaged in, so the
+        // running sum alone bounds nothing. That is not the whole story -- values
+        // are bounded in [-1, 1], so star1 pruning could derive a window from
+        // what the unseen outcomes can still contribute, and let the ancestors'
+        // bounds flow through chance nodes instead of being discarded here.
+        // Measured: 94% of corpus nodes and ~100% of deep-position nodes sit
+        // below a chance edge, so this reset is where the search spends itself.
         let applied = state.apply_with_chance(&action, &outcomes);
+        ctx.chance_depth += 1;
         let child = match applied {
             Ok(()) => solve_p0(state, ctx, -1.0, 1.0),
             Err(_) => Err(SolveStop::Unsolvable),
         };
+        ctx.chance_depth -= 1;
         state.restore(undo);
         value += probability * child?;
     }
@@ -270,6 +288,8 @@ pub fn solve_root(
         deadline: limits.deadline,
         saw_chance: false,
         since_clock_check: 0,
+        chance_depth: 0,
+        nodes_under_chance: 0,
     };
     let actor = actor_of(state);
     let sign = if actor == 0 { 1.0 } else { -1.0 };
@@ -312,6 +332,7 @@ pub fn solve_root(
         per_action,
         saw_chance: ctx.saw_chance,
         nodes: ctx.nodes,
+        nodes_under_chance: ctx.nodes_under_chance,
         exact_per_action: mode == PolicyMode::Exact,
     })
 }

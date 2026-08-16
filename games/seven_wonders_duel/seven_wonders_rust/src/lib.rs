@@ -899,6 +899,7 @@ impl RustGame {
             out.set_item("root_value", solved.root_value)?;
             out.set_item("best_index", solved.best_index)?;
             out.set_item("nodes", solved.nodes)?;
+            out.set_item("nodes_under_chance", solved.nodes_under_chance)?;
             out.set_item("exact_per_action", solved.exact_per_action)?;
             let per_action = PyDict::new(py);
             for (index, value) in &solved.per_action {
