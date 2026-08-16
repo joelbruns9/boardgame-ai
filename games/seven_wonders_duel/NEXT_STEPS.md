@@ -79,18 +79,42 @@ capture to hand. A replay whose packet capture has gaps is skipped rather than
 replayed: one missed construct rebases every later coin comparison, which would
 report as a wall of mismatches nowhere near the real problem.
 
-### 2. Validate the encoder's existing features — the big one
+### 2. Validate the encoder's existing features — DONE, and it is clean
 
-We have checked that the *engine* is right. We have **not** checked that the
-encoder's ~65 derived features say true things. We found the discard bug by
-accident, from a game that happened to be lost in a memorable way. That is not
-a method.
+    python -m games.seven_wonders_duel.encoder_audit --games 200 --hunt 6
 
-The sharpest available check: features like "this player can still win by
-science" are *claims the exact solver can falsify*. Any position where the
-encoder says impossible and the solver finds a winning line is a bug, found
-automatically over thousands of positions with nobody watching. That single
-check would have caught the original bug with no human insight involved.
+`encoder_audit.py` plays games and tries to catch the encoder saying something
+untrue, three ways: against what the game went on to do, against what the
+engine did on the very next move, and against a directed search that tries to
+beat the bounds the encoder claims. 200 games, 12,325 decision points, 378,627
+individual claims, 4,800 of them searched against — **nothing contradicted**.
+The corpus reached all three endings (70 civilian, 73 military, 57 scientific),
+which matters: a run that never produced a science win would have tested the
+science claims not at all and still reported clean.
+
+**The finding worth keeping** is about the method, not the result. The design
+NEXT_STEPS assumed — watch for "this player can no longer win by science" being
+contradicted by the game — is far too weak. Put the original discard-pile bug
+back and 60 games with 7,396 such checks find *nothing*, because a science
+victory needs a chain of luck on top of the wrong claim. What does find it is
+attacking the *bound underneath the flag* (`sci_missing_obtainable`: "at most N
+more symbols are gettable") with a cooperative directed search: 20 games, and
+it produces a concrete line. The exact solver was not needed and its five-card
+depth limit would have made it useless here anyway.
+
+`test_encoder_audit.py` reintroduces that bug and requires the audit to
+rediscover it, so the audit cannot rot into decoration.
+
+**Where the coverage stops**, and what step 3 should keep in mind: the checks
+that run the engine's own helpers on the stub and on the real state
+(`card_cost`, `stub_economy`, `score_block`, `global_block`) are formula-free
+and catch reconstruction losing data — the class the discard bug belonged to.
+They cannot catch a feature whose *definition* is wrong in the same way on both
+sides. The tableau geometry features (`row`, `x`, `accessible`, `coverers`),
+the wonder/progress/discard/pool token features, and the trade-price block are
+checked only indirectly, through pricing. Nothing is checked against real BGA
+positions, because a logged position gives an observation with no ground-truth
+`GameState` behind it.
 
 ### 3. Decide the final encoder change — one shot
 
@@ -184,7 +208,10 @@ names whichever checks went unexercised at the bottom of every run.
 
 ## Rough sequencing
 
-Steps 1 and 2 are the current work and gate the retrain. Step 5 can proceed in
-parallel at any time — it touches nothing the encoder work touches. Step 7 is a
-small win available whenever someone wants it. Steps 3, 4 and 6 follow in order
-once step 2 is done.
+Steps 1 and 2 are **done**, so the retrain is no longer gated by validation —
+it is gated by step 3, deciding the final encoder change, which is now the
+current work. Step 2 found no bugs to fix, so what it feeds into step 3 is a
+map of where the checks are thin (see the end of step 2), not a list of
+corrections. Step 5 can proceed in parallel at any time — it touches nothing
+the encoder work touches. Step 7 is a small win available whenever someone
+wants it. Steps 4 and 6 follow once step 3 lands.
