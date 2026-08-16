@@ -79,6 +79,49 @@ def records():
     return rows
 
 
+def test_real_human_endgames_solve_and_agree(records):
+    """The corpus is bot-played; real games are the distribution that matters.
+
+    Measured, human endgames are not the same problem: ~3x the nodes at 10
+    cards and far more legal moves at equal card count, because a human keeps
+    wonders and options alive where a rush bot has spent them. Bot positions
+    therefore understate both cost and branching, so anything read off them --
+    reach, budgets, tie structure -- is optimistic until checked here.
+
+    Skipped when no game log is present, since `runs/` is not in version
+    control; it runs on the machine that plays the games.
+    """
+
+    from games.advisor.game_log import load_positions, log_dir_for
+    from .advisor_adapter import SevenWondersAdvisor
+    from .game import Phase
+    from .rust_bridge import rust_game_from_state
+
+    logged, _ = load_positions(SevenWondersAdvisor(), log_dir_for("seven_wonders_duel"))
+    positions = []
+    for row in logged:
+        game = getattr(row.state, "game", row.state)
+        if game.phase is Phase.PLAY_AGE and game.age == 3:
+            present = sum(1 for c in game.tableau.cards.values() if c.present)
+            if present <= 8:  # keeps the test quick; deeper ones are benchmarks
+                positions.append(game)
+    if not positions:
+        pytest.skip("no captured BGA endgames on this machine")
+
+    reference = corpus.reference_solver
+    rust = corpus.rust_solver(chance_pruning="star1")
+    compared = 0
+    for game in positions:
+        want, got = reference(game), rust(game)
+        if want is None or got is None:
+            continue
+        compared += 1
+        assert got["regime"] == want["regime"]
+        for index, value in want["per_action_value"].items():
+            assert got["per_action_value"][index] == pytest.approx(value, abs=1e-9)
+    assert compared > 0
+
+
 def test_corpus_still_regenerates(records):
     """A stale corpus gates nothing, and does it quietly."""
 

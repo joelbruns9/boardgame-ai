@@ -213,6 +213,23 @@ rewrite whole decks (an Age deal) still clone, which is a normal fallback, not
 an error path. `journal_undo_audit` gates it: full-state equality after undo
 over every legal action to depth 3, on real positions.
 
+**Move ordering by cutoff history** (which action indices have been ending
+searches, per solve) beats the static "this card scores well" key by **1.95×
+nodes / 1.73× time** over 15 positions at 8–10 cards. Reversing the static key
+costs ~2×, so ordering was always worth a lot here; the static key was simply
+capturing very little of it (~4% nodes over codec order — and a single-position
+comparison had suggested it was *negative*, which is what measuring one
+position gets you).
+
+**The positions matter as much as the method.** Everything above is measured on
+bot-played endgames, and real games are a harder distribution: at 10 cards,
+human positions cost ~3× the nodes and carry far more legal moves at equal card
+count (15 vs 3–4), because a human still has wonders and options in hand where a
+rush bot has spent them. Reach on human endgames after the history heuristic is
+~8–10 cards inside 3–4s, with 12 cards taking a minute. Quoted budgets should be
+set from human positions, not bot ones. `test_real_human_endgames_solve_and_agree`
+runs the captured games against the Python reference when a game log is present.
+
 **Cores.** A single solve is single-threaded and parallelises across
 *positions*, which is what the self-play pool wants. The binding releases the
 GIL, so N Python threads run N solves at once: 2.89× at 4 threads, 3.77× at 8,

@@ -150,6 +150,12 @@ struct Ctx {
     /// from a feeling about how often 7WD endgames contain chance.
     chance_depth: u32,
     nodes_under_chance: u64,
+    /// History heuristic: how often each action index has caused a cutoff in
+    /// THIS solve. A move that refuted one position usually refutes its
+    /// siblings, and ordering by that beats any static guess about what a move
+    /// is worth -- the static key can only say "this card scores well", while
+    /// this says "this move has been ending searches".
+    history: Vec<u32>,
     pruning: ChancePruning,
 }
 
@@ -243,18 +249,25 @@ fn solve_p0(
         return Ok(terminal_p0(state));
     }
 
-    let mut ordered: Vec<(i64, usize)> = indices
+    // Cutoff history first, static shape second. History is per-solve and
+    // shared across branches, which is the point: a refutation found in one
+    // subtree is tried first everywhere else.
+    let mut ordered: Vec<(u32, i64, usize)> = indices
         .iter()
         .map(|&index| {
             let action = codec::decode_action(state, index);
-            (order_key(state, &action, actor), index)
+            (
+                ctx.history[index],
+                order_key(state, &action, actor),
+                index,
+            )
         })
         .collect();
-    ordered.sort_by(|a, b| b.0.cmp(&a.0));
+    ordered.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
 
     let maximizing = actor == 0;
     let mut best = if maximizing { f64::NEG_INFINITY } else { f64::INFINITY };
-    for (_, index) in ordered {
+    for (_, _, index) in ordered {
         let value = edge_value_p0(state, index, ctx, alpha, beta)?;
         if maximizing {
             if value > best {
@@ -272,6 +285,8 @@ fn solve_p0(
             }
         }
         if alpha >= beta {
+            // This move ended the search here; remember it for its siblings.
+            ctx.history[index] = ctx.history[index].saturating_add(1);
             break; // the other side already has something at least this good
         }
     }
@@ -511,6 +526,7 @@ pub fn solve_root(
         since_clock_check: 0,
         chance_depth: 0,
         nodes_under_chance: 0,
+        history: vec![0; codec::NUM_ACTIONS],
         pruning,
     };
     let actor = actor_of(state);
