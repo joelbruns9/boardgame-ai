@@ -113,6 +113,14 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
                 Some(row.root_value)
             },
         )?;
+        item.set_item(
+            "net_root_value",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.net_root_value)
+            },
+        )?;
         item.set_item("sims", row.sims)?;
         item.set_item("mode", if row.is_bot { "bot" } else { "closed" })?;
         item.set_item(

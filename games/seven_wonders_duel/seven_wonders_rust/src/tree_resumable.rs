@@ -1625,6 +1625,7 @@ impl SearchSession {
             action_index: self.legal[best],
             action_value: completed[best],
             root_value,
+            net_root_value: self.root_value,
             visits: self.visits,
             policy_target,
             // The network's opinion, snapshotted before the Dirichlet blend.
@@ -1672,6 +1673,7 @@ impl SearchSession {
             action_index: self.legal[best],
             action_value: self.completed_q(best),
             root_value,
+            net_root_value: self.root_value,
             visits: self.visits,
             policy_target,
             prior: crate::tree::root_prior_from(

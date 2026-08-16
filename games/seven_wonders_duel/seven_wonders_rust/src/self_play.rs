@@ -202,6 +202,10 @@ pub struct MoveRecord {
     /// actual policy improvement measurable per row.
     pub prior: Vec<f64>,
     pub root_value: f64,
+    /// The network's raw evaluation of this root, actor-relative, before the
+    /// search backed anything up. Paired with `root_value` and `solver_value`
+    /// it separates a value head that is wrong from a search that is.
+    pub net_root_value: f64,
     pub sims: usize,
     pub gumbel_topk: Vec<usize>,
     pub policy_excluded: bool,
@@ -836,6 +840,7 @@ pub fn run<E: Eval>(
             policy_target,
             prior: result.prior,
             root_value: result.root_value,
+            net_root_value: result.net_root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
             policy_excluded: !full,
@@ -1905,6 +1910,7 @@ impl GameSlot {
             policy_target,
             prior: result.prior,
             root_value: result.root_value,
+            net_root_value: result.net_root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
             // Cheap searches are excluded as always, and so is anything the
@@ -1960,6 +1966,7 @@ impl GameSlot {
             policy_target: Vec::new(),
             prior: Vec::new(),
             root_value: 0.0,
+            net_root_value: 0.0,
             sims: 0,
             gumbel_topk: Vec::new(),
             policy_excluded: self

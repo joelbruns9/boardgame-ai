@@ -379,6 +379,13 @@ pub struct SearchResult {
     pub action_index: usize,
     pub action_value: f64,
     pub root_value: f64,
+    /// The network's RAW evaluation of the root, actor-relative, before any
+    /// search backed anything up into it. `root_value` above is the search's
+    /// backed-up mean over the whole tree, so the two differ by exactly the
+    /// work the search did -- and separating them is what makes "the net is
+    /// wrong" distinguishable from "the search is wrong" at a position whose
+    /// true value the endgame solver has proven.
+    pub net_root_value: f64,
     pub visits: Vec<u32>,        // aligned to root.legal
     pub policy_target: Vec<f64>, // aligned to root.legal
     /// The network's root policy over `root.legal`, renormalised over the legal
@@ -584,6 +591,7 @@ fn puct_root<E: Eval>(
         action_index: legal[best],
         action_value: completed[best],
         root_value: sign * root.value_p0(),
+        net_root_value: root_value,
         visits,
         policy_target,
         prior: root_prior_from(clean_priors.iter().copied()),
@@ -723,6 +731,7 @@ pub fn search_closed<E: Eval>(
         action_index: legal[best],
         action_value: completed_q(best, &q_hat),
         root_value: sign * root.value_p0(),
+        net_root_value: root_value,
         visits,
         policy_target,
         prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
