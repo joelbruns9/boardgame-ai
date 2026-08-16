@@ -820,6 +820,32 @@ impl RustGame {
         chance::sample_outcomes(&self.state, &specs, &mut rng)
     }
 
+    /// Diagnostic: nanoseconds per `GameState` clone, on THIS position.
+    ///
+    /// The solver clones once per child edge (snapshot before applying, restore
+    /// after), so this number times the node count is the floor its search
+    /// pays before doing any thinking. Exposed because the alternative is
+    /// guessing which half of "clone and re-apply" to optimise.
+    fn bench_state_clone(&self, py: Python<'_>, rounds: u64) -> f64 {
+        let state = self.state.clone();
+        py.detach(move || {
+            let started = std::time::Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..rounds.max(1) {
+                let copy = state.clone();
+                sink = sink.wrapping_add(copy.tableau.slots.len());
+            }
+            std::hint::black_box(sink);
+            started.elapsed().as_nanos() as f64 / rounds.max(1) as f64
+        })
+    }
+
+    /// Diagnostic: bytes this position owns on the heap, i.e. what a clone
+    /// allocates beyond the struct itself.
+    fn heap_bytes(&self) -> usize {
+        self.state.heap_bytes()
+    }
+
     /// Exact endgame solve of this position (`solver.rs`).
     ///
     /// Returns `None` when the position is not solvable within the budget, or

@@ -14,9 +14,23 @@
 //!   count was its legal-action count (+0.65 rank correlation), which is what
 //!   ordering attacks: try the moves most likely to be best first and the
 //!   window closes sooner.
-//! * **Snapshot/restore instead of clone-per-child.** `GameState::snapshot` is
-//!   still a full clone (there is no journaled undo yet), but one per node
-//!   rather than one per child edge.
+//! What it does NOT do is avoid copying the state: `snapshot`/`restore` is one
+//! full `GameState` clone per child edge, because there is no journaled undo.
+//! Measured, that copy is 280-320ns against ~900ns per node, so about a third
+//! of the search -- but it is the *copy* that costs, not the allocation, and
+//! the fix for it is journaled undo or a smaller state, not a cleverer buffer:
+//!
+//! * reusing one buffer per depth (`clone_from` + swap, so the allocator is
+//!   never asked for anything) measured 1,107k vs 1,100k nodes/s on the corpus
+//!   and 605k vs 614k on deep positions, i.e. nothing. The crate allocates
+//!   through mimalloc, so the malloc that trick removes was already cheap;
+//! * likewise dropping the chance-chain key vectors: 1,133k vs 1,100k.
+//!
+//! And the ceiling on all of it is low. Node counts grow ~2.5x per extra card
+//! (4.5M at 8 cards, 11.0M at 9, 29.6M at 10), so removing the clone entirely
+//! would be ~1.4x, worth about half a card of depth. Node COUNT is the lever:
+//! chance edges carry a median of 5 outcomes (mean 8.2, max 20), each
+//! multiplying its subtree, which is what star1/star2 pruning would attack.
 //!
 //! **Chance nodes are not pruned.** A chance node's value is an average, so a
 //! partial sum bounds nothing until every child is in — pruning there needs
@@ -378,3 +392,4 @@ mod tests {
         assert_eq!(stop.err(), Some(SolveStop::Budget));
     }
 }
+
