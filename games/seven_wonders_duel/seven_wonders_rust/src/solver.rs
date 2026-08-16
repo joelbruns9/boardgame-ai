@@ -28,9 +28,17 @@
 //!
 //! And the ceiling on all of it is low. Node counts grow ~2.5x per extra card
 //! (4.5M at 8 cards, 11.0M at 9, 29.6M at 10), so removing the clone entirely
-//! would be ~1.4x, worth about half a card of depth. Node COUNT is the lever:
-//! chance edges carry a median of 5 outcomes (mean 8.2, max 20), each
-//! multiplying its subtree, which is what star1/star2 pruning would attack.
+//! would be ~1.4x, worth about half a card of depth.
+//!
+//! **Star1 and star2 were tried and mostly did not pay.** 94% of corpus nodes
+//! and ~100% of deep-position nodes sit below a chance edge, where the
+//! inherited window used to be discarded -- which looked like the biggest lever
+//! in the solver. Measured: star1 gives 0.87-0.97x the nodes, star2 costs
+//! 1.17-1.86x. The mechanism is the shape of 7WD chance: an edge has 5-20
+//! outcomes carrying 0.05-0.2 probability each, so one resolved outcome barely
+//! constrains an average the other 80-95% of the mass can still move by +-1.
+//! A useful bound arrives only once most of the mass is already resolved. Star1
+//! is on anyway (identical values, a little cheaper); star2 is not.
 //!
 //! **Chance nodes are not pruned.** A chance node's value is an average, so a
 //! partial sum bounds nothing until every child is in — pruning there needs
@@ -58,6 +66,29 @@ pub enum SolveStop {
     Unsolvable,
     /// Node budget or deadline reached.
     Budget,
+}
+
+/// Pruning at chance nodes. Switchable because its value is an empirical
+/// question, and because every setting must return identical values -- only the
+/// node count may differ, which is what `endgame_corpus.py` checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChancePruning {
+    /// Every outcome solved on the full window (what the Python reference does).
+    None,
+    /// Derive each child's window from the mass still unexamined. The default:
+    /// measured 0.87-0.97x the nodes of `None` on deep positions, 0.96x on the
+    /// corpus. Real, but far smaller than "94% of nodes sit under a chance
+    /// edge" suggests -- see the module note on why.
+    Star1,
+    /// Star1, plus a probing pass over one move of each child first. **Loses
+    /// here**: 1.17x, 1.61x and 1.86x the nodes of `None` at 8, 9 and 10 cards,
+    /// worsening with depth. Kept switchable because the reason is specific and
+    /// might not survive a change of design: star2 assumes a probe is cheap,
+    /// which holds when a probe is a depth-limited search ending in a heuristic
+    /// evaluation. This solver has no evaluator -- it runs to terminal -- so
+    /// every probe is a full search of one move, and probing all children costs
+    /// about as much as solving one of them outright.
+    Star2,
 }
 
 /// How the root prices actions other than the best one.
@@ -105,9 +136,16 @@ struct Ctx {
     /// from a feeling about how often 7WD endgames contain chance.
     chance_depth: u32,
     nodes_under_chance: u64,
+    pruning: ChancePruning,
 }
 
 const CLOCK_CHECK_EVERY: u32 = 1024;
+
+/// The range every game value lives in. Star1/star2 exist because of it: the
+/// mass not yet examined at a chance node can move the average by at most that
+/// mass times this range.
+const VALUE_MIN: f64 = -1.0;
+const VALUE_MAX: f64 = 1.0;
 
 impl Ctx {
     fn tick(&mut self) -> Result<(), SolveStop> {
@@ -243,34 +281,188 @@ fn edge_value_p0(
     }
 
     ctx.saw_chance = true;
-    let chains = chance::enumerate_chains_unkeyed(state, &specs);
+    chance_edge_value_p0(state, &action, &specs, ctx, alpha, beta)
+}
+
+/// Expectimax over one action's chance outcomes, pruned per `ctx.pruning`.
+///
+/// The value is `sum(p_i * v_i)`, which is usually where pruning stops -- a
+/// partial sum bounds nothing. It bounds plenty here, because every `v_i` is a
+/// game value in `[-1, 1]`: whatever mass is still unexamined can move the
+/// average by at most that mass. Star1 turns that into a window per child;
+/// star2 first buys a tighter running bound cheaply, by looking at one move of
+/// each child before committing to any full search.
+fn chance_edge_value_p0(
+    state: &mut GameState,
+    action: &Action,
+    specs: &[chance::ChanceSpec],
+    ctx: &mut Ctx,
+    alpha: f64,
+    beta: f64,
+) -> Result<f64, SolveStop> {
+    let chains = chance::enumerate_chains_unkeyed(state, specs);
     let mass: f64 = chains.iter().map(|(_, p)| *p).sum();
     if (mass - 1.0).abs() > 1e-6 {
         return Err(SolveStop::Unsolvable);
     }
-    let mut value = 0.0;
-    for (outcomes, probability) in chains {
+
+    // Mass still unexamined after each child, so the pruning bounds know how
+    // much the remaining outcomes could still swing the average.
+    let mut suffix = vec![0.0; chains.len() + 1];
+    for index in (0..chains.len()).rev() {
+        suffix[index] = suffix[index + 1] + chains[index].1;
+    }
+
+    if ctx.pruning == ChancePruning::Star2 {
+        if let Some(bound) = star2_probe(state, action, &chains, &suffix, ctx, alpha, beta)? {
+            return Ok(bound);
+        }
+    }
+
+    let mut exact_so_far = 0.0;
+    for (index, (outcomes, probability)) in chains.iter().enumerate() {
+        let remaining = suffix[index + 1];
+        // Invert "could the finished average still land inside [alpha, beta]?"
+        // into a window for this child. On the full window this collapses to
+        // [-1, 1], so an exact root solve prunes nothing and stays exact.
+        let (child_alpha, child_beta) = match ctx.pruning {
+            ChancePruning::None => (VALUE_MIN, VALUE_MAX),
+            _ => (
+                ((alpha - exact_so_far - remaining) / probability).max(VALUE_MIN),
+                ((beta - exact_so_far + remaining) / probability).min(VALUE_MAX),
+            ),
+        };
+
+        let value = solve_chance_child(state, action, outcomes, ctx, child_alpha, child_beta)?;
+        if ctx.pruning != ChancePruning::None {
+            // Outside its window this child has already decided the node: no
+            // remaining outcome can pull the average back into [alpha, beta].
+            // Fail soft -- return the bound, which the caller reads as "at most"
+            // or "at least", exactly as it would from alpha-beta.
+            //
+            // The `> VALUE_MIN` / `< VALUE_MAX` guards are load-bearing, not
+            // defensive. A window clamped to the full value range is not a
+            // window at all, and a child that comes back at exactly -1 or +1
+            // through one is reporting the true value, not failing against a
+            // bound -- and decided endgames are full of exact -1s and +1s.
+            // Without the guards the root reported bounds as values, which the
+            // corpus caught on the first run.
+            if child_alpha > VALUE_MIN && value <= child_alpha {
+                return Ok(exact_so_far + probability * value + remaining);
+            }
+            if child_beta < VALUE_MAX && value >= child_beta {
+                return Ok(exact_so_far + probability * value - remaining);
+            }
+        }
+        exact_so_far += probability * value;
+    }
+    Ok(exact_so_far)
+}
+
+/// Apply one chance outcome and solve the resulting position.
+fn solve_chance_child(
+    state: &mut GameState,
+    action: &Action,
+    outcomes: &[Vec<usize>],
+    ctx: &mut Ctx,
+    alpha: f64,
+    beta: f64,
+) -> Result<f64, SolveStop> {
+    let undo = state.snapshot();
+    let applied = state.apply_with_chance(action, outcomes);
+    ctx.chance_depth += 1;
+    let value = match applied {
+        Ok(()) => solve_p0(state, ctx, alpha, beta),
+        Err(_) => Err(SolveStop::Unsolvable),
+    };
+    ctx.chance_depth -= 1;
+    state.restore(undo);
+    value
+}
+
+/// Star2's probing pass: one move of each child, then ask whether the node is
+/// already decided.
+///
+/// A decision node is worth at least any single move to the player to move, and
+/// at most any single move when it is the opponent's turn. So one move per
+/// child costs a fraction of a full search and still yields a real bound on the
+/// whole chance node. Every outcome of one action leaves the same player to
+/// move, so the direction of those bounds is settled once, not per child.
+///
+/// Returns `Some(bound)` when the probes alone prove the node lies outside
+/// `[alpha, beta]`, and `None` when the full search still has to happen.
+fn star2_probe(
+    state: &mut GameState,
+    action: &Action,
+    chains: &[(Vec<Vec<usize>>, f64)],
+    suffix: &[f64],
+    ctx: &mut Ctx,
+    alpha: f64,
+    beta: f64,
+) -> Result<Option<f64>, SolveStop> {
+    let mut probed = 0.0;
+    let mut maximizing = None;
+    for (index, (outcomes, probability)) in chains.iter().enumerate() {
+        let remaining = suffix[index + 1];
+        let child_alpha = ((alpha - probed - remaining) / probability).max(VALUE_MIN);
+        let child_beta = ((beta - probed + remaining) / probability).min(VALUE_MAX);
+
         let undo = state.snapshot();
-        // A chance child is averaged in, so no bound on the running sum is
-        // available: it must be solved on the full window, not [alpha, beta].
-        // Full window, NOT [alpha, beta]: a chance child is averaged in, so the
-        // running sum alone bounds nothing. That is not the whole story -- values
-        // are bounded in [-1, 1], so star1 pruning could derive a window from
-        // what the unseen outcomes can still contribute, and let the ancestors'
-        // bounds flow through chance nodes instead of being discarded here.
-        // Measured: 94% of corpus nodes and ~100% of deep-position nodes sit
-        // below a chance edge, so this reset is where the search spends itself.
-        let applied = state.apply_with_chance(&action, &outcomes);
+        let applied = state.apply_with_chance(action, outcomes);
         ctx.chance_depth += 1;
-        let child = match applied {
-            Ok(()) => solve_p0(state, ctx, -1.0, 1.0),
+        let probe = match applied {
+            Ok(()) => probe_first_move(state, ctx, child_alpha, child_beta),
             Err(_) => Err(SolveStop::Unsolvable),
         };
         ctx.chance_depth -= 1;
         state.restore(undo);
-        value += probability * child?;
+        let (bound, child_maximizing) = match probe? {
+            Some(row) => row,
+            None => return Ok(None), // nothing to probe: fall through to the full search
+        };
+        maximizing = Some(child_maximizing);
+        probed += probability * bound;
     }
-    Ok(value)
+
+    // The probes bound the node in one direction only: from below when the
+    // player to move maximises (each probe under-states its child), from above
+    // when the opponent moves. Only a cut in that direction is available.
+    // Same guard as the main loop: a "cut" against the full value range is not
+    // a cut, it is the answer, and returning it as a bound loses exactness.
+    match maximizing {
+        Some(true) if beta < VALUE_MAX && probed >= beta => Ok(Some(probed)),
+        Some(false) if alpha > VALUE_MIN && probed <= alpha => Ok(Some(probed)),
+        _ => Ok(None),
+    }
+}
+
+/// Value of the first (best-ordered) move of `state`, as a bound on the
+/// position. `None` when there is no move to probe.
+fn probe_first_move(
+    state: &mut GameState,
+    ctx: &mut Ctx,
+    alpha: f64,
+    beta: f64,
+) -> Result<Option<(f64, bool)>, SolveStop> {
+    if state.phase == Phase::Complete {
+        return Ok(Some((terminal_p0(state), actor_of(state) == 0)));
+    }
+    let actor = actor_of(state);
+    let indices = codec::legal_action_indices(state);
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let best = indices
+        .iter()
+        .map(|&index| {
+            let decoded = codec::decode_action(state, index);
+            (order_key(state, &decoded, actor), index)
+        })
+        .max_by_key(|row| row.0)
+        .map(|row| row.1)
+        .unwrap_or(indices[0]);
+    let value = edge_value_p0(state, best, ctx, alpha, beta)?;
+    Ok(Some((value, actor == 0)))
 }
 
 /// Solve every legal action at the root, in actor terms.
@@ -278,6 +470,7 @@ pub fn solve_root(
     state: &GameState,
     limits: &Limits,
     mode: PolicyMode,
+    pruning: ChancePruning,
 ) -> Result<Solve, SolveStop> {
     if Instant::now() > limits.deadline {
         return Err(SolveStop::Budget); // already out of time before any work
@@ -290,6 +483,7 @@ pub fn solve_root(
         since_clock_check: 0,
         chance_depth: 0,
         nodes_under_chance: 0,
+        pruning,
     };
     let actor = actor_of(state);
     let sign = if actor == 0 { 1.0 } else { -1.0 };
@@ -389,14 +583,14 @@ mod tests {
         // Age I and II always reach the next Age's deal, which is sample-only.
         // Returning any value here would be inventing one.
         let state = age_one_position();
-        let stop = solve_root(&state, &limits(u64::MAX, 30.0), PolicyMode::Exact);
+        let stop = solve_root(&state, &limits(u64::MAX, 30.0), PolicyMode::Exact, ChancePruning::Star2);
         assert_eq!(stop.err(), Some(SolveStop::Unsolvable));
     }
 
     #[test]
     fn the_node_budget_is_enforced() {
         let state = age_one_position();
-        let stop = solve_root(&state, &limits(1, 30.0), PolicyMode::Exact);
+        let stop = solve_root(&state, &limits(1, 30.0), PolicyMode::Exact, ChancePruning::Star2);
         assert_eq!(stop.err(), Some(SolveStop::Budget));
     }
 
@@ -409,7 +603,7 @@ mod tests {
             max_nodes: u64::MAX,
             deadline: Instant::now() - Duration::from_secs(1),
         };
-        let stop = solve_root(&state, &expired, PolicyMode::Exact);
+        let stop = solve_root(&state, &expired, PolicyMode::Exact, ChancePruning::Star2);
         assert_eq!(stop.err(), Some(SolveStop::Budget));
     }
 }

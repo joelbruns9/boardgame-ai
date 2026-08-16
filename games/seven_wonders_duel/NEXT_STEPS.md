@@ -181,6 +181,23 @@ the cost of a chance edge is the state clone and re-apply per outcome, not the
 small vectors describing it. That is also why no streaming enumeration was
 built.
 
+**Star1 and star2 were tried; keep star1, skip star2.** 94% of corpus nodes and
+~100% of deep-position nodes sit under a chance edge, where the inherited
+alpha-beta window used to be thrown away — which looked like the biggest lever
+in the solver. It is not: star1 gives 0.87–0.97× the nodes, and star2 *costs*
+1.17–1.86×, worsening with depth. Two mechanisms, both worth remembering before
+anyone tries again. A 7WD chance edge has 5–20 outcomes at 0.05–0.2 probability
+each, so resolving one barely constrains an average that the remaining mass can
+still move by ±1; the bound only bites once most of the mass is resolved. And
+star2 assumes probing is cheap, which needs a depth-limited search ending in a
+heuristic evaluation — this solver has no evaluator by design, so every probe is
+a full search of one move.
+
+Both settings failed the corpus on their first run, on a mistake worth keeping
+in mind for any future pruning: a window clamped to the full value range is not
+a window, and a child returning exactly ±1 through one is reporting its true
+value, not failing against a bound. Decided endgames are full of exact ±1s.
+
 **What remains** is the self-play half: a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,
 the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for

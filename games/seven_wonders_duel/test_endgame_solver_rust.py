@@ -146,6 +146,22 @@ def test_the_solve_releases_the_gil(records):
     assert ticks > 50, f"other Python threads only advanced {ticks} times"
 
 
+@pytest.mark.parametrize("pruning", ["none", "star1", "star2"])
+def test_every_chance_pruning_setting_returns_the_same_values(records, pruning):
+    """Pruning may change the node count and nothing else.
+
+    Both star settings failed this on their first run, and for a reason worth
+    keeping: the derived window clamps to the full value range, and a child that
+    comes back at exactly -1 or +1 through such a window is reporting its true
+    value, not failing against a bound. Decided endgames are full of exact -1s
+    and +1s, so the root published bounds as values.
+    """
+
+    report = corpus.check(corpus.rust_solver(chance_pruning=pruning))
+    assert report.problems == [], str(report)
+    assert report.checked == len(records), str(report)
+
+
 def test_value_only_mode_agrees_on_the_root(records):
     """The cheap mode may leave alternatives as bounds -- never the root."""
 

@@ -853,13 +853,19 @@ impl RustGame {
     /// answer", never as a value. `policy_mode` is `"exact"` (every action
     /// priced exactly, what the equivalence gate compares) or `"value_only"`
     /// (root value and best action exact, alternatives are bounds).
-    #[pyo3(signature = (max_nodes = 2_000_000, max_secs = 5.0, policy_mode = "exact"))]
+    /// `chance_pruning` is `"star1"` (default), `"none"` or `"star2"`; all three
+    /// return identical values, and only the node count differs.
+    #[pyo3(signature = (
+        max_nodes = 2_000_000, max_secs = 5.0, policy_mode = "exact",
+        chance_pruning = "star1"
+    ))]
     fn solve_endgame(
         &self,
         py: Python<'_>,
         max_nodes: u64,
         max_secs: f64,
         policy_mode: &str,
+        chance_pruning: &str,
     ) -> PyResult<Option<Py<PyDict>>> {
         let mode = match policy_mode {
             "exact" => solver::PolicyMode::Exact,
@@ -867,6 +873,16 @@ impl RustGame {
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown policy_mode {other:?} (want \"exact\" or \"value_only\")"
+                )))
+            }
+        };
+        let pruning = match chance_pruning {
+            "none" => solver::ChancePruning::None,
+            "star1" => solver::ChancePruning::Star1,
+            "star2" => solver::ChancePruning::Star2,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown chance_pruning {other:?} (want \"none\", \"star1\" or \"star2\")"
                 )))
             }
         };
@@ -880,7 +896,7 @@ impl RustGame {
         // threaded advisor host stops answering and a thread-based solver pool
         // runs one position at a time.
         let state = self.state.clone();
-        let solved = match py.detach(move || solver::solve_root(&state, &limits, mode)) {
+        let solved = match py.detach(move || solver::solve_root(&state, &limits, mode, pruning)) {
             Ok(solved) => solved,
             Err(_) => return Ok(None),
         };

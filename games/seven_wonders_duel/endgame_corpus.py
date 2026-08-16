@@ -294,7 +294,7 @@ def check(
 
 def rust_solver(
     *, max_nodes: int = BUILD_MAX_NODES, max_secs: float = BUILD_MAX_SECS,
-    policy_mode: str = "exact",
+    policy_mode: str = "exact", chance_pruning: str = "none",
 ) -> Callable[[GameState], dict | None]:
     """The Rust solver, on a state injected from the Python position.
 
@@ -307,7 +307,9 @@ def rust_solver(
 
     def solve(game: GameState) -> dict | None:
         rust_game = rust_game_from_state(game)
-        answer = rust_game.solve_endgame(max_nodes, max_secs, policy_mode)
+        answer = rust_game.solve_endgame(
+            max_nodes, max_secs, policy_mode, chance_pruning
+        )
         if answer is None:
             return None
         return {
@@ -318,6 +320,7 @@ def rust_solver(
                 int(k): float(v) for k, v in answer["per_action_value"].items()
             },
             "nodes": answer["nodes"],
+            "nodes_under_chance": answer["nodes_under_chance"],
         }
 
     return solve
