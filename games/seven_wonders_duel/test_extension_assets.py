@@ -165,6 +165,115 @@ console.log([
 """
 
 
+_RECORDER_HARNESS = r"""
+const snippet = require(%(snippet)s);
+const { installPacketRecorder, drainPackets } = snippet;
+
+// A window shaped like the one BGA builds. Verified against a live replay page
+// on 2026-08-15: gameui.notifqueue.onNotification(packet) is where every
+// incoming packet arrives, whole, and it also accepts a JSON string.
+const makeWindow = (opts = {}) => {
+  const seen = [];
+  const w = {
+    location: { href: "https://boardgamearena.com/9/sevenwondersduel?table=77" },
+    frames: [],
+    g_gamelogs: opts.preloaded || undefined,
+  };
+  if (!opts.noGameui) {
+    w.gameui = { notifqueue: { onNotification: (p) => { seen.push(p); return "dispatched"; } } };
+  }
+  w.seen = seen;
+  return w;
+};
+const packet = (over) => Object.assign(
+  { channel: "/table/t77", table_id: 77, packet_id: "1", move_id: "1",
+    data: [{ type: "constructBuilding", args: {} }] }, over);
+const keys = (list) => list.map((p) => p.move_id + "/" + p.packet_id).join(" ");
+const out = {};
+
+// 1. seeding, hooking, pass-through
+const w = makeWindow({ preloaded: [packet({ move_id: "0", packet_id: "0" })] });
+const store = installPacketRecorder(w);
+out.hooked = store.hooked;
+out.seeded = store.seeded;
+out.passThrough = w.gameui.notifqueue.onNotification(packet());
+out.dispatchedToBga = w.seen.length;
+
+// 2. what is kept and what is not
+w.gameui.notifqueue.onNotification(JSON.stringify(packet({ move_id: "2", packet_id: "2" })));
+w.gameui.notifqueue.onNotification(packet({ move_id: "2", packet_id: "2" }));  // dup
+w.gameui.notifqueue.onNotification(packet({ move_id: "3", packet_id: "3",
+  data: [{ type: "tablechat", args: {} }] }));
+w.gameui.notifqueue.onNotification(packet({ move_id: "4", packet_id: "4",
+  channel: "/chat/global" }));
+w.gameui.notifqueue.onNotification(packet({ move_id: "5", packet_id: "5", table_id: 999 }));
+w.gameui.notifqueue.onNotification(packet({ move_id: "6", packet_id: "6",
+  channel: "/player/p42" }));
+out.kept = keys(drainPackets(w));
+out.drainedTwice = drainPackets(w).length;
+
+// 3. installing twice must not double-record or re-wrap
+const again = installPacketRecorder(w);
+again === store || (out.storeChanged = true);
+w.gameui.notifqueue.onNotification(packet({ move_id: "7", packet_id: "7" }));
+out.afterReinstall = keys(drainPackets(w));
+
+// 4. installed before BGA built gameui: the hook must still take later
+const early = makeWindow({ noGameui: true });
+out.earlyHooked = installPacketRecorder(early).hooked;
+early.gameui = { notifqueue: { onNotification: () => "dispatched" } };
+out.lateHooked = installPacketRecorder(early).hooked;
+early.gameui.notifqueue.onNotification(packet({ move_id: "8", packet_id: "8" }));
+out.lateKept = keys(drainPackets(early));
+
+console.log(JSON.stringify(out));
+"""
+
+
+def test_packet_recorder_captures_the_oracle_without_disturbing_the_table():
+    """The differential harness's whole input comes through this hook.
+
+    Three failures it has to make impossible. Recording must not swallow or
+    alter BGA's own dispatch -- a throw here would break the live table. The
+    capture must be complete for this game, because the harness refuses to
+    replay a game with holes in its move sequence, so a dropped packet costs
+    the whole game rather than one move. And installing must stay idempotent
+    while remaining able to hook late: the bridge can run before BGA has built
+    `gameui`, and an install that counted that attempt as done would leave the
+    recorder permanently deaf, silently.
+    """
+
+    script = _RECORDER_HARNESS % {"snippet": json.dumps(str(_CANONICAL))}
+    out = json.loads(_run_node(script))
+
+    assert out["hooked"] is True
+    assert out["seeded"] == 1  # replay/archive pages preload the history
+    # BGA's own handler still runs, still returns its value, exactly once.
+    assert out["passThrough"] == "dispatched" and out["dispatchedToBga"] == 1
+    # Kept: this table's /table packets, a JSON-string packet, our own /player
+    # stream. Dropped: duplicates, chat, other channels, other tables.
+    assert out["kept"] == "0/0 1/1 2/2 6/6"
+    assert out["drainedTwice"] == 0  # a drain hands each packet over once
+    assert "storeChanged" not in out
+    assert out["afterReinstall"] == "7/7"  # re-install did not double-wrap
+    # Hooking late is the case that would otherwise fail silently.
+    assert out["earlyHooked"] is False and out["lateHooked"] is True
+    assert out["lateKept"] == "8/8"
+
+
+def test_content_script_posts_packets_to_the_game_log():
+    """The capture is only worth anything if it reaches the log the harness reads."""
+
+    from .bga_differential import PACKET_KIND
+
+    content = _code_only((_EXTENSION / "content.js").read_text(encoding="utf-8"))
+    assert f'kind: "{PACKET_KIND}"' in content
+    bridge = _code_only((_EXTENSION / "page_bridge.js").read_text(encoding="utf-8"))
+    # Packets arrive on the opponent's turns and through end-game scoring too,
+    # so the pump must not sit behind the "is it my turn" gate.
+    assert "installPacketRecorder" in bridge and "drainPackets" in bridge
+
+
 def test_frame_selection_picks_the_seat_and_is_loud_when_it_cannot():
     """The wrong-seat hazard, which cost a Great Library position on a live table.
 

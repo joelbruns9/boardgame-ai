@@ -349,6 +349,42 @@
     }
   }
 
+  // BGA's own notification packets: the only record of what BGA *charged* for
+  // each move, and so the oracle the differential harness compares our engine
+  // against (games/seven_wonders_duel/bga_differential.py).
+  //
+  // Undelivered packets are kept and retried with the next batch rather than
+  // dropped: the harness skips any game whose move sequence has holes, so
+  // losing one batch to a host that was briefly down would cost the whole game
+  // rather than one move.
+  let pendingPackets = [];
+  let postingPackets = false;
+  const PACKET_RETRY_MS = 5000;
+
+  async function logPackets(packets) {
+    pendingPackets = pendingPackets.concat(packets);
+    if (postingPackets || !pendingPackets.length) return;
+    postingPackets = true;
+    const batch = pendingPackets;
+    try {
+      await post("/api/game_log", {
+        table_id: tableId(),
+        kind: "bga_packets",
+        extra: { packets: batch },
+      });
+      // Only what was actually sent is cleared; anything that arrived while the
+      // request was in flight stays queued.
+      pendingPackets = pendingPackets.slice(batch.length);
+    } catch (err) {
+      // Retry on a timer rather than waiting for the next drain: the batch most
+      // likely to fail is the last one of the game (the host is shut down, the
+      // game is over), and nothing would ever arrive to carry it.
+      setTimeout(() => logPackets([]), PACKET_RETRY_MS);
+    } finally {
+      postingPackets = false;
+    }
+  }
+
   async function startSearch(state) {
     await stopCurrent();
     setStatus("searching…");
@@ -433,7 +469,9 @@
     if (event.source !== window) return;
     const msg = event.data;
     if (!msg || msg.__swd !== TAG) return;
-    if (msg.type === "position") {
+    if (msg.type === "packets") {
+      logPackets(msg.payload.packets || []);
+    } else if (msg.type === "position") {
       art = msg.payload.art;
       ensurePanel();
       if (msg.payload.signature !== lastSignature) {

@@ -75,10 +75,18 @@ class GameLogWriter:
 
         table = self.safe_table_id(table_id)
         record = {"kind": kind, "table_id": table, "state": state, "extra": extra or {}}
+        # Dedup on the payload that carries the content. For a position that is
+        # ``state``, and ``extra`` is deliberately excluded: it holds things that
+        # vary between re-posts of the same board (timings, what the advisor said
+        # so far), which would defeat the dedup entirely. A stateless row -- a
+        # notification-packet batch, say -- has its content in ``extra`` instead,
+        # and keying such rows on ``state`` alone made every one of them a
+        # duplicate of the last, so only the first was ever written.
+        identity = {"kind": kind, "state": state}
+        if state is None:
+            identity["extra"] = record["extra"]
         key = hashlib.sha256(
-            json.dumps(
-                {"kind": kind, "state": state}, sort_keys=True, ensure_ascii=False
-            ).encode("utf-8")
+            json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         if self._last.get(table) == key:
             # A streaming client re-posts the same position many times per turn.

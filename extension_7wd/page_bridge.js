@@ -122,9 +122,24 @@
 
   let lastSignature = null;
 
+  // BGA's notification packets, which is where every number the differential
+  // harness checks comes from. Independent of whose turn it is, deliberately:
+  // the opponent's moves and the whole of end-game scoring are packets too, and
+  // a capture missing them is a capture the harness will refuse to replay.
+  function pumpPackets(w) {
+    try {
+      installPacketRecorder(w);
+      const packets = drainPackets(w);
+      if (packets.length) post("packets", { packets });
+    } catch (e) {
+      /* never let capture disturb the advice path */
+    }
+  }
+
   function tick() {
     const w = gameWindow();
     if (!w || w !== window) return; // another frame owns the board
+    pumpPackets(w);
     let signature = null;
     try {
       signature = turnSignature(w);
@@ -166,6 +181,16 @@
   }
   setInterval(tick, 1500);
   setTimeout(tick, 800);
+  // Hook the packet stream as early as this file runs, not at the first tick:
+  // packets that arrive before the recorder exists are simply not captured, and
+  // the harness then refuses the whole game for having gaps. installPacketRecorder
+  // re-tries its hook until it takes, so running before `gameui` exists is safe.
+  try {
+    const w0 = gameWindow();
+    if (w0 && w0 === window) installPacketRecorder(w0);
+  } catch (e) {
+    /* no board in this frame */
+  }
 
   window.addEventListener("message", (event) => {
     const data = event.data;

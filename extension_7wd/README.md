@@ -58,6 +58,20 @@ Open a table. On your turn the panel appears top-right (drag it by the `::`
 handle) and fills in as search deepens. It stops the old search and starts a new
 one whenever the position changes.
 
+While you play, two things are also written to `runs/seven_wonders_duel/bga_game_log/`
+in the background: every position the advisor was asked about, and BGA's own
+notification packets. The packets are the input to the differential harness,
+which replays the game and checks our engine's arithmetic against BGA's:
+
+```bash
+python -m games.seven_wonders_duel.bga_differential
+```
+
+**Open the table before the first move**, or at least reload it if you join
+late: capture starts when the tab does, and the harness refuses to replay a
+game whose move sequence has holes rather than report mismatches that are
+really just a missing move.
+
 ## How it works
 
 Two halves, because neither can do the whole job:

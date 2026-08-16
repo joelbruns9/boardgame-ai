@@ -324,6 +324,141 @@ async function captureAfterReload() {
   throw new Error("gamedatas did not refresh after reload");
 }
 
+// ---------------------------------------------------------------------------
+// NOTIFICATION PACKET CAPTURE (the differential harness's oracle)
+//
+// `gamedatas` says what the board looks like. It never says what BGA *charged*
+// -- the price it made you pay, the coins it handed back, where it moved the
+// conflict pawn, what each end-game category scored. Those numbers exist only
+// in BGA's notification packets, and they are the entire basis of the
+// differential harness (games/seven_wonders_duel/bga_differential.py), which
+// replays a real game and compares our engine's arithmetic to BGA's. That
+// harness is how the military off-by-one was found.
+//
+// Provenance -- all four points verified live against a BGA replay page on
+// 2026-08-15, not inferred:
+//   * `gameui.notifqueue.onNotification(packet)` is the single entry point every
+//     incoming packet passes through, raw and whole:
+//       {channel, table_id, packet_id, packet_type, move_id, time, data: [...]}
+//     which is exactly the shape the harness consumes.
+//   * It also accepts a JSON *string* (it calls fromJson on it itself), so the
+//     recorder has to as well or it would silently record nothing.
+//   * A (re)loaded page is re-sent the history through that same call with
+//     packet_type "resend". So opening the tab mid-game, or reloading it,
+//     backfills instead of losing everything before it -- which matters,
+//     because the harness refuses to replay a game with gaps in its moves.
+//   * Replay/archive pages additionally preload `window.g_gamelogs` with the
+//     same packet shape; the recorder seeds from it when it is there.
+//
+// Why hook the framework rather than subscribe per notification type: the
+// per-type dojo topics carry only the game's own notifications, and the coin
+// and score snapshots the harness compares against ride on framework
+// `gameStateChange` packets. Subscribing would also leave holes in the move
+// sequence, which the harness (correctly) treats as an untrustworthy capture.
+//
+// Kept: packets for THIS table, on either the /table channel or the /player
+// channel this browser is subscribed to (our own seat's private stream -- a
+// packet for a seat that is not ours is not delivered here in the first place).
+// Both are kept because the harness refuses to replay a game whose move
+// sequence has holes, and a move whose only packet came privately would
+// otherwise read as a hole.
+//
+// Kept out: any other channel, and chat. The log is an engine oracle, not a
+// transcript of the table talk.
+
+const SWD_PACKET_STORE = "__swdPacketStore";
+
+function _swdIsChat(packet) {
+  const chatty = new Set([
+    "chat",
+    "groupchat",
+    "chatmessage",
+    "tablechat",
+    "privatechat",
+    "startWriting",
+    "stopWriting",
+  ]);
+  if (chatty.has(String(packet.type || ""))) return true;
+  const data = packet.data || [];
+  return data.length > 0 && data.every((e) => chatty.has(String(e && e.type)));
+}
+
+function _swdRecord(store, packet) {
+  if (typeof packet === "string") {
+    // onNotification is documented above as accepting a raw JSON string.
+    try {
+      packet = JSON.parse(packet);
+    } catch (e) {
+      return;
+    }
+  }
+  if (!packet || !packet.data || !Array.isArray(packet.data)) return;
+  const channel = String(packet.channel || "");
+  if (channel.substr(0, 6) !== "/table" && channel.substr(0, 7) !== "/player") return;
+  // A /player packet with no table is a site notification, not this game.
+  if (store.tableId && String(packet.table_id) !== store.tableId) return;
+  if (_swdIsChat(packet)) return;
+  const key = String(packet.move_id) + "/" + String(packet.packet_id);
+  if (store.packets.has(key)) return;
+  store.packets.set(key, packet);
+  store.fresh.push(key);
+}
+
+// Idempotent: the bridge calls this on every tick, and the page keeps one store.
+//
+// It re-tries the hook while the store says it is unhooked, rather than
+// returning early on the store's existence alone. The bridge can run before
+// BGA has built `gameui`, and treating that first attempt as "installed" would
+// leave the recorder permanently deaf on exactly the tables it is meant to
+// watch -- silently, since a store would exist and simply stay empty.
+function installPacketRecorder(w) {
+  w = w || findGameWindow();
+  let store = w[SWD_PACKET_STORE];
+  if (!store) {
+    store = { packets: new Map(), fresh: [], tableId: null, hooked: false, seeded: 0 };
+    const match = /[?&]table=(\d+)/.exec(String(w.location.href));
+    store.tableId = match ? match[1] : null;
+    w[SWD_PACKET_STORE] = store;
+
+    // Seed from the preloaded history where there is one (replay/archive pages).
+    const preloaded = w.g_gamelogs;
+    if (Array.isArray(preloaded)) {
+      for (const packet of preloaded) _swdRecord(store, packet);
+      store.seeded = store.packets.size;
+    }
+  }
+  if (store.hooked) return store;
+
+  const queue = w.gameui && w.gameui.notifqueue;
+  if (queue && typeof queue.onNotification === "function") {
+    const original = queue.onNotification;
+    queue.onNotification = function (packet) {
+      // Record first, then hand on untouched. Recording must never be able to
+      // break the game: a throw here would take BGA's own dispatch with it.
+      try {
+        _swdRecord(store, packet);
+      } catch (e) {
+        /* never let capture break the table */
+      }
+      return original.apply(this, arguments);
+    };
+    store.hooked = true;
+  }
+  return store;
+}
+
+// Packets recorded since the last drain, oldest first. Draining rather than
+// re-sending everything keeps each POST small; anything the caller fails to
+// deliver is its problem to retry, and a reload re-seeds the history anyway.
+function drainPackets(w) {
+  w = w || findGameWindow();
+  const store = w[SWD_PACKET_STORE];
+  if (!store) return [];
+  const fresh = store.fresh;
+  store.fresh = [];
+  return fresh.map((key) => store.packets.get(key)).filter(Boolean);
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     findGameWindow,
@@ -333,5 +468,7 @@ if (typeof module !== "undefined") {
     captureDomPatch,
     captureForAdvisor,
     captureAfterReload,
+    installPacketRecorder,
+    drainPackets,
   };
 }

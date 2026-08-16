@@ -50,12 +50,34 @@ before it's worth asking.
 
 ## Next steps, in the order they unblock each other
 
-### 1. Make the differential harness durable — small, do first
+### 1. Make the differential harness durable — DONE
 
-The tool that found the military bug currently exists only as a scratch script.
-It should live in the repo, read table ids out of the game log, fetch each
-game's record from BGA itself, and run the comparison from one command. Until
-that exists, "we'll validate more as I play more games" is not actually true.
+    python -m games.seven_wonders_duel.bga_differential
+
+replays every captured game and compares every number BGA published. Two things
+changed from the plan. It does **not** fetch from BGA: the archive endpoint now
+refuses to serve the notification log of a finished table
+(`Cannot find gamenotifs log file of an archived table`), so a fetch-it-back
+design would have rotted within days. Instead the extension keeps BGA's raw
+notification packets while you play, exactly as it already keeps positions, and
+the harness runs entirely off local files. And the seat framing is no longer
+hand-entered per table: it is derived from who picked the first wonder, and
+cross-checked against the `startPlayerId` in the logged position, because
+getting it wrong flips the military sign silently.
+
+The capture hooks `gameui.notifqueue.onNotification`, the one call every
+incoming packet passes through — verified live against a replay page, along
+with the two things that make it the right hook: a reloaded page is re-sent its
+history through it, and the coin/score snapshots the harness compares ride on
+framework packets that per-notification subscriptions never see. The whole path
+was then run end to end on a real game — page hook, capture, game log, replay —
+for 0 mismatches over 74 packets.
+
+Two real games are checked into `testdata/bga_packets.json` so the harness is
+tested against BGA's arithmetic on every run, not only when someone has a fresh
+capture to hand. A replay whose packet capture has gaps is skipped rather than
+replayed: one missed construct rebases every later coin comparison, which would
+report as a wall of mismatches nowhere near the real problem.
 
 ### 2. Validate the encoder's existing features — the big one
 
@@ -119,7 +141,15 @@ Worth doing whenever the solver is fast enough to be useful in a real turn.
 ### Ongoing: keep playing
 
 Every game adds roughly forty priced moves and a hundred-plus checks for free,
-and it costs nothing but the game you were going to play anyway.
+and it costs nothing but the game you were going to play anyway. Afterwards:
+
+    python -m games.seven_wonders_duel.bga_differential
+
+Three checks no captured game has ever reached are worth a game aimed at them:
+the **Masonry rebate** (`with_rebate_token`), an **Economy transfer**
+(`economy_transfer`), and a game that ends *on points* with the conflict pawn at
+3–5 or 6–8, which is the untested half of the military scoring bands. The report
+names whichever checks went unexercised at the bottom of every run.
 
 ---
 
@@ -138,8 +168,17 @@ and it costs nothing but the game you were going to play anyway.
   and is unrelated.
 - **The advisor is running on migrated weights.** It is honest about it — every
   response says so — but the numbers are off-distribution until the retrain.
-- **The captured game logs are not in version control** (`runs/` is ignored).
-  They can be re-fetched from BGA, but the local copies are the only ones.
+- **No game has yet been captured start-to-finish by the shipped extension.**
+  The path is verified end to end against a replay, but the first real game is
+  the test of whether the tab is open early enough to catch move 1; if it is
+  not, the harness says so (it skips a game with gaps rather than replaying it)
+  and the fix is to reload the table. Until then the corpus is the four games
+  captured by hand, kept as
+  `runs/seven_wonders_duel/bga_archive/packets_4games_20260814.json`, two of
+  them trimmed into `testdata/`.
+- **The captured game logs are not in version control** (`runs/` is ignored),
+  and they can no longer be re-fetched: BGA refuses to serve a finished table's
+  notification log. The local copies are now the only ones.
 
 ---
 

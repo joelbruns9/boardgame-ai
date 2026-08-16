@@ -98,6 +98,38 @@ def test_final_record_needs_no_state(writer, adapter):
     assert positions == [] and report.lines == 1
 
 
+def test_stateless_rows_dedupe_on_their_own_content(writer, adapter):
+    """Keying a stateless row on ``state`` made every one a duplicate of the last.
+
+    Notification-packet batches carry their content in ``extra``; deduping them
+    against ``state=None`` meant only the first batch of a game was ever
+    written, and the loss was invisible until a replay came up short.
+    """
+
+    log, log_dir = writer
+    first = log.append(adapter, table_id="t1", kind="packets", extra={"packets": [1]})
+    second = log.append(adapter, table_id="t1", kind="packets", extra={"packets": [2]})
+    repeat = log.append(adapter, table_id="t1", kind="packets", extra={"packets": [2]})
+    assert [first["appended"], second["appended"], repeat["appended"]] == [
+        True,
+        True,
+        False,
+    ]
+    lines = (log_dir / "table_t1.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+
+
+def test_positions_still_dedupe_when_extra_changes(writer, adapter):
+    """``extra`` varies between re-posts of one board, so it must not key them."""
+
+    log, log_dir = writer
+    wire = _wire()
+    assert log.append(adapter, table_id="t1", state=wire, extra={"ms": 10})["appended"]
+    assert not log.append(adapter, table_id="t1", state=wire, extra={"ms": 900})[
+        "appended"
+    ]
+
+
 def test_table_id_cannot_escape_the_log_directory(writer, adapter):
     log, log_dir = writer
     log.append(adapter, table_id="../../etc/passwd", state=_wire())
