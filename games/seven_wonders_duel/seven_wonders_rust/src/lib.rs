@@ -128,6 +128,8 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
         item.set_item("search_seed", row.search_seed)?;
         item.set_item("solver_value", row.solver_value)?;
         item.set_item("solver_regime", row.solver_regime)?;
+        item.set_item("solver_attempted", row.solver_attempted)?;
+        item.set_item("solver_stop", row.solver_stop)?;
         item.set_item("solver_nodes", row.solver_nodes)?;
         item.set_item("solver_masked", row.solver_masked)?;
         moves.append(item)?;

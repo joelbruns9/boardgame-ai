@@ -221,14 +221,30 @@ Pruning and ordering may change node counts and nothing else.
    that reasoning does not transfer. Cost is contained instead by solving only
    on **full-search moves**: cheap ones emit no example at all
    (`dataset.is_fast_search_move`), so a solve there buys nothing.
-2. **Soft W/D/L for `exact_expectimax`, one-hot for `exact`**, both through a
-   new `value_solver` channel that is separate from `value_soft`. The two mean
-   different things: `value_soft` is the search's *opinion*, blended with the
-   outcome in whatever proportion `--value-bootstrap` says; a proven value is
-   the *answer*, so it **replaces** the outcome at full weight and ignores
-   `value_bootstrap` entirely. Nothing is rounded: an expectimax 0.0 is balanced
-   win/loss mass and stays `(0.5, 0, 0.5)`, while a chance-free 0.0 is a proven
-   draw and becomes one-hot on it.
+2. **`exact` rows only**, through a new `value_solver` channel separate from
+   `value_soft`. The two mean different things: `value_soft` is the search's
+   *opinion*, blended with the outcome in whatever proportion
+   `--value-bootstrap` says; a proven value is the *answer*, so it **replaces**
+   the outcome at full weight and ignores `value_bootstrap` entirely.
+
+   `exact_expectimax` rows get **no** value target and keep the realised
+   outcome. This corrects §4's suggestion of a soft target, and a first
+   implementation that took it: the solver returns a scalar expected utility,
+   `P(win) − P(loss)`, and a scalar cannot determine a three-class distribution,
+   because 7WD has genuine draws (shared civilian). Mapping 0.0 to
+   `(0.5, 0, 0.5)` fabricates a proof, and is most confidently wrong exactly
+   where the truth is most certain — a position all of whose chance outcomes
+   draw. `value_soft` makes the same zero-draw assumption deliberately and gets
+   away with it *because* it is blended: the hard outcome keeps supplying draw
+   supervision, and a replacement target has nothing left to correct it.
+
+   This costs real coverage — 64 of 85 corpus positions are `exact_expectimax`,
+   and about two thirds of solved self-play positions. Earning them back means
+   having the solver propagate an actual (win, draw, loss) distribution
+   alongside the scalar it prunes on, under a stated tie policy; the scalar
+   cannot be post-processed into one. Their **policy mask is unaffected**,
+   because the mask needs only the per-action ordering, which is exact in both
+   regimes.
 3. **No victory type, for now.** joint7 is an auxiliary head at `aux_weight`
    0.2; the proven line's victory type is only well-defined in the `exact`
    regime (under expectimax different outcomes end differently); and returning
@@ -248,9 +264,10 @@ Pruning and ordering may change node counts and nothing else.
 | trigger, solve, mask | `self_play::endgame_overlay` (called from `run` and `finish_move`) |
 | config (process-wide, like `set_cheap_top_k`) | `swr.set_endgame_solver(max_nodes, max_secs, max_cards, mask_policy)` |
 | CLI | `phase_d.py --endgame-solver-*` |
-| record fields | `MoveRecord.solver_value / solver_regime / solver_nodes / solver_masked` |
+| record fields | `MoveRecord.solver_value / solver_regime / solver_attempted / solver_stop / solver_nodes / solver_masked` |
 | value target | `dataset.collate` → `value_solver`, consumed in `train.compute_losses` |
-| gate | `test_endgame_solver_self_play.py` (9 tests) + 3 Rust unit tests |
+| run provenance | `PhaseDConfig.endgame_solver_*`, read back from the generator so the manifest records what took effect |
+| gate | `test_endgame_solver_self_play.py` (11 tests) + 3 Rust unit tests |
 
 **Off by default** (`max_nodes = 0`), and an off run is the generator that
 existed before this change — asserted, not assumed.
@@ -267,7 +284,21 @@ definition of `policy_target`, but `solver_masked` marks exactly those rows,
 which is strictly more informative than a global bump — and a bump would
 invalidate every buffer ever written to say less.
 
-Still open: `exact_fallback_positions` (a sidecar of declined roots) and
-`endgame_oversample` from §7 are not implemented; the per-move `solver_nodes`
-and the absence of `solver_value` already identify both populations in the
-buffer, so both are additive.
+**Only the mask needs `PolicyMode::Exact`.** With `--no-endgame-solver-mask-policy`
+the overlay consumes nothing but `root_value`, so it runs `ValueOnly`, which is
+where star1 also bites hardest (0.77× the corpus nodes against 0.96×). Measured
+end to end on four self-play games: **2.0× fewer nodes**, and since the solve is
+synchronous that is generation latency, not merely CPU.
+
+Declined solves are recorded, not dropped: `solver_attempted` separates the
+three populations a missing value would otherwise conflate (solver off, trigger
+not selected, solve declined), `solver_stop` says `unsolvable` or `budget`, and
+`solver_nodes` reports the cost **including** for an attempt that then failed —
+`solver::solve_root_counted` exists for exactly that. An earlier draft of this
+file claimed the buffer could already identify declined positions from
+`solver_nodes` and a missing `solver_value`; it could not, and that is now true
+rather than asserted.
+
+Still open from §7: `exact_fallback_positions` (a sidecar of declined roots) and
+`endgame_oversample`. Both are now straightforward — the buffer identifies the
+declined rows and the endgame rows directly.

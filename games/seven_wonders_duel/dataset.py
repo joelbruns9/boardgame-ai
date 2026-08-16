@@ -646,24 +646,39 @@ def solver_value_distribution(example: Example) -> tuple[float, float, float] | 
     Shared with ``w0_sizing`` because its packed batch is asserted value-identical
     to ``collate``: two copies of this mapping would drift silently, and the one
     that drifted would still pass every shape check.
+
+    **Only chance-free proofs qualify.**  The solver returns a scalar expected
+    utility, which is ``P(win) - P(loss)`` -- and a scalar does not determine a
+    three-class distribution, because 7WD has genuine draws (shared civilian
+    endings).  A value of 0 under expectimax could be a certain draw, balanced
+    wins and losses, or any mixture; mapping it to ``(0.5, 0, 0.5)`` would
+    invent a proven label, and would be most confidently wrong exactly where the
+    truth is most certain -- a position all of whose chance outcomes draw.
+
+    The comparison with ``value_soft`` is instructive: that channel makes the
+    same zero-draw assumption deliberately, but it is *blended* with the hard
+    outcome, which keeps supplying the draw supervision.  This channel REPLACES
+    the outcome, so nothing is left to correct it.
+
+    Excluding these rows costs real coverage -- 64 of 85 corpus positions are
+    ``exact_expectimax`` -- and the way to earn them back is to have the solver
+    propagate an actual (win, draw, loss) distribution alongside the scalar it
+    prunes on, under a stated tie policy.  The scalar cannot be post-processed
+    into one.  Their POLICY mask is unaffected either way: the mask needs only
+    the per-action ordering, which is exact in both regimes.
     """
 
-    if example.solver_value is None:
+    if example.solver_value is None or not example.solver_exact:
         return None
+    # Chance-free: every value in the explored tree is a min/max over terminals,
+    # so the root value IS a terminal result -- exactly -1, 0 or +1 -- and 0
+    # means a drawn game rather than a balance of outcomes.
     value = float(example.solver_value)
-    if example.solver_exact:
-        # Chance-free: the value IS the terminal result, so 0.0 means a drawn
-        # game and the target is one-hot on it.
-        if value > 0.5:
-            return (1.0, 0.0, 0.0)
-        if value < -0.5:
-            return (0.0, 0.0, 1.0)
-        return (0.0, 1.0, 0.0)
-    # Expectimax: the value is an average over outcomes, so 0.0 here means the
-    # win and loss mass balance -- NOT a draw. Rounding it to a class would
-    # invent a certainty the position does not have.
-    probability = min(1.0, max(0.0, (1.0 + value) / 2.0))
-    return (probability, 0.0, 1.0 - probability)
+    if value > 0.5:
+        return (1.0, 0.0, 0.0)
+    if value < -0.5:
+        return (0.0, 0.0, 1.0)
+    return (0.0, 1.0, 0.0)
 
 
 def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor]:

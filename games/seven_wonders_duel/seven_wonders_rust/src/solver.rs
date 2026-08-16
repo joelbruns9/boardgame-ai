@@ -520,8 +520,24 @@ pub fn solve_root(
     mode: PolicyMode,
     pruning: ChancePruning,
 ) -> Result<Solve, SolveStop> {
+    solve_root_counted(state, limits, mode, pruning).0
+}
+
+/// `solve_root`, and the nodes it visited **even when it declined**.
+///
+/// A refusal is not free: the budget was spent before it was reached, and the
+/// caller is often a self-play loop that paid that time synchronously. The
+/// ordinary `solve_root` throws the count away with the error, which makes an
+/// expensive decline and an instant one look identical downstream.
+pub fn solve_root_counted(
+    state: &GameState,
+    limits: &Limits,
+    mode: PolicyMode,
+    pruning: ChancePruning,
+) -> (Result<Solve, SolveStop>, u64) {
     if Instant::now() > limits.deadline {
-        return Err(SolveStop::Budget); // already out of time before any work
+        // Already out of time before any work, so no nodes were visited.
+        return (Err(SolveStop::Budget), 0);
     }
     let mut ctx = Ctx {
         nodes: 0,
@@ -534,6 +550,18 @@ pub fn solve_root(
         history: vec![0; codec::NUM_ACTIONS],
         pruning,
     };
+    let result = solve_root_body(state, &mut ctx, mode);
+    let nodes = ctx.nodes;
+    (result, nodes)
+}
+
+/// The root loop itself, split out only so its `?` exits can still report the
+/// node count they spent (see `solve_root_counted`).
+fn solve_root_body(
+    state: &GameState,
+    ctx: &mut Ctx,
+    mode: PolicyMode,
+) -> Result<Solve, SolveStop> {
     let actor = actor_of(state);
     let sign = if actor == 0 { 1.0 } else { -1.0 };
     let mut work = state.clone();
@@ -573,7 +601,7 @@ pub fn solve_root(
                 }
             }
         };
-        let value_p0 = edge_value_p0(&mut work, index, &mut ctx, alpha, beta)?;
+        let value_p0 = edge_value_p0(&mut work, index, ctx, alpha, beta)?;
         let actor_value = (sign * value_p0).clamp(-1.0, 1.0);
         per_action.push((index, actor_value));
         // Strictly better, by more than arithmetic noise. In `ValueOnly` a cut

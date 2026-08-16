@@ -90,8 +90,18 @@ class MoveRecord:
     proven answer to the same question."""
     solver_regime: str | None = None
     """``"exact"`` -- no chance edge was crossed, so ``solver_value`` is exactly
-    -1, 0 or +1 -- or ``"exact_expectimax"``, a probability in between."""
+    -1, 0 or +1 and maps onto a W/D/L class -- or ``"exact_expectimax"``, whose
+    scalar is ``P(win) - P(loss)`` and does NOT determine one."""
+    solver_attempted: bool = False
+    """A solve ran at this position.  Without it a missing ``solver_value``
+    conflates three different things -- solver off, trigger not selected, solve
+    declined -- so the declined positions could not be found in the buffer and
+    the cost of failed attempts could not be measured."""
+    solver_stop: str | None = None
+    """``"unsolvable"`` (a sample-only Age deal, which no budget reaches) or
+    ``"budget"``; ``None`` when the solve succeeded."""
     solver_nodes: int = 0
+    """Nodes visited, including by an attempt that then declined."""
     solver_masked: bool = False
     """This row's ``policy_target`` has had its provably-losing moves zeroed and
     the survivors renormalised.
@@ -610,11 +620,13 @@ def replay(record: GameRecord, on_state=None) -> GameState:
 def _solver_fields(move: MoveRecord) -> dict:
     """The endgame-solver keys for one move, empty when it was never solved."""
 
-    if move.solver_value is None:
+    if not move.solver_attempted:
         return {}
     return {
         "solver_value": move.solver_value,
         "solver_regime": move.solver_regime,
+        "solver_attempted": True,
+        "solver_stop": move.solver_stop,
         "solver_nodes": move.solver_nodes,
         "solver_masked": move.solver_masked,
     }
@@ -724,6 +736,8 @@ def from_json_line(line: str) -> GameRecord:
                 policy_excluded=move["policy_excluded"],
                 solver_value=move.get("solver_value"),
                 solver_regime=move.get("solver_regime"),
+                solver_attempted=move.get("solver_attempted", False),
+                solver_stop=move.get("solver_stop"),
                 solver_nodes=move.get("solver_nodes", 0),
                 solver_masked=move.get("solver_masked", False),
             )

@@ -215,6 +215,15 @@ pub struct MoveRecord {
     /// measured. `None` on every move the solver did not solve.
     pub solver_value: Option<f64>,
     pub solver_regime: Option<&'static str>,
+    /// Whether a solve was attempted at all. Separates the three populations a
+    /// missing `solver_value` would otherwise conflate: the solver was off, the
+    /// trigger did not select this move, or the solve ran and declined.
+    pub solver_attempted: bool,
+    /// Why an attempted solve declined -- `"unsolvable"` or `"budget"` -- and
+    /// `None` when it succeeded.
+    pub solver_stop: Option<&'static str>,
+    /// Nodes visited, INCLUDING by a solve that then declined. A decline is not
+    /// free: the budget was spent synchronously before it was reached.
     pub solver_nodes: u64,
     pub solver_masked: bool,
 }
@@ -467,16 +476,27 @@ pub fn endgame_solver() -> (u64, f64, usize, bool) {
     )
 }
 
-/// What a successful solve contributes to the move about to be recorded.
+/// What an ATTEMPTED solve contributes to the move about to be recorded.
+///
+/// Produced whenever the trigger fired, including when the solve then declined.
+/// A refusal that left no trace would be indistinguishable from a move the
+/// trigger never selected and from a run with the solver off, which makes the
+/// declined positions unfindable in the buffer and hides what the failed
+/// attempts cost -- and they are not free, since the solve is synchronous.
 #[derive(Clone, Debug)]
 pub struct SolverOverlay {
-    /// Exact value of the position, ACTOR-relative, in [-1, 1].
-    pub value: f64,
-    /// `"exact"` (no chance edge was crossed: the value is exactly -1, 0 or +1)
-    /// or `"exact_expectimax"` (a probability in between). The distinction is
-    /// the whole reason the value target is carried as a distribution rather
-    /// than a class -- see `dataset.collate`.
-    pub regime: &'static str,
+    /// Exact value of the position, ACTOR-relative, in [-1, 1]. `None` when the
+    /// solve declined: the caller must treat that as "no answer", never as 0.
+    pub value: Option<f64>,
+    /// `"exact"` (no chance edge was crossed) or `"exact_expectimax"`. Only the
+    /// first yields a value target: a chance-free value is a min/max over
+    /// terminals, so it is exactly -1, 0 or +1 and maps onto a W/D/L class,
+    /// while an expectimax scalar is `P(win) - P(loss)` and does not determine
+    /// one -- see `dataset.solver_value_distribution`. `None` when declined.
+    pub regime: Option<&'static str>,
+    /// `"unsolvable"` (a sample-only Age deal: no budget would help) or
+    /// `"budget"` (nodes or deadline). `None` when the solve succeeded.
+    pub stop: Option<&'static str>,
     pub nodes: u64,
     /// Whether the policy target in this record was masked and renormalised.
     /// Per-move rather than per-run because it is exactly the set of rows whose
@@ -530,9 +550,10 @@ fn mask_and_renormalise(policy: &mut [f64], keep: &[bool]) {
 /// survivor is better; the search is the only thing in the system that ranks
 /// them. Masking a prior would hand the net back a mask over its own opinion.
 ///
-/// Returns `None` when the solver is off, the position is out of range, or the
-/// solve did not finish -- all three are ordinary, and a caller must treat the
-/// absence as "no answer", never as a value.
+/// Returns `None` only when no solve was ATTEMPTED -- the solver is off, or the
+/// position is out of range. A solve that was attempted and declined returns an
+/// overlay with no value, so the decline is visible in the record along with
+/// what it cost; a caller must treat a missing value as "no answer", never as 0.
 pub fn endgame_overlay(
     state: &GameState,
     legal: &[usize],
@@ -546,17 +567,40 @@ pub fn endgame_overlay(
         max_nodes,
         deadline: Instant::now() + std::time::Duration::from_secs_f64(max_secs.max(0.0)),
     };
-    // `Exact` prices every root action on a full window, which is what the mask
-    // needs: `ValueOnly` narrows the window as better actions are found, so its
-    // non-best entries are bounds and the ties -- the entire signal here -- are
-    // hidden. It costs 1.17x the nodes on the corpus.
-    let solved = crate::solver::solve_root(
+    // `Exact` is needed ONLY for the mask: it prices every root action on a full
+    // window, while `ValueOnly` narrows the window as better actions are found,
+    // so its non-best entries are bounds and the ties -- the entire signal the
+    // mask reads -- are hidden. When the mask is off nothing but `root_value` is
+    // consumed, and `ValueOnly` is strictly cheaper: 1.17x fewer nodes for the
+    // mode itself, and star1 also bites far harder against a narrow root window
+    // (0.77x the corpus nodes against 0.96x). The solve is synchronous, so that
+    // is generation latency, not just CPU.
+    let mode = if mask_policy {
+        crate::solver::PolicyMode::Exact
+    } else {
+        crate::solver::PolicyMode::ValueOnly
+    };
+    let (outcome, nodes) = crate::solver::solve_root_counted(
         state,
         &limits,
-        crate::solver::PolicyMode::Exact,
+        mode,
         crate::solver::ChancePruning::Star1,
-    )
-    .ok()?;
+    );
+    let solved = match outcome {
+        Ok(solved) => solved,
+        Err(stop) => {
+            return Some(SolverOverlay {
+                value: None,
+                regime: None,
+                stop: Some(match stop {
+                    crate::solver::SolveStop::Unsolvable => "unsolvable",
+                    crate::solver::SolveStop::Budget => "budget",
+                }),
+                nodes,
+                masked: false,
+            })
+        }
+    };
 
     let mut masked = false;
     if mask_policy && policy_target.len() == legal.len() {
@@ -584,12 +628,22 @@ pub fn endgame_overlay(
     }
 
     Some(SolverOverlay {
-        value: solved.root_value,
-        regime: if solved.saw_chance {
+        value: Some(solved.root_value),
+        // `saw_chance` is set by any chance edge the search actually crossed, so
+        // it can only ever over-report -- and that direction is the safe one.
+        // False means every value in the explored tree was a min/max over
+        // terminals, which makes the root value exactly -1, 0 or +1 and the
+        // W/D/L class sound. True may occasionally mark a position whose value
+        // did not really depend on chance, costing a value target rather than
+        // inventing one. That asymmetry is why this is read off the search
+        // rather than from a static look at the position, and it holds in both
+        // policy modes.
+        regime: Some(if solved.saw_chance {
             "exact_expectimax"
         } else {
             "exact"
-        },
+        }),
+        stop: None,
         nodes: solved.nodes,
         masked,
     })
@@ -788,8 +842,10 @@ pub fn run<E: Eval>(
             full_search: full,
             search_seed,
             is_bot: false,
-            solver_value: overlay.as_ref().map(|o| o.value),
-            solver_regime: overlay.as_ref().map(|o| o.regime),
+            solver_value: overlay.as_ref().and_then(|o| o.value),
+            solver_regime: overlay.as_ref().and_then(|o| o.regime),
+            solver_attempted: overlay.is_some(),
+            solver_stop: overlay.as_ref().and_then(|o| o.stop),
             solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
             solver_masked: overlay.is_some_and(|o| o.masked),
         });
@@ -1863,8 +1919,10 @@ impl GameSlot {
             full_search: meta.full,
             search_seed: meta.search_seed,
             is_bot: false,
-            solver_value: overlay.as_ref().map(|o| o.value),
-            solver_regime: overlay.as_ref().map(|o| o.regime),
+            solver_value: overlay.as_ref().and_then(|o| o.value),
+            solver_regime: overlay.as_ref().and_then(|o| o.regime),
+            solver_attempted: overlay.is_some(),
+            solver_stop: overlay.as_ref().and_then(|o| o.stop),
             solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
             solver_masked: overlay.is_some_and(|o| o.masked),
         });
@@ -1916,6 +1974,8 @@ impl GameSlot {
             // sharpen, and there is no search whose ranking survives masking.
             solver_value: None,
             solver_regime: None,
+            solver_attempted: false,
+            solver_stop: None,
             solver_nodes: 0,
             solver_masked: false,
         });

@@ -662,10 +662,15 @@ byte-identical to the generator that existed before the feature.
 
 When a position is reached that the solver can settle -- Age III, at most
 `--endgame-solver-max-cards` cards left on the board, on a full-search move --
-it contributes two things. Its exact value becomes the value target,
-**replacing** the realised game result rather than blending with it (the result
-of a decided endgame is a sample of the exact value, produced by two players
-who may both then err). And with `--endgame-solver-mask-policy`, the
+it contributes two things. If the proof crossed no chance edge (`regime` is
+`exact`), its value becomes the value target, **replacing** the realised game
+result rather than blending with it -- the result of a decided endgame is a
+sample of the exact value, produced by two players who may both then err.
+Proofs that did cross a chance edge (`exact_expectimax`, about two thirds of
+them) supply **no** value target and keep the realised outcome: the solver
+returns a scalar `P(win) - P(loss)`, and a scalar cannot determine a three-class
+distribution when draws exist. Their policy mask still applies.
+And with `--endgame-solver-mask-policy`, the
 provably-losing moves are zeroed out of the search's policy target and the
 survivors renormalised; the search's ranking among them is preserved, because
 77-88% of legal moves at these positions are proven equally optimal and the
@@ -686,10 +691,18 @@ is ~60s or unsolved. Do **not** size this from bot endgames -- they cost ~3x
 less and offer far fewer legal moves at equal card count. Age I and II are never
 solvable at any budget, since the next age's deal is a sample-only chance edge.
 
-Rows the solver settled are marked in the buffer (`solver_value`,
-`solver_regime`, `solver_nodes`, `solver_masked`), so a mixed buffer stays
-separable and `TARGET_VERSION` is deliberately not bumped. Rust backend only;
-the Python generator has no solver hook.
+`--no-endgame-solver-mask-policy` is also cheaper to run, not just a narrower
+experiment: the mask is the only consumer of exact per-action pricing, so
+without it the solve uses the narrower `ValueOnly` window and measures 2.0x
+fewer nodes.
+
+Every attempted solve is marked in the buffer, whether or not it succeeded:
+`solver_attempted`, `solver_stop` (`unsolvable` / `budget`), `solver_nodes`
+(spent even on a failure), `solver_value`, `solver_regime`, `solver_masked`. So
+a mixed buffer stays separable per row and `TARGET_VERSION` is deliberately not
+bumped, and the cost of failed attempts is measurable. The settings are also
+recorded in `run_manifest.json` as launch provenance. Rust backend only; the
+Python generator has no solver hook.
 
 ### `--leaf-batch`
 

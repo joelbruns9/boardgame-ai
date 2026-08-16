@@ -67,12 +67,18 @@ def _solved_moves(records):
     ]
 
 
+def _attempted_moves(records):
+    return [
+        move for record in records for move in record["moves"] if move["solver_attempted"]
+    ]
+
+
 def test_the_disabled_solver_changes_nothing_at_all():
     """The default. Every gate in this package was written against a generator
     without a solver in it, so an off solver must not be a different generator."""
 
     baseline = _records(max_nodes=0)
-    assert _solved_moves(baseline) == []
+    assert _attempted_moves(baseline) == []
     # Off by budget and off by trigger are the same generator, and both are the
     # generator that existed before this feature.
     assert _records(max_nodes=0, max_cards=99) == baseline
@@ -88,8 +94,12 @@ def test_the_solver_reaches_real_endgames_and_records_what_it_proved():
         assert -1.0 <= move["solver_value"] <= 1.0
         assert 0 < move["solver_nodes"] <= SOLVER_MAX_NODES
         assert move["solver_masked"] is True
+        assert move["solver_attempted"] is True
+        assert move["solver_stop"] is None
         if move["solver_regime"] == "exact":
-            # Chance-free lines end at a terminal, whose value is the result.
+            # Chance-free lines end at a terminal, whose value is the result --
+            # which is what makes the W/D/L class sound for these rows and only
+            # these rows.
             assert min(abs(move["solver_value"] - v) for v in (-1.0, 0.0, 1.0)) < 1e-9
     # The search's own estimate is kept alongside the proof, not overwritten by
     # it: comparing the two per position is how the solver's value is measured.
@@ -200,6 +210,43 @@ def test_a_masked_policy_actually_changes_the_games_that_get_played():
     assert _records(max_nodes=SOLVER_MAX_NODES) != _records(max_nodes=0)
 
 
+def test_a_declined_solve_records_what_it_cost_and_why():
+    """A refusal must not look like a move the trigger never selected.
+
+    With a one-node budget every attempt fails, so the trigger's selections are
+    exactly the declined set. Without this, the declined positions cannot be
+    found in the buffer and the throughput cost of failed attempts -- which is
+    paid synchronously -- cannot be measured at all.
+    """
+
+    records = _records(max_nodes=1)
+    attempted = _attempted_moves(records)
+    assert attempted, "the trigger never fired"
+    # Not every attempt fails even at one node: the last card of a game is a
+    # single move to a terminal, which the budget covers.
+    declined = [move for move in attempted if move["solver_value"] is None]
+    assert declined, "a one-node budget declined nothing"
+    for move in declined:
+        assert move["solver_regime"] is None
+        assert move["solver_masked"] is False
+        assert move["solver_stop"] in {"budget", "unsolvable"}
+    # The cost is visible rather than reported as zero work, which is the whole
+    # point: these nodes were spent synchronously inside a scheduler slot.
+    assert any(move["solver_nodes"] > 0 for move in declined)
+
+
+def test_the_value_only_run_does_not_pay_for_exact_per_action_pricing():
+    """`PolicyMode::Exact` is needed only by the mask. With the mask off, the
+    overlay reads nothing but `root_value`, and the narrower `ValueOnly` window
+    -- which also lets star1 bite far harder -- must be what actually runs."""
+
+    masked = _records(max_nodes=SOLVER_MAX_NODES)
+    value_only = _records(max_nodes=SOLVER_MAX_NODES, mask=False)
+    masked_nodes = sum(move["solver_nodes"] for move in _solved_moves(masked))
+    value_only_nodes = sum(move["solver_nodes"] for move in _solved_moves(value_only))
+    assert value_only_nodes < masked_nodes
+
+
 # --- the value target ------------------------------------------------------
 
 
@@ -249,9 +296,15 @@ def test_a_chance_free_proof_becomes_a_one_hot_value_target():
     ]
 
 
-def test_an_expectimax_proof_stays_soft_and_is_never_rounded():
-    """A 0.0 under expectimax is balanced win and loss mass, not a draw, so it
-    must not collect the draw class -- and a 0.5 must not be rounded to a win."""
+def test_an_expectimax_proof_supplies_no_value_target_at_all():
+    """A scalar expected utility does not determine a three-class distribution.
+
+    The solver returns ``P(win) - P(loss)``, and 7WD has real draws, so a 0.0
+    could be a certain draw, balanced wins and losses, or any mixture. Turning
+    it into ``(0.5, 0, 0.5)`` would be a fabricated proof, and most confidently
+    wrong exactly where the truth is most certain -- a position all of whose
+    chance outcomes draw. These rows keep the realised outcome instead.
+    """
 
     from .dataset import collate
 
@@ -261,7 +314,8 @@ def test_an_expectimax_proof_stays_soft_and_is_never_rounded():
             _example(solver_value=0.5, solver_exact=False),
         ]
     )
-    assert batch["value_solver"].tolist() == [[0.5, 0.0, 0.5], [0.75, 0.0, 0.25]]
+    assert batch["value_solver_valid"].tolist() == [False, False]
+    assert batch["value_solver"].sum() == 0.0
 
 
 def test_a_proven_value_replaces_the_outcome_in_training_but_not_in_validation():

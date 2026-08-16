@@ -268,6 +268,21 @@ class PhaseDConfig:
     full_search_fraction: float = 0.25
     search_mode: str = "closed"
     top_k: int = 16
+
+    endgame_solver_max_nodes: int = 0
+    """Node budget for one exact endgame solve during self-play; 0 disables it.
+
+    Carried as config -- unlike the temperature schedule and cheap width, which
+    are process-global settings the manifest never sees -- because it changes
+    what the value and policy TARGETS mean, not merely how games are explored.
+    Immutable launch provenance is the point: without it, a resume under
+    different solver flags would produce differently-defined labels under the
+    old manifest identity.  Rows also carry their own solver fields, so a buffer
+    that did end up mixed stays separable per row.
+    """
+    endgame_solver_max_secs: float = 60.0
+    endgame_solver_max_cards: int = 8
+    endgame_solver_mask_policy: bool = True
     d_model: int = 128
     layers: int = 4
     heads: int | None = None
@@ -833,7 +848,7 @@ def _configure_cheap_top_k(width: int) -> None:
 
 def configure_endgame_solver(
     max_nodes: int, max_secs: float, max_cards: int, mask_policy: bool
-) -> None:
+) -> tuple[int, float, int, bool] | None:
     """Apply the exact endgame solver overlay to the Rust generator.
 
     ``max_nodes = 0`` disables it, which is the default and reproduces every run
@@ -846,6 +861,10 @@ def configure_endgame_solver(
     different move is sampled.  ``--endgame-solver-max-secs`` is a safety net
     against one pathological position holding a scheduler slot, and should be
     set generously enough never to bind.
+
+    Returns the settings the Rust generator is actually running under, read back
+    from it rather than echoed, so the manifest records what took effect instead
+    of what was requested. ``None`` when there is no Rust generator to configure.
     """
 
     if max_nodes < 0 or max_cards < 0:
@@ -853,8 +872,9 @@ def configure_endgame_solver(
     try:
         import seven_wonders_rust as swr
     except ImportError:  # pragma: no cover - Python backend needs no bridge
-        return
+        return None
     swr.set_endgame_solver(int(max_nodes), float(max_secs), int(max_cards), bool(mask_policy))
+    return swr.endgame_solver()
 
 
 def set_temperature_schedule(floor: float, anneal_moves: float) -> None:
@@ -5200,13 +5220,20 @@ def main(argv=None) -> int:
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
-    configure_endgame_solver(
+    # Read back what the generator is actually running under, so the manifest
+    # records the effective settings rather than the requested ones -- they
+    # differ when there is no Rust generator to configure at all.
+    applied_solver = configure_endgame_solver(
         args.endgame_solver_max_nodes,
         args.endgame_solver_max_secs,
         args.endgame_solver_max_cards,
         args.endgame_solver_mask_policy,
-    )
+    ) or (0, args.endgame_solver_max_secs, args.endgame_solver_max_cards, False)
     config = PhaseDConfig(
+        endgame_solver_max_nodes=int(applied_solver[0]),
+        endgame_solver_max_secs=float(applied_solver[1]),
+        endgame_solver_max_cards=int(applied_solver[2]),
+        endgame_solver_mask_policy=bool(applied_solver[3]),
         run_dir=args.run_dir,
         seed=args.seed,
         iterations=args.iterations,
