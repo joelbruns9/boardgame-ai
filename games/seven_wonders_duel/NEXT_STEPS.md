@@ -269,7 +269,8 @@ not the best such line. Note also that any ordering between a supremacy win and
 a civilian win is a preference we impose, not game truth: unlike Kingdomino,
 7WD's objective really is just win/loss.
 
-**What remains** is the self-play half: a trigger rule (age III and ≤N cards,
+**What remains** is the self-play half, planned in detail in
+`SOLVER_SELF_PLAY_PLAN.md` (written to be picked up cold): a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,
 the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for
 positions that fall back, and endgame oversampling in training — all of which
