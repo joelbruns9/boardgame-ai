@@ -30,6 +30,19 @@
 //! (4.5M at 8 cards, 11.0M at 9, 29.6M at 10), so removing the clone entirely
 //! would be ~1.4x, worth about half a card of depth.
 //!
+//! **Threads.** One solve is single-threaded: plain recursion, no rayon. It
+//! parallelises across *positions* instead, which is what a self-play solver
+//! pool wants -- the binding releases the GIL, so N Python threads run N solves
+//! at once with nothing shared. Measured on 16 logical CPUs: 2.56x at 4
+//! threads, 3.76x at 8, 4.42x at 16.
+//!
+//! That ceiling is the state copy again, and this time it is provable rather
+//! than inferred: cloning alone, with no search at all, scales the same way
+//! (2.80x at 4, 3.74x at 8) and saturates at ~10.4M clones/s, i.e. ~17.7 GB/s
+//! of memcpy. The pool runs out of memory bandwidth, not of cores. So a
+//! journaled undo would buy more than its single-threaded ~1.4x suggests: it
+//! would raise the per-core rate AND the number of cores worth giving the pool.
+//!
 //! **Star1 and star2 were tried and mostly did not pay.** 94% of corpus nodes
 //! and ~100% of deep-position nodes sit below a chance edge, where the
 //! inherited window used to be discarded -- which looked like the biggest lever

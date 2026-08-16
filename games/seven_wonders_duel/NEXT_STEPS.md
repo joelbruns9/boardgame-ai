@@ -198,6 +198,19 @@ in mind for any future pruning: a window clamped to the full value range is not
 a window, and a child returning exactly ±1 through one is reporting its true
 value, not failing against a bound. Decided endgames are full of exact ±1s.
 
+**Cores.** A single solve is single-threaded, and parallelises across
+*positions* rather than inside one — which is what the self-play pool wants
+anyway. The binding releases the GIL, so N Python threads run N solves at once:
+measured 2.56× at 4 threads, 3.76× at 8, 4.42× at 16 on 16 logical CPUs.
+
+The sublinearity is the state clone, and this one is proven rather than
+inferred: cloning alone, with no search, scales the same way (2.80× at 4, 3.74×
+at 8) and saturates at ~10.4M clones/s ≈ 17.7 GB/s of memcpy. The pool runs out
+of *memory bandwidth*, not cores. Two consequences for step 5: `solver_cpus`
+much beyond 8 buys little on this machine, and a journaled undo is worth more
+than the earlier single-threaded ~1.4× estimate — it would raise both the
+per-core rate and the number of cores worth allocating.
+
 **What remains** is the self-play half: a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,
 the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for
