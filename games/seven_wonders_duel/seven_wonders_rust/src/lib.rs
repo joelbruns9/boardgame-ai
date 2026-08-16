@@ -680,6 +680,7 @@ impl RustGame {
             victory_type: victory,
             final_scores,
             library_draws: library_draws.into_iter().collect(),
+            journal: None,
         };
         Ok(RustGame { state })
     }
@@ -818,6 +819,15 @@ impl RustGame {
         let specs = chance::chance_signature(&self.state, &action);
         let mut rng = rng::Rng::new(seed);
         chance::sample_outcomes(&self.state, &specs, &mut rng)
+    }
+
+    /// Exhaustively check journaled undo against snapshot undo from here.
+    ///
+    /// Returns the first violation, or `None` when every action to `depth`
+    /// applied and reversed to a bit-identical state.
+    fn journal_undo_audit(&self, py: Python<'_>, depth: usize) -> Option<String> {
+        let state = self.state.clone();
+        py.detach(move || engine::journal_undo_audit(&state, depth).err())
     }
 
     /// Diagnostic: nanoseconds per `GameState` clone, on THIS position.

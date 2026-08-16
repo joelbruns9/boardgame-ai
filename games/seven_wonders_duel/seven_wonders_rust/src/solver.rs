@@ -14,34 +14,31 @@
 //!   count was its legal-action count (+0.65 rank correlation), which is what
 //!   ordering attacks: try the moves most likely to be best first and the
 //!   window closes sooner.
-//! What it does NOT do is avoid copying the state: `snapshot`/`restore` is one
-//! full `GameState` clone per child edge, because there is no journaled undo.
-//! Measured, that copy is 280-320ns against ~900ns per node, so about a third
-//! of the search -- but it is the *copy* that costs, not the allocation, and
-//! the fix for it is journaled undo or a smaller state, not a cleverer buffer:
+//! **Undo is journaled** (`GameState::apply_journaled`), not a state copy.
+//! Reversing a move replays a handful of recorded changes -- a card appended to
+//! a city, a slot taken, a token off the track -- while scalars ride in a
+//! fixed-size save that allocates nothing. It replaced a full ~1.7KB clone per
+//! child edge, which had measured a third of per-node cost.
 //!
-//! * reusing one buffer per depth (`clone_from` + swap, so the allocator is
-//!   never asked for anything) measured 1,107k vs 1,100k nodes/s on the corpus
-//!   and 605k vs 614k on deep positions, i.e. nothing. The crate allocates
-//!   through mimalloc, so the malloc that trick removes was already cheap;
-//! * likewise dropping the chance-chain key vectors: 1,133k vs 1,100k.
+//! Result: 885 -> 581 ns per node, 1.52x, close to the 1.5x the clone's share
+//! predicted. Moves outside the ordinary flow of a turn -- an Age deal rewrites
+//! the tableau and a deck wholesale -- still clone, and that fallback is normal
+//! rather than exceptional. `engine::journal_undo_audit` is the gate: full-state
+//! equality after undo, every legal action to depth 3, on real positions.
 //!
-//! And the ceiling on all of it is low. Node counts grow ~2.5x per extra card
-//! (4.5M at 8 cards, 11.0M at 9, 29.6M at 10), so removing the clone entirely
-//! would be ~1.4x, worth about half a card of depth.
+//! Two things this did NOT do, both worth knowing before optimising further:
 //!
-//! **Threads.** One solve is single-threaded: plain recursion, no rayon. It
-//! parallelises across *positions* instead, which is what a self-play solver
-//! pool wants -- the binding releases the GIL, so N Python threads run N solves
-//! at once with nothing shared. Measured on 16 logical CPUs: 2.56x at 4
-//! threads, 3.76x at 8, 4.42x at 16.
-//!
-//! That ceiling is the state copy again, and this time it is provable rather
-//! than inferred: cloning alone, with no search at all, scales the same way
-//! (2.80x at 4, 3.74x at 8) and saturates at ~10.4M clones/s, i.e. ~17.7 GB/s
-//! of memcpy. The pool runs out of memory bandwidth, not of cores. So a
-//! journaled undo would buy more than its single-threaded ~1.4x suggests: it
-//! would raise the per-core rate AND the number of cores worth giving the pool.
+//! * it did not change parallel efficiency. A pool was 47% efficient at 8
+//!   threads before and after, so the earlier claim that state-copy bandwidth
+//!   was the ceiling was wrong. Clone-only work, the clone-heavy solver and the
+//!   clone-light solver all reach ~3.75x at 8 threads, which points at the
+//!   machine (all-core clock, SMT) rather than at anything the workload does.
+//!   Absolute pool throughput still improved 1.75x, purely from the per-core
+//!   win;
+//! * allocation tricks remain flat, as before: reusing a buffer per depth
+//!   measured 1,107k vs 1,100k nodes/s, and dropping chance-chain key vectors
+//!   1,133k vs 1,100k. The cost was always the copy, which is why removing the
+//!   copy is what paid.
 //!
 //! **Star1 and star2 were tried and mostly did not pay.** 94% of corpus nodes
 //! and ~100% of deep-position nodes sit below a chance edge, where the
@@ -286,6 +283,15 @@ fn edge_value_p0(
         return Err(SolveStop::Unsolvable);
     }
     if specs.is_empty() {
+        // Journaled undo where the move allows it: reversing a handful of
+        // recorded changes instead of copying the whole state back. The
+        // fallback is not an error path -- some moves (an Age deal) rewrite
+        // more than a delta can describe, and those still clone.
+        if let Some(undo) = state.apply_journaled(&action) {
+            let value = solve_p0(state, ctx, alpha, beta);
+            state.undo(undo);
+            return value;
+        }
         let undo = state.snapshot();
         state.apply_action(&action);
         let value = solve_p0(state, ctx, alpha, beta);

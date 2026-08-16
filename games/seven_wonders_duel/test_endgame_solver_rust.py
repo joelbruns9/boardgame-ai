@@ -146,6 +146,37 @@ def test_the_solve_releases_the_gil(records):
     assert ticks > 50, f"other Python threads only advanced {ticks} times"
 
 
+def test_journaled_undo_restores_state_exactly(records):
+    """The journal's whole risk is a mutation nobody recorded.
+
+    A missed one leaves the search on a quietly wrong state -- no crash, no
+    wrong answer until much later, and nothing in the solve output to show it.
+    So the journaled path is compared against the snapshot path it replaces:
+    full-state equality after undo, over every legal action to depth 3, walking
+    the same tree the solver walks. Positions the journal declines still run
+    through the snapshot path here, so the audit covers the real mix.
+    """
+
+    from .rust_bridge import rust_game_from_state
+
+    checked = 0
+    for record in records[:20]:
+        game = corpus.regenerate(record)
+        if game is None:
+            continue
+        problem = rust_game_from_state(game).journal_undo_audit(3)
+        assert problem is None, f"seed={record['seed']} ply={record['ply']}: {problem}"
+        checked += 1
+    # Deep positions too: they reach wonders, revives and token crossings that a
+    # nearly-finished board no longer offers.
+    for cards in (9, 11, 13):
+        game = _deep_position(cards=cards)
+        problem = rust_game_from_state(game).journal_undo_audit(3)
+        assert problem is None, f"{cards} cards: {problem}"
+        checked += 1
+    assert checked > 10
+
+
 @pytest.mark.parametrize("pruning", ["none", "star1", "star2"])
 def test_every_chance_pruning_setting_returns_the_same_values(records, pruning):
     """Pruning may change the node count and nothing else.

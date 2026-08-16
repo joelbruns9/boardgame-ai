@@ -219,6 +219,85 @@ pub struct GameState {
     /// Recorded Great Library draws (progress ids), consumed in order — the one
     /// play-time RNG event. Empty for positions that never reach a Great Library.
     pub library_draws: VecDeque<Vec<usize>>,
+    /// Open journal, non-`None` only while `apply_journaled` is running. A
+    /// state at rest always carries `None`, which is what keeps it out of
+    /// equality comparisons and clones in any meaningful way.
+    pub(crate) journal: Option<Vec<Delta>>,
+}
+
+
+/// One reversible change to the heap-allocated part of a `GameState`.
+///
+/// Undo used to be `snapshot()`/`restore()`: a full clone of the state per
+/// child edge, ~1.7KB across ~20 vectors, measured at a third of the solver's
+/// per-node cost and — because it is memcpy — the reason a solver pool
+/// saturated memory bandwidth at ~8 threads rather than scaling with cores.
+///
+/// A move touches almost none of that. Scalars (coins, the conflict pawn, the
+/// phase) are cheap enough to save unconditionally in `Scalars`, so only the
+/// heap changes need entries here, and there are few: a card appended to a
+/// city, a slot taken and its neighbours revealed, a token leaving the track.
+///
+/// Each variant records exactly what its reversal needs, and the log is
+/// replayed backwards, so an action that both removes and appends to the same
+/// list (the Mausoleum revives a card into a city) undoes in the right order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// Appended to a per-city list; undone by popping it.
+    PushCity { seat: usize, list: CityList },
+    /// Removed from a per-city list; undone by putting it back at its index.
+    RemoveCity { seat: usize, list: CityList, at: usize, id: usize },
+    PushDiscard,
+    RemoveDiscard { at: usize, id: usize },
+    PushBuried,
+    PushBurial,
+    PushRetired,
+    /// A military token claimed off the track.
+    RemoveMilitaryToken { at: usize, token: (i32, i32) },
+    /// A Great Library draw consumed; undone by pushing it back to the front.
+    PopLibraryDraw { drawn: Vec<usize> },
+    /// The progress-token pools are tiny (ten ids at most) and are filtered
+    /// rather than popped, so they are saved whole rather than described.
+    ProgressPools { available: Vec<usize>, unused: Vec<usize> },
+    /// A tableau slot before it was taken or revealed.
+    Slot { index: usize, before: TableauCard },
+}
+
+/// Which per-city list a `Delta` refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CityList {
+    Buildings,
+    BuiltWonders,
+    ProgressTokens,
+    ClaimedSciencePairs,
+}
+
+/// The fixed-size part of a state, saved unconditionally because copying it
+/// costs nothing: no allocation, no pointer chasing, a few dozen bytes.
+#[derive(Clone, Debug)]
+pub struct Scalars {
+    pub phase: Phase,
+    pub active_player: usize,
+    pub age: u8,
+    pub wonder_round: u8,
+    pub wonder_pick_index: u8,
+    pub conflict_position: i32,
+    pub pending_extra_turn: bool,
+    pub pending_shields: i32,
+    pub coins: [i32; 2],
+    pub winner: Option<usize>,
+    pub victory_type: Option<VictoryType>,
+    pub final_scores: Option<(i32, i32)>,
+    /// Small, but it owns a `Vec` of options, so this is the one saved field
+    /// that can allocate. Most moves either set or clear it.
+    pub pending_choice: Option<PendingChoice>,
+}
+
+/// What `apply_journaled` hands back: enough to reverse the move exactly.
+#[derive(Clone, Debug)]
+pub struct Undo {
+    pub(crate) scalars: Scalars,
+    pub(crate) deltas: Vec<Delta>,
 }
 
 /// Fully-locked setup, extracted from a Python `GameState.new(seed)`.
@@ -269,6 +348,7 @@ impl GameState {
             victory_type: None,
             final_scores: None,
             library_draws,
+            journal: None,
         }
     }
 

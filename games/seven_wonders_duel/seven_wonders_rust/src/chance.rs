@@ -60,7 +60,7 @@ fn newly_accessible_after_take(g: &GameState, taken: usize) -> Vec<(i32, i32, i3
 /// depends on victories and deferred choices that only the engine knows. A
 /// cheap public precondition gates the clone, so it happens only on the one
 /// take per Age that can empty the pyramid. Port of Python `_exhausts_the_age`.
-fn exhausts_the_age(g: &GameState, action: &Action) -> bool {
+pub(crate) fn exhausts_the_age(g: &GameState, action: &Action) -> bool {
     if g.age >= 3 {
         return false;
     }

@@ -198,18 +198,25 @@ in mind for any future pruning: a window clamped to the full value range is not
 a window, and a child returning exactly ±1 through one is reporting its true
 value, not failing against a bound. Decided endgames are full of exact ±1s.
 
-**Cores.** A single solve is single-threaded, and parallelises across
-*positions* rather than inside one — which is what the self-play pool wants
-anyway. The binding releases the GIL, so N Python threads run N solves at once:
-measured 2.56× at 4 threads, 3.76× at 8, 4.42× at 16 on 16 logical CPUs.
+**Undo is journaled**, not a state copy: reversing a move replays a few
+recorded changes instead of copying ~1.7 KB back. That was a third of per-node
+cost, and removing it delivered **885 → 581 ns per node, 1.52×**. Moves that
+rewrite whole decks (an Age deal) still clone, which is a normal fallback, not
+an error path. `journal_undo_audit` gates it: full-state equality after undo
+over every legal action to depth 3, on real positions.
 
-The sublinearity is the state clone, and this one is proven rather than
-inferred: cloning alone, with no search, scales the same way (2.80× at 4, 3.74×
-at 8) and saturates at ~10.4M clones/s ≈ 17.7 GB/s of memcpy. The pool runs out
-of *memory bandwidth*, not cores. Two consequences for step 5: `solver_cpus`
-much beyond 8 buys little on this machine, and a journaled undo is worth more
-than the earlier single-threaded ~1.4× estimate — it would raise both the
-per-core rate and the number of cores worth allocating.
+**Cores.** A single solve is single-threaded and parallelises across
+*positions*, which is what the self-play pool wants. The binding releases the
+GIL, so N Python threads run N solves at once: 2.89× at 4 threads, 3.77× at 8,
+4.37× at 16 on 16 logical CPUs.
+
+That efficiency is unchanged by the journal (47% at 8 threads before and
+after), which **disproves the earlier claim that state-copy bandwidth was the
+ceiling**. Clone-only work, the clone-heavy solver and the clone-light solver
+all land at ~3.75× on 8 threads, so the limit is the machine — all-core clock
+and SMT — not the workload. Pool throughput still improved 1.75×, entirely from
+the per-core win. For step 5: `solver_cpus` beyond ~8 buys little here, and no
+further memory-traffic work is indicated.
 
 **What remains** is the self-play half: a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,

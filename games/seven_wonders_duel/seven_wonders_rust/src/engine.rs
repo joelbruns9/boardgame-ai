@@ -372,6 +372,128 @@ impl GameState {
 
     // --- apply -----------------------------------------------------------------
 
+    /// Record one heap change, when a journal is open. Free otherwise.
+    #[inline]
+    fn record(&mut self, delta: crate::state::Delta) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.push(delta);
+        }
+    }
+
+    /// Apply `action`, returning what is needed to reverse it exactly.
+    ///
+    /// `None` means "not journaled, use snapshot/restore" and is never a
+    /// failure: it is returned for anything outside the ordinary flow of a
+    /// turn, where a move rewrites whole decks rather than nudging a few
+    /// vectors. Refusing there is what keeps the journal honest -- an Age deal
+    /// replaces the tableau and the deck wholesale, and no delta describes that
+    /// cheaply.
+    pub fn apply_journaled(&mut self, action: &Action) -> Option<crate::state::Undo> {
+        if self.phase != Phase::PlayAge || self.journal.is_some() {
+            return None;
+        }
+        match action.use_ {
+            ActionUse::ConstructBuilding
+            | ActionUse::ConstructWonder
+            | ActionUse::DiscardForCoins
+            | ActionUse::ResolvePendingChoice => {}
+            _ => return None,
+        }
+        // The last card of an Age deals the next one (or ends the game), both
+        // of which reach far beyond what the deltas cover.
+        if crate::chance::exhausts_the_age(self, action) {
+            return None;
+        }
+        let scalars = self.scalars();
+        self.journal = Some(Vec::with_capacity(8));
+        self.apply_action(action);
+        let deltas = self.journal.take().unwrap_or_default();
+        Some(crate::state::Undo { scalars, deltas })
+    }
+
+    fn scalars(&self) -> crate::state::Scalars {
+        crate::state::Scalars {
+            phase: self.phase,
+            active_player: self.active_player,
+            age: self.age,
+            wonder_round: self.wonder_round,
+            wonder_pick_index: self.wonder_pick_index,
+            conflict_position: self.conflict_position,
+            pending_extra_turn: self.pending_extra_turn,
+            pending_shields: self.pending_shields,
+            coins: [self.cities[0].coins, self.cities[1].coins],
+            winner: self.winner,
+            victory_type: self.victory_type,
+            final_scores: self.final_scores,
+            pending_choice: self.pending_choice.clone(),
+        }
+    }
+
+    /// Reverse an `apply_journaled`, exactly. Deltas replay backwards so a move
+    /// that removed and appended to the same list undoes in the right order.
+    pub fn undo(&mut self, undo: crate::state::Undo) {
+        use crate::state::{CityList, Delta};
+        for delta in undo.deltas.into_iter().rev() {
+            match delta {
+                Delta::PushCity { seat, list } => {
+                    match list {
+                        CityList::Buildings => self.cities[seat].buildings.pop(),
+                        CityList::BuiltWonders => self.cities[seat].built_wonders.pop(),
+                        CityList::ProgressTokens => self.cities[seat].progress_tokens.pop(),
+                        CityList::ClaimedSciencePairs => {
+                            self.cities[seat].claimed_science_pairs.pop().map(|_| 0)
+                        }
+                    };
+                }
+                Delta::RemoveCity { seat, list, at, id } => match list {
+                    CityList::Buildings => self.cities[seat].buildings.insert(at, id),
+                    CityList::BuiltWonders => self.cities[seat].built_wonders.insert(at, id),
+                    CityList::ProgressTokens => self.cities[seat].progress_tokens.insert(at, id),
+                    CityList::ClaimedSciencePairs => {
+                        unreachable!("science pairs are never removed")
+                    }
+                },
+                Delta::PushDiscard => {
+                    self.discard_pile.pop();
+                }
+                Delta::RemoveDiscard { at, id } => self.discard_pile.insert(at, id),
+                Delta::PushBuried => {
+                    self.buried_cards.pop();
+                }
+                Delta::PushBurial => {
+                    self.wonder_burials.pop();
+                }
+                Delta::PushRetired => {
+                    self.retired_wonders.pop();
+                }
+                Delta::RemoveMilitaryToken { at, token } => {
+                    self.military_tokens_remaining.insert(at, token)
+                }
+                Delta::PopLibraryDraw { drawn } => self.library_draws.push_front(drawn),
+                Delta::ProgressPools { available, unused } => {
+                    self.available_progress_tokens = available;
+                    self.unused_progress_tokens = unused;
+                }
+                Delta::Slot { index, before } => self.tableau.slots[index] = before,
+            }
+        }
+        let s = undo.scalars;
+        self.phase = s.phase;
+        self.active_player = s.active_player;
+        self.age = s.age;
+        self.wonder_round = s.wonder_round;
+        self.wonder_pick_index = s.wonder_pick_index;
+        self.conflict_position = s.conflict_position;
+        self.pending_extra_turn = s.pending_extra_turn;
+        self.pending_shields = s.pending_shields;
+        self.cities[0].coins = s.coins[0];
+        self.cities[1].coins = s.coins[1];
+        self.winner = s.winner;
+        self.victory_type = s.victory_type;
+        self.final_scores = s.final_scores;
+        self.pending_choice = s.pending_choice;
+    }
+
     pub fn apply_action(&mut self, action: &Action) {
         match action.use_ {
             ActionUse::DraftWonder => {
@@ -396,6 +518,7 @@ impl GameState {
                 let player = self.active_player;
                 let card_id = self.tableau.slots[slot].card_id;
                 self.take_and_reveal(slot);
+                self.record(crate::state::Delta::PushDiscard);
                 self.discard_pile.push(card_id);
                 let yellow = count_color(self, player, CardColor::Yellow);
                 self.cities[player].coins += discard_income(yellow);
@@ -409,6 +532,10 @@ impl GameState {
                 let pay = minimum_payment(self, player, &c.cost, Some(c), false);
                 self.pay(player, &pay);
                 self.take_and_reveal(slot);
+                self.record(crate::state::Delta::PushCity {
+                    seat: player,
+                    list: crate::state::CityList::Buildings,
+                });
                 self.cities[player].buildings.push(card_id);
                 self.after_building_constructed(player, card_id);
                 if pay.used_chain && has_token(self, player, "Urbanism") {
@@ -426,8 +553,14 @@ impl GameState {
                 let pay = minimum_payment(self, player, &wc, None, true);
                 self.pay(player, &pay);
                 self.take_and_reveal(slot);
+                self.record(crate::state::Delta::PushBuried);
                 self.buried_cards.push(card_id);
+                self.record(crate::state::Delta::PushBurial);
                 self.wonder_burials.push((wid, card_id));
+                self.record(crate::state::Delta::PushCity {
+                    seat: player,
+                    list: crate::state::CityList::BuiltWonders,
+                });
                 self.cities[player].built_wonders.push(wid);
 
                 let total_built: usize = self.cities.iter().map(|c| c.built_wonders.len()).sum();
@@ -443,6 +576,7 @@ impl GameState {
                         })
                         .collect();
                     assert_eq!(remaining.len(), 1, "seventh wonder must leave one unbuilt");
+                    self.record(crate::state::Delta::PushRetired);
                     self.retired_wonders.push(remaining[0]);
                 }
 
@@ -461,10 +595,14 @@ impl GameState {
     }
 
     fn take_and_reveal(&mut self, slot: usize) {
+        let before = self.tableau.slots[slot].clone();
+        self.record(crate::state::Delta::Slot { index: slot, before });
         let (_card_id, newly) = self.tableau.take_accessible(slot);
         // Simulator reveal path: the locked card is already correct, so each
         // newly-accessible slot is simply revealed in (row, x) order.
         for j in newly {
+            let before = self.tableau.slots[j].clone();
+            self.record(crate::state::Delta::Slot { index: j, before });
             self.tableau.reveal(j);
         }
     }
@@ -556,6 +694,10 @@ impl GameState {
             .filter(|&&cid| card(cid).science == Some(symbol))
             .count();
         if copies >= 2 && !self.cities[player].claimed_science_pairs.contains(&symbol) {
+            self.record(crate::state::Delta::PushCity {
+                seat: player,
+                list: crate::state::CityList::ClaimedSciencePairs,
+            });
             self.cities[player].claimed_science_pairs.push(symbol);
             let options = self.available_progress_tokens.clone();
             self.set_pending_if_options(
@@ -577,6 +719,8 @@ impl GameState {
                     .iter()
                     .position(|&(p, _)| p == b)
             }) {
+                let token = self.military_tokens_remaining[pos];
+                self.record(crate::state::Delta::RemoveMilitaryToken { at: pos, token });
                 let (_, penalty) = self.military_tokens_remaining.remove(pos);
                 let opp = &mut self.cities[1 - player];
                 opp.coins = (opp.coins - penalty).max(0);
@@ -702,6 +846,10 @@ impl GameState {
                             .library_draws
                             .pop_front()
                             .expect("great library draw outcome missing from chance log");
+                        // Consumed, so undo has to hand it back to the front.
+                        self.record(crate::state::Delta::PopLibraryDraw {
+                            drawn: drawn.clone(),
+                        });
                         assert_eq!(drawn.len(), count, "great library draw size mismatch");
                         drawn.sort_by_key(|&pid| pid);
                         self.set_pending_if_options(
@@ -732,13 +880,19 @@ impl GameState {
 
         match pending.kind {
             PendingChoiceKind::DestroyOpponentBrown | PendingChoiceKind::DestroyOpponentGrey => {
-                let opp = &mut self.cities[1 - player];
-                let pos = opp
+                let pos = self.cities[1 - player]
                     .buildings
                     .iter()
                     .position(|&c| c == choice)
                     .expect("destroy target not present");
-                opp.buildings.remove(pos);
+                self.record(crate::state::Delta::RemoveCity {
+                    seat: 1 - player,
+                    list: crate::state::CityList::Buildings,
+                    at: pos,
+                    id: choice,
+                });
+                self.cities[1 - player].buildings.remove(pos);
+                self.record(crate::state::Delta::PushDiscard);
                 self.discard_pile.push(choice);
             }
             PendingChoiceKind::BuildFromDiscardFree => {
@@ -747,13 +901,28 @@ impl GameState {
                     .iter()
                     .position(|&c| c == choice)
                     .expect("revive target not in discard");
+                self.record(crate::state::Delta::RemoveDiscard { at: pos, id: choice });
                 self.discard_pile.remove(pos);
+                self.record(crate::state::Delta::PushCity {
+                    seat: player,
+                    list: crate::state::CityList::Buildings,
+                });
                 self.cities[player].buildings.push(choice);
                 self.after_building_constructed(player, choice);
             }
             PendingChoiceKind::ChooseUnusedProgress
             | PendingChoiceKind::ChooseAvailableProgress => {
+                self.record(crate::state::Delta::PushCity {
+                    seat: player,
+                    list: crate::state::CityList::ProgressTokens,
+                });
                 self.cities[player].progress_tokens.push(choice);
+                // The two pools are filtered rather than popped, and both are
+                // tiny, so they are saved whole instead of described.
+                self.record(crate::state::Delta::ProgressPools {
+                    available: self.available_progress_tokens.clone(),
+                    unused: self.unused_progress_tokens.clone(),
+                });
                 if pending.consume_all_options {
                     let consumed = pending.options.clone();
                     self.unused_progress_tokens
@@ -1303,6 +1472,55 @@ pub fn make_unmake_audit(state: &GameState, depth: usize) -> Result<(), String> 
         g.apply_action(&crate::codec::decode_action(&g, a));
         if g != after {
             return Err(format!("re-applying action {a} was non-deterministic"));
+        }
+    }
+    Ok(())
+}
+
+/// Exhaustive check that journaled undo restores a state *exactly*.
+///
+/// The whole risk of a journal is a mutation nobody recorded: the search then
+/// runs on a state that is quietly wrong, with no crash and no wrong answer
+/// until much later. So this compares the journaled path against the one it
+/// replaces -- full-state equality after undo, over every legal action to
+/// `depth`, and it walks the same tree the solver would.
+///
+/// Actions the journal declines are still exercised, through the snapshot path,
+/// so the walk covers the real mix rather than only the journaled subset.
+pub fn journal_undo_audit(state: &GameState, depth: usize) -> Result<(), String> {
+    if depth == 0 {
+        return Ok(());
+    }
+    let before = state.clone();
+    for index in crate::codec::legal_action_indices(&before) {
+        let mut g = before.clone();
+        let action = crate::codec::decode_action(&g, index);
+        // What the state should be afterwards, per the path being replaced.
+        let mut reference = before.clone();
+        reference.apply_action(&action);
+
+        match g.apply_journaled(&action) {
+            Some(undo) => {
+                if g != reference {
+                    return Err(format!(
+                        "journaled apply of action {index} differs from apply_action"
+                    ));
+                }
+                journal_undo_audit(&g, depth - 1)?;
+                g.undo(undo);
+                if g != before {
+                    return Err(format!("journaled undo of action {index} did not restore"));
+                }
+            }
+            None => {
+                let snap = g.snapshot();
+                g.apply_action(&action);
+                journal_undo_audit(&g, depth - 1)?;
+                g.restore(snap);
+                if g != before {
+                    return Err(format!("snapshot undo of action {index} did not restore"));
+                }
+            }
         }
     }
     Ok(())
