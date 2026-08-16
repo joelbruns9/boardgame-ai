@@ -181,6 +181,14 @@ the cost of a chance edge is the state clone and re-apply per outcome, not the
 small vectors describing it. That is also why no streaming enumeration was
 built.
 
+**Star1 is worth more than it first looked, in the mode that matters.** The
+first measurement used `exact` policy mode and found 0.87–0.97× the nodes.
+In `value_only` — what self-play runs — it is 0.77× on the corpus and 0.64× at
+8 cards. `exact` gives every root action the full window, so no narrow window
+ever reaches a chance edge; `value_only` tightens the root as better actions are
+found, and that window flows down to where star1 can use it. The gap was found
+only because a review pointed out the production combination was ungated.
+
 **Star1 and star2 were tried; keep star1, skip star2.** 94% of corpus nodes and
 ~100% of deep-position nodes sit under a chance edge, where the inherited
 alpha-beta window used to be thrown away — which looked like the biggest lever

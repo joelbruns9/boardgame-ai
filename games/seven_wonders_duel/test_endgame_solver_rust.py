@@ -46,6 +46,31 @@ def _deep_position(*, cards: int):
     pytest.skip(f"no Age III position with {cards} cards found")
 
 
+def _great_library_position():
+    """An Age III position where constructing the Great Library is legal."""
+
+    from .encoder_audit import DEFAULT_PAIRINGS, make_bot
+    from .engine import apply_action, legal_actions
+    from .game import Phase, new_game
+
+    for index in range(40):
+        left, right = DEFAULT_PAIRINGS[index % len(DEFAULT_PAIRINGS)]
+        game = new_game(index)
+        bots = (make_bot(left, index), make_bot(right, index + 10_000))
+        while game.phase is not Phase.COMPLETE:
+            if game.phase is Phase.PLAY_AGE and any(
+                a.wonder_name == "The Great Library" for a in legal_actions(game)
+            ):
+                return game.clone()
+            actor = (
+                game.pending_choice.player
+                if game.pending_choice is not None
+                else game.active_player
+            )
+            apply_action(game, bots[actor].select_action(game))
+    pytest.skip("no Great Library construction found")
+
+
 @pytest.fixture(scope="module")
 def records():
     rows = corpus.load()
@@ -160,6 +185,12 @@ def test_journaled_undo_restores_state_exactly(records):
     from .rust_bridge import rust_game_from_state
 
     checked = 0
+    # A position where a Great Library build is legal: applying that action
+    # needs a supplied chance outcome, and walking it through plain
+    # `apply_action` used to make this audit panic instead of report.
+    problem = rust_game_from_state(_great_library_position()).journal_undo_audit(2)
+    assert problem is None, f"great library position: {problem}"
+    checked += 1
     for record in records[:20]:
         game = corpus.regenerate(record)
         if game is None:
@@ -193,11 +224,19 @@ def test_every_chance_pruning_setting_returns_the_same_values(records, pruning):
     assert report.checked == len(records), str(report)
 
 
-def test_value_only_mode_agrees_on_the_root(records):
-    """The cheap mode may leave alternatives as bounds -- never the root."""
+@pytest.mark.parametrize("pruning", ["none", "star1"])
+def test_value_only_mode_agrees_on_the_root(records, pruning):
+    """The cheap mode may leave alternatives as bounds -- never the root.
+
+    Parametrized over pruning because `value_only` + `star1` is the combination
+    self-play will actually run, and it is the only one where a *narrowed* root
+    window meets chance pruning: exact mode gives every root action the full
+    window, so it never exercises that interaction at the root at all. Testing
+    the default alone would have left the production path ungated.
+    """
 
     exact = corpus.rust_solver(policy_mode="exact")
-    value_only = corpus.rust_solver(policy_mode="value_only")
+    value_only = corpus.rust_solver(policy_mode="value_only", chance_pruning=pruning)
     compared = 0
     for record in records:
         game = corpus.regenerate(record)

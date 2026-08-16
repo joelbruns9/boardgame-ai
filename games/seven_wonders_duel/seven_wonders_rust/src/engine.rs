@@ -388,7 +388,17 @@ impl GameState {
     /// vectors. Refusing there is what keeps the journal honest -- an Age deal
     /// replaces the tableau and the deck wholesale, and no delta describes that
     /// cheaply.
+    ///
+    /// **Precondition:** `action` carries no chance signature. A chance action
+    /// must go through `apply_with_chance` with explicit outcomes -- applying it
+    /// here would resolve it from the locked deal, which is the hidden state a
+    /// search must never read. The solver only journals `specs.is_empty()`
+    /// edges; the assertion states that rather than leaving it to a reader.
     pub fn apply_journaled(&mut self, action: &Action) -> Option<crate::state::Undo> {
+        debug_assert!(
+            crate::chance::chance_signature(self, action).is_empty(),
+            "apply_journaled on a chance action: use apply_with_chance"
+        );
         if self.phase != Phase::PlayAge || self.journal.is_some() {
             return None;
         }
@@ -1493,8 +1503,39 @@ pub fn journal_undo_audit(state: &GameState, depth: usize) -> Result<(), String>
     }
     let before = state.clone();
     for index in crate::codec::legal_action_indices(&before) {
+        let action = crate::codec::decode_action(&before, index);
+        let specs = crate::chance::chance_signature(&before, &action);
+        if specs.iter().any(|s| s.kind == crate::chance::ChanceKind::AgeDeal) {
+            continue; // sample-only: the solver refuses these outright
+        }
+
+        // Route exactly as the solver does. Applying a chance action through
+        // plain `apply_action` would resolve it from the locked deal -- the
+        // hidden state a search must not read -- and on an injected position,
+        // which carries no preloaded Great Library draw, it panics outright.
+        // That is how this audit used to crash on a legal Great Library build
+        // rather than report on one.
+        if !specs.is_empty() {
+            let chains = crate::chance::enumerate_chains_unkeyed(&before, &specs);
+            // One outcome per chance edge: enough to reach the states beyond it,
+            // where the journaled applies this audit exists for actually happen,
+            // without the branching factor making the walk unbounded.
+            if let Some((outcomes, _)) = chains.first() {
+                let mut g = before.clone();
+                let snap = g.snapshot();
+                if g.apply_with_chance(&action, outcomes).is_err() {
+                    return Err(format!("chance apply of action {index} failed"));
+                }
+                journal_undo_audit(&g, depth - 1)?;
+                g.restore(snap);
+                if g != before {
+                    return Err(format!("snapshot undo of chance action {index} did not restore"));
+                }
+            }
+            continue;
+        }
+
         let mut g = before.clone();
-        let action = crate::codec::decode_action(&g, index);
         // What the state should be afterwards, per the path being replaced.
         let mut reference = before.clone();
         reference.apply_action(&action);

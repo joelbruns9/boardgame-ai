@@ -85,10 +85,14 @@ pub enum SolveStop {
 pub enum ChancePruning {
     /// Every outcome solved on the full window (what the Python reference does).
     None,
-    /// Derive each child's window from the mass still unexamined. The default:
-    /// measured 0.87-0.97x the nodes of `None` on deep positions, 0.96x on the
-    /// corpus. Real, but far smaller than "94% of nodes sit under a chance
-    /// edge" suggests -- see the module note on why.
+    /// Derive each child's window from the mass still unexamined. The default,
+    /// and worth much more in `ValueOnly` than in `Exact`: 0.77x the corpus
+    /// nodes against 0.96x, and 0.64x at 8 cards against 0.89x. The reason is
+    /// structural -- `Exact` gives every root action the full window, so
+    /// nothing narrow ever reaches a chance edge, while `ValueOnly` tightens
+    /// the root as better actions are found and that window flows down. Since
+    /// self-play runs `ValueOnly`, the mode that matters is the one where this
+    /// pays.
     Star1,
     /// Star1, plus a probing pass over one move of each child first. **Loses
     /// here**: 1.17x, 1.61x and 1.86x the nodes of `None` at 8, 9 and 10 cards,
