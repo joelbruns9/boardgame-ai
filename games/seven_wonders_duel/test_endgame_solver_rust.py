@@ -224,6 +224,46 @@ def test_every_chance_pruning_setting_returns_the_same_values(records, pruning):
     assert report.checked == len(records), str(report)
 
 
+def test_ties_are_broken_toward_playing_the_game(records):
+    """Which move gets named among proven-equal ones is a training label.
+
+    In a won position most moves are proven equal, so "best" is decided by the
+    tie-break, not by the search. Leaving that to codec numbering meant a
+    discard could be named while building was equally winning -- and a net
+    cannot condition on "this position is already won", so it carries that
+    preference into positions that merely look similar and are not won.
+    """
+
+    from .codec import decode_action
+    from .engine import ActionUse
+
+    exact = corpus.rust_solver(policy_mode="exact")
+    cheap = corpus.rust_solver(policy_mode="value_only", chance_pruning="star1")
+    builds = {ActionUse.CONSTRUCT_BUILDING, ActionUse.CONSTRUCT_WONDER}
+    lazy = 0
+    tied = 0
+    for record in records:
+        game = corpus.regenerate(record)
+        if game is None:
+            continue
+        full, quick = exact(game), cheap(game)
+        if full is None or quick is None:
+            continue
+        values = full["per_action_value"]
+        best = max(values.values())
+        optimal = [i for i, v in values.items() if abs(v - best) <= 1e-9]
+        if len(optimal) < 2:
+            continue
+        tied += 1
+        named = decode_action(game, quick["best_index"]).use
+        if named is ActionUse.DISCARD_FOR_COINS and any(
+            decode_action(game, i).use in builds for i in optimal
+        ):
+            lazy += 1
+    assert tied > 0
+    assert lazy == 0, f"{lazy}/{tied} tied positions named a discard over a build"
+
+
 @pytest.mark.parametrize("pruning", ["none", "star1"])
 def test_value_only_names_a_genuinely_optimal_action(records, pruning):
     """`best_index` is a policy label, so a merely-good action is a wrong one.

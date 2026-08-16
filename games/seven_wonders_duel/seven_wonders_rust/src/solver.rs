@@ -516,10 +516,23 @@ pub fn solve_root(
     let actor = actor_of(state);
     let sign = if actor == 0 { 1.0 } else { -1.0 };
     let mut work = state.clone();
-    let indices = codec::legal_action_indices(&work);
+    let mut indices = codec::legal_action_indices(&work);
     if indices.is_empty() {
         return Err(SolveStop::Unsolvable);
     }
+    // Order the root the same way as every other node. Two reasons, and the
+    // second is not about speed. A better first move tightens the window
+    // sooner, which is ordinary move ordering. But it also decides WHICH move
+    // gets named when several are proven equal -- and in a won position most
+    // moves are proven equal, so without this the answer is whatever the codec
+    // happened to number lowest. A policy label that says "discard" because a
+    // discard sorted first, when building was equally winning, teaches that
+    // preference to every position the net thinks looks similar.
+    let root_actor = actor_of(&work);
+    indices.sort_by_key(|&index| {
+        let action = codec::decode_action(&work, index);
+        std::cmp::Reverse(order_key(&work, &action, root_actor))
+    });
 
     let mut per_action: Vec<(usize, f64)> = Vec::with_capacity(indices.len());
     let mut best_actor_value = f64::NEG_INFINITY;
