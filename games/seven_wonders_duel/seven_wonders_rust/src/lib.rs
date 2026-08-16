@@ -22,6 +22,7 @@ mod pool;
 mod rng;
 mod rules;
 mod self_play;
+mod solver;
 mod state;
 mod tree;
 mod tree_resumable;
@@ -817,6 +818,64 @@ impl RustGame {
         let specs = chance::chance_signature(&self.state, &action);
         let mut rng = rng::Rng::new(seed);
         chance::sample_outcomes(&self.state, &specs, &mut rng)
+    }
+
+    /// Exact endgame solve of this position (`solver.rs`).
+    ///
+    /// Returns `None` when the position is not solvable within the budget, or
+    /// at all (an Age deal is sample-only) -- the caller must treat that as "no
+    /// answer", never as a value. `policy_mode` is `"exact"` (every action
+    /// priced exactly, what the equivalence gate compares) or `"value_only"`
+    /// (root value and best action exact, alternatives are bounds).
+    #[pyo3(signature = (max_nodes = 2_000_000, max_secs = 5.0, policy_mode = "exact"))]
+    fn solve_endgame(
+        &self,
+        py: Python<'_>,
+        max_nodes: u64,
+        max_secs: f64,
+        policy_mode: &str,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        let mode = match policy_mode {
+            "exact" => solver::PolicyMode::Exact,
+            "value_only" => solver::PolicyMode::ValueOnly,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown policy_mode {other:?} (want \"exact\" or \"value_only\")"
+                )))
+            }
+        };
+        let limits = solver::Limits {
+            max_nodes,
+            deadline: std::time::Instant::now()
+                + std::time::Duration::from_secs_f64(max_secs.max(0.0)),
+        };
+        let solved = match solver::solve_root(&self.state, &limits, mode) {
+            Ok(solved) => solved,
+            Err(_) => return Ok(None),
+        };
+        let out = PyDict::new(py);
+        {
+            // Same vocabulary as the Python reference: the regime is decided by
+            // whether a chance edge was actually hit, not guessed statically.
+            out.set_item(
+                "regime",
+                if solved.saw_chance {
+                    "exact_expectimax"
+                } else {
+                    "exact"
+                },
+            )?;
+            out.set_item("root_value", solved.root_value)?;
+            out.set_item("best_index", solved.best_index)?;
+            out.set_item("nodes", solved.nodes)?;
+            out.set_item("exact_per_action", solved.exact_per_action)?;
+            let per_action = PyDict::new(py);
+            for (index, value) in &solved.per_action {
+                per_action.set_item(index, value)?;
+            }
+            out.set_item("per_action_value", per_action)?;
+        }
+        Ok(Some(out.unbind()))
     }
 
     /// F3.1b: fingerprint of the state after applying action `index` with

@@ -130,25 +130,53 @@ two equivalence tests that replay a recorded corpus, the strength gate, and the
 confirmation that the science fix actually works. Should happen once, after
 step 3, not before.
 
-### 5. Port the exact endgame solver to Rust, then put it in self-play
+### 5. Port the exact endgame solver to Rust — SOLVER DONE, self-play next
 
-The solver is pure Python today and runs at roughly 1,500 nodes per second,
-which is why it can only answer positions with about five cards left. A Rust
-port with the existing make/unmake engine should be worth tens of times that,
-which is the difference between "answers the last few moves" and "answers real
-endgames".
+`seven_wonders_rust/src/solver.rs`, reachable from Python as
+`RustGame.solve_endgame(max_nodes, max_secs, policy_mode)`. It agrees with the
+Python reference on every banked position — regime, the value of *every* legal
+action, and the set of actions proven optimal — gated by
+`endgame_corpus.py` + `test_endgame_solver_rust.py`.
 
-Then it belongs in the self-play loop, where exact endgame values are ideal
-training targets — precisely in the region where we measured the value head
-being badly wrong. Kingdomino already has this whole pattern (a dedicated
-solver worker pool, a time budget that changes over the run, and a way to price
-non-best moves) and 7WD should copy it rather than reinvent it.
+**It is 6,800× faster, not the "tens" this section assumed.** Two independent
+factors, measured over the corpus: 740× from Rust itself (1,314 → 974,811
+nodes per second) and 9.2× from *pruning the reference never had*. The Python
+solver is full-width — no alpha-beta, no move ordering, no cutoffs — so a
+straight transliteration would have left most of the win on the table. Move
+ordering was aimed at the measured driver of node count: the legal-action count
+(+0.65 rank correlation), ahead of cards remaining (+0.52).
 
-Two things learned the hard way that should carry over: Kingdomino's
-transposition-table speedup **does not transfer** — 7WD endgames barely
-transpose, measured at 1.13× — and solving every move exactly for training
-labels costs several times more than solving just the position, which is what
-Kingdomino's policy-mode setting exists to manage.
+**Reach, at a 3s budget:** every position with ≤7 cards left, 9 of 10 at 8, 7
+of 10 at 9, and some out to 11 — against about 5 for the Python solver. Age I
+and II positions remain unsolvable at any budget, because the next age's deal
+is a sample-only chance edge.
+
+Three corrections to what this section assumed:
+
+- **There was no make/unmake to build on.** `GameState::snapshot()` is a full
+  clone; the crate's own comment calls its audit "load-bearing for a *future*
+  journaled undo". The port uses one clone per node instead of one per child
+  edge, and a real journaled undo is still available as further work.
+- **Chance is not a corner case.** 19 of the 28 corpus positions are
+  `exact_expectimax`. An earlier reading of ~25% was survivorship bias —
+  chance-free positions solve faster, so a short budget over-samples them. A
+  chance-free-only solver (which is all Kingdomino has) would decline most real
+  7WD endgames, so this one handles chance.
+- **Exact per-action labels are cheap here**: 1.1× the value-only cost at 6
+  cards, rising to 3.3× at 10 — not Kingdomino's 11×. So 7WD can probably
+  afford exact policy labels outright, and `argmax_ties`-style machinery may
+  not be needed at all.
+
+Kingdomino's transposition table still does not transfer (1.13×), and nothing
+here uses one.
+
+**What remains** is the self-play half: a trigger rule (age III and ≤N cards,
+with N set from the reach table above), a per-position budget and its schedule,
+the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for
+positions that fall back, and endgame oversampling in training — all of which
+Kingdomino already has in `self_play.py` to copy. Chance nodes are also still
+unpruned (star1/star2 would need its own gate), and the advisor still calls the
+Python solver.
 
 ### 6. Use the captured games as self-play starting points
 
