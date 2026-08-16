@@ -161,6 +161,11 @@ const CLOCK_CHECK_EVERY: u32 = 1024;
 const VALUE_MIN: f64 = -1.0;
 const VALUE_MAX: f64 = 1.0;
 
+/// Values closer than this are the same value. Expectimax sums probabilities in
+/// floating point, so an exact zero routinely arrives as -1.4e-17, and a "best"
+/// comparison that cannot tell those apart picks by noise.
+const TIE_EPSILON: f64 = 1e-9;
+
 impl Ctx {
     fn tick(&mut self) -> Result<(), SolveStop> {
         self.nodes += 1;
@@ -537,7 +542,14 @@ pub fn solve_root(
         let value_p0 = edge_value_p0(&mut work, index, &mut ctx, alpha, beta)?;
         let actor_value = (sign * value_p0).clamp(-1.0, 1.0);
         per_action.push((index, actor_value));
-        if actor_value > best_actor_value {
+        // Strictly better, by more than arithmetic noise. In `ValueOnly` a cut
+        // action reports a *bound*, not a value, and a bound is only meaningful
+        // as "no better than the incumbent" -- so it must never displace one.
+        // Without the epsilon it could: a bound landing at 0.0 beat an incumbent
+        // of -1.4e-17 (a computed zero), and the solver named an action worth
+        // -0.3 as best. One position in 86, and a wrong policy label every time
+        // it happens.
+        if actor_value > best_actor_value + TIE_EPSILON {
             best_actor_value = actor_value;
             best_index = index;
         }

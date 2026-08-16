@@ -225,6 +225,38 @@ def test_every_chance_pruning_setting_returns_the_same_values(records, pruning):
 
 
 @pytest.mark.parametrize("pruning", ["none", "star1"])
+def test_value_only_names_a_genuinely_optimal_action(records, pruning):
+    """`best_index` is a policy label, so a merely-good action is a wrong one.
+
+    In `value_only` the alternatives come back as bounds, and a bound must never
+    displace an incumbent exact value. It could: with the incumbent at -1.4e-17
+    (a computed zero) a bound of 0.0 won the strict comparison, and the solver
+    named an action worth -0.3 as best. One position in 86 -- and a wrong policy
+    target on every one like it.
+    """
+
+    exact = corpus.rust_solver(policy_mode="exact")
+    cheap = corpus.rust_solver(policy_mode="value_only", chance_pruning=pruning)
+    checked = 0
+    for record in records:
+        game = corpus.regenerate(record)
+        if game is None:
+            continue
+        full, quick = exact(game), cheap(game)
+        if full is None or quick is None:
+            continue
+        checked += 1
+        values = full["per_action_value"]
+        best = max(values.values())
+        chosen = values[quick["best_index"]]
+        assert best - chosen <= 1e-9, (
+            f"seed={record['seed']} ply={record['ply']}: value_only chose an "
+            f"action worth {chosen:.6g} where {best:.6g} was available"
+        )
+    assert checked > 0
+
+
+@pytest.mark.parametrize("pruning", ["none", "star1"])
 def test_value_only_mode_agrees_on_the_root(records, pruning):
     """The cheap mode may leave alternatives as bounds -- never the root.
 
