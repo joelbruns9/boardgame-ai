@@ -151,6 +151,12 @@ of 10 at 9, and some out to 11 — against about 5 for the Python solver. Age I
 and II positions remain unsolvable at any budget, because the next age's deal
 is a sample-only chance edge.
 
+The solve releases the GIL, so it cannot freeze a threaded advisor host or
+serialise a thread-based solver pool — which is what step 5's async pool will
+be. The budget is a hard bound in both currencies (nodes and wall clock); an
+earlier version sampled the clock only every 1,024 nodes, which quietly let any
+position finishable inside one window ignore the deadline completely.
+
 Three corrections to what this section assumed:
 
 - **There was no make/unmake to build on.** `GameState::snapshot()` is a full
@@ -168,7 +174,12 @@ Three corrections to what this section assumed:
   not be needed at all.
 
 Kingdomino's transposition table still does not transfer (1.13×), and nothing
-here uses one.
+here uses one. Nor does trimming allocations around chance edges: dropping the
+observable-key vectors the solver discards measured 1,133k vs 1,100k nodes/s on
+the corpus and 619k vs 614k on deep positions — nothing outside noise, because
+the cost of a chance edge is the state clone and re-apply per outcome, not the
+small vectors describing it. That is also why no streaming enumeration was
+built.
 
 **What remains** is the self-play half: a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,

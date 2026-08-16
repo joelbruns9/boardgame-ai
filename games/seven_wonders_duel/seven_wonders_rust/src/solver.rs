@@ -79,8 +79,11 @@ struct Ctx {
     max_nodes: u64,
     deadline: Instant,
     saw_chance: bool,
-    /// Checking the clock every node costs more than it saves; the node counter
-    /// is the fine-grained bound and the clock is sampled between batches.
+    /// Checking the clock every node costs more than it saves, so it is sampled
+    /// between batches -- but the FIRST tick always checks. Starting the counter
+    /// at zero made the deadline soft: a position finishable in under 1,024
+    /// nodes ignored it completely, and `max_secs = 0` still returned complete
+    /// answers. The budget is a contract with the caller, not a hint.
     since_clock_check: u32,
 }
 
@@ -93,7 +96,7 @@ impl Ctx {
             return Err(SolveStop::Budget);
         }
         self.since_clock_check += 1;
-        if self.since_clock_check >= CLOCK_CHECK_EVERY {
+        if self.nodes == 1 || self.since_clock_check >= CLOCK_CHECK_EVERY {
             self.since_clock_check = 0;
             if Instant::now() > self.deadline {
                 return Err(SolveStop::Budget);
@@ -217,13 +220,13 @@ fn edge_value_p0(
     }
 
     ctx.saw_chance = true;
-    let chains = chance::enumerate_chains(state, &specs);
-    let mass: f64 = chains.iter().map(|(_, p, _)| *p).sum();
+    let chains = chance::enumerate_chains_unkeyed(state, &specs);
+    let mass: f64 = chains.iter().map(|(_, p)| *p).sum();
     if (mass - 1.0).abs() > 1e-6 {
         return Err(SolveStop::Unsolvable);
     }
     let mut value = 0.0;
-    for (outcomes, probability, _key) in chains {
+    for (outcomes, probability) in chains {
         let undo = state.snapshot();
         // A chance child is averaged in, so no bound on the running sum is
         // available: it must be solved on the full window, not [alpha, beta].
@@ -244,6 +247,9 @@ pub fn solve_root(
     limits: &Limits,
     mode: PolicyMode,
 ) -> Result<Solve, SolveStop> {
+    if Instant::now() > limits.deadline {
+        return Err(SolveStop::Budget); // already out of time before any work
+    }
     let mut ctx = Ctx {
         nodes: 0,
         max_nodes: limits.max_nodes,
@@ -294,4 +300,81 @@ pub fn solve_root(
         nodes: ctx.nodes,
         exact_per_action: mode == PolicyMode::Exact,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Budget and refusal semantics, which the Python equivalence gate cannot
+    //! reach: it only ever compares *answers*, so a solver that ignored its
+    //! limits or returned a value where it should have declined would still
+    //! pass every position in the corpus.
+
+    use super::*;
+    use crate::state::Setup;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    fn sample_setup() -> Setup {
+        Setup {
+            first_player: 0,
+            available_progress_tokens: vec![0, 1, 2, 3, 4],
+            unused_progress_tokens: vec![5, 6, 7, 8, 9],
+            wonder_groups: [vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            unused_wonders: vec![8, 9, 10, 11],
+            age_decks: [
+                Vec::new(),
+                (0..20).collect(),
+                (0..20).collect(),
+                (0..20).collect(),
+            ],
+            removed_age_cards: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            selected_guilds: Vec::new(),
+            unused_guilds: Vec::new(),
+        }
+    }
+
+    fn age_one_position() -> GameState {
+        let mut g = GameState::from_setup(sample_setup(), VecDeque::new());
+        while g.phase != Phase::PlayAge {
+            let legal = codec::legal_action_indices(&g);
+            g.apply_action(&codec::decode_action(&g, legal[0]));
+        }
+        g
+    }
+
+    fn limits(max_nodes: u64, secs: f64) -> Limits {
+        Limits {
+            max_nodes,
+            deadline: Instant::now() + Duration::from_secs_f64(secs),
+        }
+    }
+
+    #[test]
+    fn an_age_one_position_is_refused_rather_than_guessed() {
+        // Age I and II always reach the next Age's deal, which is sample-only.
+        // Returning any value here would be inventing one.
+        let state = age_one_position();
+        let stop = solve_root(&state, &limits(u64::MAX, 30.0), PolicyMode::Exact);
+        assert_eq!(stop.err(), Some(SolveStop::Unsolvable));
+    }
+
+    #[test]
+    fn the_node_budget_is_enforced() {
+        let state = age_one_position();
+        let stop = solve_root(&state, &limits(1, 30.0), PolicyMode::Exact);
+        assert_eq!(stop.err(), Some(SolveStop::Budget));
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_before_any_work() {
+        //! The clock is sampled every N nodes for throughput, which once made
+        //! the deadline unenforceable for anything finishing inside one window.
+        let state = age_one_position();
+        let expired = Limits {
+            max_nodes: u64::MAX,
+            deadline: Instant::now() - Duration::from_secs(1),
+        };
+        let stop = solve_root(&state, &expired, PolicyMode::Exact);
+        assert_eq!(stop.err(), Some(SolveStop::Budget));
+    }
 }

@@ -849,7 +849,12 @@ impl RustGame {
             deadline: std::time::Instant::now()
                 + std::time::Duration::from_secs_f64(max_secs.max(0.0)),
         };
-        let solved = match solver::solve_root(&self.state, &limits, mode) {
+        // The solve is pure CPU and can run for seconds, so it must not hold
+        // the GIL: doing so freezes every other Python thread, which means a
+        // threaded advisor host stops answering and a thread-based solver pool
+        // runs one position at a time.
+        let state = self.state.clone();
+        let solved = match py.detach(move || solver::solve_root(&state, &limits, mode)) {
             Ok(solved) => solved,
             Err(_) => return Ok(None),
         };

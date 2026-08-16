@@ -231,15 +231,34 @@ pub fn enumerate_chains(
     g: &GameState,
     specs: &[ChanceSpec],
 ) -> Vec<(Vec<Vec<usize>>, f64, Vec<Vec<i32>>)> {
-    let pool = unseen_pool(g);
-    let mut used = vec![false; crate::data::NUM_CARDS];
-    expand(&pool, specs, 0, &mut used)
+    enumerate_chains_unkeyed(g, specs)
         .into_iter()
         .map(|(outcomes, p)| {
             let key = outcome_key(&outcomes);
             (outcomes, p, key)
         })
         .collect()
+}
+
+/// The same chains without the observable key.
+///
+/// The key exists for the searcher, which coalesces chance children that look
+/// identical to the player. The solver expands every outcome separately and
+/// throws the key away, so it asks for chains without one.
+///
+/// Do not expect this to be faster. It was written on the theory that the key
+/// allocation mattered on chance-heavy endgames, and measurement said no:
+/// 1,133k vs 1,100k nodes/s on the corpus and 619k vs 614k on deep positions,
+/// i.e. nothing outside noise. The cost of a chance edge is the state clone and
+/// re-apply per outcome, not the small vectors describing it -- which is also
+/// why a streaming/visitor enumeration was not pursued.
+pub fn enumerate_chains_unkeyed(
+    g: &GameState,
+    specs: &[ChanceSpec],
+) -> Vec<(Vec<Vec<usize>>, f64)> {
+    let pool = unseen_pool(g);
+    let mut used = vec![false; crate::data::NUM_CARDS];
+    expand(&pool, specs, 0, &mut used)
 }
 
 fn expand(

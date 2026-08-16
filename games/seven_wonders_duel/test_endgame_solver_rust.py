@@ -21,6 +21,31 @@ from . import endgame_corpus as corpus
 seven_wonders_rust = pytest.importorskip("seven_wonders_rust")
 
 
+def _deep_position(*, cards: int):
+    """An Age III position with roughly `cards` left -- too deep to solve fast."""
+
+    from .encoder_audit import DEFAULT_PAIRINGS, make_bot
+    from .engine import apply_action
+    from .game import Phase, new_game
+
+    for index in range(40):
+        left, right = DEFAULT_PAIRINGS[index % len(DEFAULT_PAIRINGS)]
+        game = new_game(index)
+        bots = (make_bot(left, index), make_bot(right, index + 10_000))
+        while game.phase is not Phase.COMPLETE:
+            if game.phase is Phase.PLAY_AGE and game.age == 3:
+                present = sum(1 for c in game.tableau.cards.values() if c.present)
+                if present == cards:
+                    return game.clone()
+            actor = (
+                game.pending_choice.player
+                if game.pending_choice is not None
+                else game.active_player
+            )
+            apply_action(game, bots[actor].select_action(game))
+    pytest.skip(f"no Age III position with {cards} cards found")
+
+
 @pytest.fixture(scope="module")
 def records():
     rows = corpus.load()
@@ -56,6 +81,69 @@ def test_both_regimes_are_covered(records):
     report = corpus.check(corpus.rust_solver())
     assert report.regimes.get("exact", 0) > 0
     assert report.regimes.get("exact_expectimax", 0) > 0
+
+
+def test_a_budget_of_zero_returns_no_answer(records):
+    """The budget is a contract, not a hint.
+
+    The clock is sampled every N nodes for throughput, which quietly made the
+    deadline unenforceable for any position that finished inside one sampling
+    window: `max_secs=0` still returned complete answers. A late answer is not
+    a free bonus -- the caller asked for a bound because something downstream
+    depends on it.
+    """
+
+    solve = corpus.rust_solver(max_secs=0.0)
+    answered = 0
+    for record in records:
+        game = corpus.regenerate(record)
+        if game is not None and solve(game) is not None:
+            answered += 1
+    assert answered == 0
+
+
+def test_the_solve_releases_the_gil(records):
+    """A multi-second solve must not stop the rest of the process.
+
+    Holding the GIL through the solve freezes a threaded advisor host and
+    serialises any thread-based solver pool -- the pool would run one position
+    at a time while looking parallel.
+    """
+
+    import threading
+    import time
+
+    # Deliberately NOT a corpus position: those now solve in microseconds, so
+    # the thread would see no contention either way and the test would pass
+    # while proving nothing. This position is past the reach table's limit, so
+    # the solver is guaranteed to spend the whole budget and then give up.
+    game = _deep_position(cards=13)
+    from .rust_bridge import rust_game_from_state
+
+    rust_game = rust_game_from_state(game)
+    ticks = 0
+    stop = threading.Event()
+
+    def count_ticks():
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            time.sleep(0.001)
+
+    ticker = threading.Thread(target=count_ticks, daemon=True)
+    ticker.start()
+    # A budget long enough that a GIL-holding solve would starve the ticker.
+    started = time.perf_counter()
+    rust_game.solve_endgame(2_000_000_000, 1.0, "exact")
+    elapsed = time.perf_counter() - started
+    stop.set()
+    ticker.join(timeout=2.0)
+
+    # If the solve returned early the test proves nothing, so say so instead.
+    assert elapsed > 0.5, f"solve finished in {elapsed:.3f}s; not a real test"
+
+    # Without the release this sits at ~0; with it the ticker runs throughout.
+    assert ticks > 50, f"other Python threads only advanced {ticks} times"
 
 
 def test_value_only_mode_agrees_on_the_root(records):

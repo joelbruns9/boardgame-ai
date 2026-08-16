@@ -270,6 +270,25 @@ def check(
                 f"{where}: best-action set {sorted(best_got)} != "
                 f"{sorted(best_expected)}"
             )
+
+        # `root_value` and `best_index` are separate fields on the result, and
+        # they are the ones callers actually read -- a value target and a policy
+        # target. Deriving the verdict from `per_action_value` alone would pass a
+        # solver whose per-action table was right while those two were stale.
+        root_value = float(answer["root_value"])
+        if abs(root_value - float(record["root_value"])) > tolerance:
+            report.problems.append(
+                f"{where}: root_value {root_value:.9g} != "
+                f"{float(record['root_value']):.9g}"
+            )
+        best_index = int(answer["best_index"])
+        # Not the reference's index: ties are common in endgames and which one a
+        # solver names is arbitrary. That it names a proven-optimal one is not.
+        if best_index not in best_expected:
+            report.problems.append(
+                f"{where}: best_index {best_index} is not optimal "
+                f"(optimal: {sorted(best_expected)})"
+            )
     return report
 
 
