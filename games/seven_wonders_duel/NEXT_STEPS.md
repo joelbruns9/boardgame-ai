@@ -226,6 +226,32 @@ and SMT — not the workload. Pool throughput still improved 1.75×, entirely fr
 the per-core win. For step 5: `solver_cpus` beyond ~8 buys little here, and no
 further memory-traffic work is indicated.
 
+**The exact label is blunt in 7WD, and sharpening it exactly is unaffordable.**
+Kingdomino's value is a score *margin*, so ties are rare and its winning
+`argmax_ties` label (one-hot over proven ties, +231−162=7 vs soft_clamp) is
+genuinely sharp. 7WD's value is win/draw/loss, so an endgame label marks most
+moves as equally best: measured over the corpus, **88% of legal moves are
+"best" in chance-free positions and 77% with chance** (values are win/draw/loss
+only in 100% and 72% of positions respectively). Chance is not the problem —
+it is the one thing that *grades* the values.
+
+So do not expect KD's label-shape result to transfer, and switch the value and
+policy targets on **independently**: the value target is unambiguously better
+than a bootstrapped estimate, while a near-uniform policy label could be worse
+than the Gumbel visit counts it would replace.
+
+Sharpening by ranking wins (margin for a civilian win, fewer plies for a
+supremacy win, and the mirror for losses) is sound in principle and **measured
+as unaffordable as an exact objective**: a lexicographic comparison cannot cut
+on equality, and losing that costs 6.9–7.9× the nodes on the corpus and
+11–19× at 8–9 cards (5.4 s → 172 s). Ties are common here, so equality cutoffs
+are most of the pruning. If a sharper label is wanted, propagate the refinement
+alongside the value *without* using it for pruning — deterministic and nearly
+free, but the refinement is then "the first line that achieved this value",
+not the best such line. Note also that any ordering between a supremacy win and
+a civilian win is a preference we impose, not game truth: unlike Kingdomino,
+7WD's objective really is just win/loss.
+
 **What remains** is the self-play half: a trigger rule (age III and ≤N cards,
 with N set from the reach table above), a per-position budget and its schedule,
 the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for
