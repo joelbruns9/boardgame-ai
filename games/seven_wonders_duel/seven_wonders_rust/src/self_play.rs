@@ -208,6 +208,15 @@ pub struct MoveRecord {
     pub full_search: bool,
     pub search_seed: u64,
     pub is_bot: bool,
+    /// Exact endgame value of the PRE-move position, actor-relative, when the
+    /// solver reached one. Distinct from `root_value`, which stays the search's
+    /// own estimate: the two are the sampled and the proven answer to the same
+    /// question, and comparing them is how the solver's contribution gets
+    /// measured. `None` on every move the solver did not solve.
+    pub solver_value: Option<f64>,
+    pub solver_regime: Option<&'static str>,
+    pub solver_nodes: u64,
+    pub solver_masked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -407,6 +416,185 @@ pub(crate) fn actual_chance_outcomes(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Exact endgame solver overlay (SOLVER_SELF_PLAY_PLAN.md)
+// ---------------------------------------------------------------------------
+
+/// Node budget for one endgame solve. **Zero disables the solver entirely**,
+/// which is the default: with it unset every state, digest and target this
+/// module produces is byte-identical to a build without this feature, so the
+/// existing gates keep gating the thing they were written for.
+///
+/// The node budget, not the deadline, is the knob to set. A solve that stops on
+/// wall-clock time makes self-play irreproducible from `(seed, net)`: the same
+/// position solves on an idle machine and times out on a loaded one, the mask
+/// appears or does not, and a different move is sampled. Nodes are deterministic.
+/// `SOLVER_MAX_SECS` exists as a safety net against a pathological position
+/// holding a scheduler slot, and should be set generously enough not to bind.
+static SOLVER_MAX_NODES: AtomicU64 = AtomicU64::new(0);
+static SOLVER_MAX_SECS_BITS: AtomicU64 = AtomicU64::new(0);
+/// Cards still on the board at or below which a solve is attempted. Measured on
+/// real (human) endgames, not bot ones, which are 3x cheaper and far narrower:
+/// <=6 cards is milliseconds, 8 is 0.05-0.31s, 10 is 3.4-4.1s, 12 is ~60s or
+/// unsolved. Age I and II are never solvable at any budget -- the next age's
+/// deal is a sample-only chance edge -- so the trigger also requires Age III.
+static SOLVER_MAX_CARDS: AtomicUsize = AtomicUsize::new(0);
+/// Whether a successful solve also masks the policy target. Independent of the
+/// value target on purpose: the two have different risk profiles and want to be
+/// A/B-able separately.
+static SOLVER_MASK_POLICY: AtomicBool = AtomicBool::new(false);
+
+/// Configure the endgame solver overlay, process-wide.
+///
+/// Global for the same reason `set_cheap_top_k` and the temperature schedule
+/// are: only self-play generation reads it, and threading four more fields
+/// through `SelfPlayConfig` would touch ten pyo3 signatures to express something
+/// no two concurrent callers vary.
+pub fn set_endgame_solver(max_nodes: u64, max_secs: f64, max_cards: usize, mask_policy: bool) {
+    SOLVER_MAX_NODES.store(max_nodes, Ordering::Relaxed);
+    SOLVER_MAX_SECS_BITS.store(max_secs.to_bits(), Ordering::Relaxed);
+    SOLVER_MAX_CARDS.store(max_cards, Ordering::Relaxed);
+    SOLVER_MASK_POLICY.store(mask_policy, Ordering::Relaxed);
+}
+
+/// `(max_nodes, max_secs, max_cards, mask_policy)` in force, for run manifests.
+pub fn endgame_solver() -> (u64, f64, usize, bool) {
+    (
+        SOLVER_MAX_NODES.load(Ordering::Relaxed),
+        f64::from_bits(SOLVER_MAX_SECS_BITS.load(Ordering::Relaxed)),
+        SOLVER_MAX_CARDS.load(Ordering::Relaxed),
+        SOLVER_MASK_POLICY.load(Ordering::Relaxed),
+    )
+}
+
+/// What a successful solve contributes to the move about to be recorded.
+#[derive(Clone, Debug)]
+pub struct SolverOverlay {
+    /// Exact value of the position, ACTOR-relative, in [-1, 1].
+    pub value: f64,
+    /// `"exact"` (no chance edge was crossed: the value is exactly -1, 0 or +1)
+    /// or `"exact_expectimax"` (a probability in between). The distinction is
+    /// the whole reason the value target is carried as a distribution rather
+    /// than a class -- see `dataset.collate`.
+    pub regime: &'static str,
+    pub nodes: u64,
+    /// Whether the policy target in this record was masked and renormalised.
+    /// Per-move rather than per-run because it is exactly the set of rows whose
+    /// `policy_target` follows the new definition; a global `TARGET_VERSION`
+    /// bump would say less and invalidate every existing buffer to say it.
+    pub masked: bool,
+}
+
+fn cards_left(state: &GameState) -> usize {
+    state.tableau.slots.iter().filter(|card| card.present).count()
+}
+
+/// Cheap pre-filter, evaluated before any search work is committed to a solve.
+fn solver_eligible(state: &GameState, max_cards: usize) -> bool {
+    state.phase == Phase::PlayAge && state.tableau.age == 3 && cards_left(state) <= max_cards
+}
+
+/// Zero the losing moves and renormalise the survivors, in place.
+///
+/// Split out from the solve so the arithmetic is testable without one. The
+/// fallback matters: `keep` always holds at least one move (the maximum attains
+/// its own tolerance), but a search that put all of its mass on provably-losing
+/// moves would leave nothing to renormalise, and dividing by that zero would
+/// emit a NaN policy label.
+fn mask_and_renormalise(policy: &mut [f64], keep: &[bool]) {
+    debug_assert_eq!(policy.len(), keep.len());
+    let total: f64 = policy
+        .iter()
+        .zip(keep)
+        .filter(|(_, &alive)| alive)
+        .map(|(&p, _)| p)
+        .sum();
+    if total > 0.0 {
+        for (p, &alive) in policy.iter_mut().zip(keep) {
+            *p = if alive { *p / total } else { 0.0 };
+        }
+        return;
+    }
+    let survivors = keep.iter().filter(|&&alive| alive).count().max(1) as f64;
+    for (p, &alive) in policy.iter_mut().zip(keep) {
+        *p = if alive { 1.0 / survivors } else { 0.0 };
+    }
+}
+
+/// Solve `state` if it is an endgame the budget can reach, and mask
+/// `policy_target` with the answer.
+///
+/// The policy target masked here is the SEARCH's, not the net's raw prior, and
+/// that is the load-bearing choice. 77-88% of legal moves at these positions are
+/// proven equally optimal, so the solver says almost nothing about which
+/// survivor is better; the search is the only thing in the system that ranks
+/// them. Masking a prior would hand the net back a mask over its own opinion.
+///
+/// Returns `None` when the solver is off, the position is out of range, or the
+/// solve did not finish -- all three are ordinary, and a caller must treat the
+/// absence as "no answer", never as a value.
+pub fn endgame_overlay(
+    state: &GameState,
+    legal: &[usize],
+    policy_target: &mut [f64],
+) -> Option<SolverOverlay> {
+    let (max_nodes, max_secs, max_cards, mask_policy) = endgame_solver();
+    if max_nodes == 0 || !solver_eligible(state, max_cards) {
+        return None;
+    }
+    let limits = crate::solver::Limits {
+        max_nodes,
+        deadline: Instant::now() + std::time::Duration::from_secs_f64(max_secs.max(0.0)),
+    };
+    // `Exact` prices every root action on a full window, which is what the mask
+    // needs: `ValueOnly` narrows the window as better actions are found, so its
+    // non-best entries are bounds and the ties -- the entire signal here -- are
+    // hidden. It costs 1.17x the nodes on the corpus.
+    let solved = crate::solver::solve_root(
+        state,
+        &limits,
+        crate::solver::PolicyMode::Exact,
+        crate::solver::ChancePruning::Star1,
+    )
+    .ok()?;
+
+    let mut masked = false;
+    if mask_policy && policy_target.len() == legal.len() {
+        // `per_action` comes back in the solver's own move ordering, so align it
+        // to `legal` before comparing anything positionally.
+        let mut values = vec![f64::NAN; legal.len()];
+        for &(index, value) in &solved.per_action {
+            if let Some(position) = legal.iter().position(|&action| action == index) {
+                values[position] = value;
+            }
+        }
+        // Every legal action is priced in `Exact` mode. If that is somehow not
+        // true the sets disagree, and masking against a partial pricing could
+        // zero a move that was never evaluated -- so decline the mask and keep
+        // the value, rather than emit a label built on a guess.
+        if values.iter().all(|value| value.is_finite()) {
+            let best = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let keep: Vec<bool> = values
+                .iter()
+                .map(|&value| value >= best - crate::solver::TIE_EPSILON)
+                .collect();
+            mask_and_renormalise(policy_target, &keep);
+            masked = true;
+        }
+    }
+
+    Some(SolverOverlay {
+        value: solved.root_value,
+        regime: if solved.saw_chance {
+            "exact_expectimax"
+        } else {
+            "exact"
+        },
+        nodes: solved.nodes,
+        masked,
+    })
+}
+
 /// Defaults, matching `phase_d.temperature_for_move`. Every run before
 /// 2026-08-05 hard-coded these, so leaving them unset reproduces it exactly.
 pub const DEFAULT_TEMPERATURE_FLOOR: f64 = 0.25;
@@ -564,10 +752,20 @@ pub fn run<E: Eval>(
             .map_or(cfg.leaf_batch, |batches| batches[actor]);
         let (result, _, _) =
             tree_resumable::search_closed_batched(&state, &eval, &search_cfg, leaf_batch)?;
-        let action = if cfg.deterministic_actions {
-            best_policy_action(&legal, &result.policy_target)
+        // The solve runs on the PRE-move state, and before the action is chosen:
+        // the mask is what makes a provably-losing move unplayable, not merely
+        // unlabelled. Cheap moves are skipped because they emit no example at
+        // all (`dataset.is_fast_search_move`), so a solve there would buy nothing.
+        let mut policy_target = result.policy_target;
+        let overlay = if full {
+            endgame_overlay(&state, &legal, &mut policy_target)
         } else {
-            sample_policy(&legal, &result.policy_target, temperature(i), &mut rng)
+            None
+        };
+        let action = if cfg.deterministic_actions {
+            best_policy_action(&legal, &policy_target)
+        } else {
+            sample_policy(&legal, &policy_target, temperature(i), &mut rng)
         };
         trajectory.update(&state);
         chance_log.extend(actual_chance_outcomes(&state, action, i)?);
@@ -577,8 +775,11 @@ pub fn run<E: Eval>(
             actor,
             action,
             legal,
+            // Visits stay the raw search evidence, unmasked: reanalyze and the
+            // target diagnostics read them to reconstruct what the search
+            // actually did, which the masked distribution no longer shows.
             visits: result.visits,
-            policy_target: result.policy_target,
+            policy_target,
             prior: result.prior,
             root_value: result.root_value,
             sims: result.sims,
@@ -587,6 +788,10 @@ pub fn run<E: Eval>(
             full_search: full,
             search_seed,
             is_bot: false,
+            solver_value: overlay.as_ref().map(|o| o.value),
+            solver_regime: overlay.as_ref().map(|o| o.regime),
+            solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
+            solver_masked: overlay.is_some_and(|o| o.masked),
         });
     }
 
@@ -1610,15 +1815,21 @@ impl GameSlot {
 
     fn finish_move(&mut self, meta: SearchMeta, result: crate::tree::SearchResult) -> PyResult<()> {
         let i = self.moves.len();
-        let action = if self.cfg.deterministic_actions {
-            best_policy_action(&meta.legal, &result.policy_target)
+        // See `run`: pre-move state, before the action is chosen, full searches
+        // only. The solve is synchronous, so it holds this scheduler slot (and
+        // the shard's thread) for its duration -- which is why the budget is a
+        // node count and why the card trigger is set from the measured table
+        // rather than optimistically.
+        let mut policy_target = result.policy_target;
+        let overlay = if meta.full {
+            endgame_overlay(&self.state, &meta.legal, &mut policy_target)
         } else {
-            sample_policy(
-                &meta.legal,
-                &result.policy_target,
-                temperature(i),
-                &mut self.rng,
-            )
+            None
+        };
+        let action = if self.cfg.deterministic_actions {
+            best_policy_action(&meta.legal, &policy_target)
+        } else {
+            sample_policy(&meta.legal, &policy_target, temperature(i), &mut self.rng)
         };
         let digest_started = Instant::now();
         self.trajectory.update(&self.state);
@@ -1635,7 +1846,7 @@ impl GameSlot {
             action,
             legal: meta.legal,
             visits: result.visits,
-            policy_target: result.policy_target,
+            policy_target,
             prior: result.prior,
             root_value: result.root_value,
             sims: result.sims,
@@ -1652,6 +1863,10 @@ impl GameSlot {
             full_search: meta.full,
             search_seed: meta.search_seed,
             is_bot: false,
+            solver_value: overlay.as_ref().map(|o| o.value),
+            solver_regime: overlay.as_ref().map(|o| o.regime),
+            solver_nodes: overlay.as_ref().map_or(0, |o| o.nodes),
+            solver_masked: overlay.is_some_and(|o| o.masked),
         });
         self.stage = if self.state.phase == Phase::Complete {
             SlotStage::Complete
@@ -1696,6 +1911,13 @@ impl GameSlot {
             full_search: false,
             search_seed: 0,
             is_bot: true,
+            // A curriculum bot's move carries no solve: its policy label is
+            // "imitate the bot", which a mask would contradict rather than
+            // sharpen, and there is no search whose ranking survives masking.
+            solver_value: None,
+            solver_regime: None,
+            solver_nodes: 0,
+            solver_masked: false,
         });
         self.stage = if self.state.phase == Phase::Complete {
             SlotStage::Complete
@@ -2544,5 +2766,43 @@ pub fn component_name(kind: ChanceKind, id: usize) -> &'static str {
         ChanceKind::CardReveal | ChanceKind::AgeDeal => data::card(id).name,
         ChanceKind::GreatLibraryDraw => data::progress(id).name,
         ChanceKind::WonderGroupReveal => data::wonder(id).name,
+    }
+}
+
+#[cfg(test)]
+mod solver_overlay_tests {
+    //! The mask's arithmetic, separated from the solve that produces it.
+    //! Whether the solver is *right* is `endgame_corpus.py`'s job; this is the
+    //! part that turns a right answer into a training label.
+
+    use super::mask_and_renormalise;
+
+    #[test]
+    fn losing_moves_lose_their_mass_and_the_survivors_keep_their_ranking() {
+        let mut policy = vec![0.5, 0.3, 0.2];
+        mask_and_renormalise(&mut policy, &[false, true, true]);
+        assert_eq!(policy[0], 0.0);
+        // 0.3 : 0.2 before, 0.6 : 0.4 after -- the search's discrimination among
+        // proven-equal moves is exactly what the mask must not flatten.
+        assert!((policy[1] - 0.6).abs() < 1e-12);
+        assert!((policy[2] - 0.4).abs() < 1e-12);
+        assert!((policy.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_all_optimal_position_is_left_alone() {
+        let mut policy = vec![0.25, 0.25, 0.5];
+        mask_and_renormalise(&mut policy, &[true, true, true]);
+        assert_eq!(policy, vec![0.25, 0.25, 0.5]);
+    }
+
+    #[test]
+    fn a_search_that_backed_only_losing_moves_falls_back_to_uniform() {
+        // Not defensive: dividing the survivors' zero mass by itself would put
+        // NaN into a policy label, which trains as a silent poison rather than
+        // an error.
+        let mut policy = vec![1.0, 0.0, 0.0];
+        mask_and_renormalise(&mut policy, &[false, true, true]);
+        assert_eq!(policy, vec![0.0, 0.5, 0.5]);
     }
 }

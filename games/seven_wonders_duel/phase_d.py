@@ -831,6 +831,32 @@ def _configure_cheap_top_k(width: int) -> None:
     swr.set_cheap_top_k(int(width))
 
 
+def configure_endgame_solver(
+    max_nodes: int, max_secs: float, max_cards: int, mask_policy: bool
+) -> None:
+    """Apply the exact endgame solver overlay to the Rust generator.
+
+    ``max_nodes = 0`` disables it, which is the default and reproduces every run
+    before this feature byte for byte.  A no-op for the Python backend, which has
+    no solver hook: runs that want it must use --generation-backend rust.
+
+    Bound the solve by NODES, not seconds.  A deadline makes generation
+    irreproducible from ``(seed, net)`` -- the same position solves on an idle
+    machine and times out on a loaded one, so the mask appears or does not and a
+    different move is sampled.  ``--endgame-solver-max-secs`` is a safety net
+    against one pathological position holding a scheduler slot, and should be
+    set generously enough never to bind.
+    """
+
+    if max_nodes < 0 or max_cards < 0:
+        raise ValueError("--endgame-solver-max-nodes/-max-cards must be non-negative")
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return
+    swr.set_endgame_solver(int(max_nodes), float(max_secs), int(max_cards), bool(mask_policy))
+
+
 def set_temperature_schedule(floor: float, anneal_moves: float) -> None:
     """Set the schedule for both generators, which must agree.
 
@@ -4854,6 +4880,48 @@ def build_parser() -> argparse.ArgumentParser:
         "Measure the effect with gumbel_target_kl.py before choosing a value.",
     )
     parser.add_argument(
+        "--endgame-solver-max-nodes",
+        type=int,
+        default=0,
+        help="node budget for one exact endgame solve during self-play; 0 (the "
+        "default) disables the solver entirely and reproduces earlier runs "
+        "exactly. The solver runs ~1.7M nodes/s, so 5,000,000 is roughly the 3s "
+        "that reaches 8-10 cards on real (human-shaped) endgames. Only "
+        "full-search moves are solved -- cheap ones emit no training example at "
+        "all -- and Age I/II are never solvable at any budget.",
+    )
+    parser.add_argument(
+        "--endgame-solver-max-secs",
+        type=float,
+        default=60.0,
+        help="wall-clock safety net per solve. Deliberately NOT the budget to "
+        "tune: a solve that stops on time makes generation irreproducible from "
+        "(seed, net), because the same position can solve on an idle machine and "
+        "time out on a loaded one, changing which move gets played. Set this "
+        "high enough that it never binds and bound the solve by nodes.",
+    )
+    parser.add_argument(
+        "--endgame-solver-max-cards",
+        type=int,
+        default=8,
+        help="attempt a solve only in Age III with at most this many cards left "
+        "on the board. Measured on real endgames: <=6 is milliseconds, 8 is "
+        "0.05-0.31s, 10 is 3.4-4.1s, 12 is ~60s or unsolved. Bot-played endgames "
+        "are ~3x cheaper and far narrower, so do not set this from them.",
+    )
+    parser.add_argument(
+        "--endgame-solver-mask-policy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="zero the provably-losing moves in a solved position's policy "
+        "target and renormalise the search's own distribution over the "
+        "survivors. --no-endgame-solver-mask-policy keeps the exact VALUE target "
+        "while leaving the policy label untouched, which is the way to A/B the "
+        "two halves separately: 77-88%% of legal moves at these positions are "
+        "proven equally optimal, so the mask removes losing mass but says "
+        "nothing about which survivor is better.",
+    )
+    parser.add_argument(
         "--temperature-floor",
         type=float,
         default=0.25,
@@ -5132,6 +5200,12 @@ def main(argv=None) -> int:
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
+    configure_endgame_solver(
+        args.endgame_solver_max_nodes,
+        args.endgame_solver_max_secs,
+        args.endgame_solver_max_cards,
+        args.endgame_solver_mask_policy,
+    )
     config = PhaseDConfig(
         run_dir=args.run_dir,
         seed=args.seed,

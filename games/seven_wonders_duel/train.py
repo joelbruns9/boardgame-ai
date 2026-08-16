@@ -54,6 +54,7 @@ def compute_losses(
     aux_weight: float = AUX_WEIGHT_DEFAULT,
     value_weight: float = VALUE_WEIGHT_DEFAULT,
     value_bootstrap: float = 0.0,
+    solver_value_target: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -66,6 +67,8 @@ def compute_losses(
     policy_loss = (
         per_row[has_policy].mean() if has_policy.any() else per_row.new_zeros(())
     )
+    solver_rows = batch.get("value_solver_valid") if solver_value_target else None
+    has_solver = solver_rows is not None and bool(solver_rows.any())
     if value_bootstrap > 0.0 and "value_soft" in batch:
         # Blend the realised outcome with the search's own estimate. The outcome
         # is one sample of a probability; fitting it hard produces a head that is
@@ -73,14 +76,27 @@ def compute_losses(
         # while accuracy moved 4 points -- pure overconfidence). Rows without a
         # search keep the hard label, so nothing is invented for them.
         hard = F.one_hot(batch["value_class"], num_classes=3).float()
-        blended = torch.where(
+        target = torch.where(
             batch["value_soft_valid"].unsqueeze(1),
             (1.0 - value_bootstrap) * hard + value_bootstrap * batch["value_soft"],
             hard,
         )
-        value_loss = F.cross_entropy(outputs["value"], blended)
+    elif has_solver:
+        target = F.one_hot(batch["value_class"], num_classes=3).float()
     else:
+        target = None
+    if has_solver:
+        # A proven value REPLACES the outcome outright rather than blending with
+        # it -- at full weight, and regardless of `value_bootstrap`. The realised
+        # result of an endgame the solver has settled is a sample of this number
+        # produced by two players who may both then err; there is nothing in it
+        # the exact value does not already contain, and averaging the two can
+        # only move the target away from the truth.
+        target = torch.where(solver_rows.unsqueeze(1), batch["value_solver"], target)
+    if target is None:
         value_loss = F.cross_entropy(outputs["value"], batch["value_class"])
+    else:
+        value_loss = F.cross_entropy(outputs["value"], target)
     joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
     margin_valid = batch["margin_valid"]
     if margin_valid.any():
@@ -155,7 +171,20 @@ def evaluate(
         batch = collate(examples[start : start + batch_size], device)
         with _evaluation_autocast(device, precision):
             outputs = model(batch)
-            _, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
+            # `solver_value_target=False` for the same reason validation drops
+            # `value_bootstrap`: a held-out number has to mean the same thing
+            # across runs, and against the realised outcome. Scoring solver rows
+            # against their own exact value would make the metric easier exactly
+            # where the training target was easier, and a run with the solver on
+            # would post a better validation loss without playing better.
+            _, parts = compute_losses(
+                outputs,
+                batch,
+                aux_weight,
+                value_weight,
+                value_bootstrap,
+                solver_value_target=False,
+            )
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
             sums[key] = sums.get(key, 0.0) + value * rows

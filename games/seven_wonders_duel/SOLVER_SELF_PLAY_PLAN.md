@@ -200,22 +200,74 @@ against the budget, with the solve attempted and its failure treated as normal.
 ## 10. Gates that must stay green
 
 ```
-python -m pytest games/seven_wonders_duel/test_endgame_solver_rust.py   # 15 tests
-cd games/seven_wonders_duel/seven_wonders_rust && cargo test --release  # 23 tests
-python -m games.seven_wonders_duel.endgame_corpus                       # corpus self-check
+python -m pytest games/seven_wonders_duel/test_endgame_solver_rust.py        # 15 tests
+python -m pytest games/seven_wonders_duel/test_endgame_solver_self_play.py   #  9 tests
+cd games/seven_wonders_duel/seven_wonders_rust && cargo test --release        # 26 tests
+python -m games.seven_wonders_duel.endgame_corpus                            # corpus self-check
 ```
 
 Any change to the solver must leave all 86 corpus positions matching the Python
 reference exactly — regime, every action's value, and the proven-optimal set.
 Pruning and ordering may change node counts and nothing else.
 
-## 11. Open decisions for the user
+## 11. Decisions (settled 2026-08-16) and what shipped
 
-1. Mask the **search policy** (better, costs a search *and* a solve) or the
-   **net prior** (one forward, Kingdomino's shape)?
-2. Value target for `exact_expectimax` rows: soft W/D/L target, or leave those
-   rows on the realised game result?
-3. Should `solve_endgame` also return the victory type, so joint7 can be labelled
-   from the proven line rather than the realised one?
-4. Ship the value target first and the policy mask second (recommended — they
-   have opposite risk profiles), or both together?
+1. **Mask the search policy**, not the net prior. The mask's value is entirely
+   in what it *removes*; with 77–88% of moves proven equal it says almost
+   nothing about which survivor is better, and the search is the only thing in
+   the system that ranks them. Masking a prior hands the net back a mask over
+   its own opinion. Kingdomino can skip its search because *its* value label is
+   a score margin, so ties are rare and the solver alone determines the label —
+   that reasoning does not transfer. Cost is contained instead by solving only
+   on **full-search moves**: cheap ones emit no example at all
+   (`dataset.is_fast_search_move`), so a solve there buys nothing.
+2. **Soft W/D/L for `exact_expectimax`, one-hot for `exact`**, both through a
+   new `value_solver` channel that is separate from `value_soft`. The two mean
+   different things: `value_soft` is the search's *opinion*, blended with the
+   outcome in whatever proportion `--value-bootstrap` says; a proven value is
+   the *answer*, so it **replaces** the outcome at full weight and ignores
+   `value_bootstrap` entirely. Nothing is rounded: an expectimax 0.0 is balanced
+   win/loss mass and stays `(0.5, 0, 0.5)`, while a chance-free 0.0 is a proven
+   draw and becomes one-hot on it.
+3. **No victory type, for now.** joint7 is an auxiliary head at `aux_weight`
+   0.2; the proven line's victory type is only well-defined in the `exact`
+   regime (under expectimax different outcomes end differently); and returning
+   it means threading a terminal descriptor up through exactly the code the
+   86-position gate covers. Bad ratio. joint7 stays on the realised outcome, and
+   this is cheap to revisit for `exact` rows alone.
+4. **Both, behind independent switches** — `--endgame-solver-max-nodes` turns
+   the value target on, `--no-endgame-solver-mask-policy` leaves the policy
+   alone. The plan's reason for sequencing them (opposite risk profiles) is a
+   reason to be able to *attribute* a result to one of them, which two switches
+   give without two deployments.
+
+### Shipped
+
+| piece | where |
+|---|---|
+| trigger, solve, mask | `self_play::endgame_overlay` (called from `run` and `finish_move`) |
+| config (process-wide, like `set_cheap_top_k`) | `swr.set_endgame_solver(max_nodes, max_secs, max_cards, mask_policy)` |
+| CLI | `phase_d.py --endgame-solver-*` |
+| record fields | `MoveRecord.solver_value / solver_regime / solver_nodes / solver_masked` |
+| value target | `dataset.collate` → `value_solver`, consumed in `train.compute_losses` |
+| gate | `test_endgame_solver_self_play.py` (9 tests) + 3 Rust unit tests |
+
+**Off by default** (`max_nodes = 0`), and an off run is the generator that
+existed before this change — asserted, not assumed.
+
+**Bound the solve by nodes, not seconds.** A deadline makes generation
+irreproducible from `(seed, net)`: the same position solves on an idle machine
+and times out on a loaded one, so the mask appears or does not and a different
+move is played. `--endgame-solver-max-secs` is a safety net against one
+pathological position holding a scheduler slot — the solve is synchronous and
+does hold one — and should be set high enough never to bind.
+
+`TARGET_VERSION` was deliberately **not** bumped. The masked rows carry a new
+definition of `policy_target`, but `solver_masked` marks exactly those rows,
+which is strictly more informative than a global bump — and a bump would
+invalidate every buffer ever written to say less.
+
+Still open: `exact_fallback_positions` (a sidecar of declined roots) and
+`endgame_oversample` from §7 are not implemented; the per-move `solver_nodes`
+and the absence of `solver_value` already identify both populations in the
+buffer, so both are additive.

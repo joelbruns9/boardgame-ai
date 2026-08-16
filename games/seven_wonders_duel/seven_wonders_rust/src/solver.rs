@@ -170,7 +170,12 @@ const VALUE_MAX: f64 = 1.0;
 /// Values closer than this are the same value. Expectimax sums probabilities in
 /// floating point, so an exact zero routinely arrives as -1.4e-17, and a "best"
 /// comparison that cannot tell those apart picks by noise.
-const TIE_EPSILON: f64 = 1e-9;
+///
+/// Public because the self-play policy mask reads the same tie structure from
+/// the outside (`self_play::endgame_overlay`): it must partition `per_action`
+/// into optimal and losing with the identical tolerance the solver used to name
+/// its best move, or the two would disagree about which moves are proven equal.
+pub const TIE_EPSILON: f64 = 1e-9;
 
 impl Ctx {
     fn tick(&mut self) -> Result<(), SolveStop> {

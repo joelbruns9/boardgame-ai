@@ -126,6 +126,10 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
         item.set_item("policy_excluded", row.policy_excluded)?;
         item.set_item("full_search", row.full_search)?;
         item.set_item("search_seed", row.search_seed)?;
+        item.set_item("solver_value", row.solver_value)?;
+        item.set_item("solver_regime", row.solver_regime)?;
+        item.set_item("solver_nodes", row.solver_nodes)?;
+        item.set_item("solver_masked", row.solver_masked)?;
         moves.append(item)?;
     }
     out.set_item("moves", moves)?;
@@ -2668,6 +2672,36 @@ fn temperature_schedule() -> (f64, f64) {
     self_play::temperature_schedule()
 }
 
+#[pyfunction]
+/// Configure the self-play endgame solver overlay (SOLVER_SELF_PLAY_PLAN.md).
+///
+/// `max_nodes = 0` -- the default -- disables it, and a disabled run is
+/// byte-identical to a build without the feature. Prefer bounding the solve by
+/// nodes: a deadline makes self-play irreproducible from `(seed, net)`, because
+/// the same position can solve on an idle machine and time out on a busy one,
+/// changing the mask and therefore the move that gets played.
+#[pyo3(signature = (max_nodes, max_secs = 60.0, max_cards = 8, mask_policy = true))]
+fn set_endgame_solver(
+    max_nodes: u64,
+    max_secs: f64,
+    max_cards: usize,
+    mask_policy: bool,
+) -> PyResult<()> {
+    if !(max_secs.is_finite() && max_secs > 0.0) {
+        return Err(PyValueError::new_err(
+            "endgame solver max_secs must be finite and positive",
+        ));
+    }
+    self_play::set_endgame_solver(max_nodes, max_secs, max_cards, mask_policy);
+    Ok(())
+}
+
+#[pyfunction]
+/// The `(max_nodes, max_secs, max_cards, mask_policy)` in force, for manifests.
+fn endgame_solver() -> (u64, f64, usize, bool) {
+    self_play::endgame_solver()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -2696,6 +2730,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::temperature_schedule;
+
+    #[pymodule_export]
+    use super::set_endgame_solver;
+
+    #[pymodule_export]
+    use super::endgame_solver;
 
     #[pymodule_export]
     use super::RustPuctSearch;

@@ -108,6 +108,17 @@ class Example:
     #: uncertain, late ones decided -- so blending it in makes the target
     #: position-specific and removes that shortcut. See `--value-bootstrap`.
     root_value: float | None = None
+    #: The exact endgame value of this position, actor-relative in [-1, +1],
+    #: when the solver proved one (`SOLVER_SELF_PLAY_PLAN.md`). Unlike
+    #: `root_value` this is not an estimate to blend against the outcome: it is
+    #: the position's true value, and the realised result of the game is at best
+    #: a noisy sample of it, so where it exists it REPLACES the outcome label.
+    solver_value: float | None = None
+    #: True when the solve crossed no chance edge, so `solver_value` is exactly
+    #: -1, 0 or +1 and the W/D/L target is one-hot. False means expectimax: the
+    #: value is a genuine probability and the target stays soft rather than
+    #: being rounded to the nearest class.
+    solver_exact: bool = False
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -268,6 +279,8 @@ def examples_from_record(
                 not move.policy_excluded and actor not in archive_seats,
                 actor,
                 move.root_value,
+                move.solver_value,
+                move.solver_regime == "exact",
             )
         )
 
@@ -308,6 +321,8 @@ def examples_from_record(
         has_policy,
         actor,
         root_value,
+        solver_value,
+        solver_exact,
     ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
@@ -326,6 +341,8 @@ def examples_from_record(
                 has_policy=has_policy,
                 value_class=_actor_value_class(game.winner, actor),
                 root_value=root_value,
+                solver_value=solver_value,
+                solver_exact=solver_exact,
                 joint7_class=_joint7_class(game.winner, game.victory_type, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -456,6 +473,8 @@ def _examples_from_rust_payload(
                 has_policy=not move.policy_excluded and actor not in archive_seats,
                 value_class=_actor_value_class(record.winner, actor),
                 root_value=move.root_value,
+                solver_value=move.solver_value,
+                solver_exact=move.solver_regime == "exact",
                 joint7_class=_joint7_class(record.winner, victory, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -621,6 +640,32 @@ def collate_inputs(
     return tensors
 
 
+def solver_value_distribution(example: Example) -> tuple[float, float, float] | None:
+    """One example's PROVEN (win, draw, loss) target, or None if it has no proof.
+
+    Shared with ``w0_sizing`` because its packed batch is asserted value-identical
+    to ``collate``: two copies of this mapping would drift silently, and the one
+    that drifted would still pass every shape check.
+    """
+
+    if example.solver_value is None:
+        return None
+    value = float(example.solver_value)
+    if example.solver_exact:
+        # Chance-free: the value IS the terminal result, so 0.0 means a drawn
+        # game and the target is one-hot on it.
+        if value > 0.5:
+            return (1.0, 0.0, 0.0)
+        if value < -0.5:
+            return (0.0, 0.0, 1.0)
+        return (0.0, 1.0, 0.0)
+    # Expectimax: the value is an average over outcomes, so 0.0 here means the
+    # win and loss mass balance -- NOT a draw. Rounding it to a class would
+    # invent a certainty the position does not have.
+    probability = min(1.0, max(0.0, (1.0 + value) / 2.0))
+    return (probability, 0.0, 1.0 - probability)
+
+
 def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor]:
     """Pad a list of examples into batched tensors.
 
@@ -645,6 +690,14 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
     # the outcome term remains their only source of supervision.
     value_soft = torch.zeros((size, 3), dtype=torch.float32)
     value_soft_valid = torch.zeros(size, dtype=torch.bool)
+    # The PROVEN value of the position, over the same (win, draw, loss) axis.
+    # Kept separate from `value_soft` because the two mean different things: one
+    # is the search's opinion, to be blended with the outcome in whatever
+    # proportion `--value-bootstrap` says, and this one is the answer, which the
+    # outcome cannot improve on. Draw mass is real here, not assumed away: a
+    # proven draw is a proven draw, and it arrives as an exact 0.0 value.
+    value_solver = torch.zeros((size, 3), dtype=torch.float32)
+    value_solver_valid = torch.zeros(size, dtype=torch.bool)
     joint7 = torch.zeros(size, dtype=torch.long)
     margin = torch.zeros(size)
     margin_valid = torch.zeros(size, dtype=torch.bool)
@@ -673,6 +726,10 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
             value_soft[row, 0] = probability
             value_soft[row, 2] = 1.0 - probability
             value_soft_valid[row] = True
+        proven = solver_value_distribution(example)
+        if proven is not None:
+            value_solver[row] = torch.tensor(proven)
+            value_solver_valid[row] = True
         joint7[row] = example.joint7_class
         margin[row] = example.margin
         margin_valid[row] = example.margin_valid
@@ -691,6 +748,8 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         "value_class": value_class,
         "value_soft": value_soft,
         "value_soft_valid": value_soft_valid,
+        "value_solver": value_solver,
+        "value_solver_valid": value_solver_valid,
         "joint7": joint7,
         "margin": margin,
         "margin_valid": margin_valid,

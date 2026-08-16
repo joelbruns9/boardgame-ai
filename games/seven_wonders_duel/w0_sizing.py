@@ -28,7 +28,13 @@ import torch
 from games.kingdomino.promotion import wilson_lower_bound
 
 from .buffer import read_records
-from .dataset import MAX_FEATURES, NUM_ACTIONS, collate, examples_from_record
+from .dataset import (
+    MAX_FEATURES,
+    NUM_ACTIONS,
+    collate,
+    examples_from_record,
+    solver_value_distribution,
+)
 from .net import default_heads
 from .phase_d import ModelAgentSpec, PhaseDConfig, PhaseDLoop
 from .train import (
@@ -211,6 +217,8 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         # it, so a target added there has to be added here too.
         "value_soft": torch.zeros(rows, 3, dtype=torch.float32),
         "value_soft_valid": torch.zeros(rows, dtype=torch.bool),
+        "value_solver": torch.zeros(rows, 3, dtype=torch.float32),
+        "value_solver_valid": torch.zeros(rows, dtype=torch.bool),
         "joint7": torch.zeros(rows, dtype=torch.int8),
         "margin": torch.zeros(rows, dtype=torch.float32),
         "margin_valid": torch.zeros(rows, dtype=torch.bool),
@@ -242,6 +250,10 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
             storage["value_soft"][row, 0] = probability
             storage["value_soft"][row, 2] = 1.0 - probability
             storage["value_soft_valid"][row] = True
+        proven = solver_value_distribution(example)
+        if proven is not None:
+            storage["value_solver"][row] = torch.tensor(proven)
+            storage["value_solver_valid"][row] = True
         storage["joint7"][row] = example.joint7_class
         storage["margin"][row] = example.margin
         storage["margin_valid"][row] = example.margin_valid

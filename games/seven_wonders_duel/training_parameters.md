@@ -650,6 +650,47 @@ result.
 
 Defaults reproduce every run before 2026-08-05, when these were hard-coded.
 
+### `--endgame-solver-max-nodes`, `--endgame-solver-max-secs`, `--endgame-solver-max-cards`, `--endgame-solver-mask-policy`
+
+**Defaults:** `0` (off), `60.0`, `8`, on. **Values:** non-negative integer,
+positive float, non-negative integer, boolean (`--no-` prefix to disable)
+
+The exact endgame solver, used during self-play. See
+`SOLVER_SELF_PLAY_PLAN.md` for the design and every measurement behind these
+numbers. `--endgame-solver-max-nodes 0` disables it, and a disabled run is
+byte-identical to the generator that existed before the feature.
+
+When a position is reached that the solver can settle -- Age III, at most
+`--endgame-solver-max-cards` cards left on the board, on a full-search move --
+it contributes two things. Its exact value becomes the value target,
+**replacing** the realised game result rather than blending with it (the result
+of a decided endgame is a sample of the exact value, produced by two players
+who may both then err). And with `--endgame-solver-mask-policy`, the
+provably-losing moves are zeroed out of the search's policy target and the
+survivors renormalised; the search's ranking among them is preserved, because
+77-88% of legal moves at these positions are proven equally optimal and the
+solver says nothing about which of them is better. `--no-endgame-solver-mask-policy`
+keeps the value target alone, which is how the two halves are A/B'd separately.
+
+**Bound the solve by nodes, not by seconds.** A solve that stops on wall-clock
+time makes generation irreproducible from `(seed, net)`: the same position
+solves on an idle machine and times out on a loaded one, so the mask appears or
+does not and a different move is played. `--endgame-solver-max-secs` is a safety
+net against one pathological position holding a scheduler slot -- the solve is
+synchronous -- and should be set high enough never to bind.
+
+Sizing: the solver runs ~1.7M nodes/s, so `5000000` is roughly the 3s that
+reaches 8-10 cards on real, human-shaped endgames. Card reach measured on those
+same positions: `<=6` is milliseconds, `8` is 0.05-0.31s, `10` is 3.4-4.1s, `12`
+is ~60s or unsolved. Do **not** size this from bot endgames -- they cost ~3x
+less and offer far fewer legal moves at equal card count. Age I and II are never
+solvable at any budget, since the next age's deal is a sample-only chance edge.
+
+Rows the solver settled are marked in the buffer (`solver_value`,
+`solver_regime`, `solver_nodes`, `solver_masked`), so a mixed buffer stays
+separable and `TARGET_VERSION` is deliberately not bumped. Rust backend only;
+the Python generator has no solver hook.
+
 ### `--leaf-batch`
 
 **Default:** `1`. **Value:** positive integer no larger than the global cap

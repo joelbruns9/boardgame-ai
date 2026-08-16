@@ -83,6 +83,24 @@ class MoveRecord:
     mode: str = "simulator"
     gumbel_topk: tuple[int, ...] | None = None
     policy_excluded: bool = False
+    solver_value: float | None = None
+    """Exact value of the pre-move position, actor-relative, when the endgame
+    solver reached one (``SOLVER_SELF_PLAY_PLAN.md``).  ``root_value`` is left
+    alone: it stays the search's estimate, so the two remain the sampled and the
+    proven answer to the same question."""
+    solver_regime: str | None = None
+    """``"exact"`` -- no chance edge was crossed, so ``solver_value`` is exactly
+    -1, 0 or +1 -- or ``"exact_expectimax"``, a probability in between."""
+    solver_nodes: int = 0
+    solver_masked: bool = False
+    """This row's ``policy_target`` has had its provably-losing moves zeroed and
+    the survivors renormalised.
+
+    Per-move rather than a ``TARGET_VERSION`` bump on purpose.  The bump would
+    invalidate every record ever written in order to say something less precise:
+    the definition of ``policy_target`` changed *for these rows only*, and a
+    buffer mixing masked and unmasked rows is intended, not a defect.  A run
+    that wants only one kind can filter on this flag."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +607,19 @@ def replay(record: GameRecord, on_state=None) -> GameState:
 # --- JSONL serialization ----------------------------------------------------
 
 
+def _solver_fields(move: MoveRecord) -> dict:
+    """The endgame-solver keys for one move, empty when it was never solved."""
+
+    if move.solver_value is None:
+        return {}
+    return {
+        "solver_value": move.solver_value,
+        "solver_regime": move.solver_regime,
+        "solver_nodes": move.solver_nodes,
+        "solver_masked": move.solver_masked,
+    }
+
+
 def to_json_line(record: GameRecord) -> str:
     payload = {
         "schema": record.schema,
@@ -608,7 +639,13 @@ def to_json_line(record: GameRecord) -> str:
             for kind, outcome in record.chance_log
         ],
         "moves": [
-            {
+            # Solver fields are omitted when the solver did not answer, which is
+            # every move of every record written before this feature and every
+            # move of a run with it off.  Emitting them unconditionally would
+            # change the bytes -- and so the source digest -- of records whose
+            # content is identical, invalidating the example cache for a field
+            # that carries no information.
+            _solver_fields(move) | {
                 "i": move.i,
                 "actor": move.actor,
                 "action": move.action,
@@ -685,6 +722,10 @@ def from_json_line(line: str) -> GameRecord:
                 if move["gumbel_topk"] is not None
                 else None,
                 policy_excluded=move["policy_excluded"],
+                solver_value=move.get("solver_value"),
+                solver_regime=move.get("solver_regime"),
+                solver_nodes=move.get("solver_nodes", 0),
+                solver_masked=move.get("solver_masked", False),
             )
             for move in payload["moves"]
         ),

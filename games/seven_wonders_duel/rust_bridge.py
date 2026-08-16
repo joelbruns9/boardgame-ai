@@ -865,6 +865,18 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
                     else None
                 ),
                 policy_excluded=bool(row["policy_excluded"]),
+                solver_value=(
+                    float(row["solver_value"])
+                    if row.get("solver_value") is not None
+                    else None
+                ),
+                solver_regime=(
+                    str(row["solver_regime"])
+                    if row.get("solver_regime") is not None
+                    else None
+                ),
+                solver_nodes=int(row.get("solver_nodes") or 0),
+                solver_masked=bool(row.get("solver_masked") or False),
             )
         )
 

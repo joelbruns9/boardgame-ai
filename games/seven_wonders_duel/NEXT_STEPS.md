@@ -130,7 +130,7 @@ two equivalence tests that replay a recorded corpus, the strength gate, and the
 confirmation that the science fix actually works. Should happen once, after
 step 3, not before.
 
-### 5. Port the exact endgame solver to Rust — SOLVER DONE, self-play next
+### 5. Port the exact endgame solver to Rust — DONE, including self-play
 
 `seven_wonders_rust/src/solver.rs`, reachable from Python as
 `RustGame.solve_endgame(max_nodes, max_secs, policy_mode)`. It agrees with the
@@ -269,13 +269,20 @@ not the best such line. Note also that any ordering between a supremacy win and
 a civilian win is a preference we impose, not game truth: unlike Kingdomino,
 7WD's objective really is just win/loss.
 
-**What remains** is the self-play half, planned in detail in
-`SOLVER_SELF_PLAY_PLAN.md` (written to be picked up cold): a trigger rule (age III and ≤N cards,
-with N set from the reach table above), a per-position budget and its schedule,
-the async solver pool with a `game_cpus`/`solver_cpus` split, a sidecar for
-positions that fall back, and endgame oversampling in training — all of which
-Kingdomino already has in `self_play.py` to copy. Chance nodes are also still
-unpruned (star1/star2 would need its own gate), and the advisor still calls the
+**The self-play half is now built** (2026-08-16), to the design in
+`SOLVER_SELF_PLAY_PLAN.md` — see its §11 for the four decisions and what
+shipped. Age III and ≤N cards triggers a solve on full-search moves only; the
+exact value becomes the value target outright (replacing the realised outcome,
+not blended with it) and the proven-losing moves are zeroed out of the search's
+policy target, whose survivors are renormalised. Off by default
+(`--endgame-solver-max-nodes 0`), and an off run is byte-identical to the
+generator that existed before.
+
+**What remains**: no run has used it yet, so there is no strength number — that
+is the next thing to get. The optional pieces from the plan's §7 are also still
+missing: the async solver pool with a `game_cpus`/`solver_cpus` split (the solve
+is currently synchronous and holds its scheduler slot), a sidecar for declined
+positions, and endgame oversampling in training. The advisor still calls the
 Python solver.
 
 ### 6. Use the captured games as self-play starting points
