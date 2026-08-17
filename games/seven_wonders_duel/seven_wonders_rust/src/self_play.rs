@@ -517,6 +517,15 @@ pub struct SolverOverlay {
     /// `policy_target` follows the new definition; a global `TARGET_VERSION`
     /// bump would say less and invalidate every existing buffer to say it.
     pub masked: bool,
+    /// The proven-optimal set, aligned to `legal`, or `None` when the solve
+    /// declined or the mask is switched off.
+    ///
+    /// Returned rather than applied because a solved position has TWO
+    /// distributions to correct and only one solve to pay for: the distribution
+    /// the move is sampled from, and the distribution recorded as the label.
+    /// They diverge under policy-target pruning, which cleans the label while
+    /// deliberately leaving forced exploration in the trajectory.
+    pub keep: Option<Vec<bool>>,
 }
 
 fn cards_left(state: &GameState) -> usize {
@@ -571,7 +580,6 @@ fn mask_and_renormalise(policy: &mut [f64], keep: &[bool]) {
 pub fn endgame_overlay(
     state: &GameState,
     legal: &[usize],
-    policy_target: &mut [f64],
 ) -> Option<SolverOverlay> {
     let (max_nodes, max_secs, max_cards, mask_policy) = endgame_solver();
     if max_nodes == 0 || !solver_eligible(state, max_cards) {
@@ -612,12 +620,13 @@ pub fn endgame_overlay(
                 }),
                 nodes,
                 masked: false,
+                keep: None,
             })
         }
     };
 
-    let mut masked = false;
-    if mask_policy && policy_target.len() == legal.len() {
+    let mut keep_set: Option<Vec<bool>> = None;
+    if mask_policy {
         // `per_action` comes back in the solver's own move ordering, so align it
         // to `legal` before comparing anything positionally.
         let mut values = vec![f64::NAN; legal.len()];
@@ -636,8 +645,7 @@ pub fn endgame_overlay(
                 .iter()
                 .map(|&value| value >= best - crate::solver::TIE_EPSILON)
                 .collect();
-            mask_and_renormalise(policy_target, &keep);
-            masked = true;
+            keep_set = Some(keep);
         }
     }
 
@@ -659,7 +667,8 @@ pub fn endgame_overlay(
         }),
         stop: None,
         nodes: solved.nodes,
-        masked,
+        masked: keep_set.is_some(),
+        keep: keep_set,
     })
 }
 
@@ -824,16 +833,33 @@ pub fn run<E: Eval>(
         // the mask is what makes a provably-losing move unplayable, not merely
         // unlabelled. Cheap moves are skipped because they emit no example at
         // all (`dataset.is_fast_search_move`), so a solve there would buy nothing.
-        let mut policy_target = result.policy_target;
-        let overlay = if full {
-            endgame_overlay(&state, &legal, &mut policy_target)
-        } else {
-            None
-        };
+        // TWO distributions from one search, and they are not the same object.
+        //
+        // `selection` decides the move actually played. `training` is what the
+        // buffer records. They start identical and diverge under policy-target
+        // pruning, whose entire purpose is to clean the LABEL while leaving the
+        // forced exploration in the trajectory -- pruning `selection` would
+        // delete that exploration from the games themselves.
+        //
+        // A proof, by contrast, belongs in both: a provably-losing move should
+        // be neither played nor taught. So `endgame_overlay` hands back the
+        // proven-optimal set and both distributions are masked from the one
+        // solve, in the order PRUNE -> MASK -> RENORMALISE.
+        let mut selection = result.policy_target.clone();
+        let mut training = result.policy_target;
+        // <- policy-target pruning slots in HERE, on `training` only. It needs
+        //    the NOISED root priors and per-action Q, which `SearchResult` does
+        //    not yet carry (`prior` is deliberately the clean pre-noise
+        //    snapshot, so KL diagnostics keep meaning what they say).
+        let overlay = endgame_overlay(&state, &legal);
+        if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
+            mask_and_renormalise(&mut selection, keep);
+            mask_and_renormalise(&mut training, keep);
+        }
         let action = if cfg.deterministic_actions {
-            best_policy_action(&legal, &policy_target)
+            best_policy_action(&legal, &selection)
         } else {
-            sample_policy(&legal, &policy_target, temperature(i), &mut rng)
+            sample_policy(&legal, &selection, temperature(i), &mut rng)
         };
         trajectory.update(&state);
         chance_log.extend(actual_chance_outcomes(&state, action, i)?);
@@ -847,7 +873,7 @@ pub fn run<E: Eval>(
             // target diagnostics read them to reconstruct what the search
             // actually did, which the masked distribution no longer shows.
             visits: result.visits,
-            policy_target,
+            policy_target: training,
             prior: result.prior,
             root_value: result.root_value,
             action_value: result.action_value,
@@ -1892,16 +1918,19 @@ impl GameSlot {
         // the shard's thread) for its duration -- which is why the budget is a
         // node count and why the card trigger is set from the measured table
         // rather than optimistically.
-        let mut policy_target = result.policy_target;
-        let overlay = if meta.full {
-            endgame_overlay(&self.state, &meta.legal, &mut policy_target)
-        } else {
-            None
-        };
+        // See `run` for why selection and training are separate objects.
+        let mut selection = result.policy_target.clone();
+        let mut training = result.policy_target;
+        // <- policy-target pruning slots in HERE; see `run`.
+        let overlay = endgame_overlay(&self.state, &meta.legal);
+        if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
+            mask_and_renormalise(&mut selection, keep);
+            mask_and_renormalise(&mut training, keep);
+        }
         let action = if self.cfg.deterministic_actions {
-            best_policy_action(&meta.legal, &policy_target)
+            best_policy_action(&meta.legal, &selection)
         } else {
-            sample_policy(&meta.legal, &policy_target, temperature(i), &mut self.rng)
+            sample_policy(&meta.legal, &selection, temperature(i), &mut self.rng)
         };
         let digest_started = Instant::now();
         self.trajectory.update(&self.state);
@@ -1918,7 +1947,7 @@ impl GameSlot {
             action,
             legal: meta.legal,
             visits: result.visits,
-            policy_target,
+            policy_target: training,
             prior: result.prior,
             root_value: result.root_value,
             action_value: result.action_value,

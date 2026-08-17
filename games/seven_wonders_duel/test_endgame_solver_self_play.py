@@ -210,6 +210,35 @@ def test_a_masked_policy_actually_changes_the_games_that_get_played():
     assert _records(max_nodes=SOLVER_MAX_NODES) != _records(max_nodes=0)
 
 
+def test_cheap_plies_are_solved_and_masked_too():
+    """The de-noising argument depends on this, and the code did not do it.
+
+    Masking every triggered ply is what makes both sides play the endgame
+    provably optimally, which is what turns the game's realised result into the
+    proven value and de-noises the outcome label for the WHOLE game. Solving
+    only full-search plies breaks that: at the production 0.25 full fraction the
+    ply after a proof is cheap ~75% of the time, unmasked, and free to throw the
+    proven result away.
+
+    So the trigger must not be conditioned on `full`. Cheap plies still emit no
+    training example -- the label is a separate concern from the mask.
+    """
+
+    seven_wonders_rust.set_endgame_solver(SOLVER_MAX_NODES, 60.0, SOLVER_MAX_CARDS, True)
+    records, _ = seven_wonders_rust.self_play_many_mock(
+        games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
+        game_seeds=SEEDS,
+        force=True,
+        # EVERY move cheap: if the trigger were gated on `full`, nothing at all
+        # would be solved here.
+        **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 0.0}),
+    )
+    assert not any(move["full_search"] for record in records for move in record["moves"])
+    solved = _solved_moves(records)
+    assert solved, "no cheap ply was solved: the trigger is still gated on `full`"
+    assert any(move["solver_masked"] for move in solved)
+
+
 def test_a_declined_solve_records_what_it_cost_and_why():
     """A refusal must not look like a move the trigger never selected.
 
