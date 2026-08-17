@@ -132,7 +132,15 @@ def collect(
                     "moves_from_end": len(moves) - position - 1,
                     "truth": float(move["solver_value"]),
                     "net": float(move["net_root_value"]),
-                    "search": float(move["root_value"]),
+                    # The visit-weighted mean over everything explored. Reading
+                    # this against a proof penalises the searcher for exploring,
+                    # so it understates search quality -- kept only so the size
+                    # of that bias stays visible next to `search`.
+                    "search_aggregate": float(move["root_value"]),
+                    # Completed Q of the SELECTED action: the search's estimate
+                    # of the position under its own best play, which is what a
+                    # proven value is comparable to.
+                    "search": float(move["action_value"]),
                 }
             )
     return rows
@@ -144,10 +152,14 @@ def report(rows: list[dict]) -> dict:
     def block(subset: list[dict]) -> dict:
         net_error = [abs(r["net"] - r["truth"]) for r in subset]
         search_error = [abs(r["search"] - r["truth"]) for r in subset]
+        aggregate_error = [
+            abs(r.get("search_aggregate", r["search"]) - r["truth"]) for r in subset
+        ]
         return {
             "positions": len(subset),
             "net_abs_error": _summarise(net_error),
             "search_abs_error": _summarise(search_error),
+            "search_aggregate_abs_error": _summarise(aggregate_error),
             # The blunt version of the same question: does it even know who is
             # winning? A sign disagreement on a PROVEN position is not a
             # calibration issue.
@@ -224,7 +236,11 @@ def _print(summary: dict, games: int, *, values_interpretable: bool = True) -> N
         print("  cannot manufacture agreement with a proof it never saw.")
     print("")
     print("  |value - truth|      mean   median      p90")
-    for label, key in (("net (no search)", "net_abs_error"), ("search", "search_abs_error")):
+    for label, key in (
+        ("net (no search)", "net_abs_error"),
+        ("search (best action)", "search_abs_error"),
+        ("search (aggregate)", "search_aggregate_abs_error"),
+    ):
         stats = overall[key]
         print(
             f"  {label:<18} {stats['mean']:>7.3f} {stats['median']:>8.3f} "

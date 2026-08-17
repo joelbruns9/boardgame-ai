@@ -202,6 +202,16 @@ pub struct MoveRecord {
     /// actual policy improvement measurable per row.
     pub prior: Vec<f64>,
     pub root_value: f64,
+    /// Completed Q of the action the search SELECTED, actor-relative.
+    ///
+    /// Distinct from `root_value`, which is the visit-weighted mean over
+    /// everything the search explored -- including the inferior actions it
+    /// deliberately sampled. Comparing `root_value` against a proven value
+    /// therefore penalises a searcher for exploring, and penalises PUCT more
+    /// than Gumbel because Dirichlet noise puts visits on moves it already
+    /// believes are bad. This is the search's estimate of the position under
+    /// its own best play, which is the quantity a proof is comparable to.
+    pub action_value: f64,
     /// The network's raw evaluation of this root, actor-relative, before the
     /// search backed anything up. Paired with `root_value` and `solver_value`
     /// it separates a value head that is wrong from a search that is.
@@ -840,6 +850,7 @@ pub fn run<E: Eval>(
             policy_target,
             prior: result.prior,
             root_value: result.root_value,
+            action_value: result.action_value,
             net_root_value: result.net_root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
@@ -1910,6 +1921,7 @@ impl GameSlot {
             policy_target,
             prior: result.prior,
             root_value: result.root_value,
+            action_value: result.action_value,
             net_root_value: result.net_root_value,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
@@ -1966,6 +1978,7 @@ impl GameSlot {
             policy_target: Vec::new(),
             prior: Vec::new(),
             root_value: 0.0,
+            action_value: 0.0,
             net_root_value: 0.0,
             sims: 0,
             gumbel_topk: Vec::new(),

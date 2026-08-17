@@ -378,6 +378,29 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[: old_state[key].shape[0]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
+        elif (
+            key in old_state
+            and old_state[key].ndim == 2
+            and tensor.ndim == 2
+            and old_state[key].shape[0] == tensor.shape[0]
+            and old_state[key].shape[1] < tensor.shape[1]
+        ):
+            # A Linear whose INPUT width grew: appending features to a token's
+            # schema widens `[out, in]` along dim 1. Zero the new columns so the
+            # appended features contribute exactly nothing and the model computes
+            # what it did before.
+            #
+            # This only aligns because new features are APPENDED. Inserted
+            # mid-vector, every later column shifts and the old weights land on
+            # the wrong features -- which is worse than useless, and is why the
+            # 2026-08-17 tempo features were moved to the end of GLOBAL_FEATURES
+            # after this branch was found missing. Before that, growth along the
+            # input dim fell through to the `else` below and zeroed the whole
+            # projection, which the caller's guard correctly refused.
+            grown = torch.zeros_like(tensor)
+            grown[:, : old_state[key].shape[1]] = old_state[key]
+            new_state[key] = grown
+            report["grown"].append(key)
         else:
             new_state[key] = torch.zeros_like(tensor)
             report["zeroed"].append(key)

@@ -114,6 +114,14 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
             },
         )?;
         item.set_item(
+            "action_value",
+            if row.is_bot {
+                None
+            } else {
+                Some(row.action_value)
+            },
+        )?;
+        item.set_item(
             "net_root_value",
             if row.is_bot {
                 None

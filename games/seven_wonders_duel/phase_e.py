@@ -512,10 +512,23 @@ def load_evaluator(
     ``migrate=True`` accepts a checkpoint whose stored encoder signature no
     longer matches the live encoder. That is normally refused, and the refusal
     is the point: a net fed features it was not trained on is silently wrong.
-    Pass it only when the schema SHAPE is unchanged and only the semantics of
-    existing features moved, which `migrate_state_dict` reports by loading every
-    tensor with nothing grown and nothing zeroed. Callers should surface it to
-    the human -- the model is being served off-distribution either way.
+    Callers should surface it to the human -- the model is being served
+    off-distribution either way.
+
+    Two kinds of mismatch, and only one is recoverable:
+
+    * **zeroed** -- a parameter has no counterpart at all, so it is reset. The
+      net is then partly random and nothing it says means anything. Refused.
+    * **grown** -- a parameter was zero-padded because the schema APPENDED
+      something. For a projection whose input width grew this is exactly
+      neutral: zero weights on the new columns contribute nothing whatever the
+      new features hold, so the model computes what it always did. Accepted,
+      and reported.
+
+    The distinction only holds because additive features go at the END of a
+    schema. Inserted mid-vector they shift every later column and the padding
+    silently aligns old weights to new features -- see the note in
+    `encoder.GLOBAL_FEATURES`.
     """
 
     import torch
@@ -534,13 +547,23 @@ def load_evaluator(
     load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
     if migrate and checkpoint.get("migration"):
         report = checkpoint["migration"]
-        if report.get("grown") or report.get("zeroed"):
+        if report.get("zeroed"):
             raise ValueError(
-                "refusing to migrate: the checkpoint needs tensor surgery "
-                f"(grown={report.get('grown')}, zeroed={report.get('zeroed')}), "
-                "which means the schema shape changed, not just its meaning"
+                "refusing to migrate: these parameters have no counterpart and "
+                f"were reset ({report['zeroed']}), so the net is partly random "
+                "-- the schema changed shape in a way padding cannot recover"
             )
-        model.load_state_dict(checkpoint["model_state"])
+        if report.get("grown"):
+            # `migrate_state_dict` has already loaded the padded weights into
+            # `model`. Re-loading the raw state dict here would shape-mismatch,
+            # and did until the additive case was allowed through.
+            print(
+                "WARNING: migrated an additive schema change; zero-padded "
+                f"{report['grown']}. The appended features contribute nothing, "
+                "so this net behaves as it did when trained."
+            )
+        else:
+            model.load_state_dict(checkpoint["model_state"])
     return Evaluator(model, device=device, precision=precision)
 
 

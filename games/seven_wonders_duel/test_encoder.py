@@ -440,7 +440,7 @@ def test_encoder_signature_is_pinned():
     # Bump ENCODER_VERSION and this pin together on any schema change (§5.8).
     assert (
         ENCODER_SIGNATURE
-        == "96fb245a6b47a000e2ae71ece616bae639250a1396933354c761971c7d88ae57"
+        == "24e15b12e1e7cd9f2222a32c1ec022140a42957c42c2c5c5ba352207166a8975"
     )
 
 
@@ -448,7 +448,7 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "8b831e3fc73976d6dde49257a8eb35f2e016a4d485069d4e201d1e78608fccd0"
+        == "22b9b0a8b0381f3de284b622a59ff8ae2626d926acb7c800bc541e79865fbe66"
     )
 
 
@@ -457,7 +457,7 @@ def test_golden_digests_cover_draft_and_pending_states():
     apply_action(draft, legal_actions(draft)[0])
     assert (
         _digest(encode(draft.observation(0)))
-        == "589555510a65e0f0b78aed69f5acdedb3a1b61067a66282834b880dfb5677eab"
+        == "b48a15fd8f87d5c93c98a345aaa6c8fc2114bb4444b5b1d8fcda92c7699ac0d9"
     )
 
     library = _playing_game(400)
@@ -468,5 +468,5 @@ def test_golden_digests_cover_draft_and_pending_states():
     assert library.pending_choice is not None
     assert (
         _digest(encode(library.observation(0)))
-        == "fdc26b8f4b9eb647a620c5d0ab0f3b0538c6719001c63299a11ff808db0cc117"
+        == "9bb1fad1037ec4d611c5a629a506204e0e5503ef6c4c9a18e2abe41e2e3ab7c7"
     )

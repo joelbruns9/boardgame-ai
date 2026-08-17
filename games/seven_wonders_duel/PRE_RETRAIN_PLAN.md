@@ -291,10 +291,16 @@ the calibrator cannot answer.
   nearly every move is optimal). Then a **small closed-loop training comparison**
   — nothing short of that answers the target-quality question.
 
-  *This also weakens a conclusion drawn earlier from the existing probe.* Its
-  "search improves on the net in only 71% of positions" used the same aggregate
-  `root_value`, so it understates search quality by the same mechanism. The
-  probe should be re-run reading the selected action's value.
+  *Re-run 2026-08-17 against the selected action's value, and the correction was
+  large*: search error mean 0.191 → **0.096**, p90 0.662 → **0.248**, sign
+  agreement 92% → **98%**, "moves toward truth" 71% → **86%**. See §4. The probe
+  now records both fields so the bias stays visible.
+
+  This makes the comparison **more** meaningful than the objection implied — the
+  metric now measures what a searcher concludes rather than how widely it
+  explored, which is exactly the bias that penalised PUCT. The other two
+  objections stand unchanged: top-1 agreement is weak under 78–82% ties, and a
+  Gumbel-trained net cannot settle which target trains a stronger net.
 * **Gate under `--eval-search-mode puct`** so the number promoted on is the
   number the advisor delivers.
 * **Error-tail analysis** (§6).
@@ -342,12 +348,36 @@ candidate set does not concentrate budget on the best line.** Low `top_k` is a
 candidate to 16, and 2 is a noisy basis for eliminating half the field), not a
 depth lever. Depth comes from `sims`.
 
-**Oracle probe, migrated net, 133 proven positions:** net |err| mean 0.221,
-median 0.056, **p90 0.919**; search 0.191 / 0.021 / 0.662; sign agreement 92%
-both; search moves toward truth 71% of the time. Read one-directionally — the
-net is off-distribution, so a *good* score is trustworthy and a bad one is not,
-while the net-vs-search *delta* is a within-subject comparison and largely
-cancels the mismatch.
+**Oracle probe, migrated net, 133 proven positions.** Read against the value of
+the **selected action** (`SearchResult.action_value`), not `root_value`:
+
+| |value − truth| | mean | median | p90 |
+|---|---|---|---|
+| net, no search | 0.221 | 0.056 | 0.919 |
+| **search (selected action)** | **0.096** | **0.005** | **0.248** |
+| search (aggregate `root_value`) | 0.191 | 0.021 | 0.662 |
+
+Knows who is winning: net 122/133 (92%), **search 131/133 (98%)**. Search moves
+toward truth in **86%** of positions. By distance from the end, search error
+rises monotonically 0.000 → 0.207 while the net's is flat-to-noisy 0.221 →
+0.315 — the expected signature of search working: near-exact at a short horizon,
+degrading as depth is needed. At `from_end = 0` search is *exact* (0.000, 100%
+sign) against the net's 0.221.
+
+**The aggregate row is a trap and this file previously fell into it.**
+`root_value` is the visit-weighted mean over everything explored, so reading it
+against a proof charges the searcher for the losing moves it correctly rejected.
+That produced two claims now withdrawn: "search barely helps" (it halves the
+error and cuts p90 nearly 4×) and "search inherits the net's error rather than
+correcting it", which had been offered as independent support for the
+optimization-or-capacity reading of the cloud6 stall. **That support is gone.**
+The error concentrates in the raw prior, which strengthens the case for changes
+that improve the prior (§D) and weakens the case that search quality is the
+problem.
+
+Read one-directionally: the net is off-distribution, so a *good* score is
+trustworthy and a bad one is not. The net-vs-search delta is within-subject and
+largely cancels the mismatch — and the delta is the part that moved.
 
 **Civilian VP available:** Age I 11 total, Age II 28, Age III 61, wonders 42.
 
@@ -429,6 +459,15 @@ readout; §A raises sims. If capacity is binding, some of this hurts. Keep each
 piece independently ablatable, and prefer measuring the stall before assuming
 more features fix it.
 
+Note the §4 correction narrows where the problem can be. Search reaches the
+proven value closely (mean |err| 0.096, 98% sign agreement) while the raw net
+does not (0.221, 92%) — so **the search is not the weak link**, and neither is
+the target it produces. That points at the prior and at whatever stops the net
+absorbing what the search already knows, which is a capacity/optimization
+question rather than a search one. It is not proof — one migrated net, 133
+positions — but it is the first evidence that distinguishes the two, and it
+argues for §D (prior quality) over §A's sims increase as the strength lever.
+
 **Feature selection by reasoning has a poor record here.** Three features argued
 from mechanism did not survive: `chance_fanout`, the decidedness set, and the VP
 bound — two refuted by measurement, one by argument. The one proposal that held
@@ -452,8 +491,24 @@ config value.
 
 **Aggregate root values.** `SearchResult.root_value` is the visit-weighted mean
 over everything the search explored, not the value of the move it chose. Any
-comparison that reads it will penalise a searcher for exploring, which biases
-against PUCT specifically and understates search quality generally.
+comparison that reads it penalises a searcher for exploring — measured at ~2× the
+error and 4× the p90 (§4), and it will bite PUCT harder than Gumbel because
+Dirichlet noise puts visits on moves the net already believes are bad.
+`action_value` is now recorded alongside it; prefer it for anything compared
+against a proof.
+
+**Schema position is load-bearing, not cosmetic.** Additive encoder features must
+be **appended**. `migrate_state_dict` warm-starts an older checkpoint by
+zero-padding grown projections, and that only aligns at the end of a vector;
+inserted mid-vector the padding maps old weights onto different features. The
+2026-08-17 tempo pair was inserted mid-vector, which cost the ability to serve
+any existing checkpoint at all until it was moved. Two related gaps were fixed
+with it: `migrate_state_dict` could not pad growth along the *input* dimension
+(only dim 0), and `load_evaluator` refused **any** surgery rather than only the
+unrecoverable kind — so the "additive-schema warm start" the code documents had
+never actually been reachable. The line now is: `zeroed` is fatal (a parameter
+has no counterpart, the net is partly random), `grown` is fine and loud (zero
+weights on appended input columns contribute nothing, exactly).
 
 **Duplicated constants.** The padded feature width was a literal in four places
 and adding two features left two behind, surfacing as a matmul shape error naming

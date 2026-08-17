@@ -28,7 +28,7 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "96fb245a6b47a000e2ae71ece616bae639250a1396933354c761971c7d88ae57";
+    "24e15b12e1e7cd9f2222a32c1ec022140a42957c42c2c5c5ba352207166a8975";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
@@ -79,7 +79,7 @@ pub struct Token {
 /// Reusable token buffer (CORE_UTILIZATION_PLAN.md step 2a).
 ///
 /// The encoder used to allocate one feature vector per token -- often for a
-/// single float, since FEATURE_COUNTS is [130, 1, 26, 1, 8, 4, 1, 79, 14] --
+/// single float, since FEATURE_COUNTS is [132, 1, 26, 1, 8, 4, 1, 79, 14] --
 /// which is ~200 M allocations in a six-minute generation run. This retains the
 /// token vector and every token's feature buffer across calls, so after the
 /// first row an encode allocates nothing.
@@ -500,11 +500,6 @@ impl Enc<'_> {
         }
         v.push(present as f64);
         v.push(present as f64 / 20.0);
-        // Tempo primitives; see `GLOBAL_FEATURES` in encoder.py for why these
-        // two and not a "who takes the last card" flag. `present` is 0 during
-        // the draft, so parity is 0 there in both languages.
-        v.push((present % 2) as f64);
-        v.push(if g.conflict_position == 0 { 1.0 } else { 0.0 });
         v.push(face_down as f64);
         v.push(face_down as f64 / 10.0);
         v.push(military as f64);
@@ -523,6 +518,11 @@ impl Enc<'_> {
         v.push(if g.pending_extra_turn { 1.0 } else { 0.0 });
         v.extend(self.per_player_values(self.actor));
         v.extend(self.per_player_values(1 - self.actor));
+        // Appended last, matching GLOBAL_FEATURES; see the note there for why
+        // position matters. `present` is 0 during the draft, so parity is 0
+        // there in both languages.
+        v.push((present % 2) as f64);
+        v.push(if g.conflict_position == 0 { 1.0 } else { 0.0 });
     }
 
     // --- tableau -------------------------------------------------------------
