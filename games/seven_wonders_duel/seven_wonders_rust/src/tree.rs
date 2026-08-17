@@ -773,3 +773,160 @@ pub fn digest(node: &Node, out: &mut Vec<f64>) {
         }
     }
 }
+
+/// KataGo policy-target pruning (paper §3.2), over the ROOT visit counts.
+///
+/// Exploration and the training label want opposite things. Dirichlet noise and
+/// forced playouts exist to make the search *look* at moves the net dislikes --
+/// that is how a policy escapes its own blind spots. But those visits are not
+/// evidence about the position, and a target built from raw visit counts teaches
+/// the noise along with the search.
+///
+/// The rule removes exactly the unjustified visits and nothing more. For every
+/// child except the most-visited one, subtract up to
+/// `n_forced = sqrt(k * P(c) * N)` visits -- but stop as soon as removing one
+/// more would raise that child's PUCT score above the best child's.
+///
+/// That guard is what makes it self-calibrating, and it is the part a flat
+/// `sqrt(kPN)` subtraction gets wrong. A child PUCT genuinely chose sits at
+/// roughly the same PUCT score as the best child by the end of the search, so
+/// the very first removal would make it competitive and nothing is taken. A
+/// child that only got visits because it was forced has a poor Q and a
+/// correspondingly low score, so there is room to subtract before it becomes
+/// competitive. The arithmetic distinguishes them without being told which is
+/// which.
+///
+/// `priors` must be the priors the search actually descended under -- the NOISED
+/// ones. The clean prior would ask a different question ("would the net have
+/// chosen this?") and would prune visits the search made on its own terms.
+///
+/// Returns a normalised distribution. A child left with a single visit is
+/// pruned entirely, as in KataGo: one visit is not evidence.
+pub(crate) fn prune_policy_target(
+    visits: &[u32],
+    priors: &[f64],
+    q: &[f64],
+    c_puct: f64,
+    k: f64,
+) -> Vec<f64> {
+    let n = visits.len();
+    let total: f64 = visits.iter().map(|&v| v as f64).sum();
+    let raw = |total: f64| -> Vec<f64> {
+        if total > 0.0 {
+            visits.iter().map(|&v| v as f64 / total).collect()
+        } else {
+            vec![0.0; n]
+        }
+    };
+    if n == 0 || total <= 0.0 || k <= 0.0 {
+        return raw(total);
+    }
+    let mut best = 0usize;
+    for j in 1..n {
+        if visits[j] > visits[best] {
+            best = j;
+        }
+    }
+    let sqrt_total = total.sqrt();
+    let puct = |j: usize, kept: f64| q[j] + c_puct * priors[j] * sqrt_total / (1.0 + kept);
+    let best_puct = puct(best, visits[best] as f64);
+
+    let mut kept: Vec<f64> = visits.iter().map(|&v| v as f64).collect();
+    for j in 0..n {
+        if j == best || visits[j] == 0 {
+            continue;
+        }
+        let forced = (k * priors[j] * total).sqrt();
+        let mut removed = 0.0;
+        while removed < forced && kept[j] > 0.0 && puct(j, kept[j] - 1.0) <= best_puct {
+            kept[j] -= 1.0;
+            removed += 1.0;
+        }
+        if kept[j] <= 1.0 {
+            kept[j] = 0.0;
+        }
+    }
+    let sum: f64 = kept.iter().sum();
+    if sum <= 0.0 {
+        // Everything pruned, which means the best child held one visit and none
+        // survived. A zero label is worse than an unpruned one.
+        return raw(total);
+    }
+    kept.into_iter().map(|v| v / sum).collect()
+}
+
+#[cfg(test)]
+mod policy_target_pruning_tests {
+    //! The invariants that make pruning safe. Getting these wrong does not
+    //! raise -- it emits a plausible label that teaches the wrong thing.
+
+    use super::prune_policy_target;
+
+    const C: f64 = 1.5;
+    const K: f64 = 2.0;
+
+    #[test]
+    fn the_most_visited_child_is_never_pruned() {
+        let visits = [80u32, 10, 10];
+        let out = prune_policy_target(&visits, &[0.5, 0.25, 0.25], &[0.9, -0.9, -0.9], C, K);
+        assert!(out[0] > 0.0);
+        assert!(out[0] >= out[1] && out[0] >= out[2]);
+    }
+
+    #[test]
+    fn a_forced_looking_child_loses_visits() {
+        // Low Q, non-trivial prior, several visits: the shape a forced playout
+        // leaves behind. It should shed mass against its raw share.
+        let out = prune_policy_target(
+            &[60u32, 20, 20],
+            &[0.4, 0.3, 0.3],
+            &[0.8, -0.8, -0.8],
+            C,
+            K,
+        );
+        assert!(out[1] < 0.2, "expected pruning, got {out:?}");
+    }
+
+    #[test]
+    fn a_child_puct_genuinely_chose_keeps_its_visits() {
+        // Equal Q and equal priors: the search spread visits on merit, so the
+        // first removal would make the child competitive and the guard must stop
+        // at once. This is the case a flat sqrt(kPN) subtraction damages.
+        let visits = [34u32, 33, 33];
+        let out = prune_policy_target(&visits, &[1.0 / 3.0; 3], &[0.5; 3], C, K);
+        for (index, value) in out.iter().enumerate() {
+            assert!(
+                (value - visits[index] as f64 / 100.0).abs() < 1e-9,
+                "merit-earned visits were pruned: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_result_is_always_a_distribution() {
+        let out = prune_policy_target(&[7, 3, 1], &[0.6, 0.3, 0.1], &[0.2, -0.1, -0.5], C, K);
+        assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(out.iter().all(|v| *v >= 0.0));
+    }
+
+    #[test]
+    fn a_single_visit_child_is_pruned_entirely() {
+        let out = prune_policy_target(&[50, 1], &[0.9, 0.1], &[0.9, -0.9], C, K);
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[0], 1.0);
+    }
+
+    #[test]
+    fn disabling_it_returns_the_raw_visit_distribution() {
+        let out = prune_policy_target(&[3, 1], &[0.5, 0.5], &[0.0, 0.0], C, 0.0);
+        assert!((out[0] - 0.75).abs() < 1e-12 && (out[1] - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_unvisited_search_does_not_divide_by_zero() {
+        assert_eq!(
+            prune_policy_target(&[0, 0], &[0.5, 0.5], &[0.0, 0.0], C, K),
+            vec![0.0, 0.0]
+        );
+    }
+}
