@@ -865,11 +865,10 @@ pub fn run<E: Eval>(
         // proven-optimal set and both distributions are masked from the one
         // solve, in the order PRUNE -> MASK -> RENORMALISE.
         let mut selection = result.policy_target.clone();
-        let mut training = result.policy_target;
-        // <- policy-target pruning slots in HERE, on `training` only. It needs
-        //    the NOISED root priors and per-action Q, which `SearchResult` does
-        //    not yet carry (`prior` is deliberately the clean pre-noise
-        //    snapshot, so KL diagnostics keep meaning what they say).
+        // Pruned when the search forced playouts, identical otherwise. The
+        // search owns this: it is the only place that holds the noised priors
+        // and the per-action Q the rule needs.
+        let mut training = result.training_policy.unwrap_or(result.policy_target);
         let overlay = endgame_overlay(&state, &legal);
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);
@@ -1940,8 +1939,7 @@ impl GameSlot {
         // rather than optimistically.
         // See `run` for why selection and training are separate objects.
         let mut selection = result.policy_target.clone();
-        let mut training = result.policy_target;
-        // <- policy-target pruning slots in HERE; see `run`.
+        let mut training = result.training_policy.unwrap_or(result.policy_target);
         let overlay = endgame_overlay(&self.state, &meta.legal);
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);

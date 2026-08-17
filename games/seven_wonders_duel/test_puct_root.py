@@ -383,3 +383,56 @@ def test_resumable_forced_playouts_match_the_one_shot_search():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert compared >= 4, f"only {compared} comparisons"
+
+
+def test_pruning_rule_matches_between_python_and_rust():
+    """The rule itself, gated directly rather than only through a whole search.
+
+    A disagreement here decides training labels, and through a search it would
+    surface as a puzzling visit-count mismatch rather than naming the cause.
+    """
+    import random
+
+    from .search import prune_policy_target as py_prune
+
+    rng = random.Random(20260817)
+    compared = 0
+    for _ in range(300):
+        n = rng.randint(2, 9)
+        visits = [rng.choice([0, 1, 2, 5, 13, 40, 97]) for _ in range(n)]
+        if sum(visits) == 0:
+            continue
+        raw = [rng.random() + 1e-3 for _ in range(n)]
+        mass = sum(raw)
+        priors = [p / mass for p in raw]
+        q = [rng.uniform(-1.0, 1.0) for _ in range(n)]
+        for k in (0.0, 0.5, 2.0, 6.0):
+            expected = py_prune(visits, priors, q, 1.5, k)
+            got = swr.prune_policy_target(visits, priors, q, 1.5, k)
+            if expected is None:
+                # Rust returns the raw distribution where Python returns None;
+                # both mean "record the unpruned target".
+                total = float(sum(visits))
+                expected = [v / total for v in visits]
+            assert len(got) == len(expected)
+            for j, (a, b) in enumerate(zip(got, expected)):
+                assert a == pytest.approx(b, abs=1e-12), f"n={n} k={k} index {j}"
+            compared += 1
+    assert compared > 500, compared
+
+
+def test_pruning_changes_the_recorded_target_but_not_the_played_move():
+    """The invariant the whole split exists for: forcing stays in the
+    trajectory, and comes back out of the label."""
+
+    state = new_game(11)
+    for _ in range(12):
+        apply_action(state, decode_action(state, legal_action_indices(state)[0]))
+    forced = _puct_search(state, 64, 8, 3, False, forced_playout_k=2.0)
+    assert forced.training_policy is not None
+    total = sum(forced.visits.values())
+    raw = {a: v / total for a, v in forced.visits.items()}
+    assert forced.policy_target == pytest.approx(raw), "selection must be raw visits"
+    assert forced.training_policy != pytest.approx(raw), "label must be pruned"
+    # The played action is still argmax of the RAW visits, unaffected by pruning.
+    assert forced.action_index == max(forced.visits, key=lambda a: forced.visits[a])

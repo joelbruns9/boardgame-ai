@@ -429,6 +429,14 @@ pub struct SearchResult {
     /// KL(policy_target || prior) -- is measurable rather than assumed: at a
     /// small budget the Gumbel guarantee bounds that quantity below by zero and
     /// says nothing about its size.
+    /// The distribution to RECORD, when it differs from `policy_target`.
+    ///
+    /// Under PUCT with pruning they differ by design: the move is played from
+    /// the raw visit distribution, keeping forced exploration in the trajectory,
+    /// while the label has those forced visits taken back out. `None` means the
+    /// two are the same -- every Gumbel search, and every PUCT search with
+    /// `forced_playout_k` at zero.
+    pub training_policy: Option<Vec<f64>>,
     pub prior: Vec<f64>,
     pub gumbel_topk: Vec<usize>, // action indices
     pub sims: usize,
@@ -624,6 +632,22 @@ fn puct_root<E: Eval>(
             best = j;
         }
     }
+    // The edges still carry the NOISED priors the search descended under, which
+    // is what pruning must reason about: the clean prior would ask "would the
+    // net have chosen this?" and would take back visits the search made on its
+    // own terms.
+    let noised: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
+    let training_policy = if cfg.forced_playout_k > 0.0 {
+        Some(prune_policy_target(
+            &visits,
+            &noised,
+            &completed,
+            cfg.c_puct,
+            cfg.forced_playout_k,
+        ))
+    } else {
+        None
+    };
     let result = SearchResult {
         action_index: legal[best],
         action_value: completed[best],
@@ -631,6 +655,7 @@ fn puct_root<E: Eval>(
         net_root_value: root_value,
         visits,
         policy_target,
+        training_policy,
         prior: root_prior_from(clean_priors.iter().copied()),
         // No Gumbel top-k exists here; an invented one would let a buffer row
         // claim a candidate set that never happened.
@@ -771,6 +796,8 @@ pub fn search_closed<E: Eval>(
         net_root_value: root_value,
         visits,
         policy_target,
+        // The Gumbel root forces nothing, so there is nothing to take back.
+        training_policy: None,
         prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
         gumbel_topk: topk,
         sims: sims_used,
@@ -839,7 +866,7 @@ pub fn digest(node: &Node, out: &mut Vec<f64>) {
 ///
 /// Returns a normalised distribution. A child left with a single visit is
 /// pruned entirely, as in KataGo: one visit is not evidence.
-pub(crate) fn prune_policy_target(
+pub fn prune_policy_target(
     visits: &[u32],
     priors: &[f64],
     q: &[f64],

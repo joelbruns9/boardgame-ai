@@ -2726,6 +2726,21 @@ fn set_endgame_solver(
 }
 
 #[pyfunction]
+/// KataGo policy-target pruning, exposed so `search.py::prune_policy_target`
+/// can be gated directly against this implementation rather than only through a
+/// whole search, where a disagreement would surface as a puzzling visit-count
+/// mismatch instead of naming the rule.
+fn prune_policy_target(
+    visits: Vec<u32>,
+    priors: Vec<f64>,
+    q: Vec<f64>,
+    c_puct: f64,
+    k: f64,
+) -> Vec<f64> {
+    tree::prune_policy_target(&visits, &priors, &q, c_puct, k)
+}
+
+#[pyfunction]
 /// The `(max_nodes, max_secs, max_cards, mask_policy)` in force, for manifests.
 fn endgame_solver() -> (u64, f64, usize, bool) {
     self_play::endgame_solver()
@@ -2765,6 +2780,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::endgame_solver;
+
+    #[pymodule_export]
+    use super::prune_policy_target;
 
     #[pymodule_export]
     use super::RustPuctSearch;

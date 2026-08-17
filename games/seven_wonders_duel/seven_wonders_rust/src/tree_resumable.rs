@@ -1665,11 +1665,31 @@ impl SearchSession {
         }
         let root_value = self.sign * self.arena.nodes[self.arena.root_id].value_p0();
         self.metrics.root_completed_q = completed.clone();
+        // The arena edges still carry the NOISED priors the search descended
+        // under; see `tree::puct_root` for why pruning must use those and not
+        // the clean snapshot.
+        let training_policy = if self.cfg.forced_playout_k > 0.0 {
+            let noised: Vec<f64> = self.arena.nodes[self.arena.root_id]
+                .edges
+                .iter()
+                .map(|e| e.prior)
+                .collect();
+            Some(crate::tree::prune_policy_target(
+                &self.visits,
+                &noised,
+                &completed,
+                self.cfg.c_puct,
+                self.cfg.forced_playout_k,
+            ))
+        } else {
+            None
+        };
         let result = SearchResult {
             action_index: self.legal[best],
             action_value: completed[best],
             root_value,
             net_root_value: self.root_value,
+            training_policy,
             visits: self.visits,
             policy_target,
             // The network's opinion, snapshotted before the Dirichlet blend.
@@ -1716,6 +1736,8 @@ impl SearchSession {
         let result = SearchResult {
             action_index: self.legal[best],
             action_value: self.completed_q(best),
+            // The Gumbel root forces nothing, so there is nothing to take back.
+            training_policy: None,
             root_value,
             net_root_value: self.root_value,
             visits: self.visits,

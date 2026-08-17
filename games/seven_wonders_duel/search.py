@@ -373,6 +373,61 @@ class OpenNode:
         return self.value_sum_p0 / self.visits if self.visits else 0.0
 
 
+def prune_policy_target(
+    visits: list[int],
+    priors: list[float],
+    q: list[float],
+    c_puct: float,
+    k: float,
+) -> "list[float] | None":
+    """KataGo policy-target pruning (§3.2) -- the other half of forced playouts.
+
+    Forced playouts put visits on children PUCT would not have chosen. Those
+    belong in the search and in the trajectory, and emphatically not in the
+    label: a target built from raw visit counts teaches the forcing.
+
+    For every child but the most-visited, subtract up to ``sqrt(k * P(c) * N)``
+    visits, stopping as soon as one more removal would raise that child's PUCT
+    score above the best child's. That guard makes the rule self-calibrating --
+    a child PUCT genuinely chose already sits at parity, so nothing is taken from
+    it -- and it is the part a flat ``sqrt(kPN)`` subtraction gets wrong.
+
+    ``priors`` are the NOISED priors the search descended under. The clean prior
+    asks a different question ("would the net have chosen this?") and would take
+    back visits the search made on its own terms.
+
+    Returns ``None`` when there is nothing to do, so callers fall back to the raw
+    distribution rather than record a fabricated one. A free function, not a
+    method, so ``tree::prune_policy_target`` can be gated directly against it.
+    """
+
+    total = sum(visits)
+    if k <= 0.0 or total <= 0:
+        return None
+    best = max(range(len(visits)), key=lambda j: visits[j])
+    root_sqrt = math.sqrt(total)
+
+    def puct(j: int, kept_j: float) -> float:
+        return q[j] + c_puct * priors[j] * root_sqrt / (1.0 + kept_j)
+
+    best_puct = puct(best, visits[best])
+    kept = [float(v) for v in visits]
+    for j, count in enumerate(visits):
+        if j == best or count == 0:
+            continue
+        forced = math.sqrt(k * priors[j] * total)
+        removed = 0.0
+        while removed < forced and kept[j] > 0 and puct(j, kept[j] - 1) <= best_puct:
+            kept[j] -= 1
+            removed += 1
+        if kept[j] <= 1:
+            kept[j] = 0.0
+    mass = sum(kept)
+    if mass <= 0:
+        return None  # a zero label is worse than an unpruned one
+    return [v / mass for v in kept]
+
+
 @dataclass(frozen=True, slots=True)
 class SearchResult:
     action_index: int
@@ -387,6 +442,15 @@ class SearchResult:
     # only the Gumbel-selected action's entry; a caller that plays a different
     # action (evaluation plays argmax(policy_target)) needs that action's Q.
     completed_q: dict
+    training_policy: dict | None = None
+    """The distribution to RECORD, when it differs from `policy_target`.
+
+    Under PUCT with policy-target pruning they differ by design: the move is
+    played from the raw visit distribution, keeping forced exploration in the
+    trajectory, while the label has those forced visits taken back out. `None`
+    means the two are the same, which is every Gumbel search and every PUCT
+    search with pruning off.
+    """
 
 
 @dataclass(slots=True)
@@ -768,6 +832,35 @@ class GumbelMCTS:
                 best, best_score = edge, score
         return best
 
+    def _prune_policy_target(self, root: ClosedNode, sign: float, visits: dict) -> dict:
+        """KataGo policy-target pruning (§3.2) -- the other half of forcing.
+
+        Forced playouts put visits on children PUCT would not have chosen. Those
+        visits belong in the search and in the trajectory, and emphatically not
+        in the label: a target built from raw visit counts teaches the forcing.
+
+        For every child but the most-visited, subtract up to
+        ``sqrt(k * P(c) * N)`` visits, stopping as soon as one more removal
+        would raise that child's PUCT score above the best child's. The guard is
+        what makes this self-calibrating -- a child PUCT genuinely chose already
+        sits at parity, so nothing is taken from it -- and it is what a flat
+        ``sqrt(kPN)`` subtraction gets wrong.
+
+        Mirrors ``tree::prune_policy_target``; the two are gated against each
+        other. Priors here are the NOISED ones the search descended under.
+        """
+
+        edges = {edge.action_index: edge for edge in root.edges}
+        order = list(visits)
+        pruned = prune_policy_target(
+            [visits[a] for a in order],
+            [edges[a].prior for a in order],
+            [sign * edges[a].q_p0 for a in order],
+            self.config.c_puct,
+            self.config.forced_playout_k,
+        )
+        return None if pruned is None else dict(zip(order, pruned))
+
     def _descend_closed(self, node: ClosedNode, forced_edge: _Edge | None) -> float:
         """One simulation from `node`; returns the leaf value (p0 terms)."""
 
@@ -864,6 +957,7 @@ class GumbelMCTS:
             self.config.sims,
             (),
             completed,
+            self._prune_policy_target(root, sign, visits),
         )
 
     def _force_expand_root(self, root: ClosedNode) -> None:
@@ -966,6 +1060,7 @@ class GumbelMCTS:
             for edge in root.edges
             if edge.probability_weighted
         }
+        training_policy = None
         if self.config.root_selection == "puct":
             (
                 best,
@@ -975,6 +1070,7 @@ class GumbelMCTS:
                 sims,
                 topk,
                 completed,
+                training_policy,
             ) = self._puct_root(root, sign, sign * root_value_p0)
         else:
             (
@@ -1004,6 +1100,7 @@ class GumbelMCTS:
             sims=sims,
             mode="closed",
             completed_q=completed,
+            training_policy=training_policy,
         )
 
     # ---- open mode --------------------------------------------------------
