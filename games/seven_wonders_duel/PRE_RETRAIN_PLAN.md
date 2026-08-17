@@ -42,9 +42,22 @@ all** (`policy_excluded = !full`, and `dataset.is_fast_search_move` drops them
 from the example set), so every recorded target is a PUCT visit distribution and
 the buffer stays homogeneous.
 
-**Cheap moves are the place to spend diversity.** They carry no targets, so
-varying sims, width, search type and chance capping there costs nothing and adds
-state-distribution variety, which is a known limiting factor.
+**Cheap moves are where diversity is cheapest — but it is NOT free.** They emit
+no *policy* target, so varying sims, width, search type and chance capping there
+costs no label consistency. It does not follow that it costs nothing: cheap
+actions are ~75% of moves, so they determine every later recorded state and the
+final outcome that every retained row's value label comes from. Weaker cheap
+play means noisier value labels and an off-policy trajectory. KataGo disables
+exploratory settings on fast searches precisely to keep them *strong*
+(paper §3.1).
+
+The tension is real rather than settled — diversity is a known limiting factor
+here (KD's run6 was a diversity package; the temperature floor is the strongest
+single lever) — and 7WD differs from Go in having chance and ~1 outcome label
+per game. So it must be **measured, not assumed either way**: any cheap-move
+diversity change needs a strength constraint alongside throughput (top-action
+agreement against a strong reference, and head-to-head non-inferiority of the
+cheap searcher). Games/hour alone will happily buy fast, weaker trajectories.
 
 **Solve at every triggered ply; no solver cache.** A cache ceilings at 40% (the
 deepest solve is 60% of per-game cost), but the 40% buys the thing that matters:
@@ -53,6 +66,15 @@ game's realised result becomes the proven value of the first solved position —
 which de-noises the outcome label for *every* row of the game, not just endgame
 rows. With only ~1 independent outcome label per game, that is plausibly worth
 more than the endgame labels themselves.
+
+**This is not what the code does today, and the gap invalidates the argument.**
+`endgame_overlay` is gated on `full` in both generation paths
+(`self_play.rs` `run` and `Slot::finish_move`). At `full_search_fraction = 0.25`
+the ply after a proof is cheap ~75% of the time, played by an unmasked search,
+and can discard the proven result — so the outcome is *not* the proven value and
+the de-noising does not happen. §3B carries the fix: **trigger the solve on
+every eligible ply, mask always, and emit the label only on recorded rows.** The
+mask changes play; the label is a separate concern.
 
 **Value targets from chance-free proofs only.** A scalar expected utility is
 `P(win) − P(loss)` and does not determine a three-class distribution when draws
@@ -86,13 +108,43 @@ a flag:
    is the only root exploration there is.
 3. **Forced playouts + policy target pruning.** Not optional under PUCT:
    Dirichlet noise pollutes a visit-count target directly, which is the problem
-   KataGo invented PTP for. Under Gumbel there was nothing to subtract.
+   KataGo invented PTP for (paper §3.2). Under Gumbel there was nothing to
+   subtract. Three requirements that are easy to miss:
+
+   * **Selection and training must read different distributions.** Both paths
+     today sample the played move from the *same mutable* `policy_target` they
+     then record (`self_play.rs` `run` ~line 817, `finish_move` ~line 1884).
+     That is correct for the solver mask — a proof should change what is played —
+     but wrong for PTP, which exists to clean the *label* while leaving the
+     exploration in the trajectory. Applying PTP in place before `sample_policy`
+     would delete the forced exploration from the games as well.
+   * **PTP needs the NOISED priors**, and `SearchResult.prior` is deliberately
+     the clean pre-noise snapshot (`tree.rs` ~line 551, kept clean so KL
+     diagnostics mean something). Either expose the noised priors alongside it or
+     carry explicit forced-playout counts out of the search.
+   * **Use KataGo's counterfactual rule, not a flat `sqrt(kPN)` subtraction.**
+     Subtract from each non-max child only down to the point where it would still
+     have been PUCT-competitive with the most-visited child; an unconditional
+     subtraction removes visits the search would have spent anyway.
+
 4. **Composition order** — load-bearing, and easy to get silently wrong:
-   **prune forced visits (search artifact) → zero provably-losing moves (proof)
-   → renormalise.** Renormalising before the mask normalises over the wrong
-   support.
-5. **Per-move mode switch.** `puct_root` is currently per-config; the hybrid
-   needs it resolved per move (`puct_root && full`).
+
+   * **played move** ← raw visit distribution, proof-masked when a solve
+     succeeded (never PTP-pruned);
+   * **training target** ← visits, PTP-pruned, then proof-masked, then
+     renormalised.
+
+   Renormalising before the mask normalises over the wrong support.
+
+5. **Per-move mode switch — do NOT overload `full`.** The obvious
+   `puct_root && full` is wrong: gate games set `full_search_fraction = 0.0` and
+   deliver their strength through the cheap path with
+   `cheap_sims = full_sims = gate_sims`, while enabling PUCT independently
+   (`phase_d.py` ~line 3832). So `full` is *always* false in a gate, and that
+   expression would silently run every promotion gate under Gumbel while
+   `--eval-search-mode puct` reported success. Add a **generation-only** hybrid
+   flag instead, and gate it behaviourally — assert PUCT-shaped output (no Gumbel
+   candidate set in the record) rather than asserting a config value.
 6. **Raise `full_sims`.** 64–128 is low for PUCT by AlphaZero standards. This is
    the sweep dimension that actually costs throughput.
 7. **Update the stale comments** asserting "self-play must stay Gumbel"
@@ -101,8 +153,23 @@ a flag:
 
 ### B. Wire the solver in properly
 
-* **`endgame_oversample`** (KD uses 2.0) — solved rows carry exact labels, so
-  concentrate gradient there.
+* **Trigger on every eligible ply, not only `full` ones.** The mask is what makes
+  the endgame provably-optimally played, and that property is what de-noises the
+  outcome for the whole game (§2). Emit the *label* only on recorded rows; a
+  cheap ply still produces no example. Without this the "no cache" decision
+  loses its justification.
+* **Head-specific weighting, NOT row oversampling.** KD's `endgame_oversample`
+  duplicates rows, and `compute_losses` averages every head over the sampled
+  batch — so duplicating a row multiplies its policy and all four auxiliary
+  losses too, not just the value loss it was meant to emphasise. Worse, only
+  `solver_exact` rows carry an exact W/D/L label; `exact_expectimax` rows keep
+  the realised outcome and would be upweighted for a certainty they do not have.
+  Instead:
+  * a value weight applied only to `solver_exact` rows;
+  * optionally a policy weight applied only to `solver_masked` rows;
+  * **no** oversampling in validation, or the metric stops being comparable;
+  * a cap per game, so a run of adjacent solved plies — which share one game and
+    one proof — cannot masquerade as independent evidence.
 * **Cost-predicted trigger**, replacing the card cap. Model: `cards_left`,
   `unrevealed`, `log10(legal)`, and the interaction `cards_left × log10(legal)`
   — held-out R² **0.904**. Attempt iff predicted cost fits the budget, with
@@ -125,12 +192,29 @@ a flag:
 
 ### C. The sweep
 
-**Objective: maximise proven labels per hour, subject to games/hour unchanged.**
-One objective and one invariant, rather than a trade-off to referee. The
-all-core-clock effect (solver threads depress generation clocks — the plan
-measured solver scaling at 2.89×/4, 3.77×/8, 4.37×/16 threads and attributed the
-ceiling to clock and SMT, *not* bandwidth) then shows up as a measured drop in
-games/hour that the sweep simply avoids.
+**"Maximise proven labels per hour" is the WRONG objective** — it contradicts
+§4's own finding. The cheapest positions to prove are the nearly-decided ones
+(cheapest decile: |value| 1.00, 94% of moves already optimal), so a
+labels-per-hour objective buys exactly the labels that teach nothing, and
+combined with any endgame weighting it would flood training with them.
+
+Report and constrain a vector instead, with **games/hour held fixed** as the
+invariant:
+
+* **unique solved games/hour**, not solved rows — adjacent solved plies in one
+  game are one piece of evidence;
+* **chance-free value labels/hour**, counted separately from expectimax masks,
+  because only the former supply a value target;
+* **losing policy mass eliminated per hour** — the mask's actual information
+  content, `1 − optimal/legal` summed, which is the metric the trigger study
+  already used and which correctly scores a fully-decided position at ~0;
+* **policy targets/hour** and their improvement over the prior;
+* **strength at a fixed deployment search budget** — the only number that
+  answers the question the rest are proxies for.
+
+The all-core-clock effect (solver scaling measured at 2.89×/4, 3.77×/8,
+4.37×/16 threads, ceiling attributed to clock and SMT, *not* bandwidth) then
+shows up as a measured drop in games/hour that the invariant rejects.
 
 Dimensions: solver cores vs generation cores; node budget; predictor threshold;
 `full_sims` and `full_search_fraction` (they interact — more sims per full move
@@ -164,9 +248,18 @@ the calibrator cannot answer.
   pattern instead of adding a third bespoke flag.
 
 * **Auxiliary reply head.** A second policy head predicting the opponent's
-  improved policy at the next decision. Target for row *t* is row *t+1*'s
-  `policy_target` over *t+1*'s legal set, when *t+1* is full-search and its actor
-  differs. No Rust: the buffer already holds it. Weight ~0.15.
+  improved policy at the next decision. Target for row *t* is the **next raw
+  move's** `policy_target` over its legal set. No Rust: the buffer already holds
+  it. Weight ~0.15 (KataGo §3.4 supports both the idea and the small weight; the
+  risk here is the local plumbing).
+
+  **Pair during raw replay, before filtering.** Fast decisions are dropped at the
+  example boundary, so "row *t+1*" in the derived list can be several actual
+  decisions later — pairing there would silently supervise a position against a
+  reply two plies downstream, and every shape check would still pass. Skip when
+  the immediate next raw move is cheap, policy-excluded, or has the same actor
+  (an extra turn makes it "what do *I* do next", a different question). Carry a
+  separate reply legality mask and a validity flag.
 
   **It adds no information** — Q already integrates the opponent's reply, which
   is why "don't take X, it uncovers Y" is already implicit in the recorded
@@ -181,9 +274,27 @@ the calibrator cannot answer.
 
 ### E. Measurement
 
-* **Gumbel vs PUCT against proven values**, matched sims, on the solver-proven
-  set — `|value − truth|` and top-1 agreement with the proven-optimal set. Cheap,
-  needs no training run, and settles §A empirically rather than by argument.
+* **Gumbel vs PUCT against proven values** — useful, but it **cannot settle §A**,
+  and an earlier draft of this file claimed it could. Three reasons:
+  `root_value` is the visit-weighted *aggregate* over everything the search
+  explored, so it penalises PUCT for deliberately sampling inferior actions;
+  top-1 agreement is nearly uninformative when 78–82% of legal moves are tied
+  optimal; and the only net that runs today is Gumbel-trained and migrated, so
+  the comparison measures immediate search behaviour, not which target trains a
+  stronger net. Gumbel's paper claims reliable improvement *at low simulation
+  counts* specifically — deploying under PUCT does not by itself make PUCT the
+  better training target.
+
+  Use instead: **per-action solver regret** for the move actually selected,
+  **probability mass placed on provably-losing moves after the selection
+  temperature**, restricted to a **non-trivial subset** (drop positions where
+  nearly every move is optimal). Then a **small closed-loop training comparison**
+  — nothing short of that answers the target-quality question.
+
+  *This also weakens a conclusion drawn earlier from the existing probe.* Its
+  "search improves on the net in only 71% of positions" used the same aggregate
+  `root_value`, so it understates search quality by the same mechanism. The
+  probe should be re-run reading the selected action's value.
 * **Gate under `--eval-search-mode puct`** so the number promoted on is the
   number the advisor delivers.
 * **Error-tail analysis** (§6).
@@ -331,6 +442,19 @@ a deadline, so gate *coverage* varies with machine load (83, 85 and 86 of 86
 positions across three runs with no code change). Worth pinning to the node
 budget alone.
 
+**`full` does not mean "recorded".** It means "this move drew the full simulation
+budget". Gates set `full_search_fraction = 0.0` and get their strength from the
+cheap path, so any rule written as `... && full` silently becomes a no-op in
+evaluation. This already produced two P1 defects in the first draft of this plan
+(the PUCT gate switch and the solver trigger). Prefer explicit
+generation-only flags, and gate them on observed behaviour rather than on a
+config value.
+
+**Aggregate root values.** `SearchResult.root_value` is the visit-weighted mean
+over everything the search explored, not the value of the move it chose. Any
+comparison that reads it will penalise a searcher for exploring, which biases
+against PUCT specifically and understates search quality generally.
+
 **Duplicated constants.** The padded feature width was a literal in four places
 and adding two features left two behind, surfacing as a matmul shape error naming
 nothing. All four now derive from the schema. The class of bug is worth watching
@@ -351,3 +475,11 @@ for elsewhere.
 
 Steps 2–4 all bump the same target version, so they should ship together or the
 buffer fragments across definitions.
+
+**Do not combine the network changes into the expensive run untested.** Mean/max
+readout and the reply head each get a short **identical-buffer ablation** —
+same data, same steps, head on/off — before either enters a long run. Without
+that this is a kitchen-sink retrain: several simultaneous changes and no way to
+attribute a strength move to any of them, which is exactly the position the
+cloud6 stall left us in. The same applies to any cheap-move diversity change,
+which needs its strength constraint measured rather than assumed.
