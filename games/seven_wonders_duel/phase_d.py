@@ -327,6 +327,34 @@ class PhaseDConfig:
     generator. Switching resets what every gate number means, exactly as
     ``eval_search_mode`` does."""
 
+    forced_playout_k: float = 0.0
+    """KataGo forced playouts at the PUCT root (paper §3.2); 0.0 is off.
+
+    Guarantees each root child at least ``sqrt(k * P(c) * N)`` visits, so
+    Dirichlet noise actually changes what gets SEARCHED rather than only what
+    the prior says. KataGo uses 2.0.
+
+    Must not be enabled without policy-target pruning, which takes these visits
+    back out of the label -- otherwise the target teaches the forcing. The two
+    are wired together in the searcher, so setting this enables both.
+    """
+
+    cheap_search_mode: str = "same"
+    """Root selection for CHEAP moves: ``same`` as --selfplay-search-mode, or an
+    explicit ``gumbel`` / ``puct``.
+
+    The hybrid is ``--selfplay-search-mode puct --cheap-search-mode gumbel``:
+    PUCT where training targets are produced, Gumbel on the cheap moves, whose
+    guarantee is built for exactly the tiny budgets those run at. Cheap moves
+    emit no policy target, so mixing root selection there costs no label
+    consistency.
+
+    Deliberately NOT derived from `full`: gate games set
+    `full_search_fraction = 0.0` and take their strength from the cheap path, so
+    a hybrid keyed off `full` would run every promotion gate under Gumbel while
+    --eval-search-mode reported PUCT.
+    """
+
     dirichlet_epsilon: float = 0.0
     """Root exploration noise. Inert under the Gumbel root, which carries its own
     exploration in the Gumbel keys; REQUIRED under PUCT, which has no other
@@ -792,6 +820,16 @@ class PhaseDConfig:
             raise ValueError("dirichlet_alpha must be finite and positive")
         if not 0.0 <= self.dirichlet_epsilon <= 1.0:
             raise ValueError("dirichlet_epsilon must lie in [0, 1]")
+        if not math.isfinite(self.forced_playout_k) or self.forced_playout_k < 0:
+            raise ValueError("forced_playout_k must be finite and non-negative")
+        if self.cheap_search_mode not in ("same", "gumbel", "puct"):
+            raise ValueError("cheap_search_mode must be same, gumbel or puct")
+        if self.forced_playout_k > 0 and self.selfplay_search_mode != "puct":
+            # Forcing is a PUCT-root mechanism; under Gumbel it would be read
+            # from the config, ignored by the search, and quietly do nothing.
+            raise ValueError(
+                "forced_playout_k needs --selfplay-search-mode puct"
+            )
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
 
@@ -844,6 +882,24 @@ def _configure_cheap_top_k(width: int) -> None:
     except ImportError:  # pragma: no cover - Python backend needs no bridge
         return
     swr.set_cheap_top_k(int(width))
+
+
+def configure_forced_playouts(k: float) -> None:
+    """Apply the forced-playout constant to the Rust generator.
+
+    Process-wide like the cheap width, and safe as one because it is inert
+    unless the root is PUCT, which evaluation sets independently. Contrast
+    `cheap_puct_root`, which must be per-call precisely because a gate would
+    otherwise inherit it.
+    """
+
+    if k < 0.0:
+        raise ValueError("--forced-playout-k must be non-negative")
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return
+    swr.set_forced_playout_k(float(k))
 
 
 def configure_endgame_solver(
@@ -3042,6 +3098,14 @@ class PhaseDLoop:
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
             puct_root=self.config.selfplay_search_mode == "puct",
+            # `None` means "same as puct_root". Only self-play passes this; the
+            # gate call below deliberately does not, so it can never inherit the
+            # hybrid and quietly evaluate under a different root than it reports.
+            cheap_puct_root=(
+                None
+                if self.config.cheap_search_mode == "same"
+                else self.config.cheap_search_mode == "puct"
+            ),
             dirichlet_epsilon=self.config.dirichlet_epsilon,
             dirichlet_alpha=self.config.dirichlet_alpha,
         )
@@ -4835,6 +4899,26 @@ def build_parser() -> argparse.ArgumentParser:
         "are not comparable across the two.",
     )
     parser.add_argument(
+        "--forced-playout-k",
+        type=float,
+        default=0.0,
+        help="KataGo forced playouts at the PUCT root (paper 3.2); 0 is off, "
+        "KataGo uses 2. Guarantees each root child sqrt(k*P*N) visits so "
+        "Dirichlet noise changes what is SEARCHED, not just the prior. Enables "
+        "policy-target pruning with it -- the label must not keep the forced "
+        "visits, or it teaches the forcing. Requires --selfplay-search-mode puct.",
+    )
+    parser.add_argument(
+        "--cheap-search-mode",
+        choices=("same", "gumbel", "puct"),
+        default="same",
+        help="root selection for CHEAP moves; 'same' follows "
+        "--selfplay-search-mode. The hybrid is 'puct' full / 'gumbel' cheap: "
+        "PUCT where targets are produced, Gumbel at the tiny budgets its "
+        "guarantee is designed for. Cheap moves emit no policy target, so this "
+        "costs no label consistency. Evaluation is unaffected.",
+    )
+    parser.add_argument(
         "--dirichlet-epsilon",
         type=float,
         default=0.0,
@@ -5220,6 +5304,7 @@ def main(argv=None) -> int:
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
+    configure_forced_playouts(args.forced_playout_k)
     # Read back what the generator is actually running under, so the manifest
     # records the effective settings rather than the requested ones -- they
     # differ when there is no Rust generator to configure at all.
@@ -5325,6 +5410,8 @@ def main(argv=None) -> int:
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
         selfplay_search_mode=args.selfplay_search_mode,
+        forced_playout_k=args.forced_playout_k,
+        cheap_search_mode=args.cheap_search_mode,
         dirichlet_epsilon=args.dirichlet_epsilon,
         dirichlet_alpha=args.dirichlet_alpha,
         cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,

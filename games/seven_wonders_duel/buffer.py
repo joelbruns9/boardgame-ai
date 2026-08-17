@@ -44,7 +44,7 @@ LOGIC_DIGEST_VERSION = "logic-sha256-v1"
    unreplayable rather than merely stale.
 """
 
-TARGET_VERSION = 2
+TARGET_VERSION = 3
 """Version of the TRAINING TARGET definition, independent of the codec.
 
 ``schema``/``spec_version`` cover replay: what a state and an action mean.  They
@@ -60,6 +60,17 @@ incompatible definitions of the thing the policy head regresses onto.
 2. completed Q min-max rescaled to [0, 1] across the root's legal actions, then
    ``(c_visit + max_visits) * c_scale`` with ``c_scale=0.1`` (mctx's
    ``value_scale``).
+3. the PUCT root's VISIT DISTRIBUTION, optionally with KataGo policy-target
+   pruning applied (2026-08-17).  A different quantity entirely from
+   definitions 1-2, not a rescaling of one: completed Q prices every legal
+   action including unvisited ones, while visit counts price only what the
+   search actually looked at.  Mixing the two in one buffer would train the
+   policy head against two incompatible notions of "improved policy" with
+   nothing in the row to say which it was holding.
+
+   Rows also carry ``solver_masked`` (proof-masked policy) and, when pruning is
+   on, a target whose forced visits have been removed -- both per-row rather
+   than per-version, because they are legitimately mixed within a single run.
 
 Bump this whenever the meaning of ``policy_target``, ``root_value`` or the
 value label changes.  Replay is unaffected: because ``replay(record)``

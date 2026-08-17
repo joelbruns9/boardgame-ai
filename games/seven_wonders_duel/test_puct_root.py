@@ -436,3 +436,62 @@ def test_pruning_changes_the_recorded_target_but_not_the_played_move():
     assert forced.training_policy != pytest.approx(raw), "label must be pruned"
     # The played action is still argmax of the RAW visits, unaffected by pruning.
     assert forced.action_index == max(forced.visits, key=lambda a: forced.visits[a])
+
+
+def _record_root_modes(records):
+    """(full-move modes, cheap-move modes) as observed in the RECORD.
+
+    `gumbel_topk` is the behavioural signature: the Gumbel root emits its
+    candidate set, the PUCT root deliberately emits none rather than invent one.
+    Asserting on this rather than on a config value is the point -- the defect
+    this guards against is a config that says PUCT while the search runs Gumbel.
+    """
+    full, cheap = set(), set()
+    for record in records:
+        for move in record["moves"]:
+            mode = "gumbel" if move["gumbel_topk"] else "puct"
+            (full if move["full_search"] else cheap).add(mode)
+    return full, cheap
+
+
+def test_a_gate_shaped_run_is_puct_on_every_move():
+    """The defect this exists for: gates set `full_search_fraction = 0.0` and
+    take their strength from the CHEAP path, so any hybrid keyed off `full`
+    would run the whole promotion gate under Gumbel while `--eval-search-mode
+    puct` reported success."""
+
+    from .rust_bridge import rust_games_for_self_play
+    from .test_f4_scheduler import _common
+
+    seeds = [20260817, 20260818, 20260819]
+    records, _ = swr.self_play_many_mock(
+        games=rust_games_for_self_play(seeds, [0, 1, 0]),
+        game_seeds=seeds,
+        force=True,
+        puct_root=True,
+        **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 0.0}),
+    )
+    full, cheap = _record_root_modes(records)
+    assert full == set(), "gate config should produce no full-budget moves"
+    assert cheap == {"puct"}, f"gate ran something other than PUCT: {cheap}"
+
+
+def test_the_hybrid_splits_full_and_cheap_moves():
+    """Opt-in, and only when asked: PUCT where targets are produced, Gumbel on
+    the cheap moves whose guarantee is built for tiny budgets."""
+
+    from .rust_bridge import rust_games_for_self_play
+    from .test_f4_scheduler import _common
+
+    seeds = [20260820, 20260821, 20260822]
+    records, _ = swr.self_play_many_mock(
+        games=rust_games_for_self_play(seeds, [0, 1, 0]),
+        game_seeds=seeds,
+        force=True,
+        puct_root=True,
+        cheap_puct_root=False,
+        **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 0.5}),
+    )
+    full, cheap = _record_root_modes(records)
+    assert full == {"puct"}, f"full moves not PUCT: {full}"
+    assert cheap == {"gumbel"}, f"cheap moves not Gumbel: {cheap}"

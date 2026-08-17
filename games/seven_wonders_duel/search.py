@@ -461,10 +461,17 @@ class SearchConfig:
     root_selection: str = "gumbel"  # or "puct"
     """How the ROOT picks which action to simulate next.
 
-    ``gumbel`` is Gumbel top-k + sequential halving: the training-target
-    generator, and what self-play must keep using.  ``puct`` selects at the
-    root by PUCT like every other node and plays argmax visits -- the search
-    the advisor runs, and therefore what evaluation should measure.
+    ``gumbel`` is Gumbel top-k + sequential halving, whose guarantee is
+    designed for small fixed budgets.  ``puct`` selects at the root by PUCT like
+    every other node and plays argmax visits.
+
+    **Self-play no longer "must stay Gumbel"** (2026-08-17).  It said so here
+    for as long as PUCT was evaluation-only, and that is now wrong: the advisor
+    is fixed PUCT, so training and gating on Gumbel meant the one surface a
+    human judges was the one off-distribution from both.  The settled shape is
+    PUCT on recorded moves, Gumbel on cheap ones -- see ``PRE_RETRAIN_PLAN.md``
+    A.  Targets differ between the two (visit counts versus completed Q), which
+    is what ``buffer.TARGET_VERSION`` exists to keep from mixing silently.
     """
 
     c_puct: float = 1.5

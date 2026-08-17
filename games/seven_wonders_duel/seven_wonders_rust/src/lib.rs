@@ -193,6 +193,7 @@ fn make_self_play_config(
     c_scale: f64,
     force: bool,
     puct_root: bool,
+    cheap_puct_root: Option<bool>,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     age_deal_samples: usize,
@@ -219,6 +220,7 @@ fn make_self_play_config(
         c_scale,
         force_expand_root_chance: force,
         puct_root,
+        cheap_puct_root,
         dirichlet_epsilon,
         dirichlet_alpha,
         age_deal_samples,
@@ -1448,6 +1450,7 @@ impl RustGame {
             c_scale,
             force,
             false, // self-play always uses the Gumbel root
+            None,  // cheap_puct_root: uniform, so a gate cannot inherit a hybrid
             0.0,   // Dirichlet is a PUCT-root mechanism; inert under Gumbel
             1.8,
             age_deal_samples,
@@ -1509,6 +1512,7 @@ impl RustGame {
             c_scale,
             force,
             false, // self-play always uses the Gumbel root
+            None,  // cheap_puct_root: uniform, so a gate cannot inherit a hybrid
             0.0,   // Dirichlet is a PUCT-root mechanism; inert under Gumbel
             1.8,
             age_deal_samples,
@@ -2001,6 +2005,7 @@ fn cooperative_jobs(
     c_scale: f64,
     force: bool,
     puct_root: bool,
+    cheap_puct_root: Option<bool>,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     age_deal_samples: usize,
@@ -2037,6 +2042,7 @@ fn cooperative_jobs(
                 c_scale,
                 force,
                 puct_root,
+                cheap_puct_root,
                 dirichlet_epsilon,
                 dirichlet_alpha,
                 age_deal_samples,
@@ -2059,7 +2065,8 @@ fn cooperative_jobs(
     draft_prior, iteration=None, c_puct=1.5, c_visit=50.0, c_scale=0.1,
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
     cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
-    max_active_slots=0, conflict_free_waves=false, round_robin_candidates=false
+    max_active_slots=0, conflict_free_waves=false, round_robin_candidates=false,
+    puct_root=false, cheap_puct_root=None
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -2087,6 +2094,8 @@ fn self_play_many_mock(
     max_active_slots: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
+    puct_root: bool,
+    cheap_puct_root: Option<bool>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
         py,
@@ -2105,7 +2114,8 @@ fn self_play_many_mock(
         c_visit,
         c_scale,
         force,
-        false, // this entry point has no puct_root parameter
+        puct_root,
+        cheap_puct_root,
         0.0,
         1.8,
         age_deal_samples,
@@ -2202,6 +2212,7 @@ fn self_play_many_net(
         c_scale,
         force,
         false, // this entry point has no puct_root parameter
+        None,  // cheap_puct_root: uniform
         0.0,
         1.8,
         age_deal_samples,
@@ -2311,7 +2322,7 @@ fn self_play_many_net(
     bot_p0=None, bot_p1=None, bots_p0=None, bots_p1=None,
     nets_p0=None, nets_p1=None,
     bot_exploration=0.0, bot_policy_iterations=10
-, puct_root=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
+, puct_root=false, cheap_puct_root=None, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
     conflict_free_waves=false, round_robin_candidates=false))]
 fn self_play_many_flat_net(
@@ -2355,6 +2366,7 @@ fn self_play_many_flat_net(
     bot_exploration: f64,
     bot_policy_iterations: i64,
     puct_root: bool,
+    cheap_puct_root: Option<bool>,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     cheap_double_reveal_offsets_p0: Option<usize>,
@@ -2381,6 +2393,7 @@ fn self_play_many_flat_net(
         c_scale,
         force,
         puct_root,
+        cheap_puct_root,
         dirichlet_epsilon,
         dirichlet_alpha,
         age_deal_samples,
@@ -2726,6 +2739,18 @@ fn set_endgame_solver(
 }
 
 #[pyfunction]
+/// Set the forced-playout constant. See `self_play::set_forced_playout_k`.
+fn set_forced_playout_k(k: f64) {
+    self_play::set_forced_playout_k(k);
+}
+
+#[pyfunction]
+/// The forced-playout constant in force, for run manifests.
+fn forced_playout_k() -> f64 {
+    self_play::forced_playout_k()
+}
+
+#[pyfunction]
 /// KataGo policy-target pruning, exposed so `search.py::prune_policy_target`
 /// can be gated directly against this implementation rather than only through a
 /// whole search, where a disagreement would surface as a puzzling visit-count
@@ -2783,6 +2808,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::prune_policy_target;
+
+    #[pymodule_export]
+    use super::set_forced_playout_k;
+
+    #[pymodule_export]
+    use super::forced_playout_k;
 
     #[pymodule_export]
     use super::RustPuctSearch;

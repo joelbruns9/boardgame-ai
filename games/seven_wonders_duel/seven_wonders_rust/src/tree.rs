@@ -349,9 +349,14 @@ pub struct SearchConfig {
     pub c_scale: f64,
     pub seed: u64,
     pub force_expand_root_chance: bool,
-    /// Root action selection: false = Gumbel top-k + sequential halving (the
-    /// training-target generator), true = plain PUCT at the root with argmax
-    /// visits (what the advisor runs, and what evaluation should measure).
+    /// Root action selection: false = Gumbel top-k + sequential halving, true =
+    /// plain PUCT at the root with argmax visits.
+    ///
+    /// This used to say PUCT was for evaluation and self-play had to stay
+    /// Gumbel. No longer true (2026-08-17): the advisor is fixed PUCT, so
+    /// training and gating under Gumbel left the only human-facing surface
+    /// off-distribution. Self-play now runs PUCT on recorded moves and Gumbel on
+    /// cheap ones (`SelfPlayConfig::cheap_puct_root`).
     pub puct_root: bool,
     /// KataGo forced playouts at the PUCT root (paper §3.2); 0.0 is off.
     /// Mirrors `search.py::SearchConfig.forced_playout_k`. Pairs with

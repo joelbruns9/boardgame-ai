@@ -24,9 +24,17 @@ Already committed on `sevenwd-engine-correctness`:
 | Exact endgame solver in self-play | committed, **off by default** (`2a509ab`, `a820979`) |
 | Oracle probe (value head vs proven values) | `solver_oracle_probe.py` (`cb5cd2e`) |
 | Trigger study + per-machine calibrator | `endgame_trigger_study.py` (`373ab15`) |
-| Encoder tempo primitives | `7wd-encoder-4` (`28f1413`) |
+| Encoder tempo primitives | `7wd-encoder-5` (`28f1413`, reordered in `ec73d4b`) |
+| Selection/training split + solver on every ply | `2c18415` |
+| Policy-target pruning primitive | `de6b6b3` |
+| Forced playouts, all three implementations | `473cf01` |
+| Pruning wired to the forced visits | `bbcd137` |
+| Hybrid root mode, Dirichlet/forcing CLI, `TARGET_VERSION` 3 | §A complete |
 
-Nothing in this file is blocked on anything except the ordering in §3.
+**§A is done.** Every knob defaults to off, so behaviour is unchanged until a
+run sets them; the gates went in before the switches so the failure modes are
+covered rather than discovered. Nothing here is blocked except by the ordering
+in §3.
 
 ---
 
@@ -58,6 +66,8 @@ per game. So it must be **measured, not assumed either way**: any cheap-move
 diversity change needs a strength constraint alongside throughput (top-action
 agreement against a strong reference, and head-to-head non-inferiority of the
 cheap searcher). Games/hour alone will happily buy fast, weaker trajectories.
+§B2 gives that constraint a sharper metric than throughput, and a second reason
+to care: cheap moves may be breaking multi-move plans outright.
 
 **Solve at every triggered ply; no solver cache.** A cache ceilings at 40% (the
 deepest solve is 60% of per-game cost), but the 40% buys the thing that matters:
@@ -102,10 +112,14 @@ a flag:
 1. **`TARGET_VERSION` bump.** PUCT's target is visit counts (`_puct_root`);
    Gumbel's is completed-Q. This is exactly what the version exists for. Batch
    every other target change (§D) into the same bump.
-2. **Expose Dirichlet.** Ported and alpha-tuned (**1.8**, not KD's 0.3 — the
-   branching differs), currently inert because no CLI flag reaches it. It
-   applies to the PUCT root only. Under Gumbel that was harmless; under PUCT it
-   is the only root exploration there is.
+2. ~~**Expose Dirichlet.**~~ **This was wrong.** `--dirichlet-epsilon` and
+   `--dirichlet-alpha` already exist, validate, and reach the generator. It was
+   inert only because it defaults to 0.0 and PUCT self-play had never been run.
+   Nothing needed building. Alpha is **1.8**, not KD's 0.3 — the branching
+   differs, and at 0.3 over ~5 actions almost all the noise mass lands on one
+   arbitrary move. Applies to the PUCT root only; under PUCT it is the only root
+   exploration there is, so `--selfplay-search-mode puct` without epsilon is a
+   mistake.
 3. **Forced playouts + policy target pruning.** Not optional under PUCT:
    Dirichlet noise pollutes a visit-count target directly, which is the problem
    KataGo invented PTP for (paper §3.2). Under Gumbel there was nothing to
@@ -136,7 +150,9 @@ a flag:
 
    Renormalising before the mask normalises over the wrong support.
 
-5. **Per-move mode switch — do NOT overload `full`.** The obvious
+5. **Per-move mode switch — do NOT overload `full`.** Shipped as
+   `--cheap-search-mode` / `SelfPlayConfig::cheap_puct_root`, an
+   `Option<bool>` where `None` means "same as `puct_root`". The obvious
    `puct_root && full` is wrong: gate games set `full_search_fraction = 0.0` and
    deliver their strength through the cheap path with
    `cheap_sims = full_sims = gate_sims`, while enabling PUCT independently
@@ -189,6 +205,65 @@ a flag:
   oracle diagnostic runs continuously instead of as a separate job.
 * **`exact_fallback_positions` sidecar** — declined roots, kept out of the replay
   buffer. Now straightforward: `solver_attempted` and `solver_stop` identify them.
+
+### B2. Do cheap moves break multi-move plans? — measure before spending
+
+A concern that is **label contamination, not diversity**, and worth separating
+from both.
+
+A full-search move's row carries the game outcome as its value label. If the
+search sees a three-move plan and plays move 1, but moves 2 and 3 are cheap and
+do not see it, the plan dies and the outcome records that the plan was bad. The
+row that did the right thing is punished for what the following cheap moves
+failed to do.
+
+The bias is selective in the worst direction. Cheap search is prior-guided, not
+random, so it reliably executes plans the prior **already knows** and drops the
+ones it does not — exactly the plans worth learning. The mechanism
+preferentially suppresses novel strategy while leaving known strategy intact.
+
+**The cheap-vs-full agreement probe.** No training run needed: play games
+normally, and at every CHEAP move also run a full search, discard it, and record
+
+* how often the two choose different actions;
+* the same rate conditioned on the full search's choice being **low-prior** —
+  the cases where search is discovering something the net does not know, and the
+  only cases where a broken chain costs anything;
+* the KL between the cheap and full policies at the same position;
+* and, at solved endgame positions, how often each plays a **provably losing**
+  move. That is ground truth rather than mutual agreement, and it puts a number
+  on how much strategy the cheap path actually drops.
+
+`search_gain_probe.py` measures something adjacent — search versus the bare net
+— but not this. The oracle probe already generates solved positions, so the
+last measurement is a filter over existing output.
+
+**Read it as a gate on how much to spend.** High agreement (~95%), or
+disagreement concentrated on moves the prior already liked, means plans rarely
+break and neither fix below is worth buying. Disagreement concentrated on
+low-prior moves confirms the mechanism and sizes it.
+
+**If confirmed, prefer RUN-LENGTH full search over full-sims iterations.** Make
+full moves arrive in runs of 3-4 rather than as independent coin flips, keeping
+the same overall fraction: compute is identical, and it targets chain coherence
+directly. The cost is that recorded positions become more correlated, which
+slightly narrows positional diversity.
+
+Full-sims iterations (every move full and recorded, every Nth iteration) are the
+fallback. They are **not** equivalent to raising `--full-search-fraction`: a
+three-move chain survives at roughly `f^3` — 1.6% at f=0.25, 12.5% at f=0.5 —
+against ~100% within a full-sims iteration. Coherence is a per-GAME property, so
+a raised fraction buys many partly-coherent games where periodic full iterations
+buy a few wholly-coherent ones, and for multi-move plans those are not
+substitutes. Cost is ~2.5x a mixed game (0.25*96 + 0.75*20 ~ 39 against 96), so
+every tenth iteration is about +15% total compute. It yields ~70 recorded rows
+per game instead of ~17 but still only ONE independent value label, so the gain
+is policy labels plus coherence, not value signal.
+
+This is the same argument that rejected the solver cache (§2): masking every
+endgame ply rather than only the deepest was justified because both sides
+playing coherently makes the realised result mean something. That reasoning
+covers the last ~7 plies today; this is the midgame version of it.
 
 ### C. The sweep
 

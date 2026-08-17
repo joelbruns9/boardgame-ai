@@ -83,8 +83,25 @@ pub struct SelfPlayConfig {
     pub c_visit: f64,
     pub c_scale: f64,
     pub force_expand_root_chance: bool,
-    /// PUCT root selection; evaluation only. Self-play must stay Gumbel.
+    /// Root selection for FULL-budget moves.
     pub puct_root: bool,
+    /// Root selection for CHEAP moves; `None` means "whatever `puct_root` says".
+    ///
+    /// This is the hybrid: PUCT on the moves that produce training targets,
+    /// Gumbel on the cheap ones, whose guarantee is designed for exactly the
+    /// tiny budgets those run at. Cheap moves emit no policy target, so mixing
+    /// root selection there costs no label consistency.
+    ///
+    /// Per-call and defaulting to `puct_root` on purpose. The obvious spelling
+    /// -- keying the hybrid off `full` -- is wrong, because `full` means "this
+    /// move drew the full simulation budget", NOT "this move is recorded". Gate
+    /// games set `full_search_fraction = 0.0` and take their strength from the
+    /// cheap path with `cheap_sims = full_sims = gate_sims`, so `puct_root &&
+    /// full` would run every promotion gate under Gumbel while
+    /// `--eval-search-mode puct` reported success. A process-global would fail
+    /// the same way, since gates call the same entry points; only an explicit
+    /// per-call value a gate never sets is safe.
+    pub cheap_puct_root: Option<bool>,
     /// Root exploration noise for the PUCT root; inert under Gumbel.
     pub dirichlet_epsilon: f64,
     pub dirichlet_alpha: f64,
@@ -826,7 +843,11 @@ pub fn run<E: Eval>(
             c_scale: cfg.c_scale,
             seed: search_seed,
             force_expand_root_chance: cfg.force_expand_root_chance,
-            puct_root: cfg.puct_root,
+            puct_root: if full {
+                cfg.puct_root
+            } else {
+                cfg.cheap_puct_root.unwrap_or(cfg.puct_root)
+            },
             // Learner-only and full-search-only; see make_search_meta.
             dirichlet_epsilon: if full && cfg.net_by_player[actor] == 0 {
                 cfg.dirichlet_epsilon
@@ -1723,7 +1744,11 @@ impl GameSlot {
                 c_scale: self.cfg.c_scale,
                 seed: search_seed,
                 force_expand_root_chance: self.cfg.force_expand_root_chance,
-                puct_root: self.cfg.puct_root,
+                puct_root: if full {
+                    self.cfg.puct_root
+                } else {
+                    self.cfg.cheap_puct_root.unwrap_or(self.cfg.puct_root)
+                },
                 // Only network 0 -- the learner -- explores. An archived
                 // opponent must play noise-free: handicapping it inflates the
                 // learner's league win rate, and league games are ~15% of the

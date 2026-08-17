@@ -650,6 +650,80 @@ result.
 
 Defaults reproduce every run before 2026-08-05, when these were hard-coded.
 
+### `--selfplay-search-mode`, `--cheap-search-mode`
+
+**Defaults:** `gumbel`, `same`. **Values:** `gumbel` / `puct`, and additionally
+`same` for the cheap one.
+
+Root selection for self-play. `--selfplay-search-mode` governs FULL-budget
+moves; `--cheap-search-mode` governs cheap ones and defaults to following it.
+
+The intended shape is **`--selfplay-search-mode puct --cheap-search-mode
+gumbel`**: PUCT where training targets are produced, Gumbel on the cheap moves,
+whose policy-improvement guarantee is designed for exactly the tiny budgets
+those run at. This costs no label consistency, because cheap moves emit no
+policy target at all (`policy_excluded`, and `dataset.is_fast_search_move` drops
+them from the example set) -- so every recorded target is a PUCT visit
+distribution and the buffer stays homogeneous.
+
+Why PUCT at all, when Gumbel is the better small-budget target generator: the
+advisor is fixed PUCT (`RustPuctSearch`), so training and gating under Gumbel
+left the only human-facing surface off-distribution from both. Set
+`--eval-search-mode puct` alongside, or the number you promote on is not the
+number a user experiences.
+
+**These change what `policy_target` MEANS** -- visit counts rather than
+completed Q -- so they bump `buffer.TARGET_VERSION` to 3. Completed Q prices
+every legal action including unvisited ones; visit counts price only what the
+search looked at. A buffer must not mix them.
+
+The split is deliberately **not** derived from `full_search`. `full` means "this
+move drew the full simulation budget", not "this move is recorded": gate games
+set `--full-search-fraction 0` and take their strength from the cheap path, so a
+hybrid keyed off `full` would run every promotion gate under Gumbel while
+`--eval-search-mode puct` reported success.
+
+### `--dirichlet-epsilon`, `--dirichlet-alpha`
+
+**Defaults:** `0.0` (off) and `1.8`. **Values:** epsilon in `[0, 1]`, alpha
+finite and positive.
+
+Root exploration noise, **PUCT root only** -- the Gumbel root carries its own
+exploration in its keys, so noise there would double up. Under PUCT there is no
+other source, and without it self-play collapses toward deterministic lines. So
+`--selfplay-search-mode puct` without epsilon is a mistake.
+
+Kingdomino's settled values are 0.25 for the learner's full-search moves and 0.0
+everywhere else (evaluation, cheap moves, archived opponents); 7WD applies the
+same rule. **Do not copy Kingdomino's alpha of 0.3.** The convention is
+`alpha ~ 10 / branching`, and 7WD's ~5.6 mean legal actions give ~1.8; at 0.3
+over five actions almost all the noise mass lands on one arbitrary move.
+
+Noise never reaches the recorded `prior`, which is snapshotted before the blend
+so KL diagnostics keep meaning what they say.
+
+### `--forced-playout-k`
+
+**Default:** `0.0` (off). **Value:** non-negative float; KataGo uses `2.0`.
+Requires `--selfplay-search-mode puct`.
+
+KataGo forced playouts (paper §3.2): guarantee each root child at least
+`sqrt(k * P(c) * N)` visits. Without it, Dirichlet noise raises a child's prior
+but PUCT can still decline to spend a single simulation there -- so the noise
+changes nothing and the policy never learns whether the move was good.
+
+**It enables policy-target pruning with it, and must.** The forced visits belong
+in the search and in the played trajectory; they emphatically do not belong in
+the label, because a target built from raw visit counts teaches the forcing.
+Pruning removes them again, subtracting up to `sqrt(k * P(c) * N)` from every
+non-best child but stopping as soon as one more removal would make that child
+PUCT-competitive with the most-visited one. That guard is what makes the rule
+self-calibrating: a child the search genuinely chose already sits at parity, so
+nothing is taken from it.
+
+The two distributions therefore differ by design, and the buffer records the
+pruned one while the move is played from the raw one.
+
 ### `--endgame-solver-max-nodes`, `--endgame-solver-max-secs`, `--endgame-solver-max-cards`, `--endgame-solver-mask-policy`
 
 **Defaults:** `0` (off), `60.0`, `8`, on. **Values:** non-negative integer,
@@ -723,6 +797,23 @@ separately approved algorithm, not merely a throughput setting. Keep this at
 Backend for seed games and self-play. `rust` runs all per-game logic—including
 curriculum bots—in Rust and calls Python only at the flat Torch inference
 boundary. `python` preserves the slower reference/legacy path.
+
+### `--derive-backend`
+
+**Default:** `rust`. **Values:** `rust`, `python`
+
+Backend for replaying buffer records and encoding them into training examples.
+Rust is the production path; Python is the independently implemented reference,
+and the two are gated against each other by the encoder equivalence tests.
+
+One asymmetry worth knowing, because it is a silent reduction in checking rather
+than an error: records written before the language-neutral fingerprint carry
+**legacy RNG-inclusive digests**, which the Rust path cannot reproduce and
+therefore cannot verify. It still applies every structural runtime check --
+action legality, mask hashes, actors, resolved chance outcomes, final result --
+but the stored trajectory and final digests go unchecked for those rows, and it
+warns once per source when it happens. Running `--derive-backend python` once
+gives the full preflight if a buffer's provenance is uncertain.
 
 ### `--gate-backend`
 
