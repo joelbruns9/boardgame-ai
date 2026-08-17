@@ -218,8 +218,10 @@ def _print(summary: dict, games: int, *, values_interpretable: bool = True) -> N
     )
     if not values_interpretable:
         print("")
-        print("  value comparison suppressed: the net is off-distribution")
-        return
+        print("  READ THESE ONE WAY ONLY. The net is off-distribution, so a BAD")
+        print("  score is uninterpretable -- it could be the shifted features.")
+        print("  A GOOD score is trustworthy: feature shift can only hurt, so it")
+        print("  cannot manufacture agreement with a proof it never saw.")
     print("")
     print("  |value - truth|      mean   median      p90")
     for label, key in (("net (no search)", "net_abs_error"), ("search", "search_abs_error")):
