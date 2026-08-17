@@ -125,7 +125,11 @@ def position_features(game) -> dict:
         # expectimax average instead of a minimax.
         "unrevealed": sum(1 for card in present if not card.revealed),
         "accessible": len(accessible),
-        # The plan's strongest measured single correlate (+0.65 rank).
+        # Once believed to be the strongest single correlate of node count
+        # (+0.65, ahead of cards remaining); this study measured +0.478 against
+        # cards' +0.938 and corrected `solver.rs`. It still earns its place --
+        # its INTERACTION with depth, `cards_x_logleg`, is the only term that
+        # beat the additive baseline.
         "legal": len(legal_action_indices(game)),
         # Why human and strong-net positions cost ~3x a rush bot's at equal card
         # count: the options a weak player has already spent.

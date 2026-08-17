@@ -10,10 +10,17 @@
 //! * **Alpha-beta at decision nodes.** The reference is full-width: no cutoffs
 //!   at all. Pruning is where most of the speedup lives, since node counts
 //!   roughly double per extra card on the board.
-//! * **Move ordering.** The strongest measured correlate of a position's node
-//!   count was its legal-action count (+0.65 rank correlation), which is what
-//!   ordering attacks: try the moves most likely to be best first and the
-//!   window closes sooner.
+//! * **Move ordering.** Ordering attacks branching: try the moves most likely
+//!   to be best first and the window closes sooner. This was originally
+//!   justified by legal-action count being "the strongest measured correlate of
+//!   node count (+0.65 rank), ahead of cards remaining (+0.52)". That ranking
+//!   is **wrong**, and was measured within a narrow card band, where depth is
+//!   held constant and branching is all that is left to vary. Over 358 real
+//!   self-play positions spanning 1-12 cards (`endgame_trigger_study.py`):
+//!   cards remaining +0.938, legal actions +0.478. Depth dominates branching,
+//!   as the b^d form predicts. Ordering still pays for the reason above -- the
+//!   1.95x fewer nodes it measures is not in doubt -- but not because branching
+//!   is the larger driver of how big a position is.
 //! **Undo is journaled** (`GameState::apply_journaled`), not a state copy.
 //! Reversing a move replays a handful of recorded changes -- a card appended to
 //! a city, a slot taken, a token off the track -- while scalars ride in a

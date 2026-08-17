@@ -143,8 +143,13 @@ factors, measured over the corpus: 740× from Rust itself (1,314 → 974,811
 nodes per second) and 9.2× from *pruning the reference never had*. The Python
 solver is full-width — no alpha-beta, no move ordering, no cutoffs — so a
 straight transliteration would have left most of the win on the table. Move
-ordering was aimed at the measured driver of node count: the legal-action count
-(+0.65 rank correlation), ahead of cards remaining (+0.52).
+ordering was aimed at what was then believed to be the driver of node count:
+the legal-action count (+0.65 rank correlation), ahead of cards remaining
+(+0.52). **That ranking was an artefact of a narrow card band** — hold depth
+constant and branching is all that varies. Over 358 real self-play positions
+spanning 1–12 cards, cards remaining is +0.938 against legal actions' +0.478
+(`endgame_trigger_study.py`). Ordering still pays its measured 1.95×; the
+mistaken part is only the claim about which variable node count tracks.
 
 **Reach, at a 3s budget:** every position with ≤7 cards left, 9 of 10 at 8, 7
 of 10 at 9, and some out to 11 — against about 5 for the Python solver. Age I
