@@ -175,6 +175,47 @@ impl Arena {
         best
     }
 
+    /// A root child owed a forced playout, or `None`. Mirror of
+    /// `tree::forced_playout_edge` and `search.py::_forced_playout_edge`; all
+    /// three must agree, and the gate is
+    /// `test_forced_playouts_match_between_python_and_rust`.
+    ///
+    /// Uses `visits + incomplete` like `select` above, which is the same
+    /// quantity as the one-shot searcher's plain `visits`: `puct_root` is only
+    /// legal at `leaf_batch = 1` (`check_puct_root`), so nothing is ever in
+    /// flight while the root is selecting.
+    fn forced_playout_edge(&self, node_id: NodeId, cfg: &SearchConfig) -> Option<usize> {
+        if cfg.forced_playout_k <= 0.0 {
+            return None;
+        }
+        let node = &self.nodes[node_id];
+        let total: f64 = node
+            .edges
+            .iter()
+            .map(|e| (e.visits + e.incomplete) as f64)
+            .sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let sign = if node.actor == 0 { 1.0 } else { -1.0 };
+        let root_sqrt = ((node.visits + node.incomplete).max(1) as f64).sqrt();
+        let mut best: Option<usize> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for (index, edge) in node.edges.iter().enumerate() {
+            let seen = (edge.visits + edge.incomplete) as f64;
+            if seen >= (cfg.forced_playout_k * edge.prior * total).sqrt() {
+                continue;
+            }
+            let q = sign * self.edge_q_p0(node_id, index);
+            let score = q + cfg.c_puct * edge.prior * root_sqrt / (1.0 + seen);
+            if score > best_score {
+                best_score = score;
+                best = Some(index);
+            }
+        }
+        best
+    }
+
     fn incomplete_total(&self) -> u64 {
         self.nodes
             .iter()
@@ -897,6 +938,7 @@ impl SearchSession {
             arena,
             clean_priors,
             cfg: SearchConfig {
+                forced_playout_k: cfg.forced_playout_k,
                 sims: cfg.sims,
                 top_k: cfg.top_k,
                 c_puct: cfg.c_puct,
@@ -1237,7 +1279,9 @@ impl SearchSession {
             }
             let root_id = self.arena.root_id;
             let root_edge = if self.cfg.puct_root {
-                self.arena.select(root_id, self.cfg.c_puct)
+                self.arena
+                    .forced_playout_edge(root_id, &self.cfg)
+                    .unwrap_or_else(|| self.arena.select(root_id, self.cfg.c_puct))
             } else {
                 self.candidates[self.candidate_pos]
             };

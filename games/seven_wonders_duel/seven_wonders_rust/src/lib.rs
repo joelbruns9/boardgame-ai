@@ -329,6 +329,7 @@ impl RustPuctSearch {
         leaf_batch: usize,
     ) -> PyResult<Self> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims: max_sims.max(1),
             top_k,
             c_puct,
@@ -374,7 +375,7 @@ impl RustPuctSearch {
 
     /// Mock-evaluator twin of `open`, for the equivalence gate only.
     #[staticmethod]
-    #[pyo3(signature = (game, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16))]
+    #[pyo3(signature = (game, max_sims, seed=0, c_puct=1.5, c_visit=50.0, c_scale=0.1, top_k=16, forced_playout_k=0.0))]
     fn open_mock(
         game: &RustGame,
         max_sims: usize,
@@ -383,8 +384,10 @@ impl RustPuctSearch {
         c_visit: f64,
         c_scale: f64,
         top_k: usize,
+        forced_playout_k: f64,
     ) -> PyResult<Self> {
         let cfg = tree::SearchConfig {
+            forced_playout_k,
             sims: max_sims.max(1),
             top_k,
             c_puct,
@@ -1005,7 +1008,7 @@ impl RustGame {
     /// root_value, visits, policy_target, gumbel_topk, sims, tree_digest)` with
     /// `visits`/`policy_target` aligned to `legal_action_indices`.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false))]
+    #[pyo3(signature = (sims, top_k, seed, c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false, puct_root=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false, forced_playout_k=0.0))]
     fn closed_search(
         &self,
         sims: usize,
@@ -1021,6 +1024,7 @@ impl RustGame {
         double_reveal_offsets: usize,
         conflict_free_waves: bool,
         round_robin_candidates: bool,
+        forced_playout_k: f64,
     ) -> PyResult<(
         usize,
         f64,
@@ -1032,6 +1036,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k,
             sims,
             top_k,
             c_puct,
@@ -1091,6 +1096,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims,
             top_k,
             c_puct,
@@ -1149,6 +1155,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims,
             top_k,
             c_puct,
@@ -1212,6 +1219,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims,
             top_k,
             c_puct,
@@ -1285,6 +1293,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims,
             top_k,
             c_puct,
@@ -1357,6 +1366,7 @@ impl RustGame {
         Vec<f64>,
     )> {
         let cfg = tree::SearchConfig {
+            forced_playout_k: 0.0,
             sims,
             top_k,
             c_puct,
@@ -1809,6 +1819,7 @@ fn search_many_flat_net(
         let mut sessions = Vec::with_capacity(states.len());
         for ((state, seed), evaluation) in states.iter().zip(search_seeds).zip(roots) {
             let cfg = tree::SearchConfig {
+                forced_playout_k: 0.0,
                 sims,
                 top_k,
                 c_puct,

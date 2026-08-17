@@ -31,7 +31,7 @@ from .test_rust_engine_equiv import (
 )
 
 
-def _puct_search(state, sims, top_k, seed, force):
+def _puct_search(state, sims, top_k, seed, force, forced_playout_k=0.0):
     mcts = GumbelMCTS(
         None,
         SearchConfig(
@@ -41,6 +41,7 @@ def _puct_search(state, sims, top_k, seed, force):
             seed=seed,
             force_expand_root_chance=force,
             root_selection="puct",
+            forced_playout_k=forced_playout_k,
         ),
     )
     mcts._evaluate = _mock_evaluate  # type: ignore[method-assign]
@@ -265,3 +266,120 @@ def test_resumable_handle_matches_the_one_shot_puct_search():
             apply_action(py, decode_action(py, idx))
             rg.apply_index(idx)
     assert compared >= 20, f"only {compared} comparisons"
+
+
+def test_forced_playouts_match_between_python_and_rust():
+    """KataGo forced playouts change WHICH simulations happen, so the two
+    implementations must agree exactly or the buffers diverge silently.
+
+    Three places implement this rule -- `search.py`, `tree.rs` and
+    `tree_resumable.rs` -- and the one that most easily drifts is `N`: the root
+    counts its own expansion in `node.visits`, so the quota is scaled by the sum
+    of CHILD visits instead, which all three can compute identically.
+    """
+
+    checked = 0
+    for game_seed in range(4):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(
+            library_draws=[list(d) for d in library], **extract_setup(py)
+        )
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                legal = legal_action_indices(py)
+                for sims in (16, 64):
+                    for k in (1.0, 2.0):
+                        expected = _puct_search(py, sims, 8, 5, False, forced_playout_k=k)
+                        act, av, _rv, visits, policy, _topk, _s, _d = rg.closed_search(
+                            sims, 8, 5, force=False, puct_root=True, forced_playout_k=k
+                        )
+                        ctx = f"game {game_seed} sims {sims} k {k}"
+                        assert act == expected.action_index, f"{ctx}: action"
+                        assert list(visits) == [
+                            expected.visits[a] for a in legal
+                        ], f"{ctx}: visits"
+                        assert av == pytest.approx(
+                            expected.action_value, abs=1e-9
+                        ), f"{ctx}: action_value"
+                        for j, a in enumerate(legal):
+                            assert policy[j] == pytest.approx(
+                                expected.policy_target[a], abs=1e-9
+                            ), f"{ctx}: policy[{a}]"
+                        checked += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert checked >= 8, f"only {checked} positions compared"
+
+
+def test_forced_playouts_actually_change_the_search():
+    """A knob that quietly did nothing would pass the equivalence test above."""
+
+    state = new_game(7)
+    for _ in range(10):
+        apply_action(state, decode_action(state, legal_action_indices(state)[0]))
+    plain = _puct_search(state, 64, 8, 3, False, forced_playout_k=0.0)
+    forced = _puct_search(state, 64, 8, 3, False, forced_playout_k=2.0)
+    assert plain.visits != forced.visits
+    # Forcing spreads the budget: more distinct actions get looked at.
+    assert sum(1 for v in forced.visits.values() if v > 0) >= sum(
+        1 for v in plain.visits.values() if v > 0
+    )
+
+
+def test_resumable_forced_playouts_match_the_one_shot_search():
+    """Three implementations of the forcing rule, so the third needs its own
+    gate. `tree_resumable` is the searcher production self-play runs, and it
+    accepted `forced_playout_k` before it honoured it -- a state where the
+    config said one thing and the search did another.
+
+    It selects on `visits + incomplete` rather than plain `visits`; those are the
+    same quantity here because `puct_root` is only legal at `leaf_batch = 1`, so
+    nothing is ever in flight while the root selects.
+    """
+    from .rust_bridge import rust_game_from_state
+
+    compared = 0
+    for game_seed in range(3):
+        first_player, actions, library = random_game(game_seed, game_seed % 2)
+        py = new_game(game_seed, first_player=first_player)
+        rg = swr.RustGame(library_draws=[list(d) for d in library], **extract_setup(py))
+        tested_here = False
+        for i, idx in enumerate(actions):
+            if (
+                not tested_here
+                and i >= 8
+                and py.phase is Phase.PLAY_AGE
+                and py.pending_choice is None
+            ):
+                for sims, chunks in ((64, (64,)), (64, (16, 48))):
+                    one_shot = rg.closed_search(
+                        sims, 8, 5, force=False, puct_root=True, forced_playout_k=2.0
+                    )
+                    handle = swr.RustPuctSearch.open_mock(
+                        rust_game_from_state(py), sims, 5, 1.5, 50.0, 0.1, 8,
+                        forced_playout_k=2.0,
+                    )
+                    done = 0
+                    for chunk in chunks:
+                        done = handle.advance(chunk)
+                    _sims_done, _rv, _rvs, _actor, edges = handle.snapshot()
+                    by_action = {a: v for a, v, _vs, _p in edges}
+                    legal = legal_action_indices(py)
+                    ctx = f"game {game_seed} sims {sims} chunks {chunks}"
+                    assert done == one_shot[6], f"{ctx}: sims"
+                    assert [by_action[a] for a in legal] == list(
+                        one_shot[3]
+                    ), f"{ctx}: visits"
+                    compared += 1
+                tested_here = True
+            apply_action(py, decode_action(py, idx))
+            rg.apply_index(idx)
+    assert compared >= 4, f"only {compared} comparisons"

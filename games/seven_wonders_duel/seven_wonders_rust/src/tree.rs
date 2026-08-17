@@ -163,6 +163,36 @@ impl Node {
     }
 }
 
+/// A root child owed a forced playout, or `None`. Port of
+/// `search.py::_forced_playout_edge`; the two must agree exactly, so `N` is the
+/// sum of CHILD visits -- the root counts its own expansion, and summing edges
+/// is the one quantity all three implementations compute identically.
+fn forced_playout_edge(root: &Node, cfg: &SearchConfig) -> Option<usize> {
+    if cfg.forced_playout_k <= 0.0 {
+        return None;
+    }
+    let total: f64 = root.edges.iter().map(|e| e.visits as f64).sum();
+    if total <= 0.0 {
+        return None; // nothing to scale a quota against yet
+    }
+    let sign = if root.actor == 0 { 1.0 } else { -1.0 };
+    let root_sqrt = (root.visits.max(1) as f64).sqrt();
+    let mut best: Option<usize> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for (index, edge) in root.edges.iter().enumerate() {
+        if edge.visits as f64 >= (cfg.forced_playout_k * edge.prior * total).sqrt() {
+            continue;
+        }
+        let q = sign * edge.q_p0();
+        let score = q + cfg.c_puct * edge.prior * root_sqrt / (1.0 + edge.visits as f64);
+        if score > best_score {
+            best_score = score;
+            best = Some(index);
+        }
+    }
+    best
+}
+
 /// Descend one edge: sample its chance chain and materialize/reuse the child,
 /// keyed by the observable key. Returns the child's index in `edge.children`.
 fn closed_child(node: &mut Node, edge_idx: usize, rng: &mut Rng) -> usize {
@@ -323,6 +353,12 @@ pub struct SearchConfig {
     /// training-target generator), true = plain PUCT at the root with argmax
     /// visits (what the advisor runs, and what evaluation should measure).
     pub puct_root: bool,
+    /// KataGo forced playouts at the PUCT root (paper §3.2); 0.0 is off.
+    /// Mirrors `search.py::SearchConfig.forced_playout_k`. Pairs with
+    /// policy-target pruning, which takes these visits back OUT of the label:
+    /// the forced look belongs in the search and the trajectory, never in the
+    /// target. Shipping this without pruning teaches the forcing.
+    pub forced_playout_k: f64,
     /// Root exploration noise, applied ONLY when `puct_root` is set
     /// (`search.py::SearchConfig.dirichlet_epsilon`). Zero is off. The Gumbel
     /// root carries exploration in its keys, so noise there would double up;
@@ -552,7 +588,8 @@ fn puct_root<E: Eval>(
     let clean_priors: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
     add_dirichlet_noise(&mut root, cfg, &mut rng);
     for _ in 0..cfg.sims {
-        descend(&mut root, None, eval, &mut rng, cfg.c_puct)?;
+        let forced = forced_playout_edge(&root, cfg);
+        descend(&mut root, forced, eval, &mut rng, cfg.c_puct)?;
     }
     let visits: Vec<u32> = root.edges.iter().map(|e| e.visits).collect();
     let completed: Vec<f64> = root

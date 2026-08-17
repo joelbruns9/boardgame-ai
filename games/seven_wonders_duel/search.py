@@ -409,6 +409,22 @@ class SearchConfig:
     # Was 1.0 against a raw q in [-1, 1], which made sigma swamp the prior.
     c_scale: float = 0.1
 
+    forced_playout_k: float = 0.0
+    """KataGo forced playouts at the PUCT root (paper §3.2). Zero is off.
+
+    Dirichlet noise raises a child's prior, but PUCT can still decline to spend
+    a single simulation there, so the noise changes nothing and the policy never
+    learns whether the move was good.  Forcing at least
+    ``sqrt(k * P(c) * N)`` visits guarantees the look.  KataGo uses ``k = 2``.
+
+    Pairs with policy-target pruning, which removes these visits from the
+    LABEL again: the forced look belongs in the search and in the trajectory,
+    never in the target.  Enabling this without pruning teaches the forcing.
+
+    Applies at the root only, and only under ``root_selection="puct"`` -- the
+    Gumbel root already guarantees every candidate a share of the budget.
+    """
+
     dirichlet_epsilon: float = 0.0
     """Root exploration noise, applied ONLY under ``root_selection="puct"``.
 
@@ -719,6 +735,39 @@ class GumbelMCTS:
                 best, best_score = edge, score
         return best
 
+    def _forced_playout_edge(self, root: ClosedNode) -> "_Edge | None":
+        """A root child owed a forced playout, or None.
+
+        ``N`` is the sum of CHILD visits, not ``node.visits``: the root counts
+        its own expansion, and the three implementations of this rule (here,
+        ``tree.rs``, ``tree_resumable.rs``) have to agree on the quantity
+        exactly or the equivalence gate fails on a boundary case nobody looks
+        at. Summing edges is unambiguous in all three.
+
+        Among children below quota, take the best PUCT score, so forcing
+        interleaves with the ordinary search instead of front-loading every
+        forced visit. Strict ``>`` takes the first on a tie, matching
+        ``_select_closed``.
+        """
+
+        k = self.config.forced_playout_k
+        if k <= 0.0:
+            return None
+        total = sum(edge.visits for edge in root.edges)
+        if total <= 0:
+            return None  # nothing to scale a quota against yet
+        sign = 1.0 if root.actor == 0 else -1.0
+        root_sqrt = math.sqrt(max(1, root.visits))
+        best, best_score = None, -math.inf
+        for edge in root.edges:
+            if edge.visits >= math.sqrt(k * edge.prior * total):
+                continue
+            q = sign * edge.q_p0
+            score = q + self.config.c_puct * edge.prior * root_sqrt / (1 + edge.visits)
+            if score > best_score:
+                best, best_score = edge, score
+        return best
+
     def _descend_closed(self, node: ClosedNode, forced_edge: _Edge | None) -> float:
         """One simulation from `node`; returns the leaf value (p0 terms)."""
 
@@ -788,7 +837,7 @@ class GumbelMCTS:
         """
 
         for _ in range(self.config.sims):
-            self._descend_closed(root, forced_edge=None)
+            self._descend_closed(root, forced_edge=self._forced_playout_edge(root))
         visits = {edge.action_index: edge.visits for edge in root.edges}
         completed = {
             edge.action_index: (

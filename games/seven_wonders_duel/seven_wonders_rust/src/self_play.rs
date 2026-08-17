@@ -467,6 +467,24 @@ static SOLVER_MAX_CARDS: AtomicUsize = AtomicUsize::new(0);
 /// A/B-able separately.
 static SOLVER_MASK_POLICY: AtomicBool = AtomicBool::new(false);
 
+/// KataGo forced playouts at the PUCT root, process-wide; 0.0 is off.
+///
+/// Global for the same reason `cheap_top_k` and the temperature schedule are:
+/// `SearchConfig` is constructed at twelve sites and no two concurrent callers
+/// need different values. The SEARCH still takes it as an ordinary config field
+/// -- `search.py` has it as one too, and an asymmetry there (field in Python,
+/// global in Rust) is exactly the kind of thing the equivalence gate would trip
+/// over on a boundary case nobody looks at.
+static FORCED_PLAYOUT_K_BITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_forced_playout_k(k: f64) {
+    FORCED_PLAYOUT_K_BITS.store(k.to_bits(), Ordering::Relaxed);
+}
+
+pub fn forced_playout_k() -> f64 {
+    f64::from_bits(FORCED_PLAYOUT_K_BITS.load(Ordering::Relaxed))
+}
+
 /// Configure the endgame solver overlay, process-wide.
 ///
 /// Global for the same reason `set_cheap_top_k` and the temperature schedule
@@ -800,6 +818,7 @@ pub fn run<E: Eval>(
         };
         let search_seed = rng.next_u64() & ((1_u64 << 63) - 1);
         let search_cfg = SearchConfig {
+            forced_playout_k: forced_playout_k(),
             sims,
             top_k: search_top_k(cfg.top_k, cheap_top_k(), full),
             c_puct: cfg.c_puct,
@@ -1697,6 +1716,7 @@ impl GameSlot {
             full,
             search_seed,
             search_cfg: SearchConfig {
+                forced_playout_k: forced_playout_k(),
                 sims,
                 top_k: search_top_k(self.cfg.top_k, cheap_top_k(), full),
                 c_puct: self.cfg.c_puct,
