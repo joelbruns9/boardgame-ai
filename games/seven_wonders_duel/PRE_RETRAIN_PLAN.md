@@ -274,6 +274,22 @@ the calibrator cannot answer.
 
 ### E. Measurement
 
+* **A frozen proven-position benchmark — build this, it is the missing
+  instrument.** ~1,000 endgame positions with their solver truth, generated once
+  and stored. Any net is then scored by a single forward per position: no search,
+  no game generation, seconds per evaluation, and **paired** across arms because
+  every net sees identical positions. Letting each net play its own games would
+  destroy the pairing and most of the statistical power.
+
+  Every value metric in this repo today is self-referential — search agreement,
+  net-vs-prior KL, outcome accuracy. This is the only ground truth available, and
+  it measures the raw prior, which §4 and §7 both identify as where the error
+  lives. Size it properly: 133 positions with a p90 of 0.919 gives a standard
+  error near 0.026 on the mean, which cannot separate 0.221 from 0.19.
+
+  Bucket it by whether an instant-win threat exists, so mean/max can be tested
+  against its actual claim (existentials) rather than on aggregate.
+
 * **Gumbel vs PUCT against proven values** — useful, but it **cannot settle §A**,
   and an earlier draft of this file claimed it could. Three reasons:
   `root_value` is the visit-weighted *aggregate* over everything the search
@@ -453,11 +469,44 @@ and see whether the read moves. That is what turns "the net is bad here" into
 
 ## 7. Standing risks
 
-**Capacity.** `cloud6` ruled out cheap targets, weight decay, search exhaustion
-and target noise, leaving optimization-or-capacity. §D adds a head and widens the
-readout; §A raises sims. If capacity is binding, some of this hurts. Keep each
-piece independently ablatable, and prefer measuring the stall before assuming
-more features fix it.
+**Capacity — and the arithmetic says the worry points the wrong way.** The cloud
+config is **d_model 384, layers 8, heads 6, bf16 — 14.90M parameters** (cloud5
+and cloud6 both). Against that:
+
+| addition | params | share |
+|---|---|---|
+| reply head | 462.8k | 3.1% |
+| mean/max readout | 442.8k | 3.0% |
+| both | 905.6k | 6.1% |
+
+Heads are only ~0.47M of 14.90M; the trunk is ~14.4M. So if capacity were
+binding, the head count is the wrong term to economise on.
+
+More to the point, cloud6 stalled after 38k games — **38k independent outcome
+labels against 14.9M parameters**. That is not a capacity-starved profile. It is
+the profile `train.py` already describes at `VALUE_WEIGHT_DEFAULT`: "~16,500
+policy labels but only ~1,000 independent outcome labels … the side of the
+objective best placed to memorise, and on a shared trunk memorising it drags the
+representation the policy head depends on." So read
+"optimization-or-capacity" as **memorisation** first.
+
+That changes the reply head's status from a cost to tolerate into an on-mechanism
+fix: it adds ~646k *distributional* labels per 38k games, dense supervision
+exactly where the value head is starved. It also fits §4 — search reaches the
+proven value at 0.096 mean error and 98% sign agreement while the raw net sits at
+0.221 and 92%, so the net is not failing to search, it is failing to absorb what
+search already knows.
+
+**Falsifiable prediction:** if memorisation is the story, the reply head should
+**narrow the train/val gap** — the symptom named in the project notes as "the gap
+widening while `policy_top1` keeps improving". If it widens the gap instead, the
+memorisation theory is wrong and the head is buying nothing.
+
+The reply head is also **train-only** — nothing consumes an opponent-reply
+prediction during generation — so it can be skipped in the inference path for
+zero throughput cost (`fuse_for_inference` is precedent). Mean/max *is* on the
+inference path, but it is two pooling ops plus one `3d → d` matmul on a `[B, d]`
+vector, against a trunk over ~100 tokens.
 
 Note the §4 correction narrows where the problem can be. Search reaches the
 proven value closely (mean |err| 0.096, 98% sign agreement) while the raw net
@@ -531,10 +580,45 @@ for elsewhere.
 Steps 2–4 all bump the same target version, so they should ship together or the
 buffer fragments across definitions.
 
-**Do not combine the network changes into the expensive run untested.** Mean/max
-readout and the reply head each get a short **identical-buffer ablation** —
-same data, same steps, head on/off — before either enters a long run. Without
-that this is a kitchen-sink retrain: several simultaneous changes and no way to
-attribute a strength move to any of them, which is exactly the position the
-cloud6 stall left us in. The same applies to any cheap-move diversity change,
-which needs its strength constraint measured rather than assumed.
+### On testing the network changes before the run
+
+An earlier draft required a short identical-buffer ablation of mean/max and the
+reply head. **That is now mostly not worth running**, and it is worth being
+precise about why rather than quietly dropping it.
+
+Its purpose was to catch capacity competition. At 3% each on a 14.9M model whose
+problem is more likely memorisation than starvation (§7), that risk is small.
+And the only buffer available to ablate on would be generated by the migrated
+net — weak play, unrepresentative distribution — so a null result would mean
+little in either direction.
+
+What it cannot do at all is settle *benefit*: the reply head's claimed mechanism
+is better prior → better search → better data, and a fixed buffer cuts that at
+the first arrow. Any static ablation measures one turn of a flywheel.
+
+Replace it with three cheaper things that answer real questions:
+
+* **Unit tests on the reply-target pairing.** The failure mode that would
+  genuinely poison training is the join being off by one — fast decisions are
+  dropped at the example boundary, so pairing there silently supervises a
+  position against a reply two plies downstream, and every shape check still
+  passes. A test with cheap moves interspersed settles that definitively, and
+  far more cheaply than a training run.
+* **The train/val gap during the retrain**, against cloud6's logged trajectory
+  as a reference. This is the §7 prediction and needs no separate run.
+* **The frozen proven-position benchmark** (§E) — ~1,000 solved positions with
+  their truth, stored once, scored by one forward per position. It makes
+  prior quality measurable on *any* net in seconds, paired across arms, and it
+  is the ground-truth evaluation set this repo does not otherwise have.
+
+**Honest limit: attribution across five simultaneous changes is not cheaply
+solvable.** PUCT, the solver, tempo features, mean/max and the reply head all
+land together. Sequential runs would attribute but cost weeks. The pragmatic
+choice is to ship together and *instrument* — benchmark for the prior, train/val
+gap for memorisation, solver statistics for label yield — so that a failure is
+**diagnosable even when it is not attributable**. That is a trade, not a
+solution, and it should be named as one.
+
+Cheap-move diversity is the exception: it still needs its strength constraint
+measured rather than assumed, because a weaker cheap searcher degrades every
+value label in the buffer (§2).
