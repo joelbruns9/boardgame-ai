@@ -28,12 +28,31 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "caa91b527f3d86018b7307674abfaca326c76d54e8aeaf5ea6787e2a666fa4d2";
+    "96fb245a6b47a000e2ae71ece616bae639250a1396933354c761971c7d88ae57";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
 /// bit-exact gate enforces it in release via the value comparison.
-pub const FEATURE_COUNTS: [usize; 9] = [130, 1, 26, 1, 8, 4, 1, 79, 14];
+pub const FEATURE_COUNTS: [usize; 9] = [132, 1, 26, 1, 8, 4, 1, 79, 14];
+
+/// Widest token feature vector — the padded row width every packed batch uses.
+///
+/// Derived, never written down. It was duplicated as a literal `130` in
+/// `derive.rs` and `eval.rs`, and adding two global features left those behind:
+/// the model was built 132 wide from the Python schema while the Rust packer
+/// still emitted 130-wide rows, which surfaces as a matmul shape error at the
+/// first forward rather than as anything that names the cause.
+pub const MAX_FEATURES: usize = {
+    let mut max = 0;
+    let mut i = 0;
+    while i < FEATURE_COUNTS.len() {
+        if FEATURE_COUNTS[i] > max {
+            max = FEATURE_COUNTS[i];
+        }
+        i += 1;
+    }
+    max
+};
 
 // TokenType indices, in `encoder.py::TokenType` declaration order.
 const T_GLOBAL: usize = 0;
@@ -481,6 +500,11 @@ impl Enc<'_> {
         }
         v.push(present as f64);
         v.push(present as f64 / 20.0);
+        // Tempo primitives; see `GLOBAL_FEATURES` in encoder.py for why these
+        // two and not a "who takes the last card" flag. `present` is 0 during
+        // the draft, so parity is 0 there in both languages.
+        v.push((present % 2) as f64);
+        v.push(if g.conflict_position == 0 { 1.0 } else { 0.0 });
         v.push(face_down as f64);
         v.push(face_down as f64 / 10.0);
         v.push(military as f64);

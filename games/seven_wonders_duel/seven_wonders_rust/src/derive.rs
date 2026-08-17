@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use rayon::prelude::*;
 
-const FEATURE_WIDTH: usize = 130;
+const FEATURE_WIDTH: usize = crate::encoder::MAX_FEATURES;
 
 pub(crate) struct DeriveSpec {
     pub state: GameState,

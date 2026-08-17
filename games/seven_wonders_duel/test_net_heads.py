@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from .dataset import MAX_FEATURES
 from .net import LEGACY_HEADS, SWDNet, default_heads
 from .train import build_model, heads_from_config, make_checkpoint
 
@@ -27,7 +28,9 @@ def _batch(rows: int = 4, tokens: int = 16) -> dict[str, torch.Tensor]:
         "type_ids": torch.zeros(rows, tokens, dtype=torch.long),
         "entity_ids": torch.zeros(rows, tokens, dtype=torch.long),
         "aux_ids": torch.zeros(rows, tokens, dtype=torch.long),
-        "features": torch.randn(rows, tokens, 130),
+        # Width from the encoder schema, not a literal: a hard-coded number
+        # silently stops matching the model the day a feature is added.
+        "features": torch.randn(rows, tokens, MAX_FEATURES),
         "pad_mask": torch.zeros(rows, tokens, dtype=torch.bool),
     }
 

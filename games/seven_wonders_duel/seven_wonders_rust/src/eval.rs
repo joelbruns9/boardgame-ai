@@ -319,7 +319,7 @@ impl Eval for PyBatchEval {
     }
 }
 
-const FLAT_FEATURE_WIDTH: usize = 130;
+const FLAT_FEATURE_WIDTH: usize = crate::encoder::MAX_FEATURES;
 
 #[derive(Clone, Debug, Default)]
 pub struct BoundaryMetrics {

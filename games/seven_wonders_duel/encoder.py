@@ -62,7 +62,12 @@ from .rules import Resource, discard_income
 # feature NAMES are unchanged, so the schema hash would not have moved on its
 # own -- and a silently-resemanticised feature is exactly what the signature
 # exists to prevent, hence the explicit version bump.
-ENCODER_VERSION = "7wd-encoder-3"
+#
+# Bumped to -4 (2026-08-16): added `cards_remaining_odd` and `military_tied`.
+# Additive, so the names move the hash on their own; no existing feature
+# changed meaning. Both are tempo primitives -- see GLOBAL_FEATURES. Batched
+# with -3 because -3's retrain had not run yet, so this costs nothing extra.
+ENCODER_VERSION = "7wd-encoder-4"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)
@@ -166,6 +171,24 @@ GLOBAL_FEATURES = (
     "age_3",
     "cards_remaining",
     "cards_remaining_s",
+    # Tempo. Both are already implied by features above -- parity by
+    # `cards_remaining`, the tie by `military` -- but neither is cheap for a
+    # network to recover, and together they gate a rule that decides games.
+    #
+    # When the Age runs out the militarily-BEHIND player chooses who starts the
+    # next Age; when military is level, the chooser is whoever took the last
+    # card (`engine._advance_turn`). So an extra-turn wonder in Age I can buy a
+    # key card AND the Age II start, which is the kind of move ZeusAI's paper
+    # reports their model mistiming against strong humans.
+    #
+    # Parity is mod-2 of a scalar, which a ReLU stack approximates badly, and
+    # the tie is an exact-zero bump rather than an ordinary threshold. Neither
+    # is a projection: both are true whatever anyone builds next, which is what
+    # an earlier draft of this pair got wrong -- an "I take the last card" flag
+    # is false as soon as the opponent repeats a turn, i.e. exactly when the
+    # age-transition fight is live.
+    "cards_remaining_odd",
+    "military_tied",
     "face_down_remaining",
     "face_down_remaining_s",
     "military",
@@ -616,6 +639,8 @@ def _global_token(derived: _Derived) -> Token:
         *(1.0 if obs.age == a else 0.0 for a in (1, 2, 3)),
         len(present),
         len(present) / 20,
+        float(len(present) % 2),
+        1.0 if obs.conflict_position == 0 else 0.0,
         face_down,
         face_down / 10,
         military,

@@ -47,7 +47,8 @@ from .rust_bridge import rust_flat_batch_adapter, rust_game_for_self_play
 
 
 SCHEMA = "f4-cost-model-1"
-FEATURE_WIDTH = 130
+#: Widest token feature vector, from the encoder schema. Bump with it.
+FEATURE_WIDTH = 132
 DEFAULT_ROWS = (1, 8, 27, 64, 128, 256)
 
 
