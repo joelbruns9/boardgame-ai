@@ -310,9 +310,36 @@ a flag:
   4.5M nodes was calibrated on weak play. Against a trained net it declines
   ~70% of its cards-10 attempts, burning the full budget on each. On the cloud
   corpus at a 5M budget the frontier is 1% declines at cap 8, 5% at 9, 12% at
-  10, 19% at 11, and 73% of all nodes wasted at cap 10. **Ship cap 8 or 9**, or
-  raise the budget — and re-derive it from `--from-buffer` after the retrain
-  rather than from bot games.
+  10, 19% at 11, and 73% of all nodes wasted at cap 10. **Ship cap 8** (see the
+  better-powered frontier below), or raise the budget — and re-derive it from
+  `--from-buffer` after the retrain rather than from bot games.
+
+  **Refit on cloud data (1,955 positions, 220 games, iterations 37-43).** Asked
+  because the cloud corpus is the right distribution; answered by scoring both
+  models on it:
+
+  | model | fit on | R² | p90 resid | underpredicts censored floors |
+  |---|---|---|---|---|
+  | 22 features | 8,242 self-play rows | 0.938 | 0.80 dec | 66% |
+  | 22 features | 965 cloud rows | **0.939** | 0.83 dec | **51%** |
+  | 4 features (plan's) | 965 cloud rows | 0.915 | 0.95 dec | 74% |
+
+  So refitting buys **nothing in R²** — the model form is genuinely about board
+  structure — but it meaningfully improves the *tail*, which is the half that
+  decides affordability. Prefer the cloud refit for that reason alone, and note
+  that even it underpredicts half the censored floors: **the safety margin must
+  come from the p90 (~0.8 decades, ~6.3×), never the median.**
+
+  Corpus size decides which feature set wins, and it flips: at 281 training rows
+  the plan's four terms beat all 22 (0.903 vs 0.884, variance dominating); at 965
+  the full set wins (0.939 vs 0.915). Fit whichever the available data supports —
+  both are reported on every run so this need not be re-argued.
+
+  **Better-powered cap frontier** (1,955 cloud positions, 5M budget): declines
+  are 0% at cap 7, 1% at 8, 4% at 9, 9% at 10, 16% at 11 — but *wasted nodes* are
+  23%, 37%, 52%, 69%, 77%. Median cost roughly triples per card (146k at 8, 669k
+  at 9, 2.72M at 10, 5.15M at 11). Cap 8 wastes a third of its budget; cap 10
+  wastes two thirds. **Ship cap 8.**
 
   *Second cost of the wall-clock bug.* The shakedown corpus cannot answer the
   budget question at all: the 3s clock cut solves below 4.5M, so "solvable
