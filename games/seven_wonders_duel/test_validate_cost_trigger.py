@@ -221,3 +221,47 @@ def test_the_censored_fit_corrects_the_truncation_bias():
 def test_the_censored_fit_matches_plain_least_squares_when_nothing_is_censored():
     rows = [_row(c, 0, int(10 ** (4 + 0.5 * c))) for c in range(1, 11)]
     assert fit_censored(rows, FEATURES) == pytest.approx(fit(rows, FEATURES))
+
+
+# --- the shipped model ------------------------------------------------------
+
+
+def test_the_shipped_model_loads_with_its_features_aligned():
+    """Coefficients are ordered intercept-first to match the design row.
+
+    A misalignment here would not raise -- it would silently price positions
+    with the wrong feature's weight, which is the kind of bug that shows up as
+    "the solver is oddly expensive this run".
+    """
+
+    from .validate_cost_trigger import TRIGGER_FEATURES, load_cost_model
+
+    coefficients, features, margin = load_cost_model()
+    assert features == TRIGGER_FEATURES
+    assert len(coefficients) == len(features) + 1
+    assert 0.0 < margin < 2.0
+
+
+def test_the_trigger_crosses_card_boundaries():
+    """The requirement that justifies the model over a card cap.
+
+    A cheap 11-card position must be attempted and a dear 8-card one skipped;
+    if neither happens the model is a cap with extra steps. Cheapness here is
+    driven by `chance_fanout`, the largest term in the fitted model -- a board
+    with nothing face down is a minimax, not an expectimax.
+    """
+
+    from .validate_cost_trigger import TRIGGER_FEATURES, should_attempt
+
+    def position(cards: int, **overrides) -> dict:
+        row = {name: 0 for name in TRIGGER_FEATURES}
+        row["cards_left"] = cards
+        row.update(overrides)
+        return row
+
+    budget = 4_500_000
+    cheap_eleven = position(11)  # nothing face down, no live wonders
+    dear_eight = position(8, chance_fanout=6, chance_wonders=4, unbuilt_wonders=4)
+
+    assert should_attempt(cheap_eleven, budget)
+    assert not should_attempt(dear_eight, budget)

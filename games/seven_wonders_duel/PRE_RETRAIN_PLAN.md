@@ -310,9 +310,9 @@ a flag:
   4.5M nodes was calibrated on weak play. Against a trained net it declines
   ~70% of its cards-10 attempts, burning the full budget on each. On the cloud
   corpus at a 5M budget the frontier is 1% declines at cap 8, 5% at 9, 12% at
-  10, 19% at 11, and 73% of all nodes wasted at cap 10. **Ship cap 8** (see the
-  better-powered frontier below), or raise the budget — and re-derive it from
-  `--from-buffer` after the retrain rather than from bot games.
+  10, 19% at 11, and 73% of all nodes wasted at cap 10. replace the cap with the cost
+  model below, and re-derive it from `--from-buffer` after the retrain rather
+  than from bot games.
 
   **Refit on cloud data (1,955 positions, 220 games, iterations 37-43).** Asked
   because the cloud corpus is the right distribution; answered by scoring both
@@ -335,11 +335,46 @@ a flag:
   the full set wins (0.939 vs 0.915). Fit whichever the available data supports —
   both are reported on every run so this need not be re-argued.
 
-  **Better-powered cap frontier** (1,955 cloud positions, 5M budget): declines
-  are 0% at cap 7, 1% at 8, 4% at 9, 9% at 10, 16% at 11 — but *wasted nodes* are
-  23%, 37%, 52%, 69%, 77%. Median cost roughly triples per card (146k at 8, 669k
-  at 9, 2.72M at 10, 5.15M at 11). Cap 8 wastes a third of its budget; cap 10
-  wastes two thirds. **Ship cap 8.**
+  **The shipped rule is the model, not a cap.** An earlier draft of this section
+  recommended "ship cap 8", which was a mistake in kind: the entire purpose of a
+  cost model is a trigger that *crosses* card counts, and a cap cannot. Measured
+  on 990 held-out cloud positions at a 4.5M budget with a 0.4-decade margin:
+
+  | cards left | attempted |
+  |---|---|
+  | 11 | **20%** |
+  | 10 | 36% |
+  | 9 | 82% |
+  | 8 | **96%** |
+  | ≤7 | 100% |
+
+  It attempts a fifth of the 11-card positions and skips a twentieth of the
+  8-card ones — exactly the behaviour a cap cannot express. Against fixed caps
+  on the same holdout:
+
+  | rule | solves | nodes |
+  |---|---|---|
+  | cap ≤ 10 | 805 | 564.6M |
+  | **cost model, margin 0.4** | **805** | **249.1M (44%)** |
+  | cap ≤ 9 | 762 | 265.6M |
+  | cost model, margin 0.6 | 782 | 164.3M (62%) |
+
+  Identical proof count for 44% of the compute, or more proofs for 62% of it.
+  The margin is the dial: 0.0 → 875 attempts/50 declines, 0.8 → 757/6, 1.2 →
+  689/3. **0.4 is the shipped default** — it matches the widest cap's value while
+  halving the spend, and the leftover budget is better spent on depth than on
+  insurance.
+
+  The fitted model lives in `endgame_cost_model.json` (data, not constants, so
+  the Rust trigger and the Python analysis cannot drift), with
+  `load_cost_model()` / `should_attempt()` in `validate_cost_trigger.py`. Refit
+  with `--fit-on` after the retrain.
+
+  Largest terms are `chance_fanout` (+1.04) and `chance_wonders` (+0.44), ahead
+  of `cards_left` (+0.27) — cost is driven by how much of the board is still
+  *unrevealed*, which is what turns a minimax subtree into an expectimax one.
+  That is also why a card cap is the wrong shape: two 10-card positions can
+  differ by an order of magnitude in cost depending on what is face down.
 
   *Second cost of the wall-clock bug.* The shakedown corpus cannot answer the
   budget question at all: the 3s clock cut solves below 4.5M, so "solvable

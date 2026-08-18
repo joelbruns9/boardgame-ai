@@ -321,6 +321,118 @@ def study_rows(path: Path) -> list[dict]:
     return rows
 
 
+#: The shipped model, refit with `--fit-on` and rewritten by hand when the
+#: corpus changes. Kept as data rather than constants so the Rust trigger and
+#: the Python analysis cannot drift apart.
+COST_MODEL_PATH = Path(__file__).with_name("endgame_cost_model.json")
+
+
+def load_cost_model(path: Path | None = None) -> tuple[list[float], tuple[str, ...], float]:
+    """Return `(coefficients, features, margin_decades)` for the shipped model.
+
+    Coefficients are ordered intercept-first to match `_design`, so a caller can
+    hand them straight to `predict` without knowing the file's layout.
+    """
+
+    payload = json.loads((path or COST_MODEL_PATH).read_text(encoding="utf-8"))
+    features = tuple(payload["features"])
+    coefficients = [float(payload["intercept"])] + [
+        float(payload["coefficients"][name]) for name in features
+    ]
+    return coefficients, features, float(payload["margin_decades"])
+
+
+def should_attempt(row: dict, budget: int, model=None) -> bool:
+    """The trigger itself: is this position predicted to fit the budget?
+
+    This is what replaces `cards_left <= cap`. On held-out cloud endgames it
+    attempts 20% of 11-card positions and skips 4% of 8-card ones, which is the
+    whole point -- a cap cannot do either.
+    """
+
+    coefficients, features, margin = model or load_cost_model()
+    return predict(coefficients, row, features) + margin <= math.log10(budget)
+
+
+def trigger_profile(
+    rows: list[dict],
+    coefficients: list[float],
+    features: tuple[str, ...],
+    budget: int,
+    margin_decades: float,
+) -> dict[str, Any]:
+    """What the cost rule actually does, broken out by card count.
+
+    The point of a cost-predicted trigger is not a better threshold on
+    `cards_left` -- it is a rule that **crosses** card counts, attempting a cheap
+    11 and skipping a dear 8. If it never does that, it is a card cap with extra
+    steps and should be replaced by one.
+
+    So this reports, per card count, the share attempted. A rule equivalent to a
+    cap shows 100% down to some count and 0% below it; a genuinely variable rule
+    shows intermediate shares on both sides of the boundary.
+    """
+
+    ceiling = math.log10(budget) - margin_decades
+    by_cards: dict[int, dict[str, int]] = {}
+    attempts = solved = spent = 0
+    for row in rows:
+        cards = int(row["cards_left"])
+        bucket = by_cards.setdefault(cards, {"n": 0, "attempted": 0, "solved": 0})
+        bucket["n"] += 1
+        if predict(coefficients, row, features) > ceiling:
+            continue
+        bucket["attempted"] += 1
+        attempts += 1
+        cost = max(1, row["nodes"])
+        # A censored row's true cost exceeds its floor, so it cannot have been
+        # solved inside this budget unless the floor itself already fits.
+        if not row["censored"] and cost <= budget:
+            bucket["solved"] += 1
+            solved += 1
+            spent += cost
+        else:
+            spent += budget
+    return {
+        "margin_decades": margin_decades,
+        "attempts": attempts,
+        "solved": solved,
+        "declines": attempts - solved,
+        "decline_rate": (attempts - solved) / attempts if attempts else 0.0,
+        "nodes": spent,
+        "solves_per_mnode": solved / (spent / 1e6) if spent else 0.0,
+        "by_cards": {
+            str(cards): by_cards[cards] for cards in sorted(by_cards, reverse=True)
+        },
+    }
+
+
+def best_cap(rows: list[dict], budget: int) -> dict[str, Any]:
+    """The best fixed card cap on the same rows, priced the same way."""
+
+    best = None
+    for cap in sorted({int(row["cards_left"]) for row in rows}):
+        chosen = [row for row in rows if row["cards_left"] <= cap]
+        solved = spent = 0
+        for row in chosen:
+            cost = max(1, row["nodes"])
+            if not row["censored"] and cost <= budget:
+                solved += 1
+                spent += cost
+            else:
+                spent += budget
+        entry = {
+            "cap": cap,
+            "attempts": len(chosen),
+            "solved": solved,
+            "nodes": spent,
+            "solves_per_mnode": solved / (spent / 1e6) if spent else 0.0,
+        }
+        if best is None or entry["solves_per_mnode"] > best["solves_per_mnode"]:
+            best = entry
+    return best
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
