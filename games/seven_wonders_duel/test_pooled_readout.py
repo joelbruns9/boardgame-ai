@@ -165,3 +165,29 @@ def test_a_gate_spec_carries_the_architecture_switches():
     )
     rebuilt = _model_from_spec(spec)   # raises if the switches are dropped
     assert rebuilt.pooled_readout and rebuilt.reply_head
+
+
+def test_make_checkpoint_derives_the_switches_from_the_model():
+    """No caller can omit an architecture switch, because none of them supply it.
+
+    Four call sites assembled the config dict by hand and three were left behind
+    when the switches were added -- each failing only at the next reload.
+    """
+
+    from .train import make_checkpoint
+
+    model = build_model("transformer", 32, 1, None, True, True)
+    checkpoint = make_checkpoint(model, {"model": "transformer"})   # says nothing
+    assert checkpoint["config"]["pooled_readout"] is True
+    assert checkpoint["config"]["reply_head"] is True
+
+    plain = build_model("transformer", 32, 1, None, False, False)
+    assert make_checkpoint(plain, {})["config"]["pooled_readout"] is False
+
+
+def test_make_checkpoint_refuses_a_config_that_contradicts_the_model():
+    from .train import make_checkpoint
+
+    model = build_model("transformer", 32, 1, None, True, False)
+    with pytest.raises(ValueError, match="rebuild its own weights"):
+        make_checkpoint(model, {"pooled_readout": False})

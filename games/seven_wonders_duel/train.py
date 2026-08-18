@@ -387,8 +387,39 @@ def stable_game_split(
     return train, val
 
 
+# Architecture switches that change which parameters exist. A checkpoint whose
+# config omits one cannot rebuild its own weights, so they are read off the model
+# rather than trusted from the caller's dict.
+ARCHITECTURE_SWITCHES = ("pooled_readout", "reply_head")
+
+
 def make_checkpoint(model, config: dict) -> dict:
+    """Package weights with the config needed to rebuild them.
+
+    The architecture switches are derived from the MODEL, not taken from
+    ``config``. Four separate call sites assembled that dict by hand, and adding
+    ``pooled_readout`` / ``reply_head`` to the model left three of them behind --
+    each producing a checkpoint that saved ``readout_proj`` weights alongside a
+    config denying they existed, which the strict reload then rejected. Deriving
+    here ends the class of bug: a caller can no longer forget a switch, because
+    it never had the chance to state one.
+
+    A caller that does state one must agree with the model, or the checkpoint
+    would misdescribe its own weights.
+    """
+
     model = getattr(model, "_orig_mod", model)  # unwrap torch.compile
+    config = dict(config)
+    for switch in ARCHITECTURE_SWITCHES:
+        actual = bool(getattr(model, switch, False))
+        stated = config.get(switch)
+        if stated is not None and bool(stated) != actual:
+            raise ValueError(
+                f"checkpoint config says {switch}={stated!r} but the model was "
+                f"built with {switch}={actual!r}; the checkpoint would not be "
+                "able to rebuild its own weights"
+            )
+        config[switch] = actual
     return {
         "model_state": model.state_dict(),
         "config": config,

@@ -160,11 +160,17 @@ Then the overnight run itself:
 
 **What to read in the morning.** In `training_log.jsonl`, per iteration:
 
-- `generated_summary.solver` --- `attempted` should be non-zero (the smoke that
-  preceded this section reported zero, because it generated at one simulation per
-  move and nothing said so). `masked_fraction` well below 1.0, or `stops`
-  dominated by `budget`, means the trigger is selecting positions the node cap
-  cannot finish and the search is being paid for twice.
+- `generation_performance.summary.solver` --- note the key: under
+  `--selfplay-generator-mode soft_gate` the controller nests the summary here,
+  *not* at `generated_summary.solver` as the strict-gate path does. `attempted`
+  should be non-zero (an early smoke reported zero because it generated at one
+  simulation per move, and nothing in the log said so). `masked_fraction` well
+  below 1.0, or `stops` dominated by `budget`, means the trigger is selecting
+  positions the node cap cannot finish and the search is being paid for twice.
+  The flag-check run showed `stops: {budget: 1, none: 9}` with `nodes_max`
+  4,415,489 against the 4,500,000 cap --- so at `--endgame-solver-max-cards 10`
+  the cap does bind occasionally, and a `budget` share that climbs much above
+  10% is the signal to lower max-cards rather than raise the cap.
 - `training_performance.pretrain_newest_metrics.reply` --- present and falling.
   Absent means the reply head is not being trained.
 - The **train/validation gap**. §7 of `PRE_RETRAIN_PLAN.md` predicts the reply
