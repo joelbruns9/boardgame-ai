@@ -360,6 +360,18 @@ class _RustFlatBatchAdapter:
             payload["legal_offsets"], dtype=torch.int32
         ).long()
         legal_lengths = legal_offsets[1:] - legal_offsets[:-1]
+        # An empty buffer is not a length-zero tensor to `frombuffer` -- it is a
+        # ValueError naming neither the field nor the batch ("both buffer length
+        # (0) and count (-1) must not be 0"). A batch whose every row is terminal
+        # should never reach here (`drain_immediate_wave` calls that a protocol
+        # error), so say which invariant broke rather than dying in a decoder.
+        if len(payload["legal_actions"]) == 0:
+            raise ValueError(
+                f"flat batch of {rows} rows carries no legal actions at all "
+                f"(tokens={tokens}, legal_offsets={legal_offsets.tolist()[:16]}); "
+                "every row is terminal, which the searcher is supposed to have "
+                "drained without an evaluation"
+            )
         legal_actions = torch.frombuffer(
             payload["legal_actions"], dtype=torch.uint16
         ).long()

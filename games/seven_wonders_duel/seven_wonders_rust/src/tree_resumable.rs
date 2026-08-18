@@ -874,8 +874,41 @@ pub struct SearchSession {
     metrics: SearchMetrics,
 }
 
+/// Settle the forced children the engine already answers, returning the rest.
+///
+/// A forced chance child can be terminal. `finish_turn` -- which deals the next
+/// age -- returns early once a card play declares military or scientific
+/// victory, so an action whose chance spec says "this deals Age N+1" can instead
+/// end the game, and then every sampled deal outcome collapses onto the same
+/// finished position. Such a node has no legal actions and no priors to predict.
+///
+/// Sending it to the network produced a batch whose every row carried zero legal
+/// actions, which the evaluator boundary cannot decode -- it died in
+/// `torch.frombuffer` on an empty buffer, naming neither the field nor the game.
+/// The ordinary wave path has always routed these to `drain_immediate_wave`; the
+/// forced path had no equivalent. Settling here gives the edge exactly what an
+/// evaluated child would have contributed to its probability-weighted Q: one
+/// visit, at the proven terminal value.
+fn settle_terminal_forced(arena: &mut Arena, nodes: Vec<NodeId>) -> Vec<NodeId> {
+    nodes
+        .into_iter()
+        .filter(|&node_id| {
+            if !arena.nodes[node_id].terminal {
+                return true;
+            }
+            let value_p0 = terminal_value_p0(&arena.nodes[node_id].state);
+            let node = &mut arena.nodes[node_id];
+            node.visits = 1;
+            node.value_sum_p0 = value_p0;
+            node.cached_evaluation = Some((value_p0, Vec::new()));
+            false
+        })
+        .collect()
+}
+
 impl SearchSession {
     fn new(mut arena: Arena, cfg: &SearchConfig, leaf_batch: usize, forced_nodes: Vec<NodeId>) -> Self {
+        let forced_nodes = settle_terminal_forced(&mut arena, forced_nodes);
         let root = &arena.nodes[arena.root_id];
         let sign = if root.actor == 0 { 1.0 } else { -1.0 };
         let root_value = sign * root.value_p0();
@@ -1021,7 +1054,7 @@ impl SearchSession {
     }
 
     fn set_forced_rows(&mut self, forced: ForcedRows) {
-        self.forced_nodes = forced.nodes;
+        self.forced_nodes = settle_terminal_forced(&mut self.arena, forced.nodes);
         self.metrics.forced_rows_by_kind = forced.by_kind;
         self.metrics.fixed_support_edges = forced.fixed_support_edges;
         self.forced_finalized = false;
@@ -1988,4 +2021,86 @@ pub fn digest(arena: &Arena, out: &mut Vec<f64>) {
         }
     }
     visit(arena, arena.root_id, out);
+}
+
+#[cfg(test)]
+mod forced_terminal_tests {
+    use super::*;
+    use crate::state::{Phase, Setup, VictoryType};
+
+    fn sample_setup() -> Setup {
+        Setup {
+            first_player: 0,
+            available_progress_tokens: vec![0, 1, 2, 3, 4],
+            unused_progress_tokens: vec![5, 6, 7, 8, 9],
+            wonder_groups: [vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            unused_wonders: vec![8, 9, 10, 11],
+            age_decks: [
+                Vec::new(),
+                (0..20).collect(),
+                (0..20).collect(),
+                (0..20).collect(),
+            ],
+            removed_age_cards: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            selected_guilds: Vec::new(),
+            unused_guilds: Vec::new(),
+        }
+    }
+
+    fn fresh() -> GameState {
+        GameState::from_setup(sample_setup(), std::collections::VecDeque::new())
+    }
+
+    /// The forced path must not ask the network about a finished game.
+    ///
+    /// A card play that completes a military or scientific victory pre-empts
+    /// `finish_turn`, so an action whose chance spec says "this deals the next
+    /// age" can end the game instead, and every sampled outcome collapses onto
+    /// the same terminal child. Those children have no legal actions; a batch of
+    /// nothing but them cannot be decoded at the evaluator boundary at all.
+    #[test]
+    fn terminal_forced_children_are_settled_not_evaluated() {
+        let mut finished = fresh();
+        finished.phase = Phase::Complete;
+        finished.winner = Some(1);
+        finished.victory_type = Some(VictoryType::Military);
+
+        let mut arena = Arena::new(Node::make(fresh()));
+        let terminal_id = arena.push(Node::make(finished.clone()));
+        let ordinary_id = arena.push(Node::make(fresh()));
+
+        let remaining = settle_terminal_forced(&mut arena, vec![terminal_id, ordinary_id]);
+
+        assert_eq!(
+            remaining,
+            vec![ordinary_id],
+            "only the unfinished child should still need a network row"
+        );
+        let settled = &arena.nodes[terminal_id];
+        assert_eq!(settled.visits, 1, "the edge's Q needs the child to count once");
+        assert_eq!(settled.value_sum_p0, terminal_value_p0(&finished));
+        let (value, priors) = settled
+            .cached_evaluation
+            .as_ref()
+            .expect("finalize_forced rejects a forced child with no evaluation");
+        assert_eq!(*value, terminal_value_p0(&finished));
+        assert!(priors.is_empty(), "a finished game has no move to predict");
+    }
+
+    #[test]
+    fn an_all_terminal_forced_set_leaves_nothing_to_evaluate() {
+        // The exact shape that killed the overnight run: every row terminal, so
+        // the request would have carried zero legal actions in total.
+        let mut finished = fresh();
+        finished.phase = Phase::Complete;
+        finished.winner = Some(0);
+        finished.victory_type = Some(VictoryType::Scientific);
+
+        let mut arena = Arena::new(Node::make(fresh()));
+        let ids: Vec<NodeId> = (0..5)
+            .map(|_| arena.push(Node::make(finished.clone())))
+            .collect();
+
+        assert!(settle_terminal_forced(&mut arena, ids).is_empty());
+    }
 }
