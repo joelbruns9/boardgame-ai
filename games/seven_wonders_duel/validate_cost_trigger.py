@@ -48,6 +48,14 @@ from .endgame_trigger_study import FEATURES, position_features
 #: unusable in the decision it exists to make. Everything else comes straight out
 #: of `position_features`, which is O(board) by construction.
 UNAVAILABLE_AT_DECISION_TIME = frozenset({"moves_from_end"})
+
+#: The four terms the plan proposed, kept as a named alternative because the
+#: full set has 22 columns and the cloud corpus is small. Fitting 23 parameters
+#: on a few hundred strong-play positions costs more in variance than the extra
+#: columns buy in fit -- which is measurable, so it is measured rather than
+#: argued. `legal` stands in for the plan's `log10(legal)`; `cards_x_logleg` is
+#: already the interaction.
+PLAN_FEATURES = ("cards_left", "unrevealed", "legal", "cards_x_logleg")
 TRIGGER_FEATURES = tuple(
     name for name in FEATURES if name not in UNAVAILABLE_AT_DECISION_TIME
 )
@@ -109,6 +117,56 @@ def fit(rows: list[dict], features: tuple[str, ...]) -> list[float]:
     for i in range(columns):
         ata[i][i] += 1e-8
     return _solve(ata, atb)
+
+
+def fit_censored(
+    rows: list[dict], features: tuple[str, ...], iterations: int = 50
+) -> list[float]:
+    """Least squares that uses the censored rows instead of discarding them.
+
+    Dropping them is not neutral. A censored solve is one that ran out of budget,
+    so the censored set IS the expensive tail, and a fit that sees only the rows
+    that finished learns a cheaper world than the real one. That shows up
+    directly: the uncensored-only fit underpredicts 51-55% of censored floors,
+    and those are the positions a budget decision turns on.
+
+    This is the EM algorithm for a Tobit model. A censored row contributes its
+    floor when the current model already predicts above it (the observation is
+    consistent, and the conditional expectation of a right-censored normal is
+    approximated by the prediction itself), and is pulled up to the floor when
+    the model predicts below it. Iterating to a fixed point is equivalent to
+    imputing each censored value at `max(prediction, floor)`.
+
+    The correction is **partial**. Imputing at `max(prediction, floor)`
+    understates the conditional expectation of a right-censored normal, which
+    lies above the prediction by an amount depending on the residual spread. On
+    a synthetic truth with slope 0.5 it recovers 0.44 where the survivors-only
+    fit gives 0.42 -- better, not unbiased. That is deliberate: the alternative
+    is a full Tobit likelihood with a variance parameter, and the residual bias
+    is small next to the safety margin the trigger applies anyway. Do not quote
+    coefficients from this as unbiased estimates.
+    """
+
+    uncensored = [row for row in rows if not row["censored"]]
+    censored = [row for row in rows if row["censored"]]
+    if not censored:
+        return fit(rows, features)
+
+    coefficients = fit(uncensored, features)
+    for _ in range(iterations):
+        imputed = list(uncensored)
+        for row in censored:
+            floor = math.log10(max(1, row["nodes"]))
+            predicted = predict(coefficients, row, features)
+            filled = dict(row)
+            filled["nodes"] = 10 ** max(predicted, floor)
+            filled["censored"] = False
+            imputed.append(filled)
+        updated = fit(imputed, features)
+        if all(abs(a - b) < 1e-9 for a, b in zip(coefficients, updated)):
+            return updated
+        coefficients = updated
+    return coefficients
 
 
 def _solve(a: list[list[float]], b: list[float]) -> list[float]:
@@ -265,9 +323,18 @@ def study_rows(path: Path) -> list[dict]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("buffer", type=Path, help="a run's buffer_final.jsonl")
+    parser.add_argument(
+        "buffer", type=Path, nargs="?", help="a run's buffer_final.jsonl"
+    )
     parser.add_argument("--budget", type=int, default=4_500_000)
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--fit-on",
+        type=Path,
+        help="fit the model on an endgame_trigger_study --out file instead of a "
+        "buffer, and report its coefficients. Use the cloud corpus here: the "
+        "trigger meets endgames a trained net reaches, not a bot.",
+    )
     parser.add_argument(
         "--transfer-to",
         type=Path,
@@ -284,8 +351,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def report_fit(rows: list[dict], features: tuple[str, ...], holdout: float) -> dict:
+    """Fit on held-out-by-game rows and report coefficients with their scores."""
+
+    games = sorted({row.get("game", index) for index, row in enumerate(rows)})
+    cut = int(len(games) * (1.0 - holdout))
+    train_games = set(games[:cut])
+    train = [row for row in rows if row.get("game") in train_games]
+    test = [row for row in rows if row.get("game") not in train_games]
+    coefficients = fit_censored(train, features)
+    naive = fit([row for row in train if not row["censored"]], features)
+    parsimonious = fit_censored(train, PLAN_FEATURES)
+    return {
+        "train_rows": len(train),
+        "test_rows": len(test),
+        "coefficients": dict(zip(("intercept",) + features, coefficients)),
+        "censored_fit": score(coefficients, test, features),
+        "survivors_only_fit": score(naive, test, features),
+        "plan_four_features": {
+            "coefficients": dict(zip(("intercept",) + PLAN_FEATURES, parsimonious)),
+            **score(parsimonious, test, PLAN_FEATURES),
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.fit_on:
+        rows = study_rows(args.fit_on)
+        summary = {
+            "source": str(args.fit_on),
+            "rows": len(rows),
+            "censored_fraction": sum(1 for r in rows if r["censored"]) / len(rows),
+            **report_fit(rows, TRIGGER_FEATURES, args.holdout_fraction),
+        }
+        print(json.dumps(summary, indent=2))
+        if args.out:
+            args.out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return 0
     records = read_records(args.buffer)
     rows = list(solved_positions(records))
     if not rows:

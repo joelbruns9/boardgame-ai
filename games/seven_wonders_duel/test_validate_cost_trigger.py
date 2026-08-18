@@ -12,6 +12,7 @@ import math
 import pytest
 
 from .validate_cost_trigger import (
+    fit_censored,
     TRIGGER_FEATURES,
     UNAVAILABLE_AT_DECISION_TIME,
     compare_triggers,
@@ -174,3 +175,49 @@ def test_study_rows_keep_censored_positions_as_floors(tmp_path):
     # The floor is the budget it exhausted. Zero would make the single most
     # expensive position in the corpus read as the cheapest.
     assert rows[1]["nodes"] == 20_000_000
+
+
+def test_the_censored_fit_corrects_the_truncation_bias():
+    """Why dropping censored rows biases the slope, not just the intercept.
+
+    Cost at a given card count is a distribution, not a number. A fixed budget
+    censors the expensive realisations, and it censors more of them where cost is
+    higher -- so the surviving rows are progressively more selected as cards
+    rise, which flattens the fitted slope. That is the mechanism behind the
+    51-55% underprediction of censored floors measured on real data.
+
+    Truth here is `y = 4 + 0.5 * cards` plus a fixed, deterministic wobble;
+    anything above the budget is censored at it. The censored fit must recover
+    the true slope more closely than the fit that sees only survivors.
+    """
+
+    true_slope = 0.5
+    budget_log = 7.0
+    wobble = [-0.6, -0.2, 0.0, 0.3, 0.9]  # fixed, so the test cannot flake
+    rows = []
+    for cards in range(1, 12):
+        for offset in wobble:
+            y = 4 + true_slope * cards + offset
+            censored = y > budget_log
+            # The wobble must NOT be recoverable from a feature. An earlier
+            # version passed the wobble's index as `unrevealed`, so the model
+            # explained the noise exactly, truncation removed nothing the fit
+            # relied on, and both fits returned the true slope -- a fixture that
+            # could not have failed.
+            rows.append(_row(cards, 0, int(10 ** min(y, budget_log)), censored=censored))
+
+    survivors = [row for row in rows if not row["censored"]]
+    assert survivors != rows, "the fixture must actually censor something"
+
+    naive = fit(survivors, FEATURES)[1]
+    corrected = fit_censored(rows, FEATURES)[1]
+    # Measured: 0.424 naive, 0.442 corrected, 0.5 true. The correction is
+    # partial by construction (see `fit_censored`), so the assertion is that it
+    # moves toward the truth, not that it arrives.
+    assert naive < corrected < true_slope
+    assert abs(corrected - true_slope) < abs(naive - true_slope)
+
+
+def test_the_censored_fit_matches_plain_least_squares_when_nothing_is_censored():
+    rows = [_row(c, 0, int(10 ** (4 + 0.5 * c))) for c in range(1, 11)]
+    assert fit_censored(rows, FEATURES) == pytest.approx(fit(rows, FEATURES))
