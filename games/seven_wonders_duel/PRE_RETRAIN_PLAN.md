@@ -281,6 +281,44 @@ a flag:
 
   Held out by **game**, never by row: adjacent solved plies share a position and
   a proof, so a row-wise split leaks across it.
+
+  **The model transfers; the card cap does not.** Both were checked against
+  cloud6 endgames — the only large corpus reached by a trained net rather than a
+  bot (`--from-buffer`, 572 positions from 60 games of iteration 43):
+
+  * *Transfers.* Fit on self-play endgames and scored on cloud strong-play ones,
+    R² goes 0.947 → **0.936** (residual p90 0.59 → 0.77 decades). So the cost
+    model is about board structure, not about which net produced the position.
+    It can be fit once and shipped, which is what §B assumed.
+  * *Does not transfer.* The **absolute cost** is far higher at strong play, and
+    the gap grows with depth. Fraction of positions solvable within the
+    production 4.5M budget:
+
+    | cards left | self-play (128×4) | cloud6 strong play |
+    |---|---|---|
+    | 8 | ≥92% | 94% |
+    | 9 | ≥79% | **68%** |
+    | 10 | ≥44% | **29%** |
+    | 11 | — | **18%** |
+
+    The self-play figures are *lower bounds* (its own corpus is censored, below);
+    the cloud figures are exact, since a censored cloud row provably exceeds the
+    20M study budget. The comparison is therefore one-directional but sound: at
+    9 and 10 cards, strong play is strictly harder.
+
+  **Consequence for the shipped trigger.** `--endgame-solver-max-cards 10` at
+  4.5M nodes was calibrated on weak play. Against a trained net it declines
+  ~70% of its cards-10 attempts, burning the full budget on each. On the cloud
+  corpus at a 5M budget the frontier is 1% declines at cap 8, 5% at 9, 12% at
+  10, 19% at 11, and 73% of all nodes wasted at cap 10. **Ship cap 8 or 9**, or
+  raise the budget — and re-derive it from `--from-buffer` after the retrain
+  rather than from bot games.
+
+  *Second cost of the wall-clock bug.* The shakedown corpus cannot answer the
+  budget question at all: the 3s clock cut solves below 4.5M, so "solvable
+  within 4.5M" is bounded at 44%–100% for cards 10 — useless. A binding clock
+  did not merely make training data load-dependent, it destroyed the corpus's
+  value for calibration. The cloud runs, bounded by nodes, stayed usable.
 * **Async solving.** A `SolvePending` slot stage plus a solver thread pool and a
   results channel, mirroring how a slot already parks on an NN batch and yields
   its thread. The mask must be applied *before* the move is chosen, so the

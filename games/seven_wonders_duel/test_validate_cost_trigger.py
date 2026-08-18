@@ -159,10 +159,11 @@ def test_study_rows_keep_censored_positions_as_floors(tmp_path):
     path.write_text(
         json.dumps(
             {
+                "study_nodes": 20_000_000,
                 "rows": [
                     {"cards_left": 5, "unrevealed": 1, "nodes": 1234, "censored": False},
                     {"cards_left": 9, "unrevealed": 3, "nodes": None, "censored": True},
-                ]
+                ],
             }
         ),
         encoding="utf-8",
@@ -170,4 +171,6 @@ def test_study_rows_keep_censored_positions_as_floors(tmp_path):
     rows = study_rows(path)
     assert len(rows) == 2
     assert rows[1]["censored"] is True
-    assert isinstance(rows[1]["nodes"], int)
+    # The floor is the budget it exhausted. Zero would make the single most
+    # expensive position in the corpus read as the cheapest.
+    assert rows[1]["nodes"] == 20_000_000

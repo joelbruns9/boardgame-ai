@@ -246,13 +246,19 @@ def study_rows(path: Path) -> list[dict]:
     """
 
     payload = json.loads(path.read_text(encoding="utf-8"))
+    # A censored row's floor is the budget it exhausted, not zero. Normalising it
+    # to zero (as this did at first) turns the most expensive positions in the
+    # corpus into the cheapest: every "is it affordable" test then counts them as
+    # trivially affordable, and the underprediction check can never flag one.
+    budget = int(payload.get("study_nodes", 0))
     rows = []
     for row in payload["rows"]:
-        if row.get("nodes") is None and not row.get("censored"):
+        censored = bool(row.get("censored"))
+        if row.get("nodes") is None and not censored:
             continue
         normalised = dict(row)
-        normalised["nodes"] = row["nodes"] if row["nodes"] is not None else 0
-        normalised["censored"] = bool(row.get("censored"))
+        normalised["nodes"] = budget if row["nodes"] is None else row["nodes"]
+        normalised["censored"] = censored
         rows.append(normalised)
     return rows
 
