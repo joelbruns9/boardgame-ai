@@ -11,6 +11,7 @@ import contextlib
 import time
 
 from .buffer import (
+    target_version_for_moves,
     LOGIC_DIGEST_VERSION,
     GameRecord,
     MoveRecord,
@@ -887,6 +888,9 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
         )
 
     record = GameRecord(
+        # Per record, not per build: a Gumbel run writes definition-2 targets
+        # whatever this build can do. See `buffer.target_version_for_moves`.
+        target_version=target_version_for_moves(moves),
         seed=int(raw["seed"]),
         first_player=int(raw["first_player"]),
         agents=agents,

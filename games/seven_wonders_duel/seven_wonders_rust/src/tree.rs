@@ -649,6 +649,7 @@ fn puct_root<E: Eval>(
             &completed,
             cfg.c_puct,
             cfg.forced_playout_k,
+            root.visits,
         ))
     } else {
         None
@@ -877,6 +878,7 @@ pub fn prune_policy_target(
     q: &[f64],
     c_puct: f64,
     k: f64,
+    root_visits: u32,
 ) -> Vec<f64> {
     let n = visits.len();
     let total: f64 = visits.iter().map(|&v| v as f64).sum();
@@ -896,7 +898,12 @@ pub fn prune_policy_target(
             best = j;
         }
     }
-    let sqrt_total = total.sqrt();
+    // `Node::select` and `forced_playout_edge` both score with sqrt(node.visits),
+    // which counts the root's own expansion and so exceeds the child sum by one.
+    // The guard asks "would PUCT have chosen this?", so it has to ask in PUCT's
+    // own units -- taking the sum instead was a quiet second definition of the
+    // same quantity, in the one place whose whole job is to reproduce the first.
+    let sqrt_total = (root_visits.max(1) as f64).sqrt();
     let puct = |j: usize, kept: f64| q[j] + c_puct * priors[j] * sqrt_total / (1.0 + kept);
     let best_puct = puct(best, visits[best] as f64);
 
@@ -937,7 +944,7 @@ mod policy_target_pruning_tests {
     #[test]
     fn the_most_visited_child_is_never_pruned() {
         let visits = [80u32, 10, 10];
-        let out = prune_policy_target(&visits, &[0.5, 0.25, 0.25], &[0.9, -0.9, -0.9], C, K);
+        let out = prune_policy_target(&visits, &[0.5, 0.25, 0.25], &[0.9, -0.9, -0.9], C, K, 101);
         assert!(out[0] > 0.0);
         assert!(out[0] >= out[1] && out[0] >= out[2]);
     }
@@ -952,6 +959,7 @@ mod policy_target_pruning_tests {
             &[0.8, -0.8, -0.8],
             C,
             K,
+            101,
         );
         assert!(out[1] < 0.2, "expected pruning, got {out:?}");
     }
@@ -962,7 +970,7 @@ mod policy_target_pruning_tests {
         // first removal would make the child competitive and the guard must stop
         // at once. This is the case a flat sqrt(kPN) subtraction damages.
         let visits = [34u32, 33, 33];
-        let out = prune_policy_target(&visits, &[1.0 / 3.0; 3], &[0.5; 3], C, K);
+        let out = prune_policy_target(&visits, &[1.0 / 3.0; 3], &[0.5; 3], C, K, 101);
         for (index, value) in out.iter().enumerate() {
             assert!(
                 (value - visits[index] as f64 / 100.0).abs() < 1e-9,
@@ -973,28 +981,28 @@ mod policy_target_pruning_tests {
 
     #[test]
     fn the_result_is_always_a_distribution() {
-        let out = prune_policy_target(&[7, 3, 1], &[0.6, 0.3, 0.1], &[0.2, -0.1, -0.5], C, K);
+        let out = prune_policy_target(&[7, 3, 1], &[0.6, 0.3, 0.1], &[0.2, -0.1, -0.5], C, K, 12);
         assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-12);
         assert!(out.iter().all(|v| *v >= 0.0));
     }
 
     #[test]
     fn a_single_visit_child_is_pruned_entirely() {
-        let out = prune_policy_target(&[50, 1], &[0.9, 0.1], &[0.9, -0.9], C, K);
+        let out = prune_policy_target(&[50, 1], &[0.9, 0.1], &[0.9, -0.9], C, K, 52);
         assert_eq!(out[1], 0.0);
         assert_eq!(out[0], 1.0);
     }
 
     #[test]
     fn disabling_it_returns_the_raw_visit_distribution() {
-        let out = prune_policy_target(&[3, 1], &[0.5, 0.5], &[0.0, 0.0], C, 0.0);
+        let out = prune_policy_target(&[3, 1], &[0.5, 0.5], &[0.0, 0.0], C, 0.0, 5);
         assert!((out[0] - 0.75).abs() < 1e-12 && (out[1] - 0.25).abs() < 1e-12);
     }
 
     #[test]
     fn an_unvisited_search_does_not_divide_by_zero() {
         assert_eq!(
-            prune_policy_target(&[0, 0], &[0.5, 0.5], &[0.0, 0.0], C, K),
+            prune_policy_target(&[0, 0], &[0.5, 0.5], &[0.0, 0.0], C, K, 1),
             vec![0.0, 0.0]
         );
     }

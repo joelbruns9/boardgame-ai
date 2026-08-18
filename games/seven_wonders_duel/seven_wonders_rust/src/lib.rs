@@ -2761,8 +2761,9 @@ fn prune_policy_target(
     q: Vec<f64>,
     c_puct: f64,
     k: f64,
+    root_visits: u32,
 ) -> Vec<f64> {
-    tree::prune_policy_target(&visits, &priors, &q, c_puct, k)
+    tree::prune_policy_target(&visits, &priors, &q, c_puct, k, root_visits)
 }
 
 #[pyfunction]

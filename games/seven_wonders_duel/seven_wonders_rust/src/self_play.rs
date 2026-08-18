@@ -580,7 +580,14 @@ fn solver_eligible(state: &GameState, max_cards: usize) -> bool {
 /// moves would leave nothing to renormalise, and dividing by that zero would
 /// emit a NaN policy label.
 fn mask_and_renormalise(policy: &mut [f64], keep: &[bool]) {
-    debug_assert_eq!(policy.len(), keep.len());
+    // Runtime, not `debug_assert`: on a length mismatch `zip` silently truncates
+    // and leaves an unnormalised label behind, which trains as a quiet poison
+    // rather than a crash. Release builds are where that would happen.
+    assert_eq!(
+        policy.len(),
+        keep.len(),
+        "policy/keep length mismatch would silently truncate the mask"
+    );
     let total: f64 = policy
         .iter()
         .zip(keep)
@@ -835,7 +842,25 @@ pub fn run<E: Eval>(
         };
         let search_seed = rng.next_u64() & ((1_u64 << 63) - 1);
         let search_cfg = SearchConfig {
-            forced_playout_k: forced_playout_k(),
+            forced_playout_k: if full && cfg.net_by_player[actor] == 0 {
+                // Gated exactly like `dirichlet_epsilon` below, and for the same
+                // reasons. Forcing spends simulations on children PUCT declined,
+                // which is a handicap: on an archived opponent it inflates the
+                // learner's league win rate and skews those games' value labels
+                // optimistic, and on a cheap move it degrades the trajectory for
+                // no label benefit, since cheap moves emit no policy target.
+                //
+                // It also makes GATES immune for free. A gate runs
+                // `full_search_fraction = 0.0`, so `full` is always false there
+                // -- which matters because the advisor's `RustPuctSearch` takes
+                // this as an explicit parameter defaulting to 0.0 and never
+                // reads the global. Ungated, a gate would search with forcing
+                // while the advisor did not, reintroducing the very
+                // gate/advisor divergence the PUCT switch exists to close.
+                forced_playout_k()
+            } else {
+                0.0
+            },
             sims,
             top_k: search_top_k(cfg.top_k, cheap_top_k(), full),
             c_puct: cfg.c_puct,
@@ -871,8 +896,11 @@ pub fn run<E: Eval>(
             tree_resumable::search_closed_batched(&state, &eval, &search_cfg, leaf_batch)?;
         // The solve runs on the PRE-move state, and before the action is chosen:
         // the mask is what makes a provably-losing move unplayable, not merely
-        // unlabelled. Cheap moves are skipped because they emit no example at
-        // all (`dataset.is_fast_search_move`), so a solve there would buy nothing.
+        // unlabelled. EVERY eligible ply is solved, cheap ones included -- the
+        // mask is what keeps both sides playing the endgame provably optimally,
+        // which is what makes the game's realised result equal the proven value.
+        // Cheap plies still emit no training example; the label is a separate
+        // concern from the mask.
         // TWO distributions from one search, and they are not the same object.
         //
         // `selection` decides the move actually played. `training` is what the
@@ -1736,7 +1764,25 @@ impl GameSlot {
             full,
             search_seed,
             search_cfg: SearchConfig {
-                forced_playout_k: forced_playout_k(),
+                forced_playout_k: if full && self.cfg.net_by_player[actor] == 0 {
+                    // Gated exactly like `dirichlet_epsilon` below, and for the same
+                    // reasons. Forcing spends simulations on children PUCT declined,
+                    // which is a handicap: on an archived opponent it inflates the
+                    // learner's league win rate and skews those games' value labels
+                    // optimistic, and on a cheap move it degrades the trajectory for
+                    // no label benefit, since cheap moves emit no policy target.
+                    //
+                    // It also makes GATES immune for free. A gate runs
+                    // `full_search_fraction = 0.0`, so `full` is always false there
+                    // -- which matters because the advisor's `RustPuctSearch` takes
+                    // this as an explicit parameter defaulting to 0.0 and never
+                    // reads the global. Ungated, a gate would search with forcing
+                    // while the advisor did not, reintroducing the very
+                    // gate/advisor divergence the PUCT switch exists to close.
+                    forced_playout_k()
+                } else {
+                    0.0
+                },
                 sims,
                 top_k: search_top_k(self.cfg.top_k, cheap_top_k(), full),
                 c_puct: self.cfg.c_puct,
@@ -1957,8 +2003,8 @@ impl GameSlot {
 
     fn finish_move(&mut self, meta: SearchMeta, result: crate::tree::SearchResult) -> PyResult<()> {
         let i = self.moves.len();
-        // See `run`: pre-move state, before the action is chosen, full searches
-        // only. The solve is synchronous, so it holds this scheduler slot (and
+        // See `run`: pre-move state, before the action is chosen, EVERY eligible
+        // ply. The solve is synchronous, so it holds this scheduler slot (and
         // the shard's thread) for its duration -- which is why the budget is a
         // node count and why the card trigger is set from the measured table
         // rather than optimistically.
@@ -2791,6 +2837,7 @@ mod budget_tests {
 
     fn sample_config(game_seed: u64) -> SelfPlayConfig {
         SelfPlayConfig {
+            cheap_puct_root: None,
             game_seed,
             iteration: None,
             leaf_batch: 1,

@@ -379,6 +379,7 @@ def prune_policy_target(
     q: list[float],
     c_puct: float,
     k: float,
+    root_visits: int,
 ) -> "list[float] | None":
     """KataGo policy-target pruning (§3.2) -- the other half of forced playouts.
 
@@ -405,7 +406,10 @@ def prune_policy_target(
     if k <= 0.0 or total <= 0:
         return None
     best = max(range(len(visits)), key=lambda j: visits[j])
-    root_sqrt = math.sqrt(total)
+    # `_select_closed` and `_forced_playout_edge` both score with
+    # sqrt(node.visits), which counts the root's own expansion. The guard asks
+    # "would PUCT have chosen this?", so it must ask in PUCT's units.
+    root_sqrt = math.sqrt(max(1, root_visits))
 
     def puct(j: int, kept_j: float) -> float:
         return q[j] + c_puct * priors[j] * root_sqrt / (1.0 + kept_j)
@@ -865,6 +869,7 @@ class GumbelMCTS:
             [sign * edges[a].q_p0 for a in order],
             self.config.c_puct,
             self.config.forced_playout_k,
+            root.visits,
         )
         return None if pruned is None else dict(zip(order, pruned))
 

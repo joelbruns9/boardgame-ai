@@ -119,6 +119,21 @@ class Example:
     #: value is a genuine probability and the target stays soft rather than
     #: being rounded to the nearest class.
     solver_exact: bool = False
+    #: Per-row loss multipliers for the VALUE and POLICY heads.
+    #:
+    #: Head-specific on purpose. Duplicating a row -- the obvious way to
+    #: emphasise solved endgames, and what Kingdomino's `endgame_oversample`
+    #: does -- multiplies every head's loss for that row, because
+    #: `compute_losses` averages each head over the sampled batch. So a row
+    #: duplicated for its exact VALUE also gets its policy target and all four
+    #: auxiliary targets counted twice, which is not what was wanted.
+    #:
+    #: Capped per game at derivation time. A game whose last eight plies were
+    #: all solved holds eight rows derived from proofs of ONE endgame; they are
+    #: one piece of evidence wearing eight hats, so the extra weight is shared
+    #: across them rather than granted to each.
+    value_weight: float = 1.0
+    policy_weight: float = 1.0
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -181,6 +196,43 @@ def is_fast_search_move(move) -> bool:
     """
 
     return move.policy_excluded and move.sims > 0
+
+
+#: Extra loss weight a single GAME's solved rows share between them.
+#:
+#: Kingdomino uses `endgame_oversample = 2.0`, i.e. "count these rows twice".
+#: The same intent here is expressed as head-specific weight so it lands on the
+#: value head alone, and as a per-game budget so a game with eight solved plies
+#: does not read as eight independent proofs.
+SOLVER_VALUE_BONUS = 1.0
+SOLVER_POLICY_BONUS = 0.0
+
+
+def solver_row_weights(moves) -> dict[int, tuple[float, float]]:
+    """`{move index: (value_weight, policy_weight)}` for one game's solved rows.
+
+    Only `solver_exact` rows earn value weight: they are the only ones carrying
+    an exact W/D/L label (`solver_value_distribution`). An `exact_expectimax`
+    row keeps the realised outcome, so upweighting it would emphasise a
+    certainty it does not have.
+
+    The bonus is divided across the game's qualifying rows rather than granted
+    to each. Eight consecutive solved plies are proofs OF THE SAME ENDGAME,
+    reached by one line of play; treating them as eight independent pieces of
+    evidence is how a handful of games come to dominate a head.
+    """
+
+    exact = [m.i for m in moves if m.solver_regime == "exact"]
+    masked = [m.i for m in moves if m.solver_masked]
+    weights: dict[int, tuple[float, float]] = {}
+    value_share = SOLVER_VALUE_BONUS / len(exact) if exact else 0.0
+    policy_share = SOLVER_POLICY_BONUS / len(masked) if masked else 0.0
+    for index in set(exact) | set(masked):
+        weights[index] = (
+            1.0 + (value_share if index in set(exact) else 0.0),
+            1.0 + (policy_share if index in set(masked) else 0.0),
+        )
+    return weights
 
 
 def _policy_for_move(move, legal: np.ndarray) -> np.ndarray:
@@ -281,9 +333,11 @@ def examples_from_record(
                 move.root_value,
                 move.solver_value,
                 move.solver_regime == "exact",
+                move.i,
             )
         )
 
+    row_weights = solver_row_weights(record.moves)
     game = replay(record, on_state=featurize)
     maximum_track = max(maximum_track, abs(game.conflict_position))
     final_position = game.conflict_position
@@ -323,6 +377,7 @@ def examples_from_record(
         root_value,
         solver_value,
         solver_exact,
+        move_index,
     ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
@@ -343,6 +398,8 @@ def examples_from_record(
                 root_value=root_value,
                 solver_value=solver_value,
                 solver_exact=solver_exact,
+                value_weight=row_weights.get(move_index, (1.0, 1.0))[0],
+                policy_weight=row_weights.get(move_index, (1.0, 1.0))[1],
                 joint7_class=_joint7_class(game.winner, game.victory_type, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -435,6 +492,7 @@ def _examples_from_rust_payload(
         raise ReplayMismatchError("Rust replay feature payload has the wrong size")
     features = features_f64.reshape(-1, MAX_FEATURES).astype(np.float16)
     archive_seats = archive_policy_seats(record.agents)
+    row_weights = solver_row_weights(moves)
     stats_payload = payload["stats"]
     final_position = int(stats_payload["final_conflict_position"])
     science_counts = (
@@ -475,6 +533,8 @@ def _examples_from_rust_payload(
                 root_value=move.root_value,
                 solver_value=move.solver_value,
                 solver_exact=move.solver_regime == "exact",
+                value_weight=row_weights.get(move.i, (1.0, 1.0))[0],
+                policy_weight=row_weights.get(move.i, (1.0, 1.0))[1],
                 joint7_class=_joint7_class(record.winner, victory, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -698,6 +758,9 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
     legal_mask = torch.zeros(size, NUM_ACTIONS, dtype=torch.bool)
     policy = torch.zeros(size, NUM_ACTIONS)
     has_policy = torch.zeros(size, dtype=torch.bool)
+    # Per-row, per-head loss multipliers; 1.0 unless a proof earned more.
+    value_weight = torch.ones(size)
+    policy_weight = torch.ones(size)
     value_class = torch.zeros(size, dtype=torch.long)
     # Actor-relative win probability implied by the search, as a distribution
     # over (win, draw, loss). Draw mass stays at zero: shared-civilian endings
@@ -734,6 +797,8 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
             example.policy_target.astype(np.float32)
         )
         has_policy[row] = example.has_policy
+        value_weight[row] = example.value_weight
+        policy_weight[row] = example.policy_weight
         value_class[row] = example.value_class
         if example.root_value is not None:
             probability = (1.0 + float(example.root_value)) / 2.0
@@ -760,6 +825,8 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         "legal_mask": legal_mask,
         "policy": policy,
         "has_policy": has_policy,
+        "value_weight": value_weight,
+        "policy_weight": policy_weight,
         "value_class": value_class,
         "value_soft": value_soft,
         "value_soft_valid": value_soft_valid,

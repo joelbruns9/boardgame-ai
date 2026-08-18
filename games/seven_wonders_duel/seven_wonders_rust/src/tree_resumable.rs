@@ -1680,6 +1680,7 @@ impl SearchSession {
                 &completed,
                 self.cfg.c_puct,
                 self.cfg.forced_playout_k,
+                self.arena.nodes[self.arena.root_id].visits,
             ))
         } else {
             None

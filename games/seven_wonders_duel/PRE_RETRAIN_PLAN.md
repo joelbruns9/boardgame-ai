@@ -161,8 +161,39 @@ a flag:
    `--eval-search-mode puct` reported success. Add a **generation-only** hybrid
    flag instead, and gate it behaviourally — assert PUCT-shaped output (no Gumbel
    candidate set in the record) rather than asserting a config value.
-6. **Raise `full_sims`.** 64–128 is low for PUCT by AlphaZero standards. This is
-   the sweep dimension that actually costs throughput.
+6. **Raise `full_sims` — and there is now a number.** At 7WD's budgets, `k = 2`
+   spends most of the search on forcing. Measured with the mock evaluator over
+   20 PlayAge positions (ε=0.25, α=1.8), the fraction of simulations that were
+   forced:
+
+   | sims | 64 | 128 | 400 |
+   |---|---|---|---|
+   | forced | 70.8% | 59.9% | 32.8% |
+
+   Analytically the total quota is `sqrt(k·N)·Σ√Pᵢ`, so the forced fraction is
+   `sqrt(k·m/N)` with `m = (Σ√P)²` the prior's effective support — and a flat
+   prior over `n` actions gives `sqrt(k·n/N)`, which is what the measurement
+   shows. Root legal-action counts over 2,460 PlayAge plies in 40 random games:
+   mean 6.0, median 4, per-age p90 16/10/6. Even at n=4 that is 35% at N=64.
+
+   **Rule of thumb: `full_sims ≳ 16·k·m` keeps forcing under 25%.** With m≈6 and
+   k=2 that is ~190 sims, so the current 64–128 is too low for KataGo's constant
+   — KataGo runs it at ~1600 playouts, where the same formula is negligible.
+   Either raise sims or lower k; the sweep decides which, but "k=2 because
+   KataGo" without checking N is wrong.
+
+   Caveat stated plainly: the mock's priors are near-flat and a trained net
+   concentrates them, lowering `m`. No net exists yet — that is what the retrain
+   is for — so treat this as an upper bound on the forced fraction and re-measure
+   on-distribution. Do **not** assume forcing and pruning cancel: under the mock,
+   pruning took back almost none of it (total variation 0.058 at 64 sims),
+   because the guard is self-calibrating and the mock's Q gaps are narrow. That
+   number is not trustworthy with a real net either, but it is not evidence they
+   cancel.
+
+   64–128 was already flagged as low for PUCT on general AlphaZero grounds; the
+   forced-playout arithmetic above turns that into a constraint rather than a
+   preference. This is the sweep dimension that actually costs throughput.
 7. **Update the stale comments** asserting "self-play must stay Gumbel"
    (`self_play.rs`, `SelfPlayConfig::puct_root`). They become wrong; leaving them
    misleads the next reader.

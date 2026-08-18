@@ -824,6 +824,18 @@ class PhaseDConfig:
             raise ValueError("forced_playout_k must be finite and non-negative")
         if self.cheap_search_mode not in ("same", "gumbel", "puct"):
             raise ValueError("cheap_search_mode must be same, gumbel or puct")
+        if (
+            self.selfplay_search_mode == "puct" or self.cheap_search_mode == "puct"
+        ) and self.leaf_batch > 1:
+            # `check_puct_root` rejects this INSIDE the search, so without this
+            # the run dies partway through generation on its first PUCT move --
+            # and with the hybrid, on its first move of whichever kind is PUCT.
+            # A PUCT root under leaf batching would select against virtual loss,
+            # which is a different algorithm, not a slower one.
+            raise ValueError(
+                "puct root selection requires --leaf-batch 1 "
+                "(the root would otherwise select under virtual loss)"
+            )
         if self.forced_playout_k > 0 and self.selfplay_search_mode != "puct":
             # Forcing is a PUCT-root mechanism; under Gumbel it would be read
             # from the config, ignored by the search, and quietly do nothing.

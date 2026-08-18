@@ -79,6 +79,34 @@ than discarded, so this gates training, not reading.
 """
 
 
+def target_version_for_moves(moves) -> int:
+    """The target definition a record's TRAINED rows actually hold.
+
+    Stamping the module constant on every record is wrong in both directions.
+    A Gumbel run writes completed-Q targets, which is definition 2 whatever this
+    build is capable of -- so version 3 on those rows makes
+    ``check_target_versions`` reject pre-bump Gumbel buffers whose targets are
+    definitionally identical to today's, while simultaneously letting PUCT and
+    Gumbel rows mix undetected, which is the exact thing the version exists to
+    make structural rather than documented.
+
+    Read off the rows that will actually be trained on -- searched, full-budget,
+    learner-owned -- because the hybrid records BOTH kinds: its cheap moves
+    carry Gumbel targets that the example boundary then drops. ``gumbel_topk``
+    is the signature: the Gumbel root records its candidate set, the PUCT root
+    deliberately records none rather than invent one.
+    """
+
+    trained = [
+        move
+        for move in moves
+        if not move.policy_excluded and move.sims > 0 and move.gumbel_topk is not None
+    ]
+    if not trained:
+        return TARGET_VERSION
+    return 3 if any(len(move.gumbel_topk) == 0 for move in trained) else 2
+
+
 @dataclass(frozen=True, slots=True)
 class MoveRecord:
     i: int

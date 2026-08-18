@@ -407,8 +407,9 @@ def test_pruning_rule_matches_between_python_and_rust():
         priors = [p / mass for p in raw]
         q = [rng.uniform(-1.0, 1.0) for _ in range(n)]
         for k in (0.0, 0.5, 2.0, 6.0):
-            expected = py_prune(visits, priors, q, 1.5, k)
-            got = swr.prune_policy_target(visits, priors, q, 1.5, k)
+            root_visits = sum(visits) + 1  # the root counts its own expansion
+            expected = py_prune(visits, priors, q, 1.5, k, root_visits)
+            got = swr.prune_policy_target(visits, priors, q, 1.5, k, root_visits)
             if expected is None:
                 # Rust returns the raw distribution where Python returns None;
                 # both mean "record the unpruned target".

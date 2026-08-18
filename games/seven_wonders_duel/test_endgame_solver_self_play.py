@@ -377,3 +377,79 @@ def test_a_proven_value_replaces_the_outcome_in_training_but_not_in_validation()
     # realised win (~20), training halves what validation charges for both.
     assert trained["value"] == pytest.approx(10.0, abs=0.1)
     assert validated["value"] == pytest.approx(20.0, abs=0.1)
+
+
+# --- head-specific weighting ------------------------------------------------
+
+
+class _Move:
+    """Minimal stand-in for a buffer MoveRecord's weighting-relevant fields."""
+
+    def __init__(self, i, regime=None, masked=False):
+        self.i, self.solver_regime, self.solver_masked = i, regime, masked
+
+
+def test_only_chance_free_proofs_earn_value_weight():
+    """`exact_expectimax` rows keep the realised outcome, so upweighting them
+    would emphasise a certainty they do not have."""
+
+    from .dataset import solver_row_weights
+
+    weights = solver_row_weights(
+        [_Move(0), _Move(1, "exact_expectimax"), _Move(2, "exact")]
+    )
+    assert 0 not in weights
+    assert weights[2][0] > 1.0
+    assert 1 not in weights or weights[1][0] == 1.0
+
+
+def test_the_value_bonus_is_shared_across_one_games_solved_plies():
+    """Eight consecutive solved plies are proofs OF THE SAME ENDGAME reached by
+    one line of play. Granting each the full bonus would let a handful of games
+    dominate the value head."""
+
+    from .dataset import SOLVER_VALUE_BONUS, solver_row_weights
+
+    one = solver_row_weights([_Move(0, "exact")])
+    many = solver_row_weights([_Move(i, "exact") for i in range(8)])
+    assert one[0][0] == pytest.approx(1.0 + SOLVER_VALUE_BONUS)
+    assert many[0][0] == pytest.approx(1.0 + SOLVER_VALUE_BONUS / 8)
+    # The game contributes the same total extra weight either way.
+    assert sum(w[0] - 1.0 for w in many.values()) == pytest.approx(
+        sum(w[0] - 1.0 for w in one.values())
+    )
+
+
+def test_weighting_moves_the_value_loss_but_not_the_policy_loss():
+    """The whole reason for head-specific weights: row duplication would move
+    both, plus every auxiliary head."""
+
+    import torch
+
+    from .dataset import collate
+    from .train import compute_losses
+
+    rows = [
+        _example(value_class=0, solver_value=-1.0, solver_exact=True, value_weight=5.0),
+        _example(value_class=0),
+    ]
+    batch = collate(rows)
+    outputs = {
+        "policy": torch.zeros(2, 1202),
+        "value": torch.tensor([[0.0, 0.0, 20.0], [0.0, 0.0, 20.0]]),
+        "joint7": torch.zeros(2, 7),
+        "margin": torch.zeros(2),
+        "military": torch.zeros(2),
+        "science": torch.zeros(2, 2),
+    }
+    _, weighted = compute_losses(outputs, batch)
+    _, flat = compute_losses(outputs, batch, row_weights=False)
+    # Row 0 is a proven loss the net already predicts confidently, so its own
+    # value loss is ~0; weighting it up pulls the batch's value loss DOWN.
+    assert weighted["value"] < flat["value"]
+    # And the policy loss is untouched, which row duplication could not have
+    # managed -- nor could it have left joint7, margin, military and science
+    # alone either.
+    assert weighted["policy"] == pytest.approx(flat["policy"])
+    for head in ("joint7", "margin", "military", "science"):
+        assert weighted[head] == pytest.approx(flat[head])

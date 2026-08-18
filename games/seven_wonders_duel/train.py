@@ -55,6 +55,7 @@ def compute_losses(
     value_weight: float = VALUE_WEIGHT_DEFAULT,
     value_bootstrap: float = 0.0,
     solver_value_target: bool = True,
+    row_weights: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -64,9 +65,23 @@ def compute_losses(
     )
     per_row = -(batch["policy"] * safe_log).sum(dim=-1)
     has_policy = batch["has_policy"]
-    policy_loss = (
-        per_row[has_policy].mean() if has_policy.any() else per_row.new_zeros(())
+    # Per-row weights, head by head. Duplicating a row would have been simpler
+    # and is wrong: every head averages over the batch, so a row duplicated to
+    # emphasise its exact VALUE would also count its policy and all four
+    # auxiliary targets twice.
+    policy_w = (
+        batch.get("policy_weight") if row_weights else None
     )
+    if policy_w is None:
+        policy_w = torch.ones_like(per_row)
+    value_w = batch.get("value_weight") if row_weights else None
+    if value_w is None:
+        value_w = torch.ones_like(per_row)
+    if has_policy.any():
+        weights = policy_w[has_policy]
+        policy_loss = (per_row[has_policy] * weights).sum() / weights.sum().clamp(min=1e-9)
+    else:
+        policy_loss = per_row.new_zeros(())
     solver_rows = batch.get("value_solver_valid") if solver_value_target else None
     has_solver = solver_rows is not None and bool(solver_rows.any())
     if value_bootstrap > 0.0 and "value_soft" in batch:
@@ -94,9 +109,12 @@ def compute_losses(
         # only move the target away from the truth.
         target = torch.where(solver_rows.unsqueeze(1), batch["value_solver"], target)
     if target is None:
-        value_loss = F.cross_entropy(outputs["value"], batch["value_class"])
+        per_value = F.cross_entropy(
+            outputs["value"], batch["value_class"], reduction="none"
+        )
     else:
-        value_loss = F.cross_entropy(outputs["value"], target)
+        per_value = F.cross_entropy(outputs["value"], target, reduction="none")
+    value_loss = (per_value * value_w).sum() / value_w.sum().clamp(min=1e-9)
     joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
     margin_valid = batch["margin_valid"]
     if margin_valid.any():
@@ -184,6 +202,12 @@ def evaluate(
                 value_weight,
                 value_bootstrap,
                 solver_value_target=False,
+                # Unweighted for the same reason: a held-out number has to mean
+                # the same thing across runs. Upweighting solved rows in
+                # validation would make the metric easier exactly where training
+                # was, which is how a run posts a better number without playing
+                # better.
+                row_weights=False,
             )
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
