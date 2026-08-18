@@ -660,9 +660,24 @@ bound — two refuted by measurement, one by argument. The one proposal that hel
 up (tempo) came from an engine rule plus an external observation, not a story.
 Prefer the error tail (§6) as the selection method.
 
-**Wall-clock budgets break reproducibility.** A solve bounded by seconds makes
-generation irreproducible from `(seed, net)`. Bound by nodes; keep `max_secs` as
-a non-binding safety net. The corpus gate has the same flaw — `BUILD_MAX_SECS` is
+**Wall-clock budgets break reproducibility --- and this one bound.** A solve
+bounded by seconds makes generation irreproducible from `(seed, net)`. Bound by
+nodes; keep `max_secs` as a non-binding safety net.
+
+*Measured 2026-08-18, and the warning was already being violated by this plan's
+own launch command.* The 12-iteration shakedown ran `--endgame-solver-max-secs
+3` alongside a 4.5M node cap. It declined **3,146 of 27,787 solves (11.3%)** and
+**not one was node-capped**: `nodes_max` peaked at 3.71M. Every decline was the
+clock. The per-iteration decline rate tracks generation throughput at
+**r = -0.817** (25.9% in the slowest iteration at 0.413 games/s, 7.4% in the
+fastest at 1.011) --- so which positions got a proof depended on what else was
+using the machine. At the implied ~1.2M nodes/s the node cap needs ~3.75s to
+bind, so 3s sat just underneath it. The launch command now passes 30.
+
+The general lesson is sharper than "prefer nodes": a seconds limit set anywhere
+near the node budget silently *becomes* the budget, and it fails asymmetrically
+--- hardest positions on the busiest machines, which is exactly the subset the
+solver exists to answer. The corpus gate has the same flaw — `BUILD_MAX_SECS` is
 a deadline, so gate *coverage* varies with machine load (83, 85 and 86 of 86
 positions across three runs with no code change). Worth pinning to the node
 budget alone.

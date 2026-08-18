@@ -124,7 +124,7 @@ Then the overnight run itself:
   --reply-head `
   --endgame-solver-max-nodes 4500000 `
   --endgame-solver-max-cards 10 `
-  --endgame-solver-max-secs 3 `
+  --endgame-solver-max-secs 30 `
   --solver-threads 4 `
   --promotion-every 3 `
   --promotion-min-lcb 0.50 `
@@ -167,10 +167,17 @@ Then the overnight run itself:
   simulation per move, and nothing in the log said so). `masked_fraction` well
   below 1.0, or `stops` dominated by `budget`, means the trigger is selecting
   positions the node cap cannot finish and the search is being paid for twice.
-  The flag-check run showed `stops: {budget: 1, none: 9}` with `nodes_max`
-  4,415,489 against the 4,500,000 cap --- so at `--endgame-solver-max-cards 10`
-  the cap does bind occasionally, and a `budget` share that climbs much above
-  10% is the signal to lower max-cards rather than raise the cap.
+  A `budget` share climbing much above 10% is the signal to lower max-cards.
+  **Check which budget bound first.** The 12-iteration shakedown declined 11.3%
+  of 27,787 solves, and none of them were node-capped: `nodes_max` peaked at
+  3.71M against the 4.50M cap, so every decline was the wall clock. It was
+  `--endgame-solver-max-secs 3`, and the decline rate correlated with generation
+  throughput at **r = -0.817** across the 12 iterations (25.9% declines in the
+  slowest iteration, 7.4% in the fastest). That is the reproducibility failure
+  §7 of `PRE_RETRAIN_PLAN.md` warns about, arriving as *training data that
+  depends on machine load*. The seconds limit belongs well above the node
+  budget, as a safety net that never binds: at the observed ~1.2M nodes/s the
+  4.5M cap needs ~3.75s, so 3 was below it and 30 is comfortably above.
 - `training_performance.pretrain_newest_metrics.reply` --- present and falling.
   Absent means the reply head is not being trained.
 - The **train/validation gap**. §7 of `PRE_RETRAIN_PLAN.md` predicts the reply
@@ -179,9 +186,18 @@ Then the overnight run itself:
   a buffer reload both happen at least once, since that is the path on which the
   checkpoint-config defect surfaced.
 
-`--iterations 12` at `--games-per-iteration 300` is sized so a laptop night is
-enough for three promotion gates and at least one anchor; it is a plumbing
-budget, not a strength budget, so do not read the win rates as signal.
+`--iterations 12` at `--games-per-iteration 300` is a **~2.3 hour** run on the
+3070 laptop, not a night: measured at 12 iterations in 2h20m (0.41-1.01 games/s,
+generation is ~95% of it, and the rate depends on what else is using the GPU).
+It buys two promotions, one probation and 3,600 games. It is a plumbing budget,
+not a strength budget, so do not read the win rates as signal.
+
+To actually use a night, raise `--iterations` rather than
+`--games-per-iteration`: more iterations buys more promotion/gate/reload cycles
+*and* more total games, and the reload path is where the defects of 2026-08-18
+concentrated. At ~11 min per iteration, `--iterations 45` is about 8 hours.
+Total game volume is what finds the rare ones --- the terminal-forced-child bug
+needed ~600 games to surface even once.
 
 **The gate is on, and that is a change from this page's previous advice.** The
 earlier version set `--promotion-every 0` and argued that gates were
