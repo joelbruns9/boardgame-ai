@@ -696,6 +696,29 @@ never actually been reachable. The line now is: `zeroed` is fatal (a parameter
 has no counterpart, the net is partly random), `grown` is fine and loud (zero
 weights on appended input columns contribute nothing, exactly).
 
+**An architecture switch must travel with the weights, at every site.**
+`--pooled-readout` and `--reply-head` change what parameters exist. The switch
+therefore has to reach every place a model is rebuilt, and the first smoke run
+found two places it did not:
+
+1. `phase_d` wrote checkpoint configs at three sites (manifest contract,
+   bootstrap, per-iteration), of which only `train.py`'s CLI copy had been
+   updated — so a checkpoint was saved with `readout_proj` weights and a config
+   that did not mention them. The strict reload failed on the *next* iteration.
+2. `ModelAgentSpec` — the picklable recipe a gate rebuilds from — carried
+   `heads` but not the two switches, and four call sites rebuilt from it.
+
+Both are now single sites: `PhaseDLoop._model_contract()` and `_model_from_spec()`,
+each reading the flags off the built model rather than off config, so a
+checkpoint cannot record something the weights contradict. Note the failure was
+loud but *late*: it surfaced at the first reload, which on an overnight run is
+hours in. This is the fifth instance of the session's recurring shape — a value
+crossing an implementation boundary and being silently defaulted — after the
+duplicated feature width, the `forced_playout_k` global, `puct_root && full`, and
+the solver global. The mitigation that keeps working is the same: **one
+definition site, read from the object that was actually built, plus a test that
+round-trips it.**
+
 **Duplicated constants.** The padded feature width was a literal in four places
 and adding two features left two behind, surfacing as a matmul shape error naming
 nothing. All four now derive from the schema. The class of bug is worth watching

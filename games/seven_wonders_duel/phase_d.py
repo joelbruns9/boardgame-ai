@@ -285,6 +285,18 @@ class PhaseDConfig:
     endgame_solver_max_secs: float = 60.0
     endgame_solver_max_cards: int = 8
     endgame_solver_mask_policy: bool = True
+    solver_threads: int = 0
+    """Background solver threads; 0 solves inline on the scheduler thread.
+
+    The solve must finish before the move is chosen, so the SLOT waits either
+    way; what threads move off the scheduler is the wait, so other slots keep
+    feeding the evaluation boundary instead of idling behind one multi-second
+    solve. Matters most where CPU cores are spare while a GPU does inference --
+    the rented-box shape rather than the laptop's.
+
+    A pure throughput change, gated on producing byte-identical records
+    (`test_async_solver.py`).
+    """
     d_model: int = 128
     layers: int = 4
     heads: int | None = None
@@ -919,6 +931,18 @@ def _configure_cheap_top_k(width: int) -> None:
     swr.set_cheap_top_k(int(width))
 
 
+def configure_solver_threads(threads: int) -> None:
+    """Apply the background solver thread count to the Rust generator."""
+
+    if threads < 0:
+        raise ValueError("--solver-threads must be non-negative")
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return
+    swr.set_solver_threads(int(threads))
+
+
 def configure_forced_playouts(k: float) -> None:
     """Apply the forced-playout constant to the Rust generator.
 
@@ -1269,6 +1293,38 @@ def summarize_records(records: Sequence[GameRecord]) -> dict[str, Any]:
         "average_sims": (
             sum(move.sims for move in searched) / len(searched) if searched else 0.0
         ),
+        "solver": _summarize_solver(moves),
+    }
+
+
+def _summarize_solver(moves: Sequence[Any]) -> dict[str, Any]:
+    """What the endgame solver did this iteration.
+
+    Reported because the alternative is inferring it: the first smoke run
+    generated at one simulation per move, so the solver never fired, and nothing
+    in the log said so either way. `attempted` is positions the trigger selected;
+    `masked` is the subset where a proof actually narrowed the policy. A large
+    gap between them is the trigger paying for searches that decline.
+    """
+
+    attempted = [move for move in moves if move.solver_attempted]
+    if not attempted:
+        return {"attempted": 0}
+    masked = [move for move in attempted if move.solver_masked]
+    return {
+        "attempted": len(attempted),
+        "attempted_fraction": len(attempted) / len(moves) if moves else 0.0,
+        "masked": len(masked),
+        "masked_fraction": len(masked) / len(attempted),
+        "regimes": dict(
+            sorted(Counter(move.solver_regime or "none" for move in attempted).items())
+        ),
+        "stops": dict(
+            sorted(Counter(move.solver_stop or "none" for move in attempted).items())
+        ),
+        "nodes_total": sum(move.solver_nodes for move in attempted),
+        "nodes_mean": sum(move.solver_nodes for move in attempted) / len(attempted),
+        "nodes_max": max(move.solver_nodes for move in attempted),
     }
 
 
@@ -1388,7 +1444,14 @@ def _process_generation_init(
     # One BLAS thread per process: generation scales by process count, and
     # oversubscribing cores with intra-op threads slows every worker down.
     torch.set_num_threads(1)
-    model = build_model("transformer", config.d_model, config.layers, config.heads)
+    model = build_model(
+        "transformer",
+        config.d_model,
+        config.layers,
+        config.heads,
+        config.pooled_readout,
+        config.reply_head,
+    )
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
     # a few ms on a core, while fanning every process into one GPU serializes
@@ -1433,6 +1496,16 @@ class ModelAgentSpec:
     key resolves to it.
     """
 
+    pooled_readout: bool = False
+    reply_head: bool = False
+    """Architecture switches the weights were built under.
+
+    Here for the same reason ``heads`` is: a gate rebuilds the model from this
+    spec, and whatever the spec does not carry is silently the default. Unlike
+    ``heads`` a mismatch is loud -- the state dict has keys the model lacks --
+    but loud at gate time is still hours into a run.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class BotAgentSpec:
@@ -1446,6 +1519,25 @@ def _spec_name(spec: GateAgentSpec) -> str:
     return spec.bot.name if isinstance(spec, BotAgentSpec) else spec.name
 
 
+def _model_from_spec(spec: ModelAgentSpec):
+    """The one place a ModelAgentSpec becomes a loaded model.
+
+    Was four copies of build-then-load, each naming the architecture fields it
+    happened to know about.
+    """
+
+    model = build_model(
+        "transformer",
+        spec.d_model,
+        spec.layers,
+        spec.heads,
+        spec.pooled_readout,
+        spec.reply_head,
+    )
+    model.load_state_dict(spec.model_state)
+    return model
+
+
 def _build_gate_agent(
     spec: GateAgentSpec,
     device: str,
@@ -1454,8 +1546,7 @@ def _build_gate_agent(
 ):
     if isinstance(spec, BotAgentSpec):
         return BotAgent(spec.bot)
-    model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
-    model.load_state_dict(spec.model_state)
+    model = _model_from_spec(spec)
     return SearchAgent(
         spec.name,
         Evaluator(model, device, inference_batch, precision=precision),
@@ -2513,6 +2604,31 @@ class PhaseDLoop:
             if int(row["iteration"]) not in logged_iterations:
                 self._append_training_log(row)
 
+    def _model_contract(self, model, **extra) -> dict:
+        """The model's identity, recorded wherever its weights are.
+
+        ONE place on purpose. This was three near-copies of the same dict, and
+        adding `pooled_readout` / `reply_head` to the model without adding them
+        to all three produced a checkpoint whose own config could not rebuild
+        it. The strict `load_state_dict` caught it -- "Unexpected key(s):
+        readout_proj.weight" -- but only on the next iteration's reload, which
+        on a long run is hours in.
+
+        Read off the MODEL rather than the config, so it records what was
+        actually built.
+        """
+
+        return {
+            "model": "transformer",
+            "d_model": self.config.d_model,
+            "layers": self.config.layers,
+            "heads": self._built_heads(model),
+            "pooled_readout": bool(getattr(model, "pooled_readout", False)),
+            "reply_head": bool(getattr(model, "reply_head", False)),
+            "precision": self.config.precision,
+            **extra,
+        }
+
     def _new_model(self):
         return build_model(
             "transformer",
@@ -2663,16 +2779,12 @@ class PhaseDLoop:
             self.manifest.initialize(
                 config=self.config,
                 adapter_contract=self.adapter.contract(),
-                model_contract={
-                    "model": "transformer",
-                    "d_model": self.config.d_model,
-                    "layers": self.config.layers,
-                    "heads": self._built_heads(model),
-                    "precision": self.config.precision,
-                    "parameters": sum(
+                model_contract=self._model_contract(
+                    model,
+                    parameters=sum(
                         parameter.numel() for parameter in model.parameters()
                     ),
-                },
+                ),
             )
         # The soft-gate controller owns latest.pt/current_best.pt creation via the
         # lifecycle adapter; the legacy strict-gate path seeds current_best here.
@@ -2688,14 +2800,7 @@ class PhaseDLoop:
             bootstrap_model = self._new_model()
             checkpoint = make_checkpoint(
                 bootstrap_model,
-                {
-                    "model": "transformer",
-                    "d_model": self.config.d_model,
-                    "layers": self.config.layers,
-                    "heads": self._built_heads(bootstrap_model),
-                    "precision": self.config.precision,
-                    "iteration": -1,
-                },
+                self._model_contract(bootstrap_model, iteration=-1),
             )
             torch.save(checkpoint, self.current_best)
         manifest_payload = json.loads(self.manifest.path.read_text(encoding="utf-8"))
@@ -3640,17 +3745,13 @@ class PhaseDLoop:
         candidate = self.checkpoint_dir / f"candidate_{iteration:04d}.pt"
         checkpoint = make_checkpoint(
             model,
-            {
-                "model": "transformer",
-                "d_model": self.config.d_model,
-                "layers": self.config.layers,
-                "heads": self._built_heads(model),
-                "precision": self.config.precision,
-                "iteration": iteration,
-                "history": history,
-                "baselines": target_baselines,
-                "phase_d_split": self.last_training_stats,
-            },
+            self._model_contract(
+                model,
+                iteration=iteration,
+                history=history,
+                baselines=target_baselines,
+                phase_d_split=self.last_training_stats,
+            ),
         )
         torch.save(checkpoint, candidate)
         self.sample_resources("post_training")
@@ -3667,6 +3768,8 @@ class PhaseDLoop:
             d_model=self.config.d_model,
             layers=self.config.layers,
             heads=self._built_heads(model),
+            pooled_readout=bool(getattr(source, "pooled_readout", False)),
+            reply_head=bool(getattr(source, "reply_head", False)),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -3797,8 +3900,7 @@ class PhaseDLoop:
         import seven_wonders_rust as swr
 
         def evaluator(spec: ModelAgentSpec) -> Evaluator:
-            model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
-            model.load_state_dict(spec.model_state)
+            model = _model_from_spec(spec)
             return Evaluator(
                 model,
                 self.config.device,
@@ -3904,8 +4006,7 @@ class PhaseDLoop:
         )
 
         def evaluator(spec: ModelAgentSpec, precision: str) -> Evaluator:
-            model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
-            model.load_state_dict(spec.model_state)
+            model = _model_from_spec(spec)
             return Evaluator(
                 model,
                 self.config.device,
@@ -4066,13 +4167,7 @@ class PhaseDLoop:
 
         import seven_wonders_rust as swr
 
-        model = build_model(
-            "transformer",
-            candidate_spec.d_model,
-            candidate_spec.layers,
-            candidate_spec.heads,
-        )
-        model.load_state_dict(candidate_spec.model_state)
+        model = _model_from_spec(candidate_spec)
         evaluator = Evaluator(
             model,
             self.config.device,
@@ -5064,6 +5159,16 @@ def build_parser() -> argparse.ArgumentParser:
         "all -- and Age I/II are never solvable at any budget.",
     )
     parser.add_argument(
+        "--solver-threads",
+        type=int,
+        default=0,
+        help="background threads for the endgame solver; 0 (default) solves "
+        "inline on the scheduler thread, which stalls every slot that thread "
+        "serves and starves the evaluation boundary while it runs. Worth "
+        "setting where CPU cores are spare while a GPU does inference. Records "
+        "are byte-identical either way -- only the timing differs.",
+    )
+    parser.add_argument(
         "--endgame-solver-max-secs",
         type=float,
         default=60.0,
@@ -5374,6 +5479,7 @@ def main(argv=None) -> int:
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
     configure_forced_playouts(args.forced_playout_k)
+    configure_solver_threads(args.solver_threads)
     # Read back what the generator is actually running under, so the manifest
     # records the effective settings rather than the requested ones -- they
     # differ when there is no Rust generator to configure at all.
@@ -5388,6 +5494,7 @@ def main(argv=None) -> int:
         endgame_solver_max_secs=float(applied_solver[1]),
         endgame_solver_max_cards=int(applied_solver[2]),
         endgame_solver_mask_policy=bool(applied_solver[3]),
+        solver_threads=args.solver_threads,
         run_dir=args.run_dir,
         seed=args.seed,
         iterations=args.iterations,

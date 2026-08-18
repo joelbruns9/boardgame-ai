@@ -76,6 +76,107 @@ generated game and 5.12x per training step; see `CLOUD_TRAINING_PLAN.md`.
 PowerShell uses the backtick at the end of a line as its continuation
 character. There must be no spaces after a continuation backtick.
 
+## Overnight Pipeline Shakedown
+
+Run this before renting a box. It is **not** a run whose model matters --- it is
+the pre-retrain feature set (PUCT generation, forced playouts, the endgame
+solver, mean/max readout, reply head) exercised end to end for long enough that
+anything that only breaks on the second iteration, the first promotion, or the
+first buffer reload has broken before it costs cloud hours.
+
+First, a 90-second plumbing check of the same flag set:
+
+```powershell
+./.venv/Scripts/python.exe -m games.seven_wonders_duel.phase_d `
+  --run-dir games/seven_wonders_duel/runs/pipeline_smoke `
+  --plumbing-smoke `
+  --selfplay-search-mode puct `
+  --cheap-search-mode gumbel `
+  --eval-search-mode puct `
+  --dirichlet-epsilon 0.25 `
+  --forced-playout-k 1.0 `
+  --pooled-readout `
+  --reply-head `
+  --endgame-solver-max-nodes 4500000 `
+  --endgame-solver-max-cards 10 `
+  --solver-threads 4
+```
+
+Then the overnight run itself:
+
+```powershell
+./.venv/Scripts/python.exe -m games.seven_wonders_duel.phase_d `
+  --run-dir games/seven_wonders_duel/runs/pipeline_overnight `
+  --seed 20260817 `
+  --device cuda `
+  --generation-backend rust `
+  --gate-backend rust `
+  --schedule-basis games `
+  --selfplay-generator-mode soft_gate `
+  --bootstrap-policy auto_first_trained `
+  --selfplay-search-mode puct `
+  --cheap-search-mode gumbel `
+  --eval-search-mode puct `
+  --dirichlet-epsilon 0.25 `
+  --dirichlet-alpha 1.8 `
+  --forced-playout-k 1.0 `
+  --pooled-readout `
+  --reply-head `
+  --endgame-solver-max-nodes 4500000 `
+  --endgame-solver-max-cards 10 `
+  --endgame-solver-max-secs 3 `
+  --solver-threads 4 `
+  --promotion-every 3 `
+  --promotion-min-lcb 0.50 `
+  --revert-max-ucb 0.48 `
+  --gate-ladder-games 100 200 `
+  --gate-sims 64 `
+  --gate-slots 144 `
+  --anchor-every-iterations 4 `
+  --anchor-games 100 `
+  --iterations 12 `
+  --games-per-iteration 300 `
+  --seed-games 1000 `
+  --curriculum-anneal-games 6000 `
+  --draft-prior-games 6000 `
+  --save-buffer games/seven_wonders_duel/runs/pipeline_overnight/buffer_final.jsonl `
+  --buffer-autosave-every 1 `
+  --d-model 128 `
+  --layers 4 `
+  --precision fp32 `
+  --train-steps 57 `
+  --train-warmup-steps 25 `
+  --train-batch-size 512 `
+  --cheap-sims-min 16 `
+  --cheap-sims-max 24 `
+  --full-sims-min 64 `
+  --full-sims-max 128 `
+  --full-search-fraction 0.25 `
+  --rust-slots 48 `
+  --rust-global-batch-cap 256 `
+  --leaf-batch 1 `
+  --age-deal-samples 32
+```
+
+**What to read in the morning.** In `training_log.jsonl`, per iteration:
+
+- `generated_summary.solver` --- `attempted` should be non-zero (the smoke that
+  preceded this section reported zero, because it generated at one simulation per
+  move and nothing said so). `masked_fraction` well below 1.0, or `stops`
+  dominated by `budget`, means the trigger is selecting positions the node cap
+  cannot finish and the search is being paid for twice.
+- `training_performance.pretrain_newest_metrics.reply` --- present and falling.
+  Absent means the reply head is not being trained.
+- The **train/validation gap**. §7 of `PRE_RETRAIN_PLAN.md` predicts the reply
+  head *narrows* it; if it widens, the memorisation theory behind §D is wrong.
+- `promoted` / `decision` across iterations --- the point is that a promotion and
+  a buffer reload both happen at least once, since that is the path on which the
+  checkpoint-config defect surfaced.
+
+`--iterations 12` at `--games-per-iteration 300` is sized so a laptop night is
+enough for three promotion gates and at least one anchor; it is a plumbing
+budget, not a strength budget, so do not read the win rates as signal.
+
 **The gate is on, and that is a change from this page's previous advice.** The
 earlier version set `--promotion-every 0` and argued that gates were
 unaffordable on a laptop: "a properly powered gate is ~800 games, which at
@@ -822,6 +923,28 @@ solvable at any budget, since the next age's deal is a sample-only chance edge.
 experiment: the mask is the only consumer of exact per-action pricing, so
 without it the solve uses the narrower `ValueOnly` window and measures 2.0x
 fewer nodes.
+
+### `--solver-threads`
+
+**Default:** `0` (solve inline). **Value:** non-negative integer
+
+Background threads for the endgame solver. The solve must finish before the move
+is chosen -- the mask decides what is played -- so the *slot* waits either way.
+What threads move off the scheduler is the **wait**: at 0, a multi-second solve
+holds the scheduler loop, so every slot that worker serves stops producing
+evaluation requests and the inference boundary idles behind one game.
+
+Worth setting where CPU cores are spare while a GPU does inference, which is the
+rented-box shape rather than the laptop's. Solver scaling measured 2.89x on 4
+threads, 3.77x on 8 and 4.37x on 16 of 16 logical CPUs, with the ceiling
+attributed to all-core clock and SMT rather than memory bandwidth -- so solver
+threads do depress generation clocks somewhat, and a sweep should read
+end-to-end games/hour rather than assume independence.
+
+**Records are byte-identical at any thread count**; only the timing differs, and
+`test_async_solver.py` gates exactly that at 1, 2 and 4 threads on both dense and
+mixed schedules. `sched_solve_wait_ns` reports the stall that remained -- the
+number that says whether more threads would help.
 
 Every attempted solve is marked in the buffer, whether or not it succeeded:
 `solver_attempted`, `solver_stop` (`unsolvable` / `budget`), `solver_nodes`

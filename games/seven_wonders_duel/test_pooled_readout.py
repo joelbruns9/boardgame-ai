@@ -105,3 +105,63 @@ def test_a_row_of_pure_padding_does_not_produce_nan():
         out = model(batch)
     for key, value in out.items():
         assert torch.isfinite(value).all(), key
+
+
+def test_a_phase_d_checkpoint_records_enough_to_rebuild_itself():
+    """The smoke run caught this the hard way: the model was built with the new
+    readout and head, the checkpoint's own config did not say so, and the strict
+    reload failed with "Unexpected key(s): readout_proj.weight" -- an iteration
+    later, which on a long run is hours in.
+
+    The cause was three near-copies of one dict, of which only `train.py`'s was
+    updated. There is one now, and this asserts it carries what a rebuild needs.
+    """
+
+    from .phase_d import PhaseDConfig, PhaseDLoop
+
+    config = PhaseDConfig(
+        run_dir="unused", d_model=32, layers=1, pooled_readout=True, reply_head=True
+    )
+    loop = PhaseDLoop.__new__(PhaseDLoop)   # no run directory needed
+    loop.config = config
+    model = build_model("transformer", 32, 1, None, True, True)
+    contract = loop._model_contract(model)
+    assert contract["pooled_readout"] is True
+    assert contract["reply_head"] is True
+    # And a model rebuilt from that contract accepts the weights.
+    from .train import heads_from_config, reply_head_from_config
+
+    rebuilt = build_model(
+        "transformer",
+        contract["d_model"],
+        contract["layers"],
+        heads_from_config(contract),
+        pooled_readout_from_config(contract),
+        reply_head_from_config(contract),
+    )
+    rebuilt.load_state_dict(model.state_dict())
+
+
+def test_a_gate_spec_carries_the_architecture_switches():
+    """A gate rebuilds its model from a ModelAgentSpec. If the spec does not
+    carry the switches, the rebuild is a plain model and the load fails -- which
+    is what the smoke run hit after the checkpoint config was fixed.
+    """
+
+    from .phase_d import ModelAgentSpec, PhaseDLoop, _model_from_spec
+
+    model = build_model("transformer", 32, 1, None, True, True)
+    spec = ModelAgentSpec(
+        name="candidate",
+        model_state=model.state_dict(),
+        d_model=32,
+        layers=1,
+        sims=1,
+        mode="puct",
+        top_k=2,
+        heads=PhaseDLoop._built_heads(model),
+        pooled_readout=True,
+        reply_head=True,
+    )
+    rebuilt = _model_from_spec(spec)   # raises if the switches are dropped
+    assert rebuilt.pooled_readout and rebuilt.reply_head

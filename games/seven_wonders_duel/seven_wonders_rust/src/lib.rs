@@ -2750,6 +2750,22 @@ fn set_endgame_solver(
 }
 
 #[pyfunction]
+/// Background solver threads; 0 solves inline on the scheduler thread.
+///
+/// Async is a pure THROUGHPUT change: the records it produces must be
+/// byte-identical to the synchronous path, since only the timing differs.
+/// `test_async_solver.py` is that gate.
+fn set_solver_threads(threads: usize) {
+    self_play::set_solver_threads(threads);
+}
+
+#[pyfunction]
+/// The background solver thread count in force, for run manifests.
+fn solver_threads() -> usize {
+    self_play::solver_threads()
+}
+
+#[pyfunction]
 /// Set the forced-playout constant. See `self_play::set_forced_playout_k`.
 fn set_forced_playout_k(k: f64) {
     self_play::set_forced_playout_k(k);
@@ -2820,6 +2836,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::prune_policy_target;
+
+    #[pymodule_export]
+    use super::set_solver_threads;
+
+    #[pymodule_export]
+    use super::solver_threads;
 
     #[pymodule_export]
     use super::set_forced_playout_k;

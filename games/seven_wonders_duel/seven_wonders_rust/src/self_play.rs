@@ -517,6 +517,20 @@ pub fn forced_playout_k() -> f64 {
     f64::from_bits(FORCED_PLAYOUT_K_BITS.load(Ordering::Relaxed))
 }
 
+/// Background solver threads; 0 (the default) solves inline on the scheduler
+/// thread. Process-wide like the solver's other parameters -- and safe as one
+/// for the same reason, since `SelfPlayConfig::solve_endgames` is what actually
+/// grants permission to solve, and a gate never sets it.
+static SOLVER_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_solver_threads(threads: usize) {
+    SOLVER_THREADS.store(threads, Ordering::Relaxed);
+}
+
+pub fn solver_threads() -> usize {
+    SOLVER_THREADS.load(Ordering::Relaxed)
+}
+
 /// Configure the endgame solver overlay, process-wide.
 ///
 /// Global for the same reason `set_cheap_top_k` and the temperature schedule
@@ -580,6 +594,14 @@ pub struct SolverOverlay {
 
 fn cards_left(state: &GameState) -> usize {
     state.tableau.slots.iter().filter(|card| card.present).count()
+}
+
+/// Would the solver take this position at all? The same predicate
+/// `endgame_overlay` applies, exposed so the async path can decline to dispatch
+/// rather than pay a channel round trip to be told no.
+pub fn solver_wants(state: &GameState) -> bool {
+    let (max_nodes, _secs, max_cards, _mask) = endgame_solver();
+    max_nodes != 0 && solver_eligible(state, max_cards)
 }
 
 /// Cheap pre-filter, evaluated before any search work is committed to a solve.
@@ -1102,6 +1124,10 @@ pub struct SchedulerMetrics {
     pub sched_collect_ns: u64,
     /// `pool.retire`: finishing games and building records.
     pub sched_retire_ns: u64,
+    /// Wall time the scheduler spent blocked on the solver pool -- i.e. the
+    /// stall async did NOT remove. The number that says whether more solver
+    /// threads would help.
+    pub sched_solve_wait_ns: u64,
     /// Cloning every row's states/actors/legals/net_ids into the batch vectors.
     /// Untimed until now and a prime suspect: it copies the whole batch.
     pub sched_assemble_ns: u64,
@@ -1662,6 +1688,13 @@ enum SlotStage {
         meta: SearchMeta,
         session: tree_resumable::SearchSession,
     },
+    /// The search is done and a solve is out with the pool. The slot cannot
+    /// proceed -- the mask decides which move is played -- but the scheduler
+    /// thread can, which is the entire point of the async path.
+    SolvePending {
+        meta: SearchMeta,
+        result: crate::tree::SearchResult,
+    },
     Complete,
 }
 
@@ -1855,6 +1888,7 @@ impl GameSlot {
         &mut self,
         slot_index: usize,
         forced_row_limit: usize,
+        mut pool: Option<&mut SolverPool>,
     ) -> PyResult<Option<EvalGroup>> {
         loop {
             if let SlotStage::NeedRoot(meta) = &self.stage {
@@ -1880,6 +1914,8 @@ impl GameSlot {
                     }));
                 }
                 SlotStage::Complete => return Ok(None),
+                // Waiting on the pool; nothing to evaluate from here.
+                SlotStage::SolvePending { .. } => return Ok(None),
                 SlotStage::Searching { session, .. } => {
                     let started = Instant::now();
                     let event = session.next_event_with_limit(forced_row_limit);
@@ -1948,7 +1984,12 @@ impl GameSlot {
             self.conflict_cuts += metrics.conflict_cuts;
             self.forced_rows_per_search
                 .push(metrics.forced_outcome_rows);
-            self.finish_move(meta, result)?;
+            self.finish_move(meta, result, slot_index, pool.as_deref_mut())?;
+            if matches!(self.stage, SlotStage::SolvePending { .. }) {
+                // Parked on a solve: this slot has nothing to evaluate until the
+                // answer lands, and the caller must not treat that as finished.
+                return Ok(None);
+            }
         }
     }
 
@@ -2020,7 +2061,65 @@ impl GameSlot {
         result
     }
 
-    fn finish_move(&mut self, meta: SearchMeta, result: crate::tree::SearchResult) -> PyResult<()> {
+    /// Solve if this slot wants one, then complete the move.
+    ///
+    /// Split from `complete_move` so the solve can move off the scheduler
+    /// thread: everything before the overlay is search bookkeeping, everything
+    /// after depends on the answer. Synchronous here; the pool path parks the
+    /// slot between the two halves instead.
+    fn finish_move(
+        &mut self,
+        meta: SearchMeta,
+        result: crate::tree::SearchResult,
+        slot_index: usize,
+        pool: Option<&mut SolverPool>,
+    ) -> PyResult<()> {
+        if !self.cfg.solve_endgames {
+            return self.complete_move(meta, result, None);
+        }
+        if let Some(pool) = pool {
+            // Only park for a solve the trigger would actually take. Dispatching
+            // an ineligible position would cost a channel round trip per move to
+            // learn what `solver_eligible` answers in nanoseconds.
+            if solver_wants(&self.state) {
+                let dispatched = pool.dispatch(SolveJob {
+                    slot: slot_index,
+                    state: self.state.clone(),
+                    legal: meta.legal.clone(),
+                });
+                if dispatched {
+                    self.stage = SlotStage::SolvePending { meta, result };
+                    return Ok(());
+                }
+                // The pool is gone; fall through and solve inline rather than
+                // silently drop the mask, which would change the targets.
+            }
+        }
+        let overlay = endgame_overlay(&self.state, &meta.legal);
+        self.complete_move(meta, result, overlay)
+    }
+
+    /// Apply a solve that came back from the pool.
+    fn resume_after_solve(&mut self, overlay: Option<SolverOverlay>) -> PyResult<()> {
+        let stage = std::mem::replace(&mut self.stage, SlotStage::Complete);
+        let SlotStage::SolvePending { meta, result } = stage else {
+            return Err(PyRuntimeError::new_err(
+                "solve outcome delivered to a slot that was not waiting for one",
+            ));
+        };
+        self.complete_move(meta, result, overlay)
+    }
+
+    /// The half that needs the solver's answer. `overlay` is whatever the solve
+    /// produced -- synchronously or from the pool; the two must be
+    /// indistinguishable in the record, which is the property the async port is
+    /// gated on.
+    fn complete_move(
+        &mut self,
+        meta: SearchMeta,
+        result: crate::tree::SearchResult,
+        overlay: Option<SolverOverlay>,
+    ) -> PyResult<()> {
         let i = self.moves.len();
         // See `run`: pre-move state, before the action is chosen, EVERY eligible
         // ply. The solve is synchronous, so it holds this scheduler slot (and
@@ -2030,11 +2129,6 @@ impl GameSlot {
         // See `run` for why selection and training are separate objects.
         let mut selection = result.policy_target.clone();
         let mut training = result.training_policy.unwrap_or(result.policy_target);
-        let overlay = if self.cfg.solve_endgames {
-            endgame_overlay(&self.state, &meta.legal)
-        } else {
-            None
-        };
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);
             mask_and_renormalise(&mut training, keep);
@@ -2146,6 +2240,13 @@ impl GameSlot {
             SlotStage::NeedRoot(self.make_search_meta()?)
         };
         Ok(())
+    }
+
+    /// Parked waiting on the solver pool. Distinct from finished: a slot that
+    /// yields no evaluation group is normally done with its game, and retiring
+    /// one that is merely waiting would discard a game mid-solve.
+    fn is_parked(&self) -> bool {
+        matches!(self.stage, SlotStage::SolvePending { .. })
     }
 
     fn cancel_pending(&mut self) {
@@ -2284,10 +2385,13 @@ pub fn run_many<E: Eval>(
         for slot_index in pool.active_indices() {
             let outcome = pool
                 .slot_mut(slot_index)
-                .and_then(|slot| slot.next_eval_group(slot_index, forced_row_limit));
+                .and_then(|slot| slot.next_eval_group(slot_index, forced_row_limit, None));
+            let parked = pool.slot_mut(slot_index).map(|s| s.is_parked()).unwrap_or(false);
             match outcome {
                 Ok(Some(group)) => groups.push(group),
-                // A slot that yields no group has finished its game.
+                // No group means the game is over -- UNLESS the slot is parked on
+                // a solve, which yields nothing and is emphatically not finished.
+                Ok(None) if parked => {}
                 Ok(None) => retire.push(slot_index),
                 Err(err) => {
                     pool.abort(&budget);
@@ -2433,6 +2537,7 @@ fn collect_ready_groups(
     pending: &mut std::collections::VecDeque<EvalGroup>,
     global_batch_cap: usize,
     finished: &mut Vec<usize>,
+    mut solver: Option<&mut SolverPool>,
 ) -> PyResult<usize> {
     let mut collected = 0;
     let active = pool.active_indices();
@@ -2448,13 +2553,15 @@ fn collect_ready_groups(
         }
         match pool
             .slot_mut(slot_index)?
-            .next_eval_group(slot_index, forced_row_limit)?
+            .next_eval_group(slot_index, forced_row_limit, solver.as_deref_mut())?
         {
             Some(group) => {
                 outstanding[slot_index] = true;
                 pending.push_back(group);
                 collected += 1;
             }
+            // Parked on a solve yields no group and is not a finished game.
+            None if pool.slot_mut(slot_index)?.is_parked() => {}
             None => finished.push(slot_index),
         }
     }
@@ -2505,6 +2612,10 @@ pub fn run_many_pipelined(
         ));
     }
     validate_leaf_batches_fit(&jobs, global_batch_cap)?;
+    // One pool per scheduler loop, so shards do not contend on a shared queue.
+    // Zero threads means synchronous solving, which is the default.
+    let solver_threads = solver_threads();
+    let mut solver = (solver_threads > 0).then(|| SolverPool::new(solver_threads));
     let mut pool = SlotPool::new(jobs);
     let mut outstanding = vec![false; pool.len()];
     let mut pending = std::collections::VecDeque::new();
@@ -2547,6 +2658,7 @@ pub fn run_many_pipelined(
             &mut pending,
             global_batch_cap,
             &mut finished,
+            solver.as_mut(),
         ) {
             pool.abort(&budget);
             return Err(err);
@@ -2560,6 +2672,71 @@ pub fn run_many_pipelined(
             }
         }
         metrics.sched_retire_ns += retire_started.elapsed().as_nanos() as u64;
+
+        // Pump the solver pool. Port of KD's `pump_async_solves`: harvest what
+        // has already landed, then block for an outcome ONLY when nothing else
+        // can move -- no group waiting to be batched and no batch in flight.
+        // Waiting on a solve while a leaf evaluation could be gathered instead
+        // is precisely the stall this path exists to remove.
+        if let Some(active_solver) = solver.as_mut() {
+            let solve_started = Instant::now();
+            loop {
+                for outcome in active_solver.harvest() {
+                    let slot = match pool.slot_mut(outcome.slot) {
+                        Ok(slot) => slot,
+                        Err(err) => {
+                            pool.abort(&budget);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = slot.resume_after_solve(outcome.overlay) {
+                        pool.abort(&budget);
+                        return Err(err);
+                    }
+                }
+                let stuck = active_solver.inflight() > 0
+                    && pending.is_empty()
+                    && inflight.is_empty();
+                if !stuck {
+                    break;
+                }
+                let Some(outcome) = active_solver.wait_one() else {
+                    break;
+                };
+                let slot = match pool.slot_mut(outcome.slot) {
+                    Ok(slot) => slot,
+                    Err(err) => {
+                        pool.abort(&budget);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = slot.resume_after_solve(outcome.overlay) {
+                    pool.abort(&budget);
+                    return Err(err);
+                }
+                // A resumed slot may now have work, so re-collect before
+                // deciding to block again.
+                let mut more = Vec::new();
+                if let Err(err) = collect_ready_groups(
+                    &mut pool,
+                    &mut outstanding,
+                    &mut pending,
+                    global_batch_cap,
+                    &mut more,
+                    None,
+                ) {
+                    pool.abort(&budget);
+                    return Err(err);
+                }
+                for slot_index in more {
+                    if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
+                        pool.abort(&budget);
+                        return Err(err);
+                    }
+                }
+            }
+            metrics.sched_solve_wait_ns += solve_started.elapsed().as_nanos() as u64;
+        }
 
         while inflight.len() < max_inflight_batches && !pending.is_empty() {
             let (groups, row_count) = match take_global_batch(&mut pending, global_batch_cap) {
@@ -3027,5 +3204,150 @@ mod solver_overlay_tests {
         let mut policy = vec![1.0, 0.0, 0.0];
         mask_and_renormalise(&mut policy, &[false, true, true]);
         assert_eq!(policy, vec![0.0, 0.5, 0.5]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async endgame solving — ported from Kingdomino's `BatchedMCTS` (kingdomino_rust
+// `lib.rs`, `async_solve` / `pump_async_solves`).
+// ---------------------------------------------------------------------------
+
+/// One position handed to the background solver.
+pub struct SolveJob {
+    pub slot: usize,
+    pub state: GameState,
+    pub legal: Vec<usize>,
+}
+
+/// The answer, tagged with the slot that asked. `overlay` is `None` when the
+/// trigger declined before any solving — the same meaning `endgame_overlay`
+/// gives it.
+pub struct SolveOutcome {
+    pub slot: usize,
+    pub overlay: Option<SolverOverlay>,
+}
+
+/// A background solver thread plus its channels.
+///
+/// The solve must finish before the move is chosen -- the mask decides what is
+/// played -- so the SLOT genuinely cannot proceed. What this buys is that the
+/// other slots do: today a multi-second solve holds the scheduler loop, and
+/// while it runs no leaf evaluations are gathered from any of that worker's
+/// slots, so the evaluation boundary starves too.
+///
+/// Structure follows KD's, including the parts that look odd:
+///
+/// * the thread is spawned **unconditionally**, even when async is off, so the
+///   disabled path has no conditional-lifetime field and stays structurally
+///   identical;
+/// * `inflight` counts dispatched-but-unharvested jobs, which is what tells the
+///   pump whether blocking is even necessary.
+pub struct SolverPool {
+    job_tx: Option<std::sync::mpsc::Sender<SolveJob>>,
+    out_rx: std::sync::mpsc::Receiver<SolveOutcome>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    inflight: usize,
+}
+
+impl SolverPool {
+    pub fn new(threads: usize) -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<SolveJob>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<SolveOutcome>();
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        // One receiver shared by N workers: solves are independent and
+        // wildly uneven in length (milliseconds to seconds), so pulling from a
+        // common queue balances them without any scheduling logic.
+        let workers = threads.max(1);
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let out_tx = out_tx.clone();
+            handles.push(std::thread::spawn(move || loop {
+                let job = {
+                    let guard = job_rx.lock().expect("solver queue poisoned");
+                    guard.recv()
+                };
+                let Ok(job) = job else { break }; // senders dropped: shut down
+                let overlay = endgame_overlay(&job.state, &job.legal);
+                if out_tx.send(SolveOutcome { slot: job.slot, overlay }).is_err() {
+                    break; // the scheduler is gone
+                }
+            }));
+        }
+        // Join only the first; the rest exit on the same channel close. Kept as
+        // one handle because the pool's Drop simply closes the queue.
+        let handle = handles.into_iter().next();
+        Self { job_tx: Some(job_tx), out_rx, handle, inflight: 0 }
+    }
+
+    pub fn dispatch(&mut self, job: SolveJob) -> bool {
+        match self.job_tx.as_ref().map(|tx| tx.send(job)) {
+            Some(Ok(())) => {
+                self.inflight += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Outcomes that have already arrived. Never blocks.
+    pub fn harvest(&mut self) -> Vec<SolveOutcome> {
+        let mut out = Vec::new();
+        while let Ok(outcome) = self.out_rx.try_recv() {
+            self.inflight -= 1;
+            out.push(outcome);
+        }
+        out
+    }
+
+    /// Block for one outcome. Only correct to call when nothing else can make
+    /// progress -- see `pump` in the scheduler loop.
+    pub fn wait_one(&mut self) -> Option<SolveOutcome> {
+        if self.inflight == 0 {
+            return None;
+        }
+        match self.out_rx.recv() {
+            Ok(outcome) => {
+                self.inflight -= 1;
+                Some(outcome)
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.inflight
+    }
+}
+
+impl Drop for SolverPool {
+    fn drop(&mut self) {
+        // Closing the queue is what stops the workers; joining before that
+        // would deadlock on their blocking `recv`.
+        self.job_tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod solver_pool_tests {
+    use super::*;
+
+    #[test]
+    fn a_pool_with_no_work_reports_nothing_inflight_and_never_blocks() {
+        let mut pool = SolverPool::new(2);
+        assert_eq!(pool.inflight(), 0);
+        assert!(pool.harvest().is_empty());
+        assert!(pool.wait_one().is_none(), "wait_one blocked with no work");
+    }
+
+    #[test]
+    fn dropping_the_pool_shuts_the_workers_down() {
+        // The workers block on `recv`, so shutdown has to come from closing the
+        // queue rather than from a flag they would never look at.
+        let pool = SolverPool::new(4);
+        drop(pool); // must not hang
     }
 }
