@@ -215,11 +215,60 @@ def compare_triggers(
     return results
 
 
+def transfer(
+    train_rows: list[dict], other_rows: list[dict], features: tuple[str, ...]
+) -> dict[str, Any]:
+    """Fit on one distribution, score on another.
+
+    The question the shakedown cannot answer on its own: its endgames were
+    reached by a 128x4 net playing itself, and the trigger will meet endgames
+    reached by a trained one. If the cost model is really about board structure
+    it should transfer; if it quietly learned "this is what a weak net's
+    endgames look like", it will not.
+
+    A model that scores well in-distribution and badly here is still useful --
+    but only if refit per run, which is a different and more expensive proposal
+    than the plan makes.
+    """
+
+    coefficients = fit([row for row in train_rows if not row["censored"]], features)
+    return {
+        "in_distribution": score(coefficients, train_rows, features),
+        "transferred": score(coefficients, other_rows, features),
+    }
+
+
+def study_rows(path: Path) -> list[dict]:
+    """Rows from `endgame_trigger_study --out`, normalised to this module's keys.
+
+    The study writes `nodes: None` for a censored position; here `nodes` is
+    always a number and `censored` says whether it is a cost or a floor.
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    for row in payload["rows"]:
+        if row.get("nodes") is None and not row.get("censored"):
+            continue
+        normalised = dict(row)
+        normalised["nodes"] = row["nodes"] if row["nodes"] is not None else 0
+        normalised["censored"] = bool(row.get("censored"))
+        rows.append(normalised)
+    return rows
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("buffer", type=Path, help="a run's buffer_final.jsonl")
     parser.add_argument("--budget", type=int, default=4_500_000)
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--transfer-to",
+        type=Path,
+        help="an endgame_trigger_study --out file whose positions the model, "
+        "fit here, is then scored against. Use it to ask whether a cost model "
+        "fit on self-play endgames predicts the endgames a trained net reaches.",
+    )
     parser.add_argument(
         "--holdout-fraction",
         type=float,
@@ -255,6 +304,13 @@ def main(argv: list[str] | None = None) -> int:
         "refit_on_shakedown": score(coefficients, test, TRIGGER_FEATURES),
         "triggers": compare_triggers(test, coefficients, TRIGGER_FEATURES, args.budget),
     }
+    if args.transfer_to:
+        other = study_rows(args.transfer_to)
+        summary["transfer"] = {
+            "source": str(args.transfer_to),
+            "rows": len(other),
+            **transfer(train, other, TRIGGER_FEATURES),
+        }
     print(json.dumps(summary, indent=2))
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2), encoding="utf-8")

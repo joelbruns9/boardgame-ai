@@ -125,3 +125,49 @@ def test_the_budget_rule_drops_a_position_it_cannot_afford():
     result = compare_triggers([cheap, dear], coefficients, FEATURES, budget=10**7)
     assert result["cost_predicted"]["attempts"] == 1
     assert math.isfinite(result["cost_predicted"]["nodes"])
+
+
+def test_transfer_reports_both_distributions_separately():
+    """A model can fit its own data and fail elsewhere; the point is to see it.
+
+    Here the second distribution follows a different cost law, so the in-sample
+    score must stay high while the transferred one collapses. Reporting a single
+    blended number would hide exactly this.
+    """
+
+    from .validate_cost_trigger import transfer
+
+    home = [_row(c, 0, int(10 ** (4 + 0.5 * c))) for c in range(1, 11)]
+    away = [_row(c, 0, int(10 ** (4 + 2.0 * c))) for c in range(1, 11)]
+    result = transfer(home, away, FEATURES)
+    assert result["in_distribution"]["r2"] > 0.99
+    assert result["transferred"]["r2"] < 0.0
+
+
+def test_study_rows_keep_censored_positions_as_floors(tmp_path):
+    """The study writes `nodes: None` when its own budget ran out.
+
+    Dropping those would silently discard the most expensive positions -- the
+    ones that decide whether a budget is enough.
+    """
+
+    import json
+
+    from .validate_cost_trigger import study_rows
+
+    path = tmp_path / "study.json"
+    path.write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {"cards_left": 5, "unrevealed": 1, "nodes": 1234, "censored": False},
+                    {"cards_left": 9, "unrevealed": 3, "nodes": None, "censored": True},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = study_rows(path)
+    assert len(rows) == 2
+    assert rows[1]["censored"] is True
+    assert isinstance(rows[1]["nodes"], int)
