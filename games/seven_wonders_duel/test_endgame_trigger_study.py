@@ -211,3 +211,91 @@ def test_science_threat_is_one_symbol_from_the_instant_win():
     features = position_features(game)
     assert features["science_threat"] == int(features["science_max"] >= 5)
     assert features["science_max"] <= 6
+
+
+# --- pricing positions out of existing buffers ------------------------------
+
+
+def _finished_record(seed: int = 7):
+    """One complete bot game, recorded exactly as self-play would record it."""
+
+    from .buffer import GameRecorder
+    from .codec import encode_action
+
+    recorder = GameRecorder(seed=seed, agents={"kind": "test"})
+    bots = (
+        make_bot(DEFAULT_PAIRINGS[0][0], seed),
+        make_bot(DEFAULT_PAIRINGS[0][1], seed + 13),
+    )
+    while recorder.game.phase is not Phase.COMPLETE:
+        game = recorder.game
+        actor = (
+            game.pending_choice.player
+            if game.pending_choice is not None
+            else game.active_player
+        )
+        recorder.play(encode_action(game, bots[actor].select_action(game)))
+    return recorder.finish()
+
+
+def test_pricing_refuses_a_record_whose_trajectory_diverges():
+    """The tolerance must not extend to a mid-game divergence.
+
+    A mask mismatch means the old engine offered a move this one does not, so
+    every later recorded action was chosen for a position that no longer exists.
+    Pricing those would quietly measure arbitrary play.
+    """
+
+    import dataclasses
+
+    from .buffer import ReplayMismatchError
+    from .endgame_trigger_study import price_records
+
+    record = _finished_record()
+    moves = list(record.moves)
+    broken = dataclasses.replace(moves[2], mask_hash="sha256:not-the-real-mask")
+    moves[2] = broken
+    tampered = dataclasses.replace(record, moves=tuple(moves))
+
+    with pytest.raises(ReplayMismatchError, match="mask hash"):
+        price_records(
+            [tampered],
+            max_cards=2,
+            study_nodes=1,
+            study_secs=0.1,
+            allow_final_digest_drift=True,
+        )
+
+
+def test_pricing_tolerates_only_a_terminal_score_difference():
+    """The cloud buffers' exact shape: every position replays, the final
+    state does not, because the military fix changed how the game is scored.
+
+    Positions are captured before the terminal state, so none of them can be
+    affected -- but the default must still refuse, since for a freshly
+    generated record the same mismatch means the engine disagrees with itself.
+    """
+
+    import dataclasses
+
+    from .buffer import ReplayMismatchError
+    from .endgame_trigger_study import price_records
+
+    record = _finished_record()
+    tampered = dataclasses.replace(record, final_digest="sha256:different-score")
+
+    with pytest.raises(ReplayMismatchError, match="final digest"):
+        price_records([tampered], max_cards=0, study_nodes=1, study_secs=0.1)
+
+    # Tolerated, and with max_cards=0 no position is priced, so this exercises
+    # the replay path alone rather than the solver.
+    assert (
+        price_records(
+            [tampered],
+            max_cards=0,
+            study_nodes=1,
+            study_secs=0.1,
+            allow_final_digest_drift=True,
+        )
+        == []
+    )

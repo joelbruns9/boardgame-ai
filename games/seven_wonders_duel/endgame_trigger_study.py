@@ -55,7 +55,7 @@ import math
 import time
 from pathlib import Path
 
-from .buffer import replay
+from .buffer import ReplayMismatchError, read_records, replay
 from .codec import legal_action_indices
 from .data import WONDERS_BY_NAME, back_type_of
 from .encoder import _Derived
@@ -279,9 +279,70 @@ def collect(
         max_active_slots=slots,
     )
 
+    return price_records(
+        (phase_d_record_from_rust(raw, validate=False) for raw in records),
+        max_cards=max_cards,
+        study_nodes=study_nodes,
+        study_secs=study_secs,
+    )
+
+
+def records_from_buffers(paths, limit: int | None = None):
+    """Yield replayable records from existing buffer files.
+
+    Written for the cloud runs, which are the only large corpus of endgames
+    produced by something stronger than a bot -- and which predate the military
+    off-by-one fix, so they were played under different rules. About a third of
+    them diverge mid-game under the corrected engine: the old engine offered a
+    legal move the new one does not, and every recorded action after that point
+    was chosen for a position that no longer exists. Those are dropped whole
+    rather than truncated, because a prefix that stops before Age III carries no
+    endgame anyway.
+
+    Games that replay with every mask and actor matching are kept even though
+    their FINAL digest differs: the divergence is in the terminal score, which
+    no position before it depends on. The positions are therefore strong-play
+    positions re-derived under corrected rules, not bit-copies of what the cloud
+    net saw -- which is the right thing to price a solver on, and the wrong
+    thing to call a reproduction.
+    """
+
+    from .cloud_position_salvage import divergence_point
+
+    kept = dropped = 0
+    for path in paths:
+        for record in read_records(path):
+            if limit is not None and kept >= limit:
+                return
+            first, _ = divergence_point(record)
+            if first is not None:
+                dropped += 1
+                continue
+            kept += 1
+            yield record
+    print(f"  buffer records: {kept} replayable, {dropped} diverged and dropped")
+
+
+def price_records(
+    records,
+    *,
+    max_cards: int,
+    study_nodes: int,
+    study_secs: float,
+    allow_final_digest_drift: bool = False,
+):
+    """Price every Age III position at or under `max_cards` in each record.
+
+    `allow_final_digest_drift` exists for the pre-military-fix cloud buffers,
+    whose terminal SCORE differs under the corrected engine while every position
+    along the way reconstructs exactly. Every position priced here is captured
+    before the terminal state, so the mismatch cannot reach one -- but it is
+    opt-in rather than swallowed, because for freshly generated records the same
+    mismatch would mean the engine disagrees with itself.
+    """
+
     rows: list[dict] = []
-    for record_index, raw in enumerate(records):
-        record = phase_d_record_from_rust(raw, validate=False)
+    for record_index, record in enumerate(records):
         positions: list[tuple[int, object]] = []
 
         def capture(game, move, positions=positions):
@@ -293,7 +354,11 @@ def collect(
             ):
                 positions.append((move.i, game.clone()))
 
-        replay(record, on_state=capture)
+        try:
+            replay(record, on_state=capture)
+        except ReplayMismatchError as error:
+            if not (allow_final_digest_drift and "final digest" in str(error)):
+                raise
         total_moves = len(record.moves)
         for move_index, game in positions:
             features = position_features(game)
@@ -609,6 +674,17 @@ def calibrate(rows: list[dict], rate: float, seconds_per_game: float, games: int
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--from-buffer",
+        type=Path,
+        nargs="+",
+        help="price positions from existing buffer files instead of generating "
+        "games. The cloud runs are the only large corpus of endgames reached by "
+        "a trained net rather than a bot, which is the distribution the trigger "
+        "will actually meet. Needs no --checkpoint: the games are already "
+        "played. Records that do not replay under the current engine are "
+        "dropped, and the count is printed.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--inference-precision", default="fp32")
     parser.add_argument("--migrate", action="store_true")
@@ -689,6 +765,35 @@ def main(argv: list[str] | None = None) -> int:
             args.out.write_text(json.dumps(result, indent=2), encoding="utf-8")
             print(f"\nwrote {args.out}")
         return 0
+    if args.from_buffer:
+        rows = price_records(
+            records_from_buffers(args.from_buffer, limit=args.games),
+            max_cards=args.max_cards,
+            study_nodes=args.study_nodes,
+            study_secs=args.study_secs,
+            allow_final_digest_drift=True,
+        )
+        summary = report(rows, args.budgets)
+        _print(summary)
+        if args.out:
+            args.out.write_text(
+                json.dumps(
+                    {
+                        "source": [str(path) for path in args.from_buffer],
+                        "games": args.games,
+                        "study_nodes": args.study_nodes,
+                        "summary": summary,
+                        "rows": rows,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"wrote {args.out}")
+        return 0
+    if args.checkpoint is None:
+        parser = build_parser()
+        parser.error("one of --checkpoint or --from-buffer is required")
     evaluator = load_evaluator(
         str(args.checkpoint),
         args.device,
