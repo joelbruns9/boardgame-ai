@@ -702,6 +702,59 @@ over five actions almost all the noise mass lands on one arbitrary move.
 Noise never reaches the recorded `prior`, which is snapshotted before the blend
 so KL diagnostics keep meaning what they say.
 
+### `--pooled-readout`
+
+**Default:** off. **Value:** boolean (`--no-pooled-readout` to disable)
+
+Reads the trunk out as `GLOBAL token ‖ masked mean-pool ‖ masked max-pool`,
+projected back to `d_model` so the head bundle is unchanged. ~3% more parameters
+at the cloud config (d_model 384).
+
+**MAX is the point.** Attention is an averaging operator, so an *existential* --
+"is there ANY token with property X" -- is what it approximates worst, and 7WD is
+full of them: any card that completes their sixth science symbol, any single card
+that swings the game, any wonder that ends it. The encoder currently hand-codes
+two of these (`sci_win_feasible`, `mil_win_feasible`); this generalises the
+pattern rather than adding a third bespoke flag, and the two are complementary
+because those features are thresholds on *sums* while a max-pool answers
+*existence*.
+
+Both pools are masked. A padding token must not dilute the mean nor win the max,
+and the max path uses `-inf` fill so it cannot.
+
+**Recorded in the checkpoint**, because the readout changes what the model
+computes. A rebuild without the flag has nowhere to load `readout_proj` and
+raises, which is a stronger guard than the attention-head count gets.
+
+### `--reply-head`
+
+**Default:** off. **Value:** boolean (`--no-reply-head` to disable)
+
+An auxiliary head predicting the **opponent's** improved policy at the next
+decision, supervised by the next raw move's recorded target. ~3% more parameters,
+and train-only: nothing consumes a reply prediction during generation.
+
+**It adds no information.** Search already integrates the opponent's reply into
+Q, which is why "do not take X, it uncovers Y for them" is implicit in the
+recorded policy target already. What it adds is *supervision density* and
+explicit pressure on the trunk to encode opponent intent — a better prior, which
+is where the value error actually lives (raw net mean |error| 0.221 against
+proven values, versus the search's 0.096). Against ~1 independent outcome label
+per game, a full distribution per position is a large relative increase.
+
+Denial is why this matters in 7WD specifically: the card supply is shared, so
+every card taken is a card denied, and valuing that requires modelling what the
+opponent wanted.
+
+Weight is `REPLY_WEIGHT_DEFAULT = 0.15`, in KataGo's auxiliary range.
+
+Three rows are skipped rather than paired: the next raw move being a bot move or
+a cheap search (nothing to predict), the next move having the **same actor**
+(an extra-turn wonder makes it "what do *I* do next", a different question), and
+the end of the game. The pairing runs over **raw** moves, not derived examples --
+fast decisions are dropped at the example boundary, so pairing there would
+supervise a position against a reply several plies downstream.
+
 ### `--forced-playout-k`
 
 **Default:** `0.0` (off). **Value:** non-negative float; KataGo uses `2.0`.

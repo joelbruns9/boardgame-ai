@@ -276,9 +276,22 @@ class TokenEmbedder(nn.Module):
 
 
 class Heads(nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, reply: bool = False):
         super().__init__()
         self.policy = nn.Linear(d_model, NUM_ACTIONS)
+        #: Predicts the OPPONENT's improved policy at the next decision.
+        #:
+        #: It adds no information -- Q already integrates the opponent's reply,
+        #: which is why "do not take X, it uncovers Y for them" is already
+        #: implicit in the recorded target. What it adds is supervision density
+        #: and explicit pressure on the trunk to encode opponent intent, i.e. a
+        #: better PRIOR, which is where the oracle probe located the error (raw
+        #: net |err| 0.221 against search's 0.096).
+        #:
+        #: Optional because it is ~3% of parameters at the cloud config and
+        #: because the plan requires every network change to be independently
+        #: ablatable.
+        self.reply = nn.Linear(d_model, NUM_ACTIONS) if reply else None
         self.value = nn.Linear(d_model, 3)
         self.joint7 = nn.Linear(d_model, 7)
         self.margin = nn.Linear(d_model, 1)
@@ -286,7 +299,7 @@ class Heads(nn.Module):
         self.science = nn.Linear(d_model, 2)
 
     def forward(self, readout: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {
+        out = {
             "policy": self.policy(readout),
             "value": self.value(readout),
             "joint7": self.joint7(readout),
@@ -294,6 +307,9 @@ class Heads(nn.Module):
             "military": self.military(readout).squeeze(-1),
             "science": self.science(readout),
         }
+        if self.reply is not None:
+            out["reply"] = self.reply(readout)
+        return out
 
 
 #: Head count every checkpoint written before `heads` was configurable used.
@@ -324,7 +340,12 @@ def default_heads(d_model: int) -> int:
 
 class SWDNet(nn.Module):
     def __init__(
-        self, d_model: int = 128, layers: int = 4, heads: int | None = None
+        self,
+        d_model: int = 128,
+        layers: int = 4,
+        heads: int | None = None,
+        pooled_readout: bool = False,
+        reply_head: bool = False,
     ):
         super().__init__()
         heads = default_heads(d_model) if heads is None else int(heads)
@@ -348,12 +369,48 @@ class SWDNet(nn.Module):
             layer, num_layers=layers, enable_nested_tensor=False
         )
         self.final_norm = nn.LayerNorm(d_model)
-        self.heads = Heads(d_model)
+        #: Concatenate masked mean- and max-pools over the real tokens with the
+        #: GLOBAL token, then project back to `d_model` so `Heads` is unchanged.
+        #:
+        #: The point is MAX. Attention is an averaging operator, so "is there
+        #: ANY token with property X" -- an existential -- is something it
+        #: approximates poorly, and 7WD is full of them: is there any card that
+        #: completes their sixth science symbol, any single card that swings the
+        #: game, any wonder that ends it. The encoder hand-codes two of these
+        #: (`sci_win_feasible`, `mil_win_feasible`); this generalises the pattern
+        #: instead of adding a third bespoke flag.
+        #:
+        #: It must travel with the weights. Like the attention-head count, the
+        #: readout changes what the model COMPUTES while leaving most parameter
+        #: shapes alone, so a checkpoint rebuilt without it would load with only
+        #: `readout_proj` missing and silently compute something else.
+        self.pooled_readout = bool(pooled_readout)
+        self.readout_proj = (
+            nn.Linear(3 * d_model, d_model) if self.pooled_readout else None
+        )
+        self.reply_head = bool(reply_head)
+        self.heads = Heads(d_model, reply=self.reply_head)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         tokens = self.embedder(batch)
         encoded = self.encoder(tokens, src_key_padding_mask=batch["pad_mask"])
-        readout = self.final_norm(encoded[:, 0])  # GLOBAL token
+        normed = self.final_norm(encoded)
+        if self.readout_proj is None:
+            readout = normed[:, 0]  # GLOBAL token
+        else:
+            # Masking is load-bearing in both pools: a padding token must not
+            # dilute the mean, and must never win the max. `-inf` fill is what
+            # makes the max ignore it; the row can never be all-padding because
+            # the GLOBAL token is always present, but the clamp keeps a divide
+            # by zero impossible rather than merely unlikely.
+            real = ~batch["pad_mask"]
+            counts = real.sum(1, keepdim=True).clamp(min=1)
+            weights = real.unsqueeze(-1)
+            mean = (normed * weights).sum(1) / counts
+            maxed = normed.masked_fill(~weights, float("-inf")).max(1).values
+            readout = self.readout_proj(
+                torch.cat([normed[:, 0], mean, maxed], dim=-1)
+            )
         return self.heads(readout)
 
 

@@ -30,6 +30,37 @@ Already committed on `sevenwd-engine-correctness`:
 | Forced playouts, all three implementations | `473cf01` |
 | Pruning wired to the forced visits | `bbcd137` |
 | Hybrid root mode, Dirichlet/forcing CLI, `TARGET_VERSION` 3 | §A complete |
+| Head-specific solved-row weighting + seven review fixes | `06986bf` |
+| Mean/max readout and the opponent-reply head | §D complete |
+| Solver made per-call so gates cannot inherit it | see below |
+
+**§A and §D are done**, and the pre-retrain critical path with them: everything
+still open in §B is efficiency or instrumentation that can land *after* a run,
+and §C/§E need a net to measure against.
+
+**One pattern accounts for four defects found today**, three of them by review
+rather than by tests, and it is worth naming before the next setting is added:
+
+| leaked | how |
+|---|---|
+| the `130` feature width | duplicated literal, two of four sites left behind |
+| `forced_playout_k` | process-global, inherited by gates |
+| `puct_root && full` | no-op in gates, where `full` is always false |
+| the endgame solver | process-global, inherited by gates |
+
+Every one is a value crossing an implementation boundary and being silently
+inherited or ignored, invisible to type checking. **Three of the four are gates
+inheriting a generation setting**, which suggests the structural answer is not
+more per-call flags but making gate invocations categorically distinct from
+generation ones. Until then: new generation settings default off, are passed
+explicitly, and are gated by a test that asserts BEHAVIOUR (a gate-shaped call
+producing no solver attempts, a record carrying no Gumbel candidate set) rather
+than a config value.
+
+Note also that the obvious gate for the solver -- `net_by_player[actor] == 0`,
+the shape Dirichlet and forced playouts use -- would have been *worse* than none:
+a gate runs a different net per seat, so it would mask one side's moves and not
+the other's, which is a bias rather than a handicap.
 
 **§A is done.** Every knob defaults to off, so behaviour is unchanged until a
 run sets them; the gates went in before the switches so the failure modes are

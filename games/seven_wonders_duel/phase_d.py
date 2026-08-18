@@ -102,6 +102,8 @@ from .train import (
     build_model,
     evaluate as evaluate_model,
     heads_from_config,
+    pooled_readout_from_config,
+    reply_head_from_config,
     load_checkpoint,
     make_checkpoint,
     stable_game_split,
@@ -290,6 +292,27 @@ class PhaseDConfig:
 
     Explicit only to hold a head count fixed while sweeping width. Whatever it
     resolves to is written into every checkpoint and is what rebuilds use.
+    """
+
+    pooled_readout: bool = False
+    """Concatenate masked mean- and max-pools with the GLOBAL token, projected
+    back to ``d_model``.
+
+    The point is MAX: attention is an averaging operator, so "is there ANY token
+    with property X" is an existential it approximates poorly, and 7WD is full of
+    them. Costs ~3% of parameters at the cloud config and is recorded in the
+    checkpoint, because a rebuild without it loads a pooled net minus
+    ``readout_proj``.
+    """
+
+    reply_head: bool = False
+    """Auxiliary head predicting the OPPONENT's policy at the next decision.
+
+    Adds no information -- Q already integrates the opponent's reply -- but adds
+    supervision density and explicit pressure on the trunk to encode opponent
+    intent, which is where the oracle probe located the error. ~3% of parameters
+    at the cloud config, and train-only: nothing consumes a reply prediction
+    during generation.
     """
 
     precision: str = "fp32"
@@ -2496,6 +2519,8 @@ class PhaseDLoop:
             self.config.d_model,
             self.config.layers,
             self.config.heads,
+            self.config.pooled_readout,
+            self.config.reply_head,
         )
 
     @staticmethod
@@ -2909,7 +2934,12 @@ class PhaseDLoop:
                 "start a new run directory"
             )
         model = build_model(
-            "transformer", self.config.d_model, self.config.layers, heads
+            "transformer",
+            self.config.d_model,
+            self.config.layers,
+            heads,
+            pooled_readout_from_config(checkpoint.get("config", {})),
+            reply_head_from_config(checkpoint.get("config", {})),
         )
         load_checkpoint(path, model, checkpoint=checkpoint)
         return model, checkpoint
@@ -3118,6 +3148,11 @@ class PhaseDLoop:
                 if self.config.cheap_search_mode == "same"
                 else self.config.cheap_search_mode == "puct"
             ),
+            # Generation opts IN; the gate below never passes this, so it cannot
+            # inherit the solver. Masking makes both sides play the endgame
+            # provably optimally, which would erase endgame skill from the
+            # comparison a gate exists to make.
+            solve_endgames=self.config.endgame_solver_max_nodes > 0,
             dirichlet_epsilon=self.config.dirichlet_epsilon,
             dirichlet_alpha=self.config.dirichlet_alpha,
         )
@@ -4911,6 +4946,28 @@ def build_parser() -> argparse.ArgumentParser:
         "are not comparable across the two.",
     )
     parser.add_argument(
+        "--reply-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="auxiliary head predicting the opponent's policy at the next "
+        "decision, supervised by the next RAW move's recorded target. Adds no "
+        "information -- search already integrates the reply into Q -- but adds "
+        "supervision density where the value head is starved (~1 independent "
+        "outcome label per game) and pressure on the trunk to encode opponent "
+        "intent, which denial depends on. ~3%% more parameters; train-only.",
+    )
+    parser.add_argument(
+        "--pooled-readout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="read out the trunk as GLOBAL token + masked mean-pool + masked "
+        "max-pool, projected back to d_model. MAX is the point: attention "
+        "averages, so existentials ('is there ANY card that gives them a sixth "
+        "symbol') are what it approximates worst, and the encoder currently "
+        "hand-codes two of them. ~3%% more parameters at d_model 384. Recorded "
+        "in the checkpoint -- a rebuild without it cannot load a pooled net.",
+    )
+    parser.add_argument(
         "--forced-playout-k",
         type=float,
         default=0.0,
@@ -5422,6 +5479,8 @@ def main(argv=None) -> int:
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
         selfplay_search_mode=args.selfplay_search_mode,
+        pooled_readout=args.pooled_readout,
+        reply_head=args.reply_head,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,
         dirichlet_epsilon=args.dirichlet_epsilon,

@@ -33,6 +33,11 @@ from .net import LEGACY_HEADS, SWDNet, masked_policy_log_softmax
 
 AUX_WEIGHT_DEFAULT = 0.2
 
+#: Weight on the opponent-reply head. Small on purpose: it adds no information
+#: (Q already integrates the reply), only supervision density and pressure on the
+#: trunk to encode opponent intent. KataGo's auxiliary targets sit in this range.
+REPLY_WEIGHT_DEFAULT = 0.15
+
 #: Multiplier on every head that fits a per-GAME label rather than a
 #: per-position one: value, joint7, margin, military, science.
 #:
@@ -56,6 +61,7 @@ def compute_losses(
     value_bootstrap: float = 0.0,
     solver_value_target: bool = True,
     row_weights: bool = True,
+    reply_weight: float = REPLY_WEIGHT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -125,12 +131,28 @@ def compute_losses(
         margin_loss = outputs["margin"].new_zeros(())
     military_loss = F.mse_loss(outputs["military"], batch["military_final"])
     science_loss = F.mse_loss(outputs["science"], batch["sci_final"])
+    reply_loss = outputs["policy"].new_zeros(())
+    if "reply" in outputs and batch.get("has_reply") is not None:
+        rows = batch["has_reply"]
+        if rows.any():
+            # Same masked path as the policy head, so an illegal action cannot
+            # turn 0 * -inf into a NaN. The mask is the REPLY's legal set, which
+            # belongs to a different position than `legal_mask`.
+            reply_log = masked_policy_log_softmax(
+                outputs["reply"], batch["reply_mask"]
+            )
+            safe_reply = torch.where(
+                batch["reply_mask"], reply_log, torch.zeros_like(reply_log)
+            )
+            per_reply = -(batch["reply"] * safe_reply).sum(dim=-1)
+            reply_loss = per_reply[rows].mean()
     total = (
         policy_loss
         + value_weight * value_loss
         + value_weight
         * aux_weight
         * (joint7_loss + margin_loss + military_loss + science_loss)
+        + reply_weight * reply_loss
     )
     return total, {
         "total": float(total.detach()),
@@ -140,6 +162,7 @@ def compute_losses(
         "margin": float(margin_loss.detach()),
         "military": float(military_loss.detach()),
         "science": float(science_loss.detach()),
+        "reply": float(reply_loss.detach()),
     }
 
 
@@ -456,7 +479,14 @@ def load_checkpoint(
     return checkpoint
 
 
-def build_model(name: str, d_model: int, layers: int, heads: int | None = None):
+def build_model(
+    name: str,
+    d_model: int,
+    layers: int,
+    heads: int | None = None,
+    pooled_readout: bool = False,
+    reply_head: bool = False,
+):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
     Rebuilding a *saved* model must pass the head count its checkpoint recorded
@@ -466,10 +496,33 @@ def build_model(name: str, d_model: int, layers: int, heads: int | None = None):
     """
 
     if name == "transformer":
-        return SWDNet(d_model=d_model, layers=layers, heads=heads)
+        return SWDNet(
+            d_model=d_model,
+            layers=layers,
+            heads=heads,
+            pooled_readout=pooled_readout,
+            reply_head=reply_head,
+        )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
     raise ValueError(f"unknown model: {name}")
+
+
+def reply_head_from_config(config: dict) -> bool:
+    """Reply-head presence for rebuilding a checkpoint, honouring older files."""
+
+    return bool(config.get("reply_head", False))
+
+
+def pooled_readout_from_config(config: dict) -> bool:
+    """Readout mode for rebuilding a checkpoint, honouring pre-flag files.
+
+    Same hazard as `heads_from_config`: absent the flag a rebuild would default
+    to the CLS-only readout and load a pooled checkpoint with `readout_proj`
+    missing, so the weights would be there and the computation would not.
+    """
+
+    return bool(config.get("pooled_readout", False))
 
 
 def heads_from_config(config: dict) -> int:
@@ -898,6 +951,10 @@ def main(argv=None) -> int:
                 if hasattr(source_model, "attention_heads")
                 else None
             ),
+            # Must travel with the weights: a rebuild without it loads a
+            # pooled checkpoint minus `readout_proj` and computes something else.
+            "pooled_readout": bool(getattr(source_model, "pooled_readout", False)),
+            "reply_head": bool(getattr(source_model, "reply_head", False)),
             "precision": args.precision,
             "weight_decay": args.weight_decay,
             "aux_weight": args.aux_weight,

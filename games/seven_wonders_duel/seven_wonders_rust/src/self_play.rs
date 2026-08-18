@@ -85,6 +85,21 @@ pub struct SelfPlayConfig {
     pub force_expand_root_chance: bool,
     /// Root selection for FULL-budget moves.
     pub puct_root: bool,
+    /// Whether this call may run the exact endgame solver at all.
+    ///
+    /// Per-call, and default false, for the same reason `cheap_puct_root` is:
+    /// gates invoke the same entry points in the same process, so a
+    /// process-global would be inherited by every promotion gate. That is worse
+    /// than wasted time -- masking makes BOTH sides play the endgame provably
+    /// optimally, which erases endgame skill from the comparison. A candidate
+    /// better at endgames would get no credit and one worse no penalty, exactly
+    /// when the open problem is that nothing promotes.
+    ///
+    /// Note gating on `net_by_player[actor] == 0` instead would be actively
+    /// worse: a gate runs different nets per seat, so the solver would mask one
+    /// side's moves and not the other's. Asymmetric masking is a bias, not a
+    /// handicap.
+    pub solve_endgames: bool,
     /// Root selection for CHEAP moves; `None` means "whatever `puct_root` says".
     ///
     /// This is the hybrid: PUCT on the moves that produce training targets,
@@ -918,7 +933,11 @@ pub fn run<E: Eval>(
         // search owns this: it is the only place that holds the noised priors
         // and the per-action Q the rule needs.
         let mut training = result.training_policy.unwrap_or(result.policy_target);
-        let overlay = endgame_overlay(&state, &legal);
+        let overlay = if cfg.solve_endgames {
+            endgame_overlay(&state, &legal)
+        } else {
+            None
+        };
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);
             mask_and_renormalise(&mut training, keep);
@@ -2011,7 +2030,11 @@ impl GameSlot {
         // See `run` for why selection and training are separate objects.
         let mut selection = result.policy_target.clone();
         let mut training = result.training_policy.unwrap_or(result.policy_target);
-        let overlay = endgame_overlay(&self.state, &meta.legal);
+        let overlay = if self.cfg.solve_endgames {
+            endgame_overlay(&self.state, &meta.legal)
+        } else {
+            None
+        };
         if let Some(keep) = overlay.as_ref().and_then(|o| o.keep.as_ref()) {
             mask_and_renormalise(&mut selection, keep);
             mask_and_renormalise(&mut training, keep);
@@ -2837,6 +2860,7 @@ mod budget_tests {
 
     fn sample_config(game_seed: u64) -> SelfPlayConfig {
         SelfPlayConfig {
+            solve_endgames: true,
             cheap_puct_root: None,
             game_seed,
             iteration: None,

@@ -50,6 +50,7 @@ def _records(*, max_nodes: int, max_cards: int = SOLVER_MAX_CARDS, mask: bool = 
         games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
         game_seeds=SEEDS,
         force=True,
+        solve_endgames=True,
         # Every move a full search: the solver only ever fires on those, and a
         # mixed schedule would make "no solved move in this sample" an ambiguous
         # result rather than a failure.
@@ -229,6 +230,7 @@ def test_cheap_plies_are_solved_and_masked_too():
         games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
         game_seeds=SEEDS,
         force=True,
+        solve_endgames=True,
         # EVERY move cheap: if the trigger were gated on `full`, nothing at all
         # would be solved here.
         **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 0.0}),
@@ -453,3 +455,35 @@ def test_weighting_moves_the_value_loss_but_not_the_policy_loss():
     assert weighted["policy"] == pytest.approx(flat["policy"])
     for head in ("joint7", "margin", "military", "science"):
         assert weighted[head] == pytest.approx(flat[head])
+
+
+def test_a_gate_shaped_call_cannot_inherit_the_solver():
+    """The solver's parameters are a process-global; permission to USE them is
+    not, and this is why.
+
+    Gates call the same entry points in the same process. If they inherited the
+    solver, masking would make both sides play the endgame provably optimally --
+    which does not merely cost time, it erases endgame skill from the very
+    comparison the gate exists to make. A candidate better at endgames would earn
+    no credit and one worse no penalty, precisely when the open problem is that
+    nothing promotes.
+
+    Gating on `net_by_player` instead would be worse still: a gate runs a
+    different net per seat, so the solver would mask one side's moves and not the
+    other's, which is a bias rather than a handicap.
+    """
+
+    # Global set exactly as a solver-enabled run would leave it.
+    seven_wonders_rust.set_endgame_solver(SOLVER_MAX_NODES, 60.0, SOLVER_MAX_CARDS, True)
+    records, _ = seven_wonders_rust.self_play_many_mock(
+        games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
+        game_seeds=SEEDS,
+        force=True,
+        # The gate shape: strength from the cheap path, and crucially no
+        # `solve_endgames` -- a gate must never have to remember to opt out.
+        **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 0.0}),
+    )
+    assert _attempted_moves(records) == [], "a gate inherited the solver"
+    assert not any(
+        move["solver_masked"] for record in records for move in record["moves"]
+    )

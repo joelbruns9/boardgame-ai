@@ -214,6 +214,9 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         "has_policy": torch.zeros(rows, dtype=torch.bool),
         "value_weight": torch.ones(rows, dtype=torch.float32),
         "policy_weight": torch.ones(rows, dtype=torch.float32),
+        "reply": torch.zeros(rows, NUM_ACTIONS, dtype=torch.float32),
+        "reply_mask": torch.zeros(rows, NUM_ACTIONS, dtype=torch.bool),
+        "has_reply": torch.zeros(rows, dtype=torch.bool),
         "value_class": torch.zeros(rows, dtype=torch.int8),
         # Mirrors `collate`: the audit asserts this path is value-identical to
         # it, so a target added there has to be added here too.
@@ -247,6 +250,13 @@ def _pack_examples(examples, val_fraction: float, split_salt: str) -> dict:
         storage["has_policy"][row] = example.has_policy
         storage["value_weight"][row] = example.value_weight
         storage["policy_weight"][row] = example.policy_weight
+        if example.reply_target is not None:
+            reply_indices = torch.tensor(example.reply_legal, dtype=torch.long)
+            storage["reply_mask"][row, reply_indices] = True
+            storage["reply"][row, reply_indices] = torch.tensor(
+                example.reply_target, dtype=torch.float32
+            )
+            storage["has_reply"][row] = True
         storage["value_class"][row] = example.value_class
         if example.root_value is not None:
             probability = (1.0 + float(example.root_value)) / 2.0

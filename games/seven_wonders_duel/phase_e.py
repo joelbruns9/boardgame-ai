@@ -534,7 +534,13 @@ def load_evaluator(
     import torch
 
     from .inference import Evaluator
-    from .train import build_model, heads_from_config, load_checkpoint
+    from .train import (
+        build_model,
+        heads_from_config,
+        load_checkpoint,
+        pooled_readout_from_config,
+        reply_head_from_config,
+    )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
@@ -543,6 +549,8 @@ def load_evaluator(
         config.get("d_model", 128),
         config.get("layers", 4),
         heads_from_config(config),
+        pooled_readout_from_config(config),
+        reply_head_from_config(config),
     )
     load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
     if migrate and checkpoint.get("migration"):

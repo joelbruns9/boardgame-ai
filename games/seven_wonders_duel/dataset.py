@@ -134,6 +134,11 @@ class Example:
     #: across them rather than granted to each.
     value_weight: float = 1.0
     policy_weight: float = 1.0
+    #: The opponent's improved policy at the next decision, over ITS legal set.
+    #: `None` when the next raw move was a bot move, a cheap search, the same
+    #: actor (an extra turn), or absent. See `reply_targets`.
+    reply_legal: np.ndarray | None = None
+    reply_target: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -235,6 +240,57 @@ def solver_row_weights(moves) -> dict[int, tuple[float, float]]:
     return weights
 
 
+def reply_targets(moves, legal_by_move: dict) -> dict:
+    """`{move index: (reply_legal, reply_target)}` — the OPPONENT's next policy.
+
+    Paired over the RAW move list, never over derived examples. Fast decisions
+    are dropped at the example boundary (`is_fast_search_move`), so "the next
+    example" can be several actual decisions later; pairing there would quietly
+    supervise a position against a reply two plies downstream and every shape
+    check would still pass.
+
+    Three skips, each for its own reason:
+
+    * the next move carries no usable policy (a bot move, or a cheap search
+      whose target is not recorded) — there is nothing to predict;
+    * the next move has the SAME actor, which an extra-turn wonder causes. That
+      is "what do I do next", a different question, and blending the two teaches
+      neither. The tempo primitives in the encoder already carry the extra-turn
+      signal;
+    * there is no next move, at the end of the game.
+
+    The mask comes from the next move's LEGAL SET, not from the keys of its
+    policy target. Under PUCT the target holds only visited actions -- pruning
+    zeroes more of them -- so its keys understate what was legal, and a head
+    trained against that would learn that unvisited legal moves are illegal.
+    """
+
+    out: dict = {}
+    for current, following in zip(moves, moves[1:]):
+        if following.actor == current.actor:
+            continue
+        if not following.policy_target or following.sims == 0:
+            continue
+        legal = legal_by_move.get(following.i)
+        if legal is None or len(legal) == 0:
+            continue
+        legal = np.asarray(legal, dtype=np.int16)
+        index_of = {int(a): j for j, a in enumerate(legal)}
+        target = np.zeros(len(legal), dtype=np.float32)
+        for action, probability in following.policy_target.items():
+            position = index_of.get(int(action))
+            if position is None:
+                raise ValueError(
+                    f"move {following.i}: policy target on illegal action {action}"
+                )
+            target[position] = probability
+        total = float(target.sum())
+        if not 0.999 <= total <= 1.001:
+            continue  # a malformed row is skipped, never renormalised into truth
+        out[current.i] = (legal, target / total)
+    return out
+
+
 def _policy_for_move(move, legal: np.ndarray) -> np.ndarray:
     """Build the sparse-on-legal policy label shared by both derivation paths."""
 
@@ -298,9 +354,17 @@ def examples_from_record(
     # labels as an explicit mixed-policy experiment; only its policy is masked.
     archive_seats = archive_policy_seats(record.agents)
 
+    legal_by_move: dict[int, np.ndarray] = {}
+
     def featurize(game, move):
         nonlocal maximum_track
         maximum_track = max(maximum_track, abs(game.conflict_position))
+        # Captured for EVERY move, before the fast-move drop: the reply target
+        # pairs over raw moves, so it needs the legal set of moves that never
+        # become examples.
+        legal_by_move[move.i] = np.asarray(
+            legal_action_indices(game), dtype=np.int16
+        )
         # Replay still steps through this move -- only the example is dropped.
         if not record_fast_moves and is_fast_search_move(move):
             return
@@ -312,7 +376,7 @@ def examples_from_record(
         encoding = encode(game.observation(actor))
         if encoding.actor != actor:
             raise AssertionError("encoder actor disagrees with replay actor")
-        legal = np.asarray(legal_action_indices(game), dtype=np.int16)
+        legal = legal_by_move[move.i]
         policy = _policy_for_move(move, legal)
         type_ids, entity_ids, aux_ids, features = vectorize(encoding)
         # Inputs only: the outcome labels are unknown until the replay finishes,
@@ -339,6 +403,7 @@ def examples_from_record(
 
     row_weights = solver_row_weights(record.moves)
     game = replay(record, on_state=featurize)
+    replies = reply_targets(record.moves, legal_by_move)
     maximum_track = max(maximum_track, abs(game.conflict_position))
     final_position = game.conflict_position
     sci_counts = (len(_science_symbols(game, 0)), len(_science_symbols(game, 1)))
@@ -400,6 +465,8 @@ def examples_from_record(
                 solver_exact=solver_exact,
                 value_weight=row_weights.get(move_index, (1.0, 1.0))[0],
                 policy_weight=row_weights.get(move_index, (1.0, 1.0))[1],
+                reply_legal=replies.get(move_index, (None, None))[0],
+                reply_target=replies.get(move_index, (None, None))[1],
                 joint7_class=_joint7_class(game.winner, game.victory_type, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -493,6 +560,13 @@ def _examples_from_rust_payload(
     features = features_f64.reshape(-1, MAX_FEATURES).astype(np.float16)
     archive_seats = archive_policy_seats(record.agents)
     row_weights = solver_row_weights(moves)
+    replies = reply_targets(
+        moves,
+        {
+            move.i: move_legal[int(move_offsets[index]) : int(move_offsets[index + 1])]
+            for index, move in enumerate(moves)
+        },
+    )
     stats_payload = payload["stats"]
     final_position = int(stats_payload["final_conflict_position"])
     science_counts = (
@@ -535,6 +609,8 @@ def _examples_from_rust_payload(
                 solver_exact=move.solver_regime == "exact",
                 value_weight=row_weights.get(move.i, (1.0, 1.0))[0],
                 policy_weight=row_weights.get(move.i, (1.0, 1.0))[1],
+                reply_legal=replies.get(move.i, (None, None))[0],
+                reply_target=replies.get(move.i, (None, None))[1],
                 joint7_class=_joint7_class(record.winner, victory, actor),
                 margin=margin,
                 margin_valid=margin_valid,
@@ -761,6 +837,11 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
     # Per-row, per-head loss multipliers; 1.0 unless a proof earned more.
     value_weight = torch.ones(size)
     policy_weight = torch.ones(size)
+    # The opponent's next policy, over ITS OWN legal set -- a separate mask from
+    # `legal_mask`, because the reply is a different position's action space.
+    reply = torch.zeros(size, NUM_ACTIONS)
+    reply_mask = torch.zeros(size, NUM_ACTIONS, dtype=torch.bool)
+    has_reply = torch.zeros(size, dtype=torch.bool)
     value_class = torch.zeros(size, dtype=torch.long)
     # Actor-relative win probability implied by the search, as a distribution
     # over (win, draw, loss). Draw mass stays at zero: shared-civilian endings
@@ -799,6 +880,13 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         has_policy[row] = example.has_policy
         value_weight[row] = example.value_weight
         policy_weight[row] = example.policy_weight
+        if example.reply_target is not None:
+            reply_indices = torch.from_numpy(example.reply_legal.astype(np.int64))
+            reply_mask[row, reply_indices] = True
+            reply[row, reply_indices] = torch.from_numpy(
+                example.reply_target.astype(np.float32)
+            )
+            has_reply[row] = True
         value_class[row] = example.value_class
         if example.root_value is not None:
             probability = (1.0 + float(example.root_value)) / 2.0
@@ -827,6 +915,9 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         "has_policy": has_policy,
         "value_weight": value_weight,
         "policy_weight": policy_weight,
+        "reply": reply,
+        "reply_mask": reply_mask,
+        "has_reply": has_reply,
         "value_class": value_class,
         "value_soft": value_soft,
         "value_soft_valid": value_soft_valid,

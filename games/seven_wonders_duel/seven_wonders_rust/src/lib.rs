@@ -194,6 +194,7 @@ fn make_self_play_config(
     force: bool,
     puct_root: bool,
     cheap_puct_root: Option<bool>,
+    solve_endgames: bool,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     age_deal_samples: usize,
@@ -221,6 +222,7 @@ fn make_self_play_config(
         force_expand_root_chance: force,
         puct_root,
         cheap_puct_root,
+        solve_endgames,
         dirichlet_epsilon,
         dirichlet_alpha,
         age_deal_samples,
@@ -1451,6 +1453,7 @@ impl RustGame {
             force,
             false, // self-play always uses the Gumbel root
             None,  // cheap_puct_root: uniform, so a gate cannot inherit a hybrid
+            false, // solve_endgames: gates never solve
             0.0,   // Dirichlet is a PUCT-root mechanism; inert under Gumbel
             1.8,
             age_deal_samples,
@@ -1513,6 +1516,7 @@ impl RustGame {
             force,
             false, // self-play always uses the Gumbel root
             None,  // cheap_puct_root: uniform, so a gate cannot inherit a hybrid
+            false, // solve_endgames: gates never solve
             0.0,   // Dirichlet is a PUCT-root mechanism; inert under Gumbel
             1.8,
             age_deal_samples,
@@ -2006,6 +2010,7 @@ fn cooperative_jobs(
     force: bool,
     puct_root: bool,
     cheap_puct_root: Option<bool>,
+    solve_endgames: bool,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     age_deal_samples: usize,
@@ -2043,6 +2048,7 @@ fn cooperative_jobs(
                 force,
                 puct_root,
                 cheap_puct_root,
+                solve_endgames,
                 dirichlet_epsilon,
                 dirichlet_alpha,
                 age_deal_samples,
@@ -2066,7 +2072,7 @@ fn cooperative_jobs(
     force=false, age_deal_samples=0, cheap_double_reveal_offsets=0, max_moves=256,
     cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
     max_active_slots=0, conflict_free_waves=false, round_robin_candidates=false,
-    puct_root=false, cheap_puct_root=None
+    puct_root=false, cheap_puct_root=None, solve_endgames=false
 ))]
 fn self_play_many_mock(
     py: Python<'_>,
@@ -2096,6 +2102,7 @@ fn self_play_many_mock(
     round_robin_candidates: bool,
     puct_root: bool,
     cheap_puct_root: Option<bool>,
+    solve_endgames: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let jobs = cooperative_jobs(
         py,
@@ -2116,6 +2123,7 @@ fn self_play_many_mock(
         force,
         puct_root,
         cheap_puct_root,
+        solve_endgames,
         0.0,
         1.8,
         age_deal_samples,
@@ -2213,6 +2221,7 @@ fn self_play_many_net(
         force,
         false, // this entry point has no puct_root parameter
         None,  // cheap_puct_root: uniform
+        false, // solve_endgames: gates never solve
         0.0,
         1.8,
         age_deal_samples,
@@ -2322,7 +2331,7 @@ fn self_play_many_net(
     bot_p0=None, bot_p1=None, bots_p0=None, bots_p1=None,
     nets_p0=None, nets_p1=None,
     bot_exploration=0.0, bot_policy_iterations=10
-, puct_root=false, cheap_puct_root=None, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
+, puct_root=false, cheap_puct_root=None, solve_endgames=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
     conflict_free_waves=false, round_robin_candidates=false))]
 fn self_play_many_flat_net(
@@ -2367,6 +2376,7 @@ fn self_play_many_flat_net(
     bot_policy_iterations: i64,
     puct_root: bool,
     cheap_puct_root: Option<bool>,
+    solve_endgames: bool,
     dirichlet_epsilon: f64,
     dirichlet_alpha: f64,
     cheap_double_reveal_offsets_p0: Option<usize>,
@@ -2394,6 +2404,7 @@ fn self_play_many_flat_net(
         force,
         puct_root,
         cheap_puct_root,
+        solve_endgames,
         dirichlet_epsilon,
         dirichlet_alpha,
         age_deal_samples,
