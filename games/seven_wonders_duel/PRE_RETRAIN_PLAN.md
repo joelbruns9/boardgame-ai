@@ -248,13 +248,39 @@ a flag:
   * **no** oversampling in validation, or the metric stops being comparable;
   * a cap per game, so a run of adjacent solved plies — which share one game and
     one proof — cannot masquerade as independent evidence.
-* **Cost-predicted trigger**, replacing the card cap. Model: `cards_left`,
-  `unrevealed`, `log10(legal)`, and the interaction `cards_left × log10(legal)`
-  — held-out R² **0.904**. Attempt iff predicted cost fits the budget, with
-  margin for the model's 0.51-decade (~3.3×) residual. Worth ~1.5×: it matches
-  `cards ≤ 11`'s masked-move value at **61%** of the cost, because a card cap
-  must discard a whole card of depth at once while the predictor takes the cheap
-  11s and drops the dear 9s.
+* **Cost-predicted trigger**, replacing the card cap. Attempt iff predicted cost
+  fits the budget, with margin for the residual.
+
+  *Re-measured 2026-08-18 on production self-play* (`validate_cost_trigger.py`),
+  because the original numbers came from 40 bot-driven games and an ad-hoc fit
+  that was never persisted — `endgame_trigger_study.py` contains no regression at
+  all, so the "held-out R² 0.904" could not be rerun. The shakedown's **18,031
+  solve attempts across 1,933 games** are reconstructible through `buffer.replay`,
+  and the model form holds up:
+
+  | | 40-game claim | 18,031 solves, held out by game |
+  |---|---|---|
+  | R² on `log10(nodes)` | 0.904 | **0.935** |
+  | residual | 0.51 decades | 0.22 median, **0.68 p90** |
+  | value kept vs the card cap | ~100% | **98.9%** |
+  | cost vs the card cap | 61% | **56.3%** (~1.78×) |
+
+  Two limits on that, both material:
+
+  * **Only half the claimed mechanism is tested.** The data was generated under
+    `cards ≤ 10`, so every row has `cards_left ≤ 10` and the "takes the cheap
+    11s" half is *untested* — what is demonstrated is that it drops the dear 9s
+    and 10s while keeping 98.9% of the proofs. The 1.78× is therefore a
+    lower bound on the gain and an unverified claim about its source.
+  * **The model underestimates exactly the positions that matter.** 55.3% of
+    censored solves are predicted *below* the node count they had already
+    reached when cut off, and their true cost is higher still. Cost is
+    log-normal-ish with a long tail (uncensored median 1.1k nodes, p90 301k),
+    and the tail is where the budget is actually spent. Use a margin set from
+    the p90 (0.68 decades, ~4.8×), not the median.
+
+  Held out by **game**, never by row: adjacent solved plies share a position and
+  a proof, so a row-wise split leaks across it.
 * **Async solving.** A `SolvePending` slot stage plus a solver thread pool and a
   results channel, mirroring how a slot already parks on an NN batch and yields
   its thread. The mask must be applied *before* the move is chosen, so the
