@@ -110,13 +110,26 @@ def probe_game(
     move_index = 0
     while game.phase is not Phase.COMPLETE:
         is_full = float(torch.rand(1, generator=rng)) < full_fraction
-        cheap_result = GumbelMCTS(
-            evaluator, dataclasses.replace(cheap, seed=seed * 977 + move_index)
-        ).search(game)
+        move_seed = seed * 977 + move_index
 
-        if not is_full:
+        if is_full:
+            # A full move is PLAYED with the full search, exactly as production
+            # does. An earlier version ran the schedule but played the cheap
+            # answer at every move, so the whole game was an all-cheap game and
+            # the positions measured were not the ones production visits -- which
+            # is the one property the probe's design turns on.
+            result = GumbelMCTS(
+                evaluator, dataclasses.replace(full, seed=move_seed)
+            ).search(game)
+        else:
+            cheap_result = GumbelMCTS(
+                evaluator, dataclasses.replace(cheap, seed=move_seed)
+            ).search(game)
+            result = cheap_result
+            # The full search here is the counterfactual: recorded, compared, and
+            # thrown away. Playing it would turn every move into a full move.
             full_result = GumbelMCTS(
-                evaluator, dataclasses.replace(full, seed=seed * 977 + move_index)
+                evaluator, dataclasses.replace(full, seed=move_seed + 1)
             ).search(game)
             prior = evaluator.evaluate_states([game])[0]
             legal = legal_action_indices(game)
@@ -158,10 +171,7 @@ def probe_game(
                     row["full_loses"] = per_action.get(full_action, best) < best - 1e-9
             rows.append(row)
 
-        played = max(cheap_result.policy_target, key=cheap_result.policy_target.get)
-        # The CHEAP move is played even though a full answer exists, so the
-        # positions visited are the ones production visits. Playing the full
-        # answer would measure a different game.
+        played = max(result.policy_target, key=result.policy_target.get)
         apply_action(game, decode_action(game, played))
         move_index += 1
     return rows
