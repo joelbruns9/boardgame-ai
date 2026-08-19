@@ -100,6 +100,12 @@ pub struct SelfPlayConfig {
     /// side's moves and not the other's. Asymmetric masking is a bias, not a
     /// handicap.
     pub solve_endgames: bool,
+    /// Re-search a cheap ply at the full budget when its solve declines.
+    ///
+    /// Default OFF, and passed per call rather than read from a global: four
+    /// separate defects in this file came from a generation setting a gate or an
+    /// arena inherited without meaning to.
+    pub solver_fallback_research: bool,
     /// Root selection for CHEAP moves; `None` means "whatever `puct_root` says".
     ///
     /// This is the hybrid: PUCT on the moves that produce training targets,
@@ -1730,6 +1736,7 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.conflict_cuts += slot.conflict_cuts;
 }
 
+#[derive(Clone)]
 struct SearchMeta {
     actor: usize,
     legal: Vec<usize>,
@@ -1737,6 +1744,20 @@ struct SearchMeta {
     full: bool,
     search_seed: u64,
     search_cfg: SearchConfig,
+    /// This meta is a fallback re-search: the first search was cheap, its solve
+    /// ran out of node budget, and the position is being searched again at the
+    /// full budget before a move is chosen.
+    ///
+    /// Two things follow. The solve is NOT re-attempted -- it already declined
+    /// at this budget and would burn it again for the same answer -- and the
+    /// original decline is carried forward so the record still says a solve was
+    /// tried and what it cost.
+    researched: bool,
+    /// The declined overlay from the first attempt, preserved through the
+    /// re-search so `solver_attempted` / `solver_stop` / `solver_nodes` survive
+    /// into the row. Without it a fallback would look like a position the
+    /// trigger never selected.
+    carried_overlay: Option<SolverOverlay>,
 }
 
 enum SlotStage {
@@ -1872,6 +1893,8 @@ impl GameSlot {
                 .map_or(self.cfg.leaf_batch, |batches| batches[actor]),
             full,
             search_seed,
+            researched: false,
+            carried_overlay: None,
             search_cfg: SearchConfig {
                 forced_playout_k: if full && self.cfg.net_by_player[actor] == 0 {
                     // Gated exactly like `dirichlet_epsilon` below, and for the same
@@ -2134,6 +2157,14 @@ impl GameSlot {
         if !self.cfg.solve_endgames {
             return self.complete_move(meta, result, None);
         }
+        if meta.researched {
+            // The solve already declined at this position and this budget.
+            // Re-attempting would spend the whole budget again to be told the
+            // same thing; the carried overlay is what the record needs.
+            let mut meta = meta;
+            let carried = meta.carried_overlay.take();
+            return self.complete_move(meta, result, carried);
+        }
         if let Some(pool) = pool {
             // Only park for a solve the trigger would actually take. Dispatching
             // an ineligible position would cost a channel round trip per move to
@@ -2153,7 +2184,60 @@ impl GameSlot {
             }
         }
         let overlay = endgame_overlay(&self.state, &meta.legal);
+        // The SYNCHRONOUS path needs the same fallback as `resume_after_solve`.
+        // Without it `--solver-threads 0` would silently never re-search, and
+        // sync and async would produce different games from the same seed --
+        // the one property the async port is gated on.
+        if let Some(meta) = self.fallback_research_meta(&meta, overlay.as_ref()) {
+            self.stage = SlotStage::NeedRoot(meta);
+            return Ok(());
+        }
         self.complete_move(meta, result, overlay)
+    }
+
+    /// A fallback re-search for this position, or `None` to accept the move.
+    ///
+    /// A declined solve leaves the move to whatever the search chose -- which on
+    /// a CHEAP ply is a 20-100 simulation move in a contested endgame. The B2
+    /// probe measured what that costs: at solver-settled positions cheap search
+    /// plays a provably losing move 14.6% of the time against full search's
+    /// 10.1% (paired, p = 0.001). The selection is adverse too, since a decline
+    /// means the position was harder than the cost model predicted.
+    ///
+    /// Only budget declines qualify. `Unsolvable` is a sample-only Age deal,
+    /// which is not a hard position but a structurally impossible one, and no
+    /// amount of extra search changes what the solver could not enumerate.
+    ///
+    /// The seed is derived from the original rather than drawn from the slot
+    /// RNG, so enabling this leaves the RNG stream identical up to the first
+    /// decline: a run with the flag on and one with it off diverge only where
+    /// the fallback actually fires.
+    fn fallback_research_meta(
+        &self,
+        meta: &SearchMeta,
+        overlay: Option<&SolverOverlay>,
+    ) -> Option<SearchMeta> {
+        if !self.cfg.solver_fallback_research || meta.full || meta.researched {
+            return None;
+        }
+        let overlay = overlay?;
+        if overlay.value.is_some() {
+            return None;
+        }
+        match overlay.stop.as_deref() {
+            Some("nodes") | Some("deadline") => {}
+            _ => return None,
+        }
+        let seed = meta.search_seed ^ 0x5EA5_C4ED_1E55_0001;
+        let mut next = meta.clone();
+        next.full = true;
+        next.researched = true;
+        next.carried_overlay = Some(overlay.clone());
+        next.search_seed = seed;
+        next.search_cfg.seed = seed;
+        next.search_cfg.sims = self.cfg.full_sims_max;
+        next.search_cfg.top_k = search_top_k(self.cfg.top_k, cheap_top_k(), true);
+        Some(next)
     }
 
     /// Apply a solve that came back from the pool.
@@ -2164,6 +2248,13 @@ impl GameSlot {
                 "solve outcome delivered to a slot that was not waiting for one",
             ));
         };
+        if let Some(meta) = self.fallback_research_meta(&meta, overlay.as_ref()) {
+            // Back through NeedRoot rather than a new transition: the scheduler
+            // already knows how to take a slot from there to a search, so the
+            // fallback adds no state-machine surface to the async path.
+            self.stage = SlotStage::NeedRoot(meta);
+            return Ok(());
+        }
         self.complete_move(meta, result, overlay)
     }
 
@@ -3080,7 +3171,7 @@ mod budget_tests {
         assert_eq!(budget.spare_for_test(), 2, "still active: no donation");
     }
 
-    fn sample_setup() -> crate::state::Setup {
+    pub(super) fn sample_setup() -> crate::state::Setup {
         crate::state::Setup {
             first_player: 0,
             available_progress_tokens: vec![0, 1, 2, 3, 4],
@@ -3099,9 +3190,10 @@ mod budget_tests {
         }
     }
 
-    fn sample_config(game_seed: u64) -> SelfPlayConfig {
+    pub(super) fn sample_config(game_seed: u64) -> SelfPlayConfig {
         SelfPlayConfig {
             solve_endgames: true,
+            solver_fallback_research: false,
             cheap_puct_root: None,
             game_seed,
             iteration: None,
@@ -3413,5 +3505,129 @@ mod solver_pool_tests {
         // queue rather than from a flag they would never look at.
         let pool = SolverPool::new(4);
         drop(pool); // must not hang
+    }
+}
+
+#[cfg(test)]
+mod fallback_research_tests {
+    //! When a solve runs out of budget, does the position get searched again?
+    //!
+    //! Measured motivation: at solver-settled positions a cheap search plays a
+    //! provably losing move 14.6% of the time against a full search's 10.1%
+    //! (paired, p = 0.001). A declined solve leaves the cheap move standing, in
+    //! the endgame, at a position the cost model predicted would be affordable
+    //! and was not -- i.e. a hard one.
+
+    use super::budget_tests::{sample_config, sample_setup};
+    use super::*;
+
+    fn slot_with(fallback: bool) -> GameSlot {
+        let mut cfg = sample_config(1);
+        cfg.solver_fallback_research = fallback;
+        cfg.full_sims_max = 800;
+        GameSlot::new(
+            GameState::from_setup(sample_setup(), std::collections::VecDeque::new()),
+            cfg,
+        )
+        .expect("slot")
+    }
+
+    /// A real meta from the real builder, then forced cheap or full.
+    fn meta_of(slot: &mut GameSlot, full: bool, researched: bool) -> SearchMeta {
+        let mut meta = slot.make_search_meta().expect("meta");
+        meta.full = full;
+        meta.researched = researched;
+        meta.search_cfg.sims = 20;
+        meta
+    }
+
+    fn declined(stop: &'static str) -> SolverOverlay {
+        SolverOverlay {
+            value: None,
+            regime: None,
+            stop: Some(stop),
+            nodes: 4_500_000,
+            masked: false,
+            keep: None,
+        }
+    }
+
+    #[test]
+    fn a_budget_decline_on_a_cheap_ply_earns_a_full_re_search() {
+        let mut slot = slot_with(true);
+        let meta = meta_of(&mut slot, false, false);
+        let seed = meta.search_seed;
+        let next = slot
+            .fallback_research_meta(&meta, Some(&declined("nodes")))
+            .expect("a cheap ply whose solve ran out of budget must be re-searched");
+        assert!(next.full, "the re-search is a FULL search, not another cheap one");
+        assert!(
+            next.researched,
+            "or finish_move dispatches the same solve again and declines again"
+        );
+        assert_eq!(next.search_cfg.sims, 800);
+        assert!(
+            next.carried_overlay.is_some(),
+            "the decline must survive into the record, or the row reads as a              position the trigger never selected"
+        );
+        assert_ne!(
+            next.search_seed, seed,
+            "re-searching on the same seed would reproduce the same search"
+        );
+        assert_eq!(next.search_cfg.seed, next.search_seed);
+    }
+
+    #[test]
+    fn the_flag_is_what_turns_it_on() {
+        let mut slot = slot_with(false);
+        let meta = meta_of(&mut slot, false, false);
+        assert!(slot
+            .fallback_research_meta(&meta, Some(&declined("nodes")))
+            .is_none());
+    }
+
+    #[test]
+    fn a_full_ply_is_not_re_searched() {
+        // It already had the full budget; searching again would buy nothing.
+        let mut slot = slot_with(true);
+        let meta = meta_of(&mut slot, true, false);
+        assert!(slot
+            .fallback_research_meta(&meta, Some(&declined("nodes")))
+            .is_none());
+    }
+
+    #[test]
+    fn a_re_search_is_never_re_searched_again() {
+        let mut slot = slot_with(true);
+        let meta = meta_of(&mut slot, false, true);
+        assert!(slot
+            .fallback_research_meta(&meta, Some(&declined("nodes")))
+            .is_none());
+    }
+
+    #[test]
+    fn an_unsolvable_position_is_not_re_searched() {
+        // A sample-only Age deal is not a hard position but an impossible one:
+        // no amount of extra search changes what cannot be enumerated.
+        let mut slot = slot_with(true);
+        let meta = meta_of(&mut slot, false, false);
+        assert!(slot
+            .fallback_research_meta(&meta, Some(&declined("unsolvable")))
+            .is_none());
+    }
+
+    #[test]
+    fn a_successful_solve_is_not_re_searched() {
+        let mut slot = slot_with(true);
+        let meta = meta_of(&mut slot, false, false);
+        let solved = SolverOverlay {
+            value: Some(1.0),
+            regime: Some("exact"),
+            stop: None,
+            nodes: 1000,
+            masked: true,
+            keep: Some(vec![true, false]),
+        };
+        assert!(slot.fallback_research_meta(&meta, Some(&solved)).is_none());
     }
 }

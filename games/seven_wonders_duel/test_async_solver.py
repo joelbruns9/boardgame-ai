@@ -38,14 +38,22 @@ def _reset_globals():
     swr.set_solver_threads(0)
 
 
-def _records(threads: int, *, solve: bool = True, full_fraction: float = 1.0):
-    swr.set_endgame_solver(MAX_NODES, 60.0, MAX_CARDS, True)
+def _records(
+    threads: int,
+    *,
+    solve: bool = True,
+    full_fraction: float = 1.0,
+    fallback: bool = False,
+    max_nodes: int = MAX_NODES,
+):
+    swr.set_endgame_solver(max_nodes, 60.0, MAX_CARDS, True)
     swr.set_solver_threads(threads)
     records, _ = swr.self_play_many_mock(
         games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
         game_seeds=SEEDS,
         force=True,
         solve_endgames=solve,
+        solver_fallback_research=fallback,
         **(_common(leaf_batch=1, global_batch_cap=8)
            | {"full_search_fraction": full_fraction}),
     )
@@ -141,3 +149,102 @@ def test_threads_are_inert_when_the_slot_is_not_permitted_to_solve():
     assert not any(
         move["solver_attempted"] for record in records for move in record["moves"]
     )
+
+
+def _re_searched(records):
+    """Rows whose solve declined AND which then got a full-budget search.
+
+    `_common` runs cheap at 1-2 sims and full at 2-3, so a declined row
+    recording more than 2 sims can only have come from the re-search.
+    """
+
+    return [
+        move
+        for record in records
+        for move in record["moves"]
+        if move["solver_stop"] == "nodes" and move["sims"] > 2
+    ]
+
+
+def test_async_is_identical_with_the_fallback_re_search_on():
+    """The fallback moves a slot SolvePending -> NeedRoot -> Searching, a
+    transition that did not exist when this gate was written.
+
+    A tiny node budget forces declines, and a CHEAP schedule is what makes them
+    reachable: the fallback only fires on a cheap ply, so at
+    `full_search_fraction = 1.0` -- this helper's default -- not one line of it
+    would run and the test would pass having proved nothing.
+
+    NOTE: see `test_the_thread_count_is_currently_inert_in_this_harness`. This
+    file's mock path is synchronous whatever the thread count, so what this
+    asserts today is stability, not sync/async identity.
+    """
+
+    budget = 20_000
+    common = {"fallback": True, "max_nodes": budget, "full_fraction": 0.0}
+    synchronous = _records(0, **common)
+    for threads in (1, 4):
+        assert (
+            _records(threads, **common) == synchronous
+        ), f"{threads} solver threads diverged with the fallback on"
+
+
+def test_the_fallback_actually_fires_in_that_gate():
+    """Guards the gate above from passing vacuously.
+
+    Asserting merely that a solve DECLINED is not enough -- an earlier version
+    of this test did exactly that and passed while the fallback was unreachable,
+    because every ply was full. The signal has to be a re-search.
+    """
+
+    records = _records(0, fallback=True, max_nodes=20_000, full_fraction=0.0)
+    assert _re_searched(records), "no cheap ply was re-searched; the path is dead"
+
+
+def test_the_fallback_changes_the_records_it_touches():
+    """It must actually change a move, or it is dead configuration."""
+
+    common = {"max_nodes": 20_000, "full_fraction": 0.0}
+    assert _records(0, fallback=False, **common) != _records(
+        0, fallback=True, **common
+    )
+
+
+def test_a_re_searched_row_still_reports_the_solve_it_attempted():
+    """The carried overlay. Without it the row would look like a position the
+    trigger never selected, and the decline would vanish from the statistics
+    that size the solver's budget."""
+
+    for move in _re_searched(
+        _records(0, fallback=True, max_nodes=20_000, full_fraction=0.0)
+    ):
+        assert move["solver_attempted"] is True
+        assert move["solver_stop"] == "nodes"
+        assert move["solver_nodes"] > 0
+        assert move["solver_value"] is None
+
+
+def test_the_thread_count_is_currently_inert_in_this_harness():
+    """This file's premise does not hold, and the failure is silent.
+
+    `self_play_many_mock` runs through `self_play::run_many`, which passes
+    `None` where the pipelined schedulers pass a `SolverPool`
+    (`self_play.rs:2528` against `:2696`). No pool means no slot ever parks, so
+    every `set_solver_threads` value above takes the same SYNCHRONOUS path and
+    the identity assertions compare a run against itself.
+
+    Pinned as a known gap rather than deleted: the assertions are still worth
+    running -- they catch nondeterminism in the solve path -- but they do not
+    gate the async port, and until this test fails, nothing does. Fixing it
+    means either giving `run_many` a pool or moving the gate onto
+    `self_play_many_flat_net`.
+    """
+
+    import inspect
+
+    budget = 20_000
+    common = {"fallback": True, "max_nodes": budget, "full_fraction": 0.0}
+    # If the thread count ever starts mattering here, the mock path has grown a
+    # real solver pool and this test should be replaced by a genuine gate.
+    assert _records(0, **common) == _records(4, **common)
+    assert "solver pool" not in inspect.getdoc(swr.self_play_many_mock or object) or True

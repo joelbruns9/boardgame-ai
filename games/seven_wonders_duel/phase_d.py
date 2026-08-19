@@ -285,6 +285,20 @@ class PhaseDConfig:
     """
     endgame_solver_max_secs: float = 60.0
     endgame_solver_max_cards: int = 8
+    solver_fallback_research: bool = False
+    """Re-search a cheap ply at the full budget when its solve declines.
+
+    A declined solve leaves the move to whatever search already ran, and on a
+    cheap ply that is a 20-100 simulation move in a contested endgame -- at a
+    position the cost model predicted affordable and was wrong about, so a hard
+    one. The B2 probe measured the cost: at solver-settled positions cheap
+    search plays a provably losing move 14.6% of the time against full search's
+    10.1% (paired, p = 0.001).
+
+    Off by default. It only fires where a solve declined, so at the shipped
+    margin it touches well under 1% of moves.
+    """
+
     endgame_cost_model: dict[str, Any] | None = None
     """The fitted trigger in force, or None when the card cap decides.
 
@@ -3340,6 +3354,7 @@ class PhaseDLoop:
             # provably optimally, which would erase endgame skill from the
             # comparison a gate exists to make.
             solve_endgames=self.config.endgame_solver_max_nodes > 0,
+            solver_fallback_research=self.config.solver_fallback_research,
             dirichlet_epsilon=self.config.dirichlet_epsilon,
             dirichlet_alpha=self.config.dirichlet_alpha,
         )
@@ -5270,6 +5285,15 @@ def build_parser() -> argparse.ArgumentParser:
         "are ~3x cheaper and far narrower, so do not set this from them.",
     )
     parser.add_argument(
+        "--solver-fallback-research",
+        action="store_true",
+        help="when an endgame solve runs out of node budget on a CHEAP ply, "
+        "search the position again at the full budget before choosing a move. "
+        "A decline otherwise leaves a cheap move standing in a contested "
+        "endgame, and cheap search blunders there measurably more often "
+        "(14.6%% vs 10.1%% against proofs). Costs roughly 1.6%% more search.",
+    )
+    parser.add_argument(
         "--endgame-cost-model",
         type=Path,
         nargs="?",
@@ -5585,6 +5609,7 @@ def main(argv=None) -> int:
     applied_cost_model = configure_endgame_cost_model(args.endgame_cost_model)
     config = PhaseDConfig(
         endgame_cost_model=applied_cost_model,
+        solver_fallback_research=args.solver_fallback_research,
         endgame_solver_max_nodes=int(applied_solver[0]),
         endgame_solver_max_secs=float(applied_solver[1]),
         endgame_solver_max_cards=int(applied_solver[2]),
