@@ -673,6 +673,32 @@ the calibrator cannot answer.
   board". Positions whose outcome still turns on the deal are outside the reach
   of any proven-value instrument.
 
+  **The filter's bias is measured, not assumed (2026-08-19).** The review was
+  right that `unrevealed > 0 => not exact` is not guaranteed: `regime` is set
+  from `ctx.saw_chance` as the search runs, not statically from the board, so a
+  position with face-down cards whose value alpha-beta settles before any reveal
+  is expanded would come back `exact` and be bankable. Those are precisely the
+  forced/decided positions, i.e. the threat bucket, so a bias there would fall on
+  the population the bucket exists to measure.
+
+  `--unrevealed-sample` re-measures it on every build. Pooled over three samples
+  at three budgets:
+
+  | budget | sampled | came back exact | provably expectimax | node-capped |
+  |---|---|---|---|---|
+  | (original) | 51 | 0 | 51 | 0 |
+  | 5M | 340 | **0** | 290 | 11 |
+  | 20M | 261 | **0** | 249 | 4 |
+
+  **0 of 652 confirmed misses.** The unresolved share falls as the budget rises
+  (3.2% -> 1.5%) while the exact count stays at zero, which is the signature of
+  the mechanism actually being what it looks like: a position that needs tens of
+  millions of nodes to settle is expensive *because* it crosses chance edges, and
+  crossing one is what makes it expectimax. The worst case -- every unresolved
+  position proving exact at some larger budget -- is 2.3% of skipped positions,
+  which would be ~111 positions against the shipped corpus's 1,000. Treat the
+  threat bucket as usable and that 10% as the outer bound on what it is missing.
+
   That filter is also what made the build affordable: banking 26 proofs was
   costing 45 wasted expectimax solves and 6 declines, and predicting the regime
   from the board instead removed all of them. 1,000 positions took about an hour.
