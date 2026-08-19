@@ -4,7 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from fastapi import HTTPException
+# The advisor host is the only thing here that needs FastAPI, and
+# `games.advisor` imports it lazily precisely so training never has to. The
+# cloud setup installs numpy, maturin and pytest and NOT FastAPI, so a bare
+# top-level import made `pytest games/` fail at COLLECTION on a fresh box --
+# invisible locally, where FastAPI happens to be installed.
+HTTPException = pytest.importorskip(
+    "fastapi", reason="advisor host extra; not installed on a training box"
+).HTTPException
 
 import games.kingdomino.web_app as web_app
 from games.kingdomino.board import Board
