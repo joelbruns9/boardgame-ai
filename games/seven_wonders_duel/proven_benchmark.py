@@ -26,12 +26,26 @@ Sizing is not incidental. 133 positions with a residual p90 near 0.92 give a
 standard error around 0.026, which cannot separate 0.221 from 0.19 -- the size of
 difference actually at stake. A thousand brings that near 0.0095.
 
-**Every position here is fully revealed.** That is forced, not chosen: only an
-`exact` proof gives a value a three-class head can be scored against, and a solve
-is exact exactly when it crosses no chance edge -- no card left face down. So the
-benchmark measures the value head on *deterministic* endgames. Positions whose
-outcome still depends on the deal are out of scope for any proven-value
-instrument, and remain the harder case.
+**Almost every position here is fully revealed, and that is forced rather than
+chosen.** Only an `exact` proof gives a value a three-class head can be scored
+against, and a solve is exact when it CROSSES no chance edge. "Nothing face
+down" is a cheap sufficient-looking proxy for that, and the build uses it as a
+pre-filter because solving every candidate to find out was most of the cost.
+
+The proxy is not exact in either direction, so neither is assumed:
+
+* a fully revealed position can still hit a chance edge (a Great Library build
+  draws from the progress pool), which costs a wasted solve and banks nothing;
+* a position with face-down cards can still come back `exact`, when alpha-beta
+  settles the value before any reveal is expanded. Those are bankable positions
+  the pre-filter would skip, and skipping them biases the corpus away from the
+  most decided boards -- so `--unrevealed-sample` solves a small fraction of them
+  anyway, banks the ones that prove exact, and reports the rate. That measures
+  the filter's cost on every build instead of inheriting a one-off 0-of-51.
+
+So the benchmark measures the value head on endgames that are *effectively*
+deterministic. Positions whose outcome still depends on the deal are out of scope
+for any proven-value instrument, and remain the harder case.
 
 What this is NOT: a strength measurement. It scores value accuracy on endgames,
 not play, and not the opening or midgame. `PRE_RETRAIN_PLAN.md` §C is explicit
@@ -60,7 +74,13 @@ from typing import Any, Iterator
 
 import torch
 
-from .buffer import GameRecord, ReplayMismatchError, read_records, replay
+from .buffer import (
+    FinalDigestMismatchError,
+    GameRecord,
+    ReplayMismatchError,
+    read_records,
+    replay,
+)
 from .game import Phase
 
 #: Positions are stored as `(seed, first_player, action prefix)` rather than a
@@ -70,27 +90,43 @@ from .game import Phase
 SCHEMA = 1
 
 
+#: How far a single card can advance the conflict pawn. Two shields is the most
+#: any one Age III card carries, so "one move from 9" is |position| >= 7, not
+#: >= 8. The bucket is meant to hold positions where one move ENDS the game.
+MAX_MILITARY_ADVANCE = 2
+
+#: Distinct science symbols that end the game. One short of it is a forcing
+#: threat: the opponent must block or lose.
+SCIENCE_WIN_SYMBOLS = 6
+
+
 def _instant_win_threat(game) -> bool:
-    """Is either side one step from a military or scientific instant win?
+    """Is either side one move from a military or scientific instant win?
 
     The bucket exists so the mean/max readout can be tested against its actual
     claim -- that pooling helps with *existentials*, "does a threat exist" -- and
     not merely on an aggregate where such positions are a minority and any effect
-    washes out.
+    washes out. A bucket whose membership rule is wrong tests nothing, so both
+    thresholds are derived rather than picked:
+
+    * military: one card can move the pawn by at most `MAX_MILITARY_ADVANCE`, so
+      the threat set starts at `9 - MAX_MILITARY_ADVANCE`. The old `>= 8` missed
+      every position where a two-shield card wins from 7.
+    * science: symbols are counted with the ENGINE's `_science_symbols`, which
+      includes progress tokens. This used to count `city.buildings` only, so a
+      player holding Law -- itself a symbol -- was scored one symbol short, and
+      the positions most likely to be a real science threat were the ones most
+      likely to be misfiled.
     """
 
-    if abs(game.conflict_position) >= 8:
+    from .engine import _science_symbols
+
+    if abs(game.conflict_position) >= 9 - MAX_MILITARY_ADVANCE:
         return True
     return any(
-        len({c.science for c in _buildings(game, seat) if c.science is not None}) >= 5
+        len(_science_symbols(game, seat)) >= SCIENCE_WIN_SYMBOLS - 1
         for seat in (0, 1)
     )
-
-
-def _buildings(game, seat: int):
-    from .data import CARDS_BY_NAME
-
-    return [CARDS_BY_NAME[name] for name in game.cities[seat].buildings]
 
 
 def solved_endgames(
@@ -104,6 +140,8 @@ def solved_endgames(
     quota: int,
     found: list[dict],
     cost_model=None,
+    unrevealed_sample: float = 0.0,
+    sample_seed: int = 0,
 ) -> dict[str, int]:
     """Solve Age III positions and bank the ones that come back proven.
 
@@ -118,8 +156,14 @@ def solved_endgames(
     with near-duplicates and report a sample size it does not have.
     """
 
+    import random
+
+    from .buffer import mask_hash
     from .rust_bridge import rust_game_from_state
 
+    # Seeded rather than global: which positions get audited must not depend on
+    # what else in the process drew a random number.
+    sampler = random.Random(sample_seed)
     stats = {
         "games": 0,
         "replay_mismatches": 0,
@@ -127,6 +171,10 @@ def solved_endgames(
         "declined": 0,
         "skipped_by_cost_model": 0,
         "skipped_chance": 0,
+        # Of the face-down positions sampled anyway, how many were bankable --
+        # i.e. how often the cheap pre-filter throws away a proof.
+        "chance_sampled": 0,
+        "chance_sampled_exact": 0,
     }
     for game_index, record in enumerate(records):
         if len(found) >= quota:
@@ -142,16 +190,29 @@ def solved_endgames(
             present = len(cards)
             if present > max_cards:
                 return
-            # Only `exact` proofs are bankable, and a solve is exact exactly when
-            # it crosses no chance edge -- which means no card left face down.
-            # Measured over 77 solved positions the separation is total: 26/26
-            # with nothing unrevealed came back `exact`, and 0 of 51 with
-            # something unrevealed did. Filtering here rather than discarding the
-            # answer afterwards is what makes the build affordable: it was paying
-            # a full solve for 45 expectimax results and 6 declines to bank 26.
+            # Only `exact` proofs are bankable, and `regime` is decided by
+            # whether the search CROSSED a chance edge -- not by whether the
+            # board contains one. That makes this filter a heuristic in both
+            # directions, and only one of them is harmless:
+            #
+            # * A fully revealed position can still be `exact_expectimax`: a
+            #   Great Library build draws from the progress pool, which is a
+            #   chance edge with no face-down card. Costs a wasted solve, banks
+            #   nothing wrong.
+            # * A position WITH face-down cards can still come back `exact`, if
+            #   alpha-beta settles the value before any reveal is expanded --
+            #   most likely exactly where a forced win truncates the tree. Those
+            #   are bankable positions this filter skips, which biases the
+            #   corpus away from the most decided boards.
+            #
+            # Measured over 77 solves the separation was total (26/26 and 0/51),
+            # but that is a rate, not a proof, so `unrevealed_sample` re-measures
+            # it on every build instead of inheriting the old number.
             if any(not card.revealed for card in cards):
                 stats["skipped_chance"] += 1
-                return
+                if unrevealed_sample <= 0.0 or sampler.random() >= unrevealed_sample:
+                    return
+                stats["chance_sampled"] += 1
             stats["candidates"] += 1
             # Pre-filter with the fitted cost model. Without it the build spends
             # most of its time on solves that then decline: at nine cards the
@@ -169,9 +230,18 @@ def solved_endgames(
             answer = rust_game_from_state(game).solve_endgame(
                 max_nodes, max_secs, "value_only", "star1"
             )
-            if answer is None or answer["regime"] != "exact":
+            if answer["regime"] != "exact":
+                # Declines and expectimax answers are both unbankable, but for
+                # different reasons and at different costs, so they are counted
+                # apart -- a build that is mostly `deadline` is being limited by
+                # --max-secs rather than by the positions.
                 stats["declined"] += 1
+                stats[f"declined_{answer['stop'] or answer['regime']}"] = (
+                    stats.get(f"declined_{answer['stop'] or answer['regime']}", 0) + 1
+                )
                 return
+            if any(not card.revealed for card in cards):
+                stats["chance_sampled_exact"] += 1
             hits.append(
                 {
                     "id": f"{source}:{_gi}:{move.i}",
@@ -181,6 +251,10 @@ def solved_endgames(
                     "move_index": move.i,
                     "prefix": [m.action for m in _rec.moves[: move.i]],
                     "actor": move.actor,
+                    # The position's identity, checked on every rebuild. See
+                    # `rebuild_position`: without it a rules change that leaves
+                    # the actor alone rescopes the whole benchmark in silence.
+                    "mask_hash": mask_hash(game),
                     "value": float(answer["root_value"]),
                     "cards_left": present,
                     "instant_win_threat": bool(_instant_win_threat(game)),
@@ -191,7 +265,11 @@ def solved_endgames(
         try:
             replay(record, on_state=on_state)
             stats["games"] += 1
-        except ReplayMismatchError as error:
+        except FinalDigestMismatchError:
+            # Trajectory intact; every banked position precedes the terminal
+            # state, so the differing score cannot reach one.
+            stats["games"] += 1
+        except ReplayMismatchError:
             # A FINAL-DIGEST mismatch is expected and harmless here: the
             # pre-military-fix buffers score their terminal state differently,
             # and every position banked above precedes it. A mask mismatch is
@@ -202,10 +280,8 @@ def solved_endgames(
             # both alike, so every cloud game hit the `continue`, every solved
             # position was discarded after being paid for, and the build simply
             # never reached its quota.
-            if "final digest" not in str(error):
-                stats["replay_mismatches"] += 1
-                continue
-            stats["games"] += 1
+            stats["replay_mismatches"] += 1
+            continue
         found.extend(hits[: max(0, quota - len(found))])
     return stats
 
@@ -242,12 +318,18 @@ def _sign_agreement(values, truths, *, with_count: bool = False):
 def rebuild_position(row: dict):
     """Reconstruct a banked position from its `(seed, first_player, prefix)`.
 
-    Verified rather than trusted: the actor is re-derived and checked, so a
-    benchmark file that has drifted from the engine fails loudly instead of
-    quietly scoring a different position than it was solved at.
+    Verified rather than trusted. The actor alone is a weak check -- it agrees
+    for most drifts -- so a row also carries the position's `mask_hash`, the
+    same digest `buffer.replay` verifies move by move. That is what makes
+    "frozen" true: the 2026-08 military fix changed the rules WITHOUT changing
+    `SPEC_VERSION`, so a benchmark keyed on version metadata would have gone on
+    scoring silently different positions against unchanged proofs.
+
+    Rows written before the digest was recorded (`mask_hash` absent) fall back
+    to the actor check, with the weaker guarantee that implies.
     """
 
-    from .buffer import new_game
+    from .buffer import mask_hash, new_game
     from .codec import decode_action
     from .engine import apply_action
 
@@ -264,6 +346,15 @@ def rebuild_position(row: dict):
             f"position {row['id']} rebuilt with actor {actor}, banked as "
             f"{row['actor']}: the benchmark no longer matches this engine"
         )
+    banked = row.get("mask_hash")
+    if banked is not None:
+        current = mask_hash(game)
+        if current != banked:
+            raise ValueError(
+                f"position {row['id']} rebuilt with mask hash {current} but was "
+                f"solved at {banked}: this engine no longer produces the "
+                "position the proof belongs to, so the benchmark must be rebuilt"
+            )
     return game, actor
 
 
@@ -290,7 +381,8 @@ def score_checkpoint(
 
     # Batched: the whole point is that scoring costs one forward per position, so
     # feeding them one at a time would throw away most of the speed.
-    games = [rebuild_position(row)[0] for row in rows]
+    rebuilt = [rebuild_position(row) for row in rows]
+    games = [game for game, _ in rebuilt]
     values: list[float] = []
     for start in range(0, len(games), batch):
         for evaluation in evaluator.evaluate_states(games[start : start + batch]):
@@ -304,10 +396,15 @@ def score_checkpoint(
 
     errors: list[float] = []
     buckets: dict[str, list[float]] = {}
-    for row, value, truth in zip(rows, values, truths):
+    for (game, _), row, value, truth in zip(rebuilt, rows, values, truths):
         error = abs(value - truth)
         errors.append(error)
-        key = "threat" if row["instant_win_threat"] else "quiet"
+        # Recomputed from the rebuilt position rather than read from the file.
+        # A bucket DEFINITION is not ground truth -- unlike the proof, it is a
+        # judgement about which positions the mean/max readout should help on --
+        # and freezing it into the corpus meant a wrong threshold could only be
+        # corrected by paying for 1,000 solves again.
+        key = "threat" if _instant_win_threat(game) else "quiet"
         buckets.setdefault(key, []).append(error)
         buckets.setdefault(f"cards_{row['cards_left']}", []).append(error)
 
@@ -357,6 +454,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="safety margin for the pre-filter, in decades of predicted cost",
     )
     build.add_argument(
+        "--unrevealed-sample",
+        type=float,
+        default=0.02,
+        help="fraction of face-down positions to solve anyway, to re-measure "
+        "how often the 'no chance edge means nothing face down' pre-filter "
+        "discards a bankable proof. 0 disables the audit and inherits the "
+        "one-off 0-of-51 measurement.",
+    )
+    build.add_argument("--sample-seed", type=int, default=0)
+    build.add_argument(
         "--per-game-cap",
         type=int,
         default=2,
@@ -399,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
                 read_records(path),
                 source=path.stem,
                 cost_model=cost_model,
+                unrevealed_sample=args.unrevealed_sample,
+                sample_seed=args.sample_seed,
                 max_nodes=args.max_nodes,
                 max_secs=args.max_secs,
                 max_cards=args.max_cards,

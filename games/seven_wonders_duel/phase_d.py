@@ -938,11 +938,39 @@ def _configure_cheap_top_k(width: int) -> None:
     swr.set_cheap_top_k(int(width))
 
 
-def configure_solver_threads(threads: int) -> None:
-    """Apply the background solver thread count to the Rust generator."""
+def configure_solver_threads(threads: int, scheduler_workers: int = 1) -> None:
+    """Apply the background solver thread count to the Rust generator.
+
+    **The count is PER SHARD.** One `SolverPool` is built per scheduler loop, so
+    the number of OS threads actually solving is `threads x scheduler_workers`.
+    `--solver-threads 4 --rust-scheduler-workers 4` is sixteen, not four, and
+    every one of them is a CPU-bound alpha-beta search competing with generation
+    for the same cores. On the shakedown the solver already took 22-37% of
+    generation wall at four threads, so getting this wrong by a factor of four
+    is not a rounding error.
+
+    Warned about rather than clamped: on a box with cores to spare the product
+    is exactly what you want, and silently reducing a number the operator typed
+    would be its own trap.
+    """
 
     if threads < 0:
         raise ValueError("--solver-threads must be non-negative")
+    total = int(threads) * max(1, int(scheduler_workers))
+    if threads:
+        available = os.cpu_count() or 1
+        print(
+            f"solver threads: {threads} per shard x {scheduler_workers} shards "
+            f"= {total} total, against {available} CPUs"
+        )
+        if total > available:
+            print(
+                f"WARNING: {total} solver threads oversubscribe {available} "
+                "CPUs. Solves will run slower in wall time, which pushes them "
+                "toward the --endgame-solver-max-secs deadline -- and a "
+                "deadline decline makes which positions got a proof depend on "
+                "machine load."
+            )
     try:
         import seven_wonders_rust as swr
     except ImportError:  # pragma: no cover - Python backend needs no bridge
@@ -1029,11 +1057,21 @@ def configure_endgame_cost_model(path: str | Path | None) -> dict[str, Any] | No
     # weights are applied positionally, so a silent reordering would price every
     # position with the wrong ones.
     swr.set_endgame_cost_model(list(features), coefficients[0], coefficients[1:], margin)
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    stale = payload.get("fit", {}).get("stale_reason")
+    if stale:
+        # Loud, because it is invisible otherwise: a model fit against an older
+        # FEATURE DEFINITION still loads, still passes the name check, and still
+        # produces plausible predictions. This is the only point in a run where
+        # anyone looks at the file.
+        print(f"WARNING: {path} is marked stale.")
+        print(f"  {stale}")
     return {
         "path": str(path),
         "features": list(features),
         "margin_decades": margin,
         "intercept": coefficients[0],
+        "stale_reason": stale,
     }
 
 
@@ -5534,7 +5572,7 @@ def main(argv=None) -> int:
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
     configure_forced_playouts(args.forced_playout_k)
-    configure_solver_threads(args.solver_threads)
+    configure_solver_threads(args.solver_threads, args.rust_scheduler_workers)
     # Read back what the generator is actually running under, so the manifest
     # records the effective settings rather than the requested ones -- they
     # differ when there is no Rust generator to configure at all.

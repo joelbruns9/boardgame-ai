@@ -388,7 +388,68 @@ a flag:
 
   Verified live: a smoke run attempted 11- and 12-card positions that
   `--endgame-solver-max-cards 10` refuses, and the manifest records which rule
-  chose. Refit with `--fit-on` after the retrain.
+  chose.
+
+  **Refit recipe** (the shipped file must come out of this, never a hand
+  transcription -- nothing downstream can check the file against the fit it
+  claims to come from, because `test_cost_model_parity` compares Python to Rust
+  and both read the same file):
+
+  ```
+  python -m games.seven_wonders_duel.endgame_trigger_study       --from-buffer "<cloud buffers>" --out cloud_endgames.json
+  python -m games.seven_wonders_duel.validate_cost_trigger       --fit-on cloud_endgames.json --write-model
+  ```
+
+  `--fit-on` fits `RUST_FEATURES` -- the twenty columns the trigger can actually
+  compute -- and reports the 22-column fit alongside as a comparison. It also
+  prints the margin sweep per card count (`--margin-sweep`), which is section C's
+  dimension, and refuses to write a model over the wrong feature set.
+
+  ### Corrections from the 2026-08-19 review
+
+  Four claims in this section were wrong or unreproducible. All four are fixed
+  in code; the last needs a refit before the run.
+
+  * **`chance_wonders` did not mean the same thing in both languages.** Python's
+    `_unbuilt` counted a RETIRED Great Library or Mausoleum as unbuilt; Rust's
+    `unbuilt_named` did not. Measured on the fit distribution: over 150 cloud6
+    positions the two languages disagreed on `revive_wonders` and
+    `discard_x_revive` 21 times and on `chance_wonders` 15 times -- 36 positions,
+    24% -- and `chance_wonders` carries +0.43, larger than the whole 0.4-decade
+    margin, in the direction of Rust pricing a position CHEAPER than the fitted
+    model does. Honest qualifier: none of those 36 flipped the trigger's verdict,
+    because the only strong-play corpus available for the check is the
+    proven-endgame benchmark and every position in it has 1-5 cards left, far
+    below the affordability boundary. The flips would happen at 8-11 cards, where
+    the trigger actually decides and where no committed corpus reaches.
+    Python now excludes retired wonders (Rust's definition was the correct one:
+    a retired wonder adds no branch). **The shipped coefficients were fit
+    against the old definition and are marked stale in the JSON; `phase_d`
+    prints the warning at launch. Refit before the retrain.**
+
+  * **Parity was tested on a corpus that could not fail.** The bot games in
+    `test_cost_model_parity` never build a seventh wonder, so no retirement ever
+    happens in them -- 0 of 146 positions -- and no number of them could have
+    caught the above. The test now also runs over positions from
+    `proven_endgames.jsonl`, which come from the cloud6 buffers the model is fit
+    on and where 68% of positions have a retired wonder, plus an assertion that
+    that corpus really does exercise retirement.
+
+  * **The margin is not the residual p90, and should not be.** `cost_model.rs`
+    said it was. The shipped 0.4 was chosen because it was measured to buy the
+    same 805 proofs as `max_cards 10` for 44% of the nodes, which is better
+    evidence than a residual quantile. That is defensible because the loss is
+    bounded both ways: an underprediction costs at most `budget` nodes and then
+    declines, an overprediction costs one proof. A p90 margin would be right
+    only if an underprediction could run away -- which is exactly what a binding
+    wall clock allowed, so section 7 is what makes 0.4 safe.
+
+  * **Neither trigger comparison was scored honestly.** `best_cap` maximised
+    solves-per-node, which picks the smallest cap; `compare_triggers` picked the
+    cap with the most solves, which -- since cap sets are nested -- is always the
+    largest and most expensive cap, flattering the model's node ratio for free.
+    Both are replaced by `cap_frontier` plus `matched_cap`: the cheapest cap that
+    buys at least as many proofs as the model did.
 
   Largest terms are `chance_fanout` (+1.04) and `chance_wonders` (+0.44), ahead
   of `cards_left` (+0.27) — cost is driven by how much of the board is still
@@ -889,6 +950,39 @@ solver exists to answer. The corpus gate has the same flaw — `BUILD_MAX_SECS` 
 a deadline, so gate *coverage* varies with machine load (83, 85 and 86 of 86
 positions across three runs with no code change). Worth pinning to the node
 budget alone.
+
+*The diagnosis above had to be INFERRED, and no longer does (2026-08-19).*
+`SolveStop::Budget` was one value for "nodes ran out" and "clock ran out", so
+"not one was node-capped" was read off `nodes_max` peaking below the cap rather
+than off the buffer. The variant is now split into `Nodes` and `Deadline`, and a
+record's `solver_stop` says which. Three things follow:
+
+* `validate_cost_trigger` **drops deadline-censored rows from the fit** instead
+  of imputing them at a floor. A node-capped decline is a right-censored
+  observation of the position's cost; a clock-truncated one is an observation of
+  how busy the box was, and `study_rows` used to floor both at the study budget
+  --- so a solve cut off after 2M nodes entered the fit claiming 40M.
+* `solve_endgame` **always returns a dict**, carrying the nodes spent and the
+  reason, instead of returning `None` and discarding both. `solve_root_counted`
+  already kept the count; only the Python boundary threw it away.
+* `--study-secs` now defaults to 1200 (was 120), and both the study and the
+  buffer analysis print a warning naming the count when any decline was a
+  deadline.
+
+*Record identity under async solving has a precondition, now stated.* The
+`test_async_solver` gate proves the async and synchronous paths produce
+byte-identical records, but only while the clock is slack: a deadline decline
+depends on wall time, so under contention the two paths can decline different
+positions. The gate now asserts no `deadline` stop occurred during the identity
+run, and a companion test pins that a binding clock is visible and distinct in
+the record.
+
+*Solver threads are PER SHARD.* `run_many_pipelined` builds one `SolverPool` per
+scheduler loop, so `--solver-threads 4 --rust-scheduler-workers 4` is sixteen
+CPU-bound threads, not four. `configure_solver_threads` now prints the product
+against the core count and warns on oversubscription --- which matters here
+rather than elsewhere because slower solves in wall time are what push a run back
+toward the deadline decline this section is about.
 
 **`full` does not mean "recorded".** It means "this move drew the full simulation
 budget". Gates set `full_search_fraction = 0.0` and get their strength from the

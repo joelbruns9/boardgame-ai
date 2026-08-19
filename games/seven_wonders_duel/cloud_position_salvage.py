@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .buffer import (
+    FinalDigestMismatchError,
     GameRecord,
     ReplayMismatchError,
     StaleSpecVersionError,
@@ -62,9 +63,10 @@ def divergence_point(record: GameRecord) -> tuple[int | None, int]:
 
     try:
         replay(record, on_state=count)
-    except ReplayMismatchError as error:
-        if "final digest" in str(error):
-            return None, len(record.moves)
+    except FinalDigestMismatchError:
+        # Trajectory intact; only the terminal score differs.
+        return None, len(record.moves)
+    except ReplayMismatchError:
         return seen[0], len(record.moves)
     except StaleSpecVersionError:
         return 0, len(record.moves)

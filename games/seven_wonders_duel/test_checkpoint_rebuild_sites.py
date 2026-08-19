@@ -21,15 +21,16 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).parent
 
-#: Reading a checkpoint's head count AND building a model is the signature of a
-#: hand rebuild. Deliberately a coarse heuristic with an explicit allow-list
-#: rather than a cleverer pattern: two earlier attempts at a precise regex were
-#: wrong in both directions -- one flagged a file that only validates a head
-#: count, the next missed every module that assigns it to a local first.
-_READS_HEADS = re.compile(r"(?<!def )heads_from_config\s*\(")
+#: Building a model is the signature. Keyed on `build_model` ALONE, with an
+#: allow-list, rather than on "reads a head count AND builds": the conjunction
+#: let `cloud_preflight` through, which builds a model to size a rented box and
+#: was silently omitting `pooled_readout` / `reply_head` -- understating every
+#: disk figure for the run those switches were added for. A site that builds a
+#: model is a site that has to know the architecture, whether or not it happens
+#: to mention heads.
 _BUILDS = re.compile(r"build_model\s*\(")
 
-#: Converted, or legitimately not a rebuild.
+#: Converted, or legitimately not a rebuild of saved weights.
 ALLOWED = {
     # Defines the helpers.
     "train.py",
@@ -37,6 +38,14 @@ ALLOWED = {
     # CHECK it against this run's config and refuse a mismatched resume -- a
     # different question from rebuilding the checkpoint faithfully.
     "phase_d.py",
+    # Rebuilds via model_from_config.
+    "build_equiv_corpus.py",
+    # Builds FRESH models from an explicit spec, never from saved weights, so
+    # there is nothing for a config to be stale against. They still have to
+    # take the architecture switches, which is what `parameter_count` is
+    # asserted on below.
+    "cloud_preflight.py",
+    "phase_b_gate.py",
 }
 
 #: Modules that still rebuild by hand. All are offline analysis tools -- probes,
@@ -67,7 +76,7 @@ def _rebuild_sites() -> set[str]:
         if path.name.startswith("test_"):
             continue
         text = path.read_text(encoding="utf-8")
-        if _READS_HEADS.search(text) and _BUILDS.search(text):
+        if _BUILDS.search(text):
             found.add(path.name)
     return found
 
@@ -100,3 +109,26 @@ def test_the_training_and_gate_paths_carry_no_debt():
 
     for name in ("phase_d.py", "build_equiv_corpus.py"):
         assert name not in NOT_YET_CONVERTED, f"{name} must use model_from_config"
+        # Not merely absent from the debt list -- actually going through the
+        # helper. The list version of this assertion would pass if either file
+        # reverted to a hand rebuild that stopped mentioning a head count.
+        text = (PACKAGE / name).read_text(encoding="utf-8")
+        assert "model_from_config" in text, f"{name} must use model_from_config"
+
+
+def test_a_fresh_model_builder_still_takes_the_architecture_switches():
+    """The allow-list is not a blind spot.
+
+    `cloud_preflight` builds a fresh model rather than reloading one, so it is
+    legitimately allow-listed -- but it sizes the box the run will be rented on,
+    and a size computed without `pooled_readout` / `reply_head` is wrong in the
+    direction that matters. This pins the thing the allow-list stops checking.
+    """
+
+    from .cloud_preflight import parameter_count
+
+    plain = parameter_count(64, 2, 4)
+    pooled = parameter_count(64, 2, 4, pooled_readout=True)
+    replied = parameter_count(64, 2, 4, reply_head=True)
+    assert pooled > plain, "pooled readout adds a projection and must be counted"
+    assert replied > plain, "the reply head adds parameters and must be counted"

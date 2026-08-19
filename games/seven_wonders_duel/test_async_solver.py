@@ -8,6 +8,13 @@ multi-second solve.
 
 That makes record identity the whole gate. Same seeds, same masks, same targets,
 same games -- only the timing differs.
+
+**The gate has a precondition.** Identity holds only while the WALL CLOCK never
+binds: a deadline decline is a function of how long a solve took in real time,
+so under contention the async path and the synchronous one can decline different
+positions and produce different buffers. These tests run with a slack clock and
+`test_a_binding_clock_would_break_identity` states the precondition rather than
+leaving it implied, because the split stop reasons now make it checkable.
 """
 
 from __future__ import annotations
@@ -60,6 +67,54 @@ def test_async_is_identical_on_a_mixed_schedule_too():
     slots, which is where a lost or misrouted outcome would show."""
 
     assert _records(4, full_fraction=0.25) == _records(0, full_fraction=0.25)
+
+
+def _stops(records):
+    return {
+        move["solver_stop"]
+        for record in records
+        for move in record["moves"]
+        if move["solver_stop"] is not None
+    }
+
+
+def test_identity_is_measured_with_a_clock_that_never_binds():
+    """The precondition the identity gate rests on, asserted rather than assumed.
+
+    A `deadline` stop means the clock decided the outcome, and the clock is not
+    a function of the seed -- so an identity result gathered while it was
+    binding would be luck. The node budget may bind; it reproduces.
+    """
+
+    assert "deadline" not in _stops(_records(4)), (
+        "the wall clock bound during the identity test, so record identity was "
+        "not actually demonstrated -- raise max_secs or lower the node budget"
+    )
+
+
+def test_a_binding_clock_is_visible_in_the_record():
+    """And distinguishable from a node-capped decline, which is the point.
+
+    Same position, same node budget, a clock of nothing: every decline must be
+    reported as `deadline`, not folded into a single "budget" reason. Until
+    these were one value, section 6's diagnosis had to be inferred from the
+    maximum node count observed rather than read off the buffer.
+    """
+
+    # The smallest clock the setter accepts. It expires during the first
+    # node-batch check, which is exactly the shape of a real deadline decline.
+    swr.set_endgame_solver(MAX_NODES, 1e-9, MAX_CARDS, True)
+    swr.set_solver_threads(0)
+    records, _ = swr.self_play_many_mock(
+        games=rust_games_for_self_play(SEEDS, [0, 1, 0, 1]),
+        game_seeds=SEEDS,
+        force=True,
+        solve_endgames=True,
+        **(_common(leaf_batch=1, global_batch_cap=8) | {"full_search_fraction": 1.0}),
+    )
+    stops = _stops(records)
+    assert "deadline" in stops, f"an instantly-expired clock produced {stops}"
+    assert "nodes" not in stops, f"nothing should reach a 5M node cap here: {stops}"
 
 
 def test_the_solver_still_actually_fires_under_async():

@@ -401,8 +401,11 @@ class SWDNet(nn.Module):
             # Masking is load-bearing in both pools: a padding token must not
             # dilute the mean, and must never win the max. `-inf` fill is what
             # makes the max ignore it; the row can never be all-padding because
-            # the GLOBAL token is always present, but the clamp keeps a divide
-            # by zero impossible rather than merely unlikely.
+            # The GLOBAL token is always present, so an all-pad row cannot
+            # occur. The clamp guards the MEAN's divide-by-zero only: the max
+            # below would still take -inf on such a row and send it through
+            # `readout_proj`. Stated precisely because the previous comment
+            # claimed the clamp made failure impossible, which it does not.
             real = ~batch["pad_mask"]
             counts = real.sum(1, keepdim=True).clamp(min=1)
             weights = real.unsqueeze(-1)

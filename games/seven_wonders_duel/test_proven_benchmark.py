@@ -83,3 +83,17 @@ def test_sign_agreement_ignores_drawn_positions():
     )
     assert decisive == 1
     assert agreement == 1.0
+
+
+def test_a_terminal_score_difference_is_a_distinct_error_type():
+    """The distinction three call sites used to make by substring-matching.
+
+    A caller reading positions BEFORE the end can accept a differing terminal
+    score; none may accept a mask divergence, where the recorded actions after
+    that point were chosen for a position that no longer exists. Subclassing
+    keeps every existing `except ReplayMismatchError` working.
+    """
+
+    from .buffer import FinalDigestMismatchError, ReplayMismatchError
+
+    assert issubclass(FinalDigestMismatchError, ReplayMismatchError)

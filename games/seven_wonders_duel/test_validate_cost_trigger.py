@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import math
 
+from pathlib import Path
+
 import pytest
 
 from .validate_cost_trigger import (
     fit_censored,
     TRIGGER_FEATURES,
     UNAVAILABLE_AT_DECISION_TIME,
+    cap_frontier,
     compare_triggers,
     fit,
     predict,
@@ -104,8 +107,41 @@ def test_a_censored_row_is_never_counted_as_bought():
     rows = [_row(3, 0, 100, censored=True), _row(3, 0, 100)]
     coefficients = fit([_row(3, 0, 100)], FEATURES)
     result = compare_triggers(rows, coefficients, FEATURES, budget=10**6)
-    assert result["card_cap_best"]["attempts"] == 2
-    assert result["card_cap_best"]["solved"] == 1
+    cap = result["cap_frontier"][-1]
+    assert cap["attempts"] == 2
+    assert cap["solved"] == 1
+
+
+def test_the_cap_is_compared_at_a_MATCHED_solve_count():
+    """Not at the cap with the most solves, which is always the widest one.
+
+    Cap sets are nested, so proofs never fall as the cap rises: "the cap that
+    buys the most" is a tautology for "the largest cap", and pricing the model
+    against the most expensive rule available flatters its node ratio for free.
+    The question is what a cap costs to buy what the model bought.
+    """
+
+    from .validate_cost_trigger import matched_cap
+
+    # Three cheap positions and one ruinous one, all solvable inside budget.
+    rows = [_row(c, 0, 1_000) for c in (2, 3, 4)] + [_row(9, 0, 900_000)]
+    frontier = cap_frontier(rows, budget=10**6)
+    widest = frontier[-1]
+    assert widest["solved"] == 4, "the widest cap buys everything, as always"
+
+    # Buying three proofs does not need the position that costs 900x as much.
+    matched = matched_cap(rows, budget=10**6, solved=3)
+    assert matched["cap"] == 4
+    assert matched["nodes"] < widest["nodes"] / 100
+
+
+def test_a_proof_count_no_cap_can_reach_reports_no_match():
+    """The honest answer when the model bought something a cap cannot."""
+
+    from .validate_cost_trigger import matched_cap
+
+    rows = [_row(3, 0, 100)]
+    assert matched_cap(rows, budget=10**6, solved=99) is None
 
 
 def test_prediction_is_the_dot_product_of_the_design_row():
@@ -268,3 +304,61 @@ def test_the_trigger_crosses_card_boundaries():
 
     assert should_attempt(cheap_eleven, budget)
     assert not should_attempt(dear_eight, budget)
+
+
+def test_a_written_model_loads_back_as_the_model_that_was_written(tmp_path):
+    """The shipped file must be a fit's output, not a transcription of one.
+
+    Nothing downstream can catch a typo in it: `test_cost_model_parity` compares
+    Python against Rust and both read this same file, so a coefficient that
+    disagrees with the fit it claims to come from is invisible to every test in
+    the suite. Round-tripping is what makes the file's provenance mechanical.
+    """
+
+    from .validate_cost_trigger import RUST_FEATURES, load_cost_model, write_cost_model
+
+    coefficients = [0.5] + [round(0.01 * i, 4) for i in range(len(RUST_FEATURES))]
+    path = tmp_path / "model.json"
+    write_cost_model(path, coefficients, RUST_FEATURES, 0.35, {"corpus": "synthetic"})
+
+    loaded, features, margin = load_cost_model(path)
+    assert features == RUST_FEATURES
+    assert loaded == pytest.approx(coefficients)
+    assert margin == pytest.approx(0.35)
+
+
+def test_writing_a_model_over_the_wrong_feature_set_is_refused():
+    """Rust applies the weights POSITIONALLY over its own twenty.
+
+    A 22-column fit written to this file would be refused by Rust at install
+    time -- but only after a run had been configured to use it. Refusing at the
+    point of writing puts the error where the mistake is.
+    """
+
+    from .validate_cost_trigger import TRIGGER_FEATURES, write_cost_model
+
+    with pytest.raises(ValueError, match="Rust trigger computes"):
+        write_cost_model(
+            Path("unused.json"),
+            [0.0] * (len(TRIGGER_FEATURES) + 1),
+            TRIGGER_FEATURES,
+            0.4,
+            {},
+        )
+
+
+def test_the_holdout_refuses_rows_it_cannot_split_by_game():
+    """Rather than silently fitting nothing.
+
+    With no `game` key the split produced an empty training set, `fit` solved a
+    system that was all zeros apart from the ridge -- which passes the
+    singularity check -- and returned an all-zero model. That model predicts 0
+    decades everywhere, i.e. "solve every position", and nothing said so.
+    """
+
+    from .validate_cost_trigger import report_fit
+
+    rows = [_row(3, 0, 1000) for _ in range(4)]
+    assert "game" not in rows[0]
+    with pytest.raises(ValueError, match="no 'game' key"):
+        report_fit(rows, FEATURES, 0.5)

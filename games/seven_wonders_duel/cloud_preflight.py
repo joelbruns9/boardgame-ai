@@ -163,7 +163,13 @@ class DiskSizing:
         }
 
 
-def parameter_count(d_model: int, layers: int, heads: int) -> int:
+def parameter_count(
+    d_model: int,
+    layers: int,
+    heads: int,
+    pooled_readout: bool = False,
+    reply_head: bool = False,
+) -> int:
     """Parameters of the model this run will build.
 
     Counted rather than assumed: W0 lost a run to a checkpoint whose width was
@@ -172,7 +178,14 @@ def parameter_count(d_model: int, layers: int, heads: int) -> int:
 
     from .train import build_model
 
-    model = build_model("transformer", d_model, layers, heads)
+    # The architecture switches are part of the size. `--pooled-readout` adds a
+    # 3d x d projection and `--reply-head` another head; leaving them out here
+    # understates every disk and memory figure this module exists to produce,
+    # which is the same class of miss as the six checkpoint rebuild sites --
+    # a value crossing a boundary and silently defaulting.
+    model = build_model(
+        "transformer", d_model, layers, heads, pooled_readout, reply_head
+    )
     return sum(parameter.numel() for parameter in model.parameters())
 
 
@@ -519,7 +532,15 @@ def evaluate(
     planned_iterations = int(getattr(args, "iterations", 0) or 0)
     parameters = int(getattr(args, "parameters", 0) or 0)
     if not parameters and planned_iterations > 0:
-        parameters = parameter_count(args.d_model, args.layers, args.heads)
+        parameters = parameter_count(
+            args.d_model,
+            args.layers,
+            args.heads,
+            # Read off the run's own flags: a preflight that sizes a different
+            # architecture than the run builds is worse than no preflight.
+            bool(getattr(args, "pooled_readout", False)),
+            bool(getattr(args, "reply_head", False)),
+        )
     disk_sizing_result = disk_sizing(
         iterations=planned_iterations,
         games_per_iteration=getattr(args, "games_per_iteration", 0),

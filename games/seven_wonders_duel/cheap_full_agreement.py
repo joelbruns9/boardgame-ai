@@ -95,7 +95,6 @@ def probe_game(
     cheap: SearchConfig,
     full: SearchConfig,
     full_fraction: float,
-    low_prior_rank: float,
     solver_nodes: int,
     solver_secs: float,
     solver_max_cards: int,
@@ -128,6 +127,15 @@ def probe_game(
             result = cheap_result
             # The full search here is the counterfactual: recorded, compared, and
             # thrown away. Playing it would turn every move into a full move.
+            #
+            # ADJACENT seed, not the same one. The two searches therefore differ
+            # in their noise as well as in their depth, so some disagreement is
+            # sampling rather than mechanism and the rate is an OVER-estimate.
+            # That is the safe direction for the decision this feeds -- a low
+            # disagreement rate rules the concern out, a high one only fails to
+            # rule it out -- but do not read the rate as an effect size. Common
+            # random numbers (the same seed) would isolate depth, at the cost of
+            # making cheap a strict prefix of full at Gumbel roots.
             full_result = GumbelMCTS(
                 evaluator, dataclasses.replace(full, seed=move_seed + 1)
             ).search(game)
@@ -161,14 +169,25 @@ def probe_game(
                 # `exact_per_action` is a FLAG saying every action was priced on
                 # a full window; `per_action_value` holds the values. Reading the
                 # flag as the values is silent -- it is truthy -- so the guard
-                # checks the flag and the lookup uses the map.
-                if answer is not None and answer.get("exact_per_action"):
+                # checks the flag and the lookup uses the map. A declined solve
+                # carries the flag as False, so this also covers the refusal.
+                if answer.get("exact_per_action"):
                     per_action = {
                         int(k): float(v) for k, v in answer["per_action_value"].items()
                     }
                     best = max(per_action.values())
-                    row["cheap_loses"] = per_action.get(cheap_action, best) < best - 1e-9
-                    row["full_loses"] = per_action.get(full_action, best) < best - 1e-9
+                    # An action missing from an exact pricing is a contract
+                    # violation, not a move that happens to be fine. Defaulting
+                    # it to `best` records "not losing", which is the answer
+                    # that hides the problem.
+                    for name, action in (("cheap", cheap_action), ("full", full_action)):
+                        if action not in per_action:
+                            raise AssertionError(
+                                f"exact solve did not price the {name} action "
+                                f"{action}; per_action has {sorted(per_action)}"
+                            )
+                    row["cheap_loses"] = per_action[cheap_action] < best - 1e-9
+                    row["full_loses"] = per_action[full_action] < best - 1e-9
             rows.append(row)
 
         played = max(result.policy_target, key=result.policy_target.get)
@@ -252,7 +271,6 @@ def main(argv: list[str] | None = None) -> int:
                 cheap=cheap,
                 full=full,
                 full_fraction=args.full_search_fraction,
-                low_prior_rank=args.low_prior_rank,
                 solver_nodes=args.solver_nodes,
                 solver_secs=args.solver_secs,
                 solver_max_cards=args.solver_max_cards,

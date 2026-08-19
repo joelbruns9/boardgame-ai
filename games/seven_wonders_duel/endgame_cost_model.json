@@ -5,7 +5,8 @@
     "positions": 1955,
     "games": 220,
     "censored_fraction": 0.0752,
-    "method": "Tobit EM (fit_censored), right-censored at the 40M study budget"
+    "method": "Tobit EM (fit_censored), right-censored at the 40M study budget",
+    "stale_reason": "Fit BEFORE the 2026-08-19 `_unbuilt` fix. `chance_wonders`, `revive_wonders` and `discard_x_revive` counted RETIRED wonders as unbuilt on the Python side, so these coefficients were estimated against a feature that conflated 'this wonder still adds a branch' with 'this wonder is out of the game'. 24% of cloud6 Age III endgames are affected, and chance_wonders carries +0.43. The trigger is now self-consistent (Python and Rust compute the same thing) but the weights belong to the old definition. Refit before the retrain: python -m games.seven_wonders_duel.endgame_trigger_study --from-buffer <cloud6 buffers> --out cloud_endgames.json, then python -m games.seven_wonders_duel.validate_cost_trigger --fit-on cloud_endgames.json --write-model"
   },
   "margin_decades": 0.4,
   "features": [

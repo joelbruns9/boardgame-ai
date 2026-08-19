@@ -249,10 +249,19 @@ def reply_targets(moves, legal_by_move: dict) -> dict:
     supervise a position against a reply two plies downstream and every shape
     check would still pass.
 
-    Three skips, each for its own reason:
+    Four skips, each for its own reason:
 
-    * the next move carries no usable policy (a bot move, or a cheap search
-      whose target is not recorded) — there is nothing to predict;
+    * the next move carries no policy at all — a curriculum bot's move records
+      none, so there is nothing to predict;
+    * the next move is `policy_excluded`. That covers BOTH a cheap search, whose
+      16–24-sim top-k-pruned target is the low-quality label the main policy
+      head exists to exclude, and a move played by an ARCHIVED net, whose policy
+      belongs to an older, weaker opponent. A record carries `policy_target` for
+      every searched move regardless of exclusion, so testing for the target's
+      presence — as this did — lets both straight through; only the flag
+      separates them. Supervising the reply head on labels the policy head
+      refuses would put exactly the noise the exclusion exists to keep out back
+      into the trunk;
     * the next move has the SAME actor, which an extra-turn wonder causes. That
       is "what do I do next", a different question, and blending the two teaches
       neither. The tempo primitives in the encoder already carry the extra-turn
@@ -270,6 +279,10 @@ def reply_targets(moves, legal_by_move: dict) -> dict:
         if following.actor == current.actor:
             continue
         if not following.policy_target or following.sims == 0:
+            continue
+        # The flag, not the target's presence: a record carries `policy_target`
+        # for every searched move including the excluded ones.
+        if getattr(following, "policy_excluded", False):
             continue
         legal = legal_by_move.get(following.i)
         if legal is None or len(legal) == 0:

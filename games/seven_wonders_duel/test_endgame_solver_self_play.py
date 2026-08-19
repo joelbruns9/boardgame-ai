@@ -137,7 +137,10 @@ def test_a_masked_target_is_supported_exactly_on_the_proven_optimal_set():
             answer = rust_game_from_state(positions[index]).solve_endgame(
                 SOLVER_MAX_NODES, 60.0, "exact", "star1"
             )
-            assert answer is not None, f"move {index} no longer solves"
+            assert answer["regime"] is not None, (
+                f"move {index} no longer solves: stop={answer['stop']!r} after "
+                f"{answer['nodes']} nodes"
+            )
             values = {int(k): float(v) for k, v in answer["per_action_value"].items()}
             best = max(values.values())
             optimal = {a for a, value in values.items() if value >= best - 1e-9}
@@ -260,7 +263,11 @@ def test_a_declined_solve_records_what_it_cost_and_why():
     for move in declined:
         assert move["solver_regime"] is None
         assert move["solver_masked"] is False
-        assert move["solver_stop"] in {"budget", "unsolvable"}
+        # "nodes", never "deadline": a one-node budget is exhausted long before
+        # any clock, and the two must not be interchangeable. A "deadline" here
+        # would mean the run's declines depend on machine load rather than on
+        # the positions, which is the property the split exists to expose.
+        assert move["solver_stop"] in {"nodes", "unsolvable"}
     # The cost is visible rather than reported as zero work, which is the whole
     # point: these nodes were spent synchronously inside a scheduler slot.
     assert any(move["solver_nodes"] > 0 for move in declined)
@@ -487,3 +494,58 @@ def test_a_gate_shaped_call_cannot_inherit_the_solver():
     assert not any(
         move["solver_masked"] for record in records for move in record["moves"]
     )
+
+
+def test_a_stale_cost_model_is_announced_at_launch(tmp_path, capsys):
+    """A model fit against an older FEATURE DEFINITION still loads cleanly.
+
+    It passes the name check, applies its weights positionally without
+    complaint, and produces plausible predictions -- it is simply pricing a
+    variable that no longer means what it meant when the weights were fit. The
+    only moment anyone looks at the file is when a run installs it, so that is
+    where it has to say so.
+    """
+
+    import json
+
+    from .phase_d import configure_endgame_cost_model
+    from .validate_cost_trigger import COST_MODEL_PATH
+
+    payload = json.loads(COST_MODEL_PATH.read_text(encoding="utf-8"))
+    payload["fit"]["stale_reason"] = "refit me before spending money"
+    path = tmp_path / "stale.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    try:
+        applied = configure_endgame_cost_model(path)
+    finally:
+        import seven_wonders_rust as swr
+
+        swr.set_endgame_cost_model([], 0.0, [], 0.0)
+
+    assert applied["stale_reason"] == "refit me before spending money"
+    assert "refit me before spending money" in capsys.readouterr().out
+
+
+def test_a_current_cost_model_says_nothing(tmp_path, capsys):
+    """Otherwise the warning becomes noise and stops being read."""
+
+    import json
+
+    from .phase_d import configure_endgame_cost_model
+    from .validate_cost_trigger import COST_MODEL_PATH
+
+    payload = json.loads(COST_MODEL_PATH.read_text(encoding="utf-8"))
+    payload["fit"].pop("stale_reason", None)
+    path = tmp_path / "current.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    try:
+        applied = configure_endgame_cost_model(path)
+    finally:
+        import seven_wonders_rust as swr
+
+        swr.set_endgame_cost_model([], 0.0, [], 0.0)
+
+    assert applied["stale_reason"] is None
+    assert "stale" not in capsys.readouterr().out.lower()

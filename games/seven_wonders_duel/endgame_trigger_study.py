@@ -55,7 +55,7 @@ import math
 import time
 from pathlib import Path
 
-from .buffer import ReplayMismatchError, read_records, replay
+from .buffer import FinalDigestMismatchError, read_records, replay
 from .codec import legal_action_indices
 from .data import WONDERS_BY_NAME, back_type_of
 from .encoder import _Derived
@@ -83,11 +83,31 @@ _REVIVE_WONDERS = ("The Mausoleum",)
 
 
 def _unbuilt(game, names) -> int:
+    """How many of `names` can still be BUILT, per city.
+
+    Retired wonders are excluded, and that exclusion is the whole point. When
+    the seventh wonder is constructed the last unbuilt one is retired
+    (`engine._construct_wonder`) but stays in `city.wonders`, so a membership
+    test alone counts a wonder that can never be built again. For these two
+    names that is not a cosmetic error: they are here because they add a
+    BRANCH -- the Great Library draws from the progress pool, the Mausoleum
+    revives from the discard -- and a retired one adds none.
+
+    This shipped disagreeing with `seven_wonders_rust::cost_model::unbuilt_named`,
+    which had the retired check. Measured on cloud6 endgames (the distribution
+    the model is fit on), 24% of Age III positions have a retired-but-unbuilt
+    Great Library or Mausoleum, and `chance_wonders` carries +0.43 -- more than
+    the trigger's whole 0.4-decade margin. The parity test never saw it because
+    its bot games retire no wonders at all (measured: 0 of 146 positions).
+    """
+
     return sum(
         1
         for city in game.cities
         for wonder in city.wonders
-        if wonder in names and wonder not in city.built_wonders
+        if wonder in names
+        and wonder not in city.built_wonders
+        and wonder not in game.retired_wonders
     )
 
 
@@ -133,6 +153,14 @@ def position_features(game) -> dict:
         "legal": len(legal_action_indices(game)),
         # Why human and strong-net positions cost ~3x a rush bot's at equal card
         # count: the options a weak player has already spent.
+        #
+        # Deliberately does NOT exclude retired wonders, unlike `_unbuilt`
+        # below. This is a proxy for how much of the game is still undecided,
+        # and a retirement means seven wonders are already up -- which is the
+        # late, narrow board it is trying to detect. `chance_wonders` and
+        # `revive_wonders` ask a different question (does this wonder still add
+        # a branch?), where a retired one answers no. Both definitions match
+        # `seven_wonders_rust::cost_model`; keep them matching.
         "unbuilt_wonders": unbuilt_wonders,
         "chance_wonders": _unbuilt(game, _CHANCE_WONDERS),
         "revive_wonders": _unbuilt(game, _REVIVE_WONDERS),
@@ -356,8 +384,8 @@ def price_records(
 
         try:
             replay(record, on_state=capture)
-        except ReplayMismatchError as error:
-            if not (allow_final_digest_drift and "final digest" in str(error)):
+        except FinalDigestMismatchError:
+            if not allow_final_digest_drift:
                 raise
         total_moves = len(record.moves)
         for move_index, game in positions:
@@ -367,19 +395,25 @@ def price_records(
                 study_nodes, study_secs, "exact", "star1"
             )
             elapsed = time.perf_counter() - started
+            # `solve_endgame` always answers; `regime is None` means it declined
+            # and `stop` says why. `nodes` is what the attempt cost either way,
+            # which is the difference between a floor the analysis can use and a
+            # number it has to invent: a solve cut off by the CLOCK may have
+            # spent a twentieth of the node budget, and flooring it at the
+            # budget (as this file used to force `study_rows` to do) turns the
+            # cheapest observation in the corpus into the most expensive.
+            declined = answer["regime"] is None
             rows.append(
                 {
                     "game": record_index,
                     "move": move_index,
                     "moves_from_end": total_moves - move_index - 1,
                     **features,
-                    # None when the study budget itself was not enough: the
-                    # observation is right-censored at `study_nodes`, not
-                    # missing, and the analysis must not treat it as either
-                    # cheap or absent.
-                    "nodes": None if answer is None else int(answer["nodes"]),
-                    "censored": answer is None,
-                    "regime": None if answer is None else answer["regime"],
+                    "nodes": int(answer["nodes"]),
+                    "censored": declined,
+                    # "nodes" | "deadline" | "unsolvable", or None when solved.
+                    "stop": answer["stop"],
+                    "regime": answer["regime"],
                     "seconds": elapsed,
                     # Is an EXPENSIVE position a more VALUABLE one? The intuition
                     # says yes -- a close game with many live options is both
@@ -388,10 +422,10 @@ def price_records(
                     # trigger is wrong: deep solves would be worth more each, so
                     # the optimum cap sits deeper than counting solves equally
                     # suggests. Recorded so that is measured rather than assumed.
-                    "root_value": None if answer is None else float(answer["root_value"]),
+                    "root_value": None if declined else float(answer["root_value"]),
                     "optimal": (
                         None
-                        if answer is None
+                        if declined
                         else sum(
                             1
                             for v in answer["per_action_value"].values()
@@ -612,7 +646,10 @@ def measure_node_rate(samples: int = 8) -> float:
                         40_000_000, 60.0, "exact", "star1"
                     )
                     elapsed = time.perf_counter() - started
-                    if answer and answer["nodes"] > 500_000 and elapsed > 0:
+                    # A DECLINED solve still measures the box's rate -- it
+                    # visited real nodes for real time -- so it counts here,
+                    # unlike everywhere else where a decline carries no value.
+                    if answer["nodes"] > 500_000 and elapsed > 0:
                         rates.append(answer["nodes"] / elapsed)
                     break
             actor = (
@@ -692,7 +729,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-base", type=int, default=20260816)
     parser.add_argument("--max-cards", type=int, default=DEFAULT_MAX_CARDS)
     parser.add_argument("--study-nodes", type=int, default=50_000_000)
-    parser.add_argument("--study-secs", type=float, default=120.0)
+    parser.add_argument(
+        "--study-secs",
+        type=float,
+        default=1200.0,
+        help="wall-clock ceiling per solve. This must stay SLACK against "
+        "--study-nodes or the study measures the box instead of the positions: "
+        "a clock-censored row's node count is not a floor on the position's "
+        "cost, and which positions got a proof becomes a function of machine "
+        "load. At ~1.2M nodes/s a 50M-node budget needs ~40s, so the default is "
+        "a safety net rather than a limit. `--report` prints the decline "
+        "breakdown; any 'deadline' entry means this was binding.",
+    )
     parser.add_argument("--full-sims", type=int, nargs=2, default=[64, 128])
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--slots", type=int, default=16)

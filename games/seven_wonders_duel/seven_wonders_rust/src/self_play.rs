@@ -517,10 +517,19 @@ pub fn forced_playout_k() -> f64 {
     f64::from_bits(FORCED_PLAYOUT_K_BITS.load(Ordering::Relaxed))
 }
 
-/// Background solver threads; 0 (the default) solves inline on the scheduler
-/// thread. Process-wide like the solver's other parameters -- and safe as one
-/// for the same reason, since `SelfPlayConfig::solve_endgames` is what actually
-/// grants permission to solve, and a gate never sets it.
+/// Background solver threads **per scheduler shard**; 0 (the default) solves
+/// inline on the scheduler thread.
+///
+/// Per shard, not in total: `run_many_pipelined` builds one `SolverPool` each,
+/// so N here with S shards is N x S CPU-bound threads. `phase_d`'s
+/// `configure_solver_threads` prints the product and warns when it exceeds the
+/// core count, because oversubscription slows each solve in WALL time and
+/// pushes it toward the deadline -- and a deadline decline is the one that
+/// makes the buffer depend on machine load.
+///
+/// Process-wide like the solver's other parameters -- and safe as one for the
+/// same reason, since `SelfPlayConfig::solve_endgames` is what actually grants
+/// permission to solve, and a gate never sets it.
 static SOLVER_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_solver_threads(threads: usize) {
@@ -593,8 +602,15 @@ pub struct SolverOverlay {
     /// while an expectimax scalar is `P(win) - P(loss)` and does not determine
     /// one -- see `dataset.solver_value_distribution`. `None` when declined.
     pub regime: Option<&'static str>,
-    /// `"unsolvable"` (a sample-only Age deal: no budget would help) or
-    /// `"budget"` (nodes or deadline). `None` when the solve succeeded.
+    /// `"unsolvable"` (a sample-only Age deal: no budget would help),
+    /// `"nodes"` (the node budget ran out) or `"deadline"` (the wall clock did).
+    /// `None` when the solve succeeded.
+    ///
+    /// The last two are kept apart because only one of them reproduces. A
+    /// node-capped decline is a property of the position; a deadline decline is
+    /// a property of how busy the box was, so a run containing them did not
+    /// produce a buffer that is a function of its seeds. `phase_d` reports the
+    /// counts per iteration for exactly that reason.
     pub stop: Option<&'static str>,
     pub nodes: u64,
     /// Whether the policy target in this record was masked and renormalised.
@@ -615,6 +631,16 @@ pub struct SolverOverlay {
 
 fn cards_left(state: &GameState) -> usize {
     state.tableau.slots.iter().filter(|card| card.present).count()
+}
+
+/// The buffer's vocabulary for a refusal. One place, because Python matches on
+/// these strings and a second copy would drift from the enum.
+pub fn solve_stop_name(stop: crate::solver::SolveStop) -> &'static str {
+    match stop {
+        crate::solver::SolveStop::Unsolvable => "unsolvable",
+        crate::solver::SolveStop::Nodes => "nodes",
+        crate::solver::SolveStop::Deadline => "deadline",
+    }
 }
 
 /// Would the solver take this position at all? The same predicate
@@ -714,22 +740,20 @@ pub fn endgame_overlay(
     } else {
         crate::solver::PolicyMode::ValueOnly
     };
-    let (outcome, nodes) = crate::solver::solve_root_counted(
+    let (outcome, cost) = crate::solver::solve_root_counted(
         state,
         &limits,
         mode,
         crate::solver::ChancePruning::Star1,
     );
+    let nodes = cost.nodes;
     let solved = match outcome {
         Ok(solved) => solved,
         Err(stop) => {
             return Some(SolverOverlay {
                 value: None,
                 regime: None,
-                stop: Some(match stop {
-                    crate::solver::SolveStop::Unsolvable => "unsolvable",
-                    crate::solver::SolveStop::Budget => "budget",
-                }),
+                stop: Some(solve_stop_name(stop)),
                 nodes,
                 masked: false,
                 keep: None,
@@ -2749,6 +2773,13 @@ pub fn run_many_pipelined(
                 }
                 // A resumed slot may now have work, so re-collect before
                 // deciding to block again.
+                //
+                // The solver is passed BACK IN (reborrowed) rather than left as
+                // `None`. With `None`, a slot that finished its search here took
+                // `finish_move`'s inline branch and ran a multi-second solve on
+                // the scheduler thread -- the exact stall this pool exists to
+                // remove, in the one branch that only runs when the scheduler is
+                // already blocked, which is when solves are densest.
                 let mut more = Vec::new();
                 if let Err(err) = collect_ready_groups(
                     &mut pool,
@@ -2756,7 +2787,7 @@ pub fn run_many_pipelined(
                     &mut pending,
                     global_batch_cap,
                     &mut more,
-                    None,
+                    Some(&mut *active_solver),
                 ) {
                     pool.abort(&budget);
                     return Err(err);

@@ -310,7 +310,10 @@ def rust_solver(
         answer = rust_game.solve_endgame(
             max_nodes, max_secs, policy_mode, chance_pruning
         )
-        if answer is None:
+        # `solve_endgame` always returns a dict now; a decline is `regime: None`
+        # with the cost and the reason filled in. Testing truthiness here would
+        # silently accept a refusal as an answer.
+        if answer["regime"] is None:
             return None
         return {
             "regime": answer["regime"],

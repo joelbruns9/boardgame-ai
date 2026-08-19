@@ -406,9 +406,30 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
     had enumerated by hand the config keys it happened to know about. Adding a
     switch now means adding it here, once.
 
-    `fallbacks` supplies `d_model` / `layers` for configs that omit them.
+    `fallbacks` supplies `d_model` / `layers` for configs that omit them. A
+    config with neither is refused by name rather than dying in `int(None)`,
+    which reads as a bug in this helper rather than as a checkpoint that does
+    not describe its own width.
     """
 
+    missing = [
+        key
+        for key in ("d_model", "layers")
+        if config.get(key, fallbacks.get(key)) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"checkpoint config has no {', '.join(missing)} and no fallback was "
+            "supplied; the model cannot be rebuilt from it"
+        )
+    # Named explicitly rather than left to `int(None)`, whose TypeError names
+    # neither the field nor the checkpoint.
+    for field in ("d_model", "layers"):
+        if config.get(field, fallbacks.get(field)) is None:
+            raise ValueError(
+                f"checkpoint config has no {field!r} and no fallback was given; "
+                "cannot rebuild the model"
+            )
     return build_model(
         name,
         int(config.get("d_model", fallbacks.get("d_model"))),

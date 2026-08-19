@@ -9,6 +9,15 @@ tests because nothing compared the two directly.
 
 Parity is checked on real Age III positions from played games, not constructed
 ones, so the comparison covers the boards the trigger will actually meet.
+
+**Two corpora, and the second is the one that earns its keep.** Bot games are
+cheap and reproducible but they are not the distribution the coefficients were
+fit on, and the difference is not academic: `chance_wonders` diverged for weeks
+because Python counted a RETIRED Great Library as unbuilt and Rust did not, and
+bot games retire no wonders at all (measured: 0 of 146 positions), so no number
+of them could have caught it. The committed proven-endgame benchmark is drawn
+from the same cloud6 buffers the model was fit on, where 68% of positions have
+a retired wonder -- so parity is checked there too.
 """
 
 from __future__ import annotations
@@ -58,22 +67,74 @@ def test_the_feature_order_is_shared_not_assumed():
     assert tuple(swr.endgame_cost_model_features()) == RUST_FEATURES
 
 
-def test_every_feature_matches_python_on_real_positions():
-    positions = list(_age_three_positions())
-    assert len(positions) > 100, "not enough Age III positions to be meaningful"
-
-    mismatches: dict[str, int] = {}
+def _mismatches(positions) -> dict[str, int]:
+    counts: dict[str, int] = {}
     for game in positions:
         expected = position_features(game)
         actual = swr.endgame_cost_features(rust_game_from_state(game))
         for name, value in zip(RUST_FEATURES, actual):
             if not math.isclose(value, float(expected[name]), rel_tol=1e-9, abs_tol=1e-9):
-                mismatches[name] = mismatches.get(name, 0) + 1
+                counts[name] = counts.get(name, 0) + 1
+    return counts
 
+
+def test_every_feature_matches_python_on_real_positions():
+    positions = list(_age_three_positions())
+    assert len(positions) > 100, "not enough Age III positions to be meaningful"
+
+    mismatches = _mismatches(positions)
     assert not mismatches, (
         f"Rust and Python disagree on {len(positions)} positions: {mismatches}. "
         "The fitted coefficients belong to Python's definitions, so a mismatch "
         "prices positions with the wrong weights."
+    )
+
+
+def _fit_distribution_positions(limit: int = 120):
+    """Age III positions from the corpus the coefficients were fit on.
+
+    Bot games are the wrong distribution for this check in a specific,
+    demonstrated way -- they never build a seventh wonder, so no retirement
+    ever happens in them and any feature whose definition turns on
+    `retired_wonders` is untested. These positions come from cloud6 self-play.
+    """
+
+    from .proven_benchmark import load_benchmark, rebuild_position
+
+    for row in load_benchmark()[:limit]:
+        yield rebuild_position(row)[0]
+
+
+def test_every_feature_matches_python_on_the_fit_distribution():
+    """The check the bot corpus cannot make.
+
+    `chance_wonders` (+0.43, the second-largest weight) disagreed here for weeks
+    while every bot-game parity assertion passed.
+    """
+
+    positions = list(_fit_distribution_positions())
+    assert len(positions) > 50, "benchmark corpus too small to be meaningful"
+
+    mismatches = _mismatches(positions)
+    assert not mismatches, (
+        f"Rust and Python disagree on {len(positions)} strong-play positions: "
+        f"{mismatches}. These are the positions the coefficients were fit on."
+    )
+
+
+def test_the_fit_distribution_actually_exercises_retirement():
+    """Otherwise the test above is just a second bot corpus.
+
+    A corpus that happens to contain no retired wonder would pass the parity
+    assertion while testing nothing about the definition that broke.
+    """
+
+    retired = sum(
+        1 for game in _fit_distribution_positions() if game.retired_wonders
+    )
+    assert retired > 10, (
+        f"only {retired} positions have a retired wonder; this corpus cannot "
+        "cover the features whose definition depends on retirement"
     )
 
 

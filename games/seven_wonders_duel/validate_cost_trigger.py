@@ -24,12 +24,21 @@ What this does and does not answer:
   share a position and a proof, so a row-wise split leaks the answer across it
   and would flatter any model.
 
-* **Censoring is respected.** The shakedown ran with a binding 3-second wall
-  clock (see PRE_RETRAIN_PLAN.md section 7), so declined solves stopped at an
-  arbitrary, machine-load-dependent node count. Their true cost is unknown and
-  only bounded below. They are scored as right-censored -- a prediction above
-  the observed floor is not an error -- and never used to fit or to compute
-  R^2, which would otherwise learn how busy the GPU was.
+* **Censoring is respected, and its REASON is respected too.** A solve that
+  exhausted its node budget is a right-censored observation of the position's
+  cost: a prediction above the floor is not an error, and `fit_censored` uses
+  it. A solve the WALL CLOCK cut off is not an observation of the position at
+  all -- a quieter box would have answered it -- so it is dropped and counted,
+  never imputed. The shakedown ran with a binding 3-second clock (see
+  PRE_RETRAIN_PLAN.md section 7) and the two were indistinguishable until
+  `solve_endgame` began reporting which one fired.
+
+* **The shipped model comes out of this file.** `--fit-on ... --write-model`
+  fits `RUST_FEATURES` -- exactly the columns the Rust trigger can compute --
+  and writes `endgame_cost_model.json`. That is deliberate history: the plan's
+  "held-out R^2 0.904" came from an ad-hoc fit that was never persisted and
+  cannot be rerun, and the first shipped coefficients were transcribed by hand,
+  which nothing downstream could have checked.
 """
 
 from __future__ import annotations
@@ -93,8 +102,10 @@ def solved_positions(records: list[GameRecord]) -> Iterator[dict[str, Any]]:
                 return
             row = position_features(game)
             row["nodes"] = attempt.solver_nodes
-            # `solver_stop` is None exactly when the solve completed; a stop of
-            # "budget" is a floor on cost, not a measurement of it.
+            # `solver_stop` is None exactly when the solve completed. A stop of
+            # "nodes" makes `nodes` a FLOOR on cost rather than a measurement of
+            # it; a stop of "deadline" makes it neither, since the clock, not
+            # the position, decided when to give up.
             row["censored"] = attempt.solver_stop is not None
             row["stop"] = attempt.solver_stop
             row["regime"] = attempt.solver_regime
@@ -243,7 +254,11 @@ def score(
 
 
 def compare_triggers(
-    rows: list[dict], coefficients: list[float], features: tuple[str, ...], budget: int
+    rows: list[dict],
+    coefficients: list[float],
+    features: tuple[str, ...],
+    budget: int,
+    margin_decades: float | None = None,
 ) -> dict[str, Any]:
     """Card cap versus predicted cost, priced on the same positions.
 
@@ -251,39 +266,47 @@ def compare_triggers(
     have *bought*, where buying means a solve that completes inside `budget`.
     Censored rows count as unbought at their observed floor, which is the
     charitable reading for the card cap: their true cost is higher still.
+
+    The cap is chosen at a MATCHED SOLVE COUNT -- the cheapest cap that buys at
+    least as many proofs as the model does. Picking the cap with the most solves
+    instead (as this did) always returns the LARGEST cap, because cap sets are
+    nested and proofs never fall as the cap rises; comparing against the most
+    expensive rule available flatters the model's node ratio for free.
+
+    `margin_decades` defaults to the SHIPPED margin rather than a constant kept
+    here, so this scores the trigger that will actually run.
     """
+
+    if margin_decades is None:
+        margin_decades = load_cost_model()[2]
 
     def outcome(row: dict) -> tuple[int, bool]:
         cost = max(1, row["nodes"])
         return cost, (not row["censored"]) and cost <= budget
 
-    results: dict[str, Any] = {"budget": budget}
-    caps = sorted({int(row["cards_left"]) for row in rows})
-    best_cap = None
-    for cap in caps:
-        chosen = [row for row in rows if row["cards_left"] <= cap]
-        spent = sum(outcome(row)[0] for row in chosen)
-        bought = sum(1 for row in chosen if outcome(row)[1])
-        entry = {"cap": cap, "attempts": len(chosen), "solved": bought, "nodes": spent}
-        if best_cap is None or bought > best_cap["solved"]:
-            best_cap = entry
-    margin = math.log10(3.3)  # the study's ~0.51-decade residual
+    results: dict[str, Any] = {"budget": budget, "margin_decades": margin_decades}
     chosen = [
         row
         for row in rows
-        if predict(coefficients, row, features) + margin <= math.log10(budget)
+        if predict(coefficients, row, features) + margin_decades <= math.log10(budget)
     ]
     spent = sum(outcome(row)[0] for row in chosen)
     bought = sum(1 for row in chosen if outcome(row)[1])
-    results["card_cap_best"] = best_cap
     results["cost_predicted"] = {
         "attempts": len(chosen),
         "solved": bought,
         "nodes": spent,
     }
-    if best_cap and best_cap["solved"]:
-        results["solved_ratio"] = bought / best_cap["solved"]
-        results["cost_ratio"] = spent / best_cap["nodes"] if best_cap["nodes"] else None
+    results["cap_frontier"] = cap_frontier(rows, budget)
+    matched = matched_cap(rows, budget, bought)
+    results["card_cap_matched"] = matched
+    if matched:
+        results["solved_ratio"] = bought / matched["solved"] if matched["solved"] else None
+        results["cost_ratio"] = spent / matched["nodes"] if matched["nodes"] else None
+    else:
+        # No cap reaches this proof count at any threshold.
+        results["solved_ratio"] = None
+        results["cost_ratio"] = None
     return results
 
 
@@ -310,34 +333,90 @@ def transfer(
     }
 
 
-def study_rows(path: Path) -> list[dict]:
+def study_rows(path: Path, *, keep_deadline_censored: bool = False) -> list[dict]:
     """Rows from `endgame_trigger_study --out`, normalised to this module's keys.
 
-    The study writes `nodes: None` for a censored position; here `nodes` is
-    always a number and `censored` says whether it is a cost or a floor.
+    `nodes` comes out a number for every row, and `censored` says whether it is
+    a measured cost or a floor.
+
+    Two wrong floors have shipped here, in opposite directions. The first
+    normalised a censored row to ZERO, turning the most expensive positions in
+    the corpus into the cheapest, so every affordability test counted them as
+    free. The second floored them at the STUDY BUDGET -- right for a row that
+    exhausted its node budget, badly wrong for one the wall clock cut off after
+    a fraction of it, which the study could not distinguish because
+    `solve_endgame` returned `None` for both.
+
+    It can now. A row carries the nodes it actually reached plus a `stop`, so:
+
+    * `stop == "nodes"` -- a true right-censored observation. Floor = the nodes
+      reached, which is also the budget.
+    * `stop == "deadline"` -- not an observation of this position's cost at all.
+      The machine ran out of time; a quieter box would have answered. These are
+      DROPPED by default, because imputing them at any floor teaches the model
+      how busy the box was. `keep_deadline_censored` is for auditing how many
+      there were, not for fitting.
+    * `stop == "unsolvable"` -- no budget helps, and the trigger's job is to
+      avoid them for reasons the cost model does not express. Dropped.
+
+    Older files with `nodes: None` fall back to the study budget, which is the
+    best available floor when the reason was not recorded.
     """
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    # A censored row's floor is the budget it exhausted, not zero. Normalising it
-    # to zero (as this did at first) turns the most expensive positions in the
-    # corpus into the cheapest: every "is it affordable" test then counts them as
-    # trivially affordable, and the underprediction check can never flag one.
     budget = int(payload.get("study_nodes", 0))
     rows = []
     for row in payload["rows"]:
         censored = bool(row.get("censored"))
         if row.get("nodes") is None and not censored:
             continue
+        stop = row.get("stop")
+        if censored:
+            if stop == "unsolvable":
+                continue
+            if stop == "deadline" and not keep_deadline_censored:
+                continue
         normalised = dict(row)
-        normalised["nodes"] = budget if row["nodes"] is None else row["nodes"]
+        normalised["nodes"] = budget if row.get("nodes") is None else row["nodes"]
         normalised["censored"] = censored
         rows.append(normalised)
     return rows
 
 
-#: The shipped model, refit with `--fit-on` and rewritten by hand when the
-#: corpus changes. Kept as data rather than constants so the Rust trigger and
+def censoring_report(path: Path) -> dict[str, Any]:
+    """What the study's declines were, by reason.
+
+    Exists so a corpus can be audited before it is fitted on. A run whose
+    declines are mostly `deadline` did not measure the positions it thinks it
+    measured -- which position got a proof depended on machine load -- and the
+    fix is a slacker clock, not a cleverer estimator.
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    stops: dict[str, int] = {}
+    censored = 0
+    for row in payload["rows"]:
+        if not row.get("censored"):
+            continue
+        censored += 1
+        stops[str(row.get("stop"))] = stops.get(str(row.get("stop")), 0) + 1
+    total = len(payload["rows"])
+    return {
+        "rows": total,
+        "censored": censored,
+        "censored_fraction": censored / total if total else 0.0,
+        "by_stop": dict(sorted(stops.items())),
+        "clock_bound": stops.get("deadline", 0) > 0,
+    }
+
+
+#: The shipped model. Kept as data rather than constants so the Rust trigger and
 #: the Python analysis cannot drift apart.
+#:
+#: Written by `--fit-on ... --write-model`, never by hand. Hand-transcribing 21
+#: floats is silent when it goes wrong: `test_cost_model_parity` compares Python
+#: against Rust, and both read THIS FILE, so neither can notice that the file
+#: disagrees with the fit it claims to come from.
 COST_MODEL_PATH = Path(__file__).with_name("endgame_cost_model.json")
 
 
@@ -421,10 +500,20 @@ def trigger_profile(
     }
 
 
-def best_cap(rows: list[dict], budget: int) -> dict[str, Any]:
-    """The best fixed card cap on the same rows, priced the same way."""
+def cap_frontier(rows: list[dict], budget: int) -> list[dict[str, Any]]:
+    """Every fixed card cap, priced the way `trigger_profile` prices the model.
 
-    best = None
+    Returned whole rather than reduced to a winner, because there is no
+    single-number objective here that is not degenerate. Solves-per-node picks
+    the smallest cap (attempting only free positions maximises the ratio);
+    total solves picks the largest (cap sets are nested, so proofs never fall as
+    the cap rises). Both were shipped at different times and both are wrong.
+    The honest comparison is at MATCHED SOLVE COUNTS -- what does each rule
+    spend to buy the same number of proofs -- which needs the frontier, not a
+    winner.
+    """
+
+    frontier = []
     for cap in sorted({int(row["cards_left"]) for row in rows}):
         chosen = [row for row in rows if row["cards_left"] <= cap]
         solved = spent = 0
@@ -435,16 +524,27 @@ def best_cap(rows: list[dict], budget: int) -> dict[str, Any]:
                 spent += cost
             else:
                 spent += budget
-        entry = {
-            "cap": cap,
-            "attempts": len(chosen),
-            "solved": solved,
-            "nodes": spent,
-            "solves_per_mnode": solved / (spent / 1e6) if spent else 0.0,
-        }
-        if best is None or entry["solves_per_mnode"] > best["solves_per_mnode"]:
-            best = entry
-    return best
+        frontier.append(
+            {
+                "cap": cap,
+                "attempts": len(chosen),
+                "solved": solved,
+                "nodes": spent,
+            }
+        )
+    return frontier
+
+
+def matched_cap(rows: list[dict], budget: int, solved: int) -> dict[str, Any] | None:
+    """The cheapest fixed cap that buys at least `solved` proofs.
+
+    This is what a cost-model result is compared against: "the same proofs, for
+    how many nodes?". A cap that cannot reach the count at any threshold returns
+    None, which is itself the answer -- the model bought something no cap can.
+    """
+
+    affordable = [entry for entry in cap_frontier(rows, budget) if entry["solved"] >= solved]
+    return min(affordable, key=lambda entry: entry["nodes"]) if affordable else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -458,8 +558,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--fit-on",
         type=Path,
         help="fit the model on an endgame_trigger_study --out file instead of a "
-        "buffer, and report its coefficients. Use the cloud corpus here: the "
-        "trigger meets endgames a trained net reaches, not a bot.",
+        "buffer, and report its coefficients. Fits RUST_FEATURES (what ships); "
+        "add --write-model to emit endgame_cost_model.json. Use the cloud "
+        "corpus here: the trigger meets endgames a trained net reaches, not a "
+        "bot.",
     )
     parser.add_argument(
         "--transfer-to",
@@ -474,21 +576,73 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="games held out by seed parity; the fit never sees them",
     )
+    parser.add_argument(
+        "--write-model",
+        type=Path,
+        nargs="?",
+        const=COST_MODEL_PATH,
+        help="write the fitted model to this path (default: the shipped "
+        "endgame_cost_model.json). The shipped file must come from here rather "
+        "than from a hand transcription, because nothing downstream can check "
+        "it against the fit it claims to come from.",
+    )
+    parser.add_argument(
+        "--margin",
+        type=float,
+        default=0.4,
+        help="safety margin, in decades, recorded in the written model. Only "
+        "the difference log10(budget) - margin reaches the trigger, so this and "
+        "--budget are one knob there; sweep this at a fixed budget.",
+    )
+    parser.add_argument(
+        "--margin-sweep",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.2],
+        help="margins to profile the fitted model at (section C's sweep "
+        "dimension), reported per card count",
+    )
     return parser
 
 
 def report_fit(rows: list[dict], features: tuple[str, ...], holdout: float) -> dict:
-    """Fit on held-out-by-game rows and report coefficients with their scores."""
+    """Fit on held-out-by-game rows and report coefficients with their scores.
 
-    games = sorted({row.get("game", index) for index, row in enumerate(rows)})
+    The split is BY GAME. Adjacent solved plies in one game share a position and
+    a proof, so a row-wise split leaks the answer across it and flatters any
+    model.
+
+    A missing `game` key is refused rather than defaulted. An earlier version
+    read it with a positional fallback in the key set and a plain `.get()` in
+    the filter, so the two never agreed: `train` came out empty, `fit` solved a
+    system that was all zeros apart from the 1e-8 ridge -- which passes the
+    singularity check -- and returned an all-zero model. That model predicts 0
+    decades for every position, i.e. "solve everything", and nothing about the
+    output said so.
+    """
+
+    missing = sum(1 for row in rows if "game" not in row)
+    if missing:
+        raise ValueError(
+            f"{missing} of {len(rows)} rows have no 'game' key; the holdout "
+            "must split by game, and defaulting it silently produces an "
+            "all-zero model that attempts every position"
+        )
+    games = sorted({row["game"] for row in rows})
     cut = int(len(games) * (1.0 - holdout))
     train_games = set(games[:cut])
-    train = [row for row in rows if row.get("game") in train_games]
-    test = [row for row in rows if row.get("game") not in train_games]
+    train = [row for row in rows if row["game"] in train_games]
+    test = [row for row in rows if row["game"] not in train_games]
+    if not train or not test:
+        raise ValueError(
+            f"holdout {holdout} on {len(games)} games left "
+            f"{len(train)} train / {len(test)} test rows"
+        )
     coefficients = fit_censored(train, features)
     naive = fit([row for row in train if not row["censored"]], features)
     parsimonious = fit_censored(train, PLAN_FEATURES)
     return {
+        "features": list(features),
         "train_rows": len(train),
         "test_rows": len(test),
         "coefficients": dict(zip(("intercept",) + features, coefficients)),
@@ -501,19 +655,106 @@ def report_fit(rows: list[dict], features: tuple[str, ...], holdout: float) -> d
     }
 
 
+def write_cost_model(
+    path: Path,
+    coefficients: list[float],
+    features: tuple[str, ...],
+    margin_decades: float,
+    provenance: dict[str, Any],
+) -> None:
+    """Write `endgame_cost_model.json` from a fit, in the layout Rust expects.
+
+    The feature ORDER in the file is the order Rust applies its weights in, and
+    Rust checks the names against its own list and refuses a mismatch. Writing
+    the file from the same tuple the fit used is what makes that check able to
+    pass for the right reason.
+    """
+
+    if tuple(features) != RUST_FEATURES:
+        raise ValueError(
+            f"refusing to write a model over {len(features)} features; the Rust "
+            f"trigger computes exactly {len(RUST_FEATURES)} "
+            "(validate_cost_trigger.RUST_FEATURES) and applies them positionally"
+        )
+    payload = {
+        "comment": (
+            "log10(nodes) for an exact endgame solve. Attempt iff prediction + "
+            "margin_decades <= log10(node_budget). Features are exactly those "
+            "seven_wonders_rust cost_model computes, in this order. Written by "
+            "validate_cost_trigger --write-model; do not edit by hand."
+        ),
+        "fit": provenance,
+        "margin_decades": margin_decades,
+        "features": list(features),
+        "intercept": coefficients[0],
+        "coefficients": dict(zip(features, coefficients[1:])),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.fit_on:
+        censoring = censoring_report(args.fit_on)
         rows = study_rows(args.fit_on)
+        if not rows:
+            print("no usable rows in this study file")
+            return 1
+        # RUST_FEATURES is the shipped feature set, so it is what gets fit. The
+        # 22-column set is reported alongside to keep answering "do the two
+        # reachability features earn their place" -- it is a comparison, not a
+        # candidate, because Rust cannot compute them at the point of decision.
+        shipped = report_fit(rows, RUST_FEATURES, args.holdout_fraction)
         summary = {
             "source": str(args.fit_on),
             "rows": len(rows),
             "censored_fraction": sum(1 for r in rows if r["censored"]) / len(rows),
-            **report_fit(rows, TRIGGER_FEATURES, args.holdout_fraction),
+            "censoring": censoring,
+            "shipped_features": shipped,
+            "with_reachability_features": report_fit(
+                rows, TRIGGER_FEATURES, args.holdout_fraction
+            ),
         }
+        coefficients = [
+            shipped["coefficients"][name]
+            for name in ("intercept",) + RUST_FEATURES
+        ]
+        summary["margin_sweep"] = [
+            trigger_profile(rows, coefficients, RUST_FEATURES, args.budget, margin)
+            for margin in args.margin_sweep
+        ]
+        if censoring["clock_bound"]:
+            print(
+                f"WARNING: {censoring['by_stop'].get('deadline', 0)} declines were "
+                "the WALL CLOCK, not the node budget. Those rows are dropped, but "
+                "their positions are missing from the corpus in a "
+                "machine-load-dependent way -- re-run the study with a slacker "
+                "--study-secs before trusting this fit."
+            )
         print(json.dumps(summary, indent=2))
         if args.out:
             args.out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        if args.write_model:
+            write_cost_model(
+                args.write_model,
+                coefficients,
+                RUST_FEATURES,
+                args.margin,
+                {
+                    "corpus": str(args.fit_on),
+                    "positions": len(rows),
+                    "games": len({row["game"] for row in rows}),
+                    "censored_fraction": summary["censored_fraction"],
+                    "censoring": censoring,
+                    "holdout_fraction": args.holdout_fraction,
+                    "held_out_r2": shipped["censored_fit"]["r2"],
+                    "method": (
+                        "Tobit EM (fit_censored), right-censored at the study "
+                        "node budget; deadline-censored rows dropped"
+                    ),
+                },
+            )
+            print(f"wrote {args.write_model}")
         return 0
     records = read_records(args.buffer)
     rows = list(solved_positions(records))
@@ -529,22 +770,43 @@ def main(argv: list[str] | None = None) -> int:
     train = [row for row in rows if row["seed"] in train_seeds]
     test = [row for row in rows if row["seed"] not in train_seeds]
 
+    # A deadline decline says nothing about the position -- a quieter box would
+    # have answered it -- so it is neither a cost nor a usable floor. Counted
+    # and dropped, loudly, because a run full of them is a run whose training
+    # data depended on machine load.
+    stops: dict[str, int] = {}
+    for row in rows:
+        if row["censored"]:
+            key = str(row["stop"])
+            stops[key] = stops.get(key, 0) + 1
+    usable = [row for row in rows if row["stop"] not in ("deadline", "unsolvable")]
+    train = [row for row in usable if row["seed"] in train_seeds]
+    test = [row for row in usable if row["seed"] not in train_seeds]
+
     fit_rows = [row for row in train if not row["censored"]]
-    coefficients = fit(fit_rows, TRIGGER_FEATURES)
+    coefficients = fit(fit_rows, RUST_FEATURES)
     summary = {
         "buffer": str(args.buffer),
         "rows": len(rows),
+        "usable_rows": len(usable),
         "games": len(seeds),
         "censored_fraction": sum(1 for row in rows if row["censored"]) / len(rows),
-        "refit_on_shakedown": score(coefficients, test, TRIGGER_FEATURES),
-        "triggers": compare_triggers(test, coefficients, TRIGGER_FEATURES, args.budget),
+        "declines_by_stop": dict(sorted(stops.items())),
+        "refit_on_shakedown": score(coefficients, test, RUST_FEATURES),
+        "triggers": compare_triggers(test, coefficients, RUST_FEATURES, args.budget),
     }
+    if stops.get("deadline"):
+        print(
+            f"WARNING: {stops['deadline']} declines were the WALL CLOCK, not the "
+            "node budget. Which positions got a proof depended on machine load; "
+            "raise --endgame-solver-max-secs until this is zero."
+        )
     if args.transfer_to:
         other = study_rows(args.transfer_to)
         summary["transfer"] = {
             "source": str(args.transfer_to),
             "rows": len(other),
-            **transfer(train, other, TRIGGER_FEATURES),
+            **transfer(train, other, RUST_FEATURES),
         }
     print(json.dumps(summary, indent=2))
     if args.out:

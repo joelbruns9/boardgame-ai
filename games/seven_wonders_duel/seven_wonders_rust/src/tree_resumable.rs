@@ -807,7 +807,19 @@ pub struct SearchMetrics {
     /// `leaf_batch`. Zero when the rule is off.
     pub conflict_cuts: usize,
     pub cached_forced_leaves: usize,
+    /// Forced children the NETWORK answered. Excludes the ones the engine
+    /// already settled -- see `settled_forced_terminals` -- so this stays a
+    /// count of rows that crossed the evaluator boundary.
     pub forced_outcome_rows: usize,
+    /// Forced children answered by the engine instead: a chance outcome that
+    /// turned out to be a finished game. Counted separately because they are
+    /// the ones `settle_terminal_forced` removes from the request, and a
+    /// `forced_outcome_rows` that silently included them would overstate the
+    /// evaluator's load by exactly the rows it never saw.
+    pub settled_forced_terminals: usize,
+    /// Forced rows by chance kind, as PLANNED -- before terminal children are
+    /// settled out. `forced_outcome_rows + settled_forced_terminals` is what
+    /// was actually produced.
     pub forced_rows_by_kind: [usize; 4],
     /// Root edges left holding an APPROXIMATE closed support. Evaluation and
     /// gate runs require exact chance, so they can assert this is zero instead
@@ -889,7 +901,11 @@ pub struct SearchSession {
 /// forced path had no equivalent. Settling here gives the edge exactly what an
 /// evaluated child would have contributed to its probability-weighted Q: one
 /// visit, at the proven terminal value.
-fn settle_terminal_forced(arena: &mut Arena, nodes: Vec<NodeId>) -> Vec<NodeId> {
+fn settle_terminal_forced(
+    arena: &mut Arena,
+    nodes: Vec<NodeId>,
+    settled: &mut usize,
+) -> Vec<NodeId> {
     nodes
         .into_iter()
         .filter(|&node_id| {
@@ -901,6 +917,7 @@ fn settle_terminal_forced(arena: &mut Arena, nodes: Vec<NodeId>) -> Vec<NodeId> 
             node.visits = 1;
             node.value_sum_p0 = value_p0;
             node.cached_evaluation = Some((value_p0, Vec::new()));
+            *settled += 1;
             false
         })
         .collect()
@@ -908,7 +925,8 @@ fn settle_terminal_forced(arena: &mut Arena, nodes: Vec<NodeId>) -> Vec<NodeId> 
 
 impl SearchSession {
     fn new(mut arena: Arena, cfg: &SearchConfig, leaf_batch: usize, forced_nodes: Vec<NodeId>) -> Self {
-        let forced_nodes = settle_terminal_forced(&mut arena, forced_nodes);
+        let mut settled = 0;
+        let forced_nodes = settle_terminal_forced(&mut arena, forced_nodes, &mut settled);
         let root = &arena.nodes[arena.root_id];
         let sign = if root.actor == 0 { 1.0 } else { -1.0 };
         let root_value = sign * root.value_p0();
@@ -1013,6 +1031,7 @@ impl SearchSession {
             forced_finalized: false,
             metrics: SearchMetrics {
                 halving_survivors: vec![initial_survivors],
+                settled_forced_terminals: settled,
                 ..SearchMetrics::default()
             },
         }
@@ -1054,7 +1073,11 @@ impl SearchSession {
     }
 
     fn set_forced_rows(&mut self, forced: ForcedRows) {
-        self.forced_nodes = settle_terminal_forced(&mut self.arena, forced.nodes);
+        self.forced_nodes = settle_terminal_forced(
+            &mut self.arena,
+            forced.nodes,
+            &mut self.metrics.settled_forced_terminals,
+        );
         self.metrics.forced_rows_by_kind = forced.by_kind;
         self.metrics.fixed_support_edges = forced.fixed_support_edges;
         self.forced_finalized = false;
@@ -2069,7 +2092,13 @@ mod forced_terminal_tests {
         let terminal_id = arena.push(Node::make(finished.clone()));
         let ordinary_id = arena.push(Node::make(fresh()));
 
-        let remaining = settle_terminal_forced(&mut arena, vec![terminal_id, ordinary_id]);
+        let mut settled_count = 0;
+        let remaining = settle_terminal_forced(
+            &mut arena,
+            vec![terminal_id, ordinary_id],
+            &mut settled_count,
+        );
+        assert_eq!(settled_count, 1, "the settled child must be counted, not silent");
 
         assert_eq!(
             remaining,
@@ -2101,6 +2130,8 @@ mod forced_terminal_tests {
             .map(|_| arena.push(Node::make(finished.clone())))
             .collect();
 
-        assert!(settle_terminal_forced(&mut arena, ids).is_empty());
+        let mut settled = 0;
+        assert!(settle_terminal_forced(&mut arena, ids, &mut settled).is_empty());
+        assert_eq!(settled, 5, "every settled child must be counted");
     }
 }

@@ -137,8 +137,19 @@ class MoveRecord:
     declined -- so the declined positions could not be found in the buffer and
     the cost of failed attempts could not be measured."""
     solver_stop: str | None = None
-    """``"unsolvable"`` (a sample-only Age deal, which no budget reaches) or
-    ``"budget"``; ``None`` when the solve succeeded."""
+    """Why a solve produced no answer; ``None`` when it succeeded.
+
+    ``"unsolvable"`` -- a sample-only Age deal, which no budget reaches.
+    ``"nodes"`` -- the node budget ran out. Reproducible: `solver_nodes` is a
+    FLOOR on this position's true cost, and the same position declines again.
+    ``"deadline"`` -- the wall clock ran out. NOT reproducible: a quieter box
+    would have answered, `solver_nodes` bounds nothing, and a run containing
+    these did not produce a buffer that is a function of its seeds.
+
+    The last two were one value (``"budget"``) until 2026-08. Telling them
+    apart is what lets a run assert its own determinism instead of inferring it
+    from the maximum node count observed.
+    """
     solver_nodes: int = 0
     """Nodes visited, including by an attempt that then declined."""
     solver_masked: bool = False
@@ -192,6 +203,19 @@ class GameRecord:
 
 class ReplayMismatchError(RuntimeError):
     """A recorded game no longer reproduces under the current engine."""
+
+
+class FinalDigestMismatchError(ReplayMismatchError):
+    """Every mask and actor matched; only the TERMINAL state differs.
+
+    A distinct type because the distinction is load-bearing and was being made
+    by substring-matching the message in three places. The pre-military-fix
+    cloud buffers score their final state differently while reconstructing every
+    position along the way, so a caller that only reads positions *before* the
+    end can accept this and must still refuse a mask divergence, where the
+    recorded actions after that point were chosen for a position that no longer
+    exists. Subclassing keeps every existing `except ReplayMismatchError` intact.
+    """
 
 
 class StaleSpecVersionError(ReplayMismatchError):
@@ -640,7 +664,7 @@ def replay(record: GameRecord, on_state=None) -> GameState:
     except ValueError as error:
         raise ReplayMismatchError(str(error)) from error
     if digest != record.final_digest:
-        raise ReplayMismatchError(
+        raise FinalDigestMismatchError(
             f"final digest {digest} != recorded {record.final_digest}"
         )
     _update_trajectory(trajectory, game, record.digest_version)

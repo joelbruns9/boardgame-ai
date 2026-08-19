@@ -888,13 +888,25 @@ impl RustGame {
 
     /// Exact endgame solve of this position (`solver.rs`).
     ///
-    /// Returns `None` when the position is not solvable within the budget, or
-    /// at all (an Age deal is sample-only) -- the caller must treat that as "no
-    /// answer", never as a value. `policy_mode` is `"exact"` (every action
-    /// priced exactly, what the equivalence gate compares) or `"value_only"`
-    /// (root value and best action exact, alternatives are bounds).
-    /// `chance_pruning` is `"star1"` (default), `"none"` or `"star2"`; all three
-    /// return identical values, and only the node count differs.
+    /// **Always returns a dict.** A refusal is reported, not erased: `regime`
+    /// and `root_value` are `None`, and `stop` says why -- `"unsolvable"` (an
+    /// Age deal is sample-only, so no budget helps), `"nodes"` (the node budget
+    /// ran out) or `"deadline"` (the wall clock did). `nodes` is what the
+    /// attempt cost either way.
+    ///
+    /// This used to return `None` and throw both away, which cost real
+    /// analysis: a study could not tell a position censored at its NODE budget
+    /// from one cut off by the clock, and floored both at the budget -- turning
+    /// a cheap clock-truncated solve into the most expensive row in the corpus.
+    /// `solver::solve_root_counted` already kept the count; only this boundary
+    /// discarded it.
+    ///
+    /// Callers must test `regime`/`root_value`, never truthiness of the dict.
+    /// `policy_mode` is `"exact"` (every action priced exactly, what the
+    /// equivalence gate compares) or `"value_only"` (root value and best action
+    /// exact, alternatives are bounds). `chance_pruning` is `"star1"` (default),
+    /// `"none"` or `"star2"`; all three return identical values, and only the
+    /// node count differs.
     #[pyo3(signature = (
         max_nodes = 2_000_000, max_secs = 5.0, policy_mode = "exact",
         chance_pruning = "star1"
@@ -906,7 +918,7 @@ impl RustGame {
         max_secs: f64,
         policy_mode: &str,
         chance_pruning: &str,
-    ) -> PyResult<Option<Py<PyDict>>> {
+    ) -> PyResult<Py<PyDict>> {
         let mode = match policy_mode {
             "exact" => solver::PolicyMode::Exact,
             "value_only" => solver::PolicyMode::ValueOnly,
@@ -936,11 +948,27 @@ impl RustGame {
         // threaded advisor host stops answering and a thread-based solver pool
         // runs one position at a time.
         let state = self.state.clone();
-        let solved = match py.detach(move || solver::solve_root(&state, &limits, mode, pruning)) {
-            Ok(solved) => solved,
-            Err(_) => return Ok(None),
-        };
+        let (outcome, cost) =
+            py.detach(move || solver::solve_root_counted(&state, &limits, mode, pruning));
         let out = PyDict::new(py);
+        let solved = match outcome {
+            Ok(solved) => solved,
+            Err(stop) => {
+                // A decline is an observation, not an absence. `nodes` is a
+                // FLOOR on the position's true cost when `stop` is "nodes", and
+                // says nothing about it when `stop` is "deadline" -- which is
+                // why the two are named separately.
+                out.set_item("regime", py.None())?;
+                out.set_item("root_value", py.None())?;
+                out.set_item("best_index", py.None())?;
+                out.set_item("nodes", cost.nodes)?;
+                out.set_item("nodes_under_chance", cost.nodes_under_chance)?;
+                out.set_item("exact_per_action", false)?;
+                out.set_item("per_action_value", PyDict::new(py))?;
+                out.set_item("stop", self_play::solve_stop_name(stop))?;
+                return Ok(out.unbind());
+            }
+        };
         {
             // Same vocabulary as the Python reference: the regime is decided by
             // whether a chance edge was actually hit, not guessed statically.
@@ -962,8 +990,9 @@ impl RustGame {
                 per_action.set_item(index, value)?;
             }
             out.set_item("per_action_value", per_action)?;
+            out.set_item("stop", py.None())?;
         }
-        Ok(Some(out.unbind()))
+        Ok(out.unbind())
     }
 
     /// F3.1b: fingerprint of the state after applying action `index` with

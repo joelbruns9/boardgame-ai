@@ -1249,22 +1249,34 @@ def _replays_under_this_engine(directory: str) -> bool:
     empirical: replay one record. Cheap, and it is the actual property relied on.
     """
 
-    from .buffer import read_records, replay
+    from .buffer import ReplayMismatchError, StaleSpecVersionError, read_records, replay
 
     files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
     if not files:
         return False
-    try:
-        records = read_records(files[0])
-    except Exception:
-        return False
-    if not records:
-        return False
-    try:
-        replay(records[0])
-    except Exception:
-        return False
-    return True
+    # One record PER FILE, not one per directory. Buffers are written per
+    # iteration, so a file is the granularity at which provenance mixes: a
+    # directory holding pre-fix and post-fix iterations would pass a single
+    # probe and still feed the gate games this engine cannot produce. Replaying
+    # one game per file is still milliseconds.
+    checked = 0
+    for path in files:
+        try:
+            records = read_records(path)
+        except (OSError, ValueError):
+            return False
+        if not records:
+            continue
+        try:
+            replay(records[0])
+        except (ReplayMismatchError, StaleSpecVersionError):
+            # A stale fixture. Fall back to the committed corpus.
+            return False
+        checked += 1
+    # Anything else -- an engine regression, a decoder crash -- must NOT be
+    # caught here. Swallowing it would silently demote to the committed corpus
+    # and turn a real breakage into a passing gate on a smaller sample.
+    return checked > 0
 
 
 def _buffer_dir():

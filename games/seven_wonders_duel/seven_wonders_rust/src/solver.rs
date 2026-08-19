@@ -75,14 +75,26 @@ use crate::codec;
 use crate::engine::Action;
 use crate::state::{GameState, Phase};
 
-/// Why a solve stopped without an answer. Both mean "the net estimate stands":
-/// the caller must not treat either as a value.
+/// Why a solve stopped without an answer. All mean "the net estimate stands":
+/// the caller must not treat any of them as a value.
+///
+/// `Nodes` and `Deadline` are kept apart because they say opposite things about
+/// a run. A node-capped decline is a property of the POSITION and reproduces;
+/// a deadline decline is a property of the MACHINE, so which positions got a
+/// proof depends on how busy the box was, and the recorded buffer stops being a
+/// function of its seeds. The 2026-08 shakedown spent 3,146 declines learning
+/// that distinction the slow way, by inferring it from `nodes_max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolveStop {
     /// A sample-only chance edge (an Age deal) — not enumerable at any budget.
     Unsolvable,
-    /// Node budget or deadline reached.
-    Budget,
+    /// The node budget was exhausted. Reproducible: the same position declines
+    /// again at the same budget.
+    Nodes,
+    /// The wall-clock deadline passed. NOT reproducible: a quieter box would
+    /// have answered. Seeing these in a run means the clock is binding before
+    /// the node budget, and the training data is load-dependent.
+    Deadline,
 }
 
 /// Pruning at chance nodes. Switchable because its value is an empirical
@@ -191,13 +203,13 @@ impl Ctx {
             self.nodes_under_chance += 1;
         }
         if self.nodes > self.max_nodes {
-            return Err(SolveStop::Budget);
+            return Err(SolveStop::Nodes);
         }
         self.since_clock_check += 1;
         if self.nodes == 1 || self.since_clock_check >= CLOCK_CHECK_EVERY {
             self.since_clock_check = 0;
             if Instant::now() > self.deadline {
-                return Err(SolveStop::Budget);
+                return Err(SolveStop::Deadline);
             }
         }
         Ok(())
@@ -520,7 +532,13 @@ fn probe_first_move(
     Ok(Some((value, actor == 0)))
 }
 
-/// Solve every legal action at the root, in actor terms.
+/// Solve every legal action at the root, in actor terms, discarding the cost.
+///
+/// Test-only. Production callers take `solve_root_counted`: a decline that
+/// reports neither what it spent nor why is what made a node-capped solve and a
+/// clock-truncated one indistinguishable downstream, and no caller should be
+/// able to reach for the lossy version by accident.
+#[cfg(test)]
 pub fn solve_root(
     state: &GameState,
     limits: &Limits,
@@ -530,21 +548,31 @@ pub fn solve_root(
     solve_root_counted(state, limits, mode, pruning).0
 }
 
-/// `solve_root`, and the nodes it visited **even when it declined**.
+/// What a solve cost, reported whether or not it produced an answer.
 ///
 /// A refusal is not free: the budget was spent before it was reached, and the
-/// caller is often a self-play loop that paid that time synchronously. The
-/// ordinary `solve_root` throws the count away with the error, which makes an
-/// expensive decline and an instant one look identical downstream.
+/// caller is often a self-play loop that paid that time synchronously. It is
+/// also the only way to tell a decline that nearly finished from one that
+/// barely started, which is what says whether raising the budget would help.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SolveCost {
+    pub nodes: u64,
+    pub nodes_under_chance: u64,
+}
+
+/// `solve_root`, and what it cost **even when it declined**.
+///
+/// The ordinary `solve_root` throws the count away with the error, which makes
+/// an expensive decline and an instant one look identical downstream.
 pub fn solve_root_counted(
     state: &GameState,
     limits: &Limits,
     mode: PolicyMode,
     pruning: ChancePruning,
-) -> (Result<Solve, SolveStop>, u64) {
+) -> (Result<Solve, SolveStop>, SolveCost) {
     if Instant::now() > limits.deadline {
         // Already out of time before any work, so no nodes were visited.
-        return (Err(SolveStop::Budget), 0);
+        return (Err(SolveStop::Deadline), SolveCost::default());
     }
     let mut ctx = Ctx {
         nodes: 0,
@@ -558,8 +586,11 @@ pub fn solve_root_counted(
         pruning,
     };
     let result = solve_root_body(state, &mut ctx, mode);
-    let nodes = ctx.nodes;
-    (result, nodes)
+    let cost = SolveCost {
+        nodes: ctx.nodes,
+        nodes_under_chance: ctx.nodes_under_chance,
+    };
+    (result, cost)
 }
 
 /// The root loop itself, split out only so its `?` exits can still report the
@@ -695,7 +726,7 @@ mod tests {
     fn the_node_budget_is_enforced() {
         let state = age_one_position();
         let stop = solve_root(&state, &limits(1, 30.0), PolicyMode::Exact, ChancePruning::Star2);
-        assert_eq!(stop.err(), Some(SolveStop::Budget));
+        assert_eq!(stop.err(), Some(SolveStop::Nodes));
     }
 
     #[test]
@@ -708,7 +739,7 @@ mod tests {
             deadline: Instant::now() - Duration::from_secs(1),
         };
         let stop = solve_root(&state, &expired, PolicyMode::Exact, ChancePruning::Star2);
-        assert_eq!(stop.err(), Some(SolveStop::Budget));
+        assert_eq!(stop.err(), Some(SolveStop::Deadline));
     }
 }
 

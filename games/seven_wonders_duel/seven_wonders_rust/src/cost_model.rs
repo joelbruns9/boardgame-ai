@@ -70,10 +70,23 @@ impl CostModel {
 
     /// Is this position predicted to fit `budget`, with the safety margin?
     ///
-    /// The margin is not decoration. The fit underpredicts roughly half of the
-    /// positions that exhausted the study budget -- cost is long-tailed and the
-    /// tail is censored -- so the margin comes from the residual p90, not its
-    /// median.
+    /// The margin is not decoration: the fit underpredicts roughly half of the
+    /// positions that exhausted the study budget, because cost is long-tailed
+    /// and the tail is censored.
+    ///
+    /// It is not set from the residual p90 (~0.8 decades), and should not be.
+    /// The shipped 0.4 was chosen because it was MEASURED to buy the same 805
+    /// proofs as `max_cards 10` for 44% of the nodes on held-out cloud
+    /// endgames. That is defensible because the loss is bounded on both sides:
+    /// an underprediction costs at most `budget` nodes and then declines, an
+    /// overprediction costs one proof. A p90 margin would be the right choice
+    /// only if an underprediction could run away -- which is exactly what a
+    /// binding WALL CLOCK used to allow, and why the clock must stay slack
+    /// against the node budget (`PRE_RETRAIN_PLAN.md` section 7).
+    ///
+    /// Only `budget` and `margin_decades` TOGETHER matter here, since the test
+    /// is a comparison of their difference; the budget's separate job is
+    /// deciding when an in-flight solve is abandoned.
     pub fn affordable(&self, features: &[f64; 20], budget: u64) -> bool {
         if budget == 0 {
             return false;
