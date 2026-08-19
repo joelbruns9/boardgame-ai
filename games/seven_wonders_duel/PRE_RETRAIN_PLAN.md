@@ -499,10 +499,42 @@ The all-core-clock effect (solver scaling measured at 2.89×/4, 3.77×/8,
 4.37×/16 threads, ceiling attributed to clock and SMT, *not* bandwidth) then
 shows up as a measured drop in games/hour that the invariant rejects.
 
-Dimensions: solver cores vs generation cores; node budget; predictor threshold;
-`full_sims` and `full_search_fraction` (they interact — more sims per full move
-means fewer full moves per hour); `endgame_oversample`; Gumbel `top_k` on cheap
-moves.
+Dimensions: solver cores vs generation cores; node budget; **cost-model
+margin**; `full_sims` and `full_search_fraction` (they interact — more sims per
+full move means fewer full moves per hour); `endgame_oversample`; Gumbel `top_k`
+on cheap moves.
+
+**The margin is a first-order throughput dimension, not a tuning detail.** On
+the 12-iteration shakedown the solver consumed 4,432–7,387 s of CPU against
+4,947 s of generation wall — **22–37% of wall time across four solver threads** —
+and that run used the card cap, which the cost model undercuts by more than half
+again. The margin sets that spend directly, and the trade is steeply non-linear
+(held-out cloud positions, 4.5M budget):
+
+| margin | attempts | proofs | declines | nodes |
+|---|---|---|---|---|
+| 0.0 | 875 | 825 | 50 | 415.8M |
+| 0.4 | 827 | 805 | 22 | 249.1M |
+| 0.6 | 793 | 782 | 11 | 164.3M |
+| 0.8 | 757 | 751 | 6 | 107.4M |
+| 1.2 | 689 | 687 | 2 | 36.9M |
+
+From 0.0 to 0.8, node spend falls **74%** while proofs fall **9%**. Anywhere on
+that curve is defensible; the point of the sweep is to find where the released
+compute buys more elsewhere than the lost proofs cost.
+
+Two cautions for whoever runs it:
+
+* **The margin and the node budget are the same knob at the trigger.**
+  `affordable()` tests `predict + margin <= log10(budget)`, so only the
+  *difference* matters and sweeping both independently wastes most of the grid.
+  Sweep the margin at a fixed budget. The budget carries one *separate* effect
+  worth its own small sweep: it also decides when an in-flight solve is
+  abandoned, so it sets the cost of the model's underpredictions.
+* **The shipped 0.4 was anchored to the wrong thing.** It was chosen because it
+  matches `max_cards 10`'s proof count at 44% of its nodes — a legacy cap is a
+  convenient reference, not an objective. The sweep should pick the margin
+  against the vector above, and should be expected to move it.
 
 `endgame_trigger_study.py --calibrate` already sizes node budget and depth for a
 given box from a stored cost profile plus a one-minute rate measurement, because
