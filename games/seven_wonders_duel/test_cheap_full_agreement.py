@@ -102,3 +102,42 @@ def test_no_low_prior_moves_reports_nan_not_zero():
 
     summary = summarise([_row(agree=False, rank=0.0)], low_prior_rank=0.5)
     assert math.isnan(summary["disagreement_rate_on_low_prior"])
+
+
+def test_rows_survive_a_stopped_run(tmp_path, monkeypatch):
+    """A partial run must still be a usable sample.
+
+    The probe runs for hours and has been stopped part-way twice; the first time
+    it lost 72 games of solving because rows lived only in memory until the end.
+    """
+
+    import json
+
+    from . import cheap_full_agreement as module
+
+    calls = {"n": 0}
+
+    def fake_probe_game(seed, evaluator, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise KeyboardInterrupt("stopped part-way, as production runs were")
+        return [_row(agree=(calls["n"] == 1), rank=0.9)]
+
+    monkeypatch.setattr(module, "probe_game", fake_probe_game)
+    monkeypatch.setattr(module, "load_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(module, "model_from_config", lambda *a, **k: None)
+    monkeypatch.setattr(module, "Evaluator", lambda *a, **k: None)
+    monkeypatch.setattr(module.torch, "load", lambda *a, **k: {"config": {}})
+
+    out = tmp_path / "cfa.json"
+    with pytest.raises(KeyboardInterrupt):
+        module.main(
+            ["--checkpoint", str(tmp_path / "none.pt"), "--games", "5", "--out", str(out)]
+        )
+
+    written = [
+        json.loads(line)
+        for line in out.with_suffix(".rows.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(written) == 2, "both completed games must be on disk"

@@ -263,20 +263,45 @@ def main(argv: list[str] | None = None) -> int:
     full = SearchConfig(sims=args.full_sims, top_k=args.top_k, root_selection=root)
 
     rows: list[dict] = []
+    # Appended per game, not held to the end. This probe is hours long and has
+    # twice been stopped part-way; the first time it lost 72 games of solves,
+    # because the rows only existed in memory. A partial run is still a usable
+    # sample -- the statistics are means over independent games -- so losing it
+    # to a kill is pure waste.
+    rows_path = args.out.with_suffix(".rows.jsonl") if args.out else None
+    if rows_path is not None:
+        rows_path.write_text("", encoding="utf-8")
+
     for index in range(args.games):
-        rows.extend(
-            probe_game(
-                args.seed_base + index,
-                evaluator,
-                cheap=cheap,
-                full=full,
-                full_fraction=args.full_search_fraction,
-                solver_nodes=args.solver_nodes,
-                solver_secs=args.solver_secs,
-                solver_max_cards=args.solver_max_cards,
-            )
+        fresh = probe_game(
+            args.seed_base + index,
+            evaluator,
+            cheap=cheap,
+            full=full,
+            full_fraction=args.full_search_fraction,
+            solver_nodes=args.solver_nodes,
+            solver_secs=args.solver_secs,
+            solver_max_cards=args.solver_max_cards,
         )
-        print(f"game {index + 1}/{args.games}: {len(rows)} cheap moves", flush=True)
+        rows.extend(fresh)
+        if rows_path is not None:
+            with rows_path.open("a", encoding="utf-8") as handle:
+                for row in fresh:
+                    handle.write(json.dumps(row) + "\n")
+        # The running summary makes a stopped run readable without rerunning
+        # anything, and shows the conditional rate settling (or not) as games
+        # accumulate -- which is the number the decision turns on.
+        if (index + 1) % 10 == 0 or index + 1 == args.games:
+            running = summarise(rows, args.low_prior_rank)
+            print(
+                f"game {index + 1}/{args.games}: {len(rows)} cheap moves | "
+                f"disagree {running['disagreement_rate']:.3f} | "
+                f"low-prior {running['disagreement_rate_on_low_prior']:.3f} "
+                f"(n={running['low_prior_moves']})",
+                flush=True,
+            )
+        else:
+            print(f"game {index + 1}/{args.games}: {len(rows)} cheap moves", flush=True)
 
     summary = summarise(rows, args.low_prior_rank)
     print(json.dumps(summary, indent=2))
