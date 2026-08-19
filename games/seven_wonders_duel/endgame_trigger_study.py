@@ -528,7 +528,12 @@ def simulate_budget(rows: list[dict], budget: int, rule=None) -> dict:
 
 
 def report(rows: list[dict], budgets: list[int]) -> dict:
-    priced = [row for row in rows if row["nodes"] is not None]
+    # The `censored` FLAG, not a `nodes is None` sentinel. `solve_endgame` now
+    # returns the nodes a declined solve actually reached, so the sentinel can
+    # never fire and every censored row silently entered these statistics at its
+    # floor. Those rows are systematically the expensive ones, so including them
+    # compresses the top of the cost range and biases every correlation down.
+    priced = [row for row in rows if not row.get("censored")]
     correlations = {}
     if priced:
         costs = [math.log10(max(1, row["nodes"])) for row in priced]
@@ -540,7 +545,7 @@ def report(rows: list[dict], budgets: list[int]) -> dict:
         by_cards.setdefault(str(row["cards_left"]), {"n": 0, "censored": 0, "nodes": []})
         bucket = by_cards[str(row["cards_left"])]
         bucket["n"] += 1
-        if row["nodes"] is None:
+        if row.get("censored"):
             bucket["censored"] += 1
         else:
             bucket["nodes"].append(row["nodes"])
@@ -551,7 +556,10 @@ def report(rows: list[dict], budgets: list[int]) -> dict:
 
     return {
         "positions": len(rows),
-        "censored": sum(1 for row in rows if row["nodes"] is None),
+        "censored": sum(1 for row in rows if row.get("censored")),
+        "censored_by_deadline": sum(
+            1 for row in rows if row.get("stop") == "deadline"
+        ),
         "rank_correlation_with_log_nodes": correlations,
         "by_cards_left": {k: by_cards[k] for k in sorted(by_cards, key=int)},
         "budgets": {

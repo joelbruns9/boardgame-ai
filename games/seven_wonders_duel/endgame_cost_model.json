@@ -1,12 +1,22 @@
 {
-  "comment": "log10(nodes) for an exact endgame solve. Attempt iff prediction + margin_decades <= log10(node_budget). Features are exactly those seven_wonders_rust cost_model computes, in this order.",
+  "comment": "log10(nodes) for an exact endgame solve. Attempt iff prediction + margin_decades <= log10(node_budget). Features are exactly those seven_wonders_rust cost_model computes, in this order. Written by validate_cost_trigger --write-model; do not edit by hand.",
   "fit": {
-    "corpus": "cloud6 iterations 37-43",
-    "positions": 1955,
-    "games": 220,
-    "censored_fraction": 0.0752,
-    "method": "Tobit EM (fit_censored), right-censored at the 40M study budget",
-    "stale_reason": "Fit BEFORE the 2026-08-19 `_unbuilt` fix. `chance_wonders`, `revive_wonders` and `discard_x_revive` counted RETIRED wonders as unbuilt on the Python side, so these coefficients were estimated against a feature that conflated 'this wonder still adds a branch' with 'this wonder is out of the game'. 24% of cloud6 Age III endgames are affected, and chance_wonders carries +0.43. The trigger is now self-consistent (Python and Rust compute the same thing) but the weights belong to the old definition. Refit before the retrain: python -m games.seven_wonders_duel.endgame_trigger_study --from-buffer <cloud6 buffers> --out cloud_endgames.json, then python -m games.seven_wonders_duel.validate_cost_trigger --fit-on cloud_endgames.json --write-model"
+    "corpus": "C:\\Users\\joeld\\AppData\\Local\\Temp\\cloud_refit.json",
+    "positions": 2235,
+    "games": 221,
+    "censored_fraction": 0.0738255033557047,
+    "censoring": {
+      "rows": 2235,
+      "censored": 165,
+      "censored_fraction": 0.0738255033557047,
+      "by_stop": {
+        "nodes": 165
+      },
+      "clock_bound": false
+    },
+    "holdout_fraction": 0.5,
+    "held_out_r2": 0.9359620055452775,
+    "method": "Tobit EM (fit_censored), right-censored at the study node budget; deadline-censored rows dropped"
   },
   "margin_decades": 0.4,
   "features": [
@@ -31,27 +41,27 @@
     "cards_x_logleg",
     "discard_x_revive"
   ],
-  "intercept": -0.015561034631546972,
+  "intercept": -0.005811129179750081,
   "coefficients": {
-    "cards_left": 0.27292582964995643,
-    "unrevealed": -0.24349140150758106,
-    "accessible": 0.1985496673350282,
-    "legal": -7.72155826821133e-05,
-    "unbuilt_wonders": 0.2034363019219122,
-    "chance_wonders": 0.43292980706142664,
-    "revive_wonders": 0.09825077196800522,
-    "discard": -0.013498906303778311,
-    "coins": 0.0029333013558609784,
-    "military": -0.07850519457367695,
-    "vp_gap": 0.007081716075277339,
-    "science_max": 0.09834250419395413,
-    "science_threat": -0.29918628633719313,
-    "military_to_win": -0.07818881009080958,
-    "chance_fanout": 1.047137502690696,
-    "chance_fanout_max": 0.04266760019275427,
-    "pending_options": 0.043045849245056625,
-    "affordable_wonders": 0.11684822276557988,
-    "cards_x_logleg": 0.1180314496786383,
-    "discard_x_revive": 0.011847831807158036
+    "cards_left": 0.25368626695979246,
+    "unrevealed": -0.20008295114736255,
+    "accessible": 0.18987589379547842,
+    "legal": -0.030351186592940865,
+    "unbuilt_wonders": 0.15251837326510598,
+    "chance_wonders": 0.6583392469909862,
+    "revive_wonders": 0.3265342374143614,
+    "discard": -0.02800792836086206,
+    "coins": 0.0014752893245377065,
+    "military": -0.0316531139671158,
+    "vp_gap": 0.012524943277148138,
+    "science_max": 0.08270940265170741,
+    "science_threat": -0.3074392037328159,
+    "military_to_win": -0.01976126965491595,
+    "chance_fanout": 0.952194451305559,
+    "chance_fanout_max": 0.04551651009998845,
+    "pending_options": 0.05677766155504829,
+    "affordable_wonders": 0.12327749554911259,
+    "cards_x_logleg": 0.15225082271505552,
+    "discard_x_revive": 0.003210339008994868
   }
 }
