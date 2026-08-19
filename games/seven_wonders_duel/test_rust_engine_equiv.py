@@ -1234,8 +1234,41 @@ _COMMITTED_CORPUS = os.path.join(
 )
 
 
+def _replays_under_this_engine(directory: str) -> bool:
+    """Does this corpus describe games THIS engine still produces?
+
+    Preferring the big local buffers is only right when they are valid. The
+    2026-08 military off-by-one fix changed the rules without changing
+    `SPEC_VERSION`, so a stale buffer looks current, is preferred over the
+    committed corpus, and fails with `illegal action` -- which reads as an engine
+    bug rather than a stale fixture. That cost a debugging pass: the committed
+    corpus had just been regenerated and the gate stayed red, because the local
+    buffers were shadowing it.
+
+    Version metadata cannot answer this (both say codec-2), so the check is
+    empirical: replay one record. Cheap, and it is the actual property relied on.
+    """
+
+    from .buffer import read_records, replay
+
+    files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
+    if not files:
+        return False
+    try:
+        records = read_records(files[0])
+    except Exception:
+        return False
+    if not records:
+        return False
+    try:
+        replay(records[0])
+    except Exception:
+        return False
+    return True
+
+
 def _buffer_dir():
-    if glob.glob(os.path.join(_GATE_BOX_BUFFERS, "*.jsonl")):
+    if _replays_under_this_engine(_GATE_BOX_BUFFERS):
         return _GATE_BOX_BUFFERS
     return _COMMITTED_CORPUS
 
