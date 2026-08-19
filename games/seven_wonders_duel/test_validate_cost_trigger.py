@@ -234,10 +234,13 @@ def test_the_shipped_model_loads_with_its_features_aligned():
     "the solver is oddly expensive this run".
     """
 
-    from .validate_cost_trigger import TRIGGER_FEATURES, load_cost_model
+    from .validate_cost_trigger import RUST_FEATURES, load_cost_model
 
     coefficients, features, margin = load_cost_model()
-    assert features == TRIGGER_FEATURES
+    # RUST_FEATURES, not TRIGGER_FEATURES: the shipped model must be fit on
+    # exactly what the Rust trigger can compute, or it prices positions with
+    # features that will not exist at the point of decision.
+    assert features == RUST_FEATURES
     assert len(coefficients) == len(features) + 1
     assert 0.0 < margin < 2.0
 
@@ -251,10 +254,10 @@ def test_the_trigger_crosses_card_boundaries():
     with nothing face down is a minimax, not an expectimax.
     """
 
-    from .validate_cost_trigger import TRIGGER_FEATURES, should_attempt
+    from .validate_cost_trigger import RUST_FEATURES, should_attempt
 
     def position(cards: int, **overrides) -> dict:
-        row = {name: 0 for name in TRIGGER_FEATURES}
+        row = {name: 0 for name in RUST_FEATURES}
         row["cards_left"] = cards
         row.update(overrides)
         return row

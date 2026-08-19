@@ -56,8 +56,22 @@ UNAVAILABLE_AT_DECISION_TIME = frozenset({"moves_from_end"})
 #: argued. `legal` stands in for the plan's `log10(legal)`; `cards_x_logleg` is
 #: already the interaction.
 PLAN_FEATURES = ("cards_left", "unrevealed", "legal", "cards_x_logleg")
+
+#: Features whose Python definitions need `_Derived` -- the observation's
+#: reachability sets. Excluded from the shipped model because the trigger runs
+#: inside Rust generation, and porting that machinery is a large surface for the
+#: Python/Rust divergence this project has been bitten by. Dropping them is free:
+#: measured on held-out cloud endgames, R2 is 0.939 either way and the trigger
+#: makes the same 805 solves.
+NEEDS_REACHABILITY = frozenset({"mil_win_feasible", "sci_win_feasible"})
+
 TRIGGER_FEATURES = tuple(
     name for name in FEATURES if name not in UNAVAILABLE_AT_DECISION_TIME
+)
+
+#: What the Rust trigger computes. The shipped model is fit on exactly these.
+RUST_FEATURES = tuple(
+    name for name in TRIGGER_FEATURES if name not in NEEDS_REACHABILITY
 )
 
 

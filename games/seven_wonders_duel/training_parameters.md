@@ -123,6 +123,7 @@ Then the overnight run itself:
   --pooled-readout `
   --reply-head `
   --endgame-solver-max-nodes 4500000 `
+  --endgame-cost-model `
   --endgame-solver-max-cards 10 `
   --endgame-solver-max-secs 30 `
   --solver-threads 4 `
@@ -899,6 +900,40 @@ nothing is taken from it.
 
 The two distributions therefore differ by design, and the buffer records the
 pruned one while the move is played from the raw one.
+
+### `--endgame-cost-model`
+
+**Default:** unset (the card cap decides). **Value:** path; the flag may be
+given bare, which uses `endgame_cost_model.json`.
+
+Replaces `--endgame-solver-max-cards` with a fitted prediction of what each
+solve will cost, attempting it only when the prediction plus a safety margin
+fits `--endgame-solver-max-nodes`.
+
+A cap asks how many cards remain. The model asks what the search will cost, and
+those are different questions: fitted on 1,955 strong-play endgames the largest
+term is `chance_fanout` (+1.04) while `cards_left` is only third (+0.27), because
+what makes a subtree expensive is how much of the board is still face down --
+that is what turns a minimax into an expectimax. Two 10-card positions can differ
+by an order of magnitude, and a cap cannot see the difference.
+
+Measured on held-out positions at a 4.5M budget, the model attempts **20% of
+11-card positions and skips 4% of 8-card ones**, buying the same 805 proofs as
+`--endgame-solver-max-cards 10` for **44% of the nodes**. The margin
+(`margin_decades`, 0.4 shipped) is the dial between coverage and declines: 0.0
+gives 875 attempts and 50 declines, 0.8 gives 757 and 6.
+
+The twenty features are computed in Rust and checked against the Python
+definitions they were fit against by `test_cost_model_parity.py` — the
+coefficients are applied positionally, so a divergence would not raise, it would
+silently price every position with the wrong weights.
+
+Refit after the retrain, on positions the new net actually reaches:
+
+```
+python -m games.seven_wonders_duel.endgame_trigger_study --from-buffer <buffers> --out rows.json
+python -m games.seven_wonders_duel.validate_cost_trigger --fit-on rows.json
+```
 
 ### `--endgame-solver-max-nodes`, `--endgame-solver-max-secs`, `--endgame-solver-max-cards`, `--endgame-solver-mask-policy`
 

@@ -365,10 +365,30 @@ a flag:
   halving the spend, and the leftover budget is better spent on depth than on
   insurance.
 
-  The fitted model lives in `endgame_cost_model.json` (data, not constants, so
-  the Rust trigger and the Python analysis cannot drift), with
-  `load_cost_model()` / `should_attempt()` in `validate_cost_trigger.py`. Refit
-  with `--fit-on` after the retrain.
+  **Wired in and shipping** behind `--endgame-cost-model` (bare flag uses the
+  default file); without it the card cap still decides, so every earlier run
+  reproduces. `seven_wonders_rust::cost_model` computes the twenty features and
+  `solver_wants` consults the model instead of the cap.
+
+  Three things made this safe to do:
+
+  * The model is fit on exactly the twenty features Rust can compute
+    (`RUST_FEATURES`). The two that need Python's `_Derived` reachability sets
+    were dropped after measuring that they cost nothing — R² 0.939 either way,
+    the same 805 solves — rather than after deciding they looked unimportant.
+  * `test_cost_model_parity.py` compares all twenty against `position_features`
+    on 100+ real Age III positions, and checks the end-to-end verdict agrees in
+    both languages. The coefficients are applied positionally, so a divergence
+    would not raise: it would price every position with the wrong weights. Rust
+    also refuses a weight vector whose feature names do not match its order.
+  * `endgame_overlay` had a **second copy** of the eligibility test that
+    `solver_wants` already owned. Installing the model in one and not the other
+    would have left the async path parking a slot for a solve the overlay then
+    refused. There is one decision site now.
+
+  Verified live: a smoke run attempted 11- and 12-card positions that
+  `--endgame-solver-max-cards 10` refuses, and the manifest records which rule
+  chose. Refit with `--fit-on` after the retrain.
 
   Largest terms are `chance_fanout` (+1.04) and `chance_wonders` (+0.44), ahead
   of `cards_left` (+0.27) — cost is driven by how much of the board is still

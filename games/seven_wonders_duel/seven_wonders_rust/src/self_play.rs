@@ -554,6 +554,27 @@ pub fn endgame_solver() -> (u64, f64, usize, bool) {
     )
 }
 
+/// The fitted cost model, or `None` to fall back to the card cap.
+///
+/// A lock rather than atomics: this is read once per candidate solve, which is
+/// rare next to the millions of nodes each decision is about, and the value is
+/// twenty-two floats rather than a word.
+static ENDGAME_COST_MODEL: std::sync::RwLock<Option<crate::cost_model::CostModel>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_endgame_cost_model(model: Option<crate::cost_model::CostModel>) {
+    *ENDGAME_COST_MODEL
+        .write()
+        .expect("cost model lock poisoned") = model;
+}
+
+pub fn endgame_cost_model() -> Option<crate::cost_model::CostModel> {
+    ENDGAME_COST_MODEL
+        .read()
+        .expect("cost model lock poisoned")
+        .clone()
+}
+
 /// What an ATTEMPTED solve contributes to the move about to be recorded.
 ///
 /// Produced whenever the trigger fired, including when the solve then declined.
@@ -601,12 +622,20 @@ fn cards_left(state: &GameState) -> usize {
 /// rather than pay a channel round trip to be told no.
 pub fn solver_wants(state: &GameState) -> bool {
     let (max_nodes, _secs, max_cards, _mask) = endgame_solver();
-    max_nodes != 0 && solver_eligible(state, max_cards)
-}
-
-/// Cheap pre-filter, evaluated before any search work is committed to a solve.
-fn solver_eligible(state: &GameState, max_cards: usize) -> bool {
-    state.phase == Phase::PlayAge && state.tableau.age == 3 && cards_left(state) <= max_cards
+    if max_nodes == 0 {
+        return false;
+    }
+    if !crate::cost_model::eligible(state) {
+        return false;
+    }
+    // The cost model, when one is installed, replaces the card cap entirely --
+    // that is the point of it. A cap cannot attempt a cheap 11-card position or
+    // skip an expensive 8-card one, and cost is driven far more by how much of
+    // the board is face down than by how many cards remain.
+    if let Some(model) = endgame_cost_model() {
+        return model.affordable(&crate::cost_model::features(state), max_nodes);
+    }
+    cards_left(state) <= max_cards
 }
 
 /// Zero the losing moves and renormalise the survivors, in place.
@@ -660,8 +689,12 @@ pub fn endgame_overlay(
     state: &GameState,
     legal: &[usize],
 ) -> Option<SolverOverlay> {
-    let (max_nodes, max_secs, max_cards, mask_policy) = endgame_solver();
-    if max_nodes == 0 || !solver_eligible(state, max_cards) {
+    let (max_nodes, max_secs, _max_cards, mask_policy) = endgame_solver();
+    // ONE decision site. This used to re-implement the eligibility test that
+    // `solver_wants` already owned, so installing the cost model in one of them
+    // would have left the two disagreeing -- the async path parking a slot for a
+    // solve this function then refuses, or the reverse.
+    if !solver_wants(state) {
         return None;
     }
     let limits = crate::solver::Limits {

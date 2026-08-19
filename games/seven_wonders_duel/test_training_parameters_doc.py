@@ -16,7 +16,20 @@ import pytest
 DOC = Path(__file__).with_name("training_parameters.md")
 
 # Referenced deliberately as historical or hypothetical, not as usable flags.
-PROSE_ONLY = {"--train-epochs", "--anchor-sims", "--revert-win-rate", "--no-"}
+#
+# `--from-buffer`, `--fit-on` and `--out` are real flags of OTHER modules
+# (`endgame_trigger_study`, `validate_cost_trigger`), quoted in the refit recipe
+# for the endgame cost model. They are not phase_d's, so the parser check would
+# call them phantom.
+PROSE_ONLY = {
+    "--train-epochs",
+    "--anchor-sims",
+    "--revert-win-rate",
+    "--no-",
+    "--from-buffer",
+    "--fit-on",
+    "--out",
+}
 
 
 @pytest.fixture(scope="module")

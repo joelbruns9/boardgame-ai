@@ -9,6 +9,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod cost_model;
 mod bots;
 mod chance;
 mod codec;
@@ -2750,6 +2751,75 @@ fn set_endgame_solver(
 }
 
 #[pyfunction]
+/// Install the fitted cost model, replacing the card cap as the trigger.
+///
+/// Coefficients live in `endgame_cost_model.json` and are passed in rather than
+/// compiled in, so the file stays the single source of truth for the Rust
+/// trigger and the Python analysis alike. Passing an empty weight list clears
+/// the model and restores `max_cards`.
+///
+/// `weights` must be in `cost_model::FEATURE_NAMES` order. The names are passed
+/// alongside and checked, because a silent reordering would price every position
+/// with the wrong weights and never raise.
+fn set_endgame_cost_model(
+    feature_names: Vec<String>,
+    intercept: f64,
+    weights: Vec<f64>,
+    margin_decades: f64,
+) -> PyResult<()> {
+    if weights.is_empty() {
+        self_play::set_endgame_cost_model(None);
+        return Ok(());
+    }
+    if feature_names.len() != crate::cost_model::FEATURE_NAMES.len()
+        || weights.len() != crate::cost_model::FEATURE_NAMES.len()
+    {
+        return Err(PyValueError::new_err(format!(
+            "cost model needs {} features, got {} names and {} weights",
+            crate::cost_model::FEATURE_NAMES.len(),
+            feature_names.len(),
+            weights.len()
+        )));
+    }
+    for (index, expected) in crate::cost_model::FEATURE_NAMES.iter().enumerate() {
+        if feature_names[index] != *expected {
+            return Err(PyValueError::new_err(format!(
+                "cost model feature {index} is {:?}, expected {expected:?}: the                  weight order must match seven_wonders_rust exactly",
+                feature_names[index]
+            )));
+        }
+    }
+    if !(margin_decades.is_finite() && margin_decades >= 0.0) {
+        return Err(PyValueError::new_err(
+            "cost model margin must be finite and non-negative",
+        ));
+    }
+    let mut fixed = [0.0_f64; 20];
+    fixed.copy_from_slice(&weights);
+    self_play::set_endgame_cost_model(Some(crate::cost_model::CostModel {
+        intercept,
+        weights: fixed,
+        margin_decades,
+    }));
+    Ok(())
+}
+
+#[pyfunction]
+/// The cost model's feature order, so Python can align its coefficients.
+fn endgame_cost_model_features() -> Vec<String> {
+    crate::cost_model::FEATURE_NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
+}
+
+#[pyfunction]
+/// The twenty cost features at a position, for the Python/Rust parity gate.
+fn endgame_cost_features(game: &RustGame) -> Vec<f64> {
+    crate::cost_model::features(&game.state).to_vec()
+}
+
+#[pyfunction]
 /// Background solver threads; 0 solves inline on the scheduler thread.
 ///
 /// Async is a pure THROUGHPUT change: the records it produces must be
@@ -2830,6 +2900,15 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::set_endgame_solver;
+
+    #[pymodule_export]
+    use super::set_endgame_cost_model;
+
+    #[pymodule_export]
+    use super::endgame_cost_model_features;
+
+    #[pymodule_export]
+    use super::endgame_cost_features;
 
     #[pymodule_export]
     use super::endgame_solver;

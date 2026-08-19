@@ -284,6 +284,12 @@ class PhaseDConfig:
     """
     endgame_solver_max_secs: float = 60.0
     endgame_solver_max_cards: int = 8
+    endgame_cost_model: dict[str, Any] | None = None
+    """The fitted trigger in force, or None when the card cap decides.
+
+    Recorded so a run's manifest says which rule chose its solves; two runs with
+    the same max_cards can otherwise attempt entirely different position sets.
+    """
     endgame_solver_mask_policy: bool = True
     solver_threads: int = 0
     """Background solver threads; 0 solves inline on the scheduler thread.
@@ -990,6 +996,44 @@ def configure_endgame_solver(
         return None
     swr.set_endgame_solver(int(max_nodes), float(max_secs), int(max_cards), bool(mask_policy))
     return swr.endgame_solver()
+
+
+def configure_endgame_cost_model(path: str | Path | None) -> dict[str, Any] | None:
+    """Install the fitted cost model, replacing the card cap as the trigger.
+
+    ``None`` leaves ``--endgame-solver-max-cards`` in charge, which is the
+    behaviour every run before this had.
+
+    The cap and the model answer different questions. A cap asks how many cards
+    remain; the model asks what the solve will cost, and cost is driven mostly by
+    how much of the board is still face down -- `chance_fanout` carries almost
+    four times `cards_left`'s weight. On held-out strong-play endgames the model
+    buys the same number of proofs as ``max_cards 10`` for 44% of the nodes,
+    because it attempts a fifth of the 11-card positions and skips a twentieth of
+    the 8-card ones, which no cap can express.
+
+    Returns what took effect, read back from the coefficients actually installed.
+    """
+
+    if path is None:
+        return None
+    try:
+        import seven_wonders_rust as swr
+    except ImportError:  # pragma: no cover - Python backend needs no bridge
+        return None
+    from .validate_cost_trigger import load_cost_model
+
+    coefficients, features, margin = load_cost_model(Path(path))
+    # Rust re-checks the names against its own order and refuses a mismatch: the
+    # weights are applied positionally, so a silent reordering would price every
+    # position with the wrong ones.
+    swr.set_endgame_cost_model(list(features), coefficients[0], coefficients[1:], margin)
+    return {
+        "path": str(path),
+        "features": list(features),
+        "margin_decades": margin,
+        "intercept": coefficients[0],
+    }
 
 
 def set_temperature_schedule(floor: float, anneal_moves: float) -> None:
@@ -5188,6 +5232,17 @@ def build_parser() -> argparse.ArgumentParser:
         "are ~3x cheaper and far narrower, so do not set this from them.",
     )
     parser.add_argument(
+        "--endgame-cost-model",
+        type=Path,
+        nargs="?",
+        const=Path(__file__).with_name("endgame_cost_model.json"),
+        help="replace --endgame-solver-max-cards with the fitted cost model "
+        "(default file when the flag is given without a path). The cap cannot "
+        "attempt a cheap 11-card position or skip a dear 8-card one; on held-out "
+        "strong-play endgames the model buys the same proofs for 44%% of the "
+        "nodes. Refit with validate_cost_trigger --fit-on.",
+    )
+    parser.add_argument(
         "--endgame-solver-mask-policy",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -5489,7 +5544,9 @@ def main(argv=None) -> int:
         args.endgame_solver_max_cards,
         args.endgame_solver_mask_policy,
     ) or (0, args.endgame_solver_max_secs, args.endgame_solver_max_cards, False)
+    applied_cost_model = configure_endgame_cost_model(args.endgame_cost_model)
     config = PhaseDConfig(
+        endgame_cost_model=applied_cost_model,
         endgame_solver_max_nodes=int(applied_solver[0]),
         endgame_solver_max_secs=float(applied_solver[1]),
         endgame_solver_max_cards=int(applied_solver[2]),

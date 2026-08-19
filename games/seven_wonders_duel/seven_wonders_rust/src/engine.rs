@@ -657,7 +657,7 @@ impl GameState {
         }
     }
 
-    fn science_symbols(&self, player: usize) -> Vec<ScienceSymbol> {
+    pub(crate) fn science_symbols(&self, player: usize) -> Vec<ScienceSymbol> {
         let mut out: Vec<ScienceSymbol> = Vec::new();
         for &cid in &self.cities[player].buildings {
             if let Some(s) = card(cid).science {
