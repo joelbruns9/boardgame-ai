@@ -2842,6 +2842,34 @@ pub fn run_many_pipelined(
                         return Err(err);
                     }
                 }
+                // A harvested outcome may have made a slot ready, exactly as a
+                // waited-for one does below -- so re-collect before deciding
+                // anything. Without this the loop breaks out with `pending`
+                // still empty, nothing in flight and live slots that ARE ready,
+                // and the scheduler declares "no progress with live slots" on a
+                // pool that was about to move.
+                //
+                // The fallback re-search made that routine rather than rare: a
+                // declined solve resumes its slot into NeedRoot, needing a fresh
+                // root evaluation, instead of finishing the move.
+                let mut resumed = Vec::new();
+                if let Err(err) = collect_ready_groups(
+                    &mut pool,
+                    &mut outstanding,
+                    &mut pending,
+                    global_batch_cap,
+                    &mut resumed,
+                    Some(&mut *active_solver),
+                ) {
+                    pool.abort(&budget);
+                    return Err(err);
+                }
+                for slot_index in resumed {
+                    if let Err(err) = pool.retire(slot_index, &mut metrics, budget) {
+                        pool.abort(&budget);
+                        return Err(err);
+                    }
+                }
                 let stuck = active_solver.inflight() > 0
                     && pending.is_empty()
                     && inflight.is_empty();

@@ -2202,7 +2202,7 @@ fn self_play_many_mock(
     max_inflight_batches=2, scheduler_workers=1, leaf_batch_p0=None, leaf_batch_p1=None,
     age_deal_samples_p0=None, age_deal_samples_p1=None, deterministic_actions=false,
     cheap_double_reveal_offsets_p0=None, cheap_double_reveal_offsets_p1=None,
-    max_active_slots=0, conflict_free_waves=false, round_robin_candidates=false
+    max_active_slots=0, solve_endgames=false, solver_fallback_research=false, conflict_free_waves=false, round_robin_candidates=false
 ))]
 fn self_play_many_net(
     py: Python<'_>,
@@ -2237,6 +2237,8 @@ fn self_play_many_net(
     cheap_double_reveal_offsets_p0: Option<usize>,
     cheap_double_reveal_offsets_p1: Option<usize>,
     max_active_slots: usize,
+    solve_endgames: bool,
+    solver_fallback_research: bool,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
@@ -2259,8 +2261,14 @@ fn self_play_many_net(
         force,
         false, // this entry point has no puct_root parameter
         None,  // cheap_puct_root: uniform
-        false, // solve_endgames: gates never solve
-        false, // solver_fallback_research: follows solve_endgames
+        // Exposed on THIS entry point so the endgame solver can be tested
+        // against `run_many_pipelined_sharded` -- the scheduler production
+        // actually uses. Every solver test before this drove
+        // `self_play_many_mock`, which routes to `run_many` and passes `None`
+        // for the pool, so no test had ever run a solve through the pump, the
+        // parking, or the harvest.
+        solve_endgames,
+        solver_fallback_research,
         0.0,
         1.8,
         age_deal_samples,
