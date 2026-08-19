@@ -285,6 +285,28 @@ class PhaseDConfig:
     """
     endgame_solver_max_secs: float = 60.0
     endgame_solver_max_cards: int = 8
+    full_search_every_games: int = 0
+    """Every Nth game searches every move at the full budget. 0 is off.
+
+    A diversity lever, not a coherence one. `full_search_fraction` scatters full
+    moves as independent flips, so a game is a patchwork and a three-move plan
+    needs all three plies to land full -- 6% of the time at f=0.25. A wholly
+    full game is coherent end to end and, because `forced_playout_k` and
+    `dirichlet_epsilon` are both gated on `full`, also carries root noise and
+    forced exploration on every ply instead of a quarter of them.
+
+    Per GAME rather than per iteration, deliberately. Every net version then
+    contributes fully-coherent games instead of one version producing all of
+    them; the buffer's composition stays steady rather than lurching every Nth
+    iteration; and the games-based schedules (promotion, replay window,
+    self-anchor lag, curriculum anneal) do not have to cope with one iteration
+    costing 3.4x the rest.
+
+    Costs ~3.4x a mixed game at 1600/100 sims, so every 25th game is about +10%
+    generation compute. It buys policy rows (~17 -> ~70 per game) and coherence.
+    It does NOT multiply value signal: the game still ends once.
+    """
+
     solver_fallback_research: bool = False
     """Re-search a cheap ply at the full budget when its solve declines.
 
@@ -3317,6 +3339,7 @@ class PhaseDLoop:
             full_sims_min=self.config.full_sims_min,
             full_sims_max=self.config.full_sims_max,
             full_search_fraction=self.config.full_search_fraction,
+            full_search_every_games=self.config.full_search_every_games,
             top_k=self.config.top_k,
             draft_prior=draft_prior,
             iteration=iteration,
@@ -5285,6 +5308,16 @@ def build_parser() -> argparse.ArgumentParser:
         "are ~3x cheaper and far narrower, so do not set this from them.",
     )
     parser.add_argument(
+        "--full-search-every-games",
+        type=int,
+        default=0,
+        help="every Nth game searches EVERY move at the full budget (0 = off). "
+        "Diversity: a wholly full game is coherent end to end and gets Dirichlet "
+        "noise and forced playouts on every ply, where --full-search-fraction "
+        "scatters full moves as independent flips. Costs ~3.4x a mixed game, so "
+        "25 is about +10%% generation compute.",
+    )
+    parser.add_argument(
         "--solver-fallback-research",
         action="store_true",
         help="when an endgame solve runs out of node budget on a CHEAP ply, "
@@ -5610,6 +5643,7 @@ def main(argv=None) -> int:
     config = PhaseDConfig(
         endgame_cost_model=applied_cost_model,
         solver_fallback_research=args.solver_fallback_research,
+        full_search_every_games=args.full_search_every_games,
         endgame_solver_max_nodes=int(applied_solver[0]),
         endgame_solver_max_secs=float(applied_solver[1]),
         endgame_solver_max_cards=int(applied_solver[2]),

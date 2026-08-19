@@ -77,6 +77,23 @@ pub struct SelfPlayConfig {
     pub full_sims_min: usize,
     pub full_sims_max: usize,
     pub full_search_fraction: f64,
+    /// Every Nth game searches EVERY move at the full budget. 0 disables it.
+    ///
+    /// Diversity, not coherence. `full_search_fraction` scatters full moves as
+    /// independent coin flips, so a game is a patchwork: a three-move plan needs
+    /// all three plies full, which at f=0.25 happens 6% of the time. A wholly
+    /// full game is coherent end to end, and -- because `forced_playout_k` and
+    /// `dirichlet_epsilon` are both gated on `full` -- it also carries root
+    /// noise and forced exploration on every ply instead of a quarter of them.
+    ///
+    /// Chosen from the GAME SEED rather than a counter, so it is a property of
+    /// the game and survives sharding, resumption and any dispatch order.
+    ///
+    /// Costs ~3.4x a mixed game at the shipped 1600/100 sims split, so every
+    /// 25th game is about +10% generation compute. What it buys is policy rows
+    /// (~17 -> ~70 per game) and coherence; it does NOT multiply value signal,
+    /// since a game still ends once and yields one outcome label.
+    pub full_search_every_games: u64,
     pub top_k: usize,
     pub draft_prior: f64,
     pub c_puct: f64,
@@ -934,7 +951,8 @@ pub fn run<E: Eval>(
         }
         let actor = crate::tree::state_actor(&state);
         let legal = legal_action_indices(&state);
-        let full = rng.next_float() < cfg.full_search_fraction;
+        let roll = rng.next_float();
+        let full = all_full_game(cfg) || roll < cfg.full_search_fraction;
         let sims = if full {
             random_sims(&mut rng, cfg.full_sims_min, cfg.full_sims_max)
         } else {
@@ -1706,6 +1724,16 @@ impl SlotPool {
 ///
 /// Done at retirement rather than at the end, because the pool drops each slot
 /// as soon as its game ends — that is the whole point of the pool.
+/// Every Nth game, by seed, searches every move at the full budget.
+///
+/// One definition for both decision sites -- the cooperative scheduler's
+/// `make_search_meta` and the single-game `run` -- because a disagreement would
+/// not raise: the two paths would simply generate different games from the same
+/// seed, which is the class of bug this file has produced repeatedly.
+fn all_full_game(cfg: &SelfPlayConfig) -> bool {
+    cfg.full_search_every_games > 0 && cfg.game_seed % cfg.full_search_every_games == 0
+}
+
 fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
     metrics.moves += slot.moves.len();
     metrics.simulations += slot.simulations;
@@ -1859,6 +1887,11 @@ impl GameSlot {
         Ok(slot)
     }
 
+    /// Is this whole game a full-search game?
+    fn all_full_game(&self) -> bool {
+        all_full_game(&self.cfg)
+    }
+
     fn make_search_meta(&mut self) -> PyResult<SearchMeta> {
         let move_index = self.moves.len();
         if move_index >= self.cfg.max_moves {
@@ -1869,7 +1902,11 @@ impl GameSlot {
         }
         let actor = crate::tree::state_actor(&self.state);
         let legal = legal_action_indices(&self.state);
-        let full = self.rng.next_float() < self.cfg.full_search_fraction;
+        // The roll is consumed either way: short-circuiting would desynchronise
+        // this game's RNG stream from an otherwise identical one, so the two
+        // would diverge everywhere rather than only in search depth.
+        let roll = self.rng.next_float();
+        let full = self.all_full_game() || roll < self.cfg.full_search_fraction;
         let sims = if full {
             random_sims(
                 &mut self.rng,
@@ -3233,6 +3270,7 @@ mod budget_tests {
             full_sims_min: 2,
             full_sims_max: 2,
             full_search_fraction: 0.0,
+            full_search_every_games: 0,
             top_k: 2,
             draft_prior: 0.0,
             c_puct: 1.25,
@@ -3657,5 +3695,60 @@ mod fallback_research_tests {
             keep: Some(vec![true, false]),
         };
         assert!(slot.fallback_research_meta(&meta, Some(&solved)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod all_full_game_tests {
+    //! Which games run entirely at the full budget.
+    //!
+    //! Keyed on the GAME SEED rather than a dispatch counter, so a game's depth
+    //! is a property of the game: it survives sharding, resumption, and any
+    //! order the scheduler happens to start slots in. A counter would make the
+    //! same seed produce different data depending on how the run was split.
+
+    use super::{all_full_game, budget_tests::sample_config};
+
+    fn cfg(seed: u64, every: u64) -> super::SelfPlayConfig {
+        let mut cfg = sample_config(seed);
+        cfg.full_search_every_games = every;
+        cfg
+    }
+
+    #[test]
+    fn zero_disables_it() {
+        // The default, and what every run before this did.
+        for seed in 0..40 {
+            assert!(!all_full_game(&cfg(seed, 0)));
+        }
+    }
+
+    #[test]
+    fn every_nth_seed_qualifies() {
+        assert!(all_full_game(&cfg(0, 25)));
+        assert!(all_full_game(&cfg(25, 25)));
+        assert!(all_full_game(&cfg(50, 25)));
+        assert!(!all_full_game(&cfg(24, 25)));
+        assert!(!all_full_game(&cfg(26, 25)));
+    }
+
+    #[test]
+    fn the_rate_is_what_the_setting_says() {
+        // Seeds are handed out sequentially, so this is the real cost driver:
+        // at 25 it is 4% of games, which is about +10% generation compute.
+        for every in (5..=50).step_by(5) {
+            let hits = (0..1000).filter(|&s| all_full_game(&cfg(s, every))).count();
+            // Ceiling, not floor: seed 0 qualifies, so [0, 999] holds
+            // `ceil(1000 / every)` multiples rather than `floor`.
+            let expected = (1000 + every as usize - 1) / every as usize;
+            assert_eq!(hits, expected, "every={every}");
+        }
+    }
+
+    #[test]
+    fn one_makes_every_game_full() {
+        for seed in 0..20 {
+            assert!(all_full_game(&cfg(seed, 1)));
+        }
     }
 }

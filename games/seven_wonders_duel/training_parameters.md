@@ -901,6 +901,68 @@ nothing is taken from it.
 The two distributions therefore differ by design, and the buffer records the
 pruned one while the move is played from the raw one.
 
+### `--solver-fallback-research`
+
+**Default:** off. **Value:** flag.
+
+When an endgame solve exhausts its node budget on a **cheap** ply, search that
+position again at the full budget before choosing a move.
+
+A declined solve leaves the move to whatever search already ran. On a cheap ply
+that is a 100-simulation move in a contested endgame — and at a position the
+cost model predicted affordable and got wrong, so a hard one. The B2 probe
+measured what that costs: at solver-settled positions cheap search plays a
+**provably losing** move 14.6% of the time against full search's 10.1% (paired,
+McNemar χ² = 10.6, p = 0.001).
+
+The solve is not retried — it already declined at that budget — and the decline
+is carried into the record, so `solver_attempted` / `solver_stop` /
+`solver_nodes` survive and the position still appears in the solver statistics.
+The re-search seed is derived from the original, so enabling the flag leaves the
+RNG stream identical up to the first decline.
+
+Costs roughly **+1.6%** search compute at the shipped margin, since it fires
+only where a solve declined. Redundant in games selected by
+`--full-search-every-games`, where every ply is already full.
+
+### `--full-search-every-games`
+
+**Default:** `0` (off). **Value:** non-negative integer.
+
+Every Nth game searches **every** move at the full simulation budget, chosen by
+game seed. `--full-search-fraction` scatters full moves as independent coin
+flips, so an ordinary game is a patchwork: a three-move plan needs all three
+plies to land full, which at `f = 0.25` happens about 6% of the time.
+
+Two things make a wholly-full game worth more than its move count suggests. It
+is coherent end to end, so a plan the search finds is a plan the following moves
+can execute. And `forced_playout_k` and `dirichlet_epsilon` are both **gated on
+`full`**, so such a game also carries root noise and forced exploration on every
+ply instead of a quarter of them — materially more exploration per game.
+
+Per **game**, not per iteration, and that is deliberate. Every net version then
+contributes fully-coherent games rather than one version producing all of them;
+the buffer's composition stays steady instead of lurching every Nth iteration;
+and the games-based schedules (promotion, replay window, self-anchor lag,
+curriculum anneal) never have to cope with one iteration costing 3.4× the rest.
+
+Cost at the shipped 1600/100 split: a full game is **3.4×** a mixed one, so
+
+| setting | share of games | added generation compute |
+|---|---|---|
+| 50 | 2% | +5% |
+| 25 | 4% | **+10%** |
+| 20 | 5% | +12% |
+
+What it buys is policy rows — a mixed game records only its full moves, since
+cheap plies are `policy_excluded`, so ~17 rows become ~70 — plus coherence. It
+does **not** multiply value signal: the game still ends once and yields one
+outcome label. Those 70 rows are also consecutive plies of one trajectory, so
+they are correlated and the effective sample size rises by much less than 4×.
+
+Selection is by seed rather than a dispatch counter, so which games are full
+survives sharding, resumption and slot start order.
+
 ### `--endgame-cost-model`
 
 **Default:** unset (the card cap decides). **Value:** path; the flag may be
