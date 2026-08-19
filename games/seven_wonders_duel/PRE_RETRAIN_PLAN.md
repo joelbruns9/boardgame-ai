@@ -512,6 +512,48 @@ disagreement concentrated on moves the prior already liked, means plans rarely
 break and neither fix below is worth buying. Disagreement concentrated on
 low-prior moves confirms the mechanism and sizes it.
 
+**MEASURED 2026-08-19 — the mechanism is confirmed.** 120 games, 6,009 cheap
+moves, against the 128x4 shakedown net:
+
+| | |
+|---|---|
+| disagreement, all cheap moves | **19.0%** |
+| disagreement on LOW-PRIOR moves (n=792) | **58.0%** |
+| KL(cheap ‖ full) median / p90 | 0.047 / 0.327 |
+| provably losing, cheap (446 solved positions) | **14.6%** |
+| provably losing, full | **10.1%** |
+
+Estimates were stable from game 20 onward (19% ± 0.4, low-prior 55-58%), so this
+is converged rather than a small-sample reading.
+
+Against the rule written above: agreement is 81%, not ~95%, and disagreement is
+**3x concentrated** on exactly the moves the prior does not already believe.
+That is the pre-registered signature of the mechanism, not a post-hoc reading.
+
+The ground-truth half is the part that settles it, because it does not depend on
+two searches agreeing with each other. On the 446 positions the solver settles,
+cheap plays a **provably losing** move 14.6% of the time against full's 10.1%.
+Paired: cheap blunders where full does not 27 times, the reverse 7 times
+(McNemar chi2 = 10.6, **p = 0.001**). Cheap search is not merely choosing
+differently, it is choosing worse, against proofs.
+
+**Two reasons the disagreement rates are an UPPER bound**, and one reason the
+blunder gap is not. Cheap and full use adjacent seeds rather than common random
+numbers, so some disagreement is sampling rather than depth; and a weak prior
+disagrees with search more than a strong one, so a trained net would show less.
+Both inflate the *disagreement* numbers. The provably-losing gap is a different
+kind of measurement -- it is scored against proofs, and both arms share the same
+net -- so it is not inflated by either, though its absolute level is.
+
+**Scope limit worth stating:** the proofs cover `cards_left <= 9`, so the blunder
+gap is measured in the last few plies, while the plan-breaking concern is about
+the midgame. What is confirmed is that cheap search drops strategy the full
+search finds; that it does so specifically to multi-move plans is still inferred
+from the low-prior concentration, not observed directly.
+
+**Therefore: buy run-length full search**, per the next paragraph, and re-measure
+against the trained net before sizing it further.
+
 **If confirmed, prefer RUN-LENGTH full search over full-sims iterations.** Make
 full moves arrive in runs of 3-4 rather than as independent coin flips, keeping
 the same overall fraction: compute is identical, and it targets chain coherence
