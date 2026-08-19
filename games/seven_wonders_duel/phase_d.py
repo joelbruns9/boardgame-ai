@@ -102,6 +102,7 @@ from .train import (
     build_model,
     evaluate as evaluate_model,
     heads_from_config,
+    model_from_config,
     pooled_readout_from_config,
     reply_head_from_config,
     load_checkpoint,
@@ -3082,13 +3083,12 @@ class PhaseDLoop:
                 f"builds heads={expected}; resume with the original --heads or "
                 "start a new run directory"
             )
-        model = build_model(
-            "transformer",
-            self.config.d_model,
-            self.config.layers,
-            heads,
-            pooled_readout_from_config(checkpoint.get("config", {})),
-            reply_head_from_config(checkpoint.get("config", {})),
+        # Through the shared reader, so a switch added to the model reaches this
+        # path without anyone remembering to come here. The head check above
+        # stays: it compares the checkpoint against THIS RUN's config, which is
+        # a different question from rebuilding the checkpoint faithfully.
+        model = model_from_config(
+            stored, d_model=self.config.d_model, layers=self.config.layers
         )
         load_checkpoint(path, model, checkpoint=checkpoint)
         return model, checkpoint

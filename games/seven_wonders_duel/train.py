@@ -393,6 +393,32 @@ def stable_game_split(
 ARCHITECTURE_SWITCHES = ("pooled_readout", "reply_head")
 
 
+def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
+    """Build the model a checkpoint's config describes.
+
+    ONE place that knows which config keys are architecture. Every reader that
+    rebuilds a saved model should come through here, because the failure mode is
+    not a crash at the call site -- it is a model that loads and computes
+    something else, or a strict load that fails hours into a run.
+
+    Adding `pooled_readout` / `reply_head` to the model left SIX separate
+    rebuild sites constructing a model the weights no longer fit, each of which
+    had enumerated by hand the config keys it happened to know about. Adding a
+    switch now means adding it here, once.
+
+    `fallbacks` supplies `d_model` / `layers` for configs that omit them.
+    """
+
+    return build_model(
+        name,
+        int(config.get("d_model", fallbacks.get("d_model"))),
+        int(config.get("layers", fallbacks.get("layers"))),
+        heads_from_config(config),
+        pooled_readout_from_config(config),
+        reply_head_from_config(config),
+    )
+
+
 def make_checkpoint(model, config: dict) -> dict:
     """Package weights with the config needed to rebuild them.
 

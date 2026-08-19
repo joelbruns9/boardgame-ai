@@ -191,3 +191,23 @@ def test_make_checkpoint_refuses_a_config_that_contradicts_the_model():
     model = build_model("transformer", 32, 1, None, True, False)
     with pytest.raises(ValueError, match="rebuild its own weights"):
         make_checkpoint(model, {"pooled_readout": False})
+
+
+def test_model_from_config_rebuilds_every_architecture_switch():
+    """The reader-side counterpart to make_checkpoint's writer-side derivation.
+
+    Six separate sites rebuilt a saved model by enumerating the config keys they
+    happened to know about, and adding two switches left all six building a model
+    the weights no longer fit. This is the one place that knows.
+    """
+
+    from .train import make_checkpoint, model_from_config
+
+    for pooled, reply in ((False, False), (True, False), (False, True), (True, True)):
+        model = build_model("transformer", 32, 1, None, pooled, reply)
+        checkpoint = make_checkpoint(model, {"d_model": 32, "layers": 1})
+        rebuilt = model_from_config(checkpoint["config"])
+        # The real assertion: the weights fit without surgery.
+        rebuilt.load_state_dict(checkpoint["model_state"])
+        assert bool(getattr(rebuilt, "pooled_readout", False)) is pooled
+        assert bool(getattr(rebuilt, "reply_head", False)) is reply

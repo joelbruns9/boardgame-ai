@@ -51,7 +51,7 @@ from . import phase_d as pd
 from .buffer import GameRecord, replay, to_json_line
 from .encoder import TokenType, encode
 from .inference import Evaluator
-from .train import build_model, heads_from_config, load_checkpoint
+from .train import build_model, load_checkpoint, model_from_config
 
 CORPUS_DIR = Path(__file__).resolve().parent / "testdata" / "equiv_corpus"
 DEFAULT_LATE_CHECKPOINT = (
@@ -132,12 +132,10 @@ def _evaluator_for(
         model = build_model("transformer", config.d_model, config.layers, None)
     else:
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        saved = payload.get("config", {})
-        model = build_model(
-            "transformer",
-            int(saved.get("d_model", config.d_model)),
-            int(saved.get("layers", config.layers)),
-            heads_from_config(saved),
+        model = model_from_config(
+            payload.get("config", {}),
+            d_model=config.d_model,
+            layers=config.layers,
         )
         load_checkpoint(checkpoint_path, model, checkpoint=payload)
     return Evaluator(model, config.device, precision="fp32")
