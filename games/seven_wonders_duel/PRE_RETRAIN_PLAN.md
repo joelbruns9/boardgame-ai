@@ -589,8 +589,38 @@ the calibrator cannot answer.
 
 ### E. Measurement
 
-* **A frozen proven-position benchmark — build this, it is the missing
-  instrument.** ~1,000 endgame positions with their solver truth, generated once
+* **A frozen proven-position benchmark — BUILT 2026-08-18.**
+  `proven_benchmark.py`, 1,000 positions committed at
+  `testdata/proven_endgames.jsonl` (500 KB; stored as `(seed, first_player,
+  action prefix)` and reconstructed, since the source buffers are gitignored and
+  hundreds of megabytes). Score any checkpoint with
+
+      python -m games.seven_wonders_duel.proven_benchmark score --checkpoint <path>
+
+  Composition: 507 wins / 492 losses / 1 draw, 193 with an instant-win threat.
+  Standard error **0.0158** on the mean absolute error — against 0.026 at 133
+  positions — so differences around 0.03 are resolvable at 2σ.
+
+  **Two properties are forced, not chosen, and both narrow what it measures.**
+  Only an `exact` proof yields a value a three-class head can be scored against;
+  a solve is exact exactly when it crosses no chance edge; and no chance edge
+  means no card left face down. Measured over 77 solves the separation is total —
+  26/26 fully-revealed positions returned `exact`, 0 of 51 others did. So every
+  position is **fully revealed**, and because full revelation only happens late,
+  every position has **1–5 cards left**. The benchmark therefore measures
+  "can the prior see a forced result three or four plies out on a deterministic
+  board". Positions whose outcome still turns on the deal are outside the reach
+  of any proven-value instrument.
+
+  That filter is also what made the build affordable: banking 26 proofs was
+  costing 45 wasted expectimax solves and 6 declines, and predicting the regime
+  from the board instead removed all of them. 1,000 positions took about an hour.
+
+  Baseline (the 128×4 shakedown net, a plumbing net not a strong one): mean
+  |error| **0.619**, sign agreement **76.2%**, threat bucket 0.671 vs quiet
+  0.606. Recorded so the first cloud checkpoint has something to beat.
+
+* *(original note)* **The missing instrument.** ~1,000 endgame positions with their solver truth, generated once
   and stored. Any net is then scored by a single forward per position: no search,
   no game generation, seconds per evaluation, and **paired** across arms because
   every net sees identical positions. Letting each net play its own games would
