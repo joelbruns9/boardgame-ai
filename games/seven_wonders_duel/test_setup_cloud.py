@@ -603,3 +603,24 @@ def test_the_solver_split_is_sized_to_physical_cores(setup_text):
     assert "_physical_cores()" in setup_text
     assert 'CORES="$(_physical_cores)"' in setup_text
     assert "lscpu" in setup_text, "needs a physical-core probe, not just nproc"
+
+
+def test_the_clone_can_be_pointed_at_a_branch():
+    """A plain clone takes the remote's default branch, and the sentinel check
+    below it passes anyway, because the files it looks for exist on main too.
+    So launching unmerged work without REPO_BRANCH builds the wrong code and
+    says nothing -- the run then omits every flag the operator believes they set.
+
+    This existed as a documented knob before it existed as behaviour, which is
+    worse than neither.
+    """
+
+    common = (REPO_ROOT / "setup_cloud_common.sh").read_text(encoding="utf-8")
+    assert "REPO_BRANCH" in common, "documented in the game script, absent from the library"
+    assert '_branch_args=(--branch "$REPO_BRANCH")' in common
+    # Both paths: a fresh clone and an existing checkout being updated.
+    assert 'git clone "${_branch_args[@]}" "$REPO_URL"' in common
+    assert 'git checkout "$REPO_BRANCH"' in common
+
+    setup = (REPO_ROOT / "setup_cloud_7wd.sh").read_text(encoding="utf-8")
+    assert setup.count("REPO_BRANCH=<branch>") == 1, "documented more than once"

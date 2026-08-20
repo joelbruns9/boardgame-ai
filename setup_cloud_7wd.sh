@@ -54,6 +54,11 @@
 #   DISK_BUDGET_GB=0 DISK_HEADROOM_GB=5   0 = measure this box's free space
 #   INTERVENTION_LADDER=0                                W7b response (off)
 #   MEMORY_BUDGET_GB / VRAM_BUDGET_GB / MEMORY_HEADROOM_GB
+#   REPO_BRANCH=<branch>  clone/checkout this branch instead of the default.
+#                   REQUIRED when the code being launched is not on main: a
+#                   plain clone lands on main, the sentinel check still passes
+#                   because those files exist there too, and the box launches
+#                   without the flags you think you are running.
 #   RUN_DIR_REL=runs/seven_wonders_duel/cloud
 #   LAUNCH=1        set 0 to stop after verification
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke

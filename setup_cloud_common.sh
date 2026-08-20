@@ -103,19 +103,32 @@ common::rust_toolchain() {
 # Idempotent: an existing checkout is fast-forwarded, so re-running the script
 # is the documented way to resume a run.
 common::clone_repo() {
+  # REPO_BRANCH is empty by default, which takes the remote's default branch.
+  # Set it when the code being launched has NOT been merged. A plain clone lands
+  # on main; the sentinel check below still passes, because the files it looks
+  # for exist there too; and the box then builds and launches code missing every
+  # flag the operator believes they are running.
+  local _branch_args=()
+  [ -n "${REPO_BRANCH:-}" ] && _branch_args=(--branch "$REPO_BRANCH")
   if [ -d "$REPO_DIR/.git" ]; then
     ok "Repo already present; updating with git pull."
     cd "$REPO_DIR"
+    if [ -n "${REPO_BRANCH:-}" ]; then
+      git fetch origin "$REPO_BRANCH" &&
+        git checkout "$REPO_BRANCH" ||
+        die "Could not check out '$REPO_BRANCH' — is it pushed?"
+    fi
     git pull --ff-only || warn "git pull failed; continuing with the existing checkout."
   else
-    if git clone "$REPO_URL" "$REPO_DIR"; then
-      ok "Cloned $REPO_URL"
+    if git clone "${_branch_args[@]}" "$REPO_URL" "$REPO_DIR"; then
+      ok "Cloned $REPO_URL${REPO_BRANCH:+ (branch $REPO_BRANCH)}"
     else
       warn "Public clone failed — the repo may be private right now."
       if [ -t 0 ]; then
         read -r -p "GitHub username: " GH_USER
         read -r -s -p "GitHub personal access token (input hidden): " GH_TOKEN; echo
-        git clone "https://${GH_USER}:${GH_TOKEN}@github.com/joelbruns9/boardgame-ai.git" \
+        git clone "${_branch_args[@]}" \
+          "https://${GH_USER}:${GH_TOKEN}@github.com/joelbruns9/boardgame-ai.git" \
           "$REPO_DIR" || die "Authenticated clone failed."
         ok "Cloned with token."
       else
