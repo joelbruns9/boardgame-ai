@@ -123,7 +123,9 @@ two is visible.
   --workers 8 --process-workers 16 --pack-threads 0 `
   --example-cache-gb 40 `
   --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
-  --rust-scheduler-workers 4
+  --rust-scheduler-workers 4 `
+  --rust-slots 256 --rust-global-batch-cap 2048 --rust-max-inflight-batches 1 `
+  --gate-slots 144 --gate-global-batch-cap 1024
 ```
 
 **Two values are missing above on purpose**, because they are properties of the

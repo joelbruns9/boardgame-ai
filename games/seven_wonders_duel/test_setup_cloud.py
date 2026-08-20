@@ -575,3 +575,31 @@ def test_the_documented_cloud_command_matches_the_launcher(setup_text):
         "Update the Recommended Cloud Command section, or the page describes a "
         "run nobody launches."
     )
+
+
+def test_the_scheduler_geometry_is_cloud_scale_not_parser_default(setup_text):
+    """Empty meant "let the parser decide", and the parser is laptop-scale:
+    16 slots against cloud6's 256, a 256-row batch against 2,048. On a rented
+    GPU that is an underfed box, not a cautious default."""
+
+    for knob, minimum in (
+        ("RUST_SLOTS", 64),
+        ("RUST_GLOBAL_BATCH_CAP", 512),
+        ("GATE_SLOTS", 64),
+        ("GATE_GLOBAL_BATCH_CAP", 512),
+    ):
+        match = re.search(rf'^{knob}="\$\{{{knob}:-(\d*)\}}"$', setup_text, re.M)
+        assert match, f"{knob} is not a knob with a default"
+        assert match.group(1), f"{knob} defaults to empty, i.e. the parser default"
+        assert int(match.group(1)) >= minimum, f"{knob}={match.group(1)} is laptop-scale"
+
+
+def test_the_solver_split_is_sized_to_physical_cores(setup_text):
+    """nproc counts SMT siblings. The solver is compute-bound alpha-beta that
+    scales 4.37x across 16 logical CPUs, so sizing to the logical count puts
+    twice as many threads on a core as it can use -- and the oversubscription
+    warning, comparing against the same inflated number, stays silent."""
+
+    assert "_physical_cores()" in setup_text
+    assert 'CORES="$(_physical_cores)"' in setup_text
+    assert "lscpu" in setup_text, "needs a physical-core probe, not just nproc"

@@ -275,11 +275,21 @@ LAUNCH="${LAUNCH:-1}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 SKIP_EQUIV="${SKIP_EQUIV:-0}"
 SKIP_SWEEPS="${SKIP_SWEEPS:-0}"
-GATE_SLOTS="${GATE_SLOTS:-}"
-RUST_SLOTS="${RUST_SLOTS:-}"
-RUST_GLOBAL_BATCH_CAP="${RUST_GLOBAL_BATCH_CAP:-}"
-RUST_MAX_INFLIGHT_BATCHES="${RUST_MAX_INFLIGHT_BATCHES:-}"
-GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-}"
+# Scheduler geometry. Empty meant "let the parser decide", and the parser's
+# defaults are LAPTOP scale -- 16 slots against cloud6's 256, a 256-row global
+# batch against 2,048. On a rented GPU that is not a conservative default, it is
+# an underfed one: the box spends its money waiting for 16 games to produce
+# enough leaves to make a batch worth submitting.
+#
+# cloud6's measured values are the defaults instead. The sweep replaces them
+# (stage 8b writes sweeps/measured_env.sh; source it and re-run), which is the
+# documented path -- but an operator who skips the sweep now gets a cloud-shaped
+# configuration rather than a laptop one.
+GATE_SLOTS="${GATE_SLOTS:-144}"
+RUST_SLOTS="${RUST_SLOTS:-256}"
+RUST_GLOBAL_BATCH_CAP="${RUST_GLOBAL_BATCH_CAP:-2048}"
+RUST_MAX_INFLIGHT_BATCHES="${RUST_MAX_INFLIGHT_BATCHES:-1}"
+GATE_GLOBAL_BATCH_CAP="${GATE_GLOBAL_BATCH_CAP:-1024}"
 CRATE_DIR_REL="games/seven_wonders_duel/seven_wonders_rust"
 
 common::require_python
@@ -440,7 +450,30 @@ fi
 # One thread solves one position; there is no intra-tree parallelism. So the
 # total solver thread count IS the number of concurrent solves, and the split is
 # simply: cores that are not feeding the GPU go to solving.
-CORES="$(nproc)"
+# PHYSICAL cores, not $(nproc). The solver is compute-bound alpha-beta, which
+# scales poorly across SMT siblings -- measured 4.37x from 16 logical CPUs, a
+# ceiling attributed to all-core clock and SMT rather than bandwidth. Sizing to
+# the logical count therefore buys contention rather than solves: on a 16-core /
+# 32-thread part it would put 28 solver threads on 16 cores AND stay silent,
+# since the oversubscription check compares against the same inflated number.
+_physical_cores() {
+  local n=""
+  if command -v lscpu >/dev/null 2>&1; then
+    n="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
+  fi
+  if [ -z "$n" ] || [ "$n" -lt 1 ] 2>/dev/null; then
+    n="$(awk -F: '/^core id/{ids[$2]=1} /^physical id/{pk[$2]=1}
+          END{c=0; for (i in ids) c++; p=0; for (i in pk) p++;
+              print (c>0 && p>0) ? c*p : 0}' /proc/cpuinfo 2>/dev/null)"
+  fi
+  if [ -z "$n" ] || [ "$n" -lt 1 ] 2>/dev/null; then n="$(nproc)"; fi
+  echo "$n"
+}
+CORES="$(_physical_cores)"
+_LOGICAL="$(nproc)"
+if [ "$CORES" -lt "$_LOGICAL" ]; then
+  ok "Sizing to $CORES physical cores ($_LOGICAL logical); SMT siblings are left as headroom."
+fi
 : "${GENERATION_THREADS:=$RUST_SCHEDULER_WORKERS}"
 if [ -z "$SOLVER_THREADS" ]; then
   _spare=$(( CORES - GENERATION_THREADS ))
