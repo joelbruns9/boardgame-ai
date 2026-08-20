@@ -879,23 +879,49 @@ def test_the_sweep_grid_contains_the_settings_the_run_is_using(sweep_text):
     assert "4" in axis("SWEEP_WORKERS"), "the run's shard count is outside the grid"
 
 
-@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
-def test_the_sweep_refuses_to_run_beside_a_live_training_process(tmp_path):
-    """A sweep sharing the GPU with training measures contention, and the point
-    it crowns is whichever tolerated the interference best."""
+def _fake_run_repo(tmp_path):
+    """A real git checkout: stage 1 requires one before the stop check runs.
 
+    Without it the refusal test would pass for the WRONG reason -- dying at
+    "not a git checkout" rather than at the live-training refusal.
+    """
+
+    run_repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(run_repo)], check=True)
+    (run_repo / "seed.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(run_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(run_repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "seed"], check=True,
+    )
+    return run_repo
+
+
+def _pgrep_stub(tmp_path):
     stub = tmp_path / "bin"
-    stub.mkdir()
+    stub.mkdir(exist_ok=True)
     (stub / "pgrep").write_text(
         "#!/usr/bin/env bash\necho '4242 python -m games.seven_wonders_duel.phase_d'\n",
         encoding="utf-8",
     )
     (stub / "pgrep").chmod(0o755)
+    return stub
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_the_sweep_refuses_to_run_beside_a_live_training_process(tmp_path):
+    """A sweep sharing the GPU with training measures contention, and the point
+    it crowns is whichever tolerated the interference best."""
+
+    stub = _pgrep_stub(tmp_path)
+    run_repo = _fake_run_repo(tmp_path)
     env = {
         **os.environ,
         "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
         "OUTPUT": str(tmp_path / "out"),
-        "RUN_REPO": str(tmp_path / "repo"),
+        "RUN_REPO": str(run_repo),
+        "SWEEP_REPO": str(tmp_path / "sweep"),
+        "REPO_URL": str(run_repo),
     }
     proc = subprocess.run(
         [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
@@ -929,3 +955,46 @@ def test_the_kingdomino_launcher_also_hands_over_after_its_pull():
     guard = text.index("reexec_if_updated\n", pull)
     assert guard > pull, "the guard must run after the pull, not before"
     assert "SETUP_REEXEC" in text, "nothing stops an exec loop"
+
+
+def test_the_live_profile_runs_before_the_stop_check(sweep_text):
+    """The read-only diagnosis must be reachable WITHOUT stopping training.
+
+    Ordered the other way, the one step that costs nothing and answers the
+    solver question would be gated behind killing the run it is meant to
+    diagnose.
+    """
+
+    profile = sweep_text.index("generation_profile")
+    stop_check = sweep_text.index('stage 3 "Training must not be running"')
+    assert profile < stop_check
+    assert "PROFILE_ONLY" in sweep_text
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_profile_only_does_not_stop_at_the_live_training_check(tmp_path):
+    """PROFILE_ONLY must exit cleanly even with Phase D running -- that is the
+    entire point of it."""
+
+    stub = _pgrep_stub(tmp_path)
+    # A real checkout for stage 1, so the run reaches stage 2 rather than dying
+    # earlier for an unrelated reason and passing vacuously.
+    run_repo = _fake_run_repo(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+        "OUTPUT": str(tmp_path / "out"),
+        "RUN_REPO": str(run_repo),
+        "SWEEP_REPO": str(tmp_path / "sweep"),
+        "REPO_URL": str(run_repo),  # no network in tests
+        "PROFILE_ONLY": "1",
+    }
+    proc = subprocess.run(
+        [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"PROFILE_ONLY refused to run:\n{combined}"
+    assert "Stop training before sweeping" not in combined
+    assert "PROFILE_ONLY=1" in combined
+    # It stopped before anything that touches the GPU.
+    assert "Generation sweep" not in combined

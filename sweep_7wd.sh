@@ -7,14 +7,18 @@
 # while configuring a run at four. This script does the measurement alone.
 #
 # What it does:
-#   1. refuses to run while Phase D is alive (a sweep sharing the GPU with
-#      training measures neither configuration)
-#   2. works out of a SEPARATE checkout, so the running run's repo keeps the
+#   1. works out of a SEPARATE checkout, so the running run's repo keeps the
 #      commit its manifest recorded and stays resumable
-#   3. copies a checkpoint out of the run rather than reading it in place
-#   4. sweeps slots x cap x inflight x scheduler-workers, with the solver
+#   2. PROFILES THE LIVE RUN from what it has already written to
+#      training_log.jsonl -- read-only, requires no stop, and answers whether
+#      the solver blocks generation and whether the batches are wide enough.
+#      PROFILE_ONLY=1 stops here, which is the zero-risk diagnosis.
+#   3. refuses to go further while Phase D is alive (a sweep sharing the GPU
+#      with training measures neither configuration)
+#   4. copies a checkpoint out of the run rather than reading it in place
+#   5. sweeps slots x cap x inflight x scheduler-workers, with the solver
 #      configured as the run configures it
-#   5. writes measured_env.sh and prints the flags that changed
+#   6. writes measured_env.sh and prints the flags that changed
 #
 # What it deliberately does NOT do:
 #   * launch or resume training -- that stays a decision you make
@@ -52,6 +56,12 @@
 #   GATE_RUNG=200                  gate sweep rung; empty to skip the gate sweep
 #   OUTPUT=~/sweep_7wd             results directory
 #   FORCE=0                        1 to sweep anyway while training is alive
+#   PROFILE_ONLY=0                 1 to read the live run and stop. Safe at any
+#                                  time; nothing is stopped or measured on GPU.
+#   PROFILE_ITERATIONS=10          how many iterations of history to show
+#   SOLVER_NODE_RATE=<nodes/s/thread>  enables the solver capacity estimate
+#                                  (stage 6b of the launcher measures this)
+#   SOLVER_THREADS_TOTAL=<n>       --solver-threads x scheduler workers
 # =============================================================================
 set -euo pipefail
 
@@ -104,29 +114,11 @@ SWEEP_LOG="$OUTPUT/sweep_$(date +%Y%m%dT%H%M%S).log"
 exec > >(tee -a "$SWEEP_LOG") 2>&1
 log "logging to $SWEEP_LOG"
 
-# ── STAGE 1: the GPU must be ours alone ──────────────────────────────────────
-# Two processes sharing one GPU measure each other, and the numbers look
-# plausible either way. This is the check that makes the sweep mean anything.
-stage 1 "Training must not be running"
-LIVE="$(pgrep -af "phase_d" || true)"
-if [ -n "$LIVE" ]; then
-  warn "Phase D looks alive:"
-  printf '%s\n' "$LIVE"
-  if [ "$FORCE" != "1" ]; then
-    die "Stop training before sweeping (kill the pid above), or set FORCE=1 to
-  accept measurements taken against a busy GPU. A sweep run beside training
-  measures contention, not geometry -- and the winning point it picks will be
-  the one that tolerated the interference best."
-  fi
-  warn "FORCE=1: sweeping anyway. Every number below is contended."
-fi
-stage_done 1
-
-# ── STAGE 2: a checkout that is not the run's ────────────────────────────────
+# ── STAGE 1: a checkout that is not the run's ────────────────────────────────
 # `_refuse_changed_code` compares the whole repo's commit and dirty diff against
 # what the manifest recorded, so a `git pull` in the run's own checkout ends the
 # ability to resume it. Work somewhere else.
-stage 2 "Sweep checkout at $SWEEP_REPO"
+stage 1 "Sweep checkout at $SWEEP_REPO"
 [ -d "$RUN_REPO/.git" ] || die "$RUN_REPO is not a git checkout"
 RUN_COMMIT="$(git -C "$RUN_REPO" rev-parse HEAD)"
 SWEEP_REF="${SWEEP_REF:-$RUN_COMMIT}"
@@ -155,13 +147,53 @@ if [ "$SWEEP_COMMIT" != "$RUN_COMMIT" ]; then
   warn "measuring geometry, but the run's checkout was NOT touched -- it stays"
   warn "at ${RUN_COMMIT:0:12} and stays resumable."
 fi
+stage_done 1
+
+# ── STAGE 2: read what the live run has already recorded ─────────────────────
+# Read-only, and deliberately BEFORE the "training must not be running" check.
+# The Rust scheduler has been writing a full per-shard time breakdown into
+# training_log.jsonl all along -- nothing surfaced it. It answers whether the
+# solver blocks generation and whether batches are wide enough, on the real
+# configuration, without stopping anything. Sweep only what this cannot settle.
+stage 2 "Profile of the live run"
+cd "$SWEEP_REPO"
+"$PY" -m games.seven_wonders_duel.generation_profile "$RUN_DIR" \
+  --last "${PROFILE_ITERATIONS:-10}" \
+  ${SOLVER_NODE_RATE:+--solver-node-rate "$SOLVER_NODE_RATE"} \
+  ${SOLVER_THREADS_TOTAL:+--solver-threads-total "$SOLVER_THREADS_TOTAL"} \
+  || warn "could not profile $RUN_DIR (continuing)"
 stage_done 2
 
-# ── STAGE 3: the extension must match the code being swept ───────────────────
+if [ "${PROFILE_ONLY:-0}" = "1" ]; then
+  ok "PROFILE_ONLY=1: nothing measured on the GPU, nothing stopped, nothing
+  in the run directory touched."
+  exit 0
+fi
+
+# ── STAGE 3: the GPU must be ours alone ──────────────────────────────────────
+# Two processes sharing one GPU measure each other, and the numbers look
+# plausible either way. This is the check that makes the sweep mean anything.
+stage 3 "Training must not be running"
+LIVE="$(pgrep -af "phase_d" || true)"
+if [ -n "$LIVE" ]; then
+  warn "Phase D looks alive:"
+  printf '%s\n' "$LIVE"
+  if [ "$FORCE" != "1" ]; then
+    die "Stop training before sweeping (kill the pid above), or set FORCE=1 to
+  accept measurements taken against a busy GPU. A sweep run beside training
+  measures contention, not geometry -- and the winning point it picks will be
+  the one that tolerated the interference best.
+  To diagnose without stopping anything, re-run with PROFILE_ONLY=1."
+  fi
+  warn "FORCE=1: sweeping anyway. Every number below is contended."
+fi
+stage_done 3
+
+# ── STAGE 4: the extension must match the code being swept ───────────────────
 # The crate is installed into site-packages by `maturin develop`. Rebuilding it
 # here would swap the extension out from under the training run, so this refuses
 # instead. A Python-only difference is safe; a crate difference is not.
-stage 3 "Rust extension matches the sweep checkout"
+stage 4 "Rust extension matches the sweep checkout"
 RUN_CRATE="$(git -C "$RUN_REPO" rev-parse "$RUN_COMMIT:games/seven_wonders_duel/seven_wonders_rust")"
 SWEEP_CRATE="$(git -C "$SWEEP_REPO" rev-parse "$SWEEP_COMMIT:games/seven_wonders_duel/seven_wonders_rust")"
 if [ "$RUN_CRATE" != "$SWEEP_CRATE" ]; then
@@ -175,22 +207,22 @@ import seven_wonders_rust as swr
 print(f"extension: {swr.__file__}")
 PYEXT
 ok "crate source identical in both checkouts; extension importable"
-stage_done 3
+stage_done 4
 
-# ── STAGE 4: a checkpoint, copied out ────────────────────────────────────────
+# ── STAGE 5: a checkpoint, copied out ────────────────────────────────────────
 # Copied rather than read in place: the run rewrites current_best.pt on every
 # promotion, and a sweep that reloads it mid-grid would compare points measured
 # on two different networks.
-stage 4 "Checkpoint"
+stage 5 "Checkpoint"
 CHECKPOINT="${CHECKPOINT:-$RUN_DIR/checkpoints/current_best.pt}"
 [ -f "$CHECKPOINT" ] || die "no checkpoint at $CHECKPOINT (set CHECKPOINT=<path>)"
 SWEEP_CHECKPOINT="$OUTPUT/sweep_checkpoint.pt"
 cp "$CHECKPOINT" "$SWEEP_CHECKPOINT"
 ok "copied $CHECKPOINT -> $SWEEP_CHECKPOINT ($(du -h "$SWEEP_CHECKPOINT" | cut -f1))"
-stage_done 4
+stage_done 5
 
-# ── STAGE 5: generation sweep ────────────────────────────────────────────────
-stage 5 "Generation sweep"
+# ── STAGE 6: generation sweep ────────────────────────────────────────────────
+stage 6 "Generation sweep"
 MAX_SLOTS="$(printf '%s' "$SWEEP_SLOTS" | tr ',' '\n' | sort -n | tail -1)"
 if [ "$GAMES" -le "$MAX_SLOTS" ]; then
   warn "GAMES=$GAMES is not above the largest slot count ($MAX_SLOTS): that point"
@@ -215,10 +247,10 @@ cd "$SWEEP_REPO"
   --precision "$PRECISION" \
   || die "generation sweep did not complete; nothing was measured"
 ok "generation: $OUTPUT/generation/phase_d_sweep.json"
-stage_done 5
+stage_done 6
 
-# ── STAGE 6: gate sweep (different harness, different shape) ─────────────────
-stage 6 "Gate sweep"
+# ── STAGE 7: gate sweep (different harness, different shape) ─────────────────
+stage 7 "Gate sweep"
 if [ -z "$GATE_RUNG" ]; then
   warn "GATE_RUNG empty; skipping. measured_env.sh will not be written, since"
   warn "sweep_launch_env needs both halves."
@@ -236,10 +268,10 @@ else
     || die "gate sweep at rung $GATE_RUNG failed"
   ok "gate: $OUTPUT/gate_$GATE_RUNG.json"
 fi
-stage_done 6
+stage_done 7
 
-# ── STAGE 7: the numbers, as flags ───────────────────────────────────────────
-stage 7 "Result"
+# ── STAGE 8: the numbers, as flags ───────────────────────────────────────────
+stage 8 "Result"
 if [ -n "$GATE_RUNG" ]; then
   "$PY" "$SWEEP_REPO/games/seven_wonders_duel/sweep_launch_env.py" \
     --sweep-dir "$OUTPUT" --gate-rung "$GATE_RUNG" \
@@ -282,4 +314,4 @@ That RESUMES (do not delete the run directory). It resumes only while
 $RUN_REPO stays at ${RUN_COMMIT:0:12} -- pulling new code there makes Phase D
 refuse the resume.
 EOF
-stage_done 7
+stage_done 8
