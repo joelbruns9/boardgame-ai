@@ -1223,6 +1223,55 @@ The 2026-08-20 geometry sweep found total leaves in flight pinned near 170
 across a 4x change in shard count and a 2x change in slots -- slots and workers
 redistribute a fixed quantity, and only leaf batching raises it.
 
+### `--eval-leaf-batch`
+
+**Default:** `0` (follow `--leaf-batch`). **Value:** non-negative integer
+
+Leaf batch for gates, the arena and anchors. These previously hardcoded `1`, so
+evaluation played a different search from training no matter what was
+configured.
+
+Evaluation must match the **advisor**, which is PUCT-root: the gate is what
+certifies the advisor, so if the two batch differently the advisor's numbers
+stop meaning what the gate's mean. Following `--leaf-batch` rather than
+`--cheap-leaf-batch` is deliberate -- gate games set `full-search-fraction 0.0`
+and so run in cheap slots, but at `--gate-sims` under an explicit PUCT root, so
+they are full-path searches by every property that matters.
+
+Above `1` under a PUCT evaluation root it requires `--virtual-loss-root`.
+
+### `--full-sims-schedule`
+
+**Default:** empty (fixed budget). **Value:** `games:sims` knots, comma separated
+
+Ramps full-search simulations on the GAMES clock, e.g.
+`0:400,10000:900,25000:1600`. Empty keeps `--full-sims-min`/`max` for the whole
+run, which is what every run before this did.
+
+1,600 simulations on an untrained prior buys far less than 1,600 on a good one
+and costs exactly as much, so early games are better spent on volume.
+Kingdomino's cloud runs ramp sims "in stages" for the same reason.
+
+**Piecewise constant, not interpolated.** A continuously drifting budget would
+make every iteration incomparable with every other, rather than only those
+across a step.
+
+Three things to know:
+
+* It sets `full-sims-min` and `full-sims-max` to the SAME value, so a scheduled
+  run gives up the per-move randomisation of a range.
+* It is part of the schedule identity, so a **resume cannot change it** -- only
+  a fresh run can. A ramp changed mid-run moves every later iteration's meaning,
+  exactly as the curriculum's would.
+* It applies only under `--schedule-basis games`. There is no games clock under
+  the iterations basis, and applying it at iteration counts would be the W1.2
+  rescaling bug in a new place.
+
+It interacts with leaf batching: at 400 simulations a leaf batch of 8 is 2% of
+the search, at 1,600 it is 0.5%. Low sims early plus batching perturbs the
+EARLIEST targets hardest, so measure the batch at the bottom of the ramp, not
+only at the top.
+
 ### `--virtual-loss-root`, `--no-virtual-loss-root`
 
 **Default:** off. **Value:** flag

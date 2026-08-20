@@ -621,6 +621,42 @@ class PhaseDConfig:
     candidates, or the conflict-free rule cuts every wave back to width 1.
     """
 
+    full_sims_schedule: str = ""
+    """Full-search simulations as steps on the GAMES clock; empty keeps
+    ``full_sims_min``/``max`` fixed for the whole run.
+
+    Format ``games:sims`` knots, e.g. ``0:400,10000:900,25000:1600``. Piecewise
+    CONSTANT, not interpolated: Kingdomino's cloud runs ramp "in stages" so a
+    change is one identifiable event, and a continuously drifting budget would
+    make every iteration incomparable with every other rather than just the ones
+    across a step.
+
+    Why: 1,600 simulations on an untrained prior buys far less than 1,600 on a
+    good one, while costing exactly as much. Early games are better spent on
+    volume.
+
+    Two consequences worth knowing. It sets ``full_sims_min`` and
+    ``full_sims_max`` to the SAME value, so a scheduled run gives up the
+    per-move randomisation of a min/max range. And it is part of
+    ``schedule_identity``: changing the ramp across a resume would move every
+    later iteration's meaning, exactly as the curriculum's would.
+    """
+
+    eval_leaf_batch: int = 0
+    """Leaf batch for EVALUATION searches; 0 follows ``leaf_batch``.
+
+    Gates, the arena and the anchor previously hardcoded 1, so evaluation played
+    a different search from the one training used no matter what was configured.
+    That also broke the advisor: the advisor is PUCT-root and the gate is what
+    certifies it, so if the two batch differently the advisor's numbers stop
+    meaning what the gate's mean.
+
+    Following ``leaf_batch`` rather than ``cheap_leaf_batch`` is deliberate.
+    Gate games set ``full_search_fraction = 0.0`` and so run in cheap SLOTS, but
+    at ``gate_sims`` under an explicit PUCT root -- they are full-path searches
+    by every property that matters here.
+    """
+
     virtual_loss_root: bool = False
     """Allow a PUCT root to batch, selecting with in-flight counts folded in.
 
@@ -677,6 +713,56 @@ class PhaseDConfig:
 
     def uses_games_basis(self) -> bool:
         return self.schedule_basis == "games"
+
+    def full_sims_knots(self) -> tuple[tuple[int, int], ...]:
+        """`(games, sims)` steps, sorted and validated. Empty when unscheduled."""
+
+        if not self.full_sims_schedule.strip():
+            return ()
+        knots: list[tuple[int, int]] = []
+        for part in self.full_sims_schedule.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(
+                    f"full_sims_schedule knot {part!r} is not games:sims"
+                )
+            games_text, sims_text = part.split(":", 1)
+            try:
+                games, sims = int(games_text), int(sims_text)
+            except ValueError as error:
+                raise ValueError(
+                    f"full_sims_schedule knot {part!r} is not two integers"
+                ) from error
+            if games < 0 or sims < 1:
+                raise ValueError(
+                    f"full_sims_schedule knot {part!r} needs games >= 0 and sims >= 1"
+                )
+            knots.append((games, sims))
+        knots.sort()
+        if knots[0][0] != 0:
+            raise ValueError(
+                "full_sims_schedule must define a value at 0 games, or the "
+                "budget before the first knot is undefined"
+            )
+        if len({games for games, _ in knots}) != len(knots):
+            raise ValueError("full_sims_schedule has two knots at the same games count")
+        return tuple(knots)
+
+    def full_sims_at(self, games_played: int) -> int | None:
+        """Scheduled full-search sims at this point, or None when unscheduled."""
+
+        knots = self.full_sims_knots()
+        if not knots:
+            return None
+        value = knots[0][1]
+        for games, sims in knots:
+            if games_played >= games:
+                value = sims
+            else:
+                break
+        return value
 
     def curriculum_schedule(self) -> GameSchedule:
         """Curriculum-bot mix against the games clock."""
@@ -735,6 +821,7 @@ class PhaseDConfig:
                 replay_window_coefficient=self.replay_window_coefficient,
                 replay_window_exponent=self.replay_window_exponent,
                 replay_window_cap_games=self.replay_window_cap_games,
+                full_sims_schedule=self.full_sims_schedule,
             )
             # `games_per_iteration` is deliberately absent. Under the games basis
             # it no longer determines any schedule position, so a resume is free
@@ -757,6 +844,11 @@ class PhaseDConfig:
             hof_start_games=self.hof_start_games,
         )
         return identity
+
+    def evaluation_leaf_batch(self) -> int:
+        """The leaf batch gates, the arena and the advisor all share."""
+
+        return self.eval_leaf_batch or self.leaf_batch
 
     def gate_batch_cap(self) -> int:
         """The batch cap every evaluation path runs under.
@@ -949,6 +1041,19 @@ class PhaseDConfig:
             raise ValueError("forced_playout_k must be finite and non-negative")
         if self.cheap_search_mode not in ("same", "gumbel", "puct"):
             raise ValueError("cheap_search_mode must be same, gumbel or puct")
+        self.full_sims_knots()  # raises on a malformed schedule
+        if self.eval_leaf_batch < 0:
+            raise ValueError("eval_leaf_batch must be non-negative (0 = follow leaf_batch)")
+        if (
+            self.eval_search_mode == "puct"
+            and self.evaluation_leaf_batch() > 1
+            and not self.virtual_loss_root
+        ):
+            raise ValueError(
+                "evaluation runs a PUCT root, so a leaf batch above 1 needs "
+                "--virtual-loss-root (evaluation follows --leaf-batch unless "
+                "--eval-leaf-batch overrides it)"
+            )
         if self.cheap_leaf_batch < 0:
             raise ValueError("cheap_leaf_batch must be non-negative (0 = follow leaf_batch)")
         # The cheap override is refused under a PUCT cheap root for the same
@@ -1859,6 +1964,10 @@ class ResolvedSchedules:
 
     curriculum_mix_fraction: float
     draft_prior: float
+    #: Scheduled full-search sims, or None to keep the configured min/max.
+    #: Resolved here for the same reason the others are: the games ledger lives
+    #: on the loop, and one iteration's games must all see one budget.
+    full_sims: int | None = None
 
 
 def _search_move(
@@ -2560,6 +2669,11 @@ class PhaseDLoop:
         return ResolvedSchedules(
             curriculum_mix_fraction=self.curriculum_mix_fraction(iteration),
             draft_prior=self.draft_prior_amount(iteration),
+            full_sims=(
+                self.config.full_sims_at(self.generation_clock(iteration))
+                if self.config.uses_games_basis()
+                else None
+            ),
         )
 
     def schedule_knots(self) -> tuple[int, ...]:
@@ -3417,8 +3531,16 @@ class PhaseDLoop:
             leaf_batch=self.config.leaf_batch,
             cheap_sims_min=self.config.cheap_sims_min,
             cheap_sims_max=self.config.cheap_sims_max,
-            full_sims_min=self.config.full_sims_min,
-            full_sims_max=self.config.full_sims_max,
+            full_sims_min=(
+                schedules.full_sims
+                if schedules.full_sims is not None
+                else self.config.full_sims_min
+            ),
+            full_sims_max=(
+                schedules.full_sims
+                if schedules.full_sims is not None
+                else self.config.full_sims_max
+            ),
             full_search_fraction=self.config.full_search_fraction,
             full_search_every_games=self.config.full_search_every_games,
             top_k=self.config.top_k,
@@ -4245,7 +4367,8 @@ class PhaseDLoop:
             games=rust_games_for_self_play(seeds, first_players),
             game_seeds=seeds,
             global_batch_cap=self.config.gate_batch_cap(),
-            leaf_batch=1,
+            leaf_batch=self.config.evaluation_leaf_batch(),
+            virtual_loss_root=self.config.virtual_loss_root,
             cheap_sims_min=self.config.gate_sims,
             cheap_sims_max=self.config.gate_sims,
             full_sims_min=self.config.gate_sims,
@@ -4396,7 +4519,8 @@ class PhaseDLoop:
                     games=rust_games_for_self_play(seeds, first_players),
                     game_seeds=seeds,
                     global_batch_cap=self.config.gate_batch_cap(),
-                    leaf_batch=1,
+                    leaf_batch=self.config.evaluation_leaf_batch(),
+                    virtual_loss_root=self.config.virtual_loss_root,
                     cheap_sims_min=self.config.gate_sims,
                     cheap_sims_max=self.config.gate_sims,
                     full_sims_min=self.config.gate_sims,
@@ -5242,6 +5366,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--round-robin-candidates, without which every wave is cut to width 1.",
     )
     parser.add_argument(
+        "--full-sims-schedule",
+        default="",
+        help="full-search sims as games:sims steps, e.g. "
+        "'0:400,10000:900,25000:1600'. Piecewise constant on the games clock; "
+        "empty keeps --full-sims-min/max. Part of the schedule identity, so a "
+        "resume cannot change it.",
+    )
+    parser.add_argument(
+        "--eval-leaf-batch",
+        type=int,
+        default=0,
+        help="leaf batch for gates, arena and anchors (0 = follow --leaf-batch). "
+        "Evaluation must match the ADVISOR, which is PUCT-root, or the "
+        "advisor's numbers stop meaning what the gate's mean.",
+    )
+    parser.add_argument(
         "--virtual-loss-root",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -5853,6 +5993,8 @@ def main(argv=None) -> int:
         rust_scheduler_workers=args.rust_scheduler_workers,
         leaf_batch=args.leaf_batch,
         cheap_leaf_batch=args.cheap_leaf_batch,
+        full_sims_schedule=args.full_sims_schedule,
+        eval_leaf_batch=args.eval_leaf_batch,
         virtual_loss_root=args.virtual_loss_root,
         conflict_free_waves=args.conflict_free_waves,
         round_robin_candidates=args.round_robin_candidates,
