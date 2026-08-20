@@ -1254,3 +1254,49 @@ def test_virtual_loss_root_is_what_unlocks_a_batched_puct_root():
     assert _config(
         cheap_search_mode="puct", cheap_leaf_batch=8, virtual_loss_root=True
     ).cheap_leaf_batch == 8
+
+
+# ── leaf_batch_test.sh ───────────────────────────────────────────────────────
+# The A/B may run beside training because a win rate is not a timing: both arms
+# play the same game on the same GPU, so contention slows without biasing. What
+# must NOT happen is replacing the extension the live training process loaded.
+
+LEAF_BATCH_SH = REPO_ROOT / "leaf_batch_test.sh"
+
+
+@pytest.fixture(scope="module")
+def leaf_batch_text() -> str:
+    return LEAF_BATCH_SH.read_text(encoding="utf-8")
+
+
+def test_the_leaf_batch_test_never_installs_into_the_shared_environment(leaf_batch_text):
+    """`maturin develop` installs into site-packages, replacing the .so the
+    training process has mapped -- and Phase D's resume guard hashes the REPO,
+    not the extension, so the resulting engine drift would be silent."""
+
+    code = "\n".join(
+        line for line in leaf_batch_text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "maturin develop" not in code, "must build a wheel, never install in place"
+    assert "maturin build" in code
+    assert "--target" in code, "the wheel must go to an isolated directory"
+
+
+def test_it_refuses_an_extension_directory_inside_site_packages(leaf_batch_text):
+    assert "site-packages" in leaf_batch_text
+    assert "dist-packages" in leaf_batch_text
+
+
+def test_it_proves_the_isolation_rather_than_assuming_it(leaf_batch_text):
+    """Both halves are checked at runtime: the A/B resolves the isolated copy,
+    and the shared copy is still where it was."""
+
+    assert "isolated extension resolves first" in leaf_batch_text
+    assert "shared extension MOVED" in leaf_batch_text
+
+
+def test_it_only_uses_flags_the_ab_harness_accepts(leaf_batch_text):
+    used = _long_flags(_invocation(leaf_batch_text, "leaf_batch_ab"))
+    assert len(used) >= 5, f"only extracted {used}"
+    unknown = sorted(used - _module_options("leaf_batch_ab"))
+    assert not unknown, f"leaf_batch_test.sh passes flags the harness rejects: {unknown}"
