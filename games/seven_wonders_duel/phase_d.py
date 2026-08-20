@@ -1444,8 +1444,21 @@ def _summarize_solver(moves: Sequence[Any]) -> dict[str, Any]:
         "nodes_total": sum(move.solver_nodes for move in attempted),
         "nodes_mean": sum(move.solver_nodes for move in attempted) / len(attempted),
         "nodes_max": max(move.solver_nodes for move in attempted),
+        # Where the budget actually goes. A decline burns the whole budget while
+        # a success averages a small fraction of it, so a decline rate that
+        # looks tolerable can still be most of the spend: measured on the cloud
+        # corpus, 7.4% of attempts consumed 67% of solver nodes. Sizing the
+        # trigger from the attempt count alone reads the wrong number.
+        "nodes_on_declines": sum(
+            move.solver_nodes for move in attempted if move.solver_stop is not None
+        ),
+        # NOTE: no per-depth breakdown here. `cards_left` is not on the
+        # record, and adding it would mean threading a field through the
+        # overlay, the Rust record, the bridge and MoveRecord -- for something
+        # already obtainable offline, since `validate_cost_trigger` recomputes
+        # it by replaying the game. A live breakdown keyed on a field that does
+        # not exist would report "unknown" for every row and look like data.
     }
-
 
 def _bot_seed_game(job: GameJob) -> GameRecord:
     bot_type = CURRICULUM_BOT_TYPES[

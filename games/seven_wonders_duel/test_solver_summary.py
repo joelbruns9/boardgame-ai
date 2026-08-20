@@ -37,3 +37,22 @@ def test_attempted_and_masked_are_counted_separately():
     assert summary["stops"] == {"node_cap": 1, "proved": 1}
     assert summary["nodes_total"] == 4_501_000
     assert summary["nodes_max"] == 4_500_000
+
+
+def test_nodes_spent_on_declines_is_reported_separately():
+    """The number that sizes the trigger, and the one an attempt count hides.
+
+    A decline burns the whole budget; a success averages a small fraction of it.
+    Measured on the cloud corpus, 7.4% of attempts consumed 67% of solver nodes,
+    so a decline rate that reads as tolerable can still be most of the spend.
+    """
+
+    moves = [
+        _move(solver_attempted=True, solver_masked=True, solver_nodes=1_000),
+        _move(solver_attempted=True, solver_stop="nodes", solver_nodes=40_000_000),
+    ]
+    summary = _summarize_solver(moves)
+    assert summary["nodes_total"] == 40_001_000
+    assert summary["nodes_on_declines"] == 40_000_000
+    # 50% of attempts, 99.998% of the cost.
+    assert summary["nodes_on_declines"] / summary["nodes_total"] > 0.99

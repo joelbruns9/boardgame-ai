@@ -734,6 +734,32 @@ class RunController:
         vram = resources.get("vram_peak_physical_bytes") or 0
         if vram:
             parts.append(f"vram={int(vram) / 1024**3:.2f}GiB")
+        # The one number that says whether generation is GPU-bound or
+        # core-bound, which decides how cores should be split between game
+        # generation and anything that competes with it. Already sampled into
+        # `resources`; it was simply never surfaced, so the question could only
+        # be answered by inference from games/s.
+        gpu = resources.get("gpu_utilization_percent")
+        if gpu is not None:
+            parts.append(f"gpu={float(gpu):.0f}%")
+        # Game-agnostic on purpose: any game whose generation summary carries a
+        # `solver` block gets the line, and one that does not is silent rather
+        # than printing zeros.
+        solver = (
+            (row.get("generation_performance") or {}).get("summary") or {}
+        ).get("solver") or {}
+        if solver.get("attempted"):
+            attempted = int(solver["attempted"])
+            masked = int(solver.get("masked", 0))
+            stops = solver.get("stops") or {}
+            deadline = int(stops.get("deadline", 0))
+            part = f"solved={masked}/{attempted}"
+            if deadline:
+                # Never expected: a deadline decline makes which positions got a
+                # proof depend on machine load, so the buffer stops being a
+                # function of its seeds. Surfaced where it will be noticed.
+                part += f" DEADLINE={deadline}"
+            parts.append(part)
         parts.append(f"best_iter={row.get('current_best_iteration', -1)}")
         parts.append(f"action={row.get('promotion_action', '-')}")
         if promotion is not None:

@@ -1700,6 +1700,11 @@ fn scheduler_result_to_py(
     metrics.set_item("sched_assemble_ns", m.sched_assemble_ns)?;
     metrics.set_item("sched_submit_ns", m.sched_submit_ns)?;
     metrics.set_item("sched_wait_ns", m.sched_wait_ns)?;
+    // Tracked since the async port but never exported, so "solver seconds as a
+    // share of generation" -- which section B of the pre-retrain plan asks for,
+    // and which the sweep needs to size the solver pool -- could not be computed
+    // at all. It is the time the scheduler spent pumping and blocking on solves.
+    metrics.set_item("sched_solve_wait_ns", m.sched_solve_wait_ns)?;
     metrics.set_item("scheduler_ready_slot_cycles", m.scheduler_ready_slot_cycles)?;
     metrics.set_item(
         "scheduler_waiting_slot_cycles",

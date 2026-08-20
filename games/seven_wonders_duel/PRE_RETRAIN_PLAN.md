@@ -644,6 +644,83 @@ given box from a stored cost profile plus a one-minute rate measurement, because
 **node counts are machine-independent**. The sweep is the throughput half that
 the calibrator cannot answer.
 
+---
+
+#### The sweep procedure (2026-08-19)
+
+`run_f4_cloud_sweep.sh` is **not** this. It is the July F4 calibration harness:
+it sweeps scheduler geometry (`slots`, `global_batch_cap`, `max_inflight`,
+`scheduler_workers`, pinned memory, torch.compile) with **no solver dimension
+and no GPU-utilisation objective**, which was correct when there was no solver.
+cloud6 ran with the solver entirely off, so nothing about its solver
+configuration transfers.
+
+The objective, simplified from §C's vector on the standing judgement that deeper
+solves are better for learning:
+
+> **maximise solve depth subject to games/s not falling, with zero deadline stops.**
+
+That is a constrained climb per stage, not a grid.
+
+**Stage 0 — instrumentation.** Done. `gpu_utilization_percent` was already
+sampled into `stats.resources` but never printed; it and a solver line are now
+on the HEARTBEAT, and `sched_solve_wait_ns` is exported at last, so "solver
+seconds as a share of generation" is finally computable. Without these the knee
+below can only be inferred from games/s, which conflates "GPU saturated" with
+"generation core-bound" -- the exact question being asked.
+
+**Stage 1 — find the GPU knee, solver OFF.** Sweep generation workers and
+`--rust-scheduler-workers`; read `gpu=` and games/s. The knee is the smallest
+generation allocation that plateaus GPU throughput; everything above it is
+available for solving.
+
+Run it at the **shipped net** (384x8x6, bf16). The 2026-08-18 laptop shakedown
+measured **16-28% GPU utilisation** at 128x4 -- nowhere near GPU-bound -- and GPU
+work per evaluation scales with the net, so that knee says nothing about the real
+one. This is also where KD's "2 generation cores" gets tested for 7WD rather than
+assumed: different net, different branching, different solve costs.
+
+Run it with `--full-search-every-games` at its shipped value. A wholly-full game
+demands more GPU per game, so the knee moves; sweeping without it and running
+with it measures the wrong configuration.
+
+**Stage 2 — spend the surplus on depth.** Pin generation at the knee, give the
+rest to the solver as a PRODUCT (`--solver-threads` is per shard: 4 threads x 12
+shards is 48). Then climb the trigger -- lower the cost-model margin, raise
+`--endgame-solver-max-nodes` -- watching four things:
+
+| signal | rule |
+|---|---|
+| games/s | must not fall. The binding constraint. |
+| deadline stops | must stay **0**. Any means oversubscription, and a buffer that depends on machine load. |
+| solver-thread utilisation | climb until saturated |
+| `nodes_on_declines / nodes_total` | the real cost of going deeper, and not visible in the decline count |
+
+**Coupling the earlier draft of §C missed:** a parked slot produces no leaves, so
+deeper solving *reduces* GPU feed. The compensator is `--rust-slots` (cheap in
+CPU, costs memory; cloud6 ran 256). Sweep slots and depth as a pair, not
+independently.
+
+**Sizing prior, from the shakedown.** Sustained solver demand was 1.79M nodes/s
+against generation wall, and a solver thread does 1.2-2.0M nodes/s, so ~1-2
+threads kept up at the card cap and the cost model roughly halves that. Demand
+scales with games/s, so a box at 3 games/s needs ~5 threads at that trigger --
+and 18 threads would be ~3.7x surplus, which is depth to spend rather than
+threads to keep. **Do not size the pool to measured demand**: demand is set by
+the trigger, which is the thing being tuned.
+
+**One thread solves one position.** No intra-tree parallelism, and that is right
+under a node cap: parallel root children would race for a shared budget, so
+which children got priced would be timing-dependent -- non-deterministic
+declines, the same disease as a binding clock. Intra-solve parallelism only wins
+when threads cannot be filled with independent positions, which the utilisation
+signal above will show.
+
+**`max_secs` must be derived, not set.** At 1.2-2.0M nodes/s a 4.5M cap is a 2-4s
+solve and a 40M cap is 20-33s, so a constant that is generous at one budget binds
+at another -- which is how the 3-second clock came to censor 11.3% of solves. Set
+it from `max_nodes` and a conservative rate, generous enough never to bind.
+
 ### D. Network and targets
 
 * **Mean/max readout.** The readout is `encoded[:, 0]`, a single CLS-style
