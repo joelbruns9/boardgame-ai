@@ -860,18 +860,41 @@ def test_the_standalone_sweep_never_launches_training(sweep_text):
     assert "nohup" not in sweep_text
 
 
-def test_the_standalone_sweep_never_builds_the_crate(sweep_text):
-    """`maturin develop` installs into the shared site-packages, so building
-    from the sweep checkout would replace the extension the RUNNING training
-    process loads. The script compares crate trees and refuses instead."""
+def test_the_standalone_sweep_never_installs_into_the_shared_environment(sweep_text):
+    """`maturin develop` installs into the shared site-packages, replacing the
+    .so a training process has mapped.
+
+    This originally REFUSED when the crate differed between checkouts. That
+    blocked the case it was never meant to -- sweeping a configuration whose
+    entire point is new Rust -- so it now builds a wheel into its own directory,
+    which removes the conflict instead of arbitrating it.
+    """
 
     # Comments explain the trap, so only executable lines are checked.
     code = "\n".join(
         line for line in sweep_text.splitlines() if not line.lstrip().startswith("#")
     )
-    assert "maturin" not in code
-    assert "cargo build" not in code
-    assert "rev-parse" in code and "seven_wonders_rust" in code
+    assert "maturin develop" not in code, "must build a wheel, never install in place"
+    assert "maturin build" in code
+    assert "--target" in code, "the wheel must go to an isolated directory"
+    assert "site-packages" in sweep_text, "EXT_DIR inside site-packages must be refused"
+    # Per invocation, not per file: a bare `in code` check passed while the
+    # generation sweep had lost its PYTHONPATH, because the gate sweep and the
+    # isolation probe still carried one. Both harnesses have to use it or half
+    # the measurement runs the shared engine.
+    for module in ("f4_phase_d_sweep", "w5_gate_slots_sweep"):
+        invocations = [
+            line
+            for line in code.splitlines()
+            # The `--help` capability probe reads the harness's flags, not the
+            # engine, so it needs no extension. Every line that MEASURES does.
+            if f"-m games.seven_wonders_duel.{module}" in line and "--help" not in line
+        ]
+        assert invocations, f"no invocation of {module} found"
+        for line in invocations:
+            assert 'PYTHONPATH="$EXT_DIR"' in line, (
+                f"{module} is not run against the isolated extension: {line.strip()}"
+            )
 
 
 def test_the_sweep_grid_contains_the_settings_the_run_is_using(sweep_text):

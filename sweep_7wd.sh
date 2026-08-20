@@ -22,10 +22,11 @@
 #
 # What it deliberately does NOT do:
 #   * launch or resume training -- that stays a decision you make
-#   * build the Rust crate. `maturin develop` installs into the shared site-
-#     packages, so building from the sweep checkout would replace the extension
-#     the training run uses. If the crate source differs between the two
-#     checkouts, this refuses rather than building.
+#   * install into the shared environment. It builds a wheel and unpacks it into
+#     its own directory, running with PYTHONPATH pointed there, so the extension
+#     a training process has mapped is never replaced. (It used to REFUSE when
+#     the crate differed, which blocked the case it was never meant to: sweeping
+#     a configuration whose whole point is new Rust.)
 #   * write anything into the run directory
 #
 # Usage (from the run's checkout, when it already has this file):
@@ -48,8 +49,8 @@
 #   SWEEP_REF=main                 what to check out there. Defaults to main,
 #                                  not the run's commit: this checkout exists to
 #                                  run NEWER tooling than a run that must not be
-#                                  updated. The engine is what has to match, and
-#                                  stage 4 enforces that separately.
+#                                  updated. Stage 4 builds the engine from THIS
+#                                  checkout into an isolated directory.
 #   CHECKPOINT=<path>              default: the run's current_best.pt
 #   GAMES=200 REPETITIONS=2 WARMUP_GAMES=8
 #   SWEEP_SLOTS / SWEEP_CAPS / SWEEP_INFLIGHT / SWEEP_WORKERS  (comma separated)
@@ -67,6 +68,7 @@
 #   PRECISION=bf16                 must match the run
 #   GATE_RUNG=200                  gate sweep rung; empty to skip the gate sweep
 #   OUTPUT=~/sweep_7wd             results directory
+#   EXT_DIR=~/swr_sweep            isolated extension (never the shared venv)
 #   FORCE=0                        1 to sweep anyway while training is alive
 #   PROFILE_ONLY=0                 1 to read the live run and stop. Safe at any
 #                                  time; nothing is stopped or measured on GPU.
@@ -82,6 +84,7 @@ RUN_REPO="${RUN_REPO:-$HOME/boardgame-ai}"
 RUN_DIR="${RUN_DIR:-$RUN_REPO/runs/seven_wonders_duel/cloud}"
 SWEEP_REPO="${SWEEP_REPO:-$HOME/sweep-checkout}"
 OUTPUT="${OUTPUT:-$HOME/sweep_7wd}"
+EXT_DIR="${EXT_DIR:-$HOME/swr_sweep}"
 FORCE="${FORCE:-0}"
 
 GAMES="${GAMES:-200}"
@@ -133,7 +136,7 @@ log "logging to $SWEEP_LOG"
 # observation -- raw.githubusercontent is CDN-cached, so a curl seconds after a
 # push can legitimately return the old file. That ambiguity cost a full
 # debugging round trip; the version line ends it.
-SWEEP_SCRIPT_VERSION=5
+SWEEP_SCRIPT_VERSION=6
 log "sweep_7wd.sh version $SWEEP_SCRIPT_VERSION (checksum $(cksum < "${BASH_SOURCE[0]}" | cut -d' ' -f1))"
 
 # ── STAGE 1: a checkout that is not the run's ────────────────────────────────
@@ -278,24 +281,51 @@ if [ -n "$LIVE" ]; then
 fi
 stage_done 3
 
-# ── STAGE 4: the extension must match the code being swept ───────────────────
-# The crate is installed into site-packages by `maturin develop`. Rebuilding it
-# here would swap the extension out from under the training run, so this refuses
-# instead. A Python-only difference is safe; a crate difference is not.
-stage 4 "Rust extension matches the sweep checkout"
-RUN_CRATE="$(git -C "$RUN_REPO" rev-parse "$RUN_COMMIT:games/seven_wonders_duel/seven_wonders_rust")"
-SWEEP_CRATE="$(git -C "$SWEEP_REPO" rev-parse "$SWEEP_COMMIT:games/seven_wonders_duel/seven_wonders_rust")"
-if [ "$RUN_CRATE" != "$SWEEP_CRATE" ]; then
-  die "The crate source differs between the two checkouts. The installed
-  extension was built from the run's copy, and rebuilding it here would replace
-  the .so the training run loads. Pick a SWEEP_REF whose crate matches, or
-  rebuild deliberately on a box that is not training."
+# ── STAGE 4: an extension built from the code being swept ────────────────────
+# This used to REFUSE when the crate differed between checkouts, because
+# `maturin develop` installs into the shared site-packages and would replace the
+# .so a live training run has mapped. That guard blocked the case it was never
+# meant to: sweeping a configuration whose whole point is new Rust.
+#
+# So build a wheel and unpack it into its own directory instead, exactly as
+# leaf_batch_test.sh does, and run the sweep with PYTHONPATH pointed there. The
+# shared environment is never written to, so there is nothing to protect and
+# nothing to refuse. Both halves of the isolation are checked rather than
+# assumed.
+stage 4 "Isolated extension at $EXT_DIR"
+SHARED_EXT="$("$PY" -c 'import seven_wonders_rust as s; print(s.__file__)' 2>/dev/null || true)"
+log "shared environment uses: ${SHARED_EXT:-<none importable>}"
+case "$EXT_DIR" in
+  *site-packages*|*dist-packages*)
+    die "EXT_DIR points inside a site-packages tree; that is the shared
+  environment this exists to leave alone." ;;
+esac
+rm -rf "$EXT_DIR"
+
+# rustup adds cargo to the shell PROFILE, which a non-login shell never reads.
+# shellcheck disable=SC1091
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and
+  \$HOME/.cargo/env did not supply it. Run 'source \$HOME/.cargo/env' and retry.
+  maturin reports this as 'Cargo metadata failed', which names the symptom."
+ok "cargo: $(cargo --version)"
+
+( cd "$SWEEP_REPO/games/seven_wonders_duel/seven_wonders_rust"   && maturin build --release ) || die "wheel build failed"
+WHEEL="$(ls -t "$SWEEP_REPO/games/seven_wonders_duel/seven_wonders_rust/target/wheels/"*.whl | head -1)"
+[ -n "$WHEEL" ] || die "no wheel produced"
+"$PY" -m pip install --quiet --target "$EXT_DIR" "$WHEEL" || die "wheel install failed"
+
+ISOLATED="$(PYTHONPATH="$EXT_DIR" "$PY" -c 'import seven_wonders_rust as s; print(s.__file__)')"
+log "the sweep will use:      $ISOLATED"
+case "$ISOLATED" in
+  "$EXT_DIR"*) ok "isolated extension resolves first" ;;
+  *) die "PYTHONPATH did not take effect; refusing to sweep the wrong engine" ;;
+esac
+if [ -n "$SHARED_EXT" ]; then
+  STILL="$("$PY" -c 'import seven_wonders_rust as s; print(s.__file__)')"
+  [ "$STILL" = "$SHARED_EXT" ] || die "the shared extension MOVED; something wrote to it"
+  ok "shared extension unchanged"
 fi
-"$PY" - <<'PYEXT' || die "seven_wonders_rust does not import"
-import seven_wonders_rust as swr
-print(f"extension: {swr.__file__}")
-PYEXT
-ok "crate source identical in both checkouts; extension importable"
 stage_done 4
 
 # ── STAGE 5: a checkpoint, copied out ────────────────────────────────────────
@@ -321,7 +351,7 @@ fi
 log "grid: slots=$SWEEP_SLOTS caps=$SWEEP_CAPS inflight=$SWEEP_INFLIGHT workers=$SWEEP_WORKERS"
 log "solver: $SOLVER_THREADS per shard (x workers = the total at each point)"
 cd "$SWEEP_REPO"
-"$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
+PYTHONPATH="$EXT_DIR" "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
   --checkpoint "$SWEEP_CHECKPOINT" \
   --output "$OUTPUT/generation" \
   --games "$GAMES" \
@@ -347,7 +377,7 @@ if [ -z "$GATE_RUNG" ]; then
   warn "GATE_RUNG empty; skipping. measured_env.sh will not be written, since"
   warn "sweep_launch_env needs both halves."
 else
-  "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
+  PYTHONPATH="$EXT_DIR" "$PY" -m games.seven_wonders_duel.w5_gate_slots_sweep \
     --checkpoint "$SWEEP_CHECKPOINT" \
     --work-dir "$OUTPUT/gate_$GATE_RUNG" \
     --output "$OUTPUT/gate_$GATE_RUNG.json" \
