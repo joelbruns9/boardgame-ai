@@ -54,7 +54,8 @@ def _row(iteration=0, wall_ns=1_000, nested=True, **scheduler):
         "rust_scheduler": base,
     }
     summary = {
-        "solver": {"attempted": 11047, "masked": 10522, "nodes": 5, "stops": {}}
+        "solver": {"attempted": 11047, "masked": 10522, "nodes_total": 5,
+                   "nodes_on_declines": 0, "stops": {}}
     }
     if nested:
         reported = {"performance": performance, "summary": summary, "model": {}}
@@ -180,7 +181,7 @@ def test_the_capacity_estimate_flags_solving_that_does_not_fit():
     from .generation_profile import solver_budget
 
     row = _row()
-    row["generation_performance"]["summary"]["solver"]["nodes"] = 10**11
+    row["generation_performance"]["summary"]["solver"]["nodes_total"] = 10**11
     profile = profile_row(row)
     # 1e11 nodes at 1e6/s/thread = 100,000 thread-seconds, against
     # 12 threads x 3000s = 36,000 available.
@@ -191,7 +192,7 @@ def test_the_capacity_estimate_flags_solving_that_does_not_fit():
 
 def test_the_capacity_estimate_flags_cores_bought_and_unused():
     row = _row()
-    row["generation_performance"]["summary"]["solver"]["nodes"] = 10**9
+    row["generation_performance"]["summary"]["solver"]["nodes_total"] = 10**9
     text = render([profile_row(row)], node_rate=1e6, solver_threads_total=12)
     assert "mostly idle" in text
     assert "ESTIMATED" in text, "an estimate must never read as a measurement"
@@ -294,3 +295,41 @@ def test_wave_width_is_reported_and_flagged_when_it_is_one():
     missing = _row()
     del missing["generation_performance"]["performance"]["rust_scheduler"]["mean_wave_width"]
     assert "wave width" not in render([profile_row(missing)])
+
+
+def test_the_solver_node_key_matches_what_summarize_solver_emits():
+    """Pinned to the PRODUCER, not to this file's fixture.
+
+    The profiler read `nodes`; `_summarize_solver` emits `nodes_total`. The
+    capacity estimate therefore reported an idle solver on a run performing
+    ~10,000 solves an iteration -- a wrong answer that looked like a
+    measurement, on the exact question it was built to answer.
+    """
+
+    from pathlib import Path
+
+    source = (Path(__file__).with_name("phase_d.py")).read_text(encoding="utf-8")
+    block = source[source.index("def _summarize_solver") :]
+    block = block[: block.index("\ndef ")]
+    for key in ("nodes_total", "nodes_on_declines", "attempted", "masked"):
+        assert f'"{key}"' in block, f"_summarize_solver no longer emits {key}"
+
+    profile = profile_row(_row())
+    assert profile["solver_nodes"] == 5, "the fixture's nodes_total must be read"
+
+
+def test_a_solver_doing_work_is_not_reported_as_idle():
+    """The failure that reached the box: nodes read as 0, so the estimate said
+    0% of the pool on an iteration with ~10,000 solves."""
+
+    row = _row()
+    row["generation_performance"]["summary"]["solver"]["nodes_total"] = 2_000_000_000
+    text = render([profile_row(row)], node_rate=2e6, solver_threads_total=14)
+    assert "ESTIMATED from 2,000,000,000 nodes" in text
+    # Substring checks are a trap here: "1,000 thread-seconds" contains
+    # "0 thread-seconds". Assert the computed value instead.
+    from .generation_profile import solver_budget
+
+    budget = solver_budget(profile_row(row), node_rate=2e6, threads_total=14)
+    assert budget["thread_seconds"] == pytest.approx(1000.0)
+    assert budget["utilisation"] > 0

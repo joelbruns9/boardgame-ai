@@ -128,7 +128,14 @@ def profile_row(row: dict[str, Any], batch_cap: int = 0) -> dict[str, Any] | Non
         "solver_attempted": int(solver.get("attempted") or 0),
         "solver_masked": int(solver.get("masked") or 0),
         "solver_deadline_stops": int((solver.get("stops") or {}).get("deadline", 0)),
-        "solver_nodes": int(solver.get("nodes") or 0),
+        # `nodes_total`, not `nodes`: _summarize_solver reports totals under
+        # explicit names. Reading a key that does not exist gave 0 and the
+        # capacity estimate then reported an idle solver on a run doing ~10,000
+        # solves an iteration -- a wrong answer that looked like a measurement.
+        "solver_nodes": int(
+            solver.get("nodes_total") or solver.get("nodes") or 0
+        ),
+        "solver_nodes_on_declines": int(solver.get("nodes_on_declines") or 0),
     }
 
 
@@ -279,6 +286,13 @@ def render(
             f"{budget['capacity_thread_seconds']:,.0f} available "
             f"({budget['utilisation']:.0%} of the solver pool)."
         )
+        if latest["solver_nodes"] and latest["solver_nodes_on_declines"]:
+            share = latest["solver_nodes_on_declines"] / latest["solver_nodes"]
+            lines.append(
+                f"    {share:.0%} of those nodes went on solves that DECLINED "
+                "(hit the budget without a proof). Raising the budget buys "
+                "proofs on exactly those; lowering it wastes less on them."
+            )
         if budget["utilisation"] >= 1.0:
             lines.append(
                 "    The solving does NOT fit in the iteration: solves must be "
