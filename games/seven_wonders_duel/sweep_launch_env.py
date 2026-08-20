@@ -76,16 +76,19 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, int]:
 
 def render(env: dict[str, int]) -> str:
     lines = [
-        "# Measured on this box by setup_cloud_7wd.sh stage 8b.",
-        "# Source this, then re-run the script to launch on these numbers.",
+        "# Measured on this box (setup_cloud_7wd.sh stage 8b, or sweep_7wd.sh).",
+        "# Source this, then re-run the launcher to launch on these numbers.",
     ]
     if "RUST_SCHEDULER_WORKERS" in env:
+        workers = env["RUST_SCHEDULER_WORKERS"]
         lines += [
             "#",
-            "# NOTE: --solver-threads is PER SHARD, so this worker count",
-            f"# multiplies it: {env['RUST_SCHEDULER_WORKERS']} shards x SOLVER_THREADS is the",
-            "# number of CPU-bound solver threads competing with generation.",
-            "# Set SOLVER_THREADS deliberately; it is not swept.",
+            "# SOLVER_THREADS is deliberately ABSENT, not forgotten. It is PER",
+            f"# SHARD, so the total is {workers} x SOLVER_THREADS -- and leaving it",
+            "# unset lets stage 6b derive it from this box's core count and the",
+            "# worker count above, keeping the split tied to the geometry.",
+            "# Pinning a value here would freeze a split that should follow it.",
+            "# Set it only to override that derivation deliberately.",
         ]
     lines += [f"export {key}={value}" for key, value in env.items()]
     # Pass 2 must not re-measure: the sweeps are the expensive part of setup.
