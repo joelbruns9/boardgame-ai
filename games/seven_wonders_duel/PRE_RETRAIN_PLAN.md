@@ -660,7 +660,13 @@ solves are better for learning:
 
 > **maximise solve depth subject to games/s not falling, with zero deadline stops.**
 
-That is a constrained climb per stage, not a grid.
+In three steps, which is the whole procedure:
+
+1. measure how many generation threads it takes to **saturate the GPU**;
+2. allocate every remaining core to **endgame solving**;
+3. raise the solver's **node budget** until it starts costing games/s.
+
+A constrained climb per stage, not a grid.
 
 **Stage 0 — instrumentation.** Done. `gpu_utilization_percent` was already
 sampled into `stats.resources` but never printed; it and a solver line are now
@@ -680,14 +686,27 @@ work per evaluation scales with the net, so that knee says nothing about the rea
 one. This is also where KD's "2 generation cores" gets tested for 7WD rather than
 assumed: different net, different branching, different solve costs.
 
-Run it with `--full-search-every-games` at its shipped value. A wholly-full game
-demands more GPU per game, so the knee moves; sweeping without it and running
-with it measures the wrong configuration.
+**`--full-search-every-games` is a Stage 1 variable, not a Stage 2 one.** A
+wholly-full game searches every ply at the full budget, so it demands more GPU
+per game and moves the knee itself; sweeping without it and running with it
+measures the wrong configuration. Sweep **25 and 10** (+10% and +24% generation
+compute respectively, at the 1600/100 split). 25 is the shipped starting point;
+10 is worth pricing because diversity has repeatedly been the binding constraint
+on this project's models, and if its knee is not much worse it is the better
+buy. The knee may move enough to change the core split, which is why it cannot
+wait for Stage 2.
 
-**Stage 2 — spend the surplus on depth.** Pin generation at the knee, give the
-rest to the solver as a PRODUCT (`--solver-threads` is per shard: 4 threads x 12
-shards is 48). Then climb the trigger -- lower the cost-model margin, raise
-`--endgame-solver-max-nodes` -- watching four things:
+**Stage 2 — spend the surplus on depth.** Pin generation at the knee and give
+every remaining core to the solver. `--solver-threads` is **per shard**, so the
+operator does the division:
+
+    --solver-threads = (cores - generation threads) / --rust-scheduler-workers
+
+One thread solves one position, so N x S threads is N x S concurrent solves --
+which is the intent: on a 20-core box with a 2-worker knee, `--solver-threads 9`
+gives 18 solves in flight, one core each.
+
+Then climb **`--endgame-solver-max-nodes`**, watching four things:
 
 | signal | rule |
 |---|---|
@@ -701,7 +720,25 @@ deeper solving *reduces* GPU feed. The compensator is `--rust-slots` (cheap in
 CPU, costs memory; cloud6 ran 256). Sweep slots and depth as a pair, not
 independently.
 
-**Sizing prior, from the shakedown.** Sustained solver demand was 1.79M nodes/s
+**The node budget is the depth knob; the margin is not.** The trigger is
+`predict + margin <= log10(budget)`, so for *which positions are attempted* the
+two are the same knob and only their difference matters. The budget does a
+second job the margin does not: it is also the ceiling a solve may reach before
+being abandoned. Raise the budget tenfold and you attempt positions predicted a
+decade dearer *and* give them ten times the nodes to finish in -- more depth at
+the same decline risk. Drop the margin a decade instead and you attempt the same
+extra positions against the old ceiling, so they mostly hit it: more declines,
+each burning the full budget.
+
+So size the margin to the model's prediction error (p90 residual ~0.8 decades)
+and leave it there; buy depth with the budget. An earlier draft of this section
+said "sweep the margin at a fixed budget" -- right that they are the same knob at
+the trigger, wrong as sweep advice.
+
+**Sizing prior, from the shakedown, and how NOT to use it.** The pool is sized
+by what is spare, not by what was measured: allocate cores minus generation, then
+raise the budget until those threads are busy. The figures below say what the
+OLD shallow trigger consumed; they are a floor to beat, not a target. Sustained solver demand was 1.79M nodes/s
 against generation wall, and a solver thread does 1.2-2.0M nodes/s, so ~1-2
 threads kept up at the card cap and the cost model roughly halves that. Demand
 scales with games/s, so a box at 3 games/s needs ~5 threads at that trigger --
@@ -716,10 +753,20 @@ declines, the same disease as a binding clock. Intra-solve parallelism only wins
 when threads cannot be filled with independent positions, which the utilisation
 signal above will show.
 
-**`max_secs` must be derived, not set.** At 1.2-2.0M nodes/s a 4.5M cap is a 2-4s
-solve and a 40M cap is 20-33s, so a constant that is generous at one budget binds
-at another -- which is how the 3-second clock came to censor 11.3% of solves. Set
-it from `max_nodes` and a conservative rate, generous enough never to bind.
+**`max_secs` must be derived, not set.** Nodes is the real cutoff; seconds is a
+safety net against a position that is slow *per node* rather than large in nodes.
+
+    max_secs ~= (max_nodes / nodes_per_sec) * 5
+
+with `nodes_per_sec` measured on the box -- `endgame_trigger_study --calibrate`
+does it in about a minute, and it is the only machine-specific term, since node
+counts are machine-independent. At a conservative 1.2M nodes/s that is ~19s at a
+4.5M cap, ~83s at 20M, ~167s at 40M.
+
+The shipped 30 is fine at 4.5M and **binds at 40M**, which is exactly the bug
+pattern: a constant generous at one budget censors at another. That is how the
+3-second clock came to cut 11.3% of solves and make the buffer a function of
+machine load.
 
 ### D. Network and targets
 
