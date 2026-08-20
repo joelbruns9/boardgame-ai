@@ -29,6 +29,7 @@ PROSE_ONLY = {
     "--from-buffer",
     "--fit-on",
     "--out",
+    "--calibrate",
 }
 
 

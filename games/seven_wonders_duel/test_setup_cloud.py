@@ -542,3 +542,36 @@ def test_the_scheduler_worker_count_is_flagged_as_unmeasured(setup_text):
 
     assert "RUST_SCHEDULER_WORKERS" in _block(setup_text, "TRAIN_CMD=(")
     assert "PLACEHOLDER" in setup_text
+
+
+def test_the_documented_cloud_command_matches_the_launcher(setup_text):
+    """`training_parameters.md` reproduces the launch command for review.
+
+    A copy that nothing compares drifts, and then the page people configure runs
+    from describes a run nobody launches -- which is how the launcher came to be
+    missing sims, search modes and the solver while the plan described all
+    three.
+
+    Two flags are exempt: the launcher derives them from the box (the solver's
+    clock from the node budget and measured rate, the solver thread count from
+    the core split), so the document names the formulas instead of values.
+    """
+
+    doc = (REPO_ROOT / "games" / "seven_wonders_duel" / "training_parameters.md").read_text(
+        encoding="utf-8"
+    )
+    block = doc[doc.index("## Recommended Cloud Command") : doc.index("## Overnight")]
+    documented = set(re.findall(r"(?<![\w-])--[a-z0-9][a-z0-9-]+", block))
+
+    launched = _long_flags(_block(setup_text, "TRAIN_CMD=("))
+    # Flags the launcher builds into an array rather than writing inline.
+    launched |= {"--pooled-readout", "--reply-head", "--endgame-solver-max-nodes",
+                 "--endgame-cost-model", "--solver-fallback-research"}
+    derived_on_the_box = {"--endgame-solver-max-secs", "--solver-threads"}
+
+    missing = sorted(launched - documented - derived_on_the_box)
+    assert not missing, (
+        f"the launcher passes flags the documented cloud command omits: {missing}. "
+        "Update the Recommended Cloud Command section, or the page describes a "
+        "run nobody launches."
+    )

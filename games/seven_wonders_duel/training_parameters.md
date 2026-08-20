@@ -76,6 +76,82 @@ generated game and 5.12x per training step; see `CLOUD_TRAINING_PLAN.md`.
 PowerShell uses the backtick at the end of a line as its continuation
 character. There must be no spaces after a continuation backtick.
 
+## Recommended Cloud Command
+
+**Do not type this.** `setup_cloud_7wd.sh` emits it, and two of its values are
+derived on the box rather than chosen (see below). It is reproduced here so the
+configuration can be reviewed without reading shell, and so a drift between the
+two is visible.
+
+```powershell
+./.venv/Scripts/python.exe -m games.seven_wonders_duel.phase_d `
+  --run-dir runs/seven_wonders_duel/cloud `
+  --device cuda `
+  --generation-backend rust --gate-backend rust `
+  --schedule-basis games `
+  --iterations 200 --games-per-iteration 1000 --seed-games 5000 `
+  --d-model 384 --layers 8 --heads 6 --precision bf16 `
+  --learning-rate 5e-5 --train-steps 190 --train-warmup-steps 63 `
+  --train-batch-size 512 `
+  --cheap-sims-min 100 --cheap-sims-max 100 `
+  --full-sims-min 1600 --full-sims-max 1600 `
+  --full-search-fraction 0.25 `
+  --full-search-every-games 25 `
+  --top-k 16 --age-deal-samples 32 `
+  --selfplay-search-mode puct `
+  --cheap-search-mode gumbel `
+  --eval-search-mode puct `
+  --dirichlet-epsilon 0.25 --dirichlet-alpha 1.8 `
+  --forced-playout-k 1.0 `
+  --pooled-readout --reply-head `
+  --endgame-solver-max-nodes 4500000 `
+  --endgame-cost-model games/seven_wonders_duel/endgame_cost_model.json `
+  --solver-fallback-research `
+  --selfplay-generator-mode soft_gate `
+  --bootstrap-policy auto_first_trained `
+  --promotion-every 5 --promotion-min-lcb 0.50 --revert-max-ucb 0.48 `
+  --revert-reset-after 3 --probation-reset-after 4 `
+  --gate-ladder-games 200 600 1000 1500 `
+  --gate-ladder-step-up-after 2 --gate-ladder-floor-games 10000 `
+  --hof-opponent-fraction 0.15 --hof-start-games 50000 `
+  --curriculum-anneal-games 15000 --draft-prior-games 10000 `
+  --anchor-games 200 --anchor-gate-every-promotions 0 `
+  --self-anchor-games 400 --self-anchor-lag-games 20000 `
+  --self-anchor-every-games 10000 `
+  --intervention-window-games 20000 `
+  --replay-window-cap-games 40000 `
+  --workers 8 --process-workers 16 --pack-threads 0 `
+  --example-cache-gb 40 `
+  --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
+  --rust-scheduler-workers 4
+```
+
+**Two values are missing above on purpose**, because they are properties of the
+box rather than of the experiment, and the launcher derives them at stage 6b:
+
+* `--endgame-solver-max-secs` = `(max_nodes / measured nodes_per_sec) * 5`. A
+  constant generous at one node budget binds at another.
+* `--solver-threads` = `(cores - generation threads) / --rust-scheduler-workers`,
+  since the flag is per shard and one thread solves one position.
+
+**And one value is a guess, flagged as such at launch.**
+`--rust-scheduler-workers` defaults to 4. Its right value is stage 1 of the
+sweep in `PRE_RETRAIN_PLAN.md` — the smallest count that saturates the GPU —
+and every core above it is one that could have been solving instead. cloud6 ran
+12, deliberately not carried forward: cloud6 ran with the solver off and so had
+nothing to trade generation cores against.
+
+### What changed from cloud6
+
+| | cloud6 | now | why |
+|---|---|---|---|
+| `--eval-search-mode` | gumbel | **puct** | the advisor deploys under PUCT; a Gumbel gate promotes on a number nobody sees again |
+| `--forced-playout-k` | — | 1.0 | KataGo forced playouts at the PUCT root |
+| `--pooled-readout` / `--reply-head` | — | on | mean/max readout and the auxiliary reply target |
+| endgame solver | **off** | on, cost-model triggered | the differentiator this run is built around |
+| `--full-search-every-games` | — | 25 | diversity: wholly coherent games, ~+10% compute |
+| `--solver-fallback-research` | — | on | a declined solve must not leave a cheap move standing in a contested endgame |
+
 ## Overnight Pipeline Shakedown
 
 Run this before renting a box. It is **not** a run whose model matters --- it is
@@ -1027,7 +1103,23 @@ keeps the value target alone, which is how the two halves are A/B'd separately.
 **Bound the solve by nodes, not by seconds.** A solve that stops on wall-clock
 time makes generation irreproducible from `(seed, net)`: the same position
 solves on an idle machine and times out on a loaded one, so the mask appears or
-does not and a different move is played. `--endgame-solver-max-secs` is a safety
+does not and a different move is played.
+
+**Derive `--endgame-solver-max-secs`, do not set it.** Nodes is the real cutoff;
+seconds only catch a position that is slow *per node* rather than large in nodes.
+
+    max_secs ~= (max_nodes / nodes_per_sec) * 5
+
+with the rate measured on the box -- `endgame_trigger_study --calibrate` does it
+in about a minute, and it is the only machine-specific term, since node counts
+are machine-independent. At a conservative 1.2M nodes/s that is ~19s at a 4.5M
+budget, ~83s at 20M and ~167s at 40M. A constant that is generous at one budget
+**binds at another**: the shipped 30 is fine at 4.5M and censors at 40M, which is
+the same shape as the 3-second clock that cut 11.3% of solves on the 2026-08-18
+shakedown and made the buffer a function of machine load. `setup_cloud_7wd.sh`
+computes it at stage 6b.
+
+`--endgame-solver-max-secs` is a safety
 net against one pathological position holding a scheduler slot -- the solve is
 synchronous -- and should be set high enough never to bind.
 
@@ -1060,10 +1152,39 @@ attributed to all-core clock and SMT rather than memory bandwidth -- so solver
 threads do depress generation clocks somewhat, and a sweep should read
 end-to-end games/hour rather than assume independence.
 
-**Records are byte-identical at any thread count**; only the timing differs, and
-`test_async_solver.py` gates exactly that at 1, 2 and 4 threads on both dense and
-mixed schedules. `sched_solve_wait_ns` reports the stall that remained -- the
-number that says whether more threads would help.
+**The flag is PER SHARD.** One solver pool is built per scheduler loop, and there
+is one loop per `--rust-scheduler-workers`, so the total is the product:
+`--solver-threads 4 --rust-scheduler-workers 12` is **48** solver threads, not 4.
+One thread solves one position start to finish -- there is no intra-tree
+parallelism -- so the total *is* the number of concurrent solves. Size it as
+
+    --solver-threads = (cores - generation threads) / --rust-scheduler-workers
+
+and check the product against the core count. `setup_cloud_7wd.sh` derives it at
+stage 6b and warns when it oversubscribes: solves that run longer in wall time
+push a run toward the deadline, and a deadline decline makes which positions got
+a proof depend on machine load.
+
+**Records are byte-identical at any thread count**; only the timing differs.
+`test_solver_scheduler.py` is the gate for that, at 1, 2 and 4 threads, across
+shard counts, on dense and mixed schedules.
+
+> **Correction (2026-08-19).** This section previously credited
+> `test_async_solver.py` with that guarantee. It did not hold.
+> `test_async_solver.py` drives `self_play_many_mock`, which routes to
+> `self_play::run_many` -- a scheduler that passes `None` where the pipelined
+> ones pass a `SolverPool` (`self_play.rs:2528` against `:2696`). With no pool
+> no slot ever parks, so every thread count took the same **synchronous** path
+> and the identity assertions compared a run against itself. The async solver
+> was never gated by it. `test_solver_scheduler.py` drives
+> `self_play_many_net`, which routes to `run_many_pipelined_sharded` -- the
+> scheduler production uses -- and it found a live scheduler deadlock on its
+> first run.
+
+`sched_solve_wait_ns` reports the stall that remained -- the number that says
+whether more threads would help. It is exported as of 2026-08-19; before that it
+was tracked in Rust and never crossed to Python, so "solver seconds as a share
+of generation" could not be computed at all.
 
 Every attempted solve is marked in the buffer, whether or not it succeeded:
 `solver_attempted`, `solver_stop` (`unsolvable` / `budget`), `solver_nodes`
