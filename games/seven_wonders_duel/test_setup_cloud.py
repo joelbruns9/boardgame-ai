@@ -1058,3 +1058,15 @@ def _default_branch(repo) -> str:
         ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
+
+
+def test_the_sweep_holds_solver_threads_constant_across_the_worker_axis(sweep_text):
+    """`--solver-threads` is PER SHARD, so a fixed per-shard count across a
+    worker sweep varies total solver load with the axis being measured: 1 shard
+    would solve on 3 threads and 4 shards on 12, and fewer shards would lose
+    partly because they were under-solving."""
+
+    block = _invocation(sweep_text, "f4_phase_d_sweep")
+    assert "--solver-threads-total" in block, (
+        "the worker sweep confounds solver load with the worker count"
+    )

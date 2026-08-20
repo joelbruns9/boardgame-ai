@@ -231,6 +231,17 @@ def main() -> None:
         "0 measures with the solver off, which is the wrong cost curve for a "
         "run that solves: those threads compete with generation for cores.",
     )
+    parser.add_argument(
+        "--solver-threads-total",
+        type=int,
+        default=0,
+        help="total solver threads, divided across shards at each point. Use "
+        "this whenever --workers has more than one value: --solver-threads is "
+        "PER SHARD, so holding it fixed across the worker axis silently varies "
+        "the solver load with the axis being measured, and fewer shards would "
+        "lose partly because they were under-solving. Overrides "
+        "--solver-threads.",
+    )
     args = parser.parse_args()
 
     output = Path(args.output)
@@ -258,6 +269,24 @@ def main() -> None:
     if not grid:
         raise SystemExit("every grid point has fewer slots than shards")
 
+    def solver_threads_for(workers: int) -> int:
+        """Per-shard threads at this point, holding the TOTAL fixed when asked."""
+
+        if args.solver_threads_total <= 0:
+            return args.solver_threads
+        return max(1, args.solver_threads_total // max(1, workers))
+
+    if args.solver_threads_total > 0 and len(numbers(args.workers)) > 1:
+        print(
+            "solver: holding "
+            f"{args.solver_threads_total} threads TOTAL across the worker axis "
+            + ", ".join(
+                f"{workers}x{solver_threads_for(workers)}"
+                for workers in numbers(args.workers)
+            ),
+            flush=True,
+        )
+
     geometry = geometry_from_checkpoint(args.checkpoint)
     config = pd.PhaseDConfig(
         run_dir=str(output / "run"),
@@ -282,7 +311,8 @@ def main() -> None:
         print(f"warmup: {args.warmup_games} games", flush=True)
         run_point(
             loop, model, args.iteration, jobs_for(args.warmup_games, 999),
-            output / "warmup.jsonl", *grid[0], solver_threads=args.solver_threads,
+            output / "warmup.jsonl", *grid[0],
+            solver_threads=solver_threads_for(grid[0][3]),
         )
 
     jobs = jobs_for(args.games, args.iteration)
@@ -303,7 +333,7 @@ def main() -> None:
                 loop, model, args.iteration, jobs,
                 output
                 / f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}_w{workers}.jsonl",
-                slots, cap, inflight, workers, args.solver_threads,
+                slots, cap, inflight, workers, solver_threads_for(workers),
             )
             stats["repetition"] = repetition
             results.append(stats)
@@ -346,8 +376,8 @@ def main() -> None:
                 "global_batch_cap": cap,
                 "max_inflight_batches": inflight,
                 "scheduler_workers": workers,
-                "solver_threads_per_shard": args.solver_threads,
-                "solver_threads_total": args.solver_threads * workers,
+                "solver_threads_per_shard": solver_threads_for(workers),
+                "solver_threads_total": solver_threads_for(workers) * workers,
                 "median_seconds": statistics.median(row["wall_seconds"] for row in matching),
                 "median_games_per_hour": statistics.median(
                     row["games_per_hour"] for row in matching

@@ -52,6 +52,11 @@
 #   GAMES=200 REPETITIONS=2 WARMUP_GAMES=8
 #   SWEEP_SLOTS / SWEEP_CAPS / SWEEP_INFLIGHT / SWEEP_WORKERS  (comma separated)
 #   SOLVER_THREADS=3               per shard, as the run passes it
+#   SOLVER_THREADS_TOTAL=<n>       total solver threads, divided across shards
+#                                  at each point. SET THIS whenever SWEEP_WORKERS
+#                                  has more than one value: threads are PER
+#                                  SHARD, so a fixed per-shard count varies the
+#                                  solver load with the very axis being measured
 #   PRECISION=bf16                 must match the run
 #   GATE_RUNG=200                  gate sweep rung; empty to skip the gate sweep
 #   OUTPUT=~/sweep_7wd             results directory
@@ -268,6 +273,7 @@ cd "$SWEEP_REPO"
   --caps "$SWEEP_CAPS" \
   --inflight "$SWEEP_INFLIGHT" \
   --workers "$SWEEP_WORKERS" \
+  ${SOLVER_THREADS_TOTAL:+--solver-threads-total "$SOLVER_THREADS_TOTAL"} \
   --solver-threads "$SOLVER_THREADS" \
   --device cuda \
   --precision "$PRECISION" \
