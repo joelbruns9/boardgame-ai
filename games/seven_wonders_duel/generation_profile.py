@@ -107,6 +107,12 @@ def profile_row(row: dict[str, Any], batch_cap: int = 0) -> dict[str, Any] | Non
         "queue_wait_share": share("queue_wait_ns"),
         "tree_share": share("rust_tree_ns"),
         "encode_share": share("encode_pack_ns"),
+        # Leaves a SINGLE game's search has in flight at once, as opposed to
+        # batch width, which is leaves summed across concurrent games. 1.0 means
+        # every game issues one leaf and waits for the GPU before issuing the
+        # next -- so a 1600-sim move is 1600 sequential round trips, and the
+        # only thing hiding that latency is other games.
+        "mean_wave_width": float(scheduler.get("mean_wave_width") or 0.0),
         "batch_mean": statistics.fmean(batches) if batches else 0.0,
         "batch_p95": _percentile(batches, 0.95),
         "batch_max": int(scheduler.get("max_batch_rows") or 0),
@@ -215,7 +221,7 @@ def render(
 
     lines = [
         "",
-        "  iter  games/s   batch(mean/p95/max)   live_slots/cap   "
+        "  iter  games/s   batch(mean/p95/max)   live_slots/cap  wave   "
         "solve_wait  eval_call  tree   solved",
     ]
     for profile in profiles:
@@ -223,7 +229,8 @@ def render(
             f"  {profile['iteration']:<5} {profile['games_per_second']:<8.3f} "
             f"{profile['batch_mean']:>6.0f}/{profile['batch_p95']:>5.0f}/"
             f"{profile['batch_max']:<6} "
-            f"{profile['mean_live_slots']:>6.0f}/{profile['slot_cap']:<7} "
+            f"{profile['mean_live_slots']:>6.0f}/{profile['slot_cap']:<6} "
+            f"{profile['mean_wave_width']:>4.2f} "
             f"{profile['solve_wait_share']:>9.1%} {profile['eval_call_share']:>9.1%} "
             f"{profile['tree_share']:>6.1%} "
             f"{profile['solver_masked']}/{profile['solver_attempted']}"
@@ -281,6 +288,14 @@ def render(
                 "unused: either raise the node budget (more proof per position) "
                 "or move threads to generation."
             )
+
+    if 0 < latest["mean_wave_width"] <= 1.01:
+        lines.append(
+            "  * wave width 1.00: each game has exactly ONE leaf in flight, so a "
+            "1600-sim move is 1600 sequential GPU round trips. Batch width comes "
+            "only from running many games at once, which caps rows per live game "
+            "at 1. --leaf-batch is the only knob that lifts that ceiling."
+        )
 
     if latest["slot_cap"] and latest["mean_live_slots"] < 0.6 * latest["slot_cap"]:
         lines.append(

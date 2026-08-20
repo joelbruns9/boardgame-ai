@@ -45,6 +45,7 @@ def _row(iteration=0, wall_ns=1_000, nested=True, **scheduler):
         "max_active_slots": 256,
         "max_live_slots": 200,
         "scheduler_workers": 4,
+        "mean_wave_width": 1.0,
     }
     base.update(scheduler)
     performance = {
@@ -264,3 +265,21 @@ def test_phase_d_config_defaults_are_not_readable_as_class_attributes():
         f.default for f in dataclasses.fields(pd.PhaseDConfig) if f.name == "rust_slots"
     )
     assert isinstance(field_default("rust_slots"), int)
+
+
+def test_wave_width_is_reported_and_flagged_when_it_is_one():
+    """Wave width is leaves in flight for ONE game; batch width is leaves summed
+    across games. At 1.00 a 1600-sim move is 1600 sequential round trips, and no
+    amount of slots or workers can lift rows-per-live-game above 1."""
+
+    one = render([profile_row(_row(mean_wave_width=1.0))])
+    assert "wave width 1.00" in one
+    assert "leaf-batch" in one
+
+    batched = render([profile_row(_row(mean_wave_width=8.0))])
+    assert "wave width" not in batched
+
+    # Absent from an older metrics block: report nothing rather than 0.
+    missing = _row()
+    del missing["generation_performance"]["performance"]["rust_scheduler"]["mean_wave_width"]
+    assert "wave width" not in render([profile_row(missing)])
