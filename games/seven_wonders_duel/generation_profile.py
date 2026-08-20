@@ -162,13 +162,56 @@ def solver_budget(
     }
 
 
+def diagnose(rows: list[dict[str, Any]]) -> str:
+    """What the log actually contains, when nothing could be read from it.
+
+    "no iteration recorded scheduler metrics" was a dead end for everyone: it
+    named no key, so it could not distinguish a run that genuinely has none from
+    a reader looking at the wrong nesting level -- which is what it was. A tool
+    that cannot find its data should report what it DID find.
+    """
+
+    if not rows:
+        return "  the log has no parseable rows at all"
+    last = rows[-1]
+    lines = [
+        f"  rows in log: {len(rows)}",
+        f"  keys in the last row: {sorted(last)}",
+    ]
+    reported = last.get("generation_performance")
+    if reported is None:
+        lines.append("  the last row has NO 'generation_performance' key")
+    elif isinstance(reported, dict):
+        lines.append(f"  generation_performance keys: {sorted(reported)}")
+        for key, value in sorted(reported.items()):
+            if isinstance(value, dict):
+                lines.append(f"    {key}: {sorted(value)}")
+    stats = last.get("stats")
+    if isinstance(stats, dict):
+        lines.append(f"  stats keys: {sorted(stats)}")
+        generation = stats.get("generation")
+        if isinstance(generation, dict):
+            lines.append(f"    stats.generation: {sorted(generation)}")
+    lines.append(
+        "  Send this block back: it names the path the scheduler block is under."
+    )
+    return "\n".join(lines)
+
+
 def render(
     profiles: list[dict[str, Any]],
     node_rate: float = 0.0,
     solver_threads_total: int = 0,
+    rows: list[dict[str, Any]] | None = None,
 ) -> str:
     if not profiles:
-        return "no iteration in this log recorded scheduler metrics"
+        return "\n".join(
+            [
+                "no iteration in this log recorded scheduler metrics.",
+                "What the log does contain:",
+                diagnose(rows or []),
+            ]
+        )
 
     lines = [
         "",
@@ -274,11 +317,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     batch_cap = manifest_batch_cap(args.run_dir)
+    rows = _rows(args.run_dir)
     profiles = [
         profile
-        for profile in (
-            profile_row(row, batch_cap) for row in _rows(args.run_dir)
-        )
+        for profile in (profile_row(row, batch_cap) for row in rows)
         if profile is not None
     ]
     if args.last > 0:
@@ -288,7 +330,12 @@ def main(argv=None) -> int:
         print(json.dumps(profiles, indent=2))
     else:
         print(
-            render(profiles, args.solver_node_rate, args.solver_threads_total)
+            render(
+                profiles,
+                args.solver_node_rate,
+                args.solver_threads_total,
+                rows=rows,
+            )
         )
     return 0
 

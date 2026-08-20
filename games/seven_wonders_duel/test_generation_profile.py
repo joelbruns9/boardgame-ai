@@ -215,3 +215,35 @@ def test_the_nested_key_matches_what_the_adapter_actually_reports():
             f"training_adapter no longer reports {key!r}; generation_profile "
             "reads that key path and will report no metrics without it"
         )
+
+
+def test_an_unreadable_log_reports_what_it_did_find(tmp_path, capsys):
+    """The failure message must name keys, not just say no.
+
+    "no iteration recorded scheduler metrics" was true, uninformative, and
+    worded like the run's fault while the reader was looking one nesting level
+    too shallow. It cost a debugging round trip on a rented box.
+    """
+
+    row = {
+        "iteration": 4,
+        "generation_performance": {"performance": {"seconds": 1.0}, "summary": {}},
+        "stats": {"generation": {"games_per_second": 0.3}},
+    }
+    log = tmp_path / "training_log.jsonl"
+    log.write_text(json.dumps(row), encoding="utf-8")
+
+    assert main([str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    # Names the top-level keys, the nested keys, and where to look.
+    assert "generation_performance keys" in out
+    assert "'performance'" in out and "'summary'" in out
+    assert "performance: ['seconds']" in out
+    assert "stats.generation" in out
+
+
+def test_the_diagnosis_says_so_when_the_key_is_absent_entirely(tmp_path, capsys):
+    log = tmp_path / "training_log.jsonl"
+    log.write_text(json.dumps({"iteration": 1}), encoding="utf-8")
+    assert main([str(tmp_path)]) == 0
+    assert "NO 'generation_performance' key" in capsys.readouterr().out

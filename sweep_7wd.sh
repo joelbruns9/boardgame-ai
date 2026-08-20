@@ -114,6 +114,16 @@ SWEEP_LOG="$OUTPUT/sweep_$(date +%Y%m%dT%H%M%S).log"
 exec > >(tee -a "$SWEEP_LOG") 2>&1
 log "logging to $SWEEP_LOG"
 
+# Which copy of THIS FILE is running.
+#
+# Bumped by hand on every change to this script. Without it, "the fix did not
+# work" and "you ran a cached copy of the previous version" are the same
+# observation -- raw.githubusercontent is CDN-cached, so a curl seconds after a
+# push can legitimately return the old file. That ambiguity cost a full
+# debugging round trip; the version line ends it.
+SWEEP_SCRIPT_VERSION=4
+log "sweep_7wd.sh version $SWEEP_SCRIPT_VERSION (checksum $(cksum < "${BASH_SOURCE[0]}" | cut -d' ' -f1))"
+
 # ── STAGE 1: a checkout that is not the run's ────────────────────────────────
 # `_refuse_changed_code` compares the whole repo's commit and dirty diff against
 # what the manifest recorded, so a `git pull` in the run's own checkout ends the
