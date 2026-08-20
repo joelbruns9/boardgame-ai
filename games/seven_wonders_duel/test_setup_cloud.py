@@ -624,3 +624,89 @@ def test_the_clone_can_be_pointed_at_a_branch():
 
     setup = (REPO_ROOT / "setup_cloud_7wd.sh").read_text(encoding="utf-8")
     assert setup.count("REPO_BRANCH=<branch>") == 1, "documented more than once"
+
+
+# --- measured against a known-good run, not against my memory ---------------
+#
+# The omission tests above assert that the flags I THOUGHT OF are present. That
+# is the wrong shape: on 2026-08-20 the launcher shipped with seven training
+# parameters at argparse defaults -- weight decay 0.0001 against cloud6's 0.5, a
+# replay-window coefficient of 16 against 1,000, no value bootstrap, no minimum
+# buffer, a tighter temperature floor -- and every test here passed, because it
+# never occurred to me to check those.
+#
+# The reference is embedded rather than read from the capture directory, which
+# is gitignored. That is also the better artefact: a frozen baseline someone
+# chose, not a file that can quietly disappear.
+
+CLOUD6_FLAGS = frozenset({
+    "--run-dir", "--device", "--iterations", "--games-per-iteration",
+    "--seed-games", "--init-checkpoint", "--min-buffer-positions",
+    "--selfplay-search-mode", "--dirichlet-epsilon", "--dirichlet-alpha",
+    "--full-sims-min", "--full-sims-max", "--cheap-sims-min", "--cheap-sims-max",
+    "--gate-sims", "--eval-search-mode", "--cheap-double-reveal-offsets",
+    "--top-k", "--age-deal-samples", "--workers", "--process-workers",
+    "--d-model", "--layers", "--heads", "--precision", "--learning-rate",
+    "--weight-decay", "--value-bootstrap", "--temperature-floor",
+    "--temperature-anneal-moves", "--train-steps", "--train-warmup-steps",
+    "--train-batch-size", "--schedule-basis", "--generation-backend",
+    "--gate-backend", "--derive-backend", "--replay-window-coefficient",
+    "--replay-window-exponent", "--replay-window-cap-games",
+    "--example-cache-gb", "--hof-opponent-fraction", "--hof-start-games",
+    "--opponent-fraction", "--draft-prior-games", "--curriculum-anneal-games",
+    "--selfplay-generator-mode", "--bootstrap-policy", "--promotion-every",
+    "--revert-reset-after", "--probation-reset-after", "--promotion-min-lcb",
+    "--revert-max-ucb", "--gate-ladder-games", "--gate-ladder-step-up-after",
+    "--gate-ladder-floor-games", "--anchor-games",
+    "--anchor-gate-every-promotions", "--self-anchor-games",
+    "--self-anchor-lag-games", "--self-anchor-every-games",
+    "--intervention-window-games", "--pack-threads", "--memory-budget-gb",
+    "--vram-budget-gb", "--memory-headroom-gb", "--rust-slots",
+    "--rust-global-batch-cap", "--rust-max-inflight-batches",
+    "--rust-scheduler-workers", "--gate-slots", "--gate-global-batch-cap",
+})
+
+#: Deliberately not carried forward, each with a reason.
+CLOUD6_FLAGS_DROPPED = {
+    # This run bootstraps fresh: TARGET_VERSION went 2->3, the encoder gained
+    # features and the architecture gained two heads, so cloud6's buffer is
+    # incompatible and its weights come from a net that stalled for 38k games.
+    "--init-checkpoint",
+}
+
+
+def test_every_flag_cloud6_used_is_passed_or_deliberately_dropped(setup_text):
+    """The gate that would have caught the seven silent defaults.
+
+    A flag the launcher omits is not "unset" -- it is whatever argparse says,
+    which for weight decay is 5,000x away from the value cloud6 ran.
+    """
+
+    block = _block(setup_text, "TRAIN_CMD=(")
+    ours = _long_flags(block)
+    # Flags the launcher assembles into arrays rather than writing inline.
+    for array in ("ARCH_FLAGS", "SOLVER_FLAGS", "TUNED_FLAGS", "GATE_TUNED_FLAGS"):
+        assert f'"${{{array}[@]}}"' in block, f"{array} is not spliced into TRAIN_CMD"
+    ours |= _long_flags(setup_text)
+
+    missing = sorted(CLOUD6_FLAGS - ours - CLOUD6_FLAGS_DROPPED)
+    assert not missing, (
+        f"cloud6 passed these and this launcher does not: {missing}. "
+        "Each one silently becomes an argparse default, which is a training "
+        "decision nobody made. Pass it, or add it to CLOUD6_FLAGS_DROPPED with "
+        "a reason."
+    )
+
+
+def test_the_solver_budget_is_sized_for_a_rented_box(setup_text):
+    """4.5M leaves 12 solver threads about 2% utilised: 2.26M nodes per game at
+    ~0.33 games/s is 0.75M nodes/s against roughly 36M available. The solver is
+    the differentiator this run is built on; it should not idle."""
+
+    match = re.search(r'^ENDGAME_SOLVER_MAX_NODES="\$\{ENDGAME_SOLVER_MAX_NODES:-(\d+)\}"$',
+                      setup_text, re.M)
+    assert match, "ENDGAME_SOLVER_MAX_NODES is not a knob with a default"
+    assert int(match.group(1)) >= 20_000_000, (
+        f"{match.group(1)} nodes is laptop-scale for a box that solves at "
+        "millions of nodes per second"
+    )

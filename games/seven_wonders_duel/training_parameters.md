@@ -104,7 +104,7 @@ two is visible.
   --dirichlet-epsilon 0.25 --dirichlet-alpha 1.8 `
   --forced-playout-k 1.0 `
   --pooled-readout --reply-head `
-  --endgame-solver-max-nodes 4500000 `
+  --endgame-solver-max-nodes 40000000 `
   --endgame-cost-model games/seven_wonders_duel/endgame_cost_model.json `
   --solver-fallback-research `
   --selfplay-generator-mode soft_gate `
@@ -125,7 +125,15 @@ two is visible.
   --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
   --rust-scheduler-workers 4 `
   --rust-slots 256 --rust-global-batch-cap 2048 --rust-max-inflight-batches 1 `
-  --gate-slots 144 --gate-global-batch-cap 1024
+  --gate-slots 144 --gate-global-batch-cap 1024 `
+  --gate-sims 64 `
+  --weight-decay 0.5 --value-bootstrap 0.5 `
+  --min-buffer-positions 200000 `
+  --replay-window-coefficient 1000 --replay-window-exponent 0.6 `
+  --temperature-floor 0.35 --temperature-anneal-moves 30 `
+  --cheap-double-reveal-offsets 3 `
+  --derive-backend rust `
+  --opponent-fraction 0
 ```
 
 **Two values are missing above on purpose**, because they are properties of the
@@ -175,7 +183,7 @@ First, a 90-second plumbing check of the same flag set:
   --forced-playout-k 1.0 `
   --pooled-readout `
   --reply-head `
-  --endgame-solver-max-nodes 4500000 `
+  --endgame-solver-max-nodes 40000000 `
   --endgame-solver-max-cards 10 `
   --solver-threads 4
 ```
@@ -200,7 +208,7 @@ Then the overnight run itself:
   --forced-playout-k 1.0 `
   --pooled-readout `
   --reply-head `
-  --endgame-solver-max-nodes 4500000 `
+  --endgame-solver-max-nodes 40000000 `
   --endgame-cost-model `
   --endgame-solver-max-cards 10 `
   --endgame-solver-max-secs 30 `

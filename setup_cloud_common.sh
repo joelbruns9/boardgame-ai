@@ -40,6 +40,32 @@ die()  { printf '\033[1;31m[FATAL]\033[0m %s\n' "$*" >&2; exit 1; }
 stage()      { printf '\n\033[1;36m=== STAGE %s: %s ===\033[0m\n' "$1" "$2"; }
 stage_done() { printf '\033[1;32m=== STAGE %s COMPLETE ===\033[0m\n' "$1"; }
 
+# common::quietly <logfile> <label> -- <command...>
+# Run a verbose stage with its output in a file rather than on the terminal.
+#
+# The stage banners are the navigation: they say which check passed and which
+# refused, and a stage that prints thousands of lines scrolls the ones before it
+# out of reach. On failure the tail is printed, because a failure nobody can see
+# is worse than noise -- and the full log is always on disk.
+common::quietly() {
+  local logfile="$1" label="$2"; shift 2
+  [ "$1" = "--" ] && shift
+  mkdir -p "$(dirname "$logfile")"
+  if [ "${VERBOSE_STAGES:-0}" = "1" ]; then
+    "$@" | tee "$logfile"
+    return "${PIPESTATUS[0]}"
+  fi
+  echo "  $label (output -> $logfile)"
+  if "$@" >"$logfile" 2>&1; then
+    echo "  $label: ok, $(wc -l < "$logfile" | tr -d ' ') lines"
+    return 0
+  fi
+  local status=$?
+  warn "$label FAILED (exit $status). Last 40 lines of $logfile:"
+  tail -n 40 "$logfile" >&2
+  return "$status"
+}
+
 common::require_python() {
   PY="${PYTHON:-python3}"
   command -v "$PY" >/dev/null 2>&1 || PY=python

@@ -60,6 +60,10 @@
 #                   because those files exist there too, and the box launches
 #                   without the flags you think you are running.
 #   RUN_DIR_REL=runs/seven_wonders_duel/cloud
+#   VERBOSE_STAGES=0  set 1 to put the noisy stages back on the terminal. By
+#                   default the equivalence suite and the plumbing smoke write to
+#                   $RUN_DIR/setup/*.log so the stage banners stay readable; a
+#                   failing stage prints its last 40 lines either way.
 #   LAUNCH=1        set 0 to stop after verification
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke
 #   SKIP_EQUIV=0    set 1 to skip the equivalence suite (do not do this)
@@ -191,6 +195,30 @@ ANCHOR_GATE_EVERY_PROMOTIONS="${ANCHOR_GATE_EVERY_PROMOTIONS:-0}"
 # necessarily transfer, and the sweep costs seconds.
 PACK_THREADS="${PACK_THREADS:-0}"
 
+# ── Training-side parameters cloud6 tuned ───────────────────────────────────
+#
+# These were absent until 2026-08-20, so a launch took the parser's defaults and
+# trained a materially different run from cloud6 without anyone choosing to:
+# weight decay 0.0001 against 0.5, a replay-window coefficient of 16 against
+# 1,000, no value bootstrap, no minimum buffer, and a lower temperature floor --
+# i.e. LESS exploration, which is the opposite of what this run wants.
+#
+# Not "cloud6 was right about all of these", but "cloud6 chose them and nothing
+# has since argued otherwise", which is a better starting point than argparse.
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.5}"
+VALUE_BOOTSTRAP="${VALUE_BOOTSTRAP:-0.5}"
+MIN_BUFFER_POSITIONS="${MIN_BUFFER_POSITIONS:-200000}"
+REPLAY_WINDOW_COEFFICIENT="${REPLAY_WINDOW_COEFFICIENT:-1000}"
+REPLAY_WINDOW_EXPONENT="${REPLAY_WINDOW_EXPONENT:-0.6}"
+# Temperature is a DIVERSITY control: the floor is how random move selection
+# stays once annealing finishes, and the anneal length is how long it takes to
+# get there. Both defaults are tighter than cloud6's, which narrows exploration.
+TEMPERATURE_FLOOR="${TEMPERATURE_FLOOR:-0.35}"
+TEMPERATURE_ANNEAL_MOVES="${TEMPERATURE_ANNEAL_MOVES:-30}"
+CHEAP_DOUBLE_REVEAL_OFFSETS="${CHEAP_DOUBLE_REVEAL_OFFSETS:-3}"
+GATE_SIMS="${GATE_SIMS:-64}"
+OPPONENT_FRACTION="${OPPONENT_FRACTION:-0}"
+
 # ── Search geometry, targets and the endgame solver ─────────────────────────
 #
 # NONE of this was in the script before 2026-08-19, so a launch from here took
@@ -235,7 +263,20 @@ FULL_SEARCH_EVERY_GAMES="${FULL_SEARCH_EVERY_GAMES:-25}"
 # cannot attempt a cheap 11-card position or skip a dear 8-card one, and cost is
 # driven far more by how much of the board is face down than by how many cards
 # remain.
-ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-4500000}"
+# 4.5M was a LAPTOP number and leaves a rented box almost idle. Measured on the
+# cloud corpus at the shipped margin, a 4.5M budget costs 2.26M solver nodes per
+# game; at ~0.33 games/s that is 0.75M nodes/s of demand against roughly 36M
+# available from 12 solver threads -- about 2% utilisation, on the subsystem this
+# run is built around.
+#
+# 40M is where the same corpus lands (44.8M nodes/game unfiltered), which puts
+# the pool in a sensible range and makes 10- and 11-card positions affordable
+# rather than mostly declined. Raising it also widens the cost model's own
+# trigger, since it admits anything whose prediction plus margin fits the
+# budget -- so this buys DEPTH, not merely a longer leash on the same positions.
+#
+# The clock follows automatically: stage 6b derives max_secs from this number.
+ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-40000000}"
 ENDGAME_COST_MODEL="${ENDGAME_COST_MODEL:-games/seven_wonders_duel/endgame_cost_model.json}"
 SOLVER_FALLBACK_RESEARCH="${SOLVER_FALLBACK_RESEARCH:-1}"
 
@@ -508,7 +549,8 @@ stage 7 "Rust/Python engine equivalence suite"
 if [ "$SKIP_EQUIV" = "1" ]; then
   warn "SKIP_EQUIV=1 — launching without verifying engine parity on this box."
 else
-  "$PY" -m games.seven_wonders_duel.cloud_equivalence_smoke \
+  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/equivalence.log" "equivalence suite" -- \
+    "$PY" -m games.seven_wonders_duel.cloud_equivalence_smoke \
     || die "Engine equivalence failed or was skipped — do not train on this box."
 fi
 stage_done 7
@@ -623,7 +665,8 @@ if [ "$SKIP_SMOKE" = "1" ]; then
   warn "SKIP_SMOKE=1; skipping the CUDA plumbing smoke."
 else
   SMOKE_DIR="runs/seven_wonders_duel/phase_d_smoke_$(date +%Y%m%dT%H%M%S)"
-  "$PY" -m games.seven_wonders_duel.phase_d \
+  common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/plumbing_smoke.log" "plumbing smoke" -- \
+    "$PY" -m games.seven_wonders_duel.phase_d \
     --run-dir "$SMOKE_DIR" --device cuda --plumbing-smoke --process-workers 2 \
     || die "CUDA plumbing smoke failed — do not launch training."
   ok "Smoke completed: $SMOKE_DIR"
@@ -736,6 +779,21 @@ TRAIN_CMD=(
   --dirichlet-alpha "$DIRICHLET_ALPHA"
   --forced-playout-k "$FORCED_PLAYOUT_K"
   --rust-scheduler-workers "$RUST_SCHEDULER_WORKERS"
+  --weight-decay "$WEIGHT_DECAY"
+  --value-bootstrap "$VALUE_BOOTSTRAP"
+  --min-buffer-positions "$MIN_BUFFER_POSITIONS"
+  --replay-window-coefficient "$REPLAY_WINDOW_COEFFICIENT"
+  --replay-window-exponent "$REPLAY_WINDOW_EXPONENT"
+  --temperature-floor "$TEMPERATURE_FLOOR"
+  --temperature-anneal-moves "$TEMPERATURE_ANNEAL_MOVES"
+  --cheap-double-reveal-offsets "$CHEAP_DOUBLE_REVEAL_OFFSETS"
+  --gate-sims "$GATE_SIMS"
+  --derive-backend rust
+  # Explicit 0, not omitted: the parser DEFAULTS this to 0.15, so leaving it out
+  # sends 15% of games against a non-HOF opponent -- which cloud6 turned off and
+  # nobody here decided to turn back on. --hof-opponent-fraction is the knob
+  # that governs archived opponents.
+  --opponent-fraction "$OPPONENT_FRACTION"
   "${ARCH_FLAGS[@]}"
   "${SOLVER_FLAGS[@]}"
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
