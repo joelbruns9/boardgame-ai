@@ -998,3 +998,63 @@ def test_profile_only_does_not_stop_at_the_live_training_check(tmp_path):
     assert "PROFILE_ONLY=1" in combined
     # It stopped before anything that touches the GPU.
     assert "Generation sweep" not in combined
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_second_run_picks_up_code_pushed_since_the_first(tmp_path):
+    """`git fetch` + `git checkout main` is NOT `git pull`.
+
+    Fetch advances origin/main; the local `main` a clone left behind stays where
+    it was. Checking out the local branch therefore re-runs the code the clone
+    was made at -- which on the box meant the second invocation silently
+    re-measured the first invocation's code and printed the stale commit as if
+    it were current.
+    """
+
+    origin = _fake_run_repo(tmp_path)
+    sweep_repo = tmp_path / "sweep"
+    env = {
+        **os.environ,
+        "PATH": f"{_pgrep_stub(tmp_path)}{os.pathsep}{os.environ['PATH']}",
+        "OUTPUT": str(tmp_path / "out"),
+        "RUN_REPO": str(origin),
+        "SWEEP_REPO": str(sweep_repo),
+        "REPO_URL": str(origin),
+        "SWEEP_REF": "master" if _default_branch(origin) == "master" else "main",
+        "PROFILE_ONLY": "1",
+    }
+    first = subprocess.run(
+        [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
+    )
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    # Something lands on the remote after that clone exists.
+    (origin / "new.txt").write_text("after", encoding="utf-8")
+    subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "later"], check=True,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(origin), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    second = subprocess.run(
+        [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
+    )
+    combined = second.stdout + second.stderr
+    assert second.returncode == 0, combined
+    assert head[:12] in combined, (
+        f"second run did not reach {head[:12]}; it re-used the stale clone:\n"
+        f"{combined}"
+    )
+    # And the file from that commit is really on disk for the sweep to run.
+    assert (sweep_repo / "new.txt").is_file()
+
+
+def _default_branch(repo) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()

@@ -133,12 +133,28 @@ if [ ! -d "$SWEEP_REPO/.git" ]; then
     || git clone "$RUN_REPO" "$SWEEP_REPO" \
     || die "could not clone $REPO_URL or $RUN_REPO"
 fi
-git -C "$SWEEP_REPO" fetch --all --quiet || warn "fetch failed; using what is on disk"
-# Fetch first, then check out: a ref that only exists on the remote cannot be
-# checked out from a stale local copy, and the failure would look like a typo.
-git -C "$SWEEP_REPO" checkout --quiet "$SWEEP_REF" \
-  || git -C "$SWEEP_REPO" checkout --quiet "origin/$SWEEP_REF" \
-  || die "could not check out '$SWEEP_REF' in $SWEEP_REPO (fetched from $REPO_URL)"
+git -C "$SWEEP_REPO" fetch --all --quiet --tags \
+  || warn "fetch failed; using what is on disk"
+
+# Check out the REMOTE ref, not the local branch of the same name.
+#
+# `git fetch` advances origin/main; it does NOT advance the local `main` that a
+# clone left behind. So `git checkout main` in an existing clone lands on the
+# commit that clone was made at, however long ago -- fetching first changes
+# nothing about that. This script fetched and then checked out the local branch,
+# so the second run of it re-measured the FIRST run's code and reported the
+# stale commit as though it were current. Fetch and checkout are not a pull.
+#
+# Detached HEAD is deliberate: this checkout is disposable and exists to be at
+# one exact commit, and detaching makes "which code ran" unambiguous in the log.
+if git -C "$SWEEP_REPO" rev-parse --verify --quiet "origin/$SWEEP_REF^{commit}" >/dev/null; then
+  git -C "$SWEEP_REPO" checkout --quiet --detach "origin/$SWEEP_REF" \
+    || die "could not check out 'origin/$SWEEP_REF' in $SWEEP_REPO"
+else
+  # A raw SHA or a tag: not under origin/, so use it directly.
+  git -C "$SWEEP_REPO" checkout --quiet --detach "$SWEEP_REF" \
+    || die "could not check out '$SWEEP_REF' in $SWEEP_REPO (fetched from $REPO_URL)"
+fi
 SWEEP_COMMIT="$(git -C "$SWEEP_REPO" rev-parse HEAD)"
 ok "sweep checkout at ${SWEEP_COMMIT:0:12}"
 
