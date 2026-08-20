@@ -45,9 +45,11 @@
 #   RUN_DIR=~/boardgame-ai/runs/seven_wonders_duel/cloud   run being tuned
 #   RUN_REPO=~/boardgame-ai        the checkout the run was launched from
 #   SWEEP_REPO=~/sweep-checkout    where this script works (created if absent)
-#   SWEEP_REF=<branch|sha>         what to check out there (default: the run's
-#                                  own commit, i.e. sweep the code that is
-#                                  running; set it to pick up sweep fixes)
+#   SWEEP_REF=main                 what to check out there. Defaults to main,
+#                                  not the run's commit: this checkout exists to
+#                                  run NEWER tooling than a run that must not be
+#                                  updated. The engine is what has to match, and
+#                                  stage 4 enforces that separately.
 #   CHECKPOINT=<path>              default: the run's current_best.pt
 #   GAMES=200 REPETITIONS=2 WARMUP_GAMES=8
 #   SWEEP_SLOTS / SWEEP_CAPS / SWEEP_INFLIGHT / SWEEP_WORKERS  (comma separated)
@@ -126,7 +128,7 @@ log "logging to $SWEEP_LOG"
 # observation -- raw.githubusercontent is CDN-cached, so a curl seconds after a
 # push can legitimately return the old file. That ambiguity cost a full
 # debugging round trip; the version line ends it.
-SWEEP_SCRIPT_VERSION=4
+SWEEP_SCRIPT_VERSION=5
 log "sweep_7wd.sh version $SWEEP_SCRIPT_VERSION (checksum $(cksum < "${BASH_SOURCE[0]}" | cut -d' ' -f1))"
 
 # ── STAGE 1: a checkout that is not the run's ────────────────────────────────
@@ -136,7 +138,19 @@ log "sweep_7wd.sh version $SWEEP_SCRIPT_VERSION (checksum $(cksum < "${BASH_SOUR
 stage 1 "Sweep checkout at $SWEEP_REPO"
 [ -d "$RUN_REPO/.git" ] || die "$RUN_REPO is not a git checkout"
 RUN_COMMIT="$(git -C "$RUN_REPO" rev-parse HEAD)"
-SWEEP_REF="${SWEEP_REF:-$RUN_COMMIT}"
+# Defaults to main, NOT to the run's commit.
+#
+# It defaulted to the run's commit on the reasoning that a sweep should measure
+# the code that is running. That is backwards: this checkout exists precisely so
+# the sweep can run tooling NEWER than a run that must not be updated, and
+# pinning it to the run's commit made the tooling permanently as old as the run.
+# In practice it silently reverted a checkout the operator had just moved to
+# main, then failed on flags the old harness had never heard of.
+#
+# What must match the run is the ENGINE, and stage 4 enforces that by comparing
+# crate trees. The search settings come from the run's manifest via
+# --config-from-manifest, so newer Python measures the run's own configuration.
+SWEEP_REF="${SWEEP_REF:-main}"
 log "run checkout is at ${RUN_COMMIT:0:12}; sweeping ${SWEEP_REF:0:12}"
 
 # Cloned from GITHUB, not from $RUN_REPO. Cloning locally would mean the only
@@ -177,6 +191,45 @@ if [ "$SWEEP_COMMIT" != "$RUN_COMMIT" ]; then
   warn "The sweep runs different Python than the training run. That is fine for"
   warn "measuring geometry, but the run's checkout was NOT touched -- it stays"
   warn "at ${RUN_COMMIT:0:12} and stays resumable."
+fi
+
+# Does this checkout's harness support what we are about to ask of it?
+#
+# Checked HERE rather than discovered at stage 6, because everything between is
+# minutes of setup -- a GPU gate, a 61MB checkpoint copy -- spent on a run that
+# cannot work. argparse's "unrecognized arguments" also names the flag without
+# saying why it is missing, which is the wrong end of the problem: the cause is
+# the checkout, not the flag.
+cd "$SWEEP_REPO"
+SWEEP_HELP=""
+MISSING=""
+if [ "${PROFILE_ONLY:-0}" = "1" ]; then
+  # The profile reads a log; it never invokes the sweep harness. Demanding the
+  # sweep's flags here would refuse the one operation that is safe to run at any
+  # time, including against a checkout too old to sweep with.
+  log "PROFILE_ONLY=1: skipping the sweep-harness capability check"
+else
+SWEEP_HELP="$("$PY" -m games.seven_wonders_duel.f4_phase_d_sweep --help 2>&1 || true)"
+for flag in --workers --solver-threads-total --config-from-manifest; do
+  case "$SWEEP_HELP" in
+    *"$flag"*) ;;
+    *) MISSING="$MISSING $flag" ;;
+  esac
+done
+if [ -n "$MISSING" ]; then
+  die "The sweep harness at ${SWEEP_COMMIT:0:12} does not support:$MISSING
+
+  This checkout is on an older commit than the one that added them. Fix it with:
+      SWEEP_REF=main bash \$0 ...
+  (SWEEP_REF is currently '$SWEEP_REF'.)
+
+  Without those flags the sweep cannot vary the shard count, cannot hold solver
+  threads constant across that axis, and would measure PhaseDConfig's default
+  search rather than the one this run uses.
+
+  PROFILE_ONLY=1 still works against this checkout: it only reads the log."
+fi
+ok "sweep harness supports the axes being swept"
 fi
 stage_done 1
 

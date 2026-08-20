@@ -354,11 +354,22 @@ def test_the_common_library_is_shared_not_copied():
 
 
 def _invocation(text: str, module: str) -> str:
-    """The raw shell text of stage 8b's call to one sweep harness."""
+    """The raw shell text of the call to one sweep harness.
 
-    start = text.index(f'"$PY" -m games.seven_wonders_duel.{module}')
-    end = text.index("|| die", start)
-    return text[start:end]
+    Skips occurrences that are not the real invocation -- sweep_7wd.sh also runs
+    `--help` as a capability probe, and matching that instead swept up the next
+    command's flags and reported them as rejected by this module.
+    """
+
+    needle = f'"$PY" -m games.seven_wonders_duel.{module}'
+    start = -1
+    while True:
+        start = text.find(needle, start + 1)
+        if start == -1:
+            raise AssertionError(f"no invocation of {module} found")
+        block = text[start : text.index("|| die", start)]
+        if "--checkpoint" in block:
+            return block
 
 
 def _module_options(module: str) -> set[str]:
@@ -879,7 +890,7 @@ def test_the_sweep_grid_contains_the_settings_the_run_is_using(sweep_text):
     assert "4" in axis("SWEEP_WORKERS"), "the run's shard count is outside the grid"
 
 
-def _fake_run_repo(tmp_path):
+def _fake_run_repo(tmp_path, harness: bool = True):
     """A real git checkout: stage 1 requires one before the stop check runs.
 
     Without it the refusal test would pass for the WRONG reason -- dying at
@@ -889,6 +900,22 @@ def _fake_run_repo(tmp_path):
     run_repo = tmp_path / "repo"
     subprocess.run(["git", "init", "-q", str(run_repo)], check=True)
     (run_repo / "seed.txt").write_text("x", encoding="utf-8")
+    if harness:
+        # A stub that advertises the flags stage 1 probes for, so tests of LATER
+        # stages are not stopped by the capability check.
+        pkg = run_repo / "games" / "seven_wonders_duel"
+        pkg.mkdir(parents=True, exist_ok=True)
+        for parent in (run_repo / "games", pkg):
+            (parent / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "f4_phase_d_sweep.py").write_text(
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "for flag in ('--workers', '--solver-threads-total',\n"
+            "             '--config-from-manifest', '--checkpoint'):\n"
+            "    p.add_argument(flag)\n"
+            "p.parse_args()\n",
+            encoding="utf-8",
+        )
     subprocess.run(["git", "-C", str(run_repo), "add", "-A"], check=True)
     subprocess.run(
         ["git", "-C", str(run_repo), "-c", "user.email=t@t", "-c", "user.name=t",
@@ -922,6 +949,8 @@ def test_the_sweep_refuses_to_run_beside_a_live_training_process(tmp_path):
         "RUN_REPO": str(run_repo),
         "SWEEP_REPO": str(tmp_path / "sweep"),
         "REPO_URL": str(run_repo),
+        # SWEEP_REF defaults to main; `git init` here makes master.
+        "SWEEP_REF": _default_branch(run_repo),
     }
     proc = subprocess.run(
         [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
@@ -987,6 +1016,7 @@ def test_profile_only_does_not_stop_at_the_live_training_check(tmp_path):
         "RUN_REPO": str(run_repo),
         "SWEEP_REPO": str(tmp_path / "sweep"),
         "REPO_URL": str(run_repo),  # no network in tests
+        "SWEEP_REF": _default_branch(run_repo),
         "PROFILE_ONLY": "1",
     }
     proc = subprocess.run(
@@ -1082,3 +1112,61 @@ def test_the_sweep_measures_the_search_the_run_actually_runs(sweep_text):
     block = _invocation(sweep_text, "f4_phase_d_sweep")
     assert "--config-from-manifest" in block
     assert "run_manifest.json" in block
+
+
+def test_the_sweep_checkout_defaults_to_main_not_the_runs_commit(sweep_text):
+    """This checkout exists to run tooling NEWER than a run that must not be
+    updated. Defaulting to the run's commit pinned the tooling to be permanently
+    as old as the run, and silently reverted a checkout the operator had just
+    moved to main."""
+
+    assert 'SWEEP_REF="${SWEEP_REF:-main}"' in sweep_text
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_stale_harness_fails_at_stage_1_with_the_fix(tmp_path):
+    """The old harness has no --workers, and argparse's 'unrecognized arguments'
+    names the flag without saying the checkout is the cause. Discovering it at
+    stage 6 also wastes a GPU gate and a 61MB checkpoint copy first."""
+
+    run_repo = _fake_run_repo(tmp_path, harness=False)
+    # A checkout whose harness predates the axes: the module exists but its
+    # --help advertises none of the required flags.
+    pkg = run_repo / "games" / "seven_wonders_duel"
+    pkg.mkdir(parents=True, exist_ok=True)
+    for parent in (run_repo / "games", pkg):
+        (parent / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "f4_phase_d_sweep.py").write_text(
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--slots')\n"
+        "p.parse_args()\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(run_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(run_repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "old harness"], check=True,
+    )
+
+    proc = subprocess.run(
+        [BASH, str(SWEEP)],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{_pgrep_stub(tmp_path)}{os.pathsep}{os.environ['PATH']}",
+            "OUTPUT": str(tmp_path / "out"),
+            "RUN_REPO": str(run_repo),
+            "SWEEP_REPO": str(tmp_path / "sweep"),
+            "REPO_URL": str(run_repo),
+            "SWEEP_REF": _default_branch(run_repo),
+        },
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"stale harness was accepted:\n{combined}"
+    assert "does not support" in combined
+    assert "--workers" in combined
+    assert "SWEEP_REF=main" in combined, "the error must name the fix"
+    # And it stopped before spending time on setup.
+    assert "Checkpoint" not in combined
+    assert "Generation sweep" not in combined
