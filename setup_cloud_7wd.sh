@@ -185,6 +185,79 @@ ANCHOR_GATE_EVERY_PROMOTIONS="${ANCHOR_GATE_EVERY_PROMOTIONS:-0}"
 # on a hybrid P/E-core part the plateau measured on a homogeneous laptop does not
 # necessarily transfer, and the sweep costs seconds.
 PACK_THREADS="${PACK_THREADS:-0}"
+
+# ── Search geometry, targets and the endgame solver ─────────────────────────
+#
+# NONE of this was in the script before 2026-08-19, so a launch from here took
+# the PARSER's defaults: 16-24 cheap sims against cloud6's 100, 64-128 full
+# against 1600, Gumbel where the plan ships PUCT, no Dirichlet, and the endgame
+# solver off. cloud6's own command carried these by hand, which is why the gap
+# went unnoticed -- the script has never actually launched the shipped
+# configuration.
+CHEAP_SIMS="${CHEAP_SIMS:-100}"
+FULL_SIMS="${FULL_SIMS:-1600}"
+FULL_SEARCH_FRACTION="${FULL_SEARCH_FRACTION:-0.25}"
+TOP_K="${TOP_K:-16}"
+AGE_DEAL_SAMPLES="${AGE_DEAL_SAMPLES:-32}"
+
+# PUCT for generation and EVALUATION, Gumbel for cheap moves. The eval mode is
+# the one that is easy to get wrong: the advisor deploys under PUCT, so a gate
+# run under Gumbel promotes on a number nobody will ever see again.
+SELFPLAY_SEARCH_MODE="${SELFPLAY_SEARCH_MODE:-puct}"
+CHEAP_SEARCH_MODE="${CHEAP_SEARCH_MODE:-gumbel}"
+EVAL_SEARCH_MODE="${EVAL_SEARCH_MODE:-puct}"
+DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
+# 1.8, not KD's 0.3: the branching factor differs and alpha scales with it.
+DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-1.8}"
+FORCED_PLAYOUT_K="${FORCED_PLAYOUT_K:-1.0}"
+
+# The two head/readout switches. They change which parameters exist, so they
+# must be set at launch and never mid-run: a checkpoint records them and a
+# resume rebuilds from that record.
+POOLED_READOUT="${POOLED_READOUT:-1}"
+REPLY_HEAD="${REPLY_HEAD:-1}"
+
+# Every Nth game searches every move at the full budget. Diversity: a
+# wholly-full game is coherent end to end and carries Dirichlet noise and forced
+# playouts on every ply rather than a quarter of them. ~3.4x a mixed game, so 25
+# is about +10% generation compute.
+FULL_SEARCH_EVERY_GAMES="${FULL_SEARCH_EVERY_GAMES:-25}"
+
+# ── Endgame solver ──────────────────────────────────────────────────────────
+#
+# The node budget is the real cutoff and the depth knob. The cost model decides
+# WHICH positions are attempted, replacing --endgame-solver-max-cards: a cap
+# cannot attempt a cheap 11-card position or skip a dear 8-card one, and cost is
+# driven far more by how much of the board is face down than by how many cards
+# remain.
+ENDGAME_SOLVER_MAX_NODES="${ENDGAME_SOLVER_MAX_NODES:-4500000}"
+ENDGAME_COST_MODEL="${ENDGAME_COST_MODEL:-games/seven_wonders_duel/endgame_cost_model.json}"
+SOLVER_FALLBACK_RESEARCH="${SOLVER_FALLBACK_RESEARCH:-1}"
+
+# Seconds are a SAFETY NET, never the budget. A constant generous at one node
+# budget binds at another -- a 3-second clock censored 11.3% of solves on the
+# 2026-08-18 shakedown and made which positions got a proof depend on machine
+# load. Derived at stage 6b from the node budget and this box's measured rate;
+# set it explicitly only to override that.
+ENDGAME_SOLVER_MAX_SECS="${ENDGAME_SOLVER_MAX_SECS:-}"
+
+# Scheduler shards: one cooperative scheduler thread each, and one solver pool
+# each. This is the "generation cores" side of the split, and its right value is
+# a MEASUREMENT, not a default -- stage 1 of the sweep in PRE_RETRAIN_PLAN.md
+# finds the smallest number that saturates the GPU, and everything above it is
+# waste that could be solving instead.
+#
+# cloud6 ran 12. That is not carried forward as the default, because cloud6 ran
+# with the solver off and so had nothing to trade against; on a 20-core box, 12
+# generation threads leave 8 for solving and the plan wants the opposite ratio.
+# 4 is a placeholder chosen to leave room, and the launch says so out loud.
+RUST_SCHEDULER_WORKERS="${RUST_SCHEDULER_WORKERS:-4}"
+
+# Solver threads are PER SHARD: the pool is built once per scheduler loop, so
+# the total is this times --rust-scheduler-workers. Derived at stage 6b from the
+# core count so the product is deliberate rather than accidental.
+SOLVER_THREADS="${SOLVER_THREADS:-}"
+GENERATION_THREADS="${GENERATION_THREADS:-}"
 # 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
 # resolve a lagged advantage of 0.60+ easily but clear LCB > 0.50 only ~13% of
 # the time at 0.55 -- blind exactly where "am I still improving" gets decided.
@@ -335,6 +408,64 @@ fi
 stage_done 6
 
 # ── STAGE 7: W6.2 engine equivalence — must run, must not skip ───────────────
+# ── STAGE 6b: derive the solver's clock and thread split from THIS box ──────
+stage 6b "Solver sizing (node rate, safety clock, thread split)"
+
+# Node counts are machine-independent; the RATE is the only machine-specific
+# term, so it is measured here rather than assumed. One minute.
+NODE_RATE="$("$PY" - <<'PYRATE'
+try:
+    from games.seven_wonders_duel.endgame_trigger_study import measure_node_rate
+    print(int(measure_node_rate()))
+except Exception:
+    print(0)
+PYRATE
+)"
+
+if [ "${NODE_RATE:-0}" -gt 0 ]; then
+  ok "Solver rate on this box: $((NODE_RATE / 1000000))M nodes/s"
+else
+  NODE_RATE=1200000
+  warn "Could not measure the solver's node rate; assuming a conservative ${NODE_RATE}."
+fi
+
+if [ -z "$ENDGAME_SOLVER_MAX_SECS" ]; then
+  # (nodes / rate) x 5. Generous enough never to bind, so the node budget stays
+  # the cutoff and a decline remains a property of the POSITION rather than of
+  # how busy the box was.
+  ENDGAME_SOLVER_MAX_SECS="$(( (ENDGAME_SOLVER_MAX_NODES / NODE_RATE + 1) * 5 ))"
+  ok "Derived --endgame-solver-max-secs ${ENDGAME_SOLVER_MAX_SECS}s from a ${ENDGAME_SOLVER_MAX_NODES}-node budget."
+fi
+
+# One thread solves one position; there is no intra-tree parallelism. So the
+# total solver thread count IS the number of concurrent solves, and the split is
+# simply: cores that are not feeding the GPU go to solving.
+CORES="$(nproc)"
+: "${GENERATION_THREADS:=$RUST_SCHEDULER_WORKERS}"
+if [ -z "$SOLVER_THREADS" ]; then
+  _spare=$(( CORES - GENERATION_THREADS ))
+  [ "$_spare" -lt 1 ] && _spare=1
+  # Per shard, so divide by the shard count. Rounded down: overshooting
+  # oversubscribes, which inflates wall time per solve and pushes a run back
+  # toward the clock this stage exists to keep slack.
+  SOLVER_THREADS=$(( _spare / GENERATION_THREADS ))
+  [ "$SOLVER_THREADS" -lt 1 ] && SOLVER_THREADS=1
+fi
+_total_solver=$(( SOLVER_THREADS * GENERATION_THREADS ))
+if [ -z "${RUST_SCHEDULER_WORKERS_MEASURED:-}" ]; then
+  warn "--rust-scheduler-workers=$RUST_SCHEDULER_WORKERS is a PLACEHOLDER, not a"
+  warn "measurement. Stage 1 of the sweep finds the smallest value that saturates"
+  warn "the GPU; every core above it is one that could have been solving. Read"
+  warn "gpu= on the heartbeat and re-launch with the measured number."
+fi
+ok "Solver threads: $SOLVER_THREADS per shard x $GENERATION_THREADS shards = $_total_solver concurrent solves, on $CORES cores."
+if [ "$(( _total_solver + GENERATION_THREADS ))" -gt "$CORES" ]; then
+  warn "$_total_solver solver + $GENERATION_THREADS generation threads exceed $CORES cores."
+  warn "Solves will run slower in WALL time, which pushes them toward the deadline --"
+  warn "and a deadline decline makes which positions got a proof depend on machine load."
+fi
+stage_done 6b
+
 stage 7 "Rust/Python engine equivalence suite"
 if [ "$SKIP_EQUIV" = "1" ]; then
   warn "SKIP_EQUIV=1 — launching without verifying engine parity on this box."
@@ -505,6 +636,32 @@ fi
 
 # W7b ships present-but-disabled: detection reports either way, and enabling
 # the response is a deliberate choice made at launch, not mid-run.
+# Switches that change which PARAMETERS exist, so they are set at launch and
+# never mid-run: the checkpoint records them and a resume rebuilds from that
+# record. Passing them as flags rather than baking them in keeps a run that
+# wants the old architecture possible.
+ARCH_FLAGS=()
+[ "$POOLED_READOUT" = "1" ] && ARCH_FLAGS+=(--pooled-readout)
+[ "$REPLY_HEAD" = "1" ] && ARCH_FLAGS+=(--reply-head)
+
+SOLVER_FLAGS=()
+if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
+  SOLVER_FLAGS+=(
+    --endgame-solver-max-nodes "$ENDGAME_SOLVER_MAX_NODES"
+    --endgame-solver-max-secs "$ENDGAME_SOLVER_MAX_SECS"
+    --solver-threads "$SOLVER_THREADS"
+  )
+  if [ -n "$ENDGAME_COST_MODEL" ] && [ -f "$REPO_DIR/$ENDGAME_COST_MODEL" ]; then
+    SOLVER_FLAGS+=(--endgame-cost-model "$ENDGAME_COST_MODEL")
+  elif [ -n "$ENDGAME_COST_MODEL" ]; then
+    # Refuse rather than fall back to the card cap: they select different
+    # positions, so a silent fallback would produce a run whose solver
+    # configuration is not the one anybody chose.
+    die "ENDGAME_COST_MODEL=$ENDGAME_COST_MODEL not found under $REPO_DIR."
+  fi
+  [ "$SOLVER_FALLBACK_RESEARCH" = "1" ] && SOLVER_FLAGS+=(--solver-fallback-research)
+fi
+
 LADDER_FLAG=()
 if [ "$INTERVENTION_LADDER" = "1" ]; then
   LADDER_FLAG=(--intervention-ladder)
@@ -528,6 +685,21 @@ TRAIN_CMD=(
   --train-batch-size "$TRAIN_BATCH_SIZE"
   --schedule-basis games
   --generation-backend rust --gate-backend rust
+  --cheap-sims-min "$CHEAP_SIMS" --cheap-sims-max "$CHEAP_SIMS"
+  --full-sims-min "$FULL_SIMS" --full-sims-max "$FULL_SIMS"
+  --full-search-fraction "$FULL_SEARCH_FRACTION"
+  --full-search-every-games "$FULL_SEARCH_EVERY_GAMES"
+  --top-k "$TOP_K"
+  --age-deal-samples "$AGE_DEAL_SAMPLES"
+  --selfplay-search-mode "$SELFPLAY_SEARCH_MODE"
+  --cheap-search-mode "$CHEAP_SEARCH_MODE"
+  --eval-search-mode "$EVAL_SEARCH_MODE"
+  --dirichlet-epsilon "$DIRICHLET_EPSILON"
+  --dirichlet-alpha "$DIRICHLET_ALPHA"
+  --forced-playout-k "$FORCED_PLAYOUT_K"
+  --rust-scheduler-workers "$RUST_SCHEDULER_WORKERS"
+  "${ARCH_FLAGS[@]}"
+  "${SOLVER_FLAGS[@]}"
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
   --selfplay-generator-mode soft_gate
   --bootstrap-policy "$BOOTSTRAP_POLICY"

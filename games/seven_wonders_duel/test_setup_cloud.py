@@ -454,3 +454,91 @@ def test_the_sweep_env_handoff_matches_the_launcher(setup_text):
         assert f'{name}="${{{name}:-' in setup_text, (
             f"measured_env.sh exports {name}, but the launcher never reads it"
         )
+
+
+# --- omission, not typos ----------------------------------------------------
+#
+# Every test above checks that what the script DOES pass is valid. None of them
+# noticed that until 2026-08-19 the script passed no sims, no search mode, no
+# Dirichlet and no solver at all -- so a launch from it took the parser's
+# laptop defaults: 16-24 cheap sims against the shipped 100, 64-128 full against
+# 1600, Gumbel where the plan ships PUCT, and the endgame solver off. cloud6's
+# command carried them by hand, so the gap never showed.
+#
+# A flag left to its default is the failure mode these cover.
+
+
+def test_the_launch_sets_the_search_budget_rather_than_inheriting_it(setup_text):
+    """Parser defaults are laptop-scale: 16-24 cheap and 64-128 full."""
+
+    used = _long_flags(_block(setup_text, "TRAIN_CMD=("))
+    for flag in (
+        "--cheap-sims-min",
+        "--cheap-sims-max",
+        "--full-sims-min",
+        "--full-sims-max",
+        "--full-search-fraction",
+        "--top-k",
+    ):
+        assert flag in used, f"{flag} left to the parser default"
+
+
+def test_the_launch_sets_every_search_mode(setup_text):
+    """The eval mode is the one that matters most: the advisor deploys under
+    PUCT, so a gate run under Gumbel promotes on a number nobody will see
+    again."""
+
+    used = _long_flags(_block(setup_text, "TRAIN_CMD=("))
+    for flag in (
+        "--selfplay-search-mode",
+        "--cheap-search-mode",
+        "--eval-search-mode",
+        "--dirichlet-epsilon",
+        "--dirichlet-alpha",
+        "--forced-playout-k",
+    ):
+        assert flag in used, f"{flag} left to the parser default"
+
+
+def test_the_launch_carries_the_architecture_switches(setup_text):
+    """--pooled-readout and --reply-head change which parameters exist, so a
+    run that omits them trains a different model than the plan describes."""
+
+    assert "ARCH_FLAGS+=(--pooled-readout)" in setup_text
+    assert "ARCH_FLAGS+=(--reply-head)" in setup_text
+    assert '"${ARCH_FLAGS[@]}"' in _block(setup_text, "TRAIN_CMD=(")
+
+
+def test_the_launch_configures_the_endgame_solver(setup_text):
+    """The solver is the differentiator this run is built around, and it is OFF
+    by default -- `--endgame-solver-max-nodes` defaults to 0."""
+
+    assert "--endgame-solver-max-nodes" in setup_text
+    assert "--endgame-cost-model" in setup_text
+    assert "--solver-threads" in setup_text
+    assert '"${SOLVER_FLAGS[@]}"' in _block(setup_text, "TRAIN_CMD=(")
+
+
+def test_the_solver_clock_is_derived_from_the_node_budget(setup_text):
+    """A constant generous at one node budget binds at another. A 3-second
+    clock censored 11.3% of solves on the 2026-08-18 shakedown and made which
+    positions got a proof depend on machine load."""
+
+    assert "ENDGAME_SOLVER_MAX_SECS=\"$(( (ENDGAME_SOLVER_MAX_NODES / NODE_RATE" in setup_text
+    assert "measure_node_rate" in setup_text, "the rate must be measured on the box"
+
+
+def test_a_missing_cost_model_stops_the_launch(setup_text):
+    """The cost model and the card cap select different positions, so falling
+    back silently would produce a solver configuration nobody chose."""
+
+    assert "ENDGAME_COST_MODEL=$ENDGAME_COST_MODEL not found" in setup_text
+
+
+def test_the_scheduler_worker_count_is_flagged_as_unmeasured(setup_text):
+    """It is the generation half of the core split, and its right value is a
+    measurement. Shipping a placeholder silently would let a guess look like a
+    decision."""
+
+    assert "RUST_SCHEDULER_WORKERS" in _block(setup_text, "TRAIN_CMD=(")
+    assert "PLACEHOLDER" in setup_text
