@@ -21,8 +21,16 @@ from .generation_profile import (
 )
 
 
-def _row(iteration=0, wall_ns=1_000, **scheduler):
-    """A log row shaped like Phase D's, with one shard-second of wall."""
+def _row(iteration=0, wall_ns=1_000, nested=True, **scheduler):
+    """A log row, with one shard-second of wall.
+
+    `nested=True` is the shape the CLOUD RUNS write: training_adapter reports
+    {"performance": ..., "summary": ..., "model": ...} and az_loop stores it
+    verbatim. `nested=False` is Phase D's own flat shape. The first version of
+    this file only had the flat one -- invented from the consumer rather than
+    read off the producer -- so the profiler reported "no scheduler metrics"
+    against a real run while every test passed.
+    """
 
     base = {
         "scheduler_wall_ns": wall_ns,
@@ -39,17 +47,19 @@ def _row(iteration=0, wall_ns=1_000, **scheduler):
         "scheduler_workers": 4,
     }
     base.update(scheduler)
-    return {
-        "iteration": iteration,
-        "generation_performance": {
-            "seconds": 3000.0,
-            "games_per_second": 0.32,
-            "rust_scheduler": base,
-            "summary": {
-                "solver": {"attempted": 11047, "masked": 10522, "nodes": 5, "stops": {}}
-            },
-        },
+    performance = {
+        "seconds": 3000.0,
+        "games_per_second": 0.32,
+        "rust_scheduler": base,
     }
+    summary = {
+        "solver": {"attempted": 11047, "masked": 10522, "nodes": 5, "stops": {}}
+    }
+    if nested:
+        reported = {"performance": performance, "summary": summary, "model": {}}
+    else:
+        reported = {**performance, "summary": summary}
+    return {"iteration": iteration, "generation_performance": reported}
 
 
 def test_shares_are_fractions_of_shard_wall_not_of_wall_clock():
@@ -173,3 +183,35 @@ def test_the_capacity_estimate_flags_cores_bought_and_unused():
     text = render([profile_row(row)], node_rate=1e6, solver_threads_total=12)
     assert "mostly idle" in text
     assert "ESTIMATED" in text, "an estimate must never read as a measurement"
+
+
+def test_both_row_shapes_are_read():
+    """The nested shape is what the cloud writes; the flat one is Phase D's own
+    loop. Reading only one reports a healthy run as having no metrics."""
+
+    for nested in (True, False):
+        profile = profile_row(_row(nested=nested, wall_ns=1_000, sched_solve_wait_ns=250))
+        assert profile is not None, f"nested={nested} row was not read"
+        assert profile["solve_wait_share"] == pytest.approx(0.25)
+        assert profile["games_per_second"] == pytest.approx(0.32)
+        assert profile["solver_attempted"] == 11047
+
+
+def test_the_nested_key_matches_what_the_adapter_actually_reports():
+    """Pinned to the PRODUCER, not to this file's fixture.
+
+    `training_adapter.generate` builds the metrics dict; if its key names change,
+    the profiler goes blind in exactly the way it did on the first cloud run --
+    silently, with a message that reads like the run's fault.
+    """
+
+    source = (
+        Path(__file__).resolve().parent / "training_adapter.py"
+    ).read_text(encoding="utf-8")
+    block = source[source.index("return GenerationResult(") :]
+    block = block[: block.index("def assemble_replay")]
+    for key in ('"performance": dict(loop.last_generation_stats)', '"summary": summarize_records'):
+        assert key in block, (
+            f"training_adapter no longer reports {key!r}; generation_profile "
+            "reads that key path and will report no metrics without it"
+        )

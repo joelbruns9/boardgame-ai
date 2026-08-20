@@ -71,7 +71,20 @@ def profile_row(row: dict[str, Any], batch_cap: int = 0) -> dict[str, Any] | Non
     it -- a hint that can never fire is worse than no hint.
     """
 
-    performance = row.get("generation_performance") or {}
+    reported = row.get("generation_performance") or {}
+    # TWO SHAPES, and the nested one is what the cloud runs write.
+    #
+    # `training_adapter.generate` reports metrics as
+    #     {"performance": <loop.last_generation_stats>, "summary": ..., "model": ...}
+    # and the az_loop controller stores that dict verbatim, so the scheduler
+    # block lives at generation_performance.performance.rust_scheduler. Phase D's
+    # own loop, used by smoke runs and the toy harness, assigns
+    # last_generation_stats straight into generation_performance, leaving it
+    # flat. Reading only one of the two silently reports "no scheduler metrics"
+    # against a run that recorded them for every iteration.
+    performance = reported.get("performance")
+    if not isinstance(performance, dict):
+        performance = reported
     scheduler = performance.get("rust_scheduler") or {}
     if not scheduler:
         return None
@@ -79,7 +92,10 @@ def profile_row(row: dict[str, Any], batch_cap: int = 0) -> dict[str, Any] | Non
     wall = float(scheduler.get("scheduler_wall_ns") or 0.0)
     share = lambda key: (float(scheduler.get(key) or 0.0) / wall) if wall else 0.0
     batches = [int(value) for value in (scheduler.get("batch_rows") or [])]
-    solver = ((performance.get("summary") or {}).get("solver")) or {}
+    # `summary` sits beside `performance` in the adapter's shape and inside it
+    # in the flat one.
+    summary = reported.get("summary") or performance.get("summary") or {}
+    solver = summary.get("solver") or {}
 
     return {
         "iteration": row.get("iteration", -1),
