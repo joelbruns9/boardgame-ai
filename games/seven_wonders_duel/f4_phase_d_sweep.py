@@ -172,6 +172,58 @@ def config_from_manifest(
     return config
 
 
+def apply_config_overrides(config, overrides: list[str]) -> "pd.PhaseDConfig":
+    """Set PhaseDConfig fields from `name=value` strings, typed by the field.
+
+    The sweep reads its search settings from a run's manifest, which is correct
+    once a run exists -- and useless before one does. Choosing geometry for a
+    configuration that has never run is exactly the case here: leaf batching was
+    decided by an A/B, and sweeping without it would optimise for
+    `leaf_batch=1`, a setting nobody intends to use. Same defect as the sweep
+    measuring Gumbel at 24/128 sims against a PUCT run at 100/1600.
+
+    Names are checked against the dataclass, so a typo fails here rather than
+    being silently ignored -- an override that does nothing is worse than none,
+    because the sweep would report settings it did not measure.
+    """
+
+    if not overrides:
+        return config
+    types = {field.name: field.type for field in dataclasses.fields(pd.PhaseDConfig)}
+    applied = {}
+    for override in overrides:
+        if "=" not in override:
+            raise SystemExit(f"--config-override {override!r} is not name=value")
+        name, _, raw = override.partition("=")
+        name, raw = name.strip(), raw.strip()
+        if name not in types:
+            raise SystemExit(
+                f"--config-override {name!r} is not a PhaseDConfig field"
+            )
+        declared = str(types[name])
+        if "bool" in declared:
+            if raw.lower() not in ("true", "false", "1", "0"):
+                raise SystemExit(f"{name} is a flag; use true or false")
+            value = raw.lower() in ("true", "1")
+        elif "int" in declared:
+            value = int(raw)
+        elif "float" in declared:
+            value = float(raw)
+        else:
+            value = raw
+        setattr(config, name, value)
+        applied[name] = value
+    # Re-validate: overrides can produce a combination the parser would refuse,
+    # and finding that at the first grid point wastes the setup before it.
+    config.validate()
+    print(
+        "config overrides: "
+        + ", ".join(f"{name}={value}" for name, value in sorted(applied.items())),
+        flush=True,
+    )
+    return config
+
+
 def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
     """Schedules for the part of the run this geometry has to serve.
 
@@ -276,6 +328,15 @@ def main() -> None:
         default="fp32",
         help="must match the run being configured: bf16 is 1.69x on L, so a "
         "geometry chosen at fp32 is chosen against the wrong cost curve",
+    )
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="set a PhaseDConfig field after the manifest is read; repeatable. "
+        "Needed to sweep a configuration no run has used yet, e.g. "
+        "--config-override leaf_batch=6 --config-override virtual_loss_root=true",
     )
     parser.add_argument(
         "--config-from-manifest",
@@ -389,6 +450,8 @@ def main() -> None:
             precision=args.precision,
             **geometry,
         )
+    config = apply_config_overrides(config, args.config_override)
+
     # SNAPSHOT before anything runs. `run_point` assigns loop.config.rust_slots
     # and friends at every grid point, and `run_config` is the same object, so
     # reading the run's geometry after the grid reports the LAST POINT MEASURED

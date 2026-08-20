@@ -1366,3 +1366,14 @@ def test_a_stale_copy_hands_over_to_the_checkouts_copy(tmp_path):
     assert "Handing over" in combined
     # Exactly one handover, not a loop.
     assert combined.count("version 3") == 1, f"restart loop:\n{combined}"
+
+
+def test_the_sweep_can_measure_a_configuration_no_run_has_used(sweep_text):
+    """The sweep reads its search settings from a manifest, which is correct
+    once a run exists and useless before one does. Choosing geometry for
+    leaf batching means sweeping settings no manifest yet contains -- otherwise
+    it optimises for leaf_batch=1, a value nobody intends to run."""
+
+    assert "CONFIG_OVERRIDES" in sweep_text
+    block = _invocation(sweep_text, "f4_phase_d_sweep")
+    assert "CONFIG_OVERRIDES" in block, "the overrides must reach the harness"

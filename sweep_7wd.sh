@@ -53,6 +53,11 @@
 #   CHECKPOINT=<path>              default: the run's current_best.pt
 #   GAMES=200 REPETITIONS=2 WARMUP_GAMES=8
 #   SWEEP_SLOTS / SWEEP_CAPS / SWEEP_INFLIGHT / SWEEP_WORKERS  (comma separated)
+#   CONFIG_OVERRIDES               PhaseDConfig fields the manifest cannot
+#                                  supply, for sweeping a configuration no run
+#                                  has used yet. Space separated, e.g.
+#                                  CONFIG_OVERRIDES="--config-override leaf_batch=6
+#                                  --config-override virtual_loss_root=true"
 #   SOLVER_THREADS=3               per shard, as the run passes it
 #   SOLVER_THREADS_TOTAL=<n>       total solver threads, divided across shards
 #                                  at each point. SET THIS whenever SWEEP_WORKERS
@@ -327,6 +332,7 @@ cd "$SWEEP_REPO"
   --inflight "$SWEEP_INFLIGHT" \
   --workers "$SWEEP_WORKERS" \
   --config-from-manifest "$RUN_DIR/run_manifest.json" \
+  ${CONFIG_OVERRIDES:+$CONFIG_OVERRIDES} \
   ${SOLVER_THREADS_TOTAL:+--solver-threads-total "$SOLVER_THREADS_TOTAL"} \
   --solver-threads "$SOLVER_THREADS" \
   --device cuda \
