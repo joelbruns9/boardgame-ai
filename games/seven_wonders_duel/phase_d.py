@@ -621,6 +621,21 @@ class PhaseDConfig:
     candidates, or the conflict-free rule cuts every wave back to width 1.
     """
 
+    virtual_loss_root: bool = False
+    """Allow a PUCT root to batch, selecting with in-flight counts folded in.
+
+    An explicit opt-in, never implied by ``leaf_batch``: it is a different
+    algorithm at the root, and on a FULL move the root's visit distribution is
+    the policy target. Kingdomino runs exactly this (``--leaf_batch 6
+    --virtual_loss 1``) and its notes record degradation only "around 8", so the
+    open question is where the knee sits -- which this flag exists to let a
+    paired A/B measure, not to assume.
+
+    Virtual loss is removed after backup (an exact additive inverse), so the
+    recorded visit counts carry no residue; what changes is which paths were
+    explored.
+    """
+
     conflict_free_waves: bool = False
     """Forbid two in-flight simulations in one root candidate's subtree.
 
@@ -941,7 +956,7 @@ class PhaseDConfig:
         cheap_is_puct = self.cheap_search_mode == "puct" or (
             self.cheap_search_mode == "same" and self.selfplay_search_mode == "puct"
         )
-        if cheap_is_puct and self.cheap_leaf_batch > 1:
+        if cheap_is_puct and self.cheap_leaf_batch > 1 and not self.virtual_loss_root:
             raise ValueError(
                 "cheap_leaf_batch > 1 requires a Gumbel cheap root "
                 "(--cheap-search-mode gumbel); a PUCT root would select under "
@@ -957,7 +972,7 @@ class PhaseDConfig:
             )
         if (
             self.selfplay_search_mode == "puct" or self.cheap_search_mode == "puct"
-        ) and self.leaf_batch > 1:
+        ) and self.leaf_batch > 1 and not self.virtual_loss_root:
             # `check_puct_root` rejects this INSIDE the search, so without this
             # the run dies partway through generation on its first PUCT move --
             # and with the hybrid, on its first move of whichever kind is PUCT.
@@ -3430,6 +3445,7 @@ class PhaseDLoop:
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
             cheap_leaf_batch=(self.config.cheap_leaf_batch or None),
+            virtual_loss_root=self.config.virtual_loss_root,
             conflict_free_waves=self.config.conflict_free_waves,
             round_robin_candidates=self.config.round_robin_candidates,
             puct_root=self.config.selfplay_search_mode == "puct",
@@ -5226,6 +5242,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--round-robin-candidates, without which every wave is cut to width 1.",
     )
     parser.add_argument(
+        "--virtual-loss-root",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="allow a PUCT root to batch under virtual loss. A DIFFERENT "
+        "algorithm at the root, and on full moves the root's visit distribution "
+        "is the policy target -- measure with a paired A/B before adopting.",
+    )
+    parser.add_argument(
         "--conflict-free-waves",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -5829,6 +5853,7 @@ def main(argv=None) -> int:
         rust_scheduler_workers=args.rust_scheduler_workers,
         leaf_batch=args.leaf_batch,
         cheap_leaf_batch=args.cheap_leaf_batch,
+        virtual_loss_root=args.virtual_loss_root,
         conflict_free_waves=args.conflict_free_waves,
         round_robin_candidates=args.round_robin_candidates,
         force_root_chance=args.force_root_chance,

@@ -1214,6 +1214,73 @@ oracle. Values greater than one use WU-UCT batching and must be treated as a
 separately approved algorithm, not merely a throughput setting. Keep this at
 `1` for training unless that algorithm receives its own quality approval.
 
+Above `1` under a PUCT root it additionally requires `--virtual-loss-root`.
+
+Why this matters for throughput: wave width has been exactly 1.00 in every run
+measured (cloud5, cloud6, cloud7), so a 1,600-simulation move is 1,600
+sequential, dependent GPU round trips, and rows-per-live-game cannot exceed 1.
+The 2026-08-20 geometry sweep found total leaves in flight pinned near 170
+across a 4x change in shard count and a 2x change in slots -- slots and workers
+redistribute a fixed quantity, and only leaf batching raises it.
+
+### `--virtual-loss-root`, `--no-virtual-loss-root`
+
+**Default:** off. **Value:** flag
+
+Allows a PUCT root to batch, selecting with in-flight counts folded in. An
+explicit opt-in, never implied by `--leaf-batch`, because it is a different
+algorithm at the root and on a FULL move the root's visit distribution is the
+policy target.
+
+Virtual loss is removed after backup -- an exact additive inverse -- so the
+recorded visit counts carry no residue; what changes is which paths were
+explored. Kingdomino runs exactly this (its `leaf_batch 6`, `virtual_loss 1`) and
+its notes record degradation only "around 8", so the open question is where the
+knee sits rather than whether it works.
+
+Measure before adopting, with `python -m games.seven_wonders_duel.leaf_batch_ab`
+-- a paired same-net A/B that puts both arms in the SAME game via per-seat leaf
+batch, seat-swapped so the first-player advantage cancels exactly.
+
+### `--cheap-leaf-batch`
+
+**Default:** `0` (follow `--leaf-batch`). **Value:** non-negative integer
+
+Leaf batch for CHEAP moves only. Separate from `--leaf-batch` because the two
+paths are priced differently: cheap moves emit no policy target and run a Gumbel
+root, so widening their waves risks move quality alone, while a full move's
+visit distribution is the training label.
+
+Requires a Gumbel cheap root, and both `--conflict-free-waves` and
+`--round-robin-candidates`; without them the conflict-free rule cuts every wave
+back to width 1 and the setting buys nothing. Both refusals are raised at
+startup rather than accepted as silent no-ops.
+
+Measured 2026-08-20 on the real generation path: `8` with both wave flags took
+mean wave width from 1.00 to 1.97 and halved GPU calls. Note 1.97, not 8 -- the
+conflict-free invariant cuts a wave short rather than admitting a collision, and
+that taper IS the diversity guarantee.
+
+### `--conflict-free-waves`, `--no-conflict-free-waves`
+
+**Default:** off. **Value:** flag
+
+Forbids two in-flight simulations in one root candidate's subtree, making
+`--leaf-batch > 1` an exact batching of `1` rather than a virtual-loss
+approximation. Exact GIVEN the simulation order -- which
+`--round-robin-candidates` changes.
+
+### `--round-robin-candidates`, `--no-round-robin-candidates`
+
+**Default:** off. **Value:** flag
+
+Interleaves each halving round instead of blocking it. Required for any width:
+without it the next simulation repeats the current candidate, so the
+conflict-free rule cuts every wave to 1 (1.19 measured under PUCT).
+
+It **changes search outputs** -- a different, equally valid sample, not a
+refactor -- so it is a strength decision, not free throughput.
+
 ## Rust Scheduler and Inference Geometry
 
 ### `--generation-backend`

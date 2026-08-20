@@ -203,6 +203,15 @@ pub struct SelfPlayConfig {
     /// so consecutive simulations come from different candidates and waves can
     /// actually widen. Changes search outputs — see `tree::SearchConfig`.
     pub round_robin_candidates: bool,
+    /// Allow a PUCT root to select under virtual loss when `leaf_batch > 1`.
+    ///
+    /// OFF by default, and deliberately an explicit opt-in rather than implied
+    /// by `leaf_batch`: it is a different algorithm at the root, and on a full
+    /// move the root's visit distribution is the policy target. Kingdomino runs
+    /// this (`--leaf_batch 6 --virtual_loss 1`) and found degradation only
+    /// around 8, so the question is where the knee is, not whether it works --
+    /// but that is a measurement this flag exists to enable, not to assume.
+    pub virtual_loss_root: bool,
 }
 
 impl SelfPlayConfig {
@@ -2147,20 +2156,36 @@ impl GameSlot {
             evaluation.0,
             blend_priors(&self.state, evaluation.1, self.cfg.draft_prior),
         );
-        let started = if meta.search_cfg.force_expand_root_chance {
-            tree_resumable::begin_search_from_root_forced(
+        // The virtual-loss twins are reachable only with the opt-in AND an
+        // actual batch: at leaf_batch = 1 there is no wave to collide, so
+        // routing there anyway would change the entry point for every existing
+        // run while changing nothing about the search.
+        let virtual_loss_root = self.cfg.virtual_loss_root && meta.leaf_batch > 1;
+        let started = match (meta.search_cfg.force_expand_root_chance, virtual_loss_root) {
+            (true, false) => tree_resumable::begin_search_from_root_forced(
                 &self.state,
                 &meta.search_cfg,
                 meta.leaf_batch,
                 evaluation,
-            )
-        } else {
-            tree_resumable::begin_search_from_root(
+            ),
+            (true, true) => tree_resumable::begin_search_from_root_forced_virtual_loss(
                 &self.state,
                 &meta.search_cfg,
                 meta.leaf_batch,
                 evaluation,
-            )
+            ),
+            (false, false) => tree_resumable::begin_search_from_root(
+                &self.state,
+                &meta.search_cfg,
+                meta.leaf_batch,
+                evaluation,
+            ),
+            (false, true) => tree_resumable::begin_search_from_root_virtual_loss(
+                &self.state,
+                &meta.search_cfg,
+                meta.leaf_batch,
+                evaluation,
+            ),
         };
         let result = match started {
             Ok(session) => {
@@ -3290,6 +3315,7 @@ mod budget_tests {
             leaf_batch: 1,
             leaf_batch_by_player: None,
             cheap_leaf_batch: None,
+            virtual_loss_root: false,
             deterministic_actions: false,
             cheap_sims_min: 2,
             cheap_sims_max: 2,

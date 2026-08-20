@@ -1897,10 +1897,42 @@ pub fn begin_search_from_root_forced(
     leaf_batch: usize,
     root_evaluation: (f64, Vec<f64>),
 ) -> PyResult<SearchSession> {
+    begin_search_from_root_forced_inner(state, cfg, leaf_batch, root_evaluation, false)
+}
+
+/// `begin_search_from_root_forced` with a batched PUCT root allowed.
+///
+/// Self-play runs the FORCED entry point whenever `--force-root-chance` is on,
+/// which is the default, so the virtual-loss opt-in on the plain entry point is
+/// unreachable from a production run without this twin. Same trade as
+/// `begin_search_from_root_virtual_loss`: the root selects with in-flight counts
+/// folded in.
+pub fn begin_search_from_root_forced_virtual_loss(
+    state: &GameState,
+    cfg: &SearchConfig,
+    leaf_batch: usize,
+    root_evaluation: (f64, Vec<f64>),
+) -> PyResult<SearchSession> {
+    begin_search_from_root_forced_inner(state, cfg, leaf_batch, root_evaluation, true)
+}
+
+fn begin_search_from_root_forced_inner(
+    state: &GameState,
+    cfg: &SearchConfig,
+    leaf_batch: usize,
+    root_evaluation: (f64, Vec<f64>),
+    allow_virtual_loss_root: bool,
+) -> PyResult<SearchSession> {
     let force = cfg.force_expand_root_chance;
     let mut base_cfg = cfg.clone();
     base_cfg.force_expand_root_chance = false;
-    let mut session = begin_search_from_root(state, &base_cfg, leaf_batch, root_evaluation)?;
+    let mut session = begin_search_from_root_inner(
+        state,
+        &base_cfg,
+        leaf_batch,
+        root_evaluation,
+        allow_virtual_loss_root,
+    )?;
     session.cfg.force_expand_root_chance = force;
     if force {
         let mut forced = materialize_forced_root(

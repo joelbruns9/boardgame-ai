@@ -1239,3 +1239,18 @@ def test_the_new_flags_exist_on_the_parser():
     for flag in ("--cheap-leaf-batch", "--conflict-free-waves",
                  "--round-robin-candidates"):
         assert flag in options
+
+
+def test_virtual_loss_root_is_what_unlocks_a_batched_puct_root():
+    """Opt-in, never implied by --leaf-batch: batching a PUCT root is a
+    different algorithm there, and on full moves the root's visit distribution
+    is the policy target."""
+
+    with pytest.raises(ValueError, match="requires --leaf-batch 1"):
+        _config(leaf_batch=8, virtual_loss_root=False)
+    # With the opt-in it is permitted -- that is the whole point of the flag.
+    assert _config(leaf_batch=8, virtual_loss_root=True).leaf_batch == 8
+    # And it unlocks the cheap override under a PUCT cheap root too.
+    assert _config(
+        cheap_search_mode="puct", cheap_leaf_batch=8, virtual_loss_root=True
+    ).cheap_leaf_batch == 8
