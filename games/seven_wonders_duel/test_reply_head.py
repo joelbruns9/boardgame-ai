@@ -18,9 +18,10 @@ from .test_endgame_solver_self_play import _example
 
 
 class _Move:
-    def __init__(self, i, actor, policy=None, sims=64):
+    def __init__(self, i, actor, policy=None, sims=64, policy_excluded=False):
         self.i, self.actor, self.sims = i, actor, sims
         self.policy_target = policy
+        self.policy_excluded = policy_excluded
 
 
 def _legal(moves, size=3):
@@ -139,3 +140,46 @@ def test_a_model_without_the_head_ignores_reply_targets_entirely():
     batch = collate([_example(reply_legal=legal, reply_target=np.asarray([1.0, 0.0], np.float32))])
     _, parts = compute_losses(_outputs(1, reply=False), batch)
     assert parts["reply"] == 0.0
+
+
+def test_an_excluded_policy_never_supervises_the_reply_head():
+    """The flag, not the target's presence.
+
+    A record carries `policy_target` for EVERY searched move, including the ones
+    the main policy head refuses: a cheap search, whose 16-24-sim top-k-pruned
+    target is low-quality by construction, and a move played by an archived net,
+    whose policy belongs to an older opponent. Testing for the target's presence
+    -- as this file's other cases do, since they use `policy=None` -- lets both
+    straight through, and supervising the reply head on labels the policy head
+    rejects puts that noise back into the shared trunk.
+
+    Found by `gate_power_audit.py`: reverting the guard left every test in this
+    file green.
+    """
+
+    moves = [
+        _Move(0, 0, {0: 1.0}),
+        # Present target, but excluded -- the case the old guard missed.
+        _Move(1, 1, {2: 1.0}, sims=20, policy_excluded=True),
+        _Move(2, 0, {1: 1.0}),
+    ]
+    out = reply_targets(moves, _legal(moves))
+    assert 0 not in out, (
+        "row 0 was supervised by an excluded policy; the guard must test "
+        "`policy_excluded`, not whether a target happens to exist"
+    )
+
+
+def test_an_included_policy_still_supervises_it():
+    """The other half: the guard must not reject everything.
+
+    Without this, `if True: continue` would satisfy the test above and disable
+    the reply head entirely.
+    """
+
+    moves = [
+        _Move(0, 0, {0: 1.0}),
+        _Move(1, 1, {2: 1.0}, policy_excluded=False),
+    ]
+    out = reply_targets(moves, _legal(moves))
+    assert 0 in out, "an ordinary full-search reply must still be paired"

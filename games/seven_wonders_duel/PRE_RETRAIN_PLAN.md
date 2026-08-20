@@ -1228,6 +1228,41 @@ the solver global. The mitigation that keeps working is the same: **one
 definition site, read from the object that was actually built, plus a test that
 round-trips it.**
 
+**A gate is not evidence until it has been seen to fail.** Two of this
+project's checks could not fail on the bug they were written to prevent, and
+neither was found by reading them:
+
+* `test_async_solver.py` drove `self_play_many_mock`, which routes to a
+  scheduler that never builds a `SolverPool`. Every `set_solver_threads` value
+  took the same synchronous path, so its identity assertions compared a run
+  against itself. It is the file the notes call THE gate for the async port, and
+  it was cited as evidence for a fix to code it does not execute.
+* `test_cost_model_parity.py` compared Rust against Python on bot games, which
+  retire no wonders at all (0 of 146 positions). The one divergence that existed
+  was in retired-wonder handling, in 24% of the positions the model is fit on.
+
+`gate_power_audit.py` makes the check deliberate: break what a gate guards,
+confirm it goes red, restore. Seven mutations, each a real bug class -- a dropped
+legal action, a feature off by one across the language boundary, a confidence
+bound that always clears, a mask that keeps a proven loss.
+
+First run, 2026-08-19: **six CAUGHT, one MISSED.** The miss was
+`reply_targets`'s `policy_excluded` guard -- the external review's own fix, which
+nothing tested. Every fixture in `test_reply_head.py` built its cheap move with
+`policy_target=None`, so they all exercised the OLD guard; the actual bug is a
+move that HAS a target and is excluded. Reverting the fix left all nine tests
+green. Two tests now cover it, including that an *included* policy still
+supervises -- without which `if True: continue` would satisfy the first and
+disable the reply head entirely.
+
+The audit also caught a bug in itself: it first read any non-zero pytest exit as
+CAUGHT, and reported CAUGHT for a mutation whose gate pointed at a file that
+does not exist (exit 5, "no tests ran"). It now separates exit 1 from everything
+else and calls the rest BROKEN, as loudly as MISSED. An audit of whether checks
+can fail is worth nothing if it credits itself for a missing check.
+
+Re-run it after adding a gate, and when one has never been observed failing.
+
 **Duplicated constants.** The padded feature width was a literal in four places
 and adding two features left two behind, surfacing as a matmul shape error naming
 nothing. All four now derive from the schema. The class of bug is worth watching
