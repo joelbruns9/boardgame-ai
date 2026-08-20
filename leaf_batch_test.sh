@@ -63,7 +63,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mkdir -p "$OUTPUT"
 LOG="$OUTPUT/leaf_batch_$(date +%Y%m%dT%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
-LEAF_BATCH_SCRIPT_VERSION=1
+LEAF_BATCH_SCRIPT_VERSION=2
 log "leaf_batch_test.sh version $LEAF_BATCH_SCRIPT_VERSION (log: $LOG)"
 
 # ── STAGE 1: code ────────────────────────────────────────────────────────────
@@ -94,6 +94,21 @@ case "$EXT_DIR" in
   over the extension the training process has loaded." ;;
 esac
 rm -rf "$EXT_DIR"
+
+# rustup installs cargo to ~/.cargo/bin and adds it to the shell PROFILE, which
+# a non-login shell never reads -- so `cargo` is missing here even on a box that
+# built this crate at setup. `common::rust_toolchain` sources this file, but
+# calling that would also install and update toolchains, which is not this
+# script's business while a training run is using the machine.
+# shellcheck disable=SC1091
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and
+  \$HOME/.cargo/env did not supply it. Either:
+      source \$HOME/.cargo/env
+  in this shell and re-run, or install rustup. maturin reports this as
+  'Cargo metadata failed', which names the symptom rather than the cause."
+ok "cargo: $(cargo --version)"
+
 ( cd "$SWEEP_REPO/games/seven_wonders_duel/seven_wonders_rust" \
   && maturin build --release ) || die "wheel build failed"
 WHEEL="$(ls -t "$SWEEP_REPO/games/seven_wonders_duel/seven_wonders_rust/target/wheels/"*.whl | head -1)"

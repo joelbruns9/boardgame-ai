@@ -1300,3 +1300,21 @@ def test_it_only_uses_flags_the_ab_harness_accepts(leaf_batch_text):
     assert len(used) >= 5, f"only extracted {used}"
     unknown = sorted(used - _module_options("leaf_batch_ab"))
     assert not unknown, f"leaf_batch_test.sh passes flags the harness rejects: {unknown}"
+
+
+def test_the_leaf_batch_test_puts_cargo_on_path_itself(leaf_batch_text):
+    """rustup installs cargo to ~/.cargo/bin and adds it to the shell PROFILE,
+    which a non-login shell never reads -- so a box that BUILT this crate at
+    setup still has no cargo in a fresh ssh session. maturin reports that as
+    "Cargo metadata failed", naming the symptom rather than the cause. The box
+    hit exactly this.
+
+    Structural rather than behavioural: simulating a PATH without cargo needs
+    symlinks this test suite cannot create on Windows.
+    """
+
+    assert '[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"' in leaf_batch_text
+    build = leaf_batch_text.index("maturin build")
+    assert leaf_batch_text.index(".cargo/env") < build, "must be sourced BEFORE the build"
+    # And it must not paper over a still-missing cargo.
+    assert "cargo is not on PATH" in leaf_batch_text
