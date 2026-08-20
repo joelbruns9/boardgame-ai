@@ -106,19 +106,30 @@ def test_a_deadline_stop_is_always_called_out():
     assert "DEADLINE" not in render([profile_row(_row())])
 
 
+def test_the_batch_width_hint_does_not_tell_the_operator_to_chase_width():
+    """Measured 2026-08-20: 2 shards beat 1 shard by 19% at HALF the batch
+    width. The hint used to say "raise concurrency or lower the shard count",
+    which the sweep contradicted. A tool that prints advice must not print
+    advice its own project has measured to be wrong."""
+
+    text = render([profile_row(_row(), batch_cap=2048)])
+    assert "lower the shard count" not in text
+    assert "does not predict throughput" in text
+
+
 def test_the_batch_width_hint_needs_a_cap_and_uses_it():
     """`global_batch_cap` is not exported by the scheduler, so it comes from the
     manifest. Read as zero the comparison silently passes at every batch size --
     the hint would be dead code rather than a check."""
 
     narrow = render([profile_row(_row(), batch_cap=2048)])
-    assert "paid per call" in narrow
+    assert "cap is not binding" in narrow
 
     wide = render([profile_row(_row(), batch_cap=64)])
-    assert "paid per call" not in wide
+    assert "cap is not binding" not in wide
 
     dead = render([profile_row(_row(), batch_cap=0)])
-    assert "paid per call" not in dead
+    assert "cap is not binding" not in dead
 
 
 def test_the_batch_cap_is_read_from_the_run_manifest(tmp_path):

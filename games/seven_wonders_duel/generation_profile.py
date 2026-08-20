@@ -262,9 +262,12 @@ def render(
     if latest["batch_cap"] and latest["batch_mean"] < 0.25 * latest["batch_cap"]:
         lines.append(
             f"  * batches average {latest['batch_mean']:.0f} against a cap of "
-            f"{latest['batch_cap']}: the GPU is being paid per call, not per row. "
-            "Raise concurrency (slots) or lower the shard count -- shards divide "
-            "the games between them, so more shards means smaller batches."
+            f"{latest['batch_cap']}, so the cap is not binding. NOTE: batch "
+            "width on its own does not predict throughput here -- measured "
+            "2026-08-20, 2 shards ran 19% FASTER than 1 shard at half the batch "
+            "width, and cloud6 ran 234-wide batches at the same games/s as this "
+            "run does at 43. Total leaves in flight was near-constant across "
+            "shard counts. Treat width as a diagnostic, not a target."
         )
 
     budget = solver_budget(latest, node_rate, solver_threads_total)
