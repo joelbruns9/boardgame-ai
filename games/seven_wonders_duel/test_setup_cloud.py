@@ -818,3 +818,114 @@ def test_the_noisy_build_stages_log_to_a_file(setup_text, stage, label):
                        setup_text.index(f"stage_done {stage}")]
     assert "common::quietly" in block, f"stage {stage} still floods the terminal"
     assert label in block
+
+
+# ── sweep_7wd.sh: measuring without launching ────────────────────────────────
+# setup_cloud_7wd.sh cannot be used to sweep, because reaching stage 8b means
+# reaching stage 10, which launches. This script measures alone. Its safety
+# properties are the reason it exists, so they are what get tested.
+
+SWEEP = REPO_ROOT / "sweep_7wd.sh"
+
+
+@pytest.fixture(scope="module")
+def sweep_text() -> str:
+    return SWEEP.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("module", ["f4_phase_d_sweep", "w5_gate_slots_sweep"])
+def test_the_standalone_sweep_only_uses_flags_that_exist(sweep_text, module):
+    used = _long_flags(_invocation(sweep_text, module))
+    assert len(used) >= 6, f"only extracted {used} from the {module} call"
+    unknown = sorted(used - _module_options(module))
+    assert not unknown, f"sweep_7wd.sh passes flags {module} rejects: {unknown}"
+
+
+def test_the_standalone_sweep_never_launches_training(sweep_text):
+    """The whole point: stage 8b is unreachable without stage 10."""
+
+    assert "phase_d.py" not in sweep_text
+    assert "launch_detached" not in sweep_text
+    assert "nohup" not in sweep_text
+
+
+def test_the_standalone_sweep_never_builds_the_crate(sweep_text):
+    """`maturin develop` installs into the shared site-packages, so building
+    from the sweep checkout would replace the extension the RUNNING training
+    process loads. The script compares crate trees and refuses instead."""
+
+    # Comments explain the trap, so only executable lines are checked.
+    code = "\n".join(
+        line for line in sweep_text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "maturin" not in code
+    assert "cargo build" not in code
+    assert "rev-parse" in code and "seven_wonders_rust" in code
+
+
+def test_the_sweep_grid_contains_the_settings_the_run_is_using(sweep_text):
+    """A grid that excludes the current value cannot say whether changing it
+    helps. Stage 8b's grid excluded 256 slots and pinned inflight to 1, which is
+    why it could not have found the batch=42 problem."""
+
+    def axis(name: str) -> set[str]:
+        match = re.search(rf'^{name}="\$\{{{name}:-([^}}]*)\}}"$', sweep_text, re.M)
+        assert match, f"{name} is not a knob with a default"
+        return {part.strip() for part in match.group(1).split(",")}
+
+    assert "256" in axis("SWEEP_SLOTS"), "the run's slot count is outside the grid"
+    assert "2048" in axis("SWEEP_CAPS"), "the run's batch cap is outside the grid"
+    assert {"1", "2"} <= axis("SWEEP_INFLIGHT"), "inflight must be varied, not pinned"
+    assert "4" in axis("SWEEP_WORKERS"), "the run's shard count is outside the grid"
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_the_sweep_refuses_to_run_beside_a_live_training_process(tmp_path):
+    """A sweep sharing the GPU with training measures contention, and the point
+    it crowns is whichever tolerated the interference best."""
+
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "pgrep").write_text(
+        "#!/usr/bin/env bash\necho '4242 python -m games.seven_wonders_duel.phase_d'\n",
+        encoding="utf-8",
+    )
+    (stub / "pgrep").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+        "OUTPUT": str(tmp_path / "out"),
+        "RUN_REPO": str(tmp_path / "repo"),
+    }
+    proc = subprocess.run(
+        [BASH, str(SWEEP)], capture_output=True, text=True, env=env, cwd=tmp_path
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"swept anyway:\n{combined}"
+    assert "Stop training before sweeping" in combined
+
+    # And the override exists, so the refusal is a guard rather than a wall.
+    forced = subprocess.run(
+        [BASH, str(SWEEP)], capture_output=True, text=True,
+        env={**env, "FORCE": "1"}, cwd=tmp_path,
+    )
+    forced_out = forced.stdout + forced.stderr
+    assert "sweeping anyway" in forced_out
+    assert "Stop training before sweeping" not in forced_out
+
+
+def test_the_kingdomino_launcher_also_hands_over_after_its_pull():
+    """Same trap, same shape, different file.
+
+    `setup_cloud.sh` is self-contained rather than sourcing the common library,
+    so it carries its own copy of the guard -- but a launcher that pulls at
+    stage 2 and keeps executing the code bash read at stage 0 configures its run
+    from the previous commit either way.
+    """
+
+    text = (REPO_ROOT / "setup_cloud.sh").read_text(encoding="utf-8")
+    assert "reexec_if_updated" in text, "the Kingdomino launcher has no guard"
+    pull = text.index("git pull")
+    guard = text.index("reexec_if_updated\n", pull)
+    assert guard > pull, "the guard must run after the pull, not before"
+    assert "SETUP_REEXEC" in text, "nothing stops an exec loop"

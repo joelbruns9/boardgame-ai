@@ -65,12 +65,22 @@ def timed_scheduler_calls():
             bot_games = games if bot else 0
         started = time.monotonic()
         result = real(*args, **kwargs)
+        # `(records, metrics)`. The batch widths are the number this sweep
+        # exists to move: a run whose mean batch is 42 against a 2,048 cap is
+        # paying per-call overhead, not compute, and no wall-clock total says
+        # so on its own.
+        rows: list[int] = []
+        try:
+            rows = [int(value) for value in (result[1] or {}).get("batch_rows", ())]
+        except Exception:  # pragma: no cover - metrics shape is the contract
+            pass
         calls.append(
             {
                 "games": games,
                 "bot_games": bot_games,
                 "seconds": time.monotonic() - started,
                 "bot": bot,
+                "batch_rows": rows,
             }
         )
         return result
@@ -110,10 +120,19 @@ def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
     return pd.ResolvedSchedules(curriculum_mix_fraction=0.0, draft_prior=0.0)
 
 
-def run_point(loop, model, iteration, jobs, destination, slots, cap, inflight):
+def run_point(
+    loop, model, iteration, jobs, destination, slots, cap, inflight,
+    workers=1, solver_threads=0,
+):
     loop.config.rust_slots = slots
     loop.config.rust_global_batch_cap = cap
     loop.config.rust_max_inflight_batches = inflight
+    loop.config.rust_scheduler_workers = workers
+    # Per SHARD, so the load this point puts on the CPU is threads x workers.
+    # Applied per point rather than once at startup: the total moves with the
+    # worker axis, and a sweep that solved on one thread count while measuring
+    # another would attribute the solver's core contention to the axis.
+    pd.configure_solver_threads(solver_threads, workers)
 
     calls, restore = timed_scheduler_calls()
     try:
@@ -143,10 +162,17 @@ def run_point(loop, model, iteration, jobs, destination, slots, cap, inflight):
         )
         for record in records
     )
+    batch_rows = [row for call in calls for row in call.get("batch_rows", ())]
     stats = {
         "slots": slots,
         "global_batch_cap": cap,
         "max_inflight_batches": inflight,
+        "scheduler_workers": workers,
+        "solver_threads_per_shard": solver_threads,
+        "solver_threads_total": solver_threads * workers,
+        "mean_batch_size": statistics.fmean(batch_rows) if batch_rows else 0.0,
+        "max_batch_size": max(batch_rows) if batch_rows else 0,
+        "batches": len(batch_rows),
         "wall_seconds": wall,
         "games": len(records),
         "games_per_second": len(records) / wall if wall else 0.0,
@@ -189,14 +215,48 @@ def main() -> None:
     parser.add_argument("--slots", default="16,32,48")
     parser.add_argument("--caps", default="256,512")
     parser.add_argument("--inflight", default="1,2")
+    parser.add_argument(
+        "--workers",
+        default="1",
+        help="scheduler shard counts to sweep. Swept rather than fixed because "
+        "`rust_slots` is a GLOBAL budget shared across shards: an optimum found "
+        "at one shard is not the optimum at four, and this harness used to "
+        "measure at PhaseDConfig's default of 1 while configuring a run at 4.",
+    )
+    parser.add_argument(
+        "--solver-threads",
+        type=int,
+        default=0,
+        help="solver threads PER SHARD, as the run passes them. The default of "
+        "0 measures with the solver off, which is the wrong cost curve for a "
+        "run that solves: those threads compete with generation for cores.",
+    )
     args = parser.parse_args()
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     numbers = lambda text: [int(part) for part in text.split(",") if part.strip()]
     grid = list(
-        itertools.product(numbers(args.slots), numbers(args.caps), numbers(args.inflight))
+        itertools.product(
+            numbers(args.slots),
+            numbers(args.caps),
+            numbers(args.inflight),
+            numbers(args.workers),
+        )
     )
+    # A shard with no slot cannot make progress, and `SlotBudget::new` refuses
+    # the combination rather than widening it. Drop those points here so the
+    # sweep reports a grid it actually measured instead of dying partway.
+    dropped = [point for point in grid if point[0] < point[3]]
+    grid = [point for point in grid if point[0] >= point[3]]
+    if dropped:
+        print(
+            f"skipping {len(dropped)} point(s) with fewer slots than shards: "
+            f"{sorted({(slots, workers) for slots, _, _, workers in dropped})}",
+            flush=True,
+        )
+    if not grid:
+        raise SystemExit("every grid point has fewer slots than shards")
 
     geometry = geometry_from_checkpoint(args.checkpoint)
     config = pd.PhaseDConfig(
@@ -222,7 +282,7 @@ def main() -> None:
         print(f"warmup: {args.warmup_games} games", flush=True)
         run_point(
             loop, model, args.iteration, jobs_for(args.warmup_games, 999),
-            output / "warmup.jsonl", *grid[0],
+            output / "warmup.jsonl", *grid[0], solver_threads=args.solver_threads,
         )
 
     jobs = jobs_for(args.games, args.iteration)
@@ -238,11 +298,12 @@ def main() -> None:
     fingerprints: set = set()
     for repetition in range(args.repetitions):
         order = grid if repetition % 2 == 0 else list(reversed(grid))
-        for position, (slots, cap, inflight) in enumerate(order):
+        for position, (slots, cap, inflight, workers) in enumerate(order):
             stats, fingerprint = run_point(
                 loop, model, args.iteration, jobs,
-                output / f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}.jsonl",
-                slots, cap, inflight,
+                output
+                / f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}_w{workers}.jsonl",
+                slots, cap, inflight, workers, args.solver_threads,
             )
             stats["repetition"] = repetition
             results.append(stats)
@@ -260,7 +321,8 @@ def main() -> None:
                     f"{stats['bot_groups']} groups"
                 )
             print(
-                f"slots={slots:<3} cap={cap:<4} inflight={inflight}  "
+                f"slots={slots:<4} cap={cap:<4} inflight={inflight} workers={workers:<2} "
+                f"batch={stats['mean_batch_size']:6.1f}  "
                 f"{stats['wall_seconds']:7.1f}s  {stats['games_per_hour']:7.0f} games/h  "
                 + detail,
                 flush=True,
@@ -268,19 +330,30 @@ def main() -> None:
 
     summary = []
     for point in grid:
-        slots, cap, inflight = point
+        slots, cap, inflight, workers = point
         matching = [
             row for row in results
-            if (row["slots"], row["global_batch_cap"], row["max_inflight_batches"]) == point
+            if (
+                row["slots"],
+                row["global_batch_cap"],
+                row["max_inflight_batches"],
+                row["scheduler_workers"],
+            ) == point
         ]
         summary.append(
             {
                 "slots": slots,
                 "global_batch_cap": cap,
                 "max_inflight_batches": inflight,
+                "scheduler_workers": workers,
+                "solver_threads_per_shard": args.solver_threads,
+                "solver_threads_total": args.solver_threads * workers,
                 "median_seconds": statistics.median(row["wall_seconds"] for row in matching),
                 "median_games_per_hour": statistics.median(
                     row["games_per_hour"] for row in matching
+                ),
+                "median_batch_size": statistics.median(
+                    row["mean_batch_size"] for row in matching
                 ),
                 "runs": len(matching),
             }
@@ -293,8 +366,14 @@ def main() -> None:
         pd.PhaseDConfig.rust_slots,
         pd.PhaseDConfig.rust_global_batch_cap,
         pd.PhaseDConfig.rust_max_inflight_batches,
+        pd.PhaseDConfig.rust_scheduler_workers,
     )
-    key = lambda row: (row["slots"], row["global_batch_cap"], row["max_inflight_batches"])
+    key = lambda row: (
+        row["slots"],
+        row["global_batch_cap"],
+        row["max_inflight_batches"],
+        row["scheduler_workers"],
+    )
     base = next((row for row in summary if key(row) == defaults), None) or next(
         row for row in summary if key(row) == grid[0]
     )
@@ -324,8 +403,10 @@ def main() -> None:
     print("\nbest first:")
     for row in summary:
         print(
-            f"  slots={row['slots']:<3} cap={row['global_batch_cap']:<4} "
-            f"inflight={row['max_inflight_batches']}  "
+            f"  slots={row['slots']:<4} cap={row['global_batch_cap']:<5} "
+            f"inflight={row['max_inflight_batches']} "
+            f"workers={row['scheduler_workers']:<2} "
+            f"batch={row['median_batch_size']:5.0f}  "
             f"{row['median_games_per_hour']:7.0f} games/h  "
             f"({row['speedup_vs_baseline']:.2f}x vs {baseline_label})"
         )

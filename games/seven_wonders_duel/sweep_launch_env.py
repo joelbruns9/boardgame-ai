@@ -59,13 +59,19 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, int]:
     best_generation = summary[0]
     best_gate = _require(gate, "best", gate_path)
 
-    return {
+    env = {
         "RUST_SLOTS": int(best_generation["slots"]),
         "RUST_GLOBAL_BATCH_CAP": int(best_generation["global_batch_cap"]),
         "RUST_MAX_INFLIGHT_BATCHES": int(best_generation["max_inflight_batches"]),
         "GATE_SLOTS": int(best_gate["slots"]),
         "GATE_GLOBAL_BATCH_CAP": int(best_gate["global_batch_cap"]),
     }
+    # Older sweep outputs have no worker axis; those measured at one shard and
+    # said nothing about the shard count, so emitting a value would be inventing
+    # a measurement.
+    if "scheduler_workers" in best_generation:
+        env["RUST_SCHEDULER_WORKERS"] = int(best_generation["scheduler_workers"])
+    return env
 
 
 def render(env: dict[str, int]) -> str:
@@ -73,6 +79,14 @@ def render(env: dict[str, int]) -> str:
         "# Measured on this box by setup_cloud_7wd.sh stage 8b.",
         "# Source this, then re-run the script to launch on these numbers.",
     ]
+    if "RUST_SCHEDULER_WORKERS" in env:
+        lines += [
+            "#",
+            "# NOTE: --solver-threads is PER SHARD, so this worker count",
+            f"# multiplies it: {env['RUST_SCHEDULER_WORKERS']} shards x SOLVER_THREADS is the",
+            "# number of CPU-bound solver threads competing with generation.",
+            "# Set SOLVER_THREADS deliberately; it is not swept.",
+        ]
     lines += [f"export {key}={value}" for key, value in env.items()]
     # Pass 2 must not re-measure: the sweeps are the expensive part of setup.
     lines.append("export SKIP_SWEEPS=1")

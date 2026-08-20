@@ -52,6 +52,32 @@ PY="${PYTHON:-python3}"
 command -v "$PY" >/dev/null 2>&1 || PY=python
 command -v "$PY" >/dev/null 2>&1 || die "No python3/python on PATH."
 
+# The self-update trap: stage 2 pulls, but bash has already read this whole file
+# into memory, so a pull that changes this script has no effect on the run it is
+# about to configure. The 7WD launcher shipped a run on a stale command line
+# exactly this way -- the manifest recorded the pulled commit while every flag
+# came from the previous one, and no stage failed. Checksum before the pull and
+# hand over afterwards. This file is self-contained, so only it is covered.
+SETUP_SELF_SUM="$(cksum < "${BASH_SOURCE[0]}")"
+SETUP_ARGV=("$@")
+reexec_if_updated() {
+  if [ "${SETUP_REEXEC:-0}" = "1" ]; then
+    return 0   # already handed over once; never loop
+  fi
+  local repo_script="$REPO_DIR/setup_cloud.sh"
+  if [ ! -f "$repo_script" ]; then
+    return 0
+  fi
+  local now
+  now="$(cksum < "$repo_script")"
+  if [ "$now" = "$SETUP_SELF_SUM" ]; then
+    return 0
+  fi
+  warn "The pull changed this setup script; restarting the updated copy."
+  export SETUP_REEXEC=1
+  exec bash "$repo_script" ${SETUP_ARGV+"${SETUP_ARGV[@]}"}
+}
+
 # ── STAGE 1: Rust via rustup (NOT apt; we need >= 1.85 for edition 2024) ─────
 stage 1 "Rust toolchain (rustup)"
 if ! command -v cargo >/dev/null 2>&1; then
@@ -108,6 +134,7 @@ else
   cd "$REPO_DIR"
 fi
 [ -d "$CRATE_DIR_REL" ] || die "Expected crate dir '$CRATE_DIR_REL' missing — wrong repo?"
+reexec_if_updated
 stage_done 2
 
 # ── STAGE 3: Python dependencies — cu128 torch FIRST, then the rest ──────────

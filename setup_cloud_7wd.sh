@@ -686,9 +686,11 @@ else
     --output "$SWEEP_DIR/generation" \
     --games "${SWEEP_GENERATION_GAMES:-200}" \
     --repetitions "${SWEEP_REPETITIONS:-1}" \
-    --slots "${SWEEP_SLOTS_CSV:-48,96,144}" \
-    --caps "${SWEEP_CAPS_CSV:-256,1024}" \
-    --inflight "${SWEEP_INFLIGHT_CSV:-1}" \
+    --slots "${SWEEP_SLOTS_CSV:-128,256,512}" \
+    --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
+    --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
+    --workers "${SWEEP_WORKERS_CSV:-$RUST_SCHEDULER_WORKERS}" \
+    --solver-threads "$SOLVER_THREADS" \
     --device cuda \
     --precision "$PRECISION" \
     || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
