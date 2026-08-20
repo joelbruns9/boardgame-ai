@@ -47,16 +47,22 @@ stage_done() { printf '\033[1;32m=== STAGE %s COMPLETE ===\033[0m\n' "$1"; }
 # refused, and a stage that prints thousands of lines scrolls the ones before it
 # out of reach. On failure the tail is printed, because a failure nobody can see
 # is worse than noise -- and the full log is always on disk.
+#
+# The command runs in a SUBSHELL. Quieted commands may be functions that call
+# die() on failure, and die() exits; run in this shell that would end the script
+# with its explanation sealed inside the log file and nothing on the terminal
+# but the stage banner. In a subshell the exit lands here and the tail prints as
+# intended. Quieted commands therefore cannot set variables for later stages.
 common::quietly() {
   local logfile="$1" label="$2"; shift 2
   [ "$1" = "--" ] && shift
   mkdir -p "$(dirname "$logfile")"
   if [ "${VERBOSE_STAGES:-0}" = "1" ]; then
-    "$@" | tee "$logfile"
+    ( "$@" ) | tee "$logfile"
     return "${PIPESTATUS[0]}"
   fi
   echo "  $label (output -> $logfile)"
-  if "$@" >"$logfile" 2>&1; then
+  if ( "$@" ) >"$logfile" 2>&1; then
     echo "  $label: ok, $(wc -l < "$logfile" | tr -d ' ') lines"
     return 0
   fi
@@ -64,6 +70,51 @@ common::quietly() {
   warn "$label FAILED (exit $status). Last 40 lines of $logfile:"
   tail -n 40 "$logfile" >&2
   return "$status"
+}
+
+# ── Self-update guard ────────────────────────────────────────────────────────
+# A setup script sources this library at its top but does not `git pull` until
+# a later stage. The first re-run after a code change therefore pulls the new
+# code and then keeps executing the OLD copy bash already read -- so the run it
+# launches is configured by the previous commit while its manifest records the
+# new one. That failure is silent, survives every downstream check, and is only
+# visible by reading the launch command back.
+#
+# Usage: checksum what bash actually read, before the pull:
+#     SELF_SUM="$(common::self_checksum "${BASH_SOURCE[0]}" "$COMMON_SH")"
+# then immediately after the pull:
+#     common::reexec_if_updated "$repo_script" "$repo_common" "$SELF_SUM" "$@"
+#
+# The sum covers the script AND this library, because either can change the
+# resulting launch. It is taken over what was read rather than over the repo's
+# copies, so it is correct whether the script was launched from the checkout or
+# curled onto a bare box (where the running copy came from main and the pull may
+# put a different branch on disk).
+common::self_checksum() {
+  cat "$@" | cksum
+}
+
+common::reexec_if_updated() {
+  local repo_script="$1" repo_common="$2" expected="$3"; shift 3
+  # One restart only. The re-executed copy checksums identical to what is on
+  # disk, so it returns here immediately -- but if it ever did not (a file being
+  # written concurrently, say) this flag is what stops an exec loop.
+  if [ "${SETUP_REEXEC:-0}" = "1" ]; then
+    return 0
+  fi
+  if [ ! -f "$repo_script" ] || [ ! -f "$repo_common" ]; then
+    return 0
+  fi
+  local now
+  now="$(common::self_checksum "$repo_script" "$repo_common")"
+  if [ "$now" = "$expected" ]; then
+    return 0
+  fi
+  warn "The update changed this setup script; restarting the updated copy."
+  warn "  (otherwise the rest of setup runs the code read BEFORE the pull,"
+  warn "   while the manifest records the commit pulled after it)"
+  export SETUP_REEXEC=1
+  exec bash "$repo_script" "$@"
 }
 
 common::require_python() {

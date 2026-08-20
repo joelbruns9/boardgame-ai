@@ -8,7 +8,10 @@ place to learn that an option was renamed.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -710,3 +713,108 @@ def test_the_solver_budget_is_sized_for_a_rented_box(setup_text):
         f"{match.group(1)} nodes is laptop-scale for a box that solves at "
         "millions of nodes per second"
     )
+
+
+# ── The self-update trap ─────────────────────────────────────────────────────
+# setup_cloud_7wd.sh sources setup_cloud_common.sh at its top and does not
+# `git pull` until stage 2, so the first re-run after a code change pulls the
+# new code and keeps executing the old copy. That launched a 200k-game run on a
+# pre-change command line whose manifest recorded the post-change commit: no
+# stage failed, and the only symptom was the launch command itself.
+
+BASH = shutil.which("bash")
+
+
+def _harness(tmp_path: Path, marker: str = "") -> Path:
+    """A miniature launcher with the same shape: source the library, checksum,
+    'pull', hand over. `pending_new` stands in for what git pull would land."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    shutil.copy(COMMON, repo / "setup_cloud_common.sh")
+    (repo / "script.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        f"{marker}"
+        "set -euo pipefail\n"
+        'COMMON_SH="$(dirname "$0")/setup_cloud_common.sh"\n'
+        'source "$COMMON_SH"\n'
+        'SUM="$(common::self_checksum "${BASH_SOURCE[0]}" "$COMMON_SH")"\n'
+        'ARGV=("$@")\n'
+        'echo "RAN version=${VERSION:-1} args=${ARGV[*]:-none}"\n'
+        # stand-in for stage 2's git pull
+        '[ -f "$PENDING" ] && mv "$PENDING" "$(dirname "$0")/script.sh"\n'
+        'common::reexec_if_updated "$(dirname "$0")/script.sh" '
+        '"$(dirname "$0")/setup_cloud_common.sh" "$SUM" ${ARGV+"${ARGV[@]}"}\n'
+        'echo "CONTINUED version=${VERSION:-1}"\n',
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _run(repo: Path, pending: str = "") -> str:
+    env = {**os.environ, "PENDING": str(repo.parent / "pending"), "VERSION": "1"}
+    if pending:
+        (repo.parent / "pending").write_text(pending, encoding="utf-8")
+    proc = subprocess.run(
+        [BASH, str(repo / "script.sh"), "alpha", "beta"],
+        capture_output=True, text=True, env=env, cwd=repo.parent,
+    )
+    assert proc.returncode == 0, f"setup exited {proc.returncode}: {proc.stderr}"
+    return proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_an_unchanged_pull_does_not_restart_the_script(tmp_path):
+    out = _run(_harness(tmp_path))
+    assert out.count("RAN version=") == 1, f"restarted for no reason:\n{out}"
+    assert "CONTINUED version=1" in out
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_pull_that_changes_the_script_hands_over_to_the_new_copy(tmp_path):
+    repo = _harness(tmp_path)
+    new = (repo / "script.sh").read_text(encoding="utf-8").replace(
+        "${VERSION:-1}", "2")
+    out = _run(repo, pending=new)
+
+    # The old copy ran, the new copy took over, and the work after the pull was
+    # done by the new copy -- the whole point.
+    assert "RAN version=1" in out
+    assert "RAN version=2" in out, f"kept running the stale copy:\n{out}"
+    assert "CONTINUED version=2" in out
+    assert "CONTINUED version=1" not in out
+    # Exactly one handover, not a loop.
+    assert out.count("RAN version=") == 2, f"restart loop:\n{out}"
+    # Arguments survive the handover.
+    assert out.count("args=alpha beta") == 2
+
+
+def test_the_launcher_checks_for_its_own_update_right_after_the_pull(setup_text):
+    """Structural: the guard is worthless if it runs before the pull, or if a
+    later edit drops the call."""
+
+    assert "common::reexec_if_updated" in setup_text, (
+        "the launcher no longer checks whether the pull replaced it; the next "
+        "code change will launch on the previous commit's command line"
+    )
+    pull = setup_text.index("common::clone_repo")
+    guard = setup_text.index("common::reexec_if_updated", pull)
+    assert guard > pull
+    # Nothing expensive in between: the point is to hand over before stage 3
+    # spends ten minutes installing torch on behalf of the wrong commit.
+    assert "stage 3" not in setup_text[pull:guard]
+
+
+def test_setup_output_is_recorded_on_disk(setup_text):
+    """Stage output used to exist only in the operator's scrollback."""
+
+    assert 'exec > >(tee -a "$SETUP_LOG")' in setup_text
+    assert "setup/setup.log" in setup_text
+
+
+@pytest.mark.parametrize("stage,label", [("3", "pip install"), ("4", "maturin build")])
+def test_the_noisy_build_stages_log_to_a_file(setup_text, stage, label):
+    block = setup_text[setup_text.index(f"stage {stage} "):
+                       setup_text.index(f"stage_done {stage}")]
+    assert "common::quietly" in block, f"stage {stage} still floods the terminal"
+    assert label in block

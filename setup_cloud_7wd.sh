@@ -4,7 +4,8 @@
 #
 # Brings a fresh Linux/CUDA box to "training launched", in one command:
 #   1. Rust toolchain (rustup >= 1.85)
-#   2. clone (or update) the repo at ~/boardgame-ai
+#   2. clone (or update) the repo at ~/boardgame-ai, then hand over to the
+#      updated copy of this script if the pull replaced it
 #   3. Python deps — cu128 torch FIRST, then requirements.txt
 #   4. build the seven_wonders_rust crate with maturin
 #   5. HARD-FAIL GPU verification gate
@@ -20,6 +21,13 @@
 # The Rust stages are the reason this file was rewritten: it previously ran pure
 # Python, while every measurement in the plan assumes --generation-backend rust
 # --gate-backend rust.
+#
+# Self-updating: stage 2 pulls, and if the pull changed this script or the
+# common library, it re-executes the new copy rather than continuing on the code
+# bash read at startup. Without that, the first re-run after any change to the
+# launcher configures the run from the OLD script while recording the NEW
+# commit in the manifest -- which is how a 200k-game run was started on a stale
+# command line, missing three flags, with nothing failing to say so.
 #
 # Idempotent: re-running updates the repo and RESUMES the run. Phase D refuses a
 # resume whose commit, precision, or schedules differ from the ones the run
@@ -61,9 +69,15 @@
 #                   without the flags you think you are running.
 #   RUN_DIR_REL=runs/seven_wonders_duel/cloud
 #   VERBOSE_STAGES=0  set 1 to put the noisy stages back on the terminal. By
-#                   default the equivalence suite and the plumbing smoke write to
-#                   $RUN_DIR/setup/*.log so the stage banners stay readable; a
-#                   failing stage prints its last 40 lines either way.
+#                   default pip, the crate build, the equivalence suite and the
+#                   plumbing smoke write to $RUN_DIR/setup/*.log so the stage
+#                   banners stay readable; a failing stage prints its last 40
+#                   lines either way.
+#   SETUP_LOG=$HOME/setup_cloud_7wd.log  transcript of this whole script,
+#                   appended per invocation and copied to
+#                   $RUN_DIR/setup/setup.log on exit. It starts outside the repo
+#                   because `git clone` refuses a target directory that already
+#                   has files in it.
 #   LAUNCH=1        set 0 to stop after verification
 #   SKIP_SMOKE=0    set 1 to skip the Phase D plumbing smoke
 #   SKIP_EQUIV=0    set 1 to skip the equivalence suite (do not do this)
@@ -90,20 +104,69 @@ REPO_DIR="${REPO_DIR:-$HOME/boardgame-ai}"
 # The common library lives beside this script in a checkout, and beside the
 # repo once cloned; a bare curl of this file alone fetches it.
 if [ -f "$SCRIPT_DIR/setup_cloud_common.sh" ]; then
+  COMMON_SH="$SCRIPT_DIR/setup_cloud_common.sh"
   # shellcheck source=setup_cloud_common.sh
-  source "$SCRIPT_DIR/setup_cloud_common.sh"
+  source "$COMMON_SH"
 elif [ -f "$REPO_DIR/setup_cloud_common.sh" ]; then
+  COMMON_SH="$REPO_DIR/setup_cloud_common.sh"
   # shellcheck source=setup_cloud_common.sh
-  source "$REPO_DIR/setup_cloud_common.sh"
+  source "$COMMON_SH"
 else
   curl -fsSL "https://raw.githubusercontent.com/joelbruns9/boardgame-ai/main/setup_cloud_common.sh" \
     -o /tmp/setup_cloud_common.sh || {
       echo "[FATAL] could not fetch setup_cloud_common.sh" >&2; exit 1; }
+  COMMON_SH=/tmp/setup_cloud_common.sh
   # shellcheck source=/dev/null
-  source /tmp/setup_cloud_common.sh
+  source "$COMMON_SH"
 fi
 
 RUN_DIR_REL="${RUN_DIR_REL:-runs/seven_wonders_duel/cloud}"
+
+# ── Record this invocation ───────────────────────────────────────────────────
+# Every stage banner, warning and derived number used to exist only in the
+# operator's scrollback: nothing on disk said which stages ran, what stage 6b
+# measured, or what stage 10 launched. A run whose setup is unreproducible is
+# one whose configuration cannot be audited afterwards.
+#
+# The log starts outside the repo because $REPO_DIR may not exist yet, and
+# `git clone` refuses a non-empty target -- creating $RUN_DIR first would break
+# the clone this file is trying to record. It is copied into the run directory
+# on exit, once that directory is real.
+SETUP_LOG="${SETUP_LOG:-$HOME/setup_cloud_7wd.log}"
+if [ "${SETUP_LOGGING:-0}" != "1" ]; then
+  export SETUP_LOGGING=1 SETUP_LOG
+  mkdir -p "$(dirname "$SETUP_LOG")"
+  printf '\n===== setup invocation %s =====\n' "$(date -Is)" >>"$SETUP_LOG"
+  exec > >(tee -a "$SETUP_LOG") 2>&1
+fi
+setup::copy_log() {
+  local dest="$REPO_DIR/$RUN_DIR_REL/setup/setup.log"
+  if [ ! -d "$REPO_DIR/$RUN_DIR_REL" ]; then
+    return 0   # setup died before the clone; the copy at $SETUP_LOG is all there is
+  fi
+  # tee writes asynchronously, so the last lines may still be in flight when the
+  # shell exits. A short pause costs nothing at the end of a multi-minute setup
+  # and keeps the final stage banner in the copied log.
+  sleep 1
+  mkdir -p "$(dirname "$dest")"
+  cp "$SETUP_LOG" "$dest" 2>/dev/null || true
+}
+trap setup::copy_log EXIT
+
+# The self-update trap: this script sources setup_cloud_common.sh at its top but
+# does not `git pull` until stage 2, so the FIRST re-run after a code change
+# pulls the new code and then keeps executing the old copy bash already read.
+# That is not hypothetical -- it launched a 200k-game run on a stale command
+# line whose manifest recorded the new commit. Checksum both files before the
+# pull; if the pull moved either, hand over to the updated copy.
+#
+# The sum covers what bash actually READ -- this file and whichever copy of the
+# common library was sourced -- so it is comparable against the repo's copies
+# after the pull whether this was launched from the checkout or curled onto a
+# bare box.
+SETUP_SELF_SUM="$(common::self_checksum "${BASH_SOURCE[0]}" "$COMMON_SH")"
+SETUP_ARGV=("$@")
+
 # Sized for a 200k-game run: 200 x 1,000. Games per iteration is deliberately
 # absent from the schedule identity (W1.2), so it is free to change on a resume
 # and larger iterations are pure savings -- half the checkpoint pairs, gate
@@ -377,14 +440,19 @@ stage_done 1
 
 stage 2 "Clone repo into $REPO_DIR"
 common::clone_repo "games/seven_wonders_duel/phase_d.py" "$CRATE_DIR_REL"
+common::reexec_if_updated \
+  "$REPO_DIR/setup_cloud_7wd.sh" "$REPO_DIR/setup_cloud_common.sh" \
+  "$SETUP_SELF_SUM" ${SETUP_ARGV+"${SETUP_ARGV[@]}"}
 stage_done 2
 
 stage 3 "Python dependencies (cu128 torch first)"
-common::python_deps
+common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/python_deps.log" "pip install" -- \
+  common::python_deps
 stage_done 3
 
 stage 4 "Build seven_wonders_rust"
-common::build_crate "$CRATE_DIR_REL" seven_wonders_rust
+common::quietly "$REPO_DIR/$RUN_DIR_REL/setup/build_crate.log" "maturin build" -- \
+  common::build_crate "$CRATE_DIR_REL" seven_wonders_rust
 # A successful import proves the crate loaded, not that its native dependencies
 # work. mimalloc is compile-time (building at all is the gate), but rayon has to
 # spawn threads, and the CPU-limit detection that sizes the pack pool has only
