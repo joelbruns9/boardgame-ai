@@ -205,12 +205,14 @@ fn make_self_play_config(
     max_moves: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
+    cheap_leaf_batch: Option<usize>,
 ) -> self_play::SelfPlayConfig {
     self_play::SelfPlayConfig {
         game_seed,
         iteration,
         leaf_batch,
         leaf_batch_by_player: None,
+        cheap_leaf_batch,
         deterministic_actions: false,
         cheap_sims_min,
         cheap_sims_max,
@@ -1497,6 +1499,7 @@ impl RustGame {
             max_moves,
             conflict_free_waves,
             round_robin_candidates,
+            None,
         );
         let evaluator = eval::PyEval::new(adapter);
         let record = self_play::run(&self.state, &evaluator, &cfg)?;
@@ -1562,6 +1565,7 @@ impl RustGame {
             max_moves,
             conflict_free_waves,
             round_robin_candidates,
+            None,
         );
         let record = self_play::run(&self.state, &eval::MockEval, &cfg)?;
         Python::attach(|py| self_play_record_to_py(py, record))
@@ -2103,6 +2107,7 @@ fn cooperative_jobs(
                 max_moves,
                 conflict_free_waves,
                 round_robin_candidates,
+                None,
             );
             Ok((state, cfg))
         })
@@ -2395,7 +2400,7 @@ fn self_play_many_net(
     bot_exploration=0.0, bot_policy_iterations=10
 , puct_root=false, cheap_puct_root=None, solve_endgames=false, solver_fallback_research=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
-    conflict_free_waves=false, round_robin_candidates=false))]
+    conflict_free_waves=false, round_robin_candidates=false, cheap_leaf_batch=None))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2448,6 +2453,7 @@ fn self_play_many_flat_net(
     max_active_slots: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
+    cheap_leaf_batch: Option<usize>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -2479,6 +2485,13 @@ fn self_play_many_flat_net(
         conflict_free_waves,
         round_robin_candidates,
     )?;
+    if let Some(cheap) = cheap_leaf_batch {
+        // Applied to every job before the per-player branch, which overrides a
+        // different axis (seat) and must not silently drop this one.
+        for (_, cfg) in &mut jobs {
+            cfg.cheap_leaf_batch = Some(cheap);
+        }
+    }
     match (leaf_batch_p0, leaf_batch_p1) {
         (None, None) => {}
         (Some(p0), Some(p1)) if p0 > 0 && p1 > 0 => {

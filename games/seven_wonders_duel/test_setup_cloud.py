@@ -1170,3 +1170,72 @@ def test_a_stale_harness_fails_at_stage_1_with_the_fix(tmp_path):
     # And it stopped before spending time on setup.
     assert "Checkpoint" not in combined
     assert "Generation sweep" not in combined
+
+
+# ── Cheap-path leaf batching ─────────────────────────────────────────────────
+# Cheap and full moves differ in what batching costs: cheap moves emit no policy
+# target, a full move's visit distribution IS the target. The knobs are separate
+# for that reason, and each refusal below exists to stop a config that would
+# either corrupt targets or silently buy nothing.
+
+
+def _config(**overrides):
+    from .phase_d import PhaseDConfig
+
+    base = dict(
+        run_dir="x",
+        selfplay_search_mode="puct",
+        cheap_search_mode="gumbel",
+        conflict_free_waves=True,
+        round_robin_candidates=True,
+    )
+    base.update(overrides)
+    config = PhaseDConfig(**base)
+    # `validate()` is a separate method, not __post_init__: constructing the
+    # dataclass checks nothing, so a test that only constructs asserts nothing.
+    config.validate()
+    return config
+
+
+def test_cheap_leaf_batching_is_refused_under_a_puct_cheap_root():
+    """Same reason --leaf-batch is: the root would select under virtual loss,
+    and a PUCT root's visit distribution is the policy target."""
+
+    with pytest.raises(ValueError, match="Gumbel cheap root"):
+        _config(cheap_search_mode="puct", cheap_leaf_batch=8)
+    # `same` inherits selfplay's PUCT, so it must be refused too -- this is the
+    # case a check on the literal string would miss.
+    with pytest.raises(ValueError, match="Gumbel cheap root"):
+        _config(cheap_search_mode="same", cheap_leaf_batch=8)
+
+
+def test_cheap_leaf_batching_is_refused_when_it_would_be_inert():
+    """Without round-robin, the conflict-free rule cuts every wave to width 1.
+    Accepting the flag would report a configuration change that buys nothing."""
+
+    with pytest.raises(ValueError, match="inert"):
+        _config(cheap_leaf_batch=8, round_robin_candidates=False)
+    with pytest.raises(ValueError, match="inert"):
+        _config(cheap_leaf_batch=8, conflict_free_waves=False)
+
+
+def test_the_defaults_change_nothing():
+    """Everything ships off, so the equivalence gate stays comparable."""
+
+    config = _config(cheap_leaf_batch=0, conflict_free_waves=False,
+                     round_robin_candidates=False)
+    assert config.cheap_leaf_batch == 0
+    assert config.conflict_free_waves is False
+    assert config.round_robin_candidates is False
+    # And a full-path PUCT run still refuses --leaf-batch, as before.
+    with pytest.raises(ValueError, match="requires --leaf-batch 1"):
+        _config(leaf_batch=8)
+
+
+def test_the_new_flags_exist_on_the_parser():
+    from .phase_d import build_parser
+
+    options = _parser_options(build_parser())
+    for flag in ("--cheap-leaf-batch", "--conflict-free-waves",
+                 "--round-robin-candidates"):
+        assert flag in options

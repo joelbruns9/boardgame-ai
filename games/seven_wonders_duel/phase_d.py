@@ -606,6 +606,38 @@ class PhaseDConfig:
     rust_max_inflight_batches: int = 1
     rust_scheduler_workers: int = 1
     leaf_batch: int = 1
+
+    cheap_leaf_batch: int = 0
+    """Leaf batch for CHEAP moves only; 0 follows ``leaf_batch``.
+
+    Separate because the two paths differ in what batching costs. Cheap moves
+    emit no policy target and run a Gumbel root, so widening their waves risks
+    move quality alone. A full move's visit distribution IS the policy label, so
+    the same change there is a target decision as well as a throughput one --
+    and under a PUCT cheap root it is refused outright (see ``validate``).
+
+    Inert without ``conflict_free_waves`` + ``round_robin_candidates``: a wave
+    wider than 1 needs consecutive simulations to come from different
+    candidates, or the conflict-free rule cuts every wave back to width 1.
+    """
+
+    conflict_free_waves: bool = False
+    """Forbid two in-flight simulations in one root candidate's subtree.
+
+    Makes ``leaf_batch > 1`` an exact batching of ``leaf_batch = 1`` rather than
+    a virtual-loss approximation, by cutting a wave short instead of admitting a
+    colliding member. Exact GIVEN THE SIMULATION ORDER -- which
+    ``round_robin_candidates`` changes.
+    """
+
+    round_robin_candidates: bool = False
+    """Interleave each halving round instead of blocking it.
+
+    Required for any width: without it the next simulation repeats the current
+    candidate, so the conflict-free rule cuts every wave to 1 (1.19 measured
+    under PUCT). It CHANGES SEARCH OUTPUTS -- a different, equally valid sample,
+    not a refactor -- so it is a strength decision, not free throughput.
+    """
     force_root_chance: bool = True
     age_deal_samples: int = 32
     cheap_double_reveal_offsets: int = 0
@@ -902,6 +934,27 @@ class PhaseDConfig:
             raise ValueError("forced_playout_k must be finite and non-negative")
         if self.cheap_search_mode not in ("same", "gumbel", "puct"):
             raise ValueError("cheap_search_mode must be same, gumbel or puct")
+        if self.cheap_leaf_batch < 0:
+            raise ValueError("cheap_leaf_batch must be non-negative (0 = follow leaf_batch)")
+        # The cheap override is refused under a PUCT cheap root for the same
+        # reason `leaf_batch` is: the root would select under virtual loss.
+        cheap_is_puct = self.cheap_search_mode == "puct" or (
+            self.cheap_search_mode == "same" and self.selfplay_search_mode == "puct"
+        )
+        if cheap_is_puct and self.cheap_leaf_batch > 1:
+            raise ValueError(
+                "cheap_leaf_batch > 1 requires a Gumbel cheap root "
+                "(--cheap-search-mode gumbel); a PUCT root would select under "
+                "virtual loss"
+            )
+        if self.cheap_leaf_batch > 1 and not (
+            self.conflict_free_waves and self.round_robin_candidates
+        ):
+            raise ValueError(
+                "cheap_leaf_batch > 1 without --conflict-free-waves and "
+                "--round-robin-candidates is inert: every wave is cut back to "
+                "width 1, so it costs a config change and buys nothing"
+            )
         if (
             self.selfplay_search_mode == "puct" or self.cheap_search_mode == "puct"
         ) and self.leaf_batch > 1:
@@ -3376,6 +3429,9 @@ class PhaseDLoop:
             nets_p1=list(league.nets_p1) if league is not None else None,
             bot_exploration=self.config.bot_exploration,
             bot_policy_iterations=self.config.bot_policy_iterations,
+            cheap_leaf_batch=(self.config.cheap_leaf_batch or None),
+            conflict_free_waves=self.config.conflict_free_waves,
+            round_robin_candidates=self.config.round_robin_candidates,
             puct_root=self.config.selfplay_search_mode == "puct",
             # `None` means "same as puct_root". Only self-play passes this; the
             # gate call below deliberately does not, so it can never inherit the
@@ -5162,6 +5218,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rust-scheduler-workers", type=int, default=1)
     parser.add_argument("--leaf-batch", type=int, default=1)
     parser.add_argument(
+        "--cheap-leaf-batch",
+        type=int,
+        default=0,
+        help="leaf batch for CHEAP moves only (0 = follow --leaf-batch). "
+        "Requires a Gumbel cheap root, plus --conflict-free-waves and "
+        "--round-robin-candidates, without which every wave is cut to width 1.",
+    )
+    parser.add_argument(
+        "--conflict-free-waves",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="forbid two in-flight simulations in one root candidate's subtree, "
+        "making leaf batching exact rather than a virtual-loss approximation",
+    )
+    parser.add_argument(
+        "--round-robin-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="interleave each halving round so waves can widen. CHANGES SEARCH "
+        "OUTPUTS -- a different, equally valid sample.",
+    )
+    parser.add_argument(
         "--force-root-chance", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--age-deal-samples", type=int, choices=(0, 4, 8, 16, 32), default=32)
@@ -5750,6 +5828,9 @@ def main(argv=None) -> int:
         rust_max_inflight_batches=args.rust_max_inflight_batches,
         rust_scheduler_workers=args.rust_scheduler_workers,
         leaf_batch=args.leaf_batch,
+        cheap_leaf_batch=args.cheap_leaf_batch,
+        conflict_free_waves=args.conflict_free_waves,
+        round_robin_candidates=args.round_robin_candidates,
         force_root_chance=args.force_root_chance,
         age_deal_samples=args.age_deal_samples,
         selfplay_search_mode=args.selfplay_search_mode,

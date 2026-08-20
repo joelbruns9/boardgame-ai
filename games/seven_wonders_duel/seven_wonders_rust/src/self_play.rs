@@ -57,6 +57,22 @@ fn search_top_k(top_k: usize, cheap_top_k: usize, full: bool) -> usize {
     }
 }
 
+/// Leaf batch for ONE move: the seat's value, unless this is a cheap move and a
+/// cheap override is configured.
+///
+/// The cheap override wins because it answers the narrower question.
+/// `leaf_batch_by_player` splits by SEAT -- a different axis, used by asymmetric
+/// benchmarks -- and the two must not silently cancel each other.
+pub(crate) fn resolve_leaf_batch(cfg: &SelfPlayConfig, actor: usize, full: bool) -> usize {
+    let seat = cfg
+        .leaf_batch_by_player
+        .map_or(cfg.leaf_batch, |batches| batches[actor]);
+    match (full, cfg.cheap_leaf_batch) {
+        (false, Some(cheap)) => cheap,
+        _ => seat,
+    }
+}
+
 fn cheap_offsets(configured: usize, full: bool) -> usize {
     if full {
         0
@@ -71,6 +87,17 @@ pub struct SelfPlayConfig {
     pub iteration: Option<i64>,
     pub leaf_batch: usize,
     pub leaf_batch_by_player: Option<[usize; 2]>,
+    /// Leaf batch for CHEAP moves only; `None` uses the per-player/global value.
+    ///
+    /// Separate from `leaf_batch` because the two paths differ in what batching
+    /// costs. Cheap moves emit no policy target and run a Gumbel root, so
+    /// widening their waves risks move quality alone. Full moves run a PUCT root
+    /// and their visit distribution IS the training label, so the same change
+    /// there is a target decision as well as a throughput one.
+    ///
+    /// Resolved per move rather than per player: `leaf_batch_by_player` splits
+    /// by SEAT, which is a different question and stays independent.
+    pub cheap_leaf_batch: Option<usize>,
     pub deterministic_actions: bool,
     pub cheap_sims_min: usize,
     pub cheap_sims_max: usize,
@@ -184,6 +211,7 @@ impl SelfPlayConfig {
             || self
                 .leaf_batch_by_player
                 .is_some_and(|batches| batches.contains(&0))
+            || self.cheap_leaf_batch == Some(0)
             || self.top_k == 0
             || self.max_moves == 0
         {
@@ -1924,10 +1952,7 @@ impl GameSlot {
         Ok(SearchMeta {
             actor,
             legal,
-            leaf_batch: self
-                .cfg
-                .leaf_batch_by_player
-                .map_or(self.cfg.leaf_batch, |batches| batches[actor]),
+            leaf_batch: resolve_leaf_batch(&self.cfg, actor, full),
             full,
             search_seed,
             researched: false,
@@ -3264,6 +3289,7 @@ mod budget_tests {
             iteration: None,
             leaf_batch: 1,
             leaf_batch_by_player: None,
+            cheap_leaf_batch: None,
             deterministic_actions: false,
             cheap_sims_min: 2,
             cheap_sims_max: 2,
@@ -3750,5 +3776,52 @@ mod all_full_game_tests {
         for seed in 0..20 {
             assert!(all_full_game(&cfg(seed, 1)));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod leaf_batch_resolution_tests {
+    //! Which leaf batch a single move runs at.
+    //!
+    //! Cheap and full moves differ in what batching COSTS: cheap moves emit no
+    //! policy target and run a Gumbel root, so widening their waves risks move
+    //! quality alone, while a full move's visit distribution is the training
+    //! label. One knob for both would price them the same.
+
+    use super::{budget_tests::sample_config, resolve_leaf_batch};
+
+    #[test]
+    fn without_an_override_both_paths_take_the_global_value() {
+        let mut cfg = sample_config(1);
+        cfg.leaf_batch = 4;
+        assert_eq!(resolve_leaf_batch(&cfg, 0, true), 4);
+        assert_eq!(resolve_leaf_batch(&cfg, 0, false), 4);
+    }
+
+    #[test]
+    fn the_override_applies_to_cheap_moves_only() {
+        let mut cfg = sample_config(1);
+        cfg.leaf_batch = 1;
+        cfg.cheap_leaf_batch = Some(8);
+        assert_eq!(resolve_leaf_batch(&cfg, 0, false), 8, "cheap move");
+        assert_eq!(
+            resolve_leaf_batch(&cfg, 0, true),
+            1,
+            "a full move must not inherit the cheap override -- its visit              distribution is the policy target"
+        );
+    }
+
+    #[test]
+    fn the_seat_axis_still_governs_full_moves() {
+        let mut cfg = sample_config(1);
+        cfg.leaf_batch = 1;
+        cfg.leaf_batch_by_player = Some([2, 3]);
+        cfg.cheap_leaf_batch = Some(8);
+        assert_eq!(resolve_leaf_batch(&cfg, 0, true), 2);
+        assert_eq!(resolve_leaf_batch(&cfg, 1, true), 3);
+        // ...and the cheap override wins on cheap moves, for both seats.
+        assert_eq!(resolve_leaf_batch(&cfg, 0, false), 8);
+        assert_eq!(resolve_leaf_batch(&cfg, 1, false), 8);
     }
 }
