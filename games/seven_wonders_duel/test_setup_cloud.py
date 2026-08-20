@@ -1318,3 +1318,51 @@ def test_the_leaf_batch_test_puts_cargo_on_path_itself(leaf_batch_text):
     assert leaf_batch_text.index(".cargo/env") < build, "must be sourced BEFORE the build"
     # And it must not paper over a still-missing cargo.
     assert "cargo is not on PATH" in leaf_batch_text
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_stale_copy_hands_over_to_the_checkouts_copy(tmp_path):
+    """raw.githubusercontent is CDN-cached: a curl seconds after a push returns
+    the previous file. That happened on the box -- the checkout advanced to the
+    new commit while the script driving it was the old one, and only the version
+    line made it visible. Third appearance of one trap."""
+
+    origin = _fake_run_repo(tmp_path, harness=False)
+    fresh = (REPO_ROOT / "leaf_batch_test.sh").read_text(encoding="utf-8")
+    (origin / "leaf_batch_test.sh").write_text(fresh, encoding="utf-8")
+    (origin / "games" / "seven_wonders_duel").mkdir(parents=True, exist_ok=True)
+    (origin / "games" / "seven_wonders_duel" / "leaf_batch_ab.py").write_text(
+        "", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "fresh"], check=True,
+    )
+
+    # A "CDN-cached" copy: same script, one marker line older.
+    stale = tmp_path / "stale.sh"
+    stale.write_text(
+        fresh.replace("LEAF_BATCH_SCRIPT_VERSION=3", "LEAF_BATCH_SCRIPT_VERSION=1"),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [BASH, str(stale)],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={
+            **os.environ,
+            "OUTPUT": str(tmp_path / "out"),
+            "RUN_REPO": str(origin),
+            "SWEEP_REPO": str(tmp_path / "sweep"),
+            "REPO_URL": str(origin),
+            "SWEEP_REF": _default_branch(origin),
+            "EXT_DIR": str(tmp_path / "ext"),
+        },
+    )
+    combined = proc.stdout + proc.stderr
+    assert "version 1" in combined, f"the stale copy did not start:\n{combined}"
+    assert "version 3" in combined, f"no handover to the fresh copy:\n{combined}"
+    assert "Handing over" in combined
+    # Exactly one handover, not a loop.
+    assert combined.count("version 3") == 1, f"restart loop:\n{combined}"

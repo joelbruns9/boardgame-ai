@@ -63,8 +63,40 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mkdir -p "$OUTPUT"
 LOG="$OUTPUT/leaf_batch_$(date +%Y%m%dT%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
-LEAF_BATCH_SCRIPT_VERSION=2
+LEAF_BATCH_SCRIPT_VERSION=3
 log "leaf_batch_test.sh version $LEAF_BATCH_SCRIPT_VERSION (log: $LOG)"
+
+# Checksum this file BEFORE stage 1 updates the checkout it may live in.
+#
+# Third appearance of one trap. raw.githubusercontent is CDN-cached, so a curl
+# seconds after a push can return the previous file -- which happened here: the
+# checkout advanced to the new commit while the script driving it was the old
+# one, and only the version line above made that visible. Running the copy
+# inside $SWEEP_REPO has the same shape from the other direction, since stage 1
+# rewrites it after bash has read it.
+#
+# The guard is inline because $RUN_REPO's setup_cloud_common.sh is pinned to the
+# run's commit and predates `common::reexec_if_updated`. Sourcing a newer
+# library would mean updating the run's checkout, which is the one thing that
+# ends its resumability.
+LEAF_BATCH_SELF_SUM="$(cksum < "${BASH_SOURCE[0]}")"
+LEAF_BATCH_ARGV=("$@")
+leaf_batch_reexec_if_updated() {
+  if [ "${LEAF_BATCH_REEXEC:-0}" = "1" ]; then
+    return 0   # already handed over once; never loop
+  fi
+  local fresh="$SWEEP_REPO/leaf_batch_test.sh"
+  if [ ! -f "$fresh" ]; then
+    return 0
+  fi
+  if [ "$(cksum < "$fresh")" = "$LEAF_BATCH_SELF_SUM" ]; then
+    return 0
+  fi
+  warn "The copy in $SWEEP_REPO differs from the one running (a CDN-cached"
+  warn "curl, or a checkout that moved). Handing over to the checkout's copy."
+  export LEAF_BATCH_REEXEC=1
+  exec bash "$fresh" ${LEAF_BATCH_ARGV+"${LEAF_BATCH_ARGV[@]}"}
+}
 
 # ── STAGE 1: code ────────────────────────────────────────────────────────────
 stage 1 "Checkout at $SWEEP_REPO"
@@ -82,6 +114,8 @@ fi
 ok "at $(git -C "$SWEEP_REPO" rev-parse --short=12 HEAD)"
 [ -f "$SWEEP_REPO/games/seven_wonders_duel/leaf_batch_ab.py" ] \
   || die "this checkout has no leaf_batch_ab; SWEEP_REF=$SWEEP_REF is too old"
+# The checkout is current now. Is THIS file?
+leaf_batch_reexec_if_updated
 stage_done 1
 
 # ── STAGE 2: an extension that is NOT the training process's ─────────────────
