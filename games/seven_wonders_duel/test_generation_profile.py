@@ -247,3 +247,20 @@ def test_the_diagnosis_says_so_when_the_key_is_absent_entirely(tmp_path, capsys)
     log.write_text(json.dumps({"iteration": 1}), encoding="utf-8")
     assert main([str(tmp_path)]) == 0
     assert "NO 'generation_performance' key" in capsys.readouterr().out
+
+
+def test_phase_d_config_defaults_are_not_readable_as_class_attributes():
+    """PhaseDConfig is @dataclass(slots=True), so PhaseDConfig.rust_slots is a
+    slot descriptor rather than 16. Code that compared class attributes to
+    measured values never matched anything and silently took its fallback."""
+
+    import dataclasses
+
+    from . import phase_d as pd
+    from .f4_phase_d_sweep import field_default
+
+    assert not isinstance(getattr(pd.PhaseDConfig, "rust_slots"), int)
+    assert field_default("rust_slots") == next(
+        f.default for f in dataclasses.fields(pd.PhaseDConfig) if f.name == "rust_slots"
+    )
+    assert isinstance(field_default("rust_slots"), int)

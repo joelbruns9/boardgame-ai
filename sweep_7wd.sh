@@ -273,6 +273,7 @@ cd "$SWEEP_REPO"
   --caps "$SWEEP_CAPS" \
   --inflight "$SWEEP_INFLIGHT" \
   --workers "$SWEEP_WORKERS" \
+  --config-from-manifest "$RUN_DIR/run_manifest.json" \
   ${SOLVER_THREADS_TOTAL:+--solver-threads-total "$SOLVER_THREADS_TOTAL"} \
   --solver-threads "$SOLVER_THREADS" \
   --device cuda \

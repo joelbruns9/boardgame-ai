@@ -27,6 +27,7 @@ averages out instead of loading onto whichever point runs last.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import json
 import statistics
@@ -105,6 +106,70 @@ def geometry_from_checkpoint(path) -> dict[str, int]:
         "layers": int(stored.get("layers", 8)),
         "heads": heads_from_config(stored),
     }
+
+
+def field_default(name: str):
+    """A PhaseDConfig default, read properly.
+
+    `PhaseDConfig` is `@dataclass(slots=True)`, so `PhaseDConfig.rust_slots` is
+    a slot DESCRIPTOR, not 16. The baseline comparison below used class
+    attributes and therefore never matched any grid row -- it silently fell back
+    to the first point for every sweep ever run.
+    """
+
+    for field in dataclasses.fields(pd.PhaseDConfig):
+        if field.name == name:
+            return field.default
+    raise KeyError(name)
+
+
+def config_from_manifest(
+    manifest_path, *, output, device, games, precision, geometry
+) -> "pd.PhaseDConfig":
+    """The RUN's configuration, with only what the sweep controls overridden.
+
+    Without this the sweep measured PhaseDConfig's defaults for everything it
+    did not name -- `selfplay_search_mode="gumbel"` against a PUCT run,
+    `full_sims_max=128` against 1600, `cheap_sims_max=24` against 100. Roughly
+    50 simulations a move instead of the run's measured 522, under a different
+    search algorithm. Simulations per move set the leaf arrival rate, which is
+    what the slot and worker axes act on, so the optimum found that way belongs
+    to a machine nobody is running.
+
+    Same defect as the worker axis, one layer up: measuring a configuration
+    other than the one being configured. Fields the manifest does not have are
+    left at their defaults rather than guessed.
+    """
+
+    payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    stored = payload.get("config")
+    if not isinstance(stored, dict) or not stored:
+        raise SystemExit(
+            f"{manifest_path} has no 'config' block; it is not a run manifest"
+        )
+    fields = {field.name for field in dataclasses.fields(pd.PhaseDConfig)}
+    unknown = sorted(set(stored) - fields)
+    kwargs = {key: value for key, value in stored.items() if key in fields}
+    # The sweep owns these; the run's values would defeat the point.
+    kwargs.update(
+        run_dir=str(output / "run"),
+        device=device,
+        games_per_iteration=games,
+        seed_games=0,
+        iterations=1,
+        precision=precision,
+        **geometry,
+    )
+    config = pd.PhaseDConfig(**kwargs)
+    print(
+        f"config from {manifest_path}: search={config.selfplay_search_mode} "
+        f"cheap_sims={config.cheap_sims_min}-{config.cheap_sims_max} "
+        f"full_sims={config.full_sims_min}-{config.full_sims_max} "
+        f"full_fraction={config.full_search_fraction} top_k={config.top_k}"
+        + (f" ({len(unknown)} manifest fields ignored)" if unknown else ""),
+        flush=True,
+    )
+    return config
 
 
 def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
@@ -212,6 +277,14 @@ def main() -> None:
         help="must match the run being configured: bf16 is 1.69x on L, so a "
         "geometry chosen at fp32 is chosen against the wrong cost curve",
     )
+    parser.add_argument(
+        "--config-from-manifest",
+        default="",
+        help="run_manifest.json of the run being configured. Its config block "
+        "supplies every field the sweep does not override, so the measurement "
+        "runs the same search the run runs. Without it the search settings are "
+        "dataclass defaults.",
+    )
     parser.add_argument("--slots", default="16,32,48")
     parser.add_argument("--caps", default="256,512")
     parser.add_argument("--inflight", default="1,2")
@@ -288,14 +361,47 @@ def main() -> None:
         )
 
     geometry = geometry_from_checkpoint(args.checkpoint)
-    config = pd.PhaseDConfig(
-        run_dir=str(output / "run"),
-        device=args.device,
-        games_per_iteration=args.games,
-        seed_games=0,
-        iterations=1,
-        precision=args.precision,
-        **geometry,
+    run_config = None
+    if args.config_from_manifest:
+        config = run_config = config_from_manifest(
+            args.config_from_manifest,
+            output=output,
+            device=args.device,
+            games=args.games,
+            precision=args.precision,
+            geometry=geometry,
+        )
+    else:
+        print(
+            "WARNING: no --config-from-manifest, so every search setting takes "
+            f"its DEFAULT: {field_default('selfplay_search_mode')} search, "
+            f"{field_default('cheap_sims_max')}/{field_default('full_sims_max')} "
+            "sims. If the run being configured differs, this measures a cost "
+            "curve that is not its own.",
+            flush=True,
+        )
+        config = pd.PhaseDConfig(
+            run_dir=str(output / "run"),
+            device=args.device,
+            games_per_iteration=args.games,
+            seed_games=0,
+            iterations=1,
+            precision=args.precision,
+            **geometry,
+        )
+    # SNAPSHOT before anything runs. `run_point` assigns loop.config.rust_slots
+    # and friends at every grid point, and `run_config` is the same object, so
+    # reading the run's geometry after the grid reports the LAST POINT MEASURED
+    # instead -- a baseline that silently renames itself.
+    run_baseline = (
+        (
+            run_config.rust_slots,
+            run_config.rust_global_batch_cap,
+            run_config.rust_max_inflight_batches,
+            run_config.rust_scheduler_workers,
+        )
+        if run_config is not None
+        else None
     )
     loop = pd.PhaseDLoop(config)
     loop.buffer_dir.mkdir(parents=True, exist_ok=True)
@@ -392,21 +498,38 @@ def main() -> None:
     # Compare against Phase D's current defaults when they are in the grid --
     # the number that matters is "what would changing the config buy" -- and
     # fall back to the first grid point when they are not.
-    defaults = (
-        pd.PhaseDConfig.rust_slots,
-        pd.PhaseDConfig.rust_global_batch_cap,
-        pd.PhaseDConfig.rust_max_inflight_batches,
-        pd.PhaseDConfig.rust_scheduler_workers,
-    )
     key = lambda row: (
         row["slots"],
         row["global_batch_cap"],
         row["max_inflight_batches"],
         row["scheduler_workers"],
     )
-    base = next((row for row in summary if key(row) == defaults), None) or next(
-        row for row in summary if key(row) == grid[0]
+    # Baseline: what the run is CURRENTLY set to, when the manifest says and the
+    # grid contains it. "What would changing this buy me" is the question a
+    # sweep is run to answer, and it is only answered against the status quo --
+    # comparing against dataclass defaults answers a question nobody asked.
+    baselines = []
+    if run_baseline is not None:
+        baselines.append(run_baseline)
+    baselines.append(
+        tuple(
+            field_default(name)
+            for name in (
+                "rust_slots",
+                "rust_global_batch_cap",
+                "rust_max_inflight_batches",
+                "rust_scheduler_workers",
+            )
+        )
     )
+    baselines.append(grid[0])
+    base = None
+    for candidate in baselines:
+        base = next((row for row in summary if key(row) == tuple(candidate)), None)
+        if base is not None:
+            break
+    if base is None:
+        base = summary[0]
     baseline_label = "/".join(str(part) for part in key(base))
     for row in summary:
         row["speedup_vs_baseline"] = base["median_seconds"] / row["median_seconds"]

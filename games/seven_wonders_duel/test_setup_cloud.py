@@ -1070,3 +1070,15 @@ def test_the_sweep_holds_solver_threads_constant_across_the_worker_axis(sweep_te
     assert "--solver-threads-total" in block, (
         "the worker sweep confounds solver load with the worker count"
     )
+
+
+def test_the_sweep_measures_the_search_the_run_actually_runs(sweep_text):
+    """PhaseDConfig defaults are gumbel at 24/128 sims. This run is PUCT at
+    100/1600 -- roughly 50 simulations a move versus a measured 522, under a
+    different algorithm. Simulations per move set the leaf arrival rate, which
+    is exactly what the slot and worker axes act on, so a sweep on defaults
+    optimises a machine nobody is running."""
+
+    block = _invocation(sweep_text, "f4_phase_d_sweep")
+    assert "--config-from-manifest" in block
+    assert "run_manifest.json" in block
