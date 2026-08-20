@@ -30,7 +30,35 @@ The launcher assembles a command line. Assemble it and read it.
   every flag the previous run used is either passed or listed as deliberately
   dropped. Both have caught real omissions.
 
-### 1.2 Make the launcher survive its own update
+### 1.2 Put the values in the command, and make the rest visible
+
+The most expensive recurring defect in this project is not a wrong value. It is
+a value *configured in one place and decided in another*: the launcher
+"configures" a run, argparse quietly supplies what the launcher omitted, and the
+manifest records a number nobody chose. It happened to `--train-steps` (8x the
+intended sample reuse), `--weight-decay` (5,000x off), `--opponent-fraction`,
+and to `--leaf-batch` — a value settled by a paired A/B and then never passed at
+all, so the run would have discarded the conclusion silently.
+
+Banning defaults is not the answer; there are 130+ options and most should have
+one. Three mechanisms, in increasing strength:
+
+1. **Pass the training values explicitly in the launch command**, even where the
+   default is currently right. A default that happens to match is not the same
+   as a decision, and it stops matching the day someone changes it.
+2. **Print what was not passed.** Diff `sys.argv` against the parser at startup
+   and log every setting taking its default, into the run log and the manifest.
+   Buried defaults stop being buried: they become a list read in the first ten
+   minutes rather than discovered on iteration forty. Count each *setting* once
+   — `--x`/`--no-x` is one decision and `--help` is none — or the list is twice
+   as long as it should be and gets dismissed.
+3. **Refuse on a short critical list.** A handful of flags whose wrong value
+   fails *quietly* rather than loudly: the run exits rather than starting on an
+   unstated value. The selection test is not "is this important" but "would a
+   wrong value here be noticed" — a flag that crashes when wrong does not need
+   to be listed, and a long list gets bypassed.
+
+### 1.3 Make the launcher survive its own update
 
 **Trap:** the launcher sources shared code at the top and `git pull`s several
 stages later. The first re-run after any change pulls the new code and then
@@ -43,7 +71,7 @@ and again in a helper script fetched by `curl`.
 The fix is a checksum before the update and an `exec` of the fresh copy after
 it, guarded against looping (`common::self_checksum` / `common::reexec_if_updated`).
 
-### 1.3 Give every script a version marker
+### 1.4 Give every script a version marker
 
 Print a version and a checksum of itself at startup:
 
@@ -57,7 +85,7 @@ after a push can legitimately return the previous file — this happened, and th
 version line is the only reason it was diagnosed in one round trip instead of
 several. **Prefer running from a git checkout over `curl`;** git does not cache.
 
-### 1.4 Check that your gates can fail
+### 1.5 Check that your gates can fail
 
 A gate that cannot fail is worse than no gate: it reports safety it never
 checked. Mutate the code the gate protects and confirm it goes red. Real
@@ -75,7 +103,7 @@ fixture invented by the consumer will confirm the consumer's own error — that 
 exactly how a profiler shipped reading one nesting level too shallow, and every
 test passed.
 
-### 1.5 Know which settings are frozen once the run starts
+### 1.6 Know which settings are frozen once the run starts
 
 Every loop has some notion of run identity. Find it and write down both lists:
 
@@ -94,7 +122,7 @@ restarted.
 ### 2.1 Read the manifest back
 
 Not the console output — the manifest. Confirm every flag you intended, by name
-and value. This is the step that catches §1.2.
+and value. This is the step that catches §1.3.
 
 ### 2.2 Confirm the run's own arithmetic
 

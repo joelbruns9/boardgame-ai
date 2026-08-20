@@ -207,6 +207,8 @@ fn make_self_play_config(
     round_robin_candidates: bool,
     cheap_leaf_batch: Option<usize>,
     virtual_loss_root: bool,
+    cheap_conflict_free_waves: Option<bool>,
+    cheap_round_robin_candidates: Option<bool>,
 ) -> self_play::SelfPlayConfig {
     self_play::SelfPlayConfig {
         game_seed,
@@ -214,6 +216,8 @@ fn make_self_play_config(
         leaf_batch,
         leaf_batch_by_player: None,
         cheap_leaf_batch,
+        cheap_conflict_free_waves,
+        cheap_round_robin_candidates,
         virtual_loss_root,
         deterministic_actions: false,
         cheap_sims_min,
@@ -1503,6 +1507,8 @@ impl RustGame {
             round_robin_candidates,
             None,
             false,
+            None,
+            None,
         );
         let evaluator = eval::PyEval::new(adapter);
         let record = self_play::run(&self.state, &evaluator, &cfg)?;
@@ -1570,6 +1576,8 @@ impl RustGame {
             round_robin_candidates,
             None,
             false,
+            None,
+            None,
         );
         let record = self_play::run(&self.state, &eval::MockEval, &cfg)?;
         Python::attach(|py| self_play_record_to_py(py, record))
@@ -2113,6 +2121,8 @@ fn cooperative_jobs(
                 round_robin_candidates,
                 None,
                 false,
+                None,
+                None,
             );
             Ok((state, cfg))
         })
@@ -2406,7 +2416,8 @@ fn self_play_many_net(
 , puct_root=false, cheap_puct_root=None, solve_endgames=false, solver_fallback_research=false, dirichlet_epsilon=0.0, dirichlet_alpha=1.8, cheap_double_reveal_offsets_p0=None,
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
     conflict_free_waves=false, round_robin_candidates=false, cheap_leaf_batch=None,
-    virtual_loss_root=false))]
+    virtual_loss_root=false, cheap_conflict_free_waves=None,
+    cheap_round_robin_candidates=None))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2461,6 +2472,8 @@ fn self_play_many_flat_net(
     round_robin_candidates: bool,
     cheap_leaf_batch: Option<usize>,
     virtual_loss_root: bool,
+    cheap_conflict_free_waves: Option<bool>,
+    cheap_round_robin_candidates: Option<bool>,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     let mut jobs = cooperative_jobs(
         py,
@@ -2495,6 +2508,14 @@ fn self_play_many_flat_net(
     if virtual_loss_root {
         for (_, cfg) in &mut jobs {
             cfg.virtual_loss_root = true;
+        }
+    }
+    // Per-path wave mode. Applied to every job before the per-player branch,
+    // which overrides a different axis and must not silently drop this one.
+    if cheap_conflict_free_waves.is_some() || cheap_round_robin_candidates.is_some() {
+        for (_, cfg) in &mut jobs {
+            cfg.cheap_conflict_free_waves = cheap_conflict_free_waves;
+            cfg.cheap_round_robin_candidates = cheap_round_robin_candidates;
         }
     }
     if let Some(cheap) = cheap_leaf_batch {

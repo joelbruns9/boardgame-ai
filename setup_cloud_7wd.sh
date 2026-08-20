@@ -365,6 +365,29 @@ RUST_SCHEDULER_WORKERS="${RUST_SCHEDULER_WORKERS:-4}"
 # Solver threads are PER SHARD: the pool is built once per scheduler loop, so
 # the total is this times --rust-scheduler-workers. Derived at stage 6b from the
 # core count so the product is deliberate rather than accidental.
+# Leaf batching, adopted 2026-08-20.
+#
+# LEAF_BATCH must equal `ADVISOR_LEAF_BATCH` in advisor_adapter.py: the gate
+# certifies the advisor, and if the two batch differently they run different
+# algorithms at the root. test_advisor_leaf_batch pins the pair.
+#
+# 6 rather than 8 follows Kingdomino, whose notes record 6 as the best known
+# quality setting with degradation "around 8". The paired A/B here put 8 at
+# 0.482 [0.434, 0.531] against 1 -- no detectable harm, but too loose a bound
+# to adopt 8 on, and 6 sits inside it.
+LEAF_BATCH="${LEAF_BATCH:-6}"
+VIRTUAL_LOSS_ROOT="${VIRTUAL_LOSS_ROOT:-1}"
+# The cheap path batches under conflict-free waves instead: exact rather than a
+# virtual-loss approximation. 16 matches top_k so round one is never the
+# limiter, though sequential halving caps the realized mean near 2.6 regardless.
+CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"
+# Evaluation matches the ADVISOR, not training. The gate certifies the advisor,
+# so they should run the same search -- and a leaf batch is a fraction of a
+# budget, so sharing training's number across three budgets that differ by an
+# order of magnitude would not make the searches alike. Pinned against
+# ADVISOR_LEAF_BATCH by test_advisor_leaf_batch.
+EVAL_LEAF_BATCH="${EVAL_LEAF_BATCH:-16}"
+WAVE_FLAGS="${WAVE_FLAGS:-1}"
 SOLVER_THREADS="${SOLVER_THREADS:-}"
 GENERATION_THREADS="${GENERATION_THREADS:-}"
 # 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
@@ -791,6 +814,18 @@ fi
 # never mid-run: the checkpoint records them and a resume rebuilds from that
 # record. Passing them as flags rather than baking them in keeps a run that
 # wants the old architecture possible.
+# Boolean flags as an array: passing `--virtual-loss-root 1` would be a parser
+# error, and passing nothing at all is how the launcher lost --weight-decay.
+LEAF_BATCH_FLAGS=()
+[ "$VIRTUAL_LOSS_ROOT" = "1" ] && LEAF_BATCH_FLAGS+=(--virtual-loss-root)
+# CHEAP-path waves, not global. The two batching mechanisms are mutually
+# exclusive: virtual loss discourages collisions so width approaches
+# --leaf-batch, conflict-free waves forbid them and cut the wave short. Under
+# the PUCT root of a full move that collapses width to ~1.19, so the global flag
+# would silently disable the batching on the path carrying 1600 simulations.
+# Measured: wave 1.88 per-path against 1.56 global, same leaf batch.
+[ "$WAVE_FLAGS" = "1" ] && LEAF_BATCH_FLAGS+=(--cheap-conflict-free-waves --cheap-round-robin-candidates)
+
 ARCH_FLAGS=()
 [ "$POOLED_READOUT" = "1" ] && ARCH_FLAGS+=(--pooled-readout)
 [ "$REPLY_HEAD" = "1" ] && ARCH_FLAGS+=(--reply-head)
@@ -880,6 +915,10 @@ TRAIN_CMD=(
   --draft-prior-games "$DRAFT_PRIOR_GAMES"
   --anchor-games "$ANCHOR_GAMES"
   --anchor-gate-every-promotions "$ANCHOR_GATE_EVERY_PROMOTIONS"
+  --leaf-batch "$LEAF_BATCH"
+  --cheap-leaf-batch "$CHEAP_LEAF_BATCH"
+  --eval-leaf-batch "$EVAL_LEAF_BATCH"
+  "${LEAF_BATCH_FLAGS[@]}"
   --pack-threads "$PACK_THREADS"
   --self-anchor-games "$SELF_ANCHOR_GAMES"
   --self-anchor-lag-games "$SELF_ANCHOR_LAG_GAMES"

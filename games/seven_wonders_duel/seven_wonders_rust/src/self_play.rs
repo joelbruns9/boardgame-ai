@@ -203,6 +203,22 @@ pub struct SelfPlayConfig {
     /// so consecutive simulations come from different candidates and waves can
     /// actually widen. Changes search outputs — see `tree::SearchConfig`.
     pub round_robin_candidates: bool,
+    /// Conflict-free waves for CHEAP moves only; `None` follows the global flag.
+    ///
+    /// Per path because the two batching mechanisms are MUTUALLY EXCLUSIVE.
+    /// Virtual loss discourages collisions, so width approaches `leaf_batch`;
+    /// conflict-free waves forbid them, cutting a wave short instead. Under a
+    /// PUCT root, which concentrates hard, that collapses width to 1.19
+    /// measured -- so enabling conflict-free globally to protect the Gumbel
+    /// cheap path silently disables virtual-loss batching on the full path.
+    /// Measured 2026-08-20: wave width 2.22 with waves off against 1.56 with
+    /// them on, same leaf_batch.
+    pub cheap_conflict_free_waves: Option<bool>,
+    /// Round-robin candidates for CHEAP moves only; `None` follows the global.
+    ///
+    /// Paired with the flag above: conflict-free waves without round-robin cut
+    /// every wave to width 1, so the two are only useful together.
+    pub cheap_round_robin_candidates: Option<bool>,
     /// Allow a PUCT root to select under virtual loss when `leaf_batch > 1`.
     ///
     /// OFF by default, and deliberately an explicit opt-in rather than implied
@@ -2029,8 +2045,23 @@ impl GameSlot {
                         }),
                     full,
                 ),
-                conflict_free_waves: self.cfg.conflict_free_waves,
-                round_robin_candidates: self.cfg.round_robin_candidates,
+                // Selected on `full`, exactly like `puct_root` above: the
+                // cheap path can hold the no-collision guarantee while the
+                // full path batches under virtual loss.
+                conflict_free_waves: if full {
+                    self.cfg.conflict_free_waves
+                } else {
+                    self.cfg
+                        .cheap_conflict_free_waves
+                        .unwrap_or(self.cfg.conflict_free_waves)
+                },
+                round_robin_candidates: if full {
+                    self.cfg.round_robin_candidates
+                } else {
+                    self.cfg
+                        .cheap_round_robin_candidates
+                        .unwrap_or(self.cfg.round_robin_candidates)
+                },
             },
         })
     }
@@ -3315,6 +3346,8 @@ mod budget_tests {
             leaf_batch: 1,
             leaf_batch_by_player: None,
             cheap_leaf_batch: None,
+            cheap_conflict_free_waves: None,
+            cheap_round_robin_candidates: None,
             virtual_loss_root: false,
             deterministic_actions: false,
             cheap_sims_min: 2,

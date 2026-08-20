@@ -121,6 +121,8 @@ two is visible.
   --intervention-window-games 20000 `
   --replay-window-cap-games 40000 `
   --workers 8 --process-workers 16 --pack-threads 0 `
+  --leaf-batch 6 --virtual-loss-root --eval-leaf-batch 16 `
+  --cheap-leaf-batch 16 --cheap-conflict-free-waves --cheap-round-robin-candidates `
   --example-cache-gb 40 `
   --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
   --rust-scheduler-workers 4 `
@@ -1309,6 +1311,29 @@ Measured 2026-08-20 on the real generation path: `8` with both wave flags took
 mean wave width from 1.00 to 1.97 and halved GPU calls. Note 1.97, not 8 -- the
 conflict-free invariant cuts a wave short rather than admitting a collision, and
 that taper IS the diversity guarantee.
+
+### `--cheap-conflict-free-waves`, `--no-cheap-conflict-free-waves`
+### `--cheap-round-robin-candidates`, `--no-cheap-round-robin-candidates`
+
+**Default:** off. **Value:** flags, set together
+
+Conflict-free waves on CHEAP moves only, leaving full moves to virtual loss.
+
+**These are what you want; the global flags below are almost never right.** The
+two batching mechanisms are mutually exclusive: virtual loss *discourages*
+collisions so width approaches `--leaf-batch`, while conflict-free waves
+*forbid* them and cut a wave short instead. Under the PUCT root of a full move
+-- which concentrates hard -- that collapses width to about 1.19, so enabling
+the global flag to protect the Gumbel cheap path silently disables batching on
+the path carrying 1,600 simulations.
+
+Measured 2026-08-20 on the forced path, same leaf batch: wave width **1.88**
+per-path against **1.56** global, and batch width 39 against 29. A geometry
+sweep run with the global flags therefore measured leaf batching with half the
+mechanism disabled -- and reported no gain.
+
+They must be set together: conflict-free waves without round-robin cut every
+wave to width 1.
 
 ### `--conflict-free-waves`, `--no-conflict-free-waves`
 

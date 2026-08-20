@@ -672,6 +672,30 @@ class PhaseDConfig:
     explored.
     """
 
+    cheap_conflict_free_waves: bool = False
+    """Conflict-free waves on CHEAP moves only, leaving full moves to virtual
+    loss.
+
+    The two mechanisms are MUTUALLY EXCLUSIVE. Virtual loss discourages
+    collisions, so width approaches ``leaf_batch``; conflict-free waves forbid
+    them, cutting a wave short instead. Under a PUCT root, which concentrates
+    hard, that collapses width to 1.19 -- so setting ``conflict_free_waves``
+    globally to protect the Gumbel cheap path silently disables virtual-loss
+    batching on the full path, which is where the simulations are.
+
+    Measured 2026-08-20 on the forced path: wave width 2.22 with waves off
+    against 1.56 with them on, at the same leaf batch. A geometry sweep run with
+    them on therefore measured leaf batching with half the mechanism disabled.
+
+    This is the field that makes "cheap moves batch without collisions, full
+    moves batch under virtual loss" expressible at all.
+    """
+
+    cheap_round_robin_candidates: bool = False
+    """Round-robin on CHEAP moves only. Paired with the flag above: conflict-free
+    waves without round-robin cut every wave to width 1, so the two are only
+    useful together."""
+
     conflict_free_waves: bool = False
     """Forbid two in-flight simulations in one root candidate's subtree.
 
@@ -1067,9 +1091,18 @@ class PhaseDConfig:
                 "(--cheap-search-mode gumbel); a PUCT root would select under "
                 "virtual loss"
             )
-        if self.cheap_leaf_batch > 1 and not (
-            self.conflict_free_waves and self.round_robin_candidates
-        ):
+        cheap_waves = self.cheap_conflict_free_waves or self.conflict_free_waves
+        cheap_round_robin = (
+            self.cheap_round_robin_candidates or self.round_robin_candidates
+        )
+        if self.cheap_conflict_free_waves != self.cheap_round_robin_candidates:
+            raise ValueError(
+                "--cheap-conflict-free-waves and --cheap-round-robin-candidates "
+                "must be set together: conflict-free waves without round-robin "
+                "cut every wave to width 1, and round-robin without them only "
+                "changes the search"
+            )
+        if self.cheap_leaf_batch > 1 and not (cheap_waves and cheap_round_robin):
             raise ValueError(
                 "cheap_leaf_batch > 1 without --conflict-free-waves and "
                 "--round-robin-candidates is inert: every wave is cut back to "
@@ -3569,6 +3602,12 @@ class PhaseDLoop:
             cheap_leaf_batch=(self.config.cheap_leaf_batch or None),
             virtual_loss_root=self.config.virtual_loss_root,
             conflict_free_waves=self.config.conflict_free_waves,
+            cheap_conflict_free_waves=(
+                self.config.cheap_conflict_free_waves or None
+            ),
+            cheap_round_robin_candidates=(
+                self.config.cheap_round_robin_candidates or None
+            ),
             round_robin_candidates=self.config.round_robin_candidates,
             puct_root=self.config.selfplay_search_mode == "puct",
             # `None` means "same as puct_root". Only self-play passes this; the
@@ -5100,6 +5139,22 @@ class _PhaseDRunStore:
         return self.loop.training_log_rows()
 
 
+#: Options a run must state rather than inherit.
+#:
+#: Deliberately short. Every entry is a flag whose default silently produced a
+#: run nobody intended: --train-steps at 8x the sample reuse this loop is tuned
+#: for, --weight-decay 5,000x off, --leaf-batch discarding an A/B's conclusion.
+#: The test is not "is this important" but "does a wrong value here fail
+#: quietly" -- a flag that blows up when wrong does not need to be listed.
+CRITICAL_FLAGS = (
+    "--train-steps",
+    "--weight-decay",
+    "--leaf-batch",
+    "--full-sims-max",
+    "--cheap-sims-max",
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Every Phase D flag, in one place a tool can inspect without running.
 
@@ -5388,6 +5443,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a PUCT root to batch under virtual loss. A DIFFERENT "
         "algorithm at the root, and on full moves the root's visit distribution "
         "is the policy target -- measure with a paired A/B before adopting.",
+    )
+    parser.add_argument(
+        "--cheap-conflict-free-waves",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="conflict-free waves on CHEAP moves only, leaving full moves to "
+        "virtual loss. The two are mutually exclusive, and setting the global "
+        "flag collapses PUCT-root width to ~1.19.",
+    )
+    parser.add_argument(
+        "--cheap-round-robin-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="round-robin on CHEAP moves only; must be set with "
+        "--cheap-conflict-free-waves",
     )
     parser.add_argument(
         "--conflict-free-waves",
@@ -5877,9 +5947,67 @@ def _configure_pack_pool(requested: int) -> int:
     return actual
 
 
+def report_unspecified_flags(parser, argv, *, critical=()) -> list[str]:
+    """Name every option this invocation did NOT pass, and refuse a critical one.
+
+    Buried defaults are the most expensive recurring defect in this project.
+    `--train-steps` took the parser's 300 and trained at 8x sample reuse;
+    `--weight-decay` was absent and took a value 5,000x from the one intended;
+    `--leaf-batch` was decided by an A/B and then never passed at all. In every
+    case the launcher "configured" the run and argparse quietly decided it.
+
+    A default is not the problem -- an INVISIBLE default is. So print the list.
+    A run whose log says which of its settings nobody chose can be audited in
+    the first ten minutes instead of on iteration forty.
+
+    `critical` is the short list where a default is not acceptable at all: the
+    run refuses rather than starting on a value nobody stated.
+    """
+
+    given = set()
+    for token in (argv if argv is not None else sys.argv[1:]):
+        if token.startswith("--"):
+            given.add(token.split("=", 1)[0])
+    # One entry per SETTING, not per option string: BooleanOptionalAction
+    # registers both --x and --no-x, and counting them separately would report
+    # twice as many "unspecified" as there are decisions to make. `--help` is
+    # not a setting at all.
+    known = []
+    for action in parser._actions:
+        canonical = next(
+            (
+                option
+                for option in action.option_strings
+                if option.startswith("--") and not option.startswith("--no-")
+            ),
+            None,
+        )
+        if canonical and canonical != "--help":
+            known.append(canonical)
+
+    def stated(option: str) -> bool:
+        return option in given or option.replace("--", "--no-", 1) in given
+
+    unspecified = sorted(option for option in known if not stated(option))
+    missing_critical = [option for option in critical if not stated(option)]
+    if missing_critical:
+        raise SystemExit(
+            "these must be passed explicitly, not defaulted: "
+            + " ".join(missing_critical)
+            + "\nA default here is a training decision nobody made."
+        )
+    print(
+        f"defaults in use ({len(unspecified)} of {len(known)} options not "
+        f"passed): {' '.join(unspecified)}",
+        flush=True,
+    )
+    return unspecified
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    report_unspecified_flags(parser, argv, critical=CRITICAL_FLAGS)
     _configure_pack_pool(args.pack_threads)
     set_temperature_schedule(args.temperature_floor, args.temperature_anneal_moves)
     _configure_cheap_top_k(args.cheap_top_k)
@@ -5996,6 +6124,8 @@ def main(argv=None) -> int:
         full_sims_schedule=args.full_sims_schedule,
         eval_leaf_batch=args.eval_leaf_batch,
         virtual_loss_root=args.virtual_loss_root,
+        cheap_conflict_free_waves=args.cheap_conflict_free_waves,
+        cheap_round_robin_candidates=args.cheap_round_robin_candidates,
         conflict_free_waves=args.conflict_free_waves,
         round_robin_candidates=args.round_robin_candidates,
         force_root_chance=args.force_root_chance,

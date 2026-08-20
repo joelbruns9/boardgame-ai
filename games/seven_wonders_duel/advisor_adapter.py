@@ -172,6 +172,32 @@ def _python_follow_up(edge) -> tuple[list[int], bool] | None:
 
 
 DEFAULT_ARENA_BUDGET_MB = 512
+
+#: Leaf batch the advisor searches at, and the value EVALUATION must match.
+#:
+#: The gate certifies the advisor, so the two should run the same search. What
+#: they must NOT do is share the training value: the contexts differ by an order
+#: of magnitude in budget, and a leaf batch is a fraction of a budget.
+#:
+#:   advisor   800 simulations by default, thousands on a position the user
+#:             keeps open -- a batch of 16 is ~2% of the search
+#:   gate      64 simulations per move -- the same 16 is ~25%
+#:   training  1600 on full moves -- 16 would be ~1%, but training also batches
+#:             across hundreds of concurrent games, so it needs far less here
+#:             and pays for perturbation in POLICY TARGETS, which the other two
+#:             do not produce. It ships 6.
+#:
+#: The gate's larger share is tolerable because both arms of a gate use it
+#: identically: it changes how gate games are played, not which net wins.
+#:
+#: This is also the advisor's ONLY batching -- it searches one position, so
+#: lowering it costs interactive latency directly. Measured at 32: a 3.9x
+#: throughput gain, against the top action's visit share moving 0.941 -> 0.930
+#: with the ranking unchanged.
+#:
+#: Pinned against the launcher's --eval-leaf-batch by test_advisor_leaf_batch.
+#: Override per request with ``options.leaf_batch``; do not drift it silently.
+ADVISOR_LEAF_BATCH = 16
 """How much memory one advisor search may grow its tree to.
 
 The panel asks for an effectively unbounded search -- "keep thinking until the
@@ -636,7 +662,9 @@ class SevenWondersAdvisor:
         # the top action's visit share moved 0.941 -> 0.930 and the ranking did
         # not change, against a 3.9x throughput gain. A batched wave needs the
         # batched adapter: on the scalar bridge, leaf_batch buys nothing.
-        leaf_batch = max(1, int(req.options.get("leaf_batch", 16)))
+        leaf_batch = max(
+            1, int(req.options.get("leaf_batch", ADVISOR_LEAF_BATCH))
+        )
         evaluator = self._evaluator(req)
         adapter = (
             rust_batched_net_adapter(evaluator)

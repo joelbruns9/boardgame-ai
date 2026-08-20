@@ -180,3 +180,52 @@ def test_generation_takes_the_scheduled_sims_when_there_is_one():
     assert source.count("schedules.full_sims\n                if schedules.full_sims is not None") == 2, (
         "the generation call must take the scheduled value for both bounds"
     )
+
+
+# ── Per-path wave mode ───────────────────────────────────────────────────────
+# The two batching mechanisms are mutually exclusive, and the global flag
+# silently disabled the one that matters on the path carrying 1600 simulations.
+
+
+def test_the_cheap_wave_flags_must_be_set_together():
+    """Conflict-free waves without round-robin cut every wave to width 1, and
+    round-robin without them only changes the search. Either alone is a config
+    that costs something and buys nothing."""
+
+    with pytest.raises(ValueError, match="must be set together"):
+        _config(cheap_conflict_free_waves=True, cheap_round_robin_candidates=False)
+    with pytest.raises(ValueError, match="must be set together"):
+        _config(cheap_conflict_free_waves=False, cheap_round_robin_candidates=True)
+
+
+def test_cheap_leaf_batching_accepts_the_per_path_waves():
+    """The configuration the run actually wants: cheap batches without
+    collisions, full batches under virtual loss."""
+
+    config = _config(
+        selfplay_search_mode="puct", cheap_search_mode="gumbel",
+        leaf_batch=6, virtual_loss_root=True, cheap_leaf_batch=16,
+        cheap_conflict_free_waves=True, cheap_round_robin_candidates=True,
+        conflict_free_waves=False, round_robin_candidates=False,
+    )
+    assert config.cheap_conflict_free_waves and not config.conflict_free_waves
+
+
+def test_the_launcher_uses_the_cheap_wave_flags_not_the_global_ones():
+    """Measured 2026-08-20: wave 1.88 per-path against 1.56 global. The global
+    flag collapses PUCT-root width to ~1.19, so a run using it batches only on
+    the cheap path while believing it batches on both."""
+
+    from pathlib import Path
+
+    launcher = (
+        Path(__file__).resolve().parents[2] / "setup_cloud_7wd.sh"
+    ).read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in launcher.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "--cheap-conflict-free-waves" in code
+    assert "--cheap-round-robin-candidates" in code
+    # The global forms must not be passed: they would override the cheap ones
+    # for full moves and undo the whole point.
+    assert "LEAF_BATCH_FLAGS+=(--conflict-free-waves" not in code

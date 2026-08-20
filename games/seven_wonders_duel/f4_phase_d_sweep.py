@@ -71,8 +71,15 @@ def timed_scheduler_calls():
         # paying per-call overhead, not compute, and no wall-clock total says
         # so on its own.
         rows: list[int] = []
+        wave = 0.0
         try:
-            rows = [int(value) for value in (result[1] or {}).get("batch_rows", ())]
+            metrics = result[1] or {}
+            rows = [int(value) for value in metrics.get("batch_rows", ())]
+            # Leaves in flight for ONE game. Batch width is leaves summed across
+            # games, so batch alone cannot distinguish "leaf batching is not
+            # engaging" from "it engages and buys nothing" -- and those lead to
+            # opposite decisions.
+            wave = float(metrics.get("mean_wave_width") or 0.0)
         except Exception:  # pragma: no cover - metrics shape is the contract
             pass
         calls.append(
@@ -82,6 +89,7 @@ def timed_scheduler_calls():
                 "seconds": time.monotonic() - started,
                 "bot": bot,
                 "batch_rows": rows,
+                "mean_wave_width": wave,
             }
         )
         return result
@@ -280,6 +288,7 @@ def run_point(
         for record in records
     )
     batch_rows = [row for call in calls for row in call.get("batch_rows", ())]
+    waves = [call["mean_wave_width"] for call in calls if call.get("mean_wave_width")]
     stats = {
         "slots": slots,
         "global_batch_cap": cap,
@@ -288,6 +297,7 @@ def run_point(
         "solver_threads_per_shard": solver_threads,
         "solver_threads_total": solver_threads * workers,
         "mean_batch_size": statistics.fmean(batch_rows) if batch_rows else 0.0,
+        "mean_wave_width": statistics.fmean(waves) if waves else 0.0,
         "max_batch_size": max(batch_rows) if batch_rows else 0,
         "batches": len(batch_rows),
         "wall_seconds": wall,
@@ -521,7 +531,8 @@ def main() -> None:
                 )
             print(
                 f"slots={slots:<4} cap={cap:<4} inflight={inflight} workers={workers:<2} "
-                f"batch={stats['mean_batch_size']:6.1f}  "
+                f"batch={stats['mean_batch_size']:6.1f} "
+                f"wave={stats['mean_wave_width']:4.2f}  "
                 f"{stats['wall_seconds']:7.1f}s  {stats['games_per_hour']:7.0f} games/h  "
                 + detail,
                 flush=True,
@@ -553,6 +564,9 @@ def main() -> None:
                 ),
                 "median_batch_size": statistics.median(
                     row["mean_batch_size"] for row in matching
+                ),
+                "median_wave_width": statistics.median(
+                    row["mean_wave_width"] for row in matching
                 ),
                 "runs": len(matching),
             }
@@ -622,7 +636,8 @@ def main() -> None:
             f"  slots={row['slots']:<4} cap={row['global_batch_cap']:<5} "
             f"inflight={row['max_inflight_batches']} "
             f"workers={row['scheduler_workers']:<2} "
-            f"batch={row['median_batch_size']:5.0f}  "
+            f"batch={row['median_batch_size']:5.0f} "
+            f"wave={row['median_wave_width']:4.2f}  "
             f"{row['median_games_per_hour']:7.0f} games/h  "
             f"({row['speedup_vs_baseline']:.2f}x vs {baseline_label})"
         )
