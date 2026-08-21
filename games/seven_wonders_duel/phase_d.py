@@ -5989,7 +5989,17 @@ def report_unspecified_flags(parser, argv, *, critical=()) -> list[str]:
         return option in given or option.replace("--", "--no-", 1) in given
 
     unspecified = sorted(option for option in known if not stated(option))
-    missing_critical = [option for option in critical if not stated(option)]
+    # Only a real training run has training decisions to get wrong. The
+    # plumbing smoke deliberately runs a tiny model with almost nothing set --
+    # requiring the critical flags there turned a launcher STAGE into a failure,
+    # which is the check causing the harm it exists to prevent.
+    training_run = not any(
+        token in ("--plumbing-smoke", "--help", "-h")
+        for token in (argv if argv is not None else sys.argv[1:])
+    )
+    missing_critical = (
+        [option for option in critical if not stated(option)] if training_run else []
+    )
     if missing_critical:
         raise SystemExit(
             "these must be passed explicitly, not defaulted: "

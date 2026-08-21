@@ -94,3 +94,20 @@ def test_the_critical_list_stays_short_and_real():
     assert len(CRITICAL_FLAGS) <= 8, "a long required list becomes a nuisance"
     for flag in CRITICAL_FLAGS:
         assert flag in options, f"{flag} is required but is not a real flag"
+
+
+def test_the_plumbing_smoke_is_not_required_to_state_training_flags():
+    """The smoke deliberately runs a tiny model with almost nothing set. Making
+    it satisfy the critical list turned a launcher STAGE into a failure -- the
+    check causing exactly the harm it exists to prevent. It reached the box."""
+
+    unspecified = report_unspecified_flags(
+        build_parser(), ["--run-dir", "x", "--plumbing-smoke"], critical=CRITICAL_FLAGS
+    )
+    assert "--train-steps" in unspecified, "still reported, just not refused"
+
+
+def test_a_real_run_is_still_required_to_state_them():
+    with pytest.raises(SystemExit):
+        report_unspecified_flags(build_parser(), ["--run-dir", "x"],
+                                 critical=CRITICAL_FLAGS)

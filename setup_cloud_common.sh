@@ -62,11 +62,18 @@ common::quietly() {
     return "${PIPESTATUS[0]}"
   fi
   echo "  $label (output -> $logfile)"
-  if ( "$@" ) >"$logfile" 2>&1; then
+  # Captured BEFORE any other command runs. `$?` after a completed `if...fi` is
+  # the status of the IF STATEMENT -- which is 0 when the condition failed and
+  # there is no else branch. Reading it there returned 0 on every failure, so
+  # this function reported "FAILED (exit 0)" and then returned success, and the
+  # `|| die` at each call site never fired. The equivalence suite and the
+  # plumbing smoke were both unable to stop a launch.
+  local status=0
+  ( "$@" ) >"$logfile" 2>&1 || status=$?
+  if [ "$status" -eq 0 ]; then
     echo "  $label: ok, $(wc -l < "$logfile" | tr -d ' ') lines"
     return 0
   fi
-  local status=$?
   warn "$label FAILED (exit $status). Last 40 lines of $logfile:"
   tail -n 40 "$logfile" >&2
   return "$status"

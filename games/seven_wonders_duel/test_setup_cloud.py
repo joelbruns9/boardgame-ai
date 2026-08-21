@@ -1400,3 +1400,28 @@ def test_the_sweep_can_measure_a_configuration_no_run_has_used(sweep_text):
     assert "CONFIG_OVERRIDES" in sweep_text
     block = _invocation(sweep_text, "f4_phase_d_sweep")
     assert "CONFIG_OVERRIDES" in block, "the overrides must reach the harness"
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_quieted_stage_that_fails_stops_the_caller():
+    """`$?` after a completed `if...fi` is the status of the IF STATEMENT, which
+    is 0 when the condition failed and there is no else. common::quietly read it
+    there, so it announced "FAILED (exit 0)" and returned success -- and the
+    `|| die` at every call site never fired.
+
+    The equivalence suite and the plumbing smoke were both unable to stop a
+    launch. On the box, the smoke failed and training was launched anyway.
+    """
+
+    script = (
+        f'source "{COMMON.as_posix()}"\n'
+        'common::quietly /tmp/qt_fail.log "boom" -- bash -c "exit 3" '
+        '&& echo CALLER_CONTINUED || echo "CALLER_STOPPED $?"\n'
+        'common::quietly /tmp/qt_ok.log "fine" -- bash -c "exit 0" '
+        '&& echo OK_CONTINUED || echo OK_STOPPED\n'
+    )
+    proc = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+    combined = proc.stdout + proc.stderr
+    assert "CALLER_STOPPED 3" in combined, f"a failing stage returned success:\n{combined}"
+    assert "CALLER_CONTINUED" not in combined
+    assert "OK_CONTINUED" in combined, "a succeeding stage must not stop the caller"
