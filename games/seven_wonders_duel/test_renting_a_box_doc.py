@@ -76,3 +76,27 @@ def test_version_markers_are_present_where_the_doc_promises_them(doc):
     ):
         text = (REPO_ROOT / script).read_text(encoding="utf-8")
         assert marker in text, f"{script} lost its version marker"
+
+
+def test_the_validate_before_launch_lesson_matches_the_launcher(doc):
+    """Section 1.3 tells the reader to validate the assembled command before
+    detaching. The launcher has to actually do it, or the playbook prescribes a
+    practice this project abandoned."""
+
+    assert "--validate-config" in doc
+    launcher = (REPO_ROOT / "setup_cloud_7wd.sh").read_text(encoding="utf-8")
+    assert "--validate-config" in launcher
+    assert launcher.index("--validate-config") < launcher.index(
+        "common::launch_detached"
+    ), "the doc says BEFORE detaching"
+
+
+def test_the_inert_failure_lesson_matches_the_helper(doc):
+    """Section 1.6 names the `$?`-after-`fi` bug and gives the fix. If the
+    helper regresses, the playbook is describing a fix that is no longer there."""
+
+    assert "status of the **if statement**" in doc
+    common = (REPO_ROOT / "setup_cloud_common.sh").read_text(encoding="utf-8")
+    assert '( "$@" ) >"$logfile" 2>&1 || status=$?' in common, (
+        "common::quietly no longer captures the status at the point of failure"
+    )
