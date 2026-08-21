@@ -1425,3 +1425,19 @@ def test_a_quieted_stage_that_fails_stops_the_caller():
     assert "CALLER_STOPPED 3" in combined, f"a failing stage returned success:\n{combined}"
     assert "CALLER_CONTINUED" not in combined
     assert "OK_CONTINUED" in combined, "a succeeding stage must not stop the caller"
+
+
+def test_resuming_across_a_code_change_is_opt_in_and_warned(setup_text):
+    """The guard exists because a pull landing mid-run splits the run across two
+    engines with nothing recording it. An override is legitimate -- the operator
+    may know the change is inert -- but it must be stated, not defaulted."""
+
+    assert 'ALLOW_RESUME_CODE_DRIFT="${ALLOW_RESUME_CODE_DRIFT:-0}"' in setup_text, (
+        "the override must default to OFF"
+    )
+    assert "--allow-resume-code-drift" in setup_text
+    # And it must say what it costs, at launch, not only in a comment.
+    launch = setup_text[setup_text.index('if [ "$ALLOW_RESUME_CODE_DRIFT" = "1" ]; then') :]
+    launch = launch[: launch.index("common::launch_detached")]
+    assert "different engines" in launch
+    assert "warn " in launch
