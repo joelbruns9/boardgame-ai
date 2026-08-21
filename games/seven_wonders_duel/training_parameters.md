@@ -1225,6 +1225,23 @@ The 2026-08-20 geometry sweep found total leaves in flight pinned near 170
 across a 4x change in shard count and a 2x change in slots -- slots and workers
 redistribute a fixed quantity, and only leaf batching raises it.
 
+### `--validate-config`
+
+**Default:** off. **Value:** flag
+
+Builds the configuration, validates it, prints `config OK` and exits without
+training. Intended for a launcher to check its assembled command before
+detaching.
+
+It exists because three consecutive relaunches died at stage 10 on knob pairings
+decided in the launcher and rejected here — each after the toolchain, Python
+deps, crate build, GPU gate, preflight, equivalence suite and plumbing smoke had
+all run. The pairing that caused two of them was `--eval-leaf-batch 16` without
+`--virtual-loss-root`. Checking costs about two seconds.
+
+`setup_cloud_7wd.sh` runs it on the assembled `TRAIN_CMD` and refuses to launch
+if it fails.
+
 ### `--eval-leaf-batch`
 
 **Default:** `0` (follow `--leaf-batch`). **Value:** non-negative integer
