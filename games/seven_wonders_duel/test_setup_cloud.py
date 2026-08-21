@@ -1478,3 +1478,32 @@ def test_the_cheap_leaf_batch_default_follows_the_wave_setting(setup_text):
     waves = setup_text.index('WAVE_FLAGS="${WAVE_FLAGS:-1}"')
     cheap = setup_text.index('CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"')
     assert waves < cheap, "the wave setting must be known before the default"
+
+
+def test_the_launcher_validates_its_command_before_detaching(setup_text):
+    """Three relaunches died at stage 10 on knob pairings decided in the
+    launcher and rejected by Phase D -- each after the toolchain, preflight,
+    equivalence suite and smoke had run. Checking costs two seconds."""
+
+    assert "--validate-config" in setup_text
+    validate = setup_text.index("--validate-config")
+    launch = setup_text.index("common::launch_detached")
+    assert validate < launch, "validation must run BEFORE the process is detached"
+    # It must reconstruct the arguments, not the interpreter and module: index
+    # 0/1/2 are $PY, -m and the module name, so the slice starts at 3.
+    assert '"${TRAIN_CMD[@]:3}"' in setup_text
+    # And it must stop the launch, not warn and continue.
+    block = setup_text[validate : validate + 700]
+    assert "die " in block, "a rejected config must not proceed to launch"
+
+
+def test_validate_config_exists_and_does_not_train():
+    from .phase_d import build_parser
+
+    assert "--validate-config" in _parser_options(build_parser())
+    source = (REPO_ROOT / "games/seven_wonders_duel/phase_d.py").read_text(
+        encoding="utf-8"
+    )
+    block = source[source.index("if args.validate_config:") :][:600]
+    assert "return 0" in block
+    assert "loop.run()" not in block, "validation must not start training"

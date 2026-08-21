@@ -5868,6 +5868,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use tiny generation/training/gate budgets; verifies plumbing only",
     )
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="build the config, validate it, print 'config OK' and exit. For a "
+        "launcher to check its assembled command before detaching, so a "
+        "rejected knob combination fails in seconds with its reason rather "
+        "than inside a nohup'd process ten stages later.",
+    )
     return parser
 
 
@@ -6173,6 +6181,17 @@ def main(argv=None) -> int:
         "Structured log": (Path(config.run_dir) / "training_log.jsonl").resolve(),
         "Manifest": (Path(config.run_dir) / "run_manifest.json").resolve(),
     }
+    if args.validate_config:
+        # Build and validate, then stop -- BEFORE the run log opens, so a
+        # rejected combination does not leave a half-written run. The launcher
+        # calls this before detaching, so a bad knob pairing fails in two
+        # seconds with its reason instead of inside a nohup'd process at stage
+        # 10, after the toolchain, preflight, equivalence suite and smoke have
+        # all run. Three relaunches died exactly there.
+        PhaseDLoop(config)
+        print("config OK")
+        return 0
+
     with RunLog(run_log_path, enabled=not args.no_run_log, header=header) as run_log:
         loop = PhaseDLoop(config)
         rows = loop.run()
