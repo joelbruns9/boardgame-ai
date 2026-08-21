@@ -1441,3 +1441,40 @@ def test_resuming_across_a_code_change_is_opt_in_and_warned(setup_text):
     launch = launch[: launch.index("common::launch_detached")]
     assert "different engines" in launch
     assert "warn " in launch
+
+
+@pytest.mark.parametrize(
+    "wave_flags,leaf_batch,virtual_loss", [(1, 6, 1), (0, 1, 0), (1, 1, 0), (0, 6, 1)]
+)
+def test_every_combination_the_launcher_can_produce_validates(
+    wave_flags, leaf_batch, virtual_loss
+):
+    """A launcher knob combination that Phase D refuses is a defect in the
+    launcher, not in the operator.
+
+    CHEAP_LEAF_BATCH was pinned at 16 while the wave flags were switchable, so
+    WAVE_FLAGS=0 produced `cheap_leaf_batch=16` with no waves -- which Phase D
+    correctly refuses as inert. The run died at stage 10, five stages after the
+    decision, twice.
+    """
+
+    from .phase_d import PhaseDConfig
+
+    cheap = 16 if wave_flags else 0
+    config = PhaseDConfig(
+        run_dir="x", selfplay_search_mode="puct", cheap_search_mode="gumbel",
+        leaf_batch=leaf_batch, virtual_loss_root=bool(virtual_loss),
+        cheap_leaf_batch=cheap,
+        cheap_conflict_free_waves=bool(wave_flags),
+        cheap_round_robin_candidates=bool(wave_flags),
+        eval_leaf_batch=16 if virtual_loss else 1,
+    )
+    config.validate()
+
+
+def test_the_cheap_leaf_batch_default_follows_the_wave_setting(setup_text):
+    assert 'CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"' in setup_text
+    assert 'CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-0}"' in setup_text
+    waves = setup_text.index('WAVE_FLAGS="${WAVE_FLAGS:-1}"')
+    cheap = setup_text.index('CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"')
+    assert waves < cheap, "the wave setting must be known before the default"

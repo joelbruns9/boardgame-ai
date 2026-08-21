@@ -388,14 +388,23 @@ VIRTUAL_LOSS_ROOT="${VIRTUAL_LOSS_ROOT:-1}"
 # The cheap path batches under conflict-free waves instead: exact rather than a
 # virtual-loss approximation. 16 matches top_k so round one is never the
 # limiter, though sequential halving caps the realized mean near 2.6 regardless.
-CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"
+WAVE_FLAGS="${WAVE_FLAGS:-1}"
+# Derived from WAVE_FLAGS, not fixed. A cheap leaf batch above 1 REQUIRES the
+# cheap wave flags -- without them the conflict-free rule cuts every wave to
+# width 1 and Phase D refuses the combination as inert. Pinning 16 here meant
+# that turning waves off produced a config the run rejects at launch, five
+# stages after the decision, which is how a relaunch died twice.
+if [ "$WAVE_FLAGS" = "1" ]; then
+  CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-16}"
+else
+  CHEAP_LEAF_BATCH="${CHEAP_LEAF_BATCH:-0}"
+fi
 # Evaluation matches the ADVISOR, not training. The gate certifies the advisor,
 # so they should run the same search -- and a leaf batch is a fraction of a
 # budget, so sharing training's number across three budgets that differ by an
 # order of magnitude would not make the searches alike. Pinned against
 # ADVISOR_LEAF_BATCH by test_advisor_leaf_batch.
 EVAL_LEAF_BATCH="${EVAL_LEAF_BATCH:-16}"
-WAVE_FLAGS="${WAVE_FLAGS:-1}"
 SOLVER_THREADS="${SOLVER_THREADS:-}"
 GENERATION_THREADS="${GENERATION_THREADS:-}"
 # 400, not 200: the self-anchor is the run's stopping rule, and 100 pairs
