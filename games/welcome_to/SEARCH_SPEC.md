@@ -4,12 +4,18 @@
 and described here as built. The chance boundary is **proposed, not built** — §6
 onward is for review before implementation.
 
-**Revision, 2026-08-22.** A first draft of this document was reviewed and its
-chance-node design **blocked on three logic errors**: it retained future deck
-order in a scenario (strategy fusion), it specified the sampled-support weighting
-incorrectly, and it modelled the boundary as "draw three cards", which the engine
-does not always do. All three are corrected below and the wrong versions are
-recorded so they are not reintroduced.
+**Revision history.** Two review rounds, both of which blocked the chance
+design. Round 1 found: future deck order retained in a scenario (strategy
+fusion), an incorrect sampled-support weighting, and a boundary modelled as
+"draw three cards". Round 2 found the remaining **P0**: §7 described the retained
+transition inconsistently — as a *pre-reveal afterstate* in one place and as
+*including opponent results* in another — which cannot both be true and breaks
+outright for any root that is not seat 0. All are corrected below, and the wrong
+versions are recorded so they are not reintroduced.
+
+**The open blocker is now precisely one thing:** exactly which stochastic
+transition is retained between two decisions by the same root player (§7.1,
+§7.3). Deck sampling and weighting are settled.
 
 **Reads with:** `SELF_PLAY_PLAN.md` S1 (root-player contract, gate),
 `ENCODER_V2_SPEC.md` §10.6 (frozen 684 vocabulary), `AUX_TARGETS_SPEC.md` §5
@@ -282,15 +288,38 @@ triples. **Exhaustive expansion is not available.**
 search that samples "three cards from `deck_composition`" is wrong on three of
 them:
 
+**First, what a boundary does to the table** (`ConstructionCards::discardAux`,
+standard branch — verified against the BGA PHP). It is not "replace three cards":
+
+1. the three **aside** cards (this turn's effects) go to the discard;
+2. the three **number** cards are *promoted* into the aside slots — so **this
+   turn's numbers become next turn's effects**, which is exactly why
+   `next_effects` is a certainty and not a posterior;
+3. three **new** number cards are drawn.
+
+The cards on the table are therefore never part of the material being reshuffled;
+only the discard is.
+
 | case | behaviour |
 |---|---|
-| ordinary | `_draw_step()` draws 3 via `_draw_playable()` |
-| **mid-draw exhaustion** | `_draw()` calls `_reform_deck()` when `deck_pos >= len(deck)` — so a boundary may draw some cards from the deck, reform from discard **partway through**, and draw the rest from a different pool |
+| ordinary | discard aside, promote numbers, draw 3 via `_draw_playable()` |
+| **exact-empty reform** | the deck is empty **at the start** of the draw: reform from the discard, then draw 3 |
 | **queued reshuffle** | `_reshuffle_decks()` reforms, draws **3**, runs `_discard_step()`; then `_begin_turn` calls `_draw_step()` for **3 more** — **six ordered cards, in two batches, with a discard cycle between** |
 | terminal | `_end_turn` may reach `GAME_OVER` before any reveal |
 
-Solo mode adds a fifth: `_draw_playable()` consumes and resolves `SOLO_CARD_ID`
-before returning a card.
+⚠ **"Mid-draw exhaustion" is NOT a standard-mode case, and an earlier draft
+wrongly listed it.** `_draw()` *can* reform partway through a sequence, but in
+2–4 seat standard play deck consumption stays a **multiple of three** — six at
+setup, three per ordinary turn, six per requested reshuffle — so the deck is
+either empty before the first of three draws or holds at least three.
+
+**Measured:** `deck_remaining % 3 == 0` at the start of **every** `_draw_step` —
+56,205 observations over 120 games at 2, 3 and 4 seats, no exceptions. Of 1,058
+reforms, none occurred between two draws of a triple.
+
+Keep a generic mid-draw unit test if expert mode is to stay supported; it is not
+a search-critical case. Solo (`_draw_playable` resolving `SOLO_CARD_ID`) is
+likewise out of the training scope.
 
 **The search must not reimplement this.** Refactor an engine-owned triple:
 
@@ -309,14 +338,30 @@ waiting on a reshuffle turn.
 
 ### 7.1 Shape
 
-When every action of the turn has resolved but **before** the boundary, create a
-**pre-reveal afterstate** node. At it:
+⚠ **Not a "pre-reveal afterstate".** An earlier draft placed the chance node
+after every seat had acted and sampled only the reveal. That is **wrong for any
+root that is not seat 0**, and it contradicted §7.3. From seat 1's decision to
+seat 1's next decision, the environment does three things: later seats act, the
+boundary reveals, **and then seat 0 acts** — after the reveal, on information
+seat 1 does not have, and possibly in response to seat 1's own now-public
+previous action. There is no single point in that sequence where "the player
+actions are done and only chance remains".
 
-- draw `K` immediate outcomes via `sample_boundary_outcome`;
+**The retained object is the whole root-to-root environment transition**, sampled
+causally: from "the root player finishes acting" to "the root player acts again".
+One sample contains exactly the randomness consumed during that one transition —
+the opponents' decisions, wherever they fall relative to the reveal, and the
+boundary outcome — and **nothing else**. At it:
+
+- draw `K` transitions, each sampled causally end to end;
 - give every sample mass **`1/K`**; merge samples with **identical public
   observations** and give the merged child mass **`count/K`**;
 - **retain** those children for the life of the search and **close the edge
   against growth**;
+- where several samples share a viewer information state but differ in hidden
+  detail — most often the opponents' *live* current-turn sheets — the child holds
+  a **particle collection**, not one canonical concrete state. Collapsing them to
+  a single particle silently narrows the belief (§13, POMCP / POMCPOW);
 - the node's value is the **weight-weighted mean** of its children's backed-up
   values — a chance node averages, it does **not** PUCT;
 - later descents **sample among the retained children by their weights**.
@@ -360,9 +405,9 @@ set search exists to prevent (§13, Cowling et al.).
 
 The correct rule:
 
-- a fixed-support entry contains **only the immediate stochastic transition** —
-  this boundary's reveal, plus the opponent results that became public during the
-  turn;
+- a fixed-support entry contains **only the randomness consumed by that one
+  root-to-root transition** (§7.1) — the opponents' sampled decisions and the
+  boundary outcome;
 - decision children are keyed by the resulting **public observation**, never by an
   RNG seed and never by a hidden future;
 - **equivalent public outcomes merge** (which is what makes `count/K` the right
@@ -375,19 +420,30 @@ actions*, not their future random stream.
 
 This also resolves — correctly — the concern the first draft raised, that a
 retained child with resampled opponents is undefined. The answer is not to retain
-the RNG; it is to put the opponents' public results in the observation.
+the RNG; it is that the transition is sampled **once, causally**, and the child is
+keyed by what the viewer can then see, with hidden residue carried as particles
+rather than as a canonical state.
 
 ### 7.4 Common random outcomes across candidate actions
 
 The reveal distribution does not depend on which house the root player wrote, so
-candidate root actions should be compared against the **same** sampled outcomes.
-This cancels most of the variance in their *differences*, which is what selection
-needs. Opponents may be shared for the same reason: they cannot see the root
-player's concurrent choice.
+candidate root actions should be compared against the same randomness. This
+cancels most of the variance in their *differences*, which is what selection
+needs.
 
-The exception is the **reshuffle** decision, which does change the distribution —
-and, per §6.3, changes how many cards are drawn. There, share the underlying
-uniforms and map them through the state-specific boundary, not the outcomes.
+⚠ **Share the underlying uniforms, not realised opponent actions.** An earlier
+draft said opponents "may be shared… they cannot see the root player's concurrent
+choice". That is true only of opponents acting in the **same** turn. Opponents
+acting **after** the boundary *can* see the root's now-public previous result, so
+their policy and even their legal continuations may legitimately differ between
+candidate actions; reusing their realised moves would force a counterfactual that
+the game does not permit.
+
+The safe contract, which also covers the **reshuffle** decision (which changes
+both the distribution and, per §6.3, how many cards are drawn):
+
+> Share the underlying random **uniforms** across candidate actions and map them
+> through each action's own causal transition.
 
 ### 7.5 Re-rooting on the real reveal
 
@@ -403,9 +459,20 @@ action, because no chance intervenes. **That does not extend across a boundary.*
 ## 8. ⚠ Fixed `K` multiplies inference cost by `K`
 
 `NetEvaluator._forward` evaluates **one** state per call. Materialising `K`
-children at every new afterstate turns 128 simulations into up to **128 × K**
+children at every new chance node turns 128 simulations into up to **128 × K**
 leaf evaluations — ~2,048 at `K = 16` — which would make any bakeoff at "equal
 simulations" meaningless.
+
+⚠ **And a leaf is not the only cost.** Because the retained object is the whole
+root-to-root transition (§7.1), each sample also pays for the **opponents' policy
+evaluations**. At four seats and the measured 1.91 decisions per turn, one
+`K = 16` expansion approaches
+
+```
+16 × (1 leaf + 3 opponents × 1.91 decisions) ≈ 108 evaluated positions
+```
+
+before any deeper search happens.
 
 **Required before the bakeoff**, at least one of:
 
@@ -500,17 +567,45 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    choosing; re-rooting the selected child within a turn is *exact* and preserves
    the work.
 4. **Engine-owned boundary transition** (§6.3), with a test for each of ordinary
-   draw, mid-draw reform, queued reshuffle, terminal-before-reveal, and solo card.
-5. **Define and test the public observation key** (§6.1, §7.3) — printed faces not
-   card IDs, plus opponents' public sheets and race state.
-6. **Fixed-support chance edge** (§7) with `count/K` weights, behind a flag, the
-   current version kept as the control arm.
-7. **Batched `K`-child evaluation and cross-game leaf batching** (§8).
+   draw, **exact-empty reform**, queued reshuffle, and terminal-before-reveal;
+   plus a generic mid-draw test only if expert mode stays supported.
+5. **Define and test the viewer information-state key** (§6.1, §7.3, §12.1).
+6. **Batched evaluator** — successor batches *and* opponent-policy batches (§8).
+   **Before** step 7, because a retained transition costs both.
+7. **Fixed-support environment edge** (§7) with `count/K` weights and particle
+   children, behind a flag, the current version kept as the control arm. Build it
+   **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists
+   even temporarily.
 8. **Run S0, then the bakeoff** (§11).
 9. **Only then:** progressive widening, Gumbel root allocation, afterstate head.
 
 Steps 1–3 are small, independent of the review's outcome, and can start now.
-Steps 4–6 are what this document exists to have reviewed.
+Steps 4–7 are what this document exists to have reviewed; step 7 should not begin
+until the transition semantics of §7.1 and §7.3 are agreed.
+
+### 12.1 The key is an information state, not a public observation
+
+"Public observation" is too weak a name: the key is **viewer-relative**, and must
+contain
+
+- the viewer's **live** sheet;
+- the opponents' **turn-start public snapshots** (`public_sheets`);
+- the **printed card types** on the table, not card IDs;
+- viewer-visible plan validations and race state (`plan_turns_for`);
+- the exact visible deck and discard composition;
+- the viewer's **own** reshuffle vote;
+- turn, phase, and the relevant within-turn context.
+
+and must **exclude**
+
+- any future deck order;
+- the opponents' hidden current-turn writes;
+- the table-wide `reshuffle_next_turn` aggregate (which is private mid-turn — see
+  `ENCODER_V2_SPEC.md` §9.3a).
+
+**The test that matters** is seat 1 after seat 0 has acted: mutating seat 0's
+*live* current-turn sheet must leave seat 1's key **unchanged**, while mutating
+`public_sheets[0]` must **change** it.
 
 ---
 
@@ -541,8 +636,18 @@ repeat. Evaluated on Can't Stop.
 Why §3's original "mean not best" justification for the macro was wrong, and what
 the macro's real (finite-budget) benefit is.
 
-**Double progressive widening** — Couëtoux & Doghmen, *Adaptive Rollout Length and
-Double Progressive Widening* (2011).
+**Belief-state search and particle collapse** — Silver & Veness, *Monte-Carlo
+Planning in Large POMDPs* (POMCP, 2010).
+<https://papers.nips.cc/paper_files/paper/2010/file/edfbe1afcf9246bb0d40eb4d8027d90f-Paper.pdf>
+Sunberg & Kochenderfer, *Online Algorithms for POMDPs with Continuous State,
+Action, and Observation Spaces* (POMCPOW, 2018).
+<https://arxiv.org/abs/1709.06196>
+Why §7.1's children need particle collections: widening with a single state
+particle collapses the belief incorrectly.
+
+**Double progressive widening** — Couëtoux & Doghmen, *Adding Double Progressive
+Widening to Upper Confidence Trees to Cope with Uncertainty in Planning Problems*
+(2011).
 <https://ewrl.wordpress.com/wp-content/uploads/2011/08/ewrl2011_submission_29.pdf>
 The deferred alternative in §10, designed for exactly the case where vanilla MCTS
 keeps meeting new successors.

@@ -443,6 +443,20 @@ thing rests on the availability counts being right. Compare depth *and*
 `arena.paired` strength, merged-with-availability against the current
 observation-keyed version, at equal budget. Do not assume it wins.
 
+#### ⚠ SUPERSEDED by `SEARCH_SPEC.md` — do not implement from this section
+
+The chance design below was corrected twice after it was written here. **Four of
+its statements are now known wrong**: "sample three from the remaining
+histogram" (the boundary has four cases and a reshuffle draws six — `SEARCH_SPEC`
+§6.3); "reuse opponent samples" (share uniforms, not realised actions — §7.4);
+retaining deck order and opponent RNG in a scenario (non-anticipativity /
+strategy fusion — §7.3); and "biased by that particular sample" (IID `1/K` is
+unbiased across supports; the real hazard is that visit-based stderr inside one
+retained tree is falsely tiny — §9).
+
+`SEARCH_SPEC.md` is the spec of record for search. What follows is kept only as
+the record of how the design got there.
+
 #### External review, 2026-08-22: sparse chance sampling is the reference design
 
 Reviewed independently, verified against the engine, and it corrects two things
