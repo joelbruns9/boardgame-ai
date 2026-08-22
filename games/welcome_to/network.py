@@ -85,6 +85,14 @@ GLOBAL_HEAD_TARGETS: tuple[str, ...] = ("turns_left",)
 #: Loss weights **by group**, per AUX_TARGETS_SPEC §8.  Weighting per target
 #: would be twenty-odd independent knobs, which is not a tunable object; these
 #: five are, and they are what an ablation switches off.
+#:
+#: The weight is applied to the group's **mean**, once -- not to each of its
+#: members.  Multiplying every member by the group coefficient would make a
+#: group's real influence its coefficient times its size: ``components`` (8
+#: targets at 0.2) would outweigh ``capacity`` (4 at 0.3), and the table would
+#: not describe the model it configures.  Worse, it makes the weighting drift as
+#: the target set changes -- AUX_TARGETS_SPEC §10 step 4 adds nine targets to
+#: ``plan_race``, which would have quietly tripled that group's pull.
 LOSS_WEIGHTS: dict[str, float] = {
     "policy": 1.0,
     "objective": 1.0,   # score, rank -- score dominant early
@@ -94,6 +102,8 @@ LOSS_WEIGHTS: dict[str, float] = {
 }
 
 _GROUP_OF: dict[str, str] = {
+    "policy": "policy",
+    "rank": "objective",
     "score": "objective",
     "permits": "capacity",
     "houses": "capacity",
@@ -117,7 +127,10 @@ _GROUP_OF: dict[str, str] = {
         )
     },
 }
-assert set(_GROUP_OF) == set(PER_SEAT_HEAD_TARGETS) | set(GLOBAL_HEAD_TARGETS)
+assert set(_GROUP_OF) == (
+    {"policy", "rank"} | set(PER_SEAT_HEAD_TARGETS) | set(GLOBAL_HEAD_TARGETS)
+)
+assert set(_GROUP_OF.values()) == set(LOSS_WEIGHTS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +277,9 @@ def losses(
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Total loss and its parts.
 
+    Returned ``parts`` carries one entry per target, unweighted, plus a
+    ``group_*`` entry per group holding the mean the weight was applied to.
+
     Two masking rules are load-bearing, and both fail silently when broken:
 
     * **every per-seat loss is masked by ``seat_valid``.**  Zero is a value;
@@ -303,12 +319,21 @@ def losses(
     for name in GLOBAL_HEAD_TARGETS:
         parts[name] = ((out[name] - batch[name]) ** 2).mean()
 
-    total = LOSS_WEIGHTS["policy"] * parts["policy"]
-    total = total + LOSS_WEIGHTS["objective"] * parts["rank"]
+    # One coefficient per group, applied to the group's mean.  See LOSS_WEIGHTS.
+    grouped: dict[str, list[Tensor]] = {}
     for name, part in parts.items():
-        group = _GROUP_OF.get(name)
-        if group is not None:
-            total = total + LOSS_WEIGHTS[group] * part
+        grouped.setdefault(_GROUP_OF[name], []).append(part)
+
+    total = None
+    for group, members in grouped.items():
+        mean = members[0]
+        for member in members[1:]:
+            mean = mean + member
+        mean = mean / len(members)
+        parts[f"group_{group}"] = mean
+        weighted = LOSS_WEIGHTS[group] * mean
+        total = weighted if total is None else total + weighted
+    assert total is not None
     return total, parts
 
 

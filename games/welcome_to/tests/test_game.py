@@ -539,3 +539,25 @@ def test_redeterminize_gives_the_copy_its_own_forward_rng():
     b = state.redeterminize(search_rng)
     assert a.rng.getstate() != b.rng.getstate()
     assert a.rng.getstate() != state.rng.getstate()
+
+
+def test_reshuffle_votes_are_recorded_per_seat_and_cleared_each_turn():
+    """The table-wide flag is the OR of these; only the votes are viewer-safe."""
+    from games.welcome_to.game import Phase
+
+    state = GameState.new(seed=3, config=GameConfig(players=3, advanced=True))
+    assert state.reshuffle_votes == {}
+    assert not state.reshuffle_vote_for(0)
+
+    state.plan_turns[0][1] = state.turn
+    state.phase = Phase.ASK_RESHUFFLE
+    state.actor = 1
+    state.apply(codec.A_RESHUFFLE_YES)
+
+    assert state.reshuffle_votes == {1: True}
+    assert state.reshuffle_vote_for(1) and not state.reshuffle_vote_for(0)
+    assert state.reshuffle_next_turn
+
+    copied = state.copy()
+    copied.reshuffle_votes[2] = True
+    assert state.reshuffle_votes == {1: True}, "copy() must not share the dict"

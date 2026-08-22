@@ -204,6 +204,27 @@ def test_the_positional_fit_plane_prefers_a_numbers_natural_home():
     assert plane[0, 9] > plane[0, 0], "a 15 belongs at the right-hand end"
 
 
+def test_a_perfect_fit_is_the_strongest_fit_not_the_absence_of_one():
+    """`positional_fit` returns 0.0 for a perfect fit and None for no fit.
+
+    Truthiness collapses those two -- ``fit or -99.0`` turns the best possible
+    placement into the worst -- so they have to be told apart explicitly.  A 6
+    between a 5 and a 7 is the exactly-ideal box and must read 1.0, the maximum
+    the plane can carry.
+    """
+    state = _game()
+    sheet = state.sheets[0]
+    sheet.write(5, (0, 3), turn=1)
+    sheet.write(7, (0, 5), turn=1)
+    for slot in range(3):
+        state.stack_new[0][slot] = _card_with(number=6)
+        state.stack_old[0][slot] = _card_with(effect=Effect.SURVEYOR)
+
+    assert sheet.positional_fit(6, 0, 4) == 0.0, "the engine calls this perfect"
+    plane = enc.encode_state(state, 0)[0][0, enc.P_FIT]
+    assert plane[0, 4] == 1.0
+
+
 def test_the_fit_plane_collapses_once_a_street_is_ruined():
     state = _game()
     before = enc.encode_state(state, 0)[0][0, enc.P_FIT, 0].sum()
@@ -352,6 +373,32 @@ def test_the_reshuffle_race_block_reports_the_option_is_open():
     state.plan_turns[0][1] = state.turn - 1  # an opponent got there first
     block = enc.encode_state(state, 0)[3][enc.block_slice("reshuffle_race")]
     assert block[0] == 0.0, "the reshuffle option is gone"
+
+
+def test_a_hidden_reshuffle_vote_does_not_reach_a_later_seat():
+    """Transient global state leaks the same way a sheet does, and is easier to
+    miss: the mid-turn sheet test above watches the per-seat block, and this one
+    lives in `global_scalars`.
+
+    The table-wide `reshuffle_next_turn` flips the moment any player votes yes,
+    mid-turn, and is consumed at the start of the next turn -- so it is *never*
+    legitimately public while true.  A later serial actor reading it would learn
+    both that an earlier player voted, and that they completed a plan this turn,
+    which `plan_turns_for` is at pains to hide.
+    """
+    state = _game(3, advanced=True)
+    state.plan_turns[0][0] = state.turn  # seat 0 completed a plan THIS turn
+    state.phase = Phase.ASK_RESHUFFLE
+    state.actor = 0
+    block = enc.block_slice("reshuffle_race")
+
+    before = [enc.encode_state(state, v)[3][block].tolist() for v in range(3)]
+    state.apply(codec.A_RESHUFFLE_YES)
+    after = [enc.encode_state(state, v)[3][block].tolist() for v in range(3)]
+
+    assert state.reshuffle_next_turn, "the vote did take effect in the engine"
+    assert after[0][1] == 1.0, "the voter knows their own vote"
+    assert before[1] == after[1] and before[2] == after[2], "the vote leaked"
 
 
 def test_a_banked_plan_shows_on_the_seat_that_banked_it():

@@ -213,6 +213,42 @@ def test_the_sentinel_never_reaches_a_loss():
 def test_the_loss_weights_cover_every_head_by_group():
     for name in nw.PER_SEAT_HEAD_TARGETS + nw.GLOBAL_HEAD_TARGETS:
         assert nw._GROUP_OF[name] in nw.LOSS_WEIGHTS
+    assert nw._GROUP_OF["policy"] == "policy"
+    assert nw._GROUP_OF["rank"] == "objective"
+
+
+def test_a_group_is_weighted_once_not_once_per_target():
+    """Otherwise a group's real pull is its coefficient times its size.
+
+    Per-target weighting would make `components` (8 targets at 0.2) outweigh
+    `capacity` (4 at 0.3), so the table would not describe the model it
+    configures -- and adding a target would silently reweight its group.  §10
+    step 4 of the aux spec adds nine targets to `plan_race`.
+    """
+    net = nw.WelcomeToNet(_SMALL).eval()
+    batch = _batch(players=3, games=2, limit=200)
+    with torch.no_grad():
+        total, parts = nw.losses(_forward(net, batch), batch)
+
+    for group, weight in nw.LOSS_WEIGHTS.items():
+        members = [float(parts[n]) for n, g in nw._GROUP_OF.items() if g == group]
+        assert members
+        assert float(parts[f"group_{group}"]) == pytest.approx(
+            sum(members) / len(members), rel=1e-5
+        )
+
+    rebuilt = sum(
+        weight * float(parts[f"group_{group}"])
+        for group, weight in nw.LOSS_WEIGHTS.items()
+    )
+    assert float(total) == pytest.approx(rebuilt, rel=1e-5)
+
+    # and the defect this replaces would give a materially different number
+    per_target = sum(
+        nw.LOSS_WEIGHTS[group] * float(parts[name])
+        for name, group in nw._GROUP_OF.items()
+    )
+    assert abs(per_target - float(total)) > 0.05 * float(total)
 
 
 def test_the_loss_is_finite_and_differentiable():
@@ -285,3 +321,39 @@ def test_the_greedy_policy_plays_legal_moves():
         action = policy(state)
         assert action in state.legal_actions()
         state.apply(action)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The paired gate
+# ──────────────────────────────────────────────────────────────────────────
+def test_the_paired_gate_replaces_exactly_one_seat():
+    """The baseline arm must be a plain all-GreedyBot game at the same seed.
+
+    If it is not -- if the two arms differ in anything but the substituted seat
+    -- the delta is not attributable to the policy under test.  So the baseline
+    is reconstructed here from scratch and has to match to the point.
+    """
+    net = nw.WelcomeToNet(_SMALL)
+    metrics = tn.paired_score_gap(net, torch.device("cpu"), games=1, seed=9_000)
+    assert metrics["paired_games"] == 1.0
+
+    players, game_seed, evaluated = 2, 9_000, 0
+    bots = [GreedyBot(random.Random(game_seed * 100 + p)) for p in range(players)]
+    state = GameState.new(seed=game_seed, config=GameConfig(players=players, advanced=True))
+    while not state.is_terminal:
+        state.apply(bots[state.actor].act(state))
+    assert metrics["greedy_score"] == pytest.approx(float(state.scores()[evaluated]))
+
+
+def test_the_paired_gate_is_reproducible():
+    net = nw.WelcomeToNet(_SMALL)
+    a = tn.paired_score_gap(net, torch.device("cpu"), games=3)
+    b = tn.paired_score_gap(net, torch.device("cpu"), games=3)
+    assert a == b
+
+
+def test_the_paired_gate_reports_its_own_noise():
+    """A +-2 point gate is meaningless without knowing what 2 points is worth."""
+    net = nw.WelcomeToNet(_SMALL)
+    metrics = tn.paired_score_gap(net, torch.device("cpu"), games=4)
+    assert metrics["score_gap_stderr"] > 0.0

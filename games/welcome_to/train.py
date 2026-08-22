@@ -233,40 +233,70 @@ def paired_score_gap(
     seed: int = 9_000,
     advanced: bool = True,
 ) -> dict[str, float]:
-    """Mean score of the net's greedy policy minus GreedyBot's, on shared seeds.
+    """Replace **one seat** with the net and measure what that seat scores.
 
-    Paired deliberately.  Per-game score variance in Welcome To is tens of
-    points; an unpaired comparison over a few hundred games cannot resolve the
-    2-point difference the gate is about, while the same seed gives both players
-    the same deck and the same plans.
+    A **controlled** substitution, and the control matters more than it looks.
+    The obvious design -- one game with the net in every seat against one with
+    GreedyBot in every seat -- changes the whole table at once, and the two arms
+    then differ in something other than the policy under test: how *correlated*
+    the seats are.  Every seat of an all-net table sees the same stacks and runs
+    the same deterministic argmax, so those sheets converge on each other
+    (measured: 0.34 mean divergence against greedy's 0.80).  Correlated sheets
+    complete plans on the same turn, so they share first-place plan values
+    instead of racing for them, and they tie on the temp-agency rank.  Those are
+    scoring rules, worth 6-14 and 7/4/1 points, moving for a reason that has
+    nothing to do with placement skill.
+
+    So: the net plays seat ``k``, GreedyBots play the rest; the baseline arm is
+    the same game with a GreedyBot in seat ``k`` and **the same RNG streams**
+    everywhere else.  The evaluated seat rotates, and the statistic is the mean
+    of per-game deltas at that seat.
+
+    Pairing on the seed is what makes 60 games say anything: per-game score
+    variance is tens of points, so an unpaired comparison cannot resolve the
+    2-point difference the gate is about.  The counterfactual is not perfectly
+    clean -- the substituted seat changes when the game ends and who wins which
+    plan, so the opponents' games are not bit-identical -- but the deck, the
+    plans and the opponents' policies are shared, which removes most of it.
     """
     counts = seat_counts(games)
+    policy = greedy_policy(net, device)
+    deltas: list[float] = []
     net_scores: list[float] = []
     bot_scores: list[float] = []
-    policy = greedy_policy(net, device)
+
+    def play(config: GameConfig, game_seed: int, net_seat: Optional[int]) -> list[int]:
+        bots = {
+            p: GreedyBot(random.Random(game_seed * 100 + p))
+            for p in range(config.players)
+        }
+        state = GameState.new(seed=game_seed, config=config)
+        while not state.is_terminal:
+            actor = state.actor
+            action = policy(state) if actor == net_seat else bots[actor].act(state)
+            state.apply(action)
+        return state.scores()
 
     for i, players in enumerate(counts):
         config = GameConfig(players=players, advanced=advanced)
         game_seed = seed + i
+        evaluated = i % players  # rotate, so no seat's luck is the whole result
 
-        state = GameState.new(seed=game_seed, config=config)
-        while not state.is_terminal:
-            state.apply(policy(state))
-        net_scores.extend(float(s) for s in state.scores())
+        with_net = play(config, game_seed, evaluated)[evaluated]
+        without = play(config, game_seed, None)[evaluated]
+        net_scores.append(float(with_net))
+        bot_scores.append(float(without))
+        deltas.append(float(with_net - without))
 
-        bots = [GreedyBot(random.Random(game_seed * 100 + p)) for p in range(players)]
-        state = GameState.new(seed=game_seed, config=config)
-        while not state.is_terminal:
-            state.apply(bots[state.actor].act(state))
-        bot_scores.extend(float(s) for s in state.scores())
-
-    net_mean = sum(net_scores) / len(net_scores)
-    bot_mean = sum(bot_scores) / len(bot_scores)
+    n = len(deltas)
+    mean = sum(deltas) / n
+    variance = sum((d - mean) ** 2 for d in deltas) / max(n - 1, 1)
     return {
-        "net_score": net_mean,
-        "greedy_score": bot_mean,
-        "score_gap": net_mean - bot_mean,
-        "paired_games": float(len(counts)),
+        "net_score": sum(net_scores) / n,
+        "greedy_score": sum(bot_scores) / n,
+        "score_gap": mean,
+        "score_gap_stderr": math.sqrt(variance / n),
+        "paired_games": float(n),
     }
 
 

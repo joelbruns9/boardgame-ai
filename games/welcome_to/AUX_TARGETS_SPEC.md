@@ -665,6 +665,16 @@ plan race     0.3     will_complete_plan_k, plan_k_first
 Consistent with `PROJECT_PLAN.md` M2: "score dominant early, policy next,
 auxiliaries small." Ablate whole groups, not individual targets.
 
+⚠ **The coefficient multiplies the group's mean, once — not each member.** The
+first implementation applied it per target, which makes a group's real influence
+its coefficient times its size: `components` (8 targets × 0.2 = 1.6) outweighed
+`capacity` (4 × 0.3 = 1.2), and the table above described nothing. It also drifts
+silently as the target set changes — step 4 below adds nine targets to
+`plan race`, which would have tripled that group's pull without anyone editing a
+weight. Fixed 2026-08-21; `network.losses` returns a `group_*` entry per group
+holding the mean the weight was applied to, and a test asserts the
+reconstruction.
+
 ---
 
 ## 9. Considered and rejected

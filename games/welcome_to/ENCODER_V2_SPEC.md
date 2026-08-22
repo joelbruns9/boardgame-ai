@@ -620,6 +620,12 @@ problem that settled `MAX_OPPONENTS`.
 
 **New helpers:** `plans.DEALT_PLAN_IDS` and `plans.dense_index(plan_id)`.
 
+⚠ **`positional_fit` returns `0.0` for a perfect fit and `None` for no fit**, so
+plane 11 must tell them apart with an explicit `is None`. `fit or -99.0` reads the
+best possible placement as the worst — shipped in v1, carried into v2, fixed
+2026-08-21 with a test. Any future plane reading an `Optional[float]` whose good
+value is zero has the same trap.
+
 **Size the one-hot at the advanced superset (28) regardless of variant**, so a
 base-rules game is a strict subset of the advanced input space — ten slots stay
 dark, roundabout actions never enter the legal mask — and one weight set serves
@@ -739,6 +745,25 @@ and any quantity legitimately dependent on the turn-start snapshot.
 Symmetry is easy to break by accident — one helper reading `state.sheets[p]`
 instead of `sheet_for(viewer, p)` both breaks symmetry and leaks information. This
 test catches both at once.
+
+### 9.3a Transient global state leaks too — and §9.3 will not catch it
+
+Both §9.3 tests watch the **per-sheet** block. A second leak class lives in
+`global_scalars`, and it is easier to miss because nothing about it looks like a
+sheet.
+
+The case that was actually shipped and then fixed: `reshuffle_next_turn` is the
+table-wide OR of the `ASK_RESHUFFLE` votes. Turns are serialised, so it flips the
+moment an earlier actor votes yes — and it is consumed at the *start* of the next
+turn, which means it is **never legitimately public while it is true**. A later
+actor reading it learned that an earlier player voted, and therefore that they
+completed a plan this turn, which `plan_turns_for` exists to hide.
+
+The fix is `GameState.reshuffle_votes` plus `reshuffle_vote_for(viewer)`: encode
+the viewer's **own** vote, never the aggregate. The general rule: any engine field
+that changes mid-turn needs a viewer-relative accessor before the encoder may read
+it, and `_may_ask_reshuffle()` is fine only because it is a function of completions
+on *earlier* turns.
 
 ### 9.4 Fit-probability exactness test
 

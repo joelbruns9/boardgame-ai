@@ -218,6 +218,13 @@ class GameState:
     #: Per-player combination slot chosen this turn (expert card passing needs it).
     turn_choice: list[Optional[int]]
     reshuffle_next_turn: bool
+    #: How each player voted at ``ASK_RESHUFFLE`` this turn, by seat.  The
+    #: table-wide :attr:`reshuffle_next_turn` is the OR of these and is
+    #: **private until the turn resolves**: turns are serialised, so a later
+    #: actor reading the aggregate would learn that an earlier one voted yes --
+    #: and in the concurrent game nobody knows that, or even that the earlier
+    #: player completed a plan.  An information-set-safe reader asks this.
+    reshuffle_votes: dict[int, bool]
     rng: random.Random
     solo_card_drawn: bool = False
 
@@ -265,6 +272,7 @@ class GameState:
             ctx=TurnCtx(),
             turn_choice=[None] * config.players,
             reshuffle_next_turn=False,
+            reshuffle_votes={},
             rng=rng,
         )
 
@@ -318,6 +326,7 @@ class GameState:
             ctx=self.ctx.copy(),
             turn_choice=list(self.turn_choice),
             reshuffle_next_turn=self.reshuffle_next_turn,
+            reshuffle_votes=dict(self.reshuffle_votes),
             rng=rng,
             solo_card_drawn=self.solo_card_drawn,
         )
@@ -377,6 +386,7 @@ class GameState:
 
         self.actor = 0
         self.ctx = TurnCtx()
+        self.reshuffle_votes = {}
         self.turn_choice = [None] * self.config.players
         self.phase = Phase.CHOOSE_CARDS
         self.public_sheets = [s.copy() for s in self.sheets]
@@ -887,6 +897,7 @@ class GameState:
             return
 
         if phase is Phase.ASK_RESHUFFLE:
+            self.reshuffle_votes[self.actor] = action == codec.A_RESHUFFLE_YES
             if action == codec.A_RESHUFFLE_YES:
                 self.reshuffle_next_turn = True
             self.phase = Phase.CHOOSE_PLAN
@@ -941,6 +952,17 @@ class GameState:
         turn, mirroring ``Houses::getOfPlayer``.
         """
         return self.sheets[target] if viewer == target else self.public_sheets[target]
+
+    def reshuffle_vote_for(self, viewer: int) -> bool:
+        """Whether ``viewer`` knows a reshuffle is coming -- i.e. voted for one.
+
+        Not :attr:`reshuffle_next_turn`, which is the table-wide OR.  The vote
+        happens mid-turn and is consumed at the start of the next one, so the
+        aggregate is **never** legitimately public while it is true: reading it
+        tells a later serial actor that an earlier one voted yes, which in the
+        concurrent game nobody knows.
+        """
+        return self.reshuffle_votes.get(viewer, False)
 
     def plan_turns_for(self, viewer: int, slot: int) -> dict[int, int]:
         """Plan completions ``viewer`` may see (``AbstractPlan::getValidations``)."""

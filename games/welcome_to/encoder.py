@@ -268,14 +268,18 @@ def _sheet_planes(sheet: Sheet, offered: list[int], out: np.ndarray) -> None:
             out[P_WRITABLE, x, y] = float((x, y) in writable)
             # how many numbers could still land here at all
             out[P_SPAN, x, y] = spans[x][y] / 18.0
-            # and how well the numbers actually on offer would sit here
+            # and how well the numbers actually on offer would sit here.
+            # `positional_fit` returns 0.0 for a PERFECT fit and None for no fit
+            # at all, so the two must be told apart explicitly -- `fit or -99.0`
+            # reads the best possible placement as the worst one.
             if n is None:
-                fit = max(
-                    (sheet.positional_fit(v, x, y) or -99.0 for v in offered),
-                    default=None,
-                )
-                if fit is not None and fit > -99.0:
-                    out[P_FIT, x, y] = 1.0 / (1.0 - fit)
+                fits = [
+                    f
+                    for f in (sheet.positional_fit(v, x, y) for v in offered)
+                    if f is not None
+                ]
+                if fits:
+                    out[P_FIT, x, y] = 1.0 / (1.0 - max(fits))
     out[P_ESTATE_SIZE] = _estate_size_grid(sheet) / 6.0
 
 
@@ -443,10 +447,14 @@ def _global_scalars(state: GameState, viewer: int) -> np.ndarray:
             0.0 if state.plan_turns_for(viewer, slot) else 1.0,
         )
 
-    # THE THIRD RACE: whoever finishes the first plan chooses the reshuffle
+    # THE THIRD RACE: whoever finishes the first plan chooses the reshuffle.
+    # The second flag is the viewer's OWN vote, not the table-wide
+    # `reshuffle_next_turn`: turns are serialised, so the aggregate would tell a
+    # later actor that an earlier one voted yes -- and therefore that they
+    # completed a plan this turn, which `plan_turns_for` is at pains to hide.
     w.put(
         1.0 if state._may_ask_reshuffle() else 0.0,
-        1.0 if state.reshuffle_next_turn else 0.0,
+        1.0 if state.reshuffle_vote_for(viewer) else 0.0,
     )
 
     # NEXT TURN'S EFFECTS: known now, one-hot per stack

@@ -202,6 +202,20 @@ Implemented in `network.py` (shared sheet encoder → trunk → per-seat + globa
 heads, 3.94M parameters) and `train.py` (`python -m games.welcome_to.train`),
 which reports all three numbers and exits non-zero if any fails.
 
+**The paired comparison replaces one seat, not the whole table.** The first
+implementation played an all-net game against an all-greedy game at the same
+seed, and that is not a controlled substitution: every seat of an all-net table
+sees the same stacks and runs the same deterministic argmax, so the sheets
+converge on each other (measured 0.34 mean divergence against greedy's 0.80).
+Correlated sheets complete plans on the same turn and so *share* first-place plan
+values instead of racing for them, and they tie on the temp-agency rank — two
+scoring rules worth 6–14 and 7/4/1 points moving for a reason unrelated to
+placement skill. The gate now puts the net in seat *k* against GreedyBots on the
+same RNG streams, pairs against the same game with a GreedyBot in seat *k*,
+rotates *k*, and averages the per-game delta. It also reports
+`score_gap_stderr`, because a ±2 point threshold means nothing without knowing
+what 2 points is worth at the sample size used.
+
 Accept that greedy is race-blind — it completes ~0.42 plans per game. The
 bootstrap produces a placement-competent, race-blind policy, which is fine.
 
