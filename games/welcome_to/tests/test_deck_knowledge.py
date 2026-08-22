@@ -121,9 +121,17 @@ def test_a_reshuffle_puts_the_discard_back():
     counterfactual = dk.after_reshuffle_composition(state, 0)
     assert counterfactual.sum() > before.sum()
     assert np.array_equal(
-        counterfactual, before + dk.discard_composition(state, 0)
+        counterfactual,
+        before
+        + dk.discard_composition(state, 0)
+        + dk.aside_composition(state, 0),
     )
 
+    # The reshuffle resolves at the NEXT turn boundary, and _begin_turn runs
+    # _discard_step() BEFORE _reshuffle_decks().  Reproduce that order -- calling
+    # _reform_deck() on its own reproduces the bug this test used to encode,
+    # leaving the three aside cards out of the pool.
+    state._discard_step()
     state._reform_deck()
     assert np.array_equal(dk.deck_composition(state, 0), counterfactual)
 
@@ -196,3 +204,45 @@ def test_expert_mode_never_counts_the_shared_discard():
 
 def test_summarise_runs():
     assert "deck" in dk.summarise(_game(), 0)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Regressions for the two defects found by external review, 2026-08-21
+# ──────────────────────────────────────────────────────────────────────────
+def test_after_reshuffle_matches_the_pool_the_engine_actually_reforms():
+    """The counterfactual must equal the pool ``_reform_deck`` really sees.
+
+    It used to be ``deck + discard``, which undercounts by the three aside
+    cards: ``_begin_turn`` discards them *before* reforming.  Asserted against
+    the engine rather than against a restatement of the formula.
+    """
+    state = _game()
+    rng = random.Random(5)
+    for _ in range(40):
+        if state.is_terminal:
+            break
+        state.apply(rng.choice(state.legal_actions()))
+
+    aside = [c for c in state.stack_old[0] if c is not None]
+    assert aside, "expected aside cards to be on the table"
+    expected_size = state.deck_remaining + len(state.discard) + len(aside)
+    assert dk.after_reshuffle_composition(state, 0).sum() == expected_size
+
+    counterfactual = dk.after_reshuffle_composition(state, 0)
+    state._discard_step()
+    state._reform_deck()
+    assert np.array_equal(dk.deck_composition(state, 0), counterfactual)
+
+
+def test_after_reshuffle_is_not_merely_deck_plus_discard():
+    """Pin the specific regression: the old formula is three cards short."""
+    state = _game()
+    rng = random.Random(6)
+    for _ in range(30):
+        if state.is_terminal:
+            break
+        state.apply(rng.choice(state.legal_actions()))
+
+    old_formula = dk.deck_composition(state, 0) + dk.discard_composition(state, 0)
+    correct = dk.after_reshuffle_composition(state, 0)
+    assert correct.sum() - old_formula.sum() == 3

@@ -495,3 +495,47 @@ def test_a_greedy_advanced_game_terminates_promptly():
         state.apply(bot.act(state))
         steps += 1
         assert steps < 400, "roundabout livelock is back"
+
+
+def test_redeterminize_gives_a_different_world_each_call():
+    """Regression: it used to return the same shuffle every time.
+
+    ``copy()`` clones the RNG state exactly, so when ``rng`` defaulted to the
+    copy's own generator every determinization started from the same seed.  A
+    search built on that explores one fixed future while looking healthy, so
+    ``rng`` is now required and the caller must advance it.
+    """
+    state = _two_player()
+    for _ in range(6):
+        state.apply(state.legal_actions()[0])
+
+    search_rng = random.Random(1234)
+    worlds = {
+        tuple(state.redeterminize(search_rng).deck[state.deck_pos :])
+        for _ in range(20)
+    }
+    assert len(worlds) > 15, f"only {len(worlds)} distinct worlds in 20 draws"
+
+
+def test_redeterminize_requires_an_rng():
+    state = _two_player()
+    with pytest.raises(TypeError):
+        state.redeterminize()  # type: ignore[call-arg]
+
+
+def test_redeterminize_gives_the_copy_its_own_forward_rng():
+    """Two determinizations must not share RNG state into the rollout.
+
+    ``_reform_deck`` uses ``state.rng``; if both copies carried the source's
+    generator they would apply the same permutation pattern at a mid-rollout
+    reshuffle, correlating simulations that are meant to be independent.
+    """
+    state = _two_player()
+    for _ in range(6):
+        state.apply(state.legal_actions()[0])
+
+    search_rng = random.Random(99)
+    a = state.redeterminize(search_rng)
+    b = state.redeterminize(search_rng)
+    assert a.rng.getstate() != b.rng.getstate()
+    assert a.rng.getstate() != state.rng.getstate()

@@ -40,8 +40,12 @@ RESHUFFLE
 ─────────
 The first player to complete a City Plan may shuffle the discard back into the
 deck. Reversing which cards are still to come is a large, one-off swing in the
-number distribution, and :func:`after_reshuffle_composition` gives the exact deck
+number distribution, and :func:`after_reshuffle_composition` gives the exact pool
 that choice would produce, so the decision can be computed instead of guessed.
+
+Mind the ordering: the reshuffle resolves at the *next* turn boundary, after
+this turn's aside cards have been discarded into it but before the number
+cards beside them are.  The pool is ``deck + discard + aside``.
 
 EXPERT MODE
 ───────────
@@ -129,16 +133,49 @@ def discard_composition(state: GameState, player: int) -> np.ndarray:
     return _histogram(state.discard)
 
 
+def aside_composition(state: GameState, player: int) -> np.ndarray:
+    """``(15, 6)`` — the three cards currently showing their EFFECT face.
+
+    These join a reshuffle, and the discard does not account for them yet.  At
+    the next turn boundary :meth:`GameState._begin_turn` runs ``_discard_step()``
+    *before* ``_reshuffle_decks()``, so these cards are swept into the discard and
+    then into the reformed deck.  The number cards beside them are discarded by
+    the *second* ``_discard_step()``, which runs after ``_reform_deck()``, so they
+    stay out of it.
+
+    Zero outside standard mode, where there is no aside card.
+    """
+    if not state.config.standard:
+        return np.zeros((NUM_NUMBERS, NUM_EFFECTS), dtype=np.float32)
+    return _histogram(state.stack_old[0])
+
+
 def after_reshuffle_composition(state: GameState, player: int) -> np.ndarray:
-    """``(15, 6)`` — the deck the player would face if they took the reshuffle.
+    """``(15, 6)`` — the pool the player would face if they took the reshuffle.
 
     The counterfactual behind the only genuinely strategic use of card counting in
     the base game: whoever completes the first City Plan chooses whether the
     discard goes back in.  Comparing this against :func:`deck_composition` turns
     that into arithmetic — do I want the low numbers back, given the gaps left on
     my sheet and the plans still open?
+
+    **Three cards used to be missing from this.**  It returned ``deck + discard``,
+    which is the pool as it stands *now* — but the reshuffle does not happen now,
+    it happens at the next turn boundary, and by then this turn's three aside
+    cards have already been discarded into it (see :func:`aside_composition`).
+    Since this is the feature the card-counting edge rests on, undercounting the
+    pool by three cards mattered.
+
+    What the reshuffle then draws off the top — six cards, into the stacks — is a
+    uniformly random subset of this pool, so it does not shift the composition the
+    player should reason about.  This is the distribution the next numbers come
+    from, which is what the encoder wants.
     """
-    return deck_composition(state, player) + discard_composition(state, player)
+    return (
+        deck_composition(state, player)
+        + discard_composition(state, player)
+        + aside_composition(state, player)
+    )
 
 
 def next_number_distribution(state: GameState, player: int) -> np.ndarray:

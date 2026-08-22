@@ -490,7 +490,8 @@ def test_reshuffle_counterfactual_is_deck_plus_discard():
         deck = dk.deck_composition(state, 0)
         after = dk.after_reshuffle_composition(state, 0)
         discard = dk.discard_composition(state, 0)
-        assert (after == deck + discard).all()
+        aside = dk.aside_composition(state, 0)
+        assert (after == deck + discard + aside).all()
         assert after.sum() >= deck.sum(), "a reshuffle can never shrink the deck"
         checked += 1
     assert checked == 40

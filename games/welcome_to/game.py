@@ -950,14 +950,14 @@ class GameState:
             if p == viewer or t < self.turn
         }
 
-    def redeterminize(self, rng: Optional[random.Random] = None) -> "GameState":
+    def redeterminize(self, rng: random.Random) -> "GameState":
         """Resample everything the acting player cannot see.
 
         Only one thing is hidden: the order of the cards still to come.  Every
         card on the table is fully identified (see :meth:`table_cards`) and the
         deck's *composition* is public bookkeeping
         (:func:`games.welcome_to.deck_knowledge.deck_composition`), so this is a
-        pure permutation of the undrawn deck — it never invents or destroys a
+        pure permutation of the undrawn deck -- it never invents or destroys a
         card, and never has to guess at a face.
 
         Expert mode is only partly determinized: the opponents' private stacks
@@ -965,12 +965,28 @@ class GameState:
 
         MCTS must call this at the root, otherwise search reads the true shuffle
         and the trained policy inherits the cheat.
+
+        ``rng`` is **required, and must be a search RNG that the caller advances
+        between simulations.**  It was optional once, defaulting to the copy's
+        own generator, and that was a silent trap: :meth:`copy` clones the RNG
+        state exactly, so every ``state.redeterminize()`` began from the same
+        seed and returned the *same* shuffle.  A search built on that would
+        explore one fixed future while looking perfectly healthy.  Kingdomino's
+        ``encoder.redeterminize(state, rng)`` has always required the argument;
+        this now matches it.
+
+        The returned state also gets a **fresh generator of its own**, derived
+        from ``rng``.  Without that, two determinizations would carry identical
+        RNG state into the rollout, so any later stochastic step -- a deck
+        exhaustion or a mid-rollout reshuffle, both of which call
+        :meth:`_reform_deck` -- would apply the same permutation pattern across
+        simulations that were supposed to be independent.
         """
         nxt = self.copy()
-        rng = rng or nxt.rng
         unseen = nxt.deck[nxt.deck_pos:]
         rng.shuffle(unseen)
         nxt.deck = nxt.deck[: nxt.deck_pos] + unseen
+        nxt.rng = random.Random(rng.getrandbits(64))
         return nxt
 
     # ──────────────────────────────────────────────────────────────────

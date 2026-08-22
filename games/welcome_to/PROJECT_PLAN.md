@@ -32,7 +32,7 @@ N", which is what makes the race features worth having.
 information-set-safe encoder (18×3×12 planes + 473 flat features), exact deck
 knowledge, City Plans with distance-to-completion, baseline bots, auxiliary
 training targets, trajectory capture/replay, and the `games.az_loop` adapter seam.
-The pytest suite has not been run yet — **that is step 1**.
+The pytest suite is **green: 238 passed, 0 failed** (2026-08-21). Two defects found by external review are fixed with regressions — see §M0.
 
 **Reusable, do not rebuild.** `games/az_loop` is game-agnostic: run controller,
 soft gate, checkpoint lifecycle, games ledger, HOF, Elo, SPRT, stagnation
@@ -56,6 +56,20 @@ detection, run log. `games/kingdomino` is the worked example of both seams.
 **Gate:** suite green; 200 random games finish with no illegal action, no
 runaway, and cards conserved.
 
+**Status: DONE, 238 passed.** Two defects were found afterwards by external review
+and fixed on 2026-08-21, both of which the suite had missed:
+
+- **`redeterminize()` returned the same shuffle every call.** `copy()` clones the
+  RNG state exactly, so the optional `rng` argument defaulted to an identical
+  generator. `rng` is now required, matching Kingdomino's signature, and the copy
+  also gets a fresh forward generator so mid-rollout reshuffles do not correlate.
+- **`after_reshuffle_composition` was three cards short.** `_begin_turn` runs
+  `_discard_step()` *before* `_reshuffle_decks()`, so the turn's aside cards are in
+  the pool and the number cards beside them are not. Added `aside_composition`.
+  **The old test passed because it called `_reform_deck()` directly, reproducing the
+  same wrong ordering** — a reminder that a test written against the implementation's
+  model confirms the model rather than the behaviour.
+
 **Why first:** nothing below is worth starting on an unverified engine, and the
 suite encodes several rules that were got wrong at least once (the reveal
 structure, the bis-fence interaction, the roundabout livelock).
@@ -72,7 +86,8 @@ policy = the action greedy chose, value = final score, plus the auxiliary heads.
 **Gate:**
 - policy top-1 agreement with greedy ≥ 60% on held-out games;
 - the net *playing greedily off its own policy, with no search*, scores within
-  2 points of greedy's 47.8 on a paired seed set;
+  2 points of greedy's **51.4** (advanced, 2 seats — 47.8 was the one-seat figure,
+  and one-seat play is out of scope) on a paired seed set;
 - `permits` and `houses` heads beat predict-the-mean on held-out data.
 
 **Why:** it proves the whole pipeline — encoder → network → loss → checkpoint —
@@ -94,18 +109,87 @@ the bootstrap mix rather than trying to fix greedy.
 
 Design decisions, none of them inherited from Kingdomino:
 
-* **Trunk.** 18×3×12 = 648 spatial floats next to 473 flat features. This is an
-  MLP or a small 1-D convolution along the street axis. Kingdomino's 13×13 ResNet
-  is the wrong shape and mostly wasted parameters. Start at ~1–2M params and use
-  the capacity ladder from the Kingdomino work rather than assuming depth.
-* **Heads.** Policy (357 logits, masked by `legal_mask()`); value as three parts —
-  expected final **score**, **win probability**, score **margin** vs the best
-  opponent; plus the ~20 auxiliary heads in `training.TARGET_NAMES`, several of
-  them masked.
+* **Trunk: shared per-sheet encoder, then one MLP** (revised 2026-08-21; the
+  earlier "MLP over a flat concat" is superseded by the symmetric encoder in
+  `ENCODER_V2_SPEC.md`).
+
+  ```
+  for each seat s:  [planes_s (17,3,12), scalars_s (127)] --> SHARED MLP --> h_s (128)
+  trunk_input = [h_me, h_opp0, h_opp1, h_opp2, viewer_plane, global_scalars (380)]
+                                    --> main MLP trunk
+  ```
+
+  Every seat runs through the **same weights**, which is the Kingdomino precedent
+  (`my_board` and `opp_board` share one ResNet trunk). Concatenate the opponents
+  rather than pooling them, so identity survives — *which* opponent finishes plan
+  2 first is exactly the question. MLP rather than convolution for the sheet
+  encoder: the 3×12 grid has no symmetry group, so the sharing that pays here is
+  across seats, not across positions.
+
+  Kingdomino's 13×13 ResNet remains the wrong shape. Start around 4M params and
+  use the capacity ladder from the Kingdomino work rather than assuming depth.
+
+  **Cost.** The sheet encoder is ~5% of the network, so running it 2–4× instead of
+  once costs roughly **4% of network compute** — not the 2.5–4× an earlier estimate
+  claimed by false analogy to KD, where the per-board trunk *is* the dominant cost.
+  CPU-side encoding is the larger relative cost and is well under 4×, because the
+  deck prefix sums are computed once per state and reused across all four sheets.
+  Measure it against the current 10.1 games/s.
+* **Heads.** Policy (**684 actions**, masked; vocabulary frozen in
+  `ENCODER_V2_SPEC.md` §10.6). Then **one per-seat head evaluated four times** (11
+  units) and one global head (5 units) — 16 output units producing 49 predictions.
+  `margin` is **derived**, not a head, exactly as in Kingdomino.
+* **The per-seat head is contextual**, reading `concat(h_s, h_main)` rather than an
+  isolated `h_s`. Several of its targets — `plan_k_first`, `final_score`,
+  `end_trigger` — are definitionally cross-seat, so a head that sees only one
+  sheet's encoding cannot predict them. Weight sharing across seats is preserved.
+* **The value is a rank *distribution*, not a rank scalar** (decided 2026-08-21).
+  The global head emits a 4-wide softmax over finishing positions, masked to the
+  seat count, and the search applies a utility `u_r = (n−1−r)/(n−1)` to it. KD's
+  `win_value ** 4` certainty gate is **only valid at two players** — with a binary
+  outcome the mean is a sufficient statistic for the distribution, and with three
+  or more it is not, so a certain second place and a coin flip between first and
+  last produce the identical gate. The correct generalisation is the variance of
+  the utility, floor-corrected for seat count:
+  `confidence = max(0, (1 − 4·Var[u] − floor_n)/(1 − floor_n)) ** k` with
+  `floor_n = 1 − (n+1)/(3(n−1))`. At two seats `floor = 0` and it reduces *exactly*
+  to `win_value ** 2`, so `k = 2` reproduces KD's curve rather than departing from
+  it. **`k = 1` is the starting default** — measured 2p confidence runs 0.10 → 0.54
+  over a game, and `k = 2` would leave margin contributing ~2% of leaf value at
+  turn 12. Derivation, the gradient-dead failure case, the seat-count floor and the
+  measurement are in `AUX_TARGETS_SPEC.md` §5.1–5.2.
+* Full head specification, including the six defects in the current
+  `training.TARGET_NAMES` set and the masking rules, is in
+  **`AUX_TARGETS_SPEC.md`**.
 * **Loss weights.** Score dominant early, policy next, auxiliaries small.
-  Normalise score by ~60.
+  **Normalise score by 80** (revised 2026-08-21, was ~60). The divisor is set
+  from real BGA games at the target strength, not from GreedyBot: observed
+  losing scores run 46–90 and winning scores 65–115, centring near 75–80.
+  Dividing by 80 puts typical play at ~0.94 and the observed range at 0.58–1.44,
+  with headroom above 1.0 for a net that outplays the reference. The head has no
+  final activation, so unbounded is intended. 120 would compress everything into
+  0.38–0.96 and weaken the score loss against policy and auxiliaries; 60 would
+  push strong games to 1.9 and saturate the `tanh` in the margin blend.
+  **Set `MARGIN_GAIN` only after the divisor**: at 80, margins of 5–40 points
+  normalise to 0.06–0.5, which `MARGIN_GAIN = 2.0` maps to `tanh(0.12 … 1.0)` —
+  responsive across the range without saturating. Expect early self-play targets
+  near 0.6 rising through training; the divisor is a unit, not a normalisation of
+  the current policy, so do not retune it as the net improves.
 * **One policy head or twelve?** All phases share one head with disjoint legal
   sets. One masked head is simpler and standard — measure before splitting it.
+* **Plan one-hot is 28 wide, not 37** (decided 2026-08-21). `PLANS` holds 37
+  entries for BGA id fidelity, but only 28 are ever dealt — stack 1 gets 11
+  (basic 0–5 + advanced 18–22), stack 2 gets 11 (basic 6–11 + advanced 23–27),
+  stack 3 gets 6 (basic 12–17). Ids 28–36 are the seasonal boards and
+  `available_plan_ids` never deals them, so a 37-wide one-hot carries **9
+  permanently dead input slots** — the same dead-input problem that settled
+  `MAX_OPPONENTS`. Use a dense `plan_id → index` map over the dealt set.
+  **Size it at the advanced superset (28) regardless of variant**, so a
+  base-rules game is a strict subset of the advanced input space — ten slots stay
+  dark, roundabout actions never enter the legal mask — and one weight set serves
+  both. That is what lets the advisor read base-rules tables and give sensible
+  (if untuned) advice without a second model. Full block layout in
+  `ENCODER_V2_SPEC.md`.
 
 **Gate:** batched inference throughput measured and recorded; ablation harness
 working via `encoder.block_slice(name)` so a feature block can be zeroed and the
@@ -155,7 +239,7 @@ to keep options open — use it as an evaluator, not a policy.
 ### Risks
 | risk | mitigation |
 |---|---|
-| Bootstrap teaches a plan-blind policy (greedy completes ~0.1 plans/game) | accept in M1; if M3 does not fix it, add a plan-seeking bot to the bootstrap mix |
+| Bootstrap teaches a plan-blind policy (greedy completes **0.42** plans/game) | accept in S0; if S1 does not fix it, add a plan-seeking bot to the bootstrap mix |
 | Phase 2 misprices temps and plans | do not let those heads calibrate in Phase 2; ramp into M5 rather than switching |
 | Symmetric self-play collapses | independent per-seat sampling; log `identical_games` |
 | Roundabout adds a 34-way branch for a rarely-right action | per-phase search budget; the decline is now sticky, so the branch cannot cycle |

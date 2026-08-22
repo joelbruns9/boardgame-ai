@@ -19,8 +19,9 @@ DESIGN CONTRACT
      composition is exact bookkeeping rather than an estimate.  Only the next
      *number* is unknown, and even that has an exact distribution.
 
-   Search must still call :meth:`GameState.redeterminize` at its root; a clean
-   encoder does not make a cheating rollout honest.
+   Search must still call :meth:`GameState.redeterminize` at its root, passing a
+   search RNG it advances between simulations; a clean encoder does not make a
+   cheating rollout honest, and a repeated determinization is not a sample.
 
 2. **Fixed shape.**  ``encode_state`` always returns ``(SPATIAL_SHAPE,
    NUM_SCALAR)`` regardless of player count, so one set of weights serves 2, 3
