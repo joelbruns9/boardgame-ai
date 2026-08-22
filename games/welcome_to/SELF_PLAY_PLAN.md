@@ -321,11 +321,43 @@ decision is *within* a turn, and the macro already collapses its most important
 part — but it is not what "search" usually buys, and the budget above ~256
 simulations is spent on root averaging, not depth.
 
-**The fix, if the S1 gate wants depth, is progressive widening on the chance
-branch**: cap observation children per action at something like `√N` so the tree
-revisits observations instead of always expanding a new one. That is a change to
-a design frozen above, so it is not made unilaterally — decide it against the
-gate result.
+**Do not reach for progressive widening.** An earlier version of this note called
+it "the fix"; that was written before the following measurement and is withdrawn.
+
+Ask first why keying is needed at all, given that open loop already averages over
+chance. Two distinct problems live below a chance node, and only the second
+justifies what was built. Measured one turn ahead, same action sequence, 40
+determinizations:
+
+| | |
+|---|---|
+| moves in the union that are only *conditionally* legal | **47%** |
+| distinct legal macro sets | 25 of 40 |
+| numbers a fixed `macro_write(slot, 0, box)` can mean | **13–15, spanning 1–15** |
+
+The first row is the selection bias §above describes. It is real — and it is the
+classic ISMCTS problem, which has a fix that costs no depth: **availability
+counts**, i.e. use "how often was this action available at this node" in the UCB
+denominator rather than the node's total visits. So row one alone would *not*
+justify observation keying.
+
+The third row is what does. A macro index is `(slot, delta, box)`; the move is
+`(number, box)`. At the root those coincide because the table is known. One turn
+out, "take slot 0, box 3" means writing anything from 1 to 15 — so merging those
+simulations averages opposite moves in a game whose entire constraint is
+ascending order. No UCB correction repairs that, because the node's identity is
+genuinely a lottery.
+
+Which points at the real conclusion: **if action identity below a boundary is
+that unstable, depth through a boundary is worth little however it is keyed.**
+Progressive widening would buy depth over lottery-ticket nodes. The design that
+would make depth meaningful is different — re-key the tree below the root by
+`(number, box)` and use availability counts; the tree need not share the policy
+head's vocabulary — and it is only worth building if depth turns out to matter.
+
+**Measure before building either.** Once S0 exists, run `arena.paired` at 64,
+256 and 1024 simulations. If strength is flat past ~128, the question is closed:
+cap the budget and spend the compute on games and network quality.
 
 (A first version of this note claimed depth was capped at 2 regardless of budget.
 That was measured at one position and was wrong; a rare line does reach 4. The

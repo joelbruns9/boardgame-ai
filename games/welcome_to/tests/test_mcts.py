@@ -178,11 +178,14 @@ def test_the_tree_barely_deepens_however_large_the_budget():
 
     So this is **one-turn lookahead over a value network**, not deep search: the
     root averages over many freshly-evaluated leaves rather than resolving a
-    tree.  Strength has to come from the network.  ``SELF_PLAY_PLAN.md`` calls
-    the added branching "confined and shallow", which is true of *where* chance
-    enters and misleading about the effect.  The fix is progressive widening on
-    the chance branch — capping observation children per action so the tree
-    revisits them — which changes a frozen design and is not done here.
+    tree.  Strength has to come from the network.
+
+    That is probably a property of the game rather than a defect to fix.  One
+    turn out, a fixed ``macro_write(slot, 0, box)`` means writing any number
+    from 1 to 15 — the index is ``(slot, delta, box)`` and the *move* is
+    ``(number, box)``, and those only coincide where the table is known.  Depth
+    through a boundary is therefore worth little however it is keyed.  See
+    ``SELF_PLAY_PLAN.md`` before building machinery to deepen this.
     """
     for turn in (4, 12):
         state = _position(players=2, turn=turn)
