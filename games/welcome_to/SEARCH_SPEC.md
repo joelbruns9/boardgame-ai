@@ -282,7 +282,26 @@ determinizations of one action sequence:
 
 So a reveal is an ordered triple of printed **card types**: **66 distinct types**
 in an 81-card deck (multiplicity 1–2), on the order of 277,000 valid ordered
-triples. **Exhaustive expansion is not available.**
+triples.
+
+⚠ **Exhaustive expansion is unavailable *early* and available *late*, and an
+earlier draft claimed it was simply unavailable.** The outcome space shrinks with
+the deck, and it shrinks fast. Measured, on real states, with the exact ordered
+type-triple space computed from the remaining multiset:
+
+| deck left | possible reveals | distinct of 16 sampled | collisions |
+|---|---|---|---|
+| **3** | **6** | 5 | **11** |
+| **6** | 120 | 15 | 1 |
+| 9 | 504 | 16 | 0 |
+| 12 | 1,020 | 16 | 0 |
+| 18 | 2,856 | 16 | 0 |
+| 30 | 14,160 | 16 | 0 |
+
+Because consumption is a multiple of three and reform happens at zero (§6.3), the
+deck passes through 6 and 3 **exactly once per cycle** — roughly 2 turns in 25.
+That regime is guaranteed to occur, and it is precisely where enumeration is
+trivial.
 
 ### 6.3 ⚠ The boundary is not always "draw three from the histogram"
 
@@ -353,7 +372,23 @@ actions are done and only chance remains".
 causally: from "the root player finishes acting" to "the root player acts again".
 One sample contains exactly the randomness consumed during that one transition —
 the opponents' decisions, wherever they fall relative to the reveal, and the
-boundary outcome — and **nothing else**. At it:
+boundary outcome — and **nothing else**.
+
+**Two edge classes, chosen by the size of the outcome space** (§6.2). This is why
+`seven_wonders_duel/search.py`'s three-class structure is worth porting faithfully
+— Welcome To genuinely uses both, rather than one plus defensive bookkeeping:
+
+| outcome space | edge | weights |
+|---|---|---|
+| small (late deck: 6 at `D=3`, 120 at `D=6`) | **`probability_weighted`** — enumerate every outcome | each outcome's **true** probability |
+| large (everything else) | **`fixed_support`** — sample `K` | `count/K` |
+
+Enumeration also **subsumes the merging question** in the only regime where
+merging fires: an enumerated edge lists each outcome once, so there is nothing to
+merge. Pick the threshold on outcome count, not on `deck_remaining` — a cap
+around a few hundred covers `D ≤ 6` cheaply and can be raised if profiling allows.
+
+At a sampled edge:
 
 - draw `K` transitions, each sampled causally end to end;
 - give every sample mass **`1/K`**; merge samples with **identical public
@@ -495,18 +530,32 @@ completes **0.42 plans per game** and is structurally race-blind, so using it as
 the opponent model would bake race-blindness into every value estimate the search
 produces, in a game whose entire competitive surface is the plan race.
 
-**Merging and particles are not built in v1.** Measured inert: at `K = 16`,
-sampled reveals were 16-of-16 distinct at every deck size tested, so every
-retained child holds exactly one particle and `count/K` collapses to `1/K`.
-Implement a **counter** that records any collision; build the machinery only if it
-ever fires. (Definitions, for the record: *merging* keeps one child at weight
-`2/K` when two samples reach the same viewer information state; *particles* handle
-the case where samples share a viewer information state but differ in hidden
-detail — most plausibly opponents having written different numbers this turn,
-invisible until the next boundary — where the child is a belief, not a state, and
-collapsing it to one canonical state narrows that belief silently.)
+**Merging and particles: not built for the sampled edge, and unnecessary for the
+enumerated one.**
 
-### 7.7 Root allocation: PUCT now, Gumbel as its own arm
+⚠ **An earlier version of this decision said merging is "measured inert", full
+stop. That was measured only down to 18 cards and is wrong at the small end** —
+at `D = 6` sampling 16 reveals collides once, and at `D = 3` there are only 6
+possible reveals, so 16 samples give 5 distinct and 11 collisions. The deck
+reaches both once per cycle by construction.
+
+The resolution is the edge split above, not a merging implementation: **enumerate
+exactly where the outcome space is small**, which is exactly where collisions
+occur, and where an enumerated edge has nothing to merge. On the sampled edge,
+collisions are genuinely absent — 16-of-16 distinct at every deck size from 9
+upward — so `count/K` collapses to `1/K` and each child holds one particle.
+
+Keep a **counter** on the sampled edge anyway. If it fires, the enumeration
+threshold is set too low, which is a cheaper fix than building particles.
+
+(Definitions, for the record: *merging* keeps one child at weight `2/K` when two
+samples reach the same viewer information state; *particles* handle samples that
+share a viewer information state but differ in **hidden** detail — most plausibly
+opponents having written different numbers this turn, invisible until the next
+boundary — where the child is a belief, not a state, and collapsing it to one
+canonical state narrows that belief silently.)
+
+### 7.7 Root allocation: Gumbel first, PUCT behind the same interface
 
 **These are separable from everything above**, because both searches consume the
 same priors and the same value head — so the network cannot tell which produced
@@ -523,10 +572,21 @@ games. Our masked 495-wide macro root is its intended shape.
 Serving is not the constraint: a human waiting on the BGA advisor will tolerate a
 far larger budget than self-play can afford per move.
 
+**Decided: start with Gumbel, build PUCT behind the same interface, and switch
+when the model plateaus and simulation counts rise.** That matches where each
+one's advantage lies — Gumbel's improvement guarantee binds hardest at small `n`,
+and PUCT is what the BGA advisor will most likely serve.
+
+⚠ **The switch changes the training target, not just the search.** Gumbel trains
+the policy head toward its completed-`Q` improved policy; PUCT trains it toward
+raw visit counts. Both are valid improvement operators, so the switch should be
+safe — but it is a discontinuity in the target distribution and should be
+measured across it (paired arena either side, plus policy-target entropy) rather
+than assumed harmless.
+
 ⚠ **Sequencing.** Sequential halving allocates a fixed budget across root actions
 in rounds, which interacts with a stochastic transition beneath each action.
-Compatible, but another moving part — land the chance node first, then add Gumbel
-as its own bakeoff arm.
+Compatible, but another moving part — land the chance node first, then Gumbel.
 
 ---
 
@@ -651,7 +711,9 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists
    even temporarily.
 8. **Run S0, then the bakeoff** (§11).
-9. **Only then:** progressive widening, Gumbel root allocation, afterstate head.
+9. **Gumbel root allocation** (§7.7) — the intended default for self-play, with
+   PUCT retained behind the same interface for the later switch.
+10. **Only then:** progressive widening, afterstate head.
 
 Steps 1–3 are small, independent of the review's outcome, and can start now.
 Steps 4–7 are what this document exists to have reviewed; step 7 should not begin
