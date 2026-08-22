@@ -298,6 +298,39 @@ this reason — see the fix note in §5. Passing the state's own generator, or c
 it without one as the old signature allowed, returns the identical shuffle every
 time.
 
+#### ⚠ Measured: keying chance exactly means the tree does not deepen
+
+Built and measured 2026-08-21. "The branching this adds is confined and shallow"
+is true of *where* chance enters and **misleading about the effect**. A turn
+boundary reveals three fresh cards, so a crossing almost always produces a key
+never seen before, and therefore a fresh leaf rather than a revisit.
+
+Mean leaf depth, over 2p and 3p positions at turns 4, 12 and 20:
+
+| sims | mean leaf depth | max depth |
+|---|---|---|
+| 64 | 1.23 – 1.77 | 2 |
+| 256 | 1.26 – 2.00 | 2 – 4 |
+| 1024 | 1.34 – 2.00 | 3 – 4 |
+
+**It plateaus at about 2 by 256 simulations and stops responding to the budget.**
+So what was built is *one-turn lookahead over a value network*: the root averages
+many freshly-evaluated leaves rather than resolving a tree, and strength has to
+come from the network. That is not obviously wrong for this game — the coupled
+decision is *within* a turn, and the macro already collapses its most important
+part — but it is not what "search" usually buys, and the budget above ~256
+simulations is spent on root averaging, not depth.
+
+**The fix, if the S1 gate wants depth, is progressive widening on the chance
+branch**: cap observation children per action at something like `√N` so the tree
+revisits observations instead of always expanding a new one. That is a change to
+a design frozen above, so it is not made unilaterally — decide it against the
+gate result.
+
+(A first version of this note claimed depth was capped at 2 regardless of budget.
+That was measured at one position and was wrong; a rare line does reach 4. The
+mean is the number that holds.)
+
 Budget per phase, not flat: half of all decisions have two options, and the width
 is concentrated in `WRITE_NUMBER` (13.1 mean, 165 max) and `ACTION_SURVEYOR`
 (28.5).
@@ -309,7 +342,15 @@ of something greedy structurally cannot do.
 
 **The paired-seed harness built here is permanent.** Any change to search or the
 network gets a paired-seed score against a fixed opponent before it gets a
-training run.
+training run. Built as `arena.py`: one rotating seat substituted against
+GreedyBots on identical RNG streams, paired against the same game with a
+GreedyBot in that seat.
+
+⚠ **Measured: how many games the gate needs.** GreedyBot against GreedyBot at two
+seats has a per-game paired-delta standard deviation of about **18 points**, so
+the standard error is `18/√n` — **4.1 at 60 games, 1.0 at 330**. A 4-point gate
+read off 60 games sits inside its own noise and means nothing. Run ~300+ paired
+games and read `score_gap_stderr` every time, not the gap alone.
 
 ### S2 — The first self-play loop *(the main stage)*
 
