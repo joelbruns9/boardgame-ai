@@ -315,6 +315,14 @@ class MCTS:
             guard += 1
             if guard > 5000:  # pragma: no cover - a stuck engine, not a rules case
                 raise RuntimeError("opponents did not yield the turn")
+        # ⚠ UNDER-SPECIFIED, deliberately recorded rather than quietly fixed.
+        # This is raw card **IDs**, and it carries neither the opponents' now
+        # public sheets nor the race state.  It costs nothing while reveals are
+        # near-unique -- measured, 0 spurious splits in 60 samples -- because
+        # nothing is ever reused.  It becomes wrong the moment chance children
+        # are deliberately retained, which is what SELF_PLAY_PLAN.md's sparse
+        # chance design does: 15 of the 66 printed card types have two physical
+        # copies, so identical-looking reveals would key to different children.
         return tuple(state.table_cards(root))
 
     def _leaf(self, state: GameState, root: int) -> tuple[Optional[Node], float]:

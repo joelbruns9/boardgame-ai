@@ -443,6 +443,107 @@ thing rests on the availability counts being right. Compare depth *and*
 `arena.paired` strength, merged-with-availability against the current
 observation-keyed version, at equal budget. Do not assume it wins.
 
+#### External review, 2026-08-22: sparse chance sampling is the reference design
+
+Reviewed independently, verified against the engine, and it corrects two things
+above.
+
+**Correction 1 - the reveal is not "entirely in the numbers".** That is true only
+of the *current* offer. A construction card prints its own effect on its number
+face, so the card drawn at a boundary supplies a number for **this** turn and an
+effect for the **following** one (`next_effects`). Measured, one turn ahead over
+60 determinizations of one action sequence:
+
+| | distinct |
+|---|---|
+| effects in play this turn | **1** (certain) |
+| effects for the following turn | **46** |
+
+So a reveal is an ordered triple of printed **card types**, not of numbers. There
+are 66 distinct printed types in an 81-card deck (multiplicity 1-2), giving on the
+order of 277,000 valid ordered type triples - exhaustive chance expansion is not
+available, which the design above already assumed.
+
+This also weakens the `(number, effect, box)` edge proposed above: it is lossy
+(a 7 printed vs a 7 made with TEMP consume different cards) and, more seriously,
+**context-abstracted** - one `Q` averaged over what the other two offers are, what
+next-turn effects were just exposed, and the opponents' race state. Keep it as an
+experimental arm, not the reference.
+
+**Correction 2 - the observation key is under-specified.** `MCTS._advance`
+returns `tuple(state.table_cards(root))`: raw card **IDs**, with no opponent
+sheets and no race state. Measured, the ID granularity costs nothing today - 0
+spurious splits in 60 samples, because near-unique triples mask it - which is
+precisely why it would bite as soon as chance children are deliberately reused.
+15 of the 66 printed types have two physical copies.
+
+**Correction 3 - progressive widening was withdrawn for a bad reason.** "Sharper
+priors do not deepen the tree" is measured and true; it does **not** imply that
+nothing structural does. Prior sharpening still draws a fresh reveal every
+simulation. Progressive widening changes that behaviour by capping stochastic
+children and revisiting them. Two different claims; only the first was tested.
+
+**The recommended design.** Search the player's deterministic decisions normally
+(the macro vocabulary already removes the artificial choose/write split), then
+insert an **explicit sampled chance node at the turn boundary**, on a canonical
+pre-reveal afterstate before `_draw_step`. Sample `K` reveals from the exact
+remaining histogram, **retain those children for the whole search**, and back up
+their arithmetic mean - chance nodes average, they do not PUCT. Start with
+`K = 4, 8, 16`. Retained children are revisited *by construction*, which is the
+one thing neither exact keying nor prior sharpening can produce. This is sparse
+sampling (Kearns/Mansour/Ng) and the setting of Monte Carlo *-Minimax, which was
+built for densely stochastic games and evaluated on Can't Stop.
+
+**Use common random scenarios across candidate root actions.** The reveal
+distribution does not depend on which house the root player wrote (reshuffle
+aside), so candidates should be compared against the *same* sampled scenarios,
+which cancels most of the variance in their differences. Opponent samples can be
+reused for the same reason: opponents cannot see the root player's concurrent
+choice.
+
+⚠ **Two cautions before building it.**
+
+*The bias/variance trade runs the other way at the root.* Drawing a fresh reveal
+per simulation - what is built today - makes the root's `Q` an average over ~N
+distinct futures: unbiased, high N. Fixed-`K` sparse sampling replaces that with
+an average over `K` fixed futures: lower variance, but biased by that sample, and
+every simulation past the `K`th reuses it. Sparse sampling is **not** strictly
+more accurate; it trades a worse depth-1 expectation for having a depth-2 at all.
+Measure root value bias directly, or a depth-1 regression will hide inside a
+depth-2 gain. Late-game states with a small remaining deck are the oracle:
+enumerate every legal ordered reveal exactly and compare each approximation's
+root ranking and value bias against it.
+
+*The scenario must include the opponents, or the child is not well defined.* The
+review asks the child key to carry now-public opponent sheets, but opponent
+actions are **sampled**, not chance, and the current design deliberately keeps
+them out of the key so a node averages over the opponent model. Retaining a
+chance child while resampling opponents leaves the child's state undefined. The
+coherent reading is the review's own common-random-streams: a scenario `w` is
+**deck order and opponent randomness together**, and retained children are
+indexed by `w`. Half of this - retained deck, resampled opponents - produces a
+plausible-looking tree with incoherent statistics.
+
+**Then, only if sparse chance wins:** distil the expectation into an *afterstate
+value head*, `V_after(x) = E_c[V_post(x, c)]`, trained against an average over
+several independently sampled immediate reveals, so a turn's search can stop at
+the pre-reveal afterstate for one network call. This is Stochastic MuZero's
+afterstate factorisation, which is worth borrowing without the rest of it since
+the chance distribution here is known exactly. It is a real build - new head, new
+target, several reveals sampled per training position - so gate it on the arm
+winning first.
+
+**Bakeoff**, at equal wall-clock *and* equal network-evaluation budget: current
+(fresh reveal per simulation) | semantic-edge ISMCTS with availability counts |
+sparse chance at `K = 4/8/16` | sparse chance plus afterstate head. Report paired
+score gap and stderr over 300+ games, strength at 64/128/256 evaluations, mean
+turn boundaries crossed, action agreement across search RNGs, root value stderr,
+evaluations and wall time per move, and plans / permits / end reasons.
+
+**Sequencing: this waits on S0.** Every arm needs a trained network to compare;
+on an untrained one both arms produce noise, which is how two claims in this
+document came to be wrong.
+
 **Measure before building any of it.** Once S0 exists, run `arena.paired` at 64,
 256 and 1024 simulations. If strength is flat past ~128 the question is closed,
 and the compute belongs in games and network quality instead. If it is not flat,
