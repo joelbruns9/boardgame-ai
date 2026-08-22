@@ -202,21 +202,17 @@ Implemented in `network.py` (shared sheet encoder → trunk → per-seat + globa
 heads, 3.94M parameters) and `train.py` (`python -m games.welcome_to.train`),
 which reports all three numbers and exits non-zero if any fails.
 
-⚠ **S0 is built but has not been run, and must not be run yet.** The policy head
-is still the 357 primitive actions; the frozen vocabulary is the 684 macro one
-(`ENCODER_V2_SPEC.md` §10.6), and under it there are **no `WRITE_NUMBER` network
-calls at all**. So a top-1 agreement number measured now would be measured
-against a representation S1 discards, on a phase S1 never evaluates.
+**S0 is built and now speaks the frozen 684-macro vocabulary** — `macro_codec`
+landed first, as planned, so the top-1 number this gate produces is measured in
+the representation S1 actually uses. The corpus did not need recapturing:
+trajectories are stored as primitives and `datagen.replay` does the collapse.
 
-Decided 2026-08-21: `macro_codec` is built as **the first deliverable of S1**,
-alongside `mcts.py`, because the two share the legality work — a macro index is
-legal iff its whole primitive sequence is legal end to end, which is the same
-enumeration the search needs for edge construction. The order inside S1 is
-therefore: `macro_codec` → run S0 against macro labels → `mcts.py` → the S1 gate.
-
-The corpus itself is unaffected and does not need recapturing: trajectories are
-stored as primitives and `datagen.replay` does the collapse, so today's capture
-code already produces tomorrow's labels.
+One consequence for reading the gate: a decision is now a *macro*, so the top-1
+denominator is 28% smaller than it was and each label is harder — one choice
+among up to ~500 combination-and-placement pairs rather than one among three
+slots followed by one among thirteen boxes. The ≥ 60% threshold was written
+against primitives and has not been re-derived for macros; treat the first
+measurement as calibration.
 
 **The paired comparison replaces one seat, not the whole table.** The first
 implementation played an all-net game against an all-greedy game at the same

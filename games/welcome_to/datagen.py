@@ -39,8 +39,8 @@ from typing import Callable, Iterator, Optional, Sequence
 import numpy as np
 
 from games.welcome_to import encoder as enc
+from games.welcome_to import macro_codec as mc
 from games.welcome_to import training
-from games.welcome_to.action_codec import NUM_ACTIONS
 from games.welcome_to.game import GameConfig, GameState
 
 #: A policy is anything that maps a state to a legal action index.
@@ -139,7 +139,13 @@ def play_trajectory(
 
 
 def replay(trajectory: Trajectory) -> Iterator[Sample]:
-    """Re-run a trajectory, yielding an encoded sample per decision.
+    """Re-run a trajectory, yielding an encoded sample per **macro** decision.
+
+    The stored trajectory is primitive; the labels are not.  ``macro_codec``
+    collapses each ``CHOOSE_STACK -> (WRITE | PERMIT_REFUSAL)`` pair into one
+    action, so no sample is emitted at ``WRITE_NUMBER`` -- under the frozen
+    vocabulary the network is never asked there.  Keeping the corpus primitive
+    is what lets the vocabulary change without recapturing a single game.
 
     Raises if a recorded action is no longer legal, which is what makes a rules
     change invalidate stale data loudly instead of quietly.
@@ -147,21 +153,20 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
     state = GameState.new(seed=trajectory.seed, config=trajectory.config)
     visits: list[tuple] = []
 
-    for action in trajectory.actions:
-        actor = state.actor
+    for visited, macro in mc.collapse(state, trajectory.actions):
+        actor = visited.actor
         visits.append(
             (
-                enc.encode_state(state),
-                state.legal_mask(),
-                action,
+                enc.encode_state(visited),
+                mc.legal_mask(visited),
+                macro,
                 actor,
-                state.turn,
+                visited.turn,
                 # the seat axis is captured with the encoding, because the
                 # targets have to be indexed by the same one
-                enc.seat_order(state, actor),
+                enc.seat_order(visited, actor),
             )
         )
-        state.apply(action)
 
     if not state.is_terminal:
         raise ValueError("trajectory does not reach a terminal state")
@@ -204,7 +209,7 @@ def batch(samples: Sequence[Sample]) -> dict[str, np.ndarray]:
     assert out["sheet_scalars"].shape == (n, enc.MAX_SEATS, enc.NUM_SHEET_SCALAR)
     assert out["viewer_plane"].shape == (n, *enc.VIEWER_PLANE_SHAPE)
     assert out["global_scalars"].shape == (n, enc.NUM_GLOBAL_SCALAR)
-    assert out["legal"].shape == (n, NUM_ACTIONS)
+    assert out["legal"].shape == (n, mc.NUM_MACRO_ACTIONS)
     for name in training.PER_SEAT_TARGETS:
         assert out[name].shape == (n, training.MAX_SEATS), name
     for name in training.GLOBAL_TARGETS:

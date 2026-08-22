@@ -54,6 +54,7 @@ import torch
 
 from games.welcome_to import datagen
 from games.welcome_to import encoder as enc
+from games.welcome_to import macro_codec as mc
 from games.welcome_to import network as nw
 from games.welcome_to import training
 from games.welcome_to.bots import GreedyBot
@@ -212,18 +213,23 @@ def evaluate(
 
 
 def greedy_policy(net: nw.WelcomeToNet, device: torch.device):
-    """Play the policy head's best legal action.  No search, no sampling."""
+    """Play the policy head's best legal **macro**.  No search, no sampling.
+
+    Returns a function that *applies* the move rather than one that returns an
+    index, because a macro is up to two engine steps and the caller has no way
+    to apply it without knowing that.
+    """
 
     @torch.no_grad()
-    def policy(state: GameState) -> int:
+    def play(state: GameState) -> None:
         net.eval()
         arrays = enc.encode_state(state)
         tensors = [torch.as_tensor(a).unsqueeze(0).float().to(device) for a in arrays]
         logits = net(*tensors)["policy_logits"][0]
-        legal = torch.as_tensor(state.legal_mask()).to(device)
-        return int(logits.masked_fill(legal <= 0, -1e9).argmax())
+        legal = torch.as_tensor(mc.legal_mask(state)).to(device)
+        mc.apply_macro(state, int(logits.masked_fill(legal <= 0, -1e9).argmax()))
 
-    return policy
+    return play
 
 
 def paired_score_gap(
@@ -273,8 +279,10 @@ def paired_score_gap(
         state = GameState.new(seed=game_seed, config=config)
         while not state.is_terminal:
             actor = state.actor
-            action = policy(state) if actor == net_seat else bots[actor].act(state)
-            state.apply(action)
+            if actor == net_seat:
+                policy(state)
+            else:
+                state.apply(bots[actor].act(state))
         return state.scores()
 
     for i, players in enumerate(counts):

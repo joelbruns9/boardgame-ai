@@ -69,7 +69,7 @@ from torch.nn import functional as F
 
 from games.welcome_to import encoder as enc
 from games.welcome_to import training
-from games.welcome_to.action_codec import NUM_ACTIONS
+from games.welcome_to.macro_codec import NUM_MACRO_ACTIONS
 
 #: Per-seat regression outputs, in head order.  Derived from the target set so
 #: that adding a target and forgetting the head is impossible.
@@ -197,7 +197,7 @@ class WelcomeToNet(nn.Module):
         )
         self.trunk_out = nn.LayerNorm(c.trunk_hidden)
 
-        self.policy_head = _mlp([c.trunk_hidden, c.head_hidden, NUM_ACTIONS])
+        self.policy_head = _mlp([c.trunk_hidden, c.head_hidden, NUM_MACRO_ACTIONS])
         # contextual: the seat AND the game it is in
         self.per_seat_head = _mlp(
             [c.sheet_out + c.trunk_hidden, c.head_hidden, len(PER_SEAT_HEAD_TARGETS)]

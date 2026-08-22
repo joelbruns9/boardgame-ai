@@ -909,13 +909,17 @@ Answering each open question directly:
 the search's edge construction, so it can be reverted to primitives without
 touching the rules.
 
-**Status (2026-08-21): not built.** `network.py` and `train.py` were built against
-the 357 primitive vocabulary, which means the S0 policy head and its top-1 gate do
-not validate what S1 will use — a real gap, not a simplification. Decided: build
-`macro_codec` as the first deliverable of S1, with `mcts.py`, since both need the
-same end-to-end sequence legality. **S0 is not to be run until it lands.** The
-stored corpus is unaffected — trajectories are primitive and the collapse happens
-in `datagen.replay`.
+**Status (2026-08-21): BUILT** — `macro_codec.py`, wired into `datagen.replay`,
+`network.py` and `train.py`. The layout above is exact; `test_macro_codec.py`
+pins it.
+
+Two things worth recording from building it. **Legality really is enumerated**:
+`legal_macros` steps into each playable slot and reads the child's own
+`legal_actions()`, so the engine stays the only authority on the rules — a
+re-derivation would have been a second copy of `argWriteNumber` to keep in sync.
+And **the collapse removed 28% of network calls** on GreedyBot games (8808
+primitive decisions → 6360 macro), which is the `WRITE_NUMBER` branching
+disappearing as predicted.
 
 **Flat, not bilinear.** At 684 a flat masked head is ~350k params at D=512, while
 bilinear needs a D×D interaction (~262k) *plus* two encoders — the larger model,

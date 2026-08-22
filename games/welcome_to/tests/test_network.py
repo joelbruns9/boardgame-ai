@@ -11,7 +11,7 @@ from games.welcome_to import encoder as enc
 from games.welcome_to import network as nw
 from games.welcome_to import train as tn
 from games.welcome_to import training
-from games.welcome_to.action_codec import NUM_ACTIONS
+from games.welcome_to.macro_codec import NUM_MACRO_ACTIONS
 from games.welcome_to.bots import GreedyBot
 from games.welcome_to.game import GameConfig, GameState
 
@@ -62,7 +62,7 @@ def test_forward_shapes():
     net = nw.WelcomeToNet(_SMALL)
     out = _forward(net, batch)
     n = batch["action"].shape[0]
-    assert out["policy_logits"].shape == (n, NUM_ACTIONS)
+    assert out["policy_logits"].shape == (n, NUM_MACRO_ACTIONS)
     assert out["rank_logits"].shape == (n, training.MAX_RANKS)
     assert out["per_seat"].shape == (n, enc.MAX_SEATS, len(nw.PER_SEAT_HEAD_TARGETS))
     for name in nw.PER_SEAT_HEAD_TARGETS:
@@ -311,16 +311,22 @@ def test_the_corpus_carries_every_seat_count():
     assert {t.players for t in corpus} == {2, 3, 4}
 
 
-def test_the_greedy_policy_plays_legal_moves():
+def test_the_greedy_policy_plays_legal_macros():
+    """The policy applies the move rather than returning one: a macro is up to
+    two engine steps, and a caller holding an index cannot apply it alone."""
+    from games.welcome_to import macro_codec as mc
+    from games.welcome_to.game import Phase
+
     net = nw.WelcomeToNet(_SMALL)
-    policy = tn.greedy_policy(net, torch.device("cpu"))
+    play = tn.greedy_policy(net, torch.device("cpu"))
     state = GameState.new(seed=4, config=GameConfig(players=2, advanced=True))
     for _ in range(30):
         if state.is_terminal:
             break
-        action = policy(state)
-        assert action in state.legal_actions()
-        state.apply(action)
+        assert state.phase is not Phase.WRITE_NUMBER, "a macro left the game mid-write"
+        before = state.turn, state.actor, state.phase
+        play(state)
+        assert (state.turn, state.actor, state.phase) != before, "nothing happened"
 
 
 # ──────────────────────────────────────────────────────────────────────────
