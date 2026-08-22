@@ -870,6 +870,14 @@ is where the coupling is: you pick a combination *for* a placement, and a sequen
 decomposition scores "take slot 2" by the *mean* quality of its placements rather
 than its best — backwards, since you choose the placement.
 
+⚠ **That last clause is overstated and `SEARCH_SPEC.md` §3 corrects it.** A
+correctly built deterministic tree does *not* inherently price a stack by the mean:
+the stack child is another node controlled by the same player, and UCT is
+consistent — with enough visits the backup approaches the best continuation. The
+macro's real case is finite-budget credit assignment, action semantics, and the
+measured 28% of network evaluations it removes. It is still the right call; the
+reason above is not the reason.
+
 | index range | n | contents | legal when |
 |---|---|---|---|
 | macro write | 495 | `(slot, temp delta, box)`, `3 × 5 × 33` | `CHOOSE_CARDS` |

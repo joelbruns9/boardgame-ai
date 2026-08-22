@@ -4,13 +4,16 @@
 and described here as built. The chance boundary is **proposed, not built** — §6
 onward is for review before implementation.
 
-**Reads with:** `SELF_PLAY_PLAN.md` S1 (the root-player contract and the gate),
-`ENCODER_V2_SPEC.md` §10.6 (the frozen 684 action vocabulary),
-`AUX_TARGETS_SPEC.md` §5 (the leaf value).
+**Revision, 2026-08-22.** A first draft of this document was reviewed and its
+chance-node design **blocked on three logic errors**: it retained future deck
+order in a scenario (strategy fusion), it specified the sampled-support weighting
+incorrectly, and it modelled the boundary as "draw three cards", which the engine
+does not always do. All three are corrected below and the wrong versions are
+recorded so they are not reintroduced.
 
-**Reference implementation for §6:** `games/seven_wonders_duel/search.py` already
-does fixed-support chance edges, has been reviewed twice, and documents the
-invariant that a naive version violates. Port it; do not redesign it.
+**Reads with:** `SELF_PLAY_PLAN.md` S1 (root-player contract, gate),
+`ENCODER_V2_SPEC.md` §10.6 (frozen 684 vocabulary), `AUX_TARGETS_SPEC.md` §5
+(leaf value). Research references are collected in §13.
 
 ---
 
@@ -19,25 +22,24 @@ invariant that a naive version violates. Port it; do not redesign it.
 Two things, and they are independent:
 
 1. **Within a turn** — how the root player's own sequence of decisions is
-   represented in the tree. Settled; §3–§5.
-2. **At the turn boundary** — how the card reveal is represented. Open; §6–§9.
+   represented. Settled; §3–§5.
+2. **At the turn boundary** — how the card reveal is represented. Open; §6–§10.
 
-The reason they are independent is the single most useful structural fact about
-this game:
+They are independent because of the single most useful structural fact about this
+game:
 
 > **No chance occurs inside a turn.** Every transition from the start of a
 > player's turn to the end of it is deterministic given their actions.
 
-That makes the within-turn subtree exactly reproducible across simulations, so
-its nodes take repeat visits and its values back up through exact deterministic
+So the within-turn subtree is exactly reproducible across simulations, its nodes
+take repeat visits, and its values back up through exact deterministic
 transitions. Everything difficult is at the boundary.
 
 ---
 
 ## 2. The engine's phase graph — ground truth
 
-Transcribed from `game.py`; this is what the search must respect, not a model of
-it. Twelve phases (`Phase`), mirroring `states.inc.php`.
+Transcribed from `game.py`. Twelve phases (`Phase`), mirroring `states.inc.php`.
 
 ```
                     ┌───────────────────────────────────────┐
@@ -66,15 +68,15 @@ it. Twelve phases (`Phase`), mirroring `states.inc.php`.
                     │              │                   │
                     │              └───────────────────┘
                     ▼
-            next seat, or the TURN BOUNDARY
+            next seat, or the TURN BOUNDARY (§6.3)
 ```
 
 Facts that are easy to get wrong and are load-bearing:
 
 - **`ASK_RESHUFFLE` returns to `CHOOSE_PLAN`, not to the turn end.** A player may
-  validate more than one City Plan in a turn, so the plan/validate/reshuffle
-  section is a **loop**, not a chain.
-- **A permit refusal reaches `CHOOSE_PLAN` from two different places** — from
+  validate more than one City Plan in a turn, so plan/validate/reshuffle is a
+  **loop**, not a chain.
+- **A permit refusal reaches `CHOOSE_PLAN` from two different phases** — from
   `CHOOSE_CARDS` when nothing is playable at all, and from `WRITE_NUMBER` when
   the taken combination's *printed* number has nowhere to go. Both skip every
   effect phase.
@@ -83,9 +85,8 @@ Facts that are easy to get wrong and are load-bearing:
   passing sets `ctx.roundabout_declined`, and both guard the offer.
 - **`_settle()` resolves four transitions without asking**: `ACTION_PARK` with no
   available street, `ACTION_POOL` when unavailable, `CHOOSE_PLAN` with nothing
-  scorable, and `ASK_RESHUFFLE` when the reshuffle is not on offer. **These are
-  not decisions and must never become nodes.** The engine already collapses them;
-  the search inherits that for free.
+  scorable, `ASK_RESHUFFLE` when the reshuffle is not on offer. **These are not
+  decisions and must never become nodes.**
 
 ---
 
@@ -93,16 +94,6 @@ Facts that are easy to get wrong and are load-bearing:
 
 `macro_codec.py`, implementing `ENCODER_V2_SPEC.md` §10.6. **One** split is
 collapsed: `CHOOSE_CARDS → WRITE_NUMBER`.
-
-The reason is not throughput. **You pick a combination *for* a placement**, so
-evaluating the two steps separately prices "take stack 2" by the *mean* quality
-of the placements it leads to, when the player gets to choose the placement and
-it is therefore worth what its *best* placement is worth. A sequential
-decomposition answers a question nobody asked.
-
-The temp-agency delta belongs inside the macro for a concrete reason: it changes
-**placement legality**, so it cannot be deferred to a later node without making
-the write node's legal set depend on a decision that has not been taken.
 
 ```
 macro write     495   (stack, temp delta, box) = 3 × 5 × 33   at CHOOSE_CARDS
@@ -114,45 +105,61 @@ primitives      184   the 357-slot codec minus the four above at their phases
                 684
 ```
 
-**Measured:** the collapse removes **28% of network calls** — 8,808 primitive
-decisions become 6,360 macro ones over 30 three-seat GreedyBot games. There are
-**no `WRITE_NUMBER` evaluations at all**, which is where the branching lived
-(13.1 mean, 165 max).
+⚠ **Corrected justification.** An earlier draft — and `ENCODER_V2_SPEC.md` §10.6,
+which has the same wording — said a sequential decomposition "scores *take stack
+2* by the **mean** quality of its placements rather than its best". **That is not
+true of a correctly constructed deterministic tree.** The stack child is another
+decision node controlled by the same player, and UCT is consistent under its
+standard assumptions: with enough visits, selection concentrates on the best
+continuation and the backup approaches the max, not the mean (§13, Kocsis &
+Szepesvári).
+
+The macro is still right, for **finite-budget and action-semantics** reasons:
+
+- it matches the semantic unit of choice — you pick a combination *for* a
+  placement;
+- it removes an intermediate action that has no meaning on its own;
+- it shortens the horizon and improves credit assignment at realistic budgets;
+- **measured: it removes 28% of network evaluations** — 8,808 primitive
+  decisions become 6,360 macro ones over 30 three-seat GreedyBot games, and there
+  are no `WRITE_NUMBER` evaluations at all, which is where the branching lived
+  (13.1 mean, 165 max).
+
+The temp delta must stay inside the macro for a hard reason: **it changes
+placement legality**, so deferring it would make the write node's legal set
+depend on a decision not yet taken.
 
 **Legality is enumerated end to end, never intersected.** `legal_macros` steps
 into each playable stack and reads that child's own `legal_actions()`, because
-`WRITE` legality depends on which stack was taken — intersecting per-step masks
-would admit jointly-illegal pairs. This also keeps the engine the sole authority
-on the rules. Verified: 193,400 legal macros applied across 6,360 macro roots
-without one illegal step.
+`WRITE` legality depends on which stack was taken. Verified: 193,400 legal macros
+applied across 6,360 macro roots without one illegal step.
 
 ---
 
 ## 4. The within-turn node table — as implemented
 
-One phase is active at a time. The network emits 684 logits and the legal mask
+One phase is active at a time; the network emits 684 logits and the legal mask
 exposes only that phase's actions.
 
-| node | vocabulary | width | notes |
+| node | vocabulary | width | after §5.1 pruning |
 |---|---|---|---|
-| roundabout declaration | `ROUNDABOUT_OPEN` vs a card action | — | not a separate node; it is one entry in the `CHOOSE_CARDS` set |
-| roundabout placement | box, or pass | 34 | `ROUNDABOUT_PLACE` |
-| **combination + write** | (stack, temp delta, box) | **495** | the macro; heavily masked |
-| refusal | stack-specific, or direct | 4 | 3 macro + 1 direct |
-| surveyor | fence, or pass | 31 | 30 fence slots |
-| estate | row, or pass | 7 | 6 value rows |
-| park | street, or pass | 4 | normally 1 street + pass |
-| pool | build, or pass | 2 | |
-| bis | (box, side), or pass | 67 | 33 boxes × 2 sides |
-| city plan | slot, or pass | 4 | loops back after reshuffle |
-| plan estate validation | matching estate | ≤ 33 | sequential, only for `EstatePlan` |
-| reshuffle | yes / no | 2 | |
+| roundabout declaration | one entry in the `CHOOSE_CARDS` set | — | unchanged |
+| roundabout placement | box, or pass | 34 | **33** (pass pruned) |
+| **combination + write** | (stack, temp delta, box) | **495** | unchanged |
+| refusal | stack-specific, or direct | 4 | unchanged |
+| surveyor | fence, or pass | 31 | unchanged — a real decision |
+| estate | row, or pass | 7 | **6** (pass pruned) |
+| park | street, or pass | 4 | **node disappears** |
+| pool | build, or pass | 2 | **node disappears** |
+| bis | (box, side), or pass | 67 | unchanged — a real decision |
+| city plan | slot, or pass | 4 | unchanged |
+| plan estate validation | matching estate | ≤ 33 | unchanged |
+| reshuffle | yes / no | 2 | unchanged |
 
 **Measured cost:** a turn costs **1.91 network decisions on average** —
 distribution 2 in 169 turns, 1 in 62, 7–8 in 8, over 239 sampled turns of
-two-seat advanced play. Most turns are the macro plus at most one effect node.
-(Measured under a fixed "first legal macro" policy; the exact mean will shift
-with a trained policy, the shape will not.)
+two-seat advanced play. (Measured under a fixed "first legal macro" policy; the
+mean will shift with a trained policy, the shape will not.)
 
 ---
 
@@ -160,8 +167,8 @@ with a trained policy, the shape will not.)
 
 Rejected. Two independent reasons, both measured.
 
-**It is too large to index.** A complete-turn action — roundabout, write,
-effect, plan, validation, reshuffle as one choice — has, over 239 sampled turns:
+**It is too large to index.** A complete-turn action — roundabout, write, effect,
+plan, validation, reshuffle as one choice — over 239 sampled turns:
 
 | | sequences per turn |
 |---|---|
@@ -172,57 +179,51 @@ effect, plan, validation, reshuffle as one choice — has, over 239 sampled turn
 
 A flat head cannot index that, and a fixed vocabulary would have to cover the
 union rather than the realised set. It would need a factored or autoregressive
-decoder — a large build.
+decoder.
 
 **And it buys nothing.** Because no chance occurs inside a turn, the within-turn
-chain is **already fully revisitable**: the same keys recur in every simulation
-and the chain is developed to its natural length. To the search it already
-behaves like one optimised contingent plan, without materialising every plan as
-a root edge. Bundling would save **0.91 network calls per turn** and cost the
-conditional sharing that lets a fence-placement policy be learned across every
-write that leads to the same surveyor state.
+chain is **already fully revisitable** — the same keys recur every simulation and
+the chain develops to its natural length. Bundling would save **0.91 network
+calls per turn** and cost the conditional sharing that lets a fence-placement
+policy be learned across every write that reaches the same surveyor state.
 
-### 5.1 Sub-decisions that look forced but are kept
+### 5.1 Dominance pruning — search-only, not an engine change
 
-An argument was made for auto-applying park, pool and estate on the grounds that
-declining is never right. **The game reasoning appears sound** — all three only
-advance a scoring track:
+Park, pool and estate passes are **dominated**, and the search should not spend
+budget on them. This is a *provable* property, not a valuation:
 
-```
-ACTION_ESTATE : sheet.estate_marks[row] += 1
-ACTION_PARK   : sheet.parks[x] += 1
-ACTION_POOL   : sheet.pools[street] += 1
-```
+- `PARK_SCORES` rows are strictly increasing — `(0,2,4,10)`, `(0,2,4,6,14)`,
+  `(0,2,4,6,8,18)`; `POOL_SCORES` is strictly increasing —
+  `(0,3,6,9,13,17,21,26,31,36)` (`constants.py`);
+- all three consume **no** box, fence, number, turn or personal resource — they
+  only advance a track: `estate_marks[row] += 1`, `parks[x] += 1`,
+  `pools[street] += 1`;
+- every plan predicate that reads parks or pools (`DECORATIVE`,
+  `COMPLETE_STREET`) is **monotone** — more can only help;
+- **plans are not auto-validated** (`CHOOSE_PLAN` has `PASS_PLAN`), so taking a
+  park can never force an unwanted three-plan game end.
 
-No box is consumed, no number written, no fence placed, and the City Plans that
-touch parks and pools (`DECORATIVE`, `COMPLETE_STREET`) all want *more* of them.
-Whereas **bis** calls `sheet.write(..., is_bis=True)` — it fills a box and takes
-the penalty — and the **surveyor fence** partitions a street into estates and can
-destroy an `EstatePlan`'s required sizes. So bis and fence are genuine decisions
-and park/pool/estate look forced.
+Bis and the surveyor fence are **not** dominated and keep their pass: bis calls
+`sheet.write(..., is_bis=True)`, filling a box and taking the penalty, and the
+fence partitions a street into estates and can destroy an `EstatePlan`'s required
+sizes.
 
-**They are kept anyway**, for three reasons:
+⚠ **Estate is not a yes/no.** `estate_rows()` is a choice of *which* value row to
+advance and the rows score differently, so pruning removes the pass and leaves a
+≤6-way node. Park is normally binary (one street — the one just written in) and
+pool is binary, so those two nodes vanish entirely once forced nodes collapse.
 
-1. **BGA fidelity.** The engine is transcribed from BGA's PHP, and both the
-   differential harness and the advisor depend on speaking BGA's action space.
-   Removing a legal option makes replays and advice diverge from the real site.
-2. **It is a hand-coded valuation** — "always take the park" is a human
-   judgement, the category-2 line `ENCODER_V2_SPEC.md` §1 draws. Very probably
-   correct; if it is wrong anywhere, the model can never discover it.
-3. **The saving is small.** These are 2-option nodes that PUCT resolves in about
-   two simulations.
+**`PASS_ROUNDABOUT` is also pruned.** Opening and then passing reaches the same
+`CHOOSE_CARDS` state as never opening, minus the roundabout option — so not
+opening weakly dominates it. Pruning makes `ROUNDABOUT_OPEN` mean "I will place
+one", which is the real decision.
 
-⚠ **Correction to the framing:** estate is **not** a yes/no. `estate_rows()`
-offers a choice of *which* value row to advance, and the rows score differently.
-Auto-applying would remove the pass and leave a node behind. Park is normally
-binary (one street — the one just written in) and pool is binary; only those two
-would disappear.
-
-**The safe version of the same win** is a search-level change with no rules
-change: skip forced one-action nodes **inside simulations**, not only at the
-external root. `MCTS.play` already skips them at the real root; `_simulate` does
-not. Before doing even that, measure what share of the 1.91 calls per turn are
-park/pool nodes — it sizes the prize.
+⚠ **This is a search mask, not a rules change.** An earlier draft rejected it on
+BGA-fidelity grounds; **that argument applies to the engine, not to the search**,
+and conflating them was the error. `GameState.legal_actions()` keeps every BGA
+action, the codec keeps all 684 logits, and replay compatibility is untouched.
+The search already differs from BGA's primitive tree through the choose/write
+macro; fidelity was never a claim about which moves the search explores.
 
 ---
 
@@ -230,15 +231,15 @@ park/pool nodes — it sizes the prize.
 
 Everything from here is for review.
 
-### 6.1 What is built today, and why it is wrong
+### 6.1 What is built today, and why it is not enough
 
 `MCTS._advance` samples opponents forward to the root player's next decision and
-returns `tuple(state.table_cards(root))`. A child is keyed on
+returns `tuple(state.table_cards(root))`; a child is keyed on
 `(action, observation)`.
 
 This is correct — it never merges distinct observable states — and it **has no
-depth**. Measured mean leaf depth **1.59**, and it does not respond to the
-budget or to prior sharpness:
+depth**. Measured mean leaf depth **1.59**, unresponsive to budget or to prior
+sharpness:
 
 | prior | mean leaf depth | range |
 |---|---|---|
@@ -246,216 +247,325 @@ budget or to prior sharpness:
 | one-hot | 1.59 | 1.00 – 2.01 |
 
 (4 network seeds × 6 positions, 256 simulations, 2/24 cells differing by >0.5.
-One-hot is the *upper bound* on sharpness, so this closes the question: no
-trained policy deepens it.)
+One-hot is the *upper bound* on sharpness, so no trained policy deepens it.)
 
-The cause is that every boundary crossing draws a key never seen before, so it
-always expands a fresh leaf. The budget past roughly one simulation per root
-action goes into **root averaging over fresh leaves**, not depth.
+Every boundary crossing draws a key never seen before and expands a fresh leaf.
+Budget past roughly one simulation per root action goes into **root averaging**,
+not depth.
 
-⚠ **The key is also under-specified, latently.** It is raw card **IDs**, and it
-carries neither the opponents' now-public sheets nor the race state. Measured, it
-costs nothing today — 0 spurious splits in 60 samples — because near-unique
-reveals mask it. **15 of the 66 printed card types have two physical copies**, so
-identical-looking reveals key to different children the moment children are
-reused. Fixing the key is a prerequisite for §7, not an optional cleanup.
+⚠ **The key is also under-specified, latently.** Raw card **IDs**, no opponent
+sheets, no race state. Measured, it costs nothing today — 0 spurious splits in 60
+samples — because near-unique reveals mask it. **15 of the 66 printed card types
+have two physical copies**, so identical-looking reveals key to different children
+the moment children are reused. Fixing the key is a prerequisite for §7.
 
 ### 6.2 What a reveal actually is
 
-Not an ordered triple of numbers. A construction card prints its own effect on
-its number face, so a card drawn at a boundary supplies a **number for this turn**
-and an **effect for the following turn**. Measured, one turn ahead over 60
+Not an ordered triple of numbers. A construction card prints its own effect on its
+number face, so a card drawn at a boundary supplies a **number for this turn** and
+an **effect for the following turn**. Measured, one turn ahead over 60
 determinizations of one action sequence:
 
 | | distinct |
 |---|---|
-| effects in play this turn | **1** — certain, and equal to `next_effects` |
+| effects in play this turn | **1** — certain, equal to `next_effects` |
 | effects for the following turn | **46** |
 | numbers in play this turn | 60 |
 
-So a reveal is an ordered triple of printed **card types**. There are **66
-distinct printed types** in an 81-card deck (multiplicity 1–2), giving on the
-order of 277,000 valid ordered type triples. **Exhaustive expansion is not
-available** and no design should assume it.
+So a reveal is an ordered triple of printed **card types**: **66 distinct types**
+in an 81-card deck (multiplicity 1–2), on the order of 277,000 valid ordered
+triples. **Exhaustive expansion is not available.**
+
+### 6.3 ⚠ The boundary is not always "draw three from the histogram"
+
+**Verified against the engine.** A boundary can do four different things, and a
+search that samples "three cards from `deck_composition`" is wrong on three of
+them:
+
+| case | behaviour |
+|---|---|
+| ordinary | `_draw_step()` draws 3 via `_draw_playable()` |
+| **mid-draw exhaustion** | `_draw()` calls `_reform_deck()` when `deck_pos >= len(deck)` — so a boundary may draw some cards from the deck, reform from discard **partway through**, and draw the rest from a different pool |
+| **queued reshuffle** | `_reshuffle_decks()` reforms, draws **3**, runs `_discard_step()`; then `_begin_turn` calls `_draw_step()` for **3 more** — **six ordered cards, in two batches, with a discard cycle between** |
+| terminal | `_end_turn` may reach `GAME_OVER` before any reveal |
+
+Solo mode adds a fifth: `_draw_playable()` consumes and resolves `SOLO_CARD_ID`
+before returning a card.
+
+**The search must not reimplement this.** Refactor an engine-owned triple:
+
+```
+prepare_turn_boundary()          -> afterstate, or terminal
+sample_boundary_outcome(rng)     -> one immediate outcome, all four cases
+apply_boundary_outcome(outcome)  -> the next observed state
+```
+
+with a test per case. Reimplementing the draw in the search is a correctness bug
+waiting on a reshuffle turn.
 
 ---
 
-## 7. Proposed: a fixed-support chance node at the boundary
+## 7. Proposed: fixed-support chance nodes
 
 ### 7.1 Shape
 
-When every action of the turn has resolved, but **before** `_draw_step()`,
-create a **pre-reveal afterstate** node. At it:
+When every action of the turn has resolved but **before** the boundary, create a
+**pre-reveal afterstate** node. At it:
 
-- sample `K` reveals from the **exact remaining card histogram** (public
-  bookkeeping — `deck_knowledge.deck_composition`);
-- materialise those `K` children and **retain them for the life of the search**;
-- **re-normalise their probabilities to sum to 1** and **close the edge against
-  growth**;
-- the node's value is the **probability-weighted** mean of its children's
-  backed-up values — a chance node averages, it does **not** PUCT;
-- later simulations descending the edge **sample among the retained children by
-  their re-normalised weight**.
+- draw `K` immediate outcomes via `sample_boundary_outcome`;
+- give every sample mass **`1/K`**; merge samples with **identical public
+  observations** and give the merged child mass **`count/K`**;
+- **retain** those children for the life of the search and **close the edge
+  against growth**;
+- the node's value is the **weight-weighted mean** of its children's backed-up
+  values — a chance node averages, it does **not** PUCT;
+- later descents **sample among the retained children by their weights**.
 
-Retained children are revisited **by construction**. That is the one thing
-neither exact observation keying nor prior sharpening can produce, and it is the
-entire point.
+Retained children are revisited **by construction**, which is the one thing
+neither exact observation keying nor prior sharpening can produce. Start with
+`K ∈ {4, 8, 16}`.
 
-Start with `K ∈ {4, 8, 16}` and choose empirically.
+### 7.2 ⚠ The weighting rule, corrected
 
-### 7.2 The invariant that a naive implementation violates
+The first draft said: sample from the true distribution, keep each outcome's
+**original probability**, and renormalise those across the retained subset. **That
+is wrong.** It estimates the value *conditional on landing in the retained
+subset*, and it double-counts: a common outcome is both sampled more often *and*
+carries a larger original probability.
 
-Taken directly from `seven_wonders_duel/search.py`, which documents it because it
-was got wrong once:
+For IID sparse sampling the correct rule is the one in §7.1 — **`count/K`,
+empirical mass**. For a *stratified* construction, a representative carries the
+mass of its **stratum**, which is again not its individual outcome probability
+renormalised.
 
-> An approximate edge **MUST** be closed. Ordinary descent samples from the
-> COMPLETE chance distribution and appends any outcome it cannot find, carrying
-> that outcome's original probability. On a truncated edge that would push the
-> mass above 1, and `q` would then return a weighted sum over more than unit mass
-> **with nothing raising**.
+⚠ **`sum(weights) == 1` proves only mass conservation.** It does **not** prove the
+weights approximate the intended distribution. The first draft treated the 7WD
+closure check as if it did.
 
-So three edge classes must stay distinct, and the code must not let them blur:
+**Consequence for the port:** `seven_wonders_duel/search.py`'s *edge invariants*
+are reusable — the three edge classes, closure against growth, the mass check.
+Its **support construction is not**: `balanced_double_reveal_chains` assigns
+`1/(n·X)` per representative for a specific double-reveal geometry that Welcome
+To does not have. Port the invariants; construct the support here.
 
-| class | support | later descent |
-|---|---|---|
-| `probability_weighted` | exhaustive, exact | always finds a child |
-| `fixed_support` | retained subset, re-normalised | samples **only** among them |
-| ordinary sampled | grows lazily | may materialise a child |
+### 7.3 ⚠ A scenario must NOT contain the future deck order
 
-`close_fixed_support()` refuses to close unless the retained weights sum to 1.
-Port that check; it is the difference between a correct expectation and a
-plausible-looking wrong number.
+**The blocker in the first draft.** It defined a retained child by *deck order and
+opponent RNG together*. That violates **non-anticipativity**: two scenarios that
+reveal the same cards now but differ in their hidden tails would become different
+nodes, so the tree's later decisions could differ between worlds the player cannot
+distinguish. The tree then knows the future deck through its own node identity —
+textbook determinization **strategy fusion**, which is precisely what information
+set search exists to prevent (§13, Cowling et al.).
 
-### 7.3 A scenario is deck order **and** opponent randomness
+The correct rule:
 
-⚠ **The ambiguity most likely to be implemented wrongly.**
+- a fixed-support entry contains **only the immediate stochastic transition** —
+  this boundary's reveal, plus the opponent results that became public during the
+  turn;
+- decision children are keyed by the resulting **public observation**, never by an
+  RNG seed and never by a hidden future;
+- **equivalent public outcomes merge** (which is what makes `count/K` the right
+  weight);
+- the remaining deck stays an **unordered histogram**;
+- the **next** boundary draws a fresh conditional support.
 
-Opponent actions are **sampled**, not chance, and the root-player contract
-deliberately keeps them out of the node key so a node averages over the opponent
-model. But if a chance child is *retained* while opponents are *resampled*, the
-child's state is not well defined — its statistics accumulate over a mixture it
-does not represent.
+Opponent randomness obeys the same rule: retain the opponents' *realised public
+actions*, not their future random stream.
 
-**Therefore a retained scenario `ω` is the deck order and the opponent
-randomness together**, and children are indexed by `ω`. Retained deck with
-resampled opponents is the failure mode: it produces a tree that looks healthy
-and whose statistics are incoherent.
+This also resolves — correctly — the concern the first draft raised, that a
+retained child with resampled opponents is undefined. The answer is not to retain
+the RNG; it is to put the opponents' public results in the observation.
 
-### 7.4 Common random scenarios across candidate actions
+### 7.4 Common random outcomes across candidate actions
 
-The reveal distribution does not depend on which house the root player wrote —
-the draw is from a shared deck — so candidate root actions should be evaluated
-against the **same** sampled scenarios `ω₁…ω_K`. This cancels most of the
-variance in their *differences*, which is what selection actually needs.
+The reveal distribution does not depend on which house the root player wrote, so
+candidate root actions should be compared against the **same** sampled outcomes.
+This cancels most of the variance in their *differences*, which is what selection
+needs. Opponents may be shared for the same reason: they cannot see the root
+player's concurrent choice.
 
-The exception is the **reshuffle** decision, which does change the distribution.
-There, reuse the same underlying uniforms mapped through the state-specific deck
-distribution rather than sharing the outcomes directly.
-
-Opponent samples can be shared for the same reason: opponents cannot see the root
-player's concurrent choice, so their play is independent of it.
+The exception is the **reshuffle** decision, which does change the distribution —
+and, per §6.3, changes how many cards are drawn. There, share the underlying
+uniforms and map them through the state-specific boundary, not the outcomes.
 
 ### 7.5 Re-rooting on the real reveal
 
-When the real game reveals its cards: construct the new public state, reuse the
-matching sampled child if there is one, otherwise start a fresh root. Nothing
-here needs a persistent ordinal identity — the actual public observation is the
-anchor.
+Construct the new public state, reuse the matching sampled child if there is one,
+otherwise start a fresh root. The actual public observation is the anchor; no
+persistent ordinal identity is needed.
 
-Within a turn, the deterministic subtree **can** be re-rooted after each real
-action, because no chance intervenes. **That reasoning does not extend across a
-boundary** and must not be generalised.
+Within a turn the deterministic subtree **can** be re-rooted after each real
+action, because no chance intervenes. **That does not extend across a boundary.**
 
 ---
 
-## 8. Rejected alternatives, and why
+## 8. ⚠ Fixed `K` multiplies inference cost by `K`
+
+`NetEvaluator._forward` evaluates **one** state per call. Materialising `K`
+children at every new afterstate turns 128 simulations into up to **128 × K**
+leaf evaluations — ~2,048 at `K = 16` — which would make any bakeoff at "equal
+simulations" meaningless.
+
+**Required before the bakeoff**, at least one of:
+
+- batch all `K` children of a new afterstate in one tensor call;
+- better, batch leaves **across games and searches**;
+- or introduce children lazily, so the effective chance-sample count is part of
+  the simulation budget rather than a multiplier on it.
+
+**"Equal network-evaluation budget" must count evaluated positions**, not Python
+forward invocations. Report positions/second and accelerator utilisation
+alongside strength.
+
+---
+
+## 9. ⚠ What fixed `K` does to the estimator, corrected
+
+The first draft said fixed `K` is "lower variance, but biased by that particular
+sample". That is loose. For IID `1/K` samples:
+
+- the estimator is **unbiased across independently drawn supports**;
+- **a particular retained support carries sampling error**, and everything in that
+  search is conditioned on it;
+- its variance **across support seeds** is *higher* than an `N`-sample estimator
+  when `K < N`;
+- repeated traversal reduces internal tree noise but supplies **no additional
+  chance information**;
+- taking the max over noisy action estimates introduces **optimiser bias**.
+
+⚠ **Therefore visit-based stderr inside one retained tree is falsely tiny** — it
+counts repeat visits to the same `K` outcomes as new evidence. Root uncertainty
+must be measured **across independent support seeds**.
+
+Add to the bakeoff:
+
+- between-support-seed value variance;
+- action agreement across support seeds;
+- effective unique chance samples;
+- optimiser bias against the exact late-game oracle.
+
+**The oracle:** late-game states with a small remaining deck, where every legal
+ordered reveal can be enumerated exactly. Compare each approximation's root
+ranking *and* its root value against the exact expectation.
+
+---
+
+## 10. Rejected and deferred alternatives
 
 | design | verdict |
 |---|---|
-| **Bundle the whole turn** | Rejected — §5. Up to 71,334 sequences per turn, and it saves 0.91 network calls. |
-| **Sort the stacks** (KD's `sorted(deck[:4])`) | Rejected. KD's sort is meaningful because domino number *is* next-round pick order, so the slot encodes tempo whatever tile it carries. Sorting three Welcome To stacks gives "lowest of three random draws" — 1 in one determinization, 13 in another. No stable quantity. |
-| **Merge on `(number, effect, box)` + ISMCTS availability counts** | Demoted to an experimental arm. It is invariant and availability counts are well founded, but it is **context-abstracted**: one `Q` averaged over what the other two offers are, what next-turn effects were exposed, and the opponents' race state. It is also lossy — a 7 printed and a 7 made with TEMP consume different cards. |
-| **Progressive widening on the chance branch** | Not rejected, deferred. It was withdrawn once for a bad reason: "sharper priors do not deepen the tree" is measured and true, and does **not** imply nothing structural does. Fixed-`K` first because it is easier to reason about and to batch; PW only after that baseline exists. |
+| **Bundle the whole turn** | Rejected — §5. Up to 71,334 sequences per turn to save 0.91 network calls. |
+| **Sort the stacks** (KD's `sorted(deck[:4])`) | Rejected. KD's sort is meaningful because domino number *is* next-round pick order, so the slot encodes tempo whatever tile it carries. Sorting Welcome To's stacks gives "lowest of three random draws" — 1 in one determinization, 13 in another. No stable quantity. |
+| **Merge on `(number, effect, box)` + availability counts** | Experimental arm. Invariant, and availability counts are well founded (§13, Cowling et al.), but **context-abstracted**: one `Q` averaged over what the other two offers are, what next-turn effects were exposed, and the race state. Also lossy — a 7 printed and a 7 made with TEMP consume different cards. |
+| **Progressive widening on chance** | Deferred, not rejected. Withdrawn once for a bad reason: "sharper priors do not deepen the tree" is measured and true and does **not** imply nothing structural does. Fixed `K` first because it is easier to reason about and to batch (§13, Couëtoux & Doghmen). |
+| **Gumbel top-`k` + sequential halving at the root** | Later arm. The masked 495-wide macro root is a good fit — it targets simple regret where simulations are scarce relative to root width (§13, Danihelka et al.). Keep it out of the first chance-node implementation. |
 
 ---
 
-## 9. The trade this makes, and how to catch it going wrong
+## 11. Bakeoff
 
-⚠ **Fixed-`K` sparse sampling is a step backwards at depth 1.**
-
-The version built today draws a fresh reveal every simulation, so the root's `Q`
-is an average over ~`N` distinct futures — **unbiased, high `N`**. Fixed-`K`
-replaces that with an average over `K` fixed futures: lower variance, but
-**biased by that particular sample**, and every simulation past the `K`th reuses
-it.
-
-So sparse sampling is not strictly more accurate. **It trades a worse depth-1
-expectation for having a depth-2 at all.** That is very likely the right trade,
-and it will not show up in a strength number alone: a depth-1 regression can hide
-inside a depth-2 gain.
-
-**Measure root value bias directly.** Late-game states with a small remaining
-deck are the oracle — enumerate every legal ordered reveal exactly, and compare
-each approximation's root action ranking *and* its root value against the exact
-expectation.
-
----
-
-## 10. Bakeoff
-
-At equal wall-clock **and** equal network-evaluation budget:
+At equal wall-clock **and** equal evaluated-position budget:
 
 | arm | chance handling |
 |---|---|
 | current | fresh exact observation every simulation |
 | semantic ISMCTS | merged `(number, effect, box)` + availability counts |
-| sparse chance | retained `K = 4 / 8 / 16` |
+| sparse chance | retained `K = 4 / 8 / 16`, `count/K` weights |
 | sparse chance + afterstate head | learned chance expectation |
 
-Report, for each: paired score gap and stderr over 300+ games; strength at
-64/128/256 evaluations; mean turn boundaries crossed; selected-action agreement
-across independent search RNGs; root value stderr and bias against the late-game
-oracle; evaluations and wall time per move; plans, permits and end reasons.
+Report for each: paired score gap and stderr over 300+ games; strength at
+64/128/256 evaluated positions; mean turn boundaries crossed; action agreement
+across search RNGs **and across support seeds**; root value variance between
+support seeds; effective unique chance samples; optimiser bias against the oracle;
+positions/second, wall time and accelerator utilisation; plans, permits, end
+reasons.
 
-⚠ **The gate needs ~300 games, not 60.** Measured: the per-game paired delta has
-a standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0
-at 330. A 4-point difference read off 60 games sits inside its own noise.
+⚠ **The gate needs ~300 games, not 60.** Measured: the per-game paired delta has a
+standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 at
+330. A 4-point difference read off 60 games sits inside its own noise.
 
-⚠ **All of this waits on S0.** Every arm needs a trained network; on an untrained
-one both arms produce noise. Two claims in `SELF_PLAY_PLAN.md` were wrong because
-they were measured on an untrained net.
-
----
-
-## 11. Later: an afterstate value head
-
-Only if sparse chance wins. Train `V_after(x) ≈ E_c[V_post(x, c)]` against an
-average over several independently sampled immediate reveals, so a turn's search
-can stop at the pre-reveal afterstate for one network call.
-
-This preserves **recourse** — `V_post` assumes the future policy observes the
-reveal before acting, so it is not perfect-information Monte Carlo over a fixed
-deck. It is Stochastic MuZero's afterstate factorisation, worth borrowing without
-the rest of it because the chance distribution here is known exactly.
-
-It is a real build: new head, new target, several reveals sampled per training
-position. Gate it on the bakeoff.
+⚠ **All of this waits on S0.** Every arm needs a trained network. Two claims in
+`SELF_PLAY_PLAN.md` were wrong because they were measured on an untrained one.
 
 ---
 
 ## 12. Implementation order
 
-1. **Fix the observation key** (§6.1) — printed faces not card IDs, and include
-   the opponents' public sheets and race state. Prerequisite for anything that
-   reuses children.
-2. **Skip forced one-action nodes inside simulations** (§5.1). No rules change,
-   no structural change.
-3. **Fixed-support chance edge** (§7), behind a flag, with the current version
-   kept as the control arm. Port the invariants from
-   `seven_wonders_duel/search.py`; do not re-derive them.
-4. **Run S0.** Nothing below this line means anything without a trained net.
-5. **Bakeoff** (§10), including the late-game exact oracle.
-6. **Afterstate head** (§11), only if 3 wins.
+1. **Search-only dominance pruning** — park/pool/estate passes, `PASS_ROUNDABOUT`
+   (§5.1). No engine change.
+2. **Collapse forced internal nodes** inside simulations, not only at the external
+   root. `MCTS.play` already does the root; `_simulate` does not.
+3. **Deterministic within-turn re-rooting.** `MCTS.play` discards the tree after
+   choosing; re-rooting the selected child within a turn is *exact* and preserves
+   the work.
+4. **Engine-owned boundary transition** (§6.3), with a test for each of ordinary
+   draw, mid-draw reform, queued reshuffle, terminal-before-reveal, and solo card.
+5. **Define and test the public observation key** (§6.1, §7.3) — printed faces not
+   card IDs, plus opponents' public sheets and race state.
+6. **Fixed-support chance edge** (§7) with `count/K` weights, behind a flag, the
+   current version kept as the control arm.
+7. **Batched `K`-child evaluation and cross-game leaf batching** (§8).
+8. **Run S0, then the bakeoff** (§11).
+9. **Only then:** progressive widening, Gumbel root allocation, afterstate head.
 
-Steps 1 and 2 are small and independent of the outcome of the review. Step 3 is
-the substantive one and is what this document exists to have reviewed.
+Steps 1–3 are small, independent of the review's outcome, and can start now.
+Steps 4–6 are what this document exists to have reviewed.
+
+---
+
+## 13. Research references
+
+Collected so the reasoning above can be re-examined rather than re-derived.
+
+**Information set search and strategy fusion** — Cowling, Powley & Whitehouse,
+*Information Set Monte Carlo Tree Search* (2012).
+<https://eprints.whiterose.ac.uk/id/eprint/75048/1/CowlingPowleyWhitehouse2012.pdf>
+Why §7.3's non-anticipativity rule is not optional, and the source of the
+availability-count correction used by the semantic-ISMCTS arm.
+
+**Sparse sampling** — Kearns, Mansour & Ng, *A Sparse Sampling Algorithm for
+Near-Optimal Planning in Large MDPs* (1999).
+<https://ai.stanford.edu/~ang/papers/ijcai99-largemdp.pdf>
+The foundational result behind fixed-`K`: planning cost independent of state-space
+size, exponential in horizon. The source of the `1/K` weighting in §7.1.
+
+**Densely stochastic games** — Lanctot, Saffidine, Veness, Archibald & Winands,
+*Monte Carlo \*-Minimax Search* (2013). <https://arxiv.org/abs/1304.6057>
+Directly on point: sparse chance sampling where chance successors almost never
+repeat. Evaluated on Can't Stop.
+
+**UCT consistency** — Kocsis & Szepesvári, *Bandit-Based Monte Carlo Planning*
+(2006).
+<https://aima.cs.berkeley.edu/~russell/classes/cs294/s11/readings/Kocsis%2BSzepesvari%3A2006.pdf>
+Why §3's original "mean not best" justification for the macro was wrong, and what
+the macro's real (finite-budget) benefit is.
+
+**Double progressive widening** — Couëtoux & Doghmen, *Adaptive Rollout Length and
+Double Progressive Widening* (2011).
+<https://ewrl.wordpress.com/wp-content/uploads/2011/08/ewrl2011_submission_29.pdf>
+The deferred alternative in §10, designed for exactly the case where vanilla MCTS
+keeps meeting new successors.
+
+**Gumbel planning** — Danihelka, Guez, Schrittwieser & Silver, *Policy Improvement
+by Planning with Gumbel* (2022).
+<https://openreview.net/pdf/4f2c0c813d0fbe127329c69b1ba216fbcd95d52c.pdf>
+Simple-regret root allocation for wide roots at small budgets — the later arm in
+§10.
+
+**Afterstate factorisation** — Antonoglou, Schrittwieser, Ozair, Hubert & Silver,
+*Planning in Stochastic Environments with a Learned Model* (Stochastic MuZero,
+2022). <https://mlanthology.org/iclr/2022/antonoglou2022iclr-planning/>
+The afterstate value head of §10/§12.9. Only the factorisation is wanted; the
+chance distribution here is known exactly, so the learned chance model is not.
+
+**Value networks with expectimax** — Matsuzaki, *Developing Value Networks for
+Game 2048* (2021).
+<https://www.jstage.jst.go.jp/article/ipsjjip/29/0/29_336/_article>
+Empirical precedent for a learned value plus shallow expectimax in a densely
+stochastic game.
+
+**In-repo precedent** — `games/seven_wonders_duel/search.py`. The `_Edge` class,
+its three edge classes, `close_fixed_support()` and `fixed_support_index()`.
+Reusable for the **invariants**; its support construction is specific to that
+game's reveal geometry (§7.2).
