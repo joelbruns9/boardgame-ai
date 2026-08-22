@@ -387,6 +387,62 @@ stack's identity carries its **known next effect** across turns — `next_effect
 is a certainty and a real feature — and sorting scrambles that correspondence.
 A genuine trade-off, not a free win, and it would change the frozen vocabulary.
 
+#### The edge identity, and why sorting is not the answer
+
+Kingdomino keys children on a **slot-relative joint index with no observation in
+the key** and re-decodes it per simulation (`decode_action(idx, concrete_state)`);
+its docstring names this very problem - *"at a deep node the concrete domino in a
+given pick slot differs across determinizations"*. So open loop does not need a
+post-chance hierarchy. It needs an **invariant action encoding**.
+
+⚠ **Sorting Welcome To's stacks does not provide one, and an earlier version of
+this note wrongly proposed it as the analogue of `sorted(deck[:4])`.** Kingdomino's
+sort is meaningful because domino number *is* next-round pick order, so the slot
+encodes tempo whatever terrain it carries. Sorting three Welcome To stacks gives
+"lowest of three random draws" - which could be 1 or 13 in different
+determinizations, with different effects attached, merged into one edge. The sort
+carries no stable quantity.
+
+**What is invariant here is the action's own semantics.** Measured, one turn
+ahead, over 60 determinizations of the same action sequence:
+
+| | distinct values |
+|---|---|
+| effect triple on offer | **1** - certain, and equal to `next_effects` predicted in advance |
+| number triple on offer | 60 |
+
+**The chance is entirely in the numbers; the effects are deterministic one turn
+out.** So an edge identified as *write number N, with effect E, into box B* is
+invariant, and only its **availability** varies.
+
+That gives the design, and it costs no vocabulary change:
+
+- the policy head keeps emitting the frozen `(slot, delta, box)` 684 at states
+  where the table is visible, where the two encodings are in bijection;
+- the **tree** keys edges by `(number, effect, box)` and translates per
+  simulation - find the slot offering `(number, effect)` in *this*
+  determinization, read that macro's prior, apply that macro;
+- an edge not offered this simulation is **unavailable**, and availability counts
+  go in the UCB denominator instead of the node's total visits (ISMCTS).
+
+Structurally Kingdomino's `decode_action`, with invariance coming from semantics
+rather than from a sorted draft. Search-side only: no head resize, no retraining,
+and `datagen` already records the number written.
+
+What each keying makes `Q` mean is the whole argument:
+
+| keying | `Q(edge)` means |
+|---|---|
+| `(slot, delta, box)`, merged | "take pile 1 and box 3, whatever number pile 1 holds" - not a plan |
+| `(number, effect, box)`, merged | "if a 7 comes up on the PARK stack, put it in box 3" - a contingent plan |
+| observation-keyed (what is built) | correct, but every child is unique, so no depth |
+
+⚠ **The risk to measure before adopting it.** A specific `(number, effect)` is on
+offer roughly 1 turn in 15, so individual edges are visited rarely and the whole
+thing rests on the availability counts being right. Compare depth *and*
+`arena.paired` strength, merged-with-availability against the current
+observation-keyed version, at equal budget. Do not assume it wins.
+
 **Measure before building any of it.** Once S0 exists, run `arena.paired` at 64,
 256 and 1024 simulations. If strength is flat past ~128 the question is closed,
 and the compute belongs in games and network quality instead. If it is not flat,
