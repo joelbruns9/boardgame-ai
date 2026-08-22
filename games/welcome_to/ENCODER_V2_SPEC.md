@@ -1,6 +1,9 @@
 # Welcome To... — encoder v2 specification
 
-**Status:** spec of record for the encoder. Nothing here is implemented yet.
+**Status:** spec of record for the encoder. **§12 steps 1 and 2 are
+implemented** — the dense plan one-hot and the seat-axis restructure, with the
+§9.3 symmetry test green. Steps 3–8 add features and are not started, so the
+per-sheet block is 12 planes and 45 scalars today rather than 17 and 127.
 
 **Revision note.** An earlier draft of this document (same filename, 2026-08-21)
 specified an *asymmetric* encoder — 17 planes for the viewer, 2 per opponent —
@@ -933,12 +936,25 @@ machinery, not a config toggle.
 
 ## 12. Implementation order
 
-1. **`plans.DEALT_PLAN_IDS` + `dense_index`**, plan one-hot 37 → 28.
-   Self-contained, no new maths. Do it first.
-2. **Restructure to the seat axis** — `encode_state` returns
+1. ~~**`plans.DEALT_PLAN_IDS` + `dense_index`**, plan one-hot 37 → 28.
+   Self-contained, no new maths. Do it first.~~ **DONE.** `NUM_SCALAR` 473 → 446.
+2. ~~**Restructure to the seat axis** — `encode_state` returns
    `(sheet_planes, sheet_scalars, viewer_plane, global_scalars)`; move
    `own_tracks` / `own_score` / `opponents` into the per-sheet block; add the
-   symmetry test (§9.3) **before** adding any new feature.
+   symmetry test (§9.3) **before** adding any new feature.~~ **DONE.**
+   Per-sheet is 12 planes + 45 scalars, global is 358; the `opponents` and
+   `plan_race` blocks dissolved into the per-seat block, and `reshuffle_race`
+   shrank to 2 now that the plan counts are per-seat.
+
+   Two notes for whoever adds features next. **§9.3 as written is two tests, not
+   one.** At a turn boundary the live sheet and the public snapshot are equal, so
+   a helper reaching for `state.sheets[p]` passes a boundary symmetry test
+   unnoticed; the leak is only visible mid-turn, where a legitimate snapshot lag
+   makes an exact comparison impossible. So symmetry is asserted at a boundary
+   and the leak is asserted mid-turn, against the same block before and after an
+   opponent writes. Both were mutation-checked. And **plane 11 changed with plane
+   8**: `positional_fit` also read the viewer's locked-in combination, so it now
+   reads the offered set, temp widening included.
 3. **Fit-probability planes 13–15** + the shared deck prefix-sum helper, with §9.4.
 4. **Supply rates** (§7.3) and **refusal / houses-per-turn** (§6.4, §6.5).
 5. **Demand + reshuffle contraction** (§6.1, §6.2) — reuses the prefix sums.

@@ -1,7 +1,9 @@
 # Welcome To... — auxiliary target specification
 
 **Status:** spec of record for `training.py`'s target set and the network's head
-structure. Nothing here is implemented yet.
+structure. **Steps 1 and 2 of §10 are implemented** — the rank distribution, the
+dropped `first_plan`, the target scales, `masked_mean`, the sentinel test and the
+seat-indexed target set are all in `training.py`. Steps 3–5 are not.
 
 **Reads with:** `ENCODER_V2_SPEC.md`. The two were designed against each other —
 the head structure below depends on the symmetric per-seat encoder, and several
@@ -744,16 +746,26 @@ It is not in the final state, so it would need replay instrumentation, and
 
 ## 10. Implementation order
 
-1. **Fix the six defects in the existing set** (§3) without adding anything —
+1. ~~**Fix the six defects in the existing set** (§3) without adding anything —
    the rank distribution replacing `rank` and `won`, drop `first_plan`, add the mask-sum
    normalisation (M1) and the sentinel test (M2). This is the highest
    correctness-per-line change in the document and it is independent of the encoder
-   restructure.
-2. **Restructure `PlayerOutcome` and `sample_targets` to be seat-indexed.** Every
+   restructure.~~ **DONE.** D1, D2, D4, D6 are fixed; D3 and D5 are structural and
+   land with steps 2–4. `sample_targets` also emits `rank_mask_0..3` alongside
+   `rank_p_0..3` — four more masks than §4's inventory, carried so that M4's
+   "mask the logits, not the probabilities" rule has its data in the batch
+   instead of being re-derived from a seat count at loss time.
+2. ~~**Restructure `PlayerOutcome` and `sample_targets` to be seat-indexed.** Every
    target in §5–§6 is a function of the final state and the visit turn, and
    `final_outcomes` already builds `PlayerOutcome` with the whole terminal state in
    scope — **so no interface widening is needed**, only extra fields. `datagen.replay`
-   currently passes `outcomes[actor]`; it will pass all seats.
+   currently passes `outcomes[actor]`; it will pass all seats.~~ **DONE.**
+   `sample_targets(outcomes, order, turn)`: per-seat targets come back as tuples
+   along `encoder.seat_order`, padded to 4 with `seat_valid = 0`, and the caller
+   passes the same order it encoded with. The alignment between target seat *k*
+   and encoded seat *k* is the one thing here that fails silently — every shape
+   still matches when it is wrong — so it is asserted directly, along with
+   `training.MAX_SEATS == encoder.MAX_SEATS`.
 3. **Add the per-seat head and the global head** (§4), with the M4 padded-seat test.
 4. **Add `end_trigger`, `will_complete_plan_k`, `plan_k_first`.**
 5. **Port the win-gated blend** (§5), and dump the `win_gate` distribution before

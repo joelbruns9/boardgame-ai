@@ -103,11 +103,16 @@ bis-writes-per-game from the first iteration.**
 
 ### The encoder wants opponents too
 
-`encoder.py` reserves `MAX_OPPONENTS = 3` at `_OPP_PLANES = 2` each, plus the
-`plan_race` (24), `reshuffle_race` (4) and `opponents` (27) flat blocks. Measured
-all-zero spatial planes on a mid-game position:
+`encoder.py` reserves a seat axis of `MAX_SEATS = 4`; at two seats, half of
+`sheet_planes` and `sheet_scalars` is padding, flagged by `seat_valid = 0`.
 
-| seats | all-zero planes (of 18) | non-zero flat features (of 473) |
+The table below was measured on the **pre-restructure** encoder, where the
+opponent blocks were `plan_race` (24), `reshuffle_race` (4) and `opponents` (27)
+inside a single flat vector. The shape has changed and these have not been
+re-measured; the argument they support has not changed either, and under full
+symmetry the padding is a larger fraction of the input, not a smaller one:
+
+| seats | all-zero planes (of 18) | non-zero flat features (of 446) |
 |---|---|---|
 | 2 | 8 | 123 |
 | 4 | **5** | 129 |
@@ -186,7 +191,16 @@ block non-zero from the first gradient step.
 
 **Gate:** policy top-1 agreement with greedy ≥ 60% on held-out games; the net
 playing greedily off its own policy, with no search, scores within 2 points of
-greedy on a paired seed set; `permits` and `houses` heads beat predict-the-mean.
+greedy on a paired seed set; the `permits` head beats predict-the-mean.
+
+`houses` used to gate alongside `permits` and no longer does. `AUX_TARGETS_SPEC.md`
+§9.3 makes it extension-tier, so it may not survive to S1 — and a gate must not
+depend on a target that might be deleted. It is still *reported*: `train.evaluate`
+returns R² for every head, so dropping it from the gate costs no information.
+
+Implemented in `network.py` (shared sheet encoder → trunk → per-seat + global
+heads, 3.94M parameters) and `train.py` (`python -m games.welcome_to.train`),
+which reports all three numbers and exits non-zero if any fails.
 
 Accept that greedy is race-blind — it completes ~0.42 plans per game. The
 bootstrap produces a placement-competent, race-blind policy, which is fine.

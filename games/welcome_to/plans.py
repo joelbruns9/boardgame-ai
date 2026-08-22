@@ -126,6 +126,39 @@ PLANS: tuple[Plan, ...] = (
 NUM_PLANS: int = len(PLANS)
 SUPPORTED_VARIANTS: frozenset[Variant] = frozenset({Variant.BASIC, Variant.ADVANCED})
 
+#: The plan ids :func:`available_plan_ids` can actually deal, in id order.
+#:
+#: :data:`PLANS` holds 37 entries so that ids line up with BGA, but nine of them
+#: are seasonal boards that no supported variant ever puts on the table.  A
+#: 37-wide one-hot would therefore carry nine permanently dead input slots.
+#:
+#: This is the **advanced superset**, deliberately, and it is sized that way
+#: whether or not the game being encoded has the advanced variant on: a
+#: base-rules game is then a strict subset of the same input space, with ten
+#: slots dark, and one set of network weights reads both.
+DEALT_PLAN_IDS: tuple[int, ...] = tuple(
+    plan.id for plan in PLANS if plan.variant in SUPPORTED_VARIANTS
+)
+NUM_DEALT_PLANS: int = len(DEALT_PLAN_IDS)
+
+_DENSE_INDEX: dict[int, int] = {pid: i for i, pid in enumerate(DEALT_PLAN_IDS)}
+
+
+def dense_index(plan_id: int) -> int:
+    """Position of ``plan_id`` in :data:`DEALT_PLAN_IDS`.
+
+    Raises for a seasonal id rather than returning a placeholder: an id that
+    cannot be dealt reaching the encoder means the caller built a state this
+    engine does not support, and silently folding it into slot 0 would put a
+    real plan's weights under an unsupported one.
+    """
+    try:
+        return _DENSE_INDEX[plan_id]
+    except KeyError:
+        raise ValueError(
+            f"plan {plan_id} belongs to an unsupported expansion and is never dealt"
+        ) from None
+
 
 def available_plan_ids(stack: int, advanced: bool) -> list[int]:
     """``AbstractPlan::isAvailable`` restricted to the base board.

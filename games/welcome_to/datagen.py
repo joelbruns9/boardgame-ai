@@ -3,8 +3,8 @@ Trajectory capture and replay for the supervised bootstrap.
 
 WHY TRAJECTORIES AND NOT TENSORS
 ────────────────────────────────
-A game is ~100 decisions per seat. Storing encoded samples costs
-``612 + 473`` floats each, so five thousand games is about **1.6 GB** of float32.
+A game is ~100 decisions per seat. Storing encoded samples costs a few thousand
+floats each, so five thousand games is well over a **gigabyte** of float32.
 Storing the *trajectory* — a seed, a config and 75 small integers — is about
 **1 MB** for the same games, and the engine is deterministic given the seed, so
 replaying reproduces the encoded samples exactly.
@@ -87,15 +87,23 @@ class Trajectory:
 
 @dataclass(frozen=True, slots=True)
 class Sample:
-    """One decision, ready to batch."""
+    """One decision, ready to batch.
 
-    spatial: np.ndarray
-    scalar: np.ndarray
+    The four encoder arrays are kept apart rather than concatenated: the seat
+    axis of ``sheet_planes`` and ``sheet_scalars`` is what the shared per-sheet
+    encoder runs over, and flattening it here would throw away the structure the
+    network is built around.  ``targets`` is indexed along the same seat axis.
+    """
+
+    sheet_planes: np.ndarray
+    sheet_scalars: np.ndarray
+    viewer_plane: np.ndarray
+    global_scalars: np.ndarray
     legal: np.ndarray
     action: int
     actor: int
     turn: int
-    targets: dict[str, float]
+    targets: dict[str, float | tuple[float, ...]]
 
 
 def play_trajectory(
@@ -137,12 +145,21 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
     change invalidate stale data loudly instead of quietly.
     """
     state = GameState.new(seed=trajectory.seed, config=trajectory.config)
-    visits: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int]] = []
+    visits: list[tuple] = []
 
     for action in trajectory.actions:
-        spatial, scalar = enc.encode_state(state)
+        actor = state.actor
         visits.append(
-            (spatial, scalar, state.legal_mask(), action, state.actor, state.turn)
+            (
+                enc.encode_state(state),
+                state.legal_mask(),
+                action,
+                actor,
+                state.turn,
+                # the seat axis is captured with the encoding, because the
+                # targets have to be indexed by the same one
+                enc.seat_order(state, actor),
+            )
         )
         state.apply(action)
 
@@ -153,16 +170,19 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
             f"replay diverged: scores {state.scores()} != recorded {trajectory.scores}"
         )
 
-    outcomes = {o.player: o for o in training.final_outcomes(state)}
-    for spatial, scalar, legal, action, actor, turn in visits:
+    outcomes = training.final_outcomes(state)
+    for encoded, legal, action, actor, turn, order in visits:
+        sheet_planes, sheet_scalars, viewer_plane, global_scalars = encoded
         yield Sample(
-            spatial=spatial,
-            scalar=scalar,
+            sheet_planes=sheet_planes,
+            sheet_scalars=sheet_scalars,
+            viewer_plane=viewer_plane,
+            global_scalars=global_scalars,
             legal=legal,
             action=action,
             actor=actor,
             turn=turn,
-            targets=training.sample_targets(outcomes[actor], turn),
+            targets=training.sample_targets(outcomes, order, turn),
         )
 
 
@@ -170,19 +190,25 @@ def batch(samples: Sequence[Sample]) -> dict[str, np.ndarray]:
     """Stack samples into arrays ready for a training step."""
     n = len(samples)
     out = {
-        "spatial": np.stack([s.spatial for s in samples]),
-        "scalar": np.stack([s.scalar for s in samples]),
+        "sheet_planes": np.stack([s.sheet_planes for s in samples]),
+        "sheet_scalars": np.stack([s.sheet_scalars for s in samples]),
+        "viewer_plane": np.stack([s.viewer_plane for s in samples]),
+        "global_scalars": np.stack([s.global_scalars for s in samples]),
         "legal": np.stack([s.legal for s in samples]),
         "action": np.asarray([s.action for s in samples], dtype=np.int64),
         "turn": np.asarray([s.turn for s in samples], dtype=np.float32),
     }
     for name in training.TARGET_NAMES:
-        out[name] = np.asarray(
-            [s.targets[name] for s in samples], dtype=np.float32
-        )
-    assert out["spatial"].shape == (n, *enc.SPATIAL_SHAPE)
-    assert out["scalar"].shape == (n, enc.NUM_SCALAR)
+        out[name] = np.asarray([s.targets[name] for s in samples], dtype=np.float32)
+    assert out["sheet_planes"].shape == (n, *enc.SHEET_PLANES_SHAPE)
+    assert out["sheet_scalars"].shape == (n, enc.MAX_SEATS, enc.NUM_SHEET_SCALAR)
+    assert out["viewer_plane"].shape == (n, *enc.VIEWER_PLANE_SHAPE)
+    assert out["global_scalars"].shape == (n, enc.NUM_GLOBAL_SCALAR)
     assert out["legal"].shape == (n, NUM_ACTIONS)
+    for name in training.PER_SEAT_TARGETS:
+        assert out[name].shape == (n, training.MAX_SEATS), name
+    for name in training.GLOBAL_TARGETS:
+        assert out[name].shape == (n,), name
     return out
 
 

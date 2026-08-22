@@ -5,12 +5,15 @@ import pytest
 
 from games.welcome_to.constants import EXTREMITY_POSITIONS, ROUNDABOUT, STREET_SIZES
 from games.welcome_to.plans import (
+    DEALT_PLAN_IDS,
+    NUM_DEALT_PLANS,
     NUM_PLANS,
     PLANS,
     PlanKind,
     Variant,
     available_plan_ids,
     can_be_scored,
+    dense_index,
     estates_matching_size,
     validation_cells,
 )
@@ -36,6 +39,31 @@ def test_plan_ids_are_their_own_index():
     assert NUM_PLANS == 37
     for i, plan in enumerate(PLANS):
         assert plan.id == i
+
+
+def test_the_dense_index_covers_exactly_what_can_be_dealt():
+    """The one-hot is 28 wide, not 37: nine seasonal ids are never dealt."""
+    dealt = set()
+    for stack in (1, 2, 3):
+        dealt |= set(available_plan_ids(stack, advanced=True))
+    assert set(DEALT_PLAN_IDS) == dealt
+    assert NUM_DEALT_PLANS == 28
+    assert [dense_index(pid) for pid in DEALT_PLAN_IDS] == list(range(28))
+
+
+def test_the_dense_index_is_the_advanced_superset():
+    """A base-rules game must be a strict subset of the same input space."""
+    for stack in (1, 2, 3):
+        for plan_id in available_plan_ids(stack, advanced=False):
+            assert plan_id in DEALT_PLAN_IDS
+
+
+def test_a_seasonal_plan_has_no_dense_index():
+    seasonal = [p.id for p in PLANS if p.variant not in (Variant.BASIC, Variant.ADVANCED)]
+    assert len(seasonal) == 9
+    for plan_id in seasonal:
+        with pytest.raises(ValueError):
+            dense_index(plan_id)
 
 
 def test_basic_game_deals_only_basic_plans():

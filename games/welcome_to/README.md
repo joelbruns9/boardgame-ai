@@ -14,7 +14,9 @@ plans.py           the 37 City Plans, completion predicates, distance-to-complet
 game.py            GameState: phases, legal actions, stepping, scoring, determinization
 deck_knowledge.py  exact deck composition and next-reveal facts
 action_codec.py    the 357-slot flat policy index space
-encoder.py         (18, 3, 12) spatial planes + 473 flat features
+encoder.py         (4, 12, 3, 12) + (4, 45) per seat, (1, 3, 12) + (358,) global
+network.py         shared sheet encoder, trunk, per-seat + global heads (3.94M)
+train.py           the S0 bootstrap: corpus, loop, gate
 bots.py            RandomBot (fuzzer), GreedyBot (the actual floor), play_match
 training.py        auxiliary self-play targets + the divergence meter
 datagen.py         trajectory capture/replay for the supervised bootstrap
@@ -89,15 +91,23 @@ downstream will work. `datagen.py` is the data side and already runs: 200 games 
 trajectories against ~1.6 GB as float32 tensors, and replay re-runs the rules, so
 a rules change invalidates stale data loudly instead of silently.
 
-**M2 — `network.py`.** Decisions to make, none of them inherited from Kingdomino:
+**M2 — `network.py`, `train.py`. BUILT.** `python -m games.welcome_to.train`
+captures a GreedyBot corpus at the 60/30/10 seat mixture, trains, and reports the
+S0 gate. Decisions taken, none of them inherited from Kingdomino:
 
-* *Trunk.* The spatial input is 17 × 3 × 12 = 612 floats next to 473 flat
-  features. This is an MLP or a small 1-D convolution along the street axis — the
-  13 × 13 ResNet from Kingdomino is the wrong shape and mostly wasted parameters.
-* *Heads.* Policy (357 logits, masked by `legal_mask()`), score, win, plus the
-  ~20 auxiliary heads from `training.TARGET_NAMES`, several of which are masked.
-* *Weights.* Score dominant early, policy next, auxiliaries small. Normalise
-  score by roughly 60.
+* *Trunk.* A **shared per-sheet encoder** runs over each seat's 12 × 3 × 12
+  planes and 45 scalars, and the main trunk reads the concatenated per-seat
+  representations next to the 358 global features. This is an MLP or a small 1-D
+  convolution along the street axis — the 13 × 13 ResNet from Kingdomino is the
+  wrong shape and mostly wasted parameters. Concatenate the seats; do not pool
+  them, because identity is what the plan race is about.
+* *Heads.* Policy (357 logits, masked by `legal_mask()`), score, the 4-way rank
+  distribution, plus the auxiliary heads from `training.TARGET_NAMES`, several of
+  which are masked. `AUX_TARGETS_SPEC.md` is the spec of record for the set.
+* *Weights.* By **group**, not per target — `policy` 1.0, `objective` 1.0,
+  `capacity` 0.3, `plan_race` 0.3, `components` 0.2. Twenty-odd individual knobs
+  is not a tunable object; five is, and a group is what an ablation switches off.
+  Scores are normalised in `training.py`, not here: ÷80.
 * *One policy head or several?* Twelve phases share one head with disjoint legal
   sets. One masked head is simpler and standard; measure before splitting it.
 
@@ -357,8 +367,8 @@ trunk even when the output is never used at play time. A **plan-order head**
 
 ### Network
 
-The spatial part is small (17 × 3 × 12 = 612 floats) next to 473 flat features, so
-this is not a convnet problem. A flatten-and-MLP trunk with residual blocks, or
+The spatial part is small (12 × 3 × 12 = 432 floats per seat) next to 45
+per-seat and 358 global flat features, so this is not a convnet problem. A flatten-and-MLP trunk with residual blocks, or
 1-D convolutions along the street axis, will do — start small (~1–2M params) and
 use the capacity ladder from the Kingdomino work rather than assuming depth.
 Policy head: 357 logits masked by `legal_mask()`. `encoder.block_slice(name)`

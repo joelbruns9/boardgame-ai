@@ -94,9 +94,11 @@ def play_batch(
             assert legal, f"no legal action in {state.phase.name}"
             branching.append(len(legal))
             if encode:
-                spatial, scalar = enc.encode_state(state)
-                assert spatial.shape == enc.SPATIAL_SHAPE
-                assert scalar.shape == (enc.NUM_SCALAR,)
+                planes, sheets, viewer, glob = enc.encode_state(state)
+                assert planes.shape == enc.SHEET_PLANES_SHAPE
+                assert sheets.shape == (enc.MAX_SEATS, enc.NUM_SHEET_SCALAR)
+                assert viewer.shape == enc.VIEWER_PLANE_SHAPE
+                assert glob.shape == (enc.NUM_GLOBAL_SCALAR,)
             state.apply(bots[state.actor].act(state))
             steps += 1
             assert steps < 20000, "runaway game"

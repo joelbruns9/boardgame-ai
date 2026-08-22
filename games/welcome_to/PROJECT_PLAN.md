@@ -29,7 +29,7 @@ N", which is what makes the race features worth having.
 ## 0. Where things stand
 
 **Done.** Engine (rules-exact against the BGA PHP), 357-slot action codec,
-information-set-safe encoder (18×3×12 planes + 473 flat features), exact deck
+information-set-safe encoder (4×12×3×12 per-seat planes + 4×45 per-seat scalars + 358 global), exact deck
 knowledge, City Plans with distance-to-completion, baseline bots, auxiliary
 training targets, trajectory capture/replay, and the `games.az_loop` adapter seam.
 The pytest suite is **green: 238 passed, 0 failed** (2026-08-21). Two defects found by external review are fixed with regressions — see §M0.
@@ -105,7 +105,14 @@ the bootstrap mix rather than trying to fix greedy.
 ---
 
 ### M2. Network
-**Deliverable:** `network.py`.
+**Deliverable:** `network.py`. **BUILT**, together with `train.py` (the S0
+bootstrap loop, its corpus at the 60/30/10 seat mixture, and the S0 gate).
+
+The as-built network is 3.94M parameters and follows the design below, sized
+against the **feature-light** encoder that exists today: 12 planes and 45 scalars
+per seat, 358 global. Steps 3–8 of `ENCODER_V2_SPEC.md` §12 widen those inputs to
+17 and 127 and 380, and the layer widths should be re-checked then rather than
+assumed to still fit.
 
 Design decisions, none of them inherited from Kingdomino:
 
@@ -134,10 +141,23 @@ Design decisions, none of them inherited from Kingdomino:
   claimed by false analogy to KD, where the per-board trunk *is* the dominant cost.
   CPU-side encoding is the larger relative cost and is well under 4×, because the
   deck prefix sums are computed once per state and reused across all four sheets.
-  Measure it against the current 10.1 games/s.
+
+  **Measured** (2026-08-21, after the restructure, replay-and-encode
+  single-threaded): **1560 samples/s at 2 seats, 1181 at 3, 956 at 4**, against
+  ~3.1k/s for the pre-restructure encoder. So roughly **2×**, which is inside the
+  "well under 4×" claim but is not free — replay, not the GPU, is what sets the
+  wall clock of an S0 epoch. Corpus capture runs at ~2.8 games/s.
 * **Heads.** Policy (**684 actions**, masked; vocabulary frozen in
   `ENCODER_V2_SPEC.md` §10.6). Then **one per-seat head evaluated four times** (11
   units) and one global head (5 units) — 16 output units producing 49 predictions.
+
+  *As built:* the per-seat head is 16 units and the global head 5, because the
+  target set is the step-1/2 one — `end_trigger`, `will_complete_plan_k` and
+  `plan_k_first` arrive with §10 step 4 and the extension-tier targets have not
+  been dropped yet. The head widths are **derived from
+  `training.PER_SEAT_TARGETS`**, so adding a target and forgetting its head is
+  not possible. The per-seat head is contextual — `z_s = concat(h_s, h_main)` —
+  which is not optional: several of its targets are definitionally cross-seat.
   `margin` is **derived**, not a head, exactly as in Kingdomino.
 * **The per-seat head is contextual**, reading `concat(h_s, h_main)` rather than an
   isolated `h_s`. Several of its targets — `plan_k_first`, `final_score`,
@@ -243,7 +263,7 @@ to keep options open — use it as an evaluator, not a policy.
 | Phase 2 misprices temps and plans | do not let those heads calibrate in Phase 2; ramp into M5 rather than switching |
 | Symmetric self-play collapses | independent per-seat sampling; log `identical_games` |
 | Roundabout adds a 34-way branch for a rarely-right action | per-phase search budget; the decline is now sticky, so the branch cannot cycle |
-| Encoding throughput gates the GPU (~3.1k samples/s single-threaded) | parallelise trajectory replay; it is embarrassingly parallel |
+| Encoding throughput gates the GPU (measured **1.6k/1.2k/1.0k samples/s** at 2/3/4 seats, single-threaded) | parallelise trajectory replay; it is embarrassingly parallel |
 | Rules drift silently invalidating replay data | already handled: replay re-runs the rules and fails loudly on an illegal action |
 
 ### Open decisions
@@ -291,8 +311,8 @@ Branching by phase (base game, one seat — advanced adds the roundabout phase):
 | ACTION_BIS | 4% | 9.7 | 19 |
 | plan / pool / reshuffle | 3% | ~2.1 | 6 |
 
-Other constants worth having to hand: 357 actions; 18×3×12 spatial planes and
-473 flat features; ~3.1k samples/s replay-and-encode single-threaded; 5000
+Other constants worth having to hand: 357 actions; the encoder is
+4×12×3×12 per-seat planes + 4×45 per-seat scalars + 358 global, plus a 1×3×12 viewer plane; 1560/1181/956 samples/s replay-and-encode single-threaded at 2/3/4 seats; 5000
 trajectories are ~1.6 MB on disk against ~1.6 GB as float32 tensors.
 
 Random play is a **rules fuzzer, not a baseline** — it blocks its own streets out
