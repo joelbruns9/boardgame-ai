@@ -909,6 +909,14 @@ Answering each open question directly:
 the search's edge construction, so it can be reverted to primitives without
 touching the rules.
 
+**Status (2026-08-21): not built.** `network.py` and `train.py` were built against
+the 357 primitive vocabulary, which means the S0 policy head and its top-1 gate do
+not validate what S1 will use — a real gap, not a simplification. Decided: build
+`macro_codec` as the first deliverable of S1, with `mcts.py`, since both need the
+same end-to-end sequence legality. **S0 is not to be run until it lands.** The
+stored corpus is unaffected — trajectories are primitive and the collapse happens
+in `datagen.replay`.
+
 **Flat, not bilinear.** At 684 a flat masked head is ~350k params at D=512, while
 bilinear needs a D×D interaction (~262k) *plus* two encoders — the larger model,
 saving nothing. Bilinear's generalisation benefit applies to large, sparsely

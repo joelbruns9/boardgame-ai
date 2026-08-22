@@ -202,6 +202,22 @@ Implemented in `network.py` (shared sheet encoder → trunk → per-seat + globa
 heads, 3.94M parameters) and `train.py` (`python -m games.welcome_to.train`),
 which reports all three numbers and exits non-zero if any fails.
 
+⚠ **S0 is built but has not been run, and must not be run yet.** The policy head
+is still the 357 primitive actions; the frozen vocabulary is the 684 macro one
+(`ENCODER_V2_SPEC.md` §10.6), and under it there are **no `WRITE_NUMBER` network
+calls at all**. So a top-1 agreement number measured now would be measured
+against a representation S1 discards, on a phase S1 never evaluates.
+
+Decided 2026-08-21: `macro_codec` is built as **the first deliverable of S1**,
+alongside `mcts.py`, because the two share the legality work — a macro index is
+legal iff its whole primitive sequence is legal end to end, which is the same
+enumeration the search needs for edge construction. The order inside S1 is
+therefore: `macro_codec` → run S0 against macro labels → `mcts.py` → the S1 gate.
+
+The corpus itself is unaffected and does not need recapturing: trajectories are
+stored as primitives and `datagen.replay` does the collapse, so today's capture
+code already produces tomorrow's labels.
+
 **The paired comparison replaces one seat, not the whole table.** The first
 implementation played an all-net game against an all-greedy game at the same
 seed, and that is not a controlled substitution: every seat of an all-net table
@@ -221,8 +237,22 @@ bootstrap produces a placement-competent, race-blind policy, which is fine.
 
 ### S1 — Search *(supersedes M3)*
 
-Build `mcts.py`. Validate at **two seats against GreedyBot**, the cheapest
-configuration that still has all four race mechanics live.
+Build `macro_codec` **first**, then `mcts.py`. Validate at **two seats against
+GreedyBot**, the cheapest configuration that still has all four race mechanics
+live.
+
+**`macro_codec` (684 indices, frozen in `ENCODER_V2_SPEC.md` §10.6).** It leads
+because everything downstream is measured in its vocabulary: the S0 policy head
+is 684 wide, `datagen.replay` collapses each `CHOOSE_STACK → (WRITE |
+PERMIT_REFUSAL)` pair into one macro label, and there are no `WRITE_NUMBER`
+network calls. It sits with search rather than with S0 because the legal-mask
+contract — a macro index is legal iff its **full primitive sequence** is legal
+end to end, never a per-step mask intersection — is the same enumeration the
+search needs to build edges. Building it twice would be building it two ways.
+
+`network.py` currently imports `NUM_ACTIONS` from `action_codec`; it becomes the
+macro width, and the S0 checkpoint from before the change is not loadable
+across it. There is no migration to write — S0 is cheap to re-run.
 
 #### The root-player contract — binding
 

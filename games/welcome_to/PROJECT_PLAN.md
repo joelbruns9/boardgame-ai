@@ -151,6 +151,11 @@ Design decisions, none of them inherited from Kingdomino:
   `ENCODER_V2_SPEC.md` §10.6). Then **one per-seat head evaluated four times** (11
   units) and one global head (5 units) — 16 output units producing 49 predictions.
 
+  *As built:* the policy head is **357 wide, not 684** — the macro vocabulary is
+  not implemented, and lands with `macro_codec` at the start of S1. Until then
+  the S0 gate's top-1 number is against primitives and says nothing about S1's
+  representation, so S0 is not to be run.
+
   *As built:* the per-seat head is 16 units and the global head 5, because the
   target set is the step-1/2 one — `end_trigger`, `will_complete_plan_k` and
   `plan_k_first` arrive with §10 step 4 and the extension-tier targets have not
