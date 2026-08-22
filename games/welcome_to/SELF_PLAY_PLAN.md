@@ -305,21 +305,39 @@ is true of *where* chance enters and **misleading about the effect**. A turn
 boundary reveals three fresh cards, so a crossing almost always produces a key
 never seen before, and therefore a fresh leaf rather than a revisit.
 
-Mean leaf depth, over 2p and 3p positions at turns 4, 12 and 20:
+**Prior sharpness does not change this, and that is worth knowing because the
+obvious objection is that it should.** If most simulations are wasted on moves a
+trained policy would know are bad, concentrating them ought to buy depth.
+Measured over 4 network seeds x 6 positions at 256 simulations, comparing a
+uniform prior against a **one-hot** one (the limit of sharpening):
 
-| sims | mean leaf depth | max depth |
+| prior | mean leaf depth | range |
 |---|---|---|
-| 64 | 1.23 – 1.77 | 2 |
-| 256 | 1.26 – 2.00 | 2 – 4 |
-| 1024 | 1.34 – 2.00 | 3 – 4 |
+| uniform | 1.59 | 1.06 - 2.08 |
+| one-hot | 1.59 | 1.00 - 2.01 |
 
-**It plateaus at about 2 by 256 simulations and stops responding to the budget.**
-So what was built is *one-turn lookahead over a value network*: the root averages
-many freshly-evaluated leaves rather than resolving a tree, and strength has to
-come from the network. That is not obviously wrong for this game — the coupled
-decision is *within* a turn, and the macro already collapses its most important
-part — but it is not what "search" usually buys, and the budget above ~256
-simulations is spent on root averaging, not depth.
+Two of 24 cells differ by more than 0.5. **Because one-hot is the upper bound on
+sharpness, this closes the question rather than leaving it open** - no trained
+policy can do better than the extreme.
+
+The reason is structural. With a concentrated prior every simulation takes the
+same root action, reaches the same child - no chance has been crossed yet, so the
+key recurs - and walks the same within-turn chain. Then it hits the turn
+boundary, where **every simulation draws a unique observation and terminates as a
+fresh leaf**. So depth is about "the root player's own decisions remaining this
+turn, plus one", which is 1-2 in most turns. A uniform prior reaches the same
+depth because those within-turn chains are deterministic given the action and get
+developed after a couple of visits regardless.
+
+So the budget beyond roughly one simulation per root action goes into **root
+averaging over fresh leaves**, not into depth. That is what this search is, and
+it is genuinely chance-limited.
+
+(Two earlier versions of this note were wrong in opposite directions. The first
+claimed depth was capped at 2 regardless of budget, measured at one position. The
+second claimed depth was prior-limited and roughly doubled under sharp priors -
+measured once, with an **unseeded** network, and not reproducible. The table above
+is 24 cells with seeded weights. Measure the extreme case: it bounds the claim.)
 
 **Do not reach for progressive widening.** An earlier version of this note called
 it "the fix"; that was written before the following measurement and is withdrawn.
@@ -348,16 +366,32 @@ simulations averages opposite moves in a game whose entire constraint is
 ascending order. No UCB correction repairs that, because the node's identity is
 genuinely a lottery.
 
-Which points at the real conclusion: **if action identity below a boundary is
-that unstable, depth through a boundary is worth little however it is keyed.**
-Progressive widening would buy depth over lottery-ticket nodes. The design that
-would make depth meaningful is different — re-key the tree below the root by
-`(number, box)` and use availability counts; the tree need not share the policy
-head's vocabulary — and it is only worth building if depth turns out to matter.
+**Kingdomino is the counterexample, and it is worth being precise about.** Its
+`OpenLoopMCTS` keys children on a slot-relative joint index and **no observation
+at all**, and its docstring names this very problem — *"at a deep node the
+concrete domino in a given pick slot differs across determinizations"*. It merges
+them and works. So merging tolerates semantic drift, and "no UCB correction
+repairs that" was too strong.
 
-**Measure before building either.** Once S0 exists, run `arena.paired` at 64,
-256 and 1024 simulations. If strength is flat past ~128, the question is closed:
-cap the budget and spend the compute on games and network quality.
+What differs is one line of Kingdomino's engine: `current_row = sorted(deck[:4])`.
+**Its draft is sorted**, so slot 0 always means the lowest-numbered domino — the
+concrete tile varies, the slot's *ordinal* meaning does not, and merging averages
+over things that are alike. Welcome To's three stacks carry no ordering: slot 0
+is whichever pile is leftmost, and its number is near-uniform over 1-15.
+
+Which opens a third option, arguably the cleanest: **canonicalise the stack order
+by number**, exactly as Kingdomino sorts its draft. Slot index would then mean
+"lowest / middle / highest number on offer", merging would be as sound as
+Kingdomino's, and depth would come without keying at all. The cost is that a
+stack's identity carries its **known next effect** across turns — `next_effects`
+is a certainty and a real feature — and sorting scrambles that correspondence.
+A genuine trade-off, not a free win, and it would change the frozen vocabulary.
+
+**Measure before building any of it.** Once S0 exists, run `arena.paired` at 64,
+256 and 1024 simulations. If strength is flat past ~128 the question is closed,
+and the compute belongs in games and network quality instead. If it is not flat,
+the sorted-stack option is the first one to price - it is the only one of the
+three that buys depth rather than working around the lack of it.
 
 (A first version of this note claimed depth was capped at 2 regardless of budget.
 That was measured at one position and was wrong; a rare line does reach 4. The

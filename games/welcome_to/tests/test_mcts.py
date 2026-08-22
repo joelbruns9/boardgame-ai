@@ -158,44 +158,62 @@ def test_one_action_under_different_reveals_becomes_different_children():
     assert stats["most_observations"] > 1, "chance was merged into one child"
 
 
-def test_the_tree_barely_deepens_however_large_the_budget():
-    """MEASURED, and a real limit on what this search is.
+def test_sharpening_the_prior_does_not_deepen_the_tree():
+    """The obvious objection, tested at its own limit.
 
-    Every turn boundary reveals three fresh cards, so under exact observation
-    keying a crossing almost always produces an unseen key and therefore a new
-    leaf.  **Mean leaf depth plateaus at about 2 and stops responding to the
-    budget** — measured over 2p and 3p positions at turns 4, 12 and 20:
+    If depth were limited by simulations wasted on moves a trained policy would
+    know are bad, concentrating the prior would buy depth.  It does not.
+    Measured over 4 network seeds x 6 positions at 256 simulations: uniform mean
+    leaf depth 1.59, one-hot 1.59, with 2 of 24 cells differing by more than 0.5.
+    **One-hot is the upper bound on sharpness, so this closes the question** --
+    no trained policy beats the extreme.
 
-    | sims | mean leaf depth (range over 6 positions) | max depth |
-    |---|---|---|
-    | 64 | 1.23 – 1.77 | 2 |
-    | 256 | 1.26 – 2.00 | 2 – 4 |
-    | 1024 | 1.34 – 2.00 | 3 – 4 |
+    The reason is structural.  A concentrated prior sends every simulation down
+    the same root action, to the same child (no chance crossed yet, so the key
+    recurs), along the same within-turn chain -- and then into the turn boundary,
+    where **every simulation draws a unique observation and terminates as a fresh
+    leaf**.  Depth is therefore "the root player's own decisions left this turn,
+    plus one", and a uniform prior reaches it too because those chains are
+    deterministic given the action.
 
-    A rare line does reach depth 4, which is why this asserts the *mean* — the
-    first version of this test asserted max depth from a single position and was
-    simply wrong.
-
-    So this is **one-turn lookahead over a value network**, not deep search: the
-    root averages over many freshly-evaluated leaves rather than resolving a
-    tree.  Strength has to come from the network.
-
-    That is probably a property of the game rather than a defect to fix.  One
-    turn out, a fixed ``macro_write(slot, 0, box)`` means writing any number
-    from 1 to 15 — the index is ``(slot, delta, box)`` and the *move* is
-    ``(number, box)``, and those only coincide where the table is known.  Depth
-    through a boundary is therefore worth little however it is keyed.  See
-    ``SELF_PLAY_PLAN.md`` before building machinery to deepen this.
+    Budget beyond about one simulation per root action goes into root averaging,
+    not depth.  Two earlier versions of this test asserted the opposite things,
+    each from a single unseeded measurement; this one asserts the null, which is
+    what 24 seeded cells actually show.
     """
-    for turn in (4, 12):
+    class Sharp(mcts.NetEvaluator):
+        def evaluate(self, evaluated, viewer):
+            priors, value = super().evaluate(evaluated, viewer)
+            legal = mc.legal_mask(evaluated)
+            sharp = np.zeros_like(priors)
+            sharp[int(np.argmax(np.where(legal, priors, -1.0)))] = 1.0
+            return sharp, value
+
+    config = mcts.SearchConfig(simulations=256)
+    torch.manual_seed(0)
+    net = nw.WelcomeToNet(_SMALL)
+
+    gaps = []
+    for turn in (8, 16):
         state = _position(players=2, turn=turn)
-        search, _ = _search(simulations=1024)
-        _, _, root = search.search(state, root=0, rng=random.Random(3))
-        stats = _tree_stats(root)
-        assert stats["mean_leaf_depth"] < 3.0, (
-            f"turn {turn}: mean leaf depth {stats['mean_leaf_depth']:.2f} -- if the "
-            "tree now deepens, progressive widening may have landed; re-measure"
-        )
+        while not state.is_terminal and (
+            state.actor != 0 or state.phase is not Phase.CHOOSE_CARDS
+        ):
+            state.apply(state.legal_actions()[0])
+        if state.is_terminal:
+            continue
+        flat = mcts.MCTS(mcts.NetEvaluator(net, torch.device("cpu"), config), config)
+        sharp = mcts.MCTS(Sharp(net, torch.device("cpu"), config), config)
+        a = _tree_stats(flat.search(state, root=0, rng=random.Random(3))[2])
+        b = _tree_stats(sharp.search(state, root=0, rng=random.Random(3))[2])
+        gaps.append(b["mean_leaf_depth"] - a["mean_leaf_depth"])
+
+    assert gaps, "no usable position"
+    assert max(gaps) < 1.0, (
+        f"sharpening deepened the tree by {max(gaps):.2f} -- if that reproduces "
+        "across seeds and positions, the depth limit is not what this test says "
+        "and SELF_PLAY_PLAN.md needs re-measuring"
+    )
 
 
 def test_every_simulation_gets_its_own_determinization():
