@@ -13,9 +13,11 @@ transition inconsistently — as a *pre-reveal afterstate* in one place and as
 outright for any root that is not seat 0. All are corrected below, and the wrong
 versions are recorded so they are not reintroduced.
 
-**The open blocker is now precisely one thing:** exactly which stochastic
-transition is retained between two decisions by the same root player (§7.1,
-§7.3). Deck sampling and weighting are settled.
+**Decisions taken 2026-08-22** (§7.6). The transition semantics of §7.1/§7.3
+are agreed; `K` is a schedule rather than a constant; the in-search opponent
+model is the network, batched, and never a bot; merging and particles are
+measured inert and will not be built in v1; retained children are discarded at
+every real turn boundary.
 
 **Reads with:** `SELF_PLAY_PLAN.md` S1 (root-player contract, gate),
 `ENCODER_V2_SPEC.md` §10.6 (frozen 684 vocabulary), `AUX_TARGETS_SPEC.md` §5
@@ -447,12 +449,84 @@ both the distribution and, per §6.3, how many cards are drawn):
 
 ### 7.5 Re-rooting on the real reveal
 
+⚠ **The tree does not survive a real boundary, and that is accepted.** With ~277k
+possible reveals and `K` samples, the real reveal will essentially never be among
+the retained children — measured, 16 sampled reveals were 16 distinct outcomes at
+every deck size tested, down to 18 cards remaining. So every real turn starts a
+**fresh root** and everything searched below the chance node is discarded.
+
+This is not a regression — it is what happens today — but it means §7.5's
+"reuse the matching child" is aspirational and must not be counted on. **Tree
+reuse pays inside a turn, not across one** (§12 step 3), because there the
+transitions are deterministic and re-rooting is exact.
+
+
+
 Construct the new public state, reuse the matching sampled child if there is one,
 otherwise start a fresh root. The actual public observation is the anchor; no
 persistent ordinal identity is needed.
 
 Within a turn the deterministic subtree **can** be re-rooted after each real
 action, because no chance intervenes. **That does not extend across a boundary.**
+
+### 7.6 Decisions taken
+
+**`K` is a schedule, not a constant.** Holding a target depth `H` needs
+`K^H ≲ N`, so `K ≈ N^(1/H)`; for depth 2 that is `K ≈ √N` — 8 at 64 simulations,
+16 at 256, 32 at 1024. Low `K` early, when simulation counts are low and depth is
+what is missing; higher `K` later, when counts rise and the chance expectation
+becomes the limiting error.
+
+⚠ **Note what that rule is.** `C · visits^α` with `α = 0.5` **is** progressive
+widening. So the staged-`K` intuition and the deferred PW alternative (§10) are
+the same idea reached from opposite directions, and PW obtains it *adaptively*
+instead of requiring a schedule pinned to training stage. Fixed `K` is still
+built first — easier to reason about, easier to batch — but the deferral now
+reads "build the simpler thing first", not "probably unnecessary".
+
+**Depth scope stays fluid.** Whether the chance node applies at every boundary
+(cost `K^H`) or only near the root is deliberately not fixed here; decide it
+against measured training impact once the infrastructure exists.
+
+**The in-search opponent model is the network, batched. Never a bot.** The only
+real choice was network versus heuristic — "batched" is a throughput property of
+the same model, not a different one. A bot is excluded on principle: GreedyBot
+completes **0.42 plans per game** and is structurally race-blind, so using it as
+the opponent model would bake race-blindness into every value estimate the search
+produces, in a game whose entire competitive surface is the plan race.
+
+**Merging and particles are not built in v1.** Measured inert: at `K = 16`,
+sampled reveals were 16-of-16 distinct at every deck size tested, so every
+retained child holds exactly one particle and `count/K` collapses to `1/K`.
+Implement a **counter** that records any collision; build the machinery only if it
+ever fires. (Definitions, for the record: *merging* keeps one child at weight
+`2/K` when two samples reach the same viewer information state; *particles* handle
+the case where samples share a viewer information state but differ in hidden
+detail — most plausibly opponents having written different numbers this turn,
+invisible until the next boundary — where the child is a belief, not a state, and
+collapsing it to one canonical state narrows that belief silently.)
+
+### 7.7 Root allocation: PUCT now, Gumbel as its own arm
+
+**These are separable from everything above**, because both searches consume the
+same priors and the same value head — so the network cannot tell which produced
+its targets, and it is legitimate to **train with one and serve with the other**.
+
+The case for Gumbel top-`k` + sequential halving is not mainly low-simulation
+strength. It is that **AlphaZero's visit-count policy carries no
+policy-improvement guarantee at small `n`** — the target can be worse than the
+prior it came from — whereas the Gumbel construction guarantees improvement at
+any budget (§13, Danihelka et al.). That is a *training-target* property, and it
+binds hardest exactly where throughput wants us: few simulations per move, many
+games. Our masked 495-wide macro root is its intended shape.
+
+Serving is not the constraint: a human waiting on the BGA advisor will tolerate a
+far larger budget than self-play can afford per move.
+
+⚠ **Sequencing.** Sequential halving allocates a fixed budget across root actions
+in rounds, which interacts with a stochastic transition beneath each action.
+Compatible, but another moving part — land the chance node first, then add Gumbel
+as its own bakeoff arm.
 
 ---
 
@@ -465,7 +539,7 @@ simulations" meaningless.
 
 ⚠ **And a leaf is not the only cost.** Because the retained object is the whole
 root-to-root transition (§7.1), each sample also pays for the **opponents' policy
-evaluations**. At four seats and the measured 1.91 decisions per turn, one
+evaluations** — which are network calls, per §7.6, not cheap bot rollouts. At four seats and the measured 1.91 decisions per turn, one
 `K = 16` expansion approaches
 
 ```
