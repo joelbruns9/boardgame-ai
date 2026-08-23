@@ -69,13 +69,35 @@ is the other way round.
 Each is a decision, not code; each takes an afternoon; each is expensive to
 retrofit.
 
-### M0-A — the supported configuration matrix
+**✅ Signed off 2026-08-23.** B, C, D and F as written. A and E changed:
+`dirichlet_alpha` is **supported**, not rejected — the draft contradicted §8 —
+and the two rejection lists are now separated by *why*. E is cut back to the
+structural minimum, because the rest of it was a throughput question answered
+without a measurement.
 
-Standard 2/3/4 seats, advanced on and off. **Everything else is rejected
-loudly**, at construction, with the reason: expert, solo, `chance_widening`,
-`dirichlet_alpha`, and any `SearchConfig` field the Rust backend does not
-implement. A silently-ignored flag is how a Rust self-play run stops being
-equivalent without anybody noticing.
+### M0-A — the supported configuration matrix ✅ signed off 2026-08-23
+
+Supported: **standard 2/3/4 seats, advanced on and off.** Everything else is
+rejected **loudly, at construction, naming the reason** — a silently-ignored flag
+is how a Rust self-play run stops being equivalent without anybody noticing.
+
+⚠ **Two different lists, and an earlier draft conflated them.**
+
+**Never supported** — out of training scope, refuse rather than half-implement:
+expert mode, solo mode, expansions.
+
+**Not implemented *yet*** — refused only until the milestone that adds it:
+`chance_widening`, which §8.1 committed M5's layout to admitting and which
+becomes M7 if it wins the bakeoff. The refusal is still required in the meantime:
+a backend that silently ignored `chance_widening = 1.0` would run a different
+search than the one it was asked for.
+
+✅ **`dirichlet_alpha` is SUPPORTED, and an earlier draft wrongly listed it as
+rejected.** That contradicted §8, which already specifies the boundary — **Python
+generates the noise vector, Rust applies it**. It is also not optional:
+**S2 needs root noise**, so a backend that cannot apply it cannot run self-play,
+which is the whole purpose of the port. What *is* forbidden is a hook that
+silently omits noise; §8 says why.
 
 ### M0-B — the RNG contract ⚠ load-bearing, and it has two halves
 
@@ -146,15 +168,28 @@ PythonEvaluator.forward(batch) -> packed results
 RustScheduler.update(results)
 ```
 
-**Ownership, each with its own parity gate:**
+⚠ **That is the structural minimum, and M0 fixes nothing beyond it.** An
+earlier draft also assigned ownership of the legal mask, the masked softmax,
+rank masking, `blend_value` and the result scatter — **a priori, with no
+measurement behind any of it.** Those are throughput questions, and this plan's
+own §7 already lists the instrument that answers them (bytes crossing FFI per
+batch, allocations per leaf).
 
-| operation | owner | why |
+**So: port the hot path first, then measure what is still in Python and decide
+what else is worth moving.** Start each of these on the side it is on today and
+move it only against a number:
+
+| operation | starts | move it when |
 |---|---|---|
-| legal mask, legal gather | **Rust** | reads game state, which Rust owns |
-| masked softmax over gathered priors | **Rust** | avoids shipping 684 logits per row |
-| rank masking, `rank_probabilities` | **Python** | reads a network head |
-| `blend_value` | **Python** | config-driven, cheap, and `training.rank_utility` lives there |
-| mixed LEAF/POLICY scatter | **Rust** | it owns `request_id` |
+| legal mask / gather | Rust — it reads state Rust owns, so it has nowhere else to be | — |
+| priors: full 684 vs gathered-legal | **full 684**, the simpler thing | bytes-crossing-FFI shows up in the profile. 684 × 32 rows ≈ 87 KB against ~6 KB gathered, so the *option* is worth keeping open in the layout |
+| masked softmax | Python | it is measured to matter |
+| rank masking, `blend_value` | Python — `training.rank_utility` lives there | ditto |
+| LEAF/POLICY scatter | Rust — it owns `request_id` | — |
+
+⚠ **Wherever each ends up, it needs a parity gate.** That requirement does not
+move with the code: an operation that changes language silently changes results
+unless something checks.
 
 ⚠ **"Only leaf evaluation crosses" was inaccurate** and is corrected in §3:
 opponent `POLICY` requests cross too, and they were **97% of calls** before step
@@ -475,10 +510,12 @@ bets widening loses a bakeoff nobody has run.
 * Until implemented, **Rust rejects `chance_widening != None` loudly** (M0-A).
 * **Expert and solo** are out of training scope; reject them loudly rather than
   half-implement.
-* **Dirichlet noise:** the clean interim boundary is **Python generates the noise
-  vector, Rust applies it**. ⚠ A "hook" that silently omits noise would make
-  Rust self-play non-equivalent to Python self-play while every gate stayed
-  green.
+* **Dirichlet noise is supported, not deferred** (M0-A). The boundary is
+  **Python generates the noise vector, Rust applies it** — cheap, keeps
+  `numpy`'s Dirichlet as the single source, and needs only a parity gate on the
+  application. ⚠ A "hook" that silently omits noise would make Rust self-play
+  non-equivalent to Python self-play while every gate stayed green, which is why
+  M0-A forbids the hook rather than the feature.
 
 ---
 
