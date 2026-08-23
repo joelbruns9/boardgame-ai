@@ -105,7 +105,16 @@ def test_a_search_can_be_dropped_into_the_harness():
     Running a whole paired game is the assertion: ``apply_macro`` raises on any
     illegal step, so a completed pair means every searched move was legal end to
     end -- and it exercises the real integration path rather than a mock of it.
+
+    ⚠ **The net is seeded, and it has to be.** This built an unseeded one, so its
+    weights came from wherever the global generator happened to be, which makes
+    the test depend on how many ``torch.manual_seed`` calls ran before it -- i.e.
+    on test ordering. That is latent for as long as nobody adds a seeded test,
+    and it fired the moment someone did. The ``subject_score > 0`` assertion has
+    a thin margin to spend on luck: over 60 net seeds the mean is 10.7 but the
+    minimum is 1.0, from an untrained player at two simulations.
     """
+    torch.manual_seed(0)
     config = mcts.SearchConfig(simulations=2)
     net = nw.WelcomeToNet(
         nw.NetConfig(
@@ -124,6 +133,7 @@ def test_the_search_root_is_the_arena_seat_not_the_default_actor():
     """Clause 3 one layer up: the arena substitutes a seat, so that seat is the
     search root.  Falling back to ``state.actor`` would work by accident here
     and break the moment the harness evaluates a seat other than the mover."""
+    torch.manual_seed(0)
     seen = set()
 
     class Spy(mcts.MCTS):

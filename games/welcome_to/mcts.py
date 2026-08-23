@@ -136,7 +136,8 @@ from games.welcome_to.constants import CARD_TABLE
 from games.welcome_to.game import GameState
 
 #: What the caller may condition on between its own decisions: the viewer
-#: information state of :func:`information_key`.  Terminal states key as ``()``.
+#: information state of :func:`information_key`.  Terminal states included --
+#: two different endings are two different outcomes.
 Observation = tuple
 
 class Ask(IntEnum):
@@ -939,8 +940,15 @@ class MCTS:
             guard += 1
             if guard > 5000:  # pragma: no cover - a stuck engine, not a rules case
                 raise RuntimeError("opponents did not yield the turn")
-        if state.is_terminal:
-            return ()
+        # ⚠ **Terminal states are keyed like any other, and must be.** This
+        # returned a bare ``()`` for every ending, which is harmless in the
+        # open-loop arm -- a terminal transition stores no child, so the key is
+        # never looked up -- and silently wrong under §7.1a's widening, where the
+        # observation *is* the outcome key. Measured before the fix: 255
+        # distinct endings of one edge merged into a single outcome carrying
+        # whichever final score happened to be computed last. Different endings
+        # have different scores; collapsing them is precisely the belief
+        # collapse particles exist to prevent.
         return information_key(state, root)
 
     def _leaf(self, state: GameState, root: int) -> tuple[Optional[Node], float]:

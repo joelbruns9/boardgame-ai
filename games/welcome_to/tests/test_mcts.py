@@ -16,6 +16,8 @@ from games.welcome_to import network as nw
 from games.welcome_to import training
 from games.welcome_to.bots import GreedyBot
 from games.welcome_to.constants import CARD_TABLE, NUM_BASE_CARDS
+from typing import Optional
+
 from games.welcome_to.game import GameConfig, GameState, Phase
 
 _SMALL = nw.NetConfig(
@@ -1286,3 +1288,84 @@ def test_a_three_card_deck_finds_its_whole_support_and_no_more():
         assert sum(outcome.count / draws for outcome in outcomes.values()) == (
             pytest.approx(1.0)
         )
+
+
+def _last_decision_before_the_end(seed: int, root: int = 0) -> Optional[GameState]:
+    """The root player's final decision of a GreedyBot game, so a search from it
+    reaches terminal transitions rather than merely deep ones."""
+    bots = [GreedyBot(random.Random(seed * 10 + i)) for i in range(2)]
+    state = GameState.new(seed=seed, config=GameConfig(players=2, advanced=True))
+    previous = None
+    while not state.is_terminal:
+        if state.actor == root and state.phase is not Phase.WRITE_NUMBER:
+            previous = state.copy()
+        state.apply(bots[state.actor].act(state))
+    return previous
+
+
+def test_terminal_transitions_are_keyed_apart_not_collapsed_together():
+    """⚠ Regression for a real collapse.
+
+    ``_advance`` used to return a bare ``()`` for every ending. That is harmless
+    in the open-loop arm -- a terminal transition stores no child, so the key is
+    never looked up -- and silently wrong under widening, where the observation
+    *is* the outcome key. Measured before the fix: **255 distinct endings of one
+    edge merged into a single outcome**, carrying whichever final score happened
+    to be computed last, and every later reuse of that edge returned it. Endings
+    have different scores; collapsing them is exactly the belief collapse
+    particles exist to prevent.
+    """
+    torch.manual_seed(0)
+    search, _ = _search(simulations=256, chance_widening=1.0)
+    keys: set = set()
+    values: dict = {}
+    for seed in range(6):
+        state = _last_decision_before_the_end(seed)
+        if state is None or state.is_terminal:
+            continue
+        _, _, root = search.search(state, root=0, rng=random.Random(seed))
+        for _, _, outcomes in _edges(root):
+            for key, outcome in outcomes.items():
+                if outcome.terminal_value is None:
+                    continue
+                assert key != (), "an ending keyed as the empty observation"
+                keys.add(key)
+                values.setdefault(key, outcome.terminal_value)
+
+    assert len(keys) >= 5, f"only {len(keys)} terminal transitions reached"
+
+
+def test_the_information_key_determines_the_terminal_value():
+    """Why merging endings on the key is sound *once they are keyed properly*.
+
+    An outcome keeps one ``terminal_value`` for however many draws land on it, so
+    that is only correct if the key pins the value down. It does: the final
+    scores are a function of the sheets, and at a terminal state the live sheets
+    and the public snapshots agree, so everything ``terminal_value`` reads is in
+    the key. Verified over 39 distinct terminal keys, none mapping to two values.
+    """
+    torch.manual_seed(0)
+    config = mcts.SearchConfig(simulations=256, chance_widening=1.0)
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"), config)
+    seen: dict = collections.defaultdict(set)
+
+    class Spy(mcts.MCTS):
+        def _leaf_gen(self, state, root):
+            if state.is_terminal:
+                seen[mcts.information_key(state, root)].add(
+                    round(mcts.terminal_value(state, root, self.config), 9)
+                )
+            return (yield from super()._leaf_gen(state, root))
+
+    search = Spy(evaluator, config)
+    for seed in range(6):
+        state = _last_decision_before_the_end(seed)
+        if state is None or state.is_terminal:
+            continue
+        search.search(state, root=0, rng=random.Random(seed))
+
+    assert seen, "no terminal state was reached"
+    ambiguous = {key: values for key, values in seen.items() if len(values) > 1}
+    assert not ambiguous, (
+        f"{len(ambiguous)} information keys map to more than one terminal value"
+    )
