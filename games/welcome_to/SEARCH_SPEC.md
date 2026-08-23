@@ -1044,13 +1044,63 @@ walks an opponent through every decision it has, forced ones included, and neith
 
 before any deeper search happens.
 
-⚠ **A saving is sitting in `_advance` and is deliberately not taken yet.** An
-opponent decision with one legal action is a network call that cannot change
-anything, and measured, 13% of opponent decisions are exactly that (2.42 → 2.14
-in §4). Applying the same collapse there is worth roughly 13% of the opponent
-term above. It is not done because `_advance` is the turn-boundary code that
-§6–§9 are still deciding the shape of, and touching it twice is worse than
-touching it once.
+⚠ **A saving is still sitting in `_advance`.** An opponent decision with one
+legal action is a network call that cannot change anything, and measured, 13% of
+opponent decisions are exactly that (2.42 → 2.14 in §4). Applying the forced
+collapse there is worth roughly 13% of the opponent term above. Not taken yet;
+unlike the batching below it is a *semantic* change to the opponent model, so it
+wants its own measurement.
+
+### 8a. What step 6 actually built, and what it is worth
+
+**The seam, not the tuning.** `MCTS.search_gen` suspends at every network
+request and `run_searches` decides when and with what else they are computed. So
+cross-game batching is a driver; nothing in the descent knows whether it is
+running alone or in a wave. That is the whole deliverable — the tuning comes
+after a working self-play loop, and it will not need this rewritten.
+
+⚠ **Both kinds of request must suspend, and this is the finding.** An earlier
+version yielded only at leaves. Measured on a 32-search wave: leaves batched
+*perfectly* at 32.0 rows per call — and opponent policy sampling was still
+**53% of all rows and 97% of all calls**, every one of them a batch of one,
+because `_advance` called the network directly. Batching the leaves alone bought
+1.24×.
+
+⚠ **And both kinds must share a *call*.** A leaf wants `(priors, value)` and an
+opponent wants priors alone, but both read the same heads of the same forward.
+Splitting the wave by kind measured a mean batch of **12.1** where 32 searches
+were live; answering them together gives **22.4**.
+
+Measured, 32 concurrent searches at 64 simulations, two seats, CPU:
+
+| driver | calls | mean batch | leaves/s | speedup |
+|---|---|---|---|---|
+| one at a time | 4,430 | 1.0 | 360 | — |
+| wave, `max_batch=8` | 608 | 7.3 | 541 | 1.50× |
+| wave, `max_batch=16` | 340 | 13.0 | 562 | 1.56× |
+| wave, `max_batch=32` | 198 | 22.4 | 588 | **1.63×** |
+| wave, `max_batch=64` | 198 | 22.4 | 591 | 1.64× |
+
+⚠ **Read those two columns together, because they disagree.** Pooling the kinds
+took mean batch width from 12.1 to 22.4 — **+85% on the diagnostic** — and
+throughput from 1.58× to 1.64×, **+4%**. `THROUGHPUT_LEVERS.md` §4.7 names this
+exactly: batch width is not throughput, and a win banked on the first number
+mostly is not there. `max_batch` is a ceiling, not a target; 32 is the shipped
+default because the fixed per-call cost measured worth ~19 rows.
+
+**Why it stops at 1.64×.** Fixed cost per forward is 0.677 ms and marginal cost
+per row 0.037 ms, so batching removes almost all of the forward — but the
+forward is only ~30% of search wall clock. `encode_state` is another ~30% and is
+per-row Python that **does not batch away**; it becomes the larger share exactly
+when batching starts working (§4.2). The next throughput lever is the encoder,
+not a wider batch.
+
+⚠ **Class A, verified rather than assumed.** A batched forward is not
+bit-identical to a single one — float reductions run in a different order,
+measured at ~1e-7 on priors and values. Too small to matter as a value, and able
+in principle to flip a comparison tied to seven digits, so the check is on
+discrete outputs: `trajectory_fingerprint` over actions and visit counts, never
+float targets (§A). 32 of 32 searches came out identical.
 
 **Required before the bakeoff**, at least one of:
 
@@ -1177,8 +1227,13 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    and `_advance` now returns it. §12.1's checklist is implemented item by item
    and tested item by item, including its "test that matters". Measured neutral
    to adopt (0 of 3,840 edges change) and ~31 µs per simulation step.
-6. **Batched evaluator** — successor batches *and* opponent-policy batches (§8).
-   **Before** step 7, because a retained transition costs both.
+6. ✅ **Batched evaluator** — the *seam*, not the tuning (§8a). The search
+   suspends at every network request (`MCTS.search_gen`, `Ask`), so batching is
+   a **driver** (`run_searches`) rather than a rewrite of the descent. Measured
+   **1.64×** with 32 concurrent searches, 4,430 calls → 198, and 32/32 identical
+   trajectories. The "successor batches" half of this item is moot: §7.1a's
+   progressive widening materialises children one at a time, so there is no `K`
+   to batch.
 7. **Fixed-support environment edge** (§7) with `count/K` weights and particle
    children, behind a flag, the current version kept as the control arm. Build it
    **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists

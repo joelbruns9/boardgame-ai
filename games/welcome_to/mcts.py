@@ -116,10 +116,13 @@ permits are informative about score, the score head already uses them.
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import math
 import random
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from enum import IntEnum
+from typing import Callable, Iterator, Optional, Sequence
 
 import numpy as np
 import torch
@@ -135,6 +138,29 @@ from games.welcome_to.game import GameState
 #: What the caller may condition on between its own decisions: the viewer
 #: information state of :func:`information_key`.  Terminal states key as ``()``.
 Observation = tuple
+
+class Ask(IntEnum):
+    """What a suspended search wants computed.
+
+    ⚠ **Two kinds, and both must go through the same suspension point**, or the
+    batching only reaches half the work.  Measured on a 32-search wave before
+    ``POLICY`` was added: leaves batched perfectly at 32.0 rows per call, and
+    opponent sampling was still **53% of rows and 97% of calls**, every one of
+    them a batch of one, because ``_advance`` called the network directly.
+    """
+
+    #: A tree leaf.  Answered with ``(priors, value)``.
+    LEAF = 0
+    #: An opponent's move inside a transition.  Answered with priors alone --
+    #: no value, no tree (clause 2).
+    POLICY = 1
+
+
+#: A suspended network request: what is wanted, of what state, for which viewer.
+#: For ``LEAF`` the viewer is always the *root* player -- clause 3.
+Request = tuple[Ask, GameState, int]
+#: What comes back: ``(priors, value)`` for ``LEAF``, bare priors for ``POLICY``.
+Result = object
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,41 +367,98 @@ class NetEvaluator:
         self.net = net
         self.device = device or next(net.parameters()).device
         self.config = config or SearchConfig()
+        #: Forward passes made.  ``THROUGHPUT_LEVERS.md`` §2.1's vocabulary, kept
+        #: apart on purpose: ``calls`` is evaluator invocations, ``rows`` is
+        #: leaves, and ``batch_widths`` is the distribution of rows per call.
+        #: Reporting a batch-width improvement as a throughput win is the named
+        #: failure mode there, and it needs both numbers to avoid.
         self.calls = 0
+        self.rows = 0
+        self.batch_widths: collections.Counter[int] = collections.Counter()
 
     @torch.no_grad()
-    def _forward(self, state: GameState, viewer: int) -> dict[str, torch.Tensor]:
+    def _forward_many(self, requests: Sequence[Request]) -> dict[str, torch.Tensor]:
+        """One network call for ``requests``.  The only place the net is run."""
         self.net.eval()
         self.calls += 1
-        arrays = enc.encode_state(state, viewer)
+        self.rows += len(requests)
+        self.batch_widths[len(requests)] += 1
+        columns = zip(*(enc.encode_state(state, viewer) for state, viewer in requests))
         tensors = [
-            torch.as_tensor(a).unsqueeze(0).float().to(self.device) for a in arrays
+            torch.as_tensor(np.stack(column)).float().to(self.device)
+            for column in columns
         ]
         return self.net(*tensors)
 
+    def answer_batch(self, requests: Sequence[Request]) -> list[Result]:
+        """Answer a **mixed** batch of requests from one forward pass.
+
+        ⚠ **Mixed on purpose.** A leaf wants ``(priors, value)`` and an opponent
+        wants priors alone, but both come out of the *same* heads of the *same*
+        forward, so splitting the wave by kind would just halve the batch width.
+        Measured: splitting gave a mean batch of 12.1 where the wave had 32
+        searches live; answering them together gives the full width.
+
+        One interpretation, shared by the batched and single paths, so a batch of
+        1 and a batch of 32 cannot drift apart in how they read the heads — a
+        second reading that agrees today is a parity bug waiting to happen.
+
+        ⚠ **This does not batch the encoder**, and cannot: ``encode_state`` is
+        per-row Python and stays per-row. Measured, it is 30% of search wall
+        clock against the forward's 30%, so it becomes the larger share exactly
+        when batching starts working (``THROUGHPUT_LEVERS.md`` §4.2).
+        """
+        if not requests:
+            return []
+        rows = [(state, viewer) for _, state, viewer in requests]
+        out = self._forward_many(rows)
+        logits = out["policy_logits"].cpu().numpy()
+
+        wants_value = [i for i, (kind, _, _) in enumerate(requests) if kind is Ask.LEAF]
+        values: dict[int, float] = {}
+        if wants_value:
+            seats = [
+                min(requests[i][1].config.players, enc.MAX_SEATS) for i in wants_value
+            ]
+            mask = np.zeros((len(wants_value), training.MAX_RANKS), dtype=np.float32)
+            for row, count in enumerate(seats):
+                mask[row, :count] = 1.0
+            rank_probs = nw.rank_probabilities(
+                out["rank_logits"][wants_value],
+                torch.as_tensor(mask).to(self.device),
+            ).cpu().numpy()
+            scores = out["score"][wants_value].cpu().numpy()
+            for row, index in enumerate(wants_value):
+                values[index], _ = blend_value(
+                    rank_probs[row], scores[row], seats[row], self.config
+                )
+
+        results: list[Result] = []
+        for index, (kind, state, _) in enumerate(requests):
+            priors = _masked_softmax(logits[index], mc.legal_mask(state))
+            results.append((priors, values[index]) if kind is Ask.LEAF else priors)
+        return results
+
+    def evaluate_batch(self, rows: Sequence[tuple[GameState, int]]) -> list[Result]:
+        """``(priors, value)`` per row, from one forward pass."""
+        return self.answer_batch([(Ask.LEAF, state, viewer) for state, viewer in rows])
+
     def evaluate(self, state: GameState, viewer: int) -> tuple[np.ndarray, float]:
-        """``(priors over the legal macros, leaf value in ``viewer``'s frame)``."""
-        out = self._forward(state, viewer)
-        seats = min(state.config.players, enc.MAX_SEATS)
+        """``(priors over the legal macros, leaf value in ``viewer``'s frame)``.
 
-        mask = np.zeros(training.MAX_RANKS, dtype=np.float32)
-        mask[:seats] = 1.0
-        rank_probs = nw.rank_probabilities(
-            out["rank_logits"], torch.as_tensor(mask).to(self.device).unsqueeze(0)
-        )[0].cpu().numpy()
-        scores = out["score"][0].cpu().numpy()
-        value, _ = blend_value(rank_probs, scores, seats, self.config)
+        Kept as the single-leaf seam that tests and variant evaluators override.
+        """
+        return self.evaluate_batch([(state, viewer)])[0]
 
-        legal = mc.legal_mask(state)
-        logits = out["policy_logits"][0].cpu().numpy()
-        priors = _masked_softmax(logits, legal)
-        return priors, value
+    def policy_batch(
+        self, rows: Sequence[tuple[GameState, int]]
+    ) -> list[np.ndarray]:
+        """Bare policies for several states at once.  No value, no tree."""
+        return self.answer_batch([(Ask.POLICY, state, viewer) for state, viewer in rows])
 
     def policy(self, state: GameState, viewer: int) -> np.ndarray:
         """The bare policy, for sampling an opponent forward.  No value, no tree."""
-        out = self._forward(state, viewer)
-        logits = out["policy_logits"][0].cpu().numpy()
-        return _masked_softmax(logits, mc.legal_mask(state))
+        return self.policy_batch([(state, viewer)])[0]
 
 
 def _masked_softmax(logits: np.ndarray, legal: np.ndarray) -> np.ndarray:
@@ -389,19 +472,153 @@ def _masked_softmax(logits: np.ndarray, legal: np.ndarray) -> np.ndarray:
     return (exp / total).astype(np.float32)
 
 
-#: An opponent model: given a state and the seat to move, apply one move.
-OpponentPolicy = Callable[[GameState, int, random.Random], None]
+#: An opponent model: given a state and the seat to move, apply exactly one
+#: move, **yielding** whatever it needs computed on the way.  A generator rather
+#: than a plain callable so that opponent sampling suspends at the same point a
+#: leaf does and pools into the same wave (:class:`Ask`).
+OpponentPolicy = Callable[[GameState, int, random.Random], Iterator[Request]]
 
 
-def sampling_opponent(evaluator: NetEvaluator) -> OpponentPolicy:
-    """Sample one move from the network's own policy — clause 2, no nested search."""
+def sampling_opponent() -> OpponentPolicy:
+    """Sample one move from the network's own policy — clause 2, no nested search.
 
-    def move(state: GameState, seat: int, rng: random.Random) -> None:
-        probs = evaluator.policy(state, seat)
+    The priors are masked by ``legal_mask``, not ``search_legal_macros``: an
+    opponent is a model of what the other seat will *actually* do, and §5.1's
+    dominance pruning is a statement about how the search spends its budget, not
+    about what other people play.
+    """
+
+    def move(state: GameState, seat: int, rng: random.Random) -> Iterator[Request]:
+        probs = yield (Ask.POLICY, state, seat)
         index = rng.choices(range(len(probs)), weights=probs, k=1)[0]
         mc.apply_macro(state, index)
 
     return move
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Driving searches -- one, or a wave of them
+#
+# ``THROUGHPUT_LEVERS.md`` §2.1's vocabulary, since it is what these two are
+# about and the words drift between projects:
+#
+#   simulation   one root-to-leaf descent
+#   leaf         a descent that needs a network evaluation -- not every
+#                simulation produces one, because a terminal descent is scored
+#                by the rules and an already-expanded subtree produces nothing
+#   batch width  leaves summed **across games** in one evaluator call.  The only
+#                one of these the device ever sees, and the only one these two
+#                functions move
+#
+# ⚠ **Batch width is not throughput** (§4.7).  Measured on this search: the
+# fixed cost of a forward is worth ~19 rows, and the forward is 30% of search
+# wall clock, so driving it to zero is worth **+43% at the very most** and a
+# batch past ~32 buys almost nothing.  ``encode_state`` is the other 30% and
+# does not batch away at all.  Report leaves per second next to any batch-width
+# number, or the win will not be there.
+# ──────────────────────────────────────────────────────────────────────────
+def _answer(request: Request, evaluator: NetEvaluator) -> Result:
+    kind, state, viewer = request
+    if kind is Ask.LEAF:
+        return evaluator.evaluate(state, viewer)
+    return evaluator.policy(state, viewer)
+
+
+def drive(generator: Iterator[Request], evaluator: NetEvaluator):
+    """Run one search generator to completion, one request at a time.
+
+    The un-batched path, and the one every existing caller takes.  It goes
+    through ``evaluate`` and ``policy`` rather than their batch forms so that the
+    single-request seams subclasses override stay the seams.
+    """
+    try:
+        request = next(generator)
+        while True:
+            request = generator.send(_answer(request, evaluator))
+    except StopIteration as done:
+        return done.value
+
+
+def run_searches(
+    generators: Sequence[Iterator[Request]],
+    evaluator: NetEvaluator,
+    max_batch: int = 32,
+) -> list:
+    """Run several search generators together, pooling their leaves into batches.
+
+    Each round advances **every** live generator to its next leaf, then evaluates
+    those leaves together.  So batch width is the number of searches still
+    running, capped by ``max_batch`` — which is a ceiling, not a target.
+
+    ⚠ **This is a class A lever** (``THROUGHPUT_LEVERS.md`` §1): it changes when
+    work happens, never what work happens.  Each generator is advanced in a fixed
+    order and receives exactly its own result, so the sequence of values a search
+    sees is the sequence it would have seen alone.
+
+    ⚠ **With one caveat, and it is measured rather than assumed.** A batched
+    forward is not bit-identical to a single one — float reductions run in a
+    different order — so priors and values differ by ~1e-7 between the two
+    paths. That is far too small to matter as a value, and it *can* in principle
+    flip a PUCT comparison that was tied to seven digits. Fingerprint discrete
+    trajectories, never float targets (§A), and see
+    ``test_a_wave_of_searches_agrees_with_running_them_one_at_a_time``.
+
+    ``max_batch`` defaults to 32 because the fixed per-call cost measured worth
+    ~19 rows; there is no reason to build for hundreds.
+    """
+    pending: list[Optional[Result]] = [None] * len(generators)
+    results: list = [None] * len(generators)
+    live = list(range(len(generators)))
+    started = [False] * len(generators)
+
+    while live:
+        requests: list[tuple[int, Request]] = []
+        still_live: list[int] = []
+        for index in live:
+            generator = generators[index]
+            try:
+                if started[index]:
+                    request = generator.send(pending[index])
+                else:
+                    request = next(generator)
+                    started[index] = True
+            except StopIteration as done:
+                results[index] = done.value
+                continue
+            requests.append((index, request))
+            still_live.append(index)
+        live = still_live
+        if not requests:
+            break
+        # leaves and opponent policies go in the SAME call: they read the same
+        # heads of the same forward, so splitting by kind would only halve the
+        # batch width (measured 12.1 against 32 live searches)
+        for start in range(0, len(requests), max_batch):
+            chunk = requests[start : start + max_batch]
+            answers = evaluator.answer_batch([request for _, request in chunk])
+            for (index, _), answer in zip(chunk, answers):
+                pending[index] = answer
+    return results
+
+
+def trajectory_fingerprint(actions: Sequence[int], visits: Sequence[Sequence[float]] = ()) -> str:
+    """A digest of the **discrete** outputs of a run, for class A verification.
+
+    ``THROUGHPUT_LEVERS.md`` §A: two geometry configurations must produce
+    identical games from identical seeds, and the way to check that is to
+    fingerprint actions and visit counts — **never the float targets**, which
+    legitimately drift when a batch shape changes the order of float reductions.
+    Visit counts are integers held in a float array, so they digest safely; the
+    priors and values they were computed from do not.
+    """
+    hasher = hashlib.blake2b(digest_size=16)
+    for action in actions:
+        hasher.update(int(action).to_bytes(4, "little", signed=True))
+    for row in visits:
+        hasher.update(b"|")
+        for count in row:
+            hasher.update(int(count).to_bytes(4, "little", signed=True))
+    return hasher.hexdigest()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -619,7 +836,7 @@ class MCTS:
     ) -> None:
         self.evaluator = evaluator
         self.config = config or evaluator.config
-        self.opponent = opponent or sampling_opponent(evaluator)
+        self.opponent = opponent or sampling_opponent()
         self._retained: Optional[_Retained] = None
         #: Counters, for the measurements SEARCH_SPEC §4 and §12 record.
         #: ``simulations_reused`` is the work re-rooting saved: visits a root
@@ -659,7 +876,7 @@ class MCTS:
     # ── the transition: everything between two of r's decisions ──────────
     def _advance(
         self, state: GameState, root: int, rng: random.Random
-    ) -> Observation:
+    ) -> Iterator[Request]:
         """Sample every other seat forward until ``root`` is to act, or the end.
 
         Clause 2.  An opponent's turn is a transition, not a node, so nothing
@@ -667,7 +884,7 @@ class MCTS:
         """
         guard = 0
         while not state.is_terminal and state.actor != root:
-            self.opponent(state, state.actor, rng)
+            yield from self.opponent(state, state.actor, rng)
             guard += 1
             if guard > 5000:  # pragma: no cover - a stuck engine, not a rules case
                 raise RuntimeError("opponents did not yield the turn")
@@ -676,9 +893,22 @@ class MCTS:
         return information_key(state, root)
 
     def _leaf(self, state: GameState, root: int) -> tuple[Optional[Node], float]:
+        """Blocking :meth:`_leaf_gen`, for callers with nothing to batch against."""
+        return drive(self._leaf_gen(state, root), self.evaluator)
+
+    def _leaf_gen(self, state: GameState, root: int) -> Iterator[Request]:
+        """Expand one leaf.  **Yields** its evaluation request, receives the result.
+
+        ⚠ This ``yield`` is the whole point of the generator shape, and it is
+        deliberately the *only* one in the search.  It is what lets a driver hold
+        several searches at their leaves at once and evaluate them in one call
+        (:func:`run_searches`), without the search knowing whether it is being
+        run alone or in a wave.  Without it, cross-game batching means rewriting
+        the descent; with it, it is a driver.
+        """
         if state.is_terminal:
             return None, terminal_value(state, root, self.config)
-        priors, value = self.evaluator.evaluate(state, root)
+        priors, value = yield (Ask.LEAF, state, root)
         # ``search_legal_macros``, not ``legal_macros``: the dominated passes of
         # SEARCH_SPEC §5.1 are pruned from the *search's* action set only.  The
         # priors themselves stay masked by the full legal set and are
@@ -697,7 +927,7 @@ class MCTS:
         rng: random.Random,
         turn: int,
         observation: Observation,
-    ) -> Observation:
+    ) -> Iterator[Request]:
         """Apply every forced decision in a row, storing no node for any of them.
 
         A node with one action has nothing to decide: PUCT over a one-element
@@ -731,23 +961,26 @@ class MCTS:
             if len(forced) != 1:
                 break
             mc.apply_macro(state, forced[0])
-            observation = self._advance(state, root, rng)
+            observation = yield from self._advance(state, root, rng)
         return observation
 
-    def _simulate(self, state: GameState, node: Node, root: int, rng: random.Random) -> float:
+    def _simulate(self, state: GameState, node: Node, root: int, rng: random.Random) -> Iterator[Request]:
+        """One root-to-leaf descent.  A generator, via :meth:`_leaf_gen`."""
         path: list[tuple[Node, int]] = []
         while True:
             index = node.select(self.config.c_puct)
             path.append((node, index))
             turn = state.turn
             mc.apply_macro(state, int(node.actions[index]))
-            observation = self._advance(state, root, rng)
-            observation = self._collapse_forced(state, root, rng, turn, observation)
+            observation = yield from self._advance(state, root, rng)
+            observation = yield from self._collapse_forced(
+                state, root, rng, turn, observation
+            )
 
             key = (int(node.actions[index]), observation)
             child = node.children.get(key)
             if child is None:
-                child, value = self._leaf(state, root)
+                child, value = yield from self._leaf_gen(state, root)
                 if child is not None:
                     node.children[key] = child
                 break
@@ -780,13 +1013,28 @@ class MCTS:
         is a correctness bug, not a heuristic loss — :meth:`play` is the only
         caller that should build one, and it verifies the correspondence.
         """
+        return drive(self.search_gen(state, root, rng, node), self.evaluator)
+
+    def search_gen(
+        self,
+        state: GameState,
+        root: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        node: Optional[Node] = None,
+    ) -> Iterator[Request]:
+        """:meth:`search` as a generator, for :func:`run_searches` to interleave.
+
+        Identical work in an identical order; the only difference is that the
+        leaf evaluations leave through a ``yield`` instead of a method call, so
+        somebody else may decide when and with what else they are computed.
+        """
         root = state.actor if root is None else root
         rng = rng or random.Random()
         if state.actor != root:
             raise ValueError("search starts at a state the root player is to act in")
 
         if node is None:
-            node, _ = self._leaf(state, root)
+            node, _ = yield from self._leaf_gen(state, root)
             if node is None:
                 raise ValueError("cannot search a finished game")
         noised = self._apply_root_noise(node, rng)
@@ -798,7 +1046,7 @@ class MCTS:
         self.simulations_reused += reused
         self.simulations_run += budget
         for _ in range(budget):
-            self._simulate(state.redeterminize(rng), node, root, rng)
+            yield from self._simulate(state.redeterminize(rng), node, root, rng)
         return node.actions, node.visits, node
 
     def _root_alpha(self, width: int) -> Optional[float]:

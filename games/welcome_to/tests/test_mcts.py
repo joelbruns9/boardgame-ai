@@ -366,7 +366,10 @@ def test_a_collapsed_forced_action_is_applied_not_skipped():
     before = list(state.sheets[root].parks)
     turn = state.turn
 
-    search._collapse_forced(state, root, random.Random(0), turn, ("sentinel",))
+    mcts.drive(
+        search._collapse_forced(state, root, random.Random(0), turn, ("sentinel",)),
+        search.evaluator,
+    )
     assert state.sheets[root].parks != before, "the forced park was never built"
     assert state.phase is not Phase.ACTION_PARK
 
@@ -382,8 +385,11 @@ def test_collapsing_is_a_no_op_once_the_turn_has_advanced():
     state, root = _forced_park_state()
     before = (state.phase, list(state.sheets[root].parks))
 
-    observation = search._collapse_forced(
-        state, root, random.Random(0), state.turn - 1, ("sentinel",)
+    observation = mcts.drive(
+        search._collapse_forced(
+            state, root, random.Random(0), state.turn - 1, ("sentinel",)
+        ),
+        search.evaluator,
     )
     assert (state.phase, list(state.sheets[root].parks)) == before
     assert observation == ("sentinel",)
@@ -908,3 +914,154 @@ def test_two_different_positions_do_not_share_a_key():
             state.apply(bots[state.actor].act(state))
     assert len(seen) > 300, "not enough distinct positions sampled"
     assert collisions == 0, f"{collisions} distinct positions shared a key"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The batching seam -- SEARCH_SPEC §12 step 6
+#
+# The point of this group is that batching is a *driver*, not a rewrite: the
+# search suspends at every network request, and somebody else decides when and
+# with what else they are computed.  So the tests are about equivalence, not
+# speed -- THROUGHPUT_LEVERS §1 class A, "changes when work happens, never what
+# work happens", verified by fingerprinting discrete outputs.
+# ──────────────────────────────────────────────────────────────────────────
+def _wave_positions(count: int = 8) -> list[GameState]:
+    out = []
+    for seed in range(count):
+        for turn in (6, 12):
+            state = _position(players=2, turn=turn, seed=seed, root=0)
+            if not state.is_terminal:
+                out.append(state)
+    return out
+
+
+def test_a_wave_of_searches_agrees_with_running_them_one_at_a_time():
+    """⚠ THROUGHPUT_LEVERS §A: a class A lever must produce identical games from
+    identical seeds, and the way to check that is to fingerprint the **discrete**
+    outputs -- actions and visit counts -- never the float targets.
+
+    Those really do drift: a batched forward reduces floats in a different order
+    from a single one, measured at ~1e-7 on priors and values here.  Far too
+    small to matter as a value, and in principle able to flip a comparison that
+    was tied to seven digits, which is exactly why the fingerprint is discrete.
+    """
+    torch.manual_seed(0)
+    net = nw.WelcomeToNet(_SMALL)
+    states = _wave_positions()
+    assert len(states) >= 8
+
+    config = mcts.SearchConfig(simulations=24)
+    one = mcts.MCTS(mcts.NetEvaluator(net, torch.device("cpu"), config), config)
+    alone = [
+        one.search(state, root=0, rng=random.Random(i)) for i, state in enumerate(states)
+    ]
+
+    evaluator = mcts.NetEvaluator(net, torch.device("cpu"), config)
+    together = mcts.MCTS(evaluator, config)
+    waved = mcts.run_searches(
+        [
+            together.search_gen(state, root=0, rng=random.Random(i))
+            for i, state in enumerate(states)
+        ],
+        evaluator,
+        max_batch=16,
+    )
+
+    assert len(waved) == len(alone)
+    for (actions_a, visits_a, _), (actions_b, visits_b, _) in zip(alone, waved):
+        assert mcts.trajectory_fingerprint(
+            actions_a, [visits_a]
+        ) == mcts.trajectory_fingerprint(actions_b, [visits_b])
+
+
+def test_the_wave_pools_leaves_and_opponent_policies_into_the_same_call():
+    """⚠ Both kinds must suspend, or the batching reaches half the work.
+
+    Measured before opponent sampling went through the seam: leaves batched
+    perfectly and opponent policies were still **53% of rows and 97% of calls**,
+    every one of them a batch of one.  And both kinds must share a *call*, since
+    they read the same heads of the same forward -- splitting by kind measured a
+    mean batch of 12.1 where the wave had 32 searches live, against 22.4 pooled.
+    """
+    torch.manual_seed(0)
+    config = mcts.SearchConfig(simulations=24)
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"), config)
+    search = mcts.MCTS(evaluator, config)
+    states = _wave_positions()
+
+    kinds: list[mcts.Ask] = []
+    original = evaluator.answer_batch
+
+    def spy(requests):
+        kinds.extend(kind for kind, _, _ in requests)
+        return original(requests)
+
+    evaluator.answer_batch = spy
+    mcts.run_searches(
+        [
+            search.search_gen(state, root=0, rng=random.Random(i))
+            for i, state in enumerate(states)
+        ],
+        evaluator,
+        max_batch=32,
+    )
+
+    assert mcts.Ask.LEAF in kinds and mcts.Ask.POLICY in kinds
+    assert evaluator.rows > evaluator.calls, "nothing batched at all"
+    assert evaluator.rows / evaluator.calls > 4.0, (
+        f"mean batch {evaluator.rows / evaluator.calls:.1f} -- the wave is not pooling"
+    )
+    mixed = evaluator.batch_widths
+    assert max(mixed) > 1, "every call was a batch of one"
+
+
+def test_a_mixed_batch_answers_each_kind_the_way_the_single_calls_do():
+    """One forward, two answer shapes, and neither may drift from its single
+    form -- a second interpretation that agrees today is a parity bug waiting."""
+    torch.manual_seed(0)
+    config = mcts.SearchConfig()
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"), config)
+    states = _wave_positions(4)
+
+    requests = []
+    for i, state in enumerate(states):
+        requests.append((mcts.Ask.LEAF if i % 2 else mcts.Ask.POLICY, state, 0))
+    answers = evaluator.answer_batch(requests)
+
+    assert len(answers) == len(requests)
+    for (kind, state, viewer), answer in zip(requests, answers):
+        if kind is mcts.Ask.LEAF:
+            priors, value = answer
+            single_priors, single_value = evaluator.evaluate(state, viewer)
+            assert value == pytest.approx(single_value, abs=1e-5)
+        else:
+            priors = answer
+            single_priors = evaluator.policy(state, viewer)
+        assert priors.shape == (mc.NUM_MACRO_ACTIONS,)
+        assert priors == pytest.approx(single_priors, abs=1e-5)
+        assert priors.sum() == pytest.approx(1.0, abs=1e-5)
+
+
+def test_an_empty_batch_is_not_a_network_call():
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"))
+    before = evaluator.calls
+    assert evaluator.answer_batch([]) == []
+    assert evaluator.evaluate_batch([]) == []
+    assert evaluator.calls == before
+
+
+def test_the_counters_keep_calls_rows_and_width_apart():
+    """THROUGHPUT_LEVERS §2.1: batch width and throughput are different numbers,
+    and reporting one as the other is the named failure mode."""
+    torch.manual_seed(0)
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"))
+    states = _wave_positions(3)
+    evaluator.evaluate_batch([(state, 0) for state in states])
+    assert evaluator.calls == 1
+    assert evaluator.rows == len(states)
+    assert evaluator.batch_widths[len(states)] == 1
+
+    evaluator.evaluate(states[0], 0)
+    assert evaluator.calls == 2
+    assert evaluator.rows == len(states) + 1
+    assert evaluator.batch_widths[1] == 1
