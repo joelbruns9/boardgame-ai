@@ -120,7 +120,7 @@ import collections
 import hashlib
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable, Iterator, Optional, Sequence
 
@@ -199,6 +199,30 @@ class SearchConfig:
     #: bootstrap only), because the search itself will not out-visit 0.8 of
     #: prior mass at any budget tried.
     prune_roundabout_pass: bool = True
+    # ── The chance edge: progressive widening (SEARCH_SPEC §7.1a, C) ────
+    #
+    #: Widening constant ``C`` in ``ceil(C * samples ** alpha)``.  ``None`` is
+    #: **off**, which is the open-loop control arm: every distinct outcome gets
+    #: its own child, for ever, and the tree never revisits one.
+    #:
+    #: ⚠ Turning this on is what makes the chance edge *finite*, and it is the
+    #: only mechanism here that can produce depth.  §6.1 measured mean leaf depth
+    #: 1.59, unmoved by budget or by prior sharpness, because every boundary
+    #: crossing drew a key never seen before and expanded a fresh leaf.
+    chance_widening: Optional[float] = None
+    #: ``alpha``.  Not a free parameter: §7.6 fixes ``K ≈ N**(1/H)`` from a
+    #: target depth ``H``, so ``alpha = 1/H`` and depth 2 gives 0.5.  With
+    #: ``C = 1`` that is ~8 outcomes at 64 samples and ~16 at 256, which is the
+    #: schedule §7.6 wrote down before anyone noticed it was widening.
+    chance_widening_alpha: float = 0.5
+    #: States kept per outcome, to resume a descent from when the edge is closed.
+    #:
+    #: ⚠ **This is the particle collection**, and its size is the belief's
+    #: resolution.  One state per outcome is the collapse §13's POMCP reference
+    #: warns about: samples that share a viewer information state but differ in
+    #: hidden detail — most often the opponents' live current-turn sheets —
+    #: would all be represented by whichever one happened to arrive first.
+    max_particles: int = 4
     # ── Root exploration noise.  All off by default; S2 turns it on. ────
     #
     # SEARCH_SPEC §7.8.  Dirichlet noise perturbs the *root* prior so that a
@@ -246,11 +270,33 @@ class SearchConfig:
     temperature: float = 0.0
 
 
+@dataclass(slots=True)
+class Outcome:
+    """One sampled result of a chance edge -- ``SEARCH_SPEC.md`` §7.1a.
+
+    ``count / samples`` is the weight: the **empirical** mass of this outcome,
+    never an enumerated probability.  That is the whole of why resolution C
+    dissolves §7.1a's blocker rather than answering it — an empirical weight
+    never needs ``P(transition)``, which could not be computed, because it
+    estimates it instead, opponent randomness and all.
+    """
+
+    #: How many sampled transitions landed on this viewer information state.
+    count: int = 0
+    #: Concrete states to resume a descent from: the **particle collection**.
+    #: Several, because samples agreeing on what the viewer can see may still
+    #: differ in what it cannot, and one canonical state would narrow the belief.
+    particles: list = field(default_factory=list)
+    #: Set instead of a child node when this transition ended the game.
+    terminal_value: Optional[float] = None
+
+
 class Node:
     """One decision by the root player ``r``."""
 
     __slots__ = (
-        "actions", "prior", "visits", "total", "children", "expanded", "noised"
+        "actions", "prior", "visits", "total", "children", "expanded", "noised",
+        "edge_visits", "outcomes",
     )
 
     def __init__(self, actions: np.ndarray, prior: np.ndarray) -> None:
@@ -265,6 +311,11 @@ class Node:
         #: node twice would compound the perturbation on exactly the positions
         #: re-rooting is meant to search *more* carefully.
         self.noised = False
+        #: Chance bookkeeping, per action index.  Empty and unused unless
+        #: ``SearchConfig.chance_widening`` is set; the control arm allocates
+        #: nothing and behaves exactly as it did.
+        self.edge_visits: dict[int, int] = {}
+        self.outcomes: dict[int, dict[Observation, "Outcome"]] = {}
 
     def select(self, c_puct: float) -> int:
         """PUCT.  Returns an index into :attr:`actions`, not a macro index."""
@@ -964,25 +1015,124 @@ class MCTS:
             observation = yield from self._advance(state, root, rng)
         return observation
 
+    # ── the chance edge (SEARCH_SPEC §7.1a, resolution C) ────────────────
+    def _edge_is_closed(self, node: Node, index: int) -> bool:
+        """Whether this edge has as many distinct outcomes as it is yet allowed.
+
+        ``ceil(C · samples**alpha)``.  Closed means "stop sampling new futures
+        and start re-using the ones you have", which is what turns an unbounded
+        chance fan-out into a finite set of children that a descent can revisit.
+
+        ⚠ **A within-turn edge closes too, and that is correct.** Its support is
+        one — no card is revealed between two of ``r``'s own decisions — so it
+        reaches its cap immediately and every later descent resumes from a
+        particle instead of re-applying the move. The saving is real; what it
+        costs is determinization diversity on that edge, which is exactly the
+        trade §7.3 describes and the reason the control arm is kept.
+        """
+        if self.config.chance_widening is None:
+            return False
+        outcomes = node.outcomes.get(index)
+        if not outcomes:
+            return False
+        # ⚠ The cap counts **traversals**, while a weight counts **fresh draws**.
+        # They must be different numbers.  If reuse fed the cap's counter the
+        # edge would never widen again; if reuse fed a weight's counter the
+        # weights would be a Polya urn -- sampling in proportion to a count that
+        # the sampling itself increments amplifies whichever outcome happened to
+        # arrive first, and converges to a random limit rather than the truth.
+        visits = node.edge_visits.get(index, 0)
+        allowed = math.ceil(
+            self.config.chance_widening * visits ** self.config.chance_widening_alpha
+        )
+        return len(outcomes) >= max(allowed, 1)
+
+    def _pick_outcome(
+        self, node: Node, index: int, rng: random.Random
+    ) -> tuple[Observation, Outcome]:
+        """Sample a retained outcome **by its empirical weight**, ``count/draws``.
+
+        A chance node averages; it never PUCTs.  ``count`` is the number of times
+        this outcome came out of a *fresh* draw from the real transition, and is
+        never touched by reuse, so ``count / sum(counts)`` is an unbiased
+        estimate of its mass.  Sampling descents in that proportion is what makes
+        the visit distribution over children match the transition distribution,
+        so the ordinary running mean at the parent action *is* the
+        weight-weighted mean and no special backup is needed.
+
+        With near-unique reveals every draw is its own outcome, all counts are 1,
+        and this is uniform over the retained set -- §7.1's ``count/K`` collapsing
+        to ``1/K``.  With a three-card deck the draws collide onto the six real
+        reveals and the counts become the distribution.
+        """
+        outcomes = node.outcomes[index]
+        keys = list(outcomes)
+        weights = [outcomes[key].count for key in keys]
+        chosen = rng.choices(keys, weights=weights, k=1)[0]
+        return chosen, outcomes[chosen]
+
+    def _record_outcome(
+        self, node: Node, index: int, observation: Observation, state: GameState
+    ) -> Optional[Outcome]:
+        """Merge a freshly sampled transition into this edge, or start a child.
+
+        Merging is the mechanism, not an optimisation: it is what makes
+        ``count/samples`` converge on the true mass. At a three-card deck there
+        are only six possible reveals, so widening keeps proposing samples that
+        land on children already here, the distinct count saturates at the real
+        support, and the weights converge — the collisions §7.6 once called a
+        problem doing the work.
+        """
+        if self.config.chance_widening is None:
+            return None
+        node.edge_visits[index] = node.edge_visits.get(index, 0) + 1
+        outcomes = node.outcomes.setdefault(index, {})
+        outcome = outcomes.get(observation)
+        if outcome is None:
+            outcome = outcomes[observation] = Outcome()
+        outcome.count += 1
+        if not state.is_terminal and len(outcome.particles) < self.config.max_particles:
+            outcome.particles.append(state.copy())
+        return outcome
+
     def _simulate(self, state: GameState, node: Node, root: int, rng: random.Random) -> Iterator[Request]:
         """One root-to-leaf descent.  A generator, via :meth:`_leaf_gen`."""
         path: list[tuple[Node, int]] = []
         while True:
             index = node.select(self.config.c_puct)
             path.append((node, index))
+            action = int(node.actions[index])
+
+            if self._edge_is_closed(node, index):
+                # ⚠ The saving *and* the depth: no transition is sampled, so no
+                # opponent is evaluated and no card is drawn.  The descent
+                # resumes from a particle of an outcome already seen, which is
+                # the only way a chance child is ever revisited (§7.1a).
+                observation, outcome = self._pick_outcome(node, index, rng)
+                node.edge_visits[index] = node.edge_visits.get(index, 0) + 1
+                if outcome.terminal_value is not None:
+                    value = outcome.terminal_value
+                    break
+                state = rng.choice(outcome.particles).copy()
+                node = node.children[(action, observation)]
+                continue
+
             turn = state.turn
-            mc.apply_macro(state, int(node.actions[index]))
+            mc.apply_macro(state, action)
             observation = yield from self._advance(state, root, rng)
             observation = yield from self._collapse_forced(
                 state, root, rng, turn, observation
             )
+            outcome = self._record_outcome(node, index, observation, state)
 
-            key = (int(node.actions[index]), observation)
+            key = (action, observation)
             child = node.children.get(key)
             if child is None:
                 child, value = yield from self._leaf_gen(state, root)
                 if child is not None:
                     node.children[key] = child
+                elif outcome is not None:
+                    outcome.terminal_value = value
                 break
             node = child
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import math
 import random
 
 import numpy as np
@@ -1065,3 +1066,223 @@ def test_the_counters_keep_calls_rows_and_width_apart():
     assert evaluator.calls == 2
     assert evaluator.rows == len(states) + 1
     assert evaluator.batch_widths[1] == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The chance edge: progressive widening -- SEARCH_SPEC §7.1a resolution C, §12
+# step 7.  Behind a flag, with the open-loop version kept as the control arm.
+# ──────────────────────────────────────────────────────────────────────────
+def _widened(simulations: int = 256, **kwargs):
+    torch.manual_seed(0)
+    return _search(simulations=simulations, chance_widening=1.0, **kwargs)
+
+
+def _edges(root):
+    """Every chance edge in the tree, as ``(node, action index, outcomes)``."""
+    out = []
+
+    def walk(node):
+        for index, outcomes in node.outcomes.items():
+            out.append((node, index, outcomes))
+        for child in node.children.values():
+            walk(child)
+
+    walk(root)
+    return out
+
+
+def _tree_depth(root) -> float:
+    depths: list[int] = []
+
+    def walk(node, depth):
+        if not node.children:
+            depths.append(depth)
+        for child in node.children.values():
+            walk(child, depth + 1)
+
+    walk(root, 0)
+    return sum(depths) / len(depths)
+
+
+def test_the_control_arm_allocates_no_chance_bookkeeping():
+    """§12 step 7 keeps the open-loop version as the control arm, so with the
+    flag off nothing about the tree may change -- not even its memory."""
+    search, _ = _search(simulations=64)
+    assert search.config.chance_widening is None
+    state = _position(players=2, turn=10)
+    _, _, root = search.search(state, root=0, rng=random.Random(4))
+
+    def walk(node):
+        assert node.outcomes == {} and node.edge_visits == {}
+        for child in node.children.values():
+            walk(child)
+
+    walk(root)
+
+
+def test_widening_bounds_the_number_of_outcomes_on_every_edge():
+    """``ceil(C · traversals**alpha)``, which is what makes the chance fan-out
+    finite and therefore revisitable at all."""
+    search, _ = _widened()
+    state = _position(players=2, turn=12)
+    _, _, root = search.search(state, root=0, rng=random.Random(0))
+
+    edges = _edges(root)
+    assert edges, "no chance edge was recorded"
+    for node, index, outcomes in edges:
+        traversals = node.edge_visits[index]
+        allowed = max(
+            math.ceil(
+                search.config.chance_widening
+                * traversals ** search.config.chance_widening_alpha
+            ),
+            1,
+        )
+        assert len(outcomes) <= allowed, (
+            f"{len(outcomes)} outcomes on an edge traversed {traversals} times, "
+            f"cap {allowed}"
+        )
+
+
+def test_every_outcome_can_be_resumed_and_its_particles_are_capped():
+    search, _ = _widened()
+    state = _position(players=2, turn=12)
+    _, _, root = search.search(state, root=0, rng=random.Random(0))
+    for _, _, outcomes in _edges(root):
+        for outcome in outcomes.values():
+            assert outcome.count >= 1
+            assert outcome.particles or outcome.terminal_value is not None
+            assert len(outcome.particles) <= search.config.max_particles
+
+
+def test_reusing_an_outcome_does_not_move_its_weight():
+    """⚠ Regression for a real estimator bug.
+
+    An earlier version incremented ``count`` on reuse *and* sampled in
+    proportion to ``count``. That is a Polya urn: the sampling feeds the counter
+    it samples by, so whichever outcome happened to arrive first is reinforced
+    and the weights converge to a random limit rather than to the truth. It
+    produced weights like ``[0.045, 0.045, 0.091, 0.091, 0.727]`` on an edge
+    whose outcomes were near-unique reveals and should have been uniform.
+
+    The fix is two counters that must never be confused: ``edge_visits`` counts
+    **traversals** and drives the widening cap, ``count`` counts **fresh draws**
+    from the real transition and drives the weights.
+    """
+    search, _ = _widened(simulations=512)
+    state = _position(players=2, turn=12)
+    _, _, root = search.search(state, root=0, rng=random.Random(0))
+
+    reused = 0
+    for node, index, outcomes in _edges(root):
+        draws = sum(outcome.count for outcome in outcomes.values())
+        traversals = node.edge_visits[index]
+        assert draws <= traversals, "a weight counted a reuse"
+        reused += traversals - draws
+        weights = [outcome.count / draws for outcome in outcomes.values()]
+        assert sum(weights) == pytest.approx(1.0)
+    assert reused > 0, "no edge was ever reused, so the test proves nothing"
+
+
+def test_a_deterministic_edge_keeps_merging_onto_its_single_outcome():
+    """No card is revealed between two of the root player's own decisions, so a
+    within-turn edge has support one however often it is drawn -- every fresh
+    draw merges onto the outcome already there, which is the same mechanism that
+    makes ``count/draws`` converge where the support is genuinely larger.
+
+    ⚠ Measured, and it corrects the shape this test first assumed: 89% of *all*
+    edges carry one outcome, but among edges traversed 8 or more times only 21%
+    do.  PUCT concentrates its traversals on a few root actions, and those deep
+    repeated paths are exactly the ones that reach a turn boundary.  So this
+    asserts the property, not a majority.
+    """
+    search, _ = _widened(simulations=512)
+    state = _position(players=2, turn=12)
+    _, _, root = search.search(state, root=0, rng=random.Random(0))
+
+    remerged = [
+        outcomes
+        for node, index, outcomes in _edges(root)
+        if len(outcomes) == 1
+        and node.edge_visits[index] >= 8
+        and next(iter(outcomes.values())).count >= 2
+    ]
+    assert remerged, "no deterministic edge was drawn from twice"
+    for outcomes in remerged:
+        outcome = next(iter(outcomes.values()))
+        assert outcome.count / outcome.count == pytest.approx(1.0)
+        assert outcome.particles, "a resumable edge kept no particle"
+
+
+def test_reuse_actually_happens_and_skips_the_transition():
+    """The saving: a closed edge resumes from a particle, so no opponent is
+    evaluated and no card is drawn for that traversal."""
+    search, evaluator = _widened(simulations=512)
+    state = _position(players=2, turn=12)
+    _, _, root = search.search(state, root=0, rng=random.Random(0))
+
+    traversals = sum(
+        node.edge_visits[index] for node, index, _ in _edges(root)
+    )
+    draws = sum(
+        outcome.count
+        for _, _, outcomes in _edges(root)
+        for outcome in outcomes.values()
+    )
+    assert traversals > draws, "nothing was ever reused"
+    assert traversals - draws > 100, (
+        f"only {traversals - draws} reuses of {traversals} traversals"
+    )
+
+
+def test_widening_deepens_the_tree_and_answers_to_the_budget():
+    """⚠ This is the null §6.1 recorded, reversed.
+
+    Open loop measured mean leaf depth 1.59 and *unmoved* by budget or by prior
+    sharpness, because every boundary crossing drew a key never seen before and
+    expanded a fresh leaf: budget went into root averaging, not depth.  A finite,
+    revisitable chance edge is the thing that changes it.  Measured over 12
+    positions at two seats: control 1.32 -> 1.42 from 64 to 256 simulations,
+    widening 1.77 -> 2.14.
+    """
+    state = _position(players=2, turn=12)
+    depths = {}
+    for label, widening in (("control", None), ("widened", 1.0)):
+        for sims in (64, 256):
+            torch.manual_seed(0)
+            search, _ = _search(simulations=sims, chance_widening=widening)
+            _, _, root = search.search(state, root=0, rng=random.Random(3))
+            depths[label, sims] = _tree_depth(root)
+
+    assert depths["widened", 256] > depths["control", 256], (
+        "widening did not deepen the tree"
+    )
+    control_gain = depths["control", 256] - depths["control", 64]
+    widened_gain = depths["widened", 256] - depths["widened", 64]
+    assert widened_gain > control_gain, (
+        f"depth still does not answer to the budget: control +{control_gain:.2f}, "
+        f"widened +{widened_gain:.2f}"
+    )
+
+
+def test_a_three_card_deck_finds_its_whole_support_and_no_more():
+    """§6.2: at ``D = 3`` there are exactly six ordered reveals, and the deck
+    passes through three once per cycle by construction.  Widening should find
+    them all and stop -- there is nothing else to find."""
+    state = _position(players=2, turn=10, seed=5)
+    keep = state.deck[state.deck_pos : state.deck_pos + 3]
+    state.discard.extend(state.deck[state.deck_pos + 3 :])
+    state.deck = state.deck[: state.deck_pos] + keep
+    assert state.deck_remaining == 3
+
+    search, _ = _widened(simulations=2048)
+    _, _, root = search.search(state, root=0, rng=random.Random(1))
+
+    multi = [outcomes for _, _, outcomes in _edges(root) if len(outcomes) > 1]
+    assert multi, "no boundary-crossing edge was traversed"
+    for outcomes in multi:
+        assert len(outcomes) <= 6, f"{len(outcomes)} outcomes where only 6 exist"
+        draws = sum(outcome.count for outcome in outcomes.values())
+        assert sum(outcome.count / draws for outcome in outcomes.values()) == (
+            pytest.approx(1.0)
+        )

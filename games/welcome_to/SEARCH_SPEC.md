@@ -915,6 +915,61 @@ opponents having written different numbers this turn, invisible until the next
 boundary — where the child is a belief, not a state, and collapsing it to one
 canonical state narrows that belief silently.)
 
+### 7.9 ✅ BUILT: what widening did, and the estimator bug on the way
+
+**§6.1's null is reversed.** Open loop measured mean leaf depth 1.59, *unmoved*
+by budget or by prior sharpness, because every boundary crossing drew a key never
+seen before and expanded a fresh leaf — budget went into root averaging, not
+depth. A finite, revisitable chance edge is the thing that changes it. Measured
+over 12 positions at two seats:
+
+| arm | 64 sims | 256 sims | gain |
+|---|---|---|---|
+| open loop (control) | 1.32 | 1.42 | +0.10 |
+| **widening `C = 1`** | 1.77 | **2.14** | **+0.37** |
+| widening `C = 2` | 1.40 | 1.70 | +0.30 |
+
+So depth now *answers to the budget*, which is the property §6.1 said was
+missing. `C = 2` is worse than `C = 1`, as `K**H ≲ N` predicts: a wider edge is a
+shallower tree at fixed budget.
+
+**Two counters, and confusing them is a real bug.** `edge_visits` counts
+**traversals** and drives the widening cap; `Outcome.count` counts **fresh
+draws** from the real transition and drives the weights.
+
+⚠ **The first implementation used one counter for both, and it was a Pólya
+urn.** Sampling a child in proportion to a count that the sampling itself
+increments reinforces whichever outcome arrived first, so the weights converge to
+a random limit rather than to the truth. It was visible in the output: an edge
+whose outcomes were near-unique reveals — which must be uniform — came out at
+`[0.045, 0.045, 0.091, 0.091, 0.727]`. With the counters separated the same edge
+reads `[0.2, 0.2, 0.2, 0.2, 0.2]`, which is §7.1's `count/K` collapsing to `1/K`,
+off 5 fresh draws and 23 traversals.
+
+**At a three-card deck it finds the support and stops.** §6.2 says `D = 3` has
+exactly six ordered reveals and that the deck passes through three once per
+cycle. Measured at 4,096 simulations, the busiest chance edge holds **6
+outcomes** from 6 fresh draws over 36 traversals, weighted uniformly — which is
+the true distribution, since the six orderings are equally likely. No second edge
+class, no enumeration threshold, no stratification: the cap simply stops
+proposing once the support is exhausted.
+
+**What the shape of the tree actually looks like**, 512 simulations:
+
+- 89% of *all* edges carry one outcome — but among edges traversed 8+ times only
+  21% do. PUCT concentrates its traversals on a few root actions, and those deep
+  repeated paths are exactly the ones that reach a turn boundary. A within-turn
+  edge has support one by construction and re-merges onto it.
+- 558 of 976 traversals were **reuses**: resumed from a particle, with no
+  opponent evaluated and no card drawn.
+
+⚠ **What reuse costs, and why the control arm stays.** Resuming from a particle
+re-uses that transition's randomness, including the determinization behind it.
+That is the intent (§7.3), but it means a widened search explores fewer distinct
+futures per simulation than the open-loop one. Whether the depth is worth the
+diversity is a **strength** question, not a throughput one — it belongs in §11's
+bakeoff as equal-wall-clock arms, and `chance_widening=None` is the control.
+
 ### 7.8 ✅ DECIDED: when and how much Dirichlet noise
 
 **What it is for.** The search's move comes from visit counts, and visits follow
@@ -1234,26 +1289,29 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    trajectories. The "successor batches" half of this item is moot: §7.1a's
    progressive widening materialises children one at a time, so there is no `K`
    to batch.
-7. **Fixed-support environment edge** (§7) with `count/K` weights and particle
-   children, behind a flag, the current version kept as the control arm. Build it
-   **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists
-   even temporarily. ✅ **Unblocked 2026-08-23**: §7.1a takes resolution **C**,
-   progressive widening with empirical `count/samples` weights and children
-   merged by viewer information state. So what step 7 builds is PW, not a fixed
-   `K` with a closed edge — and **step 5 is now a hard prerequisite, not merely
-   an earlier item**, because the merge key *is* the viewer information state.
+7. ✅ **The chance edge**, as §7.1a resolution C: progressive widening with
+   empirical `count/draws` weights, children merged by viewer information state,
+   and particle collections. Behind `SearchConfig.chance_widening` with the
+   open-loop version kept as the control arm, which allocates nothing. Lazy by
+   construction — children arrive one at a time, so the eager `K`
+   materialisation this item warned about never exists. **Reverses §6.1's
+   depth null: see §7.9.**
 8. **Run S0, then the bakeoff** (§11).
 9. **Gumbel root allocation** (§7.7) — the intended default for self-play, with
    PUCT retained behind the same interface for the later switch.
 10. **Only then:** the afterstate head. (Progressive widening has moved *into*
     step 7 — see §7.1a C.)
 
-**Steps 1–4 are done.** Steps 1–3 touched nothing §6–§9 is still deciding; step 4
-is an engine refactor with no search-side change, so the search still crosses
-boundaries exactly as it did. Steps 5–7 are what this document exists to have
-reviewed. Step 7's own blocker — the §7.1 transition semantics — was resolved
-on 2026-08-23 by §7.1a taking resolution C, so what remains before it is step 5
-(whose information-state key C merges on) and step 6.
+**Steps 1–7 are done**, and with them everything this document was written to
+decide. The chance boundary was the blocker and §7.1a settled it; §7.9 records
+what the build measured, including the estimator bug it found.
+
+⚠ **Nothing after this point is settled by argument.** Step 8 is the run and the
+bakeoff, and the two open questions are both *strength* questions that only
+equal-wall-clock arms can answer: whether widening's depth is worth the
+determinization diversity it spends (`chance_widening=None` is the control), and
+what `noise_fresh_fraction` should be (§7.8). Neither is a throughput knob and
+neither should be read off games per second.
 
 ### 12.1 The key is an information state, not a public observation
 
