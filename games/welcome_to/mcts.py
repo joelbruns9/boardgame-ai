@@ -160,6 +160,25 @@ class SearchConfig:
     #: Root exploration noise.  Off by default; S2 turns it on.
     dirichlet_alpha: Optional[float] = None
     dirichlet_weight: float = 0.25
+    #: Simulations a **newly noised** root must run even if re-rooting already
+    #: met the budget.  ``None`` means a full ``simulations``.
+    #:
+    #: ⚠ **This is an S2 decision with a measured price, deliberately left
+    #: explicit.** ``simulations`` is a target *total*, so without a floor a
+    #: fully-reused root applies noise and then runs nothing, and the noise is
+    #: provably inert.  The default closes that the safe way -- a noised root
+    #: pays for a fresh search, which is what plain AlphaZero does -- but under
+    #: noise it forfeits re-rooting's saving entirely, and that saving is
+    #: **47.7% of the budget** against an S0-shaped prior (§4).  Three coherent
+    #: settings, and the choice belongs to whoever runs S2:
+    #:
+    #: - ``None``: correct, costs the saving whenever noise is on;
+    #: - an integer: keeps part of the saving, and says out loud how much
+    #:   exploration a decision is guaranteed;
+    #: - ``0`` **only** alongside noising once per *turn* rather than once per
+    #:   decision -- a different exploration contract, not this one, and it
+    #:   would need the retained root left un-noised on purpose.
+    min_fresh_simulations: Optional[int] = None
     #: Visit-count temperature for :func:`play`.  0 plays the argmax.
     temperature: float = 0.0
 
@@ -380,10 +399,17 @@ def _position_key(state: GameState, root: int) -> tuple:
     makes the check total: a key that hid something could match two positions
     that differ, which is the one failure mode re-rooting must not have.
 
-    Deck *order* is excluded on purpose — ``deck_pos`` and the discard pile pin
-    down how much has been drawn, and the unrevealed order is re-determinized per
-    simulation anyway, so requiring it to match would refuse every legitimate
-    re-root the moment a caller re-seeded.
+    Deck *order* is excluded on purpose — the unrevealed order is re-determinized
+    per simulation anyway, so requiring it to match would refuse every legitimate
+    re-root the moment a caller re-seeded.  Deck **composition** is emphatically
+    *not* excluded, and an earlier version of this function got that wrong: it
+    carried only ``deck_pos`` and ``len(discard)``, so swapping an undrawn card
+    with a discarded one of a different printed type left the key unchanged.
+    Those are different positions — different reveal distribution, different
+    ``deck_composition`` in the encoder, so different priors and values — and
+    they must not share a subtree.  Sorted physical ids are stricter than the
+    printed-type histogram that would be semantically sufficient, and cost a
+    sort of ~80 ints against a whole search.
     """
     ctx = state.ctx
     return (
@@ -392,7 +418,8 @@ def _position_key(state: GameState, root: int) -> tuple:
         state.actor,
         int(state.phase),
         state.deck_pos,
-        len(state.discard),
+        tuple(sorted(state.deck[state.deck_pos :])),
+        tuple(sorted(state.discard)),
         state.plan_ids,
         tuple(tuple(sorted(turns.items())) for turns in state.plan_turns),
         tuple(state.table_cards(root)),
@@ -445,6 +472,22 @@ class MCTS:
         self.simulations_run = 0
         self.simulations_reused = 0
         self.reroots = 0
+
+    def _fresh_after_noise(self) -> int:
+        """How many simulations a newly-noised root must run, however much it reused.
+
+        ⚠ **Without a floor here, root noise can be completely inert.** The
+        budget is a target *total*, so a retained root whose visits already meet
+        ``simulations`` runs zero fresh simulations — the prior is perturbed and
+        then nothing ever selects against it, leaving the visit counts, and so
+        the policy target, bit-identical to the un-noised search.  Reproduced
+        before it was fixed: ``prior_changed True, fresh_simulations 0,
+        visits_changed False``.  Partially-reused roots have the same problem in
+        weaker form, since how much exploration a decision gets then depends on
+        how concentrated the *previous* decision's tree happened to be.
+        """
+        floor = self.config.min_fresh_simulations
+        return self.config.simulations if floor is None else floor
 
     def _search_actions(self, state: GameState) -> list[int]:
         """The search's action set at ``state`` — §5.1 pruning, under config.
@@ -597,27 +640,31 @@ class MCTS:
             node, _ = self._leaf(state, root)
             if node is None:
                 raise ValueError("cannot search a finished game")
-        self._apply_root_noise(node, rng)
+        noised = self._apply_root_noise(node, rng)
 
         reused = int(node.visits.sum())
         budget = max(self.config.simulations - reused, 0)
+        if noised:
+            budget = max(budget, self._fresh_after_noise())
         self.simulations_reused += reused
         self.simulations_run += budget
         for _ in range(budget):
             self._simulate(state.redeterminize(rng), node, root, rng)
         return node.actions, node.visits, node
 
-    def _apply_root_noise(self, node: Node, rng: random.Random) -> None:
+    def _apply_root_noise(self, node: Node, rng: random.Random) -> bool:
+        """Mix in root noise, once per node.  Returns whether it fired *now*."""
         if node.noised:  # a retained subtree that was noised as a root already
-            return
+            return False
         if self.config.dirichlet_alpha is None or len(node.actions) < 2:
-            return
+            return False
         noise = np.random.default_rng(rng.randrange(1 << 32)).dirichlet(
             [self.config.dirichlet_alpha] * len(node.actions)
         )
         weight = self.config.dirichlet_weight
         node.prior = (1.0 - weight) * node.prior + weight * noise
         node.noised = True
+        return True
 
     # ── playing ──────────────────────────────────────────────────────────
     def reset(self) -> None:

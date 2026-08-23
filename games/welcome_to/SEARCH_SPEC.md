@@ -13,11 +13,16 @@ transition inconsistently — as a *pre-reveal afterstate* in one place and as
 outright for any root that is not seat 0. All are corrected below, and the wrong
 versions are recorded so they are not reintroduced.
 
-**Decisions taken 2026-08-22** (§7.6). The transition semantics of §7.1/§7.3
-are agreed; `K` is a schedule rather than a constant; the in-search opponent
-model is the network, batched, and never a bot; merging and particles are
-measured inert and will not be built in v1; retained children are discarded at
-every real turn boundary.
+**Decisions taken 2026-08-22** (§7.6). `K` is a schedule rather than a
+constant; the in-search opponent model is the network, batched, and never a bot;
+retained children are discarded at every real turn boundary.
+
+⚠ **Two of those decisions have since been withdrawn, and step 7 is gated on
+both.** "The transition semantics of §7.1/§7.3 are agreed" was premature — §7.1a
+shows the enumerated edge counts *reveals* where §7.1 defines the outcome as a
+whole transition. And "merging and particles are measured inert and will not be
+built in v1" was measured only down to 18 cards; §7.6 already corrected the
+merging half, and §7.1a corrects the particle half.
 
 **Reads with:** `SELF_PLAY_PLAN.md` S1 (root-player contract, gate),
 `ENCODER_V2_SPEC.md` §10.6 (frozen 684 vocabulary), `AUX_TARGETS_SPEC.md` §5
@@ -282,9 +287,11 @@ decoder.
 
 **And it buys nothing.** Because no chance occurs inside a turn, the within-turn
 chain is **already fully revisitable** — the same keys recur every simulation and
-the chain develops to its natural length. Bundling would save **0.91 network
-calls per turn** and cost the conditional sharing that lets a fence-placement
-policy be learned across every write that reaches the same surveyor state.
+the chain develops to its natural length. Bundling would save **1.14 network
+calls per turn** — one call replacing the 2.14 of §4 — and cost the conditional
+sharing that lets a fence-placement policy be learned across every write that
+reaches the same surveyor state. (This read 0.91 while §4 read 1.91; both were
+re-measured together.)
 
 ### 5.1 Dominance pruning — search-only, not an engine change
 
@@ -565,13 +572,72 @@ One sample contains exactly the randomness consumed during that one transition �
 the opponents' decisions, wherever they fall relative to the reveal, and the
 boundary outcome — and **nothing else**.
 
-**Two edge classes, chosen by the size of the outcome space** (§6.2). This is why
-`seven_wonders_duel/search.py`'s three-class structure is worth porting faithfully
-— Welcome To genuinely uses both, rather than one plus defensive bookkeeping:
+### 7.1a ⚠ BLOCKER: a reveal is not a transition, and the counts are of reveals
+
+**This invalidates the two-edge-class design below as written, and it is the one
+thing step 7 must not begin without settling.**
+
+The paragraph above defines the retained object as the **whole root-to-root
+transition** — the opponents' sampled decisions *and* the boundary outcome. The
+"small outcome space" counts (`6` at `D=3`, `120` at `D=6`) are from §6.2 and
+count **reveals**. They are not counts of transitions.
+
+With three cards left there are six ordered reveals, but each of them still has
+many opponent trajectories underneath it. So "enumerate every outcome, weight it
+by its true probability" cannot be done as stated:
+
+- weighting six children by `P(reveal)` while each holds **one** opponent
+  trajectory prices the reveal exactly and the opponent expectation not at all —
+  it collapses the belief to a single particle, which is precisely the failure
+  §13's POMCP reference is cited for;
+- weighting them by the true probability of the *transition* would require
+  enumerating opponent action sequences too, and that is not small — the
+  opponent policy is a 684-wide distribution per decision and §4 measures 2.45
+  decisions per opponent turn.
+
+Two consequences elsewhere in this document, both of which follow and neither of
+which was noticed:
+
+- **§7.6's "particles are unnecessary for the enumerated edge" is false.** An
+  enumerated reveal child aggregates opponent trajectories that share a viewer
+  information state and differ in hidden detail — exactly the definition of the
+  particle case given in that same section.
+- **§9's "exact late-game oracle" is not exact.** Enumerating ordered reveals
+  fixes the chance layer only; it is an oracle for the root value only if
+  opponent randomness is also fixed (making it a different game) or integrated
+  (making it not enumerable).
+
+**Two coherent resolutions. Neither is chosen here — this is the §7.1 semantics
+step 7 is gated on.**
+
+| | design | weights | cost |
+|---|---|---|---|
+| **A** | **Factor the transition**: sampled-opponent → *exact-reveal* → sampled-opponent, so the enumerated layer is only the chance layer | reveal children carry `P(reveal)` exactly; opponent layers stay Monte Carlo | three layers to key and batch; reveal children still hold particle collections |
+| **B** ← *recommended* | **Retain `K` complete trajectories at every deck size**, and use late-game reveal enumeration only as **stratification** | `P(reveal) × empirical conditional opponent mass` | one edge class everywhere; still needs particles where a stratum draws more than one sample |
+
+**B is the smaller change and the better fit for what is already decided.** It
+keeps `fixed_support` as the only edge, so `K`-as-a-schedule (§7.6) and the
+batching work of step 6 apply unchanged; late-game enumeration stops being a
+second mechanism and becomes variance reduction. It also solves the problem that
+motivated the split in the first place — at `D = 3`, IID sampling gave 5 distinct
+outcomes of 16 with 11 collisions, whereas stratifying over the 6 reveals
+*guarantees* coverage and prices each stratum exactly.
+
+⚠ **Under either resolution, particles stop being optional at the small end**, so
+§7.6's "not built in v1" has to be revisited rather than carried forward. The
+minimum viable form is small: a child holds a **list** of concrete states instead
+of one, and a descent picks among them uniformly. That is a particle collection,
+and it is nearer ten lines than a subsystem.
+
+**Two edge classes, chosen by the size of the outcome space** (§6.2) — ⚠ **as
+written this is the design 7.1a invalidates; kept for the review, not to build
+from.** This is why `seven_wonders_duel/search.py`'s three-class structure is
+worth porting faithfully — Welcome To genuinely uses both, rather than one plus
+defensive bookkeeping:
 
 | outcome space | edge | weights |
 |---|---|---|
-| small (late deck: 6 at `D=3`, 120 at `D=6`) | **`probability_weighted`** — enumerate every outcome | each outcome's **true** probability |
+| small (late deck: **6 reveals** at `D=3`, **120 reveals** at `D=6`) | **`probability_weighted`** — enumerate every outcome | each outcome's **true** probability |
 | large (everything else) | **`fixed_support`** — sample `K` | `count/K` |
 
 Enumeration also **subsumes the merging question** in the only regime where
@@ -636,8 +702,9 @@ The correct rule:
 - a fixed-support entry contains **only the randomness consumed by that one
   root-to-root transition** (§7.1) — the opponents' sampled decisions and the
   boundary outcome;
-- decision children are keyed by the resulting **public observation**, never by an
-  RNG seed and never by a hidden future;
+- decision children are keyed by the resulting **viewer information state**
+  (§12.1 — "public observation" is too weak a name, and this line said it),
+  never by an RNG seed and never by a hidden future;
 - **equivalent public outcomes merge** (which is what makes `count/K` the right
   weight);
 - the remaining deck stays an **unordered histogram**;
@@ -684,16 +751,13 @@ every deck size tested, down to 18 cards remaining. So every real turn starts a
 This is not a regression — it is what happens today — but it means §7.5's
 "reuse the matching child" is aspirational and must not be counted on. **Tree
 reuse pays inside a turn, not across one** (§12 step 3), because there the
-transitions are deterministic and re-rooting is exact.
+transitions are deterministic and re-rooting is exact — ✅ built, and measured at
+47.7% of the budget against an S0-shaped prior (§4).
 
-
-
-Construct the new public state, reuse the matching sampled child if there is one,
-otherwise start a fresh root. The actual public observation is the anchor; no
-persistent ordinal identity is needed.
-
-Within a turn the deterministic subtree **can** be re-rooted after each real
-action, because no chance intervenes. **That does not extend across a boundary.**
+So the rule at a real boundary is: construct the new state, reuse the matching
+sampled child **if** there happens to be one, and otherwise start a fresh root.
+The viewer information state is the anchor; no persistent ordinal identity is
+needed. Expect the fresh-root path essentially always.
 
 ### 7.6 Decisions taken
 
@@ -721,8 +785,8 @@ completes **0.42 plans per game** and is structurally race-blind, so using it as
 the opponent model would bake race-blindness into every value estimate the search
 produces, in a game whose entire competitive surface is the plan race.
 
-**Merging and particles: not built for the sampled edge, and unnecessary for the
-enumerated one.**
+**Merging: not built for the sampled edge. ⚠ Particles: needed after all —
+see §7.1a.**
 
 ⚠ **An earlier version of this decision said merging is "measured inert", full
 stop. That was measured only down to 18 cards and is wrong at the small end** —
@@ -730,11 +794,18 @@ at `D = 6` sampling 16 reveals collides once, and at `D = 3` there are only 6
 possible reveals, so 16 samples give 5 distinct and 11 collisions. The deck
 reaches both once per cycle by construction.
 
-The resolution is the edge split above, not a merging implementation: **enumerate
-exactly where the outcome space is small**, which is exactly where collisions
-occur, and where an enumerated edge has nothing to merge. On the sampled edge,
+The resolution is to give the small end systematic coverage rather than to
+implement merging: **enumerate (or stratify over) exactly where the outcome space
+is small**, which is exactly where collisions occur. On the sampled edge
 collisions are genuinely absent — 16-of-16 distinct at every deck size from 9
 upward — so `count/K` collapses to `1/K` and each child holds one particle.
+
+⚠ **The "and there is nothing to merge at the small end" half of this was wrong,
+and §7.1a is why.** Those counts are of *reveals*. A child that prices a reveal
+exactly still aggregates the opponent trajectories underneath it, which share a
+viewer information state and differ in hidden detail — the particle case, by the
+definition given two paragraphs below. Whichever resolution §7.1a takes, the
+small end needs particle children.
 
 Keep a **counter** on the sampled edge anyway. If it fires, the enumeration
 threshold is set too low, which is a cheaper fix than building particles.
@@ -852,13 +923,21 @@ Add to the bakeoff:
 ordered reveal can be enumerated exactly. Compare each approximation's root
 ranking *and* its root value against the exact expectation.
 
+⚠ **Enumerating reveals alone is not an exact root-value oracle** (§7.1a). It
+fixes the chance layer and leaves the opponents stochastic. To be an oracle it
+must additionally either **fix** opponent randomness — which makes it exact for a
+different game, still useful as a *ranking* check — or **integrate** it, which
+means many opponent samples per enumerated reveal and a stated Monte Carlo error
+bar on the "exact" value. Say which, in the bakeoff, or the comparison measures
+the opponent sampler rather than the chance approximation.
+
 ---
 
 ## 10. Rejected and deferred alternatives
 
 | design | verdict |
 |---|---|
-| **Bundle the whole turn** | Rejected — §5. Up to 71,334 sequences per turn to save 0.91 network calls. |
+| **Bundle the whole turn** | Rejected — §5. Up to 71,334 sequences per turn to save 1.14 network calls. |
 | **Sort the stacks** (KD's `sorted(deck[:4])`) | Rejected. KD's sort is meaningful because domino number *is* next-round pick order, so the slot encodes tempo whatever tile it carries. Sorting Welcome To's stacks gives "lowest of three random draws" — 1 in one determinization, 13 in another. No stable quantity. |
 | **Merge on `(number, effect, box)` + availability counts** | Experimental arm. Invariant, and availability counts are well founded (§13, Cowling et al.), but **context-abstracted**: one `Q` averaged over what the other two offers are, what next-turn effects were exposed, and the race state. Also lossy — a 7 printed and a 7 made with TEMP consume different cards. |
 | **Progressive widening on chance** | Deferred, not rejected. Withdrawn once for a bad reason: "sharper priors do not deepen the tree" is measured and true and does **not** imply nothing structural does. Fixed `K` first because it is easier to reason about and to batch (§13, Couëtoux & Doghmen). |
@@ -929,7 +1008,11 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
 7. **Fixed-support environment edge** (§7) with `count/K` weights and particle
    children, behind a flag, the current version kept as the control arm. Build it
    **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists
-   even temporarily.
+   even temporarily. ⚠ **Blocked on §7.1a**: the enumerated edge as written
+   counts *reveals* where §7.1 defines the outcome as a whole root-to-root
+   transition, so its weights are not the weights it claims. Resolve A or B
+   there first; B (one edge class, late enumeration as stratification) is the
+   recommendation and is the smaller change.
 8. **Run S0, then the bakeoff** (§11).
 9. **Gumbel root allocation** (§7.7) — the intended default for self-play, with
    PUCT retained behind the same interface for the later switch.
@@ -939,7 +1022,8 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
 is an engine refactor with no search-side change, so the search still crosses
 boundaries exactly as it did. Steps 5–7 are what this document exists to have
 reviewed, and step 7 should not begin until the transition semantics of §7.1 and
-§7.3 are agreed.
+§7.3 are agreed — which they are **not**, despite the header once saying so:
+§7.1a is the open blocker and names the two candidate resolutions.
 
 ### 12.1 The key is an information state, not a public observation
 

@@ -14,6 +14,7 @@ from games.welcome_to import mcts
 from games.welcome_to import network as nw
 from games.welcome_to import training
 from games.welcome_to.bots import GreedyBot
+from games.welcome_to.constants import CARD_TABLE
 from games.welcome_to.game import GameConfig, GameState, Phase
 
 _SMALL = nw.NetConfig(
@@ -579,3 +580,103 @@ def test_the_roundabout_pass_flag_reaches_every_part_of_the_search():
     pruning, _ = _search(simulations=4)
     assert pass_macro in keeping._search_actions(state)
     assert pass_macro not in pruning._search_actions(state)
+
+
+def test_a_newly_noised_root_always_gets_fresh_simulations():
+    """⚠ Root noise must be *observed*, not merely applied.
+
+    ``simulations`` is a target total, so a retained root whose visits already
+    meet it would perturb its prior and then run nothing -- leaving the visit
+    counts, and so the policy target, bit-identical to the un-noised search.
+    Reproduced before the fix as ``prior_changed True, fresh_simulations 0,
+    visits_changed False``.  The existing noise test proves noise is not applied
+    twice; this one proves it is applied at all.
+    """
+    torch.manual_seed(0)
+    search, evaluator = _search(simulations=8, dirichlet_alpha=1.0)
+    state = _position(players=2, turn=8, root=0)
+    rng = random.Random(3)
+
+    choice = search.play(state, root=0, rng=rng)
+    retained = search._retained
+    assert retained is not None, "nothing was retained inside a turn"
+
+    successor = mc.step_macro(state, choice)
+    while len(mc.search_legal_macros(successor)) == 1:
+        mc.apply_macro(successor, mc.search_legal_macros(successor)[0])
+    node = search._take_retained(successor, 0)
+    assert node is not None
+
+    # the pathological case: re-rooting alone already meets the whole budget
+    node.visits[:] = 0.0
+    node.visits[0] = float(search.config.simulations)
+    node.total[0] = 0.0
+    before_prior = node.prior.copy()
+    before_visits = node.visits.copy()
+    calls = evaluator.calls
+
+    _, visits, node = search.search(successor, root=0, rng=rng, node=node)
+
+    assert not np.array_equal(before_prior, node.prior), "the root was not noised"
+    assert evaluator.calls > calls, "a noised root ran zero simulations"
+    assert not np.array_equal(before_visits, visits), "no simulation saw the noise"
+
+
+def test_an_un_noised_root_keeps_the_whole_re_rooting_saving():
+    """The floor is scoped to noise; with noise off, nothing changes.  This is
+    what keeps ``min_fresh_simulations`` from quietly costing the 47.7%."""
+    torch.manual_seed(0)
+    search, _ = _search(simulations=64)
+    assert search.config.dirichlet_alpha is None
+    state = _position(players=2, turn=8, root=0)
+    rng = random.Random(11)
+
+    choice = search.play(state, root=0, rng=rng)
+    successor = mc.step_macro(state, choice)
+    while len(mc.search_legal_macros(successor)) == 1:
+        mc.apply_macro(successor, mc.search_legal_macros(successor)[0])
+    node = search._take_retained(successor, 0)
+    assert node is not None and node.visits.sum() > 0
+
+    _, visits, _ = search.search(successor, root=0, rng=rng, node=node)
+    assert visits.sum() == 64, "the target-total budget changed with noise off"
+
+
+def test_the_position_key_sees_deck_and_discard_composition():
+    """⚠ Swap an undrawn card with a discarded one of a *different* printed type.
+
+    ``deck_pos`` and ``len(discard)`` are both unchanged, so a key built from
+    those alone matches -- and an earlier version of ``_position_key`` did
+    exactly that, despite claiming to be a full identity.  The two positions have
+    different reveal distributions and different ``deck_composition`` in the
+    encoder, so they must never share a retained subtree.
+    """
+    state = _position(players=2, turn=10, root=0)
+    state.discard.append(state.deck[state.deck_pos + 5])
+    before = mcts._position_key(state, 0)
+
+    swapped = state.copy()
+    pair = next(
+        (i, j)
+        for i, card in enumerate(swapped.deck[swapped.deck_pos :])
+        for j, other in enumerate(swapped.discard)
+        if CARD_TABLE[card] != CARD_TABLE[other]
+    )
+    i, j = pair
+    card = swapped.deck[swapped.deck_pos + i]
+    other = swapped.discard[j]
+    swapped.deck[swapped.deck_pos + i], swapped.discard[j] = other, card
+
+    assert swapped.deck_pos == state.deck_pos
+    assert len(swapped.discard) == len(state.discard)
+    assert mcts._position_key(swapped, 0) != before, "the key missed the swap"
+
+
+def test_the_position_key_ignores_the_order_of_what_is_hidden():
+    """The other half: a re-determinization permutes the undrawn deck and must
+    *not* refuse a legitimate re-root.  Composition in, order out."""
+    state = _position(players=2, turn=10, root=0)
+    before = mcts._position_key(state, 0)
+    shuffled = state.redeterminize(random.Random(5))
+    assert shuffled.deck[shuffled.deck_pos :] != state.deck[state.deck_pos :]
+    assert mcts._position_key(shuffled, 0) == before, "the key read hidden order"
