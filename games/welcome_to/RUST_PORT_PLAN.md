@@ -29,7 +29,7 @@ because a plan that quietly absorbs its review teaches nobody.
 | comparator self-contradictory | said "sorted list" in one place and "raw order matters" in another | §4 M1 |
 | ABI undefined | `answer_batch` takes **Python `GameState` rows and runs the Python encoder** — using it from Rust forfeits M3's entire gain | §2 M0-E, §3 |
 | `leaf_batch > 1` mis-transferred | Welcome To has **no within-search leaf batch**; adding one needs virtual loss and is a class C strength change | §6 |
-| widening excluded "permanently" | if it wins the bakeoff, the Rust backend cannot be the production backend | §8 |
+| widening excluded "permanently" | if it wins the bakeoff, the Rust backend cannot be the production backend | §8.1 — resolved: **design for it, do not build it** |
 | M4 partition gate vacuous | information keys almost never collide naturally, so a random corpus proves only that both engines say "different" | §4 M4 |
 | M5 fingerprint gate too strong | a mock evaluator removes torch drift but **not** redeterminization or opponent sampling | §4 M5 |
 | checkpoints unmeasurable | M1 and M3 are not wired into the search, so "measure after M1" can only microbenchmark | §9 |
@@ -290,6 +290,12 @@ identical terminal value where applicable.
 
 ### M5 — the search descent
 
+**Built open-loop, designed for widening — §8.1's three constraints are part of
+this milestone, not a later concern:** an observation-keyed edge table with a
+count field, a transition step that returns the observation and whether the turn
+changed, and an unallocated particle slot in the node arena. Verify the cost is
+small; if it is not, re-open §8.1 rather than paying it quietly.
+
 **Gate 1 — strict, under full control.** A deterministic mock evaluator **and a
 fixed random tape**. ⚠ A mock removes torch drift but *not* redeterminization or
 opponent sampling; without a shared tape the trees diverge for a reason that has
@@ -425,12 +431,47 @@ permanently. That is incoherent with the objective: **if progressive widening
 wins the equal-wall-clock bakeoff, a backend that cannot run it cannot be the
 production backend.**
 
-So, explicitly:
+### 8.1 ✅ DECIDED 2026-08-23 — build open-loop, design for widening
 
-* **Settle open-loop versus widening before M5**, or design M5's node and
-  transition interfaces to admit outcomes and particle collections later. Its
-  representation is structural enough that bolting it on afterwards may rewrite
-  M5.
+**The decision that matters is narrower than "port widening or not". It is:
+*may M5 assume the tree never holds game states?*** Answer: **no.**
+
+Everything else about widening — the cap, the two counters, merging — is
+bookkeeping that can be added later without disturbing anything. Particles are
+not. Open-loop stores **no** states in the tree; widening stores up to
+`max_particles` concrete states per outcome. Measured: a `GameState` pickles to
+**6,513 bytes** and copies in **28.7 µs** in Python, and in Rust the difference
+is between a node arena of plain numbers and one that owns or indexes state
+snapshots. That is a layout decision, and layout is what does not get
+retrofitted.
+
+**Why this is not decided on evidence.** Deciding properly needs an
+equal-wall-clock strength A/B, and that needs a checkpoint where **search
+demonstrably beats no-search**. S0 is not it: its value head has score R² 0.200,
+and widening's entire product is *depth* (1.42 → 2.14 leaves), which only pays if
+the values at those leaves are informative. A bakeoff run now would most likely
+return a null, and **a null from an uninformative arm is not evidence** —
+`THROUGHPUT_LEVERS.md` §4.7. The real decision belongs after **S1**.
+
+**So M5 builds open-loop only, under three design constraints** that make
+widening additive rather than structural:
+
+1. **Edges are a table keyed by observation, with room for a count** — not a
+   bare `(action, observation) → node` map. `Outcome.count` is then a field that
+   stays zero, not a new indirection.
+2. **The transition step returns enough to key an outcome**, even when nothing
+   stores one — the observation and whether the turn changed. `edge_exact` is a
+   consequence of the second, and §7.1a's closure rule needs it.
+3. **The node arena carries a side-table slot for particles that is never
+   allocated** while `chance_widening` is `None`. Zero cost off, and no layout
+   change to turn on.
+
+⚠ **This is a hedge with a bounded price, and the price should be checked.** If
+implementing those three costs more than a small fraction of M5, say so and
+re-open the choice rather than paying it silently. The alternative on the table
+was to build strictly open-loop and treat widening as a later M7 rewrite; that
+bets widening loses a bakeoff nobody has run.
+
 * Until implemented, **Rust rejects `chance_widening != None` loudly** (M0-A).
 * **Expert and solo** are out of training scope; reject them loudly rather than
   half-implement.
@@ -446,9 +487,15 @@ So, explicitly:
 1. **M0.** Contracts first. Every one of them is cheap now and expensive later.
 2. **M1**, and measure what is measurable (§7).
 3. M2, M3, M4 in order.
-4. **Decide the widening question** (§8) before M5.
-5. M5.
-6. M6 last — concurrency on top of an incorrect engine measures nothing.
+4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
+   the widening question** — that decision was taken as "design for it, do not
+   build it", precisely so this step does not wait on a measurement that cannot
+   be made yet.
+5. M6 last — concurrency on top of an incorrect engine measures nothing.
+6. **After S1**, when a checkpoint exists that search actually improves: run the
+   widening bakeoff (and §7.8's `noise_fresh_fraction`, which waits on the same
+   thing). If widening wins, it becomes M7 and the constraints above are what
+   make that a feature rather than a rewrite.
 
 **What would stop the port:** if M1's gate cannot be made to pass at 8,000 games,
 do not proceed to M2 with a known divergence and a plan to fix it later. A rules
