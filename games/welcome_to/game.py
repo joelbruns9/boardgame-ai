@@ -48,7 +48,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -185,6 +185,36 @@ class TurnCtx:
 
 class IllegalAction(ValueError):
     pass
+
+
+#: A replacement for :meth:`GameState._draw`, at the raw-draw level.
+DrawFn = Callable[[], int]
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryOutcome:
+    """One immediate chance outcome at a turn boundary -- ``SEARCH_SPEC.md`` §6.3.
+
+    ``draws`` is the ordered sequence of **raw** draws the boundary made, which
+    is deliberately not "the three cards on the table":
+
+    - an ordinary boundary draws **three**;
+    - a **queued reshuffle** draws **six, in two batches with a discard cycle
+      between them**, so both the aside pair and the number pair on show
+      afterwards are freshly drawn;
+    - a solo card is a draw that resolves and forces another, so it appears here
+      like any other card and replays as one.
+
+    ⚠ **Every card in ``draws`` is one the boundary makes public**, and the
+    order of the deck it leaves behind is not recorded. That is the
+    non-anticipativity rule of §7.3, held structurally rather than by
+    convention: an outcome cannot leak the future because it never contains it.
+    """
+
+    draws: tuple[int, ...]
+    #: Whether the deck was reformed from the discard during this boundary.
+    #: Determined by the afterstate, not by the draw -- see ``_reveal_step``.
+    reformed: bool = False
 
 
 @dataclass
@@ -351,12 +381,46 @@ class GameState:
         self.deck_pos += 1
         return card
 
-    def _draw_playable(self) -> int:
-        """Draw, resolving the solo card if it turns up (``ConstructionCards::drawAux``)."""
-        card = self._draw()
+    def _replay_draw(self, card: int) -> int:
+        """:meth:`_draw`, except *which* card comes off the top is dictated.
+
+        The same reform-if-empty rule, the same bookkeeping; only the choice of
+        card is replaced.  ``card`` is swapped to the top of the undrawn region
+        and drawn from there, so the deck's **composition** stays exact while the
+        order of what is left stays arbitrary -- which is correct, because that
+        order is hidden and every simulation re-determinizes it anyway
+        (``SEARCH_SPEC.md`` §7.3: a sampled outcome must not carry the future
+        deck order).
+        """
+        if self.deck_pos >= len(self.deck):
+            self._reform_deck()
+        try:
+            at = self.deck.index(card, self.deck_pos)
+        except ValueError:
+            raise IllegalAction(
+                f"card {card} is not in the undrawn deck; this outcome does not "
+                "belong to this boundary"
+            ) from None
+        self.deck[self.deck_pos], self.deck[at] = (
+            self.deck[at],
+            self.deck[self.deck_pos],
+        )
+        self.deck_pos += 1
+        return card
+
+    def _draw_playable(self, draw: Optional[DrawFn] = None) -> int:
+        """Draw, resolving the solo card if it turns up (``ConstructionCards::drawAux``).
+
+        ``draw`` replaces :meth:`_draw` for the duration -- at the *raw* draw
+        level, deliberately, so that a solo card and the extra draw it forces are
+        recorded and replayed like any other card rather than being a special
+        case a second implementation has to know about.
+        """
+        take = draw or self._draw
+        card = take()
         if card == SOLO_CARD_ID:
             self._on_solo_card()
-            card = self._draw()
+            card = take()
         return card
 
     def _on_solo_card(self) -> None:
@@ -376,14 +440,35 @@ class GameState:
     # ──────────────────────────────────────────────────────────────────
     # Turn boundaries
     # ──────────────────────────────────────────────────────────────────
-    def _begin_turn(self) -> None:
-        """``stNewTurn`` -- discard, optionally reshuffle, draw, then hand over."""
-        self._discard_step()
-        if self.reshuffle_next_turn:
-            self._reshuffle_decks()
-            self.reshuffle_next_turn = False
-        self._draw_step()
+    def _begin_turn(self, draw: Optional[DrawFn] = None) -> None:
+        """``stNewTurn`` -- discard, optionally reshuffle, draw, then hand over.
 
+        Kept whole for ``setupNewGame``, which begins a turn without *ending*
+        one: no turn increment and no end-of-game test.  A real boundary goes
+        through :meth:`prepare_turn_boundary` instead.
+        """
+        self._discard_step()
+        self._reveal_step(draw)
+        self._open_turn()
+
+    def _reveal_step(self, draw: Optional[DrawFn] = None) -> None:
+        """The part of a boundary that reveals cards -- **all four cases of §6.3**.
+
+        ⚠ Which case fires is **not** chance: a queued reshuffle is
+        ``reshuffle_next_turn``, and an exact-empty reform is
+        ``deck_remaining == 0``, both of which are settled by the prepared state
+        before a card is seen.  Only *which cards* is chance.  That is what makes
+        :meth:`sample_boundary_outcome` and :meth:`apply_boundary_outcome` a
+        clean pair: they run this same code and differ only in where a card
+        comes from.
+        """
+        if self.reshuffle_next_turn:
+            self._reshuffle_decks(draw)
+            self.reshuffle_next_turn = False
+        self._draw_step(draw)
+
+    def _open_turn(self) -> None:
+        """The deterministic tail: hand the turn to seat 0 and settle."""
         self.actor = 0
         self.ctx = TurnCtx()
         self.reshuffle_votes = {}
@@ -408,7 +493,7 @@ class GameState:
                         self.discard.append(group[i])
                     group[i] = None
 
-    def _draw_step(self) -> None:
+    def _draw_step(self, draw: Optional[DrawFn] = None) -> None:
         """``ConstructionCards::drawAux``."""
         if self.config.expert:
             for p in range(self.config.players):
@@ -417,12 +502,12 @@ class GameState:
                         self.stack_new[p][0] = self.expert_pending[p]
                         self.expert_pending[p] = None
                     else:
-                        self.stack_new[p][i] = self._draw_playable()
+                        self.stack_new[p][i] = self._draw_playable(draw)
         else:
             for i in range(3):
-                self.stack_new[0][i] = self._draw_playable()
+                self.stack_new[0][i] = self._draw_playable(draw)
 
-    def _reshuffle_decks(self) -> None:
+    def _reshuffle_decks(self, draw: Optional[DrawFn] = None) -> None:
         """``ConstructionCards::reshuffle`` -- offered once, after the first plan.
 
         In standard mode BGA reforms the deck and then burns a full draw/discard
@@ -435,15 +520,45 @@ class GameState:
         self._reform_deck()
         if self.config.standard:
             for i in range(3):
-                self.stack_new[0][i] = self._draw_playable()
+                self.stack_new[0][i] = self._draw_playable(draw)
             self._discard_step()
         elif self.config.expert:
             for p in range(self.config.players):
                 if self.expert_pending[p] is None:
-                    self.expert_pending[p] = self._draw_playable()
+                    self.expert_pending[p] = self._draw_playable(draw)
 
     def _end_turn(self) -> None:
-        """``stApplyTurn``."""
+        """``stApplyTurn`` -- the three-part boundary, run straight through."""
+        if not self.prepare_turn_boundary():
+            return
+        self._reveal_step()
+        self._open_turn()
+
+    # ──────────────────────────────────────────────────────────────────
+    # The boundary, in three parts -- SEARCH_SPEC.md §6.3
+    # ──────────────────────────────────────────────────────────────────
+    def prepare_turn_boundary(self) -> bool:
+        """Everything a boundary does **before a card is revealed**, in place.
+
+        Returns ``True`` if a reveal follows and ``False`` if the game ended
+        here, which is the fourth case of §6.3 and the one a search that assumes
+        "a boundary reveals cards" gets wrong.
+
+        What this settles, all of it deterministic and all of it observable:
+
+        - expert card passing, and the turn counter;
+        - ``isEndOfGame``, tested on the **pre-discard** deck, which matters in
+          solo where the clause reads ``deck_remaining``;
+        - ``discardAux``: the three aside cards go to the discard and the three
+          **number** cards are promoted into the aside slots. So *this turn's
+          numbers become next turn's effects* -- which is the whole reason
+          ``next_effects`` is a certainty and not a posterior (§6.2), and why the
+          cards on the table are never part of the material being reshuffled.
+
+        Afterwards ``self`` is the boundary **afterstate**: ``stack_new`` empty,
+        the effects for the coming turn already known and public, and exactly one
+        thing left undecided -- which cards come off the deck.
+        """
         if self.config.expert:
             self._pass_unused_cards()
 
@@ -451,8 +566,84 @@ class GameState:
         if self._is_end_of_game():
             self.phase = Phase.GAME_OVER
             self.public_sheets = [s.copy() for s in self.sheets]
-            return
-        self._begin_turn()
+            return False
+
+        self._discard_step()
+        return True
+
+    def _is_boundary_afterstate(self) -> bool:
+        return not self.is_terminal and all(
+            card is None for group in self.stack_new for card in group
+        )
+
+    def sample_boundary_outcome(self, rng: random.Random) -> "BoundaryOutcome":
+        """One immediate outcome of this boundary.  **Does not modify ``self``.**
+
+        ``rng`` re-permutes the undrawn deck before the draw, so repeated calls
+        on the *same* afterstate give independent outcomes -- which is what a
+        chance node needs, and what reading the top of an already-determinized
+        deck would not give.  The discard is not permuted here because it does
+        not need to be: it only ever enters play through ``_reform_deck``, which
+        shuffles it with the probe's own generator.
+
+        Runs the engine's real reveal path, so the ordinary draw, the
+        exact-empty reform, the queued reshuffle and any solo card are handled
+        because they are *the same code*, not because they were re-derived.
+        """
+        if not self._is_boundary_afterstate():
+            raise IllegalAction(
+                "sample_boundary_outcome needs a prepared boundary afterstate; "
+                "call prepare_turn_boundary() first"
+            )
+        probe = self.redeterminize(rng)
+        drawn: list[int] = []
+        # ``_reform_deck`` has exactly two call sites, and both are visible from
+        # here: ``_reshuffle_decks`` always reforms, and ``_draw`` reforms when
+        # the undrawn region is empty as it is entered.  Checking both is exact,
+        # where inferring one from how ``deck_pos`` moved is not -- a reform
+        # resets the cursor, so the arithmetic stops meaning anything.
+        reformed = probe.reshuffle_next_turn
+
+        def record() -> int:
+            nonlocal reformed
+            if probe.deck_pos >= len(probe.deck):
+                reformed = True
+            card = probe._draw()
+            drawn.append(card)
+            return card
+
+        probe._reveal_step(record)
+        return BoundaryOutcome(draws=tuple(drawn), reformed=reformed)
+
+    def apply_boundary_outcome(self, outcome: "BoundaryOutcome") -> None:
+        """Apply ``outcome`` to this afterstate, in place, and open the turn.
+
+        Deterministic: the same reveal path, with each draw served from
+        ``outcome`` instead of the deck. Raises :class:`IllegalAction` if the
+        outcome does not fit this boundary -- a wrong card, or the wrong number
+        of them -- rather than silently producing a state no deal could reach.
+        """
+        if not self._is_boundary_afterstate():
+            raise IllegalAction(
+                "apply_boundary_outcome needs a prepared boundary afterstate; "
+                "call prepare_turn_boundary() first"
+            )
+        pending = iter(outcome.draws)
+
+        def replay() -> int:
+            try:
+                card = next(pending)
+            except StopIteration:
+                raise IllegalAction(
+                    "the outcome ran out of cards; it does not belong to this "
+                    "boundary"
+                ) from None
+            return self._replay_draw(card)
+
+        self._reveal_step(replay)
+        if next(pending, None) is not None:
+            raise IllegalAction("the outcome has cards this boundary did not draw")
+        self._open_turn()
 
     def _pass_unused_cards(self) -> None:
         """``Player::giveThirdCardToNextPlayer``.

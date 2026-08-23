@@ -1,6 +1,7 @@
 """Engine flow: phases, effects, scoring and information sets."""
 from __future__ import annotations
 
+import collections
 import random
 
 import pytest
@@ -13,7 +14,14 @@ from games.welcome_to.constants import (
     ROUNDABOUT,
     STREET_SIZES,
 )
-from games.welcome_to.game import GameConfig, GameState, IllegalAction, Phase
+from games.welcome_to.bots import GreedyBot
+from games.welcome_to.game import (
+    BoundaryOutcome,
+    GameConfig,
+    GameState,
+    IllegalAction,
+    Phase,
+)
 from games.welcome_to.plans import PLANS
 
 
@@ -561,3 +569,334 @@ def test_reshuffle_votes_are_recorded_per_seat_and_cleared_each_turn():
     copied = state.copy()
     copied.reshuffle_votes[2] = True
     assert state.reshuffle_votes == {1: True}, "copy() must not share the dict"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The turn boundary, in three parts -- SEARCH_SPEC.md §6.3
+#
+# The point of the split is that a search must never reimplement the draw: a
+# boundary does four different things and a reimplementation is a correctness
+# bug waiting on a reshuffle turn.  So there is a test per case, and one that
+# says the three-part path *is* the engine's own path.
+# ──────────────────────────────────────────────────────────────────────────
+def _mid_game(players: int = 2, turn: int = 4, seed: int = 3) -> GameState:
+    bots = [GreedyBot(random.Random(seed * 10 + i)) for i in range(players)]
+    state = GameState.new(seed=seed, config=GameConfig(players=players, advanced=True))
+    while not state.is_terminal and state.turn < turn:
+        state.apply(bots[state.actor].act(state))
+    assert not state.is_terminal
+    return state
+
+
+def _afterstate(**kwargs) -> GameState:
+    """A boundary afterstate: everything settled except which cards come off."""
+    state = _mid_game(**kwargs)
+    assert state.prepare_turn_boundary(), "the game ended instead"
+    return state
+
+
+def _live_cards(state: GameState) -> collections.Counter:
+    """Every card that still exists.  ``deck[:deck_pos]`` is already dealt."""
+    cards = list(state.deck[state.deck_pos :]) + list(state.discard)
+    for group in list(state.stack_new) + list(state.stack_old):
+        cards += [c for c in group if c is not None]
+    cards += [c for c in state.expert_pending if c is not None]
+    return collections.Counter(cards)
+
+
+def test_prepare_promotes_the_numbers_and_reveals_nothing():
+    """§6.2's certainty, as a transition: *this* turn's numbers become *next*
+    turn's effects, before any card is drawn.  That is why ``next_effects`` is
+    known rather than guessed, and why the table is never reshuffled material."""
+    state = _mid_game()
+    numbers = list(state.stack_new[0])
+    aside = [c for c in state.stack_old[0] if c is not None]
+    turn, discarded = state.turn, len(state.discard)
+
+    assert state.prepare_turn_boundary() is True
+    assert state.turn == turn + 1
+    assert state.stack_old[0] == numbers, "this turn's numbers were not promoted"
+    assert all(c is None for c in state.stack_new[0]), "a card was revealed early"
+    assert len(state.discard) == discarded + len(aside)
+
+
+def test_an_ordinary_boundary_draws_three():
+    state = _afterstate()
+    assert not state.reshuffle_next_turn and state.deck_remaining >= 3
+    outcome = state.sample_boundary_outcome(random.Random(0))
+    assert len(outcome.draws) == 3
+    assert outcome.reformed is False
+
+
+def test_an_exact_empty_deck_reforms_and_still_draws_three():
+    """The deck is empty *at the start* of the draw, so ``_draw`` reforms first.
+
+    Reachable and not rare: consumption is a multiple of three and reform
+    happens at zero, so the deck passes through empty once per cycle.
+    """
+    state = _afterstate()
+    state.discard.extend(state.deck[state.deck_pos :])
+    state.deck_pos = len(state.deck)
+    assert state.deck_remaining == 0 and state.discard
+
+    before = _live_cards(state)
+    outcome = state.sample_boundary_outcome(random.Random(0))
+    assert len(outcome.draws) == 3
+    assert outcome.reformed is True
+
+    state.apply_boundary_outcome(outcome)
+    assert _live_cards(state) == before, "the reform invented or lost a card"
+    assert state.deck_remaining > 0
+
+
+def test_a_queued_reshuffle_draws_six_in_two_batches():
+    """⚠ The case a "draw three from the histogram" search gets wrong.
+
+    ``_reshuffle_decks`` reforms, draws **3**, runs a discard cycle -- which
+    promotes those three into the aside slots -- and then ``_draw_step`` draws
+    **3 more**.  So both halves of every stack are freshly drawn, and the
+    boundary reveals six cards, not three.
+    """
+    state = _afterstate()
+    state.reshuffle_next_turn = True
+    before = _live_cards(state)
+
+    outcome = state.sample_boundary_outcome(random.Random(0))
+    assert len(outcome.draws) == 6, "a reshuffle boundary is not three cards"
+    assert outcome.reformed is True
+
+    state.apply_boundary_outcome(outcome)
+    assert state.reshuffle_next_turn is False, "the queued reshuffle was not consumed"
+    assert _live_cards(state) == before
+    assert list(state.stack_old[0]) == list(outcome.draws[:3])
+    assert list(state.stack_new[0]) == list(outcome.draws[3:])
+
+
+def test_a_boundary_can_end_the_game_before_revealing_anything():
+    """The fourth case, and the one a search that assumes "a boundary reveals
+    cards" gets wrong: ``prepare_turn_boundary`` returns False and there is no
+    outcome to sample at all."""
+    state = _mid_game()
+    _fill_sheet(state, 0)  # ``isEndOfGame``: a player with no free box
+
+    assert state.prepare_turn_boundary() is False
+    assert state.is_terminal and state.phase is Phase.GAME_OVER
+    with pytest.raises(IllegalAction):
+        state.sample_boundary_outcome(random.Random(0))
+
+
+@pytest.mark.parametrize("case", ["ordinary", "exact-empty reform", "queued reshuffle"])
+def test_the_three_part_boundary_is_the_engine_s_own_boundary(case):
+    """The guarantee the whole split exists for, on each of the three reveal
+    cases: ``prepare`` / ``apply`` must land on exactly the state the engine
+    reaches by itself.
+
+    The control side records what it drew (through the same ``draw`` hook
+    ``sample_boundary_outcome`` uses, which is why a reform is not a special
+    case here) and the split side replays it, so the *only* thing that can
+    differ is the logic.
+    """
+    compared = 0
+    for seed in range(6):
+        for players in (2, 3):
+            control = _afterstate(players=players, seed=seed)
+            if case == "exact-empty reform":
+                control.discard.extend(control.deck[control.deck_pos :])
+                control.deck_pos = len(control.deck)
+            elif case == "queued reshuffle":
+                control.reshuffle_next_turn = True
+            split = control.copy()
+
+            drawn: list[int] = []
+            real = control._draw
+
+            def record() -> int:
+                card = real()
+                drawn.append(card)
+                return card
+
+            control._reveal_step(record)
+            control._open_turn()
+
+            split.apply_boundary_outcome(BoundaryOutcome(draws=tuple(drawn)))
+            compared += 1
+
+            assert split.turn == control.turn
+            assert split.actor == control.actor
+            assert split.phase is control.phase
+            assert split.stack_new == control.stack_new
+            assert split.stack_old == control.stack_old
+            assert split.table_cards(0) == control.table_cards(0)
+            assert split.reshuffle_next_turn == control.reshuffle_next_turn
+            assert split.deck_remaining == control.deck_remaining
+            assert split.solo_card_drawn == control.solo_card_drawn
+            assert _live_cards(split) == _live_cards(control)
+            assert split.legal_actions() == control.legal_actions()
+    assert compared == 12, "the comparison was skipped"
+
+
+def test_the_reformed_flag_means_the_deck_was_actually_reformed():
+    """Pinned against the real call, because it is inferable and must not be.
+
+    ``_reform_deck`` has exactly two call sites -- ``_reshuffle_decks``, which
+    always reforms, and ``_draw``, which reforms on an empty undrawn region --
+    and both are checked directly.  Inferring it from how ``deck_pos`` moved
+    reads plausible and is wrong: a reform resets the cursor, so the arithmetic
+    stops meaning anything.  Verified 4,329/4,329 over 50 games at 2 and 3 seats.
+    """
+    calls = []
+    original = GameState._reform_deck
+
+    def spy(self):
+        calls.append(1)
+        original(self)
+
+    GameState._reform_deck = spy
+    try:
+        for seed in (3, 5, 8):
+            base = _afterstate(seed=seed)
+            for variant in (None, "empty", "queued"):
+                state = base.copy()
+                if variant == "empty":
+                    state.discard.extend(state.deck[state.deck_pos :])
+                    state.deck_pos = len(state.deck)
+                elif variant == "queued":
+                    state.reshuffle_next_turn = True
+                calls.clear()
+                outcome = state.sample_boundary_outcome(random.Random(7))
+                assert outcome.reformed is bool(calls), (
+                    f"{variant}: flag {outcome.reformed}, "
+                    f"actual reforms {len(calls)}"
+                )
+    finally:
+        GameState._reform_deck = original
+
+
+def test_sampling_an_outcome_does_not_touch_the_afterstate():
+    """A chance node samples many outcomes from one afterstate; if sampling
+    consumed the deck, the second sample would be drawn from a different game."""
+    state = _afterstate()
+    before = (
+        state.deck_pos,
+        list(state.deck),
+        list(state.discard),
+        [list(g) for g in state.stack_new],
+        [list(g) for g in state.stack_old],
+        state.reshuffle_next_turn,
+    )
+    outcomes = {state.sample_boundary_outcome(random.Random(k)).draws for k in range(8)}
+    after = (
+        state.deck_pos,
+        list(state.deck),
+        list(state.discard),
+        [list(g) for g in state.stack_new],
+        [list(g) for g in state.stack_old],
+        state.reshuffle_next_turn,
+    )
+    assert before == after, "sampling mutated the afterstate"
+    assert len(outcomes) > 1, "repeated samples are not independent"
+
+
+def test_an_outcome_carries_only_cards_the_boundary_makes_public():
+    """§7.3's non-anticipativity rule, held structurally.
+
+    Every card in an outcome ends up face-up on the table, and the order of what
+    is left is not recorded -- so an outcome *cannot* leak the future deck, and
+    a scenario built from one cannot become clairvoyant by accident.
+    """
+    for reshuffle in (False, True):
+        state = _afterstate()
+        state.reshuffle_next_turn = reshuffle
+        outcome = state.sample_boundary_outcome(random.Random(2))
+        state.apply_boundary_outcome(outcome)
+        assert set(outcome.draws) <= set(state.table_cards(0))
+
+
+def test_applying_an_outcome_is_deterministic():
+    state = _afterstate()
+    outcome = state.sample_boundary_outcome(random.Random(4))
+    ends = []
+    for _ in range(3):
+        applied = state.copy()
+        applied.apply_boundary_outcome(outcome)
+        ends.append((applied.table_cards(0), applied.deck_remaining, applied.phase))
+    assert ends[0] == ends[1] == ends[2]
+
+
+def test_an_outcome_from_another_boundary_is_refused():
+    """Rather than silently producing a state no deal could reach."""
+    state = _afterstate()
+    outcome = state.sample_boundary_outcome(random.Random(5))
+
+    with pytest.raises(IllegalAction):
+        state.copy().apply_boundary_outcome(
+            BoundaryOutcome(draws=outcome.draws[:2])  # too few
+        )
+    with pytest.raises(IllegalAction):
+        state.copy().apply_boundary_outcome(
+            BoundaryOutcome(draws=outcome.draws + outcome.draws)  # too many
+        )
+    on_table = next(c for c in state.stack_old[0] if c is not None)
+    with pytest.raises(IllegalAction):
+        state.copy().apply_boundary_outcome(
+            BoundaryOutcome(draws=(on_table,) + outcome.draws[1:])  # not in the deck
+        )
+
+
+def test_the_boundary_must_be_prepared_before_it_is_sampled_or_applied():
+    state = _mid_game()  # cards still on the table: not an afterstate
+    with pytest.raises(IllegalAction):
+        state.sample_boundary_outcome(random.Random(0))
+    with pytest.raises(IllegalAction):
+        state.apply_boundary_outcome(BoundaryOutcome(draws=(0, 1, 2)))
+
+
+@pytest.mark.parametrize("players", [2, 3, 4])
+def test_standard_play_never_exhausts_the_deck_mid_triple(players):
+    """Why "mid-draw exhaustion" is not a standard-mode case.
+
+    Consumption stays a multiple of three -- six at setup, three per ordinary
+    turn, six per requested reshuffle -- so the deck is either empty before the
+    first of three draws (the reform case above) or holds at least three.
+    Measured here at every ``_draw_step``; the spec's figure is 56,205
+    observations over 120 games with no exceptions.
+    """
+    seen = []
+    original = GameState._draw_step
+
+    def spy(self, draw=None):
+        seen.append(self.deck_remaining)
+        original(self, draw)
+
+    GameState._draw_step = spy
+    try:
+        for seed in range(4):
+            bots = [GreedyBot(random.Random(seed * 10 + i)) for i in range(players)]
+            state = GameState.new(
+                seed=seed, config=GameConfig(players=players, advanced=True)
+            )
+            while not state.is_terminal:
+                state.apply(bots[state.actor].act(state))
+    finally:
+        GameState._draw_step = original
+
+    assert seen, "no draw step ran"
+    offenders = [n for n in seen if n % 3 != 0]
+    assert not offenders, f"{len(offenders)} of {len(seen)} draw steps mid-triple"
+
+
+def test_a_mid_draw_reform_still_works_if_expert_mode_ever_needs_it():
+    """Generic, and *not* search-critical -- kept because ``_draw`` supports it
+    and expert mode is still in the engine.  Standard mode cannot reach it (the
+    test above), so it is driven directly."""
+    state = _afterstate()
+    keep = state.deck[state.deck_pos]
+    state.discard.extend(state.deck[state.deck_pos + 1 :])
+    state.deck = state.deck[: state.deck_pos] + [keep]
+    assert state.deck_remaining == 1 and state.discard
+
+    before = _live_cards(state)
+    outcome = state.sample_boundary_outcome(random.Random(0))
+    assert len(outcome.draws) == 3, "the draw did not survive a mid-triple reform"
+    state.apply_boundary_outcome(outcome)
+    assert _live_cards(state) == before

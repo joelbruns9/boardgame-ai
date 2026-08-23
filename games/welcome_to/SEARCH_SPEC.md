@@ -494,22 +494,55 @@ either empty before the first of three draws or holds at least three.
 
 **Measured:** `deck_remaining % 3 == 0` at the start of **every** `_draw_step` —
 56,205 observations over 120 games at 2, 3 and 4 seats, no exceptions. Of 1,058
-reforms, none occurred between two draws of a triple.
+reforms, none occurred between two draws of a triple. ✅ Now asserted per seat
+count by `test_standard_play_never_exhausts_the_deck_mid_triple`.
 
-Keep a generic mid-draw unit test if expert mode is to stay supported; it is not
-a search-critical case. Solo (`_draw_playable` resolving `SOLO_CARD_ID`) is
-likewise out of the training scope.
+The generic mid-draw case is kept as a unit test because `_draw` supports it and
+expert mode is still in the engine; it is driven directly, since standard mode
+cannot reach it. Solo (`_draw_playable` resolving `SOLO_CARD_ID`) is likewise out
+of the training scope — but it is an *extra* raw draw, so it is recorded and
+replayed like any other card rather than being a case the outcome type has to
+know about.
 
-**The search must not reimplement this.** Refactor an engine-owned triple:
+**The search must not reimplement this.** ✅ **Built** (`game.py`), as an
+engine-owned triple:
 
 ```
-prepare_turn_boundary()          -> afterstate, or terminal
-sample_boundary_outcome(rng)     -> one immediate outcome, all four cases
-apply_boundary_outcome(outcome)  -> the next observed state
+prepare_turn_boundary()      -> bool   True if a reveal follows, False if the
+                                       game ended here (the fourth case)
+sample_boundary_outcome(rng) -> BoundaryOutcome    does not modify self
+apply_boundary_outcome(out)  -> None   in place, deterministic
 ```
 
-with a test per case. Reimplementing the draw in the search is a correctness bug
-waiting on a reshuffle turn.
+⚠ **The refactor established something the design above did not state, and §7
+depends on it: *which* case fires is not chance.** A queued reshuffle is
+`reshuffle_next_turn` and an exact-empty reform is `deck_remaining == 0`, and
+both are settled by the afterstate before a card is seen. Only *which cards* is
+chance. So a chance node's support is over card sequences of a **known length**
+— 3 ordinarily, **6** on a queued reshuffle — and never over "which of four
+things happens". Measured over **84,808 boundary crossings** at 2/3/4 seats
+(83,251 ordinary, 960 exact-empty, 597 queued reshuffle; the count includes the
+crossings inside GreedyBot's one-ply lookahead, which are ordinary engine
+transitions on legal states and count the same here): 3 draws on every ordinary
+and every exact-empty boundary, 6 on every queued reshuffle, no exceptions.
+
+`sample` and `apply` are the same code path with the draw redirected — recording
+on one side, replaying on the other — so all four cases are correct *by
+construction* rather than by a second implementation agreeing with the first.
+`test_the_three_part_boundary_is_the_engine_s_own_boundary` pins that on all
+three reveal cases, and there is a test per case besides.
+
+**`BoundaryOutcome` is the ordered sequence of raw draws**, not the resulting
+table, because the four cases put cards in different places. Two properties it
+holds structurally rather than by convention:
+
+- **every card in it is one the boundary makes public** — tested; so an outcome
+  is a legitimate child key;
+- **it does not record the deck order it leaves behind.** `apply` swaps each
+  named card to the top of the undrawn region, so composition stays exact while
+  the residual order stays arbitrary. That is §7.3's non-anticipativity rule
+  made unbreakable: a scenario cannot leak the future because it never contains
+  it.
 
 ---
 
@@ -882,9 +915,14 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    so a subtree from another line or another game cannot be reused by accident.
    Preserves **8.7% of the budget under flat priors and 47.7% under an
    S0-shaped one** (§4). Discarded at the turn boundary, with a test that it is.
-4. **Engine-owned boundary transition** (§6.3), with a test for each of ordinary
-   draw, **exact-empty reform**, queued reshuffle, and terminal-before-reveal;
-   plus a generic mid-draw test only if expert mode stays supported.
+4. ✅ **Engine-owned boundary transition** (§6.3) —
+   `prepare_turn_boundary` / `sample_boundary_outcome` / `apply_boundary_outcome`
+   in `game.py`, a test for each of the four cases plus the generic mid-draw one,
+   and an equivalence test that the triple *is* the engine's own path on all
+   three reveal cases. Established on the way, and load-bearing for step 7:
+   **which case fires is deterministic given the afterstate; only which cards is
+   chance**, so a chance node's support has a known length (3, or 6 on a queued
+   reshuffle). Nothing is wired into `mcts.py` — that is step 7.
 5. **Define and test the viewer information-state key** (§6.1, §7.3, §12.1).
 6. **Batched evaluator** — successor batches *and* opponent-policy batches (§8).
    **Before** step 7, because a retained transition costs both.
@@ -897,9 +935,11 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    PUCT retained behind the same interface for the later switch.
 10. **Only then:** progressive widening, afterstate head.
 
-**Steps 1–3 are done** and touched nothing §6–§9 is still deciding. Steps 4–7 are
-what this document exists to have reviewed; step 7 should not begin until the
-transition semantics of §7.1 and §7.3 are agreed.
+**Steps 1–4 are done.** Steps 1–3 touched nothing §6–§9 is still deciding; step 4
+is an engine refactor with no search-side change, so the search still crosses
+boundaries exactly as it did. Steps 5–7 are what this document exists to have
+reviewed, and step 7 should not begin until the transition semantics of §7.1 and
+§7.3 are agreed.
 
 ### 12.1 The key is an information state, not a public observation
 
