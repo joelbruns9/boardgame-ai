@@ -297,7 +297,7 @@ class Node:
 
     __slots__ = (
         "actions", "prior", "visits", "total", "children", "expanded", "noised",
-        "edge_visits", "outcomes",
+        "edge_visits", "outcomes", "edge_exact",
     )
 
     def __init__(self, actions: np.ndarray, prior: np.ndarray) -> None:
@@ -317,6 +317,9 @@ class Node:
         #: nothing and behaves exactly as it did.
         self.edge_visits: dict[int, int] = {}
         self.outcomes: dict[int, dict[Observation, "Outcome"]] = {}
+        #: Action indices whose transition is **proven** deterministic, so their
+        #: support is exactly one and no widening target can ever exceed it.
+        self.edge_exact: set[int] = set()
 
     def select(self, c_puct: float) -> int:
         """PUCT.  Returns an index into :attr:`actions`, not a macro index."""
@@ -676,22 +679,38 @@ def trajectory_fingerprint(actions: Sequence[int], visits: Sequence[Sequence[flo
 # ──────────────────────────────────────────────────────────────────────────
 # Re-rooting: proving a retained subtree belongs to the state being searched
 # ──────────────────────────────────────────────────────────────────────────
+#: Every field of :class:`~games.welcome_to.sheet.Sheet`, in order.
+#:
+#: ⚠ **Held against ``dataclasses.fields(Sheet)`` by a test**, because this was a
+#: hand-written list and a hand-written list of somebody else's fields rots
+#: silently. Add a field to ``Sheet`` and both keys built from this would simply
+#: stop distinguishing on it: ``_position_key`` would re-root onto a subtree from
+#: a different position and ``information_key`` would merge two positions under
+#: widening, with nothing failing. The steps 1-3 review found one instance of
+#: exactly that shape; this closes the class.
+_SHEET_FIELDS: tuple[str, ...] = (
+    "numbers",
+    "is_bis",
+    "written_turn",
+    "fences",
+    "top_fences",
+    "parks",
+    "pools",
+    "estate_marks",
+    "temps",
+    "bis_marks",
+    "permits",
+    "roundabouts",
+)
+
+
+def _freeze(value):
+    return tuple(_freeze(item) for item in value) if isinstance(value, list) else value
+
+
 def _sheet_key(sheet) -> tuple:
-    """Every mutable field of a player sheet, as something hashable."""
-    return (
-        tuple(tuple(row) for row in sheet.numbers),
-        tuple(tuple(row) for row in sheet.is_bis),
-        tuple(tuple(row) for row in sheet.written_turn),
-        tuple(tuple(row) for row in sheet.fences),
-        tuple(tuple(row) for row in sheet.top_fences),
-        tuple(sheet.parks),
-        tuple(sheet.pools),
-        tuple(sheet.estate_marks),
-        sheet.temps,
-        sheet.bis_marks,
-        sheet.permits,
-        sheet.roundabouts,
-    )
+    """Every field of a player sheet, as something hashable."""
+    return tuple(_freeze(getattr(sheet, name)) for name in _SHEET_FIELDS)
 
 
 def _position_key(state: GameState, root: int) -> tuple:
@@ -817,7 +836,18 @@ def information_key(state: GameState, viewer: int) -> tuple:
         state.turn,
         state.actor,
         int(state.phase),
-        state.config.players,
+        # ⚠ **The whole frozen config, not just the seat count.** This carried
+        # `players` alone, and the encoder also reads `advanced`, `expert` and
+        # `solo` -- so flipping `advanced` left the key identical and the
+        # encoding different, breaking the containment §3.1 of the review brief
+        # claimed. Dormant while a search never changes configuration mid-flight,
+        # and false as stated, which is worse: the invariant is what licenses
+        # sharing one node's priors across a whole particle collection.
+        state.config,
+        # raw length as well as the histogram: `discard_composition` returns
+        # zeros in expert mode, where the discard is not attributable, so the
+        # count is not recoverable from it
+        len(state.discard),
         # the table, as printed faces
         tuple(_printed(card) for card in state.table_cards(viewer)),
         # sheets: live for the viewer, turn-start snapshots for everyone else
@@ -1027,22 +1057,33 @@ class MCTS:
     def _edge_is_closed(self, node: Node, index: int) -> bool:
         """Whether this edge has as many distinct outcomes as it is yet allowed.
 
-        ``ceil(C · samples**alpha)``.  Closed means "stop sampling new futures
+        ``ceil(C · traversals**alpha)``.  Closed means "stop sampling new futures
         and start re-using the ones you have", which is what turns an unbounded
         chance fan-out into a finite set of children that a descent can revisit.
 
-        ⚠ **A within-turn edge closes too, and that is correct.** Its support is
-        one — no card is revealed between two of ``r``'s own decisions — so it
-        reaches its cap immediately and every later descent resumes from a
-        particle instead of re-applying the move. The saving is real; what it
-        costs is determinization diversity on that edge, which is exactly the
-        trade §7.3 describes and the reason the control arm is kept.
+        ⚠ **A cap alone cannot close an edge whose support is smaller than the
+        cap**, and an earlier version claimed otherwise. ``len(outcomes)`` stops
+        at the real support while ``ceil(C·n**alpha)`` keeps growing, so the
+        predicate goes false for ever and the edge re-samples on almost every
+        traversal. Measured before the fix: support-one edges reused **6 of 77**
+        traversals (7.8%), against 287 of 427 (67%) on multi-outcome edges —
+        while the docstring said a within-turn edge "reaches its cap immediately
+        and every later descent resumes from a particle".
+
+        So determinism is **proven, not inferred from collisions**: a transition
+        that did not change the turn and did not end the game consumed no
+        randomness at all, so its support is exactly one, and the edge is closed
+        permanently. That is knowable here; general finite support is not.
+        Ordinary progressive widening cannot detect exhaustion from collisions
+        alone, and this does not pretend to.
         """
         if self.config.chance_widening is None:
             return False
         outcomes = node.outcomes.get(index)
         if not outcomes:
             return False
+        if index in node.edge_exact:
+            return True
         # ⚠ The cap counts **traversals**, while a weight counts **fresh draws**.
         # They must be different numbers.  If reuse fed the cap's counter the
         # edge would never widen again; if reuse fed a weight's counter the
@@ -1080,16 +1121,29 @@ class MCTS:
         return chosen, outcomes[chosen]
 
     def _record_outcome(
-        self, node: Node, index: int, observation: Observation, state: GameState
+        self,
+        node: Node,
+        index: int,
+        observation: Observation,
+        state: GameState,
+        rng: random.Random,
+        exact: bool,
     ) -> Optional[Outcome]:
         """Merge a freshly sampled transition into this edge, or start a child.
 
         Merging is the mechanism, not an optimisation: it is what makes
-        ``count/samples`` converge on the true mass. At a three-card deck there
-        are only six possible reveals, so widening keeps proposing samples that
-        land on children already here, the distinct count saturates at the real
-        support, and the weights converge — the collisions §7.6 once called a
-        problem doing the work.
+        ``count/draws`` converge on the true mass.
+
+        ``exact`` says this transition consumed no randomness — the turn did not
+        change and the game did not end — which **proves** the edge's support is
+        one and closes it for good.
+
+        ⚠ **Particles are replaced by reservoir sampling, not dropped.** Keeping
+        the first ``max_particles`` and discarding every later sample is unbiased
+        in expectation but freezes the conditional belief on whichever
+        determinizations happened to arrive first; the collection never improves
+        however long the edge is searched. Reservoir replacement keeps a uniform
+        sample of *all* fresh draws for the same memory.
         """
         if self.config.chance_widening is None:
             return None
@@ -1099,8 +1153,17 @@ class MCTS:
         if outcome is None:
             outcome = outcomes[observation] = Outcome()
         outcome.count += 1
-        if not state.is_terminal and len(outcome.particles) < self.config.max_particles:
-            outcome.particles.append(state.copy())
+        if exact and not state.is_terminal:
+            node.edge_exact.add(index)
+        if not state.is_terminal:
+            cap = self.config.max_particles
+            if len(outcome.particles) < cap:
+                outcome.particles.append(state.copy())
+            else:
+                # reservoir: the k-th draw replaces a uniform slot with p = cap/k
+                slot = rng.randrange(outcome.count)
+                if slot < cap:
+                    outcome.particles[slot] = state.copy()
         return outcome
 
     def _simulate(self, state: GameState, node: Node, root: int, rng: random.Random) -> Iterator[Request]:
@@ -1131,7 +1194,14 @@ class MCTS:
             observation = yield from self._collapse_forced(
                 state, root, rng, turn, observation
             )
-            outcome = self._record_outcome(node, index, observation, state)
+            outcome = self._record_outcome(
+                node,
+                index,
+                observation,
+                state,
+                rng,
+                exact=state.turn == turn and not state.is_terminal,
+            )
 
             key = (action, observation)
             child = node.children.get(key)

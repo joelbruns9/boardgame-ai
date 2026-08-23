@@ -574,16 +574,26 @@ apply_boundary_outcome(out)  -> None   in place, deterministic
 ```
 
 ⚠ **The refactor established something the design above did not state, and §7
-depends on it: *which* case fires is not chance.** A queued reshuffle is
-`reshuffle_next_turn` and an exact-empty reform is `deck_remaining == 0`, and
-both are settled by the afterstate before a card is seen. Only *which cards* is
-chance. So a chance node's support is over card sequences of a **known length**
-— 3 ordinarily, **6** on a queued reshuffle — and never over "which of four
-things happens". Measured over **84,808 boundary crossings** at 2/3/4 seats
-(83,251 ordinary, 960 exact-empty, 597 queued reshuffle; the count includes the
-crossings inside GreedyBot's one-ply lookahead, which are ordinary engine
-transitions on legal states and count the same here): 3 draws on every ordinary
-and every exact-empty boundary, 6 on every queued reshuffle, no exceptions.
+depends on it: **in standard 2–4-seat play**, *which* case fires is not
+chance.** A queued reshuffle is `reshuffle_next_turn` and an exact-empty reform
+is `deck_remaining == 0`, and both are settled by the afterstate before a card is
+seen. Only *which cards* is chance. So a chance node's support is over card
+sequences of a **known length** — 3 ordinarily, **6** on a queued reshuffle — and
+never over "which of four things happens".
+
+⚠ **Scoped deliberately, and solo is the reason.** `_draw_playable` consumes an
+*extra* raw card when the solo marker turns up, so a solo deck can reform
+mid-sequence and the case stops being a function of the afterstate alone.
+
+⚠ **The justification is the rules argument, not the sample count.**
+Consumption is a multiple of three — six at setup, three per ordinary turn, six
+per requested reshuffle — so the deck is either empty before the first of three
+draws or holds at least three. The measurement (**84,808 boundary crossings** at
+2/3/4 seats: 83,251 ordinary, 960 exact-empty, 597 queued reshuffle; 3 draws on
+every ordinary and exact-empty boundary, 6 on every queued reshuffle, no
+exceptions) is **regression coverage of that argument**. It is not independent
+evidence: most of those crossings are inside GreedyBot's one-ply lookahead and
+are not independent samples.
 
 `sample` and `apply` are the same code path with the draw redirected — recording
 on one side, replaying on the other — so all four cases are correct *by
@@ -690,12 +700,26 @@ Concretely, at a chance node with `n` visits:
 - samples sharing an information state but differing in hidden detail are held
   as **particles** — a list of concrete states, uniform on descent.
 
-⚠ **The late-game case then fixes itself, and the collisions §7.6 called a
-problem are the mechanism.** At `D = 3` there are six possible reveals, so
-widening keeps proposing samples that merge into the existing children, the
-distinct count saturates at the true support, and `count / samples` converges to
-`P(reveal)` — *including* the opponent expectation, which enumeration could not
-price at all. No second edge class, no stratification, no threshold to tune.
+⚠ **RETRACTED 2026-08-23 — the late-game case does *not* fix itself.** This
+said that at `D = 3` widening would keep merging onto the six possible reveals,
+saturate at the true support and stop. Two things are wrong with it.
+
+- **A cap cannot close an edge whose support is smaller than the cap.**
+  `len(outcomes)` stops at the support while `ceil(C·n^α)` keeps growing, so the
+  closure predicate goes false for ever and the edge re-samples on nearly every
+  traversal. Ordinary progressive widening **cannot detect exhaustion from
+  collisions alone**, and §7.9 records what that cost before it was fixed.
+- **Six is the number of *reveals*, not of transitions** — the same conflation
+  §7.1a exists to correct. The retained outcome is the whole root-to-root
+  transition and carries the opponents' sampled decisions, so a three-card deck
+  gives a chance edge **20** outcomes, not six.
+
+What survives is narrower and is the actual reason C was taken: `count/draws` is
+an **empirical** weight, so it never needs `P(transition)` — the quantity that
+could not be computed. Support exhaustion is a separate question and this design
+does not answer it. Determinism *is* detectable, and is handled exactly:
+a transition that changes neither the turn nor the game's end consumed no
+randomness, so its support is provably one and its edge is closed permanently.
 
 **α is not a free parameter, and this document already derived it.** §7.6 fixes
 `K ≈ N^(1/H)` from a target depth `H`, and notes in the same breath that
@@ -946,22 +970,39 @@ whose outcomes were near-unique reveals — which must be uniform — came out a
 reads `[0.2, 0.2, 0.2, 0.2, 0.2]`, which is §7.1's `count/K` collapsing to `1/K`,
 off 5 fresh draws and 23 traversals.
 
-**At a three-card deck it finds the support and stops.** §6.2 says `D = 3` has
-exactly six ordered reveals and that the deck passes through three once per
-cycle. Measured at 4,096 simulations, the busiest chance edge holds **6
-outcomes** from 6 fresh draws over 36 traversals, weighted uniformly — which is
-the true distribution, since the six orderings are equally likely. No second edge
-class, no enumeration threshold, no stratification: the cap simply stops
-proposing once the support is exhausted.
+⚠ **RETRACTED — "at a three-card deck it finds the support and stops".** The
+measurement behind it (6 outcomes from 6 fresh draws over 36 traversals) was the
+**cap binding at six**, not the support being exhausted, and six is the count of
+*reveals* while a chance edge holds whole transitions. With the closure defect
+fixed, the same edge shows **20** outcomes.
+
+The six-reveal claim is true and is now tested where it holds: on the boundary
+sampler, where 400 samples at `D = 3` give exactly **6** distinct
+`BoundaryOutcome.draws`, near-uniformly
+(`test_a_three_card_deck_has_exactly_six_reveals`).
 
 **What the shape of the tree actually looks like**, 512 simulations:
 
 - 89% of *all* edges carry one outcome — but among edges traversed 8+ times only
   21% do. PUCT concentrates its traversals on a few root actions, and those deep
-  repeated paths are exactly the ones that reach a turn boundary. A within-turn
-  edge has support one by construction and re-merges onto it.
+  repeated paths are exactly the ones that reach a turn boundary.
 - 558 of 976 traversals were **reuses**: resumed from a particle, with no
   opponent evaluated and no card drawn.
+
+⚠ **A closure defect, found in review and fixed.** A within-turn edge has support
+one, and the first implementation left it to the cap to notice — which a cap
+cannot do, since `len(outcomes)` stops at 1 while `ceil(C·n^α)` grows. Measured:
+support-one edges reused **6 of 77** traversals, 7.8%, while this document
+claimed every later descent resumed from a particle. Determinism is now
+**proven** rather than inferred — a transition that changes neither the turn nor
+the game's end consumed no randomness — and the same edges reuse **97.4%**
+(111 of 114). Multi-outcome edges were unaffected (67% before, 64% after).
+
+⚠ **Particles are reservoir-sampled, not first-come.** Keeping the first
+`max_particles` and dropping the rest is unbiased in expectation but freezes the
+conditional belief on whichever determinizations arrived first; the collection
+never improves however long the edge is searched. `max_particles = 4` is
+**unmeasured** and belongs in the bakeoff alongside `C`.
 
 ⚠ **What reuse costs, and why the control arm stays.** Resuming from a particle
 re-uses that transition's randomness, including the determinization behind it.

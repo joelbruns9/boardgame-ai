@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import math
 import random
 
@@ -10,11 +11,13 @@ import pytest
 import torch
 
 from games.welcome_to import action_codec as codec
+from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
 from games.welcome_to import network as nw
 from games.welcome_to import training
 from games.welcome_to.bots import GreedyBot
+from games.welcome_to.sheet import Sheet
 from games.welcome_to.constants import CARD_TABLE, NUM_BASE_CARDS
 from typing import Optional
 
@@ -1186,34 +1189,40 @@ def test_reusing_an_outcome_does_not_move_its_weight():
     assert reused > 0, "no edge was ever reused, so the test proves nothing"
 
 
-def test_a_deterministic_edge_keeps_merging_onto_its_single_outcome():
-    """No card is revealed between two of the root player's own decisions, so a
-    within-turn edge has support one however often it is drawn -- every fresh
-    draw merges onto the outcome already there, which is the same mechanism that
-    makes ``count/draws`` converge where the support is genuinely larger.
+def test_a_deterministic_edge_is_drawn_once_and_reused_ever_after():
+    """⚠ Regression for a closure defect the cap alone could not fix.
 
-    ⚠ Measured, and it corrects the shape this test first assumed: 89% of *all*
-    edges carry one outcome, but among edges traversed 8 or more times only 21%
-    do.  PUCT concentrates its traversals on a few root actions, and those deep
-    repeated paths are exactly the ones that reach a turn boundary.  So this
-    asserts the property, not a majority.
+    A within-turn transition consumes no randomness -- no card is revealed
+    between two of the root player's own decisions -- so its support is exactly
+    one. But ``len(outcomes)`` then stops at 1 while ``ceil(C·n**alpha)`` keeps
+    growing, so a cap-only predicate goes false for ever and the edge re-samples
+    on nearly every traversal. Measured before the fix: support-one edges reused
+    **6 of 77** traversals (7.8%), while the docstring claimed every later
+    descent resumed from a particle. With determinism *proven* rather than
+    inferred from collisions, the same edges reuse **97.4%** (111 of 114).
     """
     search, _ = _widened(simulations=512)
     state = _position(players=2, turn=12)
     _, _, root = search.search(state, root=0, rng=random.Random(0))
 
-    remerged = [
-        outcomes
+    exact = [
+        (node, index, outcomes)
         for node, index, outcomes in _edges(root)
-        if len(outcomes) == 1
-        and node.edge_visits[index] >= 8
-        and next(iter(outcomes.values())).count >= 2
+        if index in node.edge_exact and node.edge_visits[index] >= 8
     ]
-    assert remerged, "no deterministic edge was drawn from twice"
-    for outcomes in remerged:
+    assert exact, "no deterministic edge was traversed enough to say anything"
+
+    traversals = draws = 0
+    for node, index, outcomes in exact:
+        assert len(outcomes) == 1, "a proven-deterministic edge grew a second outcome"
         outcome = next(iter(outcomes.values()))
-        assert outcome.count / outcome.count == pytest.approx(1.0)
+        assert outcome.count == 1, "a closed edge sampled the transition again"
         assert outcome.particles, "a resumable edge kept no particle"
+        traversals += node.edge_visits[index]
+        draws += outcome.count
+    assert (traversals - draws) / traversals > 0.8, (
+        f"only {(traversals - draws) / traversals:.1%} of traversals reused"
+    )
 
 
 def test_reuse_actually_happens_and_skips_the_transition():
@@ -1267,10 +1276,20 @@ def test_widening_deepens_the_tree_and_answers_to_the_budget():
     )
 
 
-def test_a_three_card_deck_finds_its_whole_support_and_no_more():
-    """§6.2: at ``D = 3`` there are exactly six ordered reveals, and the deck
-    passes through three once per cycle by construction.  Widening should find
-    them all and stop -- there is nothing else to find."""
+def test_a_chance_edge_has_more_outcomes_than_the_deck_has_reveals():
+    """⚠ Retraction, with the number that forced it.
+
+    This asserted that a three-card deck gives a chance edge at most **six**
+    outcomes, because §6.2 says three cards have six ordered reveals. That
+    conflates a *reveal* with a *transition*, which is precisely the error §7.1a
+    exists to correct: the retained outcome is the whole root-to-root transition
+    and carries the opponents' sampled decisions too. It passed only because the
+    widening cap happened to bind at six; with the cap fixed, the same edge shows
+    **20** outcomes.
+
+    The six-reveal claim is true, and is tested where it holds -- on the boundary
+    sampler itself, in ``test_game.py``.
+    """
     state = _position(players=2, turn=10, seed=5)
     keep = state.deck[state.deck_pos : state.deck_pos + 3]
     state.discard.extend(state.deck[state.deck_pos + 3 :])
@@ -1282,8 +1301,11 @@ def test_a_three_card_deck_finds_its_whole_support_and_no_more():
 
     multi = [outcomes for _, _, outcomes in _edges(root) if len(outcomes) > 1]
     assert multi, "no boundary-crossing edge was traversed"
+    assert max(len(outcomes) for outcomes in multi) > 6, (
+        "the whole-transition support was no larger than the reveal support, "
+        "which would mean opponent sampling contributed nothing"
+    )
     for outcomes in multi:
-        assert len(outcomes) <= 6, f"{len(outcomes)} outcomes where only 6 exist"
         draws = sum(outcome.count for outcome in outcomes.values())
         assert sum(outcome.count / draws for outcome in outcomes.values()) == (
             pytest.approx(1.0)
@@ -1368,4 +1390,138 @@ def test_the_information_key_determines_the_terminal_value():
     ambiguous = {key: values for key, values in seen.items() if len(values) > 1}
     assert not ambiguous, (
         f"{len(ambiguous)} information keys map to more than one terminal value"
+    )
+
+
+def test_the_sheet_key_covers_every_field_of_the_sheet():
+    """Sign-off 2 of the steps 4-7 review.
+
+    ``_SHEET_FIELDS`` is a hand-written list of somebody else's fields, and a
+    hand-written list rots silently: add a field to ``Sheet`` and both keys built
+    from it stop distinguishing on it, with nothing failing. ``_position_key``
+    would re-root onto a subtree from a different position; ``information_key``
+    would merge two positions under widening.
+    """
+    declared = tuple(field.name for field in dataclasses.fields(Sheet))
+    assert mcts._SHEET_FIELDS == declared, (
+        "Sheet's fields and _SHEET_FIELDS have diverged; a key is now blind to "
+        f"{set(declared) ^ set(mcts._SHEET_FIELDS)}"
+    )
+
+
+def test_the_information_key_carries_the_whole_configuration():
+    """⚠ Regression. The key carried ``config.players`` alone while the encoder
+    also reads ``advanced``, ``expert`` and ``solo`` -- so flipping ``advanced``
+    left the key identical and the encoding different, which breaks the
+    containment that licenses sharing one node's priors across a particle
+    collection. Dormant while configuration is fixed within a search, and false
+    as stated, which is worse."""
+    state = _position(players=2, turn=10, seed=3)
+    before = mcts.information_key(state, 0)
+
+    flipped = state.copy()
+    flipped.config = GameConfig(players=2, advanced=not state.config.advanced)
+    assert mcts.information_key(flipped, 0) != before, "a config flip did not move the key"
+
+    encoded_a = enc.encode_state(state, 0)
+    encoded_b = enc.encode_state(flipped, 0)
+    assert not all(
+        np.array_equal(x, y) for x, y in zip(encoded_a, encoded_b)
+    ), "the encoder ignored the flip too, so this test proves nothing"
+
+
+def test_the_information_key_carries_the_raw_discard_count():
+    """``discard_composition`` returns zeros in expert mode, where the discard is
+    not attributable, so the count is not recoverable from the histogram."""
+    state = _position(players=2, turn=10, seed=3)
+    before = mcts.information_key(state, 0)
+    grown = state.copy()
+    grown.discard.append(grown.deck[grown.deck_pos])
+    grown.deck_pos += 1
+    assert mcts.information_key(grown, 0) != before
+
+
+def test_a_mixed_batch_attributes_rows_across_seat_counts():
+    """Sign-off 5: the mixed test used one viewer and one seat count, so a
+    mask/seat transposition in ``answer_batch`` would have survived it.
+
+    This feeds row-distinct synthetic head outputs at 2, 3 and 4 seats, so every
+    row's value and priors are separable and a transposed scatter shows up as a
+    mismatch rather than as plausible numbers.
+    """
+    torch.manual_seed(0)
+    config = mcts.SearchConfig()
+    evaluator = mcts.NetEvaluator(nw.WelcomeToNet(_SMALL), torch.device("cpu"), config)
+
+    states = [_position(players=seats, turn=8, seed=seats) for seats in (2, 3, 4)]
+    requests = [
+        (mcts.Ask.LEAF, states[0], 0),
+        (mcts.Ask.POLICY, states[1], 0),
+        (mcts.Ask.LEAF, states[2], 0),
+        (mcts.Ask.POLICY, states[0], 0),
+    ]
+
+    rows = len(requests)
+    captured: dict = {}
+
+    def synthetic(batch):
+        captured["rows"] = [(state.config.players, viewer) for state, viewer in batch]
+        policy = torch.zeros(rows, mc.NUM_MACRO_ACTIONS)
+        for i in range(rows):
+            policy[i] = float(i)  # row i is separable from every other row
+        ranks = torch.zeros(rows, training.MAX_RANKS)
+        for i in range(rows):
+            ranks[i, : mcts.enc.MAX_SEATS] = torch.arange(mcts.enc.MAX_SEATS) + i
+        score = torch.zeros(rows, mcts.enc.MAX_SEATS)
+        for i in range(rows):
+            score[i] = torch.arange(mcts.enc.MAX_SEATS) * 0.1 + i
+        return {"policy_logits": policy, "rank_logits": ranks, "score": score}
+
+    evaluator._forward_many = synthetic
+    answers = evaluator.answer_batch(requests)
+
+    assert captured["rows"] == [(2, 0), (3, 0), (4, 0), (2, 0)], (
+        "the batch rows were built in the wrong order"
+    )
+    assert len(answers) == rows
+    for index, (kind, state, _) in enumerate(requests):
+        priors = answers[index][0] if kind is mcts.Ask.LEAF else answers[index]
+        legal = mc.legal_mask(state)
+        # a flat logit row means uniform over that state's own legal set, so a
+        # transposed scatter shows as the wrong support, not just wrong numbers
+        assert priors[legal].min() == pytest.approx(priors[legal].max())
+        assert priors[~legal].sum() == pytest.approx(0.0)
+        assert priors.sum() == pytest.approx(1.0)
+
+    # and the two LEAF rows must not have swapped values: row 0 and row 2 were
+    # given different rank logits and different scores
+    assert answers[0][1] != pytest.approx(answers[2][1])
+
+
+def test_particles_are_replaced_rather_than_frozen_after_the_cap():
+    """⚠ Reservoir sampling, from the review's §4.
+
+    Keeping the first ``max_particles`` and discarding every later fresh sample
+    is unbiased in expectation but freezes the conditional belief on whichever
+    determinizations arrived first -- the collection never improves however long
+    the edge is searched. Replacement keeps a uniform sample of *all* draws for
+    the same memory.
+    """
+    torch.manual_seed(0)
+    search, _ = _search(simulations=8, chance_widening=1.0, max_particles=2)
+    node = mcts.Node(np.array([0]), np.array([1.0]))
+    rng = random.Random(0)
+    state = _position(players=2, turn=8)
+
+    seen: set[int] = set()
+    for draw in range(200):
+        marked = state.copy()
+        marked.sheets[0].temps = draw  # a per-draw marker
+        search._record_outcome(node, 0, ("k",), marked, rng, exact=False)
+    outcome = node.outcomes[0][("k",)]
+    assert outcome.count == 200
+    assert len(outcome.particles) == 2, "the cap was not honoured"
+    kept = {particle.sheets[0].temps for particle in outcome.particles}
+    assert max(kept) > 3, (
+        f"particles froze on the earliest draws: kept {sorted(kept)}"
     )

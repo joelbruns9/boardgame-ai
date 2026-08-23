@@ -900,3 +900,117 @@ def test_a_mid_draw_reform_still_works_if_expert_mode_ever_needs_it():
     assert len(outcome.draws) == 3, "the draw did not survive a mid-triple reform"
     state.apply_boundary_outcome(outcome)
     assert _live_cards(state) == before
+
+
+def test_a_rejected_outcome_leaves_the_state_untouched():
+    """⚠ Regression. ``apply_boundary_outcome`` used to validate *while* applying:
+    too few cards raised part-way through the reveal and too many were caught
+    only after it had finished, so a rejected outcome left the receiver mutated.
+    Measured before the fix, with one extra card: ``deck_remaining`` 66 -> 63 and
+    three cards face-up on the table. "Raises, and also destroys the state you
+    called it on" is not a contract worth having on a public method.
+    """
+    state = _afterstate()
+    good = state.sample_boundary_outcome(random.Random(5))
+
+    def snapshot(s):
+        return (
+            s.deck_pos,
+            s.deck_remaining,
+            list(s.discard),
+            [list(g) for g in s.stack_new],
+            [list(g) for g in s.stack_old],
+            s.turn,
+            s.phase,
+            s.reshuffle_next_turn,
+            s.boundary_prepared,
+            _live_cards(s),
+        )
+
+    on_table = next(c for c in state.stack_old[0] if c is not None)
+    for label, bad in (
+        ("too few", BoundaryOutcome(draws=good.draws[:2])),
+        ("too many", BoundaryOutcome(draws=good.draws + good.draws)),
+        ("not in the deck", BoundaryOutcome(draws=(on_table,) + good.draws[1:])),
+    ):
+        before = snapshot(state)
+        with pytest.raises(IllegalAction):
+            state.apply_boundary_outcome(bad)
+        assert snapshot(state) == before, f"a rejected outcome ({label}) mutated the state"
+
+    # and the state is still usable afterwards
+    state.apply_boundary_outcome(good)
+    assert state.phase is Phase.CHOOSE_CARDS
+
+
+def test_preparing_a_boundary_twice_is_refused():
+    """The lifecycle is an explicit flag, not "``stack_new`` happens to be empty".
+
+    Preparing twice would increment the turn again and discard the pair that was
+    just promoted -- a silently corrupt state that the old inference could not
+    refuse, because the second prepare found exactly the shape it looked for.
+    """
+    state = _mid_game()
+    assert state.prepare_turn_boundary() is True
+    assert state.boundary_prepared is True
+    with pytest.raises(IllegalAction):
+        state.prepare_turn_boundary()
+
+    outcome = state.sample_boundary_outcome(random.Random(0))
+    state.apply_boundary_outcome(outcome)
+    assert state.boundary_prepared is False, "the marker outlived the boundary"
+    assert state.prepare_turn_boundary() in (True, False), "a new boundary is allowed"
+
+
+def test_a_three_card_deck_has_exactly_six_reveals():
+    """§6.2, tested where the claim is actually true: on the **boundary sampler**.
+
+    ⚠ A version of this lived in ``test_mcts.py`` and asserted that a *chance
+    edge* has at most six outcomes at ``D = 3``. That conflates a reveal with a
+    transition -- the retained outcome is the whole root-to-root transition and
+    carries the opponents' sampled decisions too, so the same edge shows 20. Six
+    is a property of the reveal, so it belongs here.
+    """
+    state = _mid_game(players=2, turn=10, seed=5)
+    keep = state.deck[state.deck_pos : state.deck_pos + 3]
+    state.discard.extend(state.deck[state.deck_pos + 3 :])
+    state.deck = state.deck[: state.deck_pos] + keep
+
+    bots = [GreedyBot(random.Random(i)) for i in range(2)]
+    afterstate = None
+    while not state.is_terminal:
+        before = state.copy()
+        state.apply(bots[state.actor].act(state))
+        if state.turn != before.turn:
+            afterstate = before
+            break
+    assert afterstate is not None, "no boundary was reached"
+    assert afterstate.prepare_turn_boundary() is True
+    assert afterstate.deck_remaining == 3
+
+    draws = collections.Counter(
+        afterstate.sample_boundary_outcome(random.Random(seed)).draws
+        for seed in range(400)
+    )
+    assert len(draws) == 6, f"{len(draws)} distinct reveals where 3! = 6 exist"
+    assert min(draws.values()) > 400 / 6 / 3, f"badly skewed: {sorted(draws.values())}"
+
+
+def test_applying_an_outcome_leaves_no_trace_of_the_swap_in_the_deck_order():
+    """``_replay_draw`` swaps each named card to the top, so the remainder would
+    otherwise be ordered by *which cards the outcome named* rather than by any
+    deal.  Nothing may read that order -- but "nothing reads it" was a docstring,
+    not a property, so the residue is shuffled."""
+    state = _afterstate()
+    outcome = state.sample_boundary_outcome(random.Random(9))
+    before = _live_cards(state)
+
+    applied = state.copy()
+    applied.apply_boundary_outcome(outcome)
+    assert _live_cards(applied) == before, "the shuffle lost or invented a card"
+
+    # deterministic given the same receiver, because the shuffle uses its own rng
+    again = state.copy()
+    again.apply_boundary_outcome(outcome)
+    assert again.deck == applied.deck
+    assert again.table_cards(0) == applied.table_cards(0)

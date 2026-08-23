@@ -257,6 +257,15 @@ class GameState:
     reshuffle_votes: dict[int, bool]
     rng: random.Random
     solo_card_drawn: bool = False
+    #: Whether :meth:`prepare_turn_boundary` has run and no reveal has followed.
+    #:
+    #: ⚠ **An explicit lifecycle flag, not an inference.** This was read off
+    #: "every ``stack_new`` slot is ``None``", which is the shape ``_discard_step``
+    #: leaves but is an incidental property of the representation rather than a
+    #: guarantee about where the state is in its life. It also could not refuse a
+    #: second ``prepare``, which would increment the turn twice and discard the
+    #: pair that was just promoted.
+    boundary_prepared: bool = False
 
     # ──────────────────────────────────────────────────────────────────
     # Construction
@@ -359,6 +368,7 @@ class GameState:
             reshuffle_votes=dict(self.reshuffle_votes),
             rng=rng,
             solo_card_drawn=self.solo_card_drawn,
+            boundary_prepared=self.boundary_prepared,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -469,6 +479,7 @@ class GameState:
 
     def _open_turn(self) -> None:
         """The deterministic tail: hand the turn to seat 0 and settle."""
+        self.boundary_prepared = False
         self.actor = 0
         self.ctx = TurnCtx()
         self.reshuffle_votes = {}
@@ -559,6 +570,11 @@ class GameState:
         the effects for the coming turn already known and public, and exactly one
         thing left undecided -- which cards come off the deck.
         """
+        if self.boundary_prepared:
+            raise IllegalAction(
+                "this boundary is already prepared; preparing twice would "
+                "increment the turn again and discard the pair just promoted"
+            )
         if self.config.expert:
             self._pass_unused_cards()
 
@@ -569,12 +585,11 @@ class GameState:
             return False
 
         self._discard_step()
+        self.boundary_prepared = True
         return True
 
     def _is_boundary_afterstate(self) -> bool:
-        return not self.is_terminal and all(
-            card is None for group in self.stack_new for card in group
-        )
+        return self.boundary_prepared and not self.is_terminal
 
     def sample_boundary_outcome(self, rng: random.Random) -> "BoundaryOutcome":
         """One immediate outcome of this boundary.  **Does not modify ``self``.**
@@ -622,12 +637,22 @@ class GameState:
         ``outcome`` instead of the deck. Raises :class:`IllegalAction` if the
         outcome does not fit this boundary -- a wrong card, or the wrong number
         of them -- rather than silently producing a state no deal could reach.
+
+        ⚠ **Transactional.** The replay runs on a copy and is adopted only once
+        the outcome has been validated *whole*. It used to validate while
+        applying, which meant a rejected outcome left the receiver mutated: too
+        few cards raised part-way through the reveal, and too many were caught
+        only after it had finished. Measured on a rejected outcome with one
+        extra card: ``deck_remaining`` 66 -> 63 and three cards on the table.
+        "Raises, and also destroys the state you called it on" is not a contract
+        worth having on a public method.
         """
         if not self._is_boundary_afterstate():
             raise IllegalAction(
                 "apply_boundary_outcome needs a prepared boundary afterstate; "
                 "call prepare_turn_boundary() first"
             )
+        staged = self.copy()
         pending = iter(outcome.draws)
 
         def replay() -> int:
@@ -638,12 +663,51 @@ class GameState:
                     "the outcome ran out of cards; it does not belong to this "
                     "boundary"
                 ) from None
-            return self._replay_draw(card)
+            return staged._replay_draw(card)
 
-        self._reveal_step(replay)
+        staged._reveal_step(replay)
         if next(pending, None) is not None:
             raise IllegalAction("the outcome has cards this boundary did not draw")
-        self._open_turn()
+        staged._scramble_undrawn()
+        staged._open_turn()
+        self._adopt(staged)
+
+    def _scramble_undrawn(self) -> None:
+        """Shuffle what is left of the deck, so its order carries no artefact.
+
+        ``_replay_draw`` swaps each named card to the top of the undrawn region,
+        which leaves the remainder in an order determined by *which cards the
+        outcome named* rather than by any deal. The composition is exact either
+        way and the order is hidden, so nothing could read it correctly -- but
+        "nothing reads it" was a docstring, not a property. Shuffling makes it
+        one, and costs a shuffle of the undrawn tail per boundary.
+        """
+        tail = self.deck[self.deck_pos :]
+        self.rng.shuffle(tail)
+        self.deck = self.deck[: self.deck_pos] + tail
+
+    def _adopt(self, other: "GameState") -> None:
+        """Become ``other``, in place.  The commit half of a transaction."""
+        self.sheets = other.sheets
+        self.public_sheets = other.public_sheets
+        self.deck = other.deck
+        self.deck_pos = other.deck_pos
+        self.discard = other.discard
+        self.stack_new = other.stack_new
+        self.stack_old = other.stack_old
+        self.expert_pending = other.expert_pending
+        self.plan_ids = other.plan_ids
+        self.plan_turns = other.plan_turns
+        self.turn = other.turn
+        self.actor = other.actor
+        self.phase = other.phase
+        self.ctx = other.ctx
+        self.turn_choice = other.turn_choice
+        self.reshuffle_next_turn = other.reshuffle_next_turn
+        self.reshuffle_votes = other.reshuffle_votes
+        self.rng = other.rng
+        self.solo_card_drawn = other.solo_card_drawn
+        self.boundary_prepared = other.boundary_prepared
 
     def _pass_unused_cards(self) -> None:
         """``Player::giveThirdCardToNextPlayer``.

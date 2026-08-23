@@ -117,9 +117,13 @@ i.e. `information_key` must be **at least as fine-grained as `encode_state`**. I
 the encoder reads anything the key omits, the tree merges positions the network
 can tell apart, and every prior below that node is the wrong one.
 
-I checked it — 525 particle pairs across 6 searches, **0 encoding differences** —
-but that is a spot check on states that happened to arise, not a proof, and there
-is **no test for it**. The two functions were written months apart against
+⚠ **ANSWERED, and the answer was no** — see §7. The key carried
+`config.players` alone while the encoder also reads `advanced`, `expert` and
+`solo`, so flipping `advanced` left the key identical and the encoding different.
+My check could not have found it: 525 particle pairs across 6 searches with **0
+encoding differences**, but every pair came from *within one search*, where the
+configuration never changes. Fixed by putting the whole frozen `GameConfig` and
+the raw `len(discard)` in the key. The two functions were written months apart against
 `ENCODER_V2_SPEC.md` §9.3 and §12.1 respectively, and nothing makes them move
 together.
 
@@ -349,3 +353,90 @@ python -m pytest games/welcome_to/tests/test_mcts.py -q -k "widen or control_arm
 7. **§3.8** — explicit prepared-marker on `GameState`, or leave the heuristic?
 8. Anything in §3.9 that reads as though a throughput number settled a strength
    question.
+
+
+---
+
+## 7. Review response — 2026-08-23
+
+**Every finding verified against the code and reproduced. None disputed.** The
+verdict was "changes requested before enabling `chance_widening`"; both P1s and
+all three P2s are now fixed, and three claims this document and `SEARCH_SPEC.md`
+made are **retracted** rather than softened.
+
+### The two P1s
+
+**#1 — widening never stopped at finite support.** Reproduced exactly. The
+closure predicate compared `len(outcomes)` against a target that keeps growing,
+so once the target passes the real support it can never bind again.
+
+| | before | after |
+|---|---|---|
+| support-one edges, reuse | **6 of 77 traversals (7.8%)** | **111 of 114 (97.4%)** |
+| multi-outcome edges, reuse | 287 of 427 (67%) | 295 of 463 (64%) |
+
+Fixed as recommended: determinism is now **proven, not inferred from
+collisions**. A transition that changes neither the turn nor the game's end
+consumed no randomness, so its support is exactly one and the edge is closed
+permanently (`Node.edge_exact`). General finite support is *not* claimed —
+ordinary progressive widening cannot detect exhaustion from collisions, and the
+spec now says so instead of the opposite.
+
+**The three-card test was worse than you said.** With the cap fixed, the same
+edge shows **20** outcomes, not six — because the retained outcome is the whole
+root-to-root transition, exactly the reveal/transition conflation §7.1a exists to
+correct. The test is rewritten to assert that the transition support *exceeds*
+the reveal support, and the six-reveal claim has moved to where it holds: the
+boundary sampler, where 400 samples at `D = 3` give exactly **6** distinct
+`BoundaryOutcome.draws`, near-uniformly.
+
+**#2 — `information_key ⇒ identical encoding` was false.** Reproduced:
+`same_key_config_flip True, same_encoding_config_flip False`. My own §3.1 spot
+check could not have caught it — it compared particles *within one search*, where
+the configuration never changes. The key now carries the whole frozen
+`GameConfig` and the raw `len(discard)`, with a test for each.
+
+### The three P2s
+
+**#3 — rejection mutated the receiver.** Reproduced. `apply_boundary_outcome` is
+now transactional: the replay runs on a copy and is adopted only after the
+outcome validates whole. Tested against all three rejection modes, asserting the
+receiver is byte-identical afterwards and still usable.
+
+**#4 — particles froze on the first four.** Now reservoir replacement, so the
+collection stays a uniform sample of *all* fresh draws for the same memory.
+`max_particles = 4` is flagged in §7.9 as unmeasured and belongs in the bakeoff.
+
+**#5 — the boundary lifecycle is now explicit.** `GameState.boundary_prepared`,
+set by `prepare`, cleared by `_open_turn`, carried by `copy()`. It also refuses a
+**second** `prepare`, which the old inference could not — the second call found
+exactly the shape it was looking for and would have incremented the turn again.
+The residual-order concern is enforced rather than documented:
+`_scramble_undrawn` shuffles the undrawn tail, so its order carries no artefact
+of which cards the outcome named.
+
+### Sign-offs
+
+| | Your answer | What was done |
+|---|---|---|
+| 1 | No — widen the key | Done: whole `GameConfig` + raw `len(discard)`, two tests |
+| 2 | Add the guard | Done: `_SHEET_FIELDS` compared against `dataclasses.fields(Sheet)` |
+| 3 | Scope to standard 2–4p | Done: §6.3 scoped, and the **rules argument** named as the justification with the lookahead count demoted to regression coverage |
+| 4 | Counters are correct | Agreed — the defect was the predicate, not the counters. No change |
+| 5 | Indexing correct; widen the test | Done: mixed 2/3/4-seat batch with row-distinct synthetic head outputs |
+| 6 | Class A with a numerical caveat | Agreed; the docstring already says this. No change |
+| 7 | Add the marker | Done: explicit flag, plus double-prepare refusal |
+| 8 | Remove "fixes itself" / "stops" | Done: both **retracted in place** in §7.1a and §7.9 |
+
+### What I did not do
+
+* **No `BoundaryAfterstate` wrapper.** A flag on `GameState` gives the lifecycle
+  guarantee and the double-prepare refusal without changing the shape of every
+  call site or the `copy()` contract. If you want the wrapper for the type-level
+  guarantee, say so and I will build it — but I did not want to change a public
+  API shape on inference about future use.
+* **No bakeoff.** `chance_widening` stays `None`. Enabling it needs the
+  equal-wall-clock strength arms you describe, across widening constant,
+  particle count and search seed — none of which exist until S0 has run.
+* **No audit of the rest of the suite** for the unseeded-net flake shape noted
+  in §4.
