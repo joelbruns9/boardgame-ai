@@ -427,6 +427,38 @@ dialog without meaning to build, so for any policy worth having, "open" and
   network an action with no meaning. That is a `datagen` question and is out of
   scope here — the labels and replay masks are frozen (§12 step 1).
 
+### 5.1a-bis ✅ RESOLVED on the real S0 checkpoint — 2026-08-23
+
+§5.1a's caveat said the synthetic 0.8 clone was not a trained network, and that
+the conclusion would change if a trained S0 put *less* mass on
+`ROUNDABOUT_OPEN` than its teacher. **S0 has now been run (5,000 games, 4
+epochs), and it puts far more.**
+
+| | roundabouts / game | seat score | `ROUNDABOUT_OPEN` taken |
+|---|---|---|---|
+| GreedyBot | 1.12 | 50.60 | **36%** of offers |
+| **S0 checkpoint** | **0.00** | 23.10 | **90%** of offers |
+
+⚠ **The mechanism is not the one §5.1a described, and the correction cuts both
+ways.**
+
+- **Predicted:** a cloned prior opens at roughly the teacher's rate (~31% in the
+  synthetic arm) and, with the pass pruned, converts those openings into builds.
+- **Measured:** the real S0 opens **90%** of offers and then **passes every
+  time** — 0.00 roundabouts built across 40 games. Open-then-pass is a no-op, so
+  this costs no points. What it costs is *decisions*: following the net,
+  `ROUNDABOUT_PLACE` is **27%** of everything it does, against 12.8% following
+  greedy. A compulsive habit, faithfully cloned from a coin flip.
+
+**The conclusion is unchanged and its margin is larger.** Pruning
+`PASS_ROUNDABOUT` converts openings into builds, and the real checkpoint offers
+~837 of them per 40 games where the synthetic arm implied ~290 — so the cost of
+that flag is roughly **three times** what §5.1a measured.
+`SearchConfig.prune_roundabout_pass = False` stands, on stronger evidence.
+
+⚠ **And this is not where S0's points went.** Opening and passing is free; the
+score gap is a write-quality problem. See `SELF_PLAY_PLAN.md` S0.
+
 ---
 
 ## 6. The chance boundary — PROPOSED

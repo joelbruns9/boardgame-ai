@@ -214,6 +214,63 @@ slots followed by one among thirteen boxes. The ≥ 60% threshold was written
 against primitives and has not been re-derived for macros; treat the first
 measurement as calibration.
 
+### ⚠ S0 RUN 2026-08-23 — the ≥ 60% gate is UNREACHABLE, and is withdrawn
+
+5,000 games, 4 epochs, 4.03M parameters, 78 minutes.
+
+| gate | result | |
+|---|---|---|
+| policy top-1 | **0.475** | ≥ 0.60 — FAIL |
+| paired score vs greedy | **−29.65** (21.83 vs 51.48), stderr 2.03 | ±2 — FAIL |
+| permits R² | **0.089** | > 0 — **PASS** |
+
+**The pipeline works.** `encoder → net → loss → checkpoint` ran clean, score R²
+reached 0.200, and the race-timing heads learned (`turns_to_plan_0` R² +0.75).
+That was S0's stated purpose and it succeeded.
+
+⚠ **But ≥ 60% top-1 cannot be reached by any network, ever.** GreedyBot picks
+**uniformly among its tied-best actions**, so a deterministic cloner matches its
+particular draw with probability `1/|ties|`. Measured over 3,758 non-forced
+decisions, `E[1/|ties|]` — the hard ceiling for *any* cloner — is **0.562**:
+
+| phase | ceiling | share of decisions with ties |
+|---|---|---|
+| `CHOOSE_CARDS` | **0.354** | **94%** |
+| `ACTION_ESTATE` | 0.480 | 68% |
+| `ACTION_SURVEYOR` | 0.568 | 56% |
+| `ROUNDABOUT_PLACE`, `ACTION_PARK`, `ACTION_POOL` | 1.000 | 0% |
+
+So 0.475 is **85% of the achievable maximum**, not 79% of a reachable target.
+The threshold was written for the primitive vocabulary, where the tie structure
+was different, and it did not survive the move to macros.
+
+**Replacement metric, proposed:** *the fraction of decisions where the net's pick
+lies **inside** the teacher's tied-best set.* That is the quantity the old
+threshold was reaching for, it has a ceiling of 1.0, and it does not punish a
+cloner for the teacher's coin flips. Measured on this checkpoint: **68.5%**
+overall — `CHOOSE_CARDS` 76%, `ACTION_ESTATE` 92%, `ACTION_SURVEYOR` 41%.
+
+**The score gate is legitimate and the failure is real.** A perfect cloner
+sampling from the tie set would match greedy; ours is outside the tie set ~31% of
+the time. Verified it is not an argmax-versus-sampling artefact — sampling from
+the policy gives −32.07 and `T = 0.5` gives −31.55, both within noise of argmax's
+−30.75, so the deterministic tie-break is **not** the mechanism.
+
+**Where the points go:** ~24% of `CHOOSE_CARDS` picks fall outside greedy's
+tied-best set, and in this game a bad write is catastrophic rather than marginal
+— `bots.py`: *"a single careless write destroys a whole street: numbers must
+ascend strictly, so putting a 15 in the first box takes its remaining capacity
+from ten houses to two."*
+
+**The lever is corpus size, not epochs.** Training loss was still falling at
+epoch 3 (2.1219 → 2.0408 → 1.9960 → 1.9575; policy 1.7078 → 1.6025) and the
+corpus is replayed fresh every epoch, so more epochs re-fit the same 5,000 games
+rather than seeing new ones.
+
+⚠ **Trap, for whoever runs this next:** `--out` defaults to
+`runs/welcome_to_s0`, so a 60-game smoke run and a 5,000-game real run write the
+same two files and are indistinguishable afterwards. Use a run-id'd directory.
+
 **The paired comparison replaces one seat, not the whole table.** The first
 implementation played an all-net game against an all-greedy game at the same
 seed, and that is not a controlled substitution: every seat of an all-net table
