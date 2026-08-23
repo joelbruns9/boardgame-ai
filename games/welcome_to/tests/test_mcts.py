@@ -14,7 +14,7 @@ from games.welcome_to import mcts
 from games.welcome_to import network as nw
 from games.welcome_to import training
 from games.welcome_to.bots import GreedyBot
-from games.welcome_to.constants import CARD_TABLE
+from games.welcome_to.constants import CARD_TABLE, NUM_BASE_CARDS
 from games.welcome_to.game import GameConfig, GameState, Phase
 
 _SMALL = nw.NetConfig(
@@ -680,3 +680,231 @@ def test_the_position_key_ignores_the_order_of_what_is_hidden():
     shuffled = state.redeterminize(random.Random(5))
     assert shuffled.deck[shuffled.deck_pos :] != state.deck[state.deck_pos :]
     assert mcts._position_key(shuffled, 0) == before, "the key read hidden order"
+
+
+def test_the_dirichlet_alpha_scales_with_the_width_of_the_root():
+    """§7.8.  A search root here is 2 actions wide at `ASK_RESHUFFLE` and up to
+    331 at `CHOOSE_CARDS`, so one absolute alpha cannot serve both -- it either
+    drowns the narrow nodes or does nothing to the wide ones.  ``concentration /
+    width`` is AlphaZero's own rule: its published constants are ~10 / branching
+    factor (Go 0.03 at ~250, chess 0.3 at ~35, shogi 0.15 at ~70)."""
+    search, _ = _search(simulations=2, dirichlet_concentration=10.0)
+    assert search._root_alpha(50) == pytest.approx(0.2)
+    assert search._root_alpha(2) == pytest.approx(5.0)
+    assert search._root_alpha(331) == pytest.approx(10.0 / 331)
+
+    # the absolute form still works, and the scaled form wins when both are set
+    absolute, _ = _search(simulations=2, dirichlet_alpha=0.3)
+    assert absolute._root_alpha(50) == pytest.approx(0.3)
+    assert absolute._root_alpha(2) == pytest.approx(0.3)
+    both, _ = _search(simulations=2, dirichlet_alpha=0.3, dirichlet_concentration=10.0)
+    assert both._root_alpha(50) == pytest.approx(0.2)
+
+    off, _ = _search(simulations=2)
+    assert off._root_alpha(50) is None
+
+
+def test_a_scaled_alpha_actually_perturbs_a_wide_and_a_narrow_root_alike():
+    """The point of scaling: both ends move.  With one absolute alpha, whichever
+    end it was tuned for is the only one that does."""
+    state = _position(players=2, turn=8, root=0)
+    torch.manual_seed(0)
+    plain, _ = _search(simulations=8)
+    scaled, _ = _search(simulations=8, dirichlet_concentration=10.0)
+
+    base, _ = plain._leaf(state, 0)
+    for width_node in (base,):
+        before = width_node.prior.copy()
+        assert scaled._apply_root_noise(width_node, random.Random(1)) is True
+        assert not np.allclose(before, width_node.prior)
+        assert width_node.prior.sum() == pytest.approx(1.0)
+        assert (width_node.prior >= 0).all()
+
+
+def test_the_fresh_simulation_floor_is_a_fraction_of_the_budget():
+    """It has to track the budget for the same reason ``K`` does (§7.6): the same
+    checkpoint searches at different budgets in self-play, arena and analysis."""
+    full, _ = _search(simulations=64, dirichlet_concentration=10.0)
+    assert full._fresh_after_noise() == 64
+
+    quarter, _ = _search(
+        simulations=64, dirichlet_concentration=10.0, noise_fresh_fraction=0.25
+    )
+    assert quarter._fresh_after_noise() == 16
+
+    big, _ = _search(
+        simulations=256, dirichlet_concentration=10.0, noise_fresh_fraction=0.25
+    )
+    assert big._fresh_after_noise() == 64, "the floor did not scale with the budget"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The viewer information-state key -- SEARCH_SPEC §12.1, step 5
+#
+# This is the key §7.1a's progressive widening merges chance children on, so it
+# has to be right in both directions: too coarse and distinct positions merge,
+# biasing the weights; too fine and identical-looking outcomes never collide, so
+# count/samples never converges.
+# ──────────────────────────────────────────────────────────────────────────
+def _mid_turn(players: int = 3, seed: int = 4, steps: int = 40) -> GameState:
+    """A position with at least one seat already done and the turn unfinished."""
+    bots = [GreedyBot(random.Random(seed * 7 + i)) for i in range(players)]
+    state = GameState.new(seed=seed, config=GameConfig(players=players, advanced=True))
+    for _ in range(steps):
+        if state.is_terminal:
+            break
+        state.apply(bots[state.actor].act(state))
+    return state
+
+
+def test_the_key_hides_an_opponents_live_sheet_and_shows_its_public_snapshot():
+    """⚠ §12.1's "test that matters", verbatim.
+
+    Seat 1 is to act after seat 0 has already written this turn.  Mutating seat
+    0's **live** sheet must leave seat 1's key alone -- that write is hidden
+    until the turn resolves (``Houses::getOfPlayer``) -- while mutating seat 0's
+    **turn-start snapshot** must change it, because that is what seat 1 sees.
+    """
+    state = _mid_turn()
+    while not state.is_terminal and state.actor == 0:
+        state.apply(GreedyBot(random.Random(1)).act(state))
+    viewer = state.actor
+    assert viewer != 0, "seat 0 has not finished acting"
+
+    before = mcts.information_key(state, viewer)
+
+    hidden = state.copy()
+    hidden.sheets[0].parks[0] += 1  # seat 0's live, current-turn write
+    assert mcts.information_key(hidden, viewer) == before, "a hidden write leaked"
+
+    public = state.copy()
+    public.public_sheets[0].parks[0] += 1  # what seat 1 is allowed to see
+    assert mcts.information_key(public, viewer) != before, "the snapshot was ignored"
+
+    # and the viewer's own sheet is live, not snapshotted
+    own = state.copy()
+    own.sheets[viewer].parks[0] += 1
+    assert mcts.information_key(own, viewer) != before, "the viewer's own sheet is stale"
+
+
+def test_the_key_does_not_carry_the_future_deck_order():
+    """§7.3: a key that carries the deal is determinization strategy fusion --
+    the tree would know the future through its own node identity."""
+    state = _mid_turn()
+    before = mcts.information_key(state, state.actor)
+    for seed in range(6):
+        shuffled = state.redeterminize(random.Random(seed))
+        assert mcts.information_key(shuffled, shuffled.actor) == before
+
+
+def test_the_key_reads_printed_types_not_physical_ids():
+    """⚠ The latent defect §6.1 recorded: 15 of the 66 printed types have two
+    physical copies, so keying on ids splits two reveals that every player at
+    the table sees as identical.  Harmless while children are never reused, and
+    wrong the moment §7 retains them."""
+    twins = collections.defaultdict(list)
+    for card in range(NUM_BASE_CARDS):
+        twins[CARD_TABLE[card]].append(card)
+    pair = next(ids for ids in twins.values() if len(ids) == 2)
+
+    state = _mid_turn()
+    viewer = state.actor
+    slot = next(
+        i for i, card in enumerate(state.stack_new[0]) if card is not None
+    )
+    original = state.stack_new[0][slot]
+
+    swapped = state.copy()
+    swapped.stack_new[0][slot] = pair[0]
+    twinned = state.copy()
+    twinned.stack_new[0][slot] = pair[1]
+
+    assert pair[0] != pair[1]
+    assert CARD_TABLE[pair[0]] == CARD_TABLE[pair[1]]
+    assert mcts.information_key(swapped, viewer) == mcts.information_key(
+        twinned, viewer
+    ), "two copies of one printed card keyed to different children"
+    if CARD_TABLE[original] != CARD_TABLE[pair[0]]:
+        assert mcts.information_key(swapped, viewer) != mcts.information_key(
+            state, viewer
+        ), "a genuinely different card did not change the key"
+
+
+def test_the_key_carries_the_viewers_own_vote_and_not_the_table_wide_flag():
+    """``reshuffle_next_turn`` is the OR of the votes and is private mid-turn
+    (``ENCODER_V2_SPEC`` §9.3a): reading it tells a later serial actor that an
+    earlier one voted yes, which nobody knows in the concurrent game."""
+    state = _mid_turn()
+    viewer = state.actor
+    before = mcts.information_key(state, viewer)
+
+    aggregate = state.copy()
+    aggregate.reshuffle_next_turn = not aggregate.reshuffle_next_turn
+    assert mcts.information_key(aggregate, viewer) == before, "the aggregate leaked"
+
+    other = state.copy()
+    other.reshuffle_votes[1 - viewer if viewer < 2 else 0] = True
+    assert mcts.information_key(other, viewer) == before, "another seat's vote leaked"
+
+    mine = state.copy()
+    mine.reshuffle_votes[viewer] = not mine.reshuffle_vote_for(viewer)
+    assert mcts.information_key(mine, viewer) != before, "the viewer's own vote is lost"
+
+
+def test_the_key_carries_deck_and_discard_composition():
+    """Swap an undrawn card with a discarded one of a different printed type:
+    ``deck_remaining`` and the discard length are both unchanged, and the two
+    positions have genuinely different reveal distributions."""
+    state = _mid_turn()
+    state.discard.append(state.deck[state.deck_pos + 3])
+    viewer = state.actor
+    before = mcts.information_key(state, viewer)
+
+    swapped = state.copy()
+    i, j = next(
+        (i, j)
+        for i, card in enumerate(swapped.deck[swapped.deck_pos :])
+        for j, other in enumerate(swapped.discard)
+        if CARD_TABLE[card] != CARD_TABLE[other]
+    )
+    card = swapped.deck[swapped.deck_pos + i]
+    swapped.deck[swapped.deck_pos + i] = swapped.discard[j]
+    swapped.discard[j] = card
+
+    assert swapped.deck_remaining == state.deck_remaining
+    assert mcts.information_key(swapped, viewer) != before
+
+
+def test_the_key_hides_another_seats_turn_context():
+    """``ctx`` is the acting seat's scratch state -- the slot taken, the number,
+    where it went.  That is exactly this turn's hidden write, so it is in the key
+    only when the viewer *is* the actor."""
+    state = _mid_turn()
+    viewer = state.actor
+    other = next(p for p in range(state.config.players) if p != viewer)
+
+    assert mcts.information_key(state, viewer)[-1] is not None, "own ctx is missing"
+    assert mcts.information_key(state, other)[-1] is None, "another seat's ctx leaked"
+
+
+def test_two_different_positions_do_not_share_a_key():
+    """The other direction: too coarse a key merges distinct positions, which
+    biases every empirical weight built on it."""
+    seen: dict[tuple, tuple] = {}
+    collisions = 0
+    for seed in (3, 4, 5):
+        bots = [GreedyBot(random.Random(seed * 7 + i)) for i in range(3)]
+        state = GameState.new(seed=seed, config=GameConfig(players=3, advanced=True))
+        steps = 0
+        while not state.is_terminal and steps < 400:
+            steps += 1
+            if state.phase is not Phase.WRITE_NUMBER:
+                viewer = state.actor
+                key = mcts.information_key(state, viewer)
+                mark = (seed, state.turn, viewer, int(state.phase), steps)
+                if key in seen and seen[key][:4] != mark[:4]:
+                    collisions += 1
+                seen.setdefault(key, mark)
+            state.apply(bots[state.actor].act(state))
+    assert len(seen) > 300, "not enough distinct positions sampled"
+    assert collisions == 0, f"{collisions} distinct positions shared a key"

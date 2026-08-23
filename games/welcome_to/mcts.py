@@ -41,10 +41,25 @@ where it was legal, so it is systematically overvalued.
 So a child is keyed on ``(action, observed cards)``.  Chance enters only at turn
 boundaries, so the branching this adds is confined and shallow.
 
-**Opponent samples are deliberately *not* in the key.**  They are not chance —
-they are the opponent model, and averaging over them is exactly the expectation
-wanted.  They also cannot create the legality-driven bias above, because nothing
-an opponent does changes what ``r`` may play.
+**⚠ The key is the viewer information state, and that includes what an opponent
+made public.**  An earlier version keyed on raw card **ids** and nothing else —
+no opponent sheets, no race state — with the reasoning that opponent samples are
+the opponent model rather than chance, so averaging over them is the expectation
+wanted.  Both halves of that were wrong in the same direction: ids are *too fine*
+(15 of the 66 printed types have two physical copies, so identical-looking
+reveals key apart) and the table alone is *too coarse* (two transitions differing
+only in what an opponent published would merge).
+
+Under §7.1a's progressive widening the averaging happens in the **weights** —
+`count/samples` over merged children — not by collapsing distinguishable outcomes
+into one child, so a distinction the viewer can see belongs in the key.
+
+**Measured neutral to make:** over 3,840 ``(node, action, observation)`` edges at
+128–256 simulations, the id key and the information key induce **exactly the same
+partition** — 0 edges differ.  Reveals are near-unique, so the table already
+separated every boundary crossing.  The change costs ~31 µs per simulation step
+(+7% of search wall clock today, and a larger share once step 6 makes the network
+cheaper) and buys a key that is still correct when children are retained.
 
 WHAT THE SEARCH SPENDS BUDGET ON
 ────────────────────────────────
@@ -109,15 +124,16 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 import torch
 
+from games.welcome_to import deck_knowledge as dk
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import network as nw
 from games.welcome_to import training
+from games.welcome_to.constants import CARD_TABLE
 from games.welcome_to.game import GameState
 
-#: What the caller observes between its own decisions: every card on the table.
-#: All of them are fully identified, so this is public, and it is exactly the
-#: chance outcome a turn boundary reveals.
+#: What the caller may condition on between its own decisions: the viewer
+#: information state of :func:`information_key`.  Terminal states key as ``()``.
 Observation = tuple
 
 
@@ -157,28 +173,49 @@ class SearchConfig:
     #: bootstrap only), because the search itself will not out-visit 0.8 of
     #: prior mass at any budget tried.
     prune_roundabout_pass: bool = True
-    #: Root exploration noise.  Off by default; S2 turns it on.
+    # ── Root exploration noise.  All off by default; S2 turns it on. ────
+    #
+    # SEARCH_SPEC §7.8.  Dirichlet noise perturbs the *root* prior so that a
+    # confidently-wrong policy still explores: without it, an action the network
+    # dislikes is never searched, so it never appears in the training data, so
+    # the network goes on disliking it.  Root only, and self-play only -- at an
+    # internal node it would corrupt the search's own estimates rather than
+    # diversify the data it produces.
+    #
+    #: Absolute concentration, the form KD (0.3) and 7WD (1.8) use.
+    #:
+    #: ⚠ **For Welcome To this is the wrong knob, and the measurement says so.**
+    #: A search root here ranges from 2 actions (`ASK_RESHUFFLE`, `CHOOSE_PLAN`)
+    #: to 331 (`CHOOSE_CARDS`), mean 35.1 over 7,807 roots (§4).  One alpha
+    #: across a 2-to-331 range either drowns the narrow nodes or does nothing to
+    #: the wide ones.  Prefer :attr:`dirichlet_concentration`.
     dirichlet_alpha: Optional[float] = None
+    #: ``alpha = dirichlet_concentration / len(legal actions)`` -- the scaled
+    #: form, and the one to use.  Overrides :attr:`dirichlet_alpha` when set.
+    #:
+    #: **10.0 is AlphaZero's own rule, not a guess**: its published constants are
+    #: ~10 / branching factor -- Go 0.03 at ~250 moves, chess 0.3 at ~35, shogi
+    #: 0.15 at ~70.  Here it gives 0.20 at `CHOOSE_CARDS`, 0.37 at the surveyor,
+    #: 1.9 at estate and 5.0 at reshuffle, which is the spread the game has.
+    dirichlet_concentration: Optional[float] = None
     dirichlet_weight: float = 0.25
-    #: Simulations a **newly noised** root must run even if re-rooting already
-    #: met the budget.  ``None`` means a full ``simulations``.
+    #: Fraction of ``simulations`` a **newly noised** root must run fresh, even
+    #: if re-rooting already met the budget.
     #:
-    #: ⚠ **This is an S2 decision with a measured price, deliberately left
-    #: explicit.** ``simulations`` is a target *total*, so without a floor a
-    #: fully-reused root applies noise and then runs nothing, and the noise is
-    #: provably inert.  The default closes that the safe way -- a noised root
-    #: pays for a fresh search, which is what plain AlphaZero does -- but under
-    #: noise it forfeits re-rooting's saving entirely, and that saving is
-    #: **47.7% of the budget** against an S0-shaped prior (§4).  Three coherent
-    #: settings, and the choice belongs to whoever runs S2:
+    #: ⚠ **Not cosmetic: at 0 the noise is provably inert.** ``simulations`` is a
+    #: target *total*, so a fully-reused root would apply noise and then run
+    #: nothing -- prior perturbed, no simulation ever selecting against it, visit
+    #: counts and therefore the policy target bit-identical to the un-noised
+    #: search.  A fraction rather than a count because it has to track the budget
+    #: for the same reason ``K`` does (§7.6): the same checkpoint searches at
+    #: different budgets in self-play, arena and analysis.
     #:
-    #: - ``None``: correct, costs the saving whenever noise is on;
-    #: - an integer: keeps part of the saving, and says out loud how much
-    #:   exploration a decision is guaranteed;
-    #: - ``0`` **only** alongside noising once per *turn* rather than once per
-    #:   decision -- a different exploration contract, not this one, and it
-    #:   would need the retained root left un-noised on purpose.
-    min_fresh_simulations: Optional[int] = None
+    #: **1.0 is the safe default** -- a noised root pays for a fresh search, as
+    #: plain AlphaZero does -- but it forfeits re-rooting's saving whenever noise
+    #: is on, and that is 47.7% of the budget against an S0-shaped prior (§4).
+    #: §7.8 recommends **0.25** for S2 and says why it is a starting point to be
+    #: measured rather than a derived constant.
+    noise_fresh_fraction: float = 1.0
     #: Visit-count temperature for :func:`play`.  0 plays the argmax.
     temperature: float = 0.0
 
@@ -443,6 +480,124 @@ def _position_key(state: GameState, root: int) -> tuple:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# The viewer information-state key -- SEARCH_SPEC.md §12.1
+# ──────────────────────────────────────────────────────────────────────────
+def _printed(card: Optional[int]) -> Optional[tuple[int, int]]:
+    """A card's printed face — ``(number, effect)`` — never its physical id.
+
+    ⚠ **This is the whole point of the type mapping.** 15 of the 66 printed
+    types have two physical copies, so keying on ids splits two reveals that
+    look identical to every player at the table into different children. It
+    costs nothing while children are never reused — measured, 0 spurious splits
+    in 60 samples — and becomes wrong the moment §7's retained chance children
+    exist, which is why §6.1 called fixing it a prerequisite for §7.
+    """
+    if card is None:
+        return None
+    number, effect = CARD_TABLE[card]
+    return int(number), int(effect)
+
+
+def information_key(state: GameState, viewer: int) -> tuple:
+    """What ``viewer`` knows, and **nothing** it does not — §12.1's key.
+
+    This is the key a chance child is merged on under §7.1a's progressive
+    widening: two sampled transitions are the same child exactly when this
+    agrees. It therefore has to be right in *both* directions. Too coarse and
+    distinct positions merge, which biases the empirical weights. Too fine — and
+    this is the failure that actually happened, with raw card ids — and
+    identical-looking outcomes split, so ``count/samples`` never converges
+    because nothing ever collides.
+
+    ⚠ **Do not confuse this with** :func:`_position_key`, immediately above.
+    They look alike and are opposites. ``_position_key`` compares two of the
+    caller's *own real states* to guard re-rooting, so it reads hidden fields
+    deliberately and totality is its correctness condition. This one labels
+    determinizations, so reading a hidden field is a **clairvoyance bug**: the
+    tree would key on something the player cannot see, and the trained policy
+    would inherit the cheat.
+
+    Included, per §12.1: the viewer's **live** sheet; every opponent's
+    **turn-start public snapshot**; the **printed types** on the table; the plan
+    validations and race state the viewer may see; the visible deck and discard
+    composition; the viewer's **own** reshuffle vote; turn, phase and the
+    within-turn context that belongs to the viewer.
+
+    Excluded, and each for a reason that has bitten something before:
+
+    - **future deck order** — §7.3's non-anticipativity rule; a key carrying it
+      is textbook strategy fusion;
+    - **the opponents' live current-turn sheets** — ``sheet_for`` returns the
+      public snapshot for everyone but the viewer, which is what
+      ``Houses::getOfPlayer`` does;
+    - **``reshuffle_next_turn``**, the table-wide OR — private mid-turn
+      (``ENCODER_V2_SPEC.md`` §9.3a): reading it would tell a later serial actor
+      that an earlier one voted yes, which nobody knows in the concurrent game.
+      The viewer's own vote goes in; the aggregate does not;
+    - **the turn context of an actor who is not the viewer** — ``ctx`` holds the
+      slot taken, the number and where it went, which is precisely this turn's
+      hidden write. In the search this never arises, because a child is keyed
+      only where the root player is to act; it is excluded anyway, because a key
+      that is only safe when its caller behaves is not safe.
+    """
+    ctx = state.ctx
+    own_turn = state.actor == viewer
+    return (
+        viewer,
+        state.turn,
+        state.actor,
+        int(state.phase),
+        state.config.players,
+        # the table, as printed faces
+        tuple(_printed(card) for card in state.table_cards(viewer)),
+        # sheets: live for the viewer, turn-start snapshots for everyone else
+        tuple(
+            _sheet_key(state.sheet_for(viewer, player))
+            for player in range(state.config.players)
+        ),
+        # the race, as this viewer may see it
+        state.plan_ids,
+        tuple(
+            tuple(sorted(state.plan_turns_for(viewer, slot).items()))
+            for slot in range(3)
+        ),
+        # the deck, as composition -- never as order
+        state.deck_remaining,
+        _composition_key(dk.deck_composition(state, viewer)),
+        _composition_key(dk.discard_composition(state, viewer)),
+        state.solo_card_drawn,
+        # the viewer's own private bookkeeping, and nobody else's
+        state.reshuffle_vote_for(viewer),
+        state.turn_choice[viewer],
+        (
+            ctx.slot,
+            ctx.number,
+            None if ctx.effect is None else int(ctx.effect),
+            ctx.last_house,
+            ctx.built_roundabout,
+            ctx.roundabout_declined,
+            ctx.refused,
+            ctx.plan_slot,
+            ctx.pending_sizes,
+            ctx.chosen_estates,
+        )
+        if own_turn
+        else None,
+    )
+
+
+def _composition_key(counts: np.ndarray) -> bytes:
+    """A ``(15, 6)`` count matrix as something hashable, cheaply.
+
+    ``tobytes`` rather than a tuple of ints: this runs once per simulation step,
+    and 90 cells x 2 matrices is 180 ``int()`` calls that measured as most of the
+    key's cost outside numpy.  Counts are small non-negative integers, so int16
+    is exact.
+    """
+    return counts.astype(np.int16).tobytes()
+
+
 @dataclass(frozen=True, slots=True)
 class _Retained:
     """A subtree kept between two of the root player's decisions in one turn."""
@@ -486,8 +641,8 @@ class MCTS:
         weaker form, since how much exploration a decision gets then depends on
         how concentrated the *previous* decision's tree happened to be.
         """
-        floor = self.config.min_fresh_simulations
-        return self.config.simulations if floor is None else floor
+        fraction = max(0.0, min(1.0, self.config.noise_fresh_fraction))
+        return int(math.ceil(self.config.simulations * fraction))
 
     def _search_actions(self, state: GameState) -> list[int]:
         """The search's action set at ``state`` — §5.1 pruning, under config.
@@ -516,15 +671,9 @@ class MCTS:
             guard += 1
             if guard > 5000:  # pragma: no cover - a stuck engine, not a rules case
                 raise RuntimeError("opponents did not yield the turn")
-        # ⚠ UNDER-SPECIFIED, deliberately recorded rather than quietly fixed.
-        # This is raw card **IDs**, and it carries neither the opponents' now
-        # public sheets nor the race state.  It costs nothing while reveals are
-        # near-unique -- measured, 0 spurious splits in 60 samples -- because
-        # nothing is ever reused.  It becomes wrong the moment chance children
-        # are deliberately retained, which is what SELF_PLAY_PLAN.md's sparse
-        # chance design does: 15 of the 66 printed card types have two physical
-        # copies, so identical-looking reveals would key to different children.
-        return tuple(state.table_cards(root))
+        if state.is_terminal:
+            return ()
+        return information_key(state, root)
 
     def _leaf(self, state: GameState, root: int) -> tuple[Optional[Node], float]:
         if state.is_terminal:
@@ -652,14 +801,28 @@ class MCTS:
             self._simulate(state.redeterminize(rng), node, root, rng)
         return node.actions, node.visits, node
 
+    def _root_alpha(self, width: int) -> Optional[float]:
+        """The Dirichlet concentration for a root of ``width`` legal actions.
+
+        ``dirichlet_concentration`` wins when both are set, because the scaled
+        form is the correct one here and an absolute alpha is the escape hatch,
+        not the other way round.
+        """
+        if self.config.dirichlet_concentration is not None:
+            return self.config.dirichlet_concentration / width
+        return self.config.dirichlet_alpha
+
     def _apply_root_noise(self, node: Node, rng: random.Random) -> bool:
         """Mix in root noise, once per node.  Returns whether it fired *now*."""
         if node.noised:  # a retained subtree that was noised as a root already
             return False
-        if self.config.dirichlet_alpha is None or len(node.actions) < 2:
+        if len(node.actions) < 2:
+            return False
+        alpha = self._root_alpha(len(node.actions))
+        if alpha is None:
             return False
         noise = np.random.default_rng(rng.randrange(1 << 32)).dirichlet(
-            [self.config.dirichlet_alpha] * len(node.actions)
+            [alpha] * len(node.actions)
         )
         weight = self.config.dirichlet_weight
         node.prior = (1.0 - weight) * node.prior + weight * noise
@@ -734,7 +897,10 @@ class MCTS:
         if successor is None:
             self._retained = None
             return
-        child = node.children.get((choice, tuple(successor.table_cards(root))))
+        # the same key ``_advance`` stored it under -- within a turn no opponent
+        # moves and no card is revealed, so the successor's information state is
+        # exactly what every simulation saw down this edge
+        child = node.children.get((choice, information_key(successor, root)))
         if child is None:  # every simulation ended before reaching this child
             self._retained = None
             return

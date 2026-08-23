@@ -17,12 +17,19 @@ versions are recorded so they are not reintroduced.
 constant; the in-search opponent model is the network, batched, and never a bot;
 retained children are discarded at every real turn boundary.
 
-⚠ **Two of those decisions have since been withdrawn, and step 7 is gated on
-both.** "The transition semantics of §7.1/§7.3 are agreed" was premature — §7.1a
-shows the enumerated edge counts *reveals* where §7.1 defines the outcome as a
-whole transition. And "merging and particles are measured inert and will not be
-built in v1" was measured only down to 18 cards; §7.6 already corrected the
-merging half, and §7.1a corrects the particle half.
+⚠ **Two of those decisions were withdrawn on review.** "The transition
+semantics of §7.1/§7.3 are agreed" was premature — §7.1a shows the enumerated
+edge counted *reveals* where §7.1 defines the outcome as a whole transition. And
+"merging and particles are measured inert and will not be built in v1" was
+measured only down to 18 cards.
+
+**Decisions taken 2026-08-23.** §7.1a resolution **C**: the chance edge is
+**progressive widening** with empirical `count/samples` weights and children
+merged by viewer information state — so merging is the mechanism rather than an
+optional extra, particles are built, and the enumerated second edge class is
+dropped. §7.8: Dirichlet noise applies at **every** decision root, with
+`α = 10 / legal actions` and a fresh-simulation floor as a fraction of the
+budget.
 
 **Reads with:** `SELF_PLAY_PLAN.md` S1 (root-player contract, gate),
 `ENCODER_V2_SPEC.md` §10.6 (frozen 684 vocabulary), `AUX_TARGETS_SPEC.md` §5
@@ -198,6 +205,28 @@ effect phases a turn reaches depends on which cards you take, and a competent
 player takes different cards. Read the shape here, and re-read the rates off a
 real checkpoint before costing anything against them.
 
+⚠ **The widths in the table above are the *vocabulary*, not the legal set**, and
+the difference is a factor of ten where it matters most. Measured over 7,807
+real search roots at 2 and 3 seats — decisions with more than one legal macro,
+so exactly what the search sees:
+
+| phase | roots | mean legal | median | p90 | max |
+|---|---|---|---|---|---|
+| `CHOOSE_CARDS` | 4,580 | **49.7** | 30 | 124 | 331 |
+| `ROUNDABOUT_PLACE` | 1,163 | 16.7 | 16 | 30 | 33 |
+| `ACTION_ESTATE` | 796 | 5.2 | 5 | 6 | 6 |
+| `ACTION_SURVEYOR` | 734 | 27.0 | 28 | 31 | 31 |
+| `ACTION_BIS` | 361 | 6.7 | 7 | 10 | 16 |
+| `CHOOSE_PLAN` | 87 | 2.0 | 2 | 2 | 3 |
+| `VALIDATE_PLAN` | 51 | 2.8 | 2 | 4 | 7 |
+| `ASK_RESHUFFLE` | 35 | 2.0 | 2 | 2 | 2 |
+| **all** | **7,807** | **35.1** | 19 | | |
+
+The combination-and-write root is 495 *indices* wide and **49.7 actions** wide in
+practice. Anything sized against the root — Dirichlet `alpha` (§7.8), Gumbel
+`top_k` (§7.7), a widening constant — must be sized against this table, not
+against 495.
+
 *Macro decisions* counts every state the macro layer decides at. *Network
 decisions* counts only the ones the search evaluates — after §5.1 pruning and
 forced-node collapse. **Use 2.14 wherever the old 1.91 was used, and 2.45 for
@@ -255,7 +284,7 @@ shipped config, four games, two seats:
 | GreedyBot-cloned prior (S0's shape) | 32 | 51% (124 / 243) | **47.7%** |
 | GreedyBot-cloned prior (S0's shape) | 128 | 53% (133 / 253) | **45.6%** |
 
-A flat prior spreads 32 visits over a 495-wide root, so the child re-rooted onto
+A flat prior spreads 32 visits over a ~50-way root, so the child re-rooted onto
 carries almost nothing; a prior that concentrates — which is what behaviour
 cloning produces, and what the whole design assumes — carries most of the tree.
 **Budget for the S0-shaped figure, not the untrained one.** The budget is
@@ -426,11 +455,34 @@ Every boundary crossing draws a key never seen before and expands a fresh leaf.
 Budget past roughly one simulation per root action goes into **root averaging**,
 not depth.
 
-⚠ **The key is also under-specified, latently.** Raw card **IDs**, no opponent
-sheets, no race state. Measured, it costs nothing today — 0 spurious splits in 60
-samples — because near-unique reveals mask it. **15 of the 66 printed card types
-have two physical copies**, so identical-looking reveals key to different children
-the moment children are reused. Fixing the key is a prerequisite for §7.
+✅ **The key was under-specified, and is now fixed** (§12.1, step 5).
+`MCTS._advance` returns `mcts.information_key(state, root)`.
+
+It was wrong in *both* directions at once, which is why "it costs nothing today"
+was true and misleading:
+
+- **too fine** — raw card **ids**, and 15 of the 66 printed types have two
+  physical copies, so two reveals identical to everyone at the table key apart;
+- **too coarse** — the table and nothing else: no opponent sheets, no race
+  state, no deck composition, so two transitions differing only in what an
+  opponent *published* would merge.
+
+⚠ **Measured neutral to change, and that is the point.** Over **3,840**
+`(node, action, observation)` edges at 128–256 simulations, the id key and the
+information key induce **exactly the same partition** — 0 edges differ. Reveals
+are near-unique, so the table already separated every crossing. The fix is
+therefore free to take now and the search is unchanged by it; what it buys is a
+key that is still correct once §7.1a retains and merges children, which is when
+both failure modes start costing.
+
+(An earlier reading of this measurement said the information key *split* 13 edges
+the id key merged. That was a grouping error — the id key is only ever compared
+among one node's own children, and grouped that way the two agree exactly.)
+
+**Cost:** ~31 µs per simulation step, about **+7%** of search wall clock today,
+and a larger share once step 6 makes the network cheaper. Two `(15, 6)`
+composition matrices are 42% of it; they encode as `int16` bytes rather than
+tuples of Python ints, which took the key from 48 µs to 31 µs.
 
 ### 6.2 What a reveal actually is
 
@@ -572,10 +624,11 @@ One sample contains exactly the randomness consumed during that one transition �
 the opponents' decisions, wherever they fall relative to the reveal, and the
 boundary outcome — and **nothing else**.
 
-### 7.1a ⚠ BLOCKER: a reveal is not a transition, and the counts are of reveals
+### 7.1a ✅ DECIDED: progressive widening with empirical weights
 
-**This invalidates the two-edge-class design below as written, and it is the one
-thing step 7 must not begin without settling.**
+**A reveal is not a transition.** This invalidated the two-edge-class design
+below as written, and blocked step 7 until **2026-08-23, when resolution C was
+taken**. Step 7 is unblocked and builds C.
 
 The paragraph above defines the retained object as the **whole root-to-root
 transition** — the opponents' sampled decisions *and* the boundary outcome. The
@@ -607,24 +660,69 @@ which was noticed:
   opponent randomness is also fixed (making it a different game) or integrated
   (making it not enumerable).
 
-**Two coherent resolutions. Neither is chosen here — this is the §7.1 semantics
-step 7 is gated on.**
+**Three resolutions were on the table. ✅ C is decided.**
 
 | | design | weights | cost |
 |---|---|---|---|
 | **A** | **Factor the transition**: sampled-opponent → *exact-reveal* → sampled-opponent, so the enumerated layer is only the chance layer | reveal children carry `P(reveal)` exactly; opponent layers stay Monte Carlo | three layers to key and batch; reveal children still hold particle collections |
-| **B** ← *recommended* | **Retain `K` complete trajectories at every deck size**, and use late-game reveal enumeration only as **stratification** | `P(reveal) × empirical conditional opponent mass` | one edge class everywhere; still needs particles where a stratum draws more than one sample |
+| **B** | **Retain `K` complete trajectories at every deck size**, late-game reveal enumeration demoted to **stratification** | `P(reveal) × empirical conditional opponent mass` | one edge class; still needs particles where a stratum draws more than one sample |
+| **C** ✅ | **Progressive widening on the chance edge**, children merged by viewer information state | **`count / samples`** — empirical, never enumerated | merging becomes mandatory rather than optional; two constants, both pinned below |
 
-**B is the smaller change and the better fit for what is already decided.** It
-keeps `fixed_support` as the only edge, so `K`-as-a-schedule (§7.6) and the
-batching work of step 6 apply unchanged; late-game enumeration stops being a
-second mechanism and becomes variance reduction. It also solves the problem that
-motivated the split in the first place — at `D = 3`, IID sampling gave 5 distinct
-outcomes of 16 with 11 collisions, whereas stratifying over the 6 reveals
-*guarantees* coverage and prices each stratum exactly.
+**Why C was taken, and why it makes the blocker disappear rather than
+answering it.**
 
-⚠ **Under either resolution, particles stop being optional at the small end**, so
-§7.6's "not built in v1" has to be revisited rather than carried forward. The
+The problem above exists *only because the design tried to assign exact
+probabilities to enumerated outcomes.* Empirical weights never need to know
+`P(transition)`; they estimate it. So the reveal-versus-transition confusion
+cannot arise — whatever the outcome turns out to be, `count / samples` converges
+to its true mass, opponent randomness included, which is exactly the quantity A
+has to build three layers to price and B has to factor into two.
+
+Concretely, at a chance node with `n` visits:
+
+- allow `⌈C · n^α⌉` distinct children; when the criterion fires, sample **one**
+  fresh transition causally (opponents and `sample_boundary_outcome`);
+- if it lands on an existing child's viewer information state, **merge** —
+  `count += 1` — instead of adding a child;
+- weight `= count / samples`; the node's value is the weight-weighted mean; a
+  descent samples among children by weight. A chance node averages, it never
+  PUCTs;
+- samples sharing an information state but differing in hidden detail are held
+  as **particles** — a list of concrete states, uniform on descent.
+
+⚠ **The late-game case then fixes itself, and the collisions §7.6 called a
+problem are the mechanism.** At `D = 3` there are six possible reveals, so
+widening keeps proposing samples that merge into the existing children, the
+distinct count saturates at the true support, and `count / samples` converges to
+`P(reveal)` — *including* the opponent expectation, which enumeration could not
+price at all. No second edge class, no stratification, no threshold to tune.
+
+**α is not a free parameter, and this document already derived it.** §7.6 fixes
+`K ≈ N^(1/H)` from a target depth `H`, and notes in the same breath that
+`C · visits^α` with `α = 0.5` *is* progressive widening. So `α = 1/H`, and the
+depth-2 target gives `α = 0.5`. The staged-`K` schedule and PW are the same rule;
+PW just reads `n` instead of being pinned to a training stage, which is what
+"scale with the simulation count" requires and what a schedule keyed on training
+stage cannot deliver — the same checkpoint searches at different budgets in
+self-play, arena and analysis.
+
+**What C costs, stated honestly:**
+
+- **Merging stops being optional.** It is the mechanism, not a bookkeeping
+  nicety, so §7.6's "not built in v1" is withdrawn for merging as well as for
+  particles.
+- **A young node's weights are non-stationary** — a child's mass moves as
+  siblings arrive — so early chance estimates are noisier than a closed
+  `K`-sample average. Fixed `K` stays the control arm in the bakeoff (§11)
+  rather than being assumed worse.
+- **Children arrive one at a time instead of `K` at once.** ⚠ This is a *gain*
+  against §12 step 7's own requirement to "build it lazily … so no unbatched
+  eager `K` materialisation exists even temporarily": there is no eager
+  materialisation to avoid. Batching then has to come from step 6's
+  across-games leaf batching, which §8 already says is the better form.
+
+⚠ **Under *any* of the three, particles stop being optional at the small end**,
+so §7.6's "not built in v1" has to be revisited rather than carried forward. The
 minimum viable form is small: a child holds a **list** of concrete states instead
 of one, and a descent picks among them uniformly. That is a particle collection,
 and it is nearer ten lines than a subsystem.
@@ -817,6 +915,79 @@ opponents having written different numbers this turn, invisible until the next
 boundary — where the child is a belief, not a state, and collapsing it to one
 canonical state narrows that belief silently.)
 
+### 7.8 ✅ DECIDED: when and how much Dirichlet noise
+
+**What it is for.** The search's move comes from visit counts, and visits follow
+the prior. A confidently-wrong prior is never searched against, so the action
+never enters the training data, so the prior stays wrong. Dirichlet noise breaks
+that loop by perturbing the **root** prior:
+`prior ← (1−w)·prior + w·Dirichlet(α)`, `w = 0.25`.
+
+**Root only, self-play only.** At an internal node it would corrupt the search's
+own estimates rather than diversify the data; in the arena it would measure a
+handicapped player.
+
+#### When: every decision, not once per turn
+
+⚠ **Measured, 53.7% of all search roots are *later* in a turn, not the first**
+(4,193 of 7,807), and they average 22.6 legal actions against 49.6 for the
+turn's first decision. Noising once per turn would leave over half the emitted
+policy targets with no exploration at all, and they are not trivial nodes — the
+surveyor averages 27 actions and bis 6.7. So noise applies at **every** decision
+root that has two or more legal macros.
+
+The cost of that choice is real and is the second half of this decision:
+re-rooting hands a noised root visits gathered under the *un-noised* prior, so
+those visits are sound as value estimates and biased as a policy target.
+
+#### How much, part 1: `α` scales with the width of the root
+
+⚠ **A single α is wrong for this game**, and §4's width table is why: a root
+ranges from **2** actions (`ASK_RESHUFFLE`, `CHOOSE_PLAN`) to **331**
+(`CHOOSE_CARDS`), mean 35.1. One constant either drowns the narrow nodes or does
+nothing to the wide ones.
+
+So `α = concentration / len(legal actions)`, with **`concentration = 10.0`**.
+That is not a guess — it reproduces AlphaZero's own published constants, which
+are all ≈ 10 / branching factor: Go 0.03 at ~250 moves, chess 0.3 at ~35, shogi
+0.15 at ~70. Here it gives:
+
+| root | mean legal | `α` |
+|---|---|---|
+| `CHOOSE_CARDS` | 49.7 | 0.20 |
+| `ACTION_SURVEYOR` | 27.0 | 0.37 |
+| `ROUNDABOUT_PLACE` | 16.7 | 0.60 |
+| `ACTION_BIS` | 6.7 | 1.5 |
+| `ACTION_ESTATE` | 5.2 | 1.9 |
+| `CHOOSE_PLAN` / `ASK_RESHUFFLE` | 2.0 | 5.0 |
+
+`SearchConfig.dirichlet_alpha` keeps the absolute form as an escape hatch, since
+it is what KD (0.3) and 7WD (1.8) use; `dirichlet_concentration` overrides it.
+
+#### How much, part 2: how many simulations must *observe* it
+
+⚠ **At zero fresh simulations the noise is provably inert** — prior perturbed,
+nothing selecting against it, policy target bit-identical to the un-noised
+search. That was a real defect, found in review and fixed.
+
+`noise_fresh_fraction` is the floor, as a **fraction of the budget** rather than
+a count, for the same reason `K` is a schedule (§7.6): one checkpoint searches at
+different budgets in self-play, arena and analysis.
+
+- **`1.0` is the shipped default** — a noised root pays for a fresh search, which
+  is what plain AlphaZero does, and it is the setting that cannot be wrong.
+- **`0.25` is the recommendation for S2**, because 1.0 forfeits re-rooting's
+  saving whenever noise is on and that is **47.7% of the budget** against an
+  S0-shaped prior (§4).
+
+⚠ **0.25 is a starting point, not a derived constant**, and it is the one number
+in this section with no argument behind it. The quantity that matters is whether
+the boosted actions actually get visited, which depends on `c_puct`, on the
+Q-gaps at the root and on how much of the budget re-rooting supplied — none of
+which are known before S2 runs. **Measure it**: the readout is the share of
+root-visit mass landing on actions the noise boosted, and it belongs next to the
+S1 arena numbers.
+
 ### 7.7 Root allocation: Gumbel first, PUCT behind the same interface
 
 **These are separable from everything above**, because both searches consume the
@@ -940,7 +1111,7 @@ the opponent sampler rather than the chance approximation.
 | **Bundle the whole turn** | Rejected — §5. Up to 71,334 sequences per turn to save 1.14 network calls. |
 | **Sort the stacks** (KD's `sorted(deck[:4])`) | Rejected. KD's sort is meaningful because domino number *is* next-round pick order, so the slot encodes tempo whatever tile it carries. Sorting Welcome To's stacks gives "lowest of three random draws" — 1 in one determinization, 13 in another. No stable quantity. |
 | **Merge on `(number, effect, box)` + availability counts** | Experimental arm. Invariant, and availability counts are well founded (§13, Cowling et al.), but **context-abstracted**: one `Q` averaged over what the other two offers are, what next-turn effects were exposed, and the race state. Also lossy — a 7 printed and a 7 made with TEMP consume different cards. |
-| **Progressive widening on chance** | Deferred, not rejected. Withdrawn once for a bad reason: "sharper priors do not deepen the tree" is measured and true and does **not** imply nothing structural does. Fixed `K` first because it is easier to reason about and to batch (§13, Couëtoux & Doghmen). |
+| **Progressive widening on chance** | ⚠ **Promoted — it is now the recommended shape of the chance edge itself (§7.1a C), not an alternative to it.** Deferred twice before: once for a bad reason ("sharper priors do not deepen the tree" is measured and true and does **not** imply nothing structural does), then behind fixed `K` as "easier to reason about and to batch". The second reason weakened on inspection: PW materialises children *lazily*, which is what §12 step 7 wanted anyway, and it prices the transition empirically, which is what §7.1a needs (§13, Couëtoux & Doghmen). |
 | **Gumbel top-`k` + sequential halving at the root** | Later arm. The masked 495-wide macro root is a good fit — it targets simple regret where simulations are scarce relative to root width (§13, Danihelka et al.). Keep it out of the first chance-node implementation. |
 
 ---
@@ -1002,28 +1173,32 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    **which case fires is deterministic given the afterstate; only which cards is
    chance**, so a chance node's support has a known length (3, or 6 on a queued
    reshuffle). Nothing is wired into `mcts.py` — that is step 7.
-5. **Define and test the viewer information-state key** (§6.1, §7.3, §12.1).
+5. ✅ **Viewer information-state key** — `mcts.information_key(state, viewer)`,
+   and `_advance` now returns it. §12.1's checklist is implemented item by item
+   and tested item by item, including its "test that matters". Measured neutral
+   to adopt (0 of 3,840 edges change) and ~31 µs per simulation step.
 6. **Batched evaluator** — successor batches *and* opponent-policy batches (§8).
    **Before** step 7, because a retained transition costs both.
 7. **Fixed-support environment edge** (§7) with `count/K` weights and particle
    children, behind a flag, the current version kept as the control arm. Build it
    **lazily** if step 6 slips, so no unbatched eager `K` materialisation exists
-   even temporarily. ⚠ **Blocked on §7.1a**: the enumerated edge as written
-   counts *reveals* where §7.1 defines the outcome as a whole root-to-root
-   transition, so its weights are not the weights it claims. Resolve A or B
-   there first; B (one edge class, late enumeration as stratification) is the
-   recommendation and is the smaller change.
+   even temporarily. ✅ **Unblocked 2026-08-23**: §7.1a takes resolution **C**,
+   progressive widening with empirical `count/samples` weights and children
+   merged by viewer information state. So what step 7 builds is PW, not a fixed
+   `K` with a closed edge — and **step 5 is now a hard prerequisite, not merely
+   an earlier item**, because the merge key *is* the viewer information state.
 8. **Run S0, then the bakeoff** (§11).
 9. **Gumbel root allocation** (§7.7) — the intended default for self-play, with
    PUCT retained behind the same interface for the later switch.
-10. **Only then:** progressive widening, afterstate head.
+10. **Only then:** the afterstate head. (Progressive widening has moved *into*
+    step 7 — see §7.1a C.)
 
 **Steps 1–4 are done.** Steps 1–3 touched nothing §6–§9 is still deciding; step 4
 is an engine refactor with no search-side change, so the search still crosses
 boundaries exactly as it did. Steps 5–7 are what this document exists to have
-reviewed, and step 7 should not begin until the transition semantics of §7.1 and
-§7.3 are agreed — which they are **not**, despite the header once saying so:
-§7.1a is the open blocker and names the two candidate resolutions.
+reviewed. Step 7's own blocker — the §7.1 transition semantics — was resolved
+on 2026-08-23 by §7.1a taking resolution C, so what remains before it is step 5
+(whose information-state key C merges on) and step 6.
 
 ### 12.1 The key is an information state, not a public observation
 
@@ -1048,6 +1223,27 @@ and must **exclude**
 **The test that matters** is seat 1 after seat 0 has acted: mutating seat 0's
 *live* current-turn sheet must leave seat 1's key **unchanged**, while mutating
 `public_sheets[0]` must **change** it.
+
+✅ **Built:** `mcts.information_key`, with that test as
+`test_the_key_hides_an_opponents_live_sheet_and_shows_its_public_snapshot` and
+one per exclusion besides — future deck order, the table-wide
+`reshuffle_next_turn` against the viewer's own vote, printed types against
+physical ids, and deck/discard composition. Plus the other direction, which the
+checklist does not state and which matters just as much under §7.1a: **distinct
+positions must not share a key**, or the empirical weights are biased. Verified
+over 300+ positions with no collisions.
+
+⚠ **One exclusion the checklist misses:** `ctx` — the acting seat's slot, number
+and last house — is *this turn's hidden write*, so it belongs in the key only
+when the viewer **is** the actor. In the search that always holds, because a
+child is keyed only where the root player is to act; it is excluded anyway,
+because a key that is only safe when its caller behaves is not safe.
+
+⚠ **Do not confuse it with `mcts._position_key`.** They look alike and are
+opposites: `_position_key` compares two of the caller's own *real* states to
+guard re-rooting, so it reads hidden fields deliberately and totality is its
+correctness condition; `information_key` labels *determinizations*, so reading a
+hidden field is a clairvoyance bug.
 
 ---
 
