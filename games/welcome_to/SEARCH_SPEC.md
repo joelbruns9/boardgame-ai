@@ -164,10 +164,101 @@ exposes only that phase's actions.
 | plan estate validation | matching estate | ≤ 33 | unchanged |
 | reshuffle | yes / no | 2 | unchanged |
 
-**Measured cost:** a turn costs **1.91 network decisions on average** —
-distribution 2 in 169 turns, 1 in 62, 7–8 in 8, over 239 sampled turns of
-two-seat advanced play. (Measured under a fixed "first legal macro" policy; the
-mean will shift with a trained policy, the shape will not.)
+**Measured cost — re-measured after §12 steps 1–2, and the old figure retired.**
+
+⚠ **The previous number, "1.91 network decisions per turn over 239 sampled
+turns", did not reproduce and has been withdrawn.** Under a literal
+"first legal macro" policy — `legal_macros(state)[0]` — the mean over 740
+player-turns is **1.64**, and *no* turn costs more than two decisions. The old distribution's
+tail (7–8 decisions in 8 turns) can only come from roundabout turns, and this
+policy never opens a roundabout, because a `MACRO_WRITE` always precedes
+`ROUNDABOUT_OPEN` in `legal_macros`. Whatever policy produced 1.91, it was not
+this one. The figures below are therefore measured on **GreedyBot** play, which
+does open roundabouts at the reference rate (1.22 built per seat-game against
+the 1.28 quoted elsewhere, so the harness agrees with the earlier corpus).
+
+| driver | player-turns | macro decisions / turn | **network decisions / turn** |
+|---|---|---|---|
+| GreedyBot, 2 seats | 1,488 | 2.45 | **2.14** |
+| GreedyBot, 3 seats | 2,199 | 2.41 | **2.10** |
+| GreedyBot, 4 seats | 2,932 | 2.42 | **2.11** |
+| first legal macro, 2 seats | 740 | 1.64 | 1.47 |
+
+⚠ **Everything in this section is measured on GreedyBot trajectories, and that
+limits what it may be used for.** The *structural* facts are policy-independent
+and are rules, not statistics — park is offered only for the street just written
+in, pool only for the box just written, `estate_rows()` masks full rows,
+`ROUNDABOUT_PLACE` offers the whole free sheet. The *frequencies* are not: which
+effect phases a turn reaches depends on which cards you take, and a competent
+player takes different cards. Read the shape here, and re-read the rates off a
+real checkpoint before costing anything against them.
+
+*Macro decisions* counts every state the macro layer decides at. *Network
+decisions* counts only the ones the search evaluates — after §5.1 pruning and
+forced-node collapse. **Use 2.14 wherever the old 1.91 was used, and 2.45 for
+anything that costs an opponent's turn** (§8): `_advance` samples opponents
+through *every* decision, forced ones included. Seat count barely moves either
+number, which is what a private per-sheet turn should do.
+
+Where the saving comes from — 25 GreedyBot games at two seats, shipped config:
+
+| phase | states visited | nodes before | nodes after |
+|---|---|---|---|
+| `CHOOSE_CARDS` | 1,973 | 1,857 | 1,857 |
+| `ROUNDABOUT_PLACE` | 485 | 485 | **484** |
+| `ACTION_ESTATE` | 320 | 320 | 320 |
+| `ACTION_SURVEYOR` | 305 | 305 | 305 |
+| **`ACTION_PARK`** | 280 | 280 | **0** |
+| `ACTION_BIS` | 145 | 145 | 145 |
+| `VALIDATE_PLAN` | 53 | 22 | 22 |
+| `CHOOSE_PLAN` | 38 | 38 | 38 |
+| **`ACTION_POOL`** | 37 | 37 | **0** |
+| `ASK_RESHUFFLE` | 16 | 16 | 16 |
+
+**The pruning table above is accurate; what it does not say is how often each
+row fires.** Two of the four narrow a node that stays a node, and it is worth
+knowing *why*, because "it would collapse if the track ran out" is true and
+never happens:
+
+- **`ACTION_ESTATE` narrows 7 → ≤ 6 and never collapses.** Full rows are
+  already masked by the engine — `estate_rows()` is
+  `estate_marks[i] < ESTATE_ROW_BOXES[i]` over `(1, 2, 3, 4, 4, 4)`, so the
+  size-1 row leaves the legal set after its single mark and no search-side
+  masking is needed. Emptying the node needs **five of six rows full, 14 of the
+  18 boxes**, and the phase is only reached ~6.4 times per seat-game. Measured
+  over 320 visits: never below **3** rows, 85% of visits at 5 or 6, and a mean
+  of 4.74 from turn 15 on. It is a genuine 3-to-6-way choice essentially always,
+  which is the point of §5.1's "estate is not a yes/no".
+- **`ROUNDABOUT_PLACE` narrows 34 → 33 and never collapses.** A roundabout may
+  go in *any* empty box, so the engine offers `available_locations(None)` — the
+  whole free sheet. Measured over 485 visits the placement count spans 1…33 and
+  is a singleton exactly **once**; 8% of visits have ≤ 4 boxes free (late game),
+  10% have 30+.
+- **Park and pool do vanish, all 317 of them**, and that is the whole of the
+  measured 2.45 → 2.14. Park is offered only for the street the number just went
+  into and pool only for the box just written, so both are binary; with the pass
+  dominated, the build is all that is left.
+
+**Re-rooting (§12 step 3) preserves 9% to 48% of the simulation budget**, and
+*which* depends entirely on how concentrated the policy is. Measured under the
+shipped config, four games, two seats:
+
+| evaluator | budget | decisions re-rooted | simulations preserved |
+|---|---|---|---|
+| untrained net (flat priors) | 32 | 34% (45 / 132) | 8.7% |
+| untrained net (flat priors) | 128 | 38% (57 / 152) | 11.9% |
+| GreedyBot-cloned prior (S0's shape) | 32 | 51% (124 / 243) | **47.7%** |
+| GreedyBot-cloned prior (S0's shape) | 128 | 53% (133 / 253) | **45.6%** |
+
+A flat prior spreads 32 visits over a 495-wide root, so the child re-rooted onto
+carries almost nothing; a prior that concentrates — which is what behaviour
+cloning produces, and what the whole design assumes — carries most of the tree.
+**Budget for the S0-shaped figure, not the untrained one.** The budget is
+almost irrelevant to the fraction — 8.7% → 11.9% flat, 47.7% → 45.6% sharp,
+from 32 to 128 simulations — because it scales both the retained and the fresh
+side. The **prior** is the variable that matters, and it is worth a factor of
+four. Note also that only about half of all decisions re-root at all: the rest
+are the first decision of a turn, where the tree is correctly discarded.
 
 ---
 
@@ -222,9 +313,12 @@ advance and the rows score differently, so pruning removes the pass and leaves a
 pool is binary, so those two nodes vanish entirely once forced nodes collapse.
 
 **`PASS_ROUNDABOUT` is also pruned.** Opening and then passing reaches the same
-`CHOOSE_CARDS` state as never opening, minus the roundabout option — so not
-opening weakly dominates it. Pruning makes `ROUNDABOUT_OPEN` mean "I will place
-one", which is the real decision.
+`CHOOSE_CARDS` state as never opening, minus the roundabout option — it is BGA's
+confirm dialog, opened and cancelled — so not opening weakly dominates it.
+Pruning makes `ROUNDABOUT_OPEN` mean "I will place one", which is the real
+decision. ⚠ It is the one pruning behind a switch, because it is the one that
+interacts with a *bootstrap* prior: §5.1a, and read roundabouts per game off the
+S0 checkpoint.
 
 ⚠ **This is a search mask, not a rules change.** An earlier draft rejected it on
 BGA-fidelity grounds; **that argument applies to the engine, not to the search**,
@@ -232,6 +326,70 @@ and conflating them was the error. `GameState.legal_actions()` keeps every BGA
 action, the codec keeps all 684 logits, and replay compatibility is untouched.
 The search already differs from BGA's primitive tree through the choose/write
 macro; fidelity was never a claim about which moves the search explores.
+
+### 5.1a ⚠ `PASS_ROUNDABOUT` is pruned — and the S0 bootstrap needs watching
+
+**What `PASS_ROUNDABOUT` actually is.** In advanced play, `CHOOSE_CARDS` offers
+`ROUNDABOUT_OPEN` *alongside* the normal "take a stack" actions. Taking it moves
+to `ROUNDABOUT_PLACE` and **does not touch the sheet**; there you either place a
+roundabout in an empty box or play `PASS_ROUNDABOUT`, which sets
+`ctx.roundabout_declined` and returns to `CHOOSE_CARDS` with the offer now
+suppressed and your actual turn still ahead of you. So open-then-pass is
+**BGA's confirm dialog, opened and cancelled** — a pure no-op that exists
+because the UI has a button. Pruning the pass makes `ROUNDABOUT_OPEN` mean "I
+will place one", which is the only decision there ever was. §5.1's dominance
+argument is right and this ships on.
+
+⚠ **The one thing to watch is the bootstrap prior, and the reason is measured.**
+GreedyBot plays `ROUNDABOUT_OPEN` ~30% of the times it is offered, and that is
+**not a preference** — it is a tie-break artifact of a no-op action. Because
+opening changes nothing on the sheet, GreedyBot's one-ply
+`_evaluate(state.step(OPEN))` is *identical* to doing nothing, so it ties with
+every other score-neutral move:
+
+| over 1,418 offers at `CHOOSE_CARDS`, 25 games, 2 seats | |
+|---|---|
+| `ROUNDABOUT_OPEN` in the tied-best set | **100%** |
+| `ROUNDABOUT_OPEN` strictly best | 4% |
+| mean size of that tie set | 3.5 actions |
+
+A uniform pick over 3.5 tied actions is where the ~30% comes from, and then at
+`ROUNDABOUT_PLACE` the bot passes, because *placing* does cost points and does
+break the tie. S0 is behaviour-cloned from this, so **S0 will faithfully
+reproduce a coin flip on a no-op** — and with the pass pruned, that coin flip
+now commits to a −3 or −8 build.
+
+How much it costs, against a synthetic 0.8-mass clone of that prior (six games,
+one search seat, two seats, 32 simulations, identical seeds):
+
+| pruning | roundabouts / game | seat score |
+|---|---|---|
+| none | 1.00 | 48.5 |
+| park + pool + estate | 1.33 | 63.3 |
+| all four | **2.00** — `ROUNDABOUT_BOXES`, i.e. the cap | 39.3 |
+
+and 128 simulations does not recover it (still 2.00; acceptance 35% → 29%).
+
+⚠ **Do not read those points as a verdict on the pruning.** They measure the
+artifact. The prior under test is a hard clone of a bot's coin flip, the value
+head is a stand-in, and six bot games are six bot games — this says what happens
+to *that* prior, not what a competent policy does. A good player never opens the
+dialog without meaning to build, so for any policy worth having, "open" and
+"build" are the same decision and the pruning is free.
+
+**What is actionable, and it is not a spec change:**
+
+- **Read roundabouts per game off the S0 checkpoint before trusting it**, next
+  to plans per game in the S1 arena report. GreedyBot builds 1.22 per seat-game.
+  Near `2.00` means the bootstrap inherited the coin flip.
+- If it has, the fix is in the **bootstrap data or the prior**, not the search:
+  measured, the search will not out-visit 0.8 of prior mass at any budget tried.
+  `SearchConfig.prune_roundabout_pass = False` exists as a bootstrap-only
+  escape hatch, not as a recommendation.
+- The clean fix, if one is wanted later, is at the data level: an
+  open-then-pass pair in a recorded trajectory is a no-op that teaches the
+  network an action with no meaning. That is a `datagen` question and is out of
+  scope here — the labels and replay masks are frozen (§12 step 1).
 
 ---
 
@@ -599,14 +757,25 @@ simulations" meaningless.
 
 ⚠ **And a leaf is not the only cost.** Because the retained object is the whole
 root-to-root transition (§7.1), each sample also pays for the **opponents' policy
-evaluations** — which are network calls, per §7.6, not cheap bot rollouts. At four seats and the measured 1.91 decisions per turn, one
+evaluations** — which are network calls, per §7.6, not cheap bot rollouts. The
+right per-turn figure here is the **unpruned** 2.42 of §4, not the 2.14: `_advance`
+walks an opponent through every decision it has, forced ones included, and neither
+§5.1 pruning nor the forced-node collapse touches that path. So at four seats one
 `K = 16` expansion approaches
 
 ```
-16 × (1 leaf + 3 opponents × 1.91 decisions) ≈ 108 evaluated positions
+16 × (1 leaf + 3 opponents × 2.42 decisions) ≈ 132 evaluated positions
 ```
 
 before any deeper search happens.
+
+⚠ **A saving is sitting in `_advance` and is deliberately not taken yet.** An
+opponent decision with one legal action is a network call that cannot change
+anything, and measured, 13% of opponent decisions are exactly that (2.42 → 2.14
+in §4). Applying the same collapse there is worth roughly 13% of the opponent
+term above. It is not done because `_advance` is the turn-boundary code that
+§6–§9 are still deciding the shape of, and touching it twice is worse than
+touching it once.
 
 **Required before the bakeoff**, at least one of:
 
@@ -693,13 +862,26 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
 
 ## 12. Implementation order
 
-1. **Search-only dominance pruning** — park/pool/estate passes, `PASS_ROUNDABOUT`
-   (§5.1). No engine change.
-2. **Collapse forced internal nodes** inside simulations, not only at the external
-   root. `MCTS.play` already does the root; `_simulate` does not.
-3. **Deterministic within-turn re-rooting.** `MCTS.play` discards the tree after
-   choosing; re-rooting the selected child within a turn is *exact* and preserves
-   the work.
+1. ✅ **Search-only dominance pruning** — `macro_codec.search_legal_macros` /
+   `search_legal_mask`, called only from `mcts.py`. `legal_macros`, `legal_mask`,
+   `GameState.legal_actions()` and every `datagen` path are unchanged, and there
+   are tests asserting so rather than trusting it. Measured: the 317 park and
+   pool nodes disappear completely; the estate node narrows to ≤ 6 but **never**
+   collapses (0 of 320) (§4). All four dominated passes ship pruned. ⚠
+   `PASS_ROUNDABOUT` sits behind `SearchConfig.prune_roundabout_pass` (on)
+   because it is the one that interacts with the **bootstrap** prior — **read
+   roundabouts per game off the S0 checkpoint before trusting it** (§5.1a).
+2. ✅ **Collapse forced internal nodes** inside simulations, not only at the
+   external root — `MCTS._collapse_forced`, guarded to stop at the turn
+   boundary so that two reveals can never end up behind one key. With step 1 it
+   takes a turn from **2.45 to 2.14 network decisions** (§4). The same saving is
+   still available in `_advance` for opponent sampling and is deliberately not
+   taken yet (§8).
+3. ✅ **Deterministic within-turn re-rooting** — `MCTS._retain` /
+   `_take_retained`, verified against a full position identity (`_position_key`)
+   so a subtree from another line or another game cannot be reused by accident.
+   Preserves **8.7% of the budget under flat priors and 47.7% under an
+   S0-shaped one** (§4). Discarded at the turn boundary, with a test that it is.
 4. **Engine-owned boundary transition** (§6.3), with a test for each of ordinary
    draw, **exact-empty reform**, queued reshuffle, and terminal-before-reveal;
    plus a generic mid-draw test only if expert mode stays supported.
@@ -715,9 +897,9 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
    PUCT retained behind the same interface for the later switch.
 10. **Only then:** progressive widening, afterstate head.
 
-Steps 1–3 are small, independent of the review's outcome, and can start now.
-Steps 4–7 are what this document exists to have reviewed; step 7 should not begin
-until the transition semantics of §7.1 and §7.3 are agreed.
+**Steps 1–3 are done** and touched nothing §6–§9 is still deciding. Steps 4–7 are
+what this document exists to have reviewed; step 7 should not begin until the
+transition semantics of §7.1 and §7.3 are agreed.
 
 ### 12.1 The key is an information state, not a public observation
 

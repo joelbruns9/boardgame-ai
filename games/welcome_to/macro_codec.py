@@ -44,6 +44,16 @@ steps into each playable slot and reads that child's own ``legal_actions()``.
 The engine stays the only source of truth about the rules, which is the same
 contract ``action_codec`` has.
 
+THE SEARCH HAS A SECOND, SMALLER ACTION SET
+──────────────────────────────────────────
+:func:`search_legal_macros` is :func:`legal_macros` minus four provably
+dominated passes (``SEARCH_SPEC.md`` §5.1).  It exists **as a separate function
+on purpose**: ``datagen.replay`` builds its training legal mask from
+:func:`legal_mask`, and GreedyBot takes those passes 1,853 times in the recorded
+corpus, so folding the pruning into :func:`legal_macros` would make 1,853
+recorded labels illegal under their own mask.  Only :mod:`games.welcome_to.mcts`
+calls the search version.
+
 STANDARD MODE ONLY
 ──────────────────
 Three choice slots, so expert and solo -- which have six ordered pairs -- have no
@@ -239,6 +249,91 @@ def legal_macros(state: GameState) -> list[int]:
 def legal_mask(state: GameState) -> np.ndarray:
     mask = np.zeros(NUM_MACRO_ACTIONS, dtype=bool)
     idx = legal_macros(state)
+    if idx:
+        mask[np.asarray(idx, dtype=np.int64)] = True
+    return mask
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The search's action set -- dominance pruning, SEARCH_SPEC.md §5.1
+# ──────────────────────────────────────────────────────────────────────────
+#: Passes the search never spends budget on, by the phase they are offered at.
+#:
+#: Each is **provably** dominated, not merely unpromising.  Park, pool and
+#: estate advance a scoring track and nothing else -- ``parks[x] += 1``,
+#: ``pools[street] += 1``, ``estate_marks[row] += 1`` -- consuming no box,
+#: fence, number, turn or resource; ``PARK_SCORES`` and ``POOL_SCORES`` are
+#: strictly increasing, and every plan predicate that reads them
+#: (``DECORATIVE``, ``COMPLETE_STREET``) is monotone.  Plans are not
+#: auto-validated (``CHOOSE_PLAN`` has ``PASS_PLAN``), so advancing a track can
+#: never force an unwanted three-plan game end.  For the roundabout: opening and
+#: then passing reaches the same ``CHOOSE_CARDS`` state as never opening, minus
+#: the option, so not opening weakly dominates it.
+#:
+#: ⚠ All four are pruned.  ``PASS_ROUNDABOUT`` is the one sitting behind a
+#: switch (``search_legal_macros``'s ``prune_roundabout_pass``, on) because it is
+#: the one that interacts with the *bootstrap* prior -- SEARCH_SPEC §5.1a.
+#:
+#: ⚠ ``PASS_BIS`` and ``PASS_SURVEYOR`` are deliberately absent.  Bis calls
+#: ``sheet.write(..., is_bis=True)``: it fills a box and takes a scoring
+#: penalty.  The surveyor fence partitions a street into estates and can destroy
+#: an ``EstatePlan``'s required sizes.  Both are genuine decisions.
+_DOMINATED_PASS: dict[Phase, int] = {
+    Phase.ACTION_PARK: from_primitive(codec.A_PASS_PARK),
+    Phase.ACTION_POOL: from_primitive(codec.A_PASS_POOL),
+    Phase.ACTION_ESTATE: from_primitive(codec.A_PASS_ESTATE),
+    Phase.ROUNDABOUT_PLACE: from_primitive(codec.A_PASS_ROUNDABOUT),
+}
+
+
+def search_legal_macros(
+    state: GameState, prune_roundabout_pass: bool = True
+) -> list[int]:
+    """:func:`legal_macros` minus the dominated passes -- **for the search only**.
+
+    ⚠ **This is a search mask, not a rules change, and it must never move into**
+    :func:`legal_macros`.  ``datagen.replay`` builds its training legal mask from
+    :func:`legal_mask`, and the reference policy takes these actions anyway:
+    measured over 75 GreedyBot games at 2/3/4 seats, ``PASS_ESTATE`` was taken 78
+    times of 1435 offers-with-an-alternative and ``PASS_ROUNDABOUT`` 1775 times
+    of 2028.  Pruning inside ``legal_macros`` would make 1,853 recorded labels
+    illegal under their own mask and break replay.  ``GameState.legal_actions()``,
+    the 684 indices and everything ``datagen`` touches stay untouched.
+
+    A pass is dropped only when an alternative exists.  The pass is a single
+    index, so ``len(macros) > 1`` *is* that condition -- and measured, it is
+    load-bearing for exactly one phase.  ``ACTION_ESTATE`` is entered with
+    ``estate_rows()`` empty, because nothing settles that phase away the way
+    ``_settle()`` handles park and pool; ``ROUNDABOUT_PLACE`` is not, because it
+    offers ``available_locations(None)``, which is the same ``has_free_box()``
+    that put the roundabout on offer.
+
+    ⚠ ``prune_roundabout_pass`` is on, and is a switch only because pruning it
+    interacts badly with a **bootstrap** prior -- ``SEARCH_SPEC.md`` §5.1a, which
+    is worth reading before trusting an early checkpoint's roundabout count.
+    Once the pass is gone, ``ROUNDABOUT_OPEN`` means "build one, for -3 or -8
+    points", and a policy cloned from GreedyBot arrives putting ~30% on it.
+    That 30% is an artifact, not a preference: opening the prompt does not touch
+    the sheet, so GreedyBot's one-ply evaluation scores it **identically** to
+    doing nothing and it lands in the tied-best set 100% of the time (strictly
+    best 4%), to be picked by a coin flip over ~3.5 tied actions.  The problem
+    is therefore in the bootstrap data, not in this function.
+    """
+    macros = legal_macros(state)
+    if not prune_roundabout_pass and state.phase is Phase.ROUNDABOUT_PLACE:
+        return macros
+    pruned = _DOMINATED_PASS.get(state.phase)
+    if pruned is None or len(macros) < 2:
+        return macros
+    return [m for m in macros if m != pruned]
+
+
+def search_legal_mask(
+    state: GameState, prune_roundabout_pass: bool = True
+) -> np.ndarray:
+    """:func:`legal_mask`'s counterpart over :func:`search_legal_macros`."""
+    mask = np.zeros(NUM_MACRO_ACTIONS, dtype=bool)
+    idx = search_legal_macros(state, prune_roundabout_pass)
     if idx:
         mask[np.asarray(idx, dtype=np.int64)] = True
     return mask

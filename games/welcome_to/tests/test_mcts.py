@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from games.welcome_to import action_codec as codec
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
 from games.welcome_to import network as nw
@@ -329,3 +330,252 @@ def test_root_noise_moves_the_priors_and_leaves_them_a_distribution():
     _, _, b = noisy.search(state, rng=random.Random(1))
     assert not np.allclose(a.prior, b.prior)
     assert b.prior.sum() == pytest.approx(1.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Forced nodes are collapsed inside simulations -- SEARCH_SPEC §12 step 2
+# ──────────────────────────────────────────────────────────────────────────
+def _forced_park_state(seed: int = 5) -> tuple[GameState, int]:
+    """A real ``ACTION_PARK`` position, where the pass is now dominated.
+
+    Walked to rather than constructed: ``_park_streets()`` reads
+    ``ctx.last_house`` -- the street the number just went into -- so a state with
+    the phase set by hand has no available street at all and ``_settle`` would
+    have skipped it.
+    """
+    bots = [GreedyBot(random.Random(seed * 10 + i)) for i in range(2)]
+    state = GameState.new(seed=seed, config=GameConfig(players=2, advanced=True))
+    while not state.is_terminal:
+        if state.phase is Phase.ACTION_PARK:
+            assert len(state.legal_actions()) > 1
+            assert len(mc.search_legal_macros(state)) == 1, "park should be forced"
+            return state, state.actor
+        state.apply(bots[state.actor].act(state))
+    raise AssertionError("no ACTION_PARK state on this line")
+
+
+def test_a_collapsed_forced_action_is_applied_not_skipped():
+    """Skipping the *node* is not skipping the *move*.
+
+    The park node disappears because its pass is dominated, but the park is
+    still built -- ``parks[x] += 1`` -- and the phase still advances.
+    """
+    search, _ = _search(simulations=1)
+    state, root = _forced_park_state()
+    before = list(state.sheets[root].parks)
+    turn = state.turn
+
+    search._collapse_forced(state, root, random.Random(0), turn, ("sentinel",))
+    assert state.sheets[root].parks != before, "the forced park was never built"
+    assert state.phase is not Phase.ACTION_PARK
+
+
+def test_collapsing_is_a_no_op_once_the_turn_has_advanced():
+    """The guard that keeps the chance key honest.
+
+    Two forced steps that each crossed a boundary would put *two* reveals behind
+    a child keyed on the second alone.  ``_collapse_forced`` refuses to run at
+    all when the turn it was given is not the turn it is looking at.
+    """
+    search, _ = _search(simulations=1)
+    state, root = _forced_park_state()
+    before = (state.phase, list(state.sheets[root].parks))
+
+    observation = search._collapse_forced(
+        state, root, random.Random(0), state.turn - 1, ("sentinel",)
+    )
+    assert (state.phase, list(state.sheets[root].parks)) == before
+    assert observation == ("sentinel",)
+
+
+def test_no_node_in_the_tree_is_a_one_action_node():
+    """PUCT over a one-element array is a network call that bought nothing."""
+    torch.manual_seed(0)
+    search, _ = _search(simulations=192)
+    state = _position(players=2, turn=10)
+    _, _, root = search.search(state, root=0, rng=random.Random(4))
+
+    widths = []
+
+    def walk(node):
+        widths.append(len(node.actions))
+        for child in node.children.values():
+            walk(child)
+
+    walk(root)
+    assert len(widths) > 1, "the tree never grew past the root"
+    assert min(widths) > 1, f"a forced node was stored ({widths.count(1)} of them)"
+
+
+def test_the_network_is_never_asked_about_a_forced_decision():
+    evaluated: list[int] = []
+
+    class Spy(mcts.NetEvaluator):
+        def evaluate(self, state, viewer):
+            evaluated.append(len(mc.search_legal_macros(state)))
+            return super().evaluate(state, viewer)
+
+    config = mcts.SearchConfig(simulations=192)
+    evaluator = Spy(nw.WelcomeToNet(_SMALL), torch.device("cpu"), config)
+    state = _position(players=2, turn=10)
+    mcts.MCTS(evaluator, config).search(state, root=0, rng=random.Random(4))
+
+    assert evaluated, "no leaf was evaluated"
+    assert min(evaluated) > 1, "a forced state was evaluated"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Deterministic within-turn re-rooting -- SEARCH_SPEC §12 step 3
+# ──────────────────────────────────────────────────────────────────────────
+def _drive(search, seats=2, seed=9, seat=0, max_steps=20000):
+    """Play one game with ``search`` in ``seat``, recording every reuse decision.
+
+    Returns ``[(turn, phase, reused), ...]`` over that seat's real decisions.
+    """
+    state = GameState.new(seed=seed, config=GameConfig(players=seats, advanced=True))
+    bots = {p: GreedyBot(random.Random(seed * 100 + p)) for p in range(seats)}
+    rng = random.Random(seed * 7919 + seat)
+    search.reset()
+    events = []
+    for _ in range(max_steps):
+        if state.is_terminal:
+            break
+        if state.actor != seat:
+            state.apply(bots[state.actor].act(state))
+            continue
+        before = search.reroots
+        decision = len(mc.search_legal_macros(state)) > 1
+        choice = search.play(state, root=seat, rng=rng)
+        if decision:
+            events.append((state.turn, state.phase, search.reroots > before))
+        mc.apply_macro(state, choice)
+    return events
+
+
+def test_a_retained_subtree_keeps_its_statistics_and_its_budget():
+    """The exactness claim, at the level the brief allows: the retained node is
+    the same object with the same numbers, and the second search tops it up to
+    ``simulations`` rather than paying for the shared work twice."""
+    torch.manual_seed(0)
+    search, _ = _search(simulations=64)
+    state = _position(players=2, turn=8, root=0)
+    rng = random.Random(11)
+
+    choice = search.play(state, root=0, rng=rng)
+    retained = search._retained
+    assert retained is not None, "nothing was retained inside a turn"
+    kept_visits = retained.node.visits.copy()
+    kept_total = retained.node.total.copy()
+    assert kept_visits.sum() > 0, "an unvisited child was retained"
+
+    mc.apply_macro(state, choice)
+    while len(mc.search_legal_macros(state)) == 1:  # the forced moves the tree skipped
+        mc.apply_macro(state, mc.search_legal_macros(state)[0])
+    assert state.actor == 0 and not state.is_terminal
+
+    node = search._take_retained(state, 0)
+    assert node is not None, "the successor was not recognised"
+    assert np.array_equal(node.visits, kept_visits)
+    assert np.array_equal(node.total, kept_total)
+
+    _, visits, node = search.search(state, root=0, rng=rng, node=node)
+    assert visits.sum() == 64, "the retained visits were not counted against budget"
+
+
+def test_a_position_that_is_not_the_predicted_successor_is_not_re_rooted():
+    """The guard is a full position identity, not a plausibility check -- so a
+    change to a seat the search does not even look at still refuses the reuse."""
+    torch.manual_seed(0)
+    search, _ = _search(simulations=32)
+    state = _position(players=2, turn=8, root=0)
+    choice = search.play(state, root=0, rng=random.Random(11))
+    assert search._retained is not None
+
+    tampered = state.copy()
+    mc.apply_macro(tampered, choice)
+    while len(mc.search_legal_macros(tampered)) == 1:
+        mc.apply_macro(tampered, mc.search_legal_macros(tampered)[0])
+    tampered.sheets[1].parks[0] += 1
+    assert search._take_retained(tampered, 0) is None, "the key missed a real change"
+
+
+def test_the_tree_is_discarded_across_a_turn_boundary():
+    """Re-rooting is exact only within a turn.  Across one a reveal intervenes and
+    the child's statistics were gathered under determinizations that no longer
+    apply -- so every first decision of a turn must search from scratch."""
+    torch.manual_seed(0)
+    search, _ = _search(simulations=24)
+    events = _drive(search, seats=2, seed=9)
+    assert len(events) > 20, "not enough decisions to say anything"
+
+    crossings = reuses = 0
+    for (turn, _, _), (next_turn, _, reused) in zip(events, events[1:]):
+        if next_turn != turn:
+            crossings += 1
+            assert not reused, f"a subtree survived the boundary into turn {next_turn}"
+        elif reused:
+            reuses += 1
+    assert crossings > 5, "the game never crossed a turn boundary"
+    assert reuses > 0, "re-rooting never fired at all"
+
+
+def test_re_rooting_never_noises_the_same_node_twice():
+    torch.manual_seed(0)
+    search, _ = _search(simulations=32, dirichlet_alpha=1.0)
+    state = _position(players=2, turn=8, root=0)
+    rng = random.Random(3)
+    search.play(state, root=0, rng=rng)
+    retained = search._retained
+    assert retained is not None
+    assert not retained.node.noised, "a child was noised before it became a root"
+
+    search._apply_root_noise(retained.node, rng)
+    once = retained.node.prior.copy()
+    search._apply_root_noise(retained.node, rng)
+    assert np.array_equal(retained.node.prior, once), "noise was applied twice"
+
+
+def test_re_rooting_saves_simulations(capsys):
+    """Measured, and the number is recorded in ``SEARCH_SPEC.md`` §4.
+
+    The net is seeded because the fraction preserved depends on how concentrated
+    the priors are, and an unseeded random net moves it by a factor of two.
+    """
+    torch.manual_seed(0)
+    search, _ = _search(simulations=24)
+    _drive(search, seats=2, seed=9)
+    total = search.simulations_run + search.simulations_reused
+    assert total > 0
+    saved = search.simulations_reused / total
+    assert saved > 0.0, "re-rooting preserved nothing"
+    with capsys.disabled():
+        print(
+            f"\n    re-rooting: {search.reroots} re-roots, "
+            f"{search.simulations_reused} of {total} simulations preserved "
+            f"({saved:.1%})"
+        )
+
+
+def test_the_roundabout_pass_flag_reaches_every_part_of_the_search():
+    """``SearchConfig.prune_roundabout_pass`` is on (SEARCH_SPEC §5.1a), and
+    whichever way it is set it must reach *all* of the search at once.
+
+    ``_collapse_forced``, ``play`` and ``_within_turn_successor`` have to agree
+    on which decisions are forced; if one of them read a different setting, a
+    retained subtree would sit one move away from the position it is compared
+    against and re-rooting would silently stop working.  So they all go through
+    ``MCTS._search_actions``, and this is the test that says so.
+    """
+    assert mcts.SearchConfig().prune_roundabout_pass is True
+
+    bots = [GreedyBot(random.Random(i)) for i in range(2)]
+    state = GameState.new(seed=3, config=GameConfig(players=2, advanced=True))
+    while not state.is_terminal and state.phase is not Phase.ROUNDABOUT_PLACE:
+        state.apply(bots[state.actor].act(state))
+    assert not state.is_terminal, "no ROUNDABOUT_PLACE state on this line"
+
+    pass_macro = mc.from_primitive(codec.A_PASS_ROUNDABOUT)
+    keeping, _ = _search(simulations=4, prune_roundabout_pass=False)
+    pruning, _ = _search(simulations=4)
+    assert pass_macro in keeping._search_actions(state)
+    assert pass_macro not in pruning._search_actions(state)
