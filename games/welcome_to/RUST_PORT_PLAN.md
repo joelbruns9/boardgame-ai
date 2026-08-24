@@ -669,6 +669,55 @@ fingerprints**. Batch width is reported only to explain the call reduction; the
 gate is games/hour and rows/s. Full Welcome To suite: **531 passed, 1 skipped**;
 Rust: **24 passed**.
 
+#### Cloud extension — fixed workers and one deterministic broker
+
+`RustCloudScheduler` is now the S2 production path. `PlaySession` makes the M5
+descent resumable at both evaluator seams (root/leaf value requests and sampled
+opponent policy requests), including a partially resolved root-to-root
+transition. A persistent pool of `--scheduler-workers` OS threads advances many
+sessions cooperatively; worker count and inflight-game count are independent.
+
+All workers rendezvous at a deterministic barrier. The coordinator waits for
+every active worker, sorts rows by stable game input, chunks only at
+`max_batch`, calls the single Python evaluator, and routes responses by request
+id. There is no timeout flush, arrival-order batch geometry, virtual loss, or
+second outstanding request from one search. Consequently two workers can feed
+a six-row batch (and eight workers can manage hundreds of inflight games)
+without changing scalar MCTS semantics. The pool persists across `play` calls,
+as do the per-game search slots and their within-turn retained subtrees.
+
+The exactness gate compares blocking M6 with the resumable path at 1/2/4
+workers: chosen action, action order, visits, totals, and final RNG state are
+identical. Reordered evaluator responses, evaluator failure/slot recovery,
+worker persistence, and retained-subtree rerooting are separately gated.
+Current verification: **551 passed, 1 skipped** in the Python suite and **24
+passed** in Rust.
+
+`WelcomeToNet.forward_inference` evaluates only the three search outputs
+(policy, rank, score) while retaining the exact checkpoint parameterization.
+CUDA evaluation reuses four page-locked host staging tensors and enqueues
+nonblocking H2D copies; FP32, head math, and value blending are unchanged.
+
+Both halves expose cumulative stage profiles. Rust reports worker search,
+encoding, coordinator wait, packing, Python evaluator, response decode, wall
+time, wave count, calls, requests, and the batch-width histogram. Python reports
+payload parsing, tensor/H2D preparation, network submission, and CPU
+postprocess/synchronization. CUDA launches are asynchronous, so launch time is
+reported separately and the unavoidable output synchronization is charged to
+postprocess rather than hidden in a misleading "forward" timer.
+
+Cloud calibration is a CUDA-only geometry matrix, not a CPU proxy:
+
+```bash
+python -m games.welcome_to.s2_throughput --checkpoint MODEL.pt \
+  --games 2048 --inflight 128,256,512 --scheduler-workers 4,8,16 \
+  --simulations 200 --out runs/welcome_to_s2/cloud_geometry.json
+```
+
+Use substantially more games than inflight slots so every arm reaches steady
+state; choose by games/hour and stage counters, with discrete trajectory
+agreement retained as the class-A gate.
+
 ---
 
 ## 5. Traps that transfer verbatim

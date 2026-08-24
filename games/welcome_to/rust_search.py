@@ -10,6 +10,7 @@ single-request M5 seam remains as a diagnostic control.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Optional, Sequence
 
 import numpy as np
@@ -69,6 +70,16 @@ class PackedNetEvaluator:
         self.rows = 0
         self.batch_widths: dict[int, int] = {}
         self._external_request_id = 0
+        # Reused page-locked staging keeps cloud H2D transfer asynchronous and
+        # avoids allocating four host tensors at every inference wave.
+        self._pinned_inputs: list[Optional[torch.Tensor]] = [None] * 4
+        self._device_inputs: list[Optional[torch.Tensor]] = [None] * 4
+        self._stage_ns = {
+            "parse": 0,
+            "tensor_transfer": 0,
+            "network_submit": 0,
+            "postprocess_sync": 0,
+        }
 
     @staticmethod
     def _arrays(buffers: Sequence[bytes]) -> tuple[np.ndarray, ...]:
@@ -112,14 +123,62 @@ class PackedNetEvaluator:
         return tuple(arrays)
 
     def _network_batch(self, arrays: Sequence[np.ndarray]) -> dict[str, torch.Tensor]:
-        tensors = [
-            torch.from_numpy(np.array(array, copy=True)).to(self.device)
-            for array in arrays
-        ]
+        started = time.perf_counter_ns()
+        if self.device.type == "cuda":
+            tensors = []
+            for index, array in enumerate(arrays):
+                host = self._pinned_inputs[index]
+                if host is None or tuple(host.shape) != array.shape:
+                    host = torch.empty(
+                        array.shape, dtype=torch.float32, pin_memory=True
+                    )
+                    self._pinned_inputs[index] = host
+                    self._device_inputs[index] = torch.empty(
+                        array.shape, dtype=torch.float32, device=self.device
+                    )
+                np.copyto(host.numpy(), array)
+                device_input = self._device_inputs[index]
+                assert device_input is not None
+                device_input.copy_(host, non_blocking=True)
+                tensors.append(device_input)
+        else:
+            tensors = [
+                torch.from_numpy(np.array(array, copy=True)).to(self.device)
+                for array in arrays
+            ]
+        self._stage_ns["tensor_transfer"] += time.perf_counter_ns() - started
         self.net.eval()
-        return self.net(*tensors)
+        started = time.perf_counter_ns()
+        with torch.inference_mode():
+            out = self.net.forward_inference(*tensors)
+        self._stage_ns["network_submit"] += time.perf_counter_ns() - started
+        return out
 
-    @torch.no_grad()
+    def profile(self) -> dict[str, object]:
+        """Cumulative Python/GPU-boundary stages without adding CUDA syncs.
+
+        CUDA launches are asynchronous, so ``network_submit_ms`` is launch time;
+        the unavoidable device synchronization is charged to
+        ``postprocess_sync_ms`` when logits/value heads return to the CPU.
+        """
+        return {
+            "calls": self.calls,
+            "rows": self.rows,
+            "parse_ms": self._stage_ns["parse"] / 1e6,
+            "tensor_transfer_ms": self._stage_ns["tensor_transfer"] / 1e6,
+            "network_submit_ms": self._stage_ns["network_submit"] / 1e6,
+            "postprocess_sync_ms": self._stage_ns["postprocess_sync"] / 1e6,
+            "batch_widths": dict(sorted(self.batch_widths.items())),
+        }
+
+    def reset_profile(self) -> None:
+        self.calls = 0
+        self.rows = 0
+        self.batch_widths.clear()
+        for name in self._stage_ns:
+            self._stage_ns[name] = 0
+
+    @torch.inference_mode()
     def evaluate_request(
         self,
         kind: int,
@@ -140,12 +199,15 @@ class PackedNetEvaluator:
                     kind, viewer, seats, request_id, tuple(legal), packed  # type: ignore[arg-type]
                 )
             )
+        started = time.perf_counter_ns()
         arrays = self._arrays(packed)
         tensors = [array[np.newaxis, ...] for array in arrays]
+        self._stage_ns["parse"] += time.perf_counter_ns() - started
         self.calls += 1
         self.rows += 1
         self.batch_widths[1] = self.batch_widths.get(1, 0) + 1
         out = self._network_batch(tensors)
+        started = time.perf_counter_ns()
         logits = out["policy_logits"][0].cpu().numpy()
         mask = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.bool_)
         mask[np.asarray(legal, dtype=np.intp)] = True
@@ -158,9 +220,10 @@ class PackedNetEvaluator:
             ranks = nw.rank_probabilities(out["rank_logits"], rank_mask)[0].cpu().numpy()
             scores = out["score"][0].cpu().numpy()
             value = mcts.blend_value(ranks, scores, seats, self.config)[0]
+        self._stage_ns["postprocess_sync"] += time.perf_counter_ns() - started
         return priors.astype("<f4", copy=False).tobytes(), value
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(self, batch: dict) -> dict:
         """Answer one mixed M0-E ``RequestBatchV2``.
 
@@ -168,6 +231,7 @@ class PackedNetEvaluator:
         as little-endian f64 so the Rust tree never quantizes its accumulator
         input; POLICY rows carry zero in that ignored column.
         """
+        parse_started = time.perf_counter_ns()
         version = int(batch.get("version", -1))
         rows = int(batch.get("rows", -1))
         if version != EVALUATOR_ABI_VERSION:
@@ -204,11 +268,13 @@ class PackedNetEvaluator:
             row_legal = legal[start:end]
             if len(np.unique(row_legal)) != len(row_legal):
                 raise ValueError(f"evaluator row {row} repeats a legal macro")
+        self._stage_ns["parse"] += time.perf_counter_ns() - parse_started
 
         self.calls += 1
         self.rows += rows
         self.batch_widths[rows] = self.batch_widths.get(rows, 0) + 1
         out = self._network_batch(arrays)
+        post_started = time.perf_counter_ns()
         logits = out["policy_logits"].cpu().numpy()
         priors = np.zeros((rows, nw.NUM_MACRO_ACTIONS), dtype=np.float32)
         for row in range(rows):
@@ -236,6 +302,8 @@ class PackedNetEvaluator:
                     int(seats[source_row]),
                     self.config,
                 )[0]
+
+        self._stage_ns["postprocess_sync"] += time.perf_counter_ns() - post_started
 
         return {
             "version": EVALUATOR_ABI_VERSION,
@@ -347,6 +415,20 @@ def native_scheduler(config: mcts.SearchConfig, capacity: int = 32):
             "games/welcome_to/welcome_to_rust"
         )
     return wr.RustScheduler(capacity=capacity, **_native_kwargs(config))
+
+
+def native_cloud_scheduler(
+    config: mcts.SearchConfig, capacity: int = 256, workers: int = 8
+):
+    """Construct the resumable fixed-worker/global-broker scheduler."""
+    if wr is None:
+        raise RuntimeError(
+            "welcome_to_rust is not installed; run maturin develop --release in "
+            "games/welcome_to/welcome_to_rust"
+        )
+    return wr.RustCloudScheduler(
+        capacity=capacity, workers=workers, **_native_kwargs(config)
+    )
 
 
 def root_noise(

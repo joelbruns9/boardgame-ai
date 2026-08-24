@@ -427,6 +427,75 @@ def test_m6_real_network_has_the_same_discrete_search_fingerprint_at_batch_four(
         assert np.array_equal(left["visits"], right["visits"])
 
 
+@pytest.mark.parametrize("workers", [1, 2, 4])
+def test_cloud_resumable_pool_is_exactly_the_blocking_search(workers):
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (71, 72, 73, 74, 75, 76)
+    ]
+    seeds = [derive_search_seed(seed, 0) for seed in (71, 72, 73, 74, 75, 76)]
+    baseline = wr.RustScheduler(capacity=6, simulations=24).play(
+        states, FixedBatchEvaluator(reverse=True), seeds, max_batch=6
+    )
+    evaluator = FixedBatchEvaluator(reverse=True)
+    cloud = wr.RustCloudScheduler(capacity=6, workers=workers, simulations=24)
+    resumed = cloud.play(states, evaluator, seeds, max_batch=6)
+    for left, right in zip(resumed, baseline):
+        assert left["choice"] == right["choice"]
+        assert left["actions"] == right["actions"]
+        assert np.array_equal(left["visits"], right["visits"])
+        assert np.array_equal(left["total"], right["total"])
+        assert left["rng_state"] == right["rng_state"]
+    # Two workers can suspend three games apiece; batch width is not capped by
+    # worker count as it was by the old one-thread-per-search design.
+    assert max(evaluator.batch_sizes) == 6
+    profile = dict(cloud.profile())
+    assert profile["workers"] == workers
+    assert profile["requests"] == sum(evaluator.batch_sizes)
+    assert profile["calls"] == len(evaluator.batch_sizes)
+    assert profile["search_ms"] > 0
+    assert profile["encode_ms"] > 0
+    assert profile["wall_ms"] > 0
+
+
+def test_cloud_evaluator_failure_returns_every_slot_to_the_pool():
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (81, 82, 83, 84)
+    ]
+
+    class Failing:
+        def forward(self, _batch):
+            raise RuntimeError("cloud broker failed at the source")
+
+    scheduler = wr.RustCloudScheduler(capacity=4, workers=2, simulations=8)
+    with pytest.raises(RuntimeError, match="cloud broker failed at the source"):
+        scheduler.play(states, Failing(), [1, 2, 3, 4])
+    scheduler.reset()
+    assert len(
+        scheduler.play(states, FixedBatchEvaluator(), [1, 2, 3, 4], max_batch=4)
+    ) == 4
+
+
+def test_cloud_workers_persist_while_search_slots_reroot():
+    state = wr.RustGameState.from_snapshot(
+        snapshot.to_snapshot(GameState.new(seed=85, rng_kind="portable"))
+    )
+    scheduler = wr.RustCloudScheduler(capacity=1, workers=1, simulations=240)
+    evaluator = FixedBatchEvaluator()
+    first = scheduler.play([state], evaluator, [derive_search_seed(85, 0)])[0]
+    state.apply_macro(first["choice"])
+    scheduler.play([state], evaluator, [derive_search_seed(85, 1)])
+    stats = scheduler.stats(0)
+    assert stats["reroots"] == 1
+    assert stats["simulations_reused"] > 0
+    assert scheduler.profile()["plays"] == 2
+
+
 def test_m6_scheduler_preserves_slots_for_within_turn_rerooting():
     state = wr.RustGameState.from_snapshot(
         snapshot.to_snapshot(GameState.new(seed=0, rng_kind="portable"))

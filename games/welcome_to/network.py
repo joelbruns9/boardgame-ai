@@ -206,19 +206,13 @@ class WelcomeToNet(nn.Module):
             [c.trunk_hidden, c.head_hidden, len(GLOBAL_HEAD_TARGETS) + training.MAX_RANKS]
         )
 
-    def forward(
+    def _features(
         self,
         sheet_planes: Tensor,
         sheet_scalars: Tensor,
         viewer_plane: Tensor,
         global_scalars: Tensor,
-    ) -> dict[str, Tensor]:
-        """Returns raw outputs; the loss applies the masks.
-
-        ``rank_logits`` comes back **unmasked** on purpose.  Masking dead
-        finishing positions is the caller's job and has to happen on the logits,
-        before any softmax -- see :func:`masked_log_softmax`.
-        """
+    ) -> tuple[Tensor, Tensor]:
         batch, seats = sheet_scalars.shape[0], sheet_scalars.shape[1]
         flat = torch.cat(
             [sheet_planes.reshape(batch, seats, -1), sheet_scalars], dim=-1
@@ -234,6 +228,52 @@ class WelcomeToNet(nn.Module):
             dim=-1,
         )
         h = self.trunk_out(self.trunk(self.trunk_in(trunk_input)))
+        return h_seat, h
+
+    def forward_inference(
+        self,
+        sheet_planes: Tensor,
+        sheet_scalars: Tensor,
+        viewer_plane: Tensor,
+        global_scalars: Tensor,
+    ) -> dict[str, Tensor]:
+        """Search-only heads: policy, rank, and score.
+
+        This keeps the checkpoint and numerical path identical to ``forward``
+        while avoiding construction of the unused auxiliary-target mapping.
+        The shared per-seat head is still evaluated because score is one of its
+        channels; splitting it would change the learned parameterization.
+        """
+        h_seat, h = self._features(
+            sheet_planes, sheet_scalars, viewer_plane, global_scalars
+        )
+        batch, seats = sheet_scalars.shape[0], sheet_scalars.shape[1]
+        context = h.unsqueeze(1).expand(batch, seats, h.shape[-1])
+        per_seat = self.per_seat_head(torch.cat([h_seat, context], dim=-1))
+        global_out = self.global_head(h)
+        return {
+            "policy_logits": self.policy_head(h),
+            "rank_logits": global_out[:, len(GLOBAL_HEAD_TARGETS) :],
+            "score": per_seat[..., PER_SEAT_HEAD_TARGETS.index("score")],
+        }
+
+    def forward(
+        self,
+        sheet_planes: Tensor,
+        sheet_scalars: Tensor,
+        viewer_plane: Tensor,
+        global_scalars: Tensor,
+    ) -> dict[str, Tensor]:
+        """Returns raw outputs; the loss applies the masks.
+
+        ``rank_logits`` comes back **unmasked** on purpose.  Masking dead
+        finishing positions is the caller's job and has to happen on the logits,
+        before any softmax -- see :func:`masked_log_softmax`.
+        """
+        h_seat, h = self._features(
+            sheet_planes, sheet_scalars, viewer_plane, global_scalars
+        )
+        batch, seats = sheet_scalars.shape[0], sheet_scalars.shape[1]
 
         context = h.unsqueeze(1).expand(batch, seats, h.shape[-1])
         per_seat = self.per_seat_head(torch.cat([h_seat, context], dim=-1))

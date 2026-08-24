@@ -25,6 +25,21 @@ pub struct EvalResponse {
     pub value: Option<f64>,
 }
 
+/// One evaluator request emitted by the resumable cloud search.  The state is
+/// owned deliberately: a fixed worker can suspend this search, advance other
+/// games, and let the global broker encode the row without borrowing the tree.
+pub struct EvalRequestEvent {
+    pub kind: RequestKind,
+    pub state: Game,
+    pub viewer: usize,
+    pub request_id: u32,
+}
+
+pub enum SearchEvent {
+    Evaluation(Box<EvalRequestEvent>),
+    Complete,
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
     pub simulations: usize,
@@ -993,6 +1008,540 @@ impl Search {
         }
         out.sort_by_key(|node| node.id);
         out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransitionMode {
+    Exact,
+    Fresh,
+}
+
+struct TransitionWork {
+    parent: usize,
+    edge: usize,
+    origin_turn: i32,
+    mode: TransitionMode,
+    opponent_steps: usize,
+}
+
+struct PendingSimulation {
+    state: Game,
+    node: usize,
+    path: Vec<(usize, usize)>,
+    transition: Option<TransitionWork>,
+}
+
+enum Waiting {
+    Root,
+    Opponent,
+    Leaf {
+        parent: usize,
+        edge: usize,
+        observation: InformationKey,
+        turn_changed: bool,
+    },
+}
+
+/// Leaf-batch-one, event-driven form of `Search::play_with_temperature`.
+///
+/// The blocking M5/M6 search remains the oracle.  This session consumes the
+/// same RNG draws and tree operations in the same order, but yields whenever a
+/// LEAF or opponent POLICY row is needed.  A small fixed worker pool can
+/// therefore manage many more sessions than it has OS threads.
+pub struct PlaySession {
+    search: Search,
+    root_state: Game,
+    root: usize,
+    rng: Rng,
+    noise: Option<Vec<f64>>,
+    temperature: f64,
+    root_node: Option<usize>,
+    remaining: usize,
+    simulation: Option<PendingSimulation>,
+    waiting: Option<Waiting>,
+    result: Option<(usize, SearchOutput)>,
+}
+
+fn validate_session_response(kind: RequestKind, response: &EvalResponse) -> EngineResult<()> {
+    if response.priors.len() != macro_codec::NUM_MACRO_ACTIONS {
+        return Err(EngineError::Invalid(format!(
+            "evaluator returned {} priors, expected {}",
+            response.priors.len(),
+            macro_codec::NUM_MACRO_ACTIONS
+        )));
+    }
+    if response.priors.iter().any(|p| !p.is_finite() || *p < 0.0) {
+        return Err(EngineError::Invalid(
+            "evaluator priors must be finite and non-negative".into(),
+        ));
+    }
+    let mass: f64 = response.priors.iter().map(|&p| f64::from(p)).sum();
+    if !mass.is_finite() || mass <= 0.0 {
+        return Err(EngineError::Invalid(
+            "evaluator priors need positive finite mass".into(),
+        ));
+    }
+    if kind == RequestKind::Leaf && response.value.is_none() {
+        return Err(EngineError::Invalid(
+            "LEAF response omitted its value".into(),
+        ));
+    }
+    if response.value.is_some_and(|value| !value.is_finite()) {
+        return Err(EngineError::Invalid(
+            "evaluator value must be finite".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl PlaySession {
+    pub fn new(
+        search: Search,
+        state: Game,
+        root: usize,
+        seed: u64,
+        noise: Option<Vec<f64>>,
+        temperature: f64,
+    ) -> EngineResult<Self> {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(EngineError::Invalid(
+                "temperature override must be finite and non-negative".into(),
+            ));
+        }
+        if state.actor != root {
+            return Err(EngineError::Invalid("play root is not the actor".into()));
+        }
+        let legal = search.search_actions(&state)?;
+        let result = (legal.len() == 1).then(|| {
+            (
+                legal[0],
+                SearchOutput {
+                    actions: legal,
+                    visits: vec![0.0],
+                    total: vec![0.0],
+                    root_node: usize::MAX,
+                    rng_state: seed,
+                },
+            )
+        });
+        let mut session = Self {
+            root_state: state,
+            root,
+            rng: Rng::new(seed),
+            noise,
+            temperature,
+            root_node: None,
+            remaining: 0,
+            simulation: None,
+            waiting: None,
+            result,
+            search,
+        };
+        if session.result.is_none() {
+            if let Some(node) = session
+                .search
+                .take_retained(&session.root_state, session.root)?
+            {
+                session.start_root(node)?;
+            }
+        }
+        Ok(session)
+    }
+
+    pub fn into_search(self) -> Search {
+        self.search
+    }
+
+    pub fn into_parts(mut self) -> EngineResult<(Search, usize, SearchOutput)> {
+        let (choice, output) = self
+            .result
+            .take()
+            .ok_or_else(|| EngineError::Invalid("search session is not complete".into()))?;
+        Ok((self.search, choice, output))
+    }
+
+    fn request(&mut self, kind: RequestKind, state: &Game, viewer: usize) -> EvalRequestEvent {
+        let request_id = self.search.next_request_id;
+        self.search.next_request_id = self.search.next_request_id.wrapping_add(1);
+        EvalRequestEvent {
+            kind,
+            state: state.clone(),
+            viewer,
+            request_id,
+        }
+    }
+
+    fn expand_from_response(
+        &mut self,
+        state: &Game,
+        response: &EvalResponse,
+    ) -> EngineResult<usize> {
+        let actions = self.search.search_actions(state)?;
+        if actions.is_empty() {
+            return Err(EngineError::Invalid(
+                "a live search leaf has no actions".into(),
+            ));
+        }
+        let mut gathered: Vec<f32> = actions.iter().map(|&a| response.priors[a]).collect();
+        let total: f32 = gathered.iter().sum();
+        if total > 0.0 {
+            for value in &mut gathered {
+                *value /= total;
+            }
+        } else {
+            gathered.fill(1.0 / actions.len() as f32);
+        }
+        let id = self.search.arena.len();
+        self.search.arena.push(Node::new(
+            actions,
+            gathered.into_iter().map(f64::from).collect(),
+        ));
+        Ok(id)
+    }
+
+    fn start_root(&mut self, node: usize) -> EngineResult<()> {
+        let noised = self.search.apply_root_noise(node, self.noise.as_deref())?;
+        let reused = self.search.arena[node].visits.iter().sum::<f64>() as usize;
+        let mut budget = self.search.config.simulations.saturating_sub(reused);
+        if noised {
+            let fraction = self.search.config.noise_fresh_fraction.clamp(0.0, 1.0);
+            budget = budget.max((self.search.config.simulations as f64 * fraction).ceil() as usize);
+        }
+        self.search.simulations_reused += reused;
+        self.search.simulations_run += budget;
+        self.root_node = Some(node);
+        self.remaining = budget;
+        Ok(())
+    }
+
+    fn backup(&mut self, value: f64) {
+        let simulation = self.simulation.take().expect("simulation exists");
+        for (parent, index) in simulation.path {
+            self.search.arena[parent].visits[index] += 1.0;
+            self.search.arena[parent].total[index] += value;
+        }
+        self.remaining -= 1;
+    }
+
+    fn finish(&mut self) -> EngineResult<()> {
+        let node = self.root_node.expect("root started");
+        let mut output = SearchOutput {
+            actions: self.search.arena[node].actions.clone(),
+            visits: self.search.arena[node].visits.clone(),
+            total: self.search.arena[node].total.clone(),
+            root_node: node,
+            rng_state: self.rng.state(),
+        };
+        let choice_index = if self.temperature <= 0.0 {
+            output
+                .visits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| {
+                    a.1.partial_cmp(b.1)
+                        .expect("finite visits")
+                        .then_with(|| b.0.cmp(&a.0))
+                })
+                .map(|(index, _)| index)
+                .expect("non-empty root")
+        } else {
+            let weights: Vec<f64> = output
+                .visits
+                .iter()
+                .map(|visits| visits.powf(1.0 / self.temperature))
+                .collect();
+            self.rng.weighted_index(&weights)
+        };
+        let choice = output.actions[choice_index];
+        self.search
+            .retain(&self.root_state, self.root, node, choice)?;
+        output.rng_state = self.rng.state();
+        self.result = Some((choice, output));
+        Ok(())
+    }
+
+    fn transition_complete(&mut self) -> EngineResult<Option<SearchEvent>> {
+        let work = self
+            .simulation
+            .as_mut()
+            .and_then(|simulation| simulation.transition.take())
+            .expect("transition exists");
+        let simulation = self.simulation.as_mut().expect("simulation exists");
+        let transition = Transition {
+            observation: information_key(&simulation.state, self.root)?,
+            turn_changed: simulation.state.turn != work.origin_turn,
+        };
+        match work.mode {
+            TransitionMode::Exact => {
+                if simulation.state.turn != work.origin_turn
+                    || simulation.state.is_terminal()
+                    || transition.turn_changed
+                {
+                    return Err(EngineError::Invalid(
+                        "an exact chance edge consumed randomness".into(),
+                    ));
+                }
+                let child = self.search.arena[work.parent].edges[work.edge]
+                    .outcomes
+                    .get(&transition.observation)
+                    .and_then(|outcome| outcome.child)
+                    .ok_or_else(|| {
+                        EngineError::Invalid(
+                            "an exact chance edge has no matching decision child".into(),
+                        )
+                    })?;
+                self.search.arena[work.parent].edges[work.edge].visits =
+                    self.search.arena[work.parent].edges[work.edge]
+                        .visits
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            EngineError::Invalid("chance edge visit counter overflow".into())
+                        })?;
+                simulation.node = child;
+                Ok(None)
+            }
+            TransitionMode::Fresh => {
+                let exact =
+                    simulation.state.turn == work.origin_turn && !simulation.state.is_terminal();
+                self.search.record_outcome(
+                    work.parent,
+                    work.edge,
+                    &transition.observation,
+                    &simulation.state,
+                    &mut self.rng,
+                    exact,
+                    transition.turn_changed,
+                )?;
+                if let Some(child) = self.search.arena[work.parent].edges[work.edge]
+                    .outcomes
+                    .get(&transition.observation)
+                    .and_then(|outcome| outcome.child)
+                {
+                    simulation.node = child;
+                    return Ok(None);
+                }
+                if simulation.state.is_terminal() {
+                    self.search.terminal_leaves += 1;
+                    let value = terminal_value(&simulation.state, self.root, &self.search.config);
+                    if self.search.config.chance_widening.is_some() {
+                        let outcome = self.search.arena[work.parent].edges[work.edge]
+                            .outcomes
+                            .get_mut(&transition.observation)
+                            .expect("recorded outcome");
+                        outcome.terminal_value = Some(value);
+                    }
+                    self.backup(value);
+                    return Ok(None);
+                }
+                let state = simulation.state.clone();
+                let event = self.request(RequestKind::Leaf, &state, self.root);
+                self.waiting = Some(Waiting::Leaf {
+                    parent: work.parent,
+                    edge: work.edge,
+                    observation: transition.observation,
+                    turn_changed: transition.turn_changed,
+                });
+                Ok(Some(SearchEvent::Evaluation(Box::new(event))))
+            }
+        }
+    }
+
+    fn drive_transition(&mut self) -> EngineResult<Option<SearchEvent>> {
+        loop {
+            let simulation = self.simulation.as_mut().expect("simulation exists");
+            if !simulation.state.is_terminal() && simulation.state.actor != self.root {
+                let viewer = simulation.state.actor;
+                let state = simulation.state.clone();
+                let event = self.request(RequestKind::Policy, &state, viewer);
+                self.waiting = Some(Waiting::Opponent);
+                return Ok(Some(SearchEvent::Evaluation(Box::new(event))));
+            }
+            let origin_turn = simulation
+                .transition
+                .as_ref()
+                .expect("transition exists")
+                .origin_turn;
+            if simulation.state.turn == origin_turn
+                && !simulation.state.is_terminal()
+                && simulation.state.actor == self.root
+                && macro_codec::is_macro_root(&simulation.state)
+            {
+                let forced = self.search.search_actions(&simulation.state)?;
+                if forced.len() == 1 {
+                    macro_codec::apply_macro(&mut simulation.state, forced[0])?;
+                    continue;
+                }
+            }
+            return self.transition_complete();
+        }
+    }
+
+    fn drive_simulation(&mut self) -> EngineResult<Option<SearchEvent>> {
+        loop {
+            if self
+                .simulation
+                .as_ref()
+                .expect("simulation exists")
+                .transition
+                .is_some()
+            {
+                if let Some(event) = self.drive_transition()? {
+                    return Ok(Some(event));
+                }
+                if self.simulation.is_none() {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let simulation = self.simulation.as_mut().expect("simulation exists");
+            let node = simulation.node;
+            let edge = self.search.arena[node].select(self.search.config.c_puct);
+            let action = self.search.arena[node].actions[edge];
+            simulation.path.push((node, edge));
+
+            if self.search.arena[node].edges[edge].exact {
+                let turn = simulation.state.turn;
+                macro_codec::apply_macro(&mut simulation.state, action)?;
+                simulation.transition = Some(TransitionWork {
+                    parent: node,
+                    edge,
+                    origin_turn: turn,
+                    mode: TransitionMode::Exact,
+                    opponent_steps: 0,
+                });
+                continue;
+            }
+            if self.search.edge_is_closed(node, edge) {
+                let (particle, child, terminal_value) =
+                    self.search.reuse_outcome(node, edge, &mut self.rng)?;
+                if let Some(value) = terminal_value {
+                    self.backup(value);
+                    return Ok(None);
+                }
+                simulation.state = particle.expect("live retained particle");
+                simulation.node = child.expect("live retained child");
+                continue;
+            }
+            let turn = simulation.state.turn;
+            macro_codec::apply_macro(&mut simulation.state, action)?;
+            simulation.transition = Some(TransitionWork {
+                parent: node,
+                edge,
+                origin_turn: turn,
+                mode: TransitionMode::Fresh,
+                opponent_steps: 0,
+            });
+        }
+    }
+
+    pub fn next_event(&mut self) -> EngineResult<SearchEvent> {
+        if self.waiting.is_some() {
+            return Err(EngineError::Invalid(
+                "cannot advance a search with an outstanding evaluation".into(),
+            ));
+        }
+        loop {
+            if self.result.is_some() {
+                return Ok(SearchEvent::Complete);
+            }
+            if self.root_node.is_none() {
+                let root_state = self.root_state.clone();
+                let event = self.request(RequestKind::Leaf, &root_state, self.root);
+                self.waiting = Some(Waiting::Root);
+                return Ok(SearchEvent::Evaluation(Box::new(event)));
+            }
+            if self.simulation.is_none() {
+                if self.remaining == 0 {
+                    self.finish()?;
+                    return Ok(SearchEvent::Complete);
+                }
+                self.simulation = Some(PendingSimulation {
+                    state: self.root_state.redeterminize(&mut self.rng),
+                    node: self.root_node.expect("root started"),
+                    path: Vec::new(),
+                    transition: None,
+                });
+            }
+            if let Some(event) = self.drive_simulation()? {
+                return Ok(event);
+            }
+        }
+    }
+
+    pub fn resume(&mut self, response: EvalResponse) -> EngineResult<SearchEvent> {
+        let waiting = self
+            .waiting
+            .take()
+            .ok_or_else(|| EngineError::Invalid("search has no outstanding evaluation".into()))?;
+        let kind = match waiting {
+            Waiting::Opponent => RequestKind::Policy,
+            Waiting::Root | Waiting::Leaf { .. } => RequestKind::Leaf,
+        };
+        validate_session_response(kind, &response)?;
+        match waiting {
+            Waiting::Root => {
+                let root_state = self.root_state.clone();
+                let node = self.expand_from_response(&root_state, &response)?;
+                self.start_root(node)?;
+            }
+            Waiting::Opponent => {
+                let simulation = self.simulation.as_mut().expect("simulation exists");
+                let weights: Vec<f64> = response.priors.iter().map(|&p| f64::from(p)).collect();
+                let action = self.rng.weighted_index(&weights);
+                macro_codec::apply_macro(&mut simulation.state, action)?;
+                let transition = simulation.transition.as_mut().expect("transition exists");
+                transition.opponent_steps += 1;
+                if transition.opponent_steps > 5000 {
+                    return Err(EngineError::Invalid(
+                        "opponents did not yield the turn".into(),
+                    ));
+                }
+            }
+            Waiting::Leaf {
+                parent,
+                edge,
+                observation,
+                turn_changed,
+            } => {
+                let state = self
+                    .simulation
+                    .as_ref()
+                    .expect("simulation exists")
+                    .state
+                    .clone();
+                let child = self.expand_from_response(&state, &response)?;
+                if self.search.config.chance_widening.is_some() {
+                    self.search.arena[parent].edges[edge]
+                        .outcomes
+                        .get_mut(&observation)
+                        .expect("recorded outcome")
+                        .child = Some(child);
+                } else {
+                    let action_edge = &mut self.search.arena[parent].edges[edge];
+                    let ordinal = action_edge.next_ordinal;
+                    action_edge.next_ordinal =
+                        action_edge.next_ordinal.checked_add(1).ok_or_else(|| {
+                            EngineError::Invalid("chance outcome ordinal overflow".into())
+                        })?;
+                    action_edge.outcomes.insert(
+                        observation,
+                        Outcome {
+                            count: 0,
+                            child: Some(child),
+                            terminal_value: None,
+                            particle_slot: None,
+                            turn_changed,
+                            ordinal,
+                        },
+                    );
+                }
+                let value = response.value.expect("validated leaf value");
+                self.backup(value);
+            }
+        }
+        self.next_event()
     }
 }
 

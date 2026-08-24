@@ -930,8 +930,11 @@ network size, so batching is not an optimisation to add later — it is the desi
 
 ### Required components
 
-1. ✅ **Cross-game batching.** M6 runs independent searches concurrently and
-   collects both LEAF and POLICY rows into one forward call.
+1. ✅ **Cross-game batching and fixed CPU pool.** `RustCloudScheduler` keeps
+   resumable searches for every inflight game on a persistent, independently
+   sized worker pool. One deterministic global barrier collects both LEAF and
+   POLICY rows; batch width is bounded by ready games and `max_batch`, not by
+   worker count. `--scheduler-workers` is pinned in the run manifest.
 2. **No within-search leaf batching.** The earlier requirement here was wrong.
    One search exposes one suspended request; adding more requires virtual loss
    or collision handling and changes the visit distribution that is itself the
@@ -945,9 +948,16 @@ network size, so batching is not an optimisation to add later — it is the desi
    Cache them on `(seat, sheet hash, offer hash)` and reuse across every simulation
    in the turn. Under the symmetric encoder these are computed for four seats, so
    this is the difference between symmetry costing ~18% and costing 4×.
-5. **Queue and backpressure.** A bounded leaf queue with explicit backpressure on
-   the game workers. Without it, actor threads outrun the evaluator and the queue
-   becomes the memory leak.
+5. ✅ **Backpressure.** Each resumable search has exactly one outstanding request
+   and every worker blocks at the global inference barrier. There is no
+   unbounded leaf queue: inflight search slots are the hard memory bound.
+
+The production evaluator uses `forward_inference` (policy/rank/score only),
+reused pinned CUDA staging buffers, and nonblocking H2D copies. Its stage profile
+is written beside generation metrics together with the Rust profile (search,
+encode, coordinator wait, pack, Python forward, decode, wall, waves, and batch
+histogram). These counters are the cloud calibration surface; do not infer the
+next bottleneck from mean batch width alone.
 
 ### The metric
 

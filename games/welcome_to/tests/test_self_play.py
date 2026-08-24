@@ -88,6 +88,12 @@ def test_s2_generation_replays_every_root_and_emits_visit_targets(generated):
     assert metrics["searched_roots"] == sum(len(t.searches) for t in trajectories)
     assert metrics["evaluator_calls"] < metrics["evaluator_rows"]
     assert metrics["mean_batch"] > 1.0
+    scheduler_profile = metrics["scheduler_profile"]
+    assert scheduler_profile["workers"] == 4
+    assert scheduler_profile["requests"] > 0
+    assert scheduler_profile["search_ms"] > 0
+    assert scheduler_profile["encode_ms"] > 0
+    assert metrics["evaluator_profiles"][0]["postprocess_sync_ms"] > 0
 
     for trajectory in trajectories:
         assert trajectory.opponents[0] == "learner"

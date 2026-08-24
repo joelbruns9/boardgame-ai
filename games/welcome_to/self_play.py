@@ -161,6 +161,7 @@ class SelfPlayConfig:
     games: int = 64
     inflight: int = 256
     max_batch: int = 256
+    scheduler_workers: int = 8
     seed: int = 0
     opening_temperature_turns: int = 10
     opening_temperature: float = 1.0
@@ -168,8 +169,15 @@ class SelfPlayConfig:
     max_decisions: int = 2_000
 
     def __post_init__(self) -> None:
-        if self.games <= 0 or self.inflight <= 0 or self.max_batch <= 0:
-            raise ValueError("games, inflight, and max_batch must be positive")
+        if (
+            self.games <= 0
+            or self.inflight <= 0
+            or self.max_batch <= 0
+            or self.scheduler_workers <= 0
+        ):
+            raise ValueError(
+                "games, inflight, max_batch, and scheduler_workers must be positive"
+            )
         if self.opening_temperature_turns < 0 or self.max_decisions <= 0:
             raise ValueError("temperature turns must be non-negative and max_decisions positive")
         for name, value in (
@@ -753,7 +761,11 @@ def generate(
 
     target_games = len(jobs)
     width = min(config.inflight, target_games)
-    scheduler = rust_search.native_scheduler(search_config, capacity=width)
+    scheduler = rust_search.native_cloud_scheduler(
+        search_config,
+        capacity=width,
+        workers=min(config.scheduler_workers, width),
+    )
     next_job = 0
     live: list[Optional[_LiveGame]] = [None] * width
     for slot in range(width):
@@ -890,6 +902,10 @@ def generate(
         for width_at_call, count in sorted(batch_widths.items())
     }
     metrics["generation_seconds"] = seconds
+    metrics["scheduler_profile"] = dict(scheduler.profile())
+    metrics["evaluator_profiles"] = [
+        evaluator.profile() for evaluator in unique_evaluators.values()
+    ]
     return trajectories, metrics
 
 
@@ -904,6 +920,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--games", type=int, default=SelfPlayConfig().games)
     parser.add_argument("--inflight", type=int, default=SelfPlayConfig().inflight)
     parser.add_argument("--max-batch", type=int, default=SelfPlayConfig().max_batch)
+    parser.add_argument(
+        "--scheduler-workers", type=int, default=SelfPlayConfig().scheduler_workers
+    )
     parser.add_argument("--simulations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--opening-temperature-turns", type=int, default=10)
@@ -918,6 +937,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         games=args.games,
         inflight=args.inflight,
         max_batch=args.max_batch,
+        scheduler_workers=args.scheduler_workers,
         seed=args.seed,
         opening_temperature_turns=args.opening_temperature_turns,
         opening_temperature=args.opening_temperature,

@@ -31,7 +31,7 @@ use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 use game::{Config, EngineError, Game};
 use rng::Rng;
 use search::{EvalResponse, RequestKind, Search, SearchConfig as NativeSearchConfig, SearchOutput};
-use scheduler::RustScheduler;
+use scheduler::{RustCloudScheduler, RustScheduler};
 
 fn to_py(err: EngineError) -> PyErr {
     match err {
@@ -869,6 +869,7 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RustGameState>()?;
     module.add_class::<RustMcts>()?;
     module.add_class::<RustScheduler>()?;
+    module.add_class::<RustCloudScheduler>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;

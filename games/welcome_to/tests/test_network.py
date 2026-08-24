@@ -71,6 +71,22 @@ def test_forward_shapes():
         assert out[name].shape == (n,)
 
 
+def test_inference_fast_path_is_numerically_the_training_path_subset():
+    batch = _batch(limit=8)
+    net = nw.WelcomeToNet(_SMALL).eval()
+    with torch.inference_mode():
+        full = _forward(net, batch)
+        fast = net.forward_inference(
+            batch["sheet_planes"],
+            batch["sheet_scalars"],
+            batch["viewer_plane"],
+            batch["global_scalars"],
+        )
+    assert set(fast) == {"policy_logits", "rank_logits", "score"}
+    for name in fast:
+        assert torch.equal(fast[name], full[name])
+
+
 def test_the_default_network_is_near_the_four_million_budget():
     count = nw.parameter_count(nw.WelcomeToNet())
     assert 3e6 < count < 5e6, count

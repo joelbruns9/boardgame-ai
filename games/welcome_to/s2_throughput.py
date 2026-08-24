@@ -1,4 +1,4 @@
-"""CUDA-only production-geometry sweep for S2 in-flight game count."""
+"""CUDA-only production-geometry sweep for S2 inflight games and Rust workers."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ def sweep(
     checkpoint: str | Path,
     *,
     inflight: Sequence[int] = (8, 16, 32),
+    scheduler_workers: Sequence[int] = (8,),
     games: int = 32,
     simulations: int = 200,
     seed: int = 15_000,
@@ -27,15 +28,21 @@ def sweep(
         raise ValueError("the S2 in-flight sweep is intentionally CUDA-only")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
-    if games <= 0 or simulations <= 0 or not inflight:
-        raise ValueError("games, simulations, and in-flight arms must be positive")
+    if games <= 0 or simulations <= 0 or not inflight or not scheduler_workers:
+        raise ValueError(
+            "games, simulations, in-flight arms, and worker arms must be positive"
+        )
     if any(width <= 0 or width > games for width in inflight):
         raise ValueError("each in-flight arm must be in [1, games]")
+    if any(workers <= 0 for workers in scheduler_workers):
+        raise ValueError("each scheduler-worker arm must be positive")
 
     net = train.load(checkpoint, device).eval()
     reference: Optional[dict[int, str]] = None
     results: list[dict] = []
-    for width in inflight:
+    for workers, width in (
+        (workers, width) for workers in scheduler_workers for width in inflight
+    ):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         trajectories, metrics = self_play.generate(
@@ -44,6 +51,7 @@ def sweep(
                 games=games,
                 inflight=width,
                 max_batch=width,
+                scheduler_workers=workers,
                 seed=seed,
             ),
             search_config=self_play.default_search_config(simulations),
@@ -67,6 +75,7 @@ def sweep(
         row = {
             "inflight": float(width),
             "max_batch": float(width),
+            "scheduler_workers": float(workers),
             "simulations": float(simulations),
             "trajectory_agreement": agreement,
             "trajectory_mismatches": mismatches,
@@ -76,7 +85,8 @@ def sweep(
         }
         results.append(row)
         print(
-            f"inflight={width:>2}  {metrics['games_per_hour']:.1f} games/h  "
+            f"workers={workers:>2} inflight={width:>3}  "
+            f"{metrics['games_per_hour']:.1f} games/h  "
             f"{metrics['evaluator_rows_per_second']:.1f} rows/s  "
             f"batch={metrics['mean_batch']:.2f} "
             f"p90={metrics['batch_p90']:.0f}  "
@@ -91,6 +101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--inflight", default="8,16,32")
+    parser.add_argument("--scheduler-workers", default="8")
     parser.add_argument("--games", type=int, default=32)
     parser.add_argument("--simulations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=15_000)
@@ -98,9 +109,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     widths = tuple(int(value) for value in args.inflight.split(",") if value)
+    worker_counts = tuple(
+        int(value) for value in args.scheduler_workers.split(",") if value
+    )
     results = sweep(
         args.checkpoint,
         inflight=widths,
+        scheduler_workers=worker_counts,
         games=args.games,
         simulations=args.simulations,
         seed=args.seed,
