@@ -1,9 +1,10 @@
-"""M5 Python boundary for the Rust-owned Welcome To search.
+"""Packed Python boundary for the Rust-owned Welcome To search and M6 scheduler.
 
 The native search owns states, observation keys, the tree and all accumulated
 statistics.  This module is deliberately small: it turns M3's four packed
 little-endian buffers into one Torch row and returns the frozen M0-E response.
-M6 will batch these same requests; it must not reinterpret them.
+M6 concatenates those rows into the frozen V2 batch-major representation; the
+single-request M5 seam remains as a diagnostic control.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ class PackedNetEvaluator:
         self.requests: list[RequestRecord] = []
         self.calls = 0
         self.rows = 0
-        self.batch_widths: dict[int, int] = {1: 0}
+        self.batch_widths: dict[int, int] = {}
 
     @staticmethod
     def _arrays(buffers: Sequence[bytes]) -> tuple[np.ndarray, ...]:
@@ -83,6 +84,39 @@ class PackedNetEvaluator:
             for raw, shape in zip(buffers, shapes)
         )
         return arrays
+
+    @staticmethod
+    def _batch_arrays(batch: dict, rows: int) -> tuple[np.ndarray, ...]:
+        shapes = (
+            enc.SHEET_PLANES_SHAPE,
+            (enc.MAX_SEATS, enc.NUM_SHEET_SCALAR),
+            enc.VIEWER_PLANE_SHAPE,
+            (enc.NUM_GLOBAL_SCALAR,),
+        )
+        names = (
+            "sheet_planes",
+            "sheet_scalars",
+            "viewer_plane",
+            "global_scalars",
+        )
+        arrays = []
+        for name, shape in zip(names, shapes):
+            raw = bytes(batch[name])
+            expected = rows * int(np.prod(shape)) * np.dtype("<f4").itemsize
+            if len(raw) != expected:
+                raise ValueError(
+                    f"{name} has {len(raw)} bytes, expected {expected} for {rows} rows"
+                )
+            arrays.append(np.frombuffer(raw, dtype="<f4").reshape((rows, *shape)))
+        return tuple(arrays)
+
+    def _network_batch(self, arrays: Sequence[np.ndarray]) -> dict[str, torch.Tensor]:
+        tensors = [
+            torch.from_numpy(np.array(array, copy=True)).to(self.device)
+            for array in arrays
+        ]
+        self.net.eval()
+        return self.net(*tensors)
 
     @torch.no_grad()
     def evaluate_request(
@@ -106,15 +140,11 @@ class PackedNetEvaluator:
                 )
             )
         arrays = self._arrays(packed)
-        tensors = [
-            torch.from_numpy(np.array(array, copy=True)).unsqueeze(0).to(self.device)
-            for array in arrays
-        ]
-        self.net.eval()
+        tensors = [array[np.newaxis, ...] for array in arrays]
         self.calls += 1
         self.rows += 1
-        self.batch_widths[1] += 1
-        out = self.net(*tensors)
+        self.batch_widths[1] = self.batch_widths.get(1, 0) + 1
+        out = self._network_batch(tensors)
         logits = out["policy_logits"][0].cpu().numpy()
         mask = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.bool_)
         mask[np.asarray(legal, dtype=np.intp)] = True
@@ -129,15 +159,94 @@ class PackedNetEvaluator:
             value = mcts.blend_value(ranks, scores, seats, self.config)[0]
         return priors.astype("<f4", copy=False).tobytes(), value
 
+    @torch.no_grad()
+    def forward(self, batch: dict) -> dict:
+        """Answer one mixed M0-E ``RequestBatchV2``.
 
-def native_search(config: mcts.SearchConfig):
-    """Construct the M5 engine, refusing every option it cannot honor."""
-    if wr is None:
-        raise RuntimeError(
-            "welcome_to_rust is not installed; run maturin develop --release in "
-            "games/welcome_to/welcome_to_rust"
-        )
-    return wr.RustMcts(
+        LEAF and POLICY rows deliberately share this call. Values are emitted
+        as little-endian f64 so the Rust tree never quantizes its accumulator
+        input; POLICY rows carry zero in that ignored column.
+        """
+        version = int(batch.get("version", -1))
+        rows = int(batch.get("rows", -1))
+        if version != EVALUATOR_ABI_VERSION:
+            raise ValueError(
+                f"evaluator request ABI {version}, expected {EVALUATOR_ABI_VERSION}"
+            )
+        if rows <= 0:
+            raise ValueError(f"evaluator batch rows must be positive, got {rows}")
+        arrays = self._batch_arrays(batch, rows)
+
+        kind = np.frombuffer(bytes(batch["kind"]), dtype=np.uint8)
+        seats = np.frombuffer(bytes(batch["seats"]), dtype=np.uint8)
+        request_ids = np.frombuffer(bytes(batch["request_id"]), dtype="<u4")
+        offsets = np.frombuffer(bytes(batch["legal_offsets"]), dtype="<u4")
+        legal = np.frombuffer(bytes(batch["legal_indices"]), dtype="<u2")
+        if len(kind) != rows or len(seats) != rows or len(request_ids) != rows:
+            raise ValueError("kind, seats, and request_id must have one entry per row")
+        if len(offsets) != rows + 1 or int(offsets[0]) != 0:
+            raise ValueError("legal_offsets must be CSR offsets with rows + 1 entries")
+        if np.any(offsets[1:] < offsets[:-1]) or int(offsets[-1]) != len(legal):
+            raise ValueError("legal_offsets are not monotone or do not cover legal_indices")
+        if np.any(kind > POLICY):
+            raise ValueError("evaluator batch contains an unknown request kind")
+        if np.any((seats < 2) | (seats > enc.MAX_SEATS)):
+            raise ValueError("evaluator batch contains a seat count outside 2-4")
+        if len(np.unique(request_ids)) != rows:
+            raise ValueError("outstanding evaluator request_id values must be unique")
+        if len(legal) and int(legal.max()) >= nw.NUM_MACRO_ACTIONS:
+            raise ValueError("legal_indices contains an out-of-range macro")
+        for row in range(rows):
+            start, end = int(offsets[row]), int(offsets[row + 1])
+            if start == end:
+                raise ValueError(f"evaluator row {row} has no legal macros")
+            row_legal = legal[start:end]
+            if len(np.unique(row_legal)) != len(row_legal):
+                raise ValueError(f"evaluator row {row} repeats a legal macro")
+
+        self.calls += 1
+        self.rows += rows
+        self.batch_widths[rows] = self.batch_widths.get(rows, 0) + 1
+        out = self._network_batch(arrays)
+        logits = out["policy_logits"].cpu().numpy()
+        priors = np.zeros((rows, nw.NUM_MACRO_ACTIONS), dtype=np.float32)
+        for row in range(rows):
+            start, end = int(offsets[row]), int(offsets[row + 1])
+            mask = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.bool_)
+            mask[legal[start:end].astype(np.intp, copy=False)] = True
+            priors[row] = mcts._masked_softmax(logits[row], mask)
+
+        values = np.zeros(rows, dtype="<f8")
+        leaf_rows = np.flatnonzero(kind == LEAF)
+        if len(leaf_rows):
+            rank_mask = torch.zeros(
+                (len(leaf_rows), training.MAX_RANKS), device=self.device
+            )
+            for local_row, source_row in enumerate(leaf_rows):
+                rank_mask[local_row, : int(seats[source_row])] = 1.0
+            ranks = nw.rank_probabilities(
+                out["rank_logits"][leaf_rows.tolist()], rank_mask
+            ).cpu().numpy()
+            scores = out["score"][leaf_rows.tolist()].cpu().numpy()
+            for local_row, source_row in enumerate(leaf_rows):
+                values[source_row] = mcts.blend_value(
+                    ranks[local_row],
+                    scores[local_row],
+                    int(seats[source_row]),
+                    self.config,
+                )[0]
+
+        return {
+            "version": EVALUATOR_ABI_VERSION,
+            "rows": rows,
+            "request_id": request_ids.astype("<u4", copy=False).tobytes(),
+            "priors": priors.astype("<f4", copy=False).tobytes(),
+            "values": values.tobytes(),
+        }
+
+
+def _native_kwargs(config: mcts.SearchConfig) -> dict:
+    return dict(
         simulations=config.simulations,
         c_puct=config.c_puct,
         alpha=config.alpha,
@@ -155,6 +264,26 @@ def native_search(config: mcts.SearchConfig):
             or config.dirichlet_concentration is not None
         ),
     )
+
+
+def native_search(config: mcts.SearchConfig):
+    """Construct the blocking M5 diagnostic engine."""
+    if wr is None:
+        raise RuntimeError(
+            "welcome_to_rust is not installed; run maturin develop --release in "
+            "games/welcome_to/welcome_to_rust"
+        )
+    return wr.RustMcts(**_native_kwargs(config))
+
+
+def native_scheduler(config: mcts.SearchConfig, capacity: int = 32):
+    """Construct M6's persistent cross-game coalescing scheduler."""
+    if wr is None:
+        raise RuntimeError(
+            "welcome_to_rust is not installed; run maturin develop --release in "
+            "games/welcome_to/welcome_to_rust"
+        )
+    return wr.RustScheduler(capacity=capacity, **_native_kwargs(config))
 
 
 def root_noise(

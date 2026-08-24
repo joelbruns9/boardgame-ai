@@ -8,12 +8,12 @@ name = "welcome_to_rust"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# M1-M5 need pyo3 and nothing else, per RUST_PORT_PLAN.md §6. rayon, mimalloc
+# M1-M6 need pyo3 and nothing else, per RUST_PORT_PLAN.md §6. rayon, mimalloc
 # and sha2 arrive if and when profiling asks for them, each recorded against
 # the measurement that justified it.
 #
 # Pinned at 0.28.x deliberately: 0.28 renamed `Python::with_gil` -> `attach` and
-# `allow_threads` -> `detach`, which M6's scheduler depends on.
+# `allow_threads` -> `detach`, which M6's scheduler uses at every wave barrier.
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 
 [profile.release]

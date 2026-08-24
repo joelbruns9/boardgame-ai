@@ -608,9 +608,11 @@ transitions and never nodes; the backed-up scalar never negated. A rewrite is
 exactly where clause 3 is lost, because `encode_state`'s viewer becomes an
 argument somebody defaults.
 
-### M6 — the global cooperative scheduler
+### M6 — the global cooperative scheduler ✅ BUILT, GATE GREEN 2026-08-24
 
-`--search-backend {python,rust}`, defaulting to `python`.
+The eventual self-play CLI gets `--search-backend {python,rust}`, defaulting to
+`python`. There is no self-play CLI yet; M6 exposes `native_scheduler(...)`
+without inventing S2's trajectory/pool loop early.
 
 **What M6 is:** many independent searches and games in flight, **one global
 coalescer**, mixed `LEAF`/`POLICY` rows in a single call, no per-search callback,
@@ -636,6 +638,36 @@ leaf.
 **Gate:** whole suite green under both backends; `arena.paired` identical on
 shared seeds by discrete fingerprint; throughput A/B on the real path in
 **leaves/s and games/hour**, not batch width.
+
+**Built.** `RustScheduler` owns fixed persistent search slots. Each independent
+search runs on a Rust worker and may have exactly one outstanding request; the
+coordinator releases the GIL at the wave barrier, sorts ready rows by stable
+input order (never thread arrival order), packs the four batch-major encoder
+buffers plus CSR legal indices, and calls `PackedNetEvaluator.forward` once per
+chunk. LEAF and POLICY rows share the call. Responses are routed by globally
+unique `u32` request id and may return in any order. A Python exception or bad
+id wakes every worker, restores every search to its slot, and re-raises the
+original error. There is no virtual loss and no within-search batch.
+
+The fixed slots are the replenishment seam: a driver resets the seats belonging
+to a completed game and immediately assigns that capacity to the next seed.
+`rust_scheduler_bench.py` exercises that path over complete games. The missing
+production selector is intentionally attached to S2's future loop rather than
+to a benchmark-only command. The existing M5 Python/Rust exact trajectory gate
+remains the backend oracle; M6 adds batch-width-1 versus batch-width-4 discrete
+search fingerprints and full-game blocking-versus-scheduled fingerprints.
+
+**Measured, production-sized network, CPU, 8 two-seat games × 16 simulations:**
+
+| | games/hour | rows/s | Python calls | mean batch |
+|---|---:|---:|---:|---:|
+| M5 blocking | 2,529 | 920 | 10,478 | 1.0 |
+| M6 scheduler | **6,336** | **2,305** | **2,443** | 4.3 |
+
+That is **2.51×** on the real complete-game path with **8/8 identical discrete
+fingerprints**. Batch width is reported only to explain the call reduction; the
+gate is games/hour and rows/s. Full Welcome To suite: **531 passed, 1 skipped**;
+Rust: **24 passed**.
 
 ---
 
@@ -735,10 +767,10 @@ backend and viewers rotated across all four seats:
 | 1,193 rows/s | 60,558 rows/s | **50.8×** |
 
 This is still a microbenchmark: M3 is not wired into search.  The Rust number is
-deliberately conservative for the eventual scheduler because it includes four
-fresh byte-buffer allocations and four Python/NumPy views per row.  M6 will use
-the already-frozen batch-major layout and reusable buffers; no benefit from that
-unbuilt path is claimed here.
+deliberately conservative for the then-future scheduler because it includes four
+fresh byte-buffer allocations and four Python/NumPy views per row. M6 now uses
+the frozen batch-major layout and retained packing buffers; that later benefit
+is measured separately in §7.5 and is not retroactively claimed here.
 
 ### 7.3 M4, measured — `rust_key_bench.py`, 2026-08-23
 
@@ -781,8 +813,26 @@ M6 coalescing requests across games. The exact real-network trajectory gate is
 the correctness measurement at this milestone; leaves/s and games/hour on the
 real generation path remain M6's definition-of-done numbers.
 
-**Re-measure the profile after M3.** §1's shares were taken with an interpreted
-engine; once the encoder is compiled the remaining Python is a different mixture.
+### 7.5 M6, measured — `rust_scheduler_bench.py`, 2026-08-24
+
+Laptop CPU, production-sized network, 8 complete two-seat games at 16
+simulations per searched decision. The scheduled arm keeps eight games in
+flight and replenishes completed slots; the control is the same Rust engine and
+search calling the same network one row at a time.
+
+| | games/hour | rows/s | Python calls | mean batch |
+|---|---:|---:|---:|---:|
+| M5 blocking | 2,529 | 920 | 10,478 | 1.0 |
+| M6 scheduler | **6,336** | **2,305** | **2,443** | 4.3 |
+
+**2.51×**, with all **8/8 discrete full-game fingerprints identical**. This is
+the real-path number M5 deferred, not the M5 synthetic-evaluator microbenchmark.
+It does not claim GPU geometry; rerun on the training device before choosing the
+production in-flight count and `max_batch`.
+
+**Profile consequence.** §1's shares were taken with an interpreted engine;
+after M6 the remaining Python is a different mixture and must be re-profiled
+before sizing another throughput lever.
 7WD's experience: **1.99× on a microbenchmark became 1.89× on the real path, and
 +48% for a concurrency step became +21%** — earlier fixes removed the fixed cost
 the later lever had been hiding.
@@ -855,7 +905,8 @@ designed to prevent.
 3. ✅ **M2**, ✅ **M3** and ✅ **M4** (built 2026-08-23).
 4. ✅ **M5**, both progressive widening and the explicit no-widening control,
    under §8.1's three design constraints — built 2026-08-24.
-5. M6 last — concurrency on top of an incorrect engine measures nothing.
+5. ✅ **M6** last — built 2026-08-24; 2.51× complete-game throughput with 8/8
+   discrete fingerprints identical (§7.5).
 6. **After S1**, when a checkpoint exists that search actually improves: tune
    `C`, `max_particles`, and §7.8's `noise_fresh_fraction` under equal wall
    clock. Keep `None` as a diagnostic control, not as the normal search.

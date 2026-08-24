@@ -68,6 +68,57 @@ class FixedEvaluator:
         )
 
 
+class FixedBatchEvaluator:
+    """Shape-invariant implementation of the frozen M0-E V2 batch ABI."""
+
+    def __init__(self, *, reverse: bool = False) -> None:
+        self.reverse = reverse
+        self.batch_sizes: list[int] = []
+        self.ids: list[int] = []
+        self.kind_batches: list[tuple[int, ...]] = []
+        self.payloads: list[dict[str, bytes]] = []
+
+    def forward(self, batch):
+        assert batch["version"] == 2
+        rows = batch["rows"]
+        ids = np.frombuffer(batch["request_id"], dtype="<u4").copy()
+        kinds = np.frombuffer(batch["kind"], dtype=np.uint8).copy()
+        seats = np.frombuffer(batch["seats"], dtype=np.uint8)
+        offsets = np.frombuffer(batch["legal_offsets"], dtype="<u4")
+        legal = np.frombuffer(batch["legal_indices"], dtype="<u2")
+        assert len(ids) == len(kinds) == len(seats) == rows
+        assert len(offsets) == rows + 1 and offsets[0] == 0
+        assert offsets[-1] == len(legal)
+        self.batch_sizes.append(rows)
+        self.ids.extend(ids.tolist())
+        self.kind_batches.append(tuple(kinds.tolist()))
+        self.payloads.append(
+            {
+                name: bytes(batch[name])
+                for name in (
+                    "sheet_planes",
+                    "sheet_scalars",
+                    "viewer_plane",
+                    "global_scalars",
+                )
+            }
+        )
+
+        priors = np.zeros((rows, mc.NUM_MACRO_ACTIONS), dtype="<f4")
+        for row in range(rows):
+            actions = legal[offsets[row] : offsets[row + 1]].astype(np.intp)
+            priors[row, actions] = np.float32(1.0 / len(actions))
+        values = np.where(kinds == 0, 0.25, 0.0).astype("<f8")
+        order = np.arange(rows - 1, -1, -1) if self.reverse else np.arange(rows)
+        return {
+            "version": 2,
+            "rows": rows,
+            "request_id": ids[order].astype("<u4", copy=False).tobytes(),
+            "priors": priors[order].astype("<f4", copy=False).tobytes(),
+            "values": values[order].astype("<f8", copy=False).tobytes(),
+        }
+
+
 def _pair(state: GameState, simulations: int = 16, seed: int = 31, **kwargs):
     config = mcts.SearchConfig(simulations=simulations, **kwargs)
     python_eval = FixedEvaluator()
@@ -304,3 +355,142 @@ def test_python_generated_root_noise_preserves_the_fixed_tape():
     assert np.array_equal(result["total"], node.total)
     assert py_eval.requests == rust_eval.requests
     assert native.debug_tree(result["root_node"])[0]["noised"] is True
+
+
+def test_m6_scheduler_coalesces_searches_and_routes_reordered_rows():
+    python_states = [GameState.new(seed=seed, rng_kind="portable") for seed in (11, 12, 13, 14)]
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(state)
+        )
+        for state in python_states
+    ]
+    seeds = [derive_search_seed(seed, 0) for seed in (11, 12, 13, 14)]
+    evaluator = FixedBatchEvaluator(reverse=True)
+    scheduler = wr.RustScheduler(capacity=4, simulations=16)
+    waved = scheduler.search(states, evaluator, seeds, max_batch=4)
+
+    independent = []
+    for state, seed in zip(states, seeds):
+        independent.append(wr.RustMcts(simulations=16).search(state, FixedEvaluator(), seed))
+    for left, right in zip(waved, independent):
+        assert left["actions"] == right["actions"]
+        assert np.array_equal(left["visits"], right["visits"])
+        assert np.array_equal(left["total"], right["total"])
+    assert max(evaluator.batch_sizes) == 4
+    assert len(evaluator.ids) == len(set(evaluator.ids))
+    assert set(kind for batch in evaluator.kind_batches for kind in batch) == {0, 1}
+    first = evaluator.payloads[0]
+    encoded = [enc.encode_state(state, state.actor) for state in python_states]
+    for name, column in zip(
+        ("sheet_planes", "sheet_scalars", "viewer_plane", "global_scalars"),
+        zip(*encoded),
+    ):
+        expected = b"".join(
+            array.astype("<f4", copy=False).tobytes() for array in column
+        )
+        assert first[name] == expected
+
+
+def test_m6_real_network_has_the_same_discrete_search_fingerprint_at_batch_four():
+    torch.manual_seed(29)
+    net = nw.WelcomeToNet(
+        nw.NetConfig(
+            sheet_hidden=32,
+            sheet_out=16,
+            trunk_hidden=48,
+            trunk_blocks=1,
+            head_hidden=32,
+        )
+    ).eval()
+    config = mcts.SearchConfig(simulations=12)
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (31, 32, 33, 34)
+    ]
+    seeds = [derive_search_seed(seed, 0) for seed in (31, 32, 33, 34)]
+    scalar = rust_search.native_scheduler(config, capacity=4).search(
+        states,
+        rust_search.PackedNetEvaluator(net, torch.device("cpu"), config),
+        seeds,
+        max_batch=1,
+    )
+    evaluator = rust_search.PackedNetEvaluator(net, torch.device("cpu"), config)
+    waved = rust_search.native_scheduler(config, capacity=4).search(
+        states, evaluator, seeds, max_batch=4
+    )
+    assert evaluator.calls < evaluator.rows
+    for left, right in zip(waved, scalar):
+        assert left["actions"] == right["actions"]
+        assert np.array_equal(left["visits"], right["visits"])
+
+
+def test_m6_scheduler_preserves_slots_for_within_turn_rerooting():
+    state = wr.RustGameState.from_snapshot(
+        snapshot.to_snapshot(GameState.new(seed=0, rng_kind="portable"))
+    )
+    scheduler = wr.RustScheduler(capacity=1, simulations=240)
+    evaluator = FixedBatchEvaluator()
+    first = scheduler.play([state], evaluator, [derive_search_seed(0, 0)])[0]
+    state.apply_macro(first["choice"])
+    scheduler.play([state], evaluator, [derive_search_seed(0, 1)])
+    stats = scheduler.stats(0)
+    assert stats["reroots"] == 1
+    assert stats["simulations_reused"] > 0
+
+
+def test_m6_evaluator_failure_wakes_every_search_and_preserves_the_python_error():
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (41, 42, 43)
+    ]
+
+    class Failing:
+        def forward(self, _batch):
+            raise RuntimeError("M6 batch failed at the source")
+
+    scheduler = wr.RustScheduler(capacity=3, simulations=8)
+    with pytest.raises(RuntimeError, match="M6 batch failed at the source"):
+        scheduler.search(states, Failing(), [1, 2, 3])
+    # The worker-owned searches were returned to their slots even on failure.
+    scheduler.reset()
+    assert len(scheduler.search(states, FixedBatchEvaluator(), [1, 2, 3])) == 3
+
+
+def test_m6_rejects_a_misaligned_response_before_routing_any_row():
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (44, 45)
+    ]
+
+    class DuplicateId(FixedBatchEvaluator):
+        def forward(self, batch):
+            response = super().forward(batch)
+            ids = np.frombuffer(response["request_id"], dtype="<u4").copy()
+            ids[1] = ids[0]
+            response["request_id"] = ids.tobytes()
+            return response
+
+    scheduler = wr.RustScheduler(capacity=2, simulations=4)
+    with pytest.raises(ValueError, match="duplicate request_id"):
+        scheduler.search(states, DuplicateId(), [1, 2])
+    scheduler.reset()
+
+
+def test_m6_scheduler_rejects_duplicate_slots_before_starting_workers():
+    states = [
+        wr.RustGameState.from_snapshot(
+            snapshot.to_snapshot(GameState.new(seed=seed, rng_kind="portable"))
+        )
+        for seed in (51, 52)
+    ]
+    with pytest.raises(ValueError, match="slots must be unique"):
+        wr.RustScheduler(capacity=2, simulations=2).search(
+            states, FixedBatchEvaluator(), [1, 2], slots=[0, 0]
+        )

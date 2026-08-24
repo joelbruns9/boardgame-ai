@@ -312,6 +312,11 @@ impl Search {
                 "LEAF response omitted its value".into(),
             ));
         }
+        if response.value.is_some_and(|value| !value.is_finite()) {
+            return Err(EngineError::Invalid(
+                "evaluator value must be finite".into(),
+            ));
+        }
         Ok(response)
     }
 

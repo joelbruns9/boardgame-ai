@@ -1,4 +1,4 @@
-//! PyO3 bindings for the Rust-owned Welcome To engine and M5 search.
+//! PyO3 bindings for the Rust-owned Welcome To engine and M5/M6 search.
 //!
 //! Path B, as Kingdomino settled it (RUST_PORT_PLAN.md §3): Rust owns the game
 //! state and search; Python keeps Torch, the replay buffer and training. M6 adds
@@ -18,6 +18,7 @@ mod information_key;
 mod macro_codec;
 mod plans;
 mod rng;
+mod scheduler;
 mod search;
 mod sheet;
 mod snapshot;
@@ -30,6 +31,7 @@ use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 use game::{Config, EngineError, Game};
 use rng::Rng;
 use search::{EvalResponse, RequestKind, Search, SearchConfig as NativeSearchConfig, SearchOutput};
+use scheduler::RustScheduler;
 
 fn to_py(err: EngineError) -> PyErr {
     match err {
@@ -866,6 +868,7 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     check_python_compatibility(module.py())?;
     module.add_class::<RustGameState>()?;
     module.add_class::<RustMcts>()?;
+    module.add_class::<RustScheduler>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;
