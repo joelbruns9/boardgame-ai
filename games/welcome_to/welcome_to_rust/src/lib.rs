@@ -11,6 +11,7 @@
 mod codec;
 mod constants;
 mod game;
+mod macro_codec;
 mod plans;
 mod rng;
 mod sheet;
@@ -337,6 +338,39 @@ impl RustGameState {
         self.inner.end_of_game_reason()
     }
 
+    // ── the macro vocabulary (M2) ─────────────────────────────────────
+    /// Every macro index whose **whole primitive sequence** is legal here, in
+    /// `macro_codec.py`'s order.
+    fn legal_macros(&self) -> PyResult<Vec<usize>> {
+        macro_codec::legal_macros(&self.inner).map_err(to_py)
+    }
+
+    /// `legal_macros` minus the provably dominated passes — the search's action
+    /// set, and **not** a rules change (SEARCH_SPEC.md §5.1).
+    #[pyo3(signature = (prune_roundabout_pass=true))]
+    fn search_legal_macros(&self, prune_roundabout_pass: bool) -> PyResult<Vec<usize>> {
+        macro_codec::search_legal_macros(&self.inner, prune_roundabout_pass).map_err(to_py)
+    }
+
+    /// Whether the macro layer decides here — everything except `WRITE_NUMBER`,
+    /// which it swallows.
+    #[getter]
+    fn is_macro_root(&self) -> bool {
+        macro_codec::is_macro_root(&self.inner)
+    }
+
+    /// Apply a macro's whole primitive sequence in place.
+    fn apply_macro(&mut self, index: usize) -> PyResult<()> {
+        macro_codec::apply_macro(&mut self.inner, index).map_err(to_py)
+    }
+
+    /// Apply a macro's whole primitive sequence to a copy.
+    fn step_macro(&self, index: usize) -> PyResult<RustGameState> {
+        Ok(RustGameState {
+            inner: macro_codec::step_macro(&self.inner, index).map_err(to_py)?,
+        })
+    }
+
     // ── the M0-C snapshot ─────────────────────────────────────────────
     /// The whole state, in the shape `snapshot.to_snapshot` produces.
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -364,6 +398,40 @@ impl RustGameState {
             self.inner.deck_remaining()
         )
     }
+}
+
+/// The primitive sequence a macro index stands for.
+#[pyfunction]
+fn macro_primitives(index: usize) -> PyResult<Vec<usize>> {
+    macro_codec::primitives_for(index).map_err(to_py)
+}
+
+/// `(slot, temp delta, box)` -> macro index, and its inverse.
+#[pyfunction]
+fn macro_write(slot: usize, delta_slot: usize, x: usize, y: usize) -> usize {
+    macro_codec::macro_write(slot, delta_slot, x, y)
+}
+
+#[pyfunction]
+fn decode_macro_write(index: usize) -> (usize, usize, usize, usize) {
+    macro_codec::decode_macro_write(index)
+}
+
+#[pyfunction]
+fn macro_refuse(slot: usize) -> usize {
+    macro_codec::macro_refuse(slot)
+}
+
+/// The macro index of a primitive the macro layer does not subsume, or `None`
+/// for one it does — a bare `WRITE` has no macro meaning without its slot.
+#[pyfunction]
+fn macro_from_primitive(action: usize) -> Option<usize> {
+    macro_codec::from_primitive(action)
+}
+
+#[pyfunction]
+fn macro_to_primitive(index: usize) -> Option<usize> {
+    macro_codec::to_primitive(index)
 }
 
 /// M0-D: the static-table signature. Compare against
@@ -403,6 +471,14 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_shuffle, module)?)?;
+    module.add_function(wrap_pyfunction!(macro_primitives, module)?)?;
+    module.add_function(wrap_pyfunction!(macro_write, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_macro_write, module)?)?;
+    module.add_function(wrap_pyfunction!(macro_refuse, module)?)?;
+    module.add_function(wrap_pyfunction!(macro_from_primitive, module)?)?;
+    module.add_function(wrap_pyfunction!(macro_to_primitive, module)?)?;
     module.add("NUM_ACTIONS", codec::NUM_ACTIONS)?;
+    module.add("NUM_MACRO_ACTIONS", macro_codec::NUM_MACRO_ACTIONS)?;
+    module.add("PRIMITIVE_ACTIONS", macro_codec::primitive_actions().clone())?;
     Ok(())
 }

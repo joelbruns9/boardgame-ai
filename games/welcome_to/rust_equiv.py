@@ -1,9 +1,11 @@
-"""The M1 lockstep equivalence harness — ``RUST_PORT_PLAN.md`` M1.
+"""The lockstep equivalence harness — ``RUST_PORT_PLAN.md`` M1 and M2.
 
 Drives the Python and Rust engines through the *same* game, action for action,
-and compares the complete M0-C snapshot after every action.  The gate is 8,000
-games at 2/3/4 seats with the advanced variant on and off; the pytest module
-runs a small sample of it, and
+and compares the complete M0-C snapshot after every action, the macro
+vocabulary at every macro root (M2), and the read API, the boundary triple and
+``redeterminize`` once per turn.  The gate is 8,000 games at 2/3/4 seats with
+the advanced variant on and off; the pytest module runs a small sample of it,
+and
 
     python -m games.welcome_to.rust_equiv --games 8000
 
@@ -33,6 +35,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional, Sequence
 
 from games.welcome_to import action_codec as codec
+from games.welcome_to import macro_codec as mc
 from games.welcome_to import snapshot as sn
 from games.welcome_to.bots import GreedyBot
 from games.welcome_to.game import GameConfig, GameState
@@ -67,6 +70,17 @@ GATE_CONFIGS: tuple[GameConfig, ...] = tuple(
 #: the same index.  Nothing about it can hide a divergence, and everything about
 #: it changes which states get compared.
 DRIVERS: tuple[str, ...] = ("random", "no-refusal", "greedy")
+
+#: How often M2's "every macro applies identically" claim is checked: on the
+#: first macro root of every Nth turn.
+#:
+#: ⚠ **Sampled by root, never by macro.** A root offers up to ~100 macros and
+#: each comparison re-serialises two whole states in Python; at every root the
+#: 8,000-game gate would take hours.  Checking *all* the macros at fewer roots
+#: keeps the property whole — "every macro this root offers applies identically"
+#: — where checking some macros at every root would leave a hole in exactly the
+#: place a rare macro lives.
+MACRO_APPLY_EVERY: int = 3
 
 
 class Divergence(AssertionError):
@@ -173,6 +187,83 @@ def _check_accessors(py: GameState, rs, where: str) -> None:
         fail("end_of_game_reason", py.end_of_game_reason(), rs.end_of_game_reason())
 
 
+def _check_macros(py: GameState, rs, where: str, apply_all: bool) -> None:
+    """M2: the macro vocabulary, at one macro root.
+
+    Three separate claims, and the third is the expensive one:
+
+    * ``legal_macros`` agrees **in order** — the same reason raw primitive order
+      is compared, one layer up;
+    * ``search_legal_macros`` agrees at **both** settings of
+      ``prune_roundabout_pass``, because the flag exists to be switched;
+    * every macro applies end to end identically (``apply_all``).
+
+    ⚠ **The third claim is sampled by root, not thinned by macro.** A macro root
+    offers up to ~100 macros and each comparison re-serialises two whole states
+    in Python; measured, checking every root costs 5.4× the M1 gate, against
+    2.7× at :data:`MACRO_APPLY_EVERY` = 3.  Applying *all* of them at fewer
+    roots keeps the property whole ("every macro this root offers applies
+    identically"); dropping some macros at every root would leave the hole
+    exactly where a rare macro lives.
+
+    ⚠ **And sampling is safe for a reason, not just cheap.** Given M1 — the same
+    primitive applied to the same state gives the same state, over 1.5M actions
+    — a macro applying identically *follows* from its primitive sequence being
+    identical, and that sequence is compared here at every sampled root, for
+    every macro.  The snapshot comparison is the empirical backstop, kept
+    because a reduction that turns out to be wrong is exactly what a gate is
+    for.
+    """
+    if not mc.is_macro_root(py):
+        # WRITE_NUMBER is inside a macro. Both engines must refuse to decide
+        # here — a port that answered would be inventing a decision point.
+        if rs.is_macro_root:
+            raise Divergence(f"is_macro_root disagrees at {where}: python False, rust True")
+        for engine, call in (("python", lambda: mc.legal_macros(py)), ("rust", rs.legal_macros)):
+            try:
+                call()
+            except ValueError:
+                continue
+            raise Divergence(f"{engine} did not refuse legal_macros at WRITE_NUMBER ({where})")
+        return
+    if not rs.is_macro_root:
+        raise Divergence(f"is_macro_root disagrees at {where}: python True, rust False")
+
+    py_macros = mc.legal_macros(py)
+    rs_macros = rs.legal_macros()
+    if py_macros != rs_macros:
+        raise Divergence(
+            f"legal_macros diverged at {where} (phase {py.phase.name}):\n"
+            f"  python {py_macros}\n  rust   {rs_macros}\n"
+            f"  {_legal_diagnostic(py_macros, rs_macros)}"
+        )
+    for prune in (True, False):
+        left = mc.search_legal_macros(py, prune_roundabout_pass=prune)
+        right = rs.search_legal_macros(prune)
+        if left != right:
+            raise Divergence(
+                f"search_legal_macros(prune_roundabout_pass={prune}) diverged at "
+                f"{where}:\n  python {left}\n  rust   {right}"
+            )
+
+    if not apply_all:
+        return
+    for index in py_macros:
+        if list(mc.primitives_for(index)) != list(wr.macro_primitives(index)):
+            raise Divergence(
+                f"primitives_for({index}) diverged at {where}: "
+                f"{mc.primitives_for(index)} != {wr.macro_primitives(index)}"
+            )
+        py_next = mc.step_macro(py, index)
+        rs_next = rs.step_macro(index)
+        lines = sn.diff(sn.to_snapshot(py_next), rs_next.snapshot())
+        if lines:
+            raise Divergence(
+                f"macro {index} ({mc.describe(index)}) applied differently at "
+                f"{where}:\n  " + "\n  ".join(lines[:20])
+            )
+
+
 def _check_boundary_triple(py: GameState, rs, seed: int, config: GameConfig, step: int) -> None:
     """The public boundary triple, in lockstep, on copies.
 
@@ -239,6 +330,8 @@ def check_game(
     driver: str = "random",
     max_steps: int = 20000,
     check_boundaries: bool = True,
+    check_macros: bool = True,
+    macro_apply_every: int = MACRO_APPLY_EVERY,
 ) -> GameReport:
     """Play one game in lockstep.  Raises :class:`Divergence` on any mismatch."""
     if wr is None:  # pragma: no cover
@@ -259,9 +352,17 @@ def check_game(
     for step in range(1, max_steps + 1):
         if py.is_terminal:
             break
-        if check_boundaries and py.turn != checked_turn:
-            _check_accessors(py, rs, f"step {step} of seed {seed} {config}")
+        where = f"step {step} of seed {seed} {config}"
+        first_of_turn = py.turn != checked_turn
+        if check_macros:
+            # ⚠ Applying every macro is the expensive claim (see _check_macros),
+            # so it runs on the first root of every ``macro_apply_every`` turns.
+            apply_all = first_of_turn and (py.turn % macro_apply_every == 0)
+            _check_macros(py, rs, where, apply_all=apply_all)
+        if check_boundaries and first_of_turn:
+            _check_accessors(py, rs, where)
             _check_boundary_triple(py, rs, seed, config, step)
+        if first_of_turn:
             checked_turn = py.turn
         py_legal = py.legal_actions()
         rs_legal = rs.legal_actions()
@@ -306,6 +407,7 @@ def gate(
     configs: Sequence[GameConfig] = GATE_CONFIGS,
     drivers: Sequence[str] = DRIVERS,
     seed0: int = 0,
+    macro_apply_every: int = MACRO_APPLY_EVERY,
 ) -> Iterator[GameReport]:
     """``games`` games, dealt round-robin across ``configs`` and ``drivers``.
 
@@ -319,6 +421,7 @@ def gate(
             seed0 + i,
             configs[i % len(configs)],
             drivers[(i // len(configs)) % len(drivers)],
+            macro_apply_every=macro_apply_every,
         )
 
 
@@ -432,6 +535,7 @@ def check_constructed(name: str, py: GameState, expect: Expectation) -> None:
         raise Divergence(f"{name}: winners {py.winners()} != {rs.winners()}")
 
     _check_accessors(py, rs, name)
+    _check_macros(py, rs, name, apply_all=True)
     _check_boundary_triple(py, rs, seed=-1, config=py.config, step=0)
 
     # ⚠ And check the case still does what it was written to do. A constructed
@@ -468,6 +572,12 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=8000, help="games to play (gate: 8000)")
     parser.add_argument("--seed0", type=int, default=0)
     parser.add_argument("--progress", type=int, default=100, help="report every N games")
+    parser.add_argument(
+        "--macro-apply-every",
+        type=int,
+        default=MACRO_APPLY_EVERY,
+        help="apply every macro on the first root of every Nth turn (M2)",
+    )
     args = parser.parse_args()
 
     cases = check_all_constructed()
@@ -476,7 +586,9 @@ def main() -> None:
     started = time.perf_counter()
     steps = 0
     played = Counter()
-    for i, report in enumerate(gate(args.games, seed0=args.seed0), start=1):
+    for i, report in enumerate(
+        gate(args.games, seed0=args.seed0, macro_apply_every=args.macro_apply_every), start=1
+    ):
         steps += report.steps
         played[(report.config.players, report.config.advanced, report.driver)] += 1
         if args.progress and i % args.progress == 0:

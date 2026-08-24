@@ -252,6 +252,7 @@ decisions, so they landed with M1:
 | M0-B `Trajectory.rng`, defaulting to `cpython` | `datagen.py` |
 | M0-C snapshot schema, **both directions** | `snapshot.py`, `src/snapshot.rs` |
 | M0-D static-table signature | `tables.py`, `src/tables.rs` |
+| the macro vocabulary (M2) | `src/macro_codec.rs` |
 | the engine | `src/{game,sheet,plans,codec,constants}.rs` |
 | the gate | `rust_equiv.py`, `tests/test_rust_engine_equiv.py` |
 | §7 instrumentation | `rust_engine_bench.py` |
@@ -354,7 +355,17 @@ only two set expressions in `game.py` are a one-member `.pop()` and a `sorted()`
 So Rust may reproduce list order directly — and M1's gate compares ordered lists
 so that it fails loudly if that ever changes.
 
-### M2 — `macro_codec`
+### M2 — `macro_codec` ✅ BUILT, GATE GREEN 2026-08-23
+
+**Gate result: the same 8,000 games, 1,490,189 actions, zero divergences, 65
+minutes** — 18 configuration × driver cells at ~444 games each. `legal_macros`
+and both settings of `search_legal_macros` compared at **every** macro root;
+every macro applied end to end at one root in three; all 684 primitive
+sequences compared exhaustively in the test module.
+
+`src/macro_codec.rs`, exposed as `legal_macros`, `search_legal_macros`,
+`is_macro_root`, `apply_macro`, `step_macro`, and the index arithmetic as module
+functions.
 
 **Gate:** over the same corpus, at every macro root, macro index lists identical
 **in order**; every macro applies end to end identically (M0-C snapshot);
@@ -363,6 +374,26 @@ so that it fails loudly if that ever changes.
 ⚠ **Legality is enumerated, never intersected** — `legal_macros` steps into each
 playable slot and reads that child's own `legal_actions()`. Reconstructing it as
 a mask intersection admits jointly-illegal pairs.
+
+**Three notes from building it:**
+
+* **The macro layout joined the table signature, and `SIGNATURE_VERSION` is now
+  2** (`0xf584598b60c8e1f7`). The 684 indices are as much an ABI as the 357
+  primitive ones — a checkpoint's policy head is indexed by them — and the 184
+  surviving primitives are hashed **in order**, because the order *is* the
+  mapping: a reordering that kept the same set would silently relabel 184
+  logits.
+* **`collapse` is deliberately not ported.** Reading a primitive trajectory as
+  macro labels belongs to `datagen`, which §3 keeps in Python. Porting it would
+  put a second implementation behind the training corpus for no gain.
+* ⚠ **The apply claim is sampled by root, never thinned by macro.** A root
+  offers up to ~100 macros and each comparison re-serialises two whole states in
+  Python: checking every root costs **5.4×** the M1 gate against **2.7×** at one
+  root in three (`--macro-apply-every`, default 3). Checking *all* the macros at
+  fewer roots keeps the property whole; checking some macros at every root would
+  leave the hole exactly where a rare macro lives. The list comparison, which is
+  M2's actual subject, runs at **every** root and costs almost nothing (+0.19s
+  against a 0.49s baseline over six games).
 
 ### M3 — `encode_state` — the biggest win and the biggest risk
 
@@ -626,7 +657,7 @@ bets widening loses a bakeoff nobody has run.
    later. **Built 2026-08-23** alongside M1, because M1's gate cannot run
    without B, C and D.
 2. ✅ **M1**, and measure what is measurable (§7) — **built 2026-08-23**, §7.1.
-3. M2, M3, M4 in order.
+3. ✅ **M2** (built 2026-08-23), then M3, M4 in order.
 4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
    the widening question** — that decision was taken as "design for it, do not
    build it", precisely so this step does not wait on a measurement that cannot

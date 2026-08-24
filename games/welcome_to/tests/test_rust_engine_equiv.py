@@ -1,7 +1,8 @@
-"""M1: the Rust engine is equivalent to ``game.py`` — ``RUST_PORT_PLAN.md`` M1.
+"""The Rust engine and macro vocabulary are equivalent to Python's —
+``RUST_PORT_PLAN.md`` M1 and M2.
 
 ⚠ **This module is a *sample* of the gate, not the gate.** The gate is 8,000
-games and takes about half an hour; a test suite that took half an hour would
+games and takes about an hour; a test suite that took half an hour would
 stop being run. The gate is::
 
     python -m games.welcome_to.rust_equiv --games 8000
@@ -23,9 +24,11 @@ from __future__ import annotations
 
 import pytest
 
+from games.welcome_to import macro_codec as mc
 from games.welcome_to import rust_equiv as eq
 from games.welcome_to import snapshot as sn
 from games.welcome_to import tables
+from games.welcome_to.constants import box_coords
 from games.welcome_to.game import GameConfig, GameState
 from games.welcome_to.portable_rng import PortableRng
 
@@ -182,6 +185,90 @@ def test_a_cpython_snapshot_is_refused_rather_than_silently_reseeded():
     py = GameState.new(seed=3, config=config, rng_kind="cpython")
     with pytest.raises(ValueError, match="cpython"):
         wr.RustGameState.from_snapshot(sn.to_snapshot(py))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# M2 — the macro vocabulary
+# ──────────────────────────────────────────────────────────────────────────
+def test_the_macro_layout_is_the_same_684():
+    """The 684 indices are an ABI: a checkpoint's policy head is indexed by
+    them, so a shifted section puts two decisions on one logit."""
+    assert wr.NUM_MACRO_ACTIONS == mc.NUM_MACRO_ACTIONS == 684
+    assert list(wr.PRIMITIVE_ACTIONS) == list(mc.PRIMITIVE_ACTIONS)
+    assert len(wr.PRIMITIVE_ACTIONS) == 184
+
+
+def test_every_macro_index_decodes_to_the_same_primitives():
+    """All 684 of them, not a sample: this is a static table and checking it
+    whole costs milliseconds."""
+    for index in range(mc.NUM_MACRO_ACTIONS):
+        assert list(mc.primitives_for(index)) == list(wr.macro_primitives(index)), index
+
+
+def test_the_macro_index_arithmetic_agrees():
+    for slot in range(mc.NUM_MACRO_SLOTS):
+        assert mc.macro_refuse(slot) == wr.macro_refuse(slot)
+        for delta in range(mc.NUM_TEMP_DELTAS):
+            for box in range(33):
+                x, y = box_coords(box)
+                index = mc.macro_write(slot, delta, x, y)
+                assert index == wr.macro_write(slot, delta, x, y)
+                assert mc.decode_macro_write(index) == tuple(wr.decode_macro_write(index))
+
+
+def test_a_subsumed_primitive_has_no_standalone_macro_index():
+    """A bare ``WRITE`` has no macro meaning without the slot that preceded it;
+    inventing one would put two different decisions on one logit."""
+    from games.welcome_to import action_codec as codec
+
+    for subsumed in (codec.A_CHOOSE_STACK, codec.A_WRITE, codec.A_PERMIT_REFUSAL,
+                     codec.A_ROUNDABOUT_OPEN):
+        assert wr.macro_from_primitive(subsumed) is None
+        with pytest.raises(ValueError):
+            mc.from_primitive(subsumed)
+    assert wr.macro_from_primitive(codec.A_PASS_PLAN) == mc.from_primitive(codec.A_PASS_PLAN)
+
+
+@pytest.mark.parametrize("config", eq.GATE_CONFIGS, ids=lambda c: f"{c.players}p-adv{int(c.advanced)}")
+def test_the_macro_vocabulary_agrees_over_a_whole_game(config):
+    """``legal_macros`` in order at every root, ``search_legal_macros`` at both
+    settings of ``prune_roundabout_pass``, and every macro applied end to end.
+
+    ``macro_apply_every=1`` here — the sample is small enough to afford the
+    claim in full, which is what makes the gate's sampling a speed choice
+    rather than the only thing that was ever checked.
+    """
+    eq.check_game(seed=77, config=config, driver="no-refusal", macro_apply_every=1)
+
+
+def test_write_number_is_inside_a_macro_in_both_engines():
+    """The macro layer never decides at ``WRITE_NUMBER``; an engine that
+    answered there would be inventing a decision point, and a search built on it
+    would ask the network a question the vocabulary has no logit for."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = GameState.new(seed=4, config=config)
+    rs = wr.RustGameState(4, players=2, advanced=True, solo_rules=False)
+    slot = next(a for a in py.legal_actions() if a < 6)
+    py.apply(slot)
+    rs.apply(slot)
+    assert py.phase.name == "WRITE_NUMBER"
+    assert not mc.is_macro_root(py) and not rs.is_macro_root
+    with pytest.raises(ValueError):
+        mc.legal_macros(py)
+    with pytest.raises(ValueError):
+        rs.legal_macros()
+
+
+def test_the_expert_configuration_has_no_macro_representation_in_either_engine():
+    """Three choice slots is the vocabulary; expert's six ordered pairs have no
+    macro form and are refused rather than silently truncated.  Rust refuses the
+    configuration outright (M0-A), which is the same answer one step earlier."""
+    config = GameConfig(players=2, advanced=False, expert=True, solo_rules=False)
+    py = GameState.new(seed=2, config=config)
+    with pytest.raises(ValueError, match="standard mode only"):
+        mc.legal_macros(py)
+    with pytest.raises(ValueError, match="expert"):
+        wr.RustGameState(2, players=2, expert=True)
 
 
 def test_the_harness_can_actually_see_a_divergence():

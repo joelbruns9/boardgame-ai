@@ -58,10 +58,15 @@ from games.welcome_to.constants import (
     TEMP_SOLO_SCORE,
     TEMP_SOLO_THRESHOLD,
 )
+from games.welcome_to import macro_codec as mc
 from games.welcome_to.plans import PLANS
 
 #: Bump when the *stream layout* changes (not when a table's values change).
-SIGNATURE_VERSION: int = 1
+#:
+#: 2 — the macro layout joined the stream (M2). The 684 indices are as much an
+#: ABI as the 357 primitive ones: a checkpoint's policy head is indexed by them,
+#: and a shifted section would put two decisions on one logit.
+SIGNATURE_VERSION: int = 2
 
 #: Plan parameters that are strings.  Fixed codes, so the stream stays integral.
 _PARAM_CODES: dict[str, int] = {
@@ -194,6 +199,19 @@ def signature_stream() -> Iterator[int]:
     for i, j in codec.EXPERT_PAIRS:
         yield i
         yield j
+
+    # -- macro layout (M2) ------------------------------------------------
+    yield mc.NUM_MACRO_ACTIONS
+    yield mc.NUM_MACRO_SLOTS
+    yield mc.M_WRITE
+    yield mc.M_REFUSE
+    yield mc.M_DIRECT_REFUSE
+    yield mc.M_ROUNDABOUT_OPEN
+    yield mc.M_PRIMITIVE
+    # The surviving primitives *in order*: the order is the mapping, so a
+    # reordering that kept the same set would silently relabel 184 logits.
+    yield len(mc.PRIMITIVE_ACTIONS)
+    yield from mc.PRIMITIVE_ACTIONS
 
 
 def table_signature() -> int:

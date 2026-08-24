@@ -19,10 +19,15 @@ use crate::constants::{
     ROUNDABOUT_BOXES, ROUNDABOUT_SCORES, SOLO_DECK_MIDDLE, STREET_SIZES, TEMP_BOXES,
     TEMP_DELTAS, TEMP_RANK_SCORES, TEMP_SOLO_SCORE, TEMP_SOLO_THRESHOLD,
 };
+use crate::macro_codec;
 use crate::plans::{Param, PLANS};
 
 /// Bump when the *stream layout* changes (not when a table's values change).
-pub const SIGNATURE_VERSION: i64 = 1;
+///
+/// 2 — the macro layout joined the stream (M2). The 684 indices are as much an
+/// ABI as the 357 primitive ones: a checkpoint's policy head is indexed by them,
+/// and a shifted section would put two decisions on one logit.
+pub const SIGNATURE_VERSION: i64 = 2;
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -155,6 +160,19 @@ pub fn signature_stream() -> Vec<i64> {
         out.push(j as i64);
     }
 
+    // -- macro layout (M2) ------------------------------------------------
+    out.push(macro_codec::NUM_MACRO_ACTIONS as i64);
+    out.push(macro_codec::NUM_MACRO_SLOTS as i64);
+    out.push(macro_codec::M_WRITE as i64);
+    out.push(macro_codec::M_REFUSE as i64);
+    out.push(macro_codec::M_DIRECT_REFUSE as i64);
+    out.push(macro_codec::M_ROUNDABOUT_OPEN as i64);
+    out.push(macro_codec::M_PRIMITIVE as i64);
+    // The surviving primitives *in order*: the order is the mapping, so a
+    // reordering that kept the same set would silently relabel 184 logits.
+    out.push(macro_codec::primitive_actions().len() as i64);
+    out.extend(macro_codec::primitive_actions().iter().map(|&a| a as i64));
+
     out
 }
 
@@ -185,7 +203,7 @@ mod tests {
     /// Python ones, this test fails before any game is played.
     #[test]
     fn signature_matches_python() {
-        assert_eq!(signature_stream().len(), 697);
-        assert_eq!(table_signature(), 0x2145_f101_3edc_fa99);
+        assert_eq!(signature_stream().len(), 889);
+        assert_eq!(table_signature(), 0xf584_598b_60c8_e1f7);
     }
 }
