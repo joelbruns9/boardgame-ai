@@ -645,7 +645,7 @@ the standard error is `18/√n` — **4.1 at 60 games, 1.0 at 330**. This no lon
 defines a gate, but it remains a warning that every paired arena conclusion needs
 its own reported standard error and adequate sample size.
 
-### S2 — The first self-play loop *(the main stage; trajectory leg built 2026-08-24)*
+### S2 — The first self-play loop *(the main stage; trajectory + optimiser built 2026-08-24)*
 
 Learner in seat 0 with full search; the other seats drawn from an opponent pool;
 seat count sampled per game across 2/3/4 at 60/30/10 (§2).
@@ -693,10 +693,11 @@ low-interaction, which is why it stays as a diagnostic — but density is not th
 as being the objective.
 
 **Gate to leave S2:** three consecutive significant promotions against the
-incumbent under the primary/secondary contract above; and the
-`first_plan` and `turns_to_plan_*` heads come off their masks and beat
-predict-the-mean. That last one is the direct evidence that race learning is
-happening rather than being assumed.
+incumbent under the primary/secondary contract above; `turns_to_plan_*` beats
+predict-the-mean on its masked support, with the support count reported; and
+`plans_completed` improves. `first_plan` was deliberately dropped in
+`AUX_TARGETS_SPEC.md` and must not reappear here as a phantom gate. These are the
+direct evidence that race learning is happening rather than being assumed.
 
 #### S2 trajectory implementation
 
@@ -720,15 +721,29 @@ happening rather than being assumed.
 * streaming shuffle-buffer batches via `self_play.iter_batches`, and the metric
   set in §4 emitted on every generation run.
 
+`s2_train.py` is the built optimisation leg:
+
+* random AlphaZero bootstrap, S0 warm-start and S2 resume are all explicit CLI
+  paths — S0 is useful prior information, not a prerequisite;
+* validation splits on complete trajectories, never adjacent states from one
+  game;
+* evaluation scores the visit distribution with cross-entropy, KL, entropy and
+  tie-aware visit-best agreement; sampled-action top-1 is diagnostic only;
+* rank cross-entropy/KL and every auxiliary R² are reported, together with the
+  actual mask support for sparse plan-timing targets;
+* AdamW moments, model/config provenance, completed epochs and metrics are saved
+  in an atomic, resume-capable checkpoint that remains readable by the generic
+  network loader.
+
 The search's internal opponent POLICY requests still use the learner checkpoint,
 which is the existing single-model opponent proxy; the frozen pool governs the
 actual game. Routing simulated opponents through their assigned frozen networks
 would be a strength change and needs a separate bakeoff, not a silent scheduler
 change.
 
-The candidate optimiser, replay-window retention and paired promotion controller
-remain to be built on this trajectory boundary. They are deliberately not hidden
-inside generation: a trajectory is immutable evidence, while promotion changes
+Replay-window retention and the paired promotion controller remain to be built
+on this trajectory boundary. They are deliberately not hidden inside generation
+or optimisation: a trajectory is immutable evidence, while promotion changes
 which policy produces the next evidence.
 
 ### S3 — Raise the symmetric share; HOF, Elo, SPRT
