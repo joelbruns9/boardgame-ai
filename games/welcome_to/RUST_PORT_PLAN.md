@@ -150,7 +150,11 @@ game that is a different game, and it would pass every per-action gate.
 `GameState` back into Python or re-encoding in Python — which forfeits M3, the
 single largest win in the plan.
 
-**✅ Frozen before M3 (2026-08-23): version 1, little-endian packed buffers.**
+**✅ Frozen before M3 and corrected at M5: version 2, little-endian packed
+buffers.** V1 specified `values` as f32 before the boundary had a consumer.
+That would quantize Python's f64 `blend_value` before adding it to the f64 tree
+total, defeating M5's exact-oracle gate for no throughput benefit. V2 changes
+only that response column to f64; no V1 scheduler or corpus existed to migrate.
 Every multi-byte field is little-endian; all float buffers are IEEE-754 `f32`.
 Shapes are implicit in `(version, rows)` plus the encoder constants, never sent
 as Python tuples per row. The single-state M3 diagnostic method returns four
@@ -158,8 +162,8 @@ as Python tuples per row. The single-state M3 diagnostic method returns four
 representation change.
 
 ```
-RustScheduler.step() -> RequestBatchV1
-    version            u16 = 1
+RustScheduler.step() -> RequestBatchV2
+    version            u16 = 2
     rows               u32
     sheet_planes, sheet_scalars, viewer_plane, global_scalars
                        four contiguous f32 buffers, batch-major, exact encoder
@@ -170,23 +174,23 @@ RustScheduler.step() -> RequestBatchV1
     seats              u8[rows]
     request_id         u32[rows], stable and unique among outstanding requests
 
-PythonEvaluator.forward(batch) -> ResponseBatchV1
-    version            u16 = 1
+PythonEvaluator.forward(batch) -> ResponseBatchV2
+    version            u16 = 2
     rows               u32, equal to request rows
     request_id         u32[rows], echoed in response order
     priors             f32[rows, 684], masked softmax; illegal entries are 0
-    values             f32[rows], blended leaf value; ignored for POLICY rows
+    values             f64[rows], blended leaf value; ignored for POLICY rows
 
 RustScheduler.update(results)
 ```
 
-⚠ **The response is deliberately full-684 in V1.** An earlier block in this
+⚠ **The response is deliberately full-684 in V2.** An earlier block in this
 plan said "gathered legal only" while the ownership table below said full 684;
 that was an ABI contradiction. Full output is the simpler first implementation
 and preserves today's Python `_masked_softmax` and `blend_value` exactly. The
 request still carries CSR legal indices because Python needs the mask and Rust
 needs the canonical list. A gathered response can become V2 only after
-bytes-crossing-FFI is measured and with a parity gate; it is not a silent V1
+bytes-crossing-FFI is measured and with a parity gate; it is not a silent V2
 layout optimization.
 
 ⚠ **That is the structural minimum, and M0 fixes nothing beyond it.** An
@@ -203,7 +207,7 @@ move it only against a number:
 | operation | starts | move it when |
 |---|---|---|
 | legal mask / gather | Rust — it reads state Rust owns, so it has nowhere else to be | — |
-| priors: full 684 vs gathered-legal | **full 684 in ABI V1**, the simpler thing | bytes-crossing-FFI shows up in the profile. 684 × 32 rows ≈ 87 KB against ~6 KB gathered; changing it means ABI V2 |
+| priors: full 684 vs gathered-legal | **full 684 in ABI V2**, the simpler thing | bytes-crossing-FFI shows up in the profile. 684 × 32 rows ≈ 87 KB against ~6 KB gathered; changing it means ABI V3 |
 | masked softmax | Python | it is measured to matter |
 | rank masking, `blend_value` | Python — `training.rank_utility` lives there | ditto |
 | LEAF/POLICY scatter | Rust — it owns `request_id` | — |
@@ -512,7 +516,50 @@ split, private votes and actor context, table order with an unchanged histogram,
 and a discard-composition pair with equal raw count and deck composition.
 Full suite: 513 passed, 1 skipped; 23 Rust unit tests passed.
 
-### M5 — the search descent
+### M5 — the search descent ✅ BUILT, GATES GREEN 2026-08-24
+
+Rust owns the open-loop tree, transitions, M4 observation maps, f64 PUCT
+statistics and within-turn retained subtree. Python answers the version-1 packed
+M0-E evaluator request one row at a time; M6 will coalesce those same requests.
+The widening-compatible layout is present exactly as §8.1 specifies: per-edge
+observation tables carry the dormant count and particle-slot fields, while the
+particle arena allocates **zero** slots with widening off. `chance_widening` is
+rejected loudly until it is implemented.
+
+**Gate 1 result:** 256 matrix-balanced played-in positions × 3 independent M0-F
+search tapes, 12 simulations each: **9,216 simulations, 40,257 evaluator
+requests (30,407 POLICY), exact request sequence/viewers/packed encodings, visit
+counts, f64 totals, observation-tree structure and chosen action; 134 terminal
+leaves; zero particle slots.** The run took 59.5s. The corpus includes the last
+root-player decision of a game in every 2/3/4-seat × standard/advanced cell, so
+terminal handling is exercised rather than inferred from mid-game positions.
+Separate fast cases cover forced-node collapse, exact within-turn re-rooting
+with nonzero reused visits, Python-generated Dirichlet noise with the correctly
+advanced random tape, widening refusal and the dormant arena.
+
+The §8.1 hedge's measured layout price on this target is **64 bytes per outcome
+versus 24 bytes for the stripped open-loop record, plus one fixed 24-byte empty
+particle-arena vector**. At 256 distinct outcomes the 40-byte delta is 10 KiB,
+about 4.1% of M4's 249 KiB key payload before common HashMap/key overhead. The
+runtime benchmark below includes it. That is a small bounded price; it does not
+justify reopening the layout decision.
+
+**Gate 2 result:** one complete two-seat real-network trajectory at identical
+batch width one: **64 decisions, 49 searched, exact action/visit/total and
+request fingerprints after every decision, and exact M0-C state after every
+macro**, in 3.8s. This is deliberately the same batch composition; M6's wider
+batches get the tolerance/reporting rule below rather than a false bit-identity
+claim.
+
+Two parity defects were found by scaling the gate. First, caching terminal
+outcomes in the Rust open-loop arm was value-equivalent but not oracle-equivalent:
+Python stores terminal values only under widening. M5 now reserves the field but
+does not populate it. Second, `PortableRng.choices` inherited NumPy `float32`
+accumulation when passed a policy array, while Rust widened each packed prior to
+f64. On a wide uniform opponent policy one cumulative threshold straddled the
+same draw and changed the opponent's placement. Python now casts every weight to
+f64 before accumulation; a direct 331-action/256-draw cross-language regression
+and the full fixed-tape gate cover it.
 
 **Built open-loop, designed for widening — §8.1's three constraints are part of
 this milestone, not a later concern:** an observation-keyed edge table with a
@@ -693,6 +740,26 @@ observation outcome.  At 256 simulations, the compact payload is roughly
 250 KiB if every simulation creates a distinct 4-seat observation; allocator and
 map overhead are not included.  This is still a microbenchmark—end-to-end search
 is not measurable until M5/M6.
+
+### 7.4 M5, measured — `rust_search_bench.py`, 2026-08-24
+
+Laptop, 48 matrix-balanced positions × 32 simulations, blocking evaluator with
+the same uniform policy and 0.25 value on both sides. Python and Rust both pay
+for their own encoder and legal-policy construction; Torch is absent so this
+isolates the integrated search/engine/encoder path M5 actually replaced:
+
+| | Python | Rust | ratio |
+|---|---:|---:|---:|
+| simulations/s | 155.5 | 5,873.0 | **37.8×** |
+| LEAF rows/s | 160.3 | 6,056.6 | **37.8×** |
+| wall | 9.88s | 0.26s | **37.8×** |
+
+Both sides issued exactly **6,958 evaluator requests**. This is a blocking M5
+hot-path measurement, not the self-play headline: a real network at batch width
+one reintroduces fixed forward cost, while production's throughput depends on
+M6 coalescing requests across games. The exact real-network trajectory gate is
+the correctness measurement at this milestone; leaves/s and games/hour on the
+real generation path remain M6's definition-of-done numbers.
 
 **Re-measure the profile after M3.** §1's shares were taken with an interpreted
 engine; once the encoder is compiled the remaining Python is a different mixture.

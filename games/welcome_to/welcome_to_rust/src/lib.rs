@@ -1,12 +1,14 @@
-//! M1 pyo3 bindings: the Welcome To engine in Rust, behind an opaque handle.
+//! PyO3 bindings for the Rust-owned Welcome To engine and M5 search.
 //!
 //! Path B, as Kingdomino settled it (RUST_PORT_PLAN.md §3): Rust owns the game
-//! state; Python keeps the loop, the replay buffer and training. M1 is the
-//! engine alone — the search, the encoder and the scheduler arrive at M3/M5/M6.
+//! state and search; Python keeps Torch, the replay buffer and training. M6 adds
+//! cooperative scheduling without changing M5's evaluator request semantics.
 //!
 //! ⚠ **Python is the oracle.** `games/welcome_to/game.py` is validated against
 //! BGA by the differential harness; this is validated against `game.py` by
 //! `tests/test_rust_engine_equiv.py`. If they disagree, Python wins.
+
+use std::mem::size_of;
 
 mod codec;
 mod constants;
@@ -16,16 +18,18 @@ mod information_key;
 mod macro_codec;
 mod plans;
 mod rng;
+mod search;
 mod sheet;
 mod snapshot;
 mod tables;
 
 use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 
 use game::{Config, EngineError, Game};
 use rng::Rng;
+use search::{EvalResponse, RequestKind, Search, SearchConfig as NativeSearchConfig, SearchOutput};
 
 fn to_py(err: EngineError) -> PyErr {
     match err {
@@ -206,7 +210,10 @@ impl RustGameState {
     /// Returns `(draws, reformed, rng_state)`.
     fn sample_boundary_outcome(&self, rng_state: u64) -> PyResult<(Vec<i32>, bool, u64)> {
         let mut rng = Rng::new(rng_state);
-        let outcome = self.inner.sample_boundary_outcome(&mut rng).map_err(to_py)?;
+        let outcome = self
+            .inner
+            .sample_boundary_outcome(&mut rng)
+            .map_err(to_py)?;
         Ok((outcome.draws, outcome.reformed, rng.state()))
     }
 
@@ -484,6 +491,270 @@ fn snapshot_version() -> i64 {
     snapshot::SNAPSHOT_VERSION
 }
 
+/// M5's blocking search boundary. Rust owns the tree and transitions; Python
+/// receives only packed M3 encoder rows and answers one LEAF/POLICY request at
+/// a time. M6 changes the scheduler, not this search's semantics.
+#[pyclass(module = "welcome_to_rust")]
+pub struct RustMcts {
+    inner: Search,
+}
+
+fn call_evaluator(
+    py: Python<'_>,
+    evaluator: &Bound<'_, PyAny>,
+    kind: RequestKind,
+    state: &Game,
+    viewer: usize,
+    request_id: u32,
+) -> PyResult<EvalResponse> {
+    let encoded = encoder::encode_state(state, viewer).map_err(to_py)?;
+    let buffers = (
+        PyBytes::new(py, &f32_le_bytes(&encoded.sheet_planes)),
+        PyBytes::new(py, &f32_le_bytes(&encoded.sheet_scalars)),
+        PyBytes::new(py, &f32_le_bytes(&encoded.viewer_plane)),
+        PyBytes::new(py, &f32_le_bytes(&encoded.global_scalars)),
+    );
+    // The legal list is part of the ABI even though the evaluator could derive
+    // it from the logits. It makes a stale or viewer-wrong request observable.
+    let legal = macro_codec::legal_macros(state).map_err(to_py)?;
+    let result = evaluator.call_method1(
+        "evaluate_request",
+        (
+            kind as u8,
+            buffers,
+            legal.clone(),
+            viewer,
+            state.config.players,
+            request_id,
+        ),
+    )?;
+    let tuple = result.cast::<PyTuple>()?;
+    if tuple.len() != 2 {
+        return Err(PyValueError::new_err(
+            "evaluate_request must return (684 packed float32 priors, value_or_none)",
+        ));
+    }
+    let raw_item = tuple.get_item(0)?;
+    let raw = raw_item.cast::<PyBytes>()?.as_bytes();
+    let expected = macro_codec::NUM_MACRO_ACTIONS * size_of::<f32>();
+    if raw.len() != expected {
+        return Err(PyValueError::new_err(format!(
+            "evaluator returned {} prior bytes, expected {expected}",
+            raw.len()
+        )));
+    }
+    let priors: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect();
+    let mut is_legal = vec![false; macro_codec::NUM_MACRO_ACTIONS];
+    for index in legal {
+        is_legal[index] = true;
+    }
+    if priors
+        .iter()
+        .enumerate()
+        .any(|(index, &prior)| prior != 0.0 && !is_legal[index])
+    {
+        return Err(PyValueError::new_err(
+            "evaluator assigned probability to an illegal macro",
+        ));
+    }
+    let value = tuple.get_item(1)?.extract::<Option<f64>>()?;
+    Ok(EvalResponse { priors, value })
+}
+
+fn search_output<'py>(
+    py: Python<'py>,
+    output: SearchOutput,
+    choice: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("actions", output.actions)?;
+    result.set_item("visits", output.visits)?;
+    result.set_item("total", output.total)?;
+    result.set_item("root_node", output.root_node)?;
+    result.set_item("rng_state", output.rng_state)?;
+    result.set_item("choice", choice)?;
+    Ok(result)
+}
+
+#[pymethods]
+impl RustMcts {
+    #[new]
+    #[pyo3(signature = (
+        simulations=128,
+        c_puct=1.5,
+        alpha=0.5,
+        margin_gain=2.0,
+        confidence_power=1.0,
+        prune_roundabout_pass=true,
+        chance_widening=None,
+        noise_fresh_fraction=1.0,
+        dirichlet_weight=0.25,
+        temperature=0.0,
+        noise_required=false
+    ))]
+    fn new(
+        simulations: usize,
+        c_puct: f64,
+        alpha: f64,
+        margin_gain: f64,
+        confidence_power: f64,
+        prune_roundabout_pass: bool,
+        chance_widening: Option<f64>,
+        noise_fresh_fraction: f64,
+        dirichlet_weight: f64,
+        temperature: f64,
+        noise_required: bool,
+    ) -> PyResult<Self> {
+        if chance_widening.is_some() {
+            return Err(PyValueError::new_err(
+                "chance_widening is designed into the M5 tree layout but is not implemented; use the Python backend until M7",
+            ));
+        }
+        Ok(Self {
+            inner: Search::new(NativeSearchConfig {
+                simulations,
+                c_puct,
+                alpha,
+                margin_gain,
+                confidence_power,
+                prune_roundabout_pass,
+                noise_fresh_fraction,
+                dirichlet_weight,
+                temperature,
+                noise_required,
+            })
+            .map_err(to_py)?,
+        })
+    }
+
+    #[pyo3(signature = (state, evaluator, seed, root=None, noise=None))]
+    fn search<'py>(
+        &mut self,
+        py: Python<'py>,
+        state: &RustGameState,
+        evaluator: &Bound<'py, PyAny>,
+        seed: u64,
+        root: Option<usize>,
+        noise: Option<Vec<f64>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let root = root.unwrap_or(state.inner.actor);
+        let mut callback_error = None;
+        let mut adapter = |kind, position: &Game, viewer, request_id| match call_evaluator(
+            py, evaluator, kind, position, viewer, request_id,
+        ) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                callback_error = Some(err);
+                Err(EngineError::Invalid("Python evaluator failed".into()))
+            }
+        };
+        let output = self
+            .inner
+            .search(&state.inner, root, seed, &mut adapter, noise.as_deref());
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        search_output(py, output.map_err(to_py)?, None)
+    }
+
+    #[pyo3(signature = (state, evaluator, seed, root=None, noise=None))]
+    fn play<'py>(
+        &mut self,
+        py: Python<'py>,
+        state: &RustGameState,
+        evaluator: &Bound<'py, PyAny>,
+        seed: u64,
+        root: Option<usize>,
+        noise: Option<Vec<f64>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let root = root.unwrap_or(state.inner.actor);
+        let mut callback_error = None;
+        let mut adapter = |kind, position: &Game, viewer, request_id| match call_evaluator(
+            py, evaluator, kind, position, viewer, request_id,
+        ) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                callback_error = Some(err);
+                Err(EngineError::Invalid("Python evaluator failed".into()))
+            }
+        };
+        let result = self
+            .inner
+            .play(&state.inner, root, seed, &mut adapter, noise.as_deref());
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        let (choice, output) = result.map_err(to_py)?;
+        search_output(py, output, Some(choice))
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    #[getter]
+    fn simulations_run(&self) -> usize {
+        self.inner.simulations_run
+    }
+
+    #[getter]
+    fn simulations_reused(&self) -> usize {
+        self.inner.simulations_reused
+    }
+
+    #[getter]
+    fn reroots(&self) -> usize {
+        self.inner.reroots
+    }
+
+    #[getter]
+    fn terminal_leaves(&self) -> usize {
+        self.inner.terminal_leaves
+    }
+
+    #[getter]
+    fn particle_slots_allocated(&self) -> usize {
+        self.inner.particle_slots_allocated()
+    }
+
+    fn debug_tree<'py>(&self, py: Python<'py>, root_node: usize) -> PyResult<Vec<Py<PyDict>>> {
+        self.inner
+            .debug_tree(root_node)
+            .into_iter()
+            .map(|node| {
+                let raw = PyDict::new(py);
+                raw.set_item("id", node.id)?;
+                raw.set_item("actions", node.actions)?;
+                raw.set_item("prior", node.prior)?;
+                raw.set_item("visits", node.visits)?;
+                raw.set_item("total", node.total)?;
+                raw.set_item("noised", node.noised)?;
+                let outcomes: PyResult<Vec<Py<PyDict>>> = node
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| {
+                        let item = PyDict::new(py);
+                        item.set_item("action", outcome.action)?;
+                        item.set_item("ordinal", outcome.ordinal)?;
+                        item.set_item("key", PyBytes::new(py, &outcome.key))?;
+                        item.set_item("child", outcome.child)?;
+                        item.set_item("terminal_value", outcome.terminal_value)?;
+                        item.set_item("count", outcome.count)?;
+                    item.set_item("particle_slot", outcome.particle_slot)?;
+                    item.set_item("turn_changed", outcome.turn_changed)?;
+                        Ok(item.unbind())
+                    })
+                    .collect();
+                raw.set_item("outcomes", outcomes?)?;
+                Ok(raw.unbind())
+            })
+            .collect()
+    }
+}
+
 fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * size_of::<f32>());
     for value in values {
@@ -497,9 +768,7 @@ fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
 /// rule tables or hand it a snapshot with a different shape.
 fn check_python_compatibility(py: Python<'_>) -> PyResult<()> {
     let python_tables = py.import("games.welcome_to.tables")?;
-    let python_signature: u64 = python_tables
-        .call_method0("table_signature")?
-        .extract()?;
+    let python_signature: u64 = python_tables.call_method0("table_signature")?.extract()?;
     let rust_signature = tables::table_signature();
     if python_signature != rust_signature {
         return Err(PyImportError::new_err(format!(
@@ -567,14 +836,28 @@ fn portable_rng_shuffle(seed: u64, n: usize) -> (Vec<usize>, u64) {
     (seq, rng.state())
 }
 
+#[pyfunction]
+fn portable_rng_weighted_indices(seed: u64, weights: Vec<f64>, n: usize) -> Vec<usize> {
+    let mut rng = Rng::new(seed);
+    (0..n).map(|_| rng.weighted_index(&weights)).collect()
+}
+
+#[pyfunction]
+fn derive_search_seed(game_seed: u64, search_index: u64) -> u64 {
+    rng::derive_search_seed(game_seed, search_index)
+}
+
 #[pymodule]
 fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     check_python_compatibility(module.py())?;
     module.add_class::<RustGameState>()?;
+    module.add_class::<RustMcts>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_shuffle, module)?)?;
+    module.add_function(wrap_pyfunction!(portable_rng_weighted_indices, module)?)?;
+    module.add_function(wrap_pyfunction!(derive_search_seed, module)?)?;
     module.add_function(wrap_pyfunction!(macro_primitives, module)?)?;
     module.add_function(wrap_pyfunction!(macro_write, module)?)?;
     module.add_function(wrap_pyfunction!(decode_macro_write, module)?)?;
@@ -583,7 +866,10 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(macro_to_primitive, module)?)?;
     module.add("NUM_ACTIONS", codec::NUM_ACTIONS)?;
     module.add("NUM_MACRO_ACTIONS", macro_codec::NUM_MACRO_ACTIONS)?;
-    module.add("PRIMITIVE_ACTIONS", macro_codec::primitive_actions().clone())?;
+    module.add(
+        "PRIMITIVE_ACTIONS",
+        macro_codec::primitive_actions().clone(),
+    )?;
     module.add("ENCODER_ABI_VERSION", encoder::ENCODER_ABI_VERSION)?;
     module.add("SHEET_PLANES_LEN", encoder::SHEET_PLANES_LEN)?;
     module.add("SHEET_SCALARS_LEN", encoder::SHEET_SCALARS_LEN)?;
@@ -593,5 +879,7 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "INFORMATION_KEY_ABI_VERSION",
         information_key::INFORMATION_KEY_ABI_VERSION,
     )?;
+    module.add("EVALUATOR_ABI_VERSION", 2usize)?;
+    module.add("SEARCH_OUTCOME_LAYOUT_BYTES", search::outcome_layout_bytes())?;
     Ok(())
 }

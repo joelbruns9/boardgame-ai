@@ -19,7 +19,9 @@ identical stream from the same seed.
 
 from __future__ import annotations
 
-from typing import Sequence, TypeVar
+from bisect import bisect
+from itertools import accumulate
+from typing import Iterable, Optional, Sequence, TypeVar
 
 _MASK64 = (1 << 64) - 1
 _TWO53 = float(1 << 53)
@@ -108,3 +110,53 @@ class PortableRng:
         if not seq:
             raise IndexError("cannot choose from an empty sequence")
         return seq[self.next_u64() % len(seq)]
+
+    def choices(
+        self,
+        population: Sequence[T],
+        weights: Optional[Iterable[float]] = None,
+        *,
+        cum_weights: Optional[Iterable[float]] = None,
+        k: int = 1,
+    ) -> list[T]:
+        """The ``random.Random.choices`` subset search needs, bit-portably.
+
+        Only ``k=1`` is used by MCTS.  The accumulation and ``bisect`` spelling
+        intentionally mirrors CPython's implementation; Rust's
+        ``weighted_index`` consumes the same one uniform draw.
+        """
+        if k != 1:
+            raise ValueError("PortableRng.choices supports only k=1")
+        if not population:
+            raise IndexError("cannot choose from an empty population")
+        if cum_weights is None:
+            if weights is None:
+                return [self.choice(population)]
+            # Search policies arrive as numpy.float32. Letting itertools keep
+            # that scalar type accumulates in f32, while Rust necessarily
+            # widens the packed f32 response into its f64 sampler. Cast each
+            # term explicitly so wide policies cannot straddle different
+            # cumulative thresholds on the same random draw.
+            cumulative = list(accumulate(float(weight) for weight in weights))
+        else:
+            if weights is not None:
+                raise TypeError("cannot specify both weights and cum_weights")
+            cumulative = [float(weight) for weight in cum_weights]
+        if len(cumulative) != len(population):
+            raise ValueError("weights and population must be the same length")
+        total = float(cumulative[-1])
+        if total <= 0.0:
+            raise ValueError("total of weights must be greater than zero")
+        index = bisect(cumulative, self.next_float() * total, 0, len(population) - 1)
+        return [population[index]]
+
+
+# M0-F: domain separation makes a search's tape independent of scheduler shape.
+SEARCH_SEED_DOMAIN: int = 0x5745_4C43_4F4D_4553  # "WELCOMES"
+
+
+def derive_search_seed(game_seed: int, search_index: int) -> int:
+    """The portable tape for one search, independent of other live searches."""
+    if search_index < 0:
+        raise ValueError("search_index must be non-negative")
+    return (game_seed ^ SEARCH_SEED_DOMAIN ^ search_index) & _MASK64

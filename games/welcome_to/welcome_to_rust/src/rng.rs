@@ -76,6 +76,32 @@ impl Rng {
         assert!(!seq.is_empty(), "cannot choose from an empty sequence");
         seq[(self.next_u64() % seq.len() as u64) as usize]
     }
+
+    /// One index in proportion to non-negative f64 weights. Mirrors
+    /// `PortableRng.choices(..., k=1)` / CPython's right-bisect rule.
+    pub fn weighted_index(&mut self, weights: &[f64]) -> usize {
+        assert!(!weights.is_empty(), "weights cannot be empty");
+        let total: f64 = weights.iter().sum();
+        assert!(
+            total.is_finite() && total > 0.0,
+            "weights need positive finite mass"
+        );
+        let target = self.next_float() * total;
+        let mut cumulative = 0.0;
+        for (index, &weight) in weights.iter().enumerate() {
+            cumulative += weight;
+            if target < cumulative || index + 1 == weights.len() {
+                return index;
+            }
+        }
+        unreachable!()
+    }
+}
+
+pub const SEARCH_SEED_DOMAIN: u64 = 0x5745_4C43_4F4D_4553;
+
+pub fn derive_search_seed(game_seed: u64, search_index: u64) -> u64 {
+    game_seed ^ SEARCH_SEED_DOMAIN ^ search_index
 }
 
 #[cfg(test)]
@@ -108,5 +134,15 @@ mod tests {
         rng.shuffle(&mut seq);
         assert_eq!(seq, vec![1, 4, 5, 2, 6, 0, 3, 7]);
         assert_eq!(rng.state(), 6_018_027_440_424_182_938);
+    }
+
+    #[test]
+    fn weighted_choice_and_search_seed_match_python() {
+        let mut rng = Rng::new(31);
+        let got: Vec<usize> = (0..8)
+            .map(|_| rng.weighted_index(&[0.1, 0.0, 0.3, 0.6]))
+            .collect();
+        assert_eq!(got, vec![3, 3, 3, 3, 3, 2, 2, 3]);
+        assert_eq!(derive_search_seed(123, 7), 0x5745_4C43_4F4D_452F);
     }
 }

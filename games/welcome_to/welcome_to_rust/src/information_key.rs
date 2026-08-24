@@ -234,6 +234,76 @@ pub fn information_key(game: &Game, viewer: usize) -> EngineResult<InformationKe
     Ok(w.bytes)
 }
 
+/// Full identity used only to prove a retained within-turn subtree belongs to
+/// the real state handed back to search. This deliberately mirrors Python's
+/// `_position_key`, not the viewer-safe key above: totality is the requirement.
+pub(crate) fn position_key(game: &Game, root: usize) -> EngineResult<Vec<u8>> {
+    if root >= game.config.players {
+        return Err(EngineError::Invalid(format!(
+            "position-key root {root} is outside {} seats",
+            game.config.players
+        )));
+    }
+    let mut w = Writer::new();
+    w.u32(root);
+    w.i32(game.turn);
+    w.u32(game.actor);
+    w.u8(game.phase as u8);
+    w.u32(game.deck_pos);
+
+    let mut undrawn = game.deck[game.deck_pos..].to_vec();
+    undrawn.sort_unstable();
+    w.u32(undrawn.len());
+    for card in undrawn {
+        w.i32(card);
+    }
+    let mut discard = game.discard.clone();
+    discard.sort_unstable();
+    w.u32(discard.len());
+    for card in discard {
+        w.i32(card);
+    }
+    for plan_id in game.plan_ids {
+        w.u32(plan_id);
+    }
+    for slot in &game.plan_turns {
+        let mut turns = slot.clone();
+        turns.sort_unstable();
+        w.u32(turns.len());
+        for (player, turn) in turns {
+            w.i32(player);
+            w.i32(turn);
+        }
+    }
+    let table = game.table_cards(root);
+    w.u32(table.len());
+    for card in table {
+        w.option_i32((card != NO_CARD).then_some(card));
+    }
+    w.u32(game.sheets.len());
+    for sheet in &game.sheets {
+        write_sheet(&mut w, sheet);
+    }
+    w.u32(game.public_sheets.len());
+    for sheet in &game.public_sheets {
+        write_sheet(&mut w, sheet);
+    }
+    w.u32(game.turn_choice.len());
+    for &choice in &game.turn_choice {
+        w.option_i32((choice != NO_CARD).then_some(choice));
+    }
+    w.bool(game.reshuffle_next_turn);
+    let mut votes = game.reshuffle_votes.clone();
+    votes.sort_unstable();
+    w.u32(votes.len());
+    for (player, vote) in votes {
+        w.u32(player);
+        w.bool(vote);
+    }
+    write_ctx(&mut w, &game.ctx);
+    Ok(w.bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
