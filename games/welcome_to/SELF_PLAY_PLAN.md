@@ -645,7 +645,7 @@ the standard error is `18/√n` — **4.1 at 60 games, 1.0 at 330**. This no lon
 defines a gate, but it remains a warning that every paired arena conclusion needs
 its own reported standard error and adequate sample size.
 
-### S2 — The first self-play loop *(the main stage; trajectory + optimiser built 2026-08-24)*
+### S2 — The first self-play loop *(the main stage; trajectory, optimiser and durable generation built 2026-08-24)*
 
 Learner in seat 0 with full search; the other seats drawn from an opponent pool;
 seat count sampled per game across 2/3/4 at 60/30/10 (§2).
@@ -713,9 +713,17 @@ direct evidence that race learning is happening rather than being assumed.
   the first ten turns and deterministic choice afterwards, with the temperature
   supplied per root so retained trees survive the schedule change;
 * real opponent moves batched by frozen checkpoint and sampled from independent
-  per-seat portable streams; no GreedyBot fallback;
+  per-seat portable streams using that **same opening/late temperature schedule**;
+  no GreedyBot fallback;
 * replay through the Python rules oracle before a game is admitted to disk,
   checking search legality, final scores, seat-axis targets and visit mass;
+* replay-validated games written as immutable atomic shards (25 games by
+  default), so a hard process loss discards at most the open shard; restart
+  validates the deterministic seed/seat schedule and generates only missing
+  seeds;
+* a sidecar manifest pins the model hashes, rules/table signature, search
+  settings, temperatures and scheduler width. A restart refuses mixed or
+  unverifiable evidence instead of silently appending it;
 * soft policy cross-entropy in `network.losses`; S0 teacher samples are promoted
   to one-hot distributions, so old bootstrap trajectories remain compatible;
 * streaming shuffle-buffer batches via `self_play.iter_batches`, and the metric
@@ -949,6 +957,37 @@ nothing about the configuration that will actually run.
 
 Report both before committing to a network size: the capacity ladder in
 `PROJECT_PLAN.md` M2 is only meaningful once the cost of a simulation is known.
+
+### Production CUDA sweep — 2026-08-24
+
+`s2_throughput.py` swept only CUDA, as requested, using the S0 checkpoint, the
+production 200 simulations per learner root, the 60/30/10 seat mixture and
+identical seed sets within each comparison. `inflight == max_batch` in every
+arm. No CPU result is mixed into this selection.
+
+| in-flight | games in arm | games/hour | evaluator rows/s | mean batch | p90 batch |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 32 | 180.8 | 1,022 | 2.06 | 4 |
+| 16 | 32 | 232.0 | 1,309 | 3.05 | 6 |
+| 32 | 64 | 392.8 | 2,383 | 4.90 | 11 |
+| 64 | 128 | 546.5 | 3,147 | 8.47 | 21 |
+| 128 | 128 | 735.3 | 4,230 | 12.68 | 40 |
+| **256** | **256** | **961.0** | **5,582** | **20.72** | **71** |
+
+The 256 arm used only 36 MiB of Torch-allocated CUDA memory (about 1.86 GiB
+device use including the process/runtime), about 2.4 GiB process working set,
+and showed no thermal problem. It is now the default. The 961 games/hour result
+is conservative for a long run: a fixed 256-game arm stops replenishing slots
+as it drains, creating a long low-utilisation tail that an overnight corpus does
+not have.
+
+Concurrency is **not bitwise strength-neutral**. Identical games compared across
+batch widths agreed between 90.6% and 94.5% in the larger paired sweeps; changed
+floating-point batch geometry can flip close choices even though aggregate game
+metrics stayed stable. The run manifest therefore pins both `inflight` and
+`max_batch`. Do not resume a width-256 corpus at another width. For the first
+overnight run, 7,500 games is about 7.8 hours of generation at the conservative
+measured rate and leaves time for optimisation and evaluation.
 
 ---
 

@@ -833,6 +833,16 @@ production in-flight count and `max_batch`.
 **Profile consequence.** §1's shares were taken with an interpreted engine;
 after M6 the remaining Python is a different mixture and must be re-profiled
 before sizing another throughput lever.
+
+**Production S2 CUDA selection (2026-08-24).** A subsequent 200-simulation
+end-to-end sweep with the S0 checkpoint and 60/30/10 seat mixture scaled from
+180.8 games/hour at 8 in-flight games to **961.0 games/hour at 256**. The 256
+arm delivered 5,582 evaluator rows/s at mean batch 20.72 (p90 71), with only
+36 MiB Torch peak allocation and no thermal issue. It is the selected default;
+the fixed-size arm's drain tail makes that rate a conservative estimate for a
+continuously replenished overnight run. No CPU arm was run. Batch width changed
+some close discrete choices, so resumable generation pins scheduler width in
+its manifest rather than treating concurrency as semantically invisible.
 7WD's experience: **1.99× on a microbenchmark became 1.89× on the real path, and
 +48% for a concurrency step became +21%** — earlier fixes removed the fixed cost
 the later lever had been hiding.

@@ -11,6 +11,7 @@ import torch
 
 from games.welcome_to import datagen
 from games.welcome_to import network as nw
+from games.welcome_to import s2_throughput
 from games.welcome_to import self_play
 
 pytest.importorskip("welcome_to_rust")
@@ -52,6 +53,32 @@ def test_s2_small_mix_keeps_every_encoder_seat_count_live():
     assert {2, 3, 4}.issubset(counts)
     counts = self_play.seat_counts(10)
     assert (counts.count(2), counts.count(3), counts.count(4)) == (6, 3, 1)
+    with pytest.raises(ValueError, match="CUDA-only"):
+        s2_throughput.sweep("unused.pt", inflight=(1,), games=1, device="cpu")
+
+
+def test_s2_learner_and_opponents_share_one_temperature_schedule():
+    config = self_play.SelfPlayConfig(
+        games=4,
+        opening_temperature_turns=10,
+        opening_temperature=1.0,
+        late_temperature=0.0,
+    )
+    assert self_play.temperature_for_turn(config, 10) == 1.0
+    assert self_play.temperature_for_turn(config, 11) == 0.0
+
+    policy = np.zeros(684, dtype=np.float32)
+    policy[[10, 20, 30]] = [0.2, 0.7, 0.1]
+    assert self_play.sample_policy(
+        (10, 20, 30), policy, self_play.PortableRng(1), 0.0
+    ) == 20
+    first = self_play.sample_policy(
+        (10, 20, 30), policy, self_play.PortableRng(2), 1.0
+    )
+    second = self_play.sample_policy(
+        (10, 20, 30), policy, self_play.PortableRng(2), 1.0
+    )
+    assert first == second
 
 
 def test_s2_generation_replays_every_root_and_emits_visit_targets(generated):
@@ -111,6 +138,67 @@ def test_s2_json_round_trip_and_batch_are_training_ready(generated, tmp_path):
     assert torch.equal(before["policy"], after["policy"])
 
 
+def test_s2_atomic_shards_resume_by_seed(generated, tmp_path):
+    trajectories, _ = generated
+    prefix = tmp_path / "trajectories.jsonl"
+    writer = self_play.TrajectoryShardWriter(prefix, shard_games=2)
+    for trajectory in trajectories[:3]:
+        writer.add(trajectory)
+    writer.close()
+    shards = self_play.trajectory_sources(prefix)
+    assert len(shards) == 2
+    assert self_play.read_trajectories(prefix) == trajectories[:3]
+    assert not list(tmp_path.glob("*.tmp"))
+
+    resumed = self_play.TrajectoryShardWriter(prefix, shard_games=2)
+    assert resumed.completed_seeds == frozenset(t.seed for t in trajectories[:3])
+    with pytest.raises(ValueError, match="already written"):
+        resumed.add(trajectories[0])
+    resumed.add(trajectories[3])
+    resumed.close()
+    assert self_play.read_trajectories(prefix) == trajectories
+
+    config = self_play.SelfPlayConfig(games=4, seed=8_100)
+    assert self_play.validate_resume(trajectories, config) == frozenset(
+        trajectory.seed for trajectory in trajectories
+    )
+    original = trajectories[0]
+    changed_players = 3 if original.players == 2 else 2
+    wrong_players = replace(
+        original,
+        players=changed_players,
+        scores=(original.scores + (0,))[:changed_players],
+        opponents=(original.opponents + ("extra",))[:changed_players],
+    )
+    with pytest.raises(ValueError, match="players"):
+        self_play.validate_resume((wrong_players, *trajectories[1:]), config)
+
+
+def test_s2_generation_manifest_refuses_mixed_runs(tmp_path):
+    checkpoint = tmp_path / "learner.pt"
+    checkpoint.write_bytes(b"frozen learner")
+    config = self_play.SelfPlayConfig(games=4, seed=12)
+    search = self_play.default_search_config(simulations=3)
+    manifest = self_play.run_manifest(config, search, checkpoint, [checkpoint])
+    prefix = tmp_path / "corpus.jsonl"
+    path = self_play.ensure_run_manifest(
+        prefix, manifest, has_existing_games=False
+    )
+    assert path.exists()
+    assert self_play.ensure_run_manifest(
+        prefix, manifest, has_existing_games=True
+    ) == path
+    changed = dict(manifest)
+    changed["table_signature"] = int(manifest["table_signature"]) + 1
+    with pytest.raises(ValueError, match="does not match"):
+        self_play.ensure_run_manifest(prefix, changed, has_existing_games=True)
+
+    with pytest.raises(ValueError, match="unverifiable resume"):
+        self_play.ensure_run_manifest(
+            tmp_path / "legacy.jsonl", manifest, has_existing_games=True
+        )
+
+
 def test_s2_replay_rejects_a_root_whose_search_legality_changed(generated):
     trajectory = generated[0][0]
     first = trajectory.searches[0]
@@ -138,6 +226,30 @@ def test_s2_discrete_games_do_not_depend_on_scheduler_width():
     serial_by_seed = {trajectory.seed: trajectory for trajectory in serial}
     waved_by_seed = {trajectory.seed: trajectory for trajectory in waved}
     assert waved_by_seed == serial_by_seed
+
+
+def test_s2_resumed_generation_only_replays_missing_seed_jobs(generated):
+    complete, _ = generated
+    completed = frozenset(trajectory.seed for trajectory in complete[:2])
+    admitted = []
+    resumed, metrics = self_play.generate(
+        _net(),
+        config=self_play.SelfPlayConfig(
+            games=4,
+            inflight=4,
+            max_batch=4,
+            seed=8_100,
+        ),
+        search_config=self_play.default_search_config(simulations=3),
+        device="cpu",
+        skip_seeds=completed,
+        on_trajectory=admitted.append,
+    )
+    assert admitted == resumed
+    assert len(resumed) == 2
+    combined = {trajectory.seed: trajectory for trajectory in (*complete[:2], *resumed)}
+    assert combined == {trajectory.seed: trajectory for trajectory in complete}
+    assert metrics["games"] == 2.0
 
 
 def test_s2_real_opponents_have_reproducible_independent_seat_streams():
