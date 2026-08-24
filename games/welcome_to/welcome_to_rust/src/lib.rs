@@ -18,7 +18,7 @@ mod sheet;
 mod snapshot;
 mod tables;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -447,6 +447,35 @@ fn snapshot_version() -> i64 {
     snapshot::SNAPSHOT_VERSION
 }
 
+/// M0-C/D are load-time ABI contracts, not merely test assertions. A stale
+/// wheel must refuse to import before a self-play process can use mismatched
+/// rule tables or hand it a snapshot with a different shape.
+fn check_python_compatibility(py: Python<'_>) -> PyResult<()> {
+    let python_tables = py.import("games.welcome_to.tables")?;
+    let python_signature: u64 = python_tables
+        .call_method0("table_signature")?
+        .extract()?;
+    let rust_signature = tables::table_signature();
+    if python_signature != rust_signature {
+        return Err(PyImportError::new_err(format!(
+            "welcome_to_rust table signature 0x{rust_signature:016x} != Python \
+             0x{python_signature:016x}; rebuild the Rust extension against the \
+             current rule tables"
+        )));
+    }
+
+    let python_snapshot = py.import("games.welcome_to.snapshot")?;
+    let python_version: i64 = python_snapshot.getattr("SNAPSHOT_VERSION")?.extract()?;
+    if python_version != snapshot::SNAPSHOT_VERSION {
+        return Err(PyImportError::new_err(format!(
+            "welcome_to_rust snapshot version {} != Python {python_version}; \
+             rebuild the Rust extension against the current schema",
+            snapshot::SNAPSHOT_VERSION
+        )));
+    }
+    Ok(())
+}
+
 /// `n` draws of the portable stream from `seed` — how the RNG parity test
 /// reaches the Rust generator without a game in the way (M0-B).
 #[pyfunction]
@@ -466,6 +495,7 @@ fn portable_rng_shuffle(seed: u64, n: usize) -> (Vec<usize>, u64) {
 
 #[pymodule]
 fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    check_python_compatibility(module.py())?;
     module.add_class::<RustGameState>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;

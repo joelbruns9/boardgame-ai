@@ -242,8 +242,15 @@ def ctx_from_snapshot(raw: dict[str, Any]) -> TurnCtx:
 
 
 def rng_from_snapshot(raw: dict[str, Any]):
-    if raw["kind"] == "portable":
+    kind = raw["kind"]
+    if kind == "portable":
         return PortableRng(raw["state"])
+    if kind != "cpython":
+        raise ValueError(
+            f"unknown snapshot rng kind {kind!r}; expected 'portable' or 'cpython'"
+        )
+    if raw.get("state") is not None:
+        raise ValueError("a cpython snapshot cannot carry a portable RNG state")
     # A ``cpython`` snapshot carries no state to restore, so what comes back is
     # a *fresh* Mersenne Twister.  Every deterministic field is exact; only
     # future draws differ, which is the price of a generator Rust cannot hold.

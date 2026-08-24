@@ -170,14 +170,24 @@ def _check_accessors(py: GameState, rs, where: str) -> None:
                 fail(f"plan_scores(viewer={viewer})", py.plan_scores(viewer), rs.plan_scores(viewer))
             if list(py.temp_scores(viewer)) != list(rs.temp_scores(viewer)):
                 fail(f"temp_scores(viewer={viewer})", py.temp_scores(viewer), rs.temp_scores(viewer))
-            left_break = py.score_breakdown(player, viewer)
-            right_break = rs.score_breakdown(player, viewer)
-            for field, value in right_break.items():
-                if field == "total":
-                    if left_break.total != value:
-                        fail(f"score_breakdown({player}, {viewer}).total", left_break.total, value)
-                elif getattr(left_break, field) != value:
-                    fail(f"score_breakdown({player}, {viewer}).{field}", getattr(left_break, field), value)
+            # The vector methods above cover every target's *total*. Check every
+            # component too: two swapped components can preserve the total and
+            # would otherwise pass.
+            for target in range(py.config.players):
+                left_break = py.score_breakdown(target, viewer)
+                right_break = rs.score_breakdown(target, viewer)
+                for field, value in right_break.items():
+                    left_value = (
+                        left_break.total
+                        if field == "total"
+                        else getattr(left_break, field)
+                    )
+                    if left_value != value:
+                        fail(
+                            f"score_breakdown({target}, {viewer}).{field}",
+                            left_value,
+                            value,
+                        )
 
     if list(py.scorable_plan_slots()) != list(rs.scorable_plan_slots()):
         fail("scorable_plan_slots", py.scorable_plan_slots(), rs.scorable_plan_slots())
@@ -312,6 +322,50 @@ def _check_boundary_triple(py: GameState, rs, seed: int, config: GameConfig, ste
     _compare(py_after, rs_after, seed, config, step, "apply_boundary_outcome")
 
 
+def _check_redeterminize(
+    py: GameState, rs, seed: int, config: GameConfig, step: int
+) -> None:
+    """MCTS's root operation, from one shared search-generator state.
+
+    This belongs in the played-game gate, not only in a standalone unit test:
+    redeterminization is sensitive to ``deck_pos`` and to the exact hidden tail,
+    so checking one fixed mid-game position cannot support the plan's advertised
+    "once per turn" coverage.
+    """
+    probe_seed = (
+        seed * 0xD1B5_4A32_D192_ED03
+        + step * 0x9E37_79B9_7F4A_7C15
+        + py.turn
+    ) & ((1 << 64) - 1)
+    probe = PortableRng(probe_seed)
+    py_next = py.redeterminize(probe)
+    rs_next, rs_probe_state = rs.redeterminize(probe_seed)
+    if probe.state != rs_probe_state:
+        raise Divergence(
+            f"redeterminize's caller RNG diverged at step {step} of seed {seed} "
+            f"{config}: python {probe.state} != rust {rs_probe_state}"
+        )
+    lines = sn.diff(sn.to_snapshot(py_next), rs_next.snapshot())
+    if lines:
+        raise Divergence(
+            f"redeterminize diverged at step {step} of seed {seed} {config}:\n  "
+            + "\n  ".join(lines[:20])
+        )
+
+
+def _has_private_midturn_state(state: GameState) -> bool:
+    """Whether an information-set accessor has something non-public to hide."""
+    return (
+        any(live != public for live, public in zip(state.sheets, state.public_sheets))
+        or any(
+            completed_turn == state.turn
+            for slot in state.plan_turns
+            for completed_turn in slot.values()
+        )
+        or bool(state.reshuffle_votes)
+    )
+
+
 def _choose(driver: str, py: GameState, legal: Sequence[int], picker: PortableRng, bot: GreedyBot) -> int:
     """Which legal action to play.  See :data:`DRIVERS`."""
     if driver == "greedy":
@@ -338,6 +392,8 @@ def check_game(
         raise RuntimeError("welcome_to_rust is not built; run `maturin develop --release`")
     if driver not in DRIVERS:
         raise ValueError(f"unknown driver {driver!r}; expected one of {DRIVERS}")
+    if macro_apply_every < 1:
+        raise ValueError("macro_apply_every must be at least 1")
 
     py = GameState.new(seed=seed, config=config)
     rs = wr.RustGameState(seed, **_config_kwargs(config))
@@ -348,12 +404,26 @@ def check_game(
 
     _compare(py, rs, seed, config, 0, None)
     checked_turn = -1
+    checked_hidden_turn = -1
 
     for step in range(1, max_steps + 1):
         if py.is_terminal:
             break
         where = f"step {step} of seed {seed} {config}"
         first_of_turn = py.turn != checked_turn
+        # Boundary checks alone cannot catch an information leak: live and
+        # public sheets are equal there. The first hand-off to a later seat is
+        # the cheapest high-value checkpoint -- seat 0 has finished mutating
+        # its live sheet (and possibly a plan/vote), while opponents must still
+        # read the public snapshot.
+        if (
+            check_boundaries
+            and py.actor > 0
+            and py.turn != checked_hidden_turn
+            and _has_private_midturn_state(py)
+        ):
+            _check_accessors(py, rs, where + " (mid-turn information set)")
+            checked_hidden_turn = py.turn
         if check_macros:
             # ⚠ Applying every macro is the expensive claim (see _check_macros),
             # so it runs on the first root of every ``macro_apply_every`` turns.
@@ -362,6 +432,7 @@ def check_game(
         if check_boundaries and first_of_turn:
             _check_accessors(py, rs, where)
             _check_boundary_triple(py, rs, seed, config, step)
+            _check_redeterminize(py, rs, seed, config, step)
         if first_of_turn:
             checked_turn = py.turn
         py_legal = py.legal_actions()
@@ -408,6 +479,7 @@ def gate(
     drivers: Sequence[str] = DRIVERS,
     seed0: int = 0,
     macro_apply_every: int = MACRO_APPLY_EVERY,
+    check_macros: bool = True,
 ) -> Iterator[GameReport]:
     """``games`` games, dealt round-robin across ``configs`` and ``drivers``.
 
@@ -421,6 +493,7 @@ def gate(
             seed0 + i,
             configs[i % len(configs)],
             drivers[(i // len(configs)) % len(drivers)],
+            check_macros=check_macros,
             macro_apply_every=macro_apply_every,
         )
 
@@ -515,7 +588,9 @@ def constructed_cases() -> Iterator[tuple[str, GameState, Expectation]]:
     )
 
 
-def check_constructed(name: str, py: GameState, expect: Expectation) -> None:
+def check_constructed(
+    name: str, py: GameState, expect: Expectation, check_macros: bool = True
+) -> None:
     """Compare a constructed position, its boundary and its scoring."""
     if wr is None:  # pragma: no cover
         raise RuntimeError("welcome_to_rust is not built; run `maturin develop --release`")
@@ -535,8 +610,10 @@ def check_constructed(name: str, py: GameState, expect: Expectation) -> None:
         raise Divergence(f"{name}: winners {py.winners()} != {rs.winners()}")
 
     _check_accessors(py, rs, name)
-    _check_macros(py, rs, name, apply_all=True)
+    if check_macros:
+        _check_macros(py, rs, name, apply_all=True)
     _check_boundary_triple(py, rs, seed=-1, config=py.config, step=0)
+    _check_redeterminize(py, rs, seed=-1, config=py.config, step=0)
 
     # ⚠ And check the case still does what it was written to do. A constructed
     # position that quietly stopped being a queued reshuffle would keep passing
@@ -560,10 +637,10 @@ def check_constructed(name: str, py: GameState, expect: Expectation) -> None:
         )
 
 
-def check_all_constructed() -> int:
+def check_all_constructed(check_macros: bool = True) -> int:
     cases = list(constructed_cases())
     for name, state, expect in cases:
-        check_constructed(name, state, expect)
+        check_constructed(name, state, expect, check_macros=check_macros)
     return len(cases)
 
 
@@ -578,16 +655,27 @@ def main() -> None:
         default=MACRO_APPLY_EVERY,
         help="apply every macro on the first root of every Nth turn (M2)",
     )
+    parser.add_argument(
+        "--m1-only",
+        action="store_true",
+        help="skip M2 macro comparisons; run the corrected engine gate only",
+    )
     args = parser.parse_args()
 
-    cases = check_all_constructed()
+    cases = check_all_constructed(check_macros=not args.m1_only)
     print(f"{cases} constructed positions agree (the ones play does not reach)", flush=True)
 
     started = time.perf_counter()
     steps = 0
     played = Counter()
     for i, report in enumerate(
-        gate(args.games, seed0=args.seed0, macro_apply_every=args.macro_apply_every), start=1
+        gate(
+            args.games,
+            seed0=args.seed0,
+            macro_apply_every=args.macro_apply_every,
+            check_macros=not args.m1_only,
+        ),
+        start=1,
     ):
         steps += report.steps
         played[(report.config.players, report.config.advanced, report.driver)] += 1

@@ -22,6 +22,8 @@ in ``games/welcome_to/welcome_to_rust`` is what un-skips it.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from games.welcome_to import macro_codec as mc
@@ -118,7 +120,9 @@ def test_a_game_agrees_after_every_action(config, driver):
     """One game per (configuration, driver) — 18 games, the shape of the gate.
 
     Compares the complete M0-C snapshot after every action, the raw
-    ``legal_actions`` order before it, and the boundary triple once per turn.
+    ``legal_actions`` order before it, and the boundary triple plus
+    redeterminization once per turn. Information-set accessors are also checked
+    after the first seat hand-off, where live and public observations differ.
     """
     report = eq.check_game(seed=41, config=config, driver=driver)
     assert report.steps > 20, "a game this short is not evidence of anything"
@@ -187,6 +191,92 @@ def test_a_cpython_snapshot_is_refused_rather_than_silently_reseeded():
         wr.RustGameState.from_snapshot(sn.to_snapshot(py))
 
 
+def test_an_unknown_snapshot_rng_is_refused_by_both_readers():
+    """A typo must not silently become a fresh Mersenne Twister in Python."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    raw = sn.to_snapshot(GameState.new(seed=3, config=config))
+    raw["rng"]["kind"] = "splitmix65"
+    with pytest.raises(ValueError, match="rng kind"):
+        sn.from_snapshot(raw)
+    with pytest.raises(ValueError, match="splitmix65"):
+        wr.RustGameState.from_snapshot(raw)
+
+    impossible_cpython = copy.deepcopy(raw)
+    impossible_cpython["rng"] = {"kind": "cpython", "state": 17}
+    with pytest.raises(ValueError, match="cannot carry"):
+        sn.from_snapshot(impossible_cpython)
+
+
+def test_the_played_gate_really_checks_redeterminize_and_a_midturn_information_set(
+    monkeypatch,
+):
+    """Regression for two claims that used to exist only in the gate's prose.
+
+    Checking accessors only at a turn boundary is vacuous for sheet visibility:
+    live and public sheets are equal there. Redeterminize was not wired into the
+    played-game path at all.
+    """
+    redetermined_turns: list[int] = []
+    accessor_actors: list[int] = []
+    accessor_asymmetries: list[bool] = []
+    original_redeterminize = eq._check_redeterminize
+    original_accessors = eq._check_accessors
+
+    def record_redeterminize(py, rs, seed, config, step):
+        redetermined_turns.append(py.turn)
+        return original_redeterminize(py, rs, seed, config, step)
+
+    def record_accessors(py, rs, where):
+        accessor_actors.append(py.actor)
+        accessor_asymmetries.append(eq._has_private_midturn_state(py))
+        return original_accessors(py, rs, where)
+
+    monkeypatch.setattr(eq, "_check_redeterminize", record_redeterminize)
+    monkeypatch.setattr(eq, "_check_accessors", record_accessors)
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    eq.check_game(seed=29, config=config, driver="no-refusal", check_macros=False)
+
+    assert len(set(redetermined_turns)) > 1
+    assert any(actor > 0 for actor in accessor_actors)
+    assert any(accessor_asymmetries)
+
+
+def test_the_macro_gate_sampling_interval_must_be_positive():
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    with pytest.raises(ValueError, match="at least 1"):
+        eq.check_game(seed=1, config=config, macro_apply_every=0)
+
+
+def test_the_m1_gate_can_skip_m2_without_skipping_engine_checks(monkeypatch):
+    """The corrected M1 rerun need not pay M2's sampled macro-apply cost."""
+    macro_calls = 0
+    redeterminize_calls = 0
+    original_redeterminize = eq._check_redeterminize
+
+    def reject_macro_check(*args, **kwargs):
+        nonlocal macro_calls
+        macro_calls += 1
+
+    def record_redeterminize(*args, **kwargs):
+        nonlocal redeterminize_calls
+        redeterminize_calls += 1
+        return original_redeterminize(*args, **kwargs)
+
+    monkeypatch.setattr(eq, "_check_macros", reject_macro_check)
+    monkeypatch.setattr(eq, "_check_redeterminize", record_redeterminize)
+    config = GameConfig(players=2, advanced=False, solo_rules=False)
+    reports = list(
+        eq.gate(
+            1,
+            configs=(config,),
+            drivers=("random",),
+            check_macros=False,
+        )
+    )
+    assert reports and macro_calls == 0
+    assert redeterminize_calls > 1
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # M2 — the macro vocabulary
 # ──────────────────────────────────────────────────────────────────────────
@@ -232,7 +322,9 @@ def test_a_subsumed_primitive_has_no_standalone_macro_index():
 @pytest.mark.parametrize("config", eq.GATE_CONFIGS, ids=lambda c: f"{c.players}p-adv{int(c.advanced)}")
 def test_the_macro_vocabulary_agrees_over_a_whole_game(config):
     """``legal_macros`` in order at every root, ``search_legal_macros`` at both
-    settings of ``prune_roundabout_pass``, and every macro applied end to end.
+    settings of ``prune_roundabout_pass``, and every compound macro offered at
+    each turn-opening root applied end to end. Other macros are one primitive
+    and ride the M1 action-parity check.
 
     ``macro_apply_every=1`` here — the sample is small enough to afford the
     claim in full, which is what makes the gate's sampling a speed choice

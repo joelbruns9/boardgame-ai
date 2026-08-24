@@ -1,10 +1,13 @@
 //! The macro action vocabulary — a mirror of `games/welcome_to/macro_codec.py`
 //! (RUST_PORT_PLAN.md M2). 684 indices, frozen in `ENCODER_V2_SPEC.md` §10.6.
 //!
-//! The whole `CHOOSE_CARDS -> WRITE_NUMBER` segment is one action, because you
-//! pick a combination *for* a placement: a sequential decomposition prices
-//! "take slot 2" by the mean quality of the placements it leads to rather than
-//! by its best one, which is backwards. `macro_codec.py` argues it at length.
+//! The whole `CHOOSE_CARDS -> WRITE_NUMBER` segment is one action. A correct
+//! deterministic tree could model the split without averaging the placement
+//! continuations; both nodes belong to the same player. The macro is still the
+//! useful finite-budget representation because you pick a combination *for* a
+//! placement: it matches the semantic action, shortens the horizon, improves
+//! credit assignment, and removes the `WRITE_NUMBER` network evaluation
+//! (`SEARCH_SPEC.md` §3 measured 28% fewer evaluations).
 //!
 //! ⚠ **Legality is enumerated, never intersected.** A macro index is legal iff
 //! its full primitive sequence is legal end to end, so `legal_macros` steps into
@@ -150,10 +153,6 @@ pub fn primitives_for(index: usize) -> EngineResult<Vec<usize>> {
 // ──────────────────────────────────────────────────────────────────────────
 // Legality
 // ──────────────────────────────────────────────────────────────────────────
-fn is_choose_stack(action: usize) -> bool {
-    (codec::A_CHOOSE_STACK..codec::A_CHOOSE_STACK + 6).contains(&action)
-}
-
 /// Whether this is a state the macro layer makes a decision at — everything
 /// except `WRITE_NUMBER`, which the macro layer swallows.
 pub fn is_macro_root(state: &Game) -> bool {

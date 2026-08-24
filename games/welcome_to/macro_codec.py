@@ -4,12 +4,14 @@ The macro action vocabulary -- 684 indices, frozen in ``ENCODER_V2_SPEC.md`` §1
 WHY A MACRO AT ALL
 ──────────────────
 The primitive codec splits one decision into two: ``CHOOSE_STACK`` picks a
-combination, then ``WRITE`` places it.  But **you pick a combination *for* a
-placement**, and a sequential decomposition prices "take slot 2" by the *mean*
-quality of the placements it leads to rather than by its best one.  That is
-backwards -- the player gets to choose the placement, so slot 2 is worth what its
-best placement is worth.  A search that evaluates the two steps separately is
-answering a question nobody asked.
+combination, then ``WRITE`` places it.  A correct deterministic tree can model
+that split without a strength error: both nodes belong to the same player and,
+with enough visits, UCT concentrates on the best continuation rather than
+averaging the placements.  The macro is still the useful representation because
+**you pick a combination *for* a placement**: it matches the semantic action,
+shortens the finite-budget horizon, improves credit assignment, and removes the
+otherwise mandatory ``WRITE_NUMBER`` network evaluation.  Measured in
+``SEARCH_SPEC.md`` §3, that removes 28% of network evaluations.
 
 So the whole ``CHOOSE_CARDS -> WRITE_NUMBER`` segment is one action::
 

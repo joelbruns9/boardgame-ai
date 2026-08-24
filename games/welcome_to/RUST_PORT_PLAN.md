@@ -231,13 +231,25 @@ Each is a separate commit with its own gate. **Land single-threaded-correct
 first; concurrency is M6.** That ordering is not taste — it is what worked on
 Kingdomino and the note says to do it again.
 
-### M1 — `RustGameState`: the engine ✅ BUILT, GATE GREEN 2026-08-23
+### M1 — `RustGameState`: the engine ✅ BUILT, CORRECTED GATE GREEN 2026-08-23
 
-**Gate result: 8,000 games, 1,490,189 actions compared, zero divergences, 37
-minutes** (`--games 8000`, 3.6 games/s — the rate is the *comparison's*, not the
-engine's: every action re-serialises both states in Python). Plus 7 constructed
-positions and, once per turn, the read API, the boundary triple and
-`redeterminize`.
+**Historical gate result (2026-08-23): 8,000 games, 1,490,189 actions compared,
+zero divergences, 37 minutes** (`--games 8000`, 3.6 games/s — the rate is the
+*comparison's*, not the engine's: every action re-serialises both states in
+Python). Plus 7 constructed positions, the read API and the boundary triple.
+
+⚠ **Post-implementation review found two advertised checks were not actually in
+that 8,000-game path.** `redeterminize` existed only in a small standalone test,
+despite the harness saying "once per turn". And the information-set accessors
+were checked only at turn boundaries, where live and public sheets are equal —
+the exact symmetry trap that lets a live-opponent-sheet leak pass. The harness
+now checks `redeterminize` once per turn and checks accessors again at the first
+mid-turn seat hand-off, after seat 0's live sheet and any plan/vote can differ
+from the public observation. **Corrected gate result: 8,000 games, 1,490,189
+actions, zero divergences, 2,596.3s (43m16s, 3.1 games/s), with 444–445 games in
+every configuration × driver cell.** M1 is signed off again. The historical run
+remains strong evidence for primitive transition parity, but not for those two
+claims; its 37-minute timing is retained above only as history.
 
 `game.py` rules and `sheet.py` behind an opaque handle, including the boundary
 triple, since `_end_turn` is built from it.
@@ -279,6 +291,11 @@ complete snapshot and an assurance that both engines hold the same tables.
 * **Expert and solo are ported but refused.** They share the boundary code with
   the standard path, so omitting them meant writing a different engine, not a
   smaller one. M0-A refuses them as a *configuration*, by name, at construction.
+* **M0-C/D are enforced when the native module imports**, not only by tests.
+  A stale wheel whose table signature or snapshot version differs from Python
+  raises `ImportError` before a self-play process can use it. This was tightened
+  in post-implementation review; the original build compared both only inside
+  tests/the equivalence harness, which did not satisfy "at load" literally.
 
 **Gate:** lockstep equivalence over **8,000 games** at 2/3/4 seats, advanced on
 and off, driven from a shared `PortableRng` seed (M0-B), comparing **after every
@@ -305,10 +322,13 @@ action** via the M0-C snapshot:
 **Three things beyond the list, added because the list is about *state* and a
 port can get every field right and still answer a question differently:**
 
-* **the read API**, once per turn — `visible_cards`, `next_effects` (§6.2's
-  certainty), `table_cards`, `playable_slots`, `scorable_plan_slots`, and the
-  information-set filters `plan_turns_for` / `reshuffle_vote_for`, plus
-  viewer-scoped `scores` / `plan_scores` / `temp_scores` / `score_breakdown`;
+* **the read API**, at the boundary and at the first mid-turn seat hand-off —
+  `visible_cards`, `next_effects` (§6.2's certainty), `table_cards`,
+  `playable_slots`, `scorable_plan_slots`, and the information-set filters
+  `plan_turns_for` / `reshuffle_vote_for`, plus viewer-scoped `scores` /
+  `plan_scores` / `temp_scores` / every component of `score_breakdown`. The
+  mid-turn checkpoint is load-bearing: only there can an opponent's live sheet
+  differ from the public snapshot;
 * **the boundary triple**, once per turn, on copies — `prepare` (including its
   `False`), then `sample` from the *same generator state*, then `apply`, with
   the afterstate compared before and after sampling (a chance node samples
@@ -325,8 +345,14 @@ of somebody else's fields rots silently; this is the same problem three times
 over.
 
 **Test:** `tests/test_rust_engine_equiv.py` — a *sample* of the gate (18 games,
-one per configuration × driver, plus every constructed position, ~5s). The gate
-itself is `python -m games.welcome_to.rust_equiv --games 8000`, ~35 minutes.
+one per configuration × driver, plus every constructed position). The corrected
+M1 gate is `python -m games.welcome_to.rust_equiv --games 8000 --m1-only`; the
+full M1+M2 gate omits `--m1-only`. The corrected M1-only run measured **43m16s**.
+Keeping the switch matters: an M1 coverage rerun should not also pay for M2's
+sampled apply-all-macros check. The combined corrected wall time has not been
+measured, so do not reuse the historical 65-minute M2 number for scheduling. A
+small 18-game all-cell sample measured **5.7s M1-only versus 10.4s with M2**;
+that validates the switch, not an 8,000-game combined-wall-time extrapolation.
 
 ⚠ **A uniform-random driver is not a gate, and that was measured.** Over 60
 uniform-random games: **60/60 ended on the third permit refusal**, City Plans
@@ -357,11 +383,13 @@ so that it fails loudly if that ever changes.
 
 ### M2 — `macro_codec` ✅ BUILT, GATE GREEN 2026-08-23
 
-**Gate result: the same 8,000 games, 1,490,189 actions, zero divergences, 65
-minutes** — 18 configuration × driver cells at ~444 games each. `legal_macros`
-and both settings of `search_legal_macros` compared at **every** macro root;
-every macro applied end to end at one root in three; all 684 primitive
-sequences compared exhaustively in the test module.
+**Historical gate result: the same 8,000 games, 1,490,189 actions, zero
+divergences, 65 minutes** — 18 configuration × driver cells at ~444 games each.
+`legal_macros` and both settings of `search_legal_macros` compared at **every**
+macro root; every macro offered at the turn-opening `CHOOSE_CARDS` root applied
+end to end on one turn in three; all 684 primitive sequences compared
+exhaustively in the test module. This remains the M2 result: the two M1 harness
+omissions above do not weaken the macro-list or macro-application comparisons.
 
 `src/macro_codec.rs`, exposed as `legal_macros`, `search_legal_macros`,
 `is_macro_root`, `apply_macro`, `step_macro`, and the index arithmetic as module
@@ -386,14 +414,16 @@ a mask intersection admits jointly-illegal pairs.
 * **`collapse` is deliberately not ported.** Reading a primitive trajectory as
   macro labels belongs to `datagen`, which §3 keeps in Python. Porting it would
   put a second implementation behind the training corpus for no gain.
-* ⚠ **The apply claim is sampled by root, never thinned by macro.** A root
-  offers up to ~100 macros and each comparison re-serialises two whole states in
-  Python: checking every root costs **5.4×** the M1 gate against **2.7×** at one
-  root in three (`--macro-apply-every`, default 3). Checking *all* the macros at
-  fewer roots keeps the property whole; checking some macros at every root would
-  leave the hole exactly where a rare macro lives. The list comparison, which is
-  M2's actual subject, runs at **every** root and costs almost nothing (+0.19s
-  against a 0.49s baseline over six games).
+* ⚠ **The compound-apply claim is sampled by root, never thinned by macro.**
+  Multi-primitive macros exist only at the turn-opening `CHOOSE_CARDS` root. It
+  offers up to ~100 of them and each comparison re-serialises two whole states
+  in Python: checking every turn-opening root costs **5.4×** the M1 gate against
+  **2.7×** at one turn in three (`--macro-apply-every`, default 3). Checking
+  *all* the macros at fewer roots keeps the property whole; checking some macros
+  everywhere would leave the hole exactly where a rare write lives. The
+  remaining macros are one primitive each and ride M1's action parity. The list
+  comparison, which is M2's actual subject, still runs at **every** root and
+  costs almost nothing (+0.19s against a 0.49s baseline over six games).
 
 ### M3 — `encode_state` — the biggest win and the biggest risk
 
