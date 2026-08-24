@@ -47,7 +47,7 @@ import random
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterator, Optional, Sequence
+from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 import torch
@@ -88,6 +88,19 @@ def seat_counts(games: int, mix: Sequence[tuple[int, float]] = SEAT_MIX) -> list
     remainder = games - sum(out.values())
     for count, value in sorted(exact, key=lambda cv: -(cv[1] % 1.0))[:remainder]:
         out[count] += 1
+    # The old largest-remainder-only spelling contradicted its own contract:
+    # four games became 3x2p + 1x3p + 0x4p. Once there are enough games to
+    # represent every configured table size, keep every encoder seat block live
+    # by moving one game from the largest bucket into each empty one. At normal
+    # corpus sizes (including 10 and 5,000) largest remainder already does this
+    # and the exact 60/30/10 counts are unchanged.
+    if games >= len(mix):
+        for count, _ in mix:
+            if out[count] != 0:
+                continue
+            donor = max((other for other, _ in mix if out[other] > 1), key=out.get)
+            out[donor] -= 1
+            out[count] += 1
     return [count for count, _ in mix for _ in range(out[count])]
 
 
@@ -112,10 +125,11 @@ def build_corpus(
 
 
 def iter_batches(
-    trajectories: Sequence[Trajectory],
+    trajectories: Sequence[object],
     batch_size: int,
     rng: random.Random,
     shuffle_buffer: int = 8192,
+    replay_fn: Callable[[object], Iterable[Sample]] = datagen.replay,
 ) -> Iterator[dict[str, np.ndarray]]:
     """Replay trajectories into shuffled batches.
 
@@ -129,7 +143,7 @@ def iter_batches(
     rng.shuffle(order)
     buffer: list[Sample] = []
     for trajectory in order:
-        for sample in datagen.replay(trajectory):
+        for sample in replay_fn(trajectory):
             buffer.append(sample)
             if len(buffer) >= shuffle_buffer:
                 rng.shuffle(buffer)

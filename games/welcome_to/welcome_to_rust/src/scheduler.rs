@@ -353,11 +353,11 @@ impl RustScheduler {
         max_batch: usize,
     ) -> PyResult<Vec<Py<PyDict>>> {
         self.run(
-            py, states, evaluator, seeds, roots, noises, slots, max_batch, false,
+            py, states, evaluator, seeds, roots, noises, None, slots, max_batch, false,
         )
     }
 
-    #[pyo3(signature = (states, evaluator, seeds, roots=None, noises=None, slots=None, max_batch=32))]
+    #[pyo3(signature = (states, evaluator, seeds, roots=None, noises=None, temperatures=None, slots=None, max_batch=32))]
     #[allow(clippy::too_many_arguments)]
     fn play<'py>(
         &mut self,
@@ -367,11 +367,21 @@ impl RustScheduler {
         seeds: Vec<u64>,
         roots: Option<Vec<usize>>,
         noises: Option<Vec<Option<Vec<f64>>>>,
+        temperatures: Option<Vec<f64>>,
         slots: Option<Vec<usize>>,
         max_batch: usize,
     ) -> PyResult<Vec<Py<PyDict>>> {
         self.run(
-            py, states, evaluator, seeds, roots, noises, slots, max_batch, true,
+            py,
+            states,
+            evaluator,
+            seeds,
+            roots,
+            noises,
+            temperatures,
+            slots,
+            max_batch,
+            true,
         )
     }
 
@@ -435,6 +445,7 @@ impl RustScheduler {
         seeds: Vec<u64>,
         roots: Option<Vec<usize>>,
         noises: Option<Vec<Option<Vec<f64>>>>,
+        temperatures: Option<Vec<f64>>,
         slots: Option<Vec<usize>>,
         max_batch: usize,
         play: bool,
@@ -475,6 +486,19 @@ impl RustScheduler {
             Some(_) => return Err(PyValueError::new_err("noises are not row-aligned")),
             None => (0..rows).map(|_| None).collect(),
         };
+        let temperatures = match temperatures {
+            Some(_) if !play => {
+                return Err(PyValueError::new_err(
+                    "temperature overrides apply only to play, not search",
+                ))
+            }
+            Some(temperatures) if temperatures.len() == rows => temperatures
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<Option<f64>>>(),
+            Some(_) => return Err(PyValueError::new_err("temperatures are not row-aligned")),
+            None => (0..rows).map(|_| None).collect(),
+        };
 
         let games: Vec<Game> = states
             .iter()
@@ -496,6 +520,7 @@ impl RustScheduler {
                 roots[input],
                 seeds[input],
                 noises[input].clone(),
+                temperatures[input],
             ));
         }
 
@@ -509,7 +534,7 @@ impl RustScheduler {
         let mut live = rows;
 
         std::thread::scope(|scope| {
-            for (input, slot, mut search, state, root, seed, noise) in tasks {
+            for (input, slot, mut search, state, root, seed, noise, temperature) in tasks {
                 let messages = message_tx.clone();
                 scope.spawn(move || {
                     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -543,9 +568,20 @@ impl RustScheduler {
                                     .map_err(EngineError::Invalid)
                             };
                         if play {
-                            search
-                                .play(&state, root, seed, &mut adapter, noise.as_deref())
-                                .map(|(choice, output)| (Some(choice), output))
+                            let result = match temperature {
+                                Some(temperature) => search.play_with_temperature(
+                                    &state,
+                                    root,
+                                    seed,
+                                    &mut adapter,
+                                    noise.as_deref(),
+                                    temperature,
+                                ),
+                                None => {
+                                    search.play(&state, root, seed, &mut adapter, noise.as_deref())
+                                }
+                            };
+                            result.map(|(choice, output)| (Some(choice), output))
                         } else {
                             search
                                 .search(&state, root, seed, &mut adapter, noise.as_deref())

@@ -447,7 +447,10 @@ impl Search {
             let edge = &mut self.arena[node_id].edges[index];
             let mut outcomes: Vec<&Outcome> = edge.outcomes.values().collect();
             outcomes.sort_by_key(|outcome| outcome.ordinal);
-            let weights: Vec<f64> = outcomes.iter().map(|outcome| outcome.count as f64).collect();
+            let weights: Vec<f64> = outcomes
+                .iter()
+                .map(|outcome| outcome.count as f64)
+                .collect();
             let chosen = outcomes[rng.weighted_index(&weights)];
             let result = (chosen.particle_slot, chosen.child, chosen.terminal_value);
             edge.visits = edge
@@ -535,10 +538,7 @@ impl Search {
                     },
                 );
             }
-            let outcome = edge
-                .outcomes
-                .get_mut(observation)
-                .expect("inserted above");
+            let outcome = edge.outcomes.get_mut(observation).expect("inserted above");
             if !is_terminal && !exact && outcome.particle_slot.is_none() {
                 outcome.particle_slot = new_particle_slot;
             }
@@ -626,8 +626,7 @@ impl Search {
             }
 
             if self.edge_is_closed(node_id, index) {
-                let (particle, child, terminal_value) =
-                    self.reuse_outcome(node_id, index, rng)?;
+                let (particle, child, terminal_value) = self.reuse_outcome(node_id, index, rng)?;
                 if let Some(value) = terminal_value {
                     break value;
                 }
@@ -870,6 +869,29 @@ impl Search {
     where
         E: FnMut(RequestKind, &Game, usize, u32) -> EngineResult<EvalResponse>,
     {
+        self.play_with_temperature(state, root, seed, evaluator, noise, self.config.temperature)
+    }
+
+    /// `play` with a per-root sampling temperature. Self-play needs an
+    /// exploratory opening and deterministic late game without rebuilding the
+    /// persistent search slot (which would discard its retained subtree).
+    pub fn play_with_temperature<E>(
+        &mut self,
+        state: &Game,
+        root: usize,
+        seed: u64,
+        evaluator: &mut E,
+        noise: Option<&[f64]>,
+        temperature: f64,
+    ) -> EngineResult<(usize, SearchOutput)>
+    where
+        E: FnMut(RequestKind, &Game, usize, u32) -> EngineResult<EvalResponse>,
+    {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(EngineError::Invalid(
+                "temperature override must be finite and non-negative".into(),
+            ));
+        }
         if state.actor != root {
             return Err(EngineError::Invalid("play root is not the actor".into()));
         }
@@ -895,7 +917,7 @@ impl Search {
                 .ok_or_else(|| EngineError::Invalid("cannot play a finished game".into()))?,
         };
         let output = self.run_from_node(state, root, node, &mut rng, evaluator, noise)?;
-        let choice_index = if self.config.temperature <= 0.0 {
+        let choice_index = if temperature <= 0.0 {
             output
                 .visits
                 .iter()
@@ -911,7 +933,7 @@ impl Search {
             let weights: Vec<f64> = output
                 .visits
                 .iter()
-                .map(|visits| visits.powf(1.0 / self.config.temperature))
+                .map(|visits| visits.powf(1.0 / temperature))
                 .collect();
             rng.weighted_index(&weights)
         };

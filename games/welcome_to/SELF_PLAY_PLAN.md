@@ -629,45 +629,46 @@ Budget per phase, not flat: half of all decisions have two options, and the widt
 is concentrated in `WRITE_NUMBER` (13.1 mean, 165 max) and `ACTION_SURVEYOR`
 (28.5).
 
-**Gate:** at a fixed budget, search + the S0 network beats bare greedy by ≥ 4
-points mean score on paired seeds, and completes ≥ 1.0 plans per game against
-greedy's 0.42. The plan number is the one that matters — it is the first evidence
-of something greedy structurally cannot do.
+**Retired gate (2026-08-24):** do not block S2 on search + S0 beating GreedyBot.
+That comparison proves neither plan-race strength nor preserved placement
+flexibility, and optimising it would select for the one-ply score objective that
+S2 is intended to escape. The completed S0 run remains a pipeline shakedown.
 
-**The paired-seed harness built here is permanent.** Any change to search or the
-network gets a paired-seed score against a fixed opponent before it gets a
-training run. Built as `arena.py`: one rotating seat substituted against
-GreedyBots on identical RNG streams, paired against the same game with a
-GreedyBot in that seat.
+**The paired-seed harness remains useful, but its opponent changed.** Search and
+network changes are compared candidate-versus-frozen-incumbent under the S2
+margin-versus-best contract. `arena.py`'s GreedyBot arm is retained only as a
+mechanical regression diagnostic; it is not a strength or promotion gate.
 
-⚠ **Measured: how many games the gate needs.** GreedyBot against GreedyBot at two
+⚠ **Historical variance measurement.** GreedyBot against GreedyBot at two
 seats has a per-game paired-delta standard deviation of about **18 points**, so
-the standard error is `18/√n` — **4.1 at 60 games, 1.0 at 330**. A 4-point gate
-read off 60 games sits inside its own noise and means nothing. Run ~300+ paired
-games and read `score_gap_stderr` every time, not the gap alone.
+the standard error is `18/√n` — **4.1 at 60 games, 1.0 at 330**. This no longer
+defines a gate, but it remains a warning that every paired arena conclusion needs
+its own reported standard error and adequate sample size.
 
-### S2 — The first self-play loop *(the main stage)*
+### S2 — The first self-play loop *(the main stage; trajectory leg built 2026-08-24)*
 
 Learner in seat 0 with full search; the other seats drawn from an opponent pool;
 seat count sampled per game across 2/3/4 at 60/30/10 (§2).
 
-**Pool composition, ramped rather than switched:**
+**Pool composition, ramped rather than switched (revised 2026-08-24):**
 
-1. start at 100% GreedyBot — a real opponent at two seats (51.5 mean score) that
-   costs nothing to run;
+1. start with the frozen incumbent checkpoint, sampled independently in every
+   opponent seat;
 2. add each promoted checkpoint to the pool as it promotes;
-3. let the greedy share decay as checkpoints accumulate.
+3. weight toward recent strong checkpoints while retaining older promoted ones
+   for policy diversity.
 
-**The honest limitation, stated up front.** Greedy completes 0.42 plans per game,
-so early *race pressure* is weak — the learner will mostly still take first-place
-plan value. What the pool buys immediately is the other three mechanics (temp
-ranking, game-end tempo, the reshuffle race) plus live encoder blocks and unmasked
-heads. Plan-race pressure then **ramps by itself** as the frozen opponents get
-better at plans.
+**Why GreedyBot was removed from S2.** S0 used it to prove the supervised
+pipeline, not to define strength. Welcome To defers score; early play is chiefly
+about racing to City Plans and preserving future placement flexibility. A
+one-ply score bot systematically underprices both, so comparison against it and
+continued use as the default S2 curriculum select for the wrong objective. The
+incumbent checkpoint is imperfect, but it at least represents the policy being
+improved and makes the paired promotion comparison coherent.
 
-Do not fix this by hand-building a plan-seeking bot unless S2 stalls. If it does
-stall — plans-per-game flat over several promotions — that is the moment to add
-one to the pool, not before.
+Do not replace that mistake with a hand-built plan-seeking bot. If plan learning
+stalls, diagnose the plan targets, root exploration, and opponent-pool diversity
+directly rather than installing a second handcrafted objective.
 
 **Promotion gate: paired-seed MARGIN VERSUS THE BEST OPPONENT.** Same seeds, same
 opponents, candidate versus incumbent, compared with a paired significance test.
@@ -691,11 +692,44 @@ score or win rate**. Score is still the densest signal in a game this
 low-interaction, which is why it stays as a diagnostic — but density is not the same
 as being the objective.
 
-**Gate to leave S2:** three consecutive significant promotions; ≥ 70% win rate
-against greedy at two seats; beats the S1 checkpoint head-to-head; and the
+**Gate to leave S2:** three consecutive significant promotions against the
+incumbent under the primary/secondary contract above; and the
 `first_plan` and `turns_to_plan_*` heads come off their masks and beat
 predict-the-mean. That last one is the direct evidence that race learning is
 happening rather than being assumed.
+
+#### S2 trajectory implementation
+
+`self_play.py` is the built generation/replay leg:
+
+* learner fixed in seat 0, with one persistent M6 search slot per live game;
+* advanced 2/3/4-seat games at 60/30/10, with the small-corpus allocator fixed
+  so any run of at least three games exercises every supported seat count;
+* complete macro-action games plus sparse `(root actions, integer visits)` only
+  at searched learner decisions — forced learner moves and opponent moves do
+  not masquerade as MCTS targets;
+* M0-F per-search seeds, Python-generated scaled Dirichlet noise, `tau=1` for
+  the first ten turns and deterministic choice afterwards, with the temperature
+  supplied per root so retained trees survive the schedule change;
+* real opponent moves batched by frozen checkpoint and sampled from independent
+  per-seat portable streams; no GreedyBot fallback;
+* replay through the Python rules oracle before a game is admitted to disk,
+  checking search legality, final scores, seat-axis targets and visit mass;
+* soft policy cross-entropy in `network.losses`; S0 teacher samples are promoted
+  to one-hot distributions, so old bootstrap trajectories remain compatible;
+* streaming shuffle-buffer batches via `self_play.iter_batches`, and the metric
+  set in §4 emitted on every generation run.
+
+The search's internal opponent POLICY requests still use the learner checkpoint,
+which is the existing single-model opponent proxy; the frozen pool governs the
+actual game. Routing simulated opponents through their assigned frozen networks
+would be a strength change and needs a separate bakeoff, not a silent scheduler
+change.
+
+The candidate optimiser, replay-window retention and paired promotion controller
+remain to be built on this trajectory boundary. They are deliberately not hidden
+inside generation: a trajectory is immutable evidence, while promotion changes
+which policy produces the next evidence.
 
 ### S3 — Raise the symmetric share; HOF, Elo, SPRT
 
@@ -716,8 +750,10 @@ Required guards:
 - `training.diversity_report()` logging `identical_games` every iteration as the
   canary. Non-zero is a stop-the-run condition.
 
-A pool of *different* policies cannot mirror itself, which is why S2 does not need
-these guards and S3 does.
+S2 already gives the searched learner and every real opponent seat independent
+sampling streams, even when the initial candidate and incumbent are the same
+checkpoint. S3 raises the risk because every seat becomes a sharpening searched
+policy, so its explicit collapse guards remain mandatory.
 
 ### S4 — Endgame
 
@@ -734,7 +770,7 @@ open.
 
 | metric | why |
 |---|---|
-| paired-seed score margin vs incumbent | the promotion signal |
+| paired-seed margin-vs-best vs incumbent | the promotion signal |
 | mean `permits` | the direct signature of capacity mismanagement |
 | mean houses placed, capacity at turn 10 | the same thing, earlier |
 | plans completed per game | the race, and the clearest strength proxy (greedy: 0.42) |
@@ -871,14 +907,12 @@ network size, so batching is not an optimisation to add later — it is the desi
 
 ### Required components
 
-1. **Cross-game batching.** Run *G* games concurrently and collect leaves across
-   them into one forward pass. This, not within-search batching, is what fills a
-   batch: a single search only exposes as many leaves at once as its virtual-loss
-   budget allows.
-2. **Leaf batching within a search**, via virtual loss, so one search contributes
-   more than one leaf per pass. Kingdomino's `leaf_batch` is the worked example —
-   and its port carries a known trap: **`leaf_batch >= 6`** is where it started
-   paying there. Re-measure; do not inherit the number.
+1. ✅ **Cross-game batching.** M6 runs independent searches concurrently and
+   collects both LEAF and POLICY rows into one forward call.
+2. **No within-search leaf batching.** The earlier requirement here was wrong.
+   One search exposes one suspended request; adding more requires virtual loss
+   or collision handling and changes the visit distribution that is itself the
+   policy target. That is a class C strength lever, not S2 infrastructure.
 3. **Evaluation cache** keyed on the encoded-state hash, shared across games in the
    same worker. Welcome To transposes weakly (sheets diverge fast), so expect this
    to pay less than in Kingdomino — measure the hit rate before sizing it.

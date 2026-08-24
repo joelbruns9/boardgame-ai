@@ -294,9 +294,16 @@ def losses(
     parts: dict[str, Tensor] = {}
     seat_valid = batch["seat_valid"]                                # (B, seats)
 
-    # policy: cross-entropy on what the reference actually played
+    # Policy: S0's one-hot teacher action and S2's MCTS visit distribution use
+    # the same soft-target cross entropy. `datagen.batch` always supplies the
+    # dense target, promoting old teacher samples to one-hot without changing
+    # their loss.
     logits = out["policy_logits"].masked_fill(batch["legal"] <= 0, -1e9)
-    parts["policy"] = F.cross_entropy(logits, batch["action"])
+    if "policy" in batch:
+        log_policy = torch.log_softmax(logits, dim=-1)
+        parts["policy"] = -(batch["policy"] * log_policy).sum(-1).mean()
+    else:  # direct unit-test/legacy callers predating S2
+        parts["policy"] = F.cross_entropy(logits, batch["action"])
 
     # rank: cross-entropy against the distribution over finishing positions
     rank_mask = torch.stack(

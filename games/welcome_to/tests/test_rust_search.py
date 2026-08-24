@@ -494,3 +494,24 @@ def test_m6_scheduler_rejects_duplicate_slots_before_starting_workers():
         wr.RustScheduler(capacity=2, simulations=2).search(
             states, FixedBatchEvaluator(), [1, 2], slots=[0, 0]
         )
+
+
+def test_s2_temperature_override_preserves_the_configured_zero_temperature_path():
+    state = wr.RustGameState.from_snapshot(
+        snapshot.to_snapshot(GameState.new(seed=61, rng_kind="portable"))
+    )
+    seed = derive_search_seed(61, 0)
+    configured = wr.RustScheduler(capacity=1, simulations=12, temperature=0.0).play(
+        [state], FixedBatchEvaluator(), [seed]
+    )[0]
+    overridden = wr.RustScheduler(capacity=1, simulations=12, temperature=1.0).play(
+        [state], FixedBatchEvaluator(), [seed], temperatures=[0.0]
+    )[0]
+    assert configured["choice"] == overridden["choice"]
+    assert configured["actions"] == overridden["actions"]
+    assert np.array_equal(configured["visits"], overridden["visits"])
+
+    with pytest.raises(RuntimeError, match="temperature override"):
+        wr.RustScheduler(capacity=1, simulations=2).play(
+            [state], FixedBatchEvaluator(), [seed], temperatures=[float("nan")]
+        )

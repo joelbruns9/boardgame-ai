@@ -68,6 +68,7 @@ class PackedNetEvaluator:
         self.calls = 0
         self.rows = 0
         self.batch_widths: dict[int, int] = {}
+        self._external_request_id = 0
 
     @staticmethod
     def _arrays(buffers: Sequence[bytes]) -> tuple[np.ndarray, ...]:
@@ -243,6 +244,68 @@ class PackedNetEvaluator:
             "priors": priors.astype("<f4", copy=False).tobytes(),
             "values": values.tobytes(),
         }
+
+    def policy_states(
+        self, states: Sequence[object], seats: Sequence[int]
+    ) -> tuple[list[np.ndarray], list[tuple[int, ...]]]:
+        """Batch real-game opponent policies from Rust-owned states.
+
+        Search POLICY rows already pass through :meth:`forward`; S2 also needs
+        cheap policies for opponents' *actual* moves. Keeping this path batched
+        avoids replacing the search callback bottleneck with one Python call per
+        opponent decision. Sampling stays outside this method so every seat can
+        own an independent portable RNG stream.
+        """
+        rows = len(states)
+        if rows == 0:
+            return [], []
+        if len(seats) != rows:
+            raise ValueError("states and seat counts are not row-aligned")
+        encodings = []
+        legals: list[tuple[int, ...]] = []
+        for state, count in zip(states, seats):
+            actor = int(state.actor)
+            if not 0 <= actor < count <= enc.MAX_SEATS:
+                raise ValueError(f"invalid actor/seats pair {actor}/{count}")
+            encodings.append(tuple(bytes(raw) for raw in state.encode_state(actor)))
+            legals.append(tuple(int(action) for action in state.legal_macros()))
+
+        ids = np.arange(
+            self._external_request_id,
+            self._external_request_id + rows,
+            dtype=np.uint64,
+        ).astype("<u4")
+        self._external_request_id = (self._external_request_id + rows) & 0xFFFFFFFF
+        offsets = [0]
+        flat_legal: list[int] = []
+        for legal in legals:
+            if not legal:
+                raise ValueError("live opponent state has no legal macros")
+            flat_legal.extend(legal)
+            offsets.append(len(flat_legal))
+        payload = {
+            "version": EVALUATOR_ABI_VERSION,
+            "rows": rows,
+            "sheet_planes": b"".join(row[0] for row in encodings),
+            "sheet_scalars": b"".join(row[1] for row in encodings),
+            "viewer_plane": b"".join(row[2] for row in encodings),
+            "global_scalars": b"".join(row[3] for row in encodings),
+            "legal_indices": np.asarray(flat_legal, dtype="<u2").tobytes(),
+            "legal_offsets": np.asarray(offsets, dtype="<u4").tobytes(),
+            "kind": bytes([POLICY] * rows),
+            "seats": bytes(int(count) for count in seats),
+            "request_id": ids.tobytes(),
+        }
+        response = self.forward(payload)
+        response_ids = np.frombuffer(response["request_id"], dtype="<u4")
+        raw_priors = np.frombuffer(response["priors"], dtype="<f4").reshape(
+            rows, nw.NUM_MACRO_ACTIONS
+        )
+        by_id = {int(request_id): row for row, request_id in enumerate(response_ids)}
+        if len(by_id) != rows or set(by_id) != set(int(request_id) for request_id in ids):
+            raise ValueError("opponent policy response request ids are not aligned")
+        policies = [raw_priors[by_id[int(request_id)]].copy() for request_id in ids]
+        return policies, legals
 
 
 def _native_kwargs(config: mcts.SearchConfig) -> dict:

@@ -113,6 +113,10 @@ class Sample:
     actor: int
     turn: int
     targets: dict[str, float | tuple[float, ...]]
+    #: Dense MCTS visit distribution for S2. ``None`` means the S0 teacher's
+    #: one-hot action target; :func:`batch` promotes both forms to one tensor so
+    #: bootstrap and self-play samples can share a replay buffer.
+    policy: Optional[np.ndarray] = None
 
 
 def play_trajectory(
@@ -206,6 +210,25 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
 def batch(samples: Sequence[Sample]) -> dict[str, np.ndarray]:
     """Stack samples into arrays ready for a training step."""
     n = len(samples)
+    policies = np.zeros((n, mc.NUM_MACRO_ACTIONS), dtype=np.float32)
+    for row, sample in enumerate(samples):
+        if sample.policy is None:
+            policies[row, sample.action] = 1.0
+        else:
+            policy = np.asarray(sample.policy, dtype=np.float32)
+            if policy.shape != (mc.NUM_MACRO_ACTIONS,):
+                raise ValueError(
+                    f"policy target has shape {policy.shape}, expected "
+                    f"({mc.NUM_MACRO_ACTIONS},)"
+                )
+            if np.any(policy < 0) or not np.isfinite(policy).all():
+                raise ValueError("policy target must be finite and non-negative")
+            mass = float(policy.sum())
+            if mass <= 0.0:
+                raise ValueError("policy target needs positive mass")
+            if np.any(policy[~np.asarray(sample.legal, dtype=bool)] != 0.0):
+                raise ValueError("policy target assigns mass to an illegal macro")
+            policies[row] = policy / mass
     out = {
         "sheet_planes": np.stack([s.sheet_planes for s in samples]),
         "sheet_scalars": np.stack([s.sheet_scalars for s in samples]),
@@ -213,6 +236,7 @@ def batch(samples: Sequence[Sample]) -> dict[str, np.ndarray]:
         "global_scalars": np.stack([s.global_scalars for s in samples]),
         "legal": np.stack([s.legal for s in samples]),
         "action": np.asarray([s.action for s in samples], dtype=np.int64),
+        "policy": policies,
         "turn": np.asarray([s.turn for s in samples], dtype=np.float32),
     }
     for name in training.TARGET_NAMES:
@@ -222,6 +246,7 @@ def batch(samples: Sequence[Sample]) -> dict[str, np.ndarray]:
     assert out["viewer_plane"].shape == (n, *enc.VIEWER_PLANE_SHAPE)
     assert out["global_scalars"].shape == (n, enc.NUM_GLOBAL_SCALAR)
     assert out["legal"].shape == (n, mc.NUM_MACRO_ACTIONS)
+    assert out["policy"].shape == (n, mc.NUM_MACRO_ACTIONS)
     for name in training.PER_SEAT_TARGETS:
         assert out[name].shape == (n, training.MAX_SEATS), name
     for name in training.GLOBAL_TARGETS:

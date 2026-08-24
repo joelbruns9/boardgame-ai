@@ -303,6 +303,8 @@ def test_a_small_corpus_still_gets_its_four_seat_games():
     counts = tn.seat_counts(10)
     assert len(counts) == 10
     assert counts.count(4) >= 1, "the far end of the seat axis went dark"
+    tiny = tn.seat_counts(4)
+    assert tiny.count(4) == 1, "the documented four-game shakedown lost 4p"
 
 
 def test_the_corpus_carries_every_seat_count():
