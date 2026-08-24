@@ -45,7 +45,7 @@ const P_ESTATE_SIZE: usize = 9;
 const P_SPAN: usize = 10;
 const P_FIT: usize = 11;
 
-type Matrix = [[f32; NUM_EFFECTS]; NUM_NUMBERS];
+pub(crate) type Matrix = [[f32; NUM_EFFECTS]; NUM_NUMBERS];
 
 pub struct EncodedState {
     pub sheet_planes: Vec<f32>,
@@ -317,7 +317,7 @@ fn add_matrix(left: &Matrix, right: &Matrix) -> Matrix {
     out
 }
 
-fn deck_composition(game: &Game, viewer: usize) -> Matrix {
+pub(crate) fn deck_composition(game: &Game, viewer: usize) -> Matrix {
     let mut known = game.table_cards(viewer);
     if !game.config.expert {
         let mut cards = game.discard.clone();
@@ -335,7 +335,7 @@ fn deck_composition(game: &Game, viewer: usize) -> Matrix {
     out
 }
 
-fn discard_composition(game: &Game) -> Matrix {
+pub(crate) fn discard_composition(game: &Game) -> Matrix {
     if game.config.expert {
         [[0.0f32; NUM_EFFECTS]; NUM_NUMBERS]
     } else {

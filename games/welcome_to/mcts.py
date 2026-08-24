@@ -771,6 +771,11 @@ def _position_key(state: GameState, root: int) -> tuple:
 # ──────────────────────────────────────────────────────────────────────────
 # The viewer information-state key -- SEARCH_SPEC.md §12.1
 # ──────────────────────────────────────────────────────────────────────────
+# Cross-language identity contract. Increment whenever a component is added,
+# removed, reinterpreted, or reordered in ``information_key``.
+INFORMATION_KEY_ABI_VERSION: int = 1
+
+
 def _printed(card: Optional[int]) -> Optional[tuple[int, int]]:
     """A card's printed face — ``(number, effect)`` — never its physical id.
 

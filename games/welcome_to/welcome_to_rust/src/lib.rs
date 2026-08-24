@@ -12,6 +12,7 @@ mod codec;
 mod constants;
 mod encoder;
 mod game;
+mod information_key;
 mod macro_codec;
 mod plans;
 mod rng;
@@ -395,6 +396,18 @@ impl RustGameState {
         ))
     }
 
+    /// M4 viewer information-state key as canonical little-endian bytes.
+    #[pyo3(signature = (viewer=None))]
+    fn information_key<'py>(
+        &self,
+        py: Python<'py>,
+        viewer: Option<usize>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let viewer = viewer.unwrap_or(self.inner.actor);
+        let key = information_key::information_key(&self.inner, viewer).map_err(to_py)?;
+        Ok(PyBytes::new(py, &key))
+    }
+
     // ── the M0-C snapshot ─────────────────────────────────────────────
     /// The whole state, in the shape `snapshot.to_snapshot` produces.
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -576,5 +589,9 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("SHEET_SCALARS_LEN", encoder::SHEET_SCALARS_LEN)?;
     module.add("VIEWER_PLANE_LEN", encoder::VIEWER_PLANE_LEN)?;
     module.add("GLOBAL_SCALARS_LEN", encoder::NUM_GLOBAL_SCALAR)?;
+    module.add(
+        "INFORMATION_KEY_ABI_VERSION",
+        information_key::INFORMATION_KEY_ABI_VERSION,
+    )?;
     Ok(())
 }

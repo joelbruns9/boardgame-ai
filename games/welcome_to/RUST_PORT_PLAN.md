@@ -479,6 +479,11 @@ checkpoints trained before it saw different data.
 
 ### M4 — `information_key`
 
+**✅ Built 2026-08-23.** Rust emits a versioned, collision-free canonical byte
+key directly from its owned state.  It is viewer-relative by construction and
+is the representation M5's observation maps will own; the PyO3 method is only a
+diagnostic view of those same bytes.
+
 **Gate — constructed equivalence classes, not a random corpus.** ⚠ Information
 keys almost never collide naturally, so comparing random pairs would
 overwhelmingly prove that both engines say "different", and would pass even if
@@ -496,6 +501,16 @@ And separation mutations for **every** visible component of the key. Then compar
 Python's and Rust's **group assignments** in linear time, and inside every
 equal-key group assert identical encoding, identical `search_legal_macros`, and
 identical terminal value where applicable.
+
+**Gate result:** 69 deliberately constructed states formed 48 observation
+groups: 21 required collisions and 43 visible-component separations.  Python's
+tuple key and Rust's byte key induced exactly the same partition.  Every
+equal-key group also had identical four-array encodings and
+`search_legal_macros`; terminal groups had one value.  The cases include 12
+redeterminizations, physical printed-card twins, the mid-turn live/public sheet
+split, private votes and actor context, table order with an unchanged histogram,
+and a discard-composition pair with equal raw count and deck composition.
+Full suite: 513 passed, 1 skipped; 23 Rust unit tests passed.
 
 ### M5 — the search descent
 
@@ -662,6 +677,23 @@ fresh byte-buffer allocations and four Python/NumPy views per row.  M6 will use
 the already-frozen batch-major layout and reusable buffers; no benefit from that
 unbuilt path is claimed here.
 
+### 7.3 M4, measured — `rust_key_bench.py`, 2026-08-23
+
+Laptop, one played-in 4-seat advanced position at turn 8, 100,000 keys per
+backend:
+
+| Python | Rust | ratio | Rust key size |
+|---:|---:|---:|---:|
+| 9,465 keys/s | 550,863 keys/s | **58.2×** | 973 bytes |
+
+The first collision-free fixed-width draft was slightly faster (598,246 keys/s)
+but produced a 1,894-byte key.  Canonical varints cut retained-child key storage
+by 49% for an 8% throughput cost, the right trade before M5 owns one key per
+observation outcome.  At 256 simulations, the compact payload is roughly
+250 KiB if every simulation creates a distinct 4-seat observation; allocator and
+map overhead are not included.  This is still a microbenchmark—end-to-end search
+is not measurable until M5/M6.
+
 **Re-measure the profile after M3.** §1's shares were taken with an interpreted
 engine; once the encoder is compiled the remaining Python is a different mixture.
 7WD's experience: **1.99× on a microbenchmark became 1.89× on the real path, and
@@ -736,7 +768,7 @@ bets widening loses a bakeoff nobody has run.
    later. **Built 2026-08-23** alongside M1, because M1's gate cannot run
    without B, C and D.
 2. ✅ **M1**, and measure what is measurable (§7) — **built 2026-08-23**, §7.1.
-3. ✅ **M2** and ✅ **M3** (built 2026-08-23), then M4.
+3. ✅ **M2**, ✅ **M3** and ✅ **M4** (built 2026-08-23).
 4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
    the widening question** — that decision was taken as "design for it, do not
    build it", precisely so this step does not wait on a measurement that cannot
