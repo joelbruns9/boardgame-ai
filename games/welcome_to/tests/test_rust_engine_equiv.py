@@ -1,0 +1,224 @@
+"""M1: the Rust engine is equivalent to ``game.py`` — ``RUST_PORT_PLAN.md`` M1.
+
+⚠ **This module is a *sample* of the gate, not the gate.** The gate is 8,000
+games and takes about half an hour; a test suite that took half an hour would
+stop being run. The gate is::
+
+    python -m games.welcome_to.rust_equiv --games 8000
+
+and what runs here is the same code over a few dozen games, plus every
+constructed position — those are cheap and they cover the rules that played
+games do not reach.
+
+⚠ **Python is the oracle** (§3). A failure here means the *Rust* engine is
+wrong, unless the diff shows otherwise; ``game.py`` is what the BGA differential
+harness validates.
+
+The whole module skips when the crate is not built, so a checkout without a
+Rust toolchain still runs the rest of the suite. ``maturin develop --release``
+in ``games/welcome_to/welcome_to_rust`` is what un-skips it.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from games.welcome_to import rust_equiv as eq
+from games.welcome_to import snapshot as sn
+from games.welcome_to import tables
+from games.welcome_to.game import GameConfig, GameState
+from games.welcome_to.portable_rng import PortableRng
+
+wr = pytest.importorskip(
+    "welcome_to_rust",
+    reason="the Rust engine is not built; run `maturin develop --release` in "
+    "games/welcome_to/welcome_to_rust",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# M0 contracts — checked first, because M1 means nothing if they are broken
+# ──────────────────────────────────────────────────────────────────────────
+def test_the_static_tables_are_the_same_tables():
+    """M0-D. A silent table divergence produces a legal-looking game that is a
+    *different game*, and it would pass every per-action gate below."""
+    assert wr.table_signature() == tables.table_signature()
+
+
+def test_the_snapshot_schemas_are_the_same_version():
+    """M0-C. Two differently-shaped dictionaries can be compared key by key and
+    agree; the version is what stops that."""
+    assert wr.snapshot_version() == sn.SNAPSHOT_VERSION
+
+
+def test_the_action_space_is_the_same_size():
+    from games.welcome_to import action_codec as codec
+
+    assert wr.NUM_ACTIONS == codec.NUM_ACTIONS
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2**63 - 1, 2**64 - 1])
+def test_the_portable_rng_streams_are_identical(seed):
+    """M0-B. "Same seed" only means something if the two generators agree."""
+    rng = PortableRng(seed)
+    assert [rng.next_u64() for _ in range(16)] == wr.portable_rng_stream(seed, 16)
+
+
+def test_the_portable_shuffle_permutes_identically():
+    """The deck shuffle *is* the deal, so a shuffle that differed by one swap
+    would give two different games from the same seed."""
+    for seed in (0, 7, 123456789):
+        for n in (2, 5, 81, 82):
+            seq = list(range(n))
+            rng = PortableRng(seed)
+            rng.shuffle(seq)
+            rust_seq, rust_state = wr.portable_rng_shuffle(seed, n)
+            assert seq == rust_seq
+            assert rng.state == rust_state
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# M0-A — the supported configuration matrix, refused loudly
+# ──────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"players": 2, "expert": True}, "expert"),
+        ({"players": 1}, "one-seat"),
+        ({"players": 5}, "5 seats"),
+    ],
+)
+def test_unsupported_configurations_are_refused_by_name(kwargs, expected):
+    """A silently-ignored flag is how a Rust self-play run stops being
+    equivalent without anybody noticing, so the refusal names the reason."""
+    with pytest.raises(ValueError, match=expected):
+        wr.RustGameState(1, **kwargs)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# M1 — lockstep equivalence
+# ──────────────────────────────────────────────────────────────────────────
+def test_a_new_game_deals_the_same_cards_and_the_same_plans():
+    """Before a single action: the same shuffle, the same three plans, the same
+    generator state.  If this fails, nothing below is meaningful."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = GameState.new(seed=5, config=config)
+    rs = wr.RustGameState(5, players=2, advanced=True, solo_rules=False)
+    assert sn.diff(sn.to_snapshot(py), rs.snapshot()) == []
+    assert list(py.plan_ids) == rs.plan_ids
+    assert py.rng.state == rs.rng_state
+
+
+@pytest.mark.parametrize("config", eq.GATE_CONFIGS, ids=lambda c: f"{c.players}p-adv{int(c.advanced)}")
+@pytest.mark.parametrize("driver", eq.DRIVERS)
+def test_a_game_agrees_after_every_action(config, driver):
+    """One game per (configuration, driver) — 18 games, the shape of the gate.
+
+    Compares the complete M0-C snapshot after every action, the raw
+    ``legal_actions`` order before it, and the boundary triple once per turn.
+    """
+    report = eq.check_game(seed=41, config=config, driver=driver)
+    assert report.steps > 20, "a game this short is not evidence of anything"
+
+
+@pytest.mark.parametrize("case", list(eq.constructed_cases()), ids=lambda c: c[0])
+def test_a_constructed_position_agrees(case):
+    """The states play does not reach: two of ``isEndOfGame``'s three clauses,
+    a queued reshuffle, an exact-empty deck, and both at once.
+
+    Measured over 60 greedy games: 56 ended on the third permit refusal, four
+    filled a sheet, none completed three plans.  Rare is exactly where a rules
+    divergence survives a gate, so these are handed to Rust through the
+    snapshot rather than played into.
+    """
+    name, state, expect = case
+    eq.check_constructed(name, state, expect)
+
+
+def test_a_snapshot_survives_the_round_trip_into_rust_and_back():
+    """M0-C in both directions, which is what the constructed positions ride
+    on: Python state -> snapshot -> Rust state -> snapshot."""
+    config = GameConfig(players=3, advanced=True, solo_rules=False)
+    py = eq._mid_game(17, config, turn=8)
+    snapshot = sn.to_snapshot(py)
+    rs = wr.RustGameState.from_snapshot(snapshot)
+    assert sn.diff(snapshot, rs.snapshot()) == []
+    assert py.legal_actions() == rs.legal_actions()
+    assert list(py.scores()) == list(rs.scores())
+
+
+@pytest.mark.parametrize("seed", [0, 12345])
+def test_redeterminize_permutes_the_undrawn_deck_identically(seed):
+    """The primitive MCTS calls at every root, and the one place a port can
+    cheat without any gate noticing: it must permute *only* the undrawn deck,
+    identically, and leave the caller's generator in the same place.
+
+    The determinized copy also gets a fresh generator of its own, derived from
+    the caller's — two determinizations that shared RNG state would apply the
+    same permutation at a mid-rollout reform, correlating simulations that are
+    meant to be independent.
+    """
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = eq._mid_game(23, config, turn=6)
+    rs = wr.RustGameState.from_snapshot(sn.to_snapshot(py))
+
+    search_rng = PortableRng(seed)
+    rust_state = seed
+    for _ in range(3):
+        py_next = py.redeterminize(search_rng)
+        rs_next, rust_state = rs.redeterminize(rust_state)
+        assert sn.diff(sn.to_snapshot(py_next), rs_next.snapshot()) == []
+        assert search_rng.state == rust_state
+        # the composition is untouched; only the hidden order moved
+        assert sorted(py_next.deck) == sorted(py.deck)
+        assert py_next.deck[: py_next.deck_pos] == py.deck[: py.deck_pos]
+
+
+def test_a_cpython_snapshot_is_refused_rather_than_silently_reseeded():
+    """A ``random.Random`` state has no Rust counterpart.  Substituting a fresh
+    generator would make the hand-off *look* successful while the two engines
+    drew different cards from there on."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = GameState.new(seed=3, config=config, rng_kind="cpython")
+    with pytest.raises(ValueError, match="cpython"):
+        wr.RustGameState.from_snapshot(sn.to_snapshot(py))
+
+
+def test_the_harness_can_actually_see_a_divergence():
+    """A negative control.  A gate that cannot fail is not a gate — and this one
+    compares two dictionaries, which is exactly the shape of check that quietly
+    stops comparing anything."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = GameState.new(seed=1, config=config)
+    rs = wr.RustGameState(2, players=2, advanced=True, solo_rules=False)
+    assert sn.diff(sn.to_snapshot(py), rs.snapshot()) != []
+
+    with pytest.raises(eq.Divergence):
+        eq._compare(py, rs, seed=1, config=config, step=0, action=None)
+
+
+def test_an_illegal_action_raises_the_same_class_on_both_sides():
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = GameState.new(seed=9, config=config)
+    rs = wr.RustGameState(9, players=2, advanced=True, solo_rules=False)
+    illegal = next(a for a in range(wr.NUM_ACTIONS) if a not in py.legal_actions())
+    with pytest.raises(ValueError):
+        py.apply(illegal)
+    with pytest.raises(ValueError):
+        rs.apply(illegal)
+
+
+def test_a_rejected_boundary_outcome_leaves_the_state_untouched():
+    """The transactional contract: "raises, and also destroys the state you
+    called it on" is not a contract worth having, in either language."""
+    config = GameConfig(players=2, advanced=True, solo_rules=False)
+    py = eq._mid_game(11, config, turn=4)
+    rs = wr.RustGameState.from_snapshot(sn.to_snapshot(py))
+    assert py.prepare_turn_boundary() and rs.prepare_turn_boundary()
+
+    before = rs.snapshot()
+    outcome = py.sample_boundary_outcome(PortableRng(2))
+    too_many = list(outcome.draws) + [outcome.draws[0]]
+    with pytest.raises(ValueError):
+        rs.apply_boundary_outcome(too_many)
+    assert sn.diff(before, rs.snapshot()) == []

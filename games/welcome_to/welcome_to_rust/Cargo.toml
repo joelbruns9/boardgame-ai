@@ -1,0 +1,22 @@
+[package]
+name = "welcome_to_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "welcome_to_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# M1 is engine-only: pyo3 and nothing else, per RUST_PORT_PLAN.md §6. rayon,
+# mimalloc and sha2 arrive if and when profiling asks for them, each recorded
+# against the measurement that justified it.
+#
+# Pinned at 0.28.x deliberately: 0.28 renamed `Python::with_gil` -> `attach` and
+# `allow_threads` -> `detach`, which M6's scheduler depends on.
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

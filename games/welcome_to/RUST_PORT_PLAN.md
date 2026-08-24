@@ -231,10 +231,53 @@ Each is a separate commit with its own gate. **Land single-threaded-correct
 first; concurrency is M6.** That ordering is not taste — it is what worked on
 Kingdomino and the note says to do it again.
 
-### M1 — `RustGameState`: the engine
+### M1 — `RustGameState`: the engine ✅ BUILT, GATE GREEN 2026-08-23
+
+**Gate result: 8,000 games, 1,490,189 actions compared, zero divergences, 37
+minutes** (`--games 8000`, 3.6 games/s — the rate is the *comparison's*, not the
+engine's: every action re-serialises both states in Python). Plus 7 constructed
+positions and, once per turn, the read API, the boundary triple and
+`redeterminize`.
 
 `game.py` rules and `sheet.py` behind an opaque handle, including the boundary
 triple, since `_end_turn` is built from it.
+
+**What landed, and where.** M0's four load-bearing contracts were code, not just
+decisions, so they landed with M1:
+
+| piece | file |
+|---|---|
+| M0-A supported matrix, refused at construction | `welcome_to_rust/src/lib.rs::check_supported` |
+| M0-B portable RNG, both languages | `portable_rng.py`, `src/rng.rs` |
+| M0-B `Trajectory.rng`, defaulting to `cpython` | `datagen.py` |
+| M0-C snapshot schema, **both directions** | `snapshot.py`, `src/snapshot.rs` |
+| M0-D static-table signature | `tables.py`, `src/tables.rs` |
+| the engine | `src/{game,sheet,plans,codec,constants}.rs` |
+| the gate | `rust_equiv.py`, `tests/test_rust_engine_equiv.py` |
+| §7 instrumentation | `rust_engine_bench.py` |
+
+⚠ **M0-E and M0-F are still decisions, not code, and that is correct.** E is the
+evaluator ABI, which nothing calls until M3; F is per-search seed derivation,
+which nothing draws until M5. A, B, C and D became code here only because M1's
+gate cannot run without them — a lockstep gate needs a shared generator, a
+complete snapshot and an assurance that both engines hold the same tables.
+
+**Four things the plan did not anticipate, all decided in its direction:**
+
+* **The engine RNG had to change on the Python side too**, and `GameState.new`
+  therefore takes `rng_kind`, defaulting to `portable`. `Trajectory.rng`
+  defaults to `cpython`, which is what keeps the pre-port corpus replayable —
+  a seed only reproduces a game together with the generator that consumed it.
+* **`PortableRng.choice` is not `random.Random.choice`.** The latter draws
+  through `_randbelow`'s rejection loop; this is one `next_u64 % n`, so Rust
+  reproduces it in a line. Plan selection at setup is the only user.
+* **The snapshot carries the generator state**, one u64, and the gate compares
+  it. That is what makes a divergence in the *number of draws* fail on the step
+  it happens rather than several boundaries later, when only the deal differs
+  and the cause is gone.
+* **Expert and solo are ported but refused.** They share the boundary code with
+  the standard path, so omitting them meant writing a different engine, not a
+  smaller one. M0-A refuses them as a *configuration*, by name, at construction.
 
 **Gate:** lockstep equivalence over **8,000 games** at 2/3/4 seats, advanced on
 and off, driven from a shared `PortableRng` seed (M0-B), comparing **after every
@@ -258,6 +301,21 @@ action** via the M0-C snapshot:
   `boundary_prepared`;
 * `scores()` and `winners()` at the end.
 
+**Three things beyond the list, added because the list is about *state* and a
+port can get every field right and still answer a question differently:**
+
+* **the read API**, once per turn — `visible_cards`, `next_effects` (§6.2's
+  certainty), `table_cards`, `playable_slots`, `scorable_plan_slots`, and the
+  information-set filters `plan_turns_for` / `reshuffle_vote_for`, plus
+  viewer-scoped `scores` / `plan_scores` / `temp_scores` / `score_breakdown`;
+* **the boundary triple**, once per turn, on copies — `prepare` (including its
+  `False`), then `sample` from the *same generator state*, then `apply`, with
+  the afterstate compared before and after sampling (a chance node samples
+  repeatedly, so sampling must not mutate) and the generator compared after;
+* **`redeterminize`** — the primitive MCTS calls at every root, and the one
+  place a port can cheat invisibly. Same permutation, same fresh child
+  generator, same caller generator left behind.
+
 ⚠ **Completeness guards, not hand-written lists.** Assert the comparator's field
 tuples against `dataclasses.fields(GameState)`, `fields(TurnCtx)` and
 `fields(Sheet)`, excluding only the deliberately different RNG representation.
@@ -265,7 +323,28 @@ The `_SHEET_FIELDS` guard already in `mcts.py` exists because a hand-written lis
 of somebody else's fields rots silently; this is the same problem three times
 over.
 
-**Test:** `tests/test_rust_engine_equiv.py`.
+**Test:** `tests/test_rust_engine_equiv.py` — a *sample* of the gate (18 games,
+one per configuration × driver, plus every constructed position, ~5s). The gate
+itself is `python -m games.welcome_to.rust_equiv --games 8000`, ~35 minutes.
+
+⚠ **A uniform-random driver is not a gate, and that was measured.** Over 60
+uniform-random games: **60/60 ended on the third permit refusal**, City Plans
+were validated 9 times *in total*, and the deck reformed **once**. A gate made
+of those games would barely touch plan scoring, and would never see a reshuffle.
+So the harness cycles three drivers — uniform, uniform-except-choosing-a-refusal,
+and `GreedyBot` (~35× slower per action, 32 plan validations and 12 reforms in
+12 games) — and the driver advances once per full pass over the configuration
+matrix, so every configuration meets every driver.
+
+⚠ **And played games still do not reach some rules at all.** Over 60 greedy
+games, 56 ended on the third refusal, 4 filled a sheet, and **none** completed
+three City Plans. Two of `isEndOfGame`'s three clauses, the queued reshuffle and
+the exact-empty reform are therefore **constructed positions**, handed to Rust
+through the M0-C snapshot — which is what the "both directions" in M0-C buys,
+and the reason `RustGameState.from_snapshot` exists at M1 rather than M5. Each
+case asserts what it is *supposed* to do at its boundary (`open`, `draws`,
+`reformed`), so a case that quietly stopped being a queued reshuffle fails
+instead of testing an ordinary boundary twice.
 
 ✅ **Canonical legal-action ordering — checked, and this trap does not apply.**
 Kingdomino's Python order came from iterating a `set` and was unreplicable.
@@ -451,6 +530,28 @@ microbenchmark until M6. Say which is which. Record from the start:
 * evaluator calls, rows, batch-width distribution;
 * end-to-end leaves/s and games/hour, **once integrated**.
 
+### 7.1 M1, measured — `rust_engine_bench.py`, 2026-08-23
+
+Laptop, 2 seats, advanced, 150 uniform-random games, **engine only** — this is
+the microbenchmark the section above says to label as one, not a claim about the
+search:
+
+| | Python | Rust | ratio |
+|---|---|---|---|
+| actions/s | 15,637 | 424,389 | **27×** |
+| games/s | 141 | 3,825 | 27× |
+| state clones/s | 78,176 | 2,241,650 | **29×** |
+
+⚠ Two runs of the same benchmark gave 25.4× / 43× and 27× / 29×, on an
+unquiesced laptop. The ratios are worth one significant figure and no more; the
+clone rate in particular moved by a third between runs.
+
+⚠ **Do not carry the 25.4× forward.** §1's ceiling is ~15× *including* the
+encoder and the torch forward, which are untouched at M1; and 7WD's 1.99×
+microbenchmark became 1.89× on the real path. The clone rate is the number worth
+remembering, because it is what the fixed-array layout bought and what M5's tree
+will spend.
+
 **Re-measure the profile after M3.** §1's shares were taken with an interpreted
 engine; once the encoder is compiled the remaining Python is a different mixture.
 7WD's experience: **1.99× on a microbenchmark became 1.89× on the real path, and
@@ -521,8 +622,10 @@ bets widening loses a bakeoff nobody has run.
 
 ## 9. Order of operations
 
-1. **M0.** Contracts first. Every one of them is cheap now and expensive later.
-2. **M1**, and measure what is measurable (§7).
+1. ✅ **M0.** Contracts first. Every one of them is cheap now and expensive
+   later. **Built 2026-08-23** alongside M1, because M1's gate cannot run
+   without B, C and D.
+2. ✅ **M1**, and measure what is measurable (§7) — **built 2026-08-23**, §7.1.
 3. M2, M3, M4 in order.
 4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
    the widening question** — that decision was taken as "design for it, do not

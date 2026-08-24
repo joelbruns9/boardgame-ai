@@ -41,7 +41,7 @@ import numpy as np
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import training
-from games.welcome_to.game import GameConfig, GameState
+from games.welcome_to.game import DEFAULT_RNG_KIND, GameConfig, GameState
 
 #: A policy is anything that maps a state to a legal action index.
 Policy = Callable[[GameState], int]
@@ -58,6 +58,14 @@ class Trajectory:
     solo_rules: bool
     actions: tuple[int, ...]
     scores: tuple[int, ...]
+    #: Which engine generator produced the deal (``RUST_PORT_PLAN.md`` M0-B).
+    #:
+    #: ⚠ **Defaults to ``"cpython"`` on purpose.** A seed only reproduces a game
+    #: together with the generator that consumed it, and every trajectory
+    #: captured before the Rust port ran on ``random.Random``.  A file written
+    #: then has no ``rng`` key, so the default is what keeps that corpus
+    #: replayable; anything captured since records ``"portable"`` explicitly.
+    rng: str = "cpython"
 
     @property
     def config(self) -> GameConfig:
@@ -82,6 +90,7 @@ class Trajectory:
             solo_rules=raw["solo_rules"],
             actions=tuple(raw["actions"]),
             scores=tuple(raw["scores"]),
+            rng=raw.get("rng", "cpython"),
         )
 
 
@@ -116,7 +125,7 @@ def play_trajectory(
     # Multiplayer by default -- a one-seat game switches scoring rules, so a
     # single-seat corpus trains on a different game.  See SELF_PLAY_PLAN.md.
     config = config or GameConfig(players=2, advanced=True, solo_rules=False)
-    state = GameState.new(seed=seed, config=config)
+    state = GameState.new(seed=seed, config=config, rng_kind=DEFAULT_RNG_KIND)
     actions: list[int] = []
     for _ in range(max_steps):
         if state.is_terminal:
@@ -135,6 +144,7 @@ def play_trajectory(
         solo_rules=config.solo_rules,
         actions=tuple(actions),
         scores=tuple(state.scores()),
+        rng=state.rng_kind,
     )
 
 
@@ -150,7 +160,9 @@ def replay(trajectory: Trajectory) -> Iterator[Sample]:
     Raises if a recorded action is no longer legal, which is what makes a rules
     change invalidate stale data loudly instead of quietly.
     """
-    state = GameState.new(seed=trajectory.seed, config=trajectory.config)
+    state = GameState.new(
+        seed=trajectory.seed, config=trajectory.config, rng_kind=trajectory.rng
+    )
     visits: list[tuple] = []
 
     for visited, macro in mc.collapse(state, trajectory.actions):

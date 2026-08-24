@@ -605,7 +605,13 @@ def test_a_newly_noised_root_always_gets_fresh_simulations():
     twice; this one proves it is applied at all.
     """
     torch.manual_seed(0)
-    search, evaluator = _search(simulations=8, dirichlet_alpha=1.0)
+    # ⚠ The budget is a *precondition*, not the subject: retention needs the
+    # chosen macro's child to exist in the tree, and this position offers ~60
+    # macros, so 8 simulations retain one only by luck.  It used to, and stopped
+    # when M0-B moved the deal to the portable RNG -- the search behaviour did
+    # not change, the fixture's deal did.  The visit counts are overwritten
+    # below anyway, so the budget only has to be big enough to expand the child.
+    search, evaluator = _search(simulations=32, dirichlet_alpha=1.0)
     state = _position(players=2, turn=8, root=0)
     rng = random.Random(3)
 

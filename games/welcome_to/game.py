@@ -69,6 +69,7 @@ from games.welcome_to.constants import (
     MAX_NUMBER,
     MIN_NUMBER,
 )
+from games.welcome_to.portable_rng import PortableRng
 from games.welcome_to.plans import (
     PLANS,
     Plan,
@@ -81,6 +82,47 @@ from games.welcome_to.sheet import Estate, Pos, Sheet, SheetScore
 
 #: The mock player id BGA uses when the solo card validates every plan.
 SOLO_MOCK_PLAYER: int = -1
+
+
+#: Either engine generator.  ``PortableRng`` is the one the Rust port mirrors
+#: (``RUST_PORT_PLAN.md`` M0-B); ``random.Random`` stays supported because the
+#: 5,000-game S0 corpus was captured under it and a format that silently
+#: invalidated it would be a data-loss bug.
+EngineRng = "random.Random | PortableRng"
+
+#: The generator a new game uses unless asked otherwise.  Portable, because
+#: every new corpus has to be replayable by *both* engines.
+DEFAULT_RNG_KIND: str = "portable"
+RNG_KINDS: tuple[str, ...] = ("portable", "cpython")
+
+
+def rng_kind_of(rng) -> str:
+    """Which generator ``rng`` is, as it appears in a snapshot."""
+    return "portable" if isinstance(rng, PortableRng) else "cpython"
+
+
+def _new_rng(kind: str, seed: Optional[int]):
+    if kind not in RNG_KINDS:
+        raise ValueError(f"unknown rng kind {kind!r}; expected one of {RNG_KINDS}")
+    if kind == "cpython":
+        return random.Random(seed)
+    if seed is None:
+        seed = random.Random().getrandbits(64)
+    return PortableRng(seed)
+
+
+def _clone_rng(rng):
+    """A generator with the same state, whichever kind it is."""
+    if isinstance(rng, PortableRng):
+        return rng.clone()
+    clone = random.Random()
+    clone.setstate(rng.getstate())
+    return clone
+
+
+def _reseed_like(rng, seed: int):
+    """A *fresh* generator of the same kind, seeded from ``seed``."""
+    return PortableRng(seed) if isinstance(rng, PortableRng) else random.Random(seed)
 
 
 class Phase(IntEnum):
@@ -255,7 +297,8 @@ class GameState:
     #: and in the concurrent game nobody knows that, or even that the earlier
     #: player completed a plan.  An information-set-safe reader asks this.
     reshuffle_votes: dict[int, bool]
-    rng: random.Random
+    #: The engine generator -- see :data:`DEFAULT_RNG_KIND`.
+    rng: "random.Random | PortableRng"
     solo_card_drawn: bool = False
     #: Whether :meth:`prepare_turn_boundary` has run and no reveal has followed.
     #:
@@ -275,15 +318,22 @@ class GameState:
         cls,
         seed: Optional[int] = None,
         config: Optional[GameConfig] = None,
+        rng_kind: str = DEFAULT_RNG_KIND,
     ) -> "GameState":
-        """``welcometo::setupNewGame``."""
+        """``welcometo::setupNewGame``.
+
+        ``rng_kind`` picks the engine generator.  ``"portable"`` is the default
+        and is what the Rust engine reproduces; ``"cpython"`` replays a game
+        captured before the port, and is what :class:`datagen.Trajectory`
+        records for that corpus.
+        """
         config = config or GameConfig()
         if config.players < 1:
             raise ValueError("need at least one player")
         if config.expert and config.players < 2:
             raise ValueError("expert rules need at least two players")
 
-        rng = random.Random(seed)
+        rng = _new_rng(rng_kind, seed)
         deck = list(range(NUM_BASE_CARDS))
         rng.shuffle(deck)
 
@@ -345,8 +395,7 @@ class GameState:
             self.deck.insert(min(index + SOLO_DECK_MIDDLE, len(self.deck)), SOLO_CARD_ID)
 
     def copy(self) -> "GameState":
-        rng = random.Random()
-        rng.setstate(self.rng.getstate())
+        rng = _clone_rng(self.rng)
         return GameState(
             config=self.config,
             sheets=[s.copy() for s in self.sheets],
@@ -442,6 +491,11 @@ class GameState:
         self.solo_card_drawn = True
         for slot in range(3):
             self.plan_turns[slot].setdefault(SOLO_MOCK_PLAYER, self.turn - 1)
+
+    @property
+    def rng_kind(self) -> str:
+        """Which generator this game is running on (``"portable"``/``"cpython"``)."""
+        return rng_kind_of(self.rng)
 
     @property
     def deck_remaining(self) -> int:
@@ -1263,7 +1317,7 @@ class GameState:
         unseen = nxt.deck[nxt.deck_pos:]
         rng.shuffle(unseen)
         nxt.deck = nxt.deck[: nxt.deck_pos] + unseen
-        nxt.rng = random.Random(rng.getrandbits(64))
+        nxt.rng = _reseed_like(self.rng, rng.getrandbits(64))
         return nxt
 
     # ──────────────────────────────────────────────────────────────────
