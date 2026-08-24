@@ -10,6 +10,7 @@ import numpy as np
 from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
+from games.welcome_to import rust_search
 from games.welcome_to import snapshot
 from games.welcome_to.portable_rng import PortableRng, derive_search_seed
 from games.welcome_to.rust_search_equiv import collect_positions
@@ -49,12 +50,19 @@ class BenchEvaluator:
         )
 
 
-def run(*, positions: int = 48, simulations: int = 32) -> dict[str, float]:
+def run(
+    *,
+    positions: int = 48,
+    simulations: int = 32,
+    chance_widening: float | None = 1.0,
+) -> dict[str, float]:
     corpus = collect_positions(positions)
     rust_states = [
         wr.RustGameState.from_snapshot(snapshot.to_snapshot(state)) for state in corpus
     ]
-    config = mcts.SearchConfig(simulations=simulations)
+    config = mcts.SearchConfig(
+        simulations=simulations, chance_widening=chance_widening
+    )
 
     python_eval = BenchEvaluator()
     started = time.perf_counter()
@@ -67,7 +75,7 @@ def run(*, positions: int = 48, simulations: int = 32) -> dict[str, float]:
     started = time.perf_counter()
     for index, state in enumerate(rust_states):
         seed = derive_search_seed(0xB3EC4, index)
-        wr.RustMcts(simulations=simulations).search(state, rust_eval, seed)
+        rust_search.native_search(config).search(state, rust_eval, seed)
     rust_seconds = time.perf_counter() - started
 
     total_simulations = positions * simulations
@@ -89,9 +97,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--positions", type=int, default=48)
     parser.add_argument("--simulations", type=int, default=32)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--chance-widening", type=float, default=1.0)
+    mode.add_argument("--control", action="store_true")
     args = parser.parse_args()
-    result = run(positions=args.positions, simulations=args.simulations)
+    result = run(
+        positions=args.positions,
+        simulations=args.simulations,
+        chance_widening=None if args.control else args.chance_widening,
+    )
     print(
+        f"Mode   {'control' if args.control else f'PW C={args.chance_widening:g}'}\n"
         f"Python {result['python_simulations_s']:.1f} simulations/s, "
         f"{result['python_leaves_s']:.1f} LEAF rows/s, "
         f"{result['python_seconds']:.2f}s"

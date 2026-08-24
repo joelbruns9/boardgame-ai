@@ -1,4 +1,5 @@
-//! M5 single-search descent.
+//! M5 single-search descent, including the optional progressive-widening
+//! chance edge from SEARCH_SPEC §7.1a.
 //!
 //! Rust owns the tree and every game transition. Python is called only for the
 //! two evaluator requests: a root-player LEAF or an opponent POLICY. M6 will
@@ -32,6 +33,9 @@ pub struct SearchConfig {
     pub margin_gain: f64,
     pub confidence_power: f64,
     pub prune_roundabout_pass: bool,
+    pub chance_widening: Option<f64>,
+    pub chance_widening_alpha: f64,
+    pub max_particles: usize,
     pub noise_fresh_fraction: f64,
     pub dirichlet_weight: f64,
     pub temperature: f64,
@@ -40,11 +44,14 @@ pub struct SearchConfig {
 
 #[derive(Debug)]
 struct Outcome {
-    /// Reserved for progressive widening. It remains zero in M5's open-loop arm.
-    count: u32,
+    /// Fresh transition draws which landed on this viewer information state.
+    /// Reusing a retained outcome must never increment this counter.
+    count: u64,
     child: Option<usize>,
     terminal_value: Option<f64>,
-    /// Index into `Search::particle_arena` when widening is built. Always None.
+    /// Concrete hidden states representing this information-state outcome.
+    /// None in the no-widening control arm and for terminal or deterministic
+    /// outcomes; exact edges preserve the incoming state instead.
     particle_slot: Option<usize>,
     turn_changed: bool,
     ordinal: u32,
@@ -76,6 +83,12 @@ pub fn outcome_layout_bytes() -> (usize, usize, usize) {
 struct ActionEdge {
     outcomes: HashMap<InformationKey, Outcome>,
     next_ordinal: u32,
+    /// All traversals of this edge. This drives K(n), independently of the
+    /// fresh-draw counts above.
+    visits: u64,
+    /// A within-turn transition consumed no randomness, so support is exactly
+    /// one and this edge may stay closed even after K(n) grows past one.
+    exact: bool,
 }
 
 #[derive(Debug)]
@@ -146,8 +159,9 @@ pub struct DebugOutcome {
     pub key: Vec<u8>,
     pub child: Option<usize>,
     pub terminal_value: Option<f64>,
-    pub count: u32,
+    pub count: u64,
     pub particle_slot: Option<usize>,
+    pub particle_count: usize,
     pub turn_changed: bool,
 }
 
@@ -159,13 +173,16 @@ pub struct DebugNode {
     pub visits: Vec<f64>,
     pub total: Vec<f64>,
     pub noised: bool,
+    pub edge_visits: Vec<u64>,
+    pub edge_exact: Vec<bool>,
     pub outcomes: Vec<DebugOutcome>,
 }
 
 pub struct Search {
     pub config: SearchConfig,
     arena: Vec<Node>,
-    /// Dormant widening side table. M5 never allocates an entry.
+    /// Concrete states retained only when progressive widening is enabled.
+    /// The no-widening control arm allocates no entries.
     particle_arena: Vec<Vec<Game>>,
     retained: Option<Retained>,
     next_request_id: u32,
@@ -209,6 +226,25 @@ impl Search {
                 "noise_fresh_fraction must be finite and dirichlet_weight in [0, 1]".into(),
             ));
         }
+        if let Some(c) = config.chance_widening {
+            if !c.is_finite() || c <= 0.0 {
+                return Err(EngineError::Invalid(
+                    "chance_widening must be finite and positive".into(),
+                ));
+            }
+            if !config.chance_widening_alpha.is_finite()
+                || !(0.0..=1.0).contains(&config.chance_widening_alpha)
+            {
+                return Err(EngineError::Invalid(
+                    "chance_widening_alpha must be in [0, 1]".into(),
+                ));
+            }
+            if config.max_particles == 0 {
+                return Err(EngineError::Invalid(
+                    "max_particles must be positive when chance widening is enabled".into(),
+                ));
+            }
+        }
         Ok(Self {
             config,
             arena: Vec::new(),
@@ -230,6 +266,10 @@ impl Search {
 
     pub fn particle_slots_allocated(&self) -> usize {
         self.particle_arena.len()
+    }
+
+    pub fn particle_states_allocated(&self) -> usize {
+        self.particle_arena.iter().map(Vec::len).sum()
     }
 
     fn search_actions(&self, state: &Game) -> EngineResult<Vec<usize>> {
@@ -369,6 +409,165 @@ impl Search {
         Ok(transition)
     }
 
+    /// Whether this action edge has reached its current progressive-widening
+    /// allowance. A closed edge reuses a retained outcome instead of sampling
+    /// another root-to-root transition.
+    fn edge_is_closed(&self, node_id: usize, index: usize) -> bool {
+        let Some(c) = self.config.chance_widening else {
+            return false;
+        };
+        let edge = &self.arena[node_id].edges[index];
+        if edge.outcomes.is_empty() {
+            return false;
+        }
+        if edge.exact {
+            return true;
+        }
+        let allowed = (c * (edge.visits as f64).powf(self.config.chance_widening_alpha))
+            .ceil()
+            .max(1.0) as usize;
+        edge.outcomes.len() >= allowed
+    }
+
+    /// Reuse one retained outcome in empirical fresh-draw proportion. Outcome
+    /// ordinal, rather than HashMap iteration order, preserves Python's
+    /// insertion-ordered `dict` tape exactly.
+    fn reuse_outcome(
+        &mut self,
+        node_id: usize,
+        index: usize,
+        rng: &mut Rng,
+    ) -> EngineResult<(Option<Game>, Option<usize>, Option<f64>)> {
+        let (particle_slot, child, terminal_value) = {
+            let edge = &mut self.arena[node_id].edges[index];
+            let mut outcomes: Vec<&Outcome> = edge.outcomes.values().collect();
+            outcomes.sort_by_key(|outcome| outcome.ordinal);
+            let weights: Vec<f64> = outcomes.iter().map(|outcome| outcome.count as f64).collect();
+            let chosen = outcomes[rng.weighted_index(&weights)];
+            let result = (chosen.particle_slot, chosen.child, chosen.terminal_value);
+            edge.visits = edge
+                .visits
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Invalid("chance edge visit counter overflow".into()))?;
+            result
+        };
+        if let Some(value) = terminal_value {
+            return Ok((None, None, Some(value)));
+        }
+        let slot = particle_slot.ok_or_else(|| {
+            EngineError::Invalid("live widened outcome has no particle collection".into())
+        })?;
+        let particles = self.particle_arena.get(slot).ok_or_else(|| {
+            EngineError::Invalid("widened outcome points outside the particle arena".into())
+        })?;
+        if particles.is_empty() {
+            return Err(EngineError::Invalid(
+                "live widened outcome has an empty particle collection".into(),
+            ));
+        }
+        let particle = particles[rng.randrange(particles.len() as u64) as usize].clone();
+        let child = child.ok_or_else(|| {
+            EngineError::Invalid("live widened outcome has no decision child".into())
+        })?;
+        Ok((Some(particle), Some(child), None))
+    }
+
+    /// Merge one freshly sampled transition into an information-state outcome
+    /// and reservoir-sample its concrete hidden state.
+    fn record_outcome(
+        &mut self,
+        node_id: usize,
+        index: usize,
+        observation: &InformationKey,
+        state: &Game,
+        rng: &mut Rng,
+        exact: bool,
+        turn_changed: bool,
+    ) -> EngineResult<()> {
+        if self.config.chance_widening.is_none() {
+            return Ok(());
+        }
+
+        let is_terminal = state.is_terminal();
+        let needs_particle_slot = !is_terminal
+            && !exact
+            && self.arena[node_id].edges[index]
+                .outcomes
+                .get(observation)
+                .and_then(|outcome| outcome.particle_slot)
+                .is_none();
+        let new_particle_slot = if needs_particle_slot {
+            let slot = self.particle_arena.len();
+            self.particle_arena.push(Vec::new());
+            Some(slot)
+        } else {
+            None
+        };
+
+        let (particle_slot, count) = {
+            let edge = &mut self.arena[node_id].edges[index];
+            edge.visits = edge
+                .visits
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Invalid("chance edge visit counter overflow".into()))?;
+            if exact && !is_terminal {
+                edge.exact = true;
+            }
+            if !edge.outcomes.contains_key(observation) {
+                let ordinal = edge.next_ordinal;
+                edge.next_ordinal = edge.next_ordinal.checked_add(1).ok_or_else(|| {
+                    EngineError::Invalid("chance outcome ordinal overflow".into())
+                })?;
+                edge.outcomes.insert(
+                    observation.clone(),
+                    Outcome {
+                        count: 0,
+                        child: None,
+                        terminal_value: None,
+                        particle_slot: new_particle_slot,
+                        turn_changed,
+                        ordinal,
+                    },
+                );
+            }
+            let outcome = edge
+                .outcomes
+                .get_mut(observation)
+                .expect("inserted above");
+            if !is_terminal && !exact && outcome.particle_slot.is_none() {
+                outcome.particle_slot = new_particle_slot;
+            }
+            if outcome.turn_changed != turn_changed {
+                return Err(EngineError::Invalid(
+                    "one information-state outcome disagrees on whether the turn changed".into(),
+                ));
+            }
+            outcome.count = outcome.count.checked_add(1).ok_or_else(|| {
+                EngineError::Invalid("chance outcome fresh-draw counter overflow".into())
+            })?;
+            (outcome.particle_slot, outcome.count)
+        };
+
+        if !is_terminal && !exact {
+            let slot = particle_slot.ok_or_else(|| {
+                EngineError::Invalid("live widened outcome has no particle slot".into())
+            })?;
+            let particles = &mut self.particle_arena[slot];
+            if particles.len() < self.config.max_particles {
+                particles.push(state.clone());
+            } else {
+                // The k-th fresh sample replaces a uniform retained slot with
+                // probability max_particles/k. This keeps the conditional
+                // belief live rather than freezing the first few particles.
+                let replacement = rng.randrange(count);
+                if replacement < self.config.max_particles as u64 {
+                    particles[replacement as usize] = state.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn simulate<E>(
         &mut self,
         mut state: Game,
@@ -385,12 +584,69 @@ impl Search {
             let index = self.arena[node_id].select(self.config.c_puct);
             let action = self.arena[node_id].actions[index];
             path.push((node_id, index));
+
+            if self.arena[node_id].edges[index].exact {
+                // The visible outcome is unique, but the incoming hidden deck
+                // is a fresh root determinization. Reusing the first particle
+                // would bind this action branch to that deck even though this
+                // transition consumed no randomness. Replay the deterministic
+                // macros on the current state and reuse only the child node.
+                let turn = state.turn;
+                macro_codec::apply_macro(&mut state, action)?;
+                let transition = self.advance(&mut state, root, rng, turn, evaluator)?;
+                let transition =
+                    self.collapse_forced(&mut state, root, rng, turn, transition, evaluator)?;
+                if state.turn != turn || state.is_terminal() || transition.turn_changed {
+                    return Err(EngineError::Invalid(
+                        "an exact chance edge consumed randomness".into(),
+                    ));
+                }
+                let child = self.arena[node_id].edges[index]
+                    .outcomes
+                    .get(&transition.observation)
+                    .and_then(|outcome| outcome.child)
+                    .ok_or_else(|| {
+                        EngineError::Invalid(
+                            "an exact chance edge has no matching decision child".into(),
+                        )
+                    })?;
+                self.arena[node_id].edges[index].visits = self.arena[node_id].edges[index]
+                    .visits
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        EngineError::Invalid("chance edge visit counter overflow".into())
+                    })?;
+                node_id = child;
+                continue;
+            }
+
+            if self.edge_is_closed(node_id, index) {
+                let (particle, child, terminal_value) =
+                    self.reuse_outcome(node_id, index, rng)?;
+                if let Some(value) = terminal_value {
+                    break value;
+                }
+                state = particle.expect("live reuse checked by reuse_outcome");
+                node_id = child.expect("live reuse checked by reuse_outcome");
+                continue;
+            }
+
             let turn = state.turn;
             macro_codec::apply_macro(&mut state, action)?;
             let transition = self.advance(&mut state, root, rng, turn, evaluator)?;
             let transition =
                 self.collapse_forced(&mut state, root, rng, turn, transition, evaluator)?;
             let observation = transition.observation;
+
+            self.record_outcome(
+                node_id,
+                index,
+                &observation,
+                &state,
+                rng,
+                state.turn == turn && !state.is_terminal(),
+                transition.turn_changed,
+            )?;
 
             let existing = self.arena[node_id].edges[index]
                 .outcomes
@@ -402,13 +658,24 @@ impl Search {
             }
 
             let (child, leaf_value) = self.expand_leaf(&state, root, evaluator)?;
-            // Open-loop Python stores no terminal child. Widening will store a
-            // terminal value in this already-reserved Outcome field, but doing
-            // so here would add a cache the oracle does not have.
-            if let Some(child) = child {
+            if self.config.chance_widening.is_some() {
+                let edge = &mut self.arena[node_id].edges[index];
+                let outcome = edge
+                    .outcomes
+                    .get_mut(&observation)
+                    .expect("record_outcome created widening outcome");
+                outcome.child = child;
+                if child.is_none() {
+                    outcome.terminal_value = Some(leaf_value);
+                }
+            } else if let Some(child) = child {
+                // The control arm stores live observation-keyed children but no
+                // counters, particles, or terminal cache.
                 let edge = &mut self.arena[node_id].edges[index];
                 let ordinal = edge.next_ordinal;
-                edge.next_ordinal += 1;
+                edge.next_ordinal = edge.next_ordinal.checked_add(1).ok_or_else(|| {
+                    EngineError::Invalid("chance outcome ordinal overflow".into())
+                })?;
                 edge.outcomes.insert(
                     observation,
                     Outcome {
@@ -676,6 +943,10 @@ impl Search {
                         terminal_value: outcome.terminal_value,
                         count: outcome.count,
                         particle_slot: outcome.particle_slot,
+                        particle_count: outcome
+                            .particle_slot
+                            .and_then(|slot| self.particle_arena.get(slot))
+                            .map_or(0, Vec::len),
                         turn_changed: outcome.turn_changed,
                     });
                 }
@@ -688,6 +959,8 @@ impl Search {
                 visits: node.visits.clone(),
                 total: node.total.clone(),
                 noised: node.noised,
+                edge_visits: node.edges.iter().map(|edge| edge.visits).collect(),
+                edge_exact: node.edges.iter().map(|edge| edge.exact).collect(),
                 outcomes,
             });
         }

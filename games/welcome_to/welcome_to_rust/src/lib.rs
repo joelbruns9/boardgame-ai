@@ -589,7 +589,9 @@ impl RustMcts {
         margin_gain=2.0,
         confidence_power=1.0,
         prune_roundabout_pass=true,
-        chance_widening=None,
+        chance_widening=Some(1.0),
+        chance_widening_alpha=0.5,
+        max_particles=4,
         noise_fresh_fraction=1.0,
         dirichlet_weight=0.25,
         temperature=0.0,
@@ -603,16 +605,13 @@ impl RustMcts {
         confidence_power: f64,
         prune_roundabout_pass: bool,
         chance_widening: Option<f64>,
+        chance_widening_alpha: f64,
+        max_particles: usize,
         noise_fresh_fraction: f64,
         dirichlet_weight: f64,
         temperature: f64,
         noise_required: bool,
     ) -> PyResult<Self> {
-        if chance_widening.is_some() {
-            return Err(PyValueError::new_err(
-                "chance_widening is designed into the M5 tree layout but is not implemented; use the Python backend until M7",
-            ));
-        }
         Ok(Self {
             inner: Search::new(NativeSearchConfig {
                 simulations,
@@ -621,12 +620,19 @@ impl RustMcts {
                 margin_gain,
                 confidence_power,
                 prune_roundabout_pass,
+                chance_widening,
+                chance_widening_alpha,
+                max_particles,
                 noise_fresh_fraction,
                 dirichlet_weight,
                 temperature,
                 noise_required,
             })
-            .map_err(to_py)?,
+            .map_err(|err| match err {
+                EngineError::Illegal(message) | EngineError::Invalid(message) => {
+                    PyValueError::new_err(message)
+                }
+            })?,
         })
     }
 
@@ -720,6 +726,11 @@ impl RustMcts {
         self.inner.particle_slots_allocated()
     }
 
+    #[getter]
+    fn particle_states_allocated(&self) -> usize {
+        self.inner.particle_states_allocated()
+    }
+
     fn debug_tree<'py>(&self, py: Python<'py>, root_node: usize) -> PyResult<Vec<Py<PyDict>>> {
         self.inner
             .debug_tree(root_node)
@@ -732,6 +743,8 @@ impl RustMcts {
                 raw.set_item("visits", node.visits)?;
                 raw.set_item("total", node.total)?;
                 raw.set_item("noised", node.noised)?;
+                raw.set_item("edge_visits", node.edge_visits)?;
+                raw.set_item("edge_exact", node.edge_exact)?;
                 let outcomes: PyResult<Vec<Py<PyDict>>> = node
                     .outcomes
                     .into_iter()
@@ -743,8 +756,9 @@ impl RustMcts {
                         item.set_item("child", outcome.child)?;
                         item.set_item("terminal_value", outcome.terminal_value)?;
                         item.set_item("count", outcome.count)?;
-                    item.set_item("particle_slot", outcome.particle_slot)?;
-                    item.set_item("turn_changed", outcome.turn_changed)?;
+                        item.set_item("particle_slot", outcome.particle_slot)?;
+                        item.set_item("particle_count", outcome.particle_count)?;
+                        item.set_item("turn_changed", outcome.turn_changed)?;
                         Ok(item.unbind())
                     })
                     .collect();

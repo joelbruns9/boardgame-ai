@@ -176,22 +176,52 @@ def collect_terminal_positions() -> list[GameState]:
     return out
 
 
-def _python_tree(node: mcts.Node):
+def _python_tree(node: mcts.Node, *, widening: bool = False):
     children = []
-    ordinal: collections.Counter[int] = collections.Counter()
-    for (action, _observation), child in node.children.items():
-        children.append((action, ordinal[action], _python_tree(child)))
-        ordinal[action] += 1
+    outcome_stats = []
+    if widening:
+        for index, action in enumerate(node.actions):
+            for ordinal, (observation, outcome) in enumerate(
+                node.outcomes.get(index, {}).items()
+            ):
+                child = node.children.get((int(action), observation))
+                outcome_stats.append(
+                    (
+                        int(action),
+                        ordinal,
+                        outcome.count,
+                        len(outcome.particles),
+                        outcome.terminal_value,
+                        child is not None,
+                    )
+                )
+                if child is not None:
+                    children.append(
+                        (int(action), ordinal, _python_tree(child, widening=True))
+                    )
+    else:
+        ordinal: collections.Counter[int] = collections.Counter()
+        for (action, _observation), child in node.children.items():
+            children.append((action, ordinal[action], _python_tree(child)))
+            ordinal[action] += 1
     children.sort(key=lambda item: (item[0], item[1]))
-    return (
+    outcome_stats.sort(key=lambda item: (item[0], item[1]))
+    base = (
         tuple(int(x) for x in node.actions),
         tuple(float(x) for x in node.visits),
         tuple(float(x) for x in node.total),
+    )
+    if not widening:
+        return base + (tuple(children),)
+    return base + (
+        tuple(node.edge_visits.get(index, 0) for index in range(len(node.actions))),
+        tuple(index in node.edge_exact for index in range(len(node.actions))),
+        tuple(outcome_stats),
         tuple(children),
     )
 
 
-def _rust_tree(native, root_node: int):
+def _rust_tree(native, root_node: int, *, widening: bool = False):
     nodes = {node["id"]: node for node in native.debug_tree(root_node)}
 
     def visit(node_id: int):
@@ -201,23 +231,56 @@ def _rust_tree(native, root_node: int):
             for item in node["outcomes"]
             if item["child"] is not None
         )
-        return (
+        base = (
             tuple(node["actions"]),
             tuple(node["visits"]),
             tuple(node["total"]),
+        )
+        if not widening:
+            return base + (children,)
+        outcome_stats = tuple(
+            (
+                item["action"],
+                item["ordinal"],
+                item["count"],
+                item["particle_count"],
+                item["terminal_value"],
+                item["child"] is not None,
+            )
+            for item in node["outcomes"]
+        )
+        return base + (
+            tuple(node["edge_visits"]),
+            tuple(node["edge_exact"]),
+            outcome_stats,
             children,
         )
 
     return visit(root_node)
 
 
-def compare_one(state: GameState, simulations: int, search_seed: int) -> dict[str, int]:
+def compare_one(
+    state: GameState,
+    simulations: int,
+    search_seed: int,
+    *,
+    chance_widening: float | None = 1.0,
+    max_particles: int = 4,
+) -> dict[str, int]:
     root = state.actor
-    config = mcts.SearchConfig(simulations=simulations)
+    config = mcts.SearchConfig(
+        simulations=simulations,
+        chance_widening=chance_widening,
+        max_particles=max_particles,
+    )
     python_eval = FixedTapeEvaluator(root)
     rust_eval = FixedTapeEvaluator(root)
     python = CountingMcts(python_eval, config)
-    native = wr.RustMcts(simulations=simulations)
+    native = wr.RustMcts(
+        simulations=simulations,
+        chance_widening=chance_widening,
+        max_particles=max_particles,
+    )
 
     actions, visits, node = python.search(state, root, PortableRng(search_seed))
     rust_state = wr.RustGameState.from_snapshot(snapshot.to_snapshot(state))
@@ -279,10 +342,15 @@ def compare_one(state: GameState, simulations: int, search_seed: int) -> dict[st
             f"rust={summary(rust_request)!r}; python={summary(python_request)!r}; "
             f"diffs={differences!r}"
         )
-    rust_tree = _rust_tree(native, result["root_node"])
-    python_tree = _python_tree(node)
+    widening = chance_widening is not None
+    rust_tree = _rust_tree(native, result["root_node"], widening=widening)
+    python_tree = _python_tree(node, widening=widening)
     if rust_tree != python_tree:
-        labels = ("actions", "visits", "total", "children")
+        labels = (
+            ("actions", "visits", "total", "edge_visits", "edge_exact", "outcomes", "children")
+            if widening
+            else ("actions", "visits", "total", "children")
+        )
         mismatch = next(
             label
             for label, rust_part, python_part in zip(labels, rust_tree, python_tree)
@@ -293,7 +361,15 @@ def compare_one(state: GameState, simulations: int, search_seed: int) -> dict[st
             f"rust={rust_tree[labels.index(mismatch)]!r} "
             f"python={python_tree[labels.index(mismatch)]!r}"
         )
-    assert native.particle_slots_allocated == 0
+    if widening:
+        python_particles = sum(
+            len(outcome.particles)
+            for _node, _index, outcomes in _all_python_edges(node)
+            for outcome in outcomes.values()
+        )
+        assert native.particle_states_allocated == python_particles
+    else:
+        assert native.particle_slots_allocated == 0
     assert native.terminal_leaves == python.terminal_leaves
     return {
         "requests": len(python_eval.requests),
@@ -302,8 +378,25 @@ def compare_one(state: GameState, simulations: int, search_seed: int) -> dict[st
     }
 
 
+def _all_python_edges(root: mcts.Node):
+    edges = []
+
+    def walk(node):
+        for index, outcomes in node.outcomes.items():
+            edges.append((node, index, outcomes))
+        for child in node.children.values():
+            walk(child)
+
+    walk(root)
+    return edges
+
+
 def run_gate(
-    *, positions: int = 256, seeds_per_position: int = 3, simulations: int = 12
+    *,
+    positions: int = 256,
+    seeds_per_position: int = 3,
+    simulations: int = 12,
+    chance_widening: float | None = 1.0,
 ) -> dict[str, float]:
     if positions < 1 or seeds_per_position < 1:
         raise ValueError("positions and seeds_per_position must be positive")
@@ -317,7 +410,12 @@ def run_gate(
         for tape in range(seeds_per_position):
             seed = derive_search_seed(0x4D35 + position_index, tape)
             try:
-                counts = compare_one(state, simulations, seed)
+                counts = compare_one(
+                    state,
+                    simulations,
+                    seed,
+                    chance_widening=chance_widening,
+                )
             except AssertionError as exc:
                 raise AssertionError(
                     f"position={position_index}, tape={tape}, "
@@ -344,14 +442,19 @@ def main() -> None:
     parser.add_argument("--positions", type=int, default=256)
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--simulations", type=int, default=12)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--chance-widening", type=float, default=1.0)
+    mode.add_argument("--control", action="store_true")
     args = parser.parse_args()
     result = run_gate(
         positions=args.positions,
         seeds_per_position=args.seeds,
         simulations=args.simulations,
+        chance_widening=None if args.control else args.chance_widening,
     )
     print(
-        "M5 fixed-tape gate green: "
+        "M5 fixed-tape gate green"
+        f" ({'control' if args.control else f'PW C={args.chance_widening:g}'}): "
         f"{int(result['positions'])} positions × {args.seeds} seeds, "
         f"{int(result['simulations']):,} simulations, "
         f"{int(result['requests']):,} requests "

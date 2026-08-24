@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import random
+
 import numpy as np
 import pytest
 import torch
@@ -12,7 +15,8 @@ from games.welcome_to import mcts
 from games.welcome_to import network as nw
 from games.welcome_to import rust_search
 from games.welcome_to import snapshot
-from games.welcome_to.game import GameState
+from games.welcome_to.bots import GreedyBot
+from games.welcome_to.game import GameConfig, GameState, Phase
 from games.welcome_to.portable_rng import PortableRng, derive_search_seed
 
 wr = pytest.importorskip("welcome_to_rust")
@@ -64,12 +68,12 @@ class FixedEvaluator:
         )
 
 
-def _pair(state: GameState, simulations: int = 16, seed: int = 31):
-    config = mcts.SearchConfig(simulations=simulations)
+def _pair(state: GameState, simulations: int = 16, seed: int = 31, **kwargs):
+    config = mcts.SearchConfig(simulations=simulations, **kwargs)
     python_eval = FixedEvaluator()
     rust_eval = FixedEvaluator()
     python = mcts.MCTS(python_eval, config)
-    rust = wr.RustMcts(simulations=simulations)
+    rust = rust_search.native_search(config)
     search_seed = derive_search_seed(seed, 0)
     py_actions, py_visits, py_node = python.search(
         state, rng=PortableRng(search_seed)
@@ -81,7 +85,9 @@ def _pair(state: GameState, simulations: int = 16, seed: int = 31):
 
 def test_fixed_tape_search_matches_at_a_turn_boundary():
     state = GameState.new(seed=7, rng_kind="portable")
-    py_eval, rust_eval, actions, visits, node, native, rust = _pair(state)
+    py_eval, rust_eval, actions, visits, node, native, rust = _pair(
+        state, chance_widening=None
+    )
     assert native["actions"] == actions.tolist()
     assert np.array_equal(native["visits"], visits)
     assert np.array_equal(native["total"], node.total)
@@ -104,9 +110,80 @@ def test_wide_float32_weight_accumulation_is_shared():
     assert rust == python
 
 
-def test_widening_is_refused_until_it_is_implemented():
-    with pytest.raises(ValueError, match="chance_widening"):
-        wr.RustMcts(chance_widening=1.0)
+def test_widening_configuration_is_accepted_and_invalid_values_fail_loudly():
+    assert mcts.SearchConfig().chance_widening == 1.0
+    wr.RustMcts(chance_widening=1.0, chance_widening_alpha=0.5, max_particles=4)
+    for value in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError, match="chance_widening"):
+            wr.RustMcts(chance_widening=value)
+    with pytest.raises(ValueError, match="chance_widening_alpha"):
+        wr.RustMcts(chance_widening=1.0, chance_widening_alpha=1.1)
+    with pytest.raises(ValueError, match="max_particles"):
+        wr.RustMcts(chance_widening=1.0, max_particles=0)
+
+
+def _played_in_position(turn: int = 12) -> GameState:
+    seed = 7
+    state = GameState.new(
+        seed=seed,
+        config=GameConfig(players=2, advanced=True),
+        rng_kind="portable",
+    )
+    bots = [GreedyBot(random.Random(seed * 10 + seat)) for seat in range(2)]
+    while not state.is_terminal and state.turn < turn:
+        state.apply(bots[state.actor].act(state))
+    while not state.is_terminal and (
+        state.actor != 0 or state.phase is Phase.WRITE_NUMBER
+    ):
+        state.apply(bots[state.actor].act(state))
+    return state
+
+
+def test_progressive_widening_matches_python_and_reuses_retained_particles():
+    state = _played_in_position()
+    py_eval, rust_eval, actions, visits, node, native, rust = _pair(
+        state,
+        simulations=128,
+        seed=123,
+        max_particles=4,
+    )
+    assert native["actions"] == actions.tolist()
+    assert np.array_equal(native["visits"], visits)
+    assert np.array_equal(native["total"], node.total)
+    assert rust_eval.requests == py_eval.requests
+
+    traversals = fresh_draws = exact_edges = 0
+    for debug_node in rust.debug_tree(native["root_node"]):
+        by_action: dict[int, list[dict]] = {}
+        for outcome in debug_node["outcomes"]:
+            by_action.setdefault(outcome["action"], []).append(outcome)
+            assert outcome["count"] >= 1
+            assert outcome["particle_count"] <= 4
+        for index, action in enumerate(debug_node["actions"]):
+            edge_visits = debug_node["edge_visits"][index]
+            outcomes = by_action.get(action, [])
+            if not outcomes:
+                continue
+            allowed = max(math.ceil(edge_visits**0.5), 1)
+            assert len(outcomes) <= allowed
+            traversals += edge_visits
+            fresh_draws += sum(outcome["count"] for outcome in outcomes)
+            if debug_node["edge_exact"][index]:
+                exact_edges += 1
+                assert len(outcomes) == 1
+                assert outcomes[0]["count"] == 1
+                assert outcomes[0]["particle_count"] == 0
+            else:
+                assert all(
+                    outcome["particle_count"]
+                    or outcome["terminal_value"] is not None
+                    for outcome in outcomes
+                )
+
+    assert exact_edges > 0
+    assert traversals > fresh_draws, "no widened edge reused a retained outcome"
+    assert rust.particle_slots_allocated > 0
+    assert 0 < rust.particle_states_allocated <= 4 * rust.particle_slots_allocated
 
 
 def test_malformed_evaluator_responses_fail_loudly():

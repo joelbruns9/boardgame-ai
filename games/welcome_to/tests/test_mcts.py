@@ -22,6 +22,7 @@ from games.welcome_to.constants import CARD_TABLE, NUM_BASE_CARDS
 from typing import Optional
 
 from games.welcome_to.game import GameConfig, GameState, Phase
+from games.welcome_to.portable_rng import PortableRng
 
 _SMALL = nw.NetConfig(
     sheet_hidden=32, sheet_out=16, trunk_hidden=48, trunk_blocks=1, head_hidden=32
@@ -197,7 +198,10 @@ def test_sharpening_the_prior_does_not_deepen_the_tree():
             sharp[int(np.argmax(np.where(legal, priors, -1.0)))] = 1.0
             return sharp, value
 
-    config = mcts.SearchConfig(simulations=256)
+    # This is specifically the historical no-widening null. With widening on,
+    # concentrating visits is expected to buy depth because retained outcomes
+    # make the selected branch revisitable.
+    config = mcts.SearchConfig(simulations=256, chance_widening=None)
     torch.manual_seed(0)
     net = nw.WelcomeToNet(_SMALL)
 
@@ -1118,7 +1122,7 @@ def _tree_depth(root) -> float:
 def test_the_control_arm_allocates_no_chance_bookkeeping():
     """§12 step 7 keeps the open-loop version as the control arm, so with the
     flag off nothing about the tree may change -- not even its memory."""
-    search, _ = _search(simulations=64)
+    search, _ = _search(simulations=64, chance_widening=None)
     assert search.config.chance_widening is None
     state = _position(players=2, turn=10)
     _, _, root = search.search(state, root=0, rng=random.Random(4))
@@ -1159,10 +1163,14 @@ def test_every_outcome_can_be_resumed_and_its_particles_are_capped():
     search, _ = _widened()
     state = _position(players=2, turn=12)
     _, _, root = search.search(state, root=0, rng=random.Random(0))
-    for _, _, outcomes in _edges(root):
+    for node, index, outcomes in _edges(root):
         for outcome in outcomes.values():
             assert outcome.count >= 1
-            assert outcome.particles or outcome.terminal_value is not None
+            assert (
+                index in node.edge_exact
+                or outcome.particles
+                or outcome.terminal_value is not None
+            )
             assert len(outcome.particles) <= search.config.max_particles
 
 
@@ -1223,11 +1231,51 @@ def test_a_deterministic_edge_is_drawn_once_and_reused_ever_after():
         assert len(outcomes) == 1, "a proven-deterministic edge grew a second outcome"
         outcome = next(iter(outcomes.values()))
         assert outcome.count == 1, "a closed edge sampled the transition again"
-        assert outcome.particles, "a resumable edge kept no particle"
+        assert not outcome.particles, "an exact edge retained an unused hidden state"
         traversals += node.edge_visits[index]
         draws += outcome.count
     assert (traversals - draws) / traversals > 0.8, (
         f"only {(traversals - draws) / traversals:.1%} of traversals reused"
+    )
+
+
+def test_an_exact_edge_preserves_each_simulation_s_incoming_determinization():
+    """An exact *observation* does not make the hidden deck exact.
+
+    Seed 0's first macro enters a within-turn estate decision. If that edge
+    resumes from its first retained particle, every simulation reaches the next
+    boundary with the same hidden deck and the root action becomes fused to one
+    reveal. Replaying the deterministic macro on the incoming state keeps the
+    fresh root determinization while still reusing the decision child.
+    """
+
+    class FirstLegal:
+        def __init__(self):
+            self.next_tables = set()
+
+        @staticmethod
+        def priors(state):
+            out = np.zeros(mc.NUM_MACRO_ACTIONS, dtype=np.float32)
+            out[mc.search_legal_macros(state, True)[0]] = 1.0
+            return out
+
+        def evaluate(self, state, viewer):
+            if state.turn > 1:
+                self.next_tables.add(tuple(state.table_cards(viewer)))
+            return self.priors(state), 0.25
+
+        def policy(self, state, viewer):
+            return self.priors(state)
+
+    evaluator = FirstLegal()
+    config = mcts.SearchConfig(simulations=128, chance_widening=1.0)
+    state = GameState.new(seed=0, rng_kind="portable")
+    search = mcts.MCTS(evaluator, config)
+    search.search(state, rng=PortableRng(123))
+
+    assert len(evaluator.next_tables) >= 4, (
+        "the deterministic edge froze the first hidden deck: "
+        f"only {len(evaluator.next_tables)} next-turn tables"
     )
 
 

@@ -107,6 +107,7 @@ def run_game(
     ]
     py_searches = [RecordingMcts(py_evaluators[s], config) for s in range(players)]
     rust_searches = [rust_search.native_search(config) for _ in range(players)]
+    max_particle_slots = [0] * players
 
     actions: list[int] = []
     searches = non_forced = 0
@@ -119,6 +120,9 @@ def run_game(
         )
         native = rust_searches[seat].play(
             rust_state, rust_evaluators[seat], search_seed, seat
+        )
+        max_particle_slots[seat] = max(
+            max_particle_slots[seat], rust_searches[seat].particle_slots_allocated
         )
         rust_choice = native["choice"]
         assert rust_choice == py_choice, (
@@ -147,7 +151,7 @@ def run_game(
             _request_tuple(request) for request in rust_evaluators[seat].requests
         ]
         assert rust_requests == python_requests, f"request tape diverged for seat {seat}"
-        assert rust_searches[seat].particle_slots_allocated == 0
+        assert max_particle_slots[seat] > 0
     return {
         "decisions": float(searches),
         "searched": float(non_forced),

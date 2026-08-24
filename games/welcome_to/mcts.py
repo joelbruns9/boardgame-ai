@@ -206,11 +206,12 @@ class SearchConfig:
     #: **off**, which is the open-loop control arm: every distinct outcome gets
     #: its own child, for ever, and the tree never revisits one.
     #:
-    #: ⚠ Turning this on is what makes the chance edge *finite*, and it is the
+    #: This is what makes the chance edge *finite*, and it is the
     #: only mechanism here that can produce depth.  §6.1 measured mean leaf depth
     #: 1.59, unmoved by budget or by prior sharpness, because every boundary
     #: crossing drew a key never seen before and expanded a fresh leaf.
-    chance_widening: Optional[float] = None
+    #: ``None`` remains the explicit no-widening control arm.
+    chance_widening: Optional[float] = 1.0
     #: ``alpha``.  Not a free parameter: §7.6 fixes ``K ≈ N**(1/H)`` from a
     #: target depth ``H``, so ``alpha = 1/H`` and depth 2 gives 0.5.  With
     #: ``C = 1`` that is ~8 outcomes at 64 samples and ~16 at 256, which is the
@@ -1140,8 +1141,10 @@ class MCTS:
         ``count/draws`` converge on the true mass.
 
         ``exact`` says this transition consumed no randomness — the turn did not
-        change and the game did not end — which **proves** the edge's support is
-        one and closes it for good.
+        change and the game did not end — which **proves** the visible outcome's
+        support is one. Its child is reused, but its incoming state is preserved:
+        the hidden deck was freshly determinized upstream and must not be
+        replaced by the first particle seen on this edge.
 
         ⚠ **Particles are replaced by reservoir sampling, not dropped.** Keeping
         the first ``max_particles`` and discarding every later sample is unbiased
@@ -1160,7 +1163,7 @@ class MCTS:
         outcome.count += 1
         if exact and not state.is_terminal:
             node.edge_exact.add(index)
-        if not state.is_terminal:
+        if not state.is_terminal and not exact:
             cap = self.config.max_particles
             if len(outcome.particles) < cap:
                 outcome.particles.append(state.copy())
@@ -1178,6 +1181,25 @@ class MCTS:
             index = node.select(self.config.c_puct)
             path.append((node, index))
             action = int(node.actions[index])
+
+            if index in node.edge_exact:
+                # The information-state outcome is proven unique, but the
+                # incoming hidden state is not: every root simulation carries a
+                # fresh deck determinization. Reusing the first stored particle
+                # here would bind this action branch to that one deck even
+                # though no chance event occurred. Replay the cheap deterministic
+                # transition on the current state and reuse only the child node.
+                turn = state.turn
+                mc.apply_macro(state, action)
+                observation = yield from self._advance(state, root, rng)
+                observation = yield from self._collapse_forced(
+                    state, root, rng, turn, observation
+                )
+                if state.turn != turn or state.is_terminal:
+                    raise AssertionError("an exact chance edge consumed randomness")
+                node.edge_visits[index] = node.edge_visits.get(index, 0) + 1
+                node = node.children[(action, observation)]
+                continue
 
             if self._edge_is_closed(node, index):
                 # ⚠ The saving *and* the depth: no transition is sampled, so no

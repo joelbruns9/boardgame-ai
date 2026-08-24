@@ -145,6 +145,8 @@ def native_search(config: mcts.SearchConfig):
         confidence_power=config.confidence_power,
         prune_roundabout_pass=config.prune_roundabout_pass,
         chance_widening=config.chance_widening,
+        chance_widening_alpha=config.chance_widening_alpha,
+        max_particles=config.max_particles,
         noise_fresh_fraction=config.noise_fresh_fraction,
         dirichlet_weight=config.dirichlet_weight,
         temperature=config.temperature,

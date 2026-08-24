@@ -1021,14 +1021,17 @@ sampler, where 400 samples at `D = 3` give exactly **6** distinct
 - 558 of 976 traversals were **reuses**: resumed from a particle, with no
   opponent evaluated and no card drawn.
 
-⚠ **A closure defect, found in review and fixed.** A within-turn edge has support
-one, and the first implementation left it to the cap to notice — which a cap
-cannot do, since `len(outcomes)` stops at 1 while `ceil(C·n^α)` grows. Measured:
-support-one edges reused **6 of 77** traversals, 7.8%, while this document
-claimed every later descent resumed from a particle. Determinism is now
-**proven** rather than inferred — a transition that changes neither the turn nor
-the game's end consumed no randomness — and the same edges reuse **97.4%**
-(111 of 114). Multi-outcome edges were unaffected (67% before, 64% after).
+⚠ **Two exact-edge defects, both fixed.** A within-turn edge has one visible
+outcome, and the first implementation left it to the cap to notice — which a cap
+cannot do, since `len(outcomes)` stops at 1 while `ceil(C·n^α)` grows. Proving
+determinism raised child reuse from **7.8%** to **97.4%**. The Rust M5 port then
+exposed the other half: resuming from the first stored particle also replaced
+every simulation's freshly determinized hidden deck with that first deck,
+binding an action branch to one future despite no chance event occurring there.
+Exact edges now replay their cheap deterministic macros on the incoming state
+and reuse only the child node and statistics. They retain no particle. A
+128-simulation regression on an opening estate decision observes at least four
+different next-turn tables; the old behavior produced one.
 
 ⚠ **Particles are reservoir-sampled, not first-come.** Keeping the first
 `max_particles` and dropping the rest is unbiased in expectation but freezes the
@@ -1039,9 +1042,9 @@ never improves however long the edge is searched. `max_particles = 4` is
 ⚠ **What reuse costs, and why the control arm stays.** Resuming from a particle
 re-uses that transition's randomness, including the determinization behind it.
 That is the intent (§7.3), but it means a widened search explores fewer distinct
-futures per simulation than the open-loop one. Whether the depth is worth the
-diversity is a **strength** question, not a throughput one — it belongs in §11's
-bakeoff as equal-wall-clock arms, and `chance_widening=None` is the control.
+futures per simulation than the no-widening one. Widening is now required for the
+normal search's depth; the equal-wall-clock control remains useful for measuring
+and tuning that diversity cost, with `chance_widening=None` spelling the arm.
 
 ### 7.8 ✅ DECIDED: when and how much Dirichlet noise
 
@@ -1379,12 +1382,13 @@ standard deviation of about **18 points**, so stderr is 4.1 at 60 games and 1.0 
 decide. The chance boundary was the blocker and §7.1a settled it; §7.9 records
 what the build measured, including the estimator bug it found.
 
-⚠ **Nothing after this point is settled by argument.** Step 8 is the run and the
-bakeoff, and the two open questions are both *strength* questions that only
-equal-wall-clock arms can answer: whether widening's depth is worth the
-determinization diversity it spends (`chance_widening=None` is the control), and
-what `noise_fresh_fraction` should be (§7.8). Neither is a throughput knob and
-neither should be read off games per second.
+**Implementation decision, 2026-08-24:** widening is required in the normal
+search so the budget can produce depth, and `C=1`, `alpha=0.5`,
+`max_particles=4` is now the default in both Python and Rust. The equal-wall-clock
+bakeoff still tunes those constants and `noise_fresh_fraction`; it no longer
+decides whether widening exists. `chance_widening=None` remains the diagnostic
+control. These are strength questions and should not be read off games per
+second.
 
 ### 12.1 The key is an information state, not a public observation
 

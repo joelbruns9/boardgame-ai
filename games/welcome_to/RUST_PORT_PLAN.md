@@ -29,7 +29,7 @@ because a plan that quietly absorbs its review teaches nobody.
 | comparator self-contradictory | said "sorted list" in one place and "raw order matters" in another | §4 M1 |
 | ABI undefined | `answer_batch` takes **Python `GameState` rows and runs the Python encoder** — using it from Rust forfeits M3's entire gain | §2 M0-E, §3 |
 | `leaf_batch > 1` mis-transferred | Welcome To has **no within-search leaf batch**; adding one needs virtual loss and is a class C strength change | §6 |
-| widening excluded "permanently" | if it wins the bakeoff, the Rust backend cannot be the production backend | §8.1 — resolved: **design for it, do not build it** |
+| widening excluded "permanently" | the no-widening arm cannot search past near-unique boundary outcomes | §8.1 — resolved: **built in M5 and promoted to the default** |
 | M4 partition gate vacuous | information keys almost never collide naturally, so a random corpus proves only that both engines say "different" | §4 M4 |
 | M5 fingerprint gate too strong | a mock evaluator removes torch drift but **not** redeterminization or opponent sampling | §4 M5 |
 | checkpoints unmeasurable | M1 and M3 are not wired into the search, so "measure after M1" can only microbenchmark | §9 |
@@ -86,11 +86,10 @@ is how a Rust self-play run stops being equivalent without anybody noticing.
 **Never supported** — out of training scope, refuse rather than half-implement:
 expert mode, solo mode, expansions.
 
-**Not implemented *yet*** — refused only until the milestone that adds it:
-`chance_widening`, which §8.1 committed M5's layout to admitting and which
-becomes M7 if it wins the bakeoff. The refusal is still required in the meantime:
-a backend that silently ignored `chance_widening = 1.0` would run a different
-search than the one it was asked for.
+**M5 search modes:** progressive widening is supported with the same `C`,
+`alpha`, and particle cap as Python. `chance_widening = 1.0` is the default;
+`None` remains the explicit no-widening control. Invalid widening parameters are
+refused at construction rather than silently reinterpreted.
 
 ✅ **`dirichlet_alpha` is SUPPORTED, and an earlier draft wrongly listed it as
 rejected.** That contradicted §8, which already specifies the boundary — **Python
@@ -516,17 +515,16 @@ split, private votes and actor context, table order with an unchanged histogram,
 and a discard-composition pair with equal raw count and deck composition.
 Full suite: 513 passed, 1 skipped; 23 Rust unit tests passed.
 
-### M5 — the search descent ✅ BUILT, GATES GREEN 2026-08-24
+### M5 — the search descent + progressive widening ✅ BUILT, GATES GREEN 2026-08-24
 
-Rust owns the open-loop tree, transitions, M4 observation maps, f64 PUCT
-statistics and within-turn retained subtree. Python answers the version-1 packed
+Rust owns the observation-keyed tree, transitions, M4 observation maps, f64 PUCT
+statistics, progressive-widening particles and the within-turn retained subtree.
+Python answers the version-1 packed
 M0-E evaluator request one row at a time; M6 will coalesce those same requests.
-The widening-compatible layout is present exactly as §8.1 specifies: per-edge
-observation tables carry the dormant count and particle-slot fields, while the
-particle arena allocates **zero** slots with widening off. `chance_widening` is
-rejected loudly until it is implemented.
+The no-widening arm still allocates zero particle slots and remains available
+with `chance_widening=None`, but it is no longer the default.
 
-**Gate 1 result:** 256 matrix-balanced played-in positions × 3 independent M0-F
+**Control Gate 1 result (before widening was promoted):** 256 matrix-balanced played-in positions × 3 independent M0-F
 search tapes, 12 simulations each: **9,216 simulations, 40,257 evaluator
 requests (30,407 POLICY), exact request sequence/viewers/packed encodings, visit
 counts, f64 totals, observation-tree structure and chosen action; 134 terminal
@@ -535,7 +533,20 @@ root-player decision of a game in every 2/3/4-seat × standard/advanced cell, so
 terminal handling is exercised rather than inferred from mid-game positions.
 Separate fast cases cover forced-node collapse, exact within-turn re-rooting
 with nonzero reused visits, Python-generated Dirichlet noise with the correctly
-advanced random tape, widening refusal and the dormant arena.
+advanced random tape, and the zero-allocation control arm.
+
+**Progressive-widening Gate 1 result:** 48 matrix-balanced played-in and terminal
+positions × 2 independent tapes, 64 simulations each: **6,144 simulations,
+21,632 exact evaluator requests (15,894 POLICY), 382 terminal leaves**, exact
+request sequence/viewers/packed encodings, visits, f64 totals, full child tree,
+edge traversal counts, fresh-draw counts, exact-edge flags, terminal values and
+particle counts. The final run took 57.0s while the search suite ran concurrently,
+so its wall time is not used as a throughput measurement. A separate 128-simulation played-in
+regression requires at least one reused outcome, proves deterministic edges draw
+exactly once, checks `len(outcomes) <= ceil(sqrt(traversals))`, and caps every
+particle reservoir at four. Exact edges retain no particle: they replay their
+cheap deterministic macros on the incoming state so a branch cannot replace each
+simulation's fresh hidden deck with the first determinization it saw.
 
 The §8.1 hedge's measured layout price on this target is **64 bytes per outcome
 versus 24 bytes for the stripped open-loop record, plus one fixed 24-byte empty
@@ -544,28 +555,33 @@ about 4.1% of M4's 249 KiB key payload before common HashMap/key overhead. The
 runtime benchmark below includes it. That is a small bounded price; it does not
 justify reopening the layout decision.
 
-**Gate 2 result:** one complete two-seat real-network trajectory at identical
-batch width one: **64 decisions, 49 searched, exact action/visit/total and
+**Gate 2 result:** one complete two-seat advanced real-network trajectory with
+default widening at identical batch width one: **55 decisions, 47 searched,
+exact action/visit/total and
 request fingerprints after every decision, and exact M0-C state after every
-macro**, in 3.8s. This is deliberately the same batch composition; M6's wider
+macro**, in 3.4s. This is deliberately the same batch composition; M6's wider
 batches get the tolerance/reporting rule below rather than a false bit-identity
 claim.
 
-Two parity defects were found by scaling the gate. First, caching terminal
-outcomes in the Rust open-loop arm was value-equivalent but not oracle-equivalent:
-Python stores terminal values only under widening. M5 now reserves the field but
-does not populate it. Second, `PortableRng.choices` inherited NumPy `float32`
+**Final package gate:** 525 Python tests passed, 1 skipped; 24 Rust unit tests
+passed.
+
+Two parity defects were found by scaling the original control gate. First,
+caching terminal outcomes in the no-widening arm was value-equivalent but not
+oracle-equivalent: Python stores terminal values only under widening. M5 now
+populates them only in that arm. Second, `PortableRng.choices` inherited NumPy `float32`
 accumulation when passed a policy array, while Rust widened each packed prior to
 f64. On a wide uniform opponent policy one cumulative threshold straddled the
 same draw and changed the opponent's placement. Python now casts every weight to
 f64 before accumulation; a direct 331-action/256-draw cross-language regression
 and the full fixed-tape gate cover it.
 
-**Built open-loop, designed for widening — §8.1's three constraints are part of
-this milestone, not a later concern:** an observation-keyed edge table with a
-count field, a transition step that returns the observation and whether the turn
-changed, and an unallocated particle slot in the node arena. Verify the cost is
-small; if it is not, re-open §8.1 rather than paying it quietly.
+**Both arms are built.** With widening enabled, the edge admits
+`ceil(C * traversals^alpha)` outcomes, uses a separate fresh-draw count for
+empirical weights, merges by the viewer information key, reservoir-samples up to
+`max_particles` concrete states per outcome, and permanently closes proven
+deterministic within-turn edges. Outcome selection follows insertion order so the
+portable RNG tape is identical to Python despite Rust's unordered `HashMap`.
 
 **Gate 1 — strict, under full control.** A deterministic mock evaluator **and a
 fixed random tape**. ⚠ A mock removes torch drift but *not* redeterminization or
@@ -750,11 +766,15 @@ isolates the integrated search/engine/encoder path M5 actually replaced:
 
 | | Python | Rust | ratio |
 |---|---:|---:|---:|
-| simulations/s | 155.5 | 5,873.0 | **37.8×** |
-| LEAF rows/s | 160.3 | 6,056.6 | **37.8×** |
-| wall | 9.88s | 0.26s | **37.8×** |
+| simulations/s | 177.9 | 7,131.1 | **40.09×** |
+| LEAF rows/s | 183.4 | 7,353.9 | **40.09×** |
+| wall | 8.63s | 0.22s | **40.09×** |
 
-Both sides issued exactly **6,958 evaluator requests**. This is a blocking M5
+Both sides issued exactly **5,922 evaluator requests** with the normal `C=1`
+widening path. The retained control issued 6,958 on the same corpus, so reuse
+removed 1,036 requests (**14.9%**) before M6 batching. In separate uncontended
+runs, the control measured 153.8 / 5,823.3 simulations/s in Python/Rust versus
+177.9 / 7,131.1 with widening. This is a blocking M5
 hot-path measurement, not the self-play headline: a real network at batch width
 one reintroduces fixed forward cost, while production's throughput depends on
 M6 coalescing requests across games. The exact real-network trajectory gate is
@@ -769,55 +789,52 @@ the later lever had been hiding.
 
 ---
 
-## 8. Not in the first pass — and *not* "permanently"
+## 8. Progressive widening — resolved in M5
 
 ⚠ **Correction.** An earlier draft said `chance_widening` stays in Python
 permanently. That is incoherent with the objective: **if progressive widening
 wins the equal-wall-clock bakeoff, a backend that cannot run it cannot be the
 production backend.**
 
-### 8.1 ✅ DECIDED 2026-08-23 — build open-loop, design for widening
+### 8.1 ✅ SUPERSEDED 2026-08-24 — build widening in M5 and make it the default
 
-**The decision that matters is narrower than "port widening or not". It is:
-*may M5 assume the tree never holds game states?*** Answer: **no.**
+The first decision was narrower than "port widening or not": M5 could not assume
+the tree never holds game states. That decision correctly reserved the particle
+arena, but the follow-on choice to leave it dormant was superseded once the
+no-widening mechanics were examined directly: near-unique boundary outcomes make
+the search spend its budget on new reveal samples rather than depth.
 
-Everything else about widening — the cap, the two counters, merging — is
-bookkeeping that can be added later without disturbing anything. Particles are
-not. Open-loop stores **no** states in the tree; widening stores up to
+The cap, the two counters and merging were additive bookkeeping. Particles were
+the structural exception: the control stores **no** states in the tree, while
+widening stores up to
 `max_particles` concrete states per outcome. Measured: a `GameState` pickles to
 **6,513 bytes** and copies in **28.7 µs** in Python, and in Rust the difference
 is between a node arena of plain numbers and one that owns or indexes state
 snapshots. That is a layout decision, and layout is what does not get
 retrofitted.
 
-**Why this is not decided on evidence.** Deciding properly needs an
-equal-wall-clock strength A/B, and that needs a checkpoint where **search
-demonstrably beats no-search**. S0 is not it: its value head has score R² 0.200,
-and widening's entire product is *depth* (1.42 → 2.14 leaves), which only pays if
-the values at those leaves are informative. A bakeoff run now would most likely
-return a null, and **a null from an uninformative arm is not evidence** —
-`THROUGHPUT_LEVERS.md` §4.7. The real decision belongs after **S1**.
+The equal-wall-clock bakeoff remains useful for tuning `C` and
+`max_particles`, but it no longer decides whether the production backend is
+capable of widening. `C=1`, `alpha=0.5`, `max_particles=4` is the normal search;
+`None` is retained as the measurement control.
 
-**So M5 builds open-loop only, under three design constraints** that make
-widening additive rather than structural:
+The three layout constraints made the completed implementation additive rather
+than structural:
 
-1. **Edges are a table keyed by observation, with room for a count** — not a
-   bare `(action, observation) → node` map. `Outcome.count` is then a field that
-   stays zero, not a new indirection.
+1. **Edges are a table keyed by observation, with a fresh-draw count** — not a
+   bare `(action, observation) → node` map.
 2. **The transition step returns enough to key an outcome**, even when nothing
    stores one — the observation and whether the turn changed. `edge_exact` is a
    consequence of the second, and §7.1a's closure rule needs it.
-3. **The node arena carries a side-table slot for particles that is never
-   allocated** while `chance_widening` is `None`. Zero cost off, and no layout
-   change to turn on.
+3. **The node arena carries a side-table slot for particles.** It is allocated
+   only with widening on; the explicit control has zero particle allocations.
 
-⚠ **This is a hedge with a bounded price, and the price should be checked.** If
-implementing those three costs more than a small fraction of M5, say so and
-re-open the choice rather than paying it silently. The alternative on the table
-was to build strictly open-loop and treat widening as a later M7 rewrite; that
-bets widening loses a bakeoff nobody has run.
+The earlier hedge had a bounded layout price, measured in §7.4. Building the
+particle path now avoided the later M7 rewrite that the reserved layout was
+designed to prevent.
 
-* Until implemented, **Rust rejects `chance_widening != None` loudly** (M0-A).
+* Rust accepts both widening and the explicit control, and rejects invalid `C`,
+  `alpha`, or particle caps loudly (M0-A).
 * **Expert and solo** are out of training scope; reject them loudly rather than
   half-implement.
 * **Dirichlet noise is supported, not deferred** (M0-A). The boundary is
@@ -836,15 +853,12 @@ bets widening loses a bakeoff nobody has run.
    without B, C and D.
 2. ✅ **M1**, and measure what is measurable (§7) — **built 2026-08-23**, §7.1.
 3. ✅ **M2**, ✅ **M3** and ✅ **M4** (built 2026-08-23).
-4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
-   the widening question** — that decision was taken as "design for it, do not
-   build it", precisely so this step does not wait on a measurement that cannot
-   be made yet.
+4. ✅ **M5**, both progressive widening and the explicit no-widening control,
+   under §8.1's three design constraints — built 2026-08-24.
 5. M6 last — concurrency on top of an incorrect engine measures nothing.
-6. **After S1**, when a checkpoint exists that search actually improves: run the
-   widening bakeoff (and §7.8's `noise_fresh_fraction`, which waits on the same
-   thing). If widening wins, it becomes M7 and the constraints above are what
-   make that a feature rather than a rewrite.
+6. **After S1**, when a checkpoint exists that search actually improves: tune
+   `C`, `max_particles`, and §7.8's `noise_fresh_fraction` under equal wall
+   clock. Keep `None` as a diagnostic control, not as the normal search.
 
 **What would stop the port:** if M1's gate cannot be made to pass at 8,000 games,
 do not proceed to M2 with a known divergence and a plan to fix it later. A rules
