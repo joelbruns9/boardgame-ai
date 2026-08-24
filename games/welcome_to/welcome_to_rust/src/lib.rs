@@ -10,6 +10,7 @@
 
 mod codec;
 mod constants;
+mod encoder;
 mod game;
 mod macro_codec;
 mod plans;
@@ -20,7 +21,7 @@ mod tables;
 
 use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 use game::{Config, EngineError, Game};
 use rng::Rng;
@@ -371,6 +372,29 @@ impl RustGameState {
         })
     }
 
+    /// M3 encoder output as four packed little-endian float32 buffers.
+    /// Python exposes these as zero-copy, read-only NumPy arrays.
+    #[pyo3(signature = (player=None))]
+    fn encode_state<'py>(
+        &self,
+        py: Python<'py>,
+        player: Option<usize>,
+    ) -> PyResult<(
+        Bound<'py, PyBytes>,
+        Bound<'py, PyBytes>,
+        Bound<'py, PyBytes>,
+        Bound<'py, PyBytes>,
+    )> {
+        let viewer = player.unwrap_or(self.inner.actor);
+        let encoded = encoder::encode_state(&self.inner, viewer).map_err(to_py)?;
+        Ok((
+            PyBytes::new(py, &f32_le_bytes(&encoded.sheet_planes)),
+            PyBytes::new(py, &f32_le_bytes(&encoded.sheet_scalars)),
+            PyBytes::new(py, &f32_le_bytes(&encoded.viewer_plane)),
+            PyBytes::new(py, &f32_le_bytes(&encoded.global_scalars)),
+        ))
+    }
+
     // ── the M0-C snapshot ─────────────────────────────────────────────
     /// The whole state, in the shape `snapshot.to_snapshot` produces.
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -447,6 +471,14 @@ fn snapshot_version() -> i64 {
     snapshot::SNAPSHOT_VERSION
 }
 
+fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * size_of::<f32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 /// M0-C/D are load-time ABI contracts, not merely test assertions. A stale
 /// wheel must refuse to import before a self-play process can use mismatched
 /// rule tables or hand it a snapshot with a different shape.
@@ -471,6 +503,35 @@ fn check_python_compatibility(py: Python<'_>) -> PyResult<()> {
             "welcome_to_rust snapshot version {} != Python {python_version}; \
              rebuild the Rust extension against the current schema",
             snapshot::SNAPSHOT_VERSION
+        )));
+    }
+
+    let python_encoder = py.import("games.welcome_to.encoder")?;
+    let python_contract = (
+        python_encoder
+            .getattr("ENCODER_ABI_VERSION")?
+            .extract::<usize>()?,
+        python_encoder.getattr("SHEET_PLANES")?.extract::<usize>()?,
+        python_encoder
+            .getattr("NUM_SHEET_SCALAR")?
+            .extract::<usize>()?,
+        python_encoder
+            .getattr("NUM_GLOBAL_SCALAR")?
+            .extract::<usize>()?,
+        python_encoder.getattr("MAX_SEATS")?.extract::<usize>()?,
+    );
+    let rust_contract = (
+        encoder::ENCODER_ABI_VERSION,
+        encoder::SHEET_PLANES,
+        encoder::NUM_SHEET_SCALAR,
+        encoder::NUM_GLOBAL_SCALAR,
+        encoder::MAX_SEATS,
+    );
+    if python_contract != rust_contract {
+        return Err(PyImportError::new_err(format!(
+            "welcome_to_rust encoder contract {rust_contract:?} != Python \
+             {python_contract:?}; rebuild the Rust extension against the \
+             current encoder"
         )));
     }
     Ok(())
@@ -510,5 +571,10 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("NUM_ACTIONS", codec::NUM_ACTIONS)?;
     module.add("NUM_MACRO_ACTIONS", macro_codec::NUM_MACRO_ACTIONS)?;
     module.add("PRIMITIVE_ACTIONS", macro_codec::primitive_actions().clone())?;
+    module.add("ENCODER_ABI_VERSION", encoder::ENCODER_ABI_VERSION)?;
+    module.add("SHEET_PLANES_LEN", encoder::SHEET_PLANES_LEN)?;
+    module.add("SHEET_SCALARS_LEN", encoder::SHEET_SCALARS_LEN)?;
+    module.add("VIEWER_PLANE_LEN", encoder::VIEWER_PLANE_LEN)?;
+    module.add("GLOBAL_SCALARS_LEN", encoder::NUM_GLOBAL_SCALAR)?;
     Ok(())
 }

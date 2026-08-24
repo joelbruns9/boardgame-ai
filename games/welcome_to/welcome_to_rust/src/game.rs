@@ -999,7 +999,7 @@ impl Game {
 
     /// `stAskReshuffle` — only before any plan has been completed on an earlier
     /// turn. Real solo skips it, as BGA does.
-    fn may_ask_reshuffle(&self) -> bool {
+    pub(crate) fn may_ask_reshuffle(&self) -> bool {
         if self.config.solo() {
             return false;
         }

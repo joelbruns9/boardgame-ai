@@ -115,6 +115,9 @@ from games.welcome_to.sheet import Sheet
 #: and identity -- *which* opponent finishes plan 2 first -- is the whole point.
 MAX_SEATS: int = 4
 MAX_OPPONENTS: int = MAX_SEATS - 1
+# Cross-language layout contract. Increment this whenever the meaning, order,
+# dtype, or shape of any encode_state output changes.
+ENCODER_ABI_VERSION: int = 1
 #: Width of the seat-index one-hot.
 MAX_PLAYERS: int = 6
 

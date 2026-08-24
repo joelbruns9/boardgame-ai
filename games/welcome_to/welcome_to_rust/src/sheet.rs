@@ -7,7 +7,7 @@
 
 use crate::constants::{
     BIS_BOXES, BIS_SCORES, EMPTY, ESTATE_ROW_BOXES, ESTATE_ROW_SCORES, FENCE_SIZES,
-    MAX_ESTATE_SIZE, MAX_STREET_LEN, NUM_STREETS, PARK_BOXES,
+    MAX_ESTATE_SIZE, MAX_NUMBER, MAX_STREET_LEN, MIN_NUMBER, NUM_STREETS, PARK_BOXES,
     PARK_SCORES, PERMIT_BOXES, PERMIT_SCORES, POOL_BOXES, POOL_POSITIONS, POOL_SCORES,
     ROUNDABOUT, ROUNDABOUT_BOXES, ROUNDABOUT_SCORES, STREET_SIZES,
 };
@@ -139,6 +139,108 @@ impl Sheet {
     /// Cheap `available_locations(None)` emptiness test (end-of-game check).
     pub fn has_free_box(&self) -> bool {
         (0..NUM_STREETS).any(|x| (0..STREET_SIZES[x]).any(|y| self.is_empty(x, y)))
+    }
+
+    /// How many distinct numbers each empty box could still legally take.
+    pub fn box_spans(&self) -> [[i32; MAX_STREET_LEN]; NUM_STREETS] {
+        let mut spans = [[0i32; MAX_STREET_LEN]; NUM_STREETS];
+        for x in 0..NUM_STREETS {
+            let size = STREET_SIZES[x];
+            let row = &self.numbers[x];
+            for y in 0..size {
+                if row[y] != EMPTY {
+                    continue;
+                }
+                let mut low = MIN_NUMBER - 1;
+                for k in (0..y).rev() {
+                    if row[k] != EMPTY {
+                        if row[k] != ROUNDABOUT {
+                            low = row[k];
+                        }
+                        break;
+                    }
+                }
+                let mut high = MAX_NUMBER + 1;
+                for &value in row.iter().take(size).skip(y + 1) {
+                    if value != EMPTY {
+                        if value != ROUNDABOUT {
+                            high = value;
+                        }
+                        break;
+                    }
+                }
+                spans[x][y] = (high - low - 1).max(0);
+            }
+        }
+        spans
+    }
+
+    /// Per street, the most houses that could still be written there.
+    pub fn placement_capacity(&self) -> [i32; NUM_STREETS] {
+        let mut out = [0i32; NUM_STREETS];
+        for x in 0..NUM_STREETS {
+            let size = STREET_SIZES[x];
+            let row = &self.numbers[x];
+            let mut y = 0usize;
+            while y < size {
+                if row[y] != EMPTY {
+                    y += 1;
+                    continue;
+                }
+                let start = y;
+                while y < size && row[y] == EMPTY {
+                    y += 1;
+                }
+                let run = (y - start) as i32;
+                let mut low = MIN_NUMBER - 1;
+                if start > 0 && row[start - 1] != EMPTY && row[start - 1] != ROUNDABOUT {
+                    low = row[start - 1];
+                }
+                let mut high = MAX_NUMBER + 1;
+                if y < size && row[y] != EMPTY && row[y] != ROUNDABOUT {
+                    high = row[y];
+                }
+                out[x] += run.min((high - low - 1).max(0));
+            }
+        }
+        out
+    }
+
+    /// `(first, last, low, high)` for the empty run containing `(x, y)`.
+    fn gap_bounds(&self, x: usize, y: usize) -> Option<(usize, usize, i32, i32)> {
+        let row = &self.numbers[x];
+        let size = STREET_SIZES[x];
+        if row[y] != EMPTY {
+            return None;
+        }
+        let mut first = y;
+        while first > 0 && row[first - 1] == EMPTY {
+            first -= 1;
+        }
+        let mut last = y;
+        while last + 1 < size && row[last + 1] == EMPTY {
+            last += 1;
+        }
+        let mut low = MIN_NUMBER - 1;
+        if first > 0 && row[first - 1] != EMPTY && row[first - 1] != ROUNDABOUT {
+            low = row[first - 1];
+        }
+        let mut high = MAX_NUMBER + 1;
+        if last + 1 < size && row[last + 1] != EMPTY && row[last + 1] != ROUNDABOUT {
+            high = row[last + 1];
+        }
+        Some((first, last, low, high))
+    }
+
+    /// Negated distance from `number`'s ideal position; `0.0` is perfect.
+    pub fn positional_fit(&self, number: i32, x: usize, y: usize) -> Option<f64> {
+        let (first, last, low, high) = self.gap_bounds(x, y)?;
+        if high - low <= 1 {
+            return None;
+        }
+        let ideal = first as f64
+            + (last - first) as f64 * (number - low) as f64 / (high - low) as f64;
+        Some(-((y as f64) - ideal).abs())
     }
 
     /// `Houses::getAvailableLocationsForBis`.

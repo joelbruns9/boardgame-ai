@@ -136,6 +136,24 @@ fn is_supported(variant: Variant) -> bool {
     matches!(variant, Variant::Basic | Variant::Advanced)
 }
 
+/// Width of the dense advanced-superset plan identity used by the encoder.
+pub const NUM_DEALT_PLANS: usize = 28;
+
+/// Dense encoder position of a plan that standard/advanced play can deal.
+pub fn dense_index(plan_id: usize) -> Option<usize> {
+    let mut dense = 0usize;
+    for plan in PLANS.iter() {
+        if !is_supported(plan.variant) {
+            continue;
+        }
+        if plan.id == plan_id {
+            return Some(dense);
+        }
+        dense += 1;
+    }
+    None
+}
+
 /// `AbstractPlan::isAvailable` restricted to the base board, in id order.
 pub fn available_plan_ids(stack: u8, advanced: bool) -> Vec<usize> {
     let mut out = Vec::new();
@@ -212,6 +230,106 @@ pub fn can_be_scored(plan: &Plan, sheet: &Sheet) -> bool {
             "pool&park" => {
                 let x = plan.params[1].int() as usize;
                 sheet.street_parks_complete()[x] && sheet.street_pools_complete()[x]
+            }
+            other => panic!("seasonal decorative plan {other:?} is not supported"),
+        },
+        PlanKind::Unsupported => {
+            panic!("plan {} belongs to an unsupported expansion", plan.id)
+        }
+    }
+}
+
+/// Encoder distance to completion: `(fraction, marks_left)`.
+pub fn progress(plan: &Plan, sheet: &Sheet) -> (f64, i32) {
+    match plan.kind {
+        PlanKind::Estate => {
+            let required = plan.required_sizes();
+            let mut supply = [0usize; MAX_ESTATE_SIZE];
+            for (_, _, size) in sheet.free_estates() {
+                if (1..=MAX_ESTATE_SIZE).contains(&size) {
+                    supply[size - 1] += 1;
+                }
+            }
+            let mut need = [0usize; MAX_ESTATE_SIZE];
+            for &size in required.iter() {
+                need[size - 1] += 1;
+            }
+            let matched: usize = (0..MAX_ESTATE_SIZE)
+                .map(|i| need[i].min(supply[i]))
+                .sum();
+            let left = required.len() - matched;
+            (matched as f64 / required.len() as f64, left as i32)
+        }
+        PlanKind::FullStreet => {
+            let x = plan.params[0].int() as usize;
+            let size = STREET_SIZES[x];
+            if (0..size).any(|y| sheet.top_fences[x][y]) {
+                return (0.0, size as i32);
+            }
+            let built = (0..size).filter(|&y| !sheet.is_empty(x, y)).count();
+            (built as f64 / size as f64, (size - built) as i32)
+        }
+        PlanKind::FiveBis => {
+            let best = *sheet.bis_count_per_street().iter().max().expect("three streets");
+            (best.min(5) as f64 / 5.0, (5 - best).max(0))
+        }
+        PlanKind::SevenTemp => (
+            sheet.temps.min(7) as f64 / 7.0,
+            (7 - sheet.temps).max(0),
+        ),
+        PlanKind::Extremities => {
+            let done = EXTREMITY_POSITIONS
+                .iter()
+                .filter(|&&(x, y)| !sheet.is_empty(x, y) && !sheet.top_fences[x][y])
+                .count();
+            (
+                done as f64 / EXTREMITY_POSITIONS.len() as f64,
+                (EXTREMITY_POSITIONS.len() - done) as i32,
+            )
+        }
+        PlanKind::CompleteStreet => {
+            let mut best_left: Option<i32> = None;
+            let mut best_cap = 1i32;
+            for x in 0..NUM_STREETS {
+                let cap = PARK_BOXES[x] + 3 + 1;
+                let left = (PARK_BOXES[x] - sheet.parks[x])
+                    + (3 - sheet.pools[x])
+                    + if sheet.has_roundabout_in_street(x) { 0 } else { 1 };
+                if best_left.is_none() || left < best_left.expect("set") {
+                    best_left = Some(left);
+                    best_cap = cap;
+                }
+            }
+            let left = best_left.unwrap_or(0);
+            (1.0 - left as f64 / best_cap as f64, left)
+        }
+        PlanKind::Decorative => match plan.params[0].text() {
+            "park" => {
+                let mut needs = [0i32; NUM_STREETS];
+                for x in 0..NUM_STREETS {
+                    needs[x] = PARK_BOXES[x] - sheet.parks[x];
+                }
+                needs.sort_unstable();
+                let left = needs[0] + needs[1];
+                (
+                    1.0 - left as f64 / (PARK_BOXES[0] + PARK_BOXES[1]) as f64,
+                    left,
+                )
+            }
+            "pool" => {
+                let mut needs = [0i32; NUM_STREETS];
+                for x in 0..NUM_STREETS {
+                    needs[x] = 3 - sheet.pools[x];
+                }
+                needs.sort_unstable();
+                let left = needs[0] + needs[1];
+                (1.0 - left as f64 / 6.0, left)
+            }
+            "pool&park" => {
+                let x = plan.params[1].int() as usize;
+                let cap = PARK_BOXES[x] + 3;
+                let left = (PARK_BOXES[x] - sheet.parks[x]) + (3 - sheet.pools[x]);
+                (1.0 - left as f64 / cap as f64, left)
             }
             other => panic!("seasonal decorative plan {other:?} is not supported"),
         },

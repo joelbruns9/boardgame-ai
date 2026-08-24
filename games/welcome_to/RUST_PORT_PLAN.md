@@ -150,23 +150,44 @@ game that is a different game, and it would pass every per-action gate.
 `GameState` back into Python or re-encoding in Python — which forfeits M3, the
 single largest win in the plan.
 
-Specify, before M3:
+**✅ Frozen before M3 (2026-08-23): version 1, little-endian packed buffers.**
+Every multi-byte field is little-endian; all float buffers are IEEE-754 `f32`.
+Shapes are implicit in `(version, rows)` plus the encoder constants, never sent
+as Python tuples per row. The single-state M3 diagnostic method returns four
+`bytes` objects in this same row layout; M6 concatenates those rows without a
+representation change.
 
 ```
-RustScheduler.step()  -> a packed request batch
+RustScheduler.step() -> RequestBatchV1
+    version            u16 = 1
+    rows               u32
     sheet_planes, sheet_scalars, viewer_plane, global_scalars
-                       four contiguous f32 buffers, batch-major
-    legal              packed legal indices + CSR-style offsets, per row
-    kind               u8 per row: LEAF | POLICY
-    seats              u8 per row
-    request_id         u32 per row, stable across the round trip
+                       four contiguous f32 buffers, batch-major, exact encoder
+                       row shapes `(4,12,3,12)`, `(4,45)`, `(1,3,12)`, `(358,)`
+    legal_indices      u16, concatenated in canonical macro order
+    legal_offsets      u32[rows + 1], CSR-style
+    kind               u8[rows]: 0 = LEAF, 1 = POLICY
+    seats              u8[rows]
+    request_id         u32[rows], stable and unique among outstanding requests
 
-PythonEvaluator.forward(batch) -> packed results
-    priors             gathered over each row's LEGAL indices only, never 684
-    values             f32, LEAF rows only
+PythonEvaluator.forward(batch) -> ResponseBatchV1
+    version            u16 = 1
+    rows               u32, equal to request rows
+    request_id         u32[rows], echoed in response order
+    priors             f32[rows, 684], masked softmax; illegal entries are 0
+    values             f32[rows], blended leaf value; ignored for POLICY rows
 
 RustScheduler.update(results)
 ```
+
+⚠ **The response is deliberately full-684 in V1.** An earlier block in this
+plan said "gathered legal only" while the ownership table below said full 684;
+that was an ABI contradiction. Full output is the simpler first implementation
+and preserves today's Python `_masked_softmax` and `blend_value` exactly. The
+request still carries CSR legal indices because Python needs the mask and Rust
+needs the canonical list. A gathered response can become V2 only after
+bytes-crossing-FFI is measured and with a parity gate; it is not a silent V1
+layout optimization.
 
 ⚠ **That is the structural minimum, and M0 fixes nothing beyond it.** An
 earlier draft also assigned ownership of the legal mask, the masked softmax,
@@ -182,7 +203,7 @@ move it only against a number:
 | operation | starts | move it when |
 |---|---|---|
 | legal mask / gather | Rust — it reads state Rust owns, so it has nowhere else to be | — |
-| priors: full 684 vs gathered-legal | **full 684**, the simpler thing | bytes-crossing-FFI shows up in the profile. 684 × 32 rows ≈ 87 KB against ~6 KB gathered, so the *option* is worth keeping open in the layout |
+| priors: full 684 vs gathered-legal | **full 684 in ABI V1**, the simpler thing | bytes-crossing-FFI shows up in the profile. 684 × 32 rows ≈ 87 KB against ~6 KB gathered; changing it means ABI V2 |
 | masked softmax | Python | it is measured to matter |
 | rank masking, `blend_value` | Python — `training.rank_utility` lives there | ditto |
 | LEAF/POLICY scatter | Rust — it owns `request_id` | — |
@@ -427,8 +448,21 @@ a mask intersection admits jointly-illegal pairs.
 
 ### M3 — `encode_state` — the biggest win and the biggest risk
 
+**✅ Built 2026-08-23.** Rust owns all four feature computations and exposes the
+M0-E row layout as four packed little-endian `bytes` buffers; `rust_encoder.py`
+adds read-only NumPy views without a NumPy dependency in the crate.  Python is
+still the oracle, and the extension refuses to import if the encoder ABI version
+or any frozen dimension differs.
+
 **Gate:** **bit-exact** over ≥400,000 encodings from the M1 corpus, at 2/3/4
 seats and every viewer, `np.array_equal` on all four arrays — not `allclose`.
+
+**Gate result:** 400,342 encodings in 124,741 primitive states, 671 complete
+games and 124,070 actions; all 18 configuration × driver cells had 37–38 games,
+with **zero divergences** in 420.2s.  The focused suite also hands every M1
+constructed rare position through the snapshot and separately verifies the
+mid-turn live-sheet/public-snapshot leak invariant.  Full suite: 510 passed,
+1 skipped; 20 Rust unit tests passed.
 
 ⚠ **Match numpy's cast chain exactly:** `int/int` divisions in **f64**, then cast
 to f32, mirroring numpy's float64 → float32 array-assignment cast.
@@ -613,6 +647,21 @@ microbenchmark became 1.89× on the real path. The clone rate is the number wort
 remembering, because it is what the fixed-array layout bought and what M5's tree
 will spend.
 
+### 7.2 M3, measured — `rust_encoder_bench.py`, 2026-08-23
+
+Laptop, one played-in 4-seat advanced position at turn 10, 10,000 rows per
+backend and viewers rotated across all four seats:
+
+| Python | Rust | ratio |
+|---:|---:|---:|
+| 1,193 rows/s | 60,558 rows/s | **50.8×** |
+
+This is still a microbenchmark: M3 is not wired into search.  The Rust number is
+deliberately conservative for the eventual scheduler because it includes four
+fresh byte-buffer allocations and four Python/NumPy views per row.  M6 will use
+the already-frozen batch-major layout and reusable buffers; no benefit from that
+unbuilt path is claimed here.
+
 **Re-measure the profile after M3.** §1's shares were taken with an interpreted
 engine; once the encoder is compiled the remaining Python is a different mixture.
 7WD's experience: **1.99× on a microbenchmark became 1.89× on the real path, and
@@ -687,7 +736,7 @@ bets widening loses a bakeoff nobody has run.
    later. **Built 2026-08-23** alongside M1, because M1's gate cannot run
    without B, C and D.
 2. ✅ **M1**, and measure what is measurable (§7) — **built 2026-08-23**, §7.1.
-3. ✅ **M2** (built 2026-08-23), then M3, M4 in order.
+3. ✅ **M2** and ✅ **M3** (built 2026-08-23), then M4.
 4. M5, open-loop, under §8.1's three design constraints. **No longer blocked on
    the widening question** — that decision was taken as "design for it, do not
    build it", precisely so this step does not wait on a measurement that cannot
