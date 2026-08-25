@@ -18,6 +18,7 @@ mod information_key;
 mod macro_codec;
 mod plans;
 mod rng;
+mod samples;
 mod scheduler;
 mod search;
 mod sheet;
@@ -32,6 +33,7 @@ use game::{Config, EngineError, Game};
 use rng::Rng;
 use search::{EvalResponse, RequestKind, Search, SearchConfig as NativeSearchConfig, SearchOutput};
 use scheduler::{RustCloudScheduler, RustScheduler};
+use samples::{RustSampleShardWriter, RustTrainingCapture, RustTrainingGame};
 
 fn to_py(err: EngineError) -> PyErr {
     match err {
@@ -870,6 +872,9 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RustMcts>()?;
     module.add_class::<RustScheduler>()?;
     module.add_class::<RustCloudScheduler>()?;
+    module.add_class::<RustTrainingCapture>()?;
+    module.add_class::<RustTrainingGame>()?;
+    module.add_class::<RustSampleShardWriter>()?;
     module.add_function(wrap_pyfunction!(table_signature, module)?)?;
     module.add_function(wrap_pyfunction!(snapshot_version, module)?)?;
     module.add_function(wrap_pyfunction!(portable_rng_stream, module)?)?;
@@ -898,6 +903,20 @@ fn welcome_to_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
         information_key::INFORMATION_KEY_ABI_VERSION,
     )?;
     module.add("EVALUATOR_ABI_VERSION", 2usize)?;
+    module.add("TRAINING_SHARD_VERSION", samples::TRAINING_SHARD_VERSION)?;
+    module.add("TRAINING_GLOBAL_TARGETS", samples::GLOBAL_TARGET_COUNT)?;
+    module.add(
+        "TRAINING_PER_SEAT_TARGETS",
+        samples::PER_SEAT_TARGET_COUNT,
+    )?;
+    module.add(
+        "TRAINING_GLOBAL_TARGET_NAMES",
+        samples::GLOBAL_TARGET_NAMES.to_vec(),
+    )?;
+    module.add(
+        "TRAINING_PER_SEAT_TARGET_NAMES",
+        samples::PER_SEAT_TARGET_NAMES.to_vec(),
+    )?;
     module.add("SEARCH_OUTCOME_LAYOUT_BYTES", search::outcome_layout_bytes())?;
     Ok(())
 }

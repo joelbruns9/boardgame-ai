@@ -690,7 +690,7 @@ The exactness gate compares blocking M6 with the resumable path at 1/2/4
 workers: chosen action, action order, visits, totals, and final RNG state are
 identical. Reordered evaluator responses, evaluator failure/slot recovery,
 worker persistence, and retained-subtree rerooting are separately gated.
-Current verification: **551 passed, 1 skipped** in the Python suite and **24
+Current verification: **553 passed, 1 skipped** in the Python suite and **24
 passed** in Rust.
 
 `WelcomeToNet.forward_inference` evaluates only the three search outputs
@@ -717,6 +717,41 @@ python -m games.welcome_to.s2_throughput --checkpoint MODEL.pt \
 Use substantially more games than inflight slots so every arm reaches steady
 state; choose by games/hour and stage counters, with discrete trajectory
 agreement retained as the class-A gate.
+
+#### Post-M6 training-data path — direct capture and durable shards ✅ BUILT 2026-08-24
+
+Python trajectory replay was still a serial tail after the engine, encoder and
+search moved to Rust. It was useful as a port oracle, but repeating every real
+action and encoder call before admission made already-proved equivalence part of
+the production hot path. It is now an offline gate, not a runtime dependency.
+
+At each searched learner root, Rust retains the four M3 encoder buffers, the
+full 684-bit legal mask, selected action, actor/turn metadata, cyclic seat axis
+and sparse integer visit counts. When the real game terminates, Rust computes
+the nine global and four-by-twenty per-seat targets from that terminal state and
+attaches them to the retained roots. The target names are a checked ABI on both
+sides; equal lengths cannot conceal a reordering.
+
+Completed games enter a bounded Rust channel. A persistent writer thread owns
+the in-memory shard buffer, serializes both training rows and the raw portable
+trajectory, flushes and synchronizes a temporary file, then atomically renames
+it. Resume validates every discovered shard (including non-contiguous indices),
+record bounds, table signature and unique game seeds before choosing the next
+index. Queue capacity provides explicit backpressure rather than unbounded RAM.
+
+The raw JSON trajectory in each record is deliberate: it preserves Python as an
+independent rules/encoder oracle and permits later target re-derivation without
+making replay the production admission barrier. The focused gate compares every
+encoder array, legal mask, normalized policy, action/actor/turn field and target
+as float32 with `array_equal`; writer restart, atomic cleanup and deliberate
+truncation rejection are separate tests.
+
+Focused laptop read-path measurement, 20 mixed-seat games / 487 searched roots:
+the finalized shards streamed at **3,624 rows/s** versus **209 rows/s** for
+Python macro replay plus encoding, a **17.4×** improvement. Four five-game
+shards occupied 5.21 MB. This isolates corpus materialization; it is not a claim
+about CUDA training throughput, which still needs an end-to-end loader/GPU
+profile on the rented box.
 
 ---
 

@@ -701,7 +701,7 @@ direct evidence that race learning is happening rather than being assumed.
 
 #### S2 trajectory implementation
 
-`self_play.py` is the built generation/replay leg:
+`self_play.py` is the built generation/capture leg:
 
 * learner fixed in seat 0, with one persistent M6 search slot per live game;
 * advanced 2/3/4-seat games at 60/30/10, with the small-corpus allocator fixed
@@ -715,12 +715,21 @@ direct evidence that race learning is happening rather than being assumed.
 * real opponent moves batched by frozen checkpoint and sampled from independent
   per-seat portable streams using that **same opening/late temperature schedule**;
   no GreedyBot fallback;
-* replay through the Python rules oracle before a game is admitted to disk,
-  checking search legality, final scores, seat-axis targets and visit mass;
-* replay-validated games written as immutable atomic shards (25 games by
-  default), so a hard process loss discards at most the open shard; restart
-  validates the deterministic seed/seat schedule and generates only missing
-  seeds;
+* direct Rust capture of the encoded root, full legal mask and sparse integer
+  visit policy before the selected action is applied; Rust checks the ordered
+  search-legal action list and positive integral visit mass at admission;
+* terminal target finalization in Rust, including tie-shared rank distributions,
+  cyclic seat-axis alignment, plan timing masks and padded seats. The frozen
+  target-name ABI is checked against Python at read time, not inferred from
+  matching vector lengths;
+* a bounded asynchronous Rust writer buffers completed games and writes
+  immutable binary shards (25 games by default) through flush + file sync +
+  atomic rename. Restart scans and validates every existing shard, rejects
+  duplicate seeds and truncated records, then generates only missing seeds;
+* the complete portable macro trajectory remains in every binary game record.
+  Python replay is retained as an offline oracle and re-derivation path, but is
+  no longer a serial production admission barrier. The parity gate compares all
+  four encoder arrays, legal masks, policies, metadata and all targets exactly;
 * a sidecar manifest pins the model hashes, rules/table signature, search
   settings, temperatures and scheduler width. A restart refuses mixed or
   unverifiable evidence instead of silently appending it;

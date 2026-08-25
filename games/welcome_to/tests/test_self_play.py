@@ -32,19 +32,33 @@ def _net(seed: int = 17) -> nw.WelcomeToNet:
 
 
 @pytest.fixture(scope="module")
-def generated():
-    return self_play.generate(
-        _net(),
-        config=self_play.SelfPlayConfig(
-            games=4,
-            inflight=4,
-            max_batch=4,
-            seed=8_100,
-            opening_temperature_turns=10,
-        ),
-        search_config=self_play.default_search_config(simulations=3),
-        device="cpu",
+def captured_generation(tmp_path_factory):
+    prefix = tmp_path_factory.mktemp("rust-samples") / "trajectories.jsonl"
+    writer = self_play.wr.RustSampleShardWriter(
+        prefix, shard_games=2, queue_games=2
     )
+    try:
+        generated = self_play.generate(
+            _net(),
+            config=self_play.SelfPlayConfig(
+                games=4,
+                inflight=4,
+                max_batch=4,
+                seed=8_100,
+                opening_temperature_turns=10,
+            ),
+            search_config=self_play.default_search_config(simulations=3),
+            device="cpu",
+            on_captured=lambda _trajectory, captured: writer.add(captured),
+        )
+    finally:
+        writer.close()
+    return generated, prefix
+
+
+@pytest.fixture(scope="module")
+def generated(captured_generation):
+    return captured_generation[0]
 
 
 def test_s2_small_mix_keeps_every_encoder_seat_count_live():
@@ -142,6 +156,56 @@ def test_s2_json_round_trip_and_batch_are_training_ready(generated, tmp_path):
     batch["action"] = torch.zeros_like(batch["action"])
     _, after = nw.losses(out, batch)
     assert torch.equal(before["policy"], after["policy"])
+
+
+def test_s2_rust_sample_shards_are_exactly_the_python_oracle(captured_generation):
+    (trajectories, _), prefix = captured_generation
+    cached = self_play.read_trajectories(prefix)
+    assert cached == trajectories
+    assert len(self_play.training_shard_paths(prefix)) == 2
+    assert not list(prefix.parent.glob("*.tmp"))
+
+    for trajectory, cached_trajectory in zip(trajectories, cached):
+        # Round-tripping the JSON deliberately drops the Rust row source and
+        # forces the independent Python replay oracle.
+        oracle = self_play.SelfPlayTrajectory.from_json(trajectory.to_json())
+        oracle_samples = list(self_play.replay(oracle))
+        cached_samples = list(self_play.replay(cached_trajectory))
+        assert len(cached_samples) == len(oracle_samples) == len(trajectory.searches)
+        for actual, expected in zip(cached_samples, oracle_samples):
+            assert np.array_equal(actual.sheet_planes, expected.sheet_planes)
+            assert np.array_equal(actual.sheet_scalars, expected.sheet_scalars)
+            assert np.array_equal(actual.viewer_plane, expected.viewer_plane)
+            assert np.array_equal(actual.global_scalars, expected.global_scalars)
+            assert np.array_equal(actual.legal, expected.legal)
+            assert np.array_equal(actual.policy, expected.policy)
+            assert (actual.action, actual.actor, actual.turn) == (
+                expected.action,
+                expected.actor,
+                expected.turn,
+            )
+            assert actual.targets.keys() == expected.targets.keys()
+            for name in actual.targets:
+                assert np.array_equal(
+                    np.asarray(actual.targets[name], dtype=np.float32),
+                    np.asarray(expected.targets[name], dtype=np.float32),
+                ), name
+
+
+def test_s2_rust_sample_writer_restarts_and_rejects_truncation(
+    captured_generation, tmp_path
+):
+    (trajectories, _), prefix = captured_generation
+    writer = self_play.wr.RustSampleShardWriter(prefix, shard_games=2, queue_games=1)
+    assert writer.completed_seeds == sorted(t.seed for t in trajectories)
+    writer.close()
+
+    shard = self_play.training_shard_paths(prefix)[0]
+    truncated_prefix = tmp_path / "broken.jsonl"
+    truncated = tmp_path / "broken.part-000000.wts"
+    truncated.write_bytes(shard.read_bytes()[:-1])
+    with pytest.raises((RuntimeError, ValueError), match="truncated"):
+        self_play.wr.RustSampleShardWriter(truncated_prefix)
 
 
 def test_s2_atomic_shards_resume_by_seed(generated, tmp_path):

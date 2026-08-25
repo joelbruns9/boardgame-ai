@@ -8,10 +8,11 @@ eventually sampled from them.
 
 The stored format is deliberately different from S0's primitive teacher
 trajectory. S2 records complete *macro* action games plus sparse root visit rows.
-Replay re-runs the Python oracle from the portable game seed, verifies every
-root action list and final score, then constructs the same auxiliary targets as
-S0. A rule, codec, or search-legality change therefore invalidates stale data
-loudly.
+Production roots are encoded directly from the live Rust state, terminal targets
+are finalized in Rust, and a bounded background writer commits atomic binary
+shards. Each shard retains the raw portable trajectory so Python replay remains
+an independent offline oracle and targets can be re-derived after a schema
+change; it is no longer a serial admission stage in the self-play hot path.
 """
 
 from __future__ import annotations
@@ -20,9 +21,10 @@ import hashlib
 import json
 import math
 import os
+import struct
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterator, Optional, Sequence
 
@@ -91,6 +93,7 @@ class SelfPlayTrajectory:
     learner: int = LEARNER_SEAT
     rng: str = "portable"
     version: int = FORMAT_VERSION
+    _sample_source: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.version != FORMAT_VERSION:
@@ -114,7 +117,20 @@ class SelfPlayTrajectory:
         return GameConfig(players=self.players, advanced=True, solo_rules=False)
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), separators=(",", ":"))
+        raw = {
+            "seed": self.seed,
+            "players": self.players,
+            "actions": self.actions,
+            "searches": [asdict(target) for target in self.searches],
+            "scores": self.scores,
+            "opponents": self.opponents,
+            "prune_roundabout_pass": self.prune_roundabout_pass,
+            "advanced": self.advanced,
+            "learner": self.learner,
+            "rng": self.rng,
+            "version": self.version,
+        }
+        return json.dumps(raw, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, line: str) -> "SelfPlayTrajectory":
@@ -199,6 +215,7 @@ class _LiveGame:
     policy_rngs: tuple[Optional[PortableRng], ...]
     actions: list[int]
     searches: list[SearchTarget]
+    capture: object
     learner_decisions: int = 0
 
 
@@ -276,7 +293,10 @@ def seat_counts(games: int) -> list[int]:
 
 
 def replay(trajectory: SelfPlayTrajectory) -> Iterator[datagen.Sample]:
-    """Rebuild S2 visit-policy and auxiliary samples through the Python oracle."""
+    """Read captured rows, or rebuild a legacy trajectory with the Python oracle."""
+    if trajectory._sample_source is not None:
+        yield from trajectory._sample_source.samples()
+        return
     state = GameState.new(
         seed=trajectory.seed,
         config=trajectory.config,
@@ -363,6 +383,189 @@ def _shard_paths(path: Path) -> list[Path]:
     return sorted(path.parent.glob(f"{stem}.part-*{suffix}"))
 
 
+def training_shard_paths(path: str | Path) -> list[Path]:
+    """Atomic Rust sample shards associated with a trajectory prefix."""
+    path = Path(path)
+    if path.is_dir():
+        return sorted(path.glob("*.wts"))
+    stem = path.stem if path.suffix else path.name
+    return sorted(path.parent.glob(f"{stem}.part-*.wts"))
+
+
+_WTS_HEADER = struct.Struct("<8sHHHHQI")
+_WTS_RECORD = struct.Struct("<Q")
+_WTS_FIXED_ENCODER_FLOATS = (
+    int(np.prod(enc.SHEET_PLANES_SHAPE))
+    + enc.MAX_SEATS * enc.NUM_SHEET_SCALAR
+    + int(np.prod(enc.VIEWER_PLANE_SHAPE))
+    + enc.NUM_GLOBAL_SCALAR
+)
+_WTS_SAMPLE_PREFIX = (
+    _WTS_FIXED_ENCODER_FLOATS * 4
+    + mc.NUM_MACRO_ACTIONS
+    + 2  # selected action
+    + 1  # actor
+    + 4  # turn
+    + 2  # sparse policy support
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedGameSamples:
+    path: Path
+    offsets: tuple[int, ...]
+
+    @staticmethod
+    def _f32(handle, shape: tuple[int, ...]) -> np.ndarray:
+        count = int(np.prod(shape))
+        raw = handle.read(count * 4)
+        if len(raw) != count * 4:
+            raise ValueError("training shard ended inside an encoder array")
+        return np.frombuffer(raw, dtype="<f4").reshape(shape).copy()
+
+    def samples(self) -> Iterator[datagen.Sample]:
+        with self.path.open("rb") as handle:
+            for offset in self.offsets:
+                handle.seek(offset)
+                sheet_planes = self._f32(handle, enc.SHEET_PLANES_SHAPE)
+                sheet_scalars = self._f32(
+                    handle, (enc.MAX_SEATS, enc.NUM_SHEET_SCALAR)
+                )
+                viewer_plane = self._f32(handle, enc.VIEWER_PLANE_SHAPE)
+                global_scalars = self._f32(handle, (enc.NUM_GLOBAL_SCALAR,))
+                legal_raw = handle.read(mc.NUM_MACRO_ACTIONS)
+                if len(legal_raw) != mc.NUM_MACRO_ACTIONS:
+                    raise ValueError("training shard ended inside a legal mask")
+                legal = np.frombuffer(legal_raw, dtype=np.uint8).astype(np.bool_)
+                fixed = handle.read(9)
+                if len(fixed) != 9:
+                    raise ValueError("training shard ended inside sample metadata")
+                action, actor, turn, support = struct.unpack("<HBiH", fixed)
+                sparse = handle.read(support * 6)
+                if len(sparse) != support * 6:
+                    raise ValueError("training shard ended inside a sparse policy")
+                policy = np.zeros(mc.NUM_MACRO_ACTIONS, dtype=np.float32)
+                for index in range(support):
+                    macro_action, visits = struct.unpack_from("<HI", sparse, index * 6)
+                    policy[macro_action] = np.float32(visits)
+                mass = policy.sum(dtype=np.float32)
+                if not mass > 0:
+                    raise ValueError("training shard policy has no visit mass")
+                policy /= mass
+                target_count = len(training.GLOBAL_TARGETS) + (
+                    training.MAX_SEATS * len(training.PER_SEAT_TARGETS)
+                )
+                raw_targets = handle.read(target_count * 4)
+                if len(raw_targets) != target_count * 4:
+                    raise ValueError("training shard ended inside target values")
+                flat = np.frombuffer(raw_targets, dtype="<f4")
+                targets: dict[str, float | tuple[float, ...]] = {
+                    name: float(flat[index])
+                    for index, name in enumerate(training.GLOBAL_TARGETS)
+                }
+                seats = flat[len(training.GLOBAL_TARGETS) :].reshape(
+                    training.MAX_SEATS, len(training.PER_SEAT_TARGETS)
+                )
+                for index, name in enumerate(training.PER_SEAT_TARGETS):
+                    targets[name] = tuple(float(value) for value in seats[:, index])
+                yield datagen.Sample(
+                    sheet_planes=sheet_planes,
+                    sheet_scalars=sheet_scalars,
+                    viewer_plane=viewer_plane,
+                    global_scalars=global_scalars,
+                    legal=legal,
+                    action=int(action),
+                    actor=int(actor),
+                    turn=int(turn),
+                    targets=targets,
+                    policy=policy,
+                )
+
+
+def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
+    if wr is None:
+        raise RuntimeError("welcome_to_rust is required to validate training shards")
+    out: list[SelfPlayTrajectory] = []
+    with path.open("rb") as handle:
+        file_size = path.stat().st_size
+        raw = handle.read(_WTS_HEADER.size)
+        if len(raw) != _WTS_HEADER.size:
+            raise ValueError(f"training shard {path} has a truncated header")
+        magic, version, globals_, per_seat, max_seats, signature, games = (
+            _WTS_HEADER.unpack(raw)
+        )
+        if (
+            magic != b"WTSHRD01"
+            or version != int(wr.TRAINING_SHARD_VERSION)
+            or globals_ != len(training.GLOBAL_TARGETS)
+            or per_seat != len(training.PER_SEAT_TARGETS)
+            or max_seats != training.MAX_SEATS
+            or signature != int(wr.table_signature())
+            or tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) != training.GLOBAL_TARGETS
+            or tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES)
+            != training.PER_SEAT_TARGETS
+        ):
+            raise ValueError(f"training shard {path} has an incompatible ABI")
+        target_bytes = (
+            len(training.GLOBAL_TARGETS)
+            + training.MAX_SEATS * len(training.PER_SEAT_TARGETS)
+        ) * 4
+        for _ in range(games):
+            raw_length = handle.read(_WTS_RECORD.size)
+            if len(raw_length) != _WTS_RECORD.size:
+                raise ValueError(f"training shard {path} ended before a game record")
+            (record_length,) = _WTS_RECORD.unpack(raw_length)
+            record_start = handle.tell()
+            record_end = record_start + record_length
+            if record_length < 16 or record_end > file_size:
+                raise ValueError(f"training shard {path} has a truncated game record")
+            fixed = handle.read(12)
+            if len(fixed) != 12:
+                raise ValueError(f"training shard {path} has a truncated game record")
+            seed, json_length = struct.unpack("<QI", fixed)
+            raw_json = handle.read(json_length)
+            if len(raw_json) != json_length:
+                raise ValueError(f"training shard {path} has truncated trajectory JSON")
+            trajectory = SelfPlayTrajectory.from_json(raw_json.decode("utf-8"))
+            if trajectory.seed != seed:
+                raise ValueError(
+                    f"training shard {path} seed {seed} disagrees with its trajectory"
+                )
+            raw_count = handle.read(4)
+            if len(raw_count) != 4:
+                raise ValueError(f"training shard {path} omitted its sample count")
+            (sample_count,) = struct.unpack("<I", raw_count)
+            offsets = []
+            for _sample in range(sample_count):
+                offsets.append(handle.tell())
+                handle.seek(_WTS_SAMPLE_PREFIX - 2, os.SEEK_CUR)
+                if handle.tell() + 2 > record_end:
+                    raise ValueError(f"training shard {path} ended inside a sample")
+                raw_support = handle.read(2)
+                if len(raw_support) != 2:
+                    raise ValueError(f"training shard {path} ended inside a sample")
+                (support,) = struct.unpack("<H", raw_support)
+                handle.seek(support * 6 + target_bytes, os.SEEK_CUR)
+                if handle.tell() > record_end:
+                    raise ValueError(f"training shard {path} ended inside a sample")
+            if handle.tell() != record_end:
+                raise ValueError(f"training shard {path} game record length is inconsistent")
+            if sample_count != len(trajectory.searches):
+                raise ValueError(
+                    f"training shard {path} has {sample_count} rows for "
+                    f"{len(trajectory.searches)} search targets"
+                )
+            out.append(
+                replace(
+                    trajectory,
+                    _sample_source=_CachedGameSamples(path, tuple(offsets)),
+                )
+            )
+        if handle.read(1):
+            raise ValueError(f"training shard {path} has trailing bytes")
+    return out
+
+
 def trajectory_sources(path: str | Path) -> list[Path]:
     """Resolve a legacy monolith, a shard prefix, or a shard directory."""
     path = Path(path)
@@ -375,7 +578,8 @@ def trajectory_sources(path: str | Path) -> list[Path]:
 
 def read_trajectories(path: str | Path) -> list[SelfPlayTrajectory]:
     sources = trajectory_sources(path)
-    if not sources:
+    sample_sources = training_shard_paths(path)
+    if not sources and not sample_sources:
         raise FileNotFoundError(f"no trajectory file or shards found for {path}")
     trajectories: list[SelfPlayTrajectory] = []
     for source in sources:
@@ -383,6 +587,11 @@ def read_trajectories(path: str | Path) -> list[SelfPlayTrajectory]:
             trajectories.extend(
                 SelfPlayTrajectory.from_json(line) for line in handle if line.strip()
             )
+    for source in sample_sources:
+        trajectories.extend(_read_training_shard(source))
+    seeds = [trajectory.seed for trajectory in trajectories]
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("trajectory corpus contains duplicate game seeds")
     return trajectories
 
 
@@ -581,7 +790,7 @@ def iter_batches(
     rng,
     shuffle_buffer: int = 8192,
 ) -> Iterator[dict[str, np.ndarray]]:
-    """Replay S2 games through the existing streaming shuffle-buffer loader."""
+    """Stream captured or legacy S2 rows through the shuffle-buffer loader."""
     from games.welcome_to import train
 
     yield from train.iter_batches(
@@ -626,6 +835,7 @@ def _new_live(
         policy_rngs=tuple(rngs),
         actions=[],
         searches=[],
+        capture=wr.RustTrainingCapture(seed),
     )
 
 
@@ -714,6 +924,7 @@ def generate(
     device: Optional[torch.device | str] = None,
     skip_seeds: Collection[int] = (),
     on_trajectory: Optional[Callable[[SelfPlayTrajectory], None]] = None,
+    on_captured: Optional[Callable[[SelfPlayTrajectory, object], None]] = None,
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
@@ -811,6 +1022,13 @@ def generate(
                 if sum(visits) > 0:
                     if any(float(value) != visit for value, visit in zip(result["visits"], visits)):
                         raise RuntimeError("Rust search returned a non-integral visit count")
+                    game.capture.capture(
+                        game.state,
+                        [int(action) for action in result["actions"]],
+                        [float(value) for value in result["visits"]],
+                        choice,
+                        search_config.prune_roundabout_pass,
+                    )
                     game.searches.append(
                         SearchTarget(
                             decision=len(game.actions),
@@ -864,9 +1082,9 @@ def generate(
                 opponents=game.opponent_names,
                 prune_roundabout_pass=search_config.prune_roundabout_pass,
             )
-            # Replay is the write barrier: a generated game does not enter the
-            # corpus until Python proves its rules, roots, targets, and score.
-            list(replay(trajectory))
+            captured = game.capture.finish(game.state, trajectory.to_json())
+            if on_captured is not None:
+                on_captured(trajectory, captured)
             if on_trajectory is not None:
                 on_trajectory(trajectory)
             trajectories.append(trajectory)
@@ -929,6 +1147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--opening-temperature", type=float, default=1.0)
     parser.add_argument("--late-temperature", type=float, default=0.0)
     parser.add_argument("--shard-games", type=int, default=25)
+    parser.add_argument("--writer-queue-games", type=int, default=100)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", default="runs/welcome_to_s2/trajectories.jsonl")
     args = parser.parse_args(argv)
@@ -950,9 +1169,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         Opponent(Path(path).stem, learner if path == args.checkpoint else train.load(path, args.device))
         for path in opponent_paths
     ]
-    store = TrajectoryShardWriter(args.out, shard_games=args.shard_games)
-    completed_seeds = validate_resume(store.existing, config)
-    existing_games = len(store.existing)
+    has_existing = bool(trajectory_sources(args.out) or training_shard_paths(args.out))
+    existing = read_trajectories(args.out) if has_existing else []
+    completed_seeds = validate_resume(existing, config)
+    existing_games = len(existing)
     ensure_run_manifest(
         args.out,
         run_manifest(config, search_config, args.checkpoint, opponent_paths),
@@ -960,12 +1180,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     )
     # Resume validation needs full trajectories, generation does not. Do not
     # retain an old overnight corpus alongside the new one for the whole run.
-    store.existing.clear()
+    existing.clear()
     pending = config.games - len(completed_seeds)
     if pending == 0:
         print(f"S2 corpus already complete: {config.games} games at {args.out}")
         return 0
 
+    store = wr.RustSampleShardWriter(
+        args.out,
+        shard_games=args.shard_games,
+        queue_games=args.writer_queue_games,
+    )
     try:
         trajectories, metrics = generate(
             learner,
@@ -974,11 +1199,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             opponents=opponents,
             device=args.device,
             skip_seeds=completed_seeds,
-            on_trajectory=store.add,
+            on_captured=lambda _trajectory, captured: store.add(captured),
         )
     finally:
-        # Also flush a short final shard on clean completion, Ctrl-C, or a
-        # Python exception. A hard process loss is bounded by --shard-games.
+        # Also drain the bounded queue and flush a short final shard on clean
+        # completion, Ctrl-C, or a Python exception.
         store.close()
 
     path = Path(args.out)
