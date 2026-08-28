@@ -8,10 +8,26 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::encoder::MAX_SEATS;
 use crate::game::{EngineError, EngineResult, Game};
 use crate::information_key::{information_key, position_key, InformationKey};
 use crate::macro_codec;
 use crate::rng::Rng;
+
+/// The search's value is a distribution over at most `MAX_SEATS` finishing
+/// positions, exactly like `training.rank_distributions`, which refuses a
+/// larger table outright. Refuse it here too: `terminal_value` would otherwise
+/// index its four-wide distribution with a fifth seat's rank and panic inside a
+/// worker thread, which surfaces only as "search worker panicked".
+fn check_seats(state: &Game) -> EngineResult<()> {
+    if state.config.players > MAX_SEATS {
+        return Err(EngineError::Invalid(format!(
+            "search supports at most {MAX_SEATS} seats, not {}",
+            state.config.players
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -33,6 +49,11 @@ pub struct EvalRequestEvent {
     pub state: Game,
     pub viewer: usize,
     pub request_id: u32,
+    /// The **full** macro vocabulary legal here, enumerated once. The broker
+    /// packs this rather than recomputing it: at `CHOOSE_CARDS` the enumeration
+    /// clones the whole `Game` per playable slot, and a LEAF used to pay for it
+    /// twice — here and again when the response expanded the node.
+    pub legal: Vec<usize>,
 }
 
 pub enum SearchEvent {
@@ -793,6 +814,7 @@ impl Search {
                 "search starts at a state the root player is to act in".into(),
             ));
         }
+        check_seats(state)?;
         self.reset();
         let (node, _) = self.expand_leaf(state, root, evaluator)?;
         let node =
@@ -910,6 +932,7 @@ impl Search {
         if state.actor != root {
             return Err(EngineError::Invalid("play root is not the actor".into()));
         }
+        check_seats(state)?;
         let legal = self.search_actions(state)?;
         if legal.len() == 1 {
             return Ok((
@@ -1061,6 +1084,11 @@ pub struct PlaySession {
     simulation: Option<PendingSimulation>,
     waiting: Option<Waiting>,
     result: Option<(usize, SearchOutput)>,
+    /// Search actions for the state an outstanding LEAF request describes,
+    /// pruned from the same enumeration that request was packed from. The state
+    /// cannot move between the request and its response, so reusing this is
+    /// identical to re-enumerating.
+    pending_actions: Option<Vec<usize>>,
 }
 
 fn validate_session_response(kind: RequestKind, response: &EvalResponse) -> EngineResult<()> {
@@ -1112,6 +1140,7 @@ impl PlaySession {
         if state.actor != root {
             return Err(EngineError::Invalid("play root is not the actor".into()));
         }
+        check_seats(&state)?;
         let legal = search.search_actions(&state)?;
         let result = (legal.len() == 1).then(|| {
             (
@@ -1136,6 +1165,7 @@ impl PlaySession {
             simulation: None,
             waiting: None,
             result,
+            pending_actions: None,
             search,
         };
         if session.result.is_none() {
@@ -1161,15 +1191,31 @@ impl PlaySession {
         Ok((self.search, choice, output))
     }
 
-    fn request(&mut self, kind: RequestKind, state: &Game, viewer: usize) -> EvalRequestEvent {
+    fn request(
+        &mut self,
+        kind: RequestKind,
+        state: &Game,
+        viewer: usize,
+    ) -> EngineResult<EvalRequestEvent> {
         let request_id = self.search.next_request_id;
         self.search.next_request_id = self.search.next_request_id.wrapping_add(1);
-        EvalRequestEvent {
+        let legal = macro_codec::legal_macros(state)?;
+        // Only a LEAF expands a node from its response; an opponent POLICY row
+        // samples an action and never builds one, so it stashes nothing.
+        self.pending_actions = (kind == RequestKind::Leaf).then(|| {
+            macro_codec::prune_search_macros(
+                state,
+                legal.clone(),
+                self.search.config.prune_roundabout_pass,
+            )
+        });
+        Ok(EvalRequestEvent {
             kind,
             state: state.clone(),
             viewer,
             request_id,
-        }
+            legal,
+        })
     }
 
     fn expand_from_response(
@@ -1177,7 +1223,10 @@ impl PlaySession {
         state: &Game,
         response: &EvalResponse,
     ) -> EngineResult<usize> {
-        let actions = self.search.search_actions(state)?;
+        let actions = match self.pending_actions.take() {
+            Some(actions) => actions,
+            None => self.search.search_actions(state)?,
+        };
         if actions.is_empty() {
             return Err(EngineError::Invalid(
                 "a live search leaf has no actions".into(),
@@ -1335,7 +1384,7 @@ impl PlaySession {
                     return Ok(None);
                 }
                 let state = simulation.state.clone();
-                let event = self.request(RequestKind::Leaf, &state, self.root);
+                let event = self.request(RequestKind::Leaf, &state, self.root)?;
                 self.waiting = Some(Waiting::Leaf {
                     parent: work.parent,
                     edge: work.edge,
@@ -1353,7 +1402,7 @@ impl PlaySession {
             if !simulation.state.is_terminal() && simulation.state.actor != self.root {
                 let viewer = simulation.state.actor;
                 let state = simulation.state.clone();
-                let event = self.request(RequestKind::Policy, &state, viewer);
+                let event = self.request(RequestKind::Policy, &state, viewer)?;
                 self.waiting = Some(Waiting::Opponent);
                 return Ok(Some(SearchEvent::Evaluation(Box::new(event))));
             }
@@ -1448,7 +1497,7 @@ impl PlaySession {
             }
             if self.root_node.is_none() {
                 let root_state = self.root_state.clone();
-                let event = self.request(RequestKind::Leaf, &root_state, self.root);
+                let event = self.request(RequestKind::Leaf, &root_state, self.root)?;
                 self.waiting = Some(Waiting::Root);
                 return Ok(SearchEvent::Evaluation(Box::new(event)));
             }
@@ -1553,7 +1602,7 @@ fn confidence_floor(num_seats: usize) -> f64 {
     }
 }
 
-fn blend_value(rank_probs: &[f64], scores: &[f64], seats: usize, config: &SearchConfig) -> f64 {
+pub(crate) fn blend_value(rank_probs: &[f64], scores: &[f64], seats: usize, config: &SearchConfig) -> f64 {
     let mut mean = 0.0;
     let mut second = 0.0;
     for (rank, &probability) in rank_probs.iter().take(seats).enumerate() {

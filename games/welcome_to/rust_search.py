@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - source checkouts need no Rust toolchai
 
 LEAF = 0
 POLICY = 1
-EVALUATOR_ABI_VERSION = 2
+EVALUATOR_ABI_VERSION = 3
 
 if wr is not None and wr.EVALUATOR_ABI_VERSION != EVALUATOR_ABI_VERSION:
     raise ImportError(
@@ -59,9 +59,16 @@ class PackedNetEvaluator:
         device: Optional[torch.device] = None,
         config: Optional[mcts.SearchConfig] = None,
         *,
+        policy_net: Optional[nw.WelcomeToNet] = None,
         record_requests: bool = False,
+        cuda_events: bool = False,
+        cuda_event_sample_every: int = 32,
     ) -> None:
         self.net = net
+        # Promotion gates can hold the simulated-opponent model fixed while
+        # comparing two learner value/policy models. Ordinary generation keeps
+        # the historical single-network path.
+        self.policy_net = policy_net if policy_net is not None else net
         self.device = device or next(net.parameters()).device
         self.config = config or mcts.SearchConfig()
         self.record_requests = record_requests
@@ -69,6 +76,7 @@ class PackedNetEvaluator:
         self.calls = 0
         self.rows = 0
         self.batch_widths: dict[int, int] = {}
+        self.kind_rows = {"leaf": 0, "policy": 0}
         self._external_request_id = 0
         # Reused page-locked staging keeps cloud H2D transfer asynchronous and
         # avoids allocating four host tensors at every inference wave.
@@ -80,6 +88,12 @@ class PackedNetEvaluator:
             "network_submit": 0,
             "postprocess_sync": 0,
         }
+        if cuda_event_sample_every <= 0:
+            raise ValueError("cuda_event_sample_every must be positive")
+        self._cuda_events = bool(cuda_events and self.device.type == "cuda")
+        self._cuda_event_sample_every = int(cuda_event_sample_every)
+        self._cuda_event_pairs: list[tuple[int, object, object]] = []
+        self._cuda_forward_ms: list[tuple[int, float]] = []
 
     @staticmethod
     def _arrays(buffers: Sequence[bytes]) -> tuple[np.ndarray, ...]:
@@ -122,7 +136,11 @@ class PackedNetEvaluator:
             arrays.append(np.frombuffer(raw, dtype="<f4").reshape((rows, *shape)))
         return tuple(arrays)
 
-    def _network_batch(self, arrays: Sequence[np.ndarray]) -> dict[str, torch.Tensor]:
+    def _network_batch(
+        self, arrays: Sequence[np.ndarray], leaf_rows: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        if len(self._cuda_event_pairs) >= 2048:
+            self._drain_cuda_events()
         started = time.perf_counter_ns()
         if self.device.type == "cuda":
             tensors = []
@@ -148,11 +166,93 @@ class PackedNetEvaluator:
             ]
         self._stage_ns["tensor_transfer"] += time.perf_counter_ns() - started
         self.net.eval()
+        self.policy_net.eval()
         started = time.perf_counter_ns()
+        sample_event = self._cuda_events and (
+            self.calls % self._cuda_event_sample_every == 0
+        )
+        cuda_start = None
+        if sample_event:
+            cuda_start = torch.cuda.Event(enable_timing=True)
+            cuda_start.record()
         with torch.inference_mode():
-            out = self.net.forward_inference(*tensors)
+            if self.policy_net is self.net:
+                out = self.net.forward_inference(*tensors, leaf_rows=leaf_rows)
+            else:
+                rows = int(tensors[0].shape[0])
+                is_policy = torch.ones(rows, dtype=torch.bool, device=self.device)
+                is_policy[leaf_rows] = False
+                policy_rows = torch.nonzero(is_policy, as_tuple=False).flatten()
+                policy_logits = tensors[0].new_empty((rows, nw.NUM_MACRO_ACTIONS))
+
+                if leaf_rows.numel():
+                    leaf_inputs = [value.index_select(0, leaf_rows) for value in tensors]
+                    leaf_out = self.net.forward_inference(*leaf_inputs)
+                    policy_logits.index_copy_(0, leaf_rows, leaf_out["policy_logits"])
+                    rank_logits = leaf_out["rank_logits"]
+                    scores = leaf_out["score"]
+                else:
+                    rank_logits = tensors[0].new_empty((0, training.MAX_RANKS))
+                    scores = tensors[0].new_empty((0, enc.MAX_SEATS))
+
+                if policy_rows.numel():
+                    policy_inputs = [
+                        value.index_select(0, policy_rows) for value in tensors
+                    ]
+                    no_values = torch.empty(
+                        0, dtype=torch.long, device=self.device
+                    )
+                    policy_out = self.policy_net.forward_inference(
+                        *policy_inputs, leaf_rows=no_values
+                    )
+                    policy_logits.index_copy_(
+                        0, policy_rows, policy_out["policy_logits"]
+                    )
+                out = {
+                    "policy_logits": policy_logits,
+                    "rank_logits": rank_logits,
+                    "score": scores,
+                }
+        if cuda_start is not None:
+            cuda_end = torch.cuda.Event(enable_timing=True)
+            cuda_end.record()
+            self._cuda_event_pairs.append((int(arrays[0].shape[0]), cuda_start, cuda_end))
         self._stage_ns["network_submit"] += time.perf_counter_ns() - started
         return out
+
+    def _drain_cuda_events(self) -> None:
+        """Resolve sampled device timings only after their response has synced."""
+        for width, start, end in self._cuda_event_pairs:
+            end.synchronize()
+            self._cuda_forward_ms.append((width, float(start.elapsed_time(end))))
+        self._cuda_event_pairs.clear()
+
+    def _cuda_event_profile(self) -> dict[str, object]:
+        self._drain_cuda_events()
+        values = np.asarray(
+            [milliseconds for _, milliseconds in self._cuda_forward_ms],
+            dtype=np.float64,
+        )
+        by_width: dict[str, dict[str, float]] = {}
+        for width in sorted({width for width, _ in self._cuda_forward_ms}):
+            samples = np.asarray(
+                [ms for sample_width, ms in self._cuda_forward_ms if sample_width == width],
+                dtype=np.float64,
+            )
+            by_width[str(width)] = {
+                "samples": float(len(samples)),
+                "mean_ms": float(samples.mean()),
+                "p90_ms": float(np.percentile(samples, 90)),
+            }
+        return {
+            "cuda_events_enabled": self._cuda_events,
+            "cuda_event_sample_every": self._cuda_event_sample_every,
+            "cuda_forward_samples": int(len(values)),
+            "cuda_forward_mean_ms": float(values.mean()) if len(values) else None,
+            "cuda_forward_p50_ms": float(np.percentile(values, 50)) if len(values) else None,
+            "cuda_forward_p90_ms": float(np.percentile(values, 90)) if len(values) else None,
+            "cuda_forward_by_batch": by_width,
+        }
 
     def profile(self) -> dict[str, object]:
         """Cumulative Python/GPU-boundary stages without adding CUDA syncs.
@@ -164,17 +264,23 @@ class PackedNetEvaluator:
         return {
             "calls": self.calls,
             "rows": self.rows,
+            "leaf_rows": self.kind_rows["leaf"],
+            "policy_rows": self.kind_rows["policy"],
             "parse_ms": self._stage_ns["parse"] / 1e6,
             "tensor_transfer_ms": self._stage_ns["tensor_transfer"] / 1e6,
             "network_submit_ms": self._stage_ns["network_submit"] / 1e6,
             "postprocess_sync_ms": self._stage_ns["postprocess_sync"] / 1e6,
             "batch_widths": dict(sorted(self.batch_widths.items())),
+            **self._cuda_event_profile(),
         }
 
     def reset_profile(self) -> None:
+        self._drain_cuda_events()
         self.calls = 0
         self.rows = 0
+        self.kind_rows = {"leaf": 0, "policy": 0}
         self.batch_widths.clear()
+        self._cuda_forward_ms.clear()
         for name in self._stage_ns:
             self._stage_ns[name] = 0
 
@@ -205,8 +311,12 @@ class PackedNetEvaluator:
         self._stage_ns["parse"] += time.perf_counter_ns() - started
         self.calls += 1
         self.rows += 1
+        self.kind_rows["leaf" if kind == LEAF else "policy"] += 1
         self.batch_widths[1] = self.batch_widths.get(1, 0) + 1
-        out = self._network_batch(tensors)
+        leaf_rows = torch.tensor(
+            [0] if kind == LEAF else [], dtype=torch.long, device=self.device
+        )
+        out = self._network_batch(tensors, leaf_rows)
         started = time.perf_counter_ns()
         logits = out["policy_logits"][0].cpu().numpy()
         mask = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.bool_)
@@ -261,47 +371,45 @@ class PackedNetEvaluator:
             raise ValueError("outstanding evaluator request_id values must be unique")
         if len(legal) and int(legal.max()) >= nw.NUM_MACRO_ACTIONS:
             raise ValueError("legal_indices contains an out-of-range macro")
-        for row in range(rows):
-            start, end = int(offsets[row]), int(offsets[row + 1])
-            if start == end:
-                raise ValueError(f"evaluator row {row} has no legal macros")
-            row_legal = legal[start:end]
-            if len(np.unique(row_legal)) != len(row_legal):
-                raise ValueError(f"evaluator row {row} repeats a legal macro")
+        # Whole-batch checks, not a per-row Python loop.  This runs on the one
+        # thread holding the GIL while every Rust search worker is parked at the
+        # inference barrier, so a `np.unique` per row put ``rows`` sorts directly
+        # in the critical path of the whole pool.  Tagging each macro with its
+        # row makes one sort answer the same question for all of them.
+        lengths = np.diff(offsets).astype(np.int64, copy=False)
+        empty = np.flatnonzero(lengths == 0)
+        if len(empty):
+            raise ValueError(f"evaluator row {int(empty[0])} has no legal macros")
+        row_of = np.repeat(np.arange(rows, dtype=np.int64), lengths)
+        keyed = row_of * nw.NUM_MACRO_ACTIONS + legal.astype(np.int64, copy=False)
+        if len(np.unique(keyed)) != len(keyed):
+            # Only the failing batch pays for locating the row.
+            ordered = np.sort(keyed)
+            first = ordered[np.flatnonzero(np.diff(ordered) == 0)[0]]
+            row = int(first) // nw.NUM_MACRO_ACTIONS
+            raise ValueError(f"evaluator row {row} repeats a legal macro")
         self._stage_ns["parse"] += time.perf_counter_ns() - parse_started
 
         self.calls += 1
         self.rows += rows
+        self.kind_rows["leaf"] += int(np.count_nonzero(kind == LEAF))
+        self.kind_rows["policy"] += int(np.count_nonzero(kind == POLICY))
         self.batch_widths[rows] = self.batch_widths.get(rows, 0) + 1
-        out = self._network_batch(arrays)
-        post_started = time.perf_counter_ns()
-        logits = out["policy_logits"].cpu().numpy()
-        priors = np.zeros((rows, nw.NUM_MACRO_ACTIONS), dtype=np.float32)
-        for row in range(rows):
-            start, end = int(offsets[row]), int(offsets[row + 1])
-            mask = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.bool_)
-            mask[legal[start:end].astype(np.intp, copy=False)] = True
-            priors[row] = mcts._masked_softmax(logits[row], mask)
-
-        values = np.zeros(rows, dtype="<f8")
         leaf_rows = np.flatnonzero(kind == LEAF)
-        if len(leaf_rows):
-            rank_mask = torch.zeros(
-                (len(leaf_rows), training.MAX_RANKS), device=self.device
-            )
-            for local_row, source_row in enumerate(leaf_rows):
-                rank_mask[local_row, : int(seats[source_row])] = 1.0
-            ranks = nw.rank_probabilities(
-                out["rank_logits"][leaf_rows.tolist()], rank_mask
-            ).cpu().numpy()
-            scores = out["score"][leaf_rows.tolist()].cpu().numpy()
-            for local_row, source_row in enumerate(leaf_rows):
-                values[source_row] = mcts.blend_value(
-                    ranks[local_row],
-                    scores[local_row],
-                    int(seats[source_row]),
-                    self.config,
-                )[0]
+        leaf_rows_device = torch.as_tensor(
+            leaf_rows, dtype=torch.long, device=self.device
+        )
+        out = self._network_batch(arrays, leaf_rows_device)
+        post_started = time.perf_counter_ns()
+        # One device gather replaces the old Python row loop and transfers only
+        # legal policy entries. Rust owns segmented softmax and value blending.
+        legal_rows = torch.as_tensor(row_of, device=self.device)
+        legal_actions = torch.as_tensor(
+            legal.astype(np.int64, copy=False), device=self.device
+        )
+        legal_logits = out["policy_logits"][legal_rows, legal_actions].float().cpu()
+        rank_logits = out["rank_logits"].float().cpu()
+        scores_out = out["score"].float().cpu()
 
         self._stage_ns["postprocess_sync"] += time.perf_counter_ns() - post_started
 
@@ -309,8 +417,13 @@ class PackedNetEvaluator:
             "version": EVALUATOR_ABI_VERSION,
             "rows": rows,
             "request_id": request_ids.astype("<u4", copy=False).tobytes(),
-            "priors": priors.astype("<f4", copy=False).tobytes(),
-            "values": values.tobytes(),
+            "legal_offsets": offsets.astype("<u4", copy=False).tobytes(),
+            "legal_logits": legal_logits.numpy().astype("<f4", copy=False).tobytes(),
+            "leaf_request_id": request_ids[leaf_rows]
+            .astype("<u4", copy=False)
+            .tobytes(),
+            "rank_logits": rank_logits.numpy().astype("<f4", copy=False).tobytes(),
+            "scores": scores_out.numpy().astype("<f4", copy=False).tobytes(),
         }
 
     def policy_states(
@@ -366,13 +479,30 @@ class PackedNetEvaluator:
         }
         response = self.forward(payload)
         response_ids = np.frombuffer(response["request_id"], dtype="<u4")
-        raw_priors = np.frombuffer(response["priors"], dtype="<f4").reshape(
-            rows, nw.NUM_MACRO_ACTIONS
-        )
+        response_offsets = np.frombuffer(response["legal_offsets"], dtype="<u4")
+        response_logits = np.frombuffer(response["legal_logits"], dtype="<f4")
         by_id = {int(request_id): row for row, request_id in enumerate(response_ids)}
         if len(by_id) != rows or set(by_id) != set(int(request_id) for request_id in ids):
             raise ValueError("opponent policy response request ids are not aligned")
-        policies = [raw_priors[by_id[int(request_id)]].copy() for request_id in ids]
+        policies = []
+        for request_id, row_legal in zip(ids, legals):
+            row = by_id[int(request_id)]
+            start, end = int(response_offsets[row]), int(response_offsets[row + 1])
+            compact = response_logits[start:end]
+            if len(compact) != len(row_legal):
+                raise ValueError("opponent policy response legal segment is misaligned")
+            # Actual-game opponent sampling does not cross the Rust scheduler;
+            # retain its dense public return shape while sharing ABI v3.
+            dense = np.zeros(nw.NUM_MACRO_ACTIONS, dtype=np.float32)
+            shifted = compact - compact.max()
+            weights = np.exp(shifted).astype(np.float32, copy=False)
+            mass = weights.sum(dtype=np.float32)
+            if not mass > 0:
+                weights.fill(np.float32(1.0 / len(weights)))
+            else:
+                weights /= mass
+            dense[np.asarray(row_legal, dtype=np.intp)] = weights
+            policies.append(dense)
         return policies, legals
 
 

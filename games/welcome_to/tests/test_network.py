@@ -87,6 +87,45 @@ def test_inference_fast_path_is_numerically_the_training_path_subset():
         assert torch.equal(fast[name], full[name])
 
 
+def test_inference_runs_value_heads_for_leaf_rows_only():
+    batch = _batch(limit=8)
+    net = nw.WelcomeToNet(_SMALL).eval()
+    leaf_rows = torch.tensor([1, 4, 6], dtype=torch.long)
+    seen: dict[str, int] = {}
+
+    def record(name: str):
+        def hook(_module, inputs, _output):
+            seen[name] = int(inputs[0].shape[0])
+
+        return hook
+
+    handles = [
+        net.global_head.register_forward_hook(record("global")),
+        net.per_seat_head.register_forward_hook(record("per_seat")),
+    ]
+    try:
+        with torch.inference_mode():
+            full = _forward(net, batch)
+            selective = net.forward_inference(
+                batch["sheet_planes"],
+                batch["sheet_scalars"],
+                batch["viewer_plane"],
+                batch["global_scalars"],
+                leaf_rows=leaf_rows,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert seen == {
+        "global": len(leaf_rows),
+        "per_seat": len(leaf_rows),
+    }
+    assert torch.equal(selective["policy_logits"], full["policy_logits"])
+    assert torch.allclose(selective["rank_logits"], full["rank_logits"][leaf_rows])
+    assert torch.allclose(selective["score"], full["score"][leaf_rows])
+
+
 def test_the_default_network_is_near_the_four_million_budget():
     count = nw.parameter_count(nw.WelcomeToNet())
     assert 3e6 < count < 5e6, count
@@ -191,6 +230,8 @@ def test_a_masked_target_is_normalised_by_its_mask_sum():
 
     checked = 0
     for name, mask_name in training.MASKED_TARGETS.items():
+        if name in training.BINARY_TARGETS:
+            continue  # covered by the BCE-specific mask-sum test below
         mask = batch["seat_valid"] * batch[mask_name]
         if not 0 < float(mask.sum()) < mask.numel():
             continue  # this slot was completed by nobody, or by everybody
@@ -223,6 +264,26 @@ def test_the_sentinel_never_reaches_a_loss():
         assert float(before[name]) == pytest.approx(float(after[name]), rel=1e-5)
 
 
+def test_binary_plan_and_end_heads_use_masked_bce_with_logits():
+    net = nw.WelcomeToNet(_SMALL).eval()
+    batch = _batch(players=3, games=3, limit=400)
+    with torch.no_grad():
+        out = _forward(net, batch)
+        _, parts = nw.losses(out, batch)
+    for name in training.BINARY_TARGETS:
+        mask = batch["seat_valid"]
+        mask_name = training.MASKED_TARGETS.get(name)
+        if mask_name is not None:
+            mask = mask * batch[mask_name]
+        if float(mask.sum()) == 0.0:
+            continue
+        errors = torch.nn.functional.binary_cross_entropy_with_logits(
+            out[name], batch[name], reduction="none"
+        )
+        expected = float((mask * errors).sum() / mask.sum())
+        assert float(parts[name]) == pytest.approx(expected, rel=1e-5), name
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Loss and training loop
 # ──────────────────────────────────────────────────────────────────────────
@@ -231,6 +292,24 @@ def test_the_loss_weights_cover_every_head_by_group():
         assert nw._GROUP_OF[name] in nw.LOSS_WEIGHTS
     assert nw._GROUP_OF["policy"] == "policy"
     assert nw._GROUP_OF["rank"] == "objective"
+    assert {
+        name for name, group in nw._GROUP_OF.items() if group == "plan_race"
+    } == {
+        "plans_completed",
+        "turns_to_plan_0",
+        "turns_to_plan_1",
+        "turns_to_plan_2",
+    }
+    assert {
+        name for name, group in nw._GROUP_OF.items() if group == "plan_outcome"
+    } == {
+        "will_complete_plan_0",
+        "will_complete_plan_1",
+        "will_complete_plan_2",
+        "plan_0_first",
+        "plan_1_first",
+        "plan_2_first",
+    }
 
 
 def test_a_group_is_weighted_once_not_once_per_target():
@@ -246,8 +325,21 @@ def test_a_group_is_weighted_once_not_once_per_target():
     with torch.no_grad():
         total, parts = nw.losses(_forward(net, batch), batch)
 
+    def has_support(name: str) -> bool:
+        if name not in nw.PER_SEAT_HEAD_TARGETS:
+            return True
+        mask = batch["seat_valid"]
+        mask_name = training.MASKED_TARGETS.get(name)
+        if mask_name is not None:
+            mask = mask * batch[mask_name]
+        return bool(mask.sum() > 0)
+
     for group, weight in nw.LOSS_WEIGHTS.items():
-        members = [float(parts[n]) for n, g in nw._GROUP_OF.items() if g == group]
+        members = [
+            float(parts[n])
+            for n, g in nw._GROUP_OF.items()
+            if g == group and has_support(n)
+        ]
         assert members
         assert float(parts[f"group_{group}"]) == pytest.approx(
             sum(members) / len(members), rel=1e-5
@@ -265,6 +357,32 @@ def test_a_group_is_weighted_once_not_once_per_target():
         for name, group in nw._GROUP_OF.items()
     )
     assert abs(per_target - float(total)) > 0.05 * float(total)
+
+
+def test_unsupported_legacy_plan_race_targets_do_not_dilute_group_means():
+    net = nw.WelcomeToNet(_SMALL).eval()
+    batch = _batch(players=3, games=2, limit=200)
+    for slot in range(3):
+        batch[f"plan_{slot}_first_mask"].zero_()
+    with torch.no_grad():
+        out = _forward(net, batch)
+        total, parts = nw.losses(out, batch)
+
+        changed = dict(out)
+        for slot in range(3):
+            changed[f"plan_{slot}_first"] = out[f"plan_{slot}_first"] + 100.0
+        changed_total, changed_parts = nw.losses(changed, batch)
+
+    torch.testing.assert_close(total, changed_total)
+    torch.testing.assert_close(
+        parts["group_plan_outcome"],
+        torch.stack(
+            [parts[f"will_complete_plan_{slot}"] for slot in range(3)]
+        ).mean(),
+    )
+    torch.testing.assert_close(
+        parts["group_plan_race"], changed_parts["group_plan_race"]
+    )
 
 
 def test_the_loss_is_finite_and_differentiable():
@@ -300,6 +418,9 @@ def test_a_short_run_reduces_the_loss():
     )
     assert metrics["eval_samples"] > 0
     assert 0.0 <= metrics["policy_top1"] <= 1.0
+    assert metrics["support_score_roundabouts"] > 0
+    assert metrics["target_std_score_roundabouts"] >= 0.0
+    assert metrics["target_mean_score_roundabouts"] >= 0.0
     assert metrics["paired_games"] == 2.0
     for key in ("gate_policy_agreement", "gate_score_within_2", "gate_permits_beats_mean"):
         assert key in metrics

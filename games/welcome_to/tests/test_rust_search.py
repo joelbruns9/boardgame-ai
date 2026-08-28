@@ -13,6 +13,7 @@ from games.welcome_to import encoder as enc
 from games.welcome_to import macro_codec as mc
 from games.welcome_to import mcts
 from games.welcome_to import network as nw
+from games.welcome_to import rust_postprocess_equiv
 from games.welcome_to import rust_search
 from games.welcome_to import snapshot
 from games.welcome_to.bots import GreedyBot
@@ -22,8 +23,8 @@ from games.welcome_to.portable_rng import PortableRng, derive_search_seed
 wr = pytest.importorskip("welcome_to_rust")
 
 
-def test_the_evaluator_abi_is_the_f64_value_revision():
-    assert wr.EVALUATOR_ABI_VERSION == rust_search.EVALUATOR_ABI_VERSION == 2
+def test_the_evaluator_abi_is_the_raw_head_revision():
+    assert wr.EVALUATOR_ABI_VERSION == rust_search.EVALUATOR_ABI_VERSION == 3
 
 
 class FixedEvaluator:
@@ -69,7 +70,7 @@ class FixedEvaluator:
 
 
 class FixedBatchEvaluator:
-    """Shape-invariant implementation of the frozen M0-E V2 batch ABI."""
+    """Shape-invariant implementation of the compact raw-head V3 batch ABI."""
 
     def __init__(self, *, reverse: bool = False) -> None:
         self.reverse = reverse
@@ -79,7 +80,7 @@ class FixedBatchEvaluator:
         self.payloads: list[dict[str, bytes]] = []
 
     def forward(self, batch):
-        assert batch["version"] == 2
+        assert batch["version"] == 3
         rows = batch["rows"]
         ids = np.frombuffer(batch["request_id"], dtype="<u4").copy()
         kinds = np.frombuffer(batch["kind"], dtype=np.uint8).copy()
@@ -104,18 +105,25 @@ class FixedBatchEvaluator:
             }
         )
 
-        priors = np.zeros((rows, mc.NUM_MACRO_ACTIONS), dtype="<f4")
-        for row in range(rows):
-            actions = legal[offsets[row] : offsets[row + 1]].astype(np.intp)
-            priors[row, actions] = np.float32(1.0 / len(actions))
-        values = np.where(kinds == 0, 0.25, 0.0).astype("<f8")
         order = np.arange(rows - 1, -1, -1) if self.reverse else np.arange(rows)
+        response_offsets = [0]
+        compact_logits = []
+        for row in order:
+            count = int(offsets[row + 1] - offsets[row])
+            compact_logits.extend([0.0] * count)
+            response_offsets.append(len(compact_logits))
+        leaf_order = [row for row in order if kinds[row] == 0]
         return {
-            "version": 2,
+            "version": 3,
             "rows": rows,
             "request_id": ids[order].astype("<u4", copy=False).tobytes(),
-            "priors": priors[order].astype("<f4", copy=False).tobytes(),
-            "values": values[order].astype("<f8", copy=False).tobytes(),
+            "legal_offsets": np.asarray(response_offsets, dtype="<u4").tobytes(),
+            "legal_logits": np.asarray(compact_logits, dtype="<f4").tobytes(),
+            "leaf_request_id": ids[leaf_order]
+            .astype("<u4", copy=False)
+            .tobytes(),
+            "rank_logits": np.zeros((len(leaf_order), 4), dtype="<f4").tobytes(),
+            "scores": np.zeros((len(leaf_order), 4), dtype="<f4").tobytes(),
         }
 
 
@@ -145,6 +153,26 @@ def test_fixed_tape_search_matches_at_a_turn_boundary():
     assert rust_eval.requests == py_eval.requests
     assert rust.particle_slots_allocated == 0
     assert sum(native["visits"]) == 16
+
+
+def test_v3_rust_postprocess_matches_the_numpy_postprocess_it_replaced():
+    """The v2-versus-v3 parity the generation request left open.
+
+    ABI v3 moved the segmented policy softmax, the rank mask/softmax and the
+    value blend from Python into Rust. Both arithmetics are still in the tree —
+    ``evaluate_request`` keeps the NumPy one, ``forward`` uses the Rust one — so
+    one real trajectory driven through both on a shared tape is exactly the
+    old-versus-new comparison, and it is a stronger statement than comparing v3
+    to itself at two batch widths.
+
+    The trees must be identical; the backup totals need only be close, because
+    a dense masked NumPy softmax and a compact Rust one round differently. The
+    module-level gate runs this wider and at 3 and 4 seats.
+    """
+    result = rust_postprocess_equiv.run_gate(games=1, simulations=12, seed0=91_777)
+    assert result["searched"] > 0
+    # f32 rounding, not a semantic difference: the trees already matched.
+    assert result["worst_total_drift"] < 1e-4
 
 
 def test_search_seed_derivation_is_shared():
@@ -283,6 +311,49 @@ def test_one_row_real_network_search_has_an_exact_fingerprint():
     assert np.array_equal(result["total"], node.total)
 
 
+def test_promotion_evaluator_holds_simulated_opponent_policy_model_fixed():
+    torch.manual_seed(101)
+    learner = nw.WelcomeToNet(
+        nw.NetConfig(
+            sheet_hidden=16,
+            sheet_out=8,
+            trunk_hidden=24,
+            trunk_blocks=1,
+            head_hidden=16,
+        )
+    ).eval()
+    torch.manual_seed(202)
+    incumbent = nw.WelcomeToNet(learner.config).eval()
+    state = GameState.new(seed=909, rng_kind="portable")
+    encoded = enc.encode_state(state, state.actor)
+    arrays = tuple(
+        np.stack((value, value)).astype(np.float32, copy=False) for value in encoded
+    )
+    tensors = [torch.from_numpy(value) for value in arrays]
+    leaf_rows = torch.tensor([0], dtype=torch.long)
+
+    evaluator = rust_search.PackedNetEvaluator(
+        learner,
+        torch.device("cpu"),
+        mcts.SearchConfig(simulations=1),
+        policy_net=incumbent,
+    )
+    routed = evaluator._network_batch(arrays, leaf_rows)
+    with torch.inference_mode():
+        learner_out = learner.forward_inference(*tensors, leaf_rows=leaf_rows)
+        incumbent_out = incumbent.forward_inference(
+            *tensors, leaf_rows=torch.empty(0, dtype=torch.long)
+        )
+    torch.testing.assert_close(
+        routed["policy_logits"][0], learner_out["policy_logits"][0]
+    )
+    torch.testing.assert_close(
+        routed["policy_logits"][1], incumbent_out["policy_logits"][1]
+    )
+    assert routed["rank_logits"].shape[0] == 1
+    assert routed["score"].shape[0] == 1
+
+
 def test_forced_nodes_are_collapsed_without_an_evaluation():
     # Seed 1's first macro enters ACTION_PARK, whose dominated pass is pruned;
     # the build is applied but must not become a one-action node/LEAF request.
@@ -372,7 +443,11 @@ def test_m6_scheduler_coalesces_searches_and_routes_reordered_rows():
 
     independent = []
     for state, seed in zip(states, seeds):
-        independent.append(wr.RustMcts(simulations=16).search(state, FixedEvaluator(), seed))
+        independent.append(
+            wr.RustScheduler(capacity=1, simulations=16).search(
+                [state], FixedBatchEvaluator(), [seed], max_batch=1
+            )[0]
+        )
     for left, right in zip(waved, independent):
         assert left["actions"] == right["actions"]
         assert np.array_equal(left["visits"], right["visits"])

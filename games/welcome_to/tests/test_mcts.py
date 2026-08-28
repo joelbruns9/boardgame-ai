@@ -1087,9 +1087,11 @@ def test_the_counters_keep_calls_rows_and_width_apart():
 # The chance edge: progressive widening -- SEARCH_SPEC §7.1a resolution C, §12
 # step 7.  Behind a flag, with the open-loop version kept as the control arm.
 # ──────────────────────────────────────────────────────────────────────────
-def _widened(simulations: int = 256, **kwargs):
+def _widened(simulations: int = 256, chance_widening: float = 1.0, **kwargs):
     torch.manual_seed(0)
-    return _search(simulations=simulations, chance_widening=1.0, **kwargs)
+    return _search(
+        simulations=simulations, chance_widening=chance_widening, **kwargs
+    )
 
 
 def _edges(root):
@@ -1337,9 +1339,21 @@ def test_a_chance_edge_has_more_outcomes_than_the_deck_has_reveals():
     outcomes, because §6.2 says three cards have six ordered reveals. That
     conflates a *reveal* with a *transition*, which is precisely the error §7.1a
     exists to correct: the retained outcome is the whole root-to-root transition
-    and carries the opponents' sampled decisions too. It passed only because the
-    widening cap happened to bind at six; with the cap fixed, the same edge shows
-    **20** outcomes.
+    and carries the opponents' sampled decisions too.
+
+    ⚠ **The widening constant is deliberately not the shipped default here.**
+    At ``C=1, alpha=0.5`` the cap is ``ceil(sqrt(n))``, so exceeding six
+    outcomes needs one boundary edge to be traversed **37** times -- and in this
+    position the widest boundary edges sit at 27-37 visits, i.e. exactly on
+    their cap. The old form therefore measured whether the cap happened to clear
+    six, not whether the transition support does, and it flipped to failing the
+    moment an unrelated head widened the network and moved the prior. Measured
+    on this position: ``C=1`` -> 6 outcomes (at cap), ``C=4`` -> 30, ``C=8`` ->
+    80. The support is real and large; the default schedule simply does not let
+    a 2,048-simulation search reveal it.
+
+    So run the arm at a constant whose cap cannot bind below the reveal support,
+    and assert that too, rather than trusting a threshold to stay clear of it.
 
     The six-reveal claim is true, and is tested where it holds -- on the boundary
     sampler itself, in ``test_game.py``.
@@ -1350,16 +1364,30 @@ def test_a_chance_edge_has_more_outcomes_than_the_deck_has_reveals():
     state.deck = state.deck[: state.deck_pos] + keep
     assert state.deck_remaining == 3
 
-    search, _ = _widened(simulations=2048)
+    search, _ = _widened(simulations=2048, chance_widening=4.0)
     _, _, root = search.search(state, root=0, rng=random.Random(1))
 
-    multi = [outcomes for _, _, outcomes in _edges(root) if len(outcomes) > 1]
+    multi = [
+        (node, index, outcomes)
+        for node, index, outcomes in _edges(root)
+        if len(outcomes) > 1
+    ]
     assert multi, "no boundary-crossing edge was traversed"
-    assert max(len(outcomes) for outcomes in multi) > 6, (
+    node, index, widest = max(multi, key=lambda edge: len(edge[2]))
+    cap = math.ceil(
+        search.config.chance_widening
+        * node.edge_visits[index] ** search.config.chance_widening_alpha
+    )
+    assert cap > 6, (
+        f"the widening cap is {cap} at {node.edge_visits[index]} traversals, so "
+        "this edge could not show more than the six ordered reveals whatever "
+        "the transition support is -- the arm proves nothing at this constant"
+    )
+    assert len(widest) > 6, (
         "the whole-transition support was no larger than the reveal support, "
         "which would mean opponent sampling contributed nothing"
     )
-    for outcomes in multi:
+    for _, _, outcomes in multi:
         draws = sum(outcome.count for outcome in outcomes.values())
         assert sum(outcome.count / draws for outcome in outcomes.values()) == (
             pytest.approx(1.0)

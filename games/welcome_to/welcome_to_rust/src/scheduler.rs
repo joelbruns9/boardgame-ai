@@ -20,11 +20,12 @@ use crate::encoder::{self, EncodedState};
 use crate::game::{EngineError, EngineResult, Game};
 use crate::macro_codec;
 use crate::search::{
-    EvalResponse, PlaySession, RequestKind, Search, SearchConfig, SearchEvent, SearchOutput,
+    blend_value, EvalResponse, PlaySession, RequestKind, Search, SearchConfig, SearchEvent,
+    SearchOutput,
 };
 use crate::{search_output, to_py, RustGameState};
 
-const EVALUATOR_ABI_VERSION: u16 = 2;
+const EVALUATOR_ABI_VERSION: u16 = 3;
 
 struct EvalRow {
     input: usize,
@@ -151,6 +152,7 @@ fn evaluate_chunk(
     evaluator: &Bound<'_, PyAny>,
     batch: &mut PackedBatch,
     requests: &[&EvalRow],
+    config: &SearchConfig,
 ) -> PyResult<(Vec<EvalResponse>, ChunkProfile)> {
     let pack_started = Instant::now();
     batch.pack(requests)?;
@@ -176,19 +178,43 @@ fn evaluate_chunk(
     }
 
     let ids_raw = response_bytes(response, "request_id")?;
-    let priors_raw = response_bytes(response, "priors")?;
-    let values_raw = response_bytes(response, "values")?;
-    let expected_priors = rows * macro_codec::NUM_MACRO_ACTIONS * size_of::<f32>();
+    let offsets_raw = response_bytes(response, "legal_offsets")?;
+    let logits_raw = response_bytes(response, "legal_logits")?;
+    let leaf_ids_raw = response_bytes(response, "leaf_request_id")?;
+    let rank_logits_raw = response_bytes(response, "rank_logits")?;
+    let scores_raw = response_bytes(response, "scores")?;
+    let leaf_count = requests
+        .iter()
+        .filter(|request| request.kind == RequestKind::Leaf)
+        .count();
     if ids_raw.len() != rows * size_of::<u32>()
-        || priors_raw.len() != expected_priors
-        || values_raw.len() != rows * size_of::<f64>()
+        || offsets_raw.len() != (rows + 1) * size_of::<u32>()
+        || leaf_ids_raw.len() != leaf_count * size_of::<u32>()
+        || rank_logits_raw.len() != leaf_count * 4 * size_of::<f32>()
+        || scores_raw.len() != leaf_count * 4 * size_of::<f32>()
     {
         return Err(PyValueError::new_err(format!(
-            "malformed evaluator response buffers: ids={}, priors={}, values={}, rows={rows}",
+            "malformed evaluator response buffers: ids={}, offsets={}, logits={}, leaf_ids={}, rank={}, scores={}, rows={rows}",
             ids_raw.len(),
-            priors_raw.len(),
-            values_raw.len()
+            offsets_raw.len(),
+            logits_raw.len(),
+            leaf_ids_raw.len(),
+            rank_logits_raw.len(),
+            scores_raw.len()
         )));
+    }
+
+    let response_offsets: Vec<usize> = offsets_raw
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) as usize)
+        .collect();
+    if response_offsets.first().copied() != Some(0)
+        || response_offsets.windows(2).any(|pair| pair[1] < pair[0])
+        || response_offsets.last().copied().unwrap_or(0) * size_of::<f32>() != logits_raw.len()
+    {
+        return Err(PyValueError::new_err(
+            "evaluator response legal offsets are malformed",
+        ));
     }
 
     let expected: HashMap<u32, usize> = requests
@@ -209,34 +235,106 @@ fn evaluate_chunk(
                 "evaluator returned duplicate request_id {id}"
             )));
         }
-        let prior_start = response_row * macro_codec::NUM_MACRO_ACTIONS * 4;
-        let prior_end = prior_start + macro_codec::NUM_MACRO_ACTIONS * 4;
-        let priors: Vec<f32> = priors_raw[prior_start..prior_end]
+        let compact_start = response_offsets[response_row];
+        let compact_end = response_offsets[response_row + 1];
+        if compact_end - compact_start != requests[request_row].legal.len() {
+            return Err(PyValueError::new_err(format!(
+                "evaluator row for request_id {id} returned {} legal logits, expected {}",
+                compact_end - compact_start,
+                requests[request_row].legal.len()
+            )));
+        }
+        let compact_logits: Vec<f32> = logits_raw[compact_start * 4..compact_end * 4]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        let mut legal = vec![false; macro_codec::NUM_MACRO_ACTIONS];
-        for &action in &requests[request_row].legal {
-            legal[action] = true;
-        }
-        if priors
-            .iter()
-            .enumerate()
-            .any(|(action, &prior)| prior != 0.0 && !legal[action])
-        {
+        if compact_logits.iter().any(|value| !value.is_finite()) {
             return Err(PyValueError::new_err(format!(
-                "evaluator row for request_id {id} assigned probability to an illegal macro"
+                "evaluator row for request_id {id} returned a non-finite legal logit"
             )));
         }
-        let value_start = response_row * 8;
-        let raw_value =
-            f64::from_le_bytes(values_raw[value_start..value_start + 8].try_into().unwrap());
-        let value = (requests[request_row].kind == RequestKind::Leaf).then_some(raw_value);
+        let maximum = compact_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut compact_priors: Vec<f32> = compact_logits
+            .iter()
+            .map(|&logit| (logit - maximum).exp())
+            .collect();
+        let mass: f32 = compact_priors.iter().sum();
+        if mass.is_finite() && mass > 0.0 {
+            for prior in &mut compact_priors {
+                *prior /= mass;
+            }
+        } else {
+            let uniform = 1.0 / compact_priors.len() as f32;
+            compact_priors.fill(uniform);
+        }
+        let mut priors = vec![0.0f32; macro_codec::NUM_MACRO_ACTIONS];
+        for (&action, prior) in requests[request_row].legal.iter().zip(compact_priors) {
+            priors[action] = prior;
+        }
+        let value = None;
         output[request_row] = Some(EvalResponse { priors, value });
     }
     if seen.len() != rows {
         return Err(PyValueError::new_err(
             "evaluator response omitted a request_id",
+        ));
+    }
+    let mut seen_leaf = HashSet::with_capacity(leaf_count);
+    for leaf_row in 0..leaf_count {
+        let id_start = leaf_row * 4;
+        let id = u32::from_le_bytes(leaf_ids_raw[id_start..id_start + 4].try_into().unwrap());
+        let request_row = *expected.get(&id).ok_or_else(|| {
+            PyValueError::new_err(format!("evaluator returned unknown LEAF request_id {id}"))
+        })?;
+        if requests[request_row].kind != RequestKind::Leaf || !seen_leaf.insert(id) {
+            return Err(PyValueError::new_err(format!(
+                "evaluator returned invalid or duplicate LEAF request_id {id}"
+            )));
+        }
+        let decode_four = |raw: &[u8], row: usize| -> Vec<f32> {
+            raw[row * 16..row * 16 + 16]
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect()
+        };
+        let logits = decode_four(&rank_logits_raw, leaf_row);
+        let scores = decode_four(&scores_raw, leaf_row);
+        if logits.iter().chain(&scores).any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err(format!(
+                "evaluator LEAF row for request_id {id} returned a non-finite head"
+            )));
+        }
+        let seats = requests[request_row].seats;
+        let maximum = logits[..seats]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut rank_probs_f32 = [0.0f32; 4];
+        let mut mass = 0.0f32;
+        for rank in 0..seats {
+            rank_probs_f32[rank] = (logits[rank] - maximum).exp();
+            mass += rank_probs_f32[rank];
+        }
+        if !mass.is_finite() || mass <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "evaluator LEAF row for request_id {id} has invalid rank mass"
+            )));
+        }
+        for probability in &mut rank_probs_f32[..seats] {
+            *probability /= mass;
+        }
+        // Match Torch's float32 softmax before widening for the scalar value blend.
+        let rank_probs: Vec<f64> = rank_probs_f32.iter().map(|&value| value as f64).collect();
+        let scores: Vec<f64> = scores.iter().map(|&value| value as f64).collect();
+        output[request_row].as_mut().expect("response exists").value =
+            Some(blend_value(&rank_probs, &scores, seats, config));
+    }
+    if seen_leaf.len() != leaf_count {
+        return Err(PyValueError::new_err(
+            "evaluator response omitted a LEAF request_id",
         ));
     }
     let output = output.into_iter().map(Option::unwrap).collect();
@@ -322,6 +420,7 @@ fn search_stats<'py>(
 #[pyclass(module = "welcome_to_rust")]
 pub struct RustScheduler {
     searches: Vec<Option<Search>>,
+    config: SearchConfig,
     batch: PackedBatch,
     next_request_id: u32,
 }
@@ -386,6 +485,7 @@ impl RustScheduler {
         }
         Ok(Self {
             searches,
+            config,
             batch: PackedBatch::default(),
             next_request_id: 0,
         })
@@ -666,7 +766,7 @@ impl RustCloudScheduler {
                     }
                     let eval_rows: Vec<&EvalRow> =
                         chunk.iter().map(|request| &request.row).collect();
-                    match evaluate_chunk(py, evaluator, &mut self.batch, &eval_rows) {
+                    match evaluate_chunk(py, evaluator, &mut self.batch, &eval_rows, &self.config) {
                         Ok((chunk_responses, chunk_profile)) => {
                             self.profile.add_chunk(chunk.len(), chunk_profile);
                             for (request, response) in chunk.iter().zip(chunk_responses) {
@@ -819,10 +919,12 @@ fn emit_cloud_event(
         Ok(SearchEvent::Evaluation(request)) => {
             let encode_started = Instant::now();
             let encoded = encoder::encode_state(&request.state, request.viewer);
-            let legal = macro_codec::legal_macros(&request.state);
             profile.encode_ns += encode_started.elapsed().as_nanos();
-            match (encoded, legal) {
-                (Ok(encoded), Ok(legal)) => {
+            // `request.legal` is the enumeration the session already paid for;
+            // recomputing it here cloned the whole `Game` once per playable slot
+            // a second time on every row.
+            match encoded {
+                Ok(encoded) => {
                     profile.requests += 1;
                     messages
                         .send(CloudWorkerMessage::Request(CloudRequest {
@@ -831,14 +933,14 @@ fn emit_cloud_event(
                                 input: task.input,
                                 kind: request.kind,
                                 encoded,
-                                legal,
+                                legal: request.legal,
                                 seats: request.state.config.players,
                                 abi_id: request.request_id,
                             },
                         }))
                         .is_ok()
                 }
-                (Err(error), _) | (_, Err(error)) => {
+                Err(error) => {
                     let input = task.input;
                     let slot = task.slot;
                     let search = task.session.take().expect("live session").into_search();
@@ -1361,7 +1463,7 @@ impl RustScheduler {
                     if python_error.is_none() {
                         let rows: Vec<&EvalRow> =
                             chunk.iter().map(|request| &request.row).collect();
-                        match evaluate_chunk(py, evaluator, &mut self.batch, &rows) {
+                        match evaluate_chunk(py, evaluator, &mut self.batch, &rows, &self.config) {
                             Ok((responses, _profile)) => {
                                 for (request, response) in chunk.iter().zip(responses) {
                                     let _ = request.reply.send(Ok(response));

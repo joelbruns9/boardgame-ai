@@ -255,17 +255,33 @@ fn dominated_pass(phase: Phase) -> Option<usize> {
 /// recorded corpus. A pass is dropped only when an alternative exists, which
 /// `len(macros) > 1` *is*, the pass being a single index.
 pub fn search_legal_macros(state: &Game, prune_roundabout_pass: bool) -> EngineResult<Vec<usize>> {
-    let macros = legal_macros(state)?;
+    Ok(prune_search_macros(state, legal_macros(state)?, prune_roundabout_pass))
+}
+
+/// The pruning half of [`search_legal_macros`], applied to a list the caller
+/// already has.
+///
+/// Split out because the evaluator row carries the **full** vocabulary while the
+/// tree searches the pruned one, so a leaf otherwise pays for `legal_macros`
+/// twice — once to pack the request, once to expand the node the response
+/// creates — and at `CHOOSE_CARDS` that enumeration clones the whole `Game`
+/// once per playable slot. The output is identical to recomputing: this is the
+/// same filter over the same list, in the same order.
+pub fn prune_search_macros(
+    state: &Game,
+    macros: Vec<usize>,
+    prune_roundabout_pass: bool,
+) -> Vec<usize> {
     if !prune_roundabout_pass && state.phase == Phase::RoundaboutPlace {
-        return Ok(macros);
+        return macros;
     }
     let Some(pruned) = dominated_pass(state.phase) else {
-        return Ok(macros);
+        return macros;
     };
     if macros.len() < 2 {
-        return Ok(macros);
+        return macros;
     }
-    Ok(macros.into_iter().filter(|&m| m != pruned).collect())
+    macros.into_iter().filter(|&m| m != pruned).collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -15,7 +15,11 @@ from __future__ import annotations
 import pytest
 
 from games.seven_wonders_duel.portable_rng import PortableRng as SevenWondersRng
-from games.welcome_to.portable_rng import PortableRng
+from games.welcome_to.portable_rng import (
+    SEARCH_SEED_DOMAIN,
+    PortableRng,
+    derive_search_seed,
+)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 7, 12345, 2**64 - 1])
@@ -67,3 +71,30 @@ def test_an_empty_sequence_and_a_zero_range_are_refused():
         PortableRng(1).choice([])
     with pytest.raises(ValueError):
         PortableRng(1).randrange(0)
+
+
+def test_search_seeds_do_not_collide_over_a_contiguous_seed_block():
+    """The regression the XOR derivation had, stated as the run that hits it.
+
+    S2 hands out a contiguous block of game seeds and indexes searches by the
+    learner's decision count, so ``game_seed ^ DOMAIN ^ index`` gave decision
+    ``i`` of game ``s`` the tape of decision ``0`` of game ``s ^ i``: identical
+    determinizations and, at equal root width, an identical Dirichlet vector.
+    """
+    seeds = {
+        derive_search_seed(game_seed, index)
+        for game_seed in range(1_000, 1_064)
+        for index in range(64)
+    }
+    assert len(seeds) == 64 * 64
+
+    # The exact pair the old derivation collided on.
+    assert derive_search_seed(1_001, 0) != derive_search_seed(1_000, 1)
+
+
+def test_a_search_seed_is_a_draw_of_the_stream_it_names():
+    """O(1) state skipping, spelled out against the generator itself."""
+    for index in range(8):
+        rng = PortableRng(0xB3EC4 ^ SEARCH_SEED_DOMAIN)
+        drawn = [rng.next_u64() for _ in range(index + 1)][-1]
+        assert derive_search_seed(0xB3EC4, index) == drawn

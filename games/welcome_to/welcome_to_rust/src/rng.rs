@@ -9,6 +9,10 @@
 //! Same constants as `seven_wonders_rust::rng` and
 //! `kingdomino_rust::search::splitmix64`.
 
+/// SplitMix64's state step. Named because `derive_search_seed` skips states in
+/// O(1) by multiplying it, and the two must not drift apart.
+const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
 #[derive(Clone, Debug)]
 pub struct Rng {
     state: u64,
@@ -26,7 +30,7 @@ impl Rng {
     }
 
     pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.state = self.state.wrapping_add(GAMMA);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -100,8 +104,18 @@ impl Rng {
 
 pub const SEARCH_SEED_DOMAIN: u64 = 0x5745_4C43_4F4D_4553;
 
+/// The portable tape for one search — mirrors
+/// `portable_rng.derive_search_seed`, whose docstring carries the argument.
+///
+/// ⚠ **Not** `game_seed ^ DOMAIN ^ search_index`. Under XOR the decision
+/// counter occupies the same low bits as a contiguous block of game seeds, so
+/// decision `i` of game `s` reuses decision `0` of game `s ^ i` — same
+/// determinization permutations and, through `root_noise`, the same Dirichlet
+/// vector. This is instead draw `search_index` of the stream seeded at
+/// `game_seed ^ DOMAIN`, reached in O(1) because the state step is `+GAMMA`.
 pub fn derive_search_seed(game_seed: u64, search_index: u64) -> u64 {
-    game_seed ^ SEARCH_SEED_DOMAIN ^ search_index
+    let base = (game_seed ^ SEARCH_SEED_DOMAIN).wrapping_add(GAMMA.wrapping_mul(search_index));
+    Rng::new(base).next_u64()
 }
 
 #[cfg(test)]
@@ -143,6 +157,22 @@ mod tests {
             .map(|_| rng.weighted_index(&[0.1, 0.0, 0.3, 0.6]))
             .collect();
         assert_eq!(got, vec![3, 3, 3, 3, 3, 2, 2, 3]);
-        assert_eq!(derive_search_seed(123, 7), 0x5745_4C43_4F4D_452F);
+    }
+
+    /// The XOR derivation this replaced gave decision `i` of game `s` the same
+    /// tape as decision `0` of game `s ^ i`. A contiguous seed block is exactly
+    /// where that bites, so assert it directly rather than only pinning a
+    /// golden value.
+    #[test]
+    fn search_seeds_do_not_collide_across_a_contiguous_seed_block() {
+        let mut seen = std::collections::HashSet::new();
+        for game_seed in 1_000u64..1_064 {
+            for search_index in 0u64..64 {
+                assert!(
+                    seen.insert(derive_search_seed(game_seed, search_index)),
+                    "collision at ({game_seed}, {search_index})"
+                );
+            }
+        }
     }
 }

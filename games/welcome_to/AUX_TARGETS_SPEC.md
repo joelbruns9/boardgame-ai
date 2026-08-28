@@ -657,9 +657,11 @@ Weight by **group**, not per target — 44 independent knobs is not tunable.
 ```
 policy        1.0
 objective     1.0     final_score, rank_logits    (score dominant early)
-capacity      0.3     permits, turns_left
+capacity      0.3     permits, houses, capacity_left, turns_left
+plan progress 0.3     plans_completed, turns_to_plan_k
+plan outcome  0.3     will_complete_plan_k, plan_k_first
 outcome mode  0.2     end_trigger
-plan race     0.3     will_complete_plan_k, plan_k_first
+components    0.2     score component heads
 ```
 
 Consistent with `PROJECT_PLAN.md` M2: "score dominant early, policy next,
@@ -674,6 +676,14 @@ silently as the target set changes — step 4 below adds nine targets to
 weight. Fixed 2026-08-21; `network.losses` returns a `group_*` entry per group
 holding the mean the weight was applied to, and a test asserts the
 reconstruction.
+
+⚠ **Adding a member to a mean can dilute existing supervision too.** The dense
+plan labels originally joined the four-member progress group, reducing each old
+target from `0.3/4` to `0.3/10`; legacy first-finisher labels also had zero
+support but still occupied the denominator. Fixed 2026-08-28: historical plan
+progress keeps its own 0.3 group, terminal plan outcomes have a separate 0.3
+group, and a masked target participates in its group mean only when the current
+batch contains support.
 
 ---
 
@@ -777,7 +787,12 @@ It is not in the final state, so it would need replay instrumentation, and
    still matches when it is wrong — so it is asserted directly, along with
    `training.MAX_SEATS == encoder.MAX_SEATS`.
 3. **Add the per-seat head and the global head** (§4), with the M4 padded-seat test.
-4. **Add `end_trigger`, `will_complete_plan_k`, `plan_k_first`.**
+4. ~~**Add `end_trigger`, `will_complete_plan_k`, `plan_k_first`.**~~ **DONE.**
+   The three families use BCE-with-logits; `plan_k_first` is completion-masked
+   with mask-sum reduction, while `will_complete_plan_k` and all three
+   independent end clauses train on every valid seat. Version-1 WTS rows are
+   upgraded without fabricating first-finisher order: completion and end-clause
+   labels are derived exactly, and the unavailable `plan_k_first` mask stays 0.
 5. **Port the win-gated blend** (§5), and dump the `win_gate` distribution before
    choosing the power.
 

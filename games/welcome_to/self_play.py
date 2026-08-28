@@ -26,7 +26,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, Optional, Sequence
+from typing import Any, Callable, Collection, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -47,6 +47,13 @@ try:
 except ImportError:  # pragma: no cover - source checkouts need no Rust toolchain
     wr = None
 
+if wr is not None and tuple(
+    getattr(wr, "LEGACY_TRAINING_PER_SEAT_TARGET_NAMES", ())
+) != training.LEGACY_PER_SEAT_TARGETS:
+    raise ImportError(
+        "welcome_to_rust legacy training-target order does not match Python"
+    )
+
 
 FORMAT_VERSION = 1
 LEARNER_SEAT = 0
@@ -54,6 +61,12 @@ SEAT_MIX: tuple[tuple[int, float], ...] = ((2, 0.60), (3, 0.30), (4, 0.10))
 _JOB_ORDER_DOMAIN = 0x5332_4A4F_424F_5244  # "S2JOBORD"
 _POOL_DOMAIN = 0x5332_504F_4F4C_4153  # "S2POOLAS"
 _POLICY_DOMAIN = 0x5332_504F_4C49_4359  # "S2POLICY"
+_FULL_GAME_DOMAIN = 0x5332_4655_4C4C_474D  # "S2FULLGM"
+_FULL_TURN_DOMAIN = 0x5332_4655_4C4C_5452  # "S2FULLTR"
+#: SplitMix64's state step, used to walk a portable stream forward in O(1)
+#: when deriving a per-turn or per-seat sub-stream from a game seed.
+_GAMMA = 0x9E37_79B9_7F4A_7C15
+_TURN_MIX = _GAMMA
 _MASK64 = (1 << 64) - 1
 
 
@@ -183,6 +196,10 @@ class SelfPlayConfig:
     opening_temperature: float = 1.0
     late_temperature: float = 0.0
     max_decisions: int = 2_000
+    playout_cap_randomization: bool = False
+    full_search_fraction: float = 0.25
+    fast_search_simulations: int = 64
+    full_search_game_fraction: float = 0.05
 
     def __post_init__(self) -> None:
         if (
@@ -196,12 +213,59 @@ class SelfPlayConfig:
             )
         if self.opening_temperature_turns < 0 or self.max_decisions <= 0:
             raise ValueError("temperature turns must be non-negative and max_decisions positive")
+        if self.fast_search_simulations <= 0:
+            raise ValueError("fast_search_simulations must be positive")
         for name, value in (
             ("opening_temperature", self.opening_temperature),
             ("late_temperature", self.late_temperature),
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        for name, value in (
+            ("full_search_fraction", self.full_search_fraction),
+            ("full_search_game_fraction", self.full_search_game_fraction),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+
+
+def full_search_game_seeds(config: SelfPlayConfig) -> frozenset[int]:
+    """The exact, dispatch-order-independent quota of wholly full-search games."""
+    if not config.playout_cap_randomization:
+        return frozenset(range(config.seed, config.seed + config.games))
+    count = min(
+        config.games,
+        int(math.floor(config.games * config.full_search_game_fraction + 0.5)),
+    )
+    seeds = list(range(config.seed, config.seed + config.games))
+    PortableRng((config.seed ^ _FULL_GAME_DOMAIN) & _MASK64).shuffle(seeds)
+    return frozenset(seeds[:count])
+
+
+def full_search_for_turn(
+    config: SelfPlayConfig,
+    game_seed: int,
+    turn: int,
+    *,
+    all_full_search: bool = False,
+) -> bool:
+    """Choose one cap for the learner's complete player turn.
+
+    Every decision from the initial card choice through effects, plans and the
+    reshuffle prompt sees the same answer because the draw is keyed only by the
+    game seed and global turn.  It is therefore independent of scheduler width,
+    dispatch order, and how many decisions the turn happened to contain.
+    """
+    if not config.playout_cap_randomization or all_full_search:
+        return True
+    if turn < 0:
+        raise ValueError("turn must be non-negative")
+    derived = (
+        game_seed
+        ^ _FULL_TURN_DOMAIN
+        ^ (((turn + 1) * _TURN_MIX) & _MASK64)
+    ) & _MASK64
+    return PortableRng(derived).next_float() < config.full_search_fraction
 
 
 @dataclass(slots=True)
@@ -217,6 +281,13 @@ class _LiveGame:
     searches: list[SearchTarget]
     capture: object
     learner_decisions: int = 0
+    all_full_search: bool = False
+    learner_turn: Optional[int] = None
+    learner_turn_full: bool = True
+    full_search_turns: int = 0
+    fast_search_turns: int = 0
+    full_search_roots: int = 0
+    fast_search_roots: int = 0
 
 
 def default_search_config(simulations: int = 200) -> mcts.SearchConfig:
@@ -414,6 +485,8 @@ _WTS_SAMPLE_PREFIX = (
 class _CachedGameSamples:
     path: Path
     offsets: tuple[int, ...]
+    global_target_names: tuple[str, ...]
+    per_seat_target_names: tuple[str, ...]
 
     @staticmethod
     def _f32(handle, shape: tuple[int, ...]) -> np.ndarray:
@@ -452,22 +525,16 @@ class _CachedGameSamples:
                 if not mass > 0:
                     raise ValueError("training shard policy has no visit mass")
                 policy /= mass
-                target_count = len(training.GLOBAL_TARGETS) + (
-                    training.MAX_SEATS * len(training.PER_SEAT_TARGETS)
+                target_count = len(self.global_target_names) + (
+                    training.MAX_SEATS * len(self.per_seat_target_names)
                 )
                 raw_targets = handle.read(target_count * 4)
                 if len(raw_targets) != target_count * 4:
                     raise ValueError("training shard ended inside target values")
                 flat = np.frombuffer(raw_targets, dtype="<f4")
-                targets: dict[str, float | tuple[float, ...]] = {
-                    name: float(flat[index])
-                    for index, name in enumerate(training.GLOBAL_TARGETS)
-                }
-                seats = flat[len(training.GLOBAL_TARGETS) :].reshape(
-                    training.MAX_SEATS, len(training.PER_SEAT_TARGETS)
+                targets = _decode_wts_targets(
+                    flat, self.global_target_names, self.per_seat_target_names
                 )
-                for index, name in enumerate(training.PER_SEAT_TARGETS):
-                    targets[name] = tuple(float(value) for value in seats[:, index])
                 yield datagen.Sample(
                     sheet_planes=sheet_planes,
                     sheet_scalars=sheet_scalars,
@@ -482,6 +549,51 @@ class _CachedGameSamples:
                 )
 
 
+def _decode_wts_targets(
+    flat: np.ndarray,
+    global_names: tuple[str, ...],
+    per_seat_names: tuple[str, ...],
+) -> dict[str, float | tuple[float, ...]]:
+    """Decode current targets or losslessly derive what legacy rows contain."""
+    targets: dict[str, float | tuple[float, ...]] = {
+        name: float(flat[index]) for index, name in enumerate(global_names)
+    }
+    seats = flat[len(global_names) :].reshape(training.MAX_SEATS, len(per_seat_names))
+    if per_seat_names == training.PER_SEAT_TARGETS:
+        for index, name in enumerate(per_seat_names):
+            targets[name] = tuple(float(value) for value in seats[:, index])
+        return targets
+    if per_seat_names != training.LEGACY_PER_SEAT_TARGETS:
+        raise ValueError("training shard has an unknown target schema")
+
+    legacy = {name: seats[:, index] for index, name in enumerate(per_seat_names)}
+    upgraded: dict[str, np.ndarray] = {
+        name: legacy[name]
+        for name in training.LEGACY_PER_SEAT_TARGETS
+        if name != "seat_valid"
+    }
+    for slot in range(3):
+        completed = legacy[f"turns_to_plan_{slot}_mask"]
+        upgraded[f"will_complete_plan_{slot}"] = completed
+        upgraded[f"plan_{slot}_first"] = np.full(
+            training.MAX_SEATS, float(training.NEVER), dtype=np.float32
+        )
+        upgraded[f"plan_{slot}_first_mask"] = np.zeros(
+            training.MAX_SEATS, dtype=np.float32
+        )
+    upgraded["end_trigger_full_sheet"] = (legacy["houses"] >= 1.0).astype(np.float32)
+    upgraded["end_trigger_all_plans"] = (
+        legacy["plans_completed"] >= 1.0
+    ).astype(np.float32)
+    upgraded["end_trigger_max_permit"] = (
+        legacy["permits"] >= 1.0
+    ).astype(np.float32)
+    upgraded["seat_valid"] = legacy["seat_valid"]
+    for name in training.PER_SEAT_TARGETS:
+        targets[name] = tuple(float(value) for value in upgraded[name])
+    return targets
+
+
 def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
     if wr is None:
         raise RuntimeError("welcome_to_rust is required to validate training shards")
@@ -494,22 +606,34 @@ def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
         magic, version, globals_, per_seat, max_seats, signature, games = (
             _WTS_HEADER.unpack(raw)
         )
+        current_schema = (
+            version == int(wr.TRAINING_SHARD_VERSION)
+            and globals_ == len(training.GLOBAL_TARGETS)
+            and per_seat == len(training.PER_SEAT_TARGETS)
+            and tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) == training.GLOBAL_TARGETS
+            and tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES) == training.PER_SEAT_TARGETS
+        )
+        legacy_schema = (
+            version == 1
+            and globals_ == len(training.GLOBAL_TARGETS)
+            and per_seat == len(training.LEGACY_PER_SEAT_TARGETS)
+            and tuple(wr.LEGACY_TRAINING_PER_SEAT_TARGET_NAMES)
+            == training.LEGACY_PER_SEAT_TARGETS
+        )
         if (
             magic != b"WTSHRD01"
-            or version != int(wr.TRAINING_SHARD_VERSION)
-            or globals_ != len(training.GLOBAL_TARGETS)
-            or per_seat != len(training.PER_SEAT_TARGETS)
+            or not (current_schema or legacy_schema)
             or max_seats != training.MAX_SEATS
             or signature != int(wr.table_signature())
-            or tuple(wr.TRAINING_GLOBAL_TARGET_NAMES) != training.GLOBAL_TARGETS
-            or tuple(wr.TRAINING_PER_SEAT_TARGET_NAMES)
-            != training.PER_SEAT_TARGETS
         ):
             raise ValueError(f"training shard {path} has an incompatible ABI")
-        target_bytes = (
-            len(training.GLOBAL_TARGETS)
-            + training.MAX_SEATS * len(training.PER_SEAT_TARGETS)
-        ) * 4
+        global_names = training.GLOBAL_TARGETS
+        per_seat_names = (
+            training.PER_SEAT_TARGETS
+            if current_schema
+            else training.LEGACY_PER_SEAT_TARGETS
+        )
+        target_bytes = (globals_ + training.MAX_SEATS * per_seat) * 4
         for _ in range(games):
             raw_length = handle.read(_WTS_RECORD.size)
             if len(raw_length) != _WTS_RECORD.size:
@@ -558,7 +682,9 @@ def _read_training_shard(path: Path) -> list[SelfPlayTrajectory]:
             out.append(
                 replace(
                     trajectory,
-                    _sample_source=_CachedGameSamples(path, tuple(offsets)),
+                    _sample_source=_CachedGameSamples(
+                        path, tuple(offsets), global_names, per_seat_names
+                    ),
                 )
             )
         if handle.read(1):
@@ -700,6 +826,29 @@ def validate_resume(
     return frozenset(seen)
 
 
+def cumulative_generation_metrics(
+    metrics: Mapping[str, Any],
+    *,
+    existing_games: int,
+    existing_searched_roots: int,
+    new: Sequence[SelfPlayTrajectory],
+) -> dict[str, Any]:
+    """Make persisted counts describe all shards, including resumed shards."""
+    combined = dict(metrics)
+    new_roots = int(metrics["searched_roots"])
+    combined.update(
+        {
+            "existing_games": float(existing_games),
+            "new_games": float(len(new)),
+            "total_games": float(existing_games + len(new)),
+            "existing_searched_roots": float(existing_searched_roots),
+            "new_searched_roots": float(new_roots),
+            "searched_roots": float(existing_searched_roots + new_roots),
+        }
+    )
+    return combined
+
+
 def _file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -713,9 +862,11 @@ def run_manifest(
     search_config: mcts.SearchConfig,
     checkpoint: str | Path,
     opponent_checkpoints: Sequence[str | Path],
+    *,
+    opponent_pool: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict:
     """Frozen semantic and scheduler identity for safe shard resume."""
-    return {
+    manifest = {
         "format": "welcome_to_s2_generation",
         "version": 1,
         "trajectory_version": FORMAT_VERSION,
@@ -734,6 +885,9 @@ def run_manifest(
             for path in opponent_checkpoints
         ],
     }
+    if opponent_pool is not None:
+        manifest["opponent_pool"] = [dict(item) for item in opponent_pool]
+    return manifest
 
 
 def ensure_run_manifest(
@@ -802,11 +956,120 @@ def iter_batches(
     )
 
 
+def iter_random_batches(
+    trajectories: Sequence[SelfPlayTrajectory],
+    batch_size: int,
+    batches: int,
+    rng,
+) -> Iterator[dict[str, np.ndarray]]:
+    """Yield a fixed number of uniform replay minibatches with replacement.
+
+    Production `.wts` corpora use :class:`RustTrainingBatchLoader`; this
+    materialising fallback keeps legacy JSON trajectories and small tests on
+    the same fixed-step sampling contract.
+    """
+    if batch_size <= 0 or batches <= 0:
+        raise ValueError("batch size and random batch count must be positive")
+    samples = [sample for trajectory in trajectories for sample in replay(trajectory)]
+    if not samples:
+        raise ValueError("S2 training games produced no searched learner roots")
+    population = range(len(samples))
+    for _ in range(batches):
+        yield datagen.batch([samples[index] for index in rng.choices(population, k=batch_size)])
+
+
+def _rust_batch_arrays(raw: dict) -> dict[str, np.ndarray]:
+    """View one Rust-decoded WTS batch as the trainer's existing array ABI."""
+    rows = int(raw["rows"])
+    targets = np.frombuffer(raw["targets"], dtype="<f4").reshape(
+        rows,
+        len(training.GLOBAL_TARGETS)
+        + training.MAX_SEATS * len(training.PER_SEAT_TARGETS),
+    )
+    out = {
+        "sheet_planes": np.frombuffer(raw["sheet_planes"], dtype="<f4").reshape(
+            rows, *enc.SHEET_PLANES_SHAPE
+        ),
+        "sheet_scalars": np.frombuffer(raw["sheet_scalars"], dtype="<f4").reshape(
+            rows, enc.MAX_SEATS, enc.NUM_SHEET_SCALAR
+        ),
+        "viewer_plane": np.frombuffer(raw["viewer_plane"], dtype="<f4").reshape(
+            rows, *enc.VIEWER_PLANE_SHAPE
+        ),
+        "global_scalars": np.frombuffer(raw["global_scalars"], dtype="<f4").reshape(
+            rows, enc.NUM_GLOBAL_SCALAR
+        ),
+        "legal": np.frombuffer(raw["legal"], dtype=np.uint8).reshape(
+            rows, mc.NUM_MACRO_ACTIONS
+        ),
+        "action": np.frombuffer(raw["action"], dtype="<u2").astype(np.int64),
+        "policy": np.frombuffer(raw["policy"], dtype="<f4").reshape(
+            rows, mc.NUM_MACRO_ACTIONS
+        ),
+        "turn": np.frombuffer(raw["turn"], dtype="<f4"),
+    }
+    for index, name in enumerate(training.GLOBAL_TARGETS):
+        out[name] = targets[:, index]
+    per_seat = targets[:, len(training.GLOBAL_TARGETS) :].reshape(
+        rows, training.MAX_SEATS, len(training.PER_SEAT_TARGETS)
+    )
+    for index, name in enumerate(training.PER_SEAT_TARGETS):
+        out[name] = per_seat[:, :, index]
+    return out
+
+
+def rust_training_loader(
+    trajectories: Sequence[SelfPlayTrajectory],
+    batch_size: int,
+    *,
+    shuffle_seed: Optional[int],
+):
+    """Build the bulk Rust loader when every selected game came from WTS."""
+    if wr is None or not trajectories:
+        return None
+    sources = [trajectory._sample_source for trajectory in trajectories]
+    if any(not isinstance(source, _CachedGameSamples) for source in sources):
+        return None
+    paths = sorted({str(source.path) for source in sources})
+    return wr.RustTrainingBatchLoader(
+        paths,
+        [int(trajectory.seed) for trajectory in trajectories],
+        batch_size,
+        shuffle_seed,
+    )
+
+
+def iter_rust_training_batches(loader) -> Iterator[dict[str, np.ndarray]]:
+    """Drain a :class:`RustTrainingBatchLoader` through the stable trainer ABI."""
+    while True:
+        raw = loader.next_batch()
+        if raw is None:
+            return
+        yield _rust_batch_arrays(raw)
+
+
+def derive_seat_stream(game_seed: int, seat: int) -> int:
+    """The portable policy stream for one frozen seat of one game.
+
+    Advance ``PortableRng(game_seed ^ _POLICY_DOMAIN)`` by ``seat`` states and
+    take the next output, mirroring
+    :func:`games.welcome_to.portable_rng.derive_search_seed`. SplitMix64 steps
+    its state by ``+GAMMA``, so the skip is O(1) and a collision would need
+    ``dseed == GAMMA * dseat (mod 2**64)``.
+    """
+    if seat < 0:
+        raise ValueError("seat must be non-negative")
+    base = ((game_seed ^ _POLICY_DOMAIN) + _GAMMA * seat) & _MASK64
+    return PortableRng(base).next_u64()
+
+
 def _new_live(
     slot: int,
     seed: int,
     players: int,
     opponents: Sequence[Opponent],
+    *,
+    all_full_search: bool = False,
 ) -> _LiveGame:
     assignment = PortableRng((seed ^ _POOL_DOMAIN) & _MASK64)
     population = list(range(len(opponents)))
@@ -818,7 +1081,15 @@ def _new_live(
         index = assignment.choices(population, weights=weights, k=1)[0]
         indices.append(index)
         names.append(opponents[index].name)
-        rngs.append(PortableRng((seed ^ _POLICY_DOMAIN ^ seat) & _MASK64))
+        # ⚠ Not ``seed ^ _POLICY_DOMAIN ^ seat``. Seeds arrive as a contiguous
+        # block and seats are 1..3, so XOR put the seat index in the same low
+        # bits as the seed: game ``s`` seat 1 and game ``s ^ 3`` seat 2 shared
+        # one stream. Two frozen seats on one stream take correlated tie-breaks
+        # and correlated temperature samples at the same decision index, which
+        # is worst in the opening -- exactly where ``training.sheet_divergence``
+        # says the whole divergence problem lives. Same repair as
+        # ``portable_rng.derive_search_seed``: one draw of the stream itself.
+        rngs.append(PortableRng(derive_seat_stream(seed, seat)))
     return _LiveGame(
         slot=slot,
         seed=seed,
@@ -836,6 +1107,7 @@ def _new_live(
         actions=[],
         searches=[],
         capture=wr.RustTrainingCapture(seed),
+        all_full_search=all_full_search,
     )
 
 
@@ -912,7 +1184,41 @@ def _summary(
     metrics.update(training.diversity_report(list(final_states)))
     for players in (2, 3, 4):
         metrics[f"games_{players}p"] = float(sum(t.players == players for t in trajectories))
+    opponent_seats: dict[str, int] = {}
+    for trajectory in trajectories:
+        for name in trajectory.opponents[1:]:
+            opponent_seats[name] = opponent_seats.get(name, 0) + 1
+    metrics["opponent_seat_counts"] = dict(sorted(opponent_seats.items()))
     return metrics
+
+
+def _merge_scheduler_profiles(*profiles: Mapping[str, Any]) -> dict[str, Any]:
+    """Combine the full/fast scheduler counters into the historical flat shape."""
+    profiles = tuple(profile for profile in profiles if profile)
+    if not profiles:
+        return {}
+    out: dict[str, Any] = {"workers": max(int(p.get("workers", 0)) for p in profiles)}
+    for name in (
+        "plays",
+        "waves",
+        "requests",
+        "calls",
+        "search_ms",
+        "encode_ms",
+        "coordinator_wait_ms",
+        "pack_ms",
+        "python_eval_ms",
+        "decode_ms",
+        "wall_ms",
+    ):
+        out[name] = sum(float(profile.get(name, 0.0)) for profile in profiles)
+    widths: dict[str, float] = {}
+    for profile in profiles:
+        for width_at_call, count in dict(profile.get("batch_widths", {})).items():
+            key = str(width_at_call)
+            widths[key] = widths.get(key, 0.0) + float(count)
+    out["batch_widths"] = dict(sorted(widths.items(), key=lambda item: int(item[0])))
+    return out
 
 
 def generate(
@@ -925,12 +1231,18 @@ def generate(
     skip_seeds: Collection[int] = (),
     on_trajectory: Optional[Callable[[SelfPlayTrajectory], None]] = None,
     on_captured: Optional[Callable[[SelfPlayTrajectory, object], None]] = None,
+    search_policy_net: Optional[nw.WelcomeToNet] = None,
+    cuda_events: bool = False,
 ) -> tuple[list[SelfPlayTrajectory], dict[str, Any]]:
     """Generate a continuously replenished batch of learner-only S2 games.
 
     ``skip_seeds`` is the resume seam. The full seed/seat schedule is built
     first and only persisted seeds are removed, so scheduler width and restart
     timing cannot change any remaining game's identity.
+
+    ``search_policy_net`` is a gate-only seam: when supplied, simulated-opponent
+    POLICY requests use that frozen model while learner LEAF requests continue
+    to use ``learner``. Actual opponent moves still use ``opponents``.
     """
     if wr is None:
         raise RuntimeError(
@@ -941,20 +1253,31 @@ def generate(
     search_config = search_config or default_search_config()
     torch_device = torch.device(device or next(learner.parameters()).device)
     learner = learner.to(torch_device).eval()
+    if search_policy_net is not None:
+        search_policy_net = search_policy_net.to(torch_device).eval()
     opponents = tuple(opponents or (Opponent("incumbent", learner),))
     if not opponents:
         raise ValueError("S2 needs at least one frozen opponent policy")
     for opponent in opponents:
         opponent.net.to(torch_device).eval()
 
-    learner_eval = rust_search.PackedNetEvaluator(learner, torch_device, search_config)
+    learner_eval = rust_search.PackedNetEvaluator(
+        learner,
+        torch_device,
+        search_config,
+        policy_net=search_policy_net,
+        cuda_events=cuda_events,
+    )
     evaluator_by_net: dict[int, rust_search.PackedNetEvaluator] = {id(learner): learner_eval}
     opponent_evals = []
     for opponent in opponents:
         evaluator = evaluator_by_net.get(id(opponent.net))
         if evaluator is None:
             evaluator = rust_search.PackedNetEvaluator(
-                opponent.net, torch_device, search_config
+                opponent.net,
+                torch_device,
+                search_config,
+                cuda_events=cuda_events,
             )
             evaluator_by_net[id(opponent.net)] = evaluator
         opponent_evals.append(evaluator)
@@ -972,70 +1295,147 @@ def generate(
 
     target_games = len(jobs)
     width = min(config.inflight, target_games)
-    scheduler = rust_search.native_cloud_scheduler(
+    full_scheduler = rust_search.native_cloud_scheduler(
         search_config,
         capacity=width,
         workers=min(config.scheduler_workers, width),
     )
+    fast_search_config = replace(
+        search_config,
+        simulations=config.fast_search_simulations,
+        dirichlet_alpha=None,
+        dirichlet_concentration=None,
+        dirichlet_weight=0.0,
+        noise_fresh_fraction=0.0,
+    )
+    fast_scheduler = (
+        rust_search.native_cloud_scheduler(
+            fast_search_config,
+            capacity=width,
+            workers=min(config.scheduler_workers, width),
+        )
+        if config.playout_cap_randomization
+        else None
+    )
+    all_full_seeds = full_search_game_seeds(config)
     next_job = 0
     live: list[Optional[_LiveGame]] = [None] * width
     for slot in range(width):
         seed, players = jobs[next_job]
-        live[slot] = _new_live(slot, seed, players, opponents)
+        live[slot] = _new_live(
+            slot,
+            seed,
+            players,
+            opponents,
+            all_full_search=seed in all_full_seeds,
+        )
         next_job += 1
 
     trajectories: list[SelfPlayTrajectory] = []
     final_states: list[GameState] = []
     completed = 0
+    full_search_games = 0
+    full_search_turns = 0
+    full_game_turns = 0
+    ordinary_full_search_turns = 0
+    fast_search_turns = 0
+    full_search_roots = 0
+    fast_search_roots = 0
     started = time.perf_counter()
     while completed < target_games:
         learner_games = [game for game in live if game is not None and game.state.actor == 0]
         if learner_games:
-            seeds = []
-            noises = []
-            temperatures = []
             for game in learner_games:
-                search_seed = derive_search_seed(game.seed, game.learner_decisions)
-                tape = PortableRng(search_seed)
-                width_at_root = len(
-                    game.state.search_legal_macros(search_config.prune_roundabout_pass)
+                if game.learner_turn != game.state.turn:
+                    game.learner_turn = int(game.state.turn)
+                    game.learner_turn_full = full_search_for_turn(
+                        config,
+                        game.seed,
+                        game.learner_turn,
+                        all_full_search=game.all_full_search,
+                    )
+                    if game.learner_turn_full:
+                        game.full_search_turns += 1
+                        full_search_turns += 1
+                        if game.all_full_search:
+                            full_game_turns += 1
+                        else:
+                            ordinary_full_search_turns += 1
+                    else:
+                        game.fast_search_turns += 1
+                        fast_search_turns += 1
+
+            searched: list[tuple[_LiveGame, dict[str, Any], bool]] = []
+            for full in (True, False):
+                group = [game for game in learner_games if game.learner_turn_full is full]
+                if not group:
+                    continue
+                scheduler = full_scheduler if full else fast_scheduler
+                if scheduler is None:
+                    raise RuntimeError("fast turn selected without a fast scheduler")
+                seeds = []
+                noises = []
+                temperatures = []
+                for game in group:
+                    search_seed = derive_search_seed(game.seed, game.learner_decisions)
+                    if full:
+                        tape = PortableRng(search_seed)
+                        width_at_root = len(
+                            game.state.search_legal_macros(
+                                search_config.prune_roundabout_pass
+                            )
+                        )
+                        noise, advanced_seed = rust_search.root_noise(
+                            search_config, width_at_root, tape
+                        )
+                        seeds.append(advanced_seed)
+                        noises.append(None if noise is None else noise.tolist())
+                    else:
+                        # Fast turns deliberately carry neither root noise nor
+                        # policy targets. Keep the untouched search tape too.
+                        seeds.append(search_seed)
+                        noises.append(None)
+                    temperatures.append(temperature_for_turn(config, game.state.turn))
+                results = scheduler.play(
+                    [game.state for game in group],
+                    learner_eval,
+                    seeds,
+                    roots=[0] * len(group),
+                    noises=noises,
+                    temperatures=temperatures,
+                    slots=[game.slot for game in group],
+                    max_batch=config.max_batch,
                 )
-                noise, advanced_seed = rust_search.root_noise(
-                    search_config, width_at_root, tape
+                searched.extend(
+                    (game, result, full) for game, result in zip(group, results)
                 )
-                seeds.append(advanced_seed)
-                noises.append(None if noise is None else noise.tolist())
-                temperatures.append(temperature_for_turn(config, game.state.turn))
-            results = scheduler.play(
-                [game.state for game in learner_games],
-                learner_eval,
-                seeds,
-                roots=[0] * len(learner_games),
-                noises=noises,
-                temperatures=temperatures,
-                slots=[game.slot for game in learner_games],
-                max_batch=config.max_batch,
-            )
-            for game, result in zip(learner_games, results):
+
+            for game, result, full in searched:
                 choice = int(result["choice"])
                 visits = tuple(int(round(value)) for value in result["visits"])
                 if sum(visits) > 0:
                     if any(float(value) != visit for value, visit in zip(result["visits"], visits)):
                         raise RuntimeError("Rust search returned a non-integral visit count")
-                    game.capture.capture(
-                        game.state,
-                        [int(action) for action in result["actions"]],
-                        [float(value) for value in result["visits"]],
-                        choice,
-                        search_config.prune_roundabout_pass,
-                    )
-                    game.searches.append(
-                        SearchTarget(
-                            decision=len(game.actions),
-                            actions=tuple(int(action) for action in result["actions"]),
-                            visits=visits,
+                    if full:
+                        game.full_search_roots += 1
+                        full_search_roots += 1
+                        game.capture.capture(
+                            game.state,
+                            [int(action) for action in result["actions"]],
+                            [float(value) for value in result["visits"]],
+                            choice,
+                            search_config.prune_roundabout_pass,
                         )
-                    )
+                        game.searches.append(
+                            SearchTarget(
+                                decision=len(game.actions),
+                                actions=tuple(int(action) for action in result["actions"]),
+                                visits=visits,
+                            )
+                        )
+                    else:
+                        game.fast_search_roots += 1
+                        fast_search_roots += 1
                 game.actions.append(choice)
                 game.learner_decisions += 1
                 game.state.apply_macro(choice)
@@ -1090,10 +1490,19 @@ def generate(
             trajectories.append(trajectory)
             final_states.append(final_state)
             completed += 1
-            scheduler.reset(slot)
+            full_search_games += int(game.all_full_search)
+            full_scheduler.reset(slot)
+            if fast_scheduler is not None:
+                fast_scheduler.reset(slot)
             if next_job < len(jobs):
                 seed, players = jobs[next_job]
-                live[slot] = _new_live(slot, seed, players, opponents)
+                live[slot] = _new_live(
+                    slot,
+                    seed,
+                    players,
+                    opponents,
+                    all_full_search=seed in all_full_seeds,
+                )
                 next_job += 1
             else:
                 live[slot] = None
@@ -1120,7 +1529,35 @@ def generate(
         for width_at_call, count in sorted(batch_widths.items())
     }
     metrics["generation_seconds"] = seconds
-    metrics["scheduler_profile"] = dict(scheduler.profile())
+    full_profile = dict(full_scheduler.profile())
+    fast_profile = dict(fast_scheduler.profile()) if fast_scheduler is not None else {}
+    metrics["scheduler_profile"] = _merge_scheduler_profiles(full_profile, fast_profile)
+    metrics["scheduler_profiles"] = {
+        "full": full_profile,
+        **({"fast": fast_profile} if fast_profile else {}),
+    }
+    total_turns = full_search_turns + fast_search_turns
+    ordinary_turns = ordinary_full_search_turns + fast_search_turns
+    total_roots = full_search_roots + fast_search_roots
+    metrics.update(
+        {
+            "playout_cap_randomization": config.playout_cap_randomization,
+            "full_search_simulations": float(search_config.simulations),
+            "fast_search_simulations": float(config.fast_search_simulations),
+            "full_search_games": float(full_search_games),
+            "full_search_game_fraction": full_search_games / max(len(trajectories), 1),
+            "full_search_turns": float(full_search_turns),
+            "full_game_turns": float(full_game_turns),
+            "ordinary_full_search_turns": float(ordinary_full_search_turns),
+            "fast_search_turns": float(fast_search_turns),
+            "full_search_turn_fraction": full_search_turns / max(total_turns, 1),
+            "ordinary_full_search_turn_fraction": ordinary_full_search_turns
+            / max(ordinary_turns, 1),
+            "full_search_roots": float(full_search_roots),
+            "fast_search_roots": float(fast_search_roots),
+            "recorded_search_fraction": full_search_roots / max(total_roots, 1),
+        }
+    )
     metrics["evaluator_profiles"] = [
         evaluator.profile() for evaluator in unique_evaluators.values()
     ]
@@ -1135,13 +1572,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser = argparse.ArgumentParser(description="Generate S2 searched trajectories.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--opponent-checkpoint", action="append", default=[])
+    parser.add_argument("--league-manifest")
+    parser.add_argument("--league-iteration", type=int)
+    parser.add_argument("--league-current-best")
+    parser.add_argument("--league-current-weight", type=float, default=0.60)
+    parser.add_argument("--league-recent-weight", type=float, default=0.30)
+    parser.add_argument("--league-hof-weight", type=float, default=0.10)
+    parser.add_argument("--league-recent-count", type=int, default=3)
+    parser.add_argument("--league-hof-count", type=int, default=2)
+    parser.add_argument("--league-ramp-promotions", type=int, default=3)
     parser.add_argument("--games", type=int, default=SelfPlayConfig().games)
     parser.add_argument("--inflight", type=int, default=SelfPlayConfig().inflight)
     parser.add_argument("--max-batch", type=int, default=SelfPlayConfig().max_batch)
     parser.add_argument(
         "--scheduler-workers", type=int, default=SelfPlayConfig().scheduler_workers
     )
-    parser.add_argument("--simulations", type=int, default=200)
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=800,
+        help="simulation cap for full-search learner turns (default: 800)",
+    )
+    parser.add_argument(
+        "--playout-cap-randomization",
+        action="store_true",
+        help="choose full/fast search once per complete learner turn",
+    )
+    parser.add_argument(
+        "--full-search-fraction",
+        type=float,
+        default=0.25,
+        help="full-search share among turns outside wholly-full games",
+    )
+    parser.add_argument(
+        "--fast-search-simulations",
+        "--fast-move-sims",
+        dest="fast_search_simulations",
+        type=int,
+        default=64,
+        help="simulation cap for unrecorded, noiseless fast turns",
+    )
+    parser.add_argument(
+        "--full-search-game-fraction",
+        type=float,
+        default=0.05,
+        help="exact quota of games whose learner turns all use full search",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--opening-temperature-turns", type=int, default=10)
     parser.add_argument("--opening-temperature", type=float, default=1.0)
@@ -1149,8 +1625,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--shard-games", type=int, default=25)
     parser.add_argument("--writer-queue-games", type=int, default=100)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--cuda-events", action="store_true")
     parser.add_argument("--out", default="runs/welcome_to_s2/trajectories.jsonl")
     args = parser.parse_args(argv)
+    if args.league_manifest and args.opponent_checkpoint:
+        parser.error("--league-manifest cannot be combined with --opponent-checkpoint")
+    if args.league_manifest and args.league_iteration is None:
+        parser.error("--league-manifest requires --league-iteration")
 
     config = SelfPlayConfig(
         games=args.games,
@@ -1161,21 +1642,71 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         opening_temperature_turns=args.opening_temperature_turns,
         opening_temperature=args.opening_temperature,
         late_temperature=args.late_temperature,
+        playout_cap_randomization=args.playout_cap_randomization,
+        full_search_fraction=args.full_search_fraction,
+        fast_search_simulations=args.fast_search_simulations,
+        full_search_game_fraction=args.full_search_game_fraction,
     )
     search_config = default_search_config(args.simulations)
     learner = train.load(args.checkpoint, args.device)
-    opponent_paths = args.opponent_checkpoint or [args.checkpoint]
-    opponents = [
-        Opponent(Path(path).stem, learner if path == args.checkpoint else train.load(path, args.device))
-        for path in opponent_paths
-    ]
+    opponent_pool_manifest = None
+    league_selection = None
+    if args.league_manifest:
+        from games.welcome_to import s2_league
+
+        league_selection = s2_league.S2League(args.league_manifest).select(
+            args.league_current_best or args.checkpoint,
+            iteration=args.league_iteration,
+            config=s2_league.LeagueConfig(
+                current_best_weight=args.league_current_weight,
+                recent_weight=args.league_recent_weight,
+                hall_of_fame_weight=args.league_hof_weight,
+                recent_count=args.league_recent_count,
+                hall_of_fame_count=args.league_hof_count,
+                history_ramp_promotions=args.league_ramp_promotions,
+                seed=args.seed,
+            ),
+        )
+        opponent_paths = [item.path for item in league_selection.opponents]
+        learner_path = Path(args.checkpoint).resolve()
+        opponents = [
+            Opponent(
+                item.name,
+                (
+                    learner
+                    if Path(item.path).resolve() == learner_path
+                    else train.load(item.path, args.device)
+                ),
+                item.weight,
+            )
+            for item in league_selection.opponents
+        ]
+        opponent_pool_manifest = league_selection.metrics()["opponents"]
+    else:
+        opponent_paths = args.opponent_checkpoint or [args.checkpoint]
+        opponents = [
+            Opponent(
+                Path(path).stem,
+                learner
+                if Path(path).resolve() == Path(args.checkpoint).resolve()
+                else train.load(path, args.device),
+            )
+            for path in opponent_paths
+        ]
     has_existing = bool(trajectory_sources(args.out) or training_shard_paths(args.out))
     existing = read_trajectories(args.out) if has_existing else []
     completed_seeds = validate_resume(existing, config)
     existing_games = len(existing)
+    existing_searched_roots = sum(len(game.searches) for game in existing)
     ensure_run_manifest(
         args.out,
-        run_manifest(config, search_config, args.checkpoint, opponent_paths),
+        run_manifest(
+            config,
+            search_config,
+            args.checkpoint,
+            opponent_paths,
+            opponent_pool=opponent_pool_manifest,
+        ),
         has_existing_games=bool(existing_games),
     )
     # Resume validation needs full trajectories, generation does not. Do not
@@ -1200,6 +1731,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
             device=args.device,
             skip_seeds=completed_seeds,
             on_captured=lambda _trajectory, captured: store.add(captured),
+            cuda_events=args.cuda_events,
         )
     finally:
         # Also drain the bounded queue and flush a short final shard on clean
@@ -1207,14 +1739,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
         store.close()
 
     path = Path(args.out)
-    metrics["existing_games"] = float(existing_games)
-    metrics["new_games"] = float(len(trajectories))
-    metrics["total_games"] = float(len(completed_seeds) + len(trajectories))
+    new_searched_roots = int(metrics["searched_roots"])
+    # Like total_games, searched_roots describes every durable shard behind the
+    # prefix. Replay-window validation must not depend on whether generation
+    # happened in one process or was resumed after an interruption.
+    metrics = cumulative_generation_metrics(
+        metrics,
+        existing_games=existing_games,
+        existing_searched_roots=existing_searched_roots,
+        new=trajectories,
+    )
+    if league_selection is not None:
+        metrics["league_selection"] = league_selection.metrics()
     metrics_path = path.with_suffix(path.suffix + ".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
     print(
         f"wrote {len(trajectories)} new S2 games / "
-        f"{int(metrics['searched_roots'])} searched roots as shards of {path} "
+        f"{new_searched_roots} new searched roots as shards of {path} "
         f"({int(metrics['total_games'])}/{config.games} complete)"
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))

@@ -293,7 +293,21 @@ def _viewer_plane(state: GameState, viewer: int, out: np.ndarray) -> None:
     mask in spatial form and the policy head benefits from the trunk seeing it.
     It sits outside the shared sheet encoder because it is phase scratch state,
     not a property of a sheet.
+
+    ⚠ **``state.ctx`` belongs to ``state.actor``, so this reads it only when the
+    viewer *is* the actor.**  Without that guard the plane answers "where could
+    the viewer write the number the *opponent* has just picked", which is both
+    meaningless and a read of the one thing the information-set contract hides
+    (an opponent's live, mid-turn sheet and choice) — and it is invisible to
+    :func:`games.welcome_to.mcts.information_key`, which carries ``ctx`` only on
+    the viewer's own turn.  Two states the key merges could then encode
+    differently.  No reachable caller encodes a non-actor viewer at these two
+    phases today (search evaluates leaves at macro roots, where the root is the
+    actor, and ``WRITE_NUMBER`` is inside a macro), so this is the containment
+    hole closed before something falls in it, not a change to any emitted row.
     """
+    if viewer != state.actor:
+        return
     sheet = state.sheets[viewer]
     boxes: set[tuple[int, int]] = set()
     if state.phase is Phase.WRITE_NUMBER and state.ctx.number is not None:

@@ -51,6 +51,7 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from games.welcome_to import datagen
 from games.welcome_to import encoder as enc
@@ -169,7 +170,7 @@ def evaluate(
     device: torch.device,
     batch_size: int = 512,
 ) -> dict[str, float]:
-    """Held-out policy agreement, and R^2 for every regression head.
+    """Held-out policy agreement plus regression and binary-head diagnostics.
 
     R^2 is against the held-out variance of the target itself, so ``> 0`` is
     exactly "beats predict-the-mean" and the number is comparable across heads
@@ -183,6 +184,8 @@ def evaluate(
     sums: dict[str, float] = {}
     sq_sums: dict[str, float] = {}
     weights: dict[str, float] = {}
+    binary_ce: dict[str, float] = {}
+    binary_correct: dict[str, float] = {}
 
     rng = random.Random(0)
     for raw in iter_batches(trajectories, batch_size, rng, shuffle_buffer=batch_size * 2):
@@ -206,6 +209,20 @@ def evaluate(
                     mask = mask * batch[mask_name]
             else:
                 mask = torch.ones_like(target)
+            if name in training.BINARY_TARGETS:
+                probability = torch.sigmoid(prediction)
+                binary_ce[name] = binary_ce.get(name, 0.0) + float(
+                    (
+                        mask
+                        * F.binary_cross_entropy_with_logits(
+                            prediction, target, reduction="none"
+                        )
+                    ).sum()
+                )
+                binary_correct[name] = binary_correct.get(name, 0.0) + float(
+                    (mask * ((probability >= 0.5) == (target >= 0.5))).sum()
+                )
+                prediction = probability
             sq_err[name] = sq_err.get(name, 0.0) + float(
                 (mask * (prediction - target) ** 2).sum()
             )
@@ -217,10 +234,28 @@ def evaluate(
         raise ValueError("nothing to evaluate: the held-out set produced no samples")
     metrics = {"policy_top1": agree / total, "eval_samples": float(total)}
     for name, count in weights.items():
+        metrics[f"support_{name}"] = count
         if count <= 0:
-            metrics[f"r2_{name}"] = float("nan")
+            metrics[f"target_mean_{name}"] = float("nan")
+            metrics[f"target_std_{name}"] = float("nan")
+            if name in training.BINARY_TARGETS:
+                metrics[f"bce_{name}"] = float("nan")
+                metrics[f"brier_{name}"] = float("nan")
+                metrics[f"accuracy_{name}"] = float("nan")
+                metrics[f"positive_rate_{name}"] = float("nan")
+            else:
+                metrics[f"r2_{name}"] = float("nan")
             continue
-        variance = sq_sums[name] / count - (sums[name] / count) ** 2
+        target_mean = sums[name] / count
+        variance = max(0.0, sq_sums[name] / count - target_mean**2)
+        metrics[f"target_mean_{name}"] = target_mean
+        metrics[f"target_std_{name}"] = math.sqrt(variance)
+        if name in training.BINARY_TARGETS:
+            metrics[f"bce_{name}"] = binary_ce[name] / count
+            metrics[f"brier_{name}"] = sq_err[name] / count
+            metrics[f"accuracy_{name}"] = binary_correct[name] / count
+            metrics[f"positive_rate_{name}"] = target_mean
+            continue
         mse = sq_err[name] / count
         metrics[f"r2_{name}"] = 1.0 - mse / variance if variance > 0 else float("nan")
     return metrics
@@ -447,7 +482,7 @@ def train(
 def load(path: str | Path, device: str = "cpu") -> nw.WelcomeToNet:
     blob = torch.load(Path(path), map_location=device, weights_only=False)
     net = nw.WelcomeToNet(nw.NetConfig(**blob["net_config"]))
-    net.load_state_dict(blob["state_dict"])
+    nw.load_state_dict_compatible(net, blob["state_dict"])
     return net.to(device)
 
 

@@ -24,7 +24,8 @@ game, the things whose causes are local and whose values are late:
 * ``houses`` and ``capacity_left`` — did this sheet get filled or did it seize up?
 * per-component scores — eight gradients instead of one, each attributable to a
   different part of the sheet.
-* ``plan_turns`` — feeds the turns-to-finish head that the three races turn on.
+* plan outcomes — whether each plan completes, whether it completes first, how
+  long completion takes, and which independent terminal clause ends the game.
 
 These are auxiliary heads, in the KataGo sense: they are never consulted at play
 time, they exist to force the trunk to represent the long horizon.  Combined with
@@ -73,7 +74,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Optional, Sequence
 
-from games.welcome_to.constants import NUM_BOXES
+from games.welcome_to.constants import NUM_BOXES, PERMIT_BOXES
 from games.welcome_to.game import GameState
 from games.welcome_to.sheet import SheetScore
 
@@ -122,7 +123,13 @@ class PlayerOutcome:
     capacity_left: int
     #: Absolute turn on which this player completed each plan slot, or ``None``.
     plan_turns: tuple[Optional[int], ...]
+    #: Whether each completed plan tied for the earliest completion turn.
+    plan_first: tuple[bool, ...]
     plans_completed: int
+    #: Independent terminal clauses. More than one may be true on the final turn.
+    end_full_sheet: bool
+    end_all_plans: bool
+    end_max_permit: bool
     final_turn: int
     #: How many seats were at the table.  Carried on the outcome because the
     #: seat-count-dependent targets below need it and the state is gone by then.
@@ -222,11 +229,18 @@ def final_outcomes(state: GameState) -> list[PlayerOutcome]:
 
     scores = state.scores()
     distributions = rank_distributions(state)
+    first_plan_turns = tuple(
+        min(turns.values()) if turns else None for turns in state.plan_turns
+    )
 
     out: list[PlayerOutcome] = []
     for player in range(state.config.players):
         sheet = state.sheets[player]
         turns = tuple(state.plan_turns[slot].get(player) for slot in range(3))
+        first = tuple(
+            completed is not None and completed == first_plan_turns[slot]
+            for slot, completed in enumerate(turns)
+        )
         out.append(
             PlayerOutcome(
                 player=player,
@@ -236,7 +250,11 @@ def final_outcomes(state: GameState) -> list[PlayerOutcome]:
                 houses=sum(1 for row in sheet.numbers for n in row if n is not None),
                 capacity_left=sum(sheet.placement_capacity()),
                 plan_turns=turns,
+                plan_first=first,
                 plans_completed=sum(1 for t in turns if t is not None),
+                end_full_sheet=not sheet.has_free_box(),
+                end_all_plans=all(t is not None for t in turns),
+                end_max_permit=sheet.permits >= PERMIT_BOXES,
                 final_turn=state.turn,
                 num_seats=state.config.players,
                 rank_distribution=distributions[player],
@@ -248,8 +266,22 @@ def final_outcomes(state: GameState) -> list[PlayerOutcome]:
 #: Masked targets, as ``target -> mask``.  Every loss over one of these reduces
 #: with :func:`masked_mean`, and :data:`NEVER` must never reach it.
 MASKED_TARGETS: dict[str, str] = {
-    f"turns_to_plan_{slot}": f"turns_to_plan_{slot}_mask" for slot in range(3)
+    **{
+        f"turns_to_plan_{slot}": f"turns_to_plan_{slot}_mask"
+        for slot in range(3)
+    },
+    **{f"plan_{slot}_first": f"plan_{slot}_first_mask" for slot in range(3)},
 }
+
+#: Per-seat Bernoulli targets. Network outputs for these names are raw logits;
+#: training uses BCE-with-logits and evaluation reports calibrated probabilities.
+BINARY_TARGETS: tuple[str, ...] = (
+    *(f"will_complete_plan_{slot}" for slot in range(3)),
+    *(f"plan_{slot}_first" for slot in range(3)),
+    "end_trigger_full_sheet",
+    "end_trigger_all_plans",
+    "end_trigger_max_permit",
+)
 
 
 def _seat_targets(outcome: PlayerOutcome, turn: int) -> dict[str, float]:
@@ -281,6 +313,22 @@ def _seat_targets(outcome: PlayerOutcome, turn: int) -> dict[str, float]:
         else:
             targets[f"turns_to_plan_{slot}"] = max(0, completed_on - turn) / TURN_SCALE
             targets[f"turns_to_plan_{slot}_mask"] = 1.0
+    for slot, completed_on in enumerate(outcome.plan_turns):
+        targets[f"will_complete_plan_{slot}"] = float(completed_on is not None)
+    for slot, completed_on in enumerate(outcome.plan_turns):
+        if completed_on is None:
+            targets[f"plan_{slot}_first"] = float(NEVER)
+            targets[f"plan_{slot}_first_mask"] = 0.0
+        else:
+            targets[f"plan_{slot}_first"] = float(outcome.plan_first[slot])
+            targets[f"plan_{slot}_first_mask"] = 1.0
+    targets.update(
+        {
+            "end_trigger_full_sheet": float(outcome.end_full_sheet),
+            "end_trigger_all_plans": float(outcome.end_all_plans),
+            "end_trigger_max_permit": float(outcome.end_max_permit),
+        }
+    )
     #: 0.0 on a padded seat; see :data:`_PADDED_SEAT`.
     targets["seat_valid"] = 1.0
     return targets
@@ -294,7 +342,11 @@ _PROBE = PlayerOutcome(
     houses=0,
     capacity_left=0,
     plan_turns=(None, None, None),
+    plan_first=(False, False, False),
     plans_completed=0,
+    end_full_sheet=False,
+    end_all_plans=False,
+    end_max_permit=False,
     final_turn=1,
     num_seats=2,
     rank_distribution=(0.0,) * MAX_RANKS,
@@ -303,6 +355,32 @@ _PROBE = PlayerOutcome(
 #: Targets carried once per seat, as a tuple along the seat axis.  Derived from
 #: the builder rather than listed, so the two cannot drift.
 PER_SEAT_TARGETS: tuple[str, ...] = tuple(_seat_targets(_PROBE, turn=1))
+
+#: Version-1 WTS shards ended at ``seat_valid`` and predate the dense plan
+#: outcome heads. Readers use this exact order to upgrade those immutable rows.
+LEGACY_PER_SEAT_TARGETS: tuple[str, ...] = (
+    "score",
+    "permits",
+    "houses",
+    "capacity_left",
+    "plans_completed",
+    "score_parks",
+    "score_pools",
+    "score_estates",
+    "score_plans",
+    "score_temp",
+    "score_bis",
+    "score_permits",
+    "score_roundabouts",
+    "turns_to_plan_0",
+    "turns_to_plan_0_mask",
+    "turns_to_plan_1",
+    "turns_to_plan_1_mask",
+    "turns_to_plan_2",
+    "turns_to_plan_2_mask",
+    "seat_valid",
+)
+assert set(LEGACY_PER_SEAT_TARGETS).issubset(PER_SEAT_TARGETS)
 
 #: An absent seat.  Every value zero **except** the plan sentinels, which stay
 #: :data:`NEVER` behind their zero mask, and ``seat_valid``, which is the flag

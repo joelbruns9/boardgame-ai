@@ -5,6 +5,8 @@
 //! deck histogram is already `f32`, so its normalization stays in `f32`, as
 //! NumPy does for those arrays.
 
+use std::sync::OnceLock;
+
 use crate::constants::{
     box_index, card_effect, card_number, num_base_cards, Effect, BIS_BOXES, EMPTY,
     ESTATE_ROW_BOXES, MAX_ESTATE_SIZE, MAX_STREET_LEN, NUM_BOXES, NUM_STREETS, PARK_BOXES,
@@ -257,7 +259,15 @@ fn sheet_scalars(game: &Game, viewer: usize, seat: usize) -> Vec<f32> {
     w.buf
 }
 
+/// ⚠ `game.ctx` belongs to `game.actor`, so this reads it only when the viewer
+/// *is* the actor. Ungated it would answer "where could the viewer write the
+/// number the opponent just picked" — meaningless, a read of hidden mid-turn
+/// state, and invisible to `information_key`, which carries `ctx` only on the
+/// viewer's own turn. See `encoder.py::_viewer_plane` for the full argument.
 fn write_viewer_plane(game: &Game, viewer: usize, out: &mut [f32]) {
+    if viewer != game.actor {
+        return;
+    }
     let sheet = &game.sheets[viewer];
     let mut boxes = [[false; MAX_STREET_LEN]; NUM_STREETS];
     if game.phase == Phase::WriteNumber {
@@ -292,19 +302,31 @@ fn card_cell(card: i32) -> Option<(usize, usize)> {
     Some(((number - 1) as usize, effect_index(card_effect(card))?))
 }
 
-fn histogram<'a>(cards: impl IntoIterator<Item = &'a i32>) -> Matrix {
-    let mut out = [[0.0f32; NUM_EFFECTS]; NUM_NUMBERS];
+fn add_cards<'a>(out: &mut Matrix, cards: impl IntoIterator<Item = &'a i32>) {
     for &card in cards {
         if let Some((number, effect)) = card_cell(card) {
             out[number][effect] += 1.0;
         }
     }
+}
+
+fn histogram<'a>(cards: impl IntoIterator<Item = &'a i32>) -> Matrix {
+    let mut out = [[0.0f32; NUM_EFFECTS]; NUM_NUMBERS];
+    add_cards(&mut out, cards);
     out
 }
 
-fn base_deck_matrix() -> Matrix {
-    let cards: Vec<i32> = (0..num_base_cards()).map(|card| card as i32).collect();
-    histogram(cards.iter())
+/// The full 81-card deck as a `(number, effect)` histogram.
+///
+/// Memoized because `deck_composition` runs once per `information_key` — that
+/// is once per search transition, not once per evaluated leaf — and rebuilding
+/// this allocated an 81-element `Vec` and walked the card table every time.
+fn base_deck_matrix() -> &'static Matrix {
+    static BASE: OnceLock<Matrix> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let cards: Vec<i32> = (0..num_base_cards()).map(|card| card as i32).collect();
+        histogram(cards.iter())
+    })
 }
 
 fn add_matrix(left: &Matrix, right: &Matrix) -> Matrix {
@@ -318,13 +340,14 @@ fn add_matrix(left: &Matrix, right: &Matrix) -> Matrix {
 }
 
 pub(crate) fn deck_composition(game: &Game, viewer: usize) -> Matrix {
-    let mut known = game.table_cards(viewer);
+    // Accumulated in place rather than into a joined `Vec`: the previous
+    // spelling cloned `discard` (up to 81 cards) and appended the table on
+    // every call. Counts are whole numbers held in `f32`, so summation order
+    // is exact and this stays bit-identical to the Python oracle.
+    let mut seen = histogram(game.table_cards(viewer).iter());
     if !game.config.expert {
-        let mut cards = game.discard.clone();
-        cards.extend(known);
-        known = cards;
+        add_cards(&mut seen, game.discard.iter());
     }
-    let seen = histogram(known.iter());
     let base = base_deck_matrix();
     let mut out = [[0.0f32; NUM_EFFECTS]; NUM_NUMBERS];
     for n in 0..NUM_NUMBERS {

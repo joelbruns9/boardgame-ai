@@ -8,20 +8,24 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyByteArray, PyDict};
 
-use crate::constants::{EMPTY, STREET_SIZES};
+use crate::constants::{EMPTY, NUM_BOXES, PERMIT_BOXES, STREET_SIZES};
 use crate::encoder::{self, EncodedState};
 use crate::game::{EngineError, Game};
 use crate::macro_codec;
+use crate::rng::Rng;
 use crate::tables;
 use crate::{to_py, RustGameState};
 
-pub const TRAINING_SHARD_VERSION: u16 = 1;
+pub const TRAINING_SHARD_VERSION: u16 = 2;
+const LEGACY_TRAINING_SHARD_VERSION: u16 = 1;
 pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "turns_left",
     "rank_p_0",
@@ -33,7 +37,41 @@ pub const GLOBAL_TARGET_NAMES: [&str; 9] = [
     "rank_p_3",
     "rank_mask_3",
 ];
-pub const PER_SEAT_TARGET_NAMES: [&str; 20] = [
+pub const PER_SEAT_TARGET_NAMES: [&str; 32] = [
+    "score",
+    "permits",
+    "houses",
+    "capacity_left",
+    "plans_completed",
+    "score_parks",
+    "score_pools",
+    "score_estates",
+    "score_plans",
+    "score_temp",
+    "score_bis",
+    "score_permits",
+    "score_roundabouts",
+    "turns_to_plan_0",
+    "turns_to_plan_0_mask",
+    "turns_to_plan_1",
+    "turns_to_plan_1_mask",
+    "turns_to_plan_2",
+    "turns_to_plan_2_mask",
+    "will_complete_plan_0",
+    "will_complete_plan_1",
+    "will_complete_plan_2",
+    "plan_0_first",
+    "plan_0_first_mask",
+    "plan_1_first",
+    "plan_1_first_mask",
+    "plan_2_first",
+    "plan_2_first_mask",
+    "end_trigger_full_sheet",
+    "end_trigger_all_plans",
+    "end_trigger_max_permit",
+    "seat_valid",
+];
+pub const LEGACY_PER_SEAT_TARGET_NAMES: [&str; 20] = [
     "score",
     "permits",
     "houses",
@@ -55,6 +93,12 @@ pub const PER_SEAT_TARGET_NAMES: [&str; 20] = [
     "turns_to_plan_2_mask",
     "seat_valid",
 ];
+const LEGACY_PER_SEAT_TARGET_COUNT: usize = LEGACY_PER_SEAT_TARGET_NAMES.len();
+const LEGACY_PERMITS: usize = 1;
+const LEGACY_HOUSES: usize = 2;
+const LEGACY_PLANS_COMPLETED: usize = 4;
+const LEGACY_PLAN_MASKS: [usize; 3] = [14, 16, 18];
+const LEGACY_SEAT_VALID: usize = 19;
 pub const GLOBAL_TARGET_COUNT: usize = GLOBAL_TARGET_NAMES.len();
 pub const PER_SEAT_TARGET_COUNT: usize = PER_SEAT_TARGET_NAMES.len();
 pub const TARGET_FLOAT_COUNT: usize =
@@ -94,7 +138,11 @@ struct Outcome {
     houses: i32,
     capacity_left: i32,
     plan_turns: [Option<i32>; 3],
+    plan_first: [bool; 3],
     plans_completed: i32,
+    end_full_sheet: bool,
+    end_all_plans: bool,
+    end_max_permit: bool,
     final_turn: i32,
     num_seats: usize,
     rank_distribution: [f32; encoder::MAX_SEATS],
@@ -132,6 +180,8 @@ fn outcomes(game: &Game) -> Result<Vec<Outcome>, EngineError> {
     }
 
     let mut result = Vec::with_capacity(seats);
+    let first_plan_turns: [Option<i32>; 3] =
+        std::array::from_fn(|slot| game.plan_turns[slot].iter().map(|(_, turn)| *turn).min());
     for player in 0..seats {
         let sheet = &game.sheets[player];
         let plan_turns = std::array::from_fn(|slot| {
@@ -150,14 +200,22 @@ fn outcomes(game: &Game) -> Result<Vec<Outcome>, EngineError> {
                     .count() as i32
             })
             .sum();
+        let plan_first = std::array::from_fn(|slot| {
+            plan_turns[slot].is_some() && plan_turns[slot] == first_plan_turns[slot]
+        });
+        let plans_completed = plan_turns.iter().flatten().count() as i32;
         result.push(Outcome {
             score: scores[player],
             components: game.score_breakdown(player, None),
             permits: sheet.permits,
             houses,
             capacity_left: sheet.placement_capacity().iter().sum(),
-            plans_completed: plan_turns.iter().flatten().count() as i32,
+            plan_first,
+            plans_completed,
             plan_turns,
+            end_full_sheet: houses as usize == NUM_BOXES,
+            end_all_plans: plans_completed == 3,
+            end_max_permit: sheet.permits >= PERMIT_BOXES,
             final_turn: game.turn,
             num_seats: seats,
             rank_distribution: ranks[player],
@@ -195,7 +253,23 @@ fn seat_targets(outcome: &Outcome, turn: i32) -> [f32; PER_SEAT_TARGET_COUNT] {
             }
         }
     }
-    out[19] = 1.0;
+    for slot in 0..3 {
+        out[19 + slot] = outcome.plan_turns[slot].is_some() as u8 as f32;
+    }
+    for slot in 0..3 {
+        let value = 22 + slot * 2;
+        if outcome.plan_turns[slot].is_some() {
+            out[value] = outcome.plan_first[slot] as u8 as f32;
+            out[value + 1] = 1.0;
+        } else {
+            out[value] = -1.0;
+            out[value + 1] = 0.0;
+        }
+    }
+    out[28] = outcome.end_full_sheet as u8 as f32;
+    out[29] = outcome.end_all_plans as u8 as f32;
+    out[30] = outcome.end_max_permit as u8 as f32;
+    out[31] = 1.0;
     out
 }
 
@@ -222,6 +296,7 @@ fn sample_targets(
         } else {
             for slot in 0..3 {
                 out[start + 13 + slot * 2] = -1.0;
+                out[start + 22 + slot * 2] = -1.0;
             }
         }
     }
@@ -517,6 +592,30 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, String> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn read_shard_header(reader: &mut impl Read) -> Result<(usize, usize), String> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    let version = read_u16(reader)?;
+    let global_targets = read_u16(reader)? as usize;
+    let per_seat_targets = read_u16(reader)? as usize;
+    let max_seats = read_u16(reader)? as usize;
+    let signature = read_u64(reader)?;
+    let current = version == TRAINING_SHARD_VERSION
+        && global_targets == GLOBAL_TARGET_COUNT
+        && per_seat_targets == PER_SEAT_TARGET_COUNT;
+    let legacy = version == LEGACY_TRAINING_SHARD_VERSION
+        && global_targets == GLOBAL_TARGET_COUNT
+        && per_seat_targets == LEGACY_PER_SEAT_TARGET_COUNT;
+    if &magic != MAGIC
+        || !(current || legacy)
+        || max_seats != encoder::MAX_SEATS
+        || signature != tables::table_signature()
+    {
+        return Err("training shard ABI or table signature mismatch".into());
+    }
+    Ok((per_seat_targets, read_u32(reader)? as usize))
+}
+
 fn read_shard_seeds(path: &Path) -> Result<Vec<u64>, String> {
     let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
     let file_length = reader
@@ -524,18 +623,7 @@ fn read_shard_seeds(path: &Path) -> Result<Vec<u64>, String> {
         .metadata()
         .map_err(|e| e.to_string())?
         .len();
-    let mut magic = [0u8; 8];
-    reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
-    if &magic != MAGIC
-        || read_u16(&mut reader)? != TRAINING_SHARD_VERSION
-        || read_u16(&mut reader)? as usize != GLOBAL_TARGET_COUNT
-        || read_u16(&mut reader)? as usize != PER_SEAT_TARGET_COUNT
-        || read_u16(&mut reader)? as usize != encoder::MAX_SEATS
-        || read_u64(&mut reader)? != tables::table_signature()
-    {
-        return Err("training shard ABI or table signature mismatch".into());
-    }
-    let count = read_u32(&mut reader)? as usize;
+    let (_per_seat_targets, count) = read_shard_header(&mut reader)?;
     let mut seeds = Vec::with_capacity(count);
     for _ in 0..count {
         let length = read_u64(&mut reader)?;
@@ -555,6 +643,381 @@ fn read_shard_seeds(path: &Path) -> Result<Vec<u64>, String> {
         return Err("training shard has trailing bytes".into());
     }
     Ok(seeds)
+}
+
+#[derive(Clone)]
+struct TrainingRowLocation {
+    path: usize,
+    offset: u64,
+    per_seat_target_count: usize,
+}
+
+fn index_training_shard(path: &Path) -> Result<(usize, Vec<(u64, Vec<u64>)>), String> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let file_length = reader
+        .get_ref()
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .len();
+    let (per_seat_target_count, games) = read_shard_header(&mut reader)?;
+    let encoder_bytes = (encoder::SHEET_PLANES_LEN
+        + encoder::SHEET_SCALARS_LEN
+        + encoder::VIEWER_PLANE_LEN
+        + encoder::NUM_GLOBAL_SCALAR)
+        * size_of::<f32>();
+    let target_bytes =
+        (GLOBAL_TARGET_COUNT + encoder::MAX_SEATS * per_seat_target_count) * size_of::<f32>();
+    let mut result = Vec::with_capacity(games);
+    for _ in 0..games {
+        let record_length = read_u64(&mut reader)?;
+        let record_start = reader.stream_position().map_err(|e| e.to_string())?;
+        let record_end = record_start
+            .checked_add(record_length)
+            .ok_or_else(|| "training shard record length overflowed".to_string())?;
+        if record_end > file_length {
+            return Err("training shard contains a truncated game record".into());
+        }
+        let seed = read_u64(&mut reader)?;
+        let json_length = read_u32(&mut reader)? as i64;
+        reader
+            .seek(SeekFrom::Current(json_length))
+            .map_err(|e| e.to_string())?;
+        let samples = read_u32(&mut reader)? as usize;
+        let mut offsets = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            offsets.push(reader.stream_position().map_err(|e| e.to_string())?);
+            // Encoder arrays, legal mask, action, actor and turn precede support.
+            reader
+                .seek(SeekFrom::Current(
+                    (encoder_bytes + macro_codec::NUM_MACRO_ACTIONS + 7) as i64,
+                ))
+                .map_err(|e| e.to_string())?;
+            let support = read_u16(&mut reader)? as u64;
+            reader
+                .seek(SeekFrom::Current(
+                    (support * 6 + target_bytes as u64) as i64,
+                ))
+                .map_err(|e| e.to_string())?;
+            if reader.stream_position().map_err(|e| e.to_string())? > record_end {
+                return Err("training shard ended inside a sample".into());
+            }
+        }
+        if reader.stream_position().map_err(|e| e.to_string())? != record_end {
+            return Err("training shard game record length is inconsistent".into());
+        }
+        result.push((seed, offsets));
+    }
+    if reader.stream_position().map_err(|e| e.to_string())? != file_length {
+        return Err("training shard has trailing bytes".into());
+    }
+    Ok((per_seat_target_count, result))
+}
+
+#[derive(Default)]
+struct DecodedTrainingBatch {
+    rows: usize,
+    sheet_planes: Vec<u8>,
+    sheet_scalars: Vec<u8>,
+    viewer_plane: Vec<u8>,
+    global_scalars: Vec<u8>,
+    legal: Vec<u8>,
+    action: Vec<u8>,
+    policy: Vec<u8>,
+    turn: Vec<u8>,
+    targets: Vec<u8>,
+}
+
+impl DecodedTrainingBatch {
+    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        out.set_item("rows", self.rows)?;
+        out.set_item("sheet_planes", PyByteArray::new(py, &self.sheet_planes))?;
+        out.set_item("sheet_scalars", PyByteArray::new(py, &self.sheet_scalars))?;
+        out.set_item("viewer_plane", PyByteArray::new(py, &self.viewer_plane))?;
+        out.set_item("global_scalars", PyByteArray::new(py, &self.global_scalars))?;
+        out.set_item("legal", PyByteArray::new(py, &self.legal))?;
+        out.set_item("action", PyByteArray::new(py, &self.action))?;
+        out.set_item("policy", PyByteArray::new(py, &self.policy))?;
+        out.set_item("turn", PyByteArray::new(py, &self.turn))?;
+        out.set_item("targets", PyByteArray::new(py, &self.targets))?;
+        Ok(out)
+    }
+}
+
+fn append_exact(
+    reader: &mut BufReader<File>,
+    out: &mut Vec<u8>,
+    bytes: usize,
+) -> Result<(), String> {
+    let start = out.len();
+    out.resize(start + bytes, 0);
+    reader
+        .read_exact(&mut out[start..])
+        .map_err(|e| e.to_string())
+}
+
+fn append_training_targets(
+    reader: &mut BufReader<File>,
+    out: &mut Vec<u8>,
+    per_seat_target_count: usize,
+) -> Result<(), String> {
+    if per_seat_target_count == PER_SEAT_TARGET_COUNT {
+        return append_exact(reader, out, TARGET_FLOAT_COUNT * size_of::<f32>());
+    }
+    if per_seat_target_count != LEGACY_PER_SEAT_TARGET_COUNT {
+        return Err("training shard has an unknown target schema".into());
+    }
+    let legacy_count = GLOBAL_TARGET_COUNT + encoder::MAX_SEATS * LEGACY_PER_SEAT_TARGET_COUNT;
+    let mut raw = vec![0u8; legacy_count * size_of::<f32>()];
+    reader.read_exact(&mut raw).map_err(|e| e.to_string())?;
+    let legacy: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .collect();
+    let mut current = vec![0.0f32; TARGET_FLOAT_COUNT];
+    current[..GLOBAL_TARGET_COUNT].copy_from_slice(&legacy[..GLOBAL_TARGET_COUNT]);
+    for seat in 0..encoder::MAX_SEATS {
+        let old = GLOBAL_TARGET_COUNT + seat * LEGACY_PER_SEAT_TARGET_COUNT;
+        let new = GLOBAL_TARGET_COUNT + seat * PER_SEAT_TARGET_COUNT;
+        current[new..new + LEGACY_SEAT_VALID]
+            .copy_from_slice(&legacy[old..old + LEGACY_SEAT_VALID]);
+        for slot in 0..3 {
+            current[new + 19 + slot] = legacy[old + LEGACY_PLAN_MASKS[slot]];
+            current[new + 22 + slot * 2] = -1.0;
+            current[new + 23 + slot * 2] = 0.0;
+        }
+        current[new + 28] = (legacy[old + LEGACY_HOUSES] >= 1.0) as u8 as f32;
+        current[new + 29] =
+            (legacy[old + LEGACY_PLANS_COMPLETED] >= 1.0) as u8 as f32;
+        current[new + 30] = (legacy[old + LEGACY_PERMITS] >= 1.0) as u8 as f32;
+        current[new + 31] = legacy[old + LEGACY_SEAT_VALID];
+    }
+    for value in current {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Bulk decoder for production `.wts` shards.
+///
+/// Python chooses the whole-game train/validation split and passes its seeds;
+/// Rust then indexes, shuffles and materialises complete tensor columns without
+/// constructing a Python object per training row.
+#[pyclass(module = "welcome_to_rust")]
+pub struct RustTrainingBatchLoader {
+    readers: Vec<BufReader<File>>,
+    rows: Vec<TrainingRowLocation>,
+    order: Vec<usize>,
+    cursor: usize,
+    batch_size: usize,
+    random: Option<Rng>,
+    random_batches_remaining: usize,
+}
+
+#[pymethods]
+impl RustTrainingBatchLoader {
+    #[new]
+    #[pyo3(signature = (paths, seeds, batch_size=256, shuffle_seed=None))]
+    fn new(
+        paths: Vec<PathBuf>,
+        seeds: Vec<u64>,
+        batch_size: usize,
+        shuffle_seed: Option<u64>,
+    ) -> PyResult<Self> {
+        if paths.is_empty() || seeds.is_empty() || batch_size == 0 {
+            return Err(PyValueError::new_err(
+                "training loader paths, seeds, and batch size must be non-empty",
+            ));
+        }
+        let wanted: HashSet<u64> = seeds.iter().copied().collect();
+        if wanted.len() != seeds.len() {
+            return Err(PyValueError::new_err(
+                "training loader seeds are not unique",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(wanted.len());
+        let mut rows = Vec::new();
+        for (path_index, path) in paths.iter().enumerate() {
+            let (per_seat_target_count, indexed) =
+                index_training_shard(path).map_err(PyValueError::new_err)?;
+            for (seed, offsets) in indexed {
+                if wanted.contains(&seed) {
+                    if !seen.insert(seed) {
+                        return Err(PyValueError::new_err(format!(
+                            "training seed {seed} occurs in more than one shard"
+                        )));
+                    }
+                    rows.extend(offsets.into_iter().map(|offset| TrainingRowLocation {
+                        path: path_index,
+                        offset,
+                        per_seat_target_count,
+                    }));
+                }
+            }
+        }
+        if seen != wanted {
+            let mut missing: Vec<u64> = wanted.difference(&seen).copied().collect();
+            missing.sort_unstable();
+            return Err(PyValueError::new_err(format!(
+                "training shards omitted selected seeds {:?}",
+                &missing[..missing.len().min(8)]
+            )));
+        }
+        if rows.is_empty() {
+            return Err(PyValueError::new_err(
+                "selected training games contain no searched roots",
+            ));
+        }
+        let readers = paths
+            .iter()
+            .map(|path| File::open(path).map(BufReader::new))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        if let Some(seed) = shuffle_seed {
+            Rng::new(seed).shuffle(&mut order);
+        }
+        Ok(Self {
+            readers,
+            rows,
+            order,
+            cursor: 0,
+            batch_size,
+            random: None,
+            random_batches_remaining: 0,
+        })
+    }
+
+    #[pyo3(signature = (shuffle_seed=None))]
+    fn reset(&mut self, shuffle_seed: Option<u64>) {
+        self.order = (0..self.rows.len()).collect();
+        if let Some(seed) = shuffle_seed {
+            Rng::new(seed).shuffle(&mut self.order);
+        }
+        self.cursor = 0;
+        self.random = None;
+        self.random_batches_remaining = 0;
+    }
+
+    /// Select exactly `batches` full minibatches uniformly with replacement.
+    ///
+    /// This is the self-play training mode.  Unlike an epoch reset, its work is
+    /// independent of replay-window size: every draw has equal probability
+    /// over every indexed row, and a row may appear more than once.
+    fn reset_random(&mut self, sample_seed: u64, batches: usize) -> PyResult<()> {
+        if batches == 0 {
+            return Err(PyValueError::new_err("random batch count must be positive"));
+        }
+        self.random = Some(Rng::new(sample_seed));
+        self.random_batches_remaining = batches;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if self.random.is_some() {
+            if self.random_batches_remaining == 0 {
+                return Ok(None);
+            }
+        } else if self.cursor >= self.order.len() {
+            return Ok(None);
+        }
+        let decoded = py
+            .detach(|| self.decode_next())
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(Some(decoded.to_python(py)?))
+    }
+
+    #[getter]
+    fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[getter]
+    fn batches(&self) -> usize {
+        self.rows.len().div_ceil(self.batch_size)
+    }
+}
+
+impl RustTrainingBatchLoader {
+    fn decode_next(&mut self) -> Result<DecodedTrainingBatch, String> {
+        let selected: Vec<usize> = if let Some(rng) = self.random.as_mut() {
+            (0..self.batch_size)
+                .map(|_| rng.randrange(self.rows.len() as u64) as usize)
+                .collect()
+        } else {
+            let end = (self.cursor + self.batch_size).min(self.order.len());
+            self.order[self.cursor..end].to_vec()
+        };
+        let mut out = DecodedTrainingBatch {
+            rows: selected.len(),
+            sheet_planes: Vec::with_capacity(selected.len() * encoder::SHEET_PLANES_LEN * 4),
+            sheet_scalars: Vec::with_capacity(selected.len() * encoder::SHEET_SCALARS_LEN * 4),
+            viewer_plane: Vec::with_capacity(selected.len() * encoder::VIEWER_PLANE_LEN * 4),
+            global_scalars: Vec::with_capacity(selected.len() * encoder::NUM_GLOBAL_SCALAR * 4),
+            legal: Vec::with_capacity(selected.len() * macro_codec::NUM_MACRO_ACTIONS),
+            action: Vec::with_capacity(selected.len() * 2),
+            policy: vec![0; selected.len() * macro_codec::NUM_MACRO_ACTIONS * 4],
+            turn: Vec::with_capacity(selected.len() * 4),
+            targets: Vec::with_capacity(selected.len() * TARGET_FLOAT_COUNT * 4),
+        };
+        for (batch_row, &order_index) in selected.iter().enumerate() {
+            let location = &self.rows[order_index];
+            let reader = &mut self.readers[location.path];
+            reader
+                .seek(SeekFrom::Start(location.offset))
+                .map_err(|e| e.to_string())?;
+            append_exact(reader, &mut out.sheet_planes, encoder::SHEET_PLANES_LEN * 4)?;
+            append_exact(
+                reader,
+                &mut out.sheet_scalars,
+                encoder::SHEET_SCALARS_LEN * 4,
+            )?;
+            append_exact(reader, &mut out.viewer_plane, encoder::VIEWER_PLANE_LEN * 4)?;
+            append_exact(
+                reader,
+                &mut out.global_scalars,
+                encoder::NUM_GLOBAL_SCALAR * 4,
+            )?;
+            append_exact(reader, &mut out.legal, macro_codec::NUM_MACRO_ACTIONS)?;
+            append_exact(reader, &mut out.action, 2)?;
+            let mut actor = [0u8; 1];
+            reader.read_exact(&mut actor).map_err(|e| e.to_string())?;
+            let mut raw_turn = [0u8; 4];
+            reader
+                .read_exact(&mut raw_turn)
+                .map_err(|e| e.to_string())?;
+            let turn = i32::from_le_bytes(raw_turn) as f32;
+            out.turn.extend_from_slice(&turn.to_le_bytes());
+            let support = read_u16(reader)? as usize;
+            let mut visits = Vec::with_capacity(support);
+            let mut mass = 0u64;
+            for _ in 0..support {
+                let action = read_u16(reader)? as usize;
+                let count = read_u32(reader)?;
+                if action >= macro_codec::NUM_MACRO_ACTIONS {
+                    return Err("training policy contains an out-of-range action".into());
+                }
+                mass += u64::from(count);
+                visits.push((action, count));
+            }
+            if mass == 0 {
+                return Err("training policy has no visit mass".into());
+            }
+            for (action, count) in visits {
+                let start = (batch_row * macro_codec::NUM_MACRO_ACTIONS + action) * 4;
+                out.policy[start..start + 4]
+                    .copy_from_slice(&(count as f32 / mass as f32).to_le_bytes());
+            }
+            append_training_targets(reader, &mut out.targets, location.per_seat_target_count)?;
+        }
+        if self.random.is_some() {
+            self.random_batches_remaining -= 1;
+        } else {
+            self.cursor += selected.len();
+        }
+        Ok(out)
+    }
 }
 
 enum WriterCommand {
@@ -820,5 +1283,36 @@ impl Drop for RustSampleShardWriter {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_upgrade_offsets_are_pinned_to_exported_names() {
+        assert_eq!(LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_PERMITS], "permits");
+        assert_eq!(LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_HOUSES], "houses");
+        assert_eq!(
+            LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_PLANS_COMPLETED],
+            "plans_completed"
+        );
+        assert_eq!(
+            LEGACY_PLAN_MASKS.map(|index| LEGACY_PER_SEAT_TARGET_NAMES[index]),
+            [
+                "turns_to_plan_0_mask",
+                "turns_to_plan_1_mask",
+                "turns_to_plan_2_mask",
+            ]
+        );
+        assert_eq!(
+            LEGACY_PER_SEAT_TARGET_NAMES[LEGACY_SEAT_VALID],
+            "seat_valid"
+        );
+        assert_eq!(
+            &PER_SEAT_TARGET_NAMES[..LEGACY_SEAT_VALID],
+            &LEGACY_PER_SEAT_TARGET_NAMES[..LEGACY_SEAT_VALID]
+        );
     }
 }

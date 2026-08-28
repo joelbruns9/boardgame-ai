@@ -216,6 +216,49 @@ def test_turns_to_plan_is_relative_and_masked():
                 assert value == pytest.approx(expected)
 
 
+def test_dense_plan_outcomes_and_independent_end_triggers_match_terminal_games():
+    completed_seen = False
+    for seed in range(1, 16):
+        state = _finished(players=3, seed=seed)
+        outcomes = tr.final_outcomes(state)
+        targets = _targets(state, viewer=1, turn=4)
+        order = enc.seat_order(state, 1)
+        for encoded, seat in enumerate(order):
+            outcome = outcomes[seat]
+            for slot, completed_on in enumerate(outcome.plan_turns):
+                completed = completed_on is not None
+                completed_seen |= completed
+                assert targets[f"will_complete_plan_{slot}"][encoded] == float(completed)
+                assert targets[f"plan_{slot}_first_mask"][encoded] == float(completed)
+                if completed:
+                    assert targets[f"plan_{slot}_first"][encoded] == float(
+                        outcome.plan_first[slot]
+                    )
+                else:
+                    assert targets[f"plan_{slot}_first"][encoded] == float(tr.NEVER)
+            assert targets["end_trigger_full_sheet"][encoded] == float(
+                outcome.end_full_sheet
+            )
+            assert targets["end_trigger_all_plans"][encoded] == float(
+                outcome.end_all_plans
+            )
+            assert targets["end_trigger_max_permit"][encoded] == float(
+                outcome.end_max_permit
+            )
+    assert completed_seen, "the fixture corpus never exercised a completed plan"
+
+
+def test_every_binary_target_is_zero_or_one_on_a_valid_seat():
+    state = _finished(players=4, seed=7)
+    targets = _targets(state, viewer=2, turn=3)
+    for name in tr.BINARY_TARGETS:
+        mask_name = tr.MASKED_TARGETS.get(name)
+        masks = targets[mask_name] if mask_name is not None else (1.0,) * tr.MAX_SEATS
+        for value, valid, mask in zip(targets[name], targets["seat_valid"], masks):
+            if valid and mask:
+                assert value in (0.0, 1.0), name
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Masking discipline
 # ──────────────────────────────────────────────────────────────────────────

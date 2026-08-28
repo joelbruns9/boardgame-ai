@@ -156,7 +156,27 @@ SEARCH_SEED_DOMAIN: int = 0x5745_4C43_4F4D_4553  # "WELCOMES"
 
 
 def derive_search_seed(game_seed: int, search_index: int) -> int:
-    """The portable tape for one search, independent of other live searches."""
+    """The portable tape for one search, independent of other live searches.
+
+    ⚠ **Not** ``game_seed ^ DOMAIN ^ search_index``, which is what this was and
+    which collides structurally.  A run draws its game seeds from a contiguous
+    block and its search indices from ``0 .. decisions``, so under XOR the
+    decision counter lands in the same low bits as the seed: decision ``i`` of
+    game ``s`` gets **exactly** the tape decision ``0`` of game ``s ^ i`` gets,
+    and every search in a run shares its tape with ~``min(games, decisions)``
+    others.  Two searches on one tape draw the same determinization permutations
+    *and* -- because ``root_noise`` seeds NumPy from this -- the identical
+    Dirichlet vector at equal root width, so the exploration the noise exists to
+    buy is silently duplicated across the corpus.
+
+    The derivation is instead one draw of the stream itself: advance
+    ``PortableRng(game_seed ^ DOMAIN)`` by ``search_index`` states and take the
+    next output.  SplitMix64's state step is ``+GAMMA``, so the skip is O(1),
+    the finalizer is a bijection, and a collision needs
+    ``Δseed == GAMMA * Δindex (mod 2**64)`` -- unreachable for the seed blocks
+    and decision counts a real run uses.
+    """
     if search_index < 0:
         raise ValueError("search_index must be non-negative")
-    return (game_seed ^ SEARCH_SEED_DOMAIN ^ search_index) & _MASK64
+    base = ((game_seed ^ SEARCH_SEED_DOMAIN) + _GAMMA * search_index) & _MASK64
+    return PortableRng(base).next_u64()

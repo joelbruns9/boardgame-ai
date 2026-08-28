@@ -71,12 +71,21 @@ from games.welcome_to import encoder as enc
 from games.welcome_to import training
 from games.welcome_to.macro_codec import NUM_MACRO_ACTIONS
 
-#: Per-seat regression outputs, in head order.  Derived from the target set so
-#: that adding a target and forgetting the head is impossible.
+#: Per-seat supervised outputs, in head order. Binary targets are raw logits;
+#: the rest are regressions. Derived from the target set so adding a target and
+#: forgetting the head is impossible.
 PER_SEAT_HEAD_TARGETS: tuple[str, ...] = tuple(
     name
     for name in training.PER_SEAT_TARGETS
     if name != "seat_valid" and not name.endswith("_mask")
+)
+LEGACY_PER_SEAT_HEAD_TARGETS: tuple[str, ...] = tuple(
+    name
+    for name in training.LEGACY_PER_SEAT_TARGETS
+    if name != "seat_valid" and not name.endswith("_mask")
+)
+assert PER_SEAT_HEAD_TARGETS[: len(LEGACY_PER_SEAT_HEAD_TARGETS)] == (
+    LEGACY_PER_SEAT_HEAD_TARGETS
 )
 #: Global regression outputs, in head order.  ``rank_logits`` is separate: it is
 #: a masked softmax over finishing positions, not a regression.
@@ -84,20 +93,24 @@ GLOBAL_HEAD_TARGETS: tuple[str, ...] = ("turns_left",)
 
 #: Loss weights **by group**, per AUX_TARGETS_SPEC §8.  Weighting per target
 #: would be twenty-odd independent knobs, which is not a tunable object; these
-#: five are, and they are what an ablation switches off.
+#: seven are, and they are what an ablation switches off.
 #:
 #: The weight is applied to the group's **mean**, once -- not to each of its
 #: members.  Multiplying every member by the group coefficient would make a
 #: group's real influence its coefficient times its size: ``components`` (8
 #: targets at 0.2) would outweigh ``capacity`` (4 at 0.3), and the table would
 #: not describe the model it configures.  Worse, it makes the weighting drift as
-#: the target set changes -- AUX_TARGETS_SPEC §10 step 4 adds nine targets to
-#: ``plan_race``, which would have quietly tripled that group's pull.
+#: the target set changes. Newly appended terminal plan labels therefore have
+#: their own group instead of diluting or multiplying historical plan progress.
 LOSS_WEIGHTS: dict[str, float] = {
     "policy": 1.0,
     "objective": 1.0,   # score, rank -- score dominant early
     "capacity": 0.3,
     "plan_race": 0.3,
+    # New terminal plan labels add supervision; they must not divide the
+    # historical plan-progress group from 0.3/4 to 0.3/10 on legacy replay.
+    "plan_outcome": 0.3,
+    "outcome_mode": 0.2,
     "components": 0.2,
 }
 
@@ -113,6 +126,15 @@ _GROUP_OF: dict[str, str] = {
     "turns_to_plan_0": "plan_race",
     "turns_to_plan_1": "plan_race",
     "turns_to_plan_2": "plan_race",
+    "will_complete_plan_0": "plan_outcome",
+    "will_complete_plan_1": "plan_outcome",
+    "will_complete_plan_2": "plan_outcome",
+    "plan_0_first": "plan_outcome",
+    "plan_1_first": "plan_outcome",
+    "plan_2_first": "plan_outcome",
+    "end_trigger_full_sheet": "outcome_mode",
+    "end_trigger_all_plans": "outcome_mode",
+    "end_trigger_max_permit": "outcome_mode",
     **{
         f"score_{part}": "components"
         for part in (
@@ -236,21 +258,36 @@ class WelcomeToNet(nn.Module):
         sheet_scalars: Tensor,
         viewer_plane: Tensor,
         global_scalars: Tensor,
+        *,
+        leaf_rows: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
-        """Search-only heads: policy, rank, and score.
+        """Search-only heads, with value heads evaluated for LEAF rows only.
 
         This keeps the checkpoint and numerical path identical to ``forward``
         while avoiding construction of the unused auxiliary-target mapping.
-        The shared per-seat head is still evaluated because score is one of its
-        channels; splitting it would change the learned parameterization.
+        ``leaf_rows=None`` retains the historical all-LEAF behaviour.  A mixed
+        search batch supplies the row indices that need a backed-up value;
+        opponent POLICY rows need only policy logits.  The auxiliary heads still
+        shape the shared trunk during training--not executing their readouts at
+        inference cannot change the already-computed trunk or policy output.
+
+        The full existing per-seat/global modules run on the selected rows.  In
+        particular, score is still read from the learned shared per-seat head;
+        this is an inference scheduling change, not a checkpoint change.
         """
         h_seat, h = self._features(
             sheet_planes, sheet_scalars, viewer_plane, global_scalars
         )
-        batch, seats = sheet_scalars.shape[0], sheet_scalars.shape[1]
-        context = h.unsqueeze(1).expand(batch, seats, h.shape[-1])
-        per_seat = self.per_seat_head(torch.cat([h_seat, context], dim=-1))
-        global_out = self.global_head(h)
+        if leaf_rows is None:
+            leaf_rows = torch.arange(h.shape[0], device=h.device)
+        else:
+            leaf_rows = leaf_rows.to(device=h.device, dtype=torch.long)
+        selected_h = h.index_select(0, leaf_rows)
+        selected_seats = h_seat.index_select(0, leaf_rows)
+        rows, seats = selected_seats.shape[0], selected_seats.shape[1]
+        context = selected_h.unsqueeze(1).expand(rows, seats, selected_h.shape[-1])
+        per_seat = self.per_seat_head(torch.cat([selected_seats, context], dim=-1))
+        global_out = self.global_head(selected_h)
         return {
             "policy_logits": self.policy_head(h),
             "rank_logits": global_out[:, len(GLOBAL_HEAD_TARGETS) :],
@@ -332,6 +369,7 @@ def losses(
       exactly the ones the race argument says matter.
     """
     parts: dict[str, Tensor] = {}
+    active: dict[str, Tensor] = {}
     seat_valid = batch["seat_valid"]                                # (B, seats)
 
     # Policy: S0's one-hot teacher action and S2's MCTS visit distribution use
@@ -344,6 +382,7 @@ def losses(
         parts["policy"] = -(batch["policy"] * log_policy).sum(-1).mean()
     else:  # direct unit-test/legacy callers predating S2
         parts["policy"] = F.cross_entropy(logits, batch["action"])
+    active["policy"] = parts["policy"].new_ones(())
 
     # rank: cross-entropy against the distribution over finishing positions
     rank_mask = torch.stack(
@@ -354,29 +393,41 @@ def losses(
     )
     log_p = masked_log_softmax(out["rank_logits"], rank_mask)
     parts["rank"] = -(rank_target * log_p * rank_mask).sum(-1).mean()
+    active["rank"] = parts["rank"].new_ones(())
 
     for name in PER_SEAT_HEAD_TARGETS:
-        error = (out[name] - batch[name]) ** 2
+        if name in training.BINARY_TARGETS:
+            error = F.binary_cross_entropy_with_logits(
+                out[name], batch[name], reduction="none"
+            )
+        else:
+            error = (out[name] - batch[name]) ** 2
         mask = seat_valid
         mask_name = training.MASKED_TARGETS.get(name)
         if mask_name is not None:
             mask = mask * batch[mask_name]
         parts[name] = training.masked_mean(error, mask)
+        active[name] = (mask.sum() > 0).to(dtype=parts[name].dtype)
 
     for name in GLOBAL_HEAD_TARGETS:
         parts[name] = ((out[name] - batch[name]) ** 2).mean()
+        active[name] = parts[name].new_ones(())
 
-    # One coefficient per group, applied to the group's mean.  See LOSS_WEIGHTS.
-    grouped: dict[str, list[Tensor]] = {}
+    # One coefficient per group, applied to the mean of targets that have
+    # support in this batch. Legacy first-finisher masks are all zero, so they
+    # must not become constant members that dilute the other plan losses.
+    grouped: dict[str, list[tuple[Tensor, Tensor]]] = {}
     for name, part in parts.items():
-        grouped.setdefault(_GROUP_OF[name], []).append(part)
+        grouped.setdefault(_GROUP_OF[name], []).append((part, active[name]))
 
     total = None
     for group, members in grouped.items():
-        mean = members[0]
-        for member in members[1:]:
-            mean = mean + member
-        mean = mean / len(members)
+        numerator = members[0][0] * members[0][1]
+        denominator = members[0][1]
+        for member, supported in members[1:]:
+            numerator = numerator + member * supported
+            denominator = denominator + supported
+        mean = numerator / denominator.clamp_min(1.0)
         parts[f"group_{group}"] = mean
         weighted = LOSS_WEIGHTS[group] * mean
         total = weighted if total is None else total + weighted
@@ -401,3 +452,56 @@ def to_tensors(
 
 def parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def load_state_dict_compatible(
+    model: WelcomeToNet, state_dict: Mapping[str, Tensor]
+) -> bool:
+    """Load current weights, expanding the pre-plan-head output layer if needed.
+
+    The new binary outputs are appended, so every historical output retains its
+    row exactly. New rows start at a deterministic neutral logit of zero.
+    Returns whether a legacy expansion was performed.
+    """
+    expected = model.state_dict()
+    mismatched = {
+        name
+        for name, value in state_dict.items()
+        if name in expected and value.shape != expected[name].shape
+    }
+    if not mismatched:
+        model.load_state_dict(state_dict)
+        return False
+
+    final_index = max(
+        index
+        for index, module in enumerate(model.per_seat_head)
+        if isinstance(module, nn.Linear)
+    )
+    expandable = {
+        f"per_seat_head.{final_index}.weight",
+        f"per_seat_head.{final_index}.bias",
+    }
+    if mismatched != expandable:
+        raise RuntimeError(
+            f"checkpoint has incompatible tensor shapes for {sorted(mismatched)}"
+        )
+
+    migrated = dict(state_dict)
+    old_rows = len(LEGACY_PER_SEAT_HEAD_TARGETS)
+    new_rows = len(PER_SEAT_HEAD_TARGETS)
+    for name in expandable:
+        old = state_dict[name]
+        target = expected[name]
+        if old.shape[0] != old_rows or target.shape[0] != new_rows or (
+            old.ndim > 1 and old.shape[1:] != target.shape[1:]
+        ):
+            raise RuntimeError(
+                f"checkpoint tensor {name} cannot expand from {tuple(old.shape)} "
+                f"to {tuple(target.shape)}"
+            )
+        expanded = torch.zeros_like(target)
+        expanded[:old_rows].copy_(old)
+        migrated[name] = expanded
+    model.load_state_dict(migrated)
+    return True

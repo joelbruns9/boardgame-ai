@@ -658,6 +658,15 @@ seat count sampled per game across 2/3/4 at 60/30/10 (§2).
 3. weight toward recent strong checkpoints while retaining older promoted ones
    for policy diversity.
 
+**Built 2026-08-26:** `s2_league.py` records every outgoing promoted best in an
+atomic manifest. Each generation iteration loads a bounded pool: current best
+(60% weight), up to three recent archives (30%, recency-weighted), and a
+resume-stable sample of up to two older hall-of-fame archives (10%). Opponent
+history ramps in over the first three promotions, with unavailable historical
+mass remaining on current best. Opponent seats draw independently from that pool using the existing per-game portable
+assignment stream; the exact selected paths, hashes, and weights are frozen in
+the generation manifest.
+
 **Why GreedyBot was removed from S2.** S0 used it to prove the supervised
 pipeline, not to define strength. Welcome To defers score; early play is chiefly
 about racing to City Plans and preserving future placement flexibility. A
@@ -712,6 +721,14 @@ direct evidence that race learning is happening rather than being assumed.
 * M0-F per-search seeds, Python-generated scaled Dirichlet noise, `tau=1` for
   the first ten turns and deterministic choice afterwards, with the temperature
   supplied per root so retained trees survive the schedule change;
+* KataGo-style playout-cap randomization at the **complete learner-turn**
+  boundary: outside the exact 5% quota of wholly-full games, one deterministic
+  seed/turn draw assigns the initial card choice and every following effect,
+  plan, validation and reshuffle decision together. Full turns use 800
+  simulations and are recorded; fast turns use 64, receive no root Dirichlet
+  noise and advance the trajectory without emitting a training row. The
+  ordinary-turn full/fast split is 25/75, and separate persistent Rust
+  schedulers preserve deterministic within-turn re-rooting at both caps;
 * real opponent moves batched by frozen checkpoint and sampled from independent
   per-seat portable streams using that **same opening/late temperature schedule**;
   no GreedyBot fallback;
@@ -748,9 +765,16 @@ direct evidence that race learning is happening rather than being assumed.
   tie-aware visit-best agreement; sampled-action top-1 is diagnostic only;
 * rank cross-entropy/KL and every auxiliary R² are reported, together with the
   actual mask support for sparse plan-timing targets;
-* AdamW moments, model/config provenance, completed epochs and metrics are saved
+* AdamW moments, model/config provenance, completed optimizer steps and metrics are saved
   in an atomic, resume-capable checkpoint that remains readable by the generic
   network loader.
+
+The durable replay window and paired promotion controller are now built on this
+boundary (2026-08-26): immutable `.wts` iterations are selected by the shared
+games-based `GrowingReplayWindow`, Rust samples fixed-step minibatches uniformly
+with replacement, validation games receive a stable hash assignment, and the
+fixed-N gate atomically installs only candidates whose paired margin-versus-best
+lower confidence bound is positive without a mean normalized-rank regression.
 
 The search's internal opponent POLICY requests still use the learner checkpoint,
 which is the existing single-model opponent proxy; the frozen pool governs the
@@ -758,10 +782,9 @@ actual game. Routing simulated opponents through their assigned frozen networks
 would be a strength change and needs a separate bakeoff, not a silent scheduler
 change.
 
-Replay-window retention and the paired promotion controller remain to be built
-on this trajectory boundary. They are deliberately not hidden inside generation
-or optimisation: a trajectory is immutable evidence, while promotion changes
-which policy produces the next evidence.
+Replay selection and promotion remain deliberately separate from generation and
+optimisation: a trajectory is immutable evidence, while promotion changes which
+policy produces the next evidence.
 
 ### S3 — Raise the symmetric share; HOF, Elo, SPRT
 
