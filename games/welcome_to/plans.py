@@ -27,9 +27,13 @@ from typing import TYPE_CHECKING, Optional
 
 from games.welcome_to.constants import (
     EXTREMITY_POSITIONS,
+    FENCE_SIZES,
+    MAX_ESTATE_SIZE,
     NUM_STREETS,
     PARK_BOXES,
+    POOL_POSITIONS,
     STREET_SIZES,
+    TEMP_BOXES,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -366,3 +370,369 @@ def validation_cells(
         return list(EXTREMITY_POSITIONS)
 
     return []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3: requirements, feasibility and a hard turn bound
+#
+# ENCODER_V3_SPEC.md §2, §3, §6.1 and §6.2.  Read §6.1 before touching
+# `feasible`: five review rounds of that spec produced four unsound death
+# tests, every one of them by reasoning about *numbers* while forgetting that
+# a roundabout, a bis or a fence puts a house on the sheet without one.
+# ──────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class Requirements:
+    """What a plan still wants from one sheet -- "how much" AND "where".
+
+    The v2 spec described a plan by a single 7-vector of counts, which answered
+    "how much" and never "where".  Measured against the dealt pool that loses
+    almost everything: 18 of the 28 plans are estate plans whose 18 distinct
+    size multisets all collapse to "N fences needed", and 9 of the remaining 10
+    are street- or box-bound.  Exactly one -- ``SEVEN_TEMP`` -- survived intact.
+
+    So the counts are split by locus: per-street where the plan binds to a
+    street, per-size where it binds to estate sizes, and ``target_boxes`` where
+    it binds to named boxes.
+    """
+
+    #: Sheet-wide.
+    temps_needed: int
+    #: Descriptor of estate work remaining.  NOT a bound on fences: one SURVEYOR
+    #: fence can raise the estate match by two, so this may not be used as a
+    #: lower bound on anything.  See :func:`turns_lower_bound`.
+    fences_needed: int
+    #: ``need[s] - free supply[s]`` for sizes 1..6, clipped at zero.
+    estate_shortfall: tuple[int, ...]
+
+    #: Per street.
+    parks_needed: tuple[int, ...]
+    pools_needed: tuple[int, ...]
+    houses_needed: tuple[int, ...]
+    bis_needed: tuple[int, ...]
+    roundabout_needed: tuple[int, ...]
+    #: 1 where street *x* is **alive** for this plan -- not provably unable to
+    #: contribute.  A street whose work is already done is alive, not dead; the
+    #: remaining work lives in the other five vectors.
+    street_serves: tuple[int, ...]
+
+    #: Boxes this plan still needs *written*, for the plan-target planes.
+    #: Non-empty only for ``FULL_STREET`` and ``EXTREMITIES``, whose targets are
+    #: fixed by the plan itself.  Estate plans are deliberately absent: which
+    #: boxes they would consume depends on a choice, and marking "boxes whose
+    #: filling would create a needed size" would be a search, not a feature.
+    target_boxes: tuple[tuple[int, int], ...]
+
+
+def _regions(sheet: "Sheet", x: int) -> list[range]:
+    """Maximal spans of street ``x`` between existing fences and the street ends.
+
+    Fences are only ever added, never removed, so a region is the widest piece
+    of street that could still become a single estate.
+    """
+    out: list[range] = []
+    size = STREET_SIZES[x]
+    start = 0
+    for j in range(size):
+        if j == size - 1 or (j < FENCE_SIZES[x] and sheet.fences[x][j]):
+            out.append(range(start, j + 1))
+            start = j + 1
+    return out
+
+
+def reachable_estate_counts(sheet: "Sheet") -> list[int]:
+    """Loose upper bound on estates of each size 1..6 this sheet could still hold.
+
+    Deliberately the **loose** bound of ``ENCODER_V3_SPEC.md`` §13.2, shipped
+    ahead of a tighter one because three sibling death tests were unsound in
+    earlier drafts and the conservative default is the right posture until the
+    soundness fuzz is green on this form.
+
+    It counts, per fence-delimited region, ``floor(usable / s)`` estates of size
+    ``s``, where ``usable`` is the boxes not already spent on a City Plan.  Two
+    deliberate over-counts, both in the safe direction:
+
+    * it ignores whether the fences that would carve the region are *legal*
+      (``surveyor_zones`` refuses to split a bis pair or two same-plan houses);
+    * it ignores contiguity, so a region may be credited with more estates than
+      it could really yield.
+
+    **Critically it counts boxes, not free boxes.** ``Sheet.estates`` is bounded
+    by fences, not by writes, so a single fence re-partitions an already-built
+    run into estates of new sizes while consuming nothing.  A bound counting
+    only empty boxes called a fully written sheet dead when one fence completed
+    the plan.
+    """
+    counts = [0] * MAX_ESTATE_SIZE
+    for x in range(NUM_STREETS):
+        for region in _regions(sheet, x):
+            usable = sum(1 for y in region if not sheet.top_fences[x][y])
+            for size in range(1, MAX_ESTATE_SIZE + 1):
+                counts[size - 1] += usable // size
+    return counts
+
+
+def _pool_boxes_alive(sheet: "Sheet", x: int) -> int:
+    """Pool positions in street ``x`` that could still take a house."""
+    spans = sheet.span_if_roundabout()
+    alive = 0
+    for px, py in POOL_POSITIONS:
+        if px != x:
+            continue
+        if sheet.numbers[x][py] is not None:
+            continue
+        if spans[x][py] > 0 or sheet.bis_reachable(x, py):
+            alive += 1
+    return alive
+
+
+def feasible(plan: Plan, sheet: "Sheet") -> bool:
+    """Is ``plan`` still reachable on ``sheet``?  **Sound, not complete.**
+
+    Returns ``False`` only when the plan is *provably* unreachable, and ``True``
+    otherwise -- so it will miss some real deaths and must never report one that
+    is not real.  A false death is a feature that lies to the network; a missed
+    death is a feature that is merely weak.
+
+    ``tests/plan_reachability.py`` is the independent oracle this is checked
+    against, one-sidedly: ``feasible`` false requires the oracle to agree, never
+    the converse.
+
+    Every span-derived claim below is guarded against **all** the ways a house
+    reaches a box that no drawn number can:
+
+    * a **roundabout** -- ``available_locations(None)`` ignores numeric fit and
+      the sentinel counts as a built house (hence ``span_if_roundabout``);
+    * a **bis** -- ``bis_candidates`` has no ascending-order check at all
+      (hence ``bis_reachable``);
+    * a **fence** -- creates estates of new sizes consuming no box at all
+      (hence :func:`reachable_estate_counts`).
+
+    And no bound here subtracts from ``BIS_BOXES`` or ``TEMP_BOXES``.  Those two
+    tracks **saturate rather than gate**: ``legal_actions`` never reads their
+    counters, and the apply path clamps with ``min(marks + 1, CAP)``.
+    ``PERMIT_BOXES`` and ``ROUNDABOUT_BOXES`` do gate, via ``can_take_permit``
+    and ``can_build_roundabout``.
+    """
+    kind = plan.kind
+
+    if kind is PlanKind.ESTATE:
+        supply = Counter(size for _, _, size in sheet.free_estates())
+        reachable = reachable_estate_counts(sheet)
+        for size, count in Counter(plan.required_sizes).items():
+            if count > supply[size] + reachable[size - 1]:
+                return False
+        return True
+
+    if kind is PlanKind.FULL_STREET:
+        # Exact on its own, and the only clause: a house already spent on
+        # another City Plan can never be un-spent.  A capacity clause was tried
+        # and removed -- with roundabouts and bis both able to fill
+        # numerically-dead boxes, no cheap capacity bound is sound.
+        return not any(sheet.top_fences[plan.params[0]])
+
+    if kind is PlanKind.EXTREMITIES:
+        spans = sheet.span_if_roundabout()
+        for x, y in EXTREMITY_POSITIONS:
+            if sheet.top_fences[x][y]:
+                return False
+            if sheet.numbers[x][y] is not None:
+                continue
+            if spans[x][y] == 0 and not sheet.bis_reachable(x, y):
+                return False
+        return True
+
+    if kind is PlanKind.FIVE_BIS:
+        reach = sheet.bis_reach()
+        counts = sheet.bis_count_per_street()
+        return any(counts[x] + reach[x] >= 5 for x in range(NUM_STREETS))
+
+    if kind is PlanKind.SEVEN_TEMP:
+        # The temp track is eleven boxes and nothing consumes it but temp marks,
+        # so seven is always still reachable.  Kept for uniformity.
+        return TEMP_BOXES >= 7
+
+    if kind is PlanKind.COMPLETE_STREET:
+        for x in range(NUM_STREETS):
+            if sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
+                continue
+            if not sheet.has_roundabout_in_street(x):
+                if not sheet.can_build_roundabout():
+                    continue
+            return True
+        return False
+
+    if kind is PlanKind.DECORATIVE:
+        what = plan.params[0]
+        if what == "park":
+            return True  # park boxes are a pure track; nothing can block them
+        if what == "pool":
+            ok = sum(
+                1
+                for x in range(NUM_STREETS)
+                if sheet.pools[x] + _pool_boxes_alive(sheet, x) >= 3
+            )
+            return ok >= 2
+        if what == "pool&park":
+            x = plan.params[1]
+            return sheet.pools[x] + _pool_boxes_alive(sheet, x) >= 3
+        raise NotImplementedError(f"seasonal decorative plan {plan.id} is not supported")
+
+    raise NotImplementedError(f"plan {plan.id} belongs to an unsupported expansion")
+
+
+def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
+    """What ``plan`` still wants from ``sheet``, split by locus.  Spec §3."""
+    kind = plan.kind
+
+    temps_needed = 0
+    fences_needed = 0
+    estate_shortfall = [0] * MAX_ESTATE_SIZE
+    parks = [0, 0, 0]
+    pools = [0, 0, 0]
+    houses = [0, 0, 0]
+    bis = [0, 0, 0]
+    roundabout = [0, 0, 0]
+    serves = [0, 0, 0]
+    targets: list[tuple[int, int]] = []
+
+    alive = feasible(plan, sheet)
+    done = can_be_scored(plan, sheet)
+
+    if kind is PlanKind.ESTATE:
+        supply = Counter(size for _, _, size in sheet.free_estates())
+        for size, count in Counter(plan.required_sizes).items():
+            estate_shortfall[size - 1] = max(0, count - supply[size])
+        fences_needed = progress(plan, sheet)[1]
+        serves = [1 if alive else 0] * NUM_STREETS
+
+    elif kind is PlanKind.FULL_STREET:
+        x = plan.params[0]
+        serves[x] = 1 if alive else 0
+        houses[x] = sum(1 for n in sheet.numbers[x] if n is None)
+        targets = [
+            (x, y) for y in range(STREET_SIZES[x]) if sheet.numbers[x][y] is None
+        ]
+
+    elif kind is PlanKind.EXTREMITIES:
+        for x, y in EXTREMITY_POSITIONS:
+            serves[x] = 1 if alive else 0
+            if sheet.numbers[x][y] is None:
+                houses[x] += 1
+                targets.append((x, y))
+
+    elif kind is PlanKind.FIVE_BIS:
+        reach = sheet.bis_reach()
+        counts = sheet.bis_count_per_street()
+        for x in range(NUM_STREETS):
+            if counts[x] + reach[x] >= 5:
+                serves[x] = 1
+                bis[x] = max(0, 5 - counts[x])
+
+    elif kind is PlanKind.SEVEN_TEMP:
+        temps_needed = max(0, 7 - sheet.temps)
+        # Sheet-wide: no street contributes, which is correct and is not "dead".
+
+    elif kind is PlanKind.COMPLETE_STREET:
+        for x in range(NUM_STREETS):
+            if sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
+                continue
+            if not sheet.has_roundabout_in_street(x) and not sheet.can_build_roundabout():
+                continue
+            serves[x] = 1
+            parks[x] = PARK_BOXES[x] - sheet.parks[x]
+            pools[x] = 3 - sheet.pools[x]
+            roundabout[x] = 0 if sheet.has_roundabout_in_street(x) else 1
+
+    elif kind is PlanKind.DECORATIVE:
+        what = plan.params[0]
+        streets = range(NUM_STREETS) if what != "pool&park" else (plan.params[1],)
+        wants_pool = what in ("pool", "pool&park")
+        for x in streets:
+            if wants_pool and sheet.pools[x] + _pool_boxes_alive(sheet, x) < 3:
+                continue
+            serves[x] = 1
+            if what in ("park", "pool&park"):
+                parks[x] = PARK_BOXES[x] - sheet.parks[x]
+            if wants_pool:
+                pools[x] = 3 - sheet.pools[x]
+    else:
+        raise NotImplementedError(f"plan {plan.id} belongs to an unsupported expansion")
+
+    if done:
+        # A completed plan wants nothing.
+        #
+        # Note this is gated on `done` ALONE, not on `done or not alive`.  Every
+        # field except `street_serves` states what the plan still *wants*, and
+        # that stays true of a plan that has become unreachable -- a dead estate
+        # plan is still short a 3 and a 6.  Aliveness has exactly one home, the
+        # `feasible` scalar, mirrored by `street_serves`; blanking the demand
+        # vectors as well would make the two fields redundant and destroy the
+        # information a reader needs to see WHY a plan died.
+        temps_needed = 0
+        fences_needed = 0
+        estate_shortfall = [0] * MAX_ESTATE_SIZE
+        parks = [0, 0, 0]
+        pools = [0, 0, 0]
+        houses = [0, 0, 0]
+        bis = [0, 0, 0]
+        roundabout = [0, 0, 0]
+        targets = []
+
+    if not alive:
+        # No street can contribute to a plan that cannot complete.  Per-kind
+        # branches above judge streets independently -- a `pool` plan needs two
+        # viable streets and may have one -- so the whole-plan verdict has to be
+        # applied here rather than left to each branch.
+        serves = [0, 0, 0]
+    elif done:
+        # ...but a COMPLETED plan's streets stay ALIVE.  A street whose work is
+        # finished is the one that contributed most, and reading it as "cannot
+        # contribute" was the defect the aliveness definition exists to fix.
+        pass
+
+    return Requirements(
+        temps_needed=temps_needed,
+        fences_needed=fences_needed,
+        estate_shortfall=tuple(estate_shortfall),
+        parks_needed=tuple(parks),
+        pools_needed=tuple(pools),
+        houses_needed=tuple(houses),
+        bis_needed=tuple(bis),
+        roundabout_needed=tuple(roundabout),
+        street_serves=tuple(serves),
+        target_boxes=tuple(targets),
+    )
+
+
+def turns_lower_bound(plan: Plan, sheet: "Sheet") -> int:
+    """Fewest turns in which ``plan`` could still complete.  A hard bound.
+
+    Two terms, both sound:
+
+    ``effect_term``
+        A turn takes **one** combination and so applies **one** effect mark, so
+        the marks still needed *sum*.  An earlier draft took a max over effects;
+        sound, but needlessly weak on the one feature sold as a hard bound -- and
+        it contradicted the argument for the rate features, which sum for exactly
+        this reason.
+
+    ``house_term``
+        Houses needed divided by **three**, the absolute per-turn ceiling:
+        ``ROUNDABOUT_OPEN`` is legal before the write and a roundabout counts as
+        a built house, so a turn can be roundabout -> write -> bis.  Three is a
+        constant, deliberately not ``max_houses_this_turn`` -- a *lower bound on
+        turns* must not fluctuate with the current offer.
+
+    The estate contribution is ``0 if done else 1``, not the number of missing
+    estates.  One SURVEYOR fence can raise the estate match by two -- a fenced
+    run of six against a plan needing ``(3, 3)`` scores nothing, and one fence in
+    its middle scores both -- so "one missing estate is one fence" is not a lower
+    bound.  Weak but sound is the correct trade here.
+    """
+    req = requirements(plan, sheet)
+    effect_term = req.temps_needed + sum(req.parks_needed) + sum(req.pools_needed)
+    if any(req.estate_shortfall):
+        effect_term += 1
+    houses = sum(req.houses_needed)
+    house_term = -(-houses // 3)  # ceiling division
+    return max(effect_term, house_term)

@@ -392,3 +392,109 @@ def test_box_spans_are_zero_on_filled_boxes():
     sheet.write(7, (2, 6), turn=1)
     assert sheet.box_spans()[2][6] == 0
     assert sheet.box_spans()[2][5] == 7, "boxes left of a 7 accept 0..6"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3 helpers: hypotheticals, and the actions that bypass numeric fit
+#
+# Every test below exists because a review round produced an unsound
+# feasibility rule by reasoning about numbers and forgetting that a roundabout,
+# a bis or a fence writes a house without one.  See ENCODER_V3_SPEC.md §6.1.
+# ──────────────────────────────────────────────────────────────────────────
+def _written(rows: list[list[object]]) -> Sheet:
+    """A sheet with ``rows`` written directly, padded with ``None``."""
+    sheet = Sheet.new()
+    for x, row in enumerate(rows):
+        for y, n in enumerate(row):
+            if n is not None:
+                sheet.numbers[x][y] = n
+    return sheet
+
+
+def test_free_estate_size_counts_excludes_plan_consumed_estates():
+    # Street 0: 1 2 | 5  -> estates of size 2 and 1.
+    sheet = _written([[1, 2, 5]])
+    sheet.fences[0][1] = True
+    sheet.fences[0][2] = True
+    assert sheet.estate_size_counts()[:2] == [1, 1]
+    assert sheet.free_estate_size_counts()[:2] == [1, 1]
+
+    # A City Plan eats the size-1 estate.  It still SCORES -- estate_score
+    # counts every estate -- but it is no longer available to another plan.
+    sheet.mark_top_fences([(0, 2)])
+    assert sheet.estate_size_counts()[:2] == [1, 1]
+    assert sheet.free_estate_size_counts()[:2] == [0, 1]
+
+
+def test_span_if_roundabout_revives_a_dead_box():
+    # 5 _ 6 : the middle box is bounded by 5 and 6, so nothing fits.
+    sheet = _written([[5, None, 6]])
+    assert sheet.box_spans()[0][1] == 0
+    # One roundabout cannot help: the box is its own whole gap, so there is no
+    # other empty box in the run to place a roundabout in.
+    assert sheet.span_if_roundabout()[0][1] == 0
+
+    # 5 _ _ 6 : now a roundabout in the run removes one of the bounds.
+    sheet = _written([[5, None, None, 6]])
+    assert sheet.box_spans()[0][1] == 0
+    revived = sheet.span_if_roundabout()[0][1]
+    assert revived > 0
+
+
+def test_span_if_roundabout_collapses_when_none_available():
+    sheet = _written([[5, None, None, 6]])
+    assert sheet.span_if_roundabout(available=False) == sheet.box_spans()
+
+    sheet.roundabouts = 2  # both spent
+    assert not sheet.can_build_roundabout()
+    assert sheet.span_if_roundabout() == sheet.box_spans()
+
+
+def test_capacity_if_roundabout_never_below_plain_capacity():
+    sheet = _written([[9, None, None, None, 10]])
+    plain = sheet.placement_capacity()
+    repaired = sheet.capacity_if_roundabout()
+    assert repaired[0] >= plain[0]
+    assert sheet.capacity_if_roundabout(available=False) == plain
+
+
+def test_bis_reaches_boxes_no_number_can():
+    """The R5 counter-example: capacity 0, every span 0, every gap bis-writable."""
+    # The whole street, so no slack gap is left over at the right-hand end.
+    sheet = _written([[1, None, 2, None, 3, None, 4, None, 5, 6]])
+    assert sheet.placement_capacity()[0] == 0
+    assert all(sheet.box_spans()[0][y] == 0 for y in (1, 3, 5, 7))
+    # ...yet a bis copies the neighbour, with no ascending-order check.
+    assert all(sheet.bis_reachable(0, y) for y in (1, 3, 5, 7))
+    assert sheet.bis_reach()[0] == 4
+
+
+def test_bis_reachable_is_permissive_about_the_future():
+    # An empty neighbour counts: it may be written later.
+    sheet = _written([[None, None, None]])
+    assert sheet.bis_reachable(0, 0)
+    # A roundabout neighbour never counts, and a fence blocks the side.
+    sheet = _written([[ROUNDABOUT, None, 4]])
+    assert sheet.bis_reachable(0, 1)      # via the 4 on the right
+    sheet.fences[0][1] = True
+    assert not sheet.bis_reachable(0, 1)  # roundabout left, fenced right
+
+
+def test_bis_stays_legal_after_its_track_saturates():
+    """The track saturates, it does not gate -- `legal_actions` never reads it."""
+    sheet = _written([[1, None, 2, None, 3, None, 4, None, 5, 6]])
+    sheet.bis_marks = 9  # BIS_BOXES: every penalty box already crossed off
+    assert sheet.bis_reachable(0, 1)
+    assert sheet.bis_reach()[0] == 4
+
+
+def test_an_extremity_is_bis_reachable_from_box_one():
+    """Why the EXTREMITIES death test needs a bis term (R5 finding 1)."""
+    sheet = _written([[None, 7]])
+    assert sheet.box_spans()[0][0] == 7      # MIN_NUMBER is 0, so 0..6 fit
+    # A 0 is reachable -- MIN_NUMBER is 0 and a temp shifts a 1 down to it --
+    # and nothing at all fits to the left of one.
+    sheet = _written([[None, 0]])
+    assert sheet.box_spans()[0][0] == 0
+    assert sheet.span_if_roundabout()[0][0] == 0   # no other empty box in the gap
+    assert sheet.bis_reachable(0, 0)               # but a bis copies the 0

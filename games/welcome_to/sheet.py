@@ -46,6 +46,37 @@ from games.welcome_to.constants import (
     STREET_SIZES,
 )
 
+def _row_capacity(row: list[Optional[int]], size: int) -> int:
+    """The most houses that could still be written in one street's ``row``.
+
+    Factored out of :meth:`Sheet.placement_capacity` so that
+    :meth:`Sheet.capacity_if_roundabout` can evaluate a *hypothetical* row
+    through the identical rule.  Two copies of this arithmetic would drift, and
+    the hypothetical is only meaningful if it is the same function.
+    """
+    total = 0
+    y = 0
+    while y < size:
+        if row[y] is not None:
+            y += 1
+            continue
+        start = y
+        while y < size and row[y] is None:
+            y += 1
+        run = y - start
+
+        low = MIN_NUMBER - 1
+        left = start - 1
+        if left >= 0 and row[left] is not None and row[left] != ROUNDABOUT:
+            low = row[left]
+        high = MAX_NUMBER + 1
+        if y < size and row[y] is not None and row[y] != ROUNDABOUT:
+            high = row[y]
+
+        total += min(run, max(0, high - low - 1))
+    return total
+
+
 #: ``(street, box)``
 Pos = tuple[int, int]
 #: ``(street, first box, size)`` -- a housing estate.
@@ -224,31 +255,10 @@ class Sheet:
         the first box of a street destroys nine placements at once.  It is
         exposed as a feature and used by :class:`~games.welcome_to.bots.GreedyBot`.
         """
-        out: list[int] = []
-        for x, size in enumerate(STREET_SIZES):
-            row = self.numbers[x]
-            total = 0
-            y = 0
-            while y < size:
-                if row[y] is not None:
-                    y += 1
-                    continue
-                start = y
-                while y < size and row[y] is None:
-                    y += 1
-                run = y - start
-
-                low = MIN_NUMBER - 1
-                left = start - 1
-                if left >= 0 and row[left] is not None and row[left] != ROUNDABOUT:
-                    low = row[left]
-                high = MAX_NUMBER + 1
-                if y < size and row[y] is not None and row[y] != ROUNDABOUT:
-                    high = row[y]
-
-                total += min(run, max(0, high - low - 1))
-            out.append(total)
-        return out
+        return [
+            _row_capacity(self.numbers[x], size)
+            for x, size in enumerate(STREET_SIZES)
+        ]
 
     def total_span(self) -> int:
         """Sum of :meth:`box_spans` — remaining freedom, which does not saturate.
@@ -261,6 +271,122 @@ class Sheet:
         eight points a game.
         """
         return sum(sum(row) for row in self.box_spans())
+
+    # ------------------------------------------------------------------
+    # Hypotheticals: what a roundabout or a bis could still reach
+    #
+    # Every one of these exists because a house can reach a box that no *drawn
+    # number* can.  `build_roundabout` writes the sentinel and
+    # `available_locations(None)` ignores numeric fit; `bis_candidates` has no
+    # ascending-order check at all.  Four review rounds produced unsound
+    # feasibility tests by reasoning about numbers and forgetting both.
+    # ------------------------------------------------------------------
+    def span_if_roundabout(self, available: bool = True) -> list[list[int]]:
+        """:meth:`box_spans`, but allowing one roundabout elsewhere in the street.
+
+        A roundabout is written into its box but is skipped when
+        :meth:`box_spans` looks for a bounding number, so placing one *between*
+        an empty box and the number hemming it in removes that bound entirely.
+        This is what makes the deferred-roundabout line representable: a box the
+        plain span calls dead is alive for the price of a roundabout.
+
+        Only one roundabout may be placed, so a box can have its left bound or
+        its right bound removed, never both.  ``available=False`` returns
+        :meth:`box_spans` unchanged -- pass it when the variant has no
+        roundabouts or both are already spent, so the difference against
+        :meth:`box_spans` never reports option value for an option that is gone.
+        """
+        spans = self.box_spans()
+        if not available or not self.can_build_roundabout():
+            return spans
+
+        for x, size in enumerate(STREET_SIZES):
+            row = self.numbers[x]
+            for y in range(size):
+                if row[y] is not None:
+                    continue
+                bounds = self.gap_bounds(x, y)
+                assert bounds is not None
+                first, last, low, high = bounds
+                best = spans[x][y]
+                # A roundabout anywhere in [first, y-1] is the first written box
+                # seen scanning left, and it carries no number -- so the left
+                # bound falls away.
+                if y > first:
+                    best = max(best, max(0, high - (MIN_NUMBER - 1) - 1))
+                if y < last:
+                    best = max(best, max(0, (MAX_NUMBER + 1) - low - 1))
+                spans[x][y] = best
+        return spans
+
+    def capacity_if_roundabout(self, available: bool = True) -> list[int]:
+        """Per street, the best :meth:`placement_capacity` one roundabout can buy.
+
+        The roundabout *consumes* the box it sits in, so the returned figure
+        counts one fewer empty box than the street currently holds.  Any caller
+        comparing this against a count of empties must compare against the
+        hypothetical sheet's own count, not the current one.
+        """
+        capacity = self.placement_capacity()
+        if not available or not self.can_build_roundabout():
+            return capacity
+
+        for x, size in enumerate(STREET_SIZES):
+            row = self.numbers[x]
+            best = capacity[x]
+            for r in range(size):
+                if row[r] is not None:
+                    continue
+                hypothetical = list(row)
+                hypothetical[r] = ROUNDABOUT
+                best = max(best, _row_capacity(hypothetical, size))
+            capacity[x] = best
+        return capacity
+
+    def bis_reachable(self, x: int, y: int) -> bool:
+        """Could ``(x, y)`` **ever** be filled by a bis?  A sound over-estimate.
+
+        Deliberately permissive, because the only caller is a feasibility test
+        that may declare death solely when even the over-estimate says no:
+
+        * an *empty* neighbour counts, since it may be written later and a bis
+          copies whatever number ends up there;
+        * an unfenced slot counts, since fences are only ever added, never
+          removed, so assuming it stays open can only over-count.
+
+        A roundabout neighbour never counts -- ``bis_candidates`` refuses to
+        duplicate one -- and neither does a slot that is already fenced.
+
+        ⚠ **There is deliberately no ``bis_marks`` test.** The bis track
+        saturates, it does not gate: ``legal_actions`` offers ``bis_candidates``
+        at ``ACTION_BIS`` without reading ``bis_marks``, and the apply path uses
+        ``min(bis_marks + 1, BIS_BOXES)``.  Past nine marks a bis is free of its
+        own penalty and still writes a house, exactly like the temp agency past
+        eleven.  Capping here would under-count reachability and make every
+        caller's death test unsound.
+        """
+        if self.numbers[x][y] is not None:
+            return False
+        size = STREET_SIZES[x]
+        if y > 0 and not self.fences[x][y - 1]:
+            if self.numbers[x][y - 1] != ROUNDABOUT:
+                return True
+        if y < size - 1 and not self.fences[x][y]:
+            if self.numbers[x][y + 1] != ROUNDABOUT:
+                return True
+        return False
+
+    def bis_reach(self) -> list[int]:
+        """Per street, an upper bound on boxes a bis could still fill.
+
+        The only bound is the supply of reachable boxes.  ``BIS_BOXES`` does
+        **not** enter it -- see :meth:`bis_reachable` -- and an earlier draft
+        that took ``min(BIS_BOXES - bis_marks, ...)`` was unsound.
+        """
+        return [
+            sum(1 for y in range(size) if self.bis_reachable(x, y))
+            for x, size in enumerate(STREET_SIZES)
+        ]
 
     def gap_bounds(self, x: int, y: int) -> Optional[tuple[int, int, int, int]]:
         """``(first box, last box, bounding low number, bounding high number)``.
@@ -457,6 +583,22 @@ class Sheet:
         """``RealEstate::getAssocSizeNumber`` -- estates of size 1..6 (bigger ignored)."""
         mult = [0] * MAX_ESTATE_SIZE
         for _, _, size in self.estates():
+            if size <= MAX_ESTATE_SIZE:
+                mult[size - 1] += 1
+        return mult
+
+    def free_estate_size_counts(self) -> list[int]:
+        """:meth:`estate_size_counts` over :meth:`free_estates` only.
+
+        The two are different questions and the encoder needs both.
+        :meth:`estate_size_counts` is the **scoring** multiset -- a top fence
+        stops a City Plan re-using an estate, it does not remove its real-estate
+        points, so :meth:`estate_score` counts every estate.  This one is the
+        **plan-eligibility** multiset, which is what ``EstatePlan::canBeScored``
+        matches against.
+        """
+        mult = [0] * MAX_ESTATE_SIZE
+        for _, _, size in self.free_estates():
             if size <= MAX_ESTATE_SIZE:
                 mult[size - 1] += 1
         return mult
