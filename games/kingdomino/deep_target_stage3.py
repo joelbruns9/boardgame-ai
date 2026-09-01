@@ -209,10 +209,13 @@ def run_stage3(
     reuse_ordinary_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     manifest = json.loads(cohort_path.read_text(encoding="utf-8"))
-    if manifest.get("split") != "development" or not manifest.get(
+    split = manifest.get("split")
+    if split not in {"development", "confirmation"} or not manifest.get(
         "selection_frozen_before_stage3"
     ):
-        raise ValueError("Stage-3 requires the frozen development cohort")
+        raise ValueError(
+            "Stage-3 requires a frozen development or confirmation cohort"
+        )
     if _sha256(stage2_path) != manifest["stage2_sha256"]:
         raise ValueError("Stage-2 hash does not match frozen Stage-3 cohort")
     entries = list(manifest["entries"])
@@ -372,7 +375,7 @@ def run_stage3(
                 "position_id": position_id,
                 "table_id": entry["table_id"],
                 "source_decision_index": entry["source_decision_index"],
-                "split": "development",
+                "split": split,
                 "deck_count": entry["deck_count"],
                 "phase": entry["phase"],
                 "state_sha256": entry["state_sha256"],

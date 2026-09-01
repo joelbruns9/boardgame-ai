@@ -312,7 +312,8 @@ def run_realnet_oracle(
     # Fixed-weight network shared by both paths.
     torch.manual_seed(cfg.seed)
     net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim).to("cpu").eval()
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling).to("cpu").eval()
 
     # Serial: batch-1 evaluator wrapping the net.
     serial = play_games_serial(cfg, seeds, make_serial_evaluator(net, device="cpu"))
@@ -320,7 +321,8 @@ def run_realnet_oracle(
     # Parallel: real server, 1 worker, max_batch=1 (so the server forward is
     # batch-1 too, matching serial numerically).
     model_kwargs = dict(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim)
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling)
     server = RemoteInferenceServer(
         n_workers=1, model_kwargs=model_kwargs, device="cpu",
         max_batch=1, max_wait_ms=20.0, debug_checks=True)

@@ -1,11 +1,9 @@
 # Kingdomino: what is left to try
 
-- **Status:** Living decision record. Placement headroom and
-  explicit/progressive chance modeling are resolved negative. Corrected
-  deep-target reanalysis passed its development gate and now requires the
-  untouched confirmation split. The contextual open-loop offline gate remains
-  a separate low-compute search question.
-- **Date:** 2026-08-13
+- **Status:** **Final closure record.** Placement headroom, chance modeling,
+  selective deep-target reanalysis, and the final 3–4x capacity ladder are all
+  resolved negative. Ship `current_best`; no 5090 rental.
+- **Date:** 2026-08-14
 - **Current model:** `runs/kingdomino/best_checkpoint/current_best.pt`
   (sha `4bf07b0c…`, 80x6), placed **3rd in a three-month BGA arena**.
 - **Purpose:** capture credible remaining levers and, more importantly, the
@@ -25,8 +23,9 @@ obvious directions have been tried.
 | run11a — exploiter loop (PSRO-lite) | null: **locally unexploitable at equal capacity** |
 | 2026-08 — tile action-value head (M0-M2.5) | closed, see `AZ_TILE_Q_HEAD_PLAN.md` |
 | 2026-08 — exact late-placement headroom audit | closed: model no worse than strong humans on confirmation; see `PLACEMENT_LATE_AUDIT_FINDINGS.md` |
-| 2026-08 - selective 30k replay-reanalysis qualification | development passed after root-mask correction; confirmation pending; see `DEEP_TARGET_STAGE3_FINDINGS.md` |
+| 2026-08 - selective 30k replay-reanalysis qualification | closed: corrected development passed, frozen confirmation failed `LCB > 0`; see `DEEP_TARGET_STAGE3_FINDINGS.md` |
 | 2026-08 - exact/progressive post-reveal chance exposure | closed: the production progressive treatment scored 48.24% at 800 simulations and 49.46% at 4,800 against ordinary open loop; see `CHANCE_PROGRESSIVE_GATE0_FINDINGS.md` |
+| 2026-08 - final capacity/data attempt | closed: no pooling/128-channel arm beat the re-converged 80x6 control; best large arm was 3.29% worse on policy CE; see `KINGDOMINO_FINAL_CAPACITY_PLAN.md` |
 
 The run11a result is the strongest: an exploiter warm-started as a clone of the
 banked net, trained specifically to beat it, plateaued at ~48.5% over ~15,000
@@ -43,19 +42,12 @@ first claim matched the human's **76.4%** of the time, top-2 **95.5%**, with onl
 are claim-order statistics, not necessarily disagreements about the completed
 two-tile bundle; see `BGA_TWO_DISAGREEMENT_CASES.md`.
 
-## 2. Recommended next measurement
+## 2. Historical candidate measurements — no longer recommended
 
-Placement is closed. Deep-target reanalysis has earned its predeclared
-confirmation measurement, but not yet a training experiment. Separately, one
-cheap search-mechanic gate can reuse existing chance traces: test whether a
-compact context recovers the small observation-conditioned signal without
-recreating the failed exact-row tree. Contextual open loop and CORAL are one
-abstraction family, not separate levers.
-
-If that gate fails, the next distinct question is whether starting self-play
-from verified BGA states improves state-distribution coverage. That is not
-target reanalysis and needs its own sampling, value-label, mixture-weight, and
-hidden-information contract.
+There is no recommended next measurement for this model line. The sections
+below are retained as historical rationale so their ideas are not rediscovered
+without genuinely new evidence. Contextual open loop/CORAL was closed by owner
+decision; deep-target confirmation and the final capacity gate both failed.
 
 ### 2.1 Contextual open-loop abstraction — offline gate only
 
@@ -112,7 +104,7 @@ earns an equal-wall-time advisor comparison, then a small paired-game gate; it
 does not directly authorize self-play or training. See
 `KINGDOMINO_CONTEXTUAL_OPEN_LOOP_PLAN.md`.
 
-### 2.2 Deep-target qualification - development positive, confirmation pending
+### 2.2 Deep-target qualification - closed on confirmation
 
 **Question.** On realistic decision states, does the 4,800-sim search choose
 actions with material regret relative to a stable, deeper information-set-safe
@@ -162,10 +154,12 @@ teacher uplift over the 4,800 tile averaged +0.00868 Q decision-weighted and
 +0.00888 Q, with interval [+0.00050, +0.01863]. Three gains exceeded +0.03 and
 none was below -0.01, but two source positions dominate the signal.
 
-The positive lower bound passes the development gate. The 460 confirmation
-positions remain frozen and must now be tested with the method unchanged.
-Selective reanalysis is qualified for confirmation, **not yet for training**;
-a higher general self-play budget is not implied. See
+**Frozen confirmation failed (2026-08-13).** The unchanged staged method
+selected 11 suspicious roots across 7 confirmation games. Matched-teacher
+cross-seed uplift was +0.00041 Q decision-weighted and -0.00006 Q
+game-weighted, with a game-clustered 95% interval of [-0.00165, +0.00127]. The
+negative lower bound fails the hard gate. Selective reanalysis is dropped as a
+training component; sidecars retain diagnostic value only. See
 `DEEP_TARGET_STAGE3_FINDINGS.md`.
 
 This is a qualification corpus, not training data. The current KD replay buffer
@@ -173,12 +167,12 @@ cannot itself be reanalyzed because it stores encoded tensors rather than a
 reconstructable `GameState`. The BGA suite asks whether building reconstructable
 self-play sidecars and selective relabeling is worth that engineering cost.
 
-**Completed design.** On a frozen development subset, ordinary 4,800-sim actions
+**Completed design.** On frozen development and confirmation subsets, ordinary 4,800-sim actions
 were compared with repeated 30,000-sim searches using common random numbers.
 Every pick group received a matched conditional probe. Cross-seed evaluation
 distinguished stable value improvement from determinization noise. Because the
-corrected development gate passed, the planned confirmation pass is now the
-next decision point and has not yet been run.
+corrected development gate passed, but the unchanged confirmation pass did not
+reproduce its positive lower bound.
 
 The primary statistic is not action disagreement. It is the deep teacher's
 estimated value loss after forcing the 4,800-sim action, with uncertainty
@@ -190,9 +184,8 @@ selective deep-target dataset. Broad material regret earns a compute-matched
 training pilot, but still does not justify 30,000 sims on every self-play move;
 the likely treatment is 4,800-sim self-play plus selective 20k–30k reanalysis.
 
-**Gate result.** Development found concentrated, reproducible regret and earned
-confirmation. No training pilot is warranted until confirmation independently
-passes.
+**Gate result.** Development found concentrated regret and earned confirmation;
+confirmation failed. No selective-reanalysis training pilot is warranted.
 
 **Caveat.** BGA positions test real strong-human support, not the full current
 self-play distribution. A positive result qualifies reanalysis; it does not by

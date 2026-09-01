@@ -1288,6 +1288,7 @@ def load_checkpoint_network(path: str | Path, device: str):
         channels=int(config.get("channels", 96)),
         blocks=int(config.get("blocks", 8)),
         bilinear_dim=int(config.get("bilinear_dim", 64)),
+        global_pooling=bool(config.get("global_pooling", False)),
     )
     net.load_state_dict(state_dict)
     return net.to(device).eval(), config

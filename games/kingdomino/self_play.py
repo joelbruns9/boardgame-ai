@@ -135,6 +135,7 @@ class SelfPlayConfig:
     channels: int = 96
     blocks: int = 8
     bilinear_dim: int = 64
+    global_pooling: bool = False
     # search
     n_simulations: int = 100
     n_determinizations: int = 1   # PIMC worlds sampled per move
@@ -2773,7 +2774,7 @@ def validate_checkpoint_config(ckpt: dict, cfg: SelfPlayConfig) -> None:
 
     # Hard errors: architecture must match exactly.  checkpoint_version lives on
     # the network class, not the config; compare against KingdominoNet's value.
-    for field in ("channels", "blocks"):
+    for field in ("channels", "blocks", "global_pooling"):
         if field in saved and saved[field] != getattr(cfg, field, None):
             raise ValueError(
                 f"Checkpoint config mismatch on '{field}': "
@@ -2805,6 +2806,7 @@ def load_generator_net(path: str, cfg: SelfPlayConfig) -> KingdominoNet:
         blocks=cfg.blocks,
         bilinear_dim=cfg.bilinear_dim,
         score_scale=cfg.score_scale,
+        global_pooling=cfg.global_pooling,
     ).to(cfg.device)
     gen.load_state_dict(state)
     gen.eval()
@@ -3093,7 +3095,8 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
 
     net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
                         bilinear_dim=cfg.bilinear_dim,
-                        score_scale=cfg.score_scale).to(cfg.device)
+                        score_scale=cfg.score_scale,
+                        global_pooling=cfg.global_pooling).to(cfg.device)
     # Iteration the warm-start checkpoint reached (0 = fresh run).  Used only as
     # the reference point for warm_buffer staleness filtering — the training loop
     # below always counts iterations from 1.
@@ -3832,6 +3835,7 @@ def run_self_play_training(cfg: SelfPlayConfig, verbose: bool = True) -> dict:
                             blocks=iter_cfg.blocks,
                             bilinear_dim=iter_cfg.bilinear_dim,
                             score_scale=iter_cfg.score_scale,
+                            global_pooling=iter_cfg.global_pooling,
                         )
                         candidate_net.load_state_dict(avg_state)
                         candidate_net.to(iter_cfg.device)
@@ -4437,6 +4441,8 @@ if __name__ == "__main__":
     p.add_argument("--channels", type=int, default=96)
     p.add_argument("--blocks", type=int, default=8)
     p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--global_pooling", action="store_true",
+                   help="use global-pooling residual trunk blocks")
     p.add_argument("--benchmark_seeds", type=int, default=10)
     p.add_argument("--benchmark_determinizations", type=int, default=None,
                    help="PIMC worlds per benchmark move (default: reuse --determinizations)")
@@ -4739,7 +4745,8 @@ if __name__ == "__main__":
         train_steps_schedule=a.train_steps_schedule,
         buffer_capacity_schedule=a.buffer_capacity_schedule,
         buffer_capacity=a.buffer, channels=a.channels, blocks=a.blocks,
-        bilinear_dim=a.bilinear_dim, benchmark_seeds=a.benchmark_seeds,
+        bilinear_dim=a.bilinear_dim, global_pooling=a.global_pooling,
+        benchmark_seeds=a.benchmark_seeds,
         benchmark_determinizations=a.benchmark_determinizations,
         grad_clip=a.grad_clip, augment=not a.no_augment,
         weight_decay=a.weight_decay, policy_weight=a.policy_weight,

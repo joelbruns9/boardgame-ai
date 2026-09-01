@@ -107,6 +107,8 @@ def main() -> None:
     p.add_argument("--bilinear_dim", type=int, default=64)
     p.add_argument("--norm", choices=["group", "batch"], default="group",
                    help="normalization layer in the residual trunk")
+    p.add_argument("--global_pooling", action="store_true",
+                   help="use global-pooling residual blocks")
     p.add_argument("--batches", default="1,2,4,8,16,24,32,48,64,96,128,192,256")
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=15)
@@ -137,12 +139,14 @@ def main() -> None:
     mb_shape, ob_shape, flat_size = _input_shapes()
     net = KingdominoNet(channels=a.channels, blocks=a.blocks,
                         bilinear_dim=a.bilinear_dim,
-                        norm=a.norm).to(a.device).eval()
+                        norm=a.norm,
+                        global_pooling=a.global_pooling).to(a.device).eval()
     if a.channels_last:
         net = net.to(memory_format=torch.channels_last)
     batches = [int(x) for x in a.batches.split(",") if x.strip()]
 
-    print(f"device={a.device}  net={a.channels}ch/{a.blocks}b norm={a.norm}  "
+    print(f"device={a.device}  net={a.channels}ch/{a.blocks}b norm={a.norm} "
+          f"global_pooling={a.global_pooling}  "
           f"mb={tuple(mb_shape)} flat={flat_size}  "
           f"cudnn_benchmark={a.cudnn_benchmark}  "
           f"tf32={not a.no_tf32}  amp={a.amp_inference}  "

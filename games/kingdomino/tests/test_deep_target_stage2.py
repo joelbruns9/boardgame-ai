@@ -64,6 +64,9 @@ def test_cohort_selection_uses_both_close_repeats_and_one_starved_per_deck():
     assert "starved-c" in by_id
     assert "confirmation" not in by_id
 
+    confirmation = select_cohort(rows, CohortRules(), split="confirmation")
+    assert [entry["position_id"] for entry in confirmation] == ["confirmation"]
+
 
 def test_restricted_aggregation_accepts_exact_forced_pick_action_set():
     state = GameState.new(seed=91, start_player=0)

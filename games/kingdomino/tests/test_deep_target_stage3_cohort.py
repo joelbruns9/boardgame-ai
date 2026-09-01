@@ -47,3 +47,6 @@ def test_stage3_selection_has_three_predeclared_routes_and_no_confirmation():
     assert by_id["changed"]["reasons"] == ["stable_consensus_pick_changed"]
     assert by_id["unstable"]["reasons"] == ["stage2_pick_unstable"]
     assert by_id["forced"]["reasons"] == ["starved_forced_q_within_003"]
+
+    confirmation = select_stage3(stage2, forced, split="confirmation")
+    assert [entry["position_id"] for entry in confirmation] == ["confirmation"]

@@ -114,6 +114,34 @@ class ResBlock(nn.Module):
         return F.relu(x + residual, inplace=True)
 
 
+class GlobalPoolResBlock(nn.Module):
+    """Residual block with a learned board-wide bias before the second conv.
+
+    Average and max statistics expose non-local board context to every spatial
+    location.  The projection is zero-initialized by ``KingdominoNet`` so the
+    block begins as an ordinary residual block and learns the global correction
+    without perturbing the initial activation scale.
+    """
+
+    def __init__(self, channels: int, norm: str = "group"):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm1 = _make_norm(norm, channels)
+        self.global_bias = nn.Linear(2 * channels, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm2 = _make_norm(norm, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = F.relu(self.norm1(self.conv1(x)), inplace=True)
+        pooled = torch.cat(
+            [x.mean(dim=(2, 3)), x.amax(dim=(2, 3))], dim=1
+        )
+        x = x + self.global_bias(pooled).unsqueeze(-1).unsqueeze(-1)
+        x = self.norm2(self.conv2(x))
+        return F.relu(x + residual, inplace=True)
+
+
 class KingdominoNet(nn.Module):
     # Architecture version stamped into checkpoints so the loader (in
     # self_play.py) can detect migrations.  Bumped to 3 for the symmetric
@@ -130,11 +158,13 @@ class KingdominoNet(nn.Module):
         flat_policy_hidden: int = 256,
         norm: str = "group",
         score_scale: float = 160.0,
+        global_pooling: bool = False,
     ):
         super().__init__()
         self.channels = channels
         self.blocks = blocks
         self.bilinear_dim = D = bilinear_dim
+        self.global_pooling = bool(global_pooling)
         # Divisor mapping a raw board score to the normalized target the score
         # heads predict (raw_score / score_scale).  Stored for callers that
         # denormalize predictions; not applied inside forward.
@@ -146,8 +176,9 @@ class KingdominoNet(nn.Module):
             _make_norm(norm, channels),
             nn.ReLU(inplace=True),
         )
+        block_type = GlobalPoolResBlock if self.global_pooling else ResBlock
         self.res_blocks = nn.ModuleList(
-            [ResBlock(channels, norm) for _ in range(blocks)]
+            [block_type(channels, norm) for _ in range(blocks)]
         )
 
         # Global context = [avg_my, max_my, avg_opp, max_opp] → 4C.  Max pooling
@@ -209,6 +240,10 @@ class KingdominoNet(nn.Module):
                              torch.eye(NUM_PICK_SLOTS), persistent=False)
 
         self._init_weights()
+        if self.global_pooling:
+            for block in self.res_blocks:
+                nn.init.zeros_(block.global_bias.weight)
+                nn.init.zeros_(block.global_bias.bias)
 
     def _init_weights(self):
         for m in self.modules():

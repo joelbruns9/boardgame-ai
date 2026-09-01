@@ -91,12 +91,14 @@ def _sample_rank(position_id: str, salt: str) -> str:
 def select_cohort(
     stage1_rows: list[dict[str, Any]],
     rules: CohortRules = CohortRules(),
+    *,
+    split: str = "development",
 ) -> list[dict[str, Any]]:
     """Select the frozen Stage-2 cohort without consulting Stage-2 outcomes."""
     selected: dict[str, set[str]] = defaultdict(set)
     by_id = {str(row["position_id"]): row for row in stage1_rows}
     for row in stage1_rows:
-        if row.get("split") != "development":
+        if row.get("split") != split:
             continue
         position_id = str(row["position_id"])
         live = abs(_mean_root(row)) <= rules.root_abs_max
@@ -110,7 +112,7 @@ def select_cohort(
     candidates: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in stage1_rows:
         position_id = str(row["position_id"])
-        if row.get("split") != "development" or position_id in selected:
+        if row.get("split") != split or position_id in selected:
             continue
         if not bool(row["screen_flags"].get("pick_group_starved")):
             continue
@@ -156,16 +158,21 @@ def freeze_cohort(
     corpus_path: Path,
     output_path: Path,
     rules: CohortRules = CohortRules(),
+    split: str = "development",
 ) -> dict[str, Any]:
     rows = _read_jsonl(stage1_path)
-    entries = select_cohort(rows, rules)
+    entries = select_cohort(rows, rules, split=split)
     reasons: Counter[str] = Counter(
         reason for entry in entries for reason in entry["reasons"]
     )
     stage1_summary = json.loads(stage1_summary_path.read_text(encoding="utf-8"))
+    if stage1_summary.get("split") != split:
+        raise ValueError(
+            f"Stage-1 summary split {stage1_summary.get('split')!r} does not match {split!r}"
+        )
     manifest = {
         "schema": COHORT_SCHEMA,
-        "split": "development",
+        "split": split,
         "selection_frozen_before_stage2": True,
         "rules": {
             "primary": {
@@ -189,7 +196,7 @@ def freeze_cohort(
         },
         "positions": len(entries),
         "reason_counts": dict(sorted(reasons.items())),
-        "confirmation_positions": 0,
+        "confirmation_positions": len(entries) if split == "confirmation" else 0,
         "stage1": str(stage1_path),
         "stage1_sha256": _sha256(stage1_path),
         "stage1_summary": str(stage1_summary_path),
@@ -303,8 +310,13 @@ def run_stage2(
     limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     manifest = json.loads(cohort_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != COHORT_SCHEMA or manifest.get("split") != "development":
-        raise ValueError("Stage-2 cohort must be the frozen development manifest")
+    split = manifest.get("split")
+    if manifest.get("schema") != COHORT_SCHEMA or split not in {
+        "development", "confirmation"
+    }:
+        raise ValueError(
+            "Stage-2 cohort must be a frozen development or confirmation manifest"
+        )
     if _sha256(stage1_path) != manifest["stage1_sha256"]:
         raise ValueError("Stage-1 artifact hash does not match frozen cohort")
     if _sha256(corpus_path) != manifest["corpus_sha256"]:
@@ -420,7 +432,7 @@ def run_stage2(
                 "position_id": position_id,
                 "table_id": entry["table_id"],
                 "source_decision_index": entry["source_decision_index"],
-                "split": "development",
+                "split": split,
                 "deck_count": entry["deck_count"],
                 "phase": entry["phase"],
                 "state_sha256": entry["state_sha256"],
@@ -460,7 +472,9 @@ def run_stage2(
             "cohort_sha256": _sha256(cohort_path),
             "output": str(output_path),
             "output_sha256": _sha256(output_path),
-            "confirmation_positions_searched": 0,
+            "confirmation_positions_searched": (
+                len(rows) if split == "confirmation" else 0
+            ),
         }
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,6 +551,9 @@ def main() -> int:
     parser.add_argument("--sims", type=int, default=4800)
     parser.add_argument("--forced-sims", type=int, default=800)
     parser.add_argument("--freeze-only", action="store_true")
+    parser.add_argument(
+        "--split", choices=("development", "confirmation"), default="development"
+    )
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
 
@@ -546,6 +563,7 @@ def main() -> int:
             stage1_summary_path=args.stage1_summary,
             corpus_path=args.corpus,
             output_path=args.cohort,
+            split=args.split,
         )
         print(json.dumps({key: manifest[key] for key in ("schema", "positions", "reason_counts")}, indent=2))
         if args.freeze_only:

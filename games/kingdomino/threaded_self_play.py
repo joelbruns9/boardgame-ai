@@ -190,7 +190,8 @@ def run_threaded_self_play_training(
 
     # Training network (gradients here).
     net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim).to(cfg.device)
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling).to(cfg.device)
     if cfg.warm_start_path:
         ckpt = torch.load(cfg.warm_start_path, map_location=cfg.device)
         sd = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
@@ -336,6 +337,7 @@ if __name__ == "__main__":
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--global_pooling", action="store_true")
     # Search
     p.add_argument("--sims", type=int, default=50)
     p.add_argument("--determinizations", type=int, default=1)
@@ -388,6 +390,7 @@ if __name__ == "__main__":
 
     cfg = SelfPlayConfig(
         channels=a.channels, blocks=a.blocks, bilinear_dim=a.bilinear_dim,
+        global_pooling=a.global_pooling,
         n_simulations=a.sims, n_determinizations=a.determinizations,
         batch_size=a.batch_size, lr=a.lr, buffer_capacity=a.buffer,
         n_iterations=a.iterations, games_per_iteration=a.games_per_iter,

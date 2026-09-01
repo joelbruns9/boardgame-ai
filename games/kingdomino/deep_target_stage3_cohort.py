@@ -30,11 +30,12 @@ def select_stage3(
     forced_rows: list[dict[str, Any]],
     *,
     forced_q_gap_max: float = 0.03,
+    split: str = "development",
 ) -> list[dict[str, Any]]:
     reasons: dict[str, set[str]] = defaultdict(set)
     stage2_by_id = {str(row["position_id"]): row for row in stage2_rows}
     for row in stage2_rows:
-        if row.get("split") != "development":
+        if row.get("split") != split:
             continue
         position_id = str(row["position_id"])
         stage1_picks = {
@@ -49,7 +50,7 @@ def select_stage3(
             reasons[position_id].add("stage2_pick_unstable")
     for row in forced_rows:
         position_id = str(row["position_id"])
-        if stage2_by_id[position_id].get("split") != "development":
+        if stage2_by_id[position_id].get("split") != split:
             continue
         if any(
             bool(group["was_starved_at_4800"])
@@ -81,15 +82,24 @@ def freeze_stage3(
     forced_path: Path,
     output_path: Path,
 ) -> dict[str, Any]:
-    entries = select_stage3(_read_jsonl(stage2_path), _read_jsonl(forced_path))
+    stage2_rows = _read_jsonl(stage2_path)
+    splits = {str(row.get("split")) for row in stage2_rows}
+    if len(splits) != 1 or next(iter(splits)) not in {
+        "development", "confirmation"
+    }:
+        raise ValueError("Stage-2 artifact must contain exactly one recognized split")
+    split = next(iter(splits))
+    entries = select_stage3(
+        stage2_rows, _read_jsonl(forced_path), split=split
+    )
     reason_counts = Counter(reason for entry in entries for reason in entry["reasons"])
     manifest = {
         "schema": SCHEMA,
-        "split": "development",
+        "split": split,
         "selection_frozen_before_stage3": True,
         "positions": len(entries),
         "reason_counts": dict(sorted(reason_counts.items())),
-        "confirmation_positions": 0,
+        "confirmation_positions": len(entries) if split == "confirmation" else 0,
         "rules": {
             "include_stable_consensus_pick_changes_800_to_4800": True,
             "include_all_two_seed_pick_disagreements_at_4800": True,

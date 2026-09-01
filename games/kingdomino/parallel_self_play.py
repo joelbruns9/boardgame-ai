@@ -493,7 +493,8 @@ def run_parallel_self_play_training(
 
     # Training network — gradients live here, in the parent process.
     net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim).to(cfg.device)
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling).to(cfg.device)
     if cfg.warm_start_path:
         ckpt = torch.load(cfg.warm_start_path, map_location=cfg.device)
         sd = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
@@ -504,7 +505,8 @@ def run_parallel_self_play_training(
     # ── Inference (Python: a server process holding the net; Rust: none — each
     # worker holds an in-process net and calls it directly for leaf eval). ──
     model_kwargs = dict(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim)
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling)
     use_rust = (cfg.engine == "rust")
     use_batched = (cfg.engine in ("batched", "batched_open_loop"))
     use_open_loop = (cfg.engine == "open_loop")
@@ -879,6 +881,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--global_pooling", action="store_true")
     # Search
     p.add_argument("--sims", type=int, default=800)
     p.add_argument("--determinizations", type=int, default=1)
@@ -972,6 +975,7 @@ def main() -> None:
 
     cfg = SelfPlayConfig(
         channels=a.channels, blocks=a.blocks, bilinear_dim=a.bilinear_dim,
+        global_pooling=a.global_pooling,
         n_simulations=a.sims, n_determinizations=a.determinizations,
         batch_size=a.batch_size, sample_workers=a.sample_workers,
         lr=a.lr, buffer_capacity=a.buffer,

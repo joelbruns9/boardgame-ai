@@ -162,7 +162,12 @@ def run_a3(cfg: SelfPlayConfig, net, n_games: int, base: int,
     from games.kingdomino.parallel_self_play import (
         _init_worker, _generate_parallel, _worker_cleanup,
     )
-    mk = dict(channels=cfg.channels, blocks=cfg.blocks, bilinear_dim=cfg.bilinear_dim)
+    mk = dict(
+        channels=cfg.channels,
+        blocks=cfg.blocks,
+        bilinear_dim=cfg.bilinear_dim,
+        global_pooling=cfg.global_pooling,
+    )
     server = RemoteInferenceServer(
         n_workers=n_workers, model_kwargs=mk, device=cfg.device,
         max_batch=max_batch, max_wait_ms=max_wait_ms, debug_checks=False)
@@ -374,6 +379,7 @@ def main() -> None:
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--bilinear_dim", type=int, default=64)
+    p.add_argument("--global_pooling", action="store_true")
     p.add_argument("--temp_moves", type=int, default=20)
     # A1 concurrency
     p.add_argument("--game_threads", type=int, default=16)
@@ -442,6 +448,7 @@ def main() -> None:
     torch.manual_seed(a.seed)
     cfg = SelfPlayConfig(
         channels=a.channels, blocks=a.blocks, bilinear_dim=a.bilinear_dim,
+        global_pooling=a.global_pooling,
         n_simulations=a.sims, n_determinizations=a.determinizations,
         temp_moves=a.temp_moves, device=a.device, seed=a.seed,
         leaf_batch=a.leaf_batch, batch_slots=a.batch_slots,
@@ -451,7 +458,8 @@ def main() -> None:
         allow_tf32=not a.no_tf32, inference_amp=a.amp_inference)
     configure_torch_performance(cfg)
     net = KingdominoNet(channels=cfg.channels, blocks=cfg.blocks,
-                        bilinear_dim=cfg.bilinear_dim).to(cfg.device).eval()
+                        bilinear_dim=cfg.bilinear_dim,
+                        global_pooling=cfg.global_pooling).to(cfg.device).eval()
     if a.compile_net:
         net = compile_net_for_inference(
             net, backend=a.compile_backend, mode=a.compile_mode)
