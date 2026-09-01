@@ -298,24 +298,58 @@ def _terminal_value_p0(state: GameState) -> float:
 # buried card, so a single strategic idea ("build Artemis") is spread over one
 # edge per burial target per world.
 #
-# Both mechanisms below key off ONE notion of "the same idea in another
-# bucket". Wonder construction is keyed by the Wonder alone; everything else by
-# its action index, which already means the same thing in every sibling world.
+# The two mechanisms need DIFFERENT notions of "the same thing", and conflating
+# them was a real defect in the first prototype (review, 2026-09-01):
+#
+# * Mechanism 2 groups actions that should compete as one decision. Burying any
+#   card under Artemis is "build Artemis", so the Wonder alone is the right key.
+# * Mechanism 1 transfers evidence about the same TACTICAL action between chance
+#   worlds. There the burial target is the whole point: burying the newly
+#   revealed coverer removes it AND buys the extra turn, so the terminal card
+#   falls in one turn; burying some other card buys the turn and leaves the
+#   coverer standing, which is a different and much worse move. A Wonder-only
+#   key merges the refutation with its near-opposite and averages them together.
+#
+# What corresponds across reveal worlds is the structural action -- what you do,
+# to which tableau SLOT, with which Wonder. The card identity in that slot is
+# exactly what the chance event varies, so a card-derived action index does not
+# correspond; the slot does.
 # --------------------------------------------------------------------------
 
 
 def canonical_action_group(action_index: int) -> tuple:
-    """The bucket-independent identity of an action.
+    """Selection-grouping identity: the Wonder, ignoring the burial target.
 
-    Wonder construction encodes as ``CARD_TO_WONDER_BASE + card * NUM_WONDERS +
-    wonder`` (`codec.py`), so the Wonder falls out by arithmetic -- no state,
-    no decode, cheap enough to call inside selection. Every other action index
-    is already stable across chance siblings and is its own group.
+    For mechanism 2 only. Wonder construction encodes as
+    ``CARD_TO_WONDER_BASE + card * NUM_WONDERS + wonder`` (`codec.py`), so the
+    Wonder falls out by arithmetic -- no state, no decode, cheap enough to call
+    inside selection.
+
+    **Not a cross-world correspondence key.** Use `structural_action_key` for
+    that; see the note above.
     """
 
     if CARD_TO_WONDER_BASE <= action_index < DESTROY_BASE:
         return ("wonder", (action_index - CARD_TO_WONDER_BASE) % NUM_WONDERS)
     return ("action", action_index)
+
+
+def structural_action_key(state: GameState, action_index: int) -> tuple:
+    """Cross-world correspondence identity, for mechanism 1's sharing.
+
+    ``(use, slot, wonder)``. The slot is what survives a reveal: `Build the
+    newly uncovered card` is the same structural move in every world even though
+    its action index changes with the card, and `Artemis burying the uncovered
+    slot` is the refutation in every world while `Artemis burying Aqueduct` is a
+    different move in all of them.
+
+    Costs a decode per lookup, unlike `canonical_action_group`. That is the
+    price of correctness here and is why this is a prototype flag rather than a
+    default.
+    """
+
+    action = decode_action(state, action_index)
+    return (action.use.value, action.slot_id, action.wonder_name)
 
 
 @dataclass(slots=True)
@@ -614,6 +648,17 @@ class SearchConfig:
     The bonus decays as ``1 / (1 + local visits)``, so a world's own evidence
     takes over as soon as it exists. Local always outranks sibling.
     """
+
+    chance_sibling_bias_positive_only: bool = True
+    """Clamp the sibling advantage below at zero.
+
+    A symmetric clamp lets a stale sibling estimate argue AGAINST examining an
+    action. Since those estimates start as the same raw network values that
+    caused the neglect, a large gain then suppresses exactly the move the
+    mechanism exists to surface -- measured: tracked visits collapsed 172 -> 5
+    at gain 30. A discovery mechanism should only ever add exploration
+    pressure, so this defaults ON. Set False to reproduce the original signed
+    formulation."""
 
     chance_sibling_bias_cap: float = 1.0
     """Bound on the advantage a sibling statistic may claim, in value units.
@@ -928,12 +973,14 @@ class GumbelMCTS:
             return best
 
         groups = self._selection_groups(node)
-        # One pass for every group's local totals. With mechanism 2 off a
-        # canonical key can span several singleton groups (one per burial
-        # target), so this cannot be folded into the per-group sums below.
-        local = self._local_group_totals(node) if shared is not None else None
+        # Per-EDGE sibling bonuses on the STRUCTURAL key. A Wonder group holds
+        # members with different structural keys -- burying the uncovered slot
+        # versus burying something else -- so a group-level bonus would average
+        # the refutation with its near-opposite, which is the defect the review
+        # of 2026-09-01 found. Computed once here, consumed at both levels.
+        bonuses = self._sibling_bonuses(node, shared, sign) if shared else None
         best_group, best_score = None, -math.inf
-        for key, members in groups:
+        for _key, members in groups:
             visits = sum(edge.visits for edge in members)
             prior = sum(edge.prior for edge in members)
             # Pool member Q by visits. A probability-weighted member reports an
@@ -946,13 +993,16 @@ class GumbelMCTS:
                 else 0.0
             )
             score = q + config.c_puct * prior * total / (1 + visits)
-            score += self._sibling_bonus(shared, local, key, node, sign, visits)
+            if bonuses is not None:
+                # The group is worth promoting if ANY member is: max, not mean,
+                # so one member's evidence is not diluted by its siblings'.
+                score += max(bonuses.get(id(edge), 0.0) for edge in members)
             if score > best_score:
                 best_group, best_score = members, score
 
         if len(best_group) == 1:
             return best_group[0]
-        return self._select_within_group(best_group, sign)
+        return self._select_within_group(best_group, sign, bonuses)
 
     def _selection_groups(self, node: ClosedNode) -> list:
         """``node.edges`` partitioned into selection units, cached on the node.
@@ -981,7 +1031,9 @@ class GumbelMCTS:
         node.selection_groups = list(grouped.values())
         return node.selection_groups
 
-    def _select_within_group(self, members: list, sign: float) -> _Edge:
+    def _select_within_group(
+        self, members: list, sign: float, bonuses: dict | None = None
+    ) -> _Edge:
         """Choose a burial target inside a promoted Wonder group.
 
         Guarantees every target one look before any gets a second. Without that
@@ -1009,60 +1061,62 @@ class GumbelMCTS:
                 sign * edge.q_p0
                 + self.config.c_puct * prior * total / (1 + edge.visits)
             )
+            if bonuses is not None:
+                score += bonuses.get(id(edge), 0.0)
             if score > best_score:
                 best, best_score = edge, score
         return best
 
-    @staticmethod
-    def _local_group_totals(node: ClosedNode) -> dict:
-        """This node's own (visits, value_sum_p0) per canonical group key."""
+    def _sibling_bonuses(self, node: ClosedNode, shared: dict, sign: float) -> dict:
+        """Per-edge sibling bonus for every edge of ``node``, keyed by ``id``.
 
-        totals: dict = {}
+        One pass: the local contribution per structural key is subtracted out,
+        because the parent edge's table sums every descent through every one of
+        its children, this node included. Without that subtraction a world's own
+        visits would come back as its own "sibling" evidence and self-reinforce.
+
+        The bonus is an ADVANTAGE over this node's own value, capped, and
+        divided by the local visit count so it fades as soon as this world has
+        evidence of its own. Local always outranks sibling.
+        """
+
+        local: dict = {}
+        keys = []
         for edge in node.edges:
-            key = canonical_action_group(edge.action_index)
-            entry = totals.get(key)
+            key = structural_action_key(node.state, edge.action_index)
+            keys.append(key)
+            entry = local.get(key)
             if entry is None:
-                totals[key] = [edge.visits, edge.value_sum_p0]
+                local[key] = [edge.visits, edge.value_sum_p0]
             else:
                 entry[0] += edge.visits
                 entry[1] += edge.value_sum_p0
-        return totals
 
-    def _sibling_bonus(
-        self,
-        shared: dict | None,
-        local: dict | None,
-        key,
-        node: ClosedNode,
-        sign: float,
-        visits: int,
-    ) -> float:
-        """How much better this action looked in the OTHER chance worlds.
-
-        The parent edge's table sums every descent through every one of its
-        children, this node included, so the local contribution is subtracted
-        out -- otherwise a world's own visits would feed back as its own
-        "sibling" evidence and self-reinforce.
-
-        Measured against the node's own value, so the term is an advantage
-        rather than an absolute level, capped, and divided by the local visit
-        count so it fades the moment this world has evidence of its own.
-        """
-
-        if shared is None:
-            return 0.0
-        entry = shared.get(key)
-        if entry is None:
-            return 0.0
-        local_visits, local_sum = local.get(key, (0, 0.0))
-        sibling_visits = entry[0] - local_visits
-        if sibling_visits <= 0:
-            return 0.0
-        sibling_q = sign * ((entry[1] - local_sum) / sibling_visits)
-        advantage = sibling_q - sign * node.value_p0
-        cap = self.config.chance_sibling_bias_cap
-        advantage = max(-cap, min(cap, advantage))
-        return self.config.chance_sibling_bias * advantage / (1 + visits)
+        config = self.config
+        cap = config.chance_sibling_bias_cap
+        baseline = sign * node.value_p0
+        bonuses: dict = {}
+        for edge, key in zip(node.edges, keys):
+            entry = shared.get(key)
+            if entry is None:
+                continue
+            local_visits, local_sum = local[key]
+            sibling_visits = entry[0] - local_visits
+            if sibling_visits <= 0:
+                continue
+            sibling_q = sign * ((entry[1] - local_sum) / sibling_visits)
+            advantage = sibling_q - baseline
+            if config.chance_sibling_bias_positive_only and advantage < 0.0:
+                # A stale, never-searched sibling estimate must not be evidence
+                # AGAINST looking. Allowing it to be is what collapsed the
+                # high-gain arm (172 -> 5 tracked visits); a discovery mechanism
+                # should only ever add exploration pressure.
+                continue
+            advantage = max(-cap, min(cap, advantage))
+            bonuses[id(edge)] = (
+                config.chance_sibling_bias * advantage / (1 + edge.visits)
+            )
+        return bonuses
 
     def _forced_playout_edge(self, root: ClosedNode) -> "_Edge | None":
         """A root child owed a forced playout, or None.
@@ -1170,11 +1224,14 @@ class GumbelMCTS:
         node.visits += 1
         node.value_sum_p0 += value
         if source is not None:
-            # Selection-only: this never reaches any edge's q_p0.
+            # Selection-only: this never reaches any edge's q_p0. Keyed
+            # STRUCTURALLY (use, slot, wonder) so the same tactical move
+            # corresponds across reveal worlds even though its card-derived
+            # action index does not.
             if source.sibling_stats is None:
                 source.sibling_stats = {}
             entry = source.sibling_stats.get(
-                key := canonical_action_group(edge.action_index)
+                key := structural_action_key(node.state, edge.action_index)
             )
             if entry is None:
                 source.sibling_stats[key] = [1, value]

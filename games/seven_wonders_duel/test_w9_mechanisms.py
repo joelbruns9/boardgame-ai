@@ -30,7 +30,12 @@ from .codec import (
 from .engine import ActionUse, apply_action
 from .game import Phase, new_game
 from .inference import Evaluator
-from .search import GumbelMCTS, SearchConfig, canonical_action_group
+from .search import (
+    GumbelMCTS,
+    SearchConfig,
+    canonical_action_group,
+    structural_action_key,
+)
 from .train import build_model
 
 
@@ -323,7 +328,9 @@ def test_sibling_stats_equal_the_sum_over_that_edges_children(model):
                 expected: dict = {}
                 for child in edge.children.values():
                     for inner in child.node.edges:
-                        key = canonical_action_group(inner.action_index)
+                        key = structural_action_key(
+                            child.node.state, inner.action_index
+                        )
                         entry = expected.setdefault(key, [0, 0.0])
                         entry[0] += inner.visits
                         entry[1] += inner.value_sum_p0
@@ -335,43 +342,114 @@ def test_sibling_stats_equal_the_sum_over_that_edges_children(model):
 
 def test_bias_is_zero_without_sibling_evidence(model):
     """A single world has no siblings to learn from, so the term must vanish --
-    not merely be small. Otherwise the mechanism would perturb positions it has
-    no evidence about."""
+    not merely be small. Otherwise the mechanism perturbs positions it has no
+    evidence about."""
 
     _, mcts = _search(model, _positions(1)[0], sims=50, chance_sibling_bias=1.0)
     node = mcts._closed_root
-    key = canonical_action_group(node.edges[0].action_index)
-    local = GumbelMCTS._local_group_totals(node)
+    sign = 1.0 if node.actor == 0 else -1.0
 
-    assert mcts._sibling_bonus(None, local, key, node, 1.0, 5) == 0.0
-    assert mcts._sibling_bonus({}, local, key, node, 1.0, 5) == 0.0
+    assert mcts._sibling_bonuses(node, {}, sign) == {}
     # Shared totals that are entirely this node's own contribution: nothing to
     # import, so no bonus.
-    only_local = {key: list(local.get(key, [0, 0.0]))}
-    assert mcts._sibling_bonus(only_local, local, key, node, 1.0, 5) == 0.0
+    only_local: dict = {}
+    for edge in node.edges:
+        key = structural_action_key(node.state, edge.action_index)
+        entry = only_local.setdefault(key, [0, 0.0])
+        entry[0] += edge.visits
+        entry[1] += edge.value_sum_p0
+    assert mcts._sibling_bonuses(node, only_local, sign) == {}
 
 
 def test_bias_decays_with_local_visits_and_respects_its_cap(model):
     """Local evidence must override sibling evidence, and the shared signal is
     a nudge toward LOOKING at an action, never a verdict on it."""
 
-    _, mcts = _search(model, _positions(1)[0], sims=50, chance_sibling_bias=1.0)
+    _, mcts = _search(model, _positions(1)[0], sims=120, chance_sibling_bias=1.0)
     node = mcts._closed_root
-    key = canonical_action_group(node.edges[0].action_index)
-    local = {}  # no local contribution, so all shared evidence is sibling evidence
-    shared = {key: [100, 100.0]}  # siblings loved it: mean value +1.0 in p0 terms
+    sign = 1.0 if node.actor == 0 else -1.0
+    # Siblings loved every action, and none of it is this node's own doing.
+    shared = {
+        structural_action_key(node.state, edge.action_index): [1000, 1000.0 * sign]
+        for edge in node.edges
+    }
+    bonuses = mcts._sibling_bonuses(node, shared, sign)
+    assert bonuses, "no edge received a bonus from unanimous sibling evidence"
 
-    strong = mcts._sibling_bonus(shared, local, key, node, 1.0, 0)
-    weak = mcts._sibling_bonus(shared, local, key, node, 1.0, 99)
-    assert strong > weak > 0.0
-    assert weak == pytest.approx(strong / 100.0, rel=1e-9)
-
-    # Cap: the advantage is bounded even though the raw gap is not.
     cap = mcts.config.chance_sibling_bias_cap
-    assert strong <= mcts.config.chance_sibling_bias * cap + 1e-12
+    for edge in node.edges:
+        bonus = bonuses.get(id(edge))
+        if bonus is None:
+            continue
+        # Capped, and decaying in the edge's OWN visit count.
+        assert bonus <= mcts.config.chance_sibling_bias * cap + 1e-12
+        assert bonus == pytest.approx(
+            bonuses_at(mcts, node, shared, sign, edge), rel=1e-9
+        )
+    # More local visits must mean a smaller share of the same evidence.
+    ranked = sorted(
+        (e for e in node.edges if id(e) in bonuses), key=lambda e: e.visits
+    )
+    if len(ranked) >= 2 and ranked[0].visits < ranked[-1].visits:
+        assert bonuses[id(ranked[0])] > bonuses[id(ranked[-1])]
 
-    # Perspective: the same shared value must look BAD to the other actor.
-    assert mcts._sibling_bonus(shared, local, key, node, -1.0, 0) < 0.0
+
+def bonuses_at(mcts, node, shared, sign, edge):
+    """Recompute one edge's bonus from the documented formula."""
+
+    key = structural_action_key(node.state, edge.action_index)
+    local_v = sum(
+        e.visits for e in node.edges
+        if structural_action_key(node.state, e.action_index) == key
+    )
+    local_s = sum(
+        e.value_sum_p0 for e in node.edges
+        if structural_action_key(node.state, e.action_index) == key
+    )
+    sib_v = shared[key][0] - local_v
+    sib_q = sign * ((shared[key][1] - local_s) / sib_v)
+    adv = sib_q - sign * node.value_p0
+    cap = mcts.config.chance_sibling_bias_cap
+    adv = max(-cap, min(cap, adv))
+    return mcts.config.chance_sibling_bias * adv / (1 + edge.visits)
+
+
+def test_positive_only_clamp_refuses_to_argue_against_looking(model):
+    """The review finding of 2026-09-01, pinned.
+
+    A symmetric clamp lets a stale sibling estimate suppress an action. Since
+    those estimates begin as the raw network values that caused the neglect, a
+    large gain then buries exactly the move the mechanism exists to surface --
+    measured: tracked visits collapsed 172 -> 5 at gain 30. Positive-only is the
+    default; the signed form stays reachable for attribution.
+    """
+
+    _, mcts = _search(model, _positions(1)[0], sims=120, chance_sibling_bias=1.0)
+    node = mcts._closed_root
+    sign = 1.0 if node.actor == 0 else -1.0
+    # Siblings hated everything: a purely negative advantage.
+    hostile = {
+        structural_action_key(node.state, edge.action_index): [1000, -1000.0 * sign]
+        for edge in node.edges
+    }
+    assert mcts.config.chance_sibling_bias_positive_only is True
+    assert mcts._sibling_bonuses(node, hostile, sign) == {}
+
+    _, signed = _search(
+        model, _positions(1)[0], sims=120,
+        chance_sibling_bias=1.0, chance_sibling_bias_positive_only=False,
+    )
+    node2 = signed._closed_root
+    sign2 = 1.0 if node2.actor == 0 else -1.0
+    hostile2 = {
+        structural_action_key(node2.state, edge.action_index): [1000, -1000.0 * sign2]
+        for edge in node2.edges
+    }
+    negative = signed._sibling_bonuses(node2, hostile2, sign2)
+    assert negative and all(v < 0 for v in negative.values()), (
+        "the signed formulation must still be able to suppress, or this test "
+        "no longer distinguishes the two"
+    )
 
 
 def test_flags_are_separable(model):

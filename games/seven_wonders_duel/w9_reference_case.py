@@ -252,7 +252,28 @@ def root_ranking(root, sign: float, game) -> list[dict]:
     return rows
 
 
-def world_breakdown(edge, tracked: str, *, top_replies: int = 3) -> dict:
+def revealed_slots(state, action_index: int) -> list:
+    """Tableau slots the action uncovers -- the burial targets that matter.
+
+    The refutation is the Wonder burying the slot this very move exposes: doing
+    so removes the coverer AND buys the extra turn, so the terminal card falls
+    in one turn. Burying any other card buys the turn and leaves the coverer
+    standing, which hands the terminal card back. They are different moves and
+    must not be summed.
+    """
+
+    from .codec import decode_action
+    from .search import ChanceKind, chance_signature
+
+    specs = chance_signature(state, decode_action(state, action_index))
+    return [
+        spec.context[0] for spec in specs if spec.kind is ChanceKind.CARD_REVEAL
+    ]
+
+
+def world_breakdown(
+    edge, tracked: str, *, top_replies: int = 3, exact_slots=None
+) -> dict:
     """Per-chance-child statistics for one root edge.
 
     Each key of ``edge.children`` is the chain of revealed card names, so a
@@ -282,12 +303,23 @@ def world_breakdown(edge, tracked: str, *, top_replies: int = 3) -> dict:
         replies.sort(key=lambda row: (-row["visits"], -row["q"]))
         matched = [row for row in replies if tracked in row["label"]]
         # Wonder construction is exposed as one action per burial target, so the
-        # tracked Wonder is a GROUP of edges, not one. Summing them is exactly
-        # the action-variant split Workstream 9 mechanism 2 addresses: report the
-        # group total alongside its best single variant, because a group total
-        # that looks healthy can still be forty edges of four visits each.
+        # tracked Wonder is a GROUP of edges. The group total is reported for
+        # mechanism 2's sake -- a healthy-looking total can still be many edges
+        # of four visits each -- but it is NOT the refutation and must never be
+        # read as one: only the variant burying a slot this move exposes
+        # produces the extra-turn-then-terminal-card sequence. Splitting these
+        # was a review finding of 2026-09-01; the earlier harness summed them
+        # and reported the wrong action as "best variant" in 4 of 10 worlds.
         group_visits = sum(row["visits"] for row in matched)
         best = max(matched, key=lambda row: row["visits"], default=None)
+        exact = None
+        if exact_slots:
+            wanted = {tuple(slot) for slot in exact_slots}
+            for row in matched:
+                action = decode_action(node.state, row["index"])
+                if action.slot_id is not None and tuple(action.slot_id) in wanted:
+                    exact = row
+                    break
         worlds.append(
             {
                 "revealed": list(key) if isinstance(key, tuple) else [key],
@@ -299,21 +331,39 @@ def world_breakdown(edge, tracked: str, *, top_replies: int = 3) -> dict:
                 ),
                 "node_visits": int(node.visits),
                 "top_replies": replies[:top_replies],
-                "tracked": {
+                # THE measurement. Everything about promotion, funding and
+                # revision should be read from here, not from the group below.
+                "refutation": {
+                    "action": exact,
+                    "examined": bool(exact and exact["visits"] > 0),
+                    "is_top_reply": bool(
+                        exact and replies and replies[0]["index"] == exact["index"]
+                    ),
+                    "rank": (
+                        next(
+                            (i for i, row in enumerate(replies, 1)
+                             if row["index"] == exact["index"]),
+                            None,
+                        )
+                        if exact else None
+                    ),
+                },
+                # The Wonder group, for mechanism 2 only. Not the refutation.
+                "tracked_group": {
                     "variants": len(matched),
                     "group_visits": group_visits,
                     "group_prior": round(sum(row["prior"] for row in matched), 6),
                     "best_variant": best,
-                    "is_top_reply": bool(replies and best is not None
-                                         and replies[0]["index"] == best["index"]),
-                    "examined": group_visits > 0,
+                    "best_variant_is_refutation": bool(
+                        exact and best and best["index"] == exact["index"]
+                    ),
                 },
             }
         )
     worlds.sort(key=lambda world: -world["visits"])
 
-    examined = [world for world in worlds if world["tracked"]["examined"]]
-    promoted = [world for world in worlds if world["tracked"]["is_top_reply"]]
+    examined = [world for world in worlds if world["refutation"]["examined"]]
+    promoted = [world for world in worlds if world["refutation"]["is_top_reply"]]
     per_world = [world["visits"] for world in worlds]
     return {
         "edge_visits": int(edge.visits),
@@ -326,13 +376,29 @@ def world_breakdown(edge, tracked: str, *, top_replies: int = 3) -> dict:
             ),
             "visits_per_world_min": min(per_world, default=0),
             "visits_per_world_max": max(per_world, default=0),
-            "worlds_examining_tracked": len(examined),
-            "worlds_where_tracked_is_top": len(promoted),
-            "tracked_visits_total": sum(
-                world["tracked"]["group_visits"] for world in worlds
+            # The refutation -- the Wonder burying a slot this move exposes.
+            "worlds_examining_refutation": len(examined),
+            "worlds_where_refutation_is_top": len(promoted),
+            "refutation_visits_total": sum(
+                (world["refutation"]["action"] or {}).get("visits", 0)
+                for world in worlds
             ),
-            "tracked_variants_per_world": max(
-                (world["tracked"]["variants"] for world in worlds), default=0
+            "worlds_missing_refutation_action": sum(
+                1 for world in worlds if world["refutation"]["action"] is None
+            ),
+            # The Wonder group, which is NOT the refutation. Retained for
+            # mechanism 2, and to show how much of the group's funding went to
+            # a strategically different burial target.
+            "group_visits_total": sum(
+                world["tracked_group"]["group_visits"] for world in worlds
+            ),
+            "worlds_whose_best_variant_is_wrong": sum(
+                1 for world in worlds
+                if world["tracked_group"]["best_variant"] is not None
+                and not world["tracked_group"]["best_variant_is_refutation"]
+            ),
+            "variants_per_world": max(
+                (world["tracked_group"]["variants"] for world in worlds), default=0
             ),
         },
     }
@@ -365,6 +431,9 @@ def build_mcts(evaluator, args):
             wonder_group_selection=bool(args.wonder_group_selection),
             chance_sibling_bias=float(args.chance_sibling_bias),
             chance_sibling_bias_cap=float(args.chance_sibling_bias_cap),
+            chance_sibling_bias_positive_only=bool(
+                args.chance_sibling_bias_positive_only
+            ),
         ),
     )
 
@@ -378,6 +447,12 @@ ARMS = {
     "closed+sibling": {"chance_sibling_bias": 1.0},
     "closed+wonder": {"wonder_group_selection": True},
     "closed+both": {"chance_sibling_bias": 1.0, "wonder_group_selection": True},
+    # The original signed formulation, kept as an arm so the positive-only
+    # clamp's effect is attributable rather than bundled into the default.
+    "closed+sibling-signed": {
+        "chance_sibling_bias": 1.0,
+        "chance_sibling_bias_positive_only": False,
+    },
 }
 
 
@@ -421,6 +496,9 @@ def run_ladder_and_walk(position: Position, evaluator, args, log) -> dict:
     """
 
     walk_action = resolve_action(position, args.walk_action)
+    # The slots this move exposes. Only a Wonder burying one of these is the
+    # refutation; the same Wonder burying anything else is a different move.
+    exact_slots = revealed_slots(position.game, walk_action["index"])
     rungs = sorted({int(rung) for rung in args.ladder})
     mcts = build_mcts(evaluator, args)
 
@@ -447,7 +525,7 @@ def run_ladder_and_walk(position: Position, evaluator, args, log) -> dict:
             done += 1
         elapsed = time.perf_counter() - rung_started
         ranking = root_ranking(root, position.sign, position.game)
-        breakdown = world_breakdown(walk_edge, args.tracked)
+        breakdown = world_breakdown(walk_edge, args.tracked, exact_slots=exact_slots)
         ladder.append(
             {
                 "sims": done,
@@ -462,7 +540,7 @@ def run_ladder_and_walk(position: Position, evaluator, args, log) -> dict:
         log(
             f"  {done:>6} sims  {elapsed:>6.1f}s  top={top['label']!r} "
             f"({top['visits']} visits, {top['win_pct']:.1f}%)  "
-            f"tracked top in {breakdown['rollup']['worlds_where_tracked_is_top']}"
+            f"refutation top in {breakdown['rollup']['worlds_where_refutation_is_top']}"
             f"/{breakdown['rollup']['world_count']} worlds"
         )
         if args.walk_at is not None and done >= int(args.walk_at) and tree_walk is None:
@@ -477,7 +555,7 @@ def run_ladder_and_walk(position: Position, evaluator, args, log) -> dict:
             "sims": done,
             "action": walk_action,
             "tracked": args.tracked,
-            **world_breakdown(walk_edge, args.tracked),
+            **world_breakdown(walk_edge, args.tracked, exact_slots=exact_slots),
         }
 
     return {
@@ -502,6 +580,7 @@ def run_single_world_probes(position: Position, evaluator, args, log) -> dict:
     from .search import chance_signature, enumerate_chains
 
     walk_action = resolve_action(position, args.walk_action)
+    exact_slots = revealed_slots(position.game, walk_action["index"])
     action = decode_action(position.game, walk_action["index"])
     specs = chance_signature(position.game, action)
     if not specs:
@@ -533,7 +612,13 @@ def run_single_world_probes(position: Position, evaluator, args, log) -> dict:
         sign = 1.0 if root.actor == 0 else -1.0
         ranking = root_ranking(root, sign, child)
         matched = [row for row in ranking if args.tracked in row["label"]]
-        best = max(matched, key=lambda row: row["visits"], default=None)
+        wanted = {tuple(slot) for slot in exact_slots}
+        exact = None
+        for row in matched:
+            slot = decode_action(child, row["index"]).slot_id
+            if slot is not None and tuple(slot) in wanted:
+                exact = row
+                break
         probes.append(
             {
                 "revealed": list(key) if isinstance(key, tuple) else [key],
@@ -541,23 +626,28 @@ def run_single_world_probes(position: Position, evaluator, args, log) -> dict:
                 "sims": int(args.probe_sims),
                 "seconds": round(elapsed, 2),
                 "top_reply": ranking[0] if ranking else None,
-                "tracked": {
+                "refutation": {
+                    "action": exact,
+                    "is_top_reply": bool(
+                        exact and ranking and ranking[0]["index"] == exact["index"]
+                    ),
+                },
+                "tracked_group": {
                     "variants": len(matched),
                     "group_visits": sum(row["visits"] for row in matched),
-                    "best_variant": best,
-                    "is_top_reply": bool(ranking and best is not None
-                                         and ranking[0]["index"] == best["index"]),
                 },
             }
         )
         log(
             f"  world {probes[-1]['revealed']}: top={ranking[0]['label']!r} "
-            f"({ranking[0]['visits']} visits) tracked="
-            f"{probes[-1]['tracked']['group_visits']} visits"
+            f"({ranking[0]['visits']} visits) refutation="
+            f"{(exact or {}).get('visits', 0)} visits"
         )
 
-    found = [probe for probe in probes if probe["tracked"]["is_top_reply"]]
-    visits = [probe["tracked"]["group_visits"] for probe in probes]
+    found = [probe for probe in probes if probe["refutation"]["is_top_reply"]]
+    visits = [
+        (probe["refutation"]["action"] or {}).get("visits", 0) for probe in probes
+    ]
     return {
         "action": walk_action,
         "tracked": args.tracked,
@@ -565,9 +655,9 @@ def run_single_world_probes(position: Position, evaluator, args, log) -> dict:
         "worlds_probed": len(probes),
         "probes": probes,
         "rollup": {
-            "worlds_where_tracked_is_top": len(found),
-            "tracked_visits_min": min(visits, default=0),
-            "tracked_visits_max": max(visits, default=0),
+            "worlds_where_refutation_is_top": len(found),
+            "refutation_visits_min": min(visits, default=0),
+            "refutation_visits_max": max(visits, default=0),
             "sims_per_probe": int(args.probe_sims),
         },
     }
@@ -686,7 +776,7 @@ def build_summary(report: dict, args) -> dict:
         # refutation is the best reply in ANY world, and in half of them. `null`
         # means it never was inside the budget measured -- which is the finding.
         worlds_top = [
-            (rung["sims"], rung["walk_edge_rollup"]["worlds_where_tracked_is_top"],
+            (rung["sims"], rung["walk_edge_rollup"]["worlds_where_refutation_is_top"],
              rung["walk_edge_rollup"]["world_count"])
             for rung in ladder
         ]
@@ -715,17 +805,24 @@ def build_summary(report: dict, args) -> dict:
             # The contrast that names the defect: the same reply, found readily
             # with one world's budget, missed in most worlds when partitioned.
             summary["partition_penalty"] = {
-                "worlds_where_tracked_is_top_partitioned": (
-                    f"{walk['rollup']['worlds_where_tracked_is_top']}"
+                "worlds_where_refutation_is_top_partitioned": (
+                    f"{walk['rollup']['worlds_where_refutation_is_top']}"
                     f"/{walk['rollup']['world_count']}"
                 ),
-                "worlds_where_tracked_is_top_isolated": (
-                    f"{probes['rollup']['worlds_where_tracked_is_top']}"
+                "worlds_where_refutation_is_top_isolated": (
+                    f"{probes['rollup']['worlds_where_refutation_is_top']}"
                     f"/{probes['worlds_probed']}"
+                ),
+                # Ten exact refutation edges, one per world, each competing
+                # inside a two-way Wonder-target branch. NOT twenty copies of
+                # the same reply -- the other branch is a different move.
+                "exact_refutation_edges": walk["rollup"]["world_count"],
+                "wonder_target_branching": max(
+                    walk["rollup"]["variants_per_world"], 1
                 ),
                 "buckets_per_idea": (
                     walk["rollup"]["world_count"]
-                    * max(walk["rollup"]["tracked_variants_per_world"], 1)
+                    * max(walk["rollup"]["variants_per_world"], 1)
                 ),
             }
 
@@ -787,6 +884,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     search.add_argument("--chance-sibling-bias-cap", type=float, default=1.0)
     search.add_argument(
+        "--signed-sibling-bias", dest="chance_sibling_bias_positive_only",
+        action="store_false",
+        help="allow a negative sibling advantage (the original formulation)",
+    )
+    search.add_argument(
         "--arm", default=None, choices=sorted(ARMS),
         help="preset flag combination; overrides the individual mechanism flags",
     )
@@ -836,6 +938,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.arm:
         args.wonder_group_selection = False
         args.chance_sibling_bias = 0.0
+        args.chance_sibling_bias_positive_only = True
         for flag, value in ARMS[args.arm].items():
             setattr(args, flag, value)
     if args.smoke:
@@ -875,6 +978,9 @@ def run_one(position: Position, evaluator, fingerprint: dict, args, log) -> dict
             "wonder_group_selection": bool(args.wonder_group_selection),
             "chance_sibling_bias": float(args.chance_sibling_bias),
             "chance_sibling_bias_cap": float(args.chance_sibling_bias_cap),
+            "chance_sibling_bias_positive_only": bool(
+                args.chance_sibling_bias_positive_only
+            ),
         },
         "stages_run": sorted(args.stages),
         "smoke": bool(args.smoke),
@@ -981,6 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
         args.arm = arm
         args.wonder_group_selection = False
         args.chance_sibling_bias = 0.0
+        args.chance_sibling_bias_positive_only = True
         for flag, value in ARMS[arm].items():
             setattr(args, flag, value)
         report = run_one(position, evaluator, fingerprint, args, log)
