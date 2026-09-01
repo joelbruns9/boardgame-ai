@@ -577,6 +577,207 @@ def run_ladder_and_walk(position: Position, evaluator, args, log) -> dict:
     }
 
 
+VISIT_THRESHOLDS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+"""Where the refutation's Q is snapshotted as its visits accumulate.
+
+Doubling, because the question is the SHAPE of the correction -- does the value
+move on the second look or the fiftieth -- and a linear grid would spend most of
+its samples after the answer is already visible.
+"""
+
+
+def run_discovery_trace(position: Position, evaluator, args, log) -> dict:
+    """Per-world trace of the exact refutation, over the life of one search.
+
+    This is the measurement that separates the two hypotheses left standing.
+    Both explain an under-funded refutation and they call for opposite fixes:
+
+    * **Policy-prior failure** -- the edge is visited early and its Q corrects
+      within a few visits, but a ~0.03 prior never lets visits accumulate. Fix
+      is ranking targets and forced exploration.
+    * **Value-depth failure** -- the edge is visited, but Q stays wrong for many
+      visits before revising. Fix is value targets at the precursor,
+      post-Artemis and post-School states.
+
+    Recorded per world: the raw prior, the simulation of first visit, the leaf
+    value that first backup carried, Q at each visit threshold, the visit count
+    at which Q first clears the world's own value, and the simulation (if any)
+    at which the refutation becomes the top reply.
+
+    Cheap: one instrumented search per seed. Once a world's refutation edge is
+    resolved the per-descent work is a handful of integer reads.
+    """
+
+    from .advisor_adapter import _label
+    from .codec import decode_action
+
+    walk_action = resolve_action(position, args.walk_action)
+    wanted = {
+        tuple(slot) for slot in revealed_slots(position.game, walk_action["index"])
+    }
+    if not wanted:
+        raise SystemExit(
+            f"{walk_action['label']!r} exposes no slot; there is no refutation "
+            "edge to trace"
+        )
+
+    seeds = [int(args.seed) + offset for offset in range(int(args.trace_seeds))]
+    runs = []
+    for seed in seeds:
+        original, args.seed = args.seed, seed
+        try:
+            mcts = build_mcts(evaluator, args)
+            root = mcts.make_root(position.game)
+        finally:
+            args.seed = original
+        edge = next(e for e in root.edges if e.action_index == walk_action["index"])
+
+        # world key -> tracking state, resolved lazily: force expansion
+        # materializes a chance child but does not build its edges, so the
+        # refutation edge does not exist until search descends there.
+        tracked: dict = {}
+        started = time.perf_counter()
+        for sim in range(1, int(args.trace_sims) + 1):
+            mcts.descend(root)
+            for key, child in edge.children.items():
+                node = child.node
+                if not node.edges:
+                    continue
+                state = tracked.get(key)
+                if state is None:
+                    sign = 1.0 if node.actor == 0 else -1.0
+                    target = None
+                    for inner in node.edges:
+                        action = decode_action(node.state, inner.action_index)
+                        if (
+                            args.tracked in _label(action, node.state)
+                            and action.slot_id is not None
+                            and tuple(action.slot_id) in wanted
+                        ):
+                            target = inner
+                            break
+                    state = tracked[key] = {
+                        "revealed": list(key) if isinstance(key, tuple) else [key],
+                        "edge": target,
+                        "node": node,
+                        "sign": sign,
+                        "prior": round(float(target.prior), 6) if target else None,
+                        "label": (
+                            _label(
+                                decode_action(node.state, target.action_index),
+                                node.state,
+                            )
+                            if target
+                            else None
+                        ),
+                        "first_sim_visited": None,
+                        "first_leaf_value": None,
+                        "q_by_visits": {},
+                        "visits_to_clear_baseline": None,
+                        "sim_became_top_reply": None,
+                        "last_visits": 0,
+                    }
+                target = state["edge"]
+                if target is None or target.visits == state["last_visits"]:
+                    continue
+                state["last_visits"] = target.visits
+                q = state["sign"] * target.q_p0
+                if state["first_sim_visited"] is None:
+                    state["first_sim_visited"] = sim
+                    state["first_leaf_value"] = round(
+                        state["sign"] * target.value_sum_p0, 6
+                    )
+                if target.visits in VISIT_THRESHOLDS:
+                    state["q_by_visits"][str(target.visits)] = round(q, 6)
+                # "Corrected" means better than this world's own running value,
+                # which is what the alternatives are worth here -- not an
+                # absolute sign test.
+                if state["visits_to_clear_baseline"] is None and (
+                    q > state["sign"] * node.value_p0
+                ):
+                    state["visits_to_clear_baseline"] = target.visits
+                if state["sim_became_top_reply"] is None and (
+                    target.visits >= max(e.visits for e in node.edges)
+                ):
+                    state["sim_became_top_reply"] = sim
+        elapsed = time.perf_counter() - started
+
+        worlds = []
+        for state in tracked.values():
+            target = state["edge"]
+            node = state["node"]
+            worlds.append(
+                {
+                    "revealed": state["revealed"],
+                    "label": state["label"],
+                    "prior": state["prior"],
+                    "first_sim_visited": state["first_sim_visited"],
+                    "first_leaf_value": state["first_leaf_value"],
+                    "q_by_visits": state["q_by_visits"],
+                    "visits_to_clear_baseline": state["visits_to_clear_baseline"],
+                    "sim_became_top_reply": state["sim_became_top_reply"],
+                    "final_visits": int(target.visits) if target else 0,
+                    "final_q": (
+                        round(state["sign"] * target.q_p0, 6)
+                        if target and target.visits
+                        else None
+                    ),
+                    "world_visits": int(node.visits),
+                    "world_value": round(state["sign"] * node.value_p0, 6),
+                }
+            )
+        worlds.sort(key=lambda world: -world["final_visits"])
+        runs.append({"seed": seed, "seconds": round(elapsed, 1), "worlds": worlds})
+        promoted = sum(1 for w in worlds if w["sim_became_top_reply"] is not None)
+        log(
+            f"  seed {seed}: {len(worlds)} worlds traced in {elapsed:.0f}s, "
+            f"refutation became top reply in {promoted}"
+        )
+
+    # Rollup across seeds -- the point of more than one is to show whether the
+    # discovery pattern is stable or a seed artifact.
+    every = [world for run in runs for world in run["worlds"]]
+    visited = [w for w in every if w["first_sim_visited"] is not None]
+    cleared = [
+        w["visits_to_clear_baseline"]
+        for w in every
+        if w["visits_to_clear_baseline"] is not None
+    ]
+    promoted = [w for w in every if w["sim_became_top_reply"] is not None]
+    priors = [w["prior"] for w in every if w["prior"] is not None]
+    leaf = [w["first_leaf_value"] for w in every if w["first_leaf_value"] is not None]
+
+    return {
+        "action": walk_action,
+        "tracked": args.tracked,
+        "sims": int(args.trace_sims),
+        "seeds": seeds,
+        "runs": runs,
+        "rollup": {
+            "world_observations": len(every),
+            "first_visit_sim_median": (
+                round(statistics.median(w["first_sim_visited"] for w in visited), 1)
+                if visited
+                else None
+            ),
+            "prior_min": round(min(priors), 6) if priors else None,
+            "prior_max": round(max(priors), 6) if priors else None,
+            "first_leaf_value_mean": (
+                round(statistics.fmean(leaf), 4) if leaf else None
+            ),
+            # THE discriminator. Small = the value corrects almost immediately
+            # once funded, so the bottleneck is the prior. Large = the value
+            # itself needs depth, so value targets are required too.
+            "visits_to_clear_baseline_median": (
+                round(statistics.median(cleared), 1) if cleared else None
+            ),
+            "visits_to_clear_baseline_max": max(cleared, default=None),
+            "worlds_never_clearing_baseline": len(every) - len(cleared),
+            "worlds_becoming_top_reply": len(promoted),
+        },
+    }
+
+
 def run_single_world_probes(position: Position, evaluator, args, log) -> dict:
     """Search the same reply with the chance node collapsed to one outcome.
 
@@ -907,7 +1108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stages = parser.add_argument_group("stages")
     stages.add_argument(
         "--stages", default="walk,ladder,probes",
-        help="comma-separated: walk, ladder, probes, ref-values "
+        help="comma-separated: walk, ladder, probes, trace, ref-values "
              "(walk and ladder share one tree and are run together)",
     )
     stages.add_argument(
@@ -920,6 +1121,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     stages.add_argument("--walk-action", default=DEFAULT_WALK_ACTION)
     stages.add_argument("--tracked", default=DEFAULT_TRACKED)
+    stages.add_argument("--trace-sims", type=int, default=12000)
+    stages.add_argument(
+        "--trace-seeds", type=int, default=5,
+        help="independent searches to trace, seeded seed..seed+n-1 "
+             "(default: 5, so a per-world pattern can be told from a seed artifact)",
+    )
     stages.add_argument("--probe-sims", type=int, default=6000)
     stages.add_argument("--probe-worlds", type=int, default=6)
     stages.add_argument("--ref-sims", type=int, default=6000)
@@ -955,10 +1162,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.smoke:
         args.ladder, args.walk_at = "40,80", 80
         args.probe_sims, args.probe_worlds = 60, 2
+        args.trace_sims, args.trace_seeds = 60, 2
         args.ref_sims, args.ref_worlds = 60, 1
     args.ladder = [int(rung) for rung in str(args.ladder).split(",") if rung.strip()]
     args.stages = {stage.strip() for stage in args.stages.split(",") if stage.strip()}
-    unknown = args.stages - {"walk", "ladder", "probes", "ref-values"}
+    unknown = args.stages - {"walk", "ladder", "probes", "trace", "ref-values"}
     if unknown:
         raise SystemExit(f"unknown stage(s): {', '.join(sorted(unknown))}")
     return args
@@ -1008,6 +1216,12 @@ def run_one(position: Position, evaluator, fingerprint: dict, args, log) -> dict
     if "probes" in args.stages:
         log("stage: single-world probes")
         report["single_world_probes"] = run_single_world_probes(
+            position, evaluator, args, log
+        )
+
+    if "trace" in args.stages:
+        log("stage: discovery trace")
+        report["discovery_trace"] = run_discovery_trace(
             position, evaluator, args, log
         )
 

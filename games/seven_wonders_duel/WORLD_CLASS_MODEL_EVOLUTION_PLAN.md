@@ -856,6 +856,9 @@ strength evidence; mechanism 1 improves funding for the refutation without
 changing any recommendation. Nothing is ported to Rust, and on this evidence
 nothing should be until the prior-correction work below has run.
 
+The discovery trace below establishes why: the refutation needs about eight
+visits to be evaluated correctly, and mechanism 1 moved it from three to four.
+
 ### The partition
 
 One strategic reply is spread across many independent search buckets, so its
@@ -986,15 +989,74 @@ move indirectly through a different interior tree, but that is a weaker and
 unmeasured claim. Reaching root targets means factorizing the Gumbel candidate
 set itself, which is a separate design.
 
+### The discovery trace: it is a prior failure, not a value failure
+
+`w9_reference_case.py --stages trace`, five seeds x 12,000 simulations on the
+frozen checkpoint, tracing the exact refutation edge in each of the ten worlds
+over the life of the search. 50 world-observations.
+
+The separation is clean and falls at about five visits:
+
+| refutation's final visits | cleared its world's own value | became top reply |
+|---|---|---|
+| 0-5 | **0 / 34** | 1 |
+| 5-20 | 1 / 1 | 0 |
+| 20-100 | **10 / 10** | 7 |
+| 100+ | **5 / 5** | 5 |
+
+Every world that funded the refutation past a handful of visits corrected. Every
+world that did not, did not -- and all 34 of those died at 1-4 visits, so they
+were never funded enough to correct. That is a funding failure, not a value one.
+
+The Q trajectory has the same shape in every funded world:
+
+```text
+visits:      1      2      4      8     16     32     64
+Drying Room -0.60  -0.53  -0.31  -0.02  +0.14  +0.11  +0.14
+Brewery     -0.54  -0.47  -0.29  +0.01  +0.17  +0.13  +0.17
+Temple      -0.56  -0.48  -0.32  -0.01  +0.16
+```
+
+From about -0.55 to positive in **eight visits**, converged by sixteen. Median
+visits-to-clear is 4; the maximum observed is also 4. Stable across all five
+seeds (refutation became the top reply in 2-3 worlds each), so this is not a
+seed artifact.
+
+**The value head is not the bottleneck here.** Eight visits of ordinary search
+correct a -0.55 misread to +0.15. The refutation is first visited at median
+simulation 119 -- early. It simply never accumulates visits, because its prior is
+0.012-0.077 and its first leaf value is about -0.57, so PUCT abandons it after
+one to four looks.
+
+#### What this settles
+
+*The correction work is prior work.* The programme sketched under *Correct
+confidently wrong priors deliberately* proposes both policy ranking targets and
+value targets at the precursor, post-Artemis and post-School states. **The value
+targets are not indicated by this evidence** -- the value is already recoverable
+at trivial depth. Generate a training example per reveal world, force enough
+search through the exact burial action to clear roughly eight visits, and train
+policy ranking against the greedy alternatives.
+
+*It also explains the Workstream 9 null.* Mechanism 1's bonus moved the
+refutation from roughly three visits to roughly four. It needed to reach eight.
+The extra funding was real and an order of magnitude short of the threshold,
+which is why 37-58% more visits changed no recommendation.
+
+*And it makes one variant worth testing after all.* A **visit floor** -- rather
+than an additive score bonus -- now has a measured target instead of a guessed
+gain: guarantee a correspondent action about eight visits in a world once a
+sibling has cleared its baseline. That is a bounded experiment, and the trace
+supplies both the trigger and the threshold. It should still be judged against
+the prior work rather than instead of it, since a floor spends budget in every
+world whether or not the action deserves it.
+
 ### What is not measured
 
-- **A per-world discovery trace.** The first simulation on which the exact
-  refutation edge is visited; its Q after 1, 2, 4, 8, 16 visits; the simulation
-  at which it becomes the top reply; its raw prior and first leaf value. This is
-  what separates a policy-prior failure from a value-depth failure, and it should
-  exist before any further variant is tried. Note what *cannot* substitute for
-  it: the isolated 6000-simulation probe converges at ~5400 visits on the
-  refutation, but that is where it ends up, not what discovery cost.
+- ~~A per-world discovery trace.~~ **DONE** -- see above. Note what could not
+  substitute for it: the isolated 6000-simulation probe converges at ~5400
+  visits on the refutation, but that is where it ends up, not what discovery
+  cost. Discovery cost is about eight visits.
 - **A corpus.** Everything here is one position. Mechanism 2 has only been shown
   to hold a correctness property, and a guaranteed look can improve coverage
   while wasting search on obviously inferior targets. Judging it needs a corpus
@@ -1002,16 +1064,17 @@ set itself, which is a separate design.
 - **Strength.** No arena at equal simulations or equal wall-clock. Premature
   while the above is open.
 
-A candidate variant, untested: **share the revision, not the mean.** Q where
-barely searched versus where searched was -0.504 -> +0.056 for the refutation
-(+0.559) against -0.392 -> -0.370 for the incumbent Great Lighthouse (+0.022) --
-a 25x discrimination a mean discards by construction, and revision is immune to
-the freezing failure because an unsearched action has zero revision and so gets
-no bonus. Read narrowly: those numbers compare *different worlds at one
-snapshot*, computed under the old Wonder-name grouping, so they do not license
-saying the value revises the instant it is searched. Expressing the signal as a
-floor on visits rather than an additive score term is the likely shape, or the
-bonus suppresses the exploration that generates revisions.
+A candidate variant, now with a measured target: **a visit floor, triggered by a
+sibling's revision.** The trace above supplies both halves -- the trigger (a
+sibling's Q clearing its world's own value, which happens within four visits when
+it happens at all) and the threshold (about eight visits, the point past which
+every funded world corrected). An additive score bonus cannot reach that: the
+measured bonus moved the refutation from three visits to four. A floor can, by
+construction.
+
+The earlier cross-sectional revision numbers (-0.504 -> +0.056 for the
+refutation, -0.392 -> -0.370 for the incumbent) are superseded by the trace,
+which measures the same thing properly and within a single action's history.
 
 ### Where this leaves sequencing
 
@@ -1027,6 +1090,11 @@ The circularity argument in that section still holds and is why prior correction
 must be *targeted* rather than left to more self-play: the prior is low because
 search never funded the move, so the visit-count target never carried mass, so
 the prior stayed low.
+
+The trace scopes that work: it is **prior work, not value work**. Eight visits of
+ordinary search already correct the evaluation, so value targets at the
+precursor, post-Artemis and post-School states are not indicated by this
+evidence. Force search past the threshold and train the ranking.
 
 ### Open loop: mis-specified for this, not merely expensive
 
@@ -1092,7 +1160,8 @@ regression is attributable.
 | Simulations to promote, per mechanism | **DONE; no arm solves the case.** Table above. Reference case only. |
 | Flag-arm diagnostic | **DONE** for five flag arms, equal-simulation. Equal-wall-clock not yet meaningful: the first arm of a sweep pays warm-up costs, so recorded per-rung times reflect that rather than the mechanisms. |
 | `Walls` world not corrupted | **CHARACTERISED, not run as a regression.** Isolated probe: `Build: Walls` 3589 vs Artemis 2371, so the reply genuinely differs there. Usable as the negative control. |
-| Discovery latency and action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see *Cost of the error*. |
+| Discovery latency | **DONE.** Median first visit at simulation 119; about eight visits to correct; the refutation dies at 1-4 visits in 34 of 50 world-observations. Five seeds. |
+| Action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see *Cost of the error*. |
 | Arena strength at equal wall-clock | **NOT RUN.** Premature. |
 | Prior rising after a training run | **NOT RUN.** Not justified by the above. |
 
