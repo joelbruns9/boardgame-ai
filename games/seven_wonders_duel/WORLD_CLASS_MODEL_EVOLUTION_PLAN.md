@@ -848,362 +848,279 @@ Promote scale only if it improves the strongest complete architecture.
 
 ## Workstream 9: shared action statistics across chance siblings
 
-> ## PROTOTYPED AND MEASURED, 2026-09-01 -- READ THIS BEFORE THE SECTION BELOW
->
-> Both mechanisms are built in `search.py` behind flags defaulting to off
-> (`chance_sibling_bias`, `wonder_group_selection`), with exact off-equivalence
-> verified and 170 existing search/chance/parity tests plus 26 new ones passing.
-> The design as specified below is preserved for the record; these are the
-> measured verdicts.
->
-> ### Mechanism 1 (chance-sibling progressive bias): does not solve this case
->
-> **Retracted 2026-09-01 (second revision): the first write-up of this box
-> called it a "structural null" and said "there is no gain at which it works".
-> Both were wrong**, and wrong for a reason worth recording. The first
-> measurement matched the refutation by Wonder NAME, so it summed
-> `Artemis using <the exposed slot>` -- the actual refutation -- with
-> `Artemis using Aqueduct`, which buys the extra turn but leaves the coverer
-> standing and hands the terminal card back. Those are near-opposite moves. The
-> harness reported the wrong one as the group's best variant in 4 of 10 worlds,
-> and the sharing key merged them, so the mechanism was never given the chance
-> to share the right thing. See *The two keys are not the same key* below.
->
-> Re-measured with the exact refutation tracked by exposed slot, and with
-> sharing keyed structurally:
->
-> | arm | refutation visits | promote in any / half |
-> |---|---|---|
-> | closed | **152** | 2000 / never |
-> | closed + sibling, signed advantage | 181 | 3000 / never |
-> | closed + sibling, positive-only | 208 (+37%) | 2000 / never |
-> | closed + both | 223 (+47%) | 2000 / never |
-> | closed + wonder | 240 (+58%) | 2000 / never |
->
-> The baseline's true figure is **152, not the 172 first reported** -- 20 of
-> those visits were the wrong burial target.
->
-> **What survives.** No arm promotes the refutation in half the worlds at any
-> budget tested, and none changes the root recommendation. The mechanisms do not
-> solve this position.
->
-> **What does not survive.** "Cannot work" and "no gain works" are withdrawn.
-> Keyed correctly the sharing funds the refutation 37% better, and
-> `closed+both` reaches 2 of 10 worlds at **6000** sims where baseline needs
-> **12000** -- a 2x budget saving at that coverage. One position, one seed:
-> suggestive, not evidence.
->
-> ### The signed advantage was a real defect, and is fixed
->
-> The original bonus clamped symmetrically, so a stale sibling estimate could
-> argue *against* examining an action. Since those estimates begin as the raw
-> network values that caused the neglect, a large gain then buried exactly the
-> move the mechanism exists to surface: at gain 30 the refutation fell from 1st
-> to 20th of 26 groups and its visits collapsed 172 -> 5.
->
-> `chance_sibling_bias_positive_only` now defaults ON, and the measurement above
-> confirms it matters: signed reaches 181 visits and needs 3000 sims to promote
-> anywhere, positive-only reaches 208 and needs 2000. **A discovery mechanism
-> must only ever add exploration pressure.** The signed form is retained as an
-> arm purely so the difference stays attributable.
->
-> The high-gain collapse remains the same self-reinforcing loop this plan
-> describes under *Correct confidently wrong priors deliberately*, reproduced
-> one level up inside the mechanism meant to break it -- that diagnosis stands,
-> but it indicts the signed formulation, not sharing as such.
->
-> ### The two keys are not the same key
->
-> The mechanisms need different notions of "the same thing", and conflating them
-> was the defect above:
->
-> - **Mechanism 2** groups actions that should compete as one decision. Burying
->   any card under Artemis is "build Artemis", so the Wonder alone is right
->   (`canonical_action_group`).
-> - **Mechanism 1** transfers evidence about the same TACTICAL action between
->   chance worlds. There the burial target is the whole point, and what
->   corresponds across reveal worlds is the structural action -- what you do, to
->   which SLOT, with which Wonder (`structural_action_key`). The card identity in
->   that slot is exactly what the chance event varies, so a card-derived action
->   index does not correspond; the slot does.
->
-> ### A candidate variant: share the REVISION, not the mean
->
-> | group | Q where barely searched | Q where searched | gap |
-> |---|---|---|---|
-> | Great Lighthouse (incumbent) | -0.392 | -0.370 | **+0.022** |
-> | Temple of Artemis (refutation) | -0.504 | +0.056 | **+0.559** |
->
-> A 25x discrimination that a mean throws away by construction, and revision is
-> structurally immune to the freezing failure: an action nobody has searched has
-> zero revision and so gets no bonus, rather than a confidently negative one.
->
-> **Read this table narrowly.** It compares *different worlds* at one snapshot --
-> lightly-searched worlds against heavily-searched ones -- and both columns were
-> computed under the Wonder-name grouping, so they mix the refutation with the
-> other burial target. It is NOT a within-action trace, and it does not license
-> saying the value "revises the instant it is searched". The measurement that
-> would license that does not exist yet:
->
-> - the first simulation on which the exact refutation edge is visited;
-> - its Q after 1, 2, 4, 8, 16... visits;
-> - the simulation at which it becomes the top reply;
-> - its raw prior and first leaf value.
->
-> That trace is what separates a policy-prior failure from a value-depth
-> failure, and it should be built before any revision-based variant is tried.
-> **UNTESTED and, as measured, not yet properly evidenced.**
->
-> ### Mechanism 2 (Wonder-action factorization): WORKS, NARROWER THAN CLAIMED
->
-> It does what it says, absolutely, at the nodes it governs: multi-variant
-> Wonder groups holding an unexplored burial target while another is revisited
-> go from 146/2142 to **0/2056** (Gumbel root) and 180/1895 to **0/2246** (PUCT
-> root). Baseline violates 7-9% of such groups.
->
-> But it reaches **interior nodes only**. The Gumbel root runs top-k plus
-> sequential halving and calls `simulate(action_index)` directly, so root edges
-> never pass through `_select_closed`; under the PUCT root it does govern, but
-> changes nothing, because an unvisited edge's prior term already guaranteed the
-> look.
->
-> **This contradicts the claim below that mechanism 2 is "the durable half"
-> because it reshapes visit-count policy targets.** Those targets are built from
-> ROOT visits, and the training root is the Gumbel one. Targets would still move
-> indirectly -- a different interior tree yields different completed-Q -- but the
-> direct mechanism described below is not there. Mechanism 2 also has **no
-> strength evidence** yet, only a correctness property; judging it needs a
-> corpus of multi-variant Wonder decisions rather than this one position.
->
-> ### What this implies for sequencing
->
-> The execution order below puts Workstream 9 first on the grounds that it is
-> "the measured cause" of the blunder. The partition is real, but on this
-> evidence it is **not the binding constraint**: correcting the key and the
-> clamp buys 37-58% more funding for the refutation and still does not change
-> the recommendation. What remains is the ~0.03 prior and the network's -0.6
-> evaluation of a move that scores around +0.1 once actually searched. Prior and
-> value correction should lead -- Workstream 5 and *Correct confidently wrong
-> priors deliberately*.
->
-> Note the earlier framing "it takes ~5400 visits to discover" is withdrawn:
-> 5400 is where the isolated 6000-simulation probe *converged*, not what
-> discovery cost. Discovery cost is unmeasured until the trace above exists.
->
-> Nothing here is shippable to the advisor: this is the Python searcher and the
-> advisor defaults to Rust. Per the sequencing below a Rust port waits on
-> measured benefit, and mechanism 1 has none.
+**Status: prototyped, measured, and not promoted.** Both mechanisms are built in
+`search.py` behind flags defaulting to off (`chance_sibling_bias`,
+`wonder_group_selection`), with exact off-equivalence verified. Neither solves
+the reference case. Mechanism 2 delivers a real correctness property with no
+strength evidence; mechanism 1 improves funding for the refutation without
+changing any recommendation. Nothing is ported to Rust, and on this evidence
+nothing should be until the prior-correction work below has run.
 
-### Current limitation
+### The partition
 
-One strategic reply is partitioned across many independent search buckets, so
-its discovery cost is multiplied by the size of that partition. Table
-`908370787` measured the partition at twenty buckets for a single idea
-(corrected 2026-09-01 from "roughly forty"), each receiving about four visits
-where roughly a thousand in one bucket were required.
+One strategic reply is spread across many independent search buckets, so its
+discovery cost is multiplied by the size of that spread. Two independent
+dimensions, measured on the `Discard for coins: Caravansery` edge of table
+`908370787` at 3000 root simulations:
 
-The partition has two independent dimensions.
+**Chance-sibling split.** Taking a covering card uncovers a face-down slot, which
+fires a `CardReveal` on the *actor's own move*. The searcher creates one child
+per possible identity: 1649 visits over ten children of roughly 165 each.
 
-**Chance-sibling split.** Taking a covering card uncovers a face-down slot,
-which fires a `CardReveal` on the *actor's own move*. The searcher creates one
-child per possible identity. Measured on the `Discard for coins: Caravansery`
-edge:
-1649 visits over ten children of roughly 160 visits each.
+**Action-variant split.** Constructing a Wonder is a separate action per burial
+target, and here the opponent has exactly two accessible cards, so each world
+carries two `Wonder: The Temple of Artemis (using X)` edges.
 
-**Action-variant split.** Constructing a Wonder is exposed as a separate action
-per burial target. In each world the opponent held **two**
-`Wonder: The Temple of Artemis (using X)` edges, plus the same variants for
-every other unbuilt Wonder. (Corrected 2026-09-01 from "roughly four": the
-opponent has exactly two accessible cards here.)
+The two dimensions do **not** multiply into "twenty copies of one reply", and
+getting this wrong is what invalidated the first round of measurement. Only the
+variant burying the **newly exposed slot** is the refutation: it removes the
+coverer *and* buys the extra turn, so `School` falls in one turn. Burying
+`Aqueduct` buys the turn and leaves the coverer standing, handing `School` back.
+Those are near-opposite moves. The true shape is **ten exact refutation edges,
+one per world, each competing inside a two-way burial branch.**
 
-They "differ only in which card is buried" in the codec's sense and in no other:
-only the variant burying the newly exposed slot is the refutation. Treating the
-pair as interchangeable is what made the first Workstream 9 measurement wrong.
-
-Combined, `The Temple of Artemis` received 172 of 1639 opponent visits, spread
-so thinly that eight of the ten worlds funded it at only 2-7 visits -- enough to
-look, never enough to learn (corrected 2026-09-01 from "never examined it at
-all"). It does not
-resolve at a practical budget: the per-world budget grows linearly while the
-requirement is per-world, and at 45,000 root simulations the same edge held only
-about 294 visits per world.
+The exact refutation received 152 of 1639 opponent visits, with eight of the ten
+worlds funding it at 2-7 visits -- enough to look, never enough to learn. It does
+not resolve at a practical budget: the requirement is per world while the budget
+is shared, and at 45,000 root simulations the same edge held about 294 visits per
+world.
 
 ### Why the existing chance coalescing cannot help
 
-`chance.rs` already coalesces chance children, but on an *observability* key:
-two outcomes that look identical to the player are the same child, which off
-`AGE_DEAL` means no coalescing at all. That rule is correct and must stay. The
-ten revealed cards here are plainly distinguishable and genuinely change the
-opponent's options and values -- in the `Walls` world the opponent simply builds
-`Walls` for 141 of 154 visits. Merging these nodes would be unsound.
+`chance.rs` coalesces chance children on an *observability* key: two outcomes
+that look identical to the player are the same child, which off `AGE_DEAL` means
+no coalescing at all. That rule is correct and must stay. The ten revealed cards
+are plainly distinguishable and genuinely change the opponent's options and
+values -- in the `Walls` world the opponent simply builds `Walls` for 141 of 154
+visits. Merging these nodes would be unsound.
 
-The problem is therefore not that distinguishable outcomes are kept apart. It is
-that an action which is *correspondent across* those outcomes has to be
-rediscovered independently inside each one, from a prior near 0.03.
+The problem is not that distinguishable outcomes are kept apart. It is that an
+action *correspondent across* those outcomes must be rediscovered inside each
+one, from a prior near 0.03.
 
-### Change
+### The two mechanisms, and the two keys they need
 
-Two independent mechanisms. Prototype both in the Python searcher first; they
-compose but must be measured separately.
+They compose but are independently switchable, and they require **different**
+notions of "the same thing". Conflating those was the central defect of the first
+prototype.
 
-1. **Chance-sibling progressive bias.** Keep per-world child nodes and keep value
-   backup exactly as it is, per outcome and probability-weighted. Add a bounded
-   *selection-only* statistic, accumulated per
-   `(parent edge, canonical action key)` across chance siblings, that biases
-   exploration inside a world toward actions its siblings found strong. In the
-   measured position `Wonder: The Temple of Artemis (using Aqueduct)` carries
-   the same action index in every world, so it shares trivially; variants that
-   differ only by burial target need the canonical key from mechanism 2.
+**Mechanism 2: hierarchical Wonder-action factorization**
+(`wonder_group_selection`). Select the Wonder group first, then the burial target
+within the promoted group, instead of exposing every `(Wonder, buried card)` pair
+as a flat sibling. Group prior is the sum of legal member priors; every full
+action keeps its own edge, statistics and original index, so policy targets are
+unchanged in shape. Exploration among burial targets is guaranteed once the group
+is promoted, or the low-prior failure simply recurs one level down.
 
-   Use the shared statistic as a decaying progressive-bias or first-play-urgency
-   term, not as raw shared visits: importing visit counts into PUCT can suppress
-   rather than promote exploration. Aggregate only across siblings in which the
-   canonical action group is legal, cap its influence, and decay it toward zero
-   as direct local visits accumulate. Local evidence must override sibling
-   evidence.
+Its key is `canonical_action_group` -- **the Wonder alone**, ignoring the burial
+target, because burying anything under Artemis is the one decision "build
+Artemis" competing against other moves.
 
-   Selection-only sharing does not algebraically mix incompatible world values
-   into `q_p0`, but it still changes the sampled tree and can therefore affect
-   finite-budget Q estimates and policy targets. Treat that as a measured bias,
-   not as a claim of harmlessness.
+**Mechanism 1: chance-sibling progressive bias** (`chance_sibling_bias`). Keep
+per-world child nodes and probability-weighted value backup exactly as they are.
+Add a bounded *selection-only* statistic on the parent edge
+(`_Edge.sibling_stats`), accumulated across its chance children, that biases
+exploration inside a world toward actions its siblings found strong. Applied as a
+decaying advantage over the node's own value, capped, and divided by local visits
+so a world's own evidence takes over as soon as it exists. The node's own
+contribution is subtracted out, or its visits would return as its own "sibling"
+evidence.
 
-2. **Hierarchical Wonder-action factorization.** Select the Wonder group first,
-   then select the burial target within the promoted group, instead of exposing
-   every `(Wonder, buried card)` pair as a flat sibling action. Preserve separate
-   statistics, original action indices, and final policy targets for every full
-   action. The sacrificed card's effect is not activated, but its slot and
-   identity are not low-value: the target determines denial, tableau topology,
-   and subsequent reveals.
+Its key is `structural_action_key` -- **`(use, slot, wonder)`**. What corresponds
+across reveal worlds is the structural action: what you do, to which tableau
+slot, with which Wonder. The card identity in a revealed slot is precisely what
+the chance event varies, so a card-derived action index does not correspond
+across worlds; the slot does. A Wonder-only key here merges the refutation with
+its near-opposite and averages them together.
 
-   Initialize a Wonder group's prior from the sum of its legal member priors and
-   guarantee exploration among the burial targets after the group is selected;
-   otherwise the same low-prior failure can recur one level lower. This
-   factorization also supplies the canonical action key mechanism 1 needs, and
-   is useful on its own even where no chance node is involved.
+Sharing is selection-only and never touches `q_p0`: folding values from
+distinguishable worlds into one expectation is exactly the unsound merge
+`chance.rs` refuses. It still changes which leaves are sampled, and therefore
+finite-budget Q and policy targets. That is a measured bias, not a harmless one.
 
-### Why not rely on more simulations or a better prior
+### Results
 
-The practical-budget simulation argument is arithmetic and is given above. The
-prior argument is circular: the prior is low precisely because self-play search
-never funded the move, so the visit-count target never carried mass, so the
-prior stayed low. This is the loop described under *Correct confidently wrong
-priors deliberately*. Sharing discovery evidence changes the arithmetic instead
-of assuming the prior improves.
+Visits to the **exact** refutation at 3000 simulations, frozen
+`candidate_0085.pt`, same seed:
 
-### Where this lands
+| arm | refutation visits | promote in any world / in half |
+|---|---|---|
+| closed (baseline) | 152 | 2000 / never |
+| + sibling, signed advantage | 181 | 3000 / never |
+| + sibling, positive-only | 208 | 2000 / never |
+| + both | 223 | 2000 / never |
+| + wonder | 240 | 2000 / never |
 
-Both mechanisms are searcher changes, in `search.py` and the
-`seven_wonders_rust` crate, and the searcher is shared:
+**No arm solves the position.** None promotes the refutation in half the worlds
+at any budget tested, and none changes the root recommendation; the played move's
+displayed win% moves by under a point against a ~20-point error.
 
-- **Advisor.** Immediate effect at inference, with no retraining.
-- **Training.** `self_play_many_net` uses the same crate, so visit-count policy
-  targets change too. This was expected to be the durable half: what allows the
-  next training run to break the low-prior loop rather than paying to overcome
-  it every turn.
+**But the mechanisms are not inert.** Correct keying funds the refutation 37-58%
+better, and `closed+both` reaches 2 of 10 worlds at 6000 simulations where
+baseline needs 12000 -- a 2x budget saving at that coverage. One position, one
+seed: suggestive, not evidence.
 
-  **Not supported as written (2026-09-01).** Visit-count policy targets are
-  built from ROOT visits, and the training root is the Gumbel one, which selects
-  by top-k plus sequential halving and never passes root edges through
-  `_select_closed`. Mechanism 2 therefore cannot reach the target's root
-  allocation; mechanism 1 is a null regardless. Targets would still move
-  indirectly through a different interior tree, but that is a weaker and
-  unmeasured claim. Reaching root targets would require factorizing the Gumbel
-  candidate set itself, which is a separate design.
+**A discovery mechanism must only ever add exploration pressure.** The original
+bonus clamped symmetrically, letting a stale sibling estimate argue *against*
+examining an action. Those estimates begin as the raw network values that caused
+the neglect, so a large gain buried exactly the move the mechanism exists to
+surface: at gain 30 the refutation fell from 1st to 20th of 26 groups and its
+visits collapsed to 5. `chance_sibling_bias_positive_only` therefore defaults on,
+and the measurement confirms it matters (208 vs 181 visits; 2000 vs 3000
+simulations to promote anywhere). The signed form is retained as an arm only so
+the difference stays attributable.
 
-Sequence the advisor benefit first for cheap validation, but do not treat it as
-the deliverable.
+**Mechanism 2 works, at interior nodes only.** Wonder groups holding an
+unexplored burial target while another is revisited go from 146/2142 to 0/2056
+(Gumbel root) and 180/1895 to 0/2246 (PUCT root); baseline violates 7-9% of such
+groups. But the Gumbel root runs top-k plus sequential halving and calls
+`simulate(action_index)` directly, so root edges never pass through
+`_select_closed`. Under the PUCT root it governs but changes nothing, because an
+unvisited edge's prior term already guaranteed the look.
 
-### Interaction with existing chance work
+That bounds a claim worth stating plainly: mechanism 2 was expected to be the
+durable half because self-play shares the searcher, so visit-count policy targets
+would improve. **Those targets are built from root visits and the training root
+is the Gumbel one, so the factorization cannot reach them.** Targets would still
+move indirectly through a different interior tree, but that is a weaker and
+unmeasured claim. Reaching root targets means factorizing the Gumbel candidate
+set itself, which is a separate design.
 
-`CHANCE_ENUMERATION_PLAN.md` distinguishes probability-weighted, fixed-support,
-and ordinary sampled edges. Both mechanisms must preserve each class's
-invariants: the mass accounting behind `q_p0` is untouched because sharing is
-selection-only, and a fixed-support edge must remain closed against growth.
-Mechanism 2 changes the action-edge layout rather than the chance layer, so
-verify it against the same parity tests.
+### What is not measured
 
-### Revisit open-loop search as a diagnostic, not the default architecture
+- **A per-world discovery trace.** The first simulation on which the exact
+  refutation edge is visited; its Q after 1, 2, 4, 8, 16 visits; the simulation
+  at which it becomes the top reply; its raw prior and first leaf value. This is
+  what separates a policy-prior failure from a value-depth failure, and it should
+  exist before any further variant is tried. Note what *cannot* substitute for
+  it: the isolated 6000-simulation probe converges at ~5400 visits on the
+  refutation, but that is where it ends up, not what discovery cost.
+- **A corpus.** Everything here is one position. Mechanism 2 has only been shown
+  to hold a correctness property, and a guaranteed look can improve coverage
+  while wasting search on obviously inferior targets. Judging it needs a corpus
+  of multi-variant Wonder decisions.
+- **Strength.** No arena at equal simulations or equal wall-clock. Premature
+  while the above is open.
 
-The existing Python open-loop searcher automatically shares action-path
-statistics across determinizations, so table `908370787` is a reason to include
-it in the Workstream 9 experiment. It is not a reason to replace closed-loop
-search by default.
+A candidate variant, untested: **share the revision, not the mean.** Q where
+barely searched versus where searched was -0.504 -> +0.056 for the refutation
+(+0.559) against -0.392 -> -0.370 for the incumbent Great Lighthouse (+0.022) --
+a 25x discrimination a mean discards by construction, and revision is immune to
+the freezing failure because an unsearched action has zero revision and so gets
+no bonus. Read narrowly: those numbers compare *different worlds at one
+snapshot*, computed under the old Wonder-name grouping, so they do not license
+saying the value revises the instant it is searched. Expressing the signal as a
+floor on visits rather than an additive score term is the likely shape, or the
+bonus suppresses the exploration that generates revisions.
 
-Open-loop nodes alias publicly distinguishable reveal outcomes even though the
-correct continuation can depend on the revealed identity. The current reference
-implementation also caches the policy and value context from the first world to
-expand an action-path node, then only re-masks legality in later worlds. Phase E
-measured the resulting stale-prior signature and worse consequential trap
-coverage, although its eleven consequential positions were too few to settle
-equal-wall-clock playing strength.
+### Where this leaves sequencing
 
-**This arm would not measure what this section expects (2026-09-01).** Open loop
-aggregates on the action path, and the refutation's action index is
-card-derived: `Artemis (using Sawmill)` in one world, `Artemis (using Drying
-Room)` in the next. The index therefore changes with the reveal, so open loop
-does **not** naturally aggregate the exact refutation across worlds -- the very
-sharing this section recruits it to demonstrate. It would still alias
-publicly distinguishable outcomes and carry its stale-prior defect. Run it only
-with a structural (slot-based) path key, or not at all; as written the arm is
-mis-specified rather than merely expensive. De-prioritised.
+The execution order elsewhere in this plan puts Workstream 9 first, as "the
+measured cause" of the blunder. **That is not supported.** The partition is real,
+but correcting both the key and the clamp buys 37-58% more funding and still does
+not change the recommendation. What remains is the ~0.03 prior and the network's
+-0.6 evaluation of a move worth roughly +0.1 once actually searched. Prior and
+value correction should lead -- Workstream 5 and *Correct confidently wrong
+priors deliberately*.
 
-Use open loop as the aggressive statistic-sharing control. The intended
-production design remains a closed-loop hybrid: retain outcome-conditioned
-nodes, priors, values, and probability-weighted backup while transferring only
-bounded action-discovery evidence across siblings. If open loop solves the
-reference case but regresses cases such as the `Walls` world, that is positive
-evidence for the hybrid rather than evidence to switch architectures. Consider
-an open-loop production path only if it passes the expanded conditional-outcome
-suite and equal-wall-clock arenas after its stale-prior defect is addressed.
+The circularity argument in that section still holds and is why prior correction
+must be *targeted* rather than left to more self-play: the prior is low because
+search never funded the move, so the visit-count target never carried mass, so
+the prior stayed low.
 
-### Strength-preserving migration
+### Open loop: mis-specified for this, not merely expensive
 
-Ship both behind flags defaulting to off. Off must reproduce current search
-output exactly, verified by the existing Python/Rust parity, perspective, and
-chance-node tests. Port to Rust only after the Python prototype shows measured
-benefit, and keep the flags separable so a regression can be attributed.
+The Python open-loop searcher shares action-path statistics across
+determinizations automatically, which is why this section originally recruited it
+as the aggressive sharing control.
+
+It would not measure that. Open loop aggregates on the action path, and the
+refutation's action index is card-derived -- `Artemis (using Sawmill)` in one
+world, `Artemis (using Drying Room)` in the next -- so the index changes with the
+reveal and the exact refutation is never aggregated across worlds. It also
+aliases publicly distinguishable reveal outcomes even though the correct
+continuation can depend on the revealed identity, and its reference
+implementation caches policy and value context from the first world to expand an
+action-path node, re-masking only legality later; Phase E measured the resulting
+stale-prior signature and worse consequential-trap coverage on eleven positions,
+too few to settle equal-wall-clock strength.
+
+Run it only with a structural, slot-based path key, or not at all. De-prioritised.
+
+The intended production design remains a closed-loop hybrid: outcome-conditioned
+nodes, priors, values and probability-weighted backup retained, with only bounded
+action-discovery evidence transferred across siblings.
+
+### Invariants and migration
+
+`CHANCE_ENUMERATION_PLAN.md` distinguishes probability-weighted, fixed-support
+and ordinary sampled edges. Both mechanisms preserve each class: the mass
+accounting behind `q_p0` is untouched because sharing is selection-only, and a
+fixed-support edge stays closed against growth. Mechanism 2 changes the
+action-edge layout rather than the chance layer, so it is verified against the
+same parity tests.
+
+Both ship behind flags defaulting to off. Off reproduces current search output
+exactly -- bit-identical action, visits, policy target and completed Q, with no
+added rng draw and no allocation on the off path. Port to Rust only after a
+Python prototype shows measured benefit, and keep the flags separable so a
+regression is attributable.
 
 ### Gate
 
 - Exact output equivalence with both features disabled.
-- On a corpus of positions where the actor's move uncovers a known threat,
-  report simulations required to promote the refutation, for each mechanism
-  alone and for both together. Table `908370787` is the reference case.
-- Run a five-arm Python diagnostic with the same frozen network and seeds:
-  current closed loop, current open loop, closed plus sibling bias, closed plus
-  Wonder factorization, and closed plus both. Report both equal-simulation and
-  equal-wall-clock results.
-- Confirm no regression where a chance outcome genuinely changes the correct
-  reply or its value -- the `Walls` world above is the case that must not be
-  corrupted. Re-run the prior consequential trap corpus and expand it with
-  actor-created public threats before drawing an architecture conclusion.
+- On a corpus of positions where the actor's move uncovers a known threat, report
+  simulations required to promote the **exact** refutation, per mechanism and
+  combined. Table `908370787` is the reference case.
+- Report both equal-simulation and equal-wall-clock results across the flag arms.
+- Confirm no regression where a chance outcome genuinely changes the correct reply
+  -- the `Walls` world is the case that must not be corrupted. Re-run the
+  consequential trap corpus and expand it with actor-created public threats before
+  drawing an architecture conclusion.
 - Measure refutation-discovery latency and action regret against shallow-exact or
-  deep-search references; do not use only final action agreement.
-- Arena strength at equal wall-clock cost, not only equal simulation count,
-  since both mechanisms change work per simulation.
+  deep-search references; final action agreement alone is not enough.
+- Arena strength at equal wall-clock cost, since both mechanisms change work per
+  simulation.
 - After a training run with the searcher enabled, re-measure the policy prior on
-  the reference refutation. The prior rising is the evidence that the loop
-  broke; advisor-side improvement alone is not.
-
-### Gate status, 2026-09-01
+  the reference refutation. The prior rising is the evidence the loop broke;
+  advisor-side improvement alone is not.
 
 | gate item | status |
 |---|---|
-| Exact output equivalence, both features disabled | **PASS.** Bit-identical action, visits, policy target and completed Q on 6 positions; no added rng draw; no allocation on the off path. Each flag alone changes output on 5 of 6, so the equivalence is not passing vacuously. |
-| Sims required to promote the refutation, per mechanism | **DONE; no arm solves the case.** All arms promote in some world at 2000 sims (signed sibling: 3000) and in half the worlds never. Refutation funding does improve: 152 baseline -> 208 (+sibling) / 223 (+both) / 240 (+wonder). Reference case only, not a corpus. |
-| Five-arm diagnostic | **PARTIAL.** Five flag arms run (closed, +sibling positive-only, +sibling signed, +wonder, +both). The open-loop arm is excluded and now believed mis-specified -- its action-path key is card-derived, so it would not aggregate the refutation across worlds at all. Equal-simulation reported; equal-wall-clock not yet meaningful, because the first arm in a sweep pays warm-up costs and the recorded per-rung times reflect that, not the mechanisms. |
-| Exact refutation tracked, not the Wonder group | **FIXED, was wrong.** The first measurement matched on Wonder name and summed both burial targets, reporting the wrong action as best variant in 4 of 10 worlds. Now matched by exposed slot, with `worlds_whose_best_variant_is_wrong` reported so the contamination stays visible. All amended numbers postdate this fix. |
-| No regression in the `Walls` world | **NOT RUN as a regression test.** The `Walls` world is now characterised (isolated probe: `Build: Walls` 3589 vs Artemis 2371, so the reply genuinely differs there), which makes it usable as the negative control. With mechanism 1 a null there is nothing yet to regress. |
-| Refutation-discovery latency and action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see the note under *Cost of the error*. |
-| Arena strength at equal wall-clock | **NOT RUN.** Premature: mechanism 1 is a null and mechanism 2 has no strength evidence, only a correctness property. |
-| Prior rising after a training run | **NOT RUN.** No training run with these mechanisms is justified by the above. |
+| Off-equivalence, both flags disabled | **PASS.** Bit-identical on 6 positions. Each flag alone changes output on 5 of 6, so this is not passing vacuously. |
+| Exact refutation tracked, not the Wonder group | **PASS, after correction.** Matched by exposed slot and verified against the decoded action; `worlds_whose_best_variant_is_wrong` reported so contamination stays visible. |
+| Simulations to promote, per mechanism | **DONE; no arm solves the case.** Table above. Reference case only. |
+| Flag-arm diagnostic | **DONE** for five flag arms, equal-simulation. Equal-wall-clock not yet meaningful: the first arm of a sweep pays warm-up costs, so recorded per-rung times reflect that rather than the mechanisms. |
+| `Walls` world not corrupted | **CHARACTERISED, not run as a regression.** Isolated probe: `Build: Walls` 3589 vs Artemis 2371, so the reply genuinely differs there. Usable as the negative control. |
+| Discovery latency and action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see *Cost of the error*. |
+| Arena strength at equal wall-clock | **NOT RUN.** Premature. |
+| Prior rising after a training run | **NOT RUN.** Not justified by the above. |
 
-The corpus item is the honest gap in this verdict: everything here is one
-position. Mechanism 1's null is diagnosed well enough that a corpus is unlikely
-to reverse it -- the failure is in the mechanism's own feedback structure, not
-in this position's specifics -- but mechanism 2 has *only* been shown to hold a
-correctness property, and whether that buys playing strength is untested and
-needs a corpus of multi-variant Wonder decisions.
+### Correction history
+
+Two rounds of measurement on this section were wrong, both recorded because the
+failure mode generalises.
+
+1. Reasons asserted before measurement. The high-gain collapse was attributed to
+   "rich-get-richer" (wrong: the statistic is read sign-flipped in the replying
+   frame) and mechanism 2 was said to govern the PUCT root (it does, but changes
+   nothing there).
+2. A verdict built on a harness that tracked the wrong action. The refutation was
+   matched by Wonder *name*, summing it with the other burial target, which
+   reported the wrong action as the group's best variant in 4 of 10 worlds. On
+   those numbers mechanism 1 was declared a "structural null" at every gain.
+   **Retracted.** Keyed correctly it is not null, merely insufficient.
+
+Superseded figures that must not be quoted: "forty buckets" and "twenty buckets";
+"roughly four burial variants"; "eight of ten worlds never examined it" (they
+examined it, at 2-7 visits); 172 refutation visits (that was the contaminated
+group total; the exact figure is 152); "six of six" isolated probes (five of six
+-- the sixth is `Walls`); "revises +0.56 the instant it is searched"; "~5400
+visits to discover".
+
+The lesson worth keeping: before concluding a mechanism cannot work, verify the
+measurement identifies the exact tactical object. A substring match on a name is
+not an action.
 
 ## Experiment and promotion framework
 
