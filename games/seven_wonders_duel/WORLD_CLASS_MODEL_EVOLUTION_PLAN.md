@@ -227,30 +227,77 @@ sampled worlds at 5395-5853 visits.
 
 ### Cost of the error
 
-Deep-search reference estimates are 6000 dedicated simulations at the child
-position, repeated across independent determinizations. They are not solved
-game-theoretic values, but are sufficient to expose the advisor's large error.
+Re-measured 2026-09-01 with `w9_reference_case.py --stages ref-values`. Each root
+action is rolled forward through any FORCED actor continuations until the
+opponent is genuinely to move, then every chance world behind it is searched
+separately at 1500 simulations and the world values are probability-weighted
+back together. The frozen `candidate_0085.pt` throughout.
 
-> **Open question, 2026-09-01.** "Repeated across independent determinizations"
-> is probably the wrong axis for a chance-node action. Determinization is which
-> hidden cards exist; the chance worlds are which card the reveal turns up, and
-> this plan already established that single-world determinization is *not* the
-> defect (the searcher resamples chance itself). For the played move the
-> decision-relevant number is also a probability-weighted mean over all ten
-> worlds, not a min-max range over a sampled few. `w9_reference_case.py`
-> implements the chance-world axis; settle this before spending the run.
-
-| Action at the decision | Measured | Shown at 45k | Root visits |
+| Action at the decision | Value | per-world range | worlds |
 |---|---|---|---|
-| `Circus Maximus (using Caravansery)` | 59-70% | 66.9% | 41738 |
-| `Build: Aqueduct` (keeps the chain closed) | 53-62% | 62.5% | 72 |
-| `Discard: Caravansery` (played) | **42-51%** | **63.0%** | 2944 |
+| `Circus Maximus (using Caravansery)` | **68.9%** | 61.6-73.8 | 10/10 exact |
+| `Circus Maximus (using Aqueduct)` | 60.0% | 46.2-66.2 | 30/90 sampled |
+| `Build: Aqueduct` | 57.0% | 53.0-66.8 | 30/90 sampled |
+| `Discard: Aqueduct` | 56.8% | 50.1-67.4 | 30/90 sampled |
+| `Discard: Caravansery` (played) | **49.3%** | 43.0-62.4 | 10/10 exact |
+
+Still deep estimates, not solved values, and one determinization of the cards
+that are not on the board. Sufficient to size the error and nothing finer.
+
+Three methodological points, each of which changed a number:
+
+- **Probability-weighted, not min-max.** The actor chooses under the chance
+  distribution, not against its best or worst case. The earlier ranges are
+  retained above as a spread, not as the estimate.
+- **Common ply.** `Circus Maximus` destroys an opponent building, so it fires a
+  pending choice and its child is the ACTOR still to move. Searching from there
+  buries the opponent's reply one ply down as an ordinary interior node, where a
+  low-prior refutation starves, while an action whose child is already the
+  opponent's reply gets it force-expanded at the root. Measured: the exact
+  refutation held 3 visits at rank 7-10 in the first case against rank 1 with
+  ~1200 visits in the second, at identical budget. Rolling forward through the
+  forced choice (it had exactly one legal action, so nothing is chosen on the
+  actor's behalf) removes that artifact.
+- **Chance worlds, not determinizations.** Determinization is which hidden cards
+  exist; the chance worlds are which card the reveal turns up, and this plan
+  already established that single-world determinization is not the defect
+  because the searcher resamples chance itself.
+
+#### The two families do not separate -- the error is narrower than it looked
+
+Both `Caravansery` actions expose `r2c10` and both concede the Theology line.
+Both were confirmed by walking the principal variation under a force-funded
+refutation: the opponent plays `Artemis` -> `Build: School` -> `Theology` in
+**both** branches, ending with the science pair and the token in hand.
+
+Conceding Theology is not what loses. What it is spent on is:
+
+| after | Artemis | after School | after Theology | your best reply at ply 2 |
+|---|---|---|---|---|
+| `Discard: Caravansery` | +0.118 | +0.148 | +0.152 | `Circus Maximus (using Aqueduct)` at **-0.147** |
+| `Circus Maximus (using Caravansery)` | -0.138 | -0.105 | -0.097 | `Build: Aqueduct` at **+0.114** |
+
+(Opponent's frame for the first three columns, actor's for the last.) The same
+opponent sequence is worth about 25 points less against the Wonder build,
+because the actor has already spent the turn on a Wonder and a destruction
+rather than on coins, and that tempo covers the concession.
+
+So the advisor's error is not "blind to Theology in the Caravansery family". It
+is sharper: **it recommended the one Caravansery action where the concession is
+not paid for, while an action making the identical concession profitably was the
+best move on the board.** The 20-point gap is within the family, not between the
+families -- the best and worst moves available both take Caravansery.
+
+#### What the advisor showed
 
 At the approximately 4000 simulations a 24-second turn affords, the losing move
 was displayed **first** at 1000, 2000, and 3000 simulations, and second by no
-more than about two points thereafter. The advisor recommended the losing move
-for most of the available thinking time, and never expressed the roughly
-twenty-point gap that separates it from the best move.
+more than about two points thereafter. The advisor recommended it for most of
+the available thinking time and never expressed the roughly twenty-point gap
+separating it from `Circus Maximus (using Caravansery)`.
+
+The superseded first-round figures, which must not be quoted, were 59-70% /
+53-62% / 42-51% at mixed plies with min-max ranges.
 
 ### What this evidence does and does not implicate
 
@@ -1096,6 +1143,14 @@ ordinary search already correct the evaluation, so value targets at the
 precursor, post-Artemis and post-School states are not indicated by this
 evidence. Force search past the threshold and train the ranking.
 
+*Cost of the error* sharpens the target further. The correction is not "learn
+that exposing `r2c10` is bad" -- it is not, and the model already prices the
+refutation differently in the two branches (0.038 after the discard, 0.017 after
+the Wonder build, correctly). The correction is to fund the refutation where it
+IS good, so the discard's true value surfaces. A ranking target that taught
+blanket avoidance of the exposure would make the model worse, since the best
+move on the board makes the same exposure.
+
 ### Open loop: mis-specified for this, not merely expensive
 
 The Python open-loop searcher shares action-path statistics across
@@ -1161,7 +1216,7 @@ regression is attributable.
 | Flag-arm diagnostic | **DONE** for five flag arms, equal-simulation. Equal-wall-clock not yet meaningful: the first arm of a sweep pays warm-up costs, so recorded per-rung times reflect that rather than the mechanisms. |
 | `Walls` world not corrupted | **CHARACTERISED, not run as a regression.** Isolated probe: `Build: Walls` 3589 vs Artemis 2371, so the reply genuinely differs there. Usable as the negative control. |
 | Discovery latency | **DONE.** Median first visit at simulation 119; about eight visits to correct; the refutation dies at 1-4 visits in 34 of 50 world-observations. Five seeds. |
-| Action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see *Cost of the error*. |
+| Action regret vs deep references | **DONE.** Common-ply, probability-weighted reference values for all five root actions; see *Cost of the error*. The played `Discard: Caravansery` is worst at 49.3%, `Circus Maximus (using Caravansery)` best at 68.9%, and both concede Theology. |
 | Arena strength at equal wall-clock | **NOT RUN.** Premature. |
 | Prior rising after a training run | **NOT RUN.** Not justified by the above. |
 

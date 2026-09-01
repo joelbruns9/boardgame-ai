@@ -888,30 +888,79 @@ def run_reference_values(position: Position, evaluator, args, log) -> dict:
     anything finer than that.
     """
 
-    from .codec import decode_action
+    from .codec import decode_action, legal_action_indices
     from .engine import apply_action
-    from .search import chance_signature, enumerate_chains
+    from .game import Phase
+    from .search import chance_signature, enumerate_chains, state_actor
 
+    def roll_to_opponent(state, decider: int, limit: int = 6) -> int:
+        """Advance through FORCED actor continuations, in place.
+
+        Some actions leave the actor still to move -- Circus Maximus destroys an
+        opponent building, so it fires a pending choice whose resolution is the
+        only legal action. Searching from there is not comparable with an action
+        whose child is already the opponent's reply: the opponent's node would
+        sit one ply deeper, as an ordinary interior node rather than a
+        force-expanded root, and a low-prior refutation starves there while the
+        same refutation is found immediately at a root.
+
+        Measured: after `Circus Maximus (using Caravansery)` the exact refutation
+        held 3 visits at rank 7-10, against rank 1 with ~1200 visits after
+        `Discard for coins: Caravansery` at the same budget. That gap was an
+        artifact of the ply, not of the position.
+
+        Only FORCED steps are taken (exactly one legal action), so nothing is
+        chosen on the actor's behalf. Returns the number of plies advanced.
+        """
+
+        advanced = 0
+        while advanced < limit and state.phase is not Phase.COMPLETE:
+            if state_actor(state) != decider:
+                break
+            legal = legal_action_indices(state)
+            if len(legal) != 1:
+                break  # a real decision; stop rather than pick one
+            action = decode_action(state, legal[0])
+            if chance_signature(state, action):
+                break  # a forced move that fires chance needs its own handling
+            apply_action(state, action)
+            advanced += 1
+        return advanced
+
+    wanted_actions = [a.strip() for a in (args.ref_actions or "").split(",") if a.strip()]
     results = []
     for entry in position.legal:
+        if wanted_actions and not any(w in entry["label"] for w in wanted_actions):
+            continue
         action = decode_action(position.game, entry["index"])
         specs = chance_signature(position.game, action)
         if specs:
             chains = enumerate_chains(position.game, specs)
             wanted = min(int(args.ref_worlds), len(chains))
-            step = max(1, len(chains) // wanted)
-            selected = chains[::step][:wanted]
+            if args.ref_sample == "random":
+                # An evenly spaced slice is not a representative sample of a
+                # TWO-reveal space: the enumeration is ordered by the first
+                # reveal, so a stride over-represents whichever card leads it.
+                # Uniform-without-replacement, seeded so the run reproduces.
+                selected = random.Random(int(args.seed)).sample(chains, wanted)
+            else:
+                step = max(1, len(chains) // wanted)
+                selected = chains[::step][:wanted]
         else:
             selected = [([], 1.0, ())]
 
         values = []
-        for outcomes, _probability, key in selected:
+        for outcomes, probability, key in selected:
             child = position.game.clone()
             child.search_barrier = True
             apply_action(
                 child,
                 decode_action(child, entry["index"]),
                 chance_outcomes=outcomes or None,
+            )
+            plies = (
+                roll_to_opponent(child, position.actor)
+                if args.ref_common_ply else 0
             )
             mcts = build_mcts(evaluator, args)
             started = time.perf_counter()
@@ -924,33 +973,60 @@ def run_reference_values(position: Position, evaluator, args, log) -> dict:
             values.append(
                 {
                     "revealed": list(key) if isinstance(key, tuple) else [key],
+                    "probability": round(float(probability), 8),
+                    "forced_plies_advanced": plies,
+                    "searched_actor": state_actor(child),
                     "win_pct": round(win_pct(value), 2),
                     "seconds": round(time.perf_counter() - started, 2),
                 }
             )
         pcts = [row["win_pct"] for row in values]
+        # The decision-relevant number is the probability-weighted mean over the
+        # chance worlds, not a min-max range: the actor is choosing under that
+        # distribution, not against its worst or best case. Weights are
+        # renormalised over the sampled subset, so this is exact only when every
+        # world was sampled -- `worlds_sampled == worlds_total` says whether it
+        # was.
+        mass = sum(row["probability"] for row in values) or 1.0
+        weighted = sum(
+            row["win_pct"] * row["probability"] for row in values
+        ) / mass
         results.append(
             {
                 **entry,
                 "worlds": values,
+                "worlds_sampled": len(values),
+                "worlds_total": len(chains) if specs else 1,
                 "win_pct_min": round(min(pcts), 2),
                 "win_pct_max": round(max(pcts), 2),
                 "win_pct_mean": round(statistics.fmean(pcts), 2),
+                "win_pct_weighted": round(weighted, 2),
             }
         )
         log(
-            f"  {entry['label']!r}: {results[-1]['win_pct_min']:.1f}-"
-            f"{results[-1]['win_pct_max']:.1f}% over {len(values)} world(s)"
+            f"  {entry['label']!r}: weighted {results[-1]['win_pct_weighted']:.1f}% "
+            f"(range {results[-1]['win_pct_min']:.1f}-"
+            f"{results[-1]['win_pct_max']:.1f}%) over "
+            f"{len(values)}/{results[-1]['worlds_total']} world(s)"
         )
 
     return {
         "sims_per_world": int(args.ref_sims),
         "worlds_per_action": int(args.ref_worlds),
+        "sampling": args.ref_sample,
+        "sample_seed": int(args.seed),
+        "common_ply": bool(args.ref_common_ply),
+        "common_ply_note": (
+            "each action rolled forward through FORCED actor continuations so "
+            "every search starts with the opponent to move; without this an "
+            "action that fires a pending choice hides the opponent's reply one "
+            "ply deeper and its refutation starves"
+        ),
         "caveat": (
             "deep-search estimates, not solved game-theoretic values; "
             "sufficient only to expose a large advisor error"
         ),
-        "actions": sorted(results, key=lambda row: -row["win_pct_mean"]),
+        "actions": sorted(results, key=lambda row: -row["win_pct_weighted"]),
     }
 
 
@@ -1041,7 +1117,11 @@ def build_summary(report: dict, args) -> dict:
     refs = report.get("reference_values")
     if refs:
         summary["reference_values"] = {
-            row["label"]: f"{row['win_pct_min']:.1f}-{row['win_pct_max']:.1f}%"
+            row["label"]: {
+                "weighted": row["win_pct_weighted"],
+                "range": f"{row['win_pct_min']:.1f}-{row['win_pct_max']:.1f}%",
+                "worlds": f"{row['worlds_sampled']}/{row['worlds_total']}",
+            }
             for row in refs["actions"]
         }
 
@@ -1131,6 +1211,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stages.add_argument("--probe-worlds", type=int, default=6)
     stages.add_argument("--ref-sims", type=int, default=6000)
     stages.add_argument("--ref-worlds", type=int, default=3)
+    stages.add_argument(
+        "--ref-sample", default="random", choices=("random", "slice"),
+        help="how to pick chance worlds when not enumerating all of them. "
+             "'random' is uniform without replacement, seeded by --seed; "
+             "'slice' is the old evenly-spaced stride, kept only to reproduce "
+             "earlier artifacts (it is not representative of a two-reveal space)",
+    )
+    stages.add_argument(
+        "--no-common-ply", dest="ref_common_ply", action="store_false",
+        help="do NOT roll forward to the opponent's move; reproduces the "
+             "earlier, non-comparable measurement",
+    )
+    stages.add_argument(
+        "--ref-actions", default=None,
+        help="comma-separated substrings; measure only matching root actions",
+    )
     stages.add_argument(
         "--smoke", action="store_true",
         help="tiny budgets for a plumbing check; the numbers mean nothing",
