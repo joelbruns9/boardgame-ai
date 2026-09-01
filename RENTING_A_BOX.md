@@ -357,7 +357,120 @@ you carefully preserved.
 
 ---
 
-## 8. Cost discipline
+## 8. Schedules: decide what ramps before you rent
+
+A rented run is a one-shot commitment: the settings that matter most are the
+ones you cannot change once it starts. Section 1.7 says to write down which
+those are. This section is about the consequence — **anything you would want to
+change at hour 40 has to be a schedule at hour 0, or a controller inside the
+process. There is no third option**, because noticing a plateau and restarting
+with better flags is exactly what resume identity refuses.
+
+### 8.1 Pick one clock and put everything on it
+
+`--schedule-basis games` indexes every schedule on cumulative games rather than
+iteration count. That is the right default because it decouples the schedule
+from `--games-per-iteration`: you can resize an iteration on a resume without
+moving any schedule position. Under an iterations basis that same change
+silently re-times every anneal you configured.
+
+`schedule_identity()` in `phase_d.py` is the enforcement. It pins the
+games-basis constants — window coefficient, window exponent, window cap,
+curriculum anneal, draft prior, opponent fraction, seed retain, sims schedule —
+and refuses a resume that changes any of them, because a schedule changed
+mid-run moves the meaning of every later iteration rather than only the current
+one. `games_per_iteration` is deliberately absent from that list; that freedom
+is the whole point of the games basis.
+
+### 8.2 Ramp the expensive things up, not down
+
+Early iterations train on a weak net whose targets are noisy anyway. Spending a
+full search budget there buys precision the labels cannot carry. The general
+shape:
+
+| quantity | direction | why |
+|---|---|---|
+| search sims | **up** | cheap while the net is weak; expensive once targets are worth sharpening |
+| replay window | **up** | a small window early keeps data fresh; a large one later resists overfitting |
+| learning rate | **down** | large steps while the loss surface is coarse, small ones to converge |
+| scaffolding (curriculum, draft prior, seed retain) | **down to zero** | it exists to bootstrap, and outstays its welcome |
+
+### 8.3 What this project actually has
+
+Three of those four are implemented; one is not.
+
+- **Replay window — done, and it is a growth curve, not a constant.**
+  `window = clamp(coefficient * total_games ** exponent, floor, cap)`
+  (`games/az_loop/schedule.py`). At `--replay-window-coefficient 1000
+  --replay-window-exponent 0.6 --replay-window-cap-games 20000` it grows
+  sublinearly and then flattens at the cap.
+- **Search sims — implemented, unused.** `--full-sims-schedule` takes
+  piecewise-constant knots as `games:sims`, e.g. `0:400,10000:900,25000:1600`,
+  and must define a value at 0 games. Runs that pass a flat
+  `--full-sims-min/--full-sims-max` are opting out of it.
+- **Scaffolding anneals — done.** `--curriculum-anneal-games`,
+  `--draft-prior-games`, `--seed-retain-fraction`, plus `--gate-ladder-games`
+  and `--hof-start-games` for the evaluation side.
+- **Learning rate — missing.** There is no cross-iteration LR schedule.
+  `train.py` accepts a `cosine_decay` argument, but `phase_d` never passes it,
+  so `--learning-rate` is flat for the life of the run and
+  `--train-warmup-steps` only warms within each iteration. This is the gap.
+
+**Piecewise-constant, not continuous.** A continuously drifting budget makes
+every iteration incomparable with every other, instead of only those across a
+step. Steps give you segments you can average within.
+
+### 8.4 Metric-based is the upgrade, and it must live in-process
+
+A clock schedule guesses *when* the plateau will arrive. A metric-driven one
+waits for it. The three levels:
+
+0. **Constants.** Every value chosen once, at launch.
+1. **Clock schedules.** Values move on the games counter. Where this project is.
+2. **Metric triggers.** Values move when a measurement says the current setting
+   has stopped paying — validation loss flat across N iterations, gate margin
+   decaying, promotions per 10k games falling.
+
+Level 2 is already built here and switched off. `--intervention-ladder`
+(`intervention_ladder: bool = False`) multiplies exactly the right three axes —
+`sims_multiplier`, `window_multiplier` (applied to both the window coefficient
+and its cap) and `learning_rate_multiplier` — and holds a rung for
+`--intervention-window-games` before judging its effect.
+
+Its docstring names the blocker precisely: *"a running process cannot pick up a
+mid-run change, and restarting to get one is what W6.5 refuses."* That is the
+whole argument for level 2. The manual alternative — watch the metrics, stop the
+run, relaunch with new flags — is refused by resume identity for a good reason,
+and doing it anyway costs an in-flight iteration each time.
+
+The existence proof that in-process control works is already running: the
+soft-gate controller promotes, puts on probation and reverts entirely on
+measured gate outcomes, with no operator in the loop.
+
+### 8.5 Rules
+
+- **Every schedule on the same clock.** Mixed clocks drift relative to each
+  other the moment iteration size changes.
+- **Print the resolved value every iteration**, not the configuration that
+  produced it. A `schedule:` line showing `curriculum=0.000 draft_prior=0.000
+  seed_retain=0.000` is how you know scaffolding actually annealed out.
+- **A metric-triggered change is still a regime boundary.** Record it and its
+  games clock so later analysis can segment at it — the pattern
+  `--allow-hof-change` already uses, where the change is persisted and its clock
+  becomes a revert-suppress knot. Recording a change does not make the
+  iterations across it comparable; it makes the incomparability findable.
+- **Decide the ramps on a laptop.** A schedule is cheap to reason about and
+  impossible to change later, which is the worst combination to discover under
+  billing.
+
+---
+
+## 9. Cost discipline
+
+Throughput tuning has its own playbook: **`THROUGHPUT_LEVERS.md`** covers which
+levers can be swept on wall clock, which need a strength measurement, and what a
+sweep harness has to prove before its numbers mean anything.
+
 
 - Decide the acceptable share of wall clock spent on evaluation *before* the
   run, not when the gate ladder surprises you.
@@ -370,7 +483,7 @@ you carefully preserved.
 
 ---
 
-## 9. The one-line version
+## 10. The one-line version
 
 Everything above reduces to: **verify the thing you are about to pay for, using
 the thing itself, before you pay for it** — the real command, the real manifest,
