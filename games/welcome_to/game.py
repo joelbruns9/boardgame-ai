@@ -45,10 +45,12 @@ what an MCTS root must call.
 """
 from __future__ import annotations
 
+import itertools
 import random
+from collections import Counter
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional, Sequence
 
 import numpy as np
 
@@ -68,14 +70,19 @@ from games.welcome_to.constants import (
     TEMP_SOLO_THRESHOLD,
     MAX_NUMBER,
     MIN_NUMBER,
+    NUM_STREETS,
+    PARK_BOXES,
+    STREET_SIZES,
 )
 from games.welcome_to.portable_rng import PortableRng
 from games.welcome_to.plans import (
     PLANS,
     Plan,
+    PlanKind,
     available_plan_ids,
     can_be_scored,
     estates_matching_size,
+    progress,
     validation_cells,
 )
 from games.welcome_to.sheet import Estate, Pos, Sheet, SheetScore
@@ -905,15 +912,13 @@ class GameState:
         return cards
 
     def numbers_for(self, number: int, effect: Effect) -> list[int]:
-        """``Player::getAvailableNumbersOfCombination`` -- candidate numbers, in codec order."""
-        if effect is not Effect.TEMP:
-            return [number]
-        out = [number]
-        for delta in TEMP_DELTAS[1:]:
-            n = number + delta
-            if MIN_NUMBER <= n <= MAX_NUMBER:
-                out.append(n)
-        return out
+        """``Player::getAvailableNumbersOfCombination`` -- candidate numbers, in codec order.
+
+        Delegates to the module-level :func:`_numbers_for` so the sheet-level
+        turn enumeration and the engine cannot drift apart -- two copies of the
+        temp widening is exactly the kind of duplication that goes stale.
+        """
+        return _numbers_for(number, effect)
 
     def _writable(self, number: int, effect: Effect, sheet: Sheet) -> dict[int, list[Pos]]:
         result: dict[int, list[Pos]] = {}
@@ -1479,3 +1484,468 @@ def play_random_game(
             return state
         state.apply(rng.choice(state.legal_actions()))
     raise RuntimeError("game did not terminate")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3: what a single turn can reach, and who is one turn from a plan
+#
+# ENCODER_V3_SPEC.md §6.4 and §8.  The threat predicates are the reason the
+# plan race is representable at all: `progress()` says "two parks away", and
+# these say "and the cards on the table right now supply exactly that".
+#
+# ⚠ SCOPE: `config.standard` only.  The premise that every seat sees the same
+# three stacks is `Globals::isStandard` -- in expert mode stacks are private, so
+# reading an opponent's would leak and reading the viewer's would answer a
+# different question, and `known_next_effects` is all-zero in expert AND solo.
+# Solo has no opponent to threaten, so both predicates emit 0.0 there.
+# ──────────────────────────────────────────────────────────────────────────
+class TurnEnumerationExhausted(RuntimeError):
+    """The one-turn enumeration hit its cap.  Never silently a "no"."""
+
+
+#: Sound upper bound on how far ONE turn can advance a plan, per kind.
+#:
+#: ⚠ These are bounds on *plan progress*, not on houses, and the difference is
+#: what an earlier draft got wrong.  A turn applies exactly one effect mark
+#: (one combination per turn), but it can place up to THREE houses --
+#: `ROUNDABOUT_OPEN` is legal before the write and a roundabout counts as a
+#: built house, so roundabout -> write -> bis.
+#:
+#: ESTATE gets no early exit at all.  A single SURVEYOR fence can raise the
+#: estate match by two -- a fenced run of six against a plan needing (3, 3)
+#: scores nothing, and one fence in its middle scores both -- and a turn
+#: supplies up to three fences, since `build_roundabout` fences both its sides.
+#: `steps_left` never exceeds `len(required_sizes)` <= 6 anyway, so "never exit"
+#: costs a ceiling of six and is the only obviously sound choice.
+_ONE_TURN_CEILING: dict[PlanKind, int] = {
+    PlanKind.FULL_STREET: 3,      # three houses, all in the target street
+    PlanKind.EXTREMITIES: 3,      # three houses, all of them extremity boxes
+    PlanKind.FIVE_BIS: 1,         # one BIS effect is one bis mark
+    PlanKind.SEVEN_TEMP: 1,       # one TEMP effect is one temp mark
+    PlanKind.DECORATIVE: 1,       # one PARK or POOL mark
+    PlanKind.COMPLETE_STREET: 2,  # one mark, plus a roundabout the same turn
+}
+
+
+def one_turn_ceiling(plan: Plan) -> int:
+    """The most `progress()` steps one turn could close for ``plan``."""
+    if plan.kind is PlanKind.ESTATE:
+        return len(plan.required_sizes)  # i.e. never early-exit
+    try:
+        return _ONE_TURN_CEILING[plan.kind]
+    except KeyError:
+        raise NotImplementedError(
+            f"plan kind {plan.kind} has no one-turn ceiling; add one rather than "
+            f"defaulting, or a threat will be missed silently"
+        ) from None
+
+
+def _resolve_effect(sheet: Sheet, effect: Effect, pos: Pos) -> Iterator[Sheet]:
+    """Every sheet the effect of a just-written house could produce, plus a pass.
+
+    Passing is legal for every effect that offers a *choice* (`passAction()` is
+    generic), so the unmodified sheet is yielded for those.
+
+    ⚠ **TEMP is the exception: its mark is automatic.** `stActionTemp` crosses a
+    box off with no decision to make and goes straight to `CHOOSE_PLAN`, so a
+    turn that takes a TEMP combination ALWAYS advances the temp track.  Offering
+    a pass branch invented 4,356 sheets on one state -- every write of a TEMP
+    number with the track untouched -- and each one is a sheet the engine cannot
+    produce.
+    """
+    if effect is not Effect.TEMP:
+        yield sheet
+
+    if effect is Effect.PARK:
+        # ⚠ A park mark is bound to the street of the house just written --
+        # `_park_streets` filters `park_streets()` down to `ctx.last_house[0]`.
+        # Iterating every street builds illegal successors and lets a threat
+        # predicate report a completion where the number is writable in one
+        # street and the park is needed in another.
+        x = pos[0]
+        if sheet.parks[x] < PARK_BOXES[x]:
+            nxt = sheet.copy()
+            nxt.parks[x] += 1
+            yield nxt
+
+    elif effect is Effect.POOL:
+        if sheet.can_build_pool_at(pos):
+            nxt = sheet.copy()
+            nxt.pools[pos[0]] += 1
+            yield nxt
+
+    elif effect is Effect.TEMP:
+        nxt = sheet.copy()
+        nxt.temps = min(nxt.temps + 1, TEMP_BOXES)
+        yield nxt
+
+    elif effect is Effect.BIS:
+        for x, y, number, _side in sheet.bis_candidates():
+            nxt = sheet.copy()
+            nxt.write(number, (x, y), turn=0, is_bis=True)
+            nxt.bis_marks = min(nxt.bis_marks + 1, BIS_BOXES)
+            yield nxt
+
+    elif effect is Effect.SURVEYOR:
+        for x, j in sheet.surveyor_zones():
+            nxt = sheet.copy()
+            nxt.fences[x][j] = True
+            yield nxt
+
+    # Effect.ESTATE marks a scoring row and cannot change `can_be_scored` for
+    # any plan kind, so the pass branch above covers it.
+
+
+def one_turn_sheets(
+    sheet: Sheet,
+    offers: Sequence[tuple[Optional[int], Optional[Effect]]],
+    *,
+    advanced: bool,
+    cap: int = 200_000,
+) -> Iterator[Sheet]:
+    """Every sheet reachable from ``sheet`` in one turn, given ``offers``.
+
+    A turn is, at most: an opening roundabout, then a chosen combination written
+    somewhere, then that combination's effect resolved.  Refusal branches are
+    omitted -- a refusal writes no house and marks no track, so it cannot make a
+    plan scoreable, which is the only question asked of this.
+
+    Raises :class:`TurnEnumerationExhausted` rather than truncating: a capped
+    search that answered "no threat" would be worse than no feature at all.
+    """
+    produced = 0
+
+    starts = [sheet]
+    if advanced and sheet.can_build_roundabout():
+        for pos in sheet.available_locations(None):
+            opened = sheet.copy()
+            opened.build_roundabout(pos, turn=0)
+            starts.append(opened)
+
+    for start in starts:
+        # ⚠ A turn does not end here unless it HAS to.  `ROUNDABOUT_OPEN` returns
+        # to `CHOOSE_CARDS`, so after placing one the player still chooses a
+        # combination -- "roundabout and stop" is not a legal outcome.  The
+        # no-write sheet is reachable only through a permit refusal, i.e. only
+        # when nothing on offer can be written, and the permit mark it leaves
+        # affects no plan predicate.
+        #
+        # Yielding it unconditionally invented 33 sheets on a fresh state, and
+        # they were not merely weaker versions of real ones: an ordinary write
+        # can MERGE two runs and so *break* an estate plan the roundabout-only
+        # sheet satisfies.
+        if not any(
+            start.available_locations(value)
+            for number, effect in offers
+            if number is not None and effect is not None
+            for value in _numbers_for(number, effect)
+        ):
+            yield start
+        for number, effect in offers:
+            if number is None or effect is None:
+                continue
+            for value in _numbers_for(number, effect):
+                for pos in start.available_locations(value):
+                    written = start.copy()
+                    written.write(value, pos, turn=0)
+                    for done in _resolve_effect(written, effect, pos):
+                        produced += 1
+                        if produced > cap:
+                            raise TurnEnumerationExhausted(
+                                f"one-turn enumeration exceeded {cap} sheets"
+                            )
+                        yield done
+
+
+def _numbers_for(number: int, effect: Effect) -> list[int]:
+    """`GameState.numbers_for` as a free function, for sheet-level enumeration."""
+    if effect is not Effect.TEMP:
+        return [number]
+    out = [number]
+    for delta in TEMP_DELTAS[1:]:
+        candidate = number + delta
+        if MIN_NUMBER <= candidate <= MAX_NUMBER:
+            out.append(candidate)
+    return out
+
+
+def _estate_houses_short(plan: Plan, sheet: Sheet) -> int:
+    """Houses that must still be WRITTEN before ``plan``'s estates can exist.
+
+    A cheap, sound pre-filter for the threat predicates.  An estate of size ``s``
+    is ``s`` contiguous written boxes inside a fence-delimited region, so meeting
+    a shortfall of ``k`` estates of size ``s`` needs ``k * s`` written boxes.
+    Boxes already written and not spent on a City Plan can all be re-used --
+    fences only ever accumulate, so an existing run may be split -- and counting
+    every one of them as available is the generous direction.
+
+    Zero for non-estate plans.  The result is a **lower bound** on new houses, so
+    a caller may exit when it exceeds what a turn can place, and never otherwise.
+    """
+    if plan.kind is not PlanKind.ESTATE:
+        return 0
+    supply = Counter(size for _, _, size in sheet.free_estates())
+    need = Counter(plan.required_sizes)
+    boxes_wanted = sum(
+        max(0, count - supply[size]) * size for size, count in need.items()
+    )
+    reusable = sum(
+        1
+        for x, size in enumerate(STREET_SIZES)
+        for y in range(size)
+        if sheet.numbers[x][y] is not None and not sheet.top_fences[x][y]
+    )
+    return max(0, boxes_wanted - reusable)
+
+
+def _one_turn_hopeless(plan: Plan, sheet: Sheet) -> bool:
+    """Cheap sound test that ``plan`` cannot possibly complete in a single turn.
+
+    Guards the expensive enumeration.  Both clauses are lower bounds against the
+    three-house-per-turn ceiling, so a `True` here is never a missed threat.
+
+    This matters for throughput, not just tidiness: on a nearly EMPTY sheet the
+    one-turn enumeration reaches ~32,000 sheets for a single offer (33 roundabout
+    sites x 33 write boxes x 30 fence resolutions), while on a realistic
+    late-game sheet it reaches ~300.  The sparse case is also the one where the
+    answer is always no, so filtering it costs nothing in signal.
+    """
+    if progress(plan, sheet)[1] > one_turn_ceiling(plan):
+        return True
+    return _estate_houses_short(plan, sheet) > 3
+
+
+def max_houses_this_turn(state: "GameState", viewer: int, seat: int) -> int:
+    """0-3: the most houses the currently legal sequences could place.
+
+    ⚠ It really can be **three**.  `ROUNDABOUT_OPEN` is legal before the write
+    (`ctx.last_house is None`), placing a roundabout returns to `CHOOSE_CARDS`,
+    and a roundabout counts as a built house -- so a turn can be
+    roundabout -> choose + write -> bis, capped at one roundabout by the same
+    guard.  An earlier draft of the spec said "1 normally, 2 with a bis".
+
+    How many are actually placed is behavioural: a roundabout costs 3 or 8 points
+    and a bis is opt-in.  This states the ceiling; the policy learns the choice.
+    """
+    sheet = state.sheet_for(viewer, seat)
+    offers = [
+        (number, effect)
+        for number, effect in state.visible_cards(viewer)
+        if number is not None and effect is not None
+    ]
+
+    # ⚠ Maximised over legal SEQUENCES, not summed over independent predicates.
+    # A bis needs a BIS combination to be *offered*, not merely a candidate on
+    # the sheet; and an offered BIS can create its own candidate through the
+    # preceding write, so a sheet with no candidate now may still reach three.
+    # A roundabout also changes what is writable and what is bis-able, so the
+    # three tests are not independent.
+    best = 0
+    starts = [(sheet, 0)]
+    if state.config.advanced and sheet.can_build_roundabout() and sheet.has_free_box():
+        for pos in sheet.available_locations(None):
+            opened = sheet.copy()
+            opened.build_roundabout(pos, turn=0)
+            starts.append((opened, 1))
+
+    for start, placed in starts:
+        best = max(best, placed)
+        for number, effect in offers:
+            for value in _numbers_for(number, effect):
+                for pos in start.available_locations(value):
+                    written = start.copy()
+                    written.write(value, pos, turn=0)
+                    total = placed + 1
+                    if effect is Effect.BIS and written.bis_candidates():
+                        total += 1
+                    best = max(best, total)
+    return min(best, 3)
+
+
+def bis_usable(state: "GameState", viewer: int, seat: int) -> bool:
+    """Whether a bis write would be legal: a written house with an empty neighbour."""
+    return bool(state.sheet_for(viewer, seat).bis_candidates())
+
+
+def can_complete_this_turn(state: "GameState", viewer: int, seat: int, slot: int) -> bool:
+    """Could ``seat`` finish plan ``slot`` this turn, on what is on the table?
+
+    `progress()` says "two parks away"; it does not say "and the cards showing
+    right now supply exactly that".  The second is computable, because in
+    standard mode every seat sees the same three stacks and opponents' sheets are
+    public, so this is a deterministic predicate over information the viewer is
+    entitled to have.
+
+    It matters because of the tie rule: `plan_scores` pays `scores[0]` to *every*
+    player whose completion turn equals the earliest, so the live question is
+    never "will they beat me" but **"is this my last turn to finish alone"**.
+
+    ⚠ **Honest limitation, and it is the right one:** this answers "could they",
+    not "did they".  Whether a seat has already acted this turn is genuinely
+    hidden, and correctly so.  Search and the value head absorb the rest.
+    """
+    if not state.config.standard:
+        return False
+    # A seat that has already banked this slot cannot score it again.  Without
+    # this, `can_be_scored` -- which deliberately tests only the sheet -- reports
+    # a permanent threat from a finished plan: SEVEN_TEMP stays true forever once
+    # `temps >= 7`.
+    if seat in state.plan_turns_for(viewer, slot):
+        return False
+
+    plan = PLANS[state.plan_ids[slot]]
+    sheet = state.sheet_for(viewer, seat)
+    if can_be_scored(plan, sheet):
+        return True
+    if _one_turn_hopeless(plan, sheet):
+        return False
+
+    offers = state.visible_cards(viewer)
+    for candidate in one_turn_sheets(
+        sheet, offers, advanced=state.config.advanced
+    ):
+        if can_be_scored(plan, candidate):
+            return True
+    return False
+
+
+def _completing_numbers(
+    state: "GameState", sheet: Sheet, plan: Plan, effect: Optional[Effect]
+) -> set[int]:
+    """Printed numbers that, offered with ``effect``, would let ``plan`` complete.
+
+    ``effect is None`` means the effect is not knowable -- expert, solo, or a
+    reshuffle the viewer has voted for -- and the answer is then the **union over
+    every effect**, which over-estimates the threat.  Over-warning is the safe
+    direction for a threat feature; under-warning is what hides a race.
+    """
+    effects = [effect] if effect is not None else list(Effect)
+    out: set[int] = set()
+    for number in range(1, 16):
+        for candidate_effect in effects:
+            if candidate_effect not in _EFFECT_PHASE:
+                continue
+            offers = [(number, candidate_effect)]
+            if any(
+                can_be_scored(plan, s)
+                for s in one_turn_sheets(
+                    sheet, offers, advanced=state.config.advanced
+                )
+            ):
+                out.add(number)
+                break
+    return out
+
+
+def p_complete_next_turn(
+    state: "GameState", viewer: int, seat: int, slot: int
+) -> float:
+    """P(``seat`` can finish plan ``slot`` on the NEXT turn's reveal).
+
+    Next turn's three **effects** are certainties -- a card prints its own effect
+    on its number face, so `next_effects` reads them off the corners -- which is
+    what collapses this from an enumeration over the whole number x effect
+    composition to an exact sum over ordered number triples.
+
+    ⚠ The three numbers are drawn **without replacement**, so this is a sum of
+    falling factorials, never a product of marginals.  `next_number_distribution`
+    is a marginal over one card and cannot answer "does any of three stacks
+    supply it".
+    """
+    if not state.config.standard:
+        return 0.0
+    if seat in state.plan_turns_for(viewer, slot):
+        return 0.0
+
+    plan = PLANS[state.plan_ids[slot]]
+    sheet = state.sheet_for(viewer, seat)
+    if can_be_scored(plan, sheet):
+        return 1.0
+    if _one_turn_hopeless(plan, sheet):
+        return 0.0
+
+    # ⚠ A queued reshuffle destroys `next_effects`: `_reshuffle_decks` redraws
+    # `stack_new` entirely, so the cards on show never become asides.  The
+    # trigger is not readable -- the table-wide flag is the OR of concurrent
+    # hidden votes -- so only the viewer's own vote is consulted, and the
+    # effect-agnostic (over-estimating) branch is taken when it is set.
+    from games.welcome_to import deck_knowledge as _dk
+
+    known = state.next_effects(viewer)
+    reshuffling = state.reshuffle_vote_for(viewer)
+    if reshuffling:
+        known = [None, None, None]
+
+    completing = [_completing_numbers(state, sheet, plan, e) for e in known]
+    if not any(completing):
+        return 0.0
+
+    if reshuffling:
+        # ⚠ A queued reshuffle reforms deck + discard + aside into ONE pool and
+        # shuffles it before drawing, so the ordinary "deck first, reform only
+        # once it runs dry" sequencing does not apply.  Following it would draw
+        # all three numbers from the current deck whenever three cards remain,
+        # and report 0.0 for a number that sits in the discard -- a false
+        # negative on a real threat.
+        pool = _dk.after_reshuffle_composition(state, viewer).sum(axis=1)
+        return _p_any_stack_supplies(pool, np.zeros_like(pool), completing)
+
+    deck = _dk.deck_composition(state, viewer).sum(axis=1)
+    reform = (
+        _dk.discard_composition(state, viewer) + _dk.aside_composition(state, viewer)
+    ).sum(axis=1)
+    return _p_any_stack_supplies(deck, reform, completing)
+
+
+def _p_any_stack_supplies(
+    deck: "np.ndarray", reform: "np.ndarray", wanted: Sequence[set[int]]
+) -> float:
+    """P(some stack ``i`` reveals a number in ``wanted[i]``), drawn without replacement.
+
+    Enumerates ordered triples over the fifteen printed-number classes, weighting
+    each by falling card counts.  The deck supplies as many of the three as it
+    holds and the reform pool supplies the rest, because `_draw` reforms the
+    discard mid-draw and still yields three cards.
+    """
+    from games.welcome_to.constants import NUMBER_INDEX
+
+    numbers = list(range(1, 16))
+    deck_counts = {n: float(deck[NUMBER_INDEX[n]]) for n in numbers}
+    reform_counts = {n: float(reform[NUMBER_INDEX[n]]) for n in numbers}
+    deck_size = sum(deck_counts.values())
+    reform_size = sum(reform_counts.values())
+    from_deck = min(3, int(deck_size))
+
+    total = 0.0
+    miss = 0.0
+    for triple in itertools.product(numbers, repeat=3):
+        weight = 1.0
+        taken_deck: dict[int, int] = {}
+        taken_reform: dict[int, int] = {}
+        available_deck = deck_size
+        available_reform = reform_size
+        for position, n in enumerate(triple):
+            if position < from_deck:
+                have = deck_counts[n] - taken_deck.get(n, 0)
+                if have <= 0 or available_deck <= 0:
+                    weight = 0.0
+                    break
+                weight *= have / available_deck
+                taken_deck[n] = taken_deck.get(n, 0) + 1
+                available_deck -= 1
+            else:
+                have = reform_counts[n] - taken_reform.get(n, 0)
+                if have <= 0 or available_reform <= 0:
+                    weight = 0.0
+                    break
+                weight *= have / available_reform
+                taken_reform[n] = taken_reform.get(n, 0) + 1
+                available_reform -= 1
+        if weight == 0.0:
+            continue
+        total += weight
+        if not any(triple[i] in wanted[i] for i in range(3)):
+            miss += weight
+    if total <= 0.0:
+        return 0.0
+    return 1.0 - miss / total

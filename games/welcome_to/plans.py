@@ -397,10 +397,14 @@ class Requirements:
 
     #: Sheet-wide.
     temps_needed: int
-    #: Descriptor of estate work remaining.  NOT a bound on fences: one SURVEYOR
-    #: fence can raise the estate match by two, so this may not be used as a
-    #: lower bound on anything.  See :func:`turns_lower_bound`.
-    fences_needed: int
+    #: Unmatched required estates -- ``progress(...)[1]`` for an estate plan.
+    #:
+    #: ⚠ **Deliberately NOT called "fences needed".** It is neither a count of
+    #: nor a bound on SURVEYOR actions: one fence can create two matches at once,
+    #: and filling an empty box inside an already-fenced region creates a match
+    #: with no fence at all.  Never contract this against a Surveyor supply rate.
+    #: Size-specific demand lives in :attr:`estate_shortfall`.
+    estate_steps_left: int
     #: ``need[s] - free supply[s]`` for sizes 1..6, clipped at zero.
     estate_shortfall: tuple[int, ...]
 
@@ -585,7 +589,7 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
     kind = plan.kind
 
     temps_needed = 0
-    fences_needed = 0
+    estate_steps_left = 0
     estate_shortfall = [0] * MAX_ESTATE_SIZE
     parks = [0, 0, 0]
     pools = [0, 0, 0]
@@ -602,7 +606,7 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
         supply = Counter(size for _, _, size in sheet.free_estates())
         for size, count in Counter(plan.required_sizes).items():
             estate_shortfall[size - 1] = max(0, count - supply[size])
-        fences_needed = progress(plan, sheet)[1]
+        estate_steps_left = progress(plan, sheet)[1]
         serves = [1 if alive else 0] * NUM_STREETS
 
     elif kind is PlanKind.FULL_STREET:
@@ -669,7 +673,7 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
         # vectors as well would make the two fields redundant and destroy the
         # information a reader needs to see WHY a plan died.
         temps_needed = 0
-        fences_needed = 0
+        estate_steps_left = 0
         estate_shortfall = [0] * MAX_ESTATE_SIZE
         parks = [0, 0, 0]
         pools = [0, 0, 0]
@@ -692,7 +696,7 @@ def requirements(plan: Plan, sheet: "Sheet") -> Requirements:
 
     return Requirements(
         temps_needed=temps_needed,
-        fences_needed=fences_needed,
+        estate_steps_left=estate_steps_left,
         estate_shortfall=tuple(estate_shortfall),
         parks_needed=tuple(parks),
         pools_needed=tuple(pools),
@@ -709,12 +713,19 @@ def turns_lower_bound(plan: Plan, sheet: "Sheet") -> int:
 
     Two terms, both sound:
 
-    ``effect_term``
-        A turn takes **one** combination and so applies **one** effect mark, so
-        the marks still needed *sum*.  An earlier draft took a max over effects;
-        sound, but needlessly weak on the one feature sold as a hard bound -- and
-        it contradicted the argument for the rate features, which sum for exactly
-        this reason.
+    ``step_term``
+        ``progress()``'s ``steps_left`` divided by the plan's own one-turn
+        ceiling.  ``progress`` already does the per-kind arithmetic correctly --
+        the best two of three streets for a decorative plan, the cheapest single
+        street for ``CompleteStreet``, the best street for ``FiveBis`` -- so this
+        inherits that and cannot double-count alternatives.
+
+        ⚠ An earlier draft summed ``parks_needed`` and ``pools_needed`` across
+        streets.  Those vectors hold **per-street alternatives**, not work that
+        must all be done, so summing them made the "hard lower bound" too HIGH
+        for every alternative-street plan; and because it read neither
+        ``bis_needed`` nor ``roundabout_needed`` it returned **zero** for an
+        unfinished ``FiveBis``.  Both directions were wrong.
 
     ``house_term``
         Houses needed divided by **three**, the absolute per-turn ceiling:
@@ -722,17 +733,15 @@ def turns_lower_bound(plan: Plan, sheet: "Sheet") -> int:
         a built house, so a turn can be roundabout -> write -> bis.  Three is a
         constant, deliberately not ``max_houses_this_turn`` -- a *lower bound on
         turns* must not fluctuate with the current offer.
-
-    The estate contribution is ``0 if done else 1``, not the number of missing
-    estates.  One SURVEYOR fence can raise the estate match by two -- a fenced
-    run of six against a plan needing ``(3, 3)`` scores nothing, and one fence in
-    its middle scores both -- so "one missing estate is one fence" is not a lower
-    bound.  Weak but sound is the correct trade here.
     """
+    from games.welcome_to.game import one_turn_ceiling
+
+    steps = progress(plan, sheet)[1]
+    if steps == 0:
+        return 0
+    ceiling = max(1, one_turn_ceiling(plan))
+    step_term = -(-steps // ceiling)  # ceiling division
+
     req = requirements(plan, sheet)
-    effect_term = req.temps_needed + sum(req.parks_needed) + sum(req.pools_needed)
-    if any(req.estate_shortfall):
-        effect_term += 1
-    houses = sum(req.houses_needed)
-    house_term = -(-houses // 3)  # ceiling division
-    return max(effect_term, house_term)
+    house_term = -(-sum(req.houses_needed) // 3)
+    return max(step_term, house_term)

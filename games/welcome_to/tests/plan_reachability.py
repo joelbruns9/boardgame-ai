@@ -140,9 +140,13 @@ GEOMETRY, FENCES, PARKS, POOLS, TEMPS = (
 #: * ``DECORATIVE``      -- ``street_parks_complete`` / ``street_pools_complete``
 #: * ``COMPLETE_STREET`` -- those two plus ``has_roundabout_in_street`` -> numbers
 #:
-#: ``GEOMETRY`` gates the three house-writing moves (write, bis, roundabout);
-#: ``FENCES`` gates the standalone surveyor move on its own, because **only
-#: ESTATE reads the fence grid**.
+#: ``GEOMETRY`` gates writes and bis; ``FENCES`` gates the standalone surveyor
+#: move on its own, because **only ESTATE reads the fence grid**.
+#:
+#: ⚠ A read set is NOT simply "the fields the predicate reads".  It must also
+#: cover the **legality dependencies of every move it keeps** -- which is why the
+#: roundabout survives for POOLS even though a decorative pool plan never looks
+#: at `numbers`.
 _READS: dict[PlanKind, frozenset[str]] = {
     PlanKind.ESTATE: frozenset({GEOMETRY, FENCES}),
     PlanKind.FULL_STREET: frozenset({GEOMETRY}),
@@ -222,8 +226,16 @@ def _successors(sheet: Sheet, reads: frozenset[str]) -> Iterator[Sheet]:
                     pooled.pools[pos[0]] += 1
                     yield pooled
 
-    # 3. a roundabout ignores numeric fit and still counts as a built house
-    if geometry and sheet.roundabouts < ROUNDABOUT_BOXES:
+    # 3. a roundabout ignores numeric fit and still counts as a built house.
+    #
+    # ⚠ Retained whenever POOLS is read, even though a DECORATIVE pool plan's
+    # predicate never looks at `numbers`.  A read set must cover the **legality
+    # dependencies of the moves it keeps**, not only the fields the predicate
+    # reads: in a `5 _ _ 6` gap both boxes are numerically dead, and dropping a
+    # roundabout into one revives the other -- which may be the pool position the
+    # plan needs.  Pruning it here made the oracle able to miss a real
+    # completion, the one direction it may never take.
+    if (geometry or POOLS in reads) and sheet.roundabouts < ROUNDABOUT_BOXES:
         for pos in sheet.available_locations(None):
             nxt = sheet.copy()
             nxt.build_roundabout(pos, turn=0)

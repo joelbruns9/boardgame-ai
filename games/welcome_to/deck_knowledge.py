@@ -244,3 +244,130 @@ def summarise(state: GameState, player: int) -> str:
             f"   next turn's effect: {nxt.name if nxt else 'n/a'}"
         )
     return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3: prefix sums and exact supply rates
+#
+# ENCODER_V3_SPEC.md §7.1, §7.4 and §9.3.  Two rules run through all of it:
+#
+#   * divide by the ACTUAL sum of the matrix being summed, never by
+#     `deck_remaining`.  In solo the undrawn deck also holds `SOLO_CARD_ID`,
+#     which is not a printed construction card and so is absent from
+#     `DECK_MATRIX`; `sum(c) == deck_remaining - 1` there.
+#   * there is no `D < 3` approximation.  The next reveal still produces three
+#     cards -- `_draw` reforms the discard mid-draw and carries on -- so the
+#     boundary is enumerated exactly rather than waved away.
+# ──────────────────────────────────────────────────────────────────────────
+def number_prefix_sums(
+    state: GameState, player: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cumulative card counts over printed numbers 1..15.
+
+    Returns ``(deck, reform, reshuffled)``, each a ``(16,)`` array where
+    ``p[k]`` is the number of cards with printed number ``<= k``.  The count of
+    cards in an exclusive range ``(low, high)`` is then a single subtraction::
+
+        cards_in(low, high) = p[min(high - 1, 15)] - p[max(low, 0)]
+
+    which is what makes the fit-probability planes affordable: the sums are
+    built **once per state** and reused across all four sheets and every gap.
+
+    * ``deck``       -- the undrawn deck as it stands;
+    * ``reform``     -- what a mid-draw reform would put back (discard plus the
+      three aside cards, which ``_discard_step`` sweeps in before ``_draw``
+      finds the deck empty);
+    * ``reshuffled`` -- the pool after a queued reshuffle, i.e. both together.
+    """
+    deck = deck_composition(state, player).sum(axis=1)
+    reform = (
+        discard_composition(state, player) + aside_composition(state, player)
+    ).sum(axis=1)
+    reshuffled = deck + reform
+
+    def prefix(counts: np.ndarray) -> np.ndarray:
+        out = np.zeros(NUM_NUMBERS + 1, dtype=np.float64)
+        out[1:] = np.cumsum(counts)
+        return out
+
+    return prefix(deck), prefix(reform), prefix(reshuffled)
+
+
+def _falling(n: float, k: int) -> float:
+    """``n * (n-1) * ... * (n-k+1)``, and 1.0 for ``k == 0``."""
+    out = 1.0
+    for i in range(k):
+        out *= max(0.0, n - i)
+    return out
+
+
+def _p_none_in_next_three(deck_hits: float, deck_size: float,
+                          reform_hits: float, reform_size: float) -> float:
+    """P(none of the three cards revealed next turn is a "hit").
+
+    The reveal draws three cards **without replacement**, so this is a product of
+    falling factorials, never ``(1 - p)**3``.  And when the deck holds fewer than
+    three, ``_draw`` reforms the discard *mid-draw* and keeps going, so the three
+    cards come from two pools in sequence -- the draw does not simply stop.
+
+    Both phases are exact hypergeometrics; the deck phase takes as many cards as
+    it has, the reform phase supplies the remainder.
+    """
+    from_deck = min(3, int(deck_size))
+    from_reform = 3 - from_deck
+
+    p = 1.0
+    if from_deck:
+        denominator = _falling(deck_size, from_deck)
+        if denominator <= 0.0:
+            return 0.0
+        p *= _falling(deck_size - deck_hits, from_deck) / denominator
+    if from_reform:
+        denominator = _falling(reform_size, from_reform)
+        if denominator <= 0.0:
+            # Nothing left anywhere to draw: the question is vacuous, and
+            # reporting "a hit is impossible" is the honest reading.
+            return 1.0
+        p *= _falling(reform_size - reform_hits, from_reform) / denominator
+    return p
+
+
+def effect_supply_rate(state: GameState, player: int) -> np.ndarray:
+    """``(6,)`` -- P(effect ``e`` is among the three cards revealed next turn).
+
+    ⚠ **Not** ``1 - (1 - p)**3``.  Three cards are drawn without replacement, so
+    the independent-trials form is an approximation; at ``D = 40, k = 9`` it gives
+    0.535 against 0.545 exact, and the gap widens as the deck drains.
+
+    This is **exact for turn+2**, not a steady-state estimate: the three cards
+    drawn at the next boundary are precisely the ones whose effects are offered
+    two turns from now, because they become the asides.  Next turn's effects are
+    already certainties in :func:`known_next_effects`.
+    """
+    deck = deck_composition(state, player)
+    reform = discard_composition(state, player) + aside_composition(state, player)
+    deck_size = float(deck.sum())
+    reform_size = float(reform.sum())
+
+    rates = np.zeros(NUM_EFFECTS, dtype=np.float32)
+    for e in range(NUM_EFFECTS):
+        rates[e] = 1.0 - _p_none_in_next_three(
+            float(deck[:, e].sum()), deck_size, float(reform[:, e].sum()), reform_size
+        )
+    return rates
+
+
+def reveals_to_reform(state: GameState) -> int:
+    """How many reveals until ``_reform_deck`` runs, as an UPPER BOUND.
+
+    ``floor(D / 3) + 1``.  The ``+ 1`` is not cosmetic: ``_draw`` reforms only
+    when it *finds* the deck empty, so with ``D = 3`` the next reveal consumes the
+    last three cards and the reform fires on the reveal after that.
+
+    It is a **bound**, not a prediction.  Exhaustion is deterministic at three
+    cards a turn, but the first player to finish a City Plan may also *choose* a
+    reshuffle, and one YES from anyone fires it.  That is a decision, not a state,
+    and it can only make the refresh arrive sooner -- so this stays sound.
+    ``reshuffle_race`` carries the opportunity; the policy learns the choice.
+    """
+    return state.deck_remaining // 3 + 1

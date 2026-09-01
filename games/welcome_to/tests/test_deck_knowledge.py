@@ -246,3 +246,89 @@ def test_after_reshuffle_is_not_merely_deck_plus_discard():
     old_formula = dk.deck_composition(state, 0) + dk.discard_composition(state, 0)
     correct = dk.after_reshuffle_composition(state, 0)
     assert correct.sum() - old_formula.sum() == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Encoder v3: prefix sums and exact supply rates (ENCODER_V3_SPEC.md §7.1, §9.3)
+# ──────────────────────────────────────────────────────────────────────────
+import itertools
+
+
+def _fresh(seed: int = 3, **cfg):
+    return GameState.new(seed=seed, config=GameConfig(players=2, advanced=True, **cfg))
+
+
+def test_prefix_sums_are_cumulative_and_total_the_deck():
+    state = _fresh()
+    deck, reform, reshuffled = dk.number_prefix_sums(state, 0)
+    for p in (deck, reform, reshuffled):
+        assert p.shape == (16,)
+        assert p[0] == 0
+        assert all(p[i] <= p[i + 1] for i in range(15))
+    assert deck[-1] == dk.deck_composition(state, 0).sum()
+    assert reshuffled[-1] == deck[-1] + reform[-1]
+
+
+def test_prefix_range_subtraction_matches_a_direct_count():
+    """The subtraction the fit planes make, checked against counting by hand."""
+    state = _fresh(seed=11)
+    deck, _, _ = dk.number_prefix_sums(state, 0)
+    composition = dk.deck_composition(state, 0).sum(axis=1)
+    for low, high in ((7, 9), (-1, 18), (0, 4), (12, 16), (5, 6)):
+        expected = sum(
+            composition[NUMBER_INDEX[n]]
+            for n in range(1, 16)
+            if low < n < high
+        )
+        got = deck[min(high - 1, 15)] - deck[max(low, 0)]
+        assert got == expected, (low, high)
+
+
+def _brute_force_effect_rate(state, player, effect_index: int) -> float:
+    """P(effect appears among three drawn) by enumerating the literal deck."""
+    remaining = state.deck[state.deck_pos :]
+    cards = [c for c in remaining if CARD_TABLE[c][1] in EFFECT_INDEX]
+    hits = 0
+    total = 0
+    for combo in itertools.combinations(range(len(cards)), 3):
+        total += 1
+        if any(EFFECT_INDEX[CARD_TABLE[cards[i]][1]] == effect_index for i in combo):
+            hits += 1
+    return hits / total
+
+
+def test_effect_supply_rate_is_exact_not_the_independent_approximation():
+    """Three cards are drawn WITHOUT replacement; `1 - (1-p)**3` is not it."""
+    exact = 1.0 - dk._p_none_in_next_three(9, 40, 0, 0)
+    approximation = 1.0 - (1.0 - 9 / 40) ** 3
+    # The spec's worked example: 0.545 exact against 0.535 approximate.
+    assert abs(exact - 0.545) < 5e-4
+    assert abs(approximation - 0.5345) < 5e-4
+    assert exact > approximation
+
+
+def test_effect_supply_rate_matches_brute_force_over_the_real_deck():
+    state = _fresh(seed=5)
+    rates = dk.effect_supply_rate(state, 0)
+    for e in range(dk.NUM_EFFECTS):
+        # `effect_supply_rate` returns float32; the arithmetic itself is f64.
+        assert abs(float(rates[e]) - _brute_force_effect_rate(state, 0, e)) < 1e-6
+
+
+def test_a_near_empty_deck_still_reveals_three_cards():
+    """`_draw` reforms mid-draw, so `D < 3` is not a degenerate case."""
+    # Two cards left, one of them a hit: drawing both makes the hit certain.
+    assert dk._p_none_in_next_three(1, 2, 0, 30) == 0.0
+    # An empty deck draws all three from the reform pool.
+    assert dk._p_none_in_next_three(0, 0, 5, 30) == (25 * 24 * 23) / (30 * 29 * 28)
+    # And the hits sitting in the reform pool are what decide it, not the deck.
+    assert dk._p_none_in_next_three(0, 0, 0, 30) == 1.0
+
+
+def test_reveals_to_reform_counts_the_reveal_that_finds_the_deck_empty():
+    """`floor(D/3) + 1`: `_draw` reforms only when it FINDS the deck empty."""
+    state = _fresh()
+    for remaining, expected in ((0, 1), (3, 2), (4, 2), (6, 3), (7, 3)):
+        state.deck_pos = len(state.deck) - remaining
+        assert state.deck_remaining == remaining
+        assert dk.reveals_to_reform(state) == expected
