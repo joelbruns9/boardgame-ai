@@ -42,6 +42,7 @@ its response shape and replace the scoring function with NN/MCTS advisor output.
 """
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -233,7 +234,7 @@ class SearchJob:
     started_at: float
     updated_at: float
     _stop: threading.Event
-    _thread: Optional[threading.Thread] = None
+    _future: Optional[Future] = None
     # The remaining fields are worker-owned. They intentionally never escape
     # through the API and are discarded by the finished-job reaper.
     _req: Optional[RecommendStartRequest] = None
@@ -245,6 +246,17 @@ class SearchJob:
 _SEARCH_JOBS: dict[str, SearchJob] = {}
 _STATE_TO_JOB: dict[tuple[str, str], str] = {}
 _SEARCH_JOBS_LOCK = threading.RLock()
+# A POOL, NOT A THREAD PER JOB. Torch's CPU inference allocates per-thread
+# arenas that it does NOT return when the thread exits -- measured at ~8 MB for
+# a thread that only runs forward passes, ~18 MB once a whole search runs on
+# one. An advisor starts a job per position, so a thread per job leaks without
+# bound across a session; the 7WD host lost 1.3 GB per game to exactly this
+# (games/advisor/jobs.py). Reusing workers makes the cost a one-off.
+#
+# Four workers, though a start cancels every other active job: a cancelled
+# search only notices at its next chunk boundary, and queueing the new one
+# behind it would show up as advisor lag.
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kingdomino-advisor")
 _SEARCH_JOB_TTL_SECS = 60.0
 _ACTIVE_SEARCH_STATUSES = ("running", "testing_fragility", "solving_exact")
 
@@ -1488,6 +1500,7 @@ def _load_nn_evaluator(req: BotActionRequest):
             channels=channels,
             blocks=blocks,
             bilinear_dim=bilinear_dim,
+            global_pooling=bool(cfg.get("global_pooling", False)),
         ).to(req.device)
         net.load_state_dict(sd)
         net.eval()
@@ -1962,6 +1975,12 @@ def _run_search_job(job: SearchJob) -> None:
     req = job._req
     state = job._state
     assert req is not None and state is not None
+    if job._stop.is_set():
+        # Cancelled while queued behind another search (a later /start cancels
+        # every active job): loading an evaluator only to throw it away buys
+        # nothing.
+        _set_job_status(job, "cancelled", bump=True)
+        return
     try:
         exact_fallback_reason: Optional[str] = None
         if _exact_supported_detail(state, req.state) is None:
@@ -2445,16 +2464,9 @@ def recommend_start(req: RecommendStartRequest) -> dict[str, Any]:
             _req=req,
             _state=state,
         )
-        thread = threading.Thread(
-            target=_run_search_job,
-            args=(job,),
-            name=f"kingdomino-advisor-{job_id[:8]}",
-            daemon=True,
-        )
-        job._thread = thread
         _SEARCH_JOBS[job_id] = job
         _STATE_TO_JOB[dedupe_key] = job_id
-        thread.start()
+        job._future = _SEARCH_POOL.submit(_run_search_job, job)
     return {
         "job_id": job_id,
         "status": job.status,

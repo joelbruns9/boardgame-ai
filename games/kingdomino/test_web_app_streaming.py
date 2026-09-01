@@ -1,4 +1,5 @@
 import threading
+from concurrent import futures
 
 import pytest
 
@@ -72,7 +73,7 @@ def test_start_poll_done_and_dedupe(monkeypatch):
     assert initial["version"] == 0
     release.set()
     job = web_app._SEARCH_JOBS[first["job_id"]]
-    job._thread.join(timeout=2)
+    futures.wait([job._future], timeout=2)  # the worker is a pooled thread
 
     done = web_app.recommend_poll(first["job_id"], -1)
     assert done["status"] == "done"
@@ -151,7 +152,7 @@ def test_exact_eligible_job_publishes_one_solved_snapshot(monkeypatch):
 
     started = web_app.recommend_start(_request(state))
     job = web_app._SEARCH_JOBS[started["job_id"]]
-    job._thread.join(timeout=2)
+    futures.wait([job._future], timeout=2)  # the worker is a pooled thread
     done = web_app.recommend_poll(job.job_id, -1)
 
     assert done["status"] == "done"
@@ -181,7 +182,7 @@ def test_exact_timeout_continues_same_job_with_nn(monkeypatch):
 
     started = web_app.recommend_start(_request(state))
     job = web_app._SEARCH_JOBS[started["job_id"]]
-    job._thread.join(timeout=2)
+    futures.wait([job._future], timeout=2)  # the worker is a pooled thread
     done = web_app.recommend_poll(job.job_id, -1)
 
     assert done["job_id"] == started["job_id"]
@@ -213,7 +214,7 @@ def test_exact_job_cancels_between_bounded_solver_calls(monkeypatch):
     stopped = web_app.recommend_stop(web_app.RecommendStopRequest(job_id=started["job_id"]))
     release_second_solve.set()
     job = web_app._SEARCH_JOBS[started["job_id"]]
-    job._thread.join(timeout=2)
+    futures.wait([job._future], timeout=2)  # the worker is a pooled thread
 
     assert stopped["status"] == "cancelled"
     assert web_app.recommend_poll(job.job_id, -1)["status"] == "cancelled"
@@ -248,3 +249,27 @@ def test_rust_handle_accumulates_visits():
     assert visits2 == 16
     assert handle.sims_done == 16
     assert handle.transpositions >= 1
+
+
+def test_search_workers_are_pooled_not_one_per_job(monkeypatch):
+    """One job per advised position, and torch's CPU inference permanently
+    costs ~8 MB for every distinct thread that runs a forward pass (measured
+    2026-08-31; it is not returned when the thread exits). A thread per job
+    therefore leaks for as long as the host is up -- the 7WD advisor lost
+    1.3 GB per game to exactly this. Count DISTINCT thread idents, not live
+    threads: a per-job thread is already gone by the time its job is.
+    """
+
+    seen: set[int] = set()
+
+    def fake_worker(job):
+        seen.add(threading.get_ident())
+        web_app._set_job_status(job, "done", bump=True)
+
+    monkeypatch.setattr(web_app, "_run_search_job", fake_worker)
+    for seed in range(12):
+        started = web_app.recommend_start(_request(GameState.new(seed=seed)))
+        job = web_app._SEARCH_JOBS[started["job_id"]]
+        futures.wait([job._future], timeout=2)
+
+    assert len(seen) <= 4, f"12 jobs ran on {len(seen)} threads; the pool is not reused"
