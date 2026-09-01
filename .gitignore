@@ -66,3 +66,12 @@ tmp/
 
 # Claude local context
 .claude/
+
+# Ad-hoc experiment output dropped at the repo root (ablation sweeps, KL
+# probes and their logs). These are run artifacts, not project artifacts.
+/ablation_*.json
+/ablation_*.log
+/kl_*.json
+
+# Model checkpoints staged into an extension folder for local testing.
+extension_*/*.pt
