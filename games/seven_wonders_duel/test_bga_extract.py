@@ -8,6 +8,7 @@ determinizes into a full state whose public projection matches the input.
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 
 from .advisor_scrape import determinize_observation, observation_from_wire
 from .bga_extract import StaleGamedata, UnsupportedBgaState, wire_from_bga
+from .encoder import WONDER_FEATURES, TokenType, encode
 from .game import Phase
 
 _TESTDATA = Path(__file__).parent / "testdata"
@@ -247,7 +249,8 @@ def test_pending_build_from_discard():
 
 def test_pending_destroy_opponent_grey():
     # Circus Maximus etc.: destroy an opponent Grey card. Colour read from the
-    # live gamestate description; options = opponent's cards of that colour.
+    # description fallback used by older/manual captures; options = opponent's
+    # cards of that colour.
     data = _age3_pending(
         "chooseOpponentBuilding", active="89146710",
         description="You must choose one of the opponent's Grey cards to discard",
@@ -271,6 +274,53 @@ def test_pending_destroy_opponent_brown():
         "Clay Pool", "Stone Pit", "Logging Camp", "Brickyard", "Sawmill",
     }
     assert _resolve_actions(obs) == set(pc["options"])
+
+
+@pytest.mark.parametrize(
+    ("colour", "translated", "kind", "expected"),
+    (
+        ("Brown", "Marron", "destroy_opponent_brown", {
+            "Clay Pool", "Stone Pit", "Logging Camp", "Brickyard", "Sawmill",
+        }),
+        ("Grey", "Gris", "destroy_opponent_grey", {"Glassworks"}),
+    ),
+)
+def test_pending_destroy_uses_live_transition_args(
+    colour: str, translated: str, kind: str, expected: set[str]
+):
+    """Real BGA shape: gameStateChange.args.args owns the discriminator.
+
+    The live page updates gamestate id/name but can leave its args empty. The
+    extension therefore recovers the matching raw transition args and carries
+    them at the envelope's top level. Prefer non-localized ``buildingType``;
+    ``buildingTypeTranslatable`` deliberately differs here to prove language
+    cannot change the decision.
+    """
+    from .bga_extract import wire_from_bga_payload
+
+    data = _age3_pending(
+        "chooseOpponentBuilding",
+        active="89146710",
+        description=(
+            "${you} must choose one of the opponent's "
+            "${buildingTypeTranslatable} cards to discard"
+        ),
+    )
+    data["gamestate"]["args"] = {}  # observed stale live-gamedatas shape
+    payload = {
+        "bga": data,
+        "args": {
+            "buildingType": colour,
+            "buildingTypeTranslatable": translated,
+            "i18n": ["buildingTypeTranslatable"],
+        },
+    }
+
+    obs = wire_from_bga_payload(payload)["observation"]
+    assert obs["pending_choice"]["kind"] == kind
+    assert set(obs["pending_choice"]["options"]) == expected
+    assert _resolve_actions(obs) == expected
+    assert data["gamestate"]["args"] == {}  # payload overlay is non-mutating
 
 
 def test_pending_destroy_color_ambiguous_raises():
@@ -369,6 +419,84 @@ def test_bga_title_cased_card_name_is_normalized():
         names |= set(city["buildings"])
     assert "Chamber Of Commerce" not in names
     assert "Chamber of Commerce" in names
+
+
+def test_constructed_wonders_reach_the_network_as_owned_built_tokens():
+    """The BGA mapper must honor the same Wonder contract as self-play.
+
+    ``wonders`` is all four drafted Wonders and ``built_wonders`` is its
+    constructed subset. Before this regression, live inference emitted only the
+    four still-unbuilt Wonder tokens from this fixture instead of all eight.
+    """
+
+    wire = wire_from_bga(_load_live_reference()["bga"])
+    obs = wire["observation"]
+    assert [len(city["wonders"]) for city in obs["cities"]] == [4, 4]
+    for city in obs["cities"]:
+        assert set(city["built_wonders"]) <= set(city["wonders"])
+
+    encoding = encode(observation_from_wire(obs))
+    tokens = [token for token in encoding.tokens if token.type is TokenType.WONDER]
+    built_index = WONDER_FEATURES.index("built")
+    assert len(tokens) == 8
+    assert sum(token.features[built_index] for token in tokens) == 4
+
+
+def _seven_wonder_position(*, remove_retired: bool) -> tuple[dict, str, str]:
+    """Turn the live Age-III fixture into a structurally valid seventh build."""
+
+    data = copy.deepcopy(_load_live_reference()["bga"])
+    unbuilt: list[tuple[str, dict]] = []
+    for pid, rows in data["wondersSituation"].items():
+        if pid == "selection":
+            continue
+        unbuilt.extend((str(pid), row) for row in rows if not int(row["constructed"]))
+    assert len(unbuilt) == 4
+    for _pid, row in unbuilt[:3]:
+        row["constructed"] = 3
+    retired_pid, retired_row = unbuilt[3]
+    retired_name = data["wonders"][str(retired_row["wonder"])]["name"]
+    if remove_retired:
+        data["wondersSituation"][retired_pid].remove(retired_row)
+    return data, retired_pid, retired_name
+
+
+def test_removed_eighth_wonder_is_restored_as_its_owners_retired_token():
+    data, retired_pid, retired_name = _seven_wonder_position(remove_retired=True)
+    player_name = data["players"][retired_pid]["name"]
+    log = [
+        f"{player_name}'s Wonder “{retired_name}” is removed from the game "
+        "because 7 Wonders have been constructed"
+    ]
+
+    obs = wire_from_bga(data, log_lines=log)["observation"]
+    p0 = str(data["startPlayerId"])
+    pids = [p0, next(pid for pid in map(str, data["players"]) if pid != p0)]
+    owner = obs["cities"][pids.index(retired_pid)]
+    assert obs["retired_wonders"] == [retired_name]
+    assert retired_name in owner["wonders"]
+    assert retired_name not in owner["built_wonders"]
+    assert [len(city["wonders"]) for city in obs["cities"]] == [4, 4]
+
+    encoding = encode(observation_from_wire(obs))
+    tokens = [token for token in encoding.tokens if token.type is TokenType.WONDER]
+    built_index = WONDER_FEATURES.index("built")
+    retired_index = WONDER_FEATURES.index("retired")
+    assert len(tokens) == 8
+    assert sum(token.features[built_index] for token in tokens) == 7
+    assert sum(token.features[retired_index] for token in tokens) == 1
+
+
+def test_seventh_wonder_transient_identifies_the_remaining_row_as_retired():
+    data, _retired_pid, retired_name = _seven_wonder_position(remove_retired=False)
+    obs = wire_from_bga(data)["observation"]
+    assert obs["retired_wonders"] == [retired_name]
+
+
+def test_post_retirement_capture_without_identity_fails_loudly():
+    data, _retired_pid, _retired_name = _seven_wonder_position(remove_retired=True)
+    with pytest.raises(UnsupportedBgaState, match="does not identify exactly one"):
+        wire_from_bga(data)
 
 
 def test_unknown_card_name_raises_typed():
@@ -847,3 +975,57 @@ def test_a_start_player_capture_before_the_deal_is_refused():
     data["draftpool"] = {"age": "3", "cards": full[:11]}
     with pytest.raises(UnsupportedBgaState, match="11 of 20"):
         wire_from_bga(data)
+
+
+def _grant_theology(data: dict, pid: str) -> dict:
+    """Put Theology in ``pid``'s city, leaving the rest of the fixture alone."""
+    owned = data["progressTokensSituation"].setdefault(pid, [])
+    if not any(t["type"] == "Theology" for t in owned):
+        owned.append({"type": "Theology"})
+    return data
+
+
+def test_pending_defers_theology_extra_turn():
+    """A Wonder-borne choice suspends the extra turn the Wonder already earned.
+
+    Both fields were hardcoded False/0, which is a different position: without
+    the flag the searcher hands the next move to the opponent, so a won
+    military race reads as a losing one (real table 905030060: -0.82 vs +1.00).
+    """
+
+    data = _grant_theology(_age3_pending("chooseDiscardedBuilding", active="89146710"),
+                           "89146710")
+    obs = wire_from_bga(data)["observation"]
+    assert obs["pending_choice"]["kind"] == "build_from_discard_free"
+    assert obs["pending_extra_turn"] is True
+    assert obs["pending_shields"] == 0  # The Mausoleum carries none
+
+
+def test_pending_defers_wonder_shields():
+    # Circus Maximus advances the conflict pawn 1 as it opens the choice; the
+    # engine applies those shields only once the choice resolves.
+    data = _age3_pending(
+        "chooseOpponentBuilding", active="89146710",
+        description="You must choose one of the opponent's Grey cards to discard",
+    )
+    obs = wire_from_bga(data)["observation"]
+    assert obs["pending_shields"] == 1
+    assert obs["pending_extra_turn"] is False  # no Theology in the fixture
+
+
+def test_science_pair_choice_defers_nothing():
+    # CHOOSE_AVAILABLE_PROGRESS comes from a science pair, not a Wonder, so it
+    # carries no shields and no extra turn even under Theology.
+    data = _grant_theology(_age3_pending("chooseProgressToken", active="89146710"),
+                           "89146710")
+    obs = wire_from_bga(data)["observation"]
+    assert obs["pending_choice"]["kind"] == "choose_available_progress"
+    assert obs["pending_extra_turn"] is False
+    assert obs["pending_shields"] == 0
+
+
+def test_main_turn_defers_nothing():
+    obs = wire_from_bga(_load_age3())["observation"]
+    assert obs["pending_choice"] is None
+    assert obs["pending_extra_turn"] is False
+    assert obs["pending_shields"] == 0

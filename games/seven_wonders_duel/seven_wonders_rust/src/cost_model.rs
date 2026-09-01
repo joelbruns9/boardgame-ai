@@ -127,8 +127,16 @@ pub fn features(state: &GameState) -> [f64; 20] {
     let legal = crate::codec::legal_action_indices(state).len();
     let log_legal = (legal.max(1) as f64).log10();
 
-    let unbuilt_wonders: usize = (0..2)
-        .map(|seat| state.cities[seat].wonders.len() - state.cities[seat].built_wonders.len())
+    // Scraped advisor states carry only the still-unbuilt wonders in `wonders`,
+    // while replayed states carry all drafted wonders there. Python's fitted
+    // feature uses signed subtraction and can therefore be negative on the
+    // scraped representation. Keep exact parity: usize subtraction wrapped
+    // 0 - 4 to 2^64-4, making the model reject a captured 90-node solve as an
+    // impossibly large position.
+    let unbuilt_wonders: i64 = (0..2)
+        .map(|seat| {
+            state.cities[seat].wonders.len() as i64 - state.cities[seat].built_wonders.len() as i64
+        })
         .sum();
     let revive = unbuilt_named(state, "The Mausoleum");
 

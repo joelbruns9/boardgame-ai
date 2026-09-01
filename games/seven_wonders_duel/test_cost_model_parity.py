@@ -90,6 +90,29 @@ def test_every_feature_matches_python_on_real_positions():
     )
 
 
+def test_malformed_wonder_representation_does_not_unsigned_wrap():
+    """A malformed/legacy injected state must not unsigned-wrap.
+
+    Canonical self-play and BGA states keep all drafted Wonders in ``wonders``
+    and use ``built_wonders`` as a subset. Keep the arithmetic defensive anyway:
+    an old serialized or manually injected split-list state must not turn a
+    negative Python value into roughly 2^64 in Rust.
+    """
+
+    game = next(_age_three_positions(seeds=range(10)))
+    game.cities[0].wonders = []
+    game.cities[0].built_wonders = ["The Appian Way"]
+    game.cities[1].wonders = []
+    game.cities[1].built_wonders = ["The Pyramids"]
+    expected = position_features(game)["unbuilt_wonders"]
+    names = tuple(swr.endgame_cost_model_features())
+    actual = dict(
+        zip(names, swr.endgame_cost_features(rust_game_from_state(game)))
+    )["unbuilt_wonders"]
+    assert expected < 0, "fixture must exercise signed subtraction"
+    assert actual == expected
+
+
 def _fit_distribution_positions(limit: int = 120):
     """Age III positions from the corpus the coefficients were fit on.
 

@@ -15,6 +15,7 @@ PowerShell (Windows):
 ```powershell
 $env:SWD_ADVISOR_CHECKPOINT = "extension_7wd/candidate_0085.pt"
 $env:SWD_ADVISOR_DEVICE = "cpu"
+$env:SWD_ADVISOR_EXACT_ENDGAME = "1"
 .venv\Scripts\python.exe -m uvicorn games.seven_wonders_duel.web_app:app --port 8000
 ```
 
@@ -23,6 +24,7 @@ bash:
 ```bash
 SWD_ADVISOR_CHECKPOINT=extension_7wd/candidate_0085.pt \
 SWD_ADVISOR_DEVICE=cpu \
+SWD_ADVISOR_EXACT_ENDGAME=1 \
   uvicorn games.seven_wonders_duel.web_app:app --port 8000
 ```
 
@@ -131,6 +133,27 @@ It comes from the net's `joint7` head (winner × victory type) plus the VP-margi
 and science forecasts, all of which were computed on every evaluation and thrown
 away until now. One root evaluation, so it appears immediately and does not
 change as search deepens.
+
+### Exact endgames
+
+With `SWD_ADVISOR_EXACT_ENDGAME=1`, the host runs the Rust solver concurrently
+with neural MCTS. A fitted solve-cost model decides which Age III positions are
+predicted to need at most 10 million nodes; the old fixed card-count cutoff is
+not used. An admitted solve has no node cutoff and runs until it completes or
+reaches its 30-second wall-clock cap. If it times out, the panel simply keeps
+the neural-search answer. If it succeeds, its annotation is folded into the
+live snapshot and preserved across later MCTS updates.
+
+The solver status strip is always explicit: it reports disabled, ready for Age
+III, solving concurrently, skipped with the predicted-node comparison, timed
+out, errored, or solved with elapsed time and actual nodes. Solver silence is
+never used as a status.
+
+When a proof succeeds, the panel replaces Q values with exact outcomes (or an
+exact win percentage when chance genuinely matters) and marks every tied best
+move. A +1/-1 expectation is displayed as guaranteed even if the traversal saw
+chance: a boundary expectation cannot contain a different positive-probability
+outcome. An expectimax zero is not called a guaranteed draw.
 
 ### Two display rules that come from measurement
 

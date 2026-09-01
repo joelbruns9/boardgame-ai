@@ -107,6 +107,21 @@ def test_only_the_background_script_makes_network_calls():
     assert "fetch(" in background
 
 
+def test_panel_renders_exact_endgame_annotations_and_ties():
+    """The host answer is useful only if the shipped panel consumes it."""
+
+    content = _code_only((_EXTENSION / "content.js").read_text(encoding="utf-8"))
+    assert "snap.summary.exact_endgame" in content
+    assert "r.annotations.exact_endgame" in content
+    assert "guaranteed " in content
+    assert "best (ties included)" in content
+    assert "exact solver · solving concurrently…" in content
+    assert "exact solver · skipped · estimate " in content
+    assert "exact solver · timed out" in content
+    assert "exact solver · disabled in host" in content
+    assert 'call("/health"' in content
+
+
 def _run_node(script: str) -> str:
     """Execute a Node snippet, or skip when Node is unavailable.
 
@@ -167,7 +182,7 @@ console.log([
 
 _RECORDER_HARNESS = r"""
 const snippet = require(%(snippet)s);
-const { installPacketRecorder, drainPackets } = snippet;
+const { installPacketRecorder, drainPackets, captureCurrentStateArgs } = snippet;
 
 // A window shaped like the one BGA builds. Verified against a live replay page
 // on 2026-08-15: gameui.notifqueue.onNotification(packet) is where every
@@ -226,6 +241,27 @@ out.lateHooked = installPacketRecorder(early).hooked;
 early.gameui.notifqueue.onNotification(packet({ move_id: "8", packet_id: "8" }));
 out.lateKept = keys(drainPackets(early));
 
+// 5. gamedatas can carry stale/empty args even though its state id is current.
+// The raw state-change packet is authoritative for per-state fields such as
+// chooseOpponentBuilding's Brown/Grey discriminator.
+const stateW = makeWindow();
+stateW.gameui.gamedatas = { gamestate: { id: 65, args: {} } };
+installPacketRecorder(stateW);
+stateW.gameui.notifqueue.onNotification(packet({ move_id: "9", packet_id: "9",
+  data: [{ type: "gameStateChange", args: { id: 65, args: {
+    buildingType: "Brown", buildingTypeTranslatable: "Brown",
+    i18n: ["buildingTypeTranslatable"]
+  } } }] }));
+out.currentStateArgs = captureCurrentStateArgs(stateW, stateW.gameui.gamedatas);
+
+// Never search back to the old id-65 transition if the newest state change no
+// longer matches the live state. A dropped packet must degrade to the explicit
+// gamedatas fallback, not silently reuse an earlier Wonder's colour.
+stateW.gameui.gamedatas.gamestate.args = { source: "fallback" };
+stateW.gameui.notifqueue.onNotification(packet({ move_id: "10", packet_id: "10",
+  data: [{ type: "gameStateChange", args: { id: 30, args: {} } }] }));
+out.noStaleReuse = captureCurrentStateArgs(stateW, stateW.gameui.gamedatas);
+
 console.log(JSON.stringify(out));
 """
 
@@ -259,6 +295,8 @@ def test_packet_recorder_captures_the_oracle_without_disturbing_the_table():
     # Hooking late is the case that would otherwise fail silently.
     assert out["earlyHooked"] is False and out["lateHooked"] is True
     assert out["lateKept"] == "8/8"
+    assert out["currentStateArgs"]["buildingType"] == "Brown"
+    assert out["noStaleReuse"] == {"source": "fallback"}
 
 
 def test_content_script_posts_packets_to_the_game_log():

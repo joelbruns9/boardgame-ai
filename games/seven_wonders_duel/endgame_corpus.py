@@ -209,6 +209,24 @@ def load(path: Path = CORPUS) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def regimes_compatible(
+    left: str, right: str, values: Iterable[float], *, tolerance: float = 1e-9
+) -> bool:
+    """Whether two traversal tags support the same display certainty.
+
+    Alpha-beta may prove boundary results without descending into a chance
+    branch that the full-width reference visits. At +1/-1 the distinction is
+    immaterial and the result is guaranteed either way. Zero and fractional
+    values retain strict regime matching because chance can change their
+    interpretation.
+    """
+
+    values = tuple(float(value) for value in values)
+    return left == right or bool(values) and all(
+        abs(abs(value) - 1.0) <= tolerance for value in values
+    )
+
+
 def check(
     solver: Callable[[GameState], dict | None],
     *,
@@ -240,11 +258,20 @@ def check(
         report.regimes[regime] = report.regimes.get(regime, 0) + 1
         where = f"seed={record['seed']} ply={record['ply']} present={record['present']}"
 
-        if regime != record["regime"]:
+        expected = {int(k): v for k, v in record["per_action_value"].items()}
+        # A full-width reference can notice chance in a branch alpha-beta never
+        # needs for its proof. If every forced root action is already a boundary
+        # result (+1/-1), both labels support the same guaranteed W/L claim: an
+        # expectation at either boundary cannot hide a different outcome with
+        # positive probability. A fractional value (or zero) gets no such
+        # latitude; calling it chance-free when it is not could make the advisor
+        # promise a result that is only an expectation.
+        if not regimes_compatible(
+            regime, record["regime"], expected.values(), tolerance=tolerance
+        ):
             report.problems.append(
                 f"{where}: regime {regime} != reference {record['regime']}"
             )
-        expected = {int(k): v for k, v in record["per_action_value"].items()}
         got = {int(k): float(v) for k, v in answer["per_action_value"].items()}
         if set(got) != set(expected):
             report.problems.append(

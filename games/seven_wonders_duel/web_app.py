@@ -20,10 +20,10 @@ Then open http://127.0.0.1:8000/ .  Optional environment:
                              but the meaning of some features moved, so the net
                              is answering off-distribution.
     SWD_ADVISOR_EXACT_ENDGAME
-                             run the exact endgame solver at settle (off by
-                             default). It costs the annotate budget on any
-                             position inside its size gate, and nothing renders
-                             its answer yet.
+                             run the Rust exact endgame solver (on by default;
+                             set to 0 to disable).
+                             A fitted cost model selects positions; eligible
+                             solves run concurrently with neural MCTS.
 
 The checkpoint may also be supplied per-request from the UI.
 """
@@ -37,15 +37,23 @@ from games.advisor import create_advisor_app
 
 from .advisor_adapter import SevenWondersAdvisor
 
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+EXACT_ENDGAME_DEFAULT = True
+
+
+def _flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 adapter = SevenWondersAdvisor(
     default_checkpoint=os.environ.get("SWD_ADVISOR_CHECKPOINT"),
     device=os.environ.get("SWD_ADVISOR_DEVICE", "cpu"),
     allow_encoder_migration=_flag("SWD_ADVISOR_ALLOW_MIGRATION"),
-    exact_endgame=_flag("SWD_ADVISOR_EXACT_ENDGAME"),
+    exact_endgame=_flag(
+        "SWD_ADVISOR_EXACT_ENDGAME", default=EXACT_ENDGAME_DEFAULT
+    ),
 )
 
 app = create_advisor_app(

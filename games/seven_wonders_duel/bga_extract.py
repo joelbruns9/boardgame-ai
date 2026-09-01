@@ -55,6 +55,8 @@ from .data import (  # noqa: F401
     GUILD_CARDS,
     PROGRESS_IDS,
     TABLEAU_LAYOUTS,
+    WONDER_IDS,
+    WONDERS_BY_NAME,
     BackType,
     back_type_of,
 )
@@ -260,9 +262,21 @@ def _wonder_offer(gamedatas: dict) -> list[str]:
 
 def _destroy_color(gamedatas: dict) -> CardColor:
     """Brown vs Grey for the ``chooseOpponentBuilding`` state. BGA serves both
-    from one state, resolving ``${buildingTypeTranslatable}`` into the live
-    gamestate; read the colour word back out of it."""
+    from one state. Its ``gameStateChange`` packet carries the stable
+    ``args.buildingType`` discriminator; descriptions are only a compatibility
+    fallback for older/manual captures."""
     gs = gamedatas["gamestate"]
+    args = gs.get("args")
+    if isinstance(args, dict):
+        # Prefer the non-localized field. Real packet captures use exactly
+        # "Brown" / "Grey"; buildingTypeTranslatable happens to be English for
+        # an English client but is explicitly marked for localization by BGA.
+        raw = str(args.get("buildingType", "")).strip().lower()
+        if raw == "brown":
+            return CardColor.BROWN
+        if raw in ("grey", "gray"):
+            return CardColor.GREY
+
     blob = " ".join(
         str(gs.get(k, "")) for k in ("description", "descriptionmyturn", "args")
     ).lower()
@@ -344,6 +358,46 @@ def _pending_choice(
     }
 
 
+#: The Wonder whose construction opens each pending choice, and the shields it
+#: carries.  A pending choice suspends the rest of the build: the engine defers
+#: BOTH the Wonder's shields (``engine._construct_wonder`` sets
+#: ``pending_shields``) and any extra turn (``pending_extra_turn``) until the
+#: choice resolves, so a scrape that rebuilds a mid-choice position has to
+#: restate them or the position is not the one on the table.
+#:
+#: ``CHOOSE_AVAILABLE_PROGRESS`` is absent by design: that choice comes from a
+#: science PAIR, not a Wonder, so it defers nothing.  In the base game each of
+#: the four Wonder-borne kinds maps to exactly one Wonder, and none of them
+#: carries PLAY_AGAIN -- so an extra turn here can only come from Theology.
+_PENDING_SOURCE_WONDER = {
+    PendingChoiceKind.BUILD_FROM_DISCARD_FREE: "The Mausoleum",
+    PendingChoiceKind.DESTROY_OPPONENT_GREY: "Circus Maximus",
+    PendingChoiceKind.DESTROY_OPPONENT_BROWN: "The Statue of Zeus",
+    PendingChoiceKind.CHOOSE_UNUSED_PROGRESS: "The Great Library",
+}
+
+
+def _deferred_wonder_effects(
+    pending: dict | None, chooser_tokens: list[str]
+) -> tuple[bool, int]:
+    """``(pending_extra_turn, pending_shields)`` for a mid-choice position.
+
+    Both were hardcoded to False/0 here, which silently changed the position:
+    a Mausoleum built under Theology asks which card to revive with the extra
+    turn ALREADY earned, and dropping it hands the next move to the opponent.
+    Measured on a real logged table (905030060, seat 1 at conflict -6 holding
+    Theology), the searched root value read -0.82 without the flag and +1.00
+    with it -- a certain military win reported as a 9% position.
+    """
+
+    if pending is None:
+        return False, 0
+    wonder = _PENDING_SOURCE_WONDER.get(PendingChoiceKind(pending["kind"]))
+    if wonder is None:
+        return False, 0
+    return "Theology" in chooser_tokens, WONDERS_BY_NAME[wonder].shields
+
+
 def _science_pairs(building_names: list[str]) -> list[str]:
     """Symbols the player has claimed a progress-token pair for: any science
     symbol they own >=2 copies of (engine._apply_science_building). Returns the
@@ -356,7 +410,9 @@ def _science_pairs(building_names: list[str]) -> list[str]:
     return sorted(sym for sym, n in counts.items() if n >= 2)
 
 
-def _city(gamedatas: dict, pid: str) -> dict:
+def _city(
+    gamedatas: dict, pid: str, *, retired_wonders: tuple[str, ...] = ()
+) -> dict:
     situation = gamedatas["playersSituation"][pid]
     # Canonical card-id order. A city is a *set* of cards -- 7WD has no rule
     # keyed on build order -- but BGA's two sources disagree on ordering
@@ -367,23 +423,125 @@ def _city(gamedatas: dict, pid: str) -> dict:
         key=CARD_IDS.__getitem__,
     )
 
-    wonders_unbuilt: list[str] = []
+    # Canonical engine contract: ``wonders`` is every Wonder drafted by this
+    # player, while ``built_wonders`` is the constructed subset.  Keeping only
+    # the unbuilt rows here used to make live BGA inference differ from
+    # self-play: encoder._wonder_tokens iterates ``wonders``, so every historical
+    # built Wonder silently disappeared before reaching the network.
+    wonders_owned: list[str] = []
     wonders_built: list[str] = []
     wlookup = gamedatas["wonders"]
     for w in gamedatas["wondersSituation"].get(pid, []):
         name = wlookup[str(w["wonder"])]["name"]
-        (wonders_built if int(w["constructed"]) else wonders_unbuilt).append(name)
+        wonders_owned.append(name)
+        if int(w["constructed"]):
+            wonders_built.append(name)
+    # After the seventh construction BGA removes the eighth Wonder from
+    # wondersSituation entirely.  Put it back in its owner's canonical list so
+    # the encoder can emit the same retired Wonder token it sees in self-play.
+    for name in retired_wonders:
+        if name not in wonders_owned:
+            wonders_owned.append(name)
 
     tokens = [t["type"] for t in gamedatas["progressTokensSituation"].get(pid, [])]
 
     return {
         "coins": int(situation["coins"]),
-        "wonders": wonders_unbuilt,
+        "wonders": wonders_owned,
         "built_wonders": wonders_built,
         "buildings": buildings,
         "progress_tokens": tokens,
         "science_pairs": _science_pairs(buildings),
     }
+
+
+_RETIREMENT_LOG = re.compile(
+    r"^\s*(.+?)(?:'s|’s)\s+Wonder\s*[“\"']([^”\"']+)[”\"'].*?"
+    r"7\s+Wonders\s+have\s+been\s+constructed",
+    re.IGNORECASE,
+)
+
+
+def _retired_wonder_owners(
+    gamedatas: dict, log_lines: list[str] | None
+) -> dict[str, tuple[str, ...]]:
+    """Retired base-game Wonders keyed by owning BGA player id.
+
+    BGA deletes the sole unbuilt Wonder from ``wondersSituation`` when the
+    seventh Wonder is constructed.  During the notification there can briefly
+    still be eight structural rows, in which case the one unbuilt row is exact.
+    Once it is gone, only the rendered game-log message retains both identity
+    and owner.  A post-retirement snapshot without either source is rejected:
+    omitting the Wonder would recreate the train/serve mismatch this mapper is
+    responsible for preventing.
+    """
+
+    rows_by_pid = {
+        str(pid): list(rows)
+        for pid, rows in gamedatas["wondersSituation"].items()
+        if pid != "selection"
+    }
+    built = sum(
+        bool(int(row.get("constructed") or 0))
+        for rows in rows_by_pid.values()
+        for row in rows
+    )
+    if built < 7:
+        return {}
+    if built > 7:
+        raise UnsupportedBgaState(f"base game cannot have {built} constructed Wonders")
+
+    wlookup = gamedatas["wonders"]
+    unbuilt = [
+        (pid, wlookup[str(row["wonder"])]["name"])
+        for pid, rows in rows_by_pid.items()
+        for row in rows
+        if not int(row.get("constructed") or 0)
+    ]
+    if len(unbuilt) == 1:
+        pid, wonder = unbuilt[0]
+        return {pid: (wonder,)}
+    if unbuilt:
+        raise UnsupportedBgaState(
+            f"seven constructed Wonders left {len(unbuilt)} unbuilt Wonders"
+        )
+
+    player_by_name = {
+        str(player.get("name", "")): str(pid)
+        for pid, player in gamedatas["players"].items()
+    }
+    parsed: set[tuple[str, str]] = set()
+    for line in log_lines or ():
+        match = _RETIREMENT_LOG.search(line)
+        if match is None:
+            continue
+        player_name, wonder = (part.strip() for part in match.groups())
+        pid = player_by_name.get(player_name)
+        canonical = next(
+            (name for name in WONDERS_BY_NAME if name.casefold() == wonder.casefold()),
+            None,
+        )
+        if pid is not None and canonical is not None:
+            parsed.add((pid, canonical))
+
+    if len(parsed) != 1:
+        raise UnsupportedBgaState(
+            "seven Wonders are constructed but BGA removed the eighth from "
+            "wondersSituation and the captured log does not identify exactly "
+            "one retired Wonder and owner"
+        )
+    pid, wonder = parsed.pop()
+    current = {
+        wlookup[str(row["wonder"])]["name"]
+        for rows in rows_by_pid.values()
+        for row in rows
+    }
+    if wonder in current:
+        raise UnsupportedBgaState(
+            f"retirement log names {wonder!r}, but it is still present in "
+            "wondersSituation"
+        )
+    return {pid: (wonder,)}
 
 
 def _facedown_back(age: int, sprite: Any) -> str:
@@ -624,13 +782,24 @@ def wire_from_bga_payload(payload: dict, *, resample_seed: int | None = None) ->
 
     ``dom`` is optional: without it this is exactly ``wire_from_bga`` on a
     freshly loaded page. ``args`` (the current state's server args) is carried
-    for cross-checks. ``log`` is the rendered game-log lines, used only to
-    identify cards buried under constructed wonders; without it those burials
-    are still *counted* (from ``wondersSituation``), just not named.
+    for cross-checks. ``log`` is the rendered game-log lines, used to identify
+    cards buried under constructed Wonders and, after the seventh construction,
+    the retired Wonder BGA removes from ``wondersSituation``. Without a log,
+    burials are still *counted* from the structural rows; a removed retired
+    Wonder cannot be recovered and is rejected rather than silently omitted.
     """
     gamedatas = payload["bga"]
     if payload.get("dom"):
         gamedatas = apply_dom_patch(gamedatas, payload["dom"])
+    # BGA updates gamestate.id/name in the live page but can leave
+    # gamestate.args stale. The browser envelope carries the matching raw
+    # gameStateChange args, recovered by the packet recorder. Overlay them on a
+    # shallow copy so the caller's captured payload remains untouched.
+    if payload.get("args") is not None:
+        gamedatas = {
+            **gamedatas,
+            "gamestate": {**gamedatas["gamestate"], "args": payload["args"]},
+        }
     if resample_seed is None:
         resample_seed = int(payload.get("resample_seed", 0))
     return wire_from_bga(
@@ -701,6 +870,15 @@ def wire_from_bga(
     board_tokens = [t["type"] for t in gamedatas["progressTokensSituation"].get("board", [])]
     discard_pile = [_card_name(d["type"]) for d in gamedatas.get("discardedBuildings", [])]
     conflict_position, military = _military(gamedatas)
+    retired_by_pid = _retired_wonder_owners(gamedatas, log_lines)
+    cities = [
+        _city(gamedatas, pid, retired_wonders=retired_by_pid.get(pid, ()))
+        for pid in (p0, p1)
+    ]
+    retired_wonders = sorted(
+        (name for names in retired_by_pid.values() for name in names),
+        key=WONDER_IDS.__getitem__,
+    )
     # Constructing a wonder buries an age card permanently. Identity from the
     # game log when available; otherwise only the age, which still keeps the
     # unseen-card pool honest. See _wonder_burials.
@@ -714,11 +892,15 @@ def wire_from_bga(
         discard_pile=discard_pile,
     )
 
+    pending_extra_turn, pending_shields = _deferred_wonder_effects(
+        pending, cities[active_player]["progress_tokens"]
+    )
+
     observation = {
         "phase": phase.value,
         "active_player": active_player,
         "age": age,
-        "cities": [_city(gamedatas, p0), _city(gamedatas, p1)],
+        "cities": cities,
         "available_progress_tokens": board_tokens,
         "wonder_offer": _wonder_offer(gamedatas) if drafting else [],
         # No age is dealt during the draft, so there is no structure to read.
@@ -726,10 +908,10 @@ def wire_from_bga(
         "discard_pile": discard_pile,
         "buried_cards": [],       # Pantheon-only; base game empty
         "wonder_burials": [list(pair) for pair in burials],
-        "retired_wonders": [],    # Agora-only
+        "retired_wonders": retired_wonders,
         "pending_choice": pending,
-        "pending_extra_turn": False,
-        "pending_shields": 0,
+        "pending_extra_turn": pending_extra_turn,
+        "pending_shields": pending_shields,
         "conflict_position": conflict_position,
         "military_tokens_remaining": military,
         "winner": None,

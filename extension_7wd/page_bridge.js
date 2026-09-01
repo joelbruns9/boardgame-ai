@@ -90,8 +90,8 @@
   }
 
   function capture() {
-    // captureForAdvisor bundles gamedatas + gamestate.args + the DOM freshness
-    // patch + the game log (for wonder-burial identities).
+    // captureForAdvisor bundles gamedatas + the latest state-change args + the
+    // DOM freshness patch + the game log (for wonder-burial identities).
     const state = captureForAdvisor();
     const w = gameWindow();
     const g = w.gameui.gamedatas;

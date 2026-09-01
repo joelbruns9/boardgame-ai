@@ -46,7 +46,32 @@
 #swd_advisor_panel .swd-adv-sub {
   font-size: 11px;
   opacity: 0.6;
-  margin: 3px 0 8px;
+  margin: 3px 0 4px;
+}
+
+#swd_advisor_panel .swd-adv-solver {
+  font-size: 11px;
+  margin: 0 0 8px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #ffffff0d;
+  color: #b9bbc4;
+}
+
+#swd_advisor_panel .swd-adv-solver-running {
+  background: #94752f33;
+  color: #f0cf78;
+}
+
+#swd_advisor_panel .swd-adv-solver-solved {
+  background: #35785a40;
+  color: #8ed6a8;
+}
+
+#swd_advisor_panel .swd-adv-solver-timeout,
+#swd_advisor_panel .swd-adv-solver-error {
+  background: #8a3b3b40;
+  color: #ef9a9a;
 }
 
 #swd_advisor_panel .swd-adv-row {
@@ -55,6 +80,14 @@
   gap: 10px;
   padding: 5px 0;
   border-top: 1px solid #ffffff14;
+}
+
+/* A solved row no longer depends on visit count. A quiet green rail marks all
+   proven-optimal moves; ties are intentionally kept rather than broken by the
+   solver's arbitrary representative index. */
+#swd_advisor_panel .swd-adv-exact-best {
+  border-left: 3px solid #5cad7a;
+  padding-left: 7px;
 }
 
 /* Q values on a handful of visits are unsearched noise; keep the row readable
@@ -134,6 +167,12 @@
   font-variant-numeric: tabular-nums;
   font-size: 15px;
   font-weight: 600;
+}
+
+#swd_advisor_panel .swd-adv-q-exact {
+  color: #8ed6a8;
+  font-size: 13px;
+  letter-spacing: 0.02em;
 }
 
 /* Victory-type outlook: how the game ends, not just who wins. */

@@ -272,7 +272,11 @@ def _determinize_draft(state, obs, pool, rng: random.Random) -> None:
     longer affect play.
     """
 
-    picked = sum(len(city.wonders) + len(city.built_wonders) for city in obs.cities)
+    # Canonical observation contract: ``wonders`` contains every drafted
+    # Wonder; ``built_wonders`` is a subset, not a second ownership list. During
+    # the draft the subset is empty, but counting only ``wonders`` keeps this
+    # reconstruction correct for every producer of PlayerObservation.
+    picked = sum(len(city.wonders) for city in obs.cities)
     state.wonder_round = picked // 4  # 0-indexed: 0 is the first group
     state.wonder_pick_index = picked % 4
     state.wonder_offer = list(obs.wonder_offer)
@@ -302,9 +306,7 @@ def _determinize_draft(state, obs, pool, rng: random.Random) -> None:
         first = state.first_player if round_index == 0 else 1 - state.first_player
         return (first, 1 - first, 1 - first, first)
 
-    queues = [
-        list(city.wonders) + list(city.built_wonders) for city in obs.cities
-    ]
+    queues = [list(city.wonders) for city in obs.cities]
     sequence: list[str] = []
     for seat in (_order(0) + _order(1))[:picked]:
         sequence.append(queues[seat].pop(0))

@@ -106,18 +106,24 @@ def test_midgame_is_gated(positions):
         deadline=_deadline(),
         stop_event=threading.Event(),
     )
-    assert result is None
+    assert result is not None
+    assert result.summary == {
+        "status": "ready",
+        "reason": "age_3_only",
+        "age": positions["midgame"].age,
+    }
 
 
-def test_node_budget_gates(positions):
-    result = ExactEndgameAnnotator(max_nodes=5).annotate(
+def test_predicted_node_threshold_gates(positions):
+    result = ExactEndgameAnnotator(max_predicted_nodes=5).annotate(
         _shim(positions["deterministic"]),
         [],
         RecommendRequest(),
         deadline=_deadline(),
         stop_event=threading.Event(),
     )
-    assert result is None
+    assert result is not None
+    assert result.summary["status"] == "skipped"
 
 
 def test_cancellation_gates(positions):
@@ -143,10 +149,138 @@ def test_deterministic_annotation_shape(positions):
         stop_event=threading.Event(),
     )
     assert result is not None and result.name == "exact_endgame"
+    assert result.summary["status"] == "solved"
     assert result.summary["regime"] == "exact"
     assert result.summary["outcome"] in ("win", "loss", "draw")
-    exactly_one_best = sum(1 for b in result.per_action.values() if b["is_best"])
-    assert exactly_one_best == 1
+    best = {action_id for action_id, blob in result.per_action.items() if blob["is_best"]}
+    assert best
+    assert best == set(result.summary["best_action_ids"])
+    assert result.summary["best_action_id"] in best
+
+
+def test_boundary_expectimax_value_is_still_a_guaranteed_outcome():
+    """Chance cannot make a +1/-1 expectation anything but a certain result."""
+
+    assert ExactEndgameAnnotator._guaranteed(1.0, "exact_expectimax")
+    assert ExactEndgameAnnotator._guaranteed(-1.0, "exact_expectimax")
+    assert not ExactEndgameAnnotator._guaranteed(0.0, "exact_expectimax")
+    assert ExactEndgameAnnotator._guaranteed(0.0, "exact")
+
+
+def test_advisor_solver_runs_concurrently_with_a_thirty_second_cap():
+    annotator = ExactEndgameAnnotator()
+    assert annotator.concurrent is True
+    assert annotator.default_budget_secs == 30.0
+    assert annotator._max_secs == 30.0
+    assert annotator._max_predicted_nodes == 10_000_000
+
+
+def test_advisor_server_enables_exact_endgames_by_default(monkeypatch):
+    from .web_app import EXACT_ENDGAME_DEFAULT, _flag
+
+    monkeypatch.delenv("SWD_ADVISOR_EXACT_ENDGAME", raising=False)
+    assert EXACT_ENDGAME_DEFAULT is True
+    assert _flag("SWD_ADVISOR_EXACT_ENDGAME", default=EXACT_ENDGAME_DEFAULT)
+    monkeypatch.setenv("SWD_ADVISOR_EXACT_ENDGAME", "0")
+    assert not _flag("SWD_ADVISOR_EXACT_ENDGAME", default=EXACT_ENDGAME_DEFAULT)
+
+
+def test_cost_model_declines_before_calling_rust(positions, monkeypatch):
+    """Attempt selection is predicted cost, not the old card-count cap."""
+
+    class FakeRustGame:
+        called = False
+
+        def solve_endgame(self, *args):
+            self.called = True
+            raise AssertionError("an unaffordable position reached the solver")
+
+    fake = FakeRustGame()
+    from . import rust_bridge
+
+    monkeypatch.setattr(rust_bridge, "rust_game_from_state", lambda game: fake)
+    monkeypatch.setattr(
+        ExactEndgameAnnotator,
+        "_cost_prediction",
+        staticmethod(lambda rust_game: 9.0),
+    )
+    result = ExactEndgameAnnotator(max_predicted_nodes=1_000_000).annotate(
+        _shim(positions["deterministic"]),
+        [],
+        RecommendRequest(),
+        deadline=_deadline(),
+        stop_event=threading.Event(),
+    )
+    assert result is not None
+    assert result.summary["status"] == "skipped"
+    assert result.summary["predicted_nodes"] == 1_000_000_000
+    assert not fake.called
+
+
+def test_ten_million_prediction_is_attempted_without_a_node_limit(
+    positions, monkeypatch
+):
+    class FakeRustGame:
+        args = None
+
+        def solve_endgame(self, *args):
+            self.args = args
+            return {"regime": None}
+
+    fake = FakeRustGame()
+    from . import rust_bridge
+
+    monkeypatch.setattr(rust_bridge, "rust_game_from_state", lambda game: fake)
+    monkeypatch.setattr(
+        ExactEndgameAnnotator,
+        "_cost_prediction",
+        staticmethod(lambda rust_game: 7.0),
+    )
+    result = ExactEndgameAnnotator().annotate(
+        _shim(positions["deterministic"]),
+        [],
+        RecommendRequest(),
+        deadline=time.perf_counter() + 30.0,
+        stop_event=threading.Event(),
+    )
+    assert result is not None
+    assert result.summary["status"] == "declined"
+    assert fake.args is not None
+    assert fake.args[0] == (1 << 64) - 1
+    assert 0.0 < fake.args[1] <= 30.0
+
+
+def test_remaining_deadline_becomes_rust_timeout(positions, monkeypatch):
+    """A solve in flight is not cancellable, so its own clock must be binding."""
+
+    class FakeRustGame:
+        max_secs = None
+
+        def solve_endgame(self, max_nodes, max_secs, policy_mode, chance_pruning):
+            self.max_secs = max_secs
+            return {"regime": None, "stop": "deadline", "nodes": 123}
+
+    fake = FakeRustGame()
+    from . import rust_bridge
+
+    monkeypatch.setattr(rust_bridge, "rust_game_from_state", lambda game: fake)
+    monkeypatch.setattr(
+        ExactEndgameAnnotator,
+        "_cost_prediction",
+        staticmethod(lambda rust_game: 2.0),
+    )
+    result = ExactEndgameAnnotator(max_secs=3.0).annotate(
+        _shim(positions["deterministic"]),
+        [],
+        RecommendRequest(),
+        deadline=time.perf_counter() + 0.05,
+        stop_event=threading.Event(),
+    )
+    assert result is not None  # timeout is visible; neural answer remains in place
+    assert result.summary["status"] == "timed_out"
+    assert result.summary["nodes"] == 123
+    assert fake.max_secs is not None
+    assert 0.0 < fake.max_secs <= 0.05
 
 
 def _adapter(**kwargs):

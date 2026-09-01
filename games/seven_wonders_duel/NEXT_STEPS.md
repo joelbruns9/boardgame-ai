@@ -287,8 +287,8 @@ generator that existed before.
 is the next thing to get. The optional pieces from the plan's §7 are also still
 missing: the async solver pool with a `game_cpus`/`solver_cpus` split (the solve
 is currently synchronous and holds its scheduler slot), a sidecar for declined
-positions, and endgame oversampling in training. The advisor still calls the
-Python solver.
+positions, and endgame oversampling in training. The advisor now calls the Rust
+solver through the fitted cost trigger described below.
 
 ### 6. Use the captured games as self-play starting points
 
@@ -296,11 +296,22 @@ Real human positions are a source of variety that self-play cannot generate on
 its own. The capture already produces positions that load straight back into
 the engine, so this is mostly plumbing into the training loop.
 
-### 7. Show the exact endgame answer in the advisor
+### 7. Show the exact endgame answer in the advisor — DONE
 
-The host already computes it correctly and returns it; the browser panel simply
-never displays it. Small, self-contained, and independent of everything above.
-Worth doing whenever the solver is fast enough to be useful in a real turn.
+The exact annotator now calls `RustGame.solve_endgame` in exact-policy mode.
+The shipped solve-cost model replaces the fixed card cap: positions estimated
+at no more than 10M nodes are attempted. An admitted solve has no node cutoff
+and a 30-second wall-clock cap. It runs concurrently with neural MCTS; a timeout
+or refusal leaves the neural answer in place, while a proof is merged into every
+subsequent live snapshot.
+The extension's documented launch command enables
+`SWD_ADVISOR_EXACT_ENDGAME=1`.
+
+The panel replaces search Qs with the exact W/D/L result or exact expectimax
+percentage, and marks the full set of tied best actions rather than only Rust's
+useful representative tie-break. Display certainty does not rely blindly on
+the traversal tag: a +1/-1 expectation is necessarily guaranteed, while an
+expectimax zero is not called a guaranteed draw.
 
 ### Ongoing: keep playing
 

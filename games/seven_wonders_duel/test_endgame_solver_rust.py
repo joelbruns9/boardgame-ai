@@ -116,7 +116,9 @@ def test_real_human_endgames_solve_and_agree(records):
         if want is None or got is None:
             continue
         compared += 1
-        assert got["regime"] == want["regime"]
+        assert corpus.regimes_compatible(
+            got["regime"], want["regime"], want["per_action_value"].values()
+        )
         for index, value in want["per_action_value"].items():
             assert got["per_action_value"][index] == pytest.approx(value, abs=1e-9)
     assert compared > 0
@@ -149,6 +151,14 @@ def test_both_regimes_are_covered(records):
     report = corpus.check(corpus.rust_solver())
     assert report.regimes.get("exact", 0) > 0
     assert report.regimes.get("exact_expectimax", 0) > 0
+
+
+def test_regime_disagreement_is_safe_only_at_boundary_values():
+    """Pin the captured-position diagnosis behind the panel's certainty rule."""
+
+    assert corpus.regimes_compatible("exact", "exact_expectimax", [-1.0, 1.0])
+    assert not corpus.regimes_compatible("exact", "exact_expectimax", [0.0])
+    assert not corpus.regimes_compatible("exact", "exact_expectimax", [0.25])
 
 
 def test_a_budget_of_zero_returns_no_answer(records):

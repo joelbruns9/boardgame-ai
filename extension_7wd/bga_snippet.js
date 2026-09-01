@@ -13,8 +13,8 @@
 // wondersSituation. They keep their load-time values until the next full load.
 //
 // `captureDomPatch` re-reads those five from the DOM so no reload is needed;
-// `captureForAdvisor` bundles gamedatas + state args + that patch into the
-// payload the host expects. `captureAfterReload` (F5 first) remains as the
+// `captureForAdvisor` bundles gamedatas + authoritative state-change args +
+// that patch into the payload the host expects. `captureAfterReload` (F5 first) remains as the
 // reference capture to diff a patched capture against.
 //
 // `wire_from_bga` still cross-checks science counts and raises StaleGamedata,
@@ -136,8 +136,9 @@ function findGameWindow() {
   return chosen.win;
 }
 
-function captureBgaGamedatas() {
-  const g = findGameWindow().gameui.gamedatas;
+function captureBgaGamedatas(w) {
+  w = w || findGameWindow();
+  const g = w.gameui.gamedatas;
   // Deep clone so we detach from the live object before serializing.
   return JSON.parse(JSON.stringify(g));
 }
@@ -293,11 +294,48 @@ function captureGameLog() {
   return [...seen];
 }
 
+function captureCurrentStateArgs(w, gamedatas) {
+  w = w || findGameWindow();
+  const g = gamedatas || (w.gameui && w.gameui.gamedatas);
+  const fallback = g && g.gamestate ? g.gamestate.args || null : null;
+  const currentId = g && g.gamestate && g.gamestate.id;
+  const store = w[SWD_PACKET_STORE];
+  if (!store || currentId == null) return fallback;
+
+  // `gameui.gamedatas.gamestate` updates the state id/name but can leave its
+  // args at the page-load value. The raw gameStateChange notification is the
+  // authoritative source. This is observable on chooseOpponentBuilding: the
+  // packet carries args.buildingType = Brown/Grey while gamedatas carries no
+  // colour, which made the advisor refuse the forced Wonder follow-up.
+  //
+  // Only inspect the MOST RECENT state change. Searching farther back for a
+  // matching id could reuse an earlier Zeus/Circus choice if the current
+  // transition packet were missing, silently turning a capture gap into a
+  // plausible but wrong position.
+  const packets = [...store.packets.values()];
+  for (let i = packets.length - 1; i >= 0; i--) {
+    const data = packets[i] && packets[i].data;
+    if (!Array.isArray(data)) continue;
+    for (let j = data.length - 1; j >= 0; j--) {
+      const entry = data[j];
+      if (!entry || entry.type !== "gameStateChange") continue;
+      const change = entry.args || {};
+      if (String(change.id) !== String(currentId)) return fallback;
+      const args = change.args;
+      return args && typeof args === "object"
+        ? JSON.parse(JSON.stringify(args))
+        : fallback;
+    }
+  }
+  return fallback;
+}
+
 function captureForAdvisor() {
-  const g = captureBgaGamedatas();
+  const w = findGameWindow();
+  const g = captureBgaGamedatas(w);
   return {
     bga: g,
-    args: g.gamestate && g.gamestate.args ? g.gamestate.args : null,
+    args: captureCurrentStateArgs(w, g),
     dom: captureDomPatch(),
     log: captureGameLog(),
   };
@@ -466,6 +504,7 @@ if (typeof module !== "undefined") {
     captureBgaGamedatas,
     captureBgaSlim,
     captureDomPatch,
+    captureCurrentStateArgs,
     captureForAdvisor,
     captureAfterReload,
     installPacketRecorder,

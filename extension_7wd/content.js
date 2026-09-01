@@ -41,6 +41,9 @@
   let art = null;
   let panel = null;
   let lastSignature = null;
+  let exactEnabled = null;
+  let lastRenderedJob = null;
+  let lastRenderedWarnings = [];
 
   // -- injection ------------------------------------------------------------
 
@@ -67,6 +70,7 @@
       '<span class="swd-adv-drag" data-role="drag" title="drag">::</span>' +
       "</div>" +
       '<div class="swd-adv-sub" data-role="sub"></div>' +
+      '<div class="swd-adv-solver" data-role="solver">exact solver · checking host…</div>' +
       '<div class="swd-adv-outlook" data-role="outlook"></div>' +
       '<div class="swd-adv-rows" data-role="rows"></div>';
     document.body.appendChild(panel);
@@ -147,20 +151,36 @@
   // where `snapshot` is the RecommendResponse and is null until the first chunk
   // has been published.
   function render(job, warnings) {
+    lastRenderedJob = job;
+    lastRenderedWarnings = warnings || [];
     const el = ensurePanel();
     const rows = el.querySelector('[data-role="rows"]');
     const sub = el.querySelector('[data-role="sub"]');
     const snap = job.snapshot;
     const recs = ((snap && snap.recommendations) || []).slice(0, TOP_N);
+    const exact = snap && snap.summary && snap.summary.exact_endgame;
+    const annotationStatus =
+      snap && snap.summary && snap.summary.annotation_status;
+    const lifecycle = annotationStatus && annotationStatus.exact_endgame;
+    const exactSolved = exact && exact.status === "solved";
+    renderSolverStatus(exact, lifecycle);
 
     const sims = job.sims_done || (snap && snap.sims_done) || 0;
     const pct = snap ? ((snap.root_value + 1) / 2) * 100 : 0;
-    sub.textContent =
-      sims.toLocaleString() +
-      " sims" +
-      (sims >= MIN_SIMS_FOR_WIN_PCT
-        ? "  ·  win " + pct.toFixed(1) + "%"
-        : "  ·  win % settling…");
+    if (exactSolved) {
+      const result = exact.outcome
+        ? "guaranteed " + exact.outcome
+        : "win " + exact.root_win_pct.toFixed(1) + "%";
+      sub.textContent =
+        "solved  ·  " + result + "  ·  " + exact.nodes.toLocaleString() + " nodes";
+    } else {
+      sub.textContent =
+        sims.toLocaleString() +
+        " sims" +
+        (sims >= MIN_SIMS_FOR_WIN_PCT
+          ? "  ·  win " + pct.toFixed(1) + "%"
+          : "  ·  win % settling…");
+    }
     // Anything the host warns about belongs on screen. Today that is the arena
     // ceiling; a silent cap looks like a counter that stalled.
     for (const warning of warnings || []) {
@@ -169,21 +189,34 @@
 
     rows.textContent = "";
     for (const r of recs) {
+      const solved = exactSolved && r.annotations && r.annotations.exact_endgame;
       const row = document.createElement("div");
       row.className = "swd-adv-row";
-      if ((r.visit_frac || 0) < LOW_VISIT_FRAC) row.classList.add("swd-adv-thin");
+      if (!solved && (r.visit_frac || 0) < LOW_VISIT_FRAC) {
+        row.classList.add("swd-adv-thin");
+      }
+      if (solved && solved.is_best) row.classList.add("swd-adv-exact-best");
       row.appendChild(rowArt(r.fields));
       const text = document.createElement("div");
       text.className = "swd-adv-text";
       const q = document.createElement("div");
       q.className = "swd-adv-q";
-      q.textContent = (r.q_value >= 0 ? "+" : "") + r.q_value.toFixed(3);
+      if (solved) {
+        q.classList.add("swd-adv-q-exact");
+        q.textContent = solved.outcome
+          ? solved.outcome.toUpperCase()
+          : solved.win_pct.toFixed(1) + "%";
+      } else {
+        q.textContent = (r.q_value >= 0 ? "+" : "") + r.q_value.toFixed(3);
+      }
       const lab = document.createElement("div");
       lab.className = "swd-adv-label";
       lab.textContent = r.label;
       const meta = document.createElement("div");
       meta.className = "swd-adv-meta";
-      meta.textContent = (r.visits || 0).toLocaleString() + " visits";
+      meta.textContent = solved
+        ? "exact" + (solved.is_best ? "  ·  best (ties included)" : "")
+        : (r.visits || 0).toLocaleString() + " visits";
       text.append(lab);
       // The rest of the move, when making it forces a second decision: which
       // card the Mausoleum revives, which building Zeus destroys, which token a
@@ -202,6 +235,65 @@
     if (!recs.length) {
       rows.textContent = snap ? "no legal moves" : "starting search…";
     }
+  }
+
+  function nodeCount(value) {
+    return Number(value || 0).toLocaleString() + " nodes";
+  }
+
+  function renderSolverStatus(exact, lifecycle) {
+    const solver = ensurePanel().querySelector('[data-role="solver"]');
+    let text = "exact solver · checking host…";
+    let tone = "idle";
+    const status = exact && exact.status;
+
+    if (status === "solved") {
+      text =
+        "exact solver · solved in " +
+        ((exact.solve_ms || 0) / 1000).toFixed(2) +
+        "s · " +
+        nodeCount(exact.nodes);
+      tone = "solved";
+    } else if (status === "skipped" && exact.reason === "predicted_too_large") {
+      text =
+        "exact solver · skipped · estimate " +
+        nodeCount(exact.predicted_nodes) +
+        " > " +
+        nodeCount(exact.max_predicted_nodes);
+      tone = "skipped";
+    } else if (status === "timed_out") {
+      text =
+        "exact solver · timed out" +
+        (exact.nodes ? " · " + nodeCount(exact.nodes) : "");
+      tone = "timeout";
+    } else if (status === "declined") {
+      text = "exact solver · declined · " + (exact.reason || "no proof");
+      tone = "skipped";
+    } else if (status === "ready" && exact.reason === "age_3_only") {
+      text = "exact solver · ready · activates in Age III";
+      tone = "ready";
+    } else if (status === "unavailable") {
+      text = "exact solver · unavailable · Rust extension missing";
+      tone = "error";
+    } else if (status === "disabled") {
+      text = "exact solver · disabled by configuration";
+      tone = "error";
+    } else if (status === "error" || (lifecycle && lifecycle.status === "error")) {
+      text = "exact solver · error";
+      tone = "error";
+    } else if (lifecycle && lifecycle.status === "running") {
+      text = "exact solver · solving concurrently…";
+      tone = "running";
+    } else if (exactEnabled === false) {
+      text = "exact solver · disabled in host";
+      tone = "error";
+    } else if (exactEnabled === true) {
+      text = "exact solver · enabled · waiting for position";
+      tone = "ready";
+    }
+
+    solver.className = "swd-adv-solver swd-adv-solver-" + tone;
+    solver.textContent = text;
   }
 
   // How the net expects the game to END, not just who wins. For 7WD that is
@@ -330,6 +422,18 @@
     }
   }
 
+  async function refreshSolverCapability() {
+    try {
+      const health = await call("/health", { method: "GET" });
+      exactEnabled = Boolean(
+        health && health.contract && health.contract.exact_endgame
+      );
+      if (lastRenderedJob) render(lastRenderedJob, lastRenderedWarnings);
+    } catch (err) {
+      exactEnabled = null; // ordinary search error handling reports host failures
+    }
+  }
+
   // BGA puts the table id in the URL of the game frame; it is the only handle
   // that ties logged positions back to a replayable game.
   function tableId() {
@@ -387,7 +491,11 @@
 
   async function startSearch(state) {
     await stopCurrent();
+    lastRenderedJob = null;
+    lastRenderedWarnings = [];
     setStatus("searching…");
+    renderSolverStatus(null, null);
+    refreshSolverCapability();
     fetchOutlook(state);
     logPosition(state);
     let started;
@@ -483,6 +591,7 @@
       lastSignature = null;
       stopCurrent();
       setStatus("waiting for your turn");
+      renderSolverStatus(null, null);
     } else if (msg.type === "capture_error") {
       stopCurrent();
       setStatus("capture failed");

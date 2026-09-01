@@ -408,10 +408,9 @@ class SevenWondersAdvisor:
         self._injected = evaluator
         self._default_checkpoint = default_checkpoint
         self._device = device
-        # Exact endgame annotation is OFF by default. It is not free: it runs
-        # at settle on any position inside `max_present` and can spend the whole
-        # annotate budget before returning None, and nothing renders its answer
-        # yet. Opt in once there is a UI for it.
+        # Exact endgame annotation is opt-in at the host boundary. Once enabled,
+        # its fitted cost model selects affordable positions and the Rust solve
+        # runs concurrently with MCTS under its own bounded clock.
         self._exact_endgame = bool(exact_endgame)
         # Serve a checkpoint whose encoder signature predates the live encoder.
         # Off by default -- the signature guard exists because a net fed
@@ -499,7 +498,7 @@ class SevenWondersAdvisor:
                 "player": player,
                 "to_move": actor == player,
                 "coins": int(city.coins),
-                "wonders": len(city.wonders) + len(city.built_wonders),
+                "wonders": len(city.wonders),
                 "built_wonders": len(city.built_wonders),
                 "buildings": len(city.buildings),
                 "science_pairs": len(city.claimed_science_pairs),
