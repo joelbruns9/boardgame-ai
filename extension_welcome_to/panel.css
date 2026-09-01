@@ -1,0 +1,185 @@
+/* Panel styling. Injected into the BGA page, so everything is namespaced under
+   #wto_advisor_panel and every property that BGA might also set is written
+   explicitly -- an inherited font-size from the table theme resizes the whole
+   panel otherwise. */
+
+#wto_advisor_panel {
+  position: fixed;
+  top: 72px;
+  right: 12px;
+  z-index: 2147483000;
+  width: 380px;
+  max-height: 82vh;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 8px 10px 10px;
+  border-radius: 10px;
+  background: rgba(22, 24, 28, 0.95);
+  color: #e8e8ea;
+  font-family: "Segoe UI", Roboto, system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 1.35;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+#wto_advisor_panel .wto-adv-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+#wto_advisor_panel .wto-adv-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+#wto_advisor_panel .wto-adv-status {
+  margin-left: auto;
+  color: #8fd0ff;
+  font-variant-numeric: tabular-nums;
+}
+
+#wto_advisor_panel .wto-adv-drag {
+  cursor: move;
+  color: #7a7f88;
+  user-select: none;
+  letter-spacing: -1px;
+}
+
+#wto_advisor_panel .wto-adv-sub {
+  color: #a8adb6;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+
+/* Warnings are load-bearing, not chrome: an approximated discard pile or an
+   untrained head changes how much of this panel can be believed. */
+#wto_advisor_panel .wto-adv-warn-line {
+  margin: 0 0 4px;
+  padding: 4px 6px;
+  border-left: 3px solid #d8a13a;
+  background: rgba(216, 161, 58, 0.12);
+  color: #f0d8a8;
+}
+
+/* -- moves -------------------------------------------------------------- */
+
+#wto_advisor_panel .wto-adv-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+#wto_advisor_panel .wto-adv-row:first-child {
+  border-top: none;
+}
+
+/* Rows below the visit threshold have a Q that is essentially unsearched.
+   Dimming beats hiding: "the net never looked here" is information. */
+#wto_advisor_panel .wto-adv-thin {
+  opacity: 0.45;
+}
+
+#wto_advisor_panel .wto-adv-q {
+  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #9fe0a8;
+}
+
+#wto_advisor_panel .wto-adv-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#wto_advisor_panel .wto-adv-label {
+  overflow-wrap: anywhere;
+}
+
+#wto_advisor_panel .wto-adv-meta {
+  color: #8b909a;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- forecast ----------------------------------------------------------- */
+
+#wto_advisor_panel .wto-adv-forecast {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+#wto_advisor_panel .wto-adv-fc-head {
+  color: #a8adb6;
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+#wto_advisor_panel .wto-adv-fc-seat {
+  position: relative;
+  margin: 2px 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+#wto_advisor_panel .wto-adv-fc-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: rgba(120, 160, 220, 0.28);
+}
+
+#wto_advisor_panel .wto-adv-fc-you .wto-adv-fc-bar {
+  background: rgba(120, 220, 150, 0.3);
+}
+
+#wto_advisor_panel .wto-adv-fc-label {
+  position: relative;
+}
+
+#wto_advisor_panel .wto-adv-chip {
+  display: inline-block;
+  margin: 2px 3px 0 0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+#wto_advisor_panel .wto-adv-chip-bad {
+  background: rgba(220, 110, 110, 0.22);
+}
+
+#wto_advisor_panel .wto-adv-chip-dead {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+#wto_advisor_panel .wto-adv-stacks {
+  margin-bottom: 4px;
+}
+
+#wto_advisor_panel .wto-adv-plan,
+#wto_advisor_panel .wto-adv-fc-foot,
+#wto_advisor_panel .wto-adv-fc-none {
+  color: #8b909a;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-top: 3px;
+}
+
+/* An untrained head returns an exact 0.5. Naming it is the only thing that
+   stops that reading as a real coin flip. */
+#wto_advisor_panel .wto-adv-fc-stale {
+  margin-top: 4px;
+  color: #d8a13a;
+  font-size: 11px;
+}
