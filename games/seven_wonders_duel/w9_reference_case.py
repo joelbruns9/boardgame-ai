@@ -331,6 +331,12 @@ def world_breakdown(
                 ),
                 "node_visits": int(node.visits),
                 "top_replies": replies[:top_replies],
+                # A world only has replies once search has descended into it.
+                # Force-expansion materializes and evaluates the child but does
+                # not build its edges, so an unexpanded world has no refutation
+                # edge yet -- which is NOT the same as the refutation being
+                # absent there, and must not be counted as such.
+                "expanded": bool(replies),
                 # THE measurement. Everything about promotion, funding and
                 # revision should be read from here, not from the group below.
                 "refutation": {
@@ -383,8 +389,13 @@ def world_breakdown(
                 (world["refutation"]["action"] or {}).get("visits", 0)
                 for world in worlds
             ),
+            "worlds_expanded": sum(1 for world in worlds if world["expanded"]),
+            # Expanded worlds where the refutation edge is genuinely absent.
+            # Counting unexpanded worlds here would report a shallow search as a
+            # missing action.
             "worlds_missing_refutation_action": sum(
-                1 for world in worlds if world["refutation"]["action"] is None
+                1 for world in worlds
+                if world["expanded"] and world["refutation"]["action"] is None
             ),
             # The Wonder group, which is NOT the refutation. Retained for
             # mechanism 2, and to show how much of the group's funding went to

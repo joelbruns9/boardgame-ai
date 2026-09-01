@@ -266,14 +266,18 @@ Correct in this position:
 
 Implicated:
 
-- **Search.** One strategic reply is partitioned across ten chance siblings and,
-  within each, across **two** burial-target variants, so it must be rediscovered
-  independently in **twenty** buckets. See Workstream 9. (Corrected 2026-09-01:
-  earlier drafts said "roughly four" and "about forty". The opponent has exactly
-  two accessible cards in this position -- the newly revealed slot and
-  `Aqueduct` -- so there are two `Wonder: The Temple of Artemis (using X)` edges
-  per world, not four. The partition is real; the multiplier was overstated 2x
-  and must not be quoted into a gate.)
+- **Search.** The reply is partitioned across **ten** chance siblings -- one
+  exact refutation edge per world -- each competing inside a **two-way** Wonder
+  burial-target branch. See Workstream 9.
+
+  (Corrected twice on 2026-09-01. Earlier drafts said "roughly four" variants
+  and "about forty buckets"; the opponent has exactly two accessible cards here,
+  the newly revealed slot and `Aqueduct`. And "twenty buckets" is still the
+  wrong shape: the two burial targets are not two copies of one reply. Burying
+  the exposed slot removes the coverer AND buys the extra turn, so the terminal
+  card falls in one turn; burying `Aqueduct` buys the turn and leaves the
+  coverer standing, handing the card back. Ten exact edges with a two-way
+  branch above each -- not twenty copies of the same idea.)
 - **Encoder.** No feature expresses that the actor's own move brings a known
   threatening card within reach, and none pairs reach-distance with an
   opponent's unbuilt extra-turn Wonder. See Workstream 2.
@@ -852,57 +856,103 @@ Promote scale only if it improves the strongest complete architecture.
 > The design as specified below is preserved for the record; these are the
 > measured verdicts.
 >
-> ### Mechanism 1 (chance-sibling progressive bias): STRUCTURAL NULL
+> ### Mechanism 1 (chance-sibling progressive bias): does not solve this case
 >
-> **Do not re-propose it in this form.** Four-arm sweep on the reference case,
-> 1000-12000 sims: no arm beat baseline on `sims_to_promote_refutation` (all
-> 2000 / never / never). Tracked visits rise (172 -> 209) and nothing else
-> moves: the played move stays rank 1 through 3000 sims in every arm, and its
-> displayed win% shifts by at most 0.6 points against a ~20-point error.
+> **Retracted 2026-09-01 (second revision): the first write-up of this box
+> called it a "structural null" and said "there is no gain at which it works".
+> Both were wrong**, and wrong for a reason worth recording. The first
+> measurement matched the refutation by Wonder NAME, so it summed
+> `Artemis using <the exposed slot>` -- the actual refutation -- with
+> `Artemis using Aqueduct`, which buys the extra turn but leaves the coverer
+> standing and hands the terminal card back. Those are near-opposite moves. The
+> harness reported the wrong one as the group's best variant in 4 of 10 worlds,
+> and the sharing key merged them, so the mechanism was never given the chance
+> to share the right thing. See *The two keys are not the same key* below.
 >
-> There is no gain at which it works, and the two ends fail *differently*:
+> Re-measured with the exact refutation tracked by exposed slot, and with
+> sharing keyed structurally:
 >
-> | gain | shared statistic | bonus | outcome |
-> |---|---|---|---|
-> | c=1 | **correct** -- ranks the refutation 1st of 26 groups | 0.003-0.09, vs a 0.3-0.7 Q gap | too weak to act on a right answer |
-> | c=30 | **frozen wrong** -- refutation falls to 20th of 26 | dominates selection | tracked visits collapse 172 -> 5 |
+> | arm | refutation visits | promote in any / half |
+> |---|---|---|
+> | closed | **152** | 2000 / never |
+> | closed + sibling, signed advantage | 181 | 3000 / never |
+> | closed + sibling, positive-only | 208 (+37%) | 2000 / never |
+> | closed + both | 223 (+47%) | 2000 / never |
+> | closed + wonder | 240 (+58%) | 2000 / never |
 >
-> The high-gain failure is the mechanism eating itself: the shared table is
-> seeded from the raw network evaluations that caused the neglect, and a strong
-> bonus acts on that seed before search can correct it, so the action is never
-> funded, so the statistic never improves. **This is the same self-reinforcing
-> loop this plan describes under *Correct confidently wrong priors
-> deliberately*, reproduced one level up inside the mechanism meant to break
-> it.**
+> The baseline's true figure is **152, not the 172 first reported** -- 20 of
+> those visits were the wrong burial target.
 >
-> Two further reasons it cannot work here, both measured:
+> **What survives.** No arm promotes the refutation in half the worlds at any
+> budget tested, and none changes the root recommendation. The mechanisms do not
+> solve this position.
 >
-> - **Nothing to share.** Finding the refutation takes ~5400 visits in one world
->   (the isolated probes). No world gets more than ~165. Ten worlds that each
->   individually lack the budget have no discovery to transfer. The section
->   below assumes some sibling has found something; none has.
-> - **Wrong quantity.** The visit-weighted mean averages the four worlds that
->   searched it (Q ~ +0.1) against the six that did not (Q ~ -0.6, the raw net)
->   and lands on +0.009 -- neutral. The prior that caused the neglect dominates
->   the statistic meant to correct it.
+> **What does not survive.** "Cannot work" and "no gain works" are withdrawn.
+> Keyed correctly the sharing funds the refutation 37% better, and
+> `closed+both` reaches 2 of 10 worlds at **6000** sims where baseline needs
+> **12000** -- a 2x budget saving at that coverage. One position, one seed:
+> suggestive, not evidence.
 >
-> ### The one live variant: share the REVISION, not the mean
+> ### The signed advantage was a real defect, and is fixed
 >
-> Measured on the reference case, per group, comparing barely-searched worlds
-> against searched ones:
+> The original bonus clamped symmetrically, so a stale sibling estimate could
+> argue *against* examining an action. Since those estimates begin as the raw
+> network values that caused the neglect, a large gain then buried exactly the
+> move the mechanism exists to surface: at gain 30 the refutation fell from 1st
+> to 20th of 26 groups and its visits collapsed 172 -> 5.
 >
-> | group | Q barely searched | Q searched | revision |
+> `chance_sibling_bias_positive_only` now defaults ON, and the measurement above
+> confirms it matters: signed reaches 181 visits and needs 3000 sims to promote
+> anywhere, positive-only reaches 208 and needs 2000. **A discovery mechanism
+> must only ever add exploration pressure.** The signed form is retained as an
+> arm purely so the difference stays attributable.
+>
+> The high-gain collapse remains the same self-reinforcing loop this plan
+> describes under *Correct confidently wrong priors deliberately*, reproduced
+> one level up inside the mechanism meant to break it -- that diagnosis stands,
+> but it indicts the signed formulation, not sharing as such.
+>
+> ### The two keys are not the same key
+>
+> The mechanisms need different notions of "the same thing", and conflating them
+> was the defect above:
+>
+> - **Mechanism 2** groups actions that should compete as one decision. Burying
+>   any card under Artemis is "build Artemis", so the Wonder alone is right
+>   (`canonical_action_group`).
+> - **Mechanism 1** transfers evidence about the same TACTICAL action between
+>   chance worlds. There the burial target is the whole point, and what
+>   corresponds across reveal worlds is the structural action -- what you do, to
+>   which SLOT, with which Wonder (`structural_action_key`). The card identity in
+>   that slot is exactly what the chance event varies, so a card-derived action
+>   index does not correspond; the slot does.
+>
+> ### A candidate variant: share the REVISION, not the mean
+>
+> | group | Q where barely searched | Q where searched | gap |
 > |---|---|---|---|
 > | Great Lighthouse (incumbent) | -0.392 | -0.370 | **+0.022** |
 > | Temple of Artemis (refutation) | -0.504 | +0.056 | **+0.559** |
 >
-> A 25x discrimination that the mean throws away by construction. Revision is
-> also structurally immune to the freezing failure: an action nobody has
-> searched has zero revision and therefore no bonus, rather than a confidently
-> negative one. It would still need expressing as a floor on visits rather than
-> an additive score term, or the bonus suppresses the very exploration that
-> generates revisions. **UNTESTED** -- this is a hypothesis with one supporting
-> measurement, not a result.
+> A 25x discrimination that a mean throws away by construction, and revision is
+> structurally immune to the freezing failure: an action nobody has searched has
+> zero revision and so gets no bonus, rather than a confidently negative one.
+>
+> **Read this table narrowly.** It compares *different worlds* at one snapshot --
+> lightly-searched worlds against heavily-searched ones -- and both columns were
+> computed under the Wonder-name grouping, so they mix the refutation with the
+> other burial target. It is NOT a within-action trace, and it does not license
+> saying the value "revises the instant it is searched". The measurement that
+> would license that does not exist yet:
+>
+> - the first simulation on which the exact refutation edge is visited;
+> - its Q after 1, 2, 4, 8, 16... visits;
+> - the simulation at which it becomes the top reply;
+> - its raw prior and first leaf value.
+>
+> That trace is what separates a policy-prior failure from a value-depth
+> failure, and it should be built before any revision-based variant is tried.
+> **UNTESTED and, as measured, not yet properly evidenced.**
 >
 > ### Mechanism 2 (Wonder-action factorization): WORKS, NARROWER THAN CLAIMED
 >
@@ -928,12 +978,17 @@ Promote scale only if it improves the strongest complete architecture.
 > ### What this implies for sequencing
 >
 > The execution order below puts Workstream 9 first on the grounds that it is
-> "the measured cause" of the blunder. The partition is real, but it is **not
-> the binding constraint**. The binding constraint is the ~0.03 prior and the
-> network's -0.6 misvaluation of a reply whose value revises +0.56 the instant
-> it is searched. The idea is not hard to find once funded; it is never funded.
-> That is prior-correction and policy work -- Workstream 5 and *Correct
-> confidently wrong priors deliberately* -- not search bookkeeping.
+> "the measured cause" of the blunder. The partition is real, but on this
+> evidence it is **not the binding constraint**: correcting the key and the
+> clamp buys 37-58% more funding for the refutation and still does not change
+> the recommendation. What remains is the ~0.03 prior and the network's -0.6
+> evaluation of a move that scores around +0.1 once actually searched. Prior and
+> value correction should lead -- Workstream 5 and *Correct confidently wrong
+> priors deliberately*.
+>
+> Note the earlier framing "it takes ~5400 visits to discover" is withdrawn:
+> 5400 is where the isolated 6000-simulation probe *converged*, not what
+> discovery cost. Discovery cost is unmeasured until the trace above exists.
 >
 > Nothing here is shippable to the advisor: this is the Python searcher and the
 > advisor defaults to Rust. Per the sequencing below a Rust port waits on
@@ -957,10 +1012,13 @@ edge:
 
 **Action-variant split.** Constructing a Wonder is exposed as a separate action
 per burial target. In each world the opponent held **two**
-`Wonder: The Temple of Artemis (using X)` edges that differ only in which card
-is buried, plus the same variants for every other unbuilt Wonder. (Corrected
-2026-09-01 from "roughly four": the opponent has exactly two accessible cards
-here -- the newly revealed slot and `Aqueduct`.)
+`Wonder: The Temple of Artemis (using X)` edges, plus the same variants for
+every other unbuilt Wonder. (Corrected 2026-09-01 from "roughly four": the
+opponent has exactly two accessible cards here.)
+
+They "differ only in which card is buried" in the codec's sense and in no other:
+only the variant burying the newly exposed slot is the refutation. Treating the
+pair as interchangeable is what made the first Workstream 9 measurement wrong.
 
 Combined, `The Temple of Artemis` received 172 of 1639 opponent visits, spread
 so thinly that eight of the ten worlds funded it at only 2-7 visits -- enough to
@@ -1079,6 +1137,16 @@ measured the resulting stale-prior signature and worse consequential trap
 coverage, although its eleven consequential positions were too few to settle
 equal-wall-clock playing strength.
 
+**This arm would not measure what this section expects (2026-09-01).** Open loop
+aggregates on the action path, and the refutation's action index is
+card-derived: `Artemis (using Sawmill)` in one world, `Artemis (using Drying
+Room)` in the next. The index therefore changes with the reveal, so open loop
+does **not** naturally aggregate the exact refutation across worlds -- the very
+sharing this section recruits it to demonstrate. It would still alias
+publicly distinguishable outcomes and carry its stale-prior defect. Run it only
+with a structural (slot-based) path key, or not at all; as written the arm is
+mis-specified rather than merely expensive. De-prioritised.
+
 Use open loop as the aggressive statistic-sharing control. The intended
 production design remains a closed-loop hybrid: retain outcome-conditioned
 nodes, priors, values, and probability-weighted backup while transferring only
@@ -1122,8 +1190,9 @@ benefit, and keep the flags separable so a regression can be attributed.
 | gate item | status |
 |---|---|
 | Exact output equivalence, both features disabled | **PASS.** Bit-identical action, visits, policy target and completed Q on 6 positions; no added rng draw; no allocation on the off path. Each flag alone changes output on 5 of 6, so the equivalence is not passing vacuously. |
-| Sims required to promote the refutation, per mechanism | **DONE, null.** All four arms: 2000 / never / never. Measured on the reference case only, not yet on a corpus. |
-| Five-arm diagnostic | **PARTIAL.** Four arms run (closed, +sibling, +wonder, +both). The open-loop arm was deliberately excluded -- see Stage 1. Equal-simulation reported; equal-wall-clock not yet meaningful, because the first arm in a sweep pays warm-up costs and the recorded per-rung times reflect that, not the mechanisms. |
+| Sims required to promote the refutation, per mechanism | **DONE; no arm solves the case.** All arms promote in some world at 2000 sims (signed sibling: 3000) and in half the worlds never. Refutation funding does improve: 152 baseline -> 208 (+sibling) / 223 (+both) / 240 (+wonder). Reference case only, not a corpus. |
+| Five-arm diagnostic | **PARTIAL.** Five flag arms run (closed, +sibling positive-only, +sibling signed, +wonder, +both). The open-loop arm is excluded and now believed mis-specified -- its action-path key is card-derived, so it would not aggregate the refutation across worlds at all. Equal-simulation reported; equal-wall-clock not yet meaningful, because the first arm in a sweep pays warm-up costs and the recorded per-rung times reflect that, not the mechanisms. |
+| Exact refutation tracked, not the Wonder group | **FIXED, was wrong.** The first measurement matched on Wonder name and summed both burial targets, reporting the wrong action as best variant in 4 of 10 worlds. Now matched by exposed slot, with `worlds_whose_best_variant_is_wrong` reported so the contamination stays visible. All amended numbers postdate this fix. |
 | No regression in the `Walls` world | **NOT RUN as a regression test.** The `Walls` world is now characterised (isolated probe: `Build: Walls` 3589 vs Artemis 2371, so the reply genuinely differs there), which makes it usable as the negative control. With mechanism 1 a null there is nothing yet to regress. |
 | Refutation-discovery latency and action regret vs deep references | **NOT RUN.** `ref-values` implemented but unrun, and its axis is unsettled -- see the note under *Cost of the error*. |
 | Arena strength at equal wall-clock | **NOT RUN.** Premature: mechanism 1 is a null and mechanism 2 has no strength evidence, only a correctness property. |

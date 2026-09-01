@@ -134,10 +134,18 @@ def test_walked_edge_carries_a_chance_partition(position, evaluator):
     assert sum(world["probability"] for world in breakdown["worlds"]) == pytest.approx(1.0)
 
 
-def test_world_breakdown_sums_wonder_burial_variants(position, evaluator):
-    """Constructing a Wonder is one action per burial target, so the tracked
-    Wonder is a GROUP of edges. Reporting only one variant would understate the
-    partition; reporting only the group total would hide it."""
+def test_refutation_is_matched_by_exposed_slot_not_by_wonder_name(position, evaluator):
+    """The review finding of 2026-09-01, pinned.
+
+    Only the Wonder burying a slot THIS move exposes is the refutation: it
+    removes the coverer and buys the extra turn, so the terminal card falls in
+    one turn. The same Wonder burying anything else buys the turn and leaves the
+    coverer standing, handing the terminal card back -- a different, much worse
+    move. The first harness matched on Wonder name alone, summed both, and
+    reported the wrong action as "best variant" in 4 of 10 worlds.
+    """
+
+    from .codec import decode_action
 
     args = _args(smoke=True)
     mcts = w9.build_mcts(evaluator, args)
@@ -147,15 +155,67 @@ def test_world_breakdown_sums_wonder_burial_variants(position, evaluator):
     for _ in range(120):
         mcts.descend(root)
 
-    breakdown = w9.world_breakdown(edge, w9.DEFAULT_TRACKED)
+    exact_slots = w9.revealed_slots(position.game, walked["index"])
+    assert exact_slots, "the walked move exposes no slot; it is not this case"
+    wanted = {tuple(slot) for slot in exact_slots}
+
+    breakdown = w9.world_breakdown(
+        edge, w9.DEFAULT_TRACKED, exact_slots=exact_slots
+    )
+    # Wherever search has actually looked, the refutation edge must be found.
+    assert breakdown["rollup"]["worlds_missing_refutation_action"] == 0
+    assert breakdown["rollup"]["worlds_expanded"] >= 1
+
+    # Child keys are the chain of revealed card names; index them by that list
+    # rather than reconstructing the key shape.
+    by_revealed = {
+        tuple(key if isinstance(key, tuple) else (key,)): child
+        for key, child in edge.children.items()
+    }
     for world in breakdown["worlds"]:
-        tracked = world["tracked"]
-        assert tracked["examined"] == (tracked["group_visits"] > 0)
-        if tracked["best_variant"] is not None:
-            assert tracked["group_visits"] >= tracked["best_variant"]["visits"]
-            assert w9.DEFAULT_TRACKED in tracked["best_variant"]["label"]
-        else:
-            assert tracked["group_visits"] == 0
+        if not world["expanded"]:
+            continue  # force-expanded but never descended into; no edges yet
+        exact = world["refutation"]["action"]
+        group = world["tracked_group"]
+        assert exact is not None
+        # It really is the Wonder burying an exposed slot ...
+        child = by_revealed[tuple(world["revealed"])]
+        action = decode_action(child.node.state, exact["index"])
+        assert w9.DEFAULT_TRACKED in exact["label"]
+        assert tuple(action.slot_id) in wanted
+        # ... and the group is a strict superset that may hold a DIFFERENT move.
+        assert group["variants"] >= 1
+        assert group["group_visits"] >= exact["visits"]
+        assert world["refutation"]["examined"] == (exact["visits"] > 0)
+
+
+def test_group_total_is_never_read_as_the_refutation(position, evaluator):
+    """The contamination has to stay visible. If a burial target other than the
+    exposed slot ever out-visits the refutation, the rollup must say so rather
+    than let the group total stand in for it."""
+
+    args = _args(smoke=True)
+    mcts = w9.build_mcts(evaluator, args)
+    root = mcts.make_root(position.game)
+    walked = w9.resolve_action(position, w9.DEFAULT_WALK_ACTION)
+    edge = next(e for e in root.edges if e.action_index == walked["index"])
+    for _ in range(200):
+        mcts.descend(root)
+
+    breakdown = w9.world_breakdown(
+        edge, w9.DEFAULT_TRACKED,
+        exact_slots=w9.revealed_slots(position.game, walked["index"]),
+    )
+    rollup = breakdown["rollup"]
+    # Separately reported, and the group is never smaller than the refutation.
+    assert rollup["group_visits_total"] >= rollup["refutation_visits_total"]
+    # The wrong-variant counter agrees with the per-world flags it summarises.
+    wrong = sum(
+        1 for world in breakdown["worlds"]
+        if world["tracked_group"]["best_variant"] is not None
+        and not world["tracked_group"]["best_variant_is_refutation"]
+    )
+    assert rollup["worlds_whose_best_variant_is_wrong"] == wrong
 
 
 def test_root_ranking_is_visit_ordered_and_actor_framed(position, evaluator):
