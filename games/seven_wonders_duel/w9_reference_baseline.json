@@ -1,0 +1,88 @@
+{
+  "harness": "w9_reference_case",
+  "harness_version": 1,
+  "generated_at": "2026-09-01T08:41:37",
+  "position": {
+    "table": "908370787",
+    "decision_row": 17,
+    "age": 2,
+    "observation_sha256": "f161001de4f9fea1a8c7ec9852415648413ec1207fbd895547ca837acfea225b"
+  },
+  "checkpoint": {
+    "path": "extension_7wd\\candidate_0085.pt",
+    "sha256": "0198a5f787d8b34c92373b30c3ff2f4e903821bda5703b28436603bd0f0c05ad",
+    "live_encoder_signature": "24e15b12e1e7cd9f2222a32c1ec022140a42957c42c2c5c5ba352207166a8975"
+  },
+  "search": {
+    "impl": "python",
+    "mode": "closed",
+    "root": "PUCT descent under an expanded root (the advisor's path)",
+    "seed": 0,
+    "c_puct": 1.5,
+    "force_expand_root_chance": true
+  },
+  "stages_run": [
+    "ladder",
+    "probes",
+    "walk"
+  ],
+  "smoke": false,
+  "summary": {
+    "tracked": "The Temple of Artemis",
+    "root_rank_by_sims": {
+      "1000": [
+        "Discard for coins: Caravansery",
+        "Wonder: Circus Maximus (using Caravansery)",
+        "Discard for coins: Aqueduct"
+      ],
+      "2000": [
+        "Discard for coins: Caravansery",
+        "Wonder: Circus Maximus (using Caravansery)",
+        "Discard for coins: Aqueduct"
+      ],
+      "3000": [
+        "Discard for coins: Caravansery",
+        "Wonder: Circus Maximus (using Caravansery)",
+        "Discard for coins: Aqueduct"
+      ]
+    },
+    "walked_action_rank_by_sims": {
+      "1000": 1,
+      "2000": 1,
+      "3000": 1
+    },
+    "walked_action_win_pct_by_sims": {
+      "1000": 69.9,
+      "2000": 68.2,
+      "3000": 67.17
+    },
+    "sims_to_promote_refutation": {
+      "in_any_world": 2000,
+      "in_half_of_worlds": null,
+      "in_all_worlds": null,
+      "max_sims_measured": 3000
+    },
+    "tree_walk": {
+      "sims": 3000,
+      "world_count": 10,
+      "visits_per_world_mean": 164.9,
+      "visits_per_world_min": 153,
+      "visits_per_world_max": 183,
+      "worlds_examining_tracked": 10,
+      "worlds_where_tracked_is_top": 1,
+      "tracked_visits_total": 172,
+      "tracked_variants_per_world": 2
+    },
+    "single_world": {
+      "worlds_where_tracked_is_top": 5,
+      "tracked_visits_min": 2371,
+      "tracked_visits_max": 5853,
+      "sims_per_probe": 6000
+    },
+    "partition_penalty": {
+      "worlds_where_tracked_is_top_partitioned": "1/10",
+      "worlds_where_tracked_is_top_isolated": "5/6",
+      "buckets_per_idea": 20
+    }
+  }
+}

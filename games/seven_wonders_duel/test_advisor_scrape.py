@@ -17,9 +17,13 @@ from .advisor_scrape import (
     observation_from_wire,
     observation_to_wire,
 )
+import pathlib
+
 from .codec import decode_action, legal_action_indices
 from .engine import apply_action, legal_actions
 from .game import Phase, new_game
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _play_age_samples(per_age: int = 8):
@@ -184,3 +188,52 @@ def test_adapter_scrape_path_recommends(samples):
     )
     assert resp.ok
     assert resp.recommendations
+
+
+_HASH_SEED_PROBE = '''
+import hashlib, json, random, sys
+from games.seven_wonders_duel.advisor_scrape import (
+    determinize_observation, observation_from_wire,
+)
+
+obs = observation_from_wire(json.loads(sys.argv[1]))
+state = determinize_observation(obs, random.Random(4242))
+payload = {
+    "tableau": {
+        str(k): (c.card_name, c.present, c.revealed)
+        for k, c in state.tableau.cards.items()
+    },
+    "removed": {str(k): list(v) for k, v in state.removed_age_cards.items()},
+    "decks": {str(k): list(v) for k, v in state.age_decks.items()},
+    "guilds": [list(state.selected_guilds), list(state.unused_guilds)],
+}
+sys.stdout.write(
+    hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+)
+'''
+
+
+@pytest.mark.parametrize("age", [1, 2, 3])
+def test_determinization_is_reproducible_across_hash_seeds(samples, age):
+    """A fixed ``resample_seed`` must reproduce the same determinization in any
+    process. The determinizer draws from ``UnseenPool.cards``, a *frozenset*;
+    iterating it directly made every hidden assignment depend on
+    ``PYTHONHASHSEED``, so cross-process determinization studies reproduced
+    nothing. Every set-derived order here must be canonical ``CARD_IDS`` order,
+    as ``pool.enumerate_card_reveal`` already is.
+    """
+
+    import os
+    import subprocess
+    import sys
+
+    wire = json.dumps(observation_to_wire(samples[age][0]))
+    digests = set()
+    for hash_seed in ("0", "1", "12345"):
+        env = {**os.environ, "PYTHONHASHSEED": hash_seed, "PYTHONPATH": str(_REPO_ROOT)}
+        out = subprocess.run(
+            [sys.executable, "-c", _HASH_SEED_PROBE, wire],
+            capture_output=True, text=True, env=env, check=True, cwd=_REPO_ROOT,
+        )
+        digests.add(out.stdout.strip())
+    assert len(digests) == 1, f"determinization varies with PYTHONHASHSEED: {digests}"

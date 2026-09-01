@@ -13,7 +13,7 @@ Firefox is the primary target; the same unmodified directory loads in Chrome.
 PowerShell (Windows):
 
 ```powershell
-$env:SWD_ADVISOR_CHECKPOINT = "games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt"
+$env:SWD_ADVISOR_CHECKPOINT = "extension_7wd/candidate_0085.pt"
 $env:SWD_ADVISOR_DEVICE = "cpu"
 .venv\Scripts\python.exe -m uvicorn games.seven_wonders_duel.web_app:app --port 8000
 ```
@@ -21,7 +21,7 @@ $env:SWD_ADVISOR_DEVICE = "cpu"
 bash:
 
 ```bash
-SWD_ADVISOR_CHECKPOINT=games/seven_wonders_duel/runs/laptop_training_03_w7/checkpoints/current_best.pt \
+SWD_ADVISOR_CHECKPOINT=extension_7wd/candidate_0085.pt \
 SWD_ADVISOR_DEVICE=cpu \
   uvicorn games.seven_wonders_duel.web_app:app --port 8000
 ```
@@ -33,10 +33,16 @@ The extension talks to `http://127.0.0.1:8000` and sends no checkpoint, so the
 host's env default is what gets used. `http://127.0.0.1:8000/` also serves the
 lab UI, which is a useful way to confirm the host is alive.
 
-**`cpu` is deliberate for the *current* model.** At 1.03M parameters, CPU and
-CUDA measured within ~2% of each other, and CPU additionally skips CUDA context
-init and leaves the GPU free for training runs — which matters for a host that
-sits running for a whole game.
+The live advisor checkpoint is `extension_7wd/candidate_0085.pt` (~15.8M
+parameters, encoder `7wd-encoder-5`). The old
+`runs/laptop_training_03_w7/checkpoints/current_best.pt` no longer loads at all:
+the encoder signature changed.
+
+**`cpu` was deliberate for the *1.03M* model.** At that size CPU and CUDA
+measured within ~2% of each other, and CPU additionally skips CUDA context init
+and leaves the GPU free for training runs — which matters for a host that sits
+running for a whole game. That rationale no longer describes the 15.8M
+checkpoint above; the device has not been re-measured at this size.
 
 **Revisit this for a larger net.** At 11.4M parameters CUDA was 1.6× unbatched
 and 10.2× at batch 32. The advisor now batches leaf evaluation by default

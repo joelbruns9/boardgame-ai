@@ -41,7 +41,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .codec import decode_action, legal_action_indices
+from .codec import (
+    CARD_TO_WONDER_BASE,
+    DESTROY_BASE,
+    NUM_WONDERS,
+    decode_action,
+    legal_action_indices,
+)
 from .data import (
     CARD_IDS,
     TABLEAU_LAYOUTS,
@@ -278,6 +284,40 @@ def _terminal_value_p0(state: GameState) -> float:
     return 1.0 if state.winner == 0 else -1.0
 
 
+# --------------------------------------------------------------------------
+# Workstream 9: one idea, many buckets
+#
+# A move that uncovers a face-down slot fires a CARD_REVEAL on the ACTOR's own
+# turn, so the searcher builds one child per possible identity. Those children
+# are genuinely distinguishable and must stay apart -- `chance.rs` coalesces on
+# observability, and merging them would be unsound. But a reply that is
+# *correspondent across* them then has to be rediscovered independently inside
+# each one, from whatever prior it carries.
+#
+# Constructing a Wonder multiplies that again: it is exposed as one action per
+# buried card, so a single strategic idea ("build Artemis") is spread over one
+# edge per burial target per world.
+#
+# Both mechanisms below key off ONE notion of "the same idea in another
+# bucket". Wonder construction is keyed by the Wonder alone; everything else by
+# its action index, which already means the same thing in every sibling world.
+# --------------------------------------------------------------------------
+
+
+def canonical_action_group(action_index: int) -> tuple:
+    """The bucket-independent identity of an action.
+
+    Wonder construction encodes as ``CARD_TO_WONDER_BASE + card * NUM_WONDERS +
+    wonder`` (`codec.py`), so the Wonder falls out by arithmetic -- no state,
+    no decode, cheap enough to call inside selection. Every other action index
+    is already stable across chance siblings and is its own group.
+    """
+
+    if CARD_TO_WONDER_BASE <= action_index < DESTROY_BASE:
+        return ("wonder", (action_index - CARD_TO_WONDER_BASE) % NUM_WONDERS)
+    return ("action", action_index)
+
+
 @dataclass(slots=True)
 class _Child:
     probability: float | None  # None for sample-only chance
@@ -293,6 +333,20 @@ class _Edge:
     children: dict = field(default_factory=dict)  # key -> _Child
     visits: int = 0
     value_sum_p0: float = 0.0  # visit-weighted running mean (selection Q)
+    sibling_stats: dict | None = None
+    """Workstream 9 mechanism 1: SELECTION-ONLY evidence shared across this
+    edge's chance children, keyed by `canonical_action_group`.
+
+    ``{group_key: [visits, value_sum_p0]}``, summed over every descent through
+    every child of this edge -- so an action examined in one world can be
+    funded in the others instead of being rediscovered from its prior in each.
+
+    Deliberately NOT part of ``q_p0``: folding values from distinguishable
+    worlds into one edge's expectation would be exactly the unsound merge
+    `chance.rs` refuses. Sharing still changes which leaves get sampled, and
+    therefore finite-budget Q and policy targets -- a measured bias, not a
+    harmless one. ``None`` until first use, so the off path allocates
+    nothing."""
     probability_weighted: bool = False
     """Use the current exact chance expectation for Q. Enabled only after
     every enumerable child has been materialized (forced root expansion)."""
@@ -352,6 +406,10 @@ class ClosedNode:
     legal: tuple = ()
     visits: int = 0
     value_sum_p0: float = 0.0
+    selection_groups: list | None = None
+    """Workstream 9: ``edges`` partitioned into selection units, built once on
+    first use. Depends only on the action indices, which never change after
+    expansion. ``None`` on the off path, where it is never built."""
 
     @property
     def value_p0(self) -> float:
@@ -524,6 +582,45 @@ class SearchConfig:
     extremely peaked, dumping nearly all the noise mass on one arbitrary action
     instead of spreading a mild perturbation across the root.
     """
+
+    wonder_group_selection: bool = False
+    """Workstream 9 mechanism 2: pick the Wonder first, then the burial target.
+
+    Constructing a Wonder is exposed as one action per buried card, so a single
+    idea competes against itself: each variant carries a fraction of the
+    Wonder's prior and accrues its own visits. Selecting hierarchically -- PUCT
+    over Wonder groups on summed priors and pooled statistics, then a second
+    selection inside the promoted group -- lets the idea be funded once and the
+    target chosen afterwards.
+
+    Every full action keeps its own edge, statistics and original index, so
+    visit-count policy targets are unchanged in shape. Only the order in which
+    selection reaches them differs.
+
+    Useful on its own, with no chance node involved, and it is also what gives
+    ``chance_sibling_bias`` a key that matches burial variants across worlds.
+    """
+
+    chance_sibling_bias: float = 0.0
+    """Workstream 9 mechanism 1: coefficient on the shared-sibling bonus. Zero
+    is off.
+
+    Adds a decaying progressive-bias term to selection inside a chance child,
+    built from how the same canonical action scored in that child's SIBLINGS
+    (`_Edge.sibling_stats`). Raw shared visit counts are deliberately not
+    imported into the PUCT visit term: adding to a child's visit count
+    *suppresses* its exploration bonus, which is the opposite of the intent.
+
+    The bonus decays as ``1 / (1 + local visits)``, so a world's own evidence
+    takes over as soon as it exists. Local always outranks sibling.
+    """
+
+    chance_sibling_bias_cap: float = 1.0
+    """Bound on the advantage a sibling statistic may claim, in value units.
+
+    Values live in [-1, 1], so an unbounded advantage could reach 2 and swamp
+    both Q and the prior term. Capping keeps the shared signal a nudge toward
+    examining an action rather than a verdict about it."""
 
     seed: int = 0
     force_expand_root_chance: bool = False
@@ -799,16 +896,173 @@ class GumbelMCTS:
             ]
         return value_p0
 
-    def _select_closed(self, node: ClosedNode) -> _Edge:
+    def _select_closed(self, node: ClosedNode, source: "_Edge | None" = None) -> _Edge:
+        """PUCT over ``node.edges``.
+
+        ``source`` is the edge whose chance child this node is, or None at the
+        root and wherever the parent action fired no chance event. It carries
+        the sibling statistics mechanism 1 reads; nothing else about selection
+        depends on it.
+
+        With both Workstream 9 flags off this is the original flat loop, down to
+        tie order, and adds no rng draw -- ``test_w9_mechanisms`` pins that
+        against a full search.
+        """
+
+        config = self.config
         sign = 1.0 if node.actor == 0 else -1.0
         total = math.sqrt(max(1, node.visits))
-        best, best_score = None, -math.inf
+        shared = (
+            source.sibling_stats
+            if source is not None and config.chance_sibling_bias > 0.0
+            else None
+        )
+
+        if not config.wonder_group_selection and shared is None:
+            best, best_score = None, -math.inf
+            for edge in node.edges:
+                q = sign * edge.q_p0
+                score = q + config.c_puct * edge.prior * total / (1 + edge.visits)
+                if score > best_score:
+                    best, best_score = edge, score
+            return best
+
+        groups = self._selection_groups(node)
+        # One pass for every group's local totals. With mechanism 2 off a
+        # canonical key can span several singleton groups (one per burial
+        # target), so this cannot be folded into the per-group sums below.
+        local = self._local_group_totals(node) if shared is not None else None
+        best_group, best_score = None, -math.inf
+        for key, members in groups:
+            visits = sum(edge.visits for edge in members)
+            prior = sum(edge.prior for edge in members)
+            # Pool member Q by visits. A probability-weighted member reports an
+            # exact chance expectation rather than a running mean, so weighting
+            # by its visits (not by its value_sum) is what keeps the two kinds
+            # of member commensurable.
+            q = (
+                sum(edge.visits * (sign * edge.q_p0) for edge in members) / visits
+                if visits
+                else 0.0
+            )
+            score = q + config.c_puct * prior * total / (1 + visits)
+            score += self._sibling_bonus(shared, local, key, node, sign, visits)
+            if score > best_score:
+                best_group, best_score = members, score
+
+        if len(best_group) == 1:
+            return best_group[0]
+        return self._select_within_group(best_group, sign)
+
+    def _selection_groups(self, node: ClosedNode) -> list:
+        """``node.edges`` partitioned into selection units, cached on the node.
+
+        With ``wonder_group_selection`` on, Wonder-construction edges collapse
+        into one unit per Wonder; everything else is its own unit. With it off
+        every edge is its own unit, which still gives mechanism 1 the canonical
+        key it shares on. Groups keep first-appearance order so ties resolve
+        exactly as the flat loop's do.
+        """
+
+        if node.selection_groups is not None:
+            return node.selection_groups
+        grouped: dict = {}
         for edge in node.edges:
-            q = sign * edge.q_p0
-            score = q + self.config.c_puct * edge.prior * total / (1 + edge.visits)
+            key = canonical_action_group(edge.action_index)
+            if not self.config.wonder_group_selection:
+                # Still keyed (mechanism 1 shares on it) but never merged, so
+                # selection stays one-edge-per-unit.
+                grouped[(key, edge.action_index)] = (key, [edge])
+                continue
+            if key in grouped:
+                grouped[key][1].append(edge)
+            else:
+                grouped[key] = (key, [edge])
+        node.selection_groups = list(grouped.values())
+        return node.selection_groups
+
+    def _select_within_group(self, members: list, sign: float) -> _Edge:
+        """Choose a burial target inside a promoted Wonder group.
+
+        Guarantees every target one look before any gets a second. Without that
+        the low-prior failure this exists to fix simply recurs a level down: the
+        group would be funded and the funding would pool on whichever variant
+        happened to be tried first.
+
+        After that, ordinary PUCT among the members, on priors renormalised
+        within the group (they are a conditional distribution given the group)
+        and against the group's own visit count.
+        """
+
+        unvisited = [edge for edge in members if edge.visits == 0]
+        if unvisited:
+            # Highest prior first, first-appearance order on a tie.
+            return max(unvisited, key=lambda edge: edge.prior)
+
+        visits = sum(edge.visits for edge in members)
+        mass = sum(edge.prior for edge in members)
+        total = math.sqrt(max(1, visits))
+        best, best_score = None, -math.inf
+        for edge in members:
+            prior = edge.prior / mass if mass > 0.0 else 1.0 / len(members)
+            score = (
+                sign * edge.q_p0
+                + self.config.c_puct * prior * total / (1 + edge.visits)
+            )
             if score > best_score:
                 best, best_score = edge, score
         return best
+
+    @staticmethod
+    def _local_group_totals(node: ClosedNode) -> dict:
+        """This node's own (visits, value_sum_p0) per canonical group key."""
+
+        totals: dict = {}
+        for edge in node.edges:
+            key = canonical_action_group(edge.action_index)
+            entry = totals.get(key)
+            if entry is None:
+                totals[key] = [edge.visits, edge.value_sum_p0]
+            else:
+                entry[0] += edge.visits
+                entry[1] += edge.value_sum_p0
+        return totals
+
+    def _sibling_bonus(
+        self,
+        shared: dict | None,
+        local: dict | None,
+        key,
+        node: ClosedNode,
+        sign: float,
+        visits: int,
+    ) -> float:
+        """How much better this action looked in the OTHER chance worlds.
+
+        The parent edge's table sums every descent through every one of its
+        children, this node included, so the local contribution is subtracted
+        out -- otherwise a world's own visits would feed back as its own
+        "sibling" evidence and self-reinforce.
+
+        Measured against the node's own value, so the term is an advantage
+        rather than an absolute level, capped, and divided by the local visit
+        count so it fades the moment this world has evidence of its own.
+        """
+
+        if shared is None:
+            return 0.0
+        entry = shared.get(key)
+        if entry is None:
+            return 0.0
+        local_visits, local_sum = local.get(key, (0, 0.0))
+        sibling_visits = entry[0] - local_visits
+        if sibling_visits <= 0:
+            return 0.0
+        sibling_q = sign * ((entry[1] - local_sum) / sibling_visits)
+        advantage = sibling_q - sign * node.value_p0
+        cap = self.config.chance_sibling_bias_cap
+        advantage = max(-cap, min(cap, advantage))
+        return self.config.chance_sibling_bias * advantage / (1 + visits)
 
     def _forced_playout_edge(self, root: ClosedNode) -> "_Edge | None":
         """A root child owed a forced playout, or None.
@@ -873,8 +1127,19 @@ class GumbelMCTS:
         )
         return None if pruned is None else dict(zip(order, pruned))
 
-    def _descend_closed(self, node: ClosedNode, forced_edge: _Edge | None) -> float:
-        """One simulation from `node`; returns the leaf value (p0 terms)."""
+    def _descend_closed(
+        self,
+        node: ClosedNode,
+        forced_edge: _Edge | None,
+        source: "_Edge | None" = None,
+    ) -> float:
+        """One simulation from `node`; returns the leaf value (p0 terms).
+
+        ``source`` is the edge this node hangs under as a chance child, carried
+        down so selection here can read that edge's sibling statistics and the
+        backup can contribute to them (Workstream 9 mechanism 1). It is None at
+        the root and stays None when the flag is off.
+        """
 
         if node.terminal:
             value = _terminal_value_p0(node.state)
@@ -886,13 +1151,36 @@ class GumbelMCTS:
             node.visits += 1
             node.value_sum_p0 += value
             return value
-        edge = forced_edge if forced_edge is not None else self._select_closed(node)
+        edge = (
+            forced_edge
+            if forced_edge is not None
+            else self._select_closed(node, source)
+        )
         child = self._closed_child(node, edge)
-        value = self._descend_closed(child, None)
+        # Only an edge with more than one materialized chance child has siblings
+        # to share with. Passing it unconditionally would make a chance-free
+        # action look like a one-world partition and cost a dict per edge.
+        value = self._descend_closed(
+            child,
+            None,
+            edge if self.config.chance_sibling_bias > 0.0 and edge.specs else None,
+        )
         edge.visits += 1
         edge.value_sum_p0 += value
         node.visits += 1
         node.value_sum_p0 += value
+        if source is not None:
+            # Selection-only: this never reaches any edge's q_p0.
+            if source.sibling_stats is None:
+                source.sibling_stats = {}
+            entry = source.sibling_stats.get(
+                key := canonical_action_group(edge.action_index)
+            )
+            if entry is None:
+                source.sibling_stats[key] = [1, value]
+            else:
+                entry[0] += 1
+                entry[1] += value
         return value
 
     def _add_dirichlet_noise(self, root: ClosedNode) -> None:

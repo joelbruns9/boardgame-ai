@@ -154,7 +154,12 @@ def determinize_observation(
     slot_by_id = {(slot.row, slot.x): slot for slot in layout}
     cards: dict = {}
     facedown_by_back: dict[BackType, list] = {}
-    _filler = next(iter(BACK_UNIVERSES[back_type_of_age(obs.age)]))
+    # Lowest canonical id, not `next(iter(frozenset))`: the placeholder survives
+    # on *absent* slots (only face-down PRESENT slots are overwritten below), so
+    # iterating the set made those names PYTHONHASHSEED-dependent.
+    _filler = min(
+        BACK_UNIVERSES[back_type_of_age(obs.age)], key=CARD_IDS.__getitem__
+    )
     for pc in obs.tableau:
         slot = slot_by_id[pc.slot_id]
         if pc.present and pc.revealed:
@@ -176,7 +181,13 @@ def determinize_observation(
         unknown_by_age[int(age)] = unknown_by_age.get(int(age), 0) + 1
 
     def _unseen(back: BackType) -> list[str]:
-        return [name for name in pool.cards[back] if name not in buried_known]
+        # Canonical id order, matching ``pool.enumerate_card_reveal``. Iterating
+        # the frozenset directly made the order depend on PYTHONHASHSEED, so a
+        # fixed ``resample_seed`` reproduced nothing across processes.
+        return sorted(
+            (name for name in pool.cards[back] if name not in buried_known),
+            key=CARD_IDS.__getitem__,
+        )
 
     if obs.age in (1, 2):
         back = back_type_of_age(obs.age)
