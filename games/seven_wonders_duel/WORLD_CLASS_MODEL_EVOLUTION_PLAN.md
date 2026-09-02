@@ -410,7 +410,9 @@ Create a permanent baseline bundle containing:
     summary committed at `w9_reference_baseline.json`.
 
     It reproduces the reviewed measurement exactly -- 1649 visits over ten
-    worlds at 3000 sims, 172 tracked visits, per-world counts 7/54/2/85/2 --
+    worlds at 3000 sims, per-world counts 7/54/2/85/2 (the "172 tracked
+    visits" first reported here was the CONTAMINATED Wonder-group total; the
+    exact refutation figure is 152) --
     which is what licenses using it as the reference. `ref-values` is
     implemented but UNRUN; see the note under *Cost of the error* about which
     axis it should vary.
@@ -710,7 +712,7 @@ strong human can count, especially:
 - whether one tempo change flips control; and
 - whether Wonder retirement removes that tempo resource first.
 
-### Feasibility is not forcing -- the gap this workstream exists to close
+### Why an explicit solver is required IN ADDITION TO better representation
 
 The encoder **already** answers the feasibility question, and answers it well.
 `science_missing_obtainable` is, in full:
@@ -735,14 +737,23 @@ extra-turn Wonders, no first-pick-of-the-next-Age. So it cannot distinguish:
 * the same symbol one removal away, with the opponent holding an affordable
   extra-turn Wonder.
 
-Both score identically. The first is noise; the second is a lost game.
+Both score identically, and that is the defect -- the feature cannot separate
+them at all.
+
+**Neither label is proved by the topology alone.** A symbol three coverers away
+may still be forced later, and a symbol one removal away with an affordable
+extra-turn Wonder may be preventable, unaffordable after the intervening move,
+blocked by seventh-Wonder retirement, or simply answerable by a defensive
+alternative. Read them as **low-urgency versus high-risk** until the control
+oracle actually rules; asserting the outcome is the error this workstream exists
+to stop making.
 
 **This is the concrete shape of the observed failure.** A reviewed game had win
 odds fall from comfortable to lost on information that had been public roughly
 five turns earlier. The encoder had a feature pointed straight at it -- and that
 feature said only that the cards existed.
 
-#### Why this is a solver and not a representation problem
+#### Why representation alone will not close it
 
 Workstreams 1 and 2 make the topology easier to LEARN: a stable slot identity,
 and cover relations available in one hop instead of five neural layers. They are
@@ -757,9 +768,16 @@ information**:
 When a quantity is exactly computable, computing it beats approximating it
 statistically -- and a network asked to infer it from examples will be wrong in
 exactly the rare, high-regret positions where it matters, because those are the
-positions self-play rarely visits. Every measurement in Workstreams 9, 10 and 11
-found the same thing from the other direction: the information was recoverable,
-and search simply never funded the look.
+positions self-play rarely visits.
+
+**This is an argument for a solver IN ADDITION TO representation, not instead of
+it.** Three things keep Workstreams 1 and 2 necessary. The solver will have a
+bounded contract and a cost, so it cannot run at every leaf; the network must
+still recognise positions outside that contract, and positions merely SIMILAR to
+ones the solver has ruled on. And the 36-point raw value error measured in
+Workstream 10 is evidence that learned value quality is independently deficient
+here -- no amount of exact control information fixes an evaluation that is wrong
+about the position it is handed.
 
 `threat_corpus_scan.py` is a crude, offline sketch of a piece of this: it asks
 whether an action uncovers a path to a threatening card, and whether the opponent
@@ -807,6 +825,60 @@ narrow ownership, reveal, and preventability questions on the public tableau.
 The existing exact endgame solver is capped at six present tableau cards and
 cannot label ordinary mid-Age forced-control positions. This is a separate,
 narrow solver with its own correctness tests.
+
+#### That key is NOT sufficient for "against best play"
+
+The abstraction above can solve a **topology-and-tempo game**: who reaches which
+slot first, given whose turn it is and how many extra turns exist. It cannot
+support a general forced-win claim, because it omits state that changes the
+answer:
+
+* **conflict position and remaining red cards**, which decide who chooses the
+  next Age's starting player -- and therefore who reaches the new pyramid first;
+* **coins, production, trade discounts and chains**, which decide whether a
+  Wonder is still affordable *after* the intervening moves, not merely now;
+* **exact extra-turn Wonder identities and their legal burial targets**, since a
+  Wonder with no legal target is not a tempo resource;
+* **pending choices and card/Wonder effects** that move any of the above.
+
+So the contract must be stated and kept narrow. Either:
+
+1. **Topology-only control** -- exact within the reduced key, and its outputs
+   must be NAMED as such (`can_reach_first`, `decisions_until_exposed`) rather
+   than as forcing claims; or
+2. **Full-engine bounded solver** -- a real search over the engine state with a
+   depth or node cap, which can make forcing claims but costs accordingly.
+
+The two are both useful and must not be conflated. A `forced_science_win_in_k`
+emitted by option 1 would be a topology fact wearing a game-theoretic label, and
+that is precisely the class of error this workstream is meant to eliminate. Any
+abstraction narrower than the full engine state must be shown sufficient for the
+claims it makes, on the tactical corpus, before its labels are trusted.
+
+#### Forcing across hidden cards needs explicit semantics
+
+`can_force_target` and `forced_science_win_in_k` are ambiguous until the
+quantifier over hidden information is fixed. Four different things could be
+meant, and they disagree:
+
+| reading | meaning |
+|---|---|
+| **strong** | forced in EVERY legal assignment of the remaining pool |
+| **probability-weighted** | forced with probability p under the remaining pool |
+| **conditional** | forced after a PARTICULAR reveal has occurred |
+| **policy-relative** | what the actor can force before versus after observing that reveal |
+
+Each output must declare which it is. The strong reading is the only one that
+justifies an unqualified "forced"; the probability-weighted reading is the one
+the encoder can consume as a feature; the conditional reading is what a search
+extension would use at a node after the reveal.
+
+**The solver operates on public information sets with explicit chance outcomes.**
+Solving one determinized `GameState` and reporting the answer as public would
+leak information the player does not have -- the same failure mode as reading a
+hidden identity in search, which `search_barrier` exists to prevent. This is not
+hypothetical: `advisor_scrape` hands the searcher a determinization, so a solver
+called on that state would silently answer the wrong question.
 
 ### Outputs
 
@@ -990,20 +1062,33 @@ computed, not how actions are identified externally.
 **This does not replace card tokens and does not grow the state encoder.** The
 action representation is BUILT FROM the existing tokens -- the source card's
 contextual token is an input, alongside the action-use embedding, the learned
-slot (Workstream 1) and a Wonder token where applicable. What is added is a small
-scoring function applied per LEGAL action, and 7WD is unusually favourable here:
-the median position offers 4 legal actions and the mean 5.6, with the widest
-position in the threat corpus reaching 20. So the cost is a handful of small
-forward passes, not a wider state encoding.
+slot (Workstream 1) and a Wonder token where applicable.
 
-**Workstream 9 produced direct evidence for this.** Making sibling sharing work
-at all required abandoning the card-derived action index: `Artemis (using
-Sawmill)` and `Artemis (using Brickyard)` are the same tactical move at different
-indices, and only a structural key -- `(use, slot, wonder)` -- corresponds across
-chance worlds. That is this workstream's thesis, arrived at empirically inside
-the searcher. It also supplies a mechanism for the measured prior: the
-refutation's 0.012-0.077 prior is low partly BECAUSE each `(card, Wonder)` pair
-is its own index that rarely receives direct examples.
+**Score them in ONE vectorized pass, not one forward pass per action.** Encode
+the state once, gather and pad every legal action's components, and score the
+whole batch together. Per-action forward passes would be an implementation
+mistake, not the design: the arithmetic is small either way, but kernel launches,
+gathers and the Python/Rust batching boundary are not, and this searcher's
+throughput work has repeatedly turned on exactly those. 7WD's branching is
+favourable -- a median of 4 legal actions and a mean of 5.6, with the widest
+position in the threat corpus reaching 20 -- so a batched scorer over legal
+actions may well be CHEAPER than producing all 1,202 flat logits. That is a
+claim to measure on the fused production path, not to assume.
+
+**Workstream 9 produced direct evidence for the STRUCTURE.** Making sibling
+sharing work at all required abandoning the card-derived action index: `Artemis
+(using Sawmill)` and `Artemis (using Brickyard)` are the same tactical move at
+different indices, and only a structural key -- `(use, slot, wonder)` --
+corresponds across chance worlds. That is this workstream's thesis, arrived at
+empirically inside the searcher.
+
+**It does NOT establish that flat action identities caused the low prior.** That
+is a strong hypothesis and should be labelled one: a tactical or value failure
+would produce the same observation, and the discovery trace shows the value at
+that node is independently 36 points wrong. The testable form is narrow -- after
+training with action tokens, does the prior on the exact refutation rise
+relative to a flat-policy control on the same data? Until that is run, the
+mechanism is plausible and unproven.
 
 ### Strength-preserving hybrid
 
@@ -1054,13 +1139,17 @@ Add search capabilities in this order:
    they are the measured cause of the table `908370787` blunder, and a budget
    extension spent on a forty-way partition is largely wasted.~~
 
-   **Superseded 2026-09-01.** They were cheap, and they were prototyped first.
-   They are not the cause: the partition is real but not binding, and neither
-   mechanism moved `sims_to_promote_refutation`. The measured cause is the
-   ~0.03 prior together with the network's -0.6 misvaluation of a reply that
-   revises +0.56 the moment it is searched. Prior correction should lead; a
-   budget extension is still largely wasted on a partition, but so is a
-   bookkeeping fix on a prior. See the verdict box at the head of Workstream 9.
+   **Superseded 2026-09-01, corrected 2026-09-02.** They were cheap, and they
+   were prototyped first, and neither moved `sims_to_promote_refutation`. But
+   the partition IS binding: the same edge budget finds the refutation
+   unpartitioned and misses it split ten ways, with a discovery threshold of
+   165-400 visits at the reply node. What these two mechanisms could not do is
+   close that gap -- the bonus moved the refutation from three visits to four
+   against a requirement of about eight. The remaining cause is the 0.012-0.077
+   prior and a value head 36 points wrong at the node after the refutation,
+   both recoverable by ordinary search once funded. (An earlier version of this
+   note said the partition was not binding, and cited a `+0.56` instant
+   correction; both are superseded -- see Workstreams 9 and 10.)
 2. Threat-triggered search-budget extension when science or military hazard
    rises sharply.
 3. Exact public tableau-control resolution when the bounded solver proves a
@@ -1854,7 +1943,7 @@ it has to beat.
   `w10_afterstate_clustering.py` now carries (checkpoint hash, observation
   digest, seed, search configuration, code version).
 - ~~The corpus of actor-created-threat positions does not exist.~~ **BUILT
-  2026-09-02** -- 248 episodes over 75 tables; see *The actor-created-threat
+  2026-09-02** -- 267 episodes over 81 tables; see *The actor-created-threat
   corpus*. What remains is to RUN the reference measurement over its stratified
   sample, which is what actually answers the regret-over-margin question.
 - Reference values under `--ref-max-outcomes 0` (exhaustive chance support,
@@ -2085,6 +2174,55 @@ If a bundled cloud candidate is statistically tied at its initial budget:
 
 ## Recommended execution order
 
+### Build order for the foundational run
+
+A dependency order, not a ranking. An earlier draft listed these by relevance and
+put Workstream 2 above Workstream 1 while also saying 2 needs 1 -- that is not a
+plan, it is a preference list.
+
+1. **Warm-start plasticity / prior-rise test.** Gates the initialisation question
+   for everything below. Laptop.
+2. **Workstream 3 offline, in parallel.** Independent of the model, and the
+   longest build. Label the tactical corpus with it and find which outputs
+   predict action regret before any encoder feature is proposed.
+3. **Workstream 1 migration**, then train the slot embeddings. The equivalence
+   check itself is MINUTES -- load the checkpoint, assert bit-identical output
+   at zero initialisation. Training the embeddings is the overnight part.
+4. **Workstream 2 on top of Workstream 1**, since the graph module consumes slot
+   identities.
+5. **Workstream 5, in two steps.** A minimal action residual over the CURRENT
+   tokens can be prototyped independently and early -- it needs neither 1 nor 3.
+   The full form, with contextual slot, graph and proven-useful control outputs,
+   comes after those exist.
+6. **Workstream 4's hierarchical head in parallel**, trained in shadow mode. Defer
+   the Rust distributional backup; it is separate work with a separate
+   justification.
+7. **Bundle whatever survived into the one justified cloud run.**
+
+#### What the warm-start test must measure
+
+It establishes whether warm starting is VIABLE. It cannot on its own settle warm
+versus cold, and should not be described as doing so.
+
+Accept warm start only on all of:
+
+- prior and rank improvement on the exact refutation, across the tactical corpus
+  rather than the reference case alone;
+- reduced simulations-to-correction on the same positions;
+- bounded policy KL and value drift on ORDINARY positions -- a correction that
+  reshapes general play is not a correction;
+- no tactical-regression or small-arena regression.
+
+**A single short warm run failing does not prove cold start is better.** It
+should trigger stronger warm recipes first, in this order: reduced or disabled
+old-policy distillation on correction rows; a direct residual loss on the
+correction targets; then controlled trunk unfreezing at a lower learning rate.
+Only if those also fail does a cold run become the justified experiment -- and
+note that a cold model trained on the SAME self-play distribution would be
+expected to learn the same blind spot, so a cold run without forced exploration
+is not a fix either.
+
+
 ### Stage 0: freeze evidence and infrastructure
 
 - Record the candidate hash, embedded metadata, missing provenance, and a fresh
@@ -2093,7 +2231,10 @@ If a bundled cloud candidate is statistically tied at its initial budget:
   current candidate broke the plateau without gate evidence.
 - Run target-mass-weighted prior/search disagreement over existing buffers.
 - Measure actual regret wherever per-action Q or proof data exists.
-- Create the permanent tactical corpus.
+- ~~Create the permanent tactical corpus.~~ **BUILT 2026-09-02** -- 267
+  episodes over 81 tables, and eleven live positions measured. Counts and
+  status are authoritative in *The actor-created-threat corpus*; do not
+  restate them elsewhere.
 - Add the military analogues of the science-threat tests.
 - Establish fixed, fresh, and compute-normalized arenas.
 - Specify detectable effect sizes, maximum samples, and tied-candidate actions.
