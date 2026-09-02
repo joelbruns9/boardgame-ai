@@ -1111,13 +1111,13 @@ world whether or not the action deserves it.
 - **Strength.** No arena at equal simulations or equal wall-clock. Premature
   while the above is open.
 
-A candidate variant, now with a measured target: **a visit floor, triggered by a
-sibling's revision.** The trace above supplies both halves -- the trigger (a
-sibling's Q clearing its world's own value, which happens within four visits when
-it happens at all) and the threshold (about eight visits, the point past which
-every funded world corrected). An additive score bonus cannot reach that: the
-measured bonus moved the refutation from three visits to four. A floor can, by
-construction.
+A candidate variant that was proposed and is now **withdrawn on scaling
+grounds**: a visit floor of about eight, triggered by a sibling's revision. The
+trace supplies both trigger and threshold, and an additive bonus provably cannot
+reach them where a floor could. But the floor costs its threshold in EVERY world
+it fires in, and the partition grows as n(n-1): at the 90 worlds behind this
+position's double-reveal actions, a floor of 8 consumes 44% of each world's
+budget. See Workstream 10, which removes the partition instead of paying it.
 
 The earlier cross-sectional revision numbers (-0.504 -> +0.056 for the
 refutation, -0.392 -> -0.370 for the incumbent) are superseded by the trace,
@@ -1126,9 +1126,13 @@ which measures the same thing properly and within a single action's history.
 ### Where this leaves sequencing
 
 The execution order elsewhere in this plan puts Workstream 9 first, as "the
-measured cause" of the blunder. **That is not supported.** The partition is real,
-but correcting both the key and the clamp buys 37-58% more funding and still does
-not change the recommendation. What remains is the ~0.03 prior and the network's
+measured cause" of the blunder. The partition IS the binding constraint --
+Workstream 10 measures the discovery threshold directly and shows the same edge
+budget finds the refutation unpartitioned and misses it split ten ways. What is
+not supported is that *these two mechanisms* are the remedy: correcting both the
+key and the clamp buys 37-58% more funding and still does not change the
+recommendation, because the bonus moves the refutation from three visits to four
+against a Q gap of ~0.5. What remains is the ~0.03 prior and the network's
 -0.6 evaluation of a move worth roughly +0.1 once actually searched. Prior and
 value correction should lead -- Workstream 5 and *Correct confidently wrong
 priors deliberately*.
@@ -1169,6 +1173,14 @@ stale-prior signature and worse consequential-trap coverage on eleven positions,
 too few to settle equal-wall-clock strength.
 
 Run it only with a structural, slot-based path key, or not at all. De-prioritised.
+
+**Workstream 10 supplies the positive argument against it.** The ten reply nodes
+differ by 18.4 points (sd 5.77) at N=1200 -- open loop merges exactly those, and
+that spread is real information about what each revealed card makes available.
+The afterstate transposition merges only the post-burial nodes, where the spread
+is 5.6, because burying is the operation that discards the information. Sharing
+where the game has already discarded the distinction is sound; sharing where it
+has not is the defect.
 
 The intended production design remains a closed-loop hybrid: outcome-conditioned
 nodes, priors, values and probability-weighted backup retained, with only bounded
@@ -1245,6 +1257,141 @@ visits to discover".
 The lesson worth keeping: before concluding a mechanism cannot work, verify the
 measurement identifies the exact tactical object. A substring match on a name is
 not an action.
+
+## Workstream 10: afterstate transposition across chance siblings
+
+**Status: diagnosed and validated, not built.** This supersedes Workstream 9's
+mechanism 1 as the search-side answer, and it is the only search change this plan
+currently has evidence for. Both Workstream 9 flags stay off.
+
+### Why Workstream 9's answer does not scale
+
+Workstream 9 tried to make one strategic reply cheaper to *rediscover* inside
+each chance world. Two measurements say that is the wrong shape of fix.
+
+**The partition is the binding constraint, and it is worse than the reference
+case shows.** Searching the opponent's reply node directly, with no partition,
+gives a discovery threshold between **165 and 400 visits** at that node:
+
+| budget at the reply node | median refutation visits | worlds where it clears |
+|---|---|---|
+| 165 | 2 | 1/4 |
+| 400 | 50 | 3/4 |
+| 1000 | 650 | 3/4 |
+| 2000+ | 1650+ | 3/4 |
+
+The root gives the `Discard: Caravansery` edge 1649 visits. Unpartitioned that is
+far past threshold and the refutation is found at rank 1. Split ten ways it is
+165 per world, below threshold, and the refutation dies at 1-3 visits. **Same
+budget, same edge: the split is what breaks it.**
+
+(This corrects an earlier statement in Workstream 9 that the partition "is not
+the binding constraint". That was inferred from mechanism 1 failing to fix it.
+Mechanism 1 failed on gain -- its bonus moved the refutation from 3 visits to 4
+against a Q gap of ~0.5 -- not because the diagnosis was wrong.)
+
+**And the split grows quadratically.** A single reveal gives 10 worlds. The
+double reveal behind the `Aqueduct` actions in the same position gives **90**
+(n(n-1) ordered pairs). Any per-world remedy is therefore paying a cost that
+scales with the branching it is trying to survive. A minimum-visit floor of 8,
+which the discovery trace would otherwise justify, costs 8/18 = **44% of every
+world's budget** at 90 worlds. That is worse than the disease, and it is why the
+visit floor is not proposed here.
+
+The requirement is to search *deeper*, not to spread a budget more fairly.
+
+### The change
+
+Keep the chance node, its per-world children, and their real action sets. Share
+only the node reached *after* an action whose consequence does not depend on the
+revealed card's identity, keyed on the afterstate with that identity dropped:
+
+```text
+transposition key = (wonder, burial slot, ...)   NOT the buried card
+```
+
+Burying a card under a Wonder does not activate it. The ten post-burial
+positions differ only in which card sits inert in the burial pile and is absent
+from the unseen pool. So `Artemis -> School -> Theology` is searched **once with
+ten times the visits** instead of ten times shallowly -- and about ninety times
+the visits on a double reveal, which is where it matters.
+
+### Why not open loop
+
+The plan elsewhere proposes open loop as the aggressive statistic-sharing
+control. The clustering measurement below is the clearest evidence against it.
+
+Open loop aliases on the action path, which merges the *decision* nodes. Those
+carry real information: the ten reply nodes differ by **18.4 points** (sd 5.77)
+at N=1200, because the revealed card sits on the board changing what is
+available. Merging them discards that, on top of open loop's known
+observability-aliasing and stale-prior defects.
+
+The afterstate transposition merges only the *consequence* nodes, which is where
+the information has actually been discarded by the game rules.
+
+Open loop is also mis-specified for this case independently: its path key is the
+card-derived action index, which changes with the reveal, so it would not
+aggregate the exact refutation across worlds at all.
+
+### The validation
+
+Ten worlds, values in the deciding player's frame, at three depths:
+
+| | spread | sd |
+|---|---|---|
+| Control: reply nodes, no action (N=1200) | **18.4** | 5.77 |
+| Post-burial afterstates (raw) | 8.2 | 2.19 |
+| Post-burial afterstates (N=200) | 4.6 | 1.48 |
+| Post-burial afterstates (N=1200) | **5.6** | 1.92 |
+
+Two things this establishes:
+
+- **The abstraction removes noise, not signal.** The worlds genuinely differ by
+  ~18 points before anyone acts; after the burial they collapse to ~5.6, three
+  times tighter. Burying is the operation that discards the information, so the
+  afterstates are legitimately near-interchangeable. Residual error is ~2-3
+  points per world against a 20-point decision.
+- **Pool divergence does not compound.** The buried card leaves the unseen pool,
+  so post-burial states are not identical and the worry was that the difference
+  would grow with horizon. It does not: 4.6 at N=200, 5.6 at N=1200.
+
+Note also the raw-versus-searched gap: the network values the post-burial
+position at **78.4%** for the actor, and 200 simulations bring it to **41.6%**.
+A 36-point correction. The value head does not see the Theology follow-up
+standing still; it needs only shallow search to find it. That refines, and
+partly qualifies, the discovery trace's "prior failure, not value failure": the
+value head IS wrong at these nodes, it is simply cheap to correct, so the fix
+remains making search look rather than retraining the value head.
+
+### Scope
+
+Validated for **Wonder burial** only.
+
+- **Discard** is plausibly aliasable -- coins depend on the actor's yellow
+  buildings rather than the card, and denial is already captured by the card
+  leaving the board -- but `The Mausoleum` and anything else reading the discard
+  pile makes those afterstates distinguishable. Needs its own clustering run
+  before any aliasing.
+- **Building a card** is not aliasable. The card enters the city; identity is the
+  whole point.
+
+### Gate
+
+- Exact output equivalence with the flag off.
+- Re-run the clustering validation on any position before aliasing there; the
+  ~3x tightening is the licence, and it is one position so far.
+- Discovery: simulations required to promote the exact refutation, against the
+  Workstream 9 arms and baseline. The target is the unpartitioned threshold
+  (~400 visits at the reply node), reached by consolidation rather than budget.
+- The `Walls` world must not be corrupted. It is the world whose correct reply
+  genuinely differs, and the reply nodes are NOT aliased, so it should be
+  untouched by construction -- verify that it is.
+- Value-backup soundness: a shared node's value is an expectation over the
+  siblings that reach it. Confirm the mass accounting and that
+  `CHANCE_ENUMERATION_PLAN.md`'s edge classes are preserved.
+- Equal-wall-clock arena, since transposition changes work per simulation.
+
 
 ## Experiment and promotion framework
 
