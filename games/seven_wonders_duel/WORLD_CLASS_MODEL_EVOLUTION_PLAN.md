@@ -417,6 +417,82 @@ Create a permanent baseline bundle containing:
 13. A per-action visit-allocation report for the advisor's displayed top-k, so
     the gap between a move's rank and its evidence is visible.
 
+### The actor-created-threat corpus -- BUILT 2026-09-02
+
+`threat_corpus_scan.py` and `threat_corpus_episodes.py`, over the 82 captured BGA
+tables (2,899 decision rows). This is the tactical slice the baseline package
+asks for under *positions where the actor's own move uncovers a visible threat*,
+and it unblocks four things that were all stalled on having one position: the
+regret-over-margin measurement for Workstream 10, any strength claim for
+Workstream 9's mechanism 2, the trigger definition for the tactical extension,
+and any targeted training correction.
+
+| | |
+|---|---|
+| positions (rows with a public threat) | 430 |
+| **episodes** (distinct physical runs) | **248** |
+| snapshots (episode x chain distance) | 362 |
+| tables represented | 75 |
+| by threat | military_band 134, science_pair 100, science_win 12, military_win 2 |
+| by minimum chain distance | d0 207, d1 36, d2 4, d3 1 |
+
+**Structural only.** The scan decides shape, not cost. Whether a threat is worth
+anything is an action-regret question answered by
+`w9_reference_case.py --stages ref-values` at minutes per position rather than
+milliseconds; keeping them apart is what makes 2,899 rows affordable.
+
+#### Three corrections that changed the corpus, not just its presentation
+
+The first version of this scan reconstructed the game's rules locally and got
+them wrong. The corrected numbers are not a refinement of the old ones:
+
+* **Science omitted `Law`.** Symbols were counted from buildings only, so a
+  sixth-symbol threat granted by the progress token was invisible.
+  `science_win` hits went 26 -> 71. Pairs now also require the pair to be
+  UNCLAIMED and a progress token to remain available.
+* **Military invented a single `|6|` band.** The engine has bands at 3 AND 6,
+  each claimed once, and `Strategy` adds a shield to a red card. `military_band`
+  hits went 75 -> 436, and the corpus is now military-heavy rather than almost
+  entirely science -- the opposite of what the broken scanner implied.
+* **Actions were never applied.** Every legal use of a slot was classified from
+  the unchanged pre-action state, so moves that RETAIN the actor's turn, end the
+  Age, or end the game were counted as though the opponent replied immediately.
+  Applying them excludes **6,537** such actions.
+
+Everything above is now delegated to `engine.py` -- `_science_symbols`,
+`military_token_band`, `military_tokens_remaining`, and the `Strategy` rule from
+`_after_building_constructed`. Nothing in the scanner re-derives a rule the
+engine owns, and `test_threat_corpus.py` asserts the agreement.
+
+#### Counting honestly
+
+An **episode** is one physical `(table, threatened card, target slot)` run over
+consecutive rows, carrying a `snapshots` list -- one per chain distance -- and a
+stable `episode_id`. An earlier version emitted each snapshot as its own episode,
+turning 82 runs into 134 reported "episodes", and every statistic and sample
+drawn from that was inflated. All counting, sampling and any future train/test
+split keys on `episode_id`. Duplicate observations in the logs (12) are collapsed
+by digest.
+
+#### Immediacy is a function of chain distance, not victory type
+
+| distance | can the opponent act on it now? |
+|---|---|
+| 0 | yes -- the card is uncovered; it simply takes it next turn. No extra-turn Wonder needed. |
+| 1 | only with exactly one extra-turn Wonder, to uncover AND take in one turn. |
+| 2+ | not with one extra turn. Real threat, not an immediate one. |
+
+An earlier version keyed this on threat class and got both ends backwards --
+exempting distance-1 terminal cards that DO need an extra turn, while demanding
+one for distance-0 pairs that do not. Extra-turn Wonders are now also checked for
+being unbuilt, un-retired, and legally affordable through the codec's own action
+set, with `extra_turn_legality_verified` recorded; mere ownership is not enough.
+
+Each snapshot retains the exact creating actions -- codec index, use, label and
+removed slot -- because a later regret search needs the specific card and Wonder
+target, not the kind of move.
+
+
 Required tactical slices include:
 
 - Age I economy versus unique-symbol denial;
@@ -1340,8 +1416,14 @@ Keep the chance node, its per-world children, and their real action sets. Cluste
 only the states reached *after* an action whose consequence the game itself has
 made identity-independent -- burying the revealed card under a Wonder.
 
-The key must be a **normalized full-state fingerprint omitting only the
-specifically validated buried-card identity**, not merely `(wonder, slot)`. A
+The key must be a **normalized INFORMATION-STATE fingerprint omitting only
+the specifically validated buried-card identity**, not merely `(wonder, slot)`
+and not a raw `GameState` hash. A full state carries determinized hidden
+placements, which differ for reasons the abstraction says nothing about; the key
+must canonicalize hidden identities and strip the buried identity from every
+public place it appears -- tableau, `buried_cards`, and Wonder burial metadata --
+while keeping every other public fact, including any secondary reveal the burial
+fired. A
 coarse key would silently merge states differing in ways nobody has measured.
 
 **Consolidation is smaller than first claimed.** On a single reveal, ten worlds
@@ -1370,52 +1452,82 @@ Open loop is also mis-specified for this case independently: its path key is the
 card-derived action index, which changes with the reveal, so it would not
 aggregate the exact refutation across worlds at all.
 
-### The validation
+### The validation, and what a second review invalidated in it
 
-`w10_afterstate_clustering.py`, ten worlds, 1200 simulations, three seeds,
-deciding-player frame. Three arms, and the third is the one that earns the
-conclusion.
+`w10_afterstate_clustering.py`. The measurement has now been rebuilt twice after
+review, and both rebuilds changed the conclusion, so the history is recorded
+alongside the numbers.
 
-| arm | value spread | agreement | distinct best | majority illegal in |
-|---|---|---|---|---|
-| control: reply nodes, no action | 18.84 | 1/10 | 10 | 9/10 |
-| **bury EXPOSED slot** | **4.60** | **10/10** | **1** | **0** |
-| control: bury AQUEDUCT (identity survives) | 7.28 | 3/10 | 7 | 6/10 |
+#### Three defects in the first measurement
 
-**Value spread does not license aliasing, and on its own would have misled.**
-4.60 against 7.28 is not a decisive gap: most of the contraction after a burial
-comes from advancing into a constrained extra-turn afterstate, not from
-discarding the revealed identity. An earlier version of this section drew a
-green light from value spread alone and was wrong to.
+* **Policy described a different object from value.** Value averaged over every
+  sampled outcome and every seed; agreement, best action, margin and regret used
+  only the FIRST outcome of the FIRST seed.
+* **Regret mixed two orderings.** "Best" was chosen by visits and regret
+  differenced Q, with `abs()` on the margin, so a member's "best" could have
+  lower Q than the cluster's action. That is how the Aqueduct arm reported a
+  regret of **-0.0131**, which is not a possible quantity. An earlier version of
+  this section also claimed regret "came back 0.0 in every arm"; the max was 0,
+  the mean was not.
+* **The control did not select its own control card.** It took the first Artemis
+  action not on an exposed slot, which is Aqueduct here only by codec iteration
+  order.
 
-**The structural metrics separate cleanly, and the mechanism is legible.** After
-burying the exposed card every world plays `Build: School` -- one action, legal
-everywhere. After burying `Aqueduct` every world plays *the card it just
-revealed* (`Build: Sawmill` in the Sawmill world, `Build: Walls` in the Walls
-world), which is why the majority action is undefined in six of ten members.
-The abstraction is sound exactly where the game has removed the distinguishing
-object, and unsound where it has not.
+A fourth error was in this document rather than the code: it claimed every
+Aqueduct member plays the card it just revealed. Three of ten do not -- Drying
+Room builds Brickyard, Temple and Rostrum build Statue -- because burying
+Aqueduct fires its own secondary reveal.
 
-**Pool divergence does not compound** with horizon: spread 4.6 at N=200 against
-4.6 at N=1200. Per-world seed spread is 0.3-1.1, so the residual is real world
-variation rather than search noise.
+#### The reply-node control was never a valid comparison
 
-#### What this does NOT establish
+Members are now partitioned by the **normalized information-state key** the
+design actually proposes, rather than analysed one arm at a time. Under that key
+the ten reply nodes produce **ten singleton clusters**: they differ publicly, so
+no implementation would ever merge them. The earlier "1/10 agreement, 9 illegal"
+for that arm measured the cost of a merge nobody would perform.
 
-- **Cost.** `cluster_regret` and `regret_over_margin` came back 0.0 in every
-  arm, including the controls -- regret is only defined where the majority
-  action is legal, and where members agree 10/10 it is zero by construction.
-  **This position has a dominant continuation, so it cannot exercise the metric
-  that matters.** A 2-3 point deviation is harmless against this game's 20-point
-  root gap and decisive at a one-point action margin. Until a corpus with
-  partially-agreeing clusters is measured, the cost of clustering is unknown.
-- **The `Walls` world is not protected by construction.** Its reply node stays
-  separate, but its Artemis edge would lead into the shared cluster, and that
-  imported value participates in choosing between Artemis and `Build: Walls`.
-  An earlier version of this section claimed it was safe by construction. It is
-  not. The negative control must compare the complete `Walls` reply policy and
-  per-action Q with clustering on versus off.
-- **Generalization.** One position, one determinization.
+`bury EXPOSED slot` produces **one cluster from ten members**, which is the
+abstraction doing what it claims.
+
+**A singleton cluster shares nothing and proves nothing.** Only multi-member
+clusters bear on soundness, and the harness now reports cluster count, singleton
+count and largest cluster so a reader cannot mistake one for the other.
+
+#### What the corrected measurement still shows
+
+At 800 simulations with reference values from dedicated per-action searches,
+before the re-partitioning:
+
+| arm | members | ref-best agreement | cluster action illegal in | regret max | regret / margin max |
+|---|---|---|---|---|---|
+| bury EXPOSED | 10 | 10/10 | 0 | 0.0 | 0.0 |
+| bury Aqueduct | 20 | 9/20 | 6 | 0.044 | **1.123** |
+
+The Aqueduct figure is the first real cost number in this workstream: the
+cluster's action costs a member **more than its entire margin**, which flips that
+member's decision. It lands on the arm that is supposed to fail.
+
+Those numbers predate the cluster partitioning and are retained as the
+whole-arm view. Per-cluster figures supersede them.
+
+#### What is still not established
+
+* **Cost on a hard position.** `bury EXPOSED` agrees 10/10, so its regret is
+  near-zero by construction. This position has a dominant continuation and
+  cannot exercise the metric that matters. The corpus below exists to supply
+  positions that can.
+* **The `Walls` world is not protected by construction.** Its reply node stays
+  separate, but its Artemis edge leads into the shared cluster and that value
+  participates in choosing between Artemis and `Build: Walls`. An earlier
+  version of this section claimed it was safe. The negative control must compare
+  the complete `Walls` reply policy and per-action Q with clustering on and off.
+* **Runtime licensing.** Establishing agreement requires deeply searching every
+  member, which is the work clustering exists to avoid. Per-position validation
+  is an offline corpus gate, not a deployable runtime rule. A shippable path
+  needs either a structurally defined, corpus-validated cluster class plus cheap
+  runtime invariants, or discovery/PV sharing treated openly as a heuristic and
+  judged in arenas.
+* **Generalization.** One position.
 
 ### Scope
 
@@ -1442,6 +1554,19 @@ Soundness, before any clustering is enabled anywhere:
   The licence is per-position, not general.
 - Cluster-size measurement, since the consolidation is ~10x on a single reveal
   and ~9x on a double, not the quadratic first claimed.
+- **Members must be partitioned by the information-state key before any metric
+  is computed.** Analysing a whole arm as one cluster measures a merge no
+  implementation would perform: under the key, the ten reply nodes are ten
+  singletons. Report cluster count, singleton count and largest cluster, and
+  read soundness only off multi-member clusters.
+- **Per-position validation is an OFFLINE gate, not a runtime licence.**
+  Establishing agreement requires deeply searching every member, which is the
+  work clustering exists to save. Deployment needs either a structurally
+  defined, corpus-validated cluster class with cheap runtime invariants, or
+  discovery/PV sharing judged openly as a heuristic in arenas. Agreement and
+  legality are necessary checks; they do not by themselves establish
+  value-sharing soundness, and they do not protect the upstream
+  Artemis-versus-`Walls` decision.
 
 Cost, which is currently unmeasured:
 
@@ -1449,7 +1574,13 @@ Cost, which is currently unmeasured:
   than its own -- and **regret over that member's own action margin**, which is
   the number that generalises to ordinary positions with thin margins. Requires
   a corpus containing partially-agreeing clusters; this position cannot supply
-  one.
+  one. The corpus now exists; the measurement over it does not.
+- Reference action values must be **probability-weighted over the chance
+  support** and averaged over several seeds, and the candidate set must be
+  **unioned across every seed**. Sampling one outcome uniformly discards the
+  probabilities the enumerator supplies, and taking candidates from a single
+  seed's top-k can exclude a low-prior correct action by construction -- which
+  is precisely the failure this programme is about.
 - Maximum conditional error per member against that member's margin.
 - Multiple seeds and a deeper reference than the clustering budget itself.
 
@@ -1468,21 +1599,27 @@ Correctness of any implementation:
 Do not implement shared nodes. A safe prototype keeps one exact `ClosedNode`,
 `GameState`, priors, edges, visits and Q per chance world, adds a search-scoped
 cluster registry alongside the tree, and initially shares only **candidate
-discovery or principal-variation scheduling -- not values**. That is provably
-non-corrupting but will not deliver the full depth consolidation; obtaining that
+discovery or principal-variation scheduling -- not values**. That *preserves
+exact state and backup semantics* -- it is not "provably non-corrupting", since
+sharing discovery still changes finite-budget allocation and can therefore
+weaken the selected policy -- but will not deliver the full depth consolidation; obtaining that
 needs a genuine aggregate/particle search with explicit member weights and
 conditional residual values, which is a materially larger algorithm.
 
 The cheaper first strength experiment is a **public tactical extension**:
 
 ```text
-Artemis buries the exposed slot -> extra turn -> School -> science pair/Theology
+extra-turn action -> immediate public tactical continuation
+                  -> terminal threat or forced progress-token choice
 ```
 
-Expanding that critical public continuation within the same simulation attacks
-the measured eight-visit correction directly, retains every world's exact
-remaining pool, and is far easier to prove correct. It also gives the clustering
-prototype a baseline it has to beat.
+The reference case instantiates it as `Artemis buries the exposed slot -> extra
+turn -> School -> Theology`, but production code should key on the general shape
+so the military channel and other extra-turn tactics are covered too. Expanding
+that critical public continuation within the same simulation attacks the measured
+eight-visit correction directly, retains every world's exact remaining pool, and
+is far easier to prove correct. It also gives the clustering prototype a baseline
+it has to beat.
 
 ### Outstanding on this workstream
 
@@ -1493,9 +1630,16 @@ prototype a baseline it has to beat.
   a `main()`, CLI parameters, and the same provenance block
   `w10_afterstate_clustering.py` now carries (checkpoint hash, observation
   digest, seed, search configuration, code version).
-- The corpus of actor-created-threat positions does not exist, and it now gates
-  three separate things: the regret-over-margin measurement above, any strength
-  claim for Workstream 9's mechanism 2, and any targeted training correction.
+- ~~The corpus of actor-created-threat positions does not exist.~~ **BUILT
+  2026-09-02** -- 248 episodes over 75 tables; see *The actor-created-threat
+  corpus*. What remains is to RUN the reference measurement over its stratified
+  sample, which is what actually answers the regret-over-margin question.
+- Reference values under `--ref-max-outcomes 0` (exhaustive chance support,
+  multi-seed) are far more expensive than the sampled version they replaced, and
+  the cost of a full Workstream 10 run under that setting is unmeasured.
+- The corpus is one determinization per row, so its face-down accounting is a
+  single draw. Fine for shape detection; not for the reveal probabilities the
+  baseline package eventually wants.
 
 ## Experiment and promotion framework
 
