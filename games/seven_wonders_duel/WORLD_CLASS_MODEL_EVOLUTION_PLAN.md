@@ -660,7 +660,12 @@ token unchanged.
 
 Learned slot identities make the cover graph learnable, but the model still has
 to discover every relationship statistically. Explicit graph edges make the
-relationship available in one operation. Transitive-distance edges prevent a
+relationship available in one operation.
+
+Neither substitutes for Workstream 3. Both make the topology easier to LEARN;
+the control questions are exactly COMPUTABLE from public information, and a
+network asked to infer them from examples will be wrong precisely in the rare,
+high-regret positions self-play seldom visits. See *Feasibility is not forcing*. Transitive-distance edges prevent a
 five-step cover chain from requiring five neural layers merely to move the
 relevant information between locations.
 
@@ -704,6 +709,84 @@ strong human can count, especially:
 - whether the line is preventable;
 - whether one tempo change flips control; and
 - whether Wonder retirement removes that tempo resource first.
+
+### Feasibility is not forcing -- the gap this workstream exists to close
+
+The encoder **already** answers the feasibility question, and answers it well.
+`science_missing_obtainable` is, in full:
+
+```python
+obtainable = {symbol of every reachable card}   # a set union
+if progress_obtainable(seat, "Law"):
+    obtainable.add(ScienceSymbol.LAW)
+return len(obtainable - have)                   # a count
+```
+
+with `mil_shields_obtainable`, `sci_win_feasible` and `mil_win_feasible`
+alongside it, and `reachable_cards` correctly folding in the Mausoleum
+discard-pile route.
+
+**That is a set union and a count.** It answers *do the symbols still exist
+anywhere in play or in the pool?* It contains no turn order, no cover graph, no
+extra-turn Wonders, no first-pick-of-the-next-Age. So it cannot distinguish:
+
+* a sixth science symbol sitting under three coverers that the opponent cannot
+  reach before the Age ends, from
+* the same symbol one removal away, with the opponent holding an affordable
+  extra-turn Wonder.
+
+Both score identically. The first is noise; the second is a lost game.
+
+**This is the concrete shape of the observed failure.** A reviewed game had win
+odds fall from comfortable to lost on information that had been public roughly
+five turns earlier. The encoder had a feature pointed straight at it -- and that
+feature said only that the cards existed.
+
+#### Why this is a solver and not a representation problem
+
+Workstreams 1 and 2 make the topology easier to LEARN: a stable slot identity,
+and cover relations available in one hop instead of five neural layers. They are
+worth having. But the quantity in question is **exactly computable from public
+information**:
+
+* the Age layout is fixed and known in advance;
+* which cards remain, and where the face-down ones can be, is known;
+* unbuilt extra-turn Wonders and their affordability are public;
+* who picks first in the next Age is determined.
+
+When a quantity is exactly computable, computing it beats approximating it
+statistically -- and a network asked to infer it from examples will be wrong in
+exactly the rare, high-regret positions where it matters, because those are the
+positions self-play rarely visits. Every measurement in Workstreams 9, 10 and 11
+found the same thing from the other direction: the information was recoverable,
+and search simply never funded the look.
+
+`threat_corpus_scan.py` is a crude, offline sketch of a piece of this: it asks
+whether an action uncovers a path to a threatening card, and whether the opponent
+holds an affordable extra-turn Wonder. Two things about how that went are worth
+carrying into this workstream:
+
+1. **Delegate every rule.** The first version reconstructed the science and
+   military rules locally and got both wrong -- it missed the symbol `Law`
+   grants, invented a single military band where the engine has two, ignored
+   `Strategy`, and never applied the candidate action so it could not tell who
+   moved next. Those errors changed which positions entered the corpus, not
+   merely how they were described. This engine must call `engine.py`, never
+   re-derive it.
+2. **Immediacy is a function of chain distance**, not of victory type: distance
+   0 needs no extra turn, distance 1 needs exactly one, distance 2 or more is
+   not immediate. Getting that backwards silently inverted the corpus filter.
+
+#### What "forcing" has to mean here
+
+The outputs below are the right list, and the distinction to hold onto while
+implementing them is that each must survive the question *"and can the opponent
+actually bring that about, against best play, given who moves when?"* --
+not merely *"is it still possible in principle?"* Concretely, at the start of
+Age III the engine should be able to say whether a science or military victory
+can be **forced** from the visible layout, which is a statement about control,
+tempo and turn order, and which no count of obtainable symbols can express.
+
 
 ### Control state
 
@@ -863,6 +946,16 @@ Initially run vector backup as telemetry only so it cannot change move
 selection. Promote it to the authoritative displayed outlook after calibration
 and perspective/chance-node tests pass.
 
+**Note which half the advisor value lives in.** "How does this move change the
+opponent's science or military win probability, under search" is the EXPENSIVE
+half: it needs the seven-way distribution backed up through the tree, which means
+changing the Rust evaluator boundary (today `(value_p0, priors)` only) plus
+storage and perspective/chance handling in both the normal and resumable trees.
+The hierarchical head on its own is cheap and trains in shadow mode, but on its
+own it only makes the RAW root outlook self-consistent. Budget the two
+separately; `inference.py` already emits `joint7` per evaluation, so no extra
+forward pass is needed -- the cost is carrying it across the boundary.
+
 ## Workstream 5: legal-action tokens
 
 ### Current limitation
@@ -893,6 +986,24 @@ Score legal actions with a shared function over the global state and action
 representation. Preserve the existing 1,202-index codec for replay, engine,
 wire, and policy-target compatibility; action tokens change how logits are
 computed, not how actions are identified externally.
+
+**This does not replace card tokens and does not grow the state encoder.** The
+action representation is BUILT FROM the existing tokens -- the source card's
+contextual token is an input, alongside the action-use embedding, the learned
+slot (Workstream 1) and a Wonder token where applicable. What is added is a small
+scoring function applied per LEGAL action, and 7WD is unusually favourable here:
+the median position offers 4 legal actions and the mean 5.6, with the widest
+position in the threat corpus reaching 20. So the cost is a handful of small
+forward passes, not a wider state encoding.
+
+**Workstream 9 produced direct evidence for this.** Making sibling sharing work
+at all required abandoning the card-derived action index: `Artemis (using
+Sawmill)` and `Artemis (using Brickyard)` are the same tactical move at different
+indices, and only a structural key -- `(use, slot, wonder)` -- corresponds across
+chance worlds. That is this workstream's thesis, arrived at empirically inside
+the searcher. It also supplies a mechanism for the measured prior: the
+refutation's 0.012-0.077 prior is low partly BECAUSE each `(card, Wonder)` pair
+is its own index that rarely receives direct examples.
 
 ### Strength-preserving hybrid
 
