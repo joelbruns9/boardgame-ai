@@ -486,6 +486,81 @@ drawn from that was inflated. All counting, sampling and any future train/test
 split keys on `episode_id`. Duplicate observations in the logs (12) are collapsed
 by digest.
 
+#### Measured: the failure generalises, and the reference case was mild
+
+Eleven live positions, nine tables, three threat classes, both chain distances,
+at 600 simulations per chance world with a common ply. For each, the rank and
+regret of the best THREAT-CREATING action against the position's best action:
+
+| episode | table | threat | d | creating actions rank | regret |
+|---|---|---|---|---|---|
+| 51fe16207658 | 899383864 | science_pair | 1 | 7-10 of 10 | **68.6** |
+| d1cec1f18d35 | 907773062 | science_win | 0 | 3-4 of 4 | **57.9** |
+| 1cf444320de6 | 904750590 | science_win | 0 | 2-4 of 8 | **52.3** |
+| 84d11f82ce85 | 908945482 | science_pair | 1 | 6-8 of 8 | 37.5 |
+| b4ed009aa6a8 | 908282325 | science_pair | 0 | 14-20 of 20 | 15.4 |
+| e37714942879 | 906785699 | science_pair | 0 | 7-12 of 12 | 14.7 |
+| c12e9b35620c | 906378778 | science_pair | 1 | 2-10 of 15 | 9.3 |
+| 809214358a97 | 905634974 | science_win | 0 | 4-6 of 6 | 9.0 |
+| ff9f5097a4f6 | 905283659 | military_band | 1 | 6-10 of 12 | 8.7 |
+| ff9f5097a4f6 | 905283659 | military_band | 0 | 1-6 of 15 | 0.0 |
+| 9060b0d0a0d9 | 908477203 | military_band | 1 | 1-4 of 4 | 0.0 |
+
+**Nine of eleven carry real regret; the median is about 15 points and four
+exceed 37.** In five positions every threat-creating action sits in the bottom
+half of the ranking -- in `b4ed009aa6a8` they occupy ranks 14 to 20 of 20.
+
+**The reference case was not unusual. It was mild.** Its roughly twenty-point
+error sits in the middle of this distribution.
+
+So the failure is not a quirk of table `908370787`: across nine games the
+advisor's willingness to uncover a threat against itself is a systematic and
+expensive mistake. That is the evidence the targeted correction needs, and it
+is now in hand.
+
+**Two positions show zero regret, and they matter.** In both, a threat-creating
+action is genuinely the best move on the board. That is the natural negative
+control this programme needs and it confirms the constraint recorded under
+*Cost of the error*: a training target teaching blanket avoidance of the
+exposure would make the model WORSE. The target must be the specific
+alternative, never the action class.
+
+Method notes. The automatic recheck fired on two positions whose top two actions
+were within 1.5 points and **changed no ranking**, which is further evidence for
+the 600-simulation budget. Wall clock was 169 minutes for nine new positions,
+dominated by one 45-minute position -- cost scales with legal actions times
+chance worlds and varies more than fourfold across the corpus.
+
+**What this does NOT establish.** These eleven are the LIVE subset of a sample
+drawn before triage existed, so they are not stratified over live positions. The
+regret magnitudes are real; the *rate* is not representative, and no per-threat
+class rate should be quoted from them. Triage itself proved far more expensive
+than expected -- about 6.5 minutes per position at 400 simulations, and still 46
+seconds at zero simulations because `make_root` force-expands the root chance
+layer -- so the corpus has not been triaged in full.
+
+#### Liveness is a property the scan cannot see
+
+A position can have the right shape and carry no decision. Triaging the
+seventeen-position sample found six dead: four where the actor was already
+winning at 87-99.8% with action spreads as small as 0.2 points, and two with no
+spread at all. `907771438` is the clearest -- flagged for a `military_win`
+threat against an actor sitting at 96%. The threat is structurally real and
+strategically irrelevant, because the scan asks whether a card would win for the
+opponent without asking whether the opponent is anywhere near winning.
+
+`threat_corpus_measure.py --triage` classifies each position as live,
+`decided_won`, `decided_lost` or `no_spread` at a cheap budget, and `--live-from`
+reuses that verdict so no position is paid for twice. This is the
+preventable / unpreventable / already-lost slice the baseline package asks for.
+
+A raw-value classifier (zero simulations) was validated against the
+four-hundred-simulation verdict on those seventeen: **agreement 16/17, with zero
+dead positions wrongly admitted** and one live position missed at the 90% ceiling
+boundary. It errs conservatively, which is the right direction, but at 46 seconds
+per position it is not cheap enough to triage 385 snapshots either.
+
+
 #### Immediacy is a function of chain distance, not victory type
 
 | distance | can the opponent act on it now? |
@@ -1371,8 +1446,11 @@ not an action.
 
 ## Workstream 10: approximate afterstate clustering across chance siblings
 
-**Status: partially validated, NOT built, and not a transposition.** Both
-Workstream 9 flags stay off.
+**Status: NOT built, not a transposition, and its cost is unmeasured.** Both
+Workstream 9 flags stay off. Under the information-state key this position
+produces exactly one real cluster, which agrees perfectly -- so the design's
+soundness is untested rather than confirmed, and both negative controls this
+section once relied on have been retracted.
 
 > **These states are not equivalent, and the name matters.** After the revealed
 > card is buried its effect is inert, but its identity is not irrelevant: it is
@@ -1505,22 +1583,37 @@ abstraction doing what it claims.
 clusters bear on soundness, and the harness now reports cluster count, singleton
 count and largest cluster so a reader cannot mistake one for the other.
 
-#### What the corrected measurement still shows
+#### Partitioned by the real key, BOTH controls dissolve
 
-At 800 simulations with reference values from dedicated per-action searches,
-before the re-partitioning:
+| arm | members | clusters | result |
+|---|---|---|---|
+| control: reply node | 10 | **10 singletons** | never merged |
+| **bury EXPOSED** | 10 | **one cluster of 10** | 10/10 agreement, 0 illegal, regret 0.0 |
+| control: bury Aqueduct | 20 | **20 singletons** | never merged |
 
-| arm | members | ref-best agreement | cluster action illegal in | regret max | regret / margin max |
-|---|---|---|---|---|---|
-| bury EXPOSED | 10 | 10/10 | 0 | 0.0 | 0.0 |
-| bury Aqueduct | 20 | 9/20 | 6 | 0.044 | **1.123** |
+**RETRACTED: the Aqueduct arm's "9/20 agreement, 6 illegal, regret/margin
+1.123".** Those numbers came from analysing the whole arm as one cluster. Under
+the information-state key the arm's twenty members are twenty singletons --
+their public secondary reveals differ, so the key refuses to merge them. The
+figures described a merge no implementation would perform, exactly as the
+reply-node control did. Both of this section's negative controls were
+constructed by the analysis rather than found in the design.
 
-The Aqueduct figure is the first real cost number in this workstream: the
-cluster's action costs a member **more than its entire margin**, which flips that
-member's decision. It lands on the arm that is supposed to fail.
+What that leaves is better for the design and worse for the evidence:
 
-Those numbers predate the cluster partitioning and are retained as the
-whole-arm view. Per-cluster figures supersede them.
+* **The key is self-protecting.** It merges precisely the ten post-burial states
+  that are publicly identical modulo the buried card, and nothing else. The
+  unsoundness the controls were built to demonstrate cannot arise, because the
+  key will not form those clusters.
+* **The cost is therefore unmeasured, and may be hard to measure at all.** No
+  cluster anywhere in this position has partial agreement, so
+  `regret_over_margin` has nothing to bite on. The single real cluster agrees
+  perfectly and costs nothing -- which is what a position with a dominant
+  continuation would give, and proves little.
+* It raises a question the plan should hold open: if the key only ever merges
+  states that already agree, the abstraction may be **safe and rarely
+  applicable**. Its value then rests entirely on how often a real cluster forms,
+  which no measurement has established.
 
 #### What is still not established
 
@@ -1583,10 +1676,13 @@ Soundness, before any clustering is enabled anywhere:
 Cost, which is currently unmeasured:
 
 - **Cluster regret** -- what a member loses playing the cluster's action rather
-  than its own -- and **regret over that member's own action margin**, which is
-  the number that generalises to ordinary positions with thin margins. Requires
-  a corpus containing partially-agreeing clusters; this position cannot supply
-  one. The corpus now exists; the measurement over it does not.
+  than its own -- and **regret over that member's own action margin**. Still
+  UNMEASURED, and harder to measure than first thought: under the real key this
+  position yields exactly one cluster, and it agrees 10/10, so there is nothing
+  to price. A cost measurement needs a position where the key forms a cluster
+  whose members DISAGREE -- and whether such positions exist is itself unknown.
+  Establishing that they do is now a precondition for this workstream, not a
+  detail of it.
 - Reference action values must be **probability-weighted over the chance
   support** and averaged over several seeds, and the candidate set must be
   **unioned across every seed**. Sampling one outcome uniformly discards the

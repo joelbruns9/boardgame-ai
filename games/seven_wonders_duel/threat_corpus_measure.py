@@ -40,7 +40,18 @@ import json
 import subprocess
 import sys
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
+
+
+def row_id_from(episode, snapshot):
+    """A measurable row from an episode's snapshot."""
+
+    return {
+        "episode_id": episode["episode_id"], "table": episode["table"],
+        "threat": episode["threat"], "target_card": episode["target_card"],
+        "rows_spanned": episode["rows_spanned"],
+    }
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -60,6 +71,83 @@ def tracked_for(row) -> str | None:
         wonders = row.get("opponent_unbuilt_extra_turn") or []
         return wonders[0] if wonders else None
     return None
+
+
+def triage_position(row, args, log) -> dict:
+    """Cheap liveness check: is there a decision here worth measuring?
+
+    A position can have the right SHAPE and carry no signal. Measured on four
+    military positions: one actor sat at 0-2% in every line (already lost), two
+    at 96-99.8% with action spreads of 3.5 and 0.2 points (already won), and only
+    one was a live decision. A threat can be structurally real and strategically
+    irrelevant -- `907771438` is flagged for a military_win threat against an
+    actor who is winning at 96%.
+
+    Running the full measurement on those spends hours to learn nothing, so this
+    filters first at a budget of seconds. It is deliberately crude: the question
+    is only whether the actions differ enough for regret to exist.
+    """
+
+    out = Path(args.out_dir)
+    if not out.is_absolute():
+        out = REPO_ROOT / out
+    (out / "triage").mkdir(parents=True, exist_ok=True)
+    artifact = out / "triage" / f"{row['episode_id']}_r{row['decision_row']}.json"
+
+    cmd = [
+        sys.executable, "-m", "games.seven_wonders_duel.w9_reference_case",
+        "--table", row["table"], "--decision-row", str(row["decision_row"]),
+        "--no-verify-position", "--stages", "ref-values",
+        "--ref-worlds", str(args.triage_worlds),
+        "--ref-sims", str(args.triage_sims),
+        "--ref-sample", "random", "--out", str(artifact), "--quiet",
+    ]
+    if artifact.exists() and not args.force:
+        elapsed = 0.0
+        result = None
+    else:
+        started = time.perf_counter()
+        result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        elapsed = time.perf_counter() - started
+        if result.returncode != 0:
+            return {**row_id(row), "status": "failed", "seconds": round(elapsed, 1),
+                    "stderr": result.stderr.strip()[-600:]}
+
+    actions = json.loads(artifact.read_text(encoding="utf-8"))["reference_values"]["actions"]
+    best = actions[0]["win_pct_weighted"]
+    worst = actions[-1]["win_pct_weighted"]
+    spread = best - worst
+    live = (
+        spread >= args.min_spread
+        and args.live_floor <= best <= args.live_ceiling
+        and len(actions) > 1
+    )
+    reason = (
+        "live" if live
+        else "no_spread" if spread < args.min_spread
+        else "decided_lost" if best < args.live_floor
+        else "decided_won"
+    )
+    entry = {
+        **row_id(row), "status": "ok", "live": live, "reason": reason,
+        "seconds": round(elapsed, 1), "legal_actions": len(actions),
+        "best_pct": best, "worst_pct": worst, "spread": round(spread, 2),
+        "top_margin": round(best - actions[1]["win_pct_weighted"], 2),
+    }
+    log(
+        f"  {'LIVE ' if live else 'skip '} {row['episode_id']} {row['table']} "
+        f"row {row['decision_row']:<3} {row['threat']:<14} d={row['distance']} "
+        f"{elapsed:>5.1f}s  {worst:>5.1f}-{best:<5.1f}%  spread={spread:>5.1f}  {reason}"
+    )
+    return entry
+
+
+def row_id(row):
+    return {
+        "episode_id": row["episode_id"], "table": row["table"],
+        "decision_row": row["decision_row"], "threat": row["threat"],
+        "distance": row["distance"], "target_card": row.get("target_card"),
+    }
 
 
 def run_position(row, args, log) -> dict:
@@ -169,6 +257,22 @@ def main(argv=None) -> int:
                              "action is identifiable")
     parser.add_argument("--trace-sims", type=int, default=6000)
     parser.add_argument("--trace-seeds", type=int, default=3)
+    parser.add_argument("--triage", action="store_true",
+                        help="cheap liveness pass instead of the full measurement")
+    parser.add_argument("--triage-sims", type=int, default=400)
+    parser.add_argument("--triage-worlds", type=int, default=6)
+    parser.add_argument("--min-spread", type=float, default=3.0,
+                        help="points between best and worst action below which "
+                             "no decision is at stake")
+    parser.add_argument("--live-floor", type=float, default=10.0)
+    parser.add_argument("--live-ceiling", type=float, default=90.0)
+    parser.add_argument("--live-from", default=None,
+                        help="a triage summary; measure only its live positions")
+    parser.add_argument("--triage-sample", type=int, default=0,
+                        help="triage roughly this many snapshots, stratified "
+                             "across (threat class, chain distance)")
+    parser.add_argument("--all-episodes", action="store_true",
+                        help="triage every episode snapshot, not just the sample")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--summary-out", default=None)
@@ -182,17 +286,64 @@ def main(argv=None) -> int:
     if not path.is_absolute():
         path = REPO_ROOT / path
     corpus = json.loads(path.read_text(encoding="utf-8"))
-    rows = corpus["sample"][: args.limit] if args.limit else corpus["sample"]
+    if args.all_episodes or args.triage_sample:
+        rows = [
+            {**row_id_from(episode, snapshot), **snapshot}
+            for episode in corpus["episodes"]
+            for snapshot in episode["snapshots"]
+        ]
+    else:
+        rows = corpus["sample"]
 
-    log(f"measuring {len(rows)} position(s) at {args.ref_sims} sims"
-        f"{' + trace' if args.trace else ''}")
+    if args.live_from:
+        # Measure only positions a triage pass already classified as live.
+        # Triage is cheap relative to the full measurement but not free, so its
+        # verdict is reused rather than recomputed, and a position with no
+        # decision at stake is never paid for twice.
+        triage_path = Path(args.live_from)
+        if not triage_path.is_absolute():
+            triage_path = REPO_ROOT / triage_path
+        verdicts = json.loads(triage_path.read_text(encoding="utf-8"))["positions"]
+        keep = {
+            (v["episode_id"], v["decision_row"])
+            for v in verdicts if v.get("status") == "ok" and v.get("live")
+        }
+        rows = [r for r in rows if (r["episode_id"], r["decision_row"]) in keep]
+
+    if args.triage_sample:
+        # Spread the triage budget across (threat class, chain distance) so the
+        # live RATE can be estimated per class. Triaging the first N in file
+        # order would answer that for whichever class happens to sort first.
+        cells = defaultdict(list)
+        for row in rows:
+            cells[(row["threat"], row["distance"])].append(row)
+        total = sum(len(v) for v in cells.values())
+        picked = []
+        for key, group in sorted(cells.items()):
+            share = max(2, round(args.triage_sample * len(group) / total))
+            # Longer standoffs first: the players themselves treated those as real.
+            picked.extend(
+                sorted(group, key=lambda r: -r.get("rows_spanned", 0))[:share]
+            )
+        rows = picked
+    rows = rows[: args.limit] if args.limit else rows
+
+    if args.triage:
+        log(f"triaging {len(rows)} position(s) at {args.triage_sims} sims")
+    else:
+        log(f"measuring {len(rows)} position(s) at {args.ref_sims} sims"
+            f"{' + trace' if args.trace else ''}")
     started = time.perf_counter()
     results = []
     for row in rows:
-        results.append(run_position(row, args, log))
+        results.append(
+            triage_position(row, args, log) if args.triage
+            else run_position(row, args, log)
+        )
     elapsed = time.perf_counter() - started
 
     ok = [r for r in results if r.get("status") == "ok"]
+    live = [r for r in ok if r.get("live")]
     report = {
         "harness": "threat_corpus_measure",
         "episodes_source": str(path.relative_to(REPO_ROOT)),
@@ -211,7 +362,14 @@ def main(argv=None) -> int:
                 1 for r in ok if r.get("recheck", {}).get("rank_changed")
             ),
             "wall_clock_minutes": round(elapsed / 60, 1),
+            **({
+                "live": len(live),
+                "decided": len(ok) - len(live),
+                "live_fraction": round(len(live) / len(ok), 3) if ok else None,
+                "by_reason": dict(Counter(r.get("reason") for r in ok)),
+            } if args.triage else {}),
         },
+        "live_positions": [r for r in live] if args.triage else None,
         "positions": results,
     }
     log("\n" + json.dumps(report["totals"], indent=2))
