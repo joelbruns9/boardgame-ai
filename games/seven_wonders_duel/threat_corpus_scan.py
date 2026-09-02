@@ -64,7 +64,13 @@ from .data import (
     EffectKind,
     covering_slots,
 )
-from .engine import _science_symbols, apply_action, military_token_band
+from .engine import (
+    _can_afford,
+    _science_symbols,
+    apply_action,
+    military_token_band,
+    minimum_payment,
+)
 from .game import Phase
 from .search import state_actor
 
@@ -184,31 +190,49 @@ def reach(tableau, slot_id, depth):
 
 
 def affordable_extra_turn_wonders(game, player):
-    """Unbuilt, un-retired extra-turn Wonders this player could legally build.
+    """Unbuilt, un-retired extra-turn Wonders this player could actually build.
 
-    Ownership alone is not enough: the plan's threat requires the opponent to
-    actually play the Wonder, so a retired one, or one it cannot pay for, does
-    not make the threat immediate. Affordability is asked of the codec's own
-    legal-action set rather than recomputed.
+    Ownership is not enough: the threat requires the opponent to PLAY the
+    Wonder, so a retired one, or one it cannot pay for, does not make the threat
+    immediate.
+
+    Affordability is priced with the engine's own `minimum_payment` /
+    `_can_afford`, which take an explicit player and so work while it is the
+    other player's turn -- unlike `legal_action_indices`, which only describes
+    the mover. An earlier version fell back to ownership whenever the player was
+    not to move, which meant EVERY corpus row reported
+    `extra_turn_legality_verified: false` and the corpus recorded a weaker claim
+    than it appeared to.
+
+    The seventh-Wonder rule is honoured: once seven are built across both
+    cities, no eighth can be constructed.
     """
 
     city = game.cities[player]
+    retired = set(getattr(game, "retired_wonders", ()) or ())
     owned = [
         w for w in city.wonders
         if w not in city.built_wonders
         and w in EXTRA_TURN_WONDERS
-        and w not in getattr(game, "retired_wonders", set())
+        and w not in retired
     ]
-    if not owned or state_actor(game) != player:
-        # Legality can only be read when it is this player's turn; otherwise
-        # report ownership and let the caller treat it as unverified.
-        return owned, False
-    legal_wonders = set()
-    for index in legal_action_indices(game):
-        action = decode_action(game, index)
-        if action.wonder_name in owned:
-            legal_wonders.add(action.wonder_name)
-    return sorted(legal_wonders), True
+    if not owned:
+        return [], True
+
+    built_total = sum(len(c.built_wonders) for c in game.cities)
+    if built_total >= 7:
+        return [], True  # no eighth Wonder is ever constructed
+
+    affordable = []
+    for name in owned:
+        wonder = WONDERS_BY_NAME[name]
+        try:
+            payment = minimum_payment(game, player, wonder.cost, is_wonder=True)
+        except Exception:
+            continue  # unpriceable here; omit rather than overclaim
+        if _can_afford(game, player, payment):
+            affordable.append(name)
+    return sorted(affordable), True
 
 
 def observation_digest(state_payload) -> str:

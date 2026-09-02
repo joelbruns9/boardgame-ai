@@ -429,12 +429,24 @@ and any targeted training correction.
 
 | | |
 |---|---|
-| positions (rows with a public threat) | 430 |
-| **episodes** (distinct physical runs) | **248** |
-| snapshots (episode x chain distance) | 362 |
-| tables represented | 75 |
-| by threat | military_band 134, science_pair 100, science_win 12, military_win 2 |
-| by minimum chain distance | d0 207, d1 36, d2 4, d3 1 |
+| positions (rows with a public threat) | 458 |
+| **episodes** (distinct physical runs) | **267** |
+| snapshots (episode x chain distance) | 385 |
+| tables represented | 81 |
+| by threat | military_band 146, science_pair 107, science_win 12, military_win 2 |
+| by minimum chain distance | d0 219, d1 42, d2 5, d3 1 |
+| snapshots with affordability VERIFIED | **385 / 385** |
+| snapshots with an AFFORDABLE extra-turn Wonder | **143 / 385** |
+
+Affordability is priced with the engine's own `minimum_payment` and
+`_can_afford`, which take an explicit player and so work while it is the other
+player's turn -- unlike `legal_action_indices`, which only describes the mover.
+An earlier version fell back to ownership whenever the player was not to move,
+so every row reported `extra_turn_legality_verified: false`. The distinction is
+not cosmetic: only **143 of 385** snapshots have an extra-turn Wonder the
+opponent can actually pay for, against every snapshot where one was merely
+owned. The seventh-Wonder rule is honoured too -- once seven are built across
+both cities there is no eighth, whatever the coins say.
 
 **Structural only.** The scan decides shape, not cost. Whether a threat is worth
 anything is an action-regret question answered by
@@ -1606,7 +1618,11 @@ weaken the selected policy -- but will not deliver the full depth consolidation;
 needs a genuine aggregate/particle search with explicit member weights and
 conditional residual values, which is a materially larger algorithm.
 
-The cheaper first strength experiment is a **public tactical extension**:
+The cheaper first strength experiment was a **public tactical extension**. It has
+since been built and measured: it recovers 19% of the leaf error it targets and
+is a NULL for this purpose -- see Workstream 11. It remains the right thing to
+have tried first, and it still gives clustering a baseline, but it is no longer
+a candidate fix. What follows is its original rationale:
 
 ```text
 extra-turn action -> immediate public tactical continuation
@@ -1640,6 +1656,103 @@ it has to beat.
 - The corpus is one determinization per row, so its face-down accounting is a
   single draw. Fine for shape detection; not for the reveal probabilities the
   baseline package eventually wants.
+
+## Workstream 11: public tactical leaf extension -- BUILT, and a NULL
+
+**Status: built, measured, not the fix. Flag off by default.**
+`SearchConfig.tactical_extension` (plies; 0 is off).
+
+This was the cheaper first strength experiment recommended over afterstate
+clustering: provable, keeps every world's exact remaining pool, and aimed
+directly at the eight-visit correction the discovery trace measured. It works
+mechanically and recovers about a fifth of the error it was built for, which is
+not enough to matter.
+
+### The change
+
+It extends the **leaf evaluation, not the tree**. Where the mover can
+immediately take a card that threatens its opponent, the position is rolled
+forward through that take and the network is asked about the RESULT. Priors
+still come from the node's own action set, so the tree, the action space and
+every backup are untouched, and `test_w9_mechanisms` off-equivalence still
+holds exactly.
+
+Keyed on the position rather than on "was that an extra turn": after an extra
+turn the state merely has the same `active_player`, with no flag to read. The
+predicate -- the mover can build an accessible, face-up card that threatens its
+opponent -- covers the reference case and the military channel identically,
+which is the generalisation the review asked for:
+
+```text
+extra-turn action -> immediate public tactical continuation
+                  -> terminal threat or forced progress-token choice
+```
+
+Deliberately conservative, because this is an evaluation aid and not a search:
+only `CONSTRUCT_BUILDING` of a revealed, accessible, threatening card; never a
+step that fires chance, which would need explicit outcomes and would change what
+the hidden pool can still produce; never a genuine choice, though a pending
+choice with exactly one option is forced and may be resolved. A cheap pre-check
+means the overwhelming majority of leaves never pay for a state clone.
+
+### The measurement, and the premise it falsifies
+
+The target was the leaf error Workstream 10 measured: on the post-burial
+afterstate the raw network says **78.4%** for the actor and 200 simulations say
+**41.6%**. The claim behind this workstream was that the value head is missing a
+short PUBLIC consequence, so showing it that consequence should recover most of
+the gap.
+
+Raw value with the extension on, no simulations, five worlds:
+
+| world | raw, off | raw, extension | 200 sims |
+|---|---|---|---|
+| Sawmill | 80.8 | 73.5 | 44.5 |
+| Brickyard | 78.0 | 71.6 | 41.3 |
+| Drying Room | 79.9 | 73.1 | 41.9 |
+| Walls | 79.0 | 72.3 | 42.4 |
+| Parade Ground | 79.1 | 71.9 | 42.3 |
+
+**About 7 points of a 37-point gap: 19%.** The extension fires in every world and
+rolls exactly as specified -- it takes `School`, claims the wheel pair, and stops
+at `choose_available_progress`, a multi-option choice it correctly refuses to
+decide. Depths of 1, 2, 3 and 5 all stop in the same place, so more plies change
+nothing.
+
+**The premise is therefore wrong.** The 36-point error is not a missing two-ply
+public consequence. The evidence was already visible in the principal variation
+recorded under *Cost of the error* and was not weighed: Q moves only
+-0.105 -> -0.097 across `Build: School` -> `Resolve Theology`. The value does not
+live in those plies. The 41.6% comes from simulations exploring the actor's
+replies and beyond -- genuine search depth -- and the trace's -0.55 -> +0.15
+correction likewise happened over eight visits of FULL search, not a forced
+sequence.
+
+### What follows
+
+Extending the roll further will not help: it stops at a real decision, and the
+one plausible extra step (resolving the token choice) is worth about a point on
+the PV evidence. Making the extension a nested SEARCH rather than a rollout
+would change the picture, but that is no longer cheap or provable -- it is a
+mini-quiescence search with its own budget question, and it should be judged
+against the prior-correction work rather than assumed.
+
+The pattern is worth stating plainly, because it now has three data points.
+Every mechanism aimed at the partition-or-search framing has come up short:
+
+| mechanism | result |
+|---|---|
+| chance-sibling bias (W9 m1) | does not solve the case at any gain |
+| Wonder-action factorization (W9 m2) | correctness property, interior nodes only, no strength evidence |
+| afterstate clustering (W10) | sound only where the game discards the identity; cost unmeasured; runtime licence unsolved |
+| public tactical leaf extension (W11) | 19% of the target error |
+
+Meanwhile every measurement keeps pointing the same way: a prior of 0.012-0.077
+on the refutation, a value head 36 points wrong at the node after it, and both
+recoverable by ordinary search once it is funded. The corpus exists now to test
+whether that holds beyond this position; the training correction is the lever
+these four mechanisms are not.
+
 
 ## Experiment and promotion framework
 

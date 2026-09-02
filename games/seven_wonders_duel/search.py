@@ -270,6 +270,84 @@ def fixed_support_index(weights, target: float) -> int:
     return len(weights) - 1
 
 
+def tactical_continuation(state: GameState, max_plies: int):
+    """Roll a leaf forward through immediate public tactical takes, or None.
+
+    The generalised shape the reference case instantiates:
+
+        extra-turn action -> immediate public tactical continuation
+                          -> terminal threat or forced progress-token choice
+
+    Keyed on the position rather than on "was that an extra turn": the mover can
+    build an ACCESSIBLE, FACE-UP card that threatens its opponent. That covers
+    the reference case (after the burial the opponent is still to move and can
+    take `School`) and the military channel equally, without the searcher having
+    to know how the mover came to be on move.
+
+    Conservative by construction, because this is a leaf-evaluation aid and not
+    a search:
+
+    * only `CONSTRUCT_BUILDING` of a revealed, accessible, threatening card;
+    * never a step that fires chance -- that would need explicit outcomes and
+      would change what the hidden pool can still produce;
+    * never a step with a genuine choice; a pending choice with one option is
+      forced and may be resolved, anything else stops the roll.
+
+    Returns the rolled-forward state, or None if nothing applied -- so the
+    ordinary evaluation stands untouched at the overwhelming majority of leaves.
+    """
+
+    from .engine import ActionUse
+    from .threat_corpus_scan import threat_of
+
+    def tactical_take(current):
+        """The index of an immediate public tactical take, or None."""
+
+        if current.phase is Phase.COMPLETE:
+            return None
+        if current.pending_choice is not None:
+            # A forced resolution is not a decision; anything else is.
+            options = current.pending_choice.options
+            if len(options) != 1:
+                return None
+            return legal_action_indices(current)[0]
+        mover = state_actor(current)
+        for index in legal_action_indices(current):
+            action = decode_action(current, index)
+            if action.use is not ActionUse.CONSTRUCT_BUILDING or action.slot_id is None:
+                continue
+            slot = current.tableau.cards.get(tuple(action.slot_id))
+            if slot is None or not slot.present or not slot.revealed:
+                continue
+            if threat_of(slot.card_name, current, mover) is None:
+                continue
+            if chance_signature(current, action):
+                return None  # a reveal needs explicit outcomes; do not guess
+            return index
+        return None
+
+    # Cheap pre-check: the overwhelming majority of leaves have nothing to roll,
+    # and must not pay for a clone to discover that.
+    if tactical_take(state) is None:
+        return None
+
+    probe = state.clone()
+    probe.search_barrier = True
+    moved = 0
+    for _ in range(max_plies):
+        chosen = tactical_take(probe)
+        if chosen is None:
+            break
+        try:
+            apply_action(probe, decode_action(probe, chosen))
+        except Exception:
+            break
+        moved += 1
+        if probe.phase is Phase.COMPLETE:
+            break
+    return probe if moved else None
+
+
 def state_actor(state: GameState) -> int:
     return (
         state.pending_choice.player
@@ -667,6 +745,30 @@ class SearchConfig:
     both Q and the prior term. Capping keeps the shared signal a nudge toward
     examining an action rather than a verdict about it."""
 
+    tactical_extension: int = 0
+    """Plies of public tactical continuation to roll through before evaluating a
+    leaf. Zero is off.
+
+    The measured problem: the value head does not see a two-ply public
+    consequence. After the refutation buries the exposed slot, the raw network
+    value of that position is 78.4% for the actor; 200 simulations bring it to
+    41.6%. A 36-point error the search has to spend visits repairing -- and the
+    trace showed the refutation only ever gets one to four visits, so it never
+    does.
+
+    This extends the LEAF EVALUATION, not the tree. Where the mover can
+    immediately take a card that threatens its opponent -- a science pair or
+    sixth symbol, a military band or the capital -- the position is rolled
+    forward through that take and the network is asked about the RESULT. Priors
+    still come from the node's own action set, so the tree, the action space and
+    every backup are untouched.
+
+    Only forced, chance-free steps are followed: a take that fires a reveal, or
+    leaves a genuine choice, stops the roll rather than having the extension
+    pick a move on the player's behalf. That is what keeps every world's exact
+    remaining pool intact, unlike an afterstate abstraction.
+    """
+
     seed: int = 0
     force_expand_root_chance: bool = False
     """Closed mode: exhaustively materialize and evaluate every enumerable
@@ -726,6 +828,21 @@ class GumbelMCTS:
         value_actor = float(evaluation.wdl[0] - evaluation.wdl[2])
         value_p0 = value_actor if actor == 0 else -value_actor
         priors = {index: float(p) for index, p in zip(legal, evaluation.policy)}
+
+        if self.config.tactical_extension > 0:
+            # Priors stay the node's own; only the VALUE is re-asked after the
+            # public tactical continuation, so the action space is unchanged.
+            extended = tactical_continuation(state, self.config.tactical_extension)
+            if extended is not None:
+                if extended.phase is Phase.COMPLETE:
+                    return _terminal_value_p0(extended), priors
+                other = state_actor(extended)
+                deep = self.evaluator.evaluate(
+                    [encode(extended.observation(other))],
+                    [legal_action_indices(extended)],
+                )[0]
+                deep_actor = float(deep.wdl[0] - deep.wdl[2])
+                value_p0 = deep_actor if other == 0 else -deep_actor
         return value_p0, priors
 
     def _sigma(self, completed: dict, max_visits: int) -> dict:
