@@ -1069,21 +1069,44 @@ visits-to-clear is 4; the maximum observed is also 4. Stable across all five
 seeds (refutation became the top reply in 2-3 worlds each), so this is not a
 seed artifact.
 
-**The value head is not the bottleneck here.** Eight visits of ordinary search
-correct a -0.55 misread to +0.15. The refutation is first visited at median
-simulation 119 -- early. It simply never accumulates visits, because its prior is
-0.012-0.077 and its first leaf value is about -0.57, so PUCT abandons it after
-one to four looks.
+**Search, not depth of value, is what is missing.** Eight visits of ordinary
+search correct a -0.55 misread to +0.15. The refutation is first visited at
+median simulation 119 -- early. It simply never accumulates visits, because its
+prior is 0.012-0.077 and its first leaf value is about -0.57, so PUCT abandons it
+after one to four looks.
+
+> **This is not a claim that the value head is fine.** It is badly wrong at these
+> nodes: Workstream 10 measures the raw value of the post-burial position at
+> **78.4%** for the actor, which 200 simulations bring to **41.6%** -- a
+> 36-point correction. The value head does not see the School/Theology
+> consequence standing still. What the trace establishes is only that the error
+> is *cheap to repair with search*, so the search-side fix is to make search
+> look rather than to deepen the value head first. For a world-class player both
+> are wanted; see below.
 
 #### What this settles
 
-*The correction work is prior work.* The programme sketched under *Correct
-confidently wrong priors deliberately* proposes both policy ranking targets and
-value targets at the precursor, post-Artemis and post-School states. **The value
-targets are not indicated by this evidence** -- the value is already recoverable
-at trivial depth. Generate a training example per reveal world, force enough
-search through the exact burial action to clear roughly eight visits, and train
-policy ranking against the greedy alternatives.
+*The correction work leads with the prior, but is not prior-only.* The programme
+sketched under *Correct confidently wrong priors deliberately* proposes both
+policy ranking targets and value targets at the precursor, post-Artemis and
+post-School states. Ordered by this evidence:
+
+1. **Policy, first and necessarily.** Nothing else matters while the exact
+   Artemis burial is funded at one to four visits. Generate a training example
+   per reveal world, force enough search through that exact action to clear
+   roughly eight visits, and train ranking against the greedy alternatives.
+2. **Value, second and still wanted.** The raw estimate of the post-burial
+   position is 36 points wrong (78.4% -> 41.6% under 200 simulations). A model
+   that needed no search to see a two-ply public consequence would be stronger,
+   and would make every search budget go further. This is a lower priority than
+   the policy work, not an unnecessary one -- an earlier version of this section
+   said value targets were "not indicated", which overstated it.
+3. **Search, for tactical robustness** while those learned estimates improve.
+
+One constraint the *Cost of the error* measurement puts on all of it: the target
+is NOT "exposing `r2c10` is bad". It is not bad -- the best move on the board
+makes the same exposure. A ranking target teaching blanket avoidance would make
+the model worse.
 
 *It also explains the Workstream 9 null.* Mechanism 1's bonus moved the
 refutation from roughly three visits to roughly four. It needed to reach eight.
@@ -1258,11 +1281,22 @@ The lesson worth keeping: before concluding a mechanism cannot work, verify the
 measurement identifies the exact tactical object. A substring match on a name is
 not an action.
 
-## Workstream 10: afterstate transposition across chance siblings
+## Workstream 10: approximate afterstate clustering across chance siblings
 
-**Status: diagnosed and validated, not built.** This supersedes Workstream 9's
-mechanism 1 as the search-side answer, and it is the only search change this plan
-currently has evidence for. Both Workstream 9 flags stay off.
+**Status: partially validated, NOT built, and not a transposition.** Both
+Workstream 9 flags stay off.
+
+> **These states are not equivalent, and the name matters.** After the revealed
+> card is buried its effect is inert, but its identity is not irrelevant: it is
+> known to be outside the unseen pool, so members differ in future reveal support
+> and in conditional values. `ClosedNode` holds ONE concrete `GameState`, and both
+> `sample_outcomes` and `enumerate_chains` read
+> `unseen_pool(node.state.observation(...))`. Sharing a node would therefore make
+> later chance enumeration use whichever member happened to build it, and would
+> let `_Edge.q_p0` read an aggregate where it expects conditional per-world
+> values. **Any cross-world object must be an explicitly APPROXIMATE cluster,
+> never a transposition, and must never be reached through `_Edge.children` --
+> that mapping stays chance-outcome to exact conditional child.**
 
 ### Why Workstream 9's answer does not scale
 
@@ -1302,19 +1336,21 @@ The requirement is to search *deeper*, not to spread a budget more fairly.
 
 ### The change
 
-Keep the chance node, its per-world children, and their real action sets. Share
-only the node reached *after* an action whose consequence does not depend on the
-revealed card's identity, keyed on the afterstate with that identity dropped:
+Keep the chance node, its per-world children, and their real action sets. Cluster
+only the states reached *after* an action whose consequence the game itself has
+made identity-independent -- burying the revealed card under a Wonder.
 
-```text
-transposition key = (wonder, burial slot, ...)   NOT the buried card
-```
+The key must be a **normalized full-state fingerprint omitting only the
+specifically validated buried-card identity**, not merely `(wonder, slot)`. A
+coarse key would silently merge states differing in ways nobody has measured.
 
-Burying a card under a Wonder does not activate it. The ten post-burial
-positions differ only in which card sits inert in the burial pile and is absent
-from the unseen pool. So `Artemis -> School -> Theology` is searched **once with
-ten times the visits** instead of ten times shallowly -- and about ninety times
-the visits on a double reveal, which is where it matters.
+**Consolidation is smaller than first claimed.** On a single reveal, ten worlds
+collapse to one cluster: 10x. On a *double* reveal, burying one revealed card
+does not erase the other -- it is still on the tableau, still public, and must
+stay in the key. The 90 ordered worlds therefore partition by the surviving
+identity into roughly **ten clusters of nine: about 9x, not 90x.** The scaling
+objection to a per-world visit floor still holds; the quadratic benefit claimed
+for this workstream does not. Cluster sizes must be measured, not assumed.
 
 ### Why not open loop
 
@@ -1327,7 +1363,7 @@ at N=1200, because the revealed card sits on the board changing what is
 available. Merging them discards that, on top of open loop's known
 observability-aliasing and stale-prior defects.
 
-The afterstate transposition merges only the *consequence* nodes, which is where
+The afterstate cluster merges only the *consequence* states, which is where
 the information has actually been discarded by the game rules.
 
 Open loop is also mis-specified for this case independently: its path key is the
@@ -1336,33 +1372,50 @@ aggregate the exact refutation across worlds at all.
 
 ### The validation
 
-Ten worlds, values in the deciding player's frame, at three depths:
+`w10_afterstate_clustering.py`, ten worlds, 1200 simulations, three seeds,
+deciding-player frame. Three arms, and the third is the one that earns the
+conclusion.
 
-| | spread | sd |
-|---|---|---|
-| Control: reply nodes, no action (N=1200) | **18.4** | 5.77 |
-| Post-burial afterstates (raw) | 8.2 | 2.19 |
-| Post-burial afterstates (N=200) | 4.6 | 1.48 |
-| Post-burial afterstates (N=1200) | **5.6** | 1.92 |
+| arm | value spread | agreement | distinct best | majority illegal in |
+|---|---|---|---|---|
+| control: reply nodes, no action | 18.84 | 1/10 | 10 | 9/10 |
+| **bury EXPOSED slot** | **4.60** | **10/10** | **1** | **0** |
+| control: bury AQUEDUCT (identity survives) | 7.28 | 3/10 | 7 | 6/10 |
 
-Two things this establishes:
+**Value spread does not license aliasing, and on its own would have misled.**
+4.60 against 7.28 is not a decisive gap: most of the contraction after a burial
+comes from advancing into a constrained extra-turn afterstate, not from
+discarding the revealed identity. An earlier version of this section drew a
+green light from value spread alone and was wrong to.
 
-- **The abstraction removes noise, not signal.** The worlds genuinely differ by
-  ~18 points before anyone acts; after the burial they collapse to ~5.6, three
-  times tighter. Burying is the operation that discards the information, so the
-  afterstates are legitimately near-interchangeable. Residual error is ~2-3
-  points per world against a 20-point decision.
-- **Pool divergence does not compound.** The buried card leaves the unseen pool,
-  so post-burial states are not identical and the worry was that the difference
-  would grow with horizon. It does not: 4.6 at N=200, 5.6 at N=1200.
+**The structural metrics separate cleanly, and the mechanism is legible.** After
+burying the exposed card every world plays `Build: School` -- one action, legal
+everywhere. After burying `Aqueduct` every world plays *the card it just
+revealed* (`Build: Sawmill` in the Sawmill world, `Build: Walls` in the Walls
+world), which is why the majority action is undefined in six of ten members.
+The abstraction is sound exactly where the game has removed the distinguishing
+object, and unsound where it has not.
 
-Note also the raw-versus-searched gap: the network values the post-burial
-position at **78.4%** for the actor, and 200 simulations bring it to **41.6%**.
-A 36-point correction. The value head does not see the Theology follow-up
-standing still; it needs only shallow search to find it. That refines, and
-partly qualifies, the discovery trace's "prior failure, not value failure": the
-value head IS wrong at these nodes, it is simply cheap to correct, so the fix
-remains making search look rather than retraining the value head.
+**Pool divergence does not compound** with horizon: spread 4.6 at N=200 against
+4.6 at N=1200. Per-world seed spread is 0.3-1.1, so the residual is real world
+variation rather than search noise.
+
+#### What this does NOT establish
+
+- **Cost.** `cluster_regret` and `regret_over_margin` came back 0.0 in every
+  arm, including the controls -- regret is only defined where the majority
+  action is legal, and where members agree 10/10 it is zero by construction.
+  **This position has a dominant continuation, so it cannot exercise the metric
+  that matters.** A 2-3 point deviation is harmless against this game's 20-point
+  root gap and decisive at a one-point action margin. Until a corpus with
+  partially-agreeing clusters is measured, the cost of clustering is unknown.
+- **The `Walls` world is not protected by construction.** Its reply node stays
+  separate, but its Artemis edge would lead into the shared cluster, and that
+  imported value participates in choosing between Artemis and `Build: Walls`.
+  An earlier version of this section claimed it was safe by construction. It is
+  not. The negative control must compare the complete `Walls` reply policy and
+  per-action Q with clustering on versus off.
+- **Generalization.** One position, one determinization.
 
 ### Scope
 
@@ -1378,20 +1431,71 @@ Validated for **Wonder burial** only.
 
 ### Gate
 
-- Exact output equivalence with the flag off.
-- Re-run the clustering validation on any position before aliasing there; the
-  ~3x tightening is the licence, and it is one position so far.
-- Discovery: simulations required to promote the exact refutation, against the
-  Workstream 9 arms and baseline. The target is the unpartitioned threshold
-  (~400 visits at the reply node), reached by consolidation rather than budget.
-- The `Walls` world must not be corrupted. It is the world whose correct reply
-  genuinely differs, and the reply nodes are NOT aliased, so it should be
-  untouched by construction -- verify that it is.
-- Value-backup soundness: a shared node's value is an expectation over the
-  siblings that reach it. Confirm the mass accounting and that
-  `CHANCE_ENUMERATION_PLAN.md`'s edge classes are preserved.
-- Equal-wall-clock arena, since transposition changes work per simulation.
+Soundness, before any clustering is enabled anywhere:
 
+- Exact output equivalence with the flag off.
+- **Majority-action legality**: the cluster's chosen action must be legal in
+  every member. Six of ten members failing this is what disqualified the
+  `Aqueduct` arm, and it is a cheap per-position check.
+- **Best-action agreement** across members, with the distinct-best-action count.
+- Re-run the clustering validation on each new position before clustering there.
+  The licence is per-position, not general.
+- Cluster-size measurement, since the consolidation is ~10x on a single reveal
+  and ~9x on a double, not the quadratic first claimed.
+
+Cost, which is currently unmeasured:
+
+- **Cluster regret** -- what a member loses playing the cluster's action rather
+  than its own -- and **regret over that member's own action margin**, which is
+  the number that generalises to ordinary positions with thin margins. Requires
+  a corpus containing partially-agreeing clusters; this position cannot supply
+  one.
+- Maximum conditional error per member against that member's margin.
+- Multiple seeds and a deeper reference than the clustering budget itself.
+
+Correctness of any implementation:
+
+- The `Walls` world's complete reply policy and per-action Q, clustering on
+  versus off. Not assumed safe.
+- `_Edge.children` remains chance-outcome to exact conditional child; the
+  cluster is a separate, search-scoped registry.
+- Every backup stays local and probability-weighted, and
+  `CHANCE_ENUMERATION_PLAN.md`'s edge classes are preserved.
+- Equal-wall-clock arena, since clustering changes work per simulation.
+
+### Sequencing, and a safer first experiment
+
+Do not implement shared nodes. A safe prototype keeps one exact `ClosedNode`,
+`GameState`, priors, edges, visits and Q per chance world, adds a search-scoped
+cluster registry alongside the tree, and initially shares only **candidate
+discovery or principal-variation scheduling -- not values**. That is provably
+non-corrupting but will not deliver the full depth consolidation; obtaining that
+needs a genuine aggregate/particle search with explicit member weights and
+conditional residual values, which is a materially larger algorithm.
+
+The cheaper first strength experiment is a **public tactical extension**:
+
+```text
+Artemis buries the exposed slot -> extra turn -> School -> science pair/Theology
+```
+
+Expanding that critical public continuation within the same simulation attacks
+the measured eight-visit correction directly, retains every world's exact
+remaining pool, and is far easier to prove correct. It also gives the clustering
+prototype a baseline it has to beat.
+
+### Outstanding on this workstream
+
+- **No tests import either measurement script.** `w9_budget_curve.py` and
+  `w10_afterstate_clustering.py` are unexercised by the suite; the 26 existing
+  tests cover the Workstream 9 harness and searcher only.
+- `w9_budget_curve.py` still runs at import time and takes no arguments. It needs
+  a `main()`, CLI parameters, and the same provenance block
+  `w10_afterstate_clustering.py` now carries (checkpoint hash, observation
+  digest, seed, search configuration, code version).
+- The corpus of actor-created-threat positions does not exist, and it now gates
+  three separate things: the regret-over-margin measurement above, any strength
+  claim for Workstream 9's mechanism 2, and any targeted training correction.
 
 ## Experiment and promotion framework
 

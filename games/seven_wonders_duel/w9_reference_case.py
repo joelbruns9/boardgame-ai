@@ -112,7 +112,7 @@ def win_pct(q: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
+@dataclass
 class Position:
     game: Any
     actor: int
@@ -120,6 +120,9 @@ class Position:
     observation_sha256: str
     legal: list[dict]
     meta: dict
+    chains: Any = None
+    """Optional: the chance worlds behind a chosen action, attached by callers
+    that enumerate them (see `w10_afterstate_clustering`)."""
 
 
 def load_position(
