@@ -132,7 +132,11 @@ def triage_position(row, args, log) -> dict:
         **row_id(row), "status": "ok", "live": live, "reason": reason,
         "seconds": round(elapsed, 1), "legal_actions": len(actions),
         "best_pct": best, "worst_pct": worst, "spread": round(spread, 2),
-        "top_margin": round(best - actions[1]["win_pct_weighted"], 2),
+        # A forced position has one legal action and therefore no margin. The
+        # liveness test above already excludes it via `len(actions) > 1`; this
+        # is the same fact, and indexing actions[1] for it crashed the shard.
+        "top_margin": (round(best - actions[1]["win_pct_weighted"], 2)
+                       if len(actions) > 1 else None),
     }
     log(
         f"  {'LIVE ' if live else 'skip '} {row['episode_id']} {row['table']} "
@@ -273,6 +277,13 @@ def main(argv=None) -> int:
                              "across (threat class, chain distance)")
     parser.add_argument("--all-episodes", action="store_true",
                         help="triage every episode snapshot, not just the sample")
+    parser.add_argument("--shard", default=None, metavar="I/N",
+                        help="run only every Nth row, offset I (0-based). Rows "
+                             "are disjoint across shards and each position "
+                             "writes its own artifact, so N shards may run "
+                             "concurrently against one out-dir. Give each its "
+                             "own --summary-out; the summary is the only "
+                             "shared write.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--summary-out", default=None)
@@ -326,6 +337,15 @@ def main(argv=None) -> int:
                 sorted(group, key=lambda r: -r.get("rows_spanned", 0))[:share]
             )
         rows = picked
+    if args.shard:
+        # Interleave rather than block: cost varies more than fourfold across
+        # the corpus, so contiguous blocks would finish at wildly different
+        # times and the expensive shard would still be running at breakfast.
+        index, count = (int(part) for part in args.shard.split("/"))
+        if not 0 <= index < count:
+            raise SystemExit(f"--shard {args.shard}: need 0 <= I < N")
+        rows = rows[index::count]
+
     rows = rows[: args.limit] if args.limit else rows
 
     if args.triage:
@@ -351,6 +371,7 @@ def main(argv=None) -> int:
             "ref_sims": args.ref_sims, "ref_worlds": args.ref_worlds,
             "recheck_margin": args.recheck_margin,
             "recheck_sims": args.recheck_sims, "trace": bool(args.trace),
+            "shard": args.shard,
         },
         "totals": {
             "positions": len(results),
