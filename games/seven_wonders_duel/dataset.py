@@ -34,7 +34,12 @@ from .buffer import (
     legal_mask_hash,
     replay,
 )
-from .codec import NUM_ACTIONS, legal_action_indices
+from .codec import (
+    NUM_ACTIONS,
+    ActionSource,
+    action_components,
+    legal_action_indices,
+)
 from .data import CARD_IDS, PROGRESS_IDS, WONDER_IDS
 from .encoder import _FEATURE_COUNTS, _SCHEMA, Encoding, TokenType, encode
 from .engine import _science_symbols
@@ -173,6 +178,86 @@ def vectorize(encoding: Encoding) -> tuple[np.ndarray, np.ndarray, np.ndarray, n
         values = token.features
         features[row, : len(values)] = values
     return type_ids, entity_ids, aux_ids, features
+
+
+_ACTION_SOURCE_TOKEN = {
+    ActionSource.DRAFT_OFFER: TokenType.DRAFT_OFFER,
+    ActionSource.TABLEAU: TokenType.TABLEAU,
+    ActionSource.CITY_CARD: TokenType.CITY_CARD,
+    ActionSource.DISCARD: TokenType.DISCARD,
+    ActionSource.PROGRESS: TokenType.PROGRESS,
+}
+
+
+def legal_action_tensors(
+    token_rows: list[tuple],
+    legal_lists: list,
+) -> dict[str, torch.Tensor]:
+    """Build the padded W5 candidate axis from codec and token identities.
+
+    The external policy remains the fixed dense 1,202-vector. These tensors are
+    an internal legal-only view used by the optional contextual action scorer.
+    Source lookup is done once while collating rather than by constructing a
+    ``[batch, legal, tokens]`` equality tensor during every model forward.
+    """
+
+    rows = len(legal_lists)
+    width = max(1, max((len(legal) for legal in legal_lists), default=0))
+    # A dedicated internal sink, outside the frozen external action space.
+    indices = torch.full((rows, width), NUM_ACTIONS, dtype=torch.long)
+    pad = torch.ones(rows, width, dtype=torch.bool)
+    families = torch.zeros(rows, width, dtype=torch.long)
+    source_indices = torch.zeros(rows, width, dtype=torch.long)
+    source_present = torch.zeros(rows, width, dtype=torch.bool)
+    wonder_indices = torch.zeros(rows, width, dtype=torch.long)
+    wonder_present = torch.zeros(rows, width, dtype=torch.bool)
+
+    for row, ((types, entities), legal) in enumerate(zip(token_rows, legal_lists)):
+        lookup: dict[tuple[int, int], int] = {}
+        for token_index, (type_id, entity_id) in enumerate(zip(types, entities)):
+            key = (int(type_id), int(entity_id))
+            # Hidden tableau cards legitimately repeat a back-type entity. They
+            # can never be legal sources, so retain an ambiguity sentinel and
+            # reject only if a future codec path tries to gather one.
+            lookup[key] = token_index if key not in lookup else -1
+
+        for column, raw_index in enumerate(legal):
+            action_index = int(raw_index)
+            component = action_components(action_index)
+            indices[row, column] = action_index
+            pad[row, column] = False
+            families[row, column] = int(component.family)
+
+            if component.source != ActionSource.NONE:
+                token_type = _ACTION_SOURCE_TOKEN[component.source]
+                key = (TYPE_IDS[token_type], component.source_entity)
+                if key not in lookup or lookup[key] < 0:
+                    raise ValueError(
+                        f"legal action {action_index} has no contextual "
+                        f"{token_type.value} token for entity {component.source_entity}"
+                    )
+                source_indices[row, column] = lookup[key]
+                source_present[row, column] = True
+
+            if component.wonder_entity >= 0:
+                key = (TYPE_IDS[TokenType.WONDER], component.wonder_entity)
+                if key not in lookup or lookup[key] < 0:
+                    raise ValueError(
+                        f"legal action {action_index} has no contextual Wonder "
+                        f"token for entity {component.wonder_entity}"
+                    )
+                wonder_indices[row, column] = lookup[key]
+                wonder_present[row, column] = True
+
+    return {
+        "legal_indices": indices,
+        "legal_pad_mask": pad,
+        "action_families": families,
+        "action_source_indices": source_indices,
+        "action_source_present": source_present,
+        "action_wonder_indices": wonder_indices,
+        "action_wonder_present": wonder_present,
+    }
 
 
 def _actor_value_class(winner: int | None, actor: int) -> int:
@@ -753,10 +838,17 @@ def collate_inputs(
     vectorized: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     legal_lists: list,
     device: str = "cpu",
+    *,
+    contextual_actions: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Inputs-only collate for inference: same input keys as :func:`collate`
     (type_ids, entity_ids, aux_ids, features, pad_mask, legal_mask), no
-    targets. ``vectorized`` entries come from :func:`vectorize`."""
+    targets. ``vectorized`` entries come from :func:`vectorize`.
+
+    ``contextual_actions`` adds W5's padded legal-candidate view. It defaults
+    off so legacy inference does no extra host work and sees the historical
+    batch contract exactly.
+    """
 
     size = len(vectorized)
     max_tokens = max(len(v[0]) for v in vectorized)
@@ -784,6 +876,13 @@ def collate_inputs(
         "pad_mask": pad_mask,
         "legal_mask": legal_mask,
     }
+    if contextual_actions:
+        tensors.update(
+            legal_action_tensors(
+                [(types, entities) for types, entities, _auxes, _feats in vectorized],
+                legal_lists,
+            )
+        )
     if device != "cpu":
         tensors = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
     return tensors
@@ -830,11 +929,14 @@ def solver_value_distribution(example: Example) -> tuple[float, float, float] | 
     return (0.0, 1.0, 0.0)
 
 
-def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor]:
+def collate(
+    batch: list[Example], device: str = "cpu", *, contextual_actions: bool = False
+) -> dict[str, torch.Tensor]:
     """Pad a list of examples into batched tensors.
 
     Policy targets become dense [B, NUM_ACTIONS] distributions with a boolean
-    legality mask; padding tokens carry type_id 0 with pad_mask True.
+    legality mask; padding tokens carry type_id 0 with pad_mask True. Optional
+    W5 metadata is built only on explicit opt-in, matching ``collate_inputs``.
     """
 
     size = len(batch)
@@ -942,6 +1044,13 @@ def collate(batch: list[Example], device: str = "cpu") -> dict[str, torch.Tensor
         "military_final": military_final,
         "sci_final": sci_final,
     }
+    if contextual_actions:
+        tensors.update(
+            legal_action_tensors(
+                [(example.type_ids, example.entity_ids) for example in batch],
+                [example.legal for example in batch],
+            )
+        )
     if device != "cpu":
         tensors = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
     return tensors

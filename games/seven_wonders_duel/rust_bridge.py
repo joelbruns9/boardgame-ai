@@ -377,10 +377,6 @@ class _RustFlatBatchAdapter:
         ).long()
         if len(legal_lengths) != rows or int(legal_lengths.sum()) != len(legal_actions):
             raise ValueError("flat legal offsets do not align")
-        tensor_seconds = time.perf_counter() - tensor_start
-
-        h2d_start = time.perf_counter()
-        h2d_event = self._begin_event()
         batch = {
             "type_ids": type_ids,
             "entity_ids": entity_ids,
@@ -404,6 +400,30 @@ class _RustFlatBatchAdapter:
                 else torch.zeros(rows, dtype=torch.long)
             ),
         }
+        if bool(getattr(self.evaluator.model, "action_residual", False)):
+            # The flat Rust boundary already supplies both ingredients. Build
+            # the same padded legal-action view as Python inference without
+            # changing the wire format or reimplementing legality in Python.
+            from .dataset import legal_action_tensors
+
+            token_rows = [
+                (
+                    type_ids[row, : int(length)],
+                    entity_ids[row, : int(length)],
+                )
+                for row, length in enumerate(lengths)
+            ]
+            legal_rows = []
+            offset = 0
+            for count in legal_lengths:
+                size = int(count)
+                legal_rows.append(legal_actions[offset : offset + size])
+                offset += size
+            batch.update(legal_action_tensors(token_rows, legal_rows))
+        tensor_seconds = time.perf_counter() - tensor_start
+
+        h2d_start = time.perf_counter()
+        h2d_event = self._begin_event()
         if self.evaluator.device != "cpu":
             batch = {
                 key: value.to(self.evaluator.device, non_blocking=True)
@@ -617,6 +637,9 @@ def rust_searcher_routed_flat_batch_adapter(
         def __init__(self, models, autocasts=None):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
+            self.action_residual = any(
+                bool(getattr(model, "action_residual", False)) for model in models
+            )
             # None keeps the single-precision path byte-identical to the one
             # W1's routing equivalence was verified against.
             self.autocasts = autocasts
@@ -640,6 +663,10 @@ def rust_searcher_routed_flat_batch_adapter(
                 else:
                     with self.autocasts[net]():
                         outputs = model(net_batch)
+                # Rust consumes only these two outputs. In particular, do not
+                # merge W5's train-only action-policy tensor across an arena in
+                # which one checkpoint predates the optional scorer.
+                outputs = {key: outputs[key] for key in ("policy", "value")}
                 if combined is None:
                     # Under mixed precision the two nets return different
                     # dtypes -- that IS the treatment -- so the merged buffer
@@ -740,6 +767,9 @@ def rust_seat_routed_flat_batch_adapter(
         def __init__(self, models):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
+            self.action_residual = any(
+                bool(getattr(model, "action_residual", False)) for model in models
+            )
 
         def forward(self, batch):
             actors = batch["actors"]
@@ -756,6 +786,7 @@ def rust_seat_routed_flat_batch_adapter(
                     if key not in ("actors", "net_ids")
                 }
                 outputs = model(seat_batch)
+                outputs = {key: outputs[key] for key in ("policy", "value")}
                 if combined is None:
                     combined = {
                         key: value.new_empty((len(actors), *value.shape[1:]))

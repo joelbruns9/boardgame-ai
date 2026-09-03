@@ -49,7 +49,12 @@ from games.az_loop.contract import (
 from .buffer import GameRecord, OPPONENT_TYPES, resolve_opponent_type
 from .dataset import GameDerivationStats
 from .phase_d import summarize_records
-from .train import make_checkpoint
+from .train import (
+    ARCHITECTURE_SWITCHES,
+    heads_from_config,
+    load_checkpoint,
+    make_checkpoint,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import only for typing
     from .phase_d import PhaseDLoop
@@ -251,8 +256,40 @@ class SevenWondersDuelLifecycleAdapter:
         path = loop.checkpoint_dir / "_bootstrap_init.pt"
         source = getattr(loop.config, "init_checkpoint", "")
         if source:
-            model = loop.load_model(source)
-            print(f"init: learner seeded from {source}")
+            payload = torch.load(source, map_location="cpu", weights_only=False)
+            stored = payload.get("config", {})
+            for field, wanted in (
+                ("d_model", loop.config.d_model),
+                ("layers", loop.config.layers),
+            ):
+                actual = int(stored.get(field, wanted))
+                if actual != wanted:
+                    raise ValueError(
+                        f"init checkpoint has {field}={actual}, run requests {wanted}"
+                    )
+            torch.manual_seed(seed)
+            model = loop._new_model()
+            if heads_from_config(stored) != loop._built_heads(model):
+                raise ValueError(
+                    "init checkpoint attention-head count differs from the new run"
+                )
+            for switch in ARCHITECTURE_SWITCHES:
+                if bool(stored.get(switch, False)) and not bool(
+                    getattr(model, switch, False)
+                ):
+                    raise ValueError(
+                        f"init checkpoint enables {switch}; additive migration "
+                        "cannot remove an existing architecture path"
+                    )
+            load_checkpoint(source, model, migrate=True, checkpoint=payload)
+            migration = payload.get("migration")
+            detail = ""
+            if migration:
+                counts = ", ".join(
+                    f"{key}={len(values)}" for key, values in migration.items()
+                )
+                detail = f"; migration({counts})"
+            print(f"init: learner seeded from {source}{detail}")
         else:
             torch.manual_seed(seed)
             model = loop._new_model()
@@ -264,6 +301,8 @@ class SevenWondersDuelLifecycleAdapter:
                 "layers": loop.config.layers,
                 "heads": loop._built_heads(model),
                 "precision": loop.config.precision,
+                "action_policy_weight": loop.config.action_policy_weight,
+                "train_action_gate": loop.config.train_action_gate,
                 "iteration": -1,
             },
         )

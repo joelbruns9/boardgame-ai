@@ -137,7 +137,15 @@ def run(
     loop = PhaseDLoop(config)
     spec = loop._model_agent_spec(checkpoint, "search_gain_probe")
 
-    model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
+    model = build_model(
+        "transformer",
+        spec.d_model,
+        spec.layers,
+        spec.heads,
+        spec.pooled_readout,
+        spec.reply_head,
+        spec.action_residual,
+    )
     model.load_state_dict(spec.model_state)
     adapter = rust_flat_batch_adapter(
         Evaluator(model, device, config.gate_batch_cap(), precision=config.precision)

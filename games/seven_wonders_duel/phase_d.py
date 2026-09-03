@@ -370,6 +370,12 @@ class PhaseDConfig:
     during generation.
     """
 
+    action_residual: bool = False
+    """W5a contextual scorer over legal actions, blended behind a zero gate."""
+
+    train_action_gate: bool = False
+    """Allow W5a to affect served logits; false trains it in shadow mode."""
+
     precision: str = "fp32"
     """Model-call precision. ``bf16`` is opt-in; ``fp32`` preserves defaults."""
 
@@ -379,6 +385,8 @@ class PhaseDConfig:
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     aux_weight: float = 0.2
+    action_policy_weight: float = 0.0
+    """Independent W5 scorer loss; zero preserves historical training."""
     value_weight: float = 1.0
     value_bootstrap: float = 0.0
     validate_every: int = 100
@@ -1128,6 +1136,17 @@ class PhaseDConfig:
             )
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
+        if not math.isfinite(self.action_policy_weight) or self.action_policy_weight < 0:
+            raise ValueError("action_policy_weight must be finite and non-negative")
+        if self.action_policy_weight > 0 and not self.action_residual:
+            raise ValueError("action_policy_weight requires --action-residual")
+        if self.train_action_gate and not self.action_residual:
+            raise ValueError("--train-action-gate requires --action-residual")
+        if self.action_residual and self.action_policy_weight == 0:
+            raise ValueError(
+                "--action-residual requires a positive --action-policy-weight "
+                "during self-play training"
+            )
 
 
 class UnderpoweredGateWarning(UserWarning):
@@ -1789,6 +1808,7 @@ def _process_generation_init(
         config.heads,
         config.pooled_readout,
         config.reply_head,
+        config.action_residual,
     )
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
@@ -1836,6 +1856,7 @@ class ModelAgentSpec:
 
     pooled_readout: bool = False
     reply_head: bool = False
+    action_residual: bool = False
     """Architecture switches the weights were built under.
 
     Here for the same reason ``heads`` is: a gate rebuilds the model from this
@@ -1871,6 +1892,7 @@ def _model_from_spec(spec: ModelAgentSpec):
         spec.heads,
         spec.pooled_readout,
         spec.reply_head,
+        spec.action_residual,
     )
     model.load_state_dict(spec.model_state)
     return model
@@ -2972,19 +2994,26 @@ class PhaseDLoop:
             "heads": self._built_heads(model),
             "pooled_readout": bool(getattr(model, "pooled_readout", False)),
             "reply_head": bool(getattr(model, "reply_head", False)),
+            "action_residual": bool(getattr(model, "action_residual", False)),
+            "action_policy_weight": self.config.action_policy_weight,
+            "train_action_gate": self.config.train_action_gate,
             "precision": self.config.precision,
             **extra,
         }
 
     def _new_model(self):
-        return build_model(
+        model = build_model(
             "transformer",
             self.config.d_model,
             self.config.layers,
             self.config.heads,
             self.config.pooled_readout,
             self.config.reply_head,
+            self.config.action_residual,
         )
+        if model.action_scorer is not None:
+            model.action_scorer.gate.requires_grad_(self.config.train_action_gate)
+        return model
 
     @staticmethod
     def _built_heads(model) -> int:
@@ -3392,6 +3421,8 @@ class PhaseDLoop:
         model = model_from_config(
             stored, d_model=self.config.d_model, layers=self.config.layers
         )
+        if model.action_scorer is not None:
+            model.action_scorer.gate.requires_grad_(self.config.train_action_gate)
         load_checkpoint(path, model, checkpoint=checkpoint)
         return model, checkpoint
 
@@ -4047,6 +4078,7 @@ class PhaseDLoop:
                 self.config.train_batch_size,
                 self.config.aux_weight,
                 precision=self.config.precision,
+                action_policy_weight=self.config.action_policy_weight,
             )
         training_started = time.monotonic()
         history, optimizer_state = train_steps(
@@ -4062,6 +4094,7 @@ class PhaseDLoop:
             aux_weight=self.config.aux_weight,
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
+            action_policy_weight=self.config.action_policy_weight,
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -4136,6 +4169,7 @@ class PhaseDLoop:
             heads=self._built_heads(model),
             pooled_readout=bool(getattr(source, "pooled_readout", False)),
             reply_head=bool(getattr(source, "reply_head", False)),
+            action_residual=bool(getattr(source, "action_residual", False)),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -5497,6 +5531,25 @@ def build_parser() -> argparse.ArgumentParser:
         "intent, which denial depends on. ~3%% more parameters; train-only.",
     )
     parser.add_argument(
+        "--action-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W5a contextual legal-action scorer behind an exactly-zero gate. "
+        "Keeps the fixed 1,202-action policy interface.",
+    )
+    parser.add_argument(
+        "--action-policy-weight",
+        type=float,
+        default=0.0,
+        help="independent policy-loss weight for the W5 action scorer; zero is off",
+    )
+    parser.add_argument(
+        "--train-action-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="let W5 alter served policy logits; default trains the scorer in shadow",
+    )
+    parser.add_argument(
         "--pooled-readout",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6094,6 +6147,7 @@ def main(argv=None) -> int:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         aux_weight=args.aux_weight,
+        action_policy_weight=args.action_policy_weight,
         value_weight=args.value_weight,
         value_bootstrap=args.value_bootstrap,
         validate_every=args.validate_every,
@@ -6151,6 +6205,8 @@ def main(argv=None) -> int:
         selfplay_search_mode=args.selfplay_search_mode,
         pooled_readout=args.pooled_readout,
         reply_head=args.reply_head,
+        action_residual=args.action_residual,
+        train_action_gate=args.train_action_gate,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,
         dirichlet_epsilon=args.dirichlet_epsilon,

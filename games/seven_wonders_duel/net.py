@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .codec import NUM_ACTIONS
+from .codec import NUM_ACTIONS, NUM_ACTION_FAMILIES
 from .dataset import (
     ENTITY_SPACES,
     FEATURE_COUNTS,
@@ -275,6 +275,55 @@ class TokenEmbedder(nn.Module):
         return out.masked_fill(batch["pad_mask"].unsqueeze(-1), 0.0)
 
 
+class ContextualActionResidual(nn.Module):
+    """W5a shared scorer over the legal actions in one state.
+
+    The source card and optional Wonder are gathered from the already-contextual
+    Transformer sequence. Action-family embeddings distinguish operations over
+    the same card. The scorer returns the legal-only candidate axis; ``SWDNet``
+    scatters it back into the frozen 1,202-action interface.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        self.family = nn.Embedding(NUM_ACTION_FAMILIES, d_model)
+        self.source = nn.Linear(d_model, d_model, bias=False)
+        self.wonder = nn.Linear(d_model, d_model, bias=False)
+        self.action_norm = nn.LayerNorm(d_model)
+        self.action_key = nn.Linear(d_model, d_model, bias=False)
+        self.state_query = nn.Linear(d_model, d_model, bias=False)
+        self.family_bias = nn.Embedding(NUM_ACTION_FAMILIES, 1)
+        # Only the gate is zero. The scorer retains ordinary initialization so
+        # its independent auxiliary loss has useful gradients from step one.
+        # It is frozen for the shadow arm by default; training entry points must
+        # opt in before the served policy can move away from the inherited net.
+        self.gate = nn.Parameter(torch.zeros(()), requires_grad=False)
+
+    @staticmethod
+    def _gather(tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        picker = indices.unsqueeze(-1).expand(*indices.shape, tokens.shape[-1])
+        return tokens.gather(1, picker)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        readout: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        source = self._gather(tokens, batch["action_source_indices"])
+        source = source * batch["action_source_present"].unsqueeze(-1)
+        wonder = self._gather(tokens, batch["action_wonder_indices"])
+        wonder = wonder * batch["action_wonder_present"].unsqueeze(-1)
+        action = self.family(batch["action_families"])
+        action = action + self.source(source) + self.wonder(wonder)
+        action = self.action_key(self.action_norm(action))
+        query = self.state_query(readout).unsqueeze(1)
+        score = (query * action).sum(dim=-1) / (self.d_model ** 0.5)
+        score = score + self.family_bias(batch["action_families"]).squeeze(-1)
+        return score.masked_fill(batch["legal_pad_mask"], 0.0)
+
+
 class Heads(nn.Module):
     def __init__(self, d_model: int, reply: bool = False):
         super().__init__()
@@ -346,6 +395,7 @@ class SWDNet(nn.Module):
         heads: int | None = None,
         pooled_readout: bool = False,
         reply_head: bool = False,
+        action_residual: bool = False,
     ):
         super().__init__()
         heads = default_heads(d_model) if heads is None else int(heads)
@@ -389,7 +439,11 @@ class SWDNet(nn.Module):
             nn.Linear(3 * d_model, d_model) if self.pooled_readout else None
         )
         self.reply_head = bool(reply_head)
+        self.action_residual = bool(action_residual)
         self.heads = Heads(d_model, reply=self.reply_head)
+        self.action_scorer = (
+            ContextualActionResidual(d_model) if self.action_residual else None
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         tokens = self.embedder(batch)
@@ -414,7 +468,18 @@ class SWDNet(nn.Module):
             readout = self.readout_proj(
                 torch.cat([normed[:, 0], mean, maxed], dim=-1)
             )
-        return self.heads(readout)
+        out = self.heads(readout)
+        if self.action_scorer is not None:
+            candidate_logits = self.action_scorer(normed, readout, batch)
+            # Padded candidates land in a disposable sink, never action 0.
+            # This also isolates their gradients if scorer masking changes.
+            residual = out["policy"].new_zeros((candidate_logits.shape[0], NUM_ACTIONS + 1))
+            residual.scatter_add_(1, batch["legal_indices"], candidate_logits)
+            residual = residual[:, :NUM_ACTIONS]
+            out["action_policy"] = residual
+            alpha = torch.tanh(self.action_scorer.gate)
+            out["policy"] = out["policy"] + alpha * residual
+        return out
 
 
 def fusion_is_profitable(device) -> bool:

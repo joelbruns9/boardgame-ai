@@ -540,6 +540,7 @@ def load_evaluator(
         load_checkpoint,
         pooled_readout_from_config,
         reply_head_from_config,
+        action_residual_from_config,
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -551,6 +552,7 @@ def load_evaluator(
         heads_from_config(config),
         pooled_readout_from_config(config),
         reply_head_from_config(config),
+        action_residual_from_config(config),
     )
     load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
     if migrate and checkpoint.get("migration"):

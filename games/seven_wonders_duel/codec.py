@@ -18,6 +18,9 @@ Block layout (spec §3.1; sizes frozen by the id tables in data.py):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import IntEnum
+
 from .data import (
     ALL_BUILDING_CARDS,
     CARD_IDS,
@@ -43,6 +46,124 @@ PROGRESS_BOARD_BASE = MAUSOLEUM_BASE + NUM_CARDS        # 1180
 PROGRESS_LIBRARY_BASE = PROGRESS_BOARD_BASE + NUM_PROGRESS  # 1190
 NEXT_AGE_BASE = PROGRESS_LIBRARY_BASE + NUM_PROGRESS    # 1200
 NUM_ACTIONS = NEXT_AGE_BASE + 2                         # 1202
+
+
+class ActionFamily(IntEnum):
+    """Composable action kinds used by the optional W5 policy residual.
+
+    These deliberately follow the codec blocks rather than ``ActionUse``.
+    Pending choices share one engine use but are strategically different
+    operations, and the two next-Age choices need distinct representations.
+    """
+
+    DRAFT_WONDER = 0
+    BUILD = 1
+    DISCARD = 2
+    CONSTRUCT_WONDER = 3
+    DESTROY = 4
+    MAUSOLEUM_REVIVE = 5
+    PROGRESS_BOARD = 6
+    PROGRESS_LIBRARY = 7
+    NEXT_AGE_SELF = 8
+    NEXT_AGE_OPPONENT = 9
+
+
+class ActionSource(IntEnum):
+    """Token collection containing an action's contextual primary entity."""
+
+    NONE = 0
+    DRAFT_OFFER = 1
+    TABLEAU = 2
+    CITY_CARD = 3
+    DISCARD = 4
+    PROGRESS = 5
+
+
+NUM_ACTION_FAMILIES = len(ActionFamily)
+
+
+@dataclass(frozen=True, slots=True)
+class ActionComponents:
+    """State-independent decomposition of one fixed codec index.
+
+    ``source_entity`` is interpreted inside ``source``'s entity space. A
+    construct-Wonder action additionally names the contextual Wonder token.
+    ``-1`` means that component is absent. The decomposition does not decide
+    legality; callers must continue to use the engine-derived legal mask.
+    """
+
+    family: ActionFamily
+    source: ActionSource
+    source_entity: int = -1
+    wonder_entity: int = -1
+
+
+def action_components(index: int) -> ActionComponents:
+    """Return the composable W5 fields encoded by ``index``.
+
+    This is arithmetic over the frozen codec layout and therefore safe to use
+    while batching stored examples: it needs neither a ``GameState`` nor a
+    second implementation of action legality.
+    """
+
+    if not 0 <= index < NUM_ACTIONS:
+        raise ValueError(f"action index out of range: {index}")
+    if index < BUILD_BASE:
+        return ActionComponents(
+            ActionFamily.DRAFT_WONDER,
+            ActionSource.DRAFT_OFFER,
+            source_entity=index - WONDER_DRAFT_BASE,
+        )
+    if index < DISCARD_BASE:
+        return ActionComponents(
+            ActionFamily.BUILD,
+            ActionSource.TABLEAU,
+            source_entity=index - BUILD_BASE,
+        )
+    if index < CARD_TO_WONDER_BASE:
+        return ActionComponents(
+            ActionFamily.DISCARD,
+            ActionSource.TABLEAU,
+            source_entity=index - DISCARD_BASE,
+        )
+    if index < DESTROY_BASE:
+        card_id, wonder_id = divmod(index - CARD_TO_WONDER_BASE, NUM_WONDERS)
+        return ActionComponents(
+            ActionFamily.CONSTRUCT_WONDER,
+            ActionSource.TABLEAU,
+            source_entity=card_id,
+            wonder_entity=wonder_id,
+        )
+    if index < MAUSOLEUM_BASE:
+        return ActionComponents(
+            ActionFamily.DESTROY,
+            ActionSource.CITY_CARD,
+            source_entity=index - DESTROY_BASE,
+        )
+    if index < PROGRESS_BOARD_BASE:
+        return ActionComponents(
+            ActionFamily.MAUSOLEUM_REVIVE,
+            ActionSource.DISCARD,
+            source_entity=index - MAUSOLEUM_BASE,
+        )
+    if index < PROGRESS_LIBRARY_BASE:
+        return ActionComponents(
+            ActionFamily.PROGRESS_BOARD,
+            ActionSource.PROGRESS,
+            source_entity=index - PROGRESS_BOARD_BASE,
+        )
+    if index < NEXT_AGE_BASE:
+        return ActionComponents(
+            ActionFamily.PROGRESS_LIBRARY,
+            ActionSource.PROGRESS,
+            source_entity=index - PROGRESS_LIBRARY_BASE,
+        )
+    family = (
+        ActionFamily.NEXT_AGE_SELF
+        if index == NEXT_AGE_BASE
+        else ActionFamily.NEXT_AGE_OPPONENT
+    )
+    return ActionComponents(family, ActionSource.NONE)
 
 _CARD_NAMES = tuple(card.name for card in ALL_BUILDING_CARDS)
 _WONDER_NAMES = tuple(wonder.name for wonder in WONDERS)

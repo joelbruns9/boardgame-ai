@@ -38,6 +38,12 @@ AUX_WEIGHT_DEFAULT = 0.2
 #: trunk to encode opponent intent. KataGo's auxiliary targets sit in this range.
 REPLY_WEIGHT_DEFAULT = 0.15
 
+# Independent supervision for W5's legal-action scorer. Zero preserves every
+# historical training recipe; prototype runs opt in explicitly. This loss is
+# required while the served residual gate is exactly zero, because the ordinary
+# policy loss can otherwise update only the gate and not the scorer behind it.
+ACTION_POLICY_WEIGHT_DEFAULT = 0.0
+
 #: Multiplier on every head that fits a per-GAME label rather than a
 #: per-position one: value, joint7, margin, military, science.
 #:
@@ -62,6 +68,7 @@ def compute_losses(
     solver_value_target: bool = True,
     row_weights: bool = True,
     reply_weight: float = REPLY_WEIGHT_DEFAULT,
+    action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -88,6 +95,20 @@ def compute_losses(
         policy_loss = (per_row[has_policy] * weights).sum() / weights.sum().clamp(min=1e-9)
     else:
         policy_loss = per_row.new_zeros(())
+    action_policy_loss = outputs["policy"].new_zeros(())
+    if "action_policy" in outputs:
+        action_log = masked_policy_log_softmax(
+            outputs["action_policy"], batch["legal_mask"]
+        )
+        safe_action_log = torch.where(
+            batch["legal_mask"], action_log, torch.zeros_like(action_log)
+        )
+        per_action_row = -(batch["policy"] * safe_action_log).sum(dim=-1)
+        if has_policy.any():
+            weights = policy_w[has_policy]
+            action_policy_loss = (
+                per_action_row[has_policy] * weights
+            ).sum() / weights.sum().clamp(min=1e-9)
     solver_rows = batch.get("value_solver_valid") if solver_value_target else None
     has_solver = solver_rows is not None and bool(solver_rows.any())
     if value_bootstrap > 0.0 and "value_soft" in batch:
@@ -148,6 +169,7 @@ def compute_losses(
             reply_loss = per_reply[rows].mean()
     total = (
         policy_loss
+        + action_policy_weight * action_policy_loss
         + value_weight * value_loss
         + value_weight
         * aux_weight
@@ -157,6 +179,7 @@ def compute_losses(
     return total, {
         "total": float(total.detach()),
         "policy": float(policy_loss.detach()),
+        "action_policy": float(action_policy_loss.detach()),
         "value": float(value_loss.detach()),
         "joint7": float(joint7_loss.detach()),
         "margin": float(margin_loss.detach()),
@@ -200,6 +223,7 @@ def evaluate(
     value_weight: float = VALUE_WEIGHT_DEFAULT,
     value_bootstrap: float = 0.0,
     precision: str = "fp32",
+    action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
 ):
     model.eval()
     sums: dict[str, float] = {}
@@ -209,7 +233,10 @@ def evaluate(
     policy_rows = 0
     count = 0
     for start in range(0, len(examples), batch_size):
-        batch = collate(examples[start : start + batch_size], device)
+        batch = collate(
+            examples[start : start + batch_size], device,
+            contextual_actions=bool(getattr(model, "action_residual", False)),
+        )
         with _evaluation_autocast(device, precision):
             outputs = model(batch)
             # `solver_value_target=False` for the same reason validation drops
@@ -231,6 +258,7 @@ def evaluate(
                 # was, which is how a run posts a better number without playing
                 # better.
                 row_weights=False,
+                action_policy_weight=action_policy_weight,
             )
         rows = batch["value_class"].shape[0]
         for key, value in parts.items():
@@ -390,7 +418,7 @@ def stable_game_split(
 # Architecture switches that change which parameters exist. A checkpoint whose
 # config omits one cannot rebuild its own weights, so they are read off the model
 # rather than trusted from the caller's dict.
-ARCHITECTURE_SWITCHES = ("pooled_readout", "reply_head")
+ARCHITECTURE_SWITCHES = ("pooled_readout", "reply_head", "action_residual")
 
 
 def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
@@ -437,6 +465,7 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         heads_from_config(config),
         pooled_readout_from_config(config),
         reply_head_from_config(config),
+        action_residual_from_config(config),
     )
 
 
@@ -478,17 +507,29 @@ def migrate_state_dict(old_state: dict, model) -> dict:
     """Additive-schema warm start (spec §5.8a): load every parameter that still
     matches, zero-initialize parameters with no counterpart (new token types'
     entity embeddings and feature projections), and zero-pad grown embedding
-    tables (the type-embedding table when a type is appended).
+    tables (the type-embedding table when a type is appended). New W5 action
+    scorer parameters retain their ordinary random initialization behind their
+    exactly-zero gate; zeroing every layer of a residual MLP would destroy the
+    gradients the independent action-policy loss is meant to train.
 
     Zero-init makes the new tokens' pre-activation contribution exactly zero.
     Note the honest caveat (also in the spec): zero-VALUE tokens still
     participate in attention normalization, so switch-on is near-neutral, not
     bit-neutral — exact bit-neutrality requires masking the new type until
-    enabled. Returns a report of what was loaded / grown / zero-initialized.
+    enabled. Returns a report of what was loaded, grown, normally initialized,
+    or zero-initialized.
     """
 
     new_state = model.state_dict()
-    report = {"loaded": [], "grown": [], "zeroed": []}
+    removed = sorted(set(old_state) - set(new_state))
+    if removed:
+        preview = ", ".join(removed[:5])
+        suffix = " ..." if len(removed) > 5 else ""
+        raise ValueError(
+            "checkpoint migration is additive only; the target would remove "
+            f"{len(removed)} parameter(s): {preview}{suffix}"
+        )
+    report = {"loaded": [], "grown": [], "initialized": [], "zeroed": []}
     for key, tensor in new_state.items():
         if key in old_state and old_state[key].shape == tensor.shape:
             new_state[key] = old_state[key]
@@ -526,6 +567,11 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[:, : old_state[key].shape[1]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
+        elif key.startswith("action_scorer."):
+            # ``tensor`` is the new model's initialized value. In particular,
+            # action_scorer.gate was constructed as exact zero while the layers
+            # behind it retain symmetry-breaking initialization.
+            report["initialized"].append(key)
         else:
             new_state[key] = torch.zeros_like(tensor)
             report["zeroed"].append(key)
@@ -544,16 +590,30 @@ def load_checkpoint(
 
     if checkpoint is None:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if checkpoint["encoder_signature"] != ENCODER_SIGNATURE:
+    signature_changed = checkpoint["encoder_signature"] != ENCODER_SIGNATURE
+    model_state = model.state_dict()
+    stored_state = checkpoint["model_state"]
+    architecture_changed = (
+        set(model_state) != set(stored_state)
+        or any(
+            key not in stored_state or stored_state[key].shape != tensor.shape
+            for key, tensor in model_state.items()
+        )
+    )
+    if signature_changed or architecture_changed:
         if not migrate:
-            raise ValueError(
-                "checkpoint encoder signature does not match the live encoder — "
-                "the encoding schema changed since this model was trained "
-                "(pass migrate=True for an additive-schema warm start)"
+            detail = (
+                "encoder signature changed since this model was trained"
+                if signature_changed
+                else "model architecture differs from the checkpoint"
             )
-        checkpoint["migration"] = migrate_state_dict(checkpoint["model_state"], model)
+            raise ValueError(
+                f"checkpoint migration required — {detail} "
+                "(pass migrate=True for an additive warm start)"
+            )
+        checkpoint["migration"] = migrate_state_dict(stored_state, model)
         return checkpoint
-    model.load_state_dict(checkpoint["model_state"])
+    model.load_state_dict(stored_state)
     return checkpoint
 
 
@@ -564,6 +624,7 @@ def build_model(
     heads: int | None = None,
     pooled_readout: bool = False,
     reply_head: bool = False,
+    action_residual: bool = False,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -580,6 +641,7 @@ def build_model(
             heads=heads,
             pooled_readout=pooled_readout,
             reply_head=reply_head,
+            action_residual=action_residual,
         )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
@@ -590,6 +652,12 @@ def reply_head_from_config(config: dict) -> bool:
     """Reply-head presence for rebuilding a checkpoint, honouring older files."""
 
     return bool(config.get("reply_head", False))
+
+
+def action_residual_from_config(config: dict) -> bool:
+    """W5 scorer presence, false for every checkpoint predating the prototype."""
+
+    return bool(config.get("action_residual", False))
 
 
 def pooled_readout_from_config(config: dict) -> bool:
@@ -624,6 +692,7 @@ def train_loop(
     value_bootstrap: float = 0.0,
     patience: int = 8,
     precision: str = "fp32",
+    action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     log=print,
 ):
     """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
@@ -667,11 +736,21 @@ def train_loop(
         running: dict[str, float] = {}
         batches = 0
         for start in range(0, len(train_examples), batch_size):
-            batch = collate(train_examples[start : start + batch_size], device)
+            batch = collate(
+                train_examples[start : start + batch_size], device,
+                contextual_actions=bool(getattr(model, "action_residual", False)),
+            )
             optimizer.zero_grad(set_to_none=True)
             with _training_autocast(device, precision):
                 outputs = model(batch)
-                total, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
+                total, parts = compute_losses(
+                    outputs,
+                    batch,
+                    aux_weight,
+                    value_weight,
+                    value_bootstrap,
+                    action_policy_weight=action_policy_weight,
+                )
             scaler.scale(total).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -693,6 +772,7 @@ def train_loop(
                 batch_size,
                 aux_weight,
                 precision=precision,
+                action_policy_weight=action_policy_weight,
             )
             row["val"] = val_metrics
             log(
@@ -752,6 +832,7 @@ def train_steps(
     grad_clip: float = 0.0,
     optimizer_name: str = "adamw",
     batch_getter=None,
+    action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -827,12 +908,22 @@ def train_steps(
         batch = (
             batch_getter(sampled, device)
             if batch_getter is not None
-            else collate([train_examples[i] for i in sampled], device)
+            else collate(
+                [train_examples[i] for i in sampled], device,
+                contextual_actions=bool(getattr(model, "action_residual", False)),
+            )
         )
         optimizer.zero_grad(set_to_none=True)
         with _training_autocast(device, precision):
             outputs = model(batch)
-            total, parts = compute_losses(outputs, batch, aux_weight, value_weight, value_bootstrap)
+            total, parts = compute_losses(
+                outputs,
+                batch,
+                aux_weight,
+                value_weight,
+                value_bootstrap,
+                action_policy_weight=action_policy_weight,
+            )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
         if grad_clip > 0:
@@ -889,6 +980,7 @@ def train_steps(
                 batch_size,
                 aux_weight,
                 precision=precision,
+                action_policy_weight=action_policy_weight,
             )
             row["val"] = val_metrics
             log(
@@ -945,6 +1037,34 @@ def main(argv=None) -> int:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT_DEFAULT)
+    parser.add_argument(
+        "--action-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable the W5a contextual legal-action residual",
+    )
+    parser.add_argument(
+        "--action-policy-weight",
+        type=float,
+        default=ACTION_POLICY_WEIGHT_DEFAULT,
+        help="independent policy loss for the W5 scorer (zero is off)",
+    )
+    parser.add_argument(
+        "--action-residual-only",
+        action="store_true",
+        help="freeze the inherited network and train only the W5 scorer "
+        "(plus its gate when --train-action-gate is set)",
+    )
+    parser.add_argument(
+        "--train-action-gate",
+        action="store_true",
+        help="allow the bounded W5 gate to change served policy logits",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="warm-start from this checkpoint; its architecture is preserved",
+    )
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--overfit", action="store_true", help="no split, no early stop")
@@ -977,7 +1097,75 @@ def main(argv=None) -> int:
         train_examples, val_examples = game_honest_split(examples, args.val_frac)
         print(f"split: {len(train_examples)} train / {len(val_examples)} val states")
 
-    model = build_model(args.model, args.d_model, args.layers, args.heads)
+    effective_d_model, effective_layers, effective_heads = (
+        args.d_model,
+        args.layers,
+        args.heads,
+    )
+    effective_pooled = False
+    effective_reply = False
+    initial = None
+    if args.action_residual and args.model != "transformer":
+        raise SystemExit("--action-residual is available only for --model transformer")
+    if not math.isfinite(args.action_policy_weight) or args.action_policy_weight < 0:
+        raise SystemExit("--action-policy-weight must be finite and non-negative")
+    if args.init_checkpoint:
+        if args.model != "transformer":
+            raise SystemExit("--init-checkpoint W5 migration requires --model transformer")
+        initial = torch.load(
+            args.init_checkpoint, map_location="cpu", weights_only=False
+        )
+        stored = initial.get("config", {})
+        effective_d_model = int(stored.get("d_model", args.d_model))
+        effective_layers = int(stored.get("layers", args.layers))
+        effective_heads = heads_from_config(stored)
+        effective_pooled = pooled_readout_from_config(stored)
+        effective_reply = reply_head_from_config(stored)
+        # Warm starts are additive. An existing W5 path is never silently
+        # removed merely because the new flag was omitted.
+        args.action_residual = bool(
+            args.action_residual or action_residual_from_config(stored)
+        )
+        print(
+            "warm-start architecture: "
+            f"d{effective_d_model} L{effective_layers} h{effective_heads} "
+            f"pooled={effective_pooled} reply={effective_reply}"
+        )
+    model = build_model(
+        args.model,
+        effective_d_model,
+        effective_layers,
+        effective_heads,
+        effective_pooled,
+        effective_reply,
+        args.action_residual,
+    )
+    if initial is not None:
+        load_checkpoint(
+            args.init_checkpoint,
+            model,
+            migrate=True,
+            checkpoint=initial,
+        )
+    if getattr(model, "action_scorer", None) is not None:
+        model.action_scorer.gate.requires_grad_(args.train_action_gate)
+    if args.action_residual_only:
+        if getattr(model, "action_scorer", None) is None:
+            raise SystemExit("--action-residual-only requires --action-residual")
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.action_scorer.parameters():
+            parameter.requires_grad_(True)
+        model.action_scorer.gate.requires_grad_(args.train_action_gate)
+        if args.action_policy_weight <= 0:
+            raise SystemExit(
+                "--action-residual-only requires a positive "
+                "--action-policy-weight"
+            )
+    if args.action_policy_weight > 0 and not args.action_residual:
+        raise SystemExit("--action-policy-weight requires --action-residual")
+    if args.train_action_gate and not args.action_residual:
+        raise SystemExit("--train-action-gate requires --action-residual")
     params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {params:,} params on {args.device}")
     if args.compile:
@@ -1005,6 +1193,7 @@ def main(argv=None) -> int:
         aux_weight=args.aux_weight,
         patience=args.patience,
         precision=args.precision,
+        action_policy_weight=args.action_policy_weight,
     )
     final = evaluate(
         model,
@@ -1013,6 +1202,7 @@ def main(argv=None) -> int:
         args.batch_size,
         args.aux_weight,
         precision=args.precision,
+        action_policy_weight=args.action_policy_weight,
     )
     print(f"final: {json.dumps({k: round(v, 4) for k, v in final.items()})}")
 
@@ -1022,8 +1212,8 @@ def main(argv=None) -> int:
         source_model = getattr(model, "_orig_mod", model)
         config = {
             "model": args.model,
-            "d_model": args.d_model,
-            "layers": args.layers,
+            "d_model": effective_d_model,
+            "layers": effective_layers,
             "heads": (
                 int(source_model.attention_heads)
                 if hasattr(source_model, "attention_heads")
@@ -1036,6 +1226,7 @@ def main(argv=None) -> int:
             "precision": args.precision,
             "weight_decay": args.weight_decay,
             "aux_weight": args.aux_weight,
+            "action_policy_weight": args.action_policy_weight,
         }
         torch.save(make_checkpoint(model, config), out / f"{args.model}.pt")
         (out / "summary.json").write_text(

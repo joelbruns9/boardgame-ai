@@ -1030,6 +1030,39 @@ forward pass is needed -- the cost is carrying it across the boundary.
 
 ## Workstream 5: legal-action tokens
 
+**Prototype implementation status (2026-09-03): focused mechanism tests pass;
+playing strength and throughput not yet validated.** The
+minimal W5a path now exists behind `action_residual=False`: the fixed action
+index is decomposed arithmetically into action family, contextual source entity,
+and optional Wonder; the already-encoded source/Wonder tokens are gathered on a
+padded legal-action axis and scored in one vectorized pass; and the result is
+added to the historical 1,202-way logits through a bounded scalar gate
+initialized to exact zero. The scorer has its own policy loss and the gate is
+frozen by default, so the first arm learns in shadow without perturbing served
+priors; `train_action_gate` is the explicit integration arm. Old checkpoints migrate additively: all inherited parameters load
+exactly, the new scorer retains ordinary initialization, and only its gate is
+zero. Checkpoint/config rebuilds, Phase D training, advisor inference, and the
+flat Rust batching path are wired; Rust's evaluator wire remains the same.
+
+This is intentionally the MINIMAL arm, not the target design below. It does not
+yet include explicit slot embeddings, graph messages, payment/effect features,
+or Workstream 3 control outputs. The original seven focused mechanism,
+migration, loss-gradient, exact-zero, checkpoint, and flat-boundary tests passed
+in 3.23 s once testing was authorized. Review then found unconditional W5
+metadata construction in training collation: this is now opt-in, just like
+inference, and the training/validation callers opt in from the model flag.
+Additional regressions cover the disabled path (including missing sources),
+ambiguous sources, repeated hidden backs, training/validation opt-in, and a
+dedicated padding scatter sink with zero influence on real-action gradients.
+The expanded focused suite passes: **15 tests in 4.87 s**. No playing-strength
+or end-to-end throughput claim is licensed by these correctness tests.
+
+Separate pre-existing launch blocker found during this review: the offline
+epoch trainer (`train_loop`) references `optimizer_name` without defining it.
+That is not fixed by the W5 collation change; resolve it before an offline CLI
+training run. The fixed-step trainer used by Phase D is covered by the focused
+opt-in/opt-out regressions.
+
 ### Current limitation
 
 The Transformer encodes state components, but the policy is a flat linear head
@@ -2257,9 +2290,9 @@ Workstream 9 prototype -- and remain the largest outstanding block of Stage 0.
 
 - Add zero-initialized learned Age/slot embeddings.
 - Add the small-gated lightweight tableau graph module.
-- Add a minimal legal-action residual using existing state tokens and legal
-  action IDs; do not wait for the online control engine to test whether
-  compositional action scoring has value.
+- **BUILT 2026-09-03; mechanism tests pass, strength/throughput gates pending.** Add a minimal legal-action residual
+  using existing state tokens and legal action IDs; do not wait for the online
+  control engine to test whether compositional action scoring has value.
 - Keep the evaluator's returned scalar/prior boundary unchanged.
 - Prototype the public tableau-control oracle offline in parallel, without
   placing it on every Rust leaf.

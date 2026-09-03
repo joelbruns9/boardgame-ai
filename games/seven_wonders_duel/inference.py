@@ -85,7 +85,16 @@ class Evaluator:
             chunk = encodings[start : start + self.max_batch]
             legals = legal_lists[start : start + self.max_batch]
             batch = collate_inputs(
-                [vectorize(e) for e in chunk], list(legals), self.device
+                [vectorize(e) for e in chunk],
+                list(legals),
+                self.device,
+                contextual_actions=bool(
+                    getattr(
+                        getattr(self.model, "_orig_mod", self.model),
+                        "action_residual",
+                        False,
+                    )
+                ),
             )
             with self.autocast():
                 outputs = self.model(batch)
