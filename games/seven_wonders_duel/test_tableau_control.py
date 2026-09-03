@@ -488,3 +488,231 @@ def test_public_only_no_identity_is_read():
     sa = ControlSolver(a.tableau.age).solve(ma, target, ATTACKER, coupons(1, 0))
     sb = ControlSolver(b.tableau.age).solve(mb, target, ATTACKER, coupons(1, 0))
     assert sa == sb
+
+
+# -- independent evidence, and the shape of the tempo space ------------------
+
+
+def sequence_oracle(present: frozenset, target, to_move: int, tempo: tuple,
+                    cover: dict, cap: int = 8) -> int:
+    """A THIRD implementation, deliberately not a minimax.
+
+    `brute_force` above and `ControlSolver` share a shape -- recursive min/max
+    over successors -- so a misconception about the game could live in both.
+    This one iteratively deepens on the question "can the attacker take the
+    target using at most k of its own turns", where the defender must survive
+    EVERY reply. Same answer, different reasoning.
+    """
+
+    def legal(state):
+        live, mover, holding = state
+        builds, counts = holding[0], list(holding[1:])
+        out = []
+        for slot in (s for s in live if not (cover[s] & live)):
+            rest = live - {slot}
+            out.append((slot, "card", (rest, 1 - mover, holding)))
+            for extra in (False, True):
+                i = 2 * mover + (1 if extra else 0)
+                if builds > 0 and counts[i] > 0:
+                    c = list(counts)
+                    c[i] -= 1
+                    nxt = (0, 0, 0, 0, 0) if builds - 1 <= 0 else (builds - 1, *c)
+                    out.append((slot, "extra" if extra else "ord",
+                                (rest, mover if extra else 1 - mover, nxt)))
+        return out
+
+    def within(state, turns):
+        live, mover, _ = state
+        if target not in live:
+            return False
+        moves = legal(state)
+        if not moves:
+            return False
+        if mover == ATTACKER:
+            if turns <= 0:
+                return False
+            return any(
+                slot == target
+                or within(nxt, turns - (0 if kind == "extra" else 1))
+                for slot, kind, nxt in moves
+            )
+        # The defender chooses, so the attacker needs EVERY reply to still
+        # work. (Writing this as `not within(...)` inverts the quantifier and
+        # silently turns the oracle into a different question.)
+        return all(
+            slot != target and within(nxt, turns)
+            for slot, kind, nxt in moves
+        )
+
+    for k in range(1, cap + 1):
+        if within((present, to_move, tempo), k):
+            return k
+    return _INF
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_solver_agrees_with_a_structurally_different_oracle(seed):
+    """Two agreeing implementations of the same shape are weaker evidence than
+    two of different shapes."""
+
+    rng = random.Random(1000 + seed)
+    age = rng.choice((1, 2, 3))
+    layout = Layout.for_age(age)
+    n = len(layout.slots)
+    keep = sorted(rng.sample(range(n), 5))
+    mask = sum(1 << i for i in keep)
+    cover = {
+        layout.slots[i]: frozenset(
+            layout.slots[j] for j in range(n)
+            if layout.covered_by[i] >> j & 1 and mask >> j & 1
+        )
+        for i in keep
+    }
+    present = frozenset(layout.slots[i] for i in keep)
+    tempo = (rng.randint(0, 3), rng.randint(0, 1), rng.randint(0, 2),
+             rng.randint(0, 1), rng.randint(0, 2))
+
+    solver = ControlSolver(age)
+    for target in present:
+        for to_move in (ATTACKER, DEFENDER):
+            assert solver.solve(mask, target, to_move, tempo) == \
+                sequence_oracle(present, target, to_move, tempo, cover), \
+                (age, keep, target, to_move, tempo)
+
+
+@pytest.mark.parametrize("age", (1, 2, 3))
+def test_tempo_monotonicity_with_the_pool_held_fixed(age):
+    """Properties that hold for any correct solver, checked without an oracle.
+
+    The pool must be held FIXED in all of them -- see the non-monotonicity test
+    below for why."""
+
+    rng = random.Random(77 + age)
+    layout = Layout.for_age(age)
+    mask = (1 << len(layout.slots)) - 1
+    solver = ControlSolver(age)
+
+    for _ in range(12):
+        for _ in range(rng.randint(0, 6)):
+            accessible = layout.accessible(mask)
+            if not accessible:
+                break
+            bits = [b for b in range(len(layout.slots)) if accessible >> b & 1]
+            mask ^= 1 << rng.choice(bits)
+        live = [s for s in layout.slots if mask >> layout.index[s] & 1]
+        if not live:
+            break
+        target = rng.choice(live)
+        to_move = rng.choice((ATTACKER, DEFENDER))
+        base = (rng.randint(1, 3), rng.randint(0, 1), rng.randint(0, 1),
+                rng.randint(0, 1), rng.randint(0, 1))
+        here = solver.solve(mask, target, to_move, base)
+
+        def shift(index):
+            counts = list(base[1:])
+            counts[index - 1] += 1
+            return solver.solve(mask, target, to_move, (base[0], *counts))
+
+        # An extra OPTION for the attacker can never hurt it.
+        assert shift(1) <= here, ("attacker ordinary Wonder", base, target)
+        assert shift(2) <= here, ("attacker extra-turn Wonder", base, target)
+        # An option for the defender can never help the attacker: a defender
+        # ordinary Wonder costs it no turns and threatens retirement.
+        assert shift(3) >= here, ("defender ordinary Wonder", base, target)
+        assert shift(4) >= here, ("defender extra-turn Wonder", base, target)
+
+
+def test_pool_size_is_deliberately_non_monotone():
+    """Raising `builds_left` helps BOTH players, so it moves control in either
+    direction. That is the retirement mechanic, not a defect -- pinned here so
+    a future "monotonicity fix" has to argue with a test.
+
+    Witnesses are searched for rather than hardcoded: the effect depends on the
+    board as much as on the pool, and a tuple copied without its mask asserts
+    something about a different position.
+    """
+
+    rng = random.Random(4242)
+    layout = Layout.for_age(1)
+    solver = ControlSolver(1)
+    full = (1 << len(layout.slots)) - 1
+
+    hurt = helped = None
+    for _ in range(300):
+        mask = full
+        for _ in range(rng.randint(0, 8)):
+            accessible = layout.accessible(mask)
+            if not accessible:
+                break
+            bits = [b for b in range(len(layout.slots)) if accessible >> b & 1]
+            mask ^= 1 << rng.choice(bits)
+        live = [s for s in layout.slots if mask >> layout.index[s] & 1]
+        if not live:
+            continue
+        target = rng.choice(live)
+        small = (1, rng.randint(0, 1), rng.randint(0, 1),
+                 rng.randint(0, 1), rng.randint(0, 1))
+        for grow in (2, 4):                # which side also gains the extra
+            big = list(small)
+            big[0] += 1
+            big[grow] += 1
+            a = solver.solve(mask, target, ATTACKER, small)
+            b = solver.solve(mask, target, ATTACKER, tuple(big))
+            if b > a and hurt is None:
+                hurt = (mask, target, small, tuple(big), a, b)
+            if b < a and helped is None:
+                helped = (mask, target, small, tuple(big), a, b)
+        if hurt and helped:
+            break
+
+    assert hurt, "a bigger pool must be able to HURT the attacker (retirement)"
+    assert helped, "a bigger pool must be able to HELP the attacker"
+    # Re-check each witness so the assertion names a concrete position.
+    for mask, target, small, big, a, b in (hurt, helped):
+        assert solver.solve(mask, target, ATTACKER, small) == a
+        assert solver.solve(mask, target, ATTACKER, big) == b
+
+
+@needs_logs
+def test_tempo_state_matches_the_engines_seventh_wonder_rule():
+    """The engine retires exactly ONE Wonder on the seventh build
+    (`engine.py`: "seventh Wonder must leave exactly one unbuilt Wonder"),
+    while `_spend` collapses every counter to zero. Those agree only because
+    eight Wonders are drafted and seven get built, so the unbuilt count is
+    always `builds_left + 1`.
+
+    That identity is the load-bearing assumption of the tempo model, and it is
+    a fact about the draft rather than about this module -- so check it against
+    real games instead of asserting it.
+    """
+
+    from .advisor_scrape import determinize_observation, observation_from_wire
+    from .bga_extract import wire_from_bga_payload
+
+    checked = 0
+    for path in sorted(LOG_DIR.glob("table_*.jsonl"))[:12]:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for row in [r for r in rows if r.get("kind") == "decision"][::4]:
+            try:
+                payload = wire_from_bga_payload(row["state"])
+                obs = observation_from_wire(payload["observation"])
+                game = determinize_observation(
+                    obs, random.Random(0),
+                    unknown_burial_ages=tuple(
+                        int(a) for a in payload.get("unknown_burial_ages", ())
+                    ),
+                )
+            except Exception:
+                continue
+            if sum(len(c.wonders) for c in game.cities) < 8:
+                continue          # the draft is not finished
+            tempo = tempo_state(game, 0)
+            if tempo[0] == 0:
+                continue          # pool exhausted: the retirement already fired
+            assert sum(tempo[1:]) == tempo[0] + 1, (path.name, tempo)
+            checked += 1
+    assert checked > 50, f"only {checked} positions checked"
