@@ -1,161 +1,222 @@
-# W3: wiring exact positional control into the encoder — review request
+# W3: wiring exact positional control into the encoder — plan of record
 
-**Status:** solver built and verified; nothing wired. This document is the plan
-for wiring it, and the questions I want attacked before any of it is built.
+**Status:** solver built and verified; nothing wired. Revision 2, after review.
 
-Prior review of the solver itself is in `W3_CONTROL_REVIEW_REQUEST.md`; its six
-findings were accepted, and items 1–3 of the agreed remediation are committed
-(`e017ab0`). This is the sequel: the reviewer's item 5, "training and inference
-must use identical calculations if these become inputs."
+Prior review of the solver is in `W3_CONTROL_REVIEW_REQUEST.md`; its six findings
+were accepted and items 1–3 are committed (`e017ab0`). Revision 1 of this
+document proposed the wiring; the review of it found a P1 and two P2s, all
+confirmed and all folded in below. The changes from revision 1 are large enough
+that the diff is worth stating up front:
+
+| revision 1 said | revision 2 says | why |
+|---|---|---|
+| key includes `who_moves`, from `state_actor` | plus a `control_valid` flag; features disabled outside clean `PLAY_AGE` | `state_actor` is not the next tableau mover in **16.7%** of encoder-visible states |
+| per-slot for the live map, global fractions for the four counterfactuals | per-slot for **all five**, global fractions dropped from the first arm | the fractions discard the interaction we want learned |
+| "a capability bound" | an exact outcome in an abstraction, **not a bound in either direction** | ignoring affordability grants options to *both* players |
+| staleness enforced by recorded commit | enforced by a feature/table **contract** | a no-op refactor must not invalidate checkpoints |
+| run the data-scaling curve first | no such prerequisite | `PLATEAU_FINDINGS.md` ranks it fifth and calls its rationale weak |
 
 ---
 
 ## What is already true
 
 `tableau_control.py` answers, exactly, *who reaches this tableau slot first*,
-given the removal poset, turn alternation, and the shared seven-Wonder build
-pool including retirement. It reads only public information — the present/absent
-mask and slot geometry — so it is safe on a determinized state.
+given the removal poset, turn alternation, and the shared seven-Wonder build pool
+including retirement. It reads only public information, so it is safe on the
+determinized states `advisor_scrape` hands the searcher.
 
-Correctness evidence, all currently passing:
-
-| line of evidence | checks | result |
+| evidence | checks | result |
 |---|---|---|
 | brute-force oracle, 4–7 slot posets, all ages, pools 0–4 | 2,452 | agree |
-| a structurally different oracle (iterative deepening over move sequences, not minimax) | 538 | agree |
+| a structurally different oracle (iterative deepening, not minimax) | 538 | agree |
 | monotonicity properties, no oracle involved | 840 | hold |
-| `tempo_state` invariant `unbuilt == builds_left + 1` on real BGA positions | 289 | 0 violations |
+| `tempo_state` invariant `unbuilt == builds_left + 1` on real positions | 289 | 0 violations |
 
-That last row matters more than it looks. `_spend` collapses every Wonder
-counter to zero on the seventh build, while `engine.py:695` retires exactly one
-Wonder. Those agree only because eight Wonders are drafted and seven get built.
-That identity is a fact about the draft, not about this module, so it is checked
-against real games rather than asserted.
-
-**Not verified:** full 20-slot boards against an oracle (exponential — covered
-only by properties and the reuse test), and the abstraction itself. The solver
-models one Age, no coins, no production, no chains, no military, no early
+**Not verified:** full 20-slot boards against an oracle (exponential); and the
+abstraction itself — one Age, no coins, production, chains, military or early
 victory. Those are documented limits, not measured ones.
+
+**Gap the review found in the invariant test:** it skips exhausted pools
+(`if tempo[0] == 0: continue`), so it never exercises the sixth-to-seventh
+build — the one moment retirement fires. Add explicit transition cases that step
+the engine through that build and check the derived tempo state against the
+successor.
 
 ---
 
 ## The cost question, measured
 
-Solving at encode time is dead. `control_features()` costs **816 ms mean and
-5.8 s worst** on real positions, against a leaf evaluation of order 1 ms.
-
-But the key space is structural and small. The removal poset is far more
-constrained than `2**20` suggests:
+Solving at encode time is dead: `control_features()` costs **816 ms mean, 5.8 s
+worst** against a ~1 ms leaf. But the key space is structural and small.
 
 | quantity | value |
 |---|---|
 | reachable tableau masks (age 1 / 2 / 3) | 428 / 428 / 132 = **988** |
-| tempo states, closed under the five feature calls | **444** |
-| total keys, `(age, mask, who_moves, tempo)` | **877,344** |
-| `control_map` mean / p90 / max over that space | 23 / 64 / 534 ms |
+| tempo states, closed under the counterfactuals | **444** |
+| total keys | **877,344** |
+| `control_map` mean / p90 / max | 23 / 64 / 534 ms |
 | **full precompute** | **5.5 core-hours — ~0.5 h on 12 cores** |
-| **table size** at 20 bytes + header per entry | **~21 MB** |
+| **table size** | **~21 MB** |
 
-So: precompute offline, ship the table, look up at encode time. The solver never
-runs in the training loop, and does not need a Rust port. The Rust side needs to
-*read* the table and *derive the same key* — a data-loading job, not a port.
-
-The 444 tempo states are the closure of the 220 naturally occurring states under
-the five counterfactuals `control_features()` queries. `_plus_extra` raises a
-count above the four-per-player draft bound and `_minus_extra` breaks the
-`builds_left + 1` invariant, so the closure is strictly larger than the set of
-states a real game can reach. **The closure is exact for the current five
-features and only for those.** A sixth counterfactual invalidates the table.
+Precompute offline, ship the table, look up at encode time. The solver never runs
+in the training loop and needs no Rust port; Rust reads the table and derives the
+same key. **These numbers are claims to be reproduced by the generator, not
+inputs to it** — the generator validates them.
 
 ---
 
-## The design
+## Applicability: the P1
 
-**Key.** `(age, present_mask, who_moves, tempo_state)`. Public structure only —
-no card identities — which is what makes 988 masks cover every game ever played,
-and what makes the table safe to use on the determinized states `advisor_scrape`
-hands the searcher.
+`state_actor` returns `pending_choice.player` when a choice is pending
+(`search.py:352`), and `_finish_turn` stashes `pending_extra_turn` to apply after
+the choice resolves (`engine.py:494`). So the current decision-maker is not the
+next tableau mover. Measured over 4,294 encoder-visible states from 60 complete
+games:
 
-**Entry.** One byte per slot: attacker turns to reach it first, or an
-unreachable marker. `control_map` currently discards the distance `solve()`
-already computed; the table keeps it, at no extra solve cost.
+| state | share |
+|---|---|
+| `PLAY_AGE`, no pending choice | 83.3% |
+| `WONDER_DRAFT` | 11.2% |
+| `CHOOSE_NEXT_START_PLAYER` | 2.8% |
+| `PLAY_AGE` with pending choice | 2.7% |
 
-**Per-slot features are primary.** `_tableau_tokens()` (`encoder.py:704`)
-already emits one token per present slot, so control attaches as extra channels
-on tokens that already exist — no new token type, no sequence-length change. The
-whole point is to let the net combine *who reaches this slot first* with *what
-card is sitting in it*. Global fractions are kept only as summaries on the
-GLOBAL token.
+**16.7% of training rows would carry a `who_moves` that does not mean what the
+key says.** Note that `pending_choice.player` equalled `active_player` in every
+one of these games: the corruption comes from `pending_extra_turn` and from the
+phase, not from the actor field. Perfect Python/Rust parity would hide it
+completely, which is exactly why parity is not the whole risk.
 
-**Five lookups per encode.** One on the live tempo state for the per-slot
-channels; four on counterfactual keys for the global "what one more extra turn
-would be worth" / "what Theology would be worth" fractions.
+Choosing a progress token can also change the tempo inventory before the next
+removal — taking Theology converts every unbuilt Wonder into an extra-turn
+Wonder — so the tempo half of the key is stale in those states too, not just
+`who_moves`.
 
-**Naming.** Following the prior review: these are named as reachability under
-topology, never as control "as things stand", because affordability is
-deliberately not modelled. The net already knows its own coins, production,
-discounts and chains, and learns whether the build is payable.
+**Decision.** Emit `control_valid` as an explicit channel. Features are computed
+only in `PLAY_AGE` with no pending choice; everywhere else the flag is 0 and
+every control channel is 0. Choice-conditioned features (what the key becomes
+*after* this progress token is taken) are a later, separately specified arm. Do
+not silently read "current decision maker" as "next tableau mover".
+
+---
+
+## Feature design
+
+**Key.** `(age, present_mask, who_moves, tempo_state)` — public structure only.
+
+**Entry.** Per slot, the attacker turns to force the take, or unreachable.
+`control_map` currently discards the distance `solve()` already computes; the
+table keeps it, at no extra solve cost.
+
+**Per-slot for all five maps.** Revision 1 attached only the live map per slot
+and reduced the four counterfactuals to global fractions. That preserves *one
+more extra-turn Wonder improves my aggregate reach* and discards *one more
+extra-turn Wonder is what lets me deny that sixth science symbol* — the second
+being the interaction this workstream exists to represent. The lookups already
+return those maps, so this costs feature channels, not solves.
+
+Global fractions are **dropped from the first arm**. Prior findings already
+showed aggregate control obscuring the strategically important card, and
+`_tableau_tokens()` (`encoder.py:704`) gives us a per-slot home for free. They
+remain a cheap later addition.
+
+**Encoding per slot, per map:**
+
+- `can_force_take_under_topology` — binary.
+- `forced_take_turns_scaled` — bounded, normalized; **zero when the flag is
+  zero**. `_INF` is 99 and must never be fed as a distance.
+- gated by the single `control_valid` flag above.
+
+**Semantics, stated so the names cannot mislead.** A zero flag means *the
+attacker cannot force the take against a defender playing optimally for that
+target in this abstraction*. It does not mean the card is inaccessible or
+unobtainable. And because affordability is not modelled, the abstraction grants
+extra Wonder options to **both** players — so the result is an exact outcome in
+the abstract game and **not an upper or lower bound on the real one**. The error
+can go either way. Revision 1 called it a capability bound; that was too strong.
+
+**Counterfactual naming.** `_minus_extra` means *remove one extra-turn Wonder
+option*, not *after I build one*: an actual build also removes a tableau card and
+consumes shared build capacity. The docstring currently reads "what losing my
+tempo would cost", which conflates the two.
+
+---
+
+## Failure, parity and staleness
+
+**On a table miss: fail explicitly.** Validate table coverage and contract
+compatibility at startup. An unexpected miss raises a descriptive typed
+exception naming the key and the artifact identity — **not a bare `assert`**,
+which `-O` disables. Self-play and advisor inference must never enter a
+multi-second solver unexpectedly. Offline tooling gets an explicit
+"solve missing entries" mode. For advisor availability, fall back to the whole
+known-good model/encoder pair rather than filling W3 features with zeros.
+
+**Parity, in three gates** rather than one corpus:
+
+1. **Key derivation** — generated states covering Wonder identities,
+   built/retired combinations, Theology, both perspectives, and phase
+   boundaries.
+2. **Table readers** — exhaustively compare Python and Rust lookups across the
+   complete generated key set.
+3. **End-to-end encoding** — compare final feature vectors, including slot
+   association, normalization and invalid-state masking, on real games and
+   generated transitions.
+
+Requiring all Python encoding to route through Rust just to derive this small key
+is not warranted.
+
+**Staleness by contract, not by commit.** A git hash is provenance, not a
+compatibility check; a harmless refactor producing identical table contents must
+not invalidate checkpoints. Pin instead: feature schema and normalization
+version; layout/slot-order and rule-data identity; counterfactual definitions and
+supported key set; table-content digest; and checkpoint metadata naming the
+required contract. A sixth counterfactual does not automatically invalidate the
+table either — it may reuse existing keys. The gate is whether every requested
+key and feature meaning is still covered.
 
 ---
 
 ## Sequencing
 
-1. **Generator.** Enumerate keys, solve, write a packed table plus a manifest
-   recording code commit, the closure definition, and a digest. ~30 min on 12
-   cores.
-2. **Python encoder lookup.** Per-slot channels primary, fractions on GLOBAL.
-   Assert on a table miss; never silently fall back to a default.
-3. **Cost and shape delta.** Measure the encoder's time and the net's input
-   change before anything trains.
-4. **Rust reader plus a Python/Rust key-parity gate.**
-5. **Gate on the tactical corpus**, not on a self-play arena first.
+Revision 1 made the data-scaling curve a prerequisite. That was wrong on the
+document of record: `PLATEAU_FINDINGS.md` ranks data scaling **fifth** and says
+its "rationale is weak: the window was full at 40k and all of it came from a
+policy that barely changed, so it measures quantity while the plausible problem
+is diversity". More games from the same policy cannot cleanly separate a data
+limit from a representation limit, and both may hold at once.
+
+The same list also says of the encoder: "Still unmeasured, still by elimination
+only. **Do not start here.**" That judgement was made when an encoder change was
+an expensive bet. At 0.5 core-hours and ~21 MB it no longer is, and the question
+becomes the tractable one: *does this cheap structural input improve important
+decisions while preserving existing strength?* This plan proceeds on that basis
+deliberately, not by overlooking the warning.
+
+1. Fix feature semantics, applicability and per-slot counterfactual design.
+2. Build a reproducible generator; validate the key-space and cost numbers above.
+3. Offline W3 fine-tune against the same checkpoint, data and training budget,
+   versus an identical run without W3.
+4. Evaluate on held-out games **and** on ordinary-strength positions.
+5. Production Rust integration only if the early evidence is useful.
+6. Equal-wall-clock strength testing before any promotion.
+
+**Migration is append-only and zero-initialized**, so the incumbent is preserved
+exactly — the same discipline W5a uses for its gate.
+
+**The tactical corpus is a development and regression set, not a holdout.** It
+has been inspected extensively, and wiring W3 to win exactly those positions
+would end its value as evidence. Reserve fresh games, and keep all positions from
+one game together. A shuffled-feature arm is worth running but is an
+input-corruption test, not clean causal attribution.
 
 ---
 
-## What I want reviewed
+## Still open
 
-1. **Key parity is the whole risk.** `tempo_state` reads built Wonders, retired
-   Wonders, Theology, and the `PLAY_AGAIN` effect list. Any divergence between
-   the Python and Rust derivations silently desynchronises training from
-   inference — the failure is invisible, not loud. Is a Welcome-To-style
-   equivalence gate over a large corpus of real positions sufficient, or does
-   the key need to be computed once in Rust and passed to Python?
-
-2. **Unreachable needs its own channel.** `_INF` is 99; feeding that as a
-   distance would swamp every other input. Proposal is a binary reachable flag
-   plus a distance that is only meaningful when the flag is set. Is there a
-   better encoding — for instance a saturating distance where unreachable is
-   just the ceiling?
-
-3. **The aggregation is not a plan, and the net may read it as one.** Each slot
-   is solved under play optimal *for that slot*. The opponent racing you for
-   slot A is not simultaneously racing you for slot B, so the 20 numbers are 20
-   separate capability bounds, not a coherent line. Does attaching them per-slot
-   make this better (the net sees each bound against its own card) or worse (the
-   net learns to sum them)? Should the global fractions be dropped entirely?
-
-4. **Table miss policy.** Assert-on-miss makes a closure bug a crash in
-   training. Is that right, or should a miss fall back to solving live and log
-   loudly? Live-solving a miss reintroduces the 5.8 s worst case into a
-   self-play loop.
-
-5. **Staleness.** The table is a function of the solver's code. If the solver
-   changes, every table and every checkpoint trained on it is stale. The
-   manifest records a commit, but nothing enforces it. What is the right
-   mechanism — a digest checked at load, or a version baked into the encoder's
-   feature-name list?
-
-6. **Is the gate right?** The plan is to judge this on the tactical corpus:
-   ~210 live actor-created-threat positions, measuring prior/rank on the exact
-   refutation, fixed-budget regret, and calibration, with shuffled control
-   features as a causal negative control. The objection is that the corpus is
-   optimisable — wire W3 to win exactly these positions and the corpus stops
-   being evidence. What is the honest holdout?
-
-7. **The bigger question, which I do not want lost in the plumbing.** The
-   plateau findings (`PLATEAU_FINDINGS.md`) leave two live hypotheses,
-   generalisation-limited data and encoder/architecture, and specify a
-   data-scaling curve to distinguish them. That curve has never been run. W3 is
-   a bet on the encoder branch. Is building the table before running the curve
-   the right order, or is it 5.5 core-hours and an encoder change spent on the
-   branch we have not yet shown we are in?
+- Choice-conditioned features for the 16.7%: worth building, or is the validity
+  flag the permanent answer?
+- Whether per-slot counterfactuals should be all four, or only the
+  `+1 extra turn` map, given the channel cost on every tableau token.
+- Whether W5a's shared action scorer is the right consumer — it can associate a
+  per-slot control fact with the action that takes that card, which is better
+  aligned than anything a pooled fraction supports.
