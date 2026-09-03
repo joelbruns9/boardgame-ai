@@ -37,8 +37,12 @@ and a supplement to neural evaluation rather than a replacement.
   unchanged (tested), which matters because `advisor_scrape` hands the searcher
   a determinization.
 * Accessibility gated against the engine's own `is_accessible`.
-* Tractable: a full 20-card Age with four extra turns per side is 6,735 nodes
-  and 18 ms, so a fresh-Age control map is precomputable.
+* Tractable: a FULL 20-target control map on a fresh Age III is ~19k nodes and
+  ~180 ms with a Wonder pool of four, ~3.7k nodes and ~33 ms with a pool of one.
+  (An earlier draft quoted "6,735 nodes and 18 ms for a full control map"; that
+  was a single-target figure read off a solver whose node counter accumulates
+  across calls, so it described neither quantity. `control_features()` computes
+  five maps, so budget the leaf cost accordingly.)
 
 Fresh Age III, first-mover control by tempo budget:
 
@@ -49,8 +53,10 @@ Fresh Age III, first-mover control by tempo budget:
 | 0 | 1 | 10% |
 | 1 | 1 | 45% |
 
-One unspent extra-turn Wonder against an opponent with none is the difference
-between 10% and 100% of Age III.
+Read the table by ROW, not across it: the 10% and 100% rows differ by which
+player holds the tempo, not by one player gaining it. The one-tempo statement is
+the 0/0 row against the 1/0 row -- 70% to 100%. Losing the tempo race to an
+opponent who holds one and you none is the 10% row.
 
 Affordability is deliberately NOT modelled: the solver states the topological
 fact, and the network -- which knows its own coins, production and chains --

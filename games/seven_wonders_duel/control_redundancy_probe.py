@@ -53,11 +53,11 @@ from .threat_corpus_scan import REPO_ROOT
 
 # The control facts worth asking about. Fractions in [0, 1] and small counts.
 TARGETS = (
-    "control_now",
+    "control_under_topology",
     "control_with_one_more_tempo",
     "control_if_opponent_takes_theology",
-    "my_tempo",
-    "their_tempo",
+    "my_extra_turn_wonders",
+    "their_extra_turn_wonders",
 )
 _COUNT_SCALE = 4.0  # tempo budgets are 0..~4; keep every target on a like scale
 
@@ -391,9 +391,9 @@ def main(argv=None) -> int:
         report["sources"][source_name] = per
 
     log("")
-    log("Read the ORDERING against my_tempo/their_tempo, the most directly")
-    log("derivable targets here -- they mark what 'the model has this' looks")
-    log("like for this probe, which is not 1.0.")
+    log("Read the ORDERING against my/their_extra_turn_wonders, the most")
+    log("directly derivable targets here -- they mark what 'the model has")
+    log("this' looks like for this probe, which is not 1.0.")
 
     if args.out:
         out = Path(args.out)

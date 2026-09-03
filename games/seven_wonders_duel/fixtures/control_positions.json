@@ -1,0 +1,421 @@
+{
+  "907773062#28": {
+    "actor": 0,
+    "age": 3,
+    "note": "Age III, six Wonders built: one shared build left. Seat 0 holds the unbuilt extra-turn Wonder, seat 1 an ordinary one that retires it.",
+    "present": [
+      [
+        0,
+        5
+      ],
+      [
+        0,
+        7
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        1,
+        6
+      ],
+      [
+        1,
+        8
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        2,
+        5
+      ],
+      [
+        2,
+        7
+      ],
+      [
+        2,
+        9
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        3,
+        8
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        4,
+        9
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        5,
+        8
+      ],
+      [
+        6,
+        7
+      ]
+    ],
+    "revealed_slots": {
+      "Armory": [
+        2,
+        9
+      ],
+      "Builders Guild": [
+        2,
+        5
+      ],
+      "Chamber of Commerce": [
+        2,
+        7
+      ],
+      "Circus": [
+        0,
+        5
+      ],
+      "Fortifications": [
+        0,
+        7
+      ],
+      "Moneylenders Guild": [
+        6,
+        7
+      ],
+      "Obelisk": [
+        4,
+        7
+      ],
+      "Observatory": [
+        4,
+        9
+      ],
+      "Port": [
+        4,
+        5
+      ],
+      "Siege Workshop": [
+        2,
+        3
+      ]
+    },
+    "tempo_by_attacker": {
+      "0": [
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "1": [
+        1,
+        1,
+        0,
+        0,
+        1
+      ]
+    },
+    "wonders_built": [
+      3,
+      3
+    ]
+  },
+  "907773062#29": {
+    "actor": 0,
+    "age": 3,
+    "note": "Age III, the seventh Wonder is built: every unbuilt Wonder is retired.",
+    "present": [
+      [
+        0,
+        5
+      ],
+      [
+        0,
+        7
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        1,
+        6
+      ],
+      [
+        1,
+        8
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        2,
+        5
+      ],
+      [
+        2,
+        7
+      ],
+      [
+        2,
+        9
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        3,
+        8
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        4,
+        9
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        5,
+        8
+      ]
+    ],
+    "revealed_slots": {
+      "Armory": [
+        2,
+        9
+      ],
+      "Builders Guild": [
+        2,
+        5
+      ],
+      "Chamber of Commerce": [
+        2,
+        7
+      ],
+      "Circus": [
+        0,
+        5
+      ],
+      "Fortifications": [
+        0,
+        7
+      ],
+      "Gardens": [
+        5,
+        6
+      ],
+      "Obelisk": [
+        4,
+        7
+      ],
+      "Observatory": [
+        4,
+        9
+      ],
+      "Port": [
+        4,
+        5
+      ],
+      "Senate": [
+        5,
+        8
+      ],
+      "Siege Workshop": [
+        2,
+        3
+      ]
+    },
+    "tempo_by_attacker": {
+      "0": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "1": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "wonders_built": [
+      4,
+      3
+    ]
+  },
+  "908370787#17": {
+    "actor": 0,
+    "age": 2,
+    "note": "Age II: burying r2c10 under an extra-turn Wonder buys School in one turn.",
+    "present": [
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        3
+      ],
+      [
+        0,
+        5
+      ],
+      [
+        0,
+        7
+      ],
+      [
+        0,
+        9
+      ],
+      [
+        0,
+        11
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        1,
+        6
+      ],
+      [
+        1,
+        8
+      ],
+      [
+        1,
+        10
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        2,
+        5
+      ],
+      [
+        2,
+        7
+      ],
+      [
+        2,
+        9
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        3,
+        6
+      ],
+      [
+        4,
+        5
+      ]
+    ],
+    "revealed_slots": {
+      "Aqueduct": [
+        4,
+        5
+      ],
+      "Barracks": [
+        0,
+        3
+      ],
+      "Caravansery": [
+        2,
+        9
+      ],
+      "Courthouse": [
+        0,
+        5
+      ],
+      "Customs House": [
+        0,
+        1
+      ],
+      "Dispensary": [
+        2,
+        7
+      ],
+      "Forum": [
+        2,
+        3
+      ],
+      "Glass-Blower": [
+        2,
+        5
+      ],
+      "Horse Breeders": [
+        0,
+        7
+      ],
+      "Library": [
+        0,
+        9
+      ],
+      "School": [
+        0,
+        11
+      ]
+    },
+    "tempo_by_attacker": {
+      "0": [
+        6,
+        1,
+        2,
+        3,
+        1
+      ],
+      "1": [
+        6,
+        3,
+        1,
+        1,
+        2
+      ]
+    },
+    "wonders_built": [
+      1,
+      0
+    ]
+  }
+}
