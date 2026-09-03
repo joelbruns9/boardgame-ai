@@ -129,13 +129,22 @@ worst** against a ~1 ms leaf. The key space is structural and small.
 | reachable masks (age 1 / 2 / 3) | 428 / 428 / 132 = **988** |
 | tempo states (Theology closure adds none — it maps natural states to natural states) | **220** |
 | total keys, `(age, mask, who_moves, tempo)` | **434,720** |
-| `control_map` mean / p90 / max | 23 / 64 / 534 ms |
-| **full precompute** | **~2.8 core-hours — ~15 min on 12 cores** |
-| **table size** at 20 bytes + header | **~10 MB** |
+| `control_map` mean / p90 / max (fresh solver per map) | 23 / 64 / 534 ms |
+| **full precompute — BUILT, measured** | **2.4 min wall on 10 jobs; 0.4 core-hours** |
+| **table size — BUILT, measured** | **8.7 MB** |
 
-Precompute offline, ship the table, look up at encode time. The solver never runs
-in the training loop and needs no Rust port; Rust reads the table and derives the
-same key. **These are claims the generator must reproduce, not inputs to it.**
+**Built.** `control_table.py` generates it; `test_control_table.py` gates it. The
+projected cost was ~2.8 core-hours and came in at **0.4** — the estimate assumed
+a fresh solver per map, but sharding on tempo lets the memo carry across masks
+within a shard, which is the one direction reuse pays. Precompute offline, ship
+the table, look up at encode time; the solver never runs in the training loop and
+needs no Rust port.
+
+The artifact is **not committed** (gitignored, regenerable in minutes). Its
+contract — schema version, rule identity, content digest, tempo enumeration —
+lives in `manifest.json`, and the test suite builds a subset table when the full
+one is absent, so a clean checkout still checks agreement against the live
+solver rather than skipping.
 
 Age III alone would be 58,080 keys (~22 min single-core). Not worth scoping to:
 the cost is negligible either way, and the strategic signal requires all ages.
