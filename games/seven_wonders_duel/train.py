@@ -692,6 +692,10 @@ def train_loop(
     value_bootstrap: float = 0.0,
     patience: int = 8,
     precision: str = "fp32",
+    # Matches :func:`train_steps`. Its absence here was a NameError on every
+    # call -- the body has read `optimizer_name` since the Adam/AdamW split was
+    # introduced, so this entry point could not run at all.
+    optimizer_name: str = "adamw",
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     log=print,
 ):
