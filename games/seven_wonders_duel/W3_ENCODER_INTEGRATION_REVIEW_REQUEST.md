@@ -1,7 +1,10 @@
 # W3: wiring exact positional control into the encoder — plan of record
 
-**Status:** solver built and verified; nothing wired. **Revision 3**, after a
-second review and a design discussion that cut the feature set roughly in half.
+**Status:** solver built and verified; nothing wired. **Revision 4**, after a
+third review. Revision 3 cut the feature set roughly in half; revision 4 keeps
+those cuts but **replaces their justifications**, because several were stated as
+structural facts on partial evidence. Three code claims were checked and all
+three were wrong (see *Corrections* below).
 
 Prior review of the solver is in `W3_CONTROL_REVIEW_REQUEST.md` (six findings,
 accepted, items 1–3 committed in `e017ab0`). Revision 2 answered a review of the
@@ -10,17 +13,36 @@ actually buys, and most of the changes are **deletions**.
 
 ## What changed, and why
 
-| revision 2 | revision 3 | why |
+| revision 2 | revision 4 | why |
 |---|---|---|
-| counterfactuals: `+1`, `−1`, `−2` tempo | **all three dropped** | `+1` is unreachable; `−1`/`−2` duplicate a one-ply successor search already expands |
-| per-action successor control lookup | **dropped from arm 1** | MCTS already encodes and evaluates each child; `top_k=16` vs mean legal width 5.6 |
+| counterfactuals: `+1`, `−1`, `−2` tempo | **all three dropped** | `+1` is unreachable (measured); `−1`/`−2` are one legal action away, so search routinely expands the successor |
+| per-action successor control lookup | **deferred — a scope decision, not proven redundancy** | see *Corrections* |
 | Theology maps "held for arm 2" | **promoted into arm 1** | the only reachable increase in tempo, and swings up to ±18 slots |
-| — | **start-decision feature added** | swings up to 20 of 20 slots and sits an age beyond search's horizon |
-| — | **auxiliary control head added** | direct supervision beats hoping outcome credit propagates |
-| Age III scoping considered | **all ages; Age III is the evaluation focus** | tempo carries across ages, so the strategic cost is only visible game-wide |
+| — | **start-decision channels added, with their own layout and validity** | swings the whole age; resolves the applicability conflict |
+| — | **auxiliary control head added, as an arm and not a gate** | direct supervision, but its failure vetoes nothing |
+| Age III scoping considered | **all ages; Age III is the evaluation focus** | tempo carries across ages |
 
-Net effect: **six channels per tableau token plus one validity flag**, down from
-ten channels, five maps and two per-action gathers.
+Net effect: **six per-slot channels plus two start-decision channels plus two
+validity flags**, down from ten channels, five maps and two per-action gathers.
+
+## Corrections carried into revision 4
+
+Three claims in revision 3 were checked against the code and did not hold. They
+are recorded rather than quietly edited, because each was stated categorically on
+partial evidence.
+
+1. **"Beyond any simulation budget."** `chance_signature` (`search.py:150`)
+   handles `AGE_DEAL` explicitly and descent continues through it. There is no
+   age-boundary cutoff; the difficulty is funding representative continuations
+   through a large chance tree. Restated as a budget-and-data hypothesis.
+2. **"Unbroken Age III coverage via the exact solver."** `MAX_PRESENT = 6`
+   selects corpus candidates and exists because the Python reference times out
+   above six cards. Not a runtime handoff. W3 now covers every reachable mask.
+3. **"Essentially every root child is expanded."** Mean legal width does not
+   bound the tail; the advisor runs `RustPuctSearch` (`advisor_adapter.py:673`),
+   not Gumbel top-k; creating a legal edge is not evaluating its successor; and
+   root coverage says nothing about low-prior decisions deeper in the tree.
+   Deferring per-action successor features is now a scope decision.
 
 ---
 
@@ -38,9 +60,18 @@ right. This is hardest to learn in Ages I–II, where the outcome signal is 20�
 moves away; it is most learnable, and most decisive, in Age III.
 
 **Strategic — price tempo and the start decision.** *An extra-turn Wonder spent
-in Age I is not available in Age III.* This is where features do something search
-structurally **cannot**: the consequence sits an entire age — roughly 20 moves —
-beyond any simulation budget. Fresh Age III, full pyramid:
+in Age I is not available in Age III.* The hypothesis is that **W3 reduces the
+search budget and training data needed to learn cross-age tempo value** — not
+that search cannot reach it. Search models age-deal chance explicitly
+(`chance_signature`, `search.py:150`) and descends through it; the difficulty is
+funding representative continuations through a large chance tree. An earlier
+draft called this a structural impossibility, which the code contradicts.
+
+Note also that the inputs describe the **current** age's tableau. Better Age III
+features improving Age I decisions is a claim about learning and propagation, not
+something the feature construction guarantees. Fresh Age III, full pyramid, at
+tempo `(builds_left = mine+theirs+2, ord_me = 1, ext_me = mine, ord_them = 1,
+ext_them = theirs)`:
 
 | my unbuilt extra turns | I start | they start |
 |---|---|---|
@@ -108,9 +139,14 @@ same key. **These are claims the generator must reproduce, not inputs to it.**
 
 Age III alone would be 58,080 keys (~22 min single-core). Not worth scoping to:
 the cost is negligible either way, and the strategic signal requires all ages.
-Age III's distinctions are that it is the evaluation focus and that below seven
-present cards it hands off to the existing exact solver
-(`endgame_corpus.py`, `MAX_PRESENT = 6`), giving Age III unbroken coverage.
+Age III's distinction is that it is the evaluation focus.
+
+**W3 coverage does not stop below seven cards.** An earlier draft claimed a
+handoff to the exact solver at `MAX_PRESENT = 6`. That constant selects *corpus
+candidate positions* and its own comment gives the reason — "above ~6 the Python
+reference itself times out (7 ~37k/29s)". It is a build-time gate, not a runtime
+contract, and the advisor's exact solver is optional, cost-gated, and may decline
+or time out. Generate W3 for every reachable mask.
 
 ---
 
@@ -136,11 +172,23 @@ no rescue by picking a better field. **16.7% of training rows would carry a
 parity would hide it entirely. Taking Theology during a pending choice also
 restates the tempo half of the key.
 
-**Decision.** Emit `control_valid` as an explicit channel. Compute features only
-in `PLAY_AGE` with no pending choice; elsewhere the flag is 0 and every control
-channel is 0. `WONDER_DRAFT` stays masked indefinitely — a 50/50 mover coin flip
-whose outcome also determines the tempo inventory the key depends on. Never
-silently read "current decision maker" as "next tableau mover".
+**Decision.** Two independent channel groups, each with its own validity flag,
+so no channel ever changes meaning by phase. Revision 3 zeroed all control
+channels outside ordinary `PLAY_AGE` while also adding start-decision maps at
+`CHOOSE_NEXT_START_PLAYER` — an implementer could not satisfy both. Separate
+groups are chosen over a phase-dependent layout because they are auditable.
+
+| group | channels | populated when | else |
+|---|---|---|---|
+| **live control** | 6 per tableau token (3 maps × flag + distance) | `PLAY_AGE`, no pending choice | all 0 |
+| `control_valid` | 1 global | always | 1 or 0 |
+| **start decision** | 2 per tableau token (I-start, they-start; flag + distance each → 4) | `CHOOSE_NEXT_START_PLAYER` | all 0 |
+| `start_choice_valid` | 1 global | always | 1 or 0 |
+
+The two groups are never both populated. `WONDER_DRAFT` and pending-choice states
+populate neither: the draft is a 50/50 mover coin flip whose outcome also
+determines the tempo inventory the key depends on. Never silently read "current
+decision maker" as "next tableau mover".
 
 ---
 
@@ -211,19 +259,28 @@ start*. Swings measured on the fresh pyramid:
 | 3 | 1 / 1 | 9 | 11 | **−2** |
 | 3 | 2 / 2 | 20 | 0 | **20** |
 
-Note the non-monotonicity: at Age III with one extra turn each, starting is
-*worse*. No "prefer the extra-turn Wonder" heuristic gets that right, and it is
-precisely where a science defender must decide whether to hand over the start.
+These are **topology counts, not move recommendations.** Nine forceable slots
+versus eleven does not mean a worse position: starting could secure the one
+science card that decides the game while conceding several irrelevant ones. That
+is exactly why global fractions were dropped, and the same caution applies here.
+The non-monotone row is interesting because a "prefer the extra-turn Wonder"
+heuristic cannot produce it — not because it tells you to decline the start.
+
+The tempo tuples are published above because extra-turn counts alone do not
+identify the solver state: ordinary Wonders and `builds_left` change the answer
+through retirement.
 
 ### Auxiliary control head
 
 Add a head that **predicts** the control map, trained against the table as
-labels. Input tells the net the answer; an auxiliary target forces the trunk to
-*represent* it rather than relying on outcome credit propagating back across 20–60
-moves. Labels are free, and the head can be dropped at inference — so it costs
-nothing in self-play and sidesteps Rust parity entirely. It is the cheaper half
-to try first, and it matters most in Ages I–II where the outcome signal is
-weakest.
+labels. Input tells the net the answer; an auxiliary target pushes the trunk to
+*represent* it rather than relying on outcome credit propagating back across
+20–60 moves. Labels are free, and the head can be dropped at inference — so it
+costs nothing in self-play and sidesteps Rust parity entirely. That makes it the
+cheapest arm to run first.
+
+It is an **arm, not a gate**: see *The arms* under Sequencing. Its success can
+make the input arm unnecessary; its failure cannot disqualify it.
 
 ### Data emphasis
 
@@ -280,15 +337,40 @@ deliberately, not by overlooking the warning.
 1. Fix feature semantics and applicability; add the sixth-to-seventh transition
    test.
 2. Build the generator; validate the key-space and cost numbers above.
-3. **Auxiliary head first** — cheapest signal on whether the trunk can represent
-   control at all, with no inference cost and no parity work.
-4. Encoder inputs; offline fine-tune against the same checkpoint, data and budget
-   versus an identical run without W3.
-5. Evaluate on held-out games **and** ordinary-strength positions, with Age III
-   tactical positions as the focus and the strategic claim (start decision, tempo
-   pricing) as the primary gate — it is where features do what search cannot.
+3. **Auxiliary head first** — cheapest arm: no inference cost, no parity work.
+4. Encoder inputs, offline fine-tune against the same checkpoint, data and
+   budget.
+5. Evaluate (below). Age III tactical positions are the focus; the strategic
+   claim is an important gate but **not a veto on a real tactical gain**.
 6. Production Rust integration only if early evidence is useful.
 7. Equal-wall-clock strength testing before any promotion.
+
+### The arms, and what each one answers
+
+| arm | question |
+|---|---|
+| baseline | same checkpoint, data, training budget |
+| auxiliary only | can extra supervision improve **decisions** without new inference inputs? |
+| inputs only | does supplying exact abstract control beat learning to reconstruct it? |
+| both, if warranted | does supervision add anything beyond supplied features? |
+
+**An auxiliary failure does not veto the input arm.** They are different
+interventions: the auxiliary head teaches the net to *compute* control, the
+inputs give it control so it can *use* it. Failure to learn the calculation is if
+anything an argument for supplying the answer, and conversely a head that
+predicts control accurately does not show that policy or value uses it. The
+existing probe already recovered some control from the trunk, so "can it
+represent control at all" is the wrong question — **does auxiliary training
+improve decisions** is the right one. Auxiliary-only may make the input arm
+unnecessary by succeeding; it cannot disqualify it by failing.
+
+**Judge on decisions, never on control-prediction accuracy alone:** tactical
+regret, starter choices, earlier tempo-spending decisions, and general strength.
+Include **military-critical** positions alongside science ones, and keep ordinary
+-game data beside the contested-science oversampling — otherwise the experiment
+can reward a "hoard Wonders" bias rather than stronger play. The strategic
+evaluation must contain both positions where preserving tempo wins **and**
+positions where spending it now is correct.
 
 **Migration is append-only and zero-initialized**, preserving the incumbent
 exactly — the same discipline W5a uses for its gate.
@@ -303,12 +385,15 @@ test, not clean causal attribution.
 
 ## Explicitly rejected
 
-- **Per-action successor control in arm 1.** MCTS encodes and evaluates each
-  child, and `top_k = 16` against a mean legal width of 5.6 means essentially
-  every root child is expanded. The value head therefore already sees a ceded
-  card's consequence. Revisit only as *prior shaping* if the corpus shows the
-  prior is the binding constraint — which W9 found it to be at depth, but not at
-  the root.
+- **Per-action successor control in arm 1 — DEFERRED, not disproven.** The
+  argument that "search already evaluates every child" does not hold generally:
+  mean legal width does not bound the tail, the advisor runs `RustPuctSearch`
+  rather than Gumbel top-k, creating a legal edge is not evaluating its
+  successor, forced root chance expansion is a separate mechanism with
+  exclusions, and root coverage says nothing about low-prior decisions deeper in
+  the tree. This is deferred to keep the first experiment small. **Before
+  declaring it unnecessary, measure actual successor-evaluation coverage by
+  search mode, budget, legal width and decision family.**
 - **Building control into W5a's action scorer instead of the encoder.** The
   scorer feeds policy logits only, while the documented failure includes a value
   head 36 points wrong at post-burial nodes. Encoder placement reaches both
@@ -328,7 +413,11 @@ test, not clean causal attribution.
 ## Still open
 
 - Does the auxiliary head suffice on its own, making encoder inputs (and all Rust
-  parity work) unnecessary?
+  parity work) unnecessary? (Only a *success* can settle this; a failure leaves
+  the input arm untouched.)
+- What is the real successor-evaluation coverage by search mode, budget, legal
+  width and decision family? Until measured, deferring per-action features is a
+  scope call rather than a finding.
 - Whether `forced_take_turns_scaled` should saturate or use a separate ceiling
   channel.
 - Whether choice-conditioned features are ever worth building for the masked
