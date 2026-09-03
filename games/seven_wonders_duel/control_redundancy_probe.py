@@ -124,7 +124,7 @@ def selfplay_positions(count: int, seed: int):
 
     rng = random.Random(seed)
     out = []
-    for game_seed in range(count * 3):
+    for game_seed in range(count * 4):
         if len(out) >= count:
             break
         game = new_game(game_seed, first_player=game_seed % 2)
@@ -145,19 +145,27 @@ def selfplay_positions(count: int, seed: int):
 def build_dataset(args, log):
     from .dataset import collate_inputs, vectorize
 
-    games = []
+    games, groups = [], []
     for table, row in corpus_positions(args.corpus_limit):
         try:
             games.append(load_logged(table, row))
+            # The GROUP is the game, not the position. Several positions from
+            # one table share a board, a deal and a pair of players, so a split
+            # that puts some in train and others in test leaks: the probe can
+            # memorise the game rather than learn the concept.
+            groups.append(f"table:{table}")
         except Exception:
             continue
-    log(f"  {len(games)} corpus positions")
+    log(f"  {len(games)} corpus positions from "
+        f"{len(set(groups))} distinct tables")
     extra = selfplay_positions(args.selfplay, args.seed)
     log(f"  {len(extra)} self-play positions")
-    games.extend(extra)
+    for i, game in enumerate(extra):
+        games.append(game)
+        groups.append(f"selfplay:{i}")
 
-    encodings, labels, legal = [], [], []
-    for game in games:
+    encodings, labels, legal, keep_groups = [], [], [], []
+    for game, group in zip(games, groups):
         features = control_features(game, state_actor(game))
         vector = label_vector(features)
         if vector is None:
@@ -166,9 +174,10 @@ def build_dataset(args, log):
         encodings.append(vectorize(encoding))
         legal.append(legal_action_indices(game))
         labels.append(vector)
-    log(f"  {len(labels)} usable examples")
+        keep_groups.append(group)
+    log(f"  {len(labels)} usable examples, {len(set(keep_groups))} groups")
     batch = collate_inputs(encodings, legal, device="cpu")
-    return batch, torch.tensor(labels, dtype=torch.float32)
+    return batch, torch.tensor(labels, dtype=torch.float32), keep_groups
 
 
 def token_features(model, batch, chunk=64):
@@ -205,14 +214,52 @@ def token_features(model, batch, chunk=64):
     return torch.cat(outs)
 
 
-def fit_probe(features, labels, args, seed):
-    """Train one probe with early stopping on a validation split."""
+def random_split(groups, holdout, seed):
+    """Position-level split, IGNORING groups. Kept only to isolate the leakage
+    effect on identical data -- never for reporting."""
+
+    rng = random.Random(seed)
+    order = list(range(len(groups)))
+    rng.shuffle(order)
+    n_test = max(1, int(len(order) * holdout))
+    n_val = max(1, int(len(order) * 0.15))
+    return (torch.tensor(order[n_test + n_val:], dtype=torch.long),
+            torch.tensor(order[n_test:n_test + n_val], dtype=torch.long),
+            torch.tensor(order[:n_test], dtype=torch.long))
+
+
+def group_split(groups, holdout, seed):
+    """Split by GROUP, so no game appears on both sides.
+
+    A random split over positions leaks: corpus positions come from 49 tables
+    with up to 9 positions each, so the same board, deal and players land in
+    train and test together and the probe can memorise the game instead of the
+    concept. Every R2 measured that way is inflated.
+    """
+
+    unique = sorted(set(groups))
+    rng = random.Random(seed)
+    rng.shuffle(unique)
+    n_test = max(1, int(len(unique) * holdout))
+    n_val = max(1, int(len(unique) * 0.15))
+    test_g = set(unique[:n_test])
+    val_g = set(unique[n_test:n_test + n_val])
+    test, val, train = [], [], []
+    for i, group in enumerate(groups):
+        (test if group in test_g else val if group in val_g else train).append(i)
+    return (torch.tensor(train, dtype=torch.long),
+            torch.tensor(val, dtype=torch.long),
+            torch.tensor(test, dtype=torch.long))
+
+
+def fit_probe(features, labels, groups, args, seed):
+    """Train one probe with early stopping, on a GROUP-aware split."""
 
     torch.manual_seed(seed)
-    order = torch.randperm(len(labels))
-    n_test = int(len(labels) * args.holdout)
-    n_val = max(20, int(len(labels) * 0.15))
-    test, val, train = order[:n_test], order[n_test:n_test + n_val], order[n_test + n_val:]
+    splitter = random_split if args.leaky_split else group_split
+    train, val, test = splitter(groups, args.holdout, seed)
+    if len(test) < 10 or len(train) < 20:
+        return [float("nan")] * len(TARGETS)
 
     probe = nn.Sequential(
         nn.Linear(features.shape[1], args.hidden), nn.ReLU(), nn.Dropout(args.dropout),
@@ -286,6 +333,9 @@ def main(argv=None) -> int:
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--leaky-split", action="store_true",
+                        help="position-level split; for isolating the "
+                             "leakage effect only, never for reporting")
     parser.add_argument("--patience", type=int, default=150)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--holdout", type=float, default=0.3)
@@ -305,7 +355,7 @@ def main(argv=None) -> int:
     model = evaluator.model
 
     log("building dataset")
-    batch, labels = build_dataset(args, log)
+    batch, labels, groups = build_dataset(args, log)
     if len(labels) < 40:
         raise SystemExit("too few examples to probe")
 
@@ -317,12 +367,15 @@ def main(argv=None) -> int:
     sources = {"pooled": features, "tokens": token_features(model, batch)}
     report = {"harness": "control_redundancy_probe", "examples": len(labels),
               "checkpoint": str(path.name), "seeds": args.seeds,
+              "split": "group-aware by table / self-play game",
+              "groups": len(set(groups)),
               "probe": {"hidden": args.hidden, "layers": 2,
                         "dropout": args.dropout, "early_stopping": True},
               "sources": {}}
 
     for source_name, source in sources.items():
-        runs = [fit_probe(source, labels, args, args.seed + k) for k in range(args.seeds)]
+        runs = [fit_probe(source, labels, groups, args, args.seed + k)
+                for k in range(args.seeds)]
         log("")
         log(f"--- probe source: {source_name} (dim {source.shape[1]}) ---")
         log(f"{'target':<40}{'R2 mean':>9}{'min':>8}{'max':>8}")
