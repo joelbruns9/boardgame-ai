@@ -144,6 +144,12 @@ class Example:
     #: actor (an extra turn), or absent. See `reply_targets`.
     reply_legal: np.ndarray | None = None
     reply_target: np.ndarray | None = None
+    #: `(age, present_mask, who_moves_is_attacker, tempo)` for the W3 control
+    #: table, or None where the position has no control label -- see
+    #: `control_table.control_key`. Only the Python replay path can fill this:
+    #: `_examples_from_rust_payload` has no game state, so rows from a Rust
+    #: self-play payload are unlabelled and MASKED, never defaulted.
+    control_key: tuple | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -257,6 +263,68 @@ def legal_action_tensors(
         "action_source_present": source_present,
         "action_wonder_indices": wonder_indices,
         "action_wonder_present": wonder_present,
+    }
+
+
+#: Distances are 0..~20 attacker turns; scaled into [0, 1] so the regression
+#: target sits on the same scale as every other head's.
+CONTROL_MAX_DIST = 20.0
+CONTROL_SLOTS = 20
+
+
+def control_target_tensors(batch, table) -> dict[str, torch.Tensor]:
+    """W3 control labels for one batch, aligned to the TABLEAU tokens.
+
+    Alignment is the load-bearing part. `_tableau_tokens` emits one token per
+    present slot in `sorted(present)` order, which is exactly `Layout.slots`
+    order -- verified over 1,235 states. It is re-checked per row here anyway,
+    and a row that fails is masked rather than guessed: a mislabelled control
+    target is worse than a missing one, because it teaches the trunk a false
+    geometry.
+
+    Rows without a key (not a clean `PLAY_AGE` state, a closed Wonder pool, or
+    a Rust-payload row that never had a game state) are masked, never defaulted.
+    """
+
+    from .control_table import UNREACH
+    from .tableau_control import Layout
+
+    rows = len(batch)
+    tableau_type = TYPE_IDS[TokenType.TABLEAU]
+    token_index = torch.zeros(rows, CONTROL_SLOTS, dtype=torch.long)
+    slot_valid = torch.zeros(rows, CONTROL_SLOTS, dtype=torch.bool)
+    reachable = torch.zeros(rows, CONTROL_SLOTS, dtype=torch.float32)
+    distance = torch.zeros(rows, CONTROL_SLOTS, dtype=torch.float32)
+    row_valid = torch.zeros(rows, dtype=torch.bool)
+
+    for row, example in enumerate(batch):
+        key = getattr(example, "control_key", None)
+        if key is None:
+            continue
+        age, mask, who_moves, tempo = key
+        cells = table.lookup(age, mask, bool(who_moves), tuple(tempo))
+        layout = Layout.for_age(age)
+        positions = [
+            i for i, t in enumerate(example.type_ids) if int(t) == tableau_type
+        ]
+        present = [i for i in range(len(layout.slots)) if (mask >> i) & 1]
+        if len(positions) != len(present):
+            continue                      # alignment broken: mask, do not guess
+        row_valid[row] = True
+        for position, slot_i in zip(positions, present):
+            token_index[row, slot_i] = position
+            slot_valid[row, slot_i] = True
+            cell = int(cells[slot_i])
+            if cell != UNREACH:
+                reachable[row, slot_i] = 1.0
+                distance[row, slot_i] = min(cell, CONTROL_MAX_DIST) / CONTROL_MAX_DIST
+
+    return {
+        "control_token_index": token_index,
+        "control_slot_valid": slot_valid,
+        "control_reachable": reachable,
+        "control_distance": distance,
+        "control_row_valid": row_valid,
     }
 
 
@@ -477,6 +545,13 @@ def examples_from_record(
         legal = legal_by_move[move.i]
         policy = _policy_for_move(move, legal)
         type_ids, entity_ids, aux_ids, features = vectorize(encoding)
+        # Derived here because `featurize` is the only point holding the live
+        # per-move state; the finished game below cannot answer it.
+        # Imported lazily: control_table -> tableau_control -> search ->
+        # inference -> dataset is a cycle at module scope.
+        from .control_table import control_key
+
+        control = control_key(game, actor)
         # Inputs only: the outcome labels are unknown until the replay finishes,
         # so the Example is built once, complete, below. It used to be built here
         # with placeholder labels and back-filled in place; `Example` is frozen
@@ -496,6 +571,7 @@ def examples_from_record(
                 move.solver_value,
                 move.solver_regime == "exact",
                 move.i,
+                control,
             )
         )
 
@@ -541,6 +617,7 @@ def examples_from_record(
         solver_value,
         solver_exact,
         move_index,
+        control,
     ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
@@ -550,6 +627,7 @@ def examples_from_record(
         rel = final_position if actor == 0 else -final_position
         examples.append(
             Example(
+                control_key=control,
                 type_ids=type_ids,
                 entity_ids=entity_ids,
                 aux_ids=aux_ids,
@@ -656,6 +734,16 @@ def _examples_from_rust_payload(
     if features_f64.size != type_ids.size * MAX_FEATURES:
         raise ReplayMismatchError("Rust replay feature payload has the wrong size")
     features = features_f64.reshape(-1, MAX_FEATURES).astype(np.float16)
+    # Optional: a Rust build predating W3 simply omits it, and every row is then
+    # unlabelled rather than wrongly labelled.
+    control_words = payload.get("control_keys")
+    if control_words is not None:
+        control_words = np.frombuffer(control_words, dtype="<u8")
+        if len(control_words) != len(row_moves):
+            raise ReplayMismatchError(
+                f"Rust replay sent {len(control_words)} control keys for "
+                f"{len(row_moves)} rows"
+            )
     archive_seats = archive_policy_seats(record.agents)
     row_weights = solver_row_weights(moves)
     replies = reply_targets(
@@ -672,6 +760,8 @@ def _examples_from_rust_payload(
         int(stats_payload["science_count_1"]),
     )
     victory = VictoryType(record.victory_type) if record.victory_type else None
+
+    from .control_table import unpack_key
 
     examples: list[Example] = []
     for row, move_index_raw in enumerate(row_moves):
@@ -694,6 +784,10 @@ def _examples_from_rust_payload(
         relative_position = final_position if actor == 0 else -final_position
         examples.append(
             Example(
+                control_key=(
+                    unpack_key(int(control_words[row]))
+                    if control_words is not None else None
+                ),
                 type_ids=type_ids[token_start:token_stop],
                 entity_ids=entity_ids[token_start:token_stop],
                 aux_ids=aux_ids[token_start:token_stop],
@@ -806,6 +900,9 @@ def derive_records_rust(
                     "unsupported buffer digest version: "
                     f"{record.digest_version!r}"
                 )
+        from .control_table import ensure_rust_table
+
+        ensure_rust_table()
         try:
             payloads = swr.derive_records(
                 games,
@@ -930,7 +1027,8 @@ def solver_value_distribution(example: Example) -> tuple[float, float, float] | 
 
 
 def collate(
-    batch: list[Example], device: str = "cpu", *, contextual_actions: bool = False
+    batch: list[Example], device: str = "cpu", *, contextual_actions: bool = False,
+    control_table=None,
 ) -> dict[str, torch.Tensor]:
     """Pad a list of examples into batched tensors.
 
@@ -1051,6 +1149,8 @@ def collate(
                 [example.legal for example in batch],
             )
         )
+    if control_table is not None:
+        tensors.update(control_target_tensors(batch, control_table))
     if device != "cpu":
         tensors = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
     return tensors

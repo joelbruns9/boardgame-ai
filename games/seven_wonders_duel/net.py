@@ -324,6 +324,44 @@ class ContextualActionResidual(nn.Module):
         return score.masked_fill(batch["legal_pad_mask"], 0.0)
 
 
+class ControlHead(nn.Module):
+    """W3 auxiliary target: predict exact positional control, per tableau slot.
+
+    Reads the TOKEN SEQUENCE, not the pooled readout. The point of the arm is to
+    push the trunk to represent control *per slot*, co-located with the card
+    identity on that slot -- a pooled prediction could be right on aggregate
+    while carrying no per-card structure, which is the failure the global
+    fractions were dropped for.
+
+    Two outputs per slot, matching the encoder-input design so the arms stay
+    comparable: whether the seat can force the take, and how many of its turns
+    that costs. Distance is only defined where the flag is set, so its loss is
+    masked by the label rather than regressed against a sentinel.
+
+    Droppable at inference: this head costs nothing in self-play and needs no
+    table on the Rust side, which is why it is the cheapest arm to run first.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 2),
+        )
+
+    def forward(self, tokens: torch.Tensor,
+                batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        index = batch["control_token_index"]
+        picker = index.unsqueeze(-1).expand(*index.shape, tokens.shape[-1])
+        gathered = tokens.gather(1, picker)
+        out = self.mlp(gathered)
+        return {
+            "control_reach_logit": out[..., 0],
+            "control_distance_pred": out[..., 1],
+        }
+
+
 class Heads(nn.Module):
     def __init__(self, d_model: int, reply: bool = False):
         super().__init__()
@@ -396,6 +434,7 @@ class SWDNet(nn.Module):
         pooled_readout: bool = False,
         reply_head: bool = False,
         action_residual: bool = False,
+        control_head: bool = False,
     ):
         super().__init__()
         heads = default_heads(d_model) if heads is None else int(heads)
@@ -444,6 +483,8 @@ class SWDNet(nn.Module):
         self.action_scorer = (
             ContextualActionResidual(d_model) if self.action_residual else None
         )
+        self.control_head = bool(control_head)
+        self.control_scorer = ControlHead(d_model) if self.control_head else None
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         tokens = self.embedder(batch)
@@ -479,6 +520,8 @@ class SWDNet(nn.Module):
             out["action_policy"] = residual
             alpha = torch.tanh(self.action_scorer.gate)
             out["policy"] = out["policy"] + alpha * residual
+        if self.control_scorer is not None and "control_token_index" in batch:
+            out.update(self.control_scorer(normed, batch))
         return out
 
 

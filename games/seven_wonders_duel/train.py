@@ -42,6 +42,7 @@ REPLY_WEIGHT_DEFAULT = 0.15
 # historical training recipe; prototype runs opt in explicitly. This loss is
 # required while the served residual gate is exactly zero, because the ordinary
 # policy loss can otherwise update only the gate and not the scorer behind it.
+CONTROL_WEIGHT_DEFAULT = 1.0
 ACTION_POLICY_WEIGHT_DEFAULT = 0.0
 
 #: Multiplier on every head that fits a per-GAME label rather than a
@@ -59,6 +60,22 @@ ACTION_POLICY_WEIGHT_DEFAULT = 0.0
 VALUE_WEIGHT_DEFAULT = 1.0
 
 
+def control_table_for(model):
+    """The W3 table to label batches with, or None when the head is absent.
+
+    Derived from the MODEL rather than passed per call site: the auxiliary head
+    is silently untrainable without labels -- its loss is exactly 0 and no head
+    parameter moves -- which is a failure that looks like a working run. Every
+    trainer and the validation path go through this.
+    """
+
+    if not getattr(model, "control_head", False):
+        return None
+    from .control_table import default_table
+
+    return default_table()
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -69,6 +86,7 @@ def compute_losses(
     row_weights: bool = True,
     reply_weight: float = REPLY_WEIGHT_DEFAULT,
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
+    control_weight: float = CONTROL_WEIGHT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -95,6 +113,23 @@ def compute_losses(
         policy_loss = (per_row[has_policy] * weights).sum() / weights.sum().clamp(min=1e-9)
     else:
         policy_loss = per_row.new_zeros(())
+    control_loss = outputs["policy"].new_zeros(())
+    if "control_reach_logit" in outputs and "control_reachable" in batch:
+        slot_mask = batch["control_slot_valid"].float()
+        denominator = slot_mask.sum().clamp(min=1.0)
+        reach = torch.nn.functional.binary_cross_entropy_with_logits(
+            outputs["control_reach_logit"], batch["control_reachable"],
+            reduction="none",
+        )
+        # Distance is meaningless where the slot is unreachable, so it is
+        # regressed only where the LABEL says it exists -- never against a
+        # sentinel standing in for "no answer".
+        distance_mask = slot_mask * batch["control_reachable"]
+        distance = (outputs["control_distance_pred"] - batch["control_distance"]) ** 2
+        control_loss = (
+            (reach * slot_mask).sum() / denominator
+            + (distance * distance_mask).sum() / distance_mask.sum().clamp(min=1.0)
+        )
     action_policy_loss = outputs["policy"].new_zeros(())
     if "action_policy" in outputs:
         action_log = masked_policy_log_softmax(
@@ -170,6 +205,7 @@ def compute_losses(
     total = (
         policy_loss
         + action_policy_weight * action_policy_loss
+        + control_weight * control_loss
         + value_weight * value_loss
         + value_weight
         * aux_weight
@@ -180,6 +216,7 @@ def compute_losses(
         "total": float(total.detach()),
         "policy": float(policy_loss.detach()),
         "action_policy": float(action_policy_loss.detach()),
+        "control": float(control_loss.detach()),
         "value": float(value_loss.detach()),
         "joint7": float(joint7_loss.detach()),
         "margin": float(margin_loss.detach()),
@@ -224,8 +261,10 @@ def evaluate(
     value_bootstrap: float = 0.0,
     precision: str = "fp32",
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
+    control_weight: float = CONTROL_WEIGHT_DEFAULT,
 ):
     model.eval()
+    control_labels = control_table_for(model)
     sums: dict[str, float] = {}
     correct = {"value": 0, "joint7": 0, "policy_top1": 0}
     abs_err = {"margin": 0.0, "military": 0.0, "science": 0.0}
@@ -236,6 +275,7 @@ def evaluate(
         batch = collate(
             examples[start : start + batch_size], device,
             contextual_actions=bool(getattr(model, "action_residual", False)),
+            control_table=control_labels,
         )
         with _evaluation_autocast(device, precision):
             outputs = model(batch)
@@ -251,6 +291,7 @@ def evaluate(
                 aux_weight,
                 value_weight,
                 value_bootstrap,
+                control_weight=control_weight,
                 solver_value_target=False,
                 # Unweighted for the same reason: a held-out number has to mean
                 # the same thing across runs. Upweighting solved rows in
@@ -466,6 +507,7 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         pooled_readout_from_config(config),
         reply_head_from_config(config),
         action_residual_from_config(config),
+        control_head_from_config(config),
     )
 
 
@@ -496,11 +538,32 @@ def make_checkpoint(model, config: dict) -> dict:
                 "able to rebuild its own weights"
             )
         config[switch] = actual
-    return {
+    out = {
         "model_state": model.state_dict(),
         "config": config,
         "encoder_signature": ENCODER_SIGNATURE,
     }
+    # Only when the model actually consumes control features. A model without
+    # them is not tied to any table, and recording one would invent a constraint
+    # that later rejects a perfectly loadable checkpoint.
+    if _reads_control_features(model):
+        from .control_table import table_content_digest
+
+        out["control_table_digest"] = table_content_digest()
+    return out
+
+
+def _reads_control_features(model) -> bool:
+    """Does this model depend on the control table's CONTENTS?
+
+    True for the auxiliary head, and true for any model whose encoder inputs
+    include the control channels -- which, once the schema carries them, is every
+    model trained after W3.
+    """
+
+    from .encoder import CONTROL_FEATURES, TABLEAU_FEATURES
+
+    return bool(set(CONTROL_FEATURES) & set(TABLEAU_FEATURES))
 
 
 def migrate_state_dict(old_state: dict, model) -> dict:
@@ -567,10 +630,18 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[:, : old_state[key].shape[1]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
-        elif key.startswith("action_scorer."):
+        elif key.startswith(("action_scorer.", "control_scorer.")):
             # ``tensor`` is the new model's initialized value. In particular,
             # action_scorer.gate was constructed as exact zero while the layers
             # behind it retain symmetry-breaking initialization.
+            #
+            # The W3 control head is exempt for the same reason and one more:
+            # zeroing a plain MLP is not a soft start, it is a dead one. With
+            # every weight and bias zero, GELU(0) = 0, so the second layer sees
+            # only zeros and BOTH layers' gradients are exactly zero -- the head
+            # could never train. It needs no gate because it feeds no shared
+            # output: policy and value are bit-identical whether it is present
+            # or not, so ordinary initialization is already switch-neutral.
             report["initialized"].append(key)
         else:
             new_state[key] = torch.zeros_like(tensor)
@@ -612,9 +683,47 @@ def load_checkpoint(
                 "(pass migrate=True for an additive warm start)"
             )
         checkpoint["migration"] = migrate_state_dict(stored_state, model)
+        _check_control_table(checkpoint, migrating=True)
         return checkpoint
     model.load_state_dict(stored_state)
+    _check_control_table(checkpoint, migrating=False)
     return checkpoint
+
+
+def _check_control_table(checkpoint: dict, *, migrating: bool) -> None:
+    """Refuse a checkpoint trained against a DIFFERENT control table.
+
+    The encoder signature pins the feature-name schema; it says nothing about
+    the cells behind those names. Serving a model against a regenerated table is
+    silent: the inputs keep their names and change their meaning, and the model
+    is simply worse for reasons nothing reports.
+
+    A checkpoint predating the digest carries none, and is accepted -- its
+    signature already differs, so it cannot reach the non-migrating path.
+    """
+
+    recorded = checkpoint.get("control_table_digest")
+    if recorded is None:
+        return
+    from .control_table import table_content_digest
+
+    current = table_content_digest()
+    if recorded == current:
+        return
+    if migrating:
+        # A migration is already an explicit "this model and this code differ".
+        # Record the mismatch rather than blocking a deliberate warm start.
+        checkpoint.setdefault("migration", {})["control_table_changed"] = {
+            "trained_with": recorded,
+            "loaded_with": current,
+        }
+        return
+    raise ValueError(
+        "checkpoint was trained against control table "
+        f"{recorded[:12]} but {current[:12]} is installed; the control features "
+        "keep their names and change their meaning. Restore the matching table "
+        "or migrate deliberately."
+    )
 
 
 def build_model(
@@ -625,6 +734,7 @@ def build_model(
     pooled_readout: bool = False,
     reply_head: bool = False,
     action_residual: bool = False,
+    control_head: bool = False,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -642,6 +752,7 @@ def build_model(
             pooled_readout=pooled_readout,
             reply_head=reply_head,
             action_residual=action_residual,
+            control_head=control_head,
         )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
@@ -658,6 +769,15 @@ def action_residual_from_config(config: dict) -> bool:
     """W5 scorer presence, false for every checkpoint predating the prototype."""
 
     return bool(config.get("action_residual", False))
+
+
+def control_head_from_config(config: dict) -> bool:
+    """W3 auxiliary control head, false for every checkpoint predating it.
+
+    Append-only and default-off, so an inherited checkpoint rebuilds as exactly
+    the model it was saved as."""
+
+    return bool(config.get("control_head", False))
 
 
 def pooled_readout_from_config(config: dict) -> bool:
@@ -697,6 +817,7 @@ def train_loop(
     # introduced, so this entry point could not run at all.
     optimizer_name: str = "adamw",
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
+    control_weight: float = CONTROL_WEIGHT_DEFAULT,
     log=print,
 ):
     """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
@@ -711,6 +832,7 @@ def train_loop(
     """
 
     model.to(device).train()
+    control_labels = control_table_for(model)
     # AdamW decouples decay (`w -= lr*lambda*w`, a fixed fractional shrink);
     # Adam folds it into the gradient as L2, so it passes through the adaptive
     # denominator and its RELATIVE strength grows as gradients shrink. The
@@ -743,6 +865,7 @@ def train_loop(
             batch = collate(
                 train_examples[start : start + batch_size], device,
                 contextual_actions=bool(getattr(model, "action_residual", False)),
+                control_table=control_labels,
             )
             optimizer.zero_grad(set_to_none=True)
             with _training_autocast(device, precision):
@@ -754,6 +877,7 @@ def train_loop(
                     value_weight,
                     value_bootstrap,
                     action_policy_weight=action_policy_weight,
+                    control_weight=control_weight,
                 )
             scaler.scale(total).backward()
             scaler.step(optimizer)
@@ -837,6 +961,7 @@ def train_steps(
     optimizer_name: str = "adamw",
     batch_getter=None,
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
+    control_weight: float = CONTROL_WEIGHT_DEFAULT,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -891,6 +1016,7 @@ def train_steps(
     # counted rather than averaged in.
     norm_steps = 0
     overflow_steps = 0
+    control_labels = control_table_for(model)
     window_start = time.time()
     window_steps = 0
 
@@ -915,6 +1041,7 @@ def train_steps(
             else collate(
                 [train_examples[i] for i in sampled], device,
                 contextual_actions=bool(getattr(model, "action_residual", False)),
+                control_table=control_labels,
             )
         )
         optimizer.zero_grad(set_to_none=True)
@@ -927,6 +1054,7 @@ def train_steps(
                 value_weight,
                 value_bootstrap,
                 action_policy_weight=action_policy_weight,
+                control_weight=control_weight,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
