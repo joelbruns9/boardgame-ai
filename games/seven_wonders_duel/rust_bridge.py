@@ -400,7 +400,11 @@ class _RustFlatBatchAdapter:
                 else torch.zeros(rows, dtype=torch.long)
             ),
         }
-        if bool(getattr(self.evaluator.model, "action_residual", False)):
+        # `getattr` on the evaluator too: not every evaluator carries a
+        # `.model` (stub and scalar evaluators do not), and W5a's probe assumed
+        # one existed.
+        if bool(getattr(getattr(self.evaluator, "model", None),
+                        "action_residual", False)):
             # The flat Rust boundary already supplies both ingredients. Build
             # the same padded legal-action view as Python inference without
             # changing the wire format or reimplementing legality in Python.
@@ -581,6 +585,10 @@ def rust_flat_batch_adapter(
 ):
     """Return the F4.5 flat-buffer adapter for the current Torch evaluator."""
 
+    # Rust encodes every search leaf, and its control channels need the table.
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
     return _RustFlatBatchAdapter(
         evaluator,
         diagnostic_sync=diagnostic_sync,
@@ -614,6 +622,12 @@ def rust_searcher_routed_flat_batch_adapter(
     different opponent assignments, keeping league generation in one scheduler
     call rather than splitting the slot pool.
     """
+    # Rust encodes here, and its control channels need the table. Every path
+    # that reaches `encode_into` installs it: forgetting is a panic at the first
+    # encode, which is the right failure but a late one.
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
 
     import torch
 
@@ -666,7 +680,11 @@ def rust_searcher_routed_flat_batch_adapter(
                 # Rust consumes only these two outputs. In particular, do not
                 # merge W5's train-only action-policy tensor across an arena in
                 # which one checkpoint predates the optional scorer.
-                outputs = {key: outputs[key] for key in ("policy", "value")}
+                outputs = {
+                    key: outputs[key]
+                    for key in ("policy", "value")
+                    if key in outputs
+                }
                 if combined is None:
                     # Under mixed precision the two nets return different
                     # dtypes -- that IS the treatment -- so the merged buffer
@@ -751,6 +769,12 @@ def rust_seat_routed_flat_batch_adapter(
        searcher. Kingdomino's ``row_search_actors`` documents the same
        distinction.
     """
+    # Rust encodes here, and its control channels need the table. Every path
+    # that reaches `encode_into` installs it: forgetting is a panic at the first
+    # encode, which is the right failure but a late one.
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
 
     import torch
 
@@ -786,7 +810,11 @@ def rust_seat_routed_flat_batch_adapter(
                     if key not in ("actors", "net_ids")
                 }
                 outputs = model(seat_batch)
-                outputs = {key: outputs[key] for key in ("policy", "value")}
+                outputs = {
+                    key: outputs[key]
+                    for key in ("policy", "value")
+                    if key in outputs
+                }
                 if combined is None:
                     combined = {
                         key: value.new_empty((len(actors), *value.shape[1:]))
@@ -1105,6 +1133,12 @@ def rust_scalar_net_adapter(evaluator):
     Lifted out of `test_rust_engine_equiv._make_net_adapter` so the advisor and
     the equivalence gate drive the searcher through the identical adapter.
     """
+    # Rust encodes here, and its control channels need the table. Every path
+    # that reaches `encode_into` installs it: forgetting is a panic at the first
+    # encode, which is the right failure but a late one.
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
 
     token_types = list(TokenType)
 

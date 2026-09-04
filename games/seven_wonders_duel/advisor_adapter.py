@@ -670,6 +670,9 @@ class SevenWondersAdvisor:
             if leaf_batch > 1
             else rust_scalar_net_adapter(evaluator)
         )
+        from .control_table import ensure_rust_table
+
+        ensure_rust_table()
         search = seven_wonders_rust.RustPuctSearch.open(
             rust_game_from_state(state.game),
             adapter,

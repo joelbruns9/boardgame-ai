@@ -48,7 +48,7 @@ from .rust_bridge import rust_flat_batch_adapter, rust_game_for_self_play
 
 SCHEMA = "f4-cost-model-1"
 #: Widest token feature vector, from the encoder schema. Bump with it.
-FEATURE_WIDTH = 132
+from .dataset import MAX_FEATURES as FEATURE_WIDTH  # never a literal: it moves
 DEFAULT_ROWS = (1, 8, 27, 64, 128, 256)
 
 
@@ -58,6 +58,12 @@ def collect_corpus(games: int, seed: int, stride: int = 3) -> list[dict]:
     Rows carry exactly what the flat boundary needs: the encoder token list, the
     acting seat, and the legal action indices.
     """
+    # Rust encodes here, and its control channels need the table. Every path
+    # that reaches `encode_into` installs it: forgetting is a panic at the first
+    # encode, which is the right failure but a late one.
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
 
     rng = random.Random(seed)
     corpus: list[dict] = []

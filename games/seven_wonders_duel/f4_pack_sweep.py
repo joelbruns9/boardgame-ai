@@ -39,6 +39,8 @@ from pathlib import Path
 
 import seven_wonders_rust
 
+from .control_table import ensure_rust_table
+
 from .cloud_preflight import container_limits
 from .rust_bridge import rust_game_for_self_play
 
@@ -138,6 +140,7 @@ def main() -> None:
         corpus = full_corpus[:rows]
         for count in threads:
             samples = [
+                ensure_rust_table()
                 seven_wonders_rust.bench_pack_routed(corpus, args.iterations, count)
                 for _ in range(args.repetitions)
             ]

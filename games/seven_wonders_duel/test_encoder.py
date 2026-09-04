@@ -438,9 +438,17 @@ def test_pending_mausoleum_choice_counts_as_reachable():
 
 def test_encoder_signature_is_pinned():
     # Bump ENCODER_VERSION and this pin together on any schema change (§5.8).
+    #
+    # 7wd-encoder-6 (W3): six control channels per tableau token and
+    # `control_valid` on GLOBAL. Regenerating a golden is how an UNINTENDED
+    # encoder change hides, so the evidence that this one is intended is
+    # recorded rather than assumed: 2,729 per-slot channels were checked against
+    # the live solver with zero mismatches, Python and Rust encode 205 real rows
+    # bit-identically, and every inapplicable position carries all-zero control
+    # channels with `control_valid` 0.
     assert (
         ENCODER_SIGNATURE
-        == "24e15b12e1e7cd9f2222a32c1ec022140a42957c42c2c5c5ba352207166a8975"
+        == "36b2ffa5cfd58e5b16aaa5b515f70ce6ccd49d27bd1ab8eb52355c223960c4e3"
     )
 
 
@@ -448,7 +456,7 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "22b9b0a8b0381f3de284b622a59ff8ae2626d926acb7c800bc541e79865fbe66"
+        == "2b83ae656ea7d16f7e6698fc4627aaecd299ebe784c524ff4efd8ede2b5979d0"
     )
 
 
@@ -457,7 +465,7 @@ def test_golden_digests_cover_draft_and_pending_states():
     apply_action(draft, legal_actions(draft)[0])
     assert (
         _digest(encode(draft.observation(0)))
-        == "b48a15fd8f87d5c93c98a345aaa6c8fc2114bb4444b5b1d8fcda92c7699ac0d9"
+        == "8be989c8876246b214465fbd756e47b34438455368b8569a36d27cb9e13258b8"
     )
 
     library = _playing_game(400)
@@ -468,5 +476,5 @@ def test_golden_digests_cover_draft_and_pending_states():
     assert library.pending_choice is not None
     assert (
         _digest(encode(library.observation(0)))
-        == "9bb1fad1037ec4d611c5a629a506204e0e5503ef6c4c9a18e2abe41e2e3ab7c7"
+        == "98a2aeb5618168895fa27ab2bec228061d44b66e6ea2a5a97e2eedc7310713ec"
     )
