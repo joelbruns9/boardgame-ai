@@ -548,8 +548,14 @@ def make_checkpoint(model, config: dict) -> dict:
     # that later rejects a perfectly loadable checkpoint.
     if _reads_control_features(model):
         from .control_table import table_content_digest
+        from .encoder import control_features_enabled
 
-        out["control_table_digest"] = table_content_digest()
+        # Which ARM this is. Both arms share a signature and a width by design,
+        # so without this a baseline and an inputs model are indistinguishable
+        # on disk -- and a result could be attributed to the wrong one.
+        out["control_features"] = "on" if control_features_enabled() else "off"
+        if control_features_enabled():
+            out["control_table_digest"] = table_content_digest()
     return out
 
 
@@ -701,6 +707,19 @@ def _check_control_table(checkpoint: dict, *, migrating: bool) -> None:
     A checkpoint predating the digest carries none, and is accepted -- its
     signature already differs, so it cannot reach the non-migrating path.
     """
+
+    # Arm mismatch is not fatal -- a baseline checkpoint is perfectly loadable
+    # under either setting -- but serving it under the other arm silently
+    # changes what the model is shown, so it is surfaced.
+    arm = checkpoint.get("control_features")
+    if arm is not None:
+        from .encoder import control_features_enabled
+
+        live = "on" if control_features_enabled() else "off"
+        if arm != live:
+            checkpoint["control_features_mismatch"] = {
+                "trained_with": arm, "loaded_with": live,
+            }
 
     recorded = checkpoint.get("control_table_digest")
     if recorded is None:

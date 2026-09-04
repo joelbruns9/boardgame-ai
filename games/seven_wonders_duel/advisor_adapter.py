@@ -402,7 +402,7 @@ class SevenWondersAdvisor:
         evaluator: Any = None,
         default_checkpoint: str | None = None,
         device: str = "cpu",
-        allow_encoder_migration: bool = False,
+        allow_encoder_migration: bool | None = None,
         exact_endgame: bool = False,
     ):
         self._injected = evaluator
@@ -413,9 +413,22 @@ class SevenWondersAdvisor:
         # runs concurrently with MCTS under its own bounded clock.
         self._exact_endgame = bool(exact_endgame)
         # Serve a checkpoint whose encoder signature predates the live encoder.
-        # Off by default -- the signature guard exists because a net fed
-        # redefined features is silently wrong. On, every response carries a
-        # warning, because the human reading the numbers needs to know.
+        # The signature guard exists because a net fed redefined features is
+        # silently wrong, so this stays off unless asked for -- and when on,
+        # every response carries a warning, because the human reading the
+        # numbers needs to know.
+        #
+        # `None` means "read SWD_ADVISOR_ALLOW_MIGRATION". `web_app` already
+        # honoured that variable while `games/advisor/app.py` constructs this
+        # bare, so the same host could serve or refuse depending on which entry
+        # point started it. Defaulting from the environment here makes the two
+        # agree instead of leaving the flag to whichever caller remembered it.
+        if allow_encoder_migration is None:
+            import os
+
+            allow_encoder_migration = os.environ.get(
+                "SWD_ADVISOR_ALLOW_MIGRATION", ""
+            ).strip().lower() not in ("", "0", "false", "no")
         self._allow_encoder_migration = bool(allow_encoder_migration)
         self._eval_cache: dict[tuple[str | None, str], Any] = {}
 

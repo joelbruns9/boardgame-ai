@@ -2998,8 +2998,26 @@ fn control_table_digest() -> Option<String> {
     crate::control::installed_digest()
 }
 
+/// Turn the W3 control INPUTS on or off. Off emits zeros in the same channels,
+/// so the baseline arm differs from the input arm only in what it is shown.
+#[pyfunction]
+fn set_control_features_enabled(enabled: bool) {
+    crate::control::set_enabled(enabled);
+}
+
+#[pyfunction]
+fn control_features_enabled() -> bool {
+    crate::control::enabled()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
+    #[pymodule_export]
+    use super::set_control_features_enabled;
+
+    #[pymodule_export]
+    use super::control_features_enabled;
+
     #[pymodule_export]
     use super::control_table_digest;
 

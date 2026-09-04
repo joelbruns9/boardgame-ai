@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import os
 import json
 import random
 
@@ -705,6 +706,44 @@ def _global_token(derived: _Derived) -> Token:
 #: every other normalized feature.
 _CONTROL_TURN_SCALE = 20.0
 
+#: Input-off mode: emit the control channels as zeros, with `control_valid` 0.
+#:
+#: The channels STAY in the schema. Removing them would change `MAX_FEATURES`
+#: and the signature, so the two arms would differ in width and architecture and
+#: the comparison would be confounded by more than the feature. With the values
+#: pinned to zero the arms are bit-identical in shape, and the input projection's
+#: control columns receive exactly zero gradient -- x is zero, so dL/dW is zero
+#: -- which means they never move from their zero initialisation. The model
+#: cannot use control, rather than merely being discouraged from it.
+#:
+#: Off-mode looks to the network exactly like a position with no control answer,
+#: which is a state it already has to handle on 16.7% of rows.
+_CONTROL_ENABLED = os.environ.get(
+    "SWD_CONTROL_FEATURES", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+
+def control_features_enabled() -> bool:
+    return _CONTROL_ENABLED
+
+
+def set_control_features(enabled: bool) -> None:
+    """Turn the control INPUTS on or off, in Python and in Rust together.
+
+    Setting one language only would be worse than either arm: the replay path
+    and the self-play path would disagree about what the model is being shown.
+    """
+
+    global _CONTROL_ENABLED
+    _CONTROL_ENABLED = bool(enabled)
+    try:
+        import seven_wonders_rust
+    except ImportError:
+        return
+    setter = getattr(seven_wonders_rust, "set_control_features_enabled", None)
+    if setter is not None:
+        setter(bool(enabled))
+
 
 def _control_maps(obs):
     """The three control maps for this position, or None where inapplicable.
@@ -719,6 +758,8 @@ def _control_maps(obs):
     from .control_table import control_key_from_observation, default_table
     from .tableau_control import ATTACKER, DEFENDER, Layout, _as_theology
 
+    if not _CONTROL_ENABLED:
+        return None
     key = control_key_from_observation(obs)
     if key is None:
         return None

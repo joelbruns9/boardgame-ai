@@ -115,6 +115,7 @@ pub fn control_key_word(state: &GameState) -> u64 {
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 pub const UNREACH: u8 = 254;
@@ -135,6 +136,20 @@ struct AgePlane {
 }
 
 static TABLE: OnceLock<ControlTable> = OnceLock::new();
+
+/// Input-off mode. The channels stay in the schema and are emitted as zeros,
+/// so both arms share a width, a signature and an architecture, and the only
+/// difference is what the network is shown. Must track Python exactly: the two
+/// languages disagreeing about what the model sees is worse than either arm.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
 
 /// Install the table Python is itself using.
 ///
@@ -295,6 +310,9 @@ pub fn as_theology(tempo: [u8; 5], player: usize) -> [u8; 5] {
 /// genuine all-unreachable position. A missing table is a deployment error and
 /// must stop the run at the first encode, not degrade it silently.
 pub fn control_maps(state: &GameState) -> Option<[&'static [u8]; 3]> {
+    if !enabled() {
+        return None;
+    }
     let (age, mask, who, tempo) = unpack(control_key_word(state))?;
     let table = table().expect(
         "control table not installed: call seven_wonders_rust.set_control_table()          with control_table.table_blob() before encoding",

@@ -190,3 +190,95 @@ def test_valid_positions_appear_and_are_the_common_case():
         game = adapter.step(game, rng.choice(legal))
     assert total > 50
     assert 0.6 < valid / total < 0.95, f"valid fraction {valid / total:.2f}"
+
+
+# -- input-off mode: the baseline arm ---------------------------------------
+
+
+def test_input_off_zeroes_every_control_channel():
+    """The baseline arm must show the network nothing.
+
+    Not "discouraged from using control" -- unable to. With the inputs pinned to
+    zero the projection's control columns receive exactly zero gradient, so they
+    never move from their zero initialisation.
+    """
+
+    from .encoder import control_features_enabled, set_control_features
+
+    game = _playing_game(30)
+    obs = game.observation(game.active_player)
+    assert _valid(obs) == 1.0, "this position is control-valid with the arm on"
+
+    set_control_features(False)
+    try:
+        assert control_features_enabled() is False
+        encoding = encode(obs)
+        global_token = next(
+            t for t in encoding.tokens if t.type is TokenType.GLOBAL
+        )
+        assert global_token.features[_VALID] == 0.0
+        for token in encoding.tokens:
+            if token.type is TokenType.TABLEAU:
+                window = token.features[_FIRST:_FIRST + len(CONTROL_FEATURES)]
+                assert all(value == 0.0 for value in window)
+    finally:
+        set_control_features(True)
+    assert _valid(obs) == 1.0, "the arm must be restorable"
+
+
+def test_input_off_changes_only_the_control_columns():
+    """Off-mode is the on-mode encoding with those columns zeroed, and nothing
+    else. If any other feature moved, the arms would differ by more than the
+    thing under test."""
+
+    from .encoder import set_control_features
+
+    game = _playing_game(30)
+    obs = game.observation(game.active_player)
+    on = _strip_control(encode(obs))
+    set_control_features(False)
+    try:
+        off = _strip_control(encode(obs))
+    finally:
+        set_control_features(True)
+    assert _digest(on) == _digest(off)
+
+
+def test_both_languages_agree_in_off_mode():
+    """Setting one language only would be worse than either arm: the replay and
+    self-play paths would disagree about what the model is shown."""
+
+    import numpy as np
+
+    from .buffer import GameRecorder
+    from .codec import legal_action_indices
+    from .control_table import ensure_rust_table
+    from .dataset import derive_records_rust, examples_from_record
+    from .encoder import set_control_features
+
+    if not ensure_rust_table():
+        pytest.skip("seven_wonders_rust not available")
+
+    recorder = GameRecorder(505, agents={"p0": "t", "p1": "t"})
+    rng = random.Random(5051)
+    while recorder.game.phase.value != "complete":
+        choice = rng.choice(legal_action_indices(recorder.game))
+        recorder.play(choice, policy_target={choice: 1.0})
+    record = recorder.finish()
+
+    set_control_features(False)
+    try:
+        python_rows = examples_from_record(record)
+        rust_rows = derive_records_rust([record])[0][0]
+        assert len(python_rows) == len(rust_rows)
+        for py, rs in zip(python_rows, rust_rows):
+            a = np.asarray(py.features, dtype=np.float64)
+            b = np.asarray(rs.features, dtype=np.float64)
+            assert a.shape == b.shape
+            assert np.abs(a - b).max() == 0.0
+        # ...and Rust really is off, not merely equal by luck.
+        import seven_wonders_rust
+
+        assert seven_wonders_rust.control_features_enabled() is False
+    finally:
+        set_control_features(True)
