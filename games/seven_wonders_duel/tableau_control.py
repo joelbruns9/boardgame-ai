@@ -46,9 +46,22 @@ import functools
 from dataclasses import dataclass
 
 from .data import TABLEAU_LAYOUTS, covering_slots
-from .search import state_actor
 
 ATTACKER, DEFENDER = 0, 1
+
+
+def _actor(state) -> int:
+    """Whose decision this is. Inlined from `search.state_actor`.
+
+    Importing it would make this module depend on `search`, and through it on
+    `inference` and `dataset` -- a cycle that forced every consumer of the
+    control table (the encoder included) into lazy imports. Four lines is a
+    cheaper price than that, and it works on an observation as well as on a
+    GameState, which is what the encoder actually holds.
+    """
+
+    pending = getattr(state, "pending_choice", None)
+    return pending.player if pending is not None else state.active_player
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,7 +453,7 @@ def control_features(game, seat: int) -> dict:
     total = bin(present).count("1")
     if not total:
         return {}
-    on_move = state_actor(game) == seat
+    on_move = _actor(game) == seat
     now = tempo_state(game, seat)
     solver = ControlSolver(game.tableau.age)
 

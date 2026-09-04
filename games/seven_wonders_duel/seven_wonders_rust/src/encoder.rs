@@ -28,12 +28,12 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "24e15b12e1e7cd9f2222a32c1ec022140a42957c42c2c5c5ba352207166a8975";
+    "36b2ffa5cfd58e5b16aaa5b515f70ce6ccd49d27bd1ab8eb52355c223960c4e3";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
 /// bit-exact gate enforces it in release via the value comparison.
-pub const FEATURE_COUNTS: [usize; 9] = [132, 1, 26, 1, 8, 4, 1, 79, 14];
+pub const FEATURE_COUNTS: [usize; 9] = [133, 1, 32, 1, 8, 4, 1, 79, 14];
 
 /// Widest token feature vector — the padded row width every packed batch uses.
 ///
@@ -79,7 +79,7 @@ pub struct Token {
 /// Reusable token buffer (CORE_UTILIZATION_PLAN.md step 2a).
 ///
 /// The encoder used to allocate one feature vector per token -- often for a
-/// single float, since FEATURE_COUNTS is [132, 1, 26, 1, 8, 4, 1, 79, 14] --
+/// single float, since FEATURE_COUNTS is [133, 1, 32, 1, 8, 4, 1, 79, 14] --
 /// which is ~200 M allocations in a six-minute generation run. This retains the
 /// token vector and every token's feature buffer across calls, so after the
 /// first row an encode allocates nothing.
@@ -523,6 +523,9 @@ impl Enc<'_> {
         // there in both languages.
         v.push((present % 2) as f64);
         v.push(if g.conflict_position == 0 { 1.0 } else { 0.0 });
+        // W3 applicability. Zero outside a clean PlayAge state, and then every
+        // control channel on every tableau token is zero too.
+        v.push(if crate::control::control_maps(g).is_some() { 1.0 } else { 0.0 });
     }
 
     // --- tableau -------------------------------------------------------------
@@ -578,6 +581,8 @@ impl Enc<'_> {
             })
             .collect();
         present.sort_by_key(|&(row, x, _)| (row, x));
+        // One key and three lookups for the whole position, not per slot.
+        let control = crate::control::control_maps(g);
 
         for &(row, x, i) in &present {
             let slot_card = &g.tableau.slots[i];
@@ -613,6 +618,26 @@ impl Enc<'_> {
             } else {
                 entity = 73 + back_type_of(slot_card.card_id) as i32;
                 v.extend(std::iter::repeat(0.0).take(2 * 9));
+            }
+            // W3 control, appended last to match TABLEAU_FEATURES. Two channels
+            // per map: reachability, then a scaled turn count that is zero
+            // whenever the flag is zero. UNREACH is 254 and must never reach the
+            // network as a distance.
+            match control {
+                None => v.extend(std::iter::repeat(0.0).take(6)),
+                Some(maps) => {
+                    for cells in maps {
+                        let cell = cells[i];
+                        if cell == crate::control::UNREACH || cell == crate::control::ABSENT {
+                            v.extend_from_slice(&[0.0, 0.0]);
+                        } else {
+                            v.extend_from_slice(&[
+                                1.0,
+                                (cell as f64).min(20.0) / 20.0,
+                            ]);
+                        }
+                    }
+                }
             }
             out.set_entity(entity);
         }

@@ -11,6 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod cost_model;
 mod bots;
+mod control;
 mod chance;
 mod codec;
 mod data;
@@ -2980,8 +2981,31 @@ fn endgame_solver() -> (u64, f64, usize, bool) {
     self_play::endgame_solver()
 }
 
+/// Install the W3 control table Python is already using.
+///
+/// The bytes come from `control_table.table_blob`, so both languages read the
+/// same table by construction rather than by agreement between two loaders.
+/// Encoding a clean PlayAge position without it panics rather than emitting
+/// zeros -- zeros would read as "the opponent reaches every slot first".
+#[pyfunction]
+fn set_control_table(blob: &[u8]) -> PyResult<()> {
+    crate::control::install(blob).map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Hex digest of the installed W3 control table, or None.
+#[pyfunction]
+fn control_table_digest() -> Option<String> {
+    crate::control::installed_digest()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
+    #[pymodule_export]
+    use super::control_table_digest;
+
+    #[pymodule_export]
+    use super::set_control_table;
+
     #[pymodule_export]
     use super::RustGame;
 

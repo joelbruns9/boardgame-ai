@@ -40,6 +40,7 @@ pub(crate) struct DerivedGame {
     aux_ids: Vec<u8>,
     features: Vec<u8>,
     row_move_indices: Vec<u8>,
+    control_keys: Vec<u8>,
     move_legal_offsets: Vec<u8>,
     move_legal_actions: Vec<u8>,
     move_actors: Vec<u8>,
@@ -160,6 +161,9 @@ fn derive_one(mut spec: DeriveSpec) -> Result<DerivedGame, String> {
             token_count += tokens.len();
             push_u32(&mut out.token_offsets, token_count)?;
             push_u32(&mut out.row_move_indices, move_index)?;
+            // W3: one u64 per row, 0 where the position has no control label.
+            out.control_keys
+                .extend_from_slice(&crate::control::control_key_word(&spec.state).to_le_bytes());
         }
 
         let decoded = decode_action(&spec.state, action);
@@ -276,6 +280,7 @@ pub(crate) fn to_python(py: Python<'_>, games: Vec<DerivedGame>) -> PyResult<Vec
             payload.set_item("aux_ids", packed_bytes(py, &game.aux_ids))?;
             payload.set_item("features_f64", packed_bytes(py, &game.features))?;
             payload.set_item("row_move_indices", packed_bytes(py, &game.row_move_indices))?;
+            payload.set_item("control_keys", packed_bytes(py, &game.control_keys))?;
             payload.set_item(
                 "move_legal_offsets",
                 packed_bytes(py, &game.move_legal_offsets),

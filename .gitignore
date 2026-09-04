@@ -76,9 +76,3 @@ tmp/
 # Model checkpoints staged into an extension folder for local testing.
 extension_*/*.pt
 
-# W3 control table: 8.7 MB, regenerable in ~2.4 min via
-#   python -m games.seven_wonders_duel.control_table build
-# Its contract (schema, rule identity, digest) lives in the manifest, and the
-# test suite builds a subset when this is absent, so a clean checkout still
-# exercises agreement with the solver.
-games/seven_wonders_duel/testdata/control_table/

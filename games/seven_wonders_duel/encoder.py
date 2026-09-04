@@ -67,7 +67,7 @@ from .rules import Resource, discard_income
 # Additive, so the names move the hash on their own; no existing feature
 # changed meaning. Both are tempo primitives -- see GLOBAL_FEATURES. Batched
 # with -3 because -3's retrain had not run yet, so this costs nothing extra.
-ENCODER_VERSION = "7wd-encoder-5"
+ENCODER_VERSION = "7wd-encoder-6"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)
@@ -210,6 +210,17 @@ GLOBAL_FEATURES = (
     # repeats a turn -- exactly when the age-transition fight is live.
     "cards_remaining_odd",
     "military_tied",
+    #: Workstream 3 applicability. 1 only in a clean PLAY_AGE state; 0 elsewhere,
+    #: and then every `control_*` channel on every tableau token is 0 too.
+    #:
+    #: Load-bearing, not decorative. Outside PLAY_AGE, or with a pending choice,
+    #: the current decision-maker is NOT the next tableau mover -- the engine
+    #: defers `pending_extra_turn`, and resolving a progress token can restate
+    #: the tempo the control map was solved under. That is 16.7% of states, and
+    #: WONDER_DRAFT emits no tableau tokens at all. Without this flag the net
+    #: could not tell a genuine "the opponent reaches everything first" from
+    #: "this position has no control answer".
+    "control_valid",
 )
 
 _TABLEAU_PER_PLAYER = (
@@ -223,6 +234,24 @@ _TABLEAU_PER_PLAYER = (
     "would_cross_token",
     "would_win_military",
 )
+#: Workstream 3. Exact positional control for THIS slot, read from the
+#: precomputed table (`control_table.py`) rather than inferred.
+#:
+#: Two channels per map, and the distance is meaningless without the flag:
+#: `_INF` is 99 and feeding it as a turn count would swamp every other input,
+#: so an unreachable slot is `(0, 0)` and never a large number. Only maps whose
+#: contingency lies beyond what search will expand earn a channel -- spending a
+#: Wonder is one legal action away and search expands it, whereas Theology may
+#: be many plies off and swings up to 18 slots.
+#:
+#: Every channel is zero unless `control_valid` on the GLOBAL token is 1.
+_CONTROL_MAPS = ("now", "theology_mine", "theology_theirs")
+CONTROL_FEATURES = tuple(
+    f"control_{name}_{suffix}"
+    for name in _CONTROL_MAPS
+    for suffix in ("can_force", "turns_s")
+)
+
 TABLEAU_FEATURES = (
     "row",
     "row_s",
@@ -234,6 +263,7 @@ TABLEAU_FEATURES = (
     "covers_hidden",
     *(f"my_{name}" for name in _TABLEAU_PER_PLAYER),
     *(f"opp_{name}" for name in _TABLEAU_PER_PLAYER),
+    *CONTROL_FEATURES,
 )
 
 DRAFT_OFFER_FEATURES = ("second_round",)
@@ -664,10 +694,60 @@ def _global_token(derived: _Derived) -> Token:
     # Appended last, matching GLOBAL_FEATURES; see the note there.
     values.append(float(len(present) % 2))
     values.append(1.0 if obs.conflict_position == 0 else 0.0)
+    values.append(0.0 if _control_maps(obs) is None else 1.0)
     return _token(TokenType.GLOBAL, 0, values)
 
 
 # --- tableau tokens ---------------------------------------------------------
+
+
+#: Attacker turns are 0..~20; scaled so the channel sits on the same range as
+#: every other normalized feature.
+_CONTROL_TURN_SCALE = 20.0
+
+
+def _control_maps(obs):
+    """The three control maps for this position, or None where inapplicable.
+
+    Read from the precomputed table, never solved here: solving costs 816 ms
+    mean and 5.8 s worst against a ~1 ms leaf, which is why W3 ships a table at
+    all. A miss raises rather than defaulting -- a zero-filled control channel
+    reads as "the opponent reaches everything first", which is a confident lie
+    rather than a missing feature.
+    """
+
+    from .control_table import control_key_from_observation, default_table
+    from .tableau_control import ATTACKER, DEFENDER, Layout, _as_theology
+
+    key = control_key_from_observation(obs)
+    if key is None:
+        return None
+    age, mask, who_moves, tempo = key
+    table = default_table()
+    return Layout.for_age(age), (
+        table.lookup(age, mask, who_moves, tempo),
+        table.lookup(age, mask, who_moves, _as_theology(tempo, ATTACKER)),
+        table.lookup(age, mask, who_moves, _as_theology(tempo, DEFENDER)),
+    )
+
+
+def _control_values(control, slot_id) -> list[float]:
+    """Per-slot control channels, in `CONTROL_FEATURES` order."""
+
+    if control is None:
+        return [0.0] * len(CONTROL_FEATURES)
+    from .control_table import UNREACH
+
+    layout, maps = control
+    index = layout.index[slot_id]
+    out: list[float] = []
+    for cells in maps:
+        cell = int(cells[index])
+        if cell == UNREACH:
+            out.extend([0.0, 0.0])          # no distance without reachability
+        else:
+            out.extend([1.0, min(cell, _CONTROL_TURN_SCALE) / _CONTROL_TURN_SCALE])
+    return out
 
 
 def _tableau_card_per_player(derived: _Derived, seat: int, card_name: str) -> list[float]:
@@ -709,6 +789,7 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
         (slot.row, slot.x): slot for slot in TABLEAU_LAYOUTS[max(obs.age, 1)]
     }
     present = {card.slot_id: card for card in obs.tableau if card.present}
+    control = _control_maps(obs)
     tokens = []
     for slot_id in sorted(present):
         public = present[slot_id]
@@ -744,6 +825,7 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
         else:
             entity = 73 + _BACK_ID[public.back]
             values.extend([0.0] * (2 * len(_TABLEAU_PER_PLAYER)))
+        values.extend(_control_values(control, slot_id))
         tokens.append(_token(TokenType.TABLEAU, entity, values))
     return tokens
 
