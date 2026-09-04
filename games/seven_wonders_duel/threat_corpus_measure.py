@@ -104,6 +104,8 @@ def triage_position(row, args, log) -> dict:
     ]
     if args.allow_migration:
         cmd.append("--allow-migration")
+    if args.checkpoint:
+        cmd += ["--checkpoint", str(args.checkpoint)]
     if artifact.exists() and not args.force:
         elapsed = 0.0
         result = None
@@ -187,6 +189,8 @@ def run_position(row, args, log) -> dict:
     ]
     if args.allow_migration:
         cmd.append("--allow-migration")
+    if args.checkpoint:
+        cmd += ["--checkpoint", str(args.checkpoint)]
     if tracked:
         cmd += ["--tracked", tracked]
     if args.trace and tracked:
@@ -291,6 +295,11 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--summary-out", default=None)
+    parser.add_argument("--checkpoint", default=None,
+                        help="measure THIS model rather than w9_reference_case's "
+                             "default. Required to compare A/B arms: without it "
+                             "every arm would be measured against the same "
+                             "incumbent and report identical regret.")
     parser.add_argument("--allow-migration", action="store_true",
                         help="measure a checkpoint whose encoder signature has "
                              "moved, warm-started additively. Required after a "
