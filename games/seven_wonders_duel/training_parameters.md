@@ -2552,3 +2552,19 @@ reverts switch generation back to the protected best while the learner keeps
 its weights and keeps training, and only the third reverting gate rolls the
 learner back. Probations do not erase that decisive evidence, but an explicitly
 suppressed schedule-knot revert advances none of the lifecycle counters.
+
+## Workstream 5a: the contextual action residual
+
+Off by default. The shared scorer exists behind a gate initialised to exactly
+zero, so a model built with it computes bit-identically to one without until the
+gate is trained.
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--action-residual` / `--no-action-residual` | off | build the shared contextual action scorer. Off means the model has no scorer parameters at all, not a scorer that is ignored. |
+| `--action-policy-weight` | see `ACTION_POLICY_WEIGHT_DEFAULT` | weight on the scorer's independent action-policy loss. This is what trains the scorer while it is shadowed; it is masked to the legal set, so illegal actions cannot absorb probability. |
+| `--train-action-gate` / `--no-train-action-gate` | off | let the gate move. While off the served policy is exactly the inherited one, whatever the scorer has learned. Turning it on is the moment W5a can change play, and should be a deliberate arm rather than a default. |
+
+Requiring `--action-policy-weight > 0` without `--action-residual` is refused:
+the weight would silently do nothing, which reads as a configured run and is not
+one.

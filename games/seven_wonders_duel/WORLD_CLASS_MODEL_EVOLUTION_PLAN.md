@@ -603,7 +603,17 @@ For each tactical position, record the best action, alternatives, action value,
 regret, preventability, oracle source, search budget, and whether hidden chance
 was enumerated or sampled.
 
+> **Status convention.** Every workstream carries one `**Status: ...**` line
+> directly under its heading, and that line is the single source of truth --
+> there is deliberately no summary table to drift out of step with it. List them
+> all with `grep -n "^\*\*Status:" WORLD_CLASS_MODEL_EVOLUTION_PLAN.md`.
+> States used: `NOT STARTED`, `PARTIAL`, `MEASURED -- NULL`, `POLICY, NOT A
+> BUILD`. "Built" never implies strength evidence; where that is missing the
+> line says so.
+
 ## Workstream 1: learned tableau positions
+
+**Status: NOT STARTED.** Learned `AGE_AND_SLOT` embedding. Not superseded by W3 -- W3 supplies an exact VALUE, W1 supplies the stable slot identity to attach it to, and the existing row/x features stay. Zero-init migration is minutes; training the embeddings is the overnight part.
 
 ### Change
 
@@ -642,6 +652,8 @@ tolerance. Train the new table while retaining all existing weights.
 - Promotion only after general and tactical arenas pass.
 
 ## Workstream 2: graph-aware tableau encoding
+
+**Status: NOT STARTED.** Tableau graph module. Depends on W1 (consumes slot identities) and solves over the same cover relation W3 does.
 
 ### First implementation
 
@@ -701,6 +713,8 @@ biases in the main Transformer. Do this after measuring whether a custom
 attention path reduces optimized inference throughput.
 
 ## Workstream 3: public tableau-control engine
+
+**Status: PARTIAL -- built, no strength evidence.** BUILT: exact solver (`tableau_control.py`, three independent oracles), the 434,720-key precomputed table (`control_table.py`, ~8.7 MB, 0.4 core-hours), the auxiliary control head, and the Rust key path with Python/Rust parity. NOT BUILT: control as an encoder INPUT, which is the actual W3 change. No arm has run. See `W3_ENCODER_INTEGRATION_REVIEW_REQUEST.md`.
 
 ### Purpose
 
@@ -933,6 +947,8 @@ additional neural simulations it displaces.
 
 ## Workstream 4: consistent winner/victory-type value
 
+**Status: NOT STARTED.** Hierarchical `P(win,draw,loss)` x `P(type | win/loss)` head. Distinct from the W3 auxiliary control head, which predicts the control map -- the two are easy to conflate because both are shadow-mode heads that defer a Rust integration. Distributional MCTS backup is separate work again.
+
 ### Current limitation
 
 The existing WDL and seven-way (`joint7`) heads are independent. MCTS backs up
@@ -1029,6 +1045,8 @@ separately; `inference.py` already emits `joint7` per evaluation, so no extra
 forward pass is needed -- the cost is carrying it across the boundary.
 
 ## Workstream 5: legal-action tokens
+
+**Status: PARTIAL -- W5a built, not strength tested.** W5a prototype (2026-09-03, `08be645`): all 1,202 actions decomposed, shared contextual scorer behind `action_residual=False` and an exactly-zero gate. Strength and throughput unvalidated. W5b -- the same scorer fed contextual slot (W1), graph (W2) and control (W3) outputs, plus an `exposes` index so a burial action can reach the slot it uncovers -- needs those first.
 
 **Prototype implementation status (2026-09-03): focused mechanism tests pass;
 playing strength and throughput not yet validated.** The
@@ -1162,6 +1180,8 @@ requiring every card/Wonder action index to receive sufficient direct examples.
 
 ## Workstream 6: search integration
 
+**Status: NOT STARTED.** Search integration / exploiting exact public tactics directly. Note W11 tested one member of this family and was a null.
+
 The neural changes should reduce the simulations needed to see forced lines,
 but a world-class player should also exploit exact public tactics directly.
 
@@ -1202,6 +1222,8 @@ lowers simulations per second; a graph module that consumes substantial GPU
 time must earn back that cost in compute-normalized arenas.
 
 ## Workstream 7: evolving specialist opponents
+
+**Status: NOT STARTED.** Specialist opponents. Deliberately last.
 
 ### Timing and purpose
 
@@ -1272,6 +1294,8 @@ much overall strength.
 
 ## Workstream 8: scale only after representation improvements
 
+**Status: POLICY, NOT A BUILD.** Encoder width may change; trunk and head size only on measured capacity saturation. `PLATEAU_FINDINGS.md` records <=0.19 nats of policy headroom and a model that overfits a narrow slice, so it is not capacity-starved on fitting.
+
 Do not assume that matching ZeusAI's approximately 92M parameters is the first
 solution. The current 15.8M model is more rule-aware, but its tableau structure
 and action representation are indirect.
@@ -1291,7 +1315,9 @@ Promote scale only if it improves the strongest complete architecture.
 
 ## Workstream 9: shared action statistics across chance siblings
 
-**Status: prototyped, measured, and not promoted.** Both mechanisms are built in
+**Status: MEASURED -- NULL.** Mechanisms do not solve the reference case; funding improves 37-58% and changes no recommendation.
+
+**Detail.** Prototyped, measured, and not promoted. Both mechanisms are built in
 `search.py` behind flags defaulting to off (`chance_sibling_bias`,
 `wonder_group_selection`), with exact off-equivalence verified. Neither solves
 the reference case. Mechanism 2 delivers a real correctness property with no
@@ -1679,7 +1705,9 @@ not an action.
 
 ## Workstream 10: approximate afterstate clustering across chance siblings
 
-**Status: NOT built, not a transposition, and its cost is unmeasured.** Both
+**Status: MEASURED -- NULL.** Demonstrably unsound where the revealed identity survives; not shown sound where it does not; runtime licensing unsolved.
+
+**Detail.** NOT built, not a transposition, and its cost is unmeasured. Both
 Workstream 9 flags stay off. Under the information-state key this position
 produces exactly one real cluster, which agrees perfectly -- so the design's
 soundness is untested rather than confirmed, and both negative controls this
@@ -1986,9 +2014,11 @@ it has to beat.
   single draw. Fine for shape detection; not for the reveal probabilities the
   baseline package eventually wants.
 
-## Workstream 11: public tactical leaf extension -- BUILT, and a NULL
+## Workstream 11: public tactical leaf extension
 
-**Status: built, measured, not the fix. Flag off by default.**
+**Status: MEASURED -- NULL.** Recovers 7 of 37 points of the post-burial leaf error; premise falsified.
+
+**Detail.** Built, measured, not the fix. Flag off by default.
 `SearchConfig.tactical_extension` (plies; 0 is off).
 
 This was the cheaper first strength experiment recommended over afterstate

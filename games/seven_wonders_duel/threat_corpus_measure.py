@@ -102,6 +102,8 @@ def triage_position(row, args, log) -> dict:
         "--ref-sims", str(args.triage_sims),
         "--ref-sample", "random", "--out", str(artifact), "--quiet",
     ]
+    if args.allow_migration:
+        cmd.append("--allow-migration")
     if artifact.exists() and not args.force:
         elapsed = 0.0
         result = None
@@ -183,6 +185,8 @@ def run_position(row, args, log) -> dict:
         "--out", str(artifact),
         "--quiet",
     ]
+    if args.allow_migration:
+        cmd.append("--allow-migration")
     if tracked:
         cmd += ["--tracked", tracked]
     if args.trace and tracked:
@@ -287,6 +291,13 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--summary-out", default=None)
+    parser.add_argument("--allow-migration", action="store_true",
+                        help="measure a checkpoint whose encoder signature has "
+                             "moved, warm-started additively. Required after a "
+                             "schema change (W3 added control channels): the "
+                             "migrated model computes exactly what it did "
+                             "before, since the new columns are zero, which is "
+                             "the right BEFORE state for a regression baseline.")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     log = (lambda *_: None) if args.quiet else (
