@@ -14,6 +14,8 @@ different position than the one that was solved.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from . import endgame_corpus as corpus
@@ -79,6 +81,44 @@ def records():
     return rows
 
 
+#: How many logged human endgames the agreement test solves by default.
+#:
+#: Each position costs two exact solves -- measured at ~25 s a pair over 105
+#: captured games, with the hardest hitting the solver's 60 s ceiling -- and the
+#: log this reads grows every time a game is played on BGA. Sweeping it took the
+#: suite past two hours on the machine that plays the most games, which is
+#: exactly the machine this test is written for. So it samples.
+#:
+#: Four is a smoke test, not coverage: it is the four deepest card counts
+#: available, so a divergence in the expensive positions still shows up in a
+#: default run, but the breadth this test was written for now lives in the
+#: deliberate sweep. `SWD_ENDGAME_HUMAN_POSITIONS=0` restores the full corpus;
+#: any positive number samples that many.
+HUMAN_POSITION_SAMPLE = 4
+
+
+def _spread_across_card_counts(positions, limit):
+    """Sample deepest-first across card counts rather than taking the head.
+
+    Cost and branching both climb steeply with cards present, so the first
+    `limit` positions in log order would quietly be a sample of the cheap end --
+    the opposite of what this test exists to cover. Taking one from each card
+    count in descending order keeps the hardest positions available in every
+    sample, however small, and stays deterministic for a given log directory.
+    """
+
+    buckets: dict[int, list] = {}
+    for present, game in positions:
+        buckets.setdefault(present, []).append(game)
+    chosen = []
+    while len(chosen) < limit and any(buckets.values()):
+        for present in sorted(buckets, reverse=True):
+            if buckets[present] and len(chosen) < limit:
+                chosen.append(buckets[present].pop(0))
+    return chosen
+
+
+@pytest.mark.slow
 def test_real_human_endgames_solve_and_agree(records):
     """The corpus is bot-played; real games are the distribution that matters.
 
@@ -98,15 +138,18 @@ def test_real_human_endgames_solve_and_agree(records):
     from .rust_bridge import rust_game_from_state
 
     logged, _ = load_positions(SevenWondersAdvisor(), log_dir_for("seven_wonders_duel"))
-    positions = []
+    found = []
     for row in logged:
         game = getattr(row.state, "game", row.state)
         if game.phase is Phase.PLAY_AGE and game.age == 3:
             present = sum(1 for c in game.tableau.cards.values() if c.present)
-            if present <= 8:  # keeps the test quick; deeper ones are benchmarks
-                positions.append(game)
-    if not positions:
+            if present <= 8:  # deeper ones are benchmarks, not a gate
+                found.append((present, game))
+    if not found:
         pytest.skip("no captured BGA endgames on this machine")
+
+    limit = int(os.environ.get("SWD_ENDGAME_HUMAN_POSITIONS", HUMAN_POSITION_SAMPLE))
+    positions = found if limit <= 0 else _spread_across_card_counts(found, limit)
 
     reference = corpus.reference_solver
     rust = corpus.rust_solver(chance_pruning="star1")
@@ -121,7 +164,10 @@ def test_real_human_endgames_solve_and_agree(records):
         )
         for index, value in want["per_action_value"].items():
             assert got["per_action_value"][index] == pytest.approx(value, abs=1e-9)
-    assert compared > 0
+    assert compared > 0, (
+        f"none of the {len(positions)} sampled positions solved within budget; "
+        "the sample says nothing about agreement"
+    )
 
 
 def test_corpus_still_regenerates(records):

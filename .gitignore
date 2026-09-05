@@ -76,3 +76,4 @@ tmp/
 # Model checkpoints staged into an extension folder for local testing.
 extension_*/*.pt
 
+.pytest_run_logs/

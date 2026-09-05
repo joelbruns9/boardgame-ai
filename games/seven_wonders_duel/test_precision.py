@@ -113,6 +113,7 @@ def test_bf16_evaluator_stays_fp32_on_cpu() -> None:
     assert dtype is torch.float32
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_evaluator_path_really_autocasts() -> None:
     evaluator = Evaluator(
@@ -127,6 +128,7 @@ def test_bf16_evaluator_path_really_autocasts() -> None:
     assert dtype is torch.bfloat16
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_regular_evaluator_path_really_autocasts() -> None:
     from .codec import legal_action_indices
@@ -149,6 +151,7 @@ def test_bf16_regular_evaluator_path_really_autocasts() -> None:
     assert dtype is torch.bfloat16
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_real_net_is_batch_invariant_before_trajectory_comparison() -> None:
     """W0.4: batch composition may move floats, not discrete root choices."""
@@ -201,6 +204,7 @@ def test_resume_refuses_changed_precision(tmp_path: Path) -> None:
         resumed.initialize()
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_real_position_fidelity() -> None:
     """Guard the measured bf16 fidelity on 512 real run-03 positions."""
