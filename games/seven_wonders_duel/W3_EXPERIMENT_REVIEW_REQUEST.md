@@ -1,5 +1,12 @@
 # W3 experiment design — review request
 
+**Revision 2, after review.** The review's central correction is accepted: I
+conflated *measurement blindness* with *bias toward a null*. Search can improve
+on the model guiding it, so an incumbent reference does not guarantee that
+unchanged arms score best. The defensible criticism is narrower and different —
+these metrics measure agreement with an **incumbent-derived teacher**, which
+makes teacher imitation hard to separate from real improvement.
+
 **Status: harnesses BUILT and smoke-tested, no result yet.** This asks whether
 the measurement can be trusted *before* it runs, because the failure mode we
 care about is not a crash — it is a number that looks like an answer and is not.
@@ -144,3 +151,70 @@ different model size or a self-play run.
   targeted tests pass.
 - Stage 3 has no test coverage — it is a measurement script, and a bug in it
   would produce a plausible wrong number rather than an error.
+
+---
+
+## The gate: what must pass before the run
+
+Each row states the claim it supports, so a result cannot be read as evidence
+for a claim its metric does not reach.
+
+| gate | status |
+|---|---|
+| Stage-3 arithmetic verified on hand-checkable cases | **DONE** — `test_w3_regret.py`, 14 tests |
+| Split integrity: no game crosses the train/test boundary | **DONE** — 300 games, 0 overlap |
+| Stage-1 and stage-3 metrics mapped to claims (below) | **DONE** |
+| Independent audit set with deeper search / exact endgames | **NOT DONE** — deferred |
+| Prespecified tempo challenge set, matched both directions | **NOT DONE** — required before promotion |
+| Independent verification of table labels | **NOT DONE** — see below |
+
+**Cleared to run stage 1 and the reference pass.** Neither can be promoted to a
+strength claim without the three outstanding gates.
+
+### Which claim each metric supports
+
+| metric | supports | does NOT support |
+|---|---|---|
+| held-out `policy_top1` | imitation of the teacher's chosen action | better evaluation; stronger play |
+| policy KL vs the search target | imitation of the teacher's distribution | better evaluation; stronger play |
+| `value_acc` on held-out games | outcome prediction on this distribution | position evaluation vs an independent reference |
+| corpus regret vs the incumbent | agreement with an incumbent-derived teacher | ground truth; stronger play |
+| paired arena at equal wall-clock | **playing strength** | — not run |
+
+KL is worth adding as a secondary, but the review is right that swapping top-1
+for it does not fix the validity problem: both are imitation metrics. A claim
+about *evaluation* needs value error against an independent reference; a claim
+about *strength* needs gameplay.
+
+### What would make a null credible
+
+A flat result is only informative if the instrument could have detected an
+effect. Required before reporting one:
+
+- `shuffled` must score **worse** than `inputs` somewhere, or the shuffle is not
+  destroying what it is supposed to destroy.
+- A deliberately degraded arm must rank worse — the aggregation is pinned for
+  this (`test_a_strictly_worse_arm_ranks_worse`), but an end-to-end version on
+  real positions is stronger.
+- Seed spread must be smaller than the effect being claimed absent. With five
+  seeds and no split variation, only training randomness is bounded.
+
+### Corrections carried from the review
+
+**The shuffle's hypothesis, stated.** It permutes control maps within groups of
+equal tableau-token count. Token count correlates with game stage, so the
+shuffle **preserves** stage-typical control structure and **destroys** only the
+position-specific map. It therefore tests whether control carries information
+*beyond what game stage already implies* — not whether any control information
+helps. A null under this shuffle is the weaker of the two readings.
+
+**A shared table is a common failure source, not corroboration.** `aux` and
+`inputs` derive from the same table, so agreement between them cannot validate
+its labels; both would inherit the same error. Independent verification needs
+hand-checked fixtures on strategically exceptional positions, which is listed
+above as outstanding.
+
+**Split allocation.** Splits stay shared across arms — that is what makes the
+comparison paired. But five training seeds on one split bounds only training
+randomness; split sensitivity is unmeasured. Repeating across split seeds is the
+right next allocation if the first result is marginal.
