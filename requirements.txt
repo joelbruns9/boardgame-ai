@@ -28,3 +28,9 @@ nvidia-ml-py>=12.0  # torch.cuda.utilization(), the one non-host-timer GPU signa
 # smoke is the only check that the engine every measurement was taken on is the
 # engine that will run.  Without pytest installed there, it cannot run at all.
 pytest>=7.0
+# Both are named in pytest.ini's addopts, so they are NOT optional extras: a
+# checkout without them cannot start pytest at all ("unrecognized arguments:
+# --timeout"), which would take the cloud box's pre-training equivalence smoke
+# down with it.
+pytest-xdist>=3.0    # -n, and --dist=loadfile to keep a file on one worker
+pytest-timeout>=2.0  # names a stalled test instead of leaving a silent hang
