@@ -214,11 +214,19 @@ def test_f4_4_timeout_wakes_scheduler_without_waiting_for_worker_shutdown():
 
     seeds = [2026072355, 2026072356]
 
-    def slow_batch(rows):
-        time.sleep(0.08)
-        return [_row_eval(*row) for row in rows]
+    # Ordering, not wall-clock. The claim is that the scheduler returns while
+    # the worker is STILL BLOCKED, and an event proves that directly. The old
+    # form asserted the whole call -- game setup included -- finished inside
+    # 70 ms, which a loaded CI box or a parallel run can miss while the
+    # scheduler is behaving perfectly.
+    worker_returned = threading.Event()
 
-    started = time.perf_counter()
+    def slow_batch(rows):
+        time.sleep(5.0)
+        rows = [_row_eval(*row) for row in rows]
+        worker_returned.set()
+        return rows
+
     with pytest.raises(TimeoutError, match="timed out"):
         swr.self_play_many_net(
             adapter=slow_batch,
@@ -227,7 +235,109 @@ def test_f4_4_timeout_wakes_scheduler_without_waiting_for_worker_shutdown():
             inference_timeout_ms=10.0,
             **_common(leaf_batch=2, global_batch_cap=8),
         )
-    assert time.perf_counter() - started < 0.07
+    assert not worker_returned.is_set(), (
+        "the scheduler waited for its blocked inference worker instead of "
+        "waking on the timeout"
+    )
+
+
+def test_f4_4_a_timed_out_worker_does_not_block_the_next_call():
+    """The pooled inference thread must not be reissued while it is still stuck.
+
+    Workers run on pooled threads now (`eval.rs`), because spawning one per call
+    leaked Torch's per-thread state -- ~16 MB a call, which took a laptop down
+    mid-match.  The hazard the pool introduces is exactly this case: a worker
+    abandoned on timeout is still inside a Python call that may never return, so
+    handing its thread to the next caller would stall a healthy search behind a
+    dead one.  A thread is only offered back once its job has actually returned.
+    """
+
+    import seven_wonders_rust as swr
+
+    seeds = [2026090401, 2026090402]
+
+    stuck_returned = threading.Event()
+
+    def slow_batch(rows):
+        time.sleep(5.0)
+        rows = [_row_eval(*row) for row in rows]
+        stuck_returned.set()
+        return rows
+
+    def fast_batch(rows):
+        return [_row_eval(*row) for row in rows]
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        swr.self_play_many_net(
+            adapter=slow_batch,
+            games=rust_games_for_self_play(seeds, [0, 1]),
+            game_seeds=seeds,
+            inference_timeout_ms=20.0,
+            **_common(leaf_batch=2, global_batch_cap=8),
+        )
+
+    # The abandoned worker is still sleeping. This call has to get a different
+    # thread and finish on its own schedule rather than waiting out that sleep.
+    records, _ = swr.self_play_many_net(
+        adapter=fast_batch,
+        games=rust_games_for_self_play(seeds, [0, 1]),
+        game_seeds=seeds,
+        **_common(leaf_batch=2, global_batch_cap=8),
+    )
+    assert len(records) == 2
+    # Again ordering rather than a stopwatch: this call finished while the
+    # abandoned worker was still inside its sleep, so it cannot have been
+    # handed that thread or queued behind it.
+    assert not stuck_returned.is_set()
+
+
+def test_f4_4_concurrent_scheduler_calls_all_complete():
+    """Pooled threads must not serialise independent searches into a deadlock.
+
+    A single shared inference thread would be enough to stop the leak and would
+    hang the advisor host the first time two of its jobs searched at once: a
+    worker loop only ends when its `EvalWorker` drops, so a second call queued
+    behind the first would never start.  The pool grows to meet concurrency
+    instead, and this is the guard that it does.
+    """
+
+    import seven_wonders_rust as swr
+
+    done: list[int] = []
+    failures: list[BaseException] = []
+    lock = threading.Lock()
+
+    def batch_eval(rows):
+        return [_row_eval(*row) for row in rows]
+
+    def play(index: int) -> None:
+        seeds = [2026090500 + index * 2, 2026090501 + index * 2]
+        try:
+            records, _ = swr.self_play_many_net(
+                adapter=batch_eval,
+                games=rust_games_for_self_play(seeds, [0, 1]),
+                game_seeds=seeds,
+                **_common(leaf_batch=2, global_batch_cap=8),
+            )
+            assert len(records) == 2
+            with lock:
+                done.append(index)
+        except BaseException as error:  # reported from the calling thread
+            with lock:
+                failures.append(error)
+
+    workers = [
+        threading.Thread(target=play, args=(index,), daemon=True)
+        for index in range(8)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=120)
+
+    assert not [worker for worker in workers if worker.is_alive()], "search deadlocked"
+    assert not failures, failures[0]
+    assert sorted(done) == list(range(8))
 
 
 def test_f4_4_mock_stress_completes_twelve_slots_without_loss():

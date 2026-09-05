@@ -811,6 +811,104 @@ struct WorkerRequest {
     enqueued: Instant,
 }
 
+// --- the inference thread pool ----------------------------------------------
+//
+// Every worker below used to be `thread::spawn`ed per call and joined at the
+// end of it. That is correct and it leaks: Torch attaches per-thread state to
+// any thread that runs a forward and never gives it back when the thread exits.
+// Measured on the arena's boundary at ~16 MB and ~7 OS threads per call, which
+// a per-ply caller turns into +3.2 GB per match and, once, an out-of-memory
+// shutdown mid-run.
+//
+// So the threads are pooled instead. What has to stay bounded is the number of
+// DISTINCT threads that ever call the adapter, not the number of live ones, and
+// reuse bounds it by peak concurrency rather than by total calls.
+//
+// Concurrency is preserved deliberately: a single shared thread would deadlock
+// the moment two searches ran at once (the advisor host runs several), because
+// a worker loop only ends when its `EvalWorker` is dropped, and a second job
+// queued behind it would never start. A thread is only offered back to the pool
+// once its job has actually returned, so a worker abandoned on timeout keeps
+// its thread out of circulation until the Python call it is stuck in finishes,
+// rather than handing a busy thread to the next caller.
+
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Idle threads, each addressed by the sender to its own job channel.
+static IDLE_WORKERS: Mutex<Vec<mpsc::Sender<PoolJob>>> = Mutex::new(Vec::new());
+
+fn release_worker(slot: mpsc::Sender<PoolJob>) {
+    if let Ok(mut idle) = IDLE_WORKERS.lock() {
+        idle.push(slot);
+    }
+    // A poisoned lock drops the sender, retiring that thread. The pool is an
+    // optimisation; losing one thread from it is not worth failing a search.
+}
+
+/// Handle for one pooled worker loop: `join` waits for the loop, `drop` detaches.
+pub struct WorkerHandle {
+    done: mpsc::Receiver<bool>,
+}
+
+impl WorkerHandle {
+    /// Wait for the worker loop to finish. `Err(())` means it panicked, which
+    /// keeps the same shape the callers' `JoinHandle::join` had.
+    pub fn join(self) -> Result<(), ()> {
+        match self.done.recv() {
+            // The thread died without reporting, which only happens if the
+            // pooled thread itself was torn down mid-job.
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(()),
+        }
+    }
+}
+
+/// Run `body` on a pooled thread, returning a handle that waits for it.
+fn run_pooled<F>(body: F) -> WorkerHandle
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let slot = IDLE_WORKERS.lock().ok().and_then(|mut idle| idle.pop());
+    let slot = match slot {
+        Some(slot) => slot,
+        None => spawn_pool_thread(),
+    };
+    let mine = slot.clone();
+    let job: PoolJob = Box::new(move || {
+        // The worker loops below call into Python; a panic there must reach the
+        // caller as a failed join rather than unwinding the pooled thread.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        let _ = done_tx.send(outcome.is_ok());
+        // Only now is this thread genuinely free: a job abandoned by a
+        // `drop(handle)` on timeout is still inside its adapter call above.
+        release_worker(mine);
+    });
+    if let Err(mpsc::SendError(job)) = slot.send(job) {
+        // The pooled thread died between being parked and being handed work.
+        // The job comes back with the error, so it runs on a fresh thread
+        // rather than being silently dropped -- a caller waiting on the handle
+        // of a job that never ran would block forever.
+        let replacement = spawn_pool_thread();
+        if replacement.send(job).is_err() {
+            return WorkerHandle { done: done_rx };
+        }
+    }
+    WorkerHandle { done: done_rx }
+}
+
+fn spawn_pool_thread() -> mpsc::Sender<PoolJob> {
+    let (tx, rx) = mpsc::channel::<PoolJob>();
+    thread::spawn(move || {
+        // Parks between jobs and never exits, which is the point: the Torch
+        // state attached to this thread is paid for once and reused.
+        while let Ok(job) = rx.recv() {
+            job();
+        }
+    });
+    tx
+}
+
 /// Scheduler-side handle for the dedicated F4.4 Python inference thread. Rust
 /// scheduling runs with the caller's GIL detached; only the worker attaches to
 /// Python and invokes the batch adapter.
@@ -998,7 +1096,7 @@ pub fn spawn_py_batch_worker(
     adapter: Py<PyAny>,
     timeout_ms: f64,
     max_rows: usize,
-) -> PyResult<(EvalWorker, Arc<AtomicBool>, thread::JoinHandle<()>)> {
+) -> PyResult<(EvalWorker, Arc<AtomicBool>, WorkerHandle)> {
     if !timeout_ms.is_finite() || timeout_ms < 0.0 {
         return Err(PyValueError::new_err(
             "inference_timeout_ms must be finite and non-negative",
@@ -1018,7 +1116,7 @@ pub fn spawn_py_batch_worker(
     let timed_out = Arc::new(AtomicBool::new(false));
     let terminal_error = Arc::new(Mutex::new(None));
     let worker_terminal_error = Arc::clone(&terminal_error);
-    let handle = thread::spawn(move || {
+    let handle = run_pooled(move || {
         let evaluator = PyBatchEval::new(adapter);
         while let Ok(request) = request_rx.recv() {
             let refs: Vec<&GameState> = request.states.iter().collect();
@@ -1066,7 +1164,7 @@ pub fn spawn_py_flat_worker(
     EvalWorker,
     Arc<AtomicBool>,
     Arc<Mutex<BoundaryMetrics>>,
-    thread::JoinHandle<()>,
+    WorkerHandle,
 )> {
     if !timeout_ms.is_finite() || timeout_ms < 0.0 {
         return Err(PyValueError::new_err(
@@ -1089,7 +1187,7 @@ pub fn spawn_py_flat_worker(
     let worker_terminal_error = Arc::clone(&terminal_error);
     let metrics = Arc::new(Mutex::new(BoundaryMetrics::default()));
     let worker_metrics = Arc::clone(&metrics);
-    let handle = thread::spawn(move || {
+    let handle = run_pooled(move || {
         let evaluator = PyFlatBatchEval::new(adapter, Arc::clone(&worker_metrics));
         while let Ok(request) = request_rx.recv() {
             if let Ok(mut counters) = worker_metrics.lock() {
