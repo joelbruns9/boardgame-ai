@@ -440,7 +440,19 @@ class SevenWondersAdvisor:
         checkpoint = req.checkpoint_path or self._default_checkpoint
         if checkpoint is None:
             raise ValueError("no checkpoint_path supplied and no default set")
-        device = req.device or self._device
+        return self._load_evaluator(checkpoint, req.device or self._device)
+
+    def _load_evaluator(self, checkpoint: str, device: str):
+        """The ONE place this adapter turns a checkpoint into an evaluator.
+
+        Every caller gets the same cache and the same migration policy. A second
+        loader existed until 2026-09-07 -- `_victory_outlook` built its own,
+        without `migrate`, inside a bare `except Exception: return None` -- so
+        after the encoder widened, that panel field silently vanished for the
+        shipped checkpoint while the ranked moves beside it worked fine. A
+        schema mismatch must not reach the user as an absent field.
+        """
+
         key = (checkpoint, device)
         cached = self._eval_cache.get(key)
         if cached is None:
@@ -591,16 +603,11 @@ class SevenWondersAdvisor:
         if evaluator is None:
             if self._default_checkpoint is None:
                 return None
-            try:
-                from .phase_e import load_evaluator
-
-                key = (self._default_checkpoint, self._device)
-                evaluator = self._eval_cache.get(key)
-                if evaluator is None:
-                    evaluator = load_evaluator(self._default_checkpoint, self._device)
-                    self._eval_cache[key] = evaluator
-            except Exception:
-                return None
+            # Through the shared loader, so this honours the migration policy
+            # and reuses the cache the ranked moves already filled. A load
+            # failure is surfaced rather than swallowed: the caller can render
+            # an error, but it must not be shown an outlook-shaped hole.
+            evaluator = self._load_evaluator(self._default_checkpoint, self._device)
         try:
             row = evaluator.evaluate_states([game])[0]
         except Exception:
