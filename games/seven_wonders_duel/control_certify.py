@@ -131,6 +131,30 @@ class _Budget:
     def note(self, reason: str) -> None:
         self.reasons.add(reason)
 
+    def spent(self) -> bool:
+        """Has a limit fired? Records the reason; consumes no node.
+
+        `tick` answers the same question one node at a time and is the entry
+        gate. This is the version the EXPANSION loops need: without it, a search
+        with the budget already gone still built every child of every remaining
+        action -- 270 clones for one exhausted node at row 85 -- only to hand
+        each of them straight back as UNKNOWN.
+        """
+
+        if self.nodes > self.max_nodes:
+            self.reasons.add("nodes")
+            self.binding = self.binding or "nodes"
+            return True
+        if self.stop is not None and self.stop.is_set():
+            self.reasons.add("cancelled")
+            self.binding = self.binding or "cancelled"
+            return True
+        if _time.perf_counter() > self.deadline:
+            self.reasons.add("deadline")
+            self.binding = self.binding or "deadline"
+            return True
+        return False
+
     def tick(self) -> bool:
         """False once the budget is spent."""
 
@@ -212,12 +236,22 @@ def _terminal_verdict(state, loser: int) -> Verdict:
     return Verdict.REFUTED
 
 
-def _children(state, action):
+#: Returned by `_children` when the budget ran out DURING enumeration. Distinct
+#: from `None`, which means "this edge is not enumerable at all" -- the two are
+#: different UNKNOWNs and recording one as the other misreports why a proof
+#: stopped, which is the whole point of `limits_hit`.
+ABORTED = object()
+
+
+def _children(state, action, budget=None):
     """``([(child, probability), ...], saw_chance)``, chance enumerated.
 
     Mirrors ``advisor_endgame._children``: barred clones and explicit outcomes,
     so no hidden identity is ever read. Returns ``None`` on a non-enumerable
-    ``AGE_DEAL`` edge, which the caller turns into UNKNOWN.
+    ``AGE_DEAL`` edge, which the caller turns into UNKNOWN, and ``ABORTED`` when
+    ``budget`` expires part-way through a wide chance edge -- Age III reveals
+    fan out 90 ways, so finishing one after the clock has stopped is 90 clones
+    spent on an answer nobody will read.
     """
 
     specs = chance_signature(state, action)
@@ -227,6 +261,8 @@ def _children(state, action):
         out = []
         mass = 0.0
         for outcomes, probability, _key in enumerate_chains(state, specs):
+            if budget is not None and budget.spent():
+                return ABORTED
             child = fast_clone(state)
             child.search_barrier = True
             apply_action(child, action, chance_outcomes=outcomes or None)
@@ -277,7 +313,8 @@ def _order(state, indices, loser: int, winner_to_move: bool):
     return sorted(indices, key=key)
 
 
-def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdict:
+def _prove(state, loser: int, plies: int, budget: _Budget, line: list,
+           types: set | None = None) -> Verdict:
     """Three-valued proof that ``loser`` cannot escape sudden death.
 
     AND node (loser to move): every defence must be PROVEN.
@@ -289,7 +326,14 @@ def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdic
     """
 
     if state.phase is Phase.COMPLETE:
-        return _terminal_verdict(state, loser)
+        verdict = _terminal_verdict(state, loser)
+        if verdict is Verdict.PROVEN and types is not None:
+            # The victory this leaf actually is. Collected here rather than
+            # guessed at the root: the root threat gate says which sudden
+            # deaths are POSSIBLE, and a position one symbol short of six can
+            # still be lost to an immediate military win.
+            types.add(state.victory_type)
+        return verdict
     if plies <= 0:
         budget.note("plies")
         return Verdict.UNKNOWN
@@ -300,12 +344,25 @@ def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdic
     winner_to_move = actor != loser
     indices = list(legal_action_indices(state))
     if not indices:
-        return _terminal_verdict(state, loser)
+        verdict = _terminal_verdict(state, loser)
+        if verdict is Verdict.PROVEN and types is not None:
+            types.add(state.victory_type)
+        return verdict
 
     saw_unknown = False
     for index in _order(state, indices, loser, winner_to_move):
+        # Before the expansion, not after: everything below builds children.
+        # `saw_unknown` is what makes stopping SAFE -- an OR node that simply
+        # broke out of its loop would report REFUTED ("nothing forced it"),
+        # turning a budget limit into a false negative.
+        if budget.spent():
+            saw_unknown = True
+            break
         action = decode_action(state, index)
-        got = _children(state, action)
+        got = _children(state, action, budget)
+        if got is ABORTED:
+            saw_unknown = True
+            break
         if got is None:
             budget.note("age_deal")
             saw_unknown = True
@@ -315,8 +372,11 @@ def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdic
         # Every chance outcome must hold for the branch to count as proven.
         branch = Verdict.PROVEN
         sub_line: list = []
+        # Per BRANCH, merged into the caller's set only if the branch is kept:
+        # a refuted branch's terminals say nothing about the proof.
+        sub_types: set = set()
         for child, _probability in children:
-            got_child = _prove(child, loser, plies - 1, budget, sub_line)
+            got_child = _prove(child, loser, plies - 1, budget, sub_line, sub_types)
             if got_child is Verdict.REFUTED:
                 branch = Verdict.REFUTED
                 break
@@ -326,6 +386,8 @@ def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdic
         if winner_to_move:
             if branch is Verdict.PROVEN:
                 line[:] = [_label(state, index)] + sub_line
+                if types is not None:
+                    types |= sub_types
                 return Verdict.PROVEN
             if branch is Verdict.UNKNOWN:
                 saw_unknown = True
@@ -334,6 +396,10 @@ def _prove(state, loser: int, plies: int, budget: _Budget, line: list) -> Verdic
                 return Verdict.REFUTED
             if branch is Verdict.UNKNOWN:
                 saw_unknown = True
+            elif types is not None:
+                # AND node: every defence must be proven, so every defence's
+                # terminals belong to the proof.
+                types |= sub_types
 
     if saw_unknown:
         return Verdict.UNKNOWN
@@ -387,19 +453,21 @@ def certify(
 
     budget = _Budget(max_nodes, started + max_secs, stop)
     line: list = []
+    types: set = set()
     root = fast_clone(game)
     root.search_barrier = True
-    verdict = _prove(root, loser, max_plies, budget, line)
+    verdict = _prove(root, loser, max_plies, budget, line, types)
     elapsed = _time.perf_counter() - started
 
+    # From the PROVEN terminals themselves, and only when they agree. The root
+    # threat gate cannot answer this: it reports which sudden deaths are within
+    # reach, so a seat one symbol from six that is actually lost to an immediate
+    # military win was certified "scientific" until 2026-09-07. A proof that
+    # ends in different victories down different branches names none of them --
+    # the certificate is the whole tree, and "you lose" is what it establishes.
     victory = None
-    if verdict is Verdict.PROVEN:
-        threat = sudden_death_threat(game, loser) or {}
-        if "science_missing" in threat and "military_steps" not in threat:
-            victory = VictoryType.SCIENTIFIC
-        elif "military_steps" in threat and "science_missing" not in threat:
-            victory = VictoryType.MILITARY
-        # Both threats live: the proof covers either, so name neither.
+    if verdict is Verdict.PROVEN and len(types) == 1:
+        victory = next(iter(types))
 
     return Certificate(
         verdict=verdict,
