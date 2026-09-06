@@ -32,6 +32,30 @@ from .rules import STARTING_COINS
 SlotId = tuple[int, int]
 
 
+#: ``age -> slot_id -> the slot_ids that cover it``. The layouts are printed
+#: constants, so which slots cover which is settled before a game starts and
+#: cannot depend on play. `TableauState.is_accessible` used to rediscover it by
+#: scanning all ~20 slots per call -- 635k `covering_slots` calls inside a
+#: single 8 s certifier proof, each rebuilding a tuple fixed at import.
+#:
+#: Slot IDS, not slots: the accessibility test indexes `TableauState.cards`,
+#: which is keyed by ``(row, x)``, so returning objects only to read ``(row, x)``
+#: back off them is a second layer of the same waste.
+#:
+#: Built here rather than in `data.py` deliberately: `control_table.rule_identity`
+#: hashes that file's BYTES, so adding even a comment there invalidates the W3
+#: control table and every checkpoint trained against it.
+COVERING_SLOT_IDS: dict[int, dict[SlotId, tuple[SlotId, ...]]] = {
+    age: {
+        (slot.row, slot.x): tuple(
+            (coverer.row, coverer.x) for coverer in covering_slots(layout, slot)
+        )
+        for slot in layout
+    }
+    for age, layout in TABLEAU_LAYOUTS.items()
+}
+
+
 class ChanceKind(str, Enum):
     """First-class chance events (CODEC_SPEC.md §4.2)."""
 
@@ -158,14 +182,17 @@ class TableauState:
         return cls(age=age, cards=cards)
 
     def is_accessible(self, slot_id: SlotId) -> bool:
-        card = self.cards.get(slot_id)
+        # Reads the precomputed topology rather than rediscovering it: this is
+        # the single hottest function in the rules engine (1.18M calls in one
+        # certifier proof), and which slots cover which is a printed constant.
+        cards = self.cards
+        card = cards.get(slot_id)
         if card is None or not card.present:
             return False
-        layout = TABLEAU_LAYOUTS[self.age]
-        return not any(
-            self.cards[(coverer.row, coverer.x)].present
-            for coverer in covering_slots(layout, card.slot)
-        )
+        for coverer in COVERING_SLOT_IDS[self.age][slot_id]:
+            if cards[coverer].present:
+                return False
+        return True
 
     def accessible_slot_ids(self) -> tuple[SlotId, ...]:
         return tuple(slot_id for slot_id in self.cards if self.is_accessible(slot_id))

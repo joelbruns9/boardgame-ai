@@ -130,6 +130,65 @@ def _discount_allocations(cost: Cost, rebate: int):
             yield allocation
 
 
+@dataclass(frozen=True, slots=True)
+class PricingContext:
+    """Everything a payment needs about the two cities, but not about the card.
+
+    Built once per `legal_actions` call and reused for every price in it. Each
+    of these four is a scan of a whole city rebuilt from card names; pricing one
+    Age III position recomputed them 42,026 times, which was 46% of the sudden-
+    death certifier's runtime.
+
+    It is a snapshot, so it is valid only until the state changes. `for_player`
+    is the only way to make one, and callers pass it down rather than caching it
+    anywhere -- a stale context would misprice silently, which is precisely the
+    bug class the certifier cannot tolerate.
+    """
+
+    fixed: "Counter[Resource]"
+    choice_producers: tuple[tuple[Resource, ...], ...]
+    opponent: "Counter[Resource]"
+    discounts: frozenset[Resource]
+    tokens: frozenset[str]
+
+    @classmethod
+    def for_player(cls, game: GameState, player: int) -> "PricingContext":
+        # One pass per city rather than four. The helpers below each rebuilt a
+        # tuple of `CardData` for the whole city, so `_cards_for_city` ran four
+        # times over the same building list to answer four questions about it.
+        # They stay, unchanged, for the callers that want one answer alone.
+        own = game.cities[player]
+        fixed: Counter[Resource] = Counter()
+        choices: list[tuple[Resource, ...]] = []
+        discounted: set[Resource] = set()
+        for name in own.buildings:
+            card = CARDS_BY_NAME[name]
+            if card.fixed_production:
+                fixed.update(card.fixed_production)
+            if card.choice_production:
+                choices.append(card.choice_production)
+            if card.trade_discount:
+                discounted.update(card.trade_discount)
+        for name in own.built_wonders:
+            choice = WONDERS_BY_NAME[name].choice_production
+            if choice:
+                choices.append(choice)
+
+        opponent: Counter[Resource] = Counter()
+        for name in game.cities[1 - player].buildings:
+            card = CARDS_BY_NAME[name]
+            if card.color in (CardColor.BROWN, CardColor.GREY):
+                opponent.update(card.fixed_production)
+
+        return cls(
+            fixed=fixed,
+            choice_producers=tuple(choices),
+            opponent=opponent,
+            discounts=frozenset(discounted),
+            tokens=frozenset(own.progress_tokens),
+        )
+
+
 def minimum_payment(
     game: GameState,
     player: int,
@@ -137,24 +196,37 @@ def minimum_payment(
     *,
     card: CardData | None = None,
     is_wonder: bool = False,
+    context: PricingContext | None = None,
 ) -> Payment:
-    """Find the cheapest legal payment across rebates and flexible production."""
+    """Find the cheapest legal payment across rebates and flexible production.
+
+    ``context`` is an optional pre-built `PricingContext` for ``player`` in
+    ``game``; omitted, one is built here, so every existing caller is unchanged.
+    """
 
     if card is not None and _chain_is_free(game, player, card):
         return Payment(0, 0, 0, (), used_chain=True)
 
+    if context is None:
+        context = PricingContext.for_player(game, player)
     rebate = 0
-    tokens = set(game.cities[player].progress_tokens)
+    tokens = context.tokens
     if is_wonder and "Architecture" in tokens:
         rebate = 2
     elif card is not None and card.color is CardColor.BLUE and "Masonry" in tokens:
         rebate = 2
 
-    fixed = _fixed_production(game, player)
-    choice_producers = _choice_producers(game, player)
-    opponent = _opponent_trade_production(game, player)
-    discounts = _trade_discounts(game, player)
+    fixed = context.fixed
+    choice_producers = context.choice_producers
+    opponent = context.opponent
+    discounts = context.discounts
     best: Payment | None = None
+
+    # A cost with no resources in it -- every coin-only and free card -- has
+    # exactly one payment, and the search below would spend a full pass over
+    # allocations and choice assignments rediscovering it.
+    if cost.total_resources == 0:
+        return Payment(cost.coins, cost.coins, 0, ())
 
     allocations = _discount_allocations(cost, rebate)
     choice_assignments = product(*choice_producers) if choice_producers else [()]
@@ -189,6 +261,12 @@ def minimum_payment(
                 best.purchased,
             ):
                 best = candidate
+                # Nothing bought and nothing traded is minimal on both keys of
+                # that comparison, so no later assignment can beat it. Stopping
+                # here is the difference between one iteration and 2^k of them
+                # for a city with k flexible producers.
+                if not purchased:
+                    return best
     if best is None:
         raise AssertionError("payment search produced no candidate")
     return best
@@ -227,19 +305,30 @@ def legal_actions(game: GameState) -> tuple[Action, ...]:
         return ()
     player = game.active_player
     actions: list[Action] = []
+    context = PricingContext.for_player(game, player)
+    # A Wonder's price does not depend on which card is spent to build it, but
+    # this loop asked for it once per accessible slot: six slots and three
+    # unbuilt Wonders bought the same three prices eighteen times. Priced once
+    # here, and the affordable ones are appended in the same per-slot order as
+    # before -- action order is part of the codec, so it must not shift.
+    affordable_wonders = []
+    for wonder_name in _unbuilt_wonders(game, player):
+        wonder = WONDERS_BY_NAME[wonder_name]
+        if wonder.cost is None:
+            raise AssertionError(f"missing Wonder cost: {wonder_name}")
+        wonder_payment = minimum_payment(
+            game, player, wonder.cost, is_wonder=True, context=context
+        )
+        if _can_afford(game, player, wonder_payment):
+            affordable_wonders.append(wonder_name)
     for slot_id in game.tableau.accessible_slot_ids():
         card = CARDS_BY_NAME[game.tableau.cards[slot_id].card_name]
-        payment = minimum_payment(game, player, card.cost, card=card)
+        payment = minimum_payment(game, player, card.cost, card=card, context=context)
         if _can_afford(game, player, payment):
             actions.append(Action(slot_id, ActionUse.CONSTRUCT_BUILDING))
         actions.append(Action(slot_id, ActionUse.DISCARD_FOR_COINS))
-        for wonder_name in _unbuilt_wonders(game, player):
-            wonder = WONDERS_BY_NAME[wonder_name]
-            if wonder.cost is None:
-                raise AssertionError(f"missing Wonder cost: {wonder_name}")
-            wonder_payment = minimum_payment(game, player, wonder.cost, is_wonder=True)
-            if _can_afford(game, player, wonder_payment):
-                actions.append(Action(slot_id, ActionUse.CONSTRUCT_WONDER, wonder_name))
+        for wonder_name in affordable_wonders:
+            actions.append(Action(slot_id, ActionUse.CONSTRUCT_WONDER, wonder_name))
     return tuple(actions)
 
 
