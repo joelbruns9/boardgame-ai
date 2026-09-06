@@ -21,6 +21,7 @@ mod encoder;
 mod engine;
 mod eval;
 mod pool;
+mod reveal;
 mod rng;
 mod rules;
 mod self_play;
@@ -3010,6 +3011,19 @@ fn control_features_enabled() -> bool {
     crate::control::enabled()
 }
 
+/// Turn the reveal-risk INPUTS on or off. Same contract as control: off emits
+/// zeros in the same channels, so the schema and the checkpoint are unchanged
+/// and only what the network is shown differs.
+#[pyfunction]
+fn set_reveal_features_enabled(enabled: bool) {
+    crate::reveal::set_enabled(enabled);
+}
+
+#[pyfunction]
+fn reveal_features_enabled() -> bool {
+    crate::reveal::enabled()
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -3017,6 +3031,12 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::control_features_enabled;
+
+    #[pymodule_export]
+    use super::set_reveal_features_enabled;
+
+    #[pymodule_export]
+    use super::reveal_features_enabled;
 
     #[pymodule_export]
     use super::control_table_digest;

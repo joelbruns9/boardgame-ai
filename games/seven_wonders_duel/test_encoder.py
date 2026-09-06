@@ -446,9 +446,26 @@ def test_encoder_signature_is_pinned():
     # the live solver with zero mismatches, Python and Rust encode 205 real rows
     # bit-identically, and every inapplicable position carries all-zero control
     # channels with `control_valid` 0.
+    #
+    # 7wd-encoder-7 (2026-09-06): five reveal-risk channels appended to
+    # TABLEAU_FEATURES. Same standard of evidence, since re-pinning is the act
+    # that would hide a mistake:
+    #   * both languages agree bit-for-bit over a whole game with the channels
+    #     LIVE, not merely both emitting zeros -- `test_control_encoder.py::
+    #     test_both_languages_agree_with_reveal_on`, which also asserts the
+    #     channels were nonzero somewhere or it proves nothing;
+    #   * stripping the added columns still reproduces the pre-W3 digests
+    #     literally, as pinned before any of this existed --
+    #     `test_control_encoder.py::test_stripping_control_reproduces_the_
+    #     pre_w3_digest`, which strips control AND reveal;
+    #   * the draft golden below is byte-identical across the bump, because a
+    #     draft observation has no tableau tokens -- the widening moved exactly
+    #     the tokens it should and nothing else;
+    #   * the values were hand-checked on Example A (table 904750590 row 24):
+    #     one nonzero slot, `reveal_n` 2, `reveal_opp_sixth` 0.429.
     assert (
         ENCODER_SIGNATURE
-        == "36b2ffa5cfd58e5b16aaa5b515f70ce6ccd49d27bd1ab8eb52355c223960c4e3"
+        == "18bf9baf715f88d00043a9130e2a02cea4147afafafe64e040dd6e3bea28e83d"
     )
 
 
@@ -456,11 +473,14 @@ def test_golden_encoding_digest_is_stable():
     game = _playing_game(30)
     assert (
         _digest(encode(game.observation(0)))
-        == "2b83ae656ea7d16f7e6698fc4627aaecd299ebe784c524ff4efd8ede2b5979d0"
+        == "d79f66b4077c6b5e4f20440af1423b78088108885a423513d3f304bf487d6e02"
     )
 
 
 def test_golden_digests_cover_draft_and_pending_states():
+    # Unchanged across the -7 bump: a draft observation carries no tableau
+    # tokens, so appending tableau channels cannot move it. A change here would
+    # have meant the widening leaked into token types it has no business in.
     draft = new_game(9)
     apply_action(draft, legal_actions(draft)[0])
     assert (
@@ -476,5 +496,5 @@ def test_golden_digests_cover_draft_and_pending_states():
     assert library.pending_choice is not None
     assert (
         _digest(encode(library.observation(0)))
-        == "98a2aeb5618168895fa27ab2bec228061d44b66e6ea2a5a97e2eedc7310713ec"
+        == "27f151f675560d3726e433ba00df144d4d786b41e403bd3551ede6f1baeac45f"
     )

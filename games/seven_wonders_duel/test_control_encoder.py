@@ -290,3 +290,69 @@ def test_both_languages_agree_in_off_mode():
         assert seven_wonders_rust.control_features_enabled() is False
     finally:
         set_control_features(True)
+
+
+# -- reveal risk, both languages --------------------------------------------
+
+
+def _reveal_columns():
+    """Indices of the reveal channels inside a tableau token's feature row."""
+
+    from .encoder import TABLEAU_FEATURES
+    from .reveal_risk import REVEAL_FEATURES
+
+    return [TABLEAU_FEATURES.index(name) for name in REVEAL_FEATURES]
+
+
+def test_both_languages_agree_with_reveal_on():
+    """The gate that lets the reveal channels reach self-play.
+
+    Off-mode agreement proves only that both languages emit zeros. Self-play
+    encodes in Rust and the replay/A-B path encodes in Python, so what has to
+    hold is agreement with the channels LIVE -- and on a whole game, because the
+    counts are pure geometry that only some positions exercise.
+    """
+
+    import numpy as np
+
+    from .buffer import GameRecorder
+    from .codec import legal_action_indices
+    from .control_table import ensure_rust_table
+    from .dataset import TYPE_IDS, derive_records_rust, examples_from_record
+    from .reveal_risk import set_reveal_features
+
+    if not ensure_rust_table():
+        pytest.skip("seven_wonders_rust not available")
+
+    recorder = GameRecorder(707, agents={"p0": "t", "p1": "t"})
+    rng = random.Random(7071)
+    while recorder.game.phase.value != "complete":
+        choice = rng.choice(legal_action_indices(recorder.game))
+        recorder.play(choice, policy_target={choice: 1.0})
+    record = recorder.finish()
+
+    set_reveal_features(True)
+    try:
+        import seven_wonders_rust
+
+        # Rust really is on, not agreeing by both being off.
+        assert seven_wonders_rust.reveal_features_enabled() is True
+        python_rows = examples_from_record(record)
+        rust_rows = derive_records_rust([record])[0][0]
+        assert len(python_rows) == len(rust_rows)
+        nonzero = 0
+        columns = _reveal_columns()
+        for py, rs in zip(python_rows, rust_rows):
+            a = np.asarray(py.features, dtype=np.float64)
+            b = np.asarray(rs.features, dtype=np.float64)
+            assert a.shape == b.shape
+            assert np.abs(a - b).max() == 0.0
+            tableau = np.asarray(py.type_ids) == TYPE_IDS[TokenType.TABLEAU]
+            if tableau.any():
+                nonzero += int(np.count_nonzero(a[tableau][:, columns]))
+    finally:
+        set_reveal_features(False)
+
+    # A whole game must actually exercise the channels, or the comparison above
+    # is agreement about zeros with extra steps.
+    assert nonzero > 0, "no reveal channel was ever nonzero; the test proves nothing"

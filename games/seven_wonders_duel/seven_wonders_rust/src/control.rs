@@ -141,14 +141,26 @@ static TABLE: OnceLock<ControlTable> = OnceLock::new();
 /// so both arms share a width, a signature and an architecture, and the only
 /// difference is what the network is shown. Must track Python exactly: the two
 /// languages disagreeing about what the model sees is worse than either arm.
-static ENABLED: AtomicBool = AtomicBool::new(true);
+///
+/// The default comes from `SWD_CONTROL_FEATURES`, the variable `encoder.py`
+/// reads, with the same parsing. Assuming `true` here was a latent
+/// disagreement: exporting `SWD_CONTROL_FEATURES=0` turned the channels off in
+/// Python and left them on in Rust, so the replay path and the self-play path
+/// were shown different inputs and nothing reported it.
+static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+
+fn flag() -> &'static AtomicBool {
+    ENABLED.get_or_init(|| {
+        AtomicBool::new(crate::reveal::env_default("SWD_CONTROL_FEATURES", true))
+    })
+}
 
 pub fn set_enabled(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Relaxed);
+    flag().store(enabled, Ordering::Relaxed);
 }
 
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    flag().load(Ordering::Relaxed)
 }
 
 /// Install the table Python is itself using.

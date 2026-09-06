@@ -69,7 +69,13 @@ from .rules import Resource, discard_income
 # Additive, so the names move the hash on their own; no existing feature
 # changed meaning. Both are tempo primitives -- see GLOBAL_FEATURES. Batched
 # with -3 because -3's retrain had not run yet, so this costs nothing extra.
-ENCODER_VERSION = "7wd-encoder-6"
+#
+# Bumped to -7 (2026-09-06): five per-slot reveal-risk channels appended to
+# TABLEAU_FEATURES (`reveal_risk.py`). Additive with new names, so the hash
+# moves on its own; the bump is the convention of §5.8 rather than a necessity.
+# Rust computes the same five channels as of the same day, so both languages
+# carry this version -- the schema is not Python-only.
+ENCODER_VERSION = "7wd-encoder-7"
 
 _RESOURCES = tuple(Resource)
 _SYMBOLS = tuple(ScienceSymbol)

@@ -28,12 +28,12 @@ const NUM_RESOURCES: usize = 5;
 /// boundary compares a checkpoint's stored signature against this to reject a
 /// net trained on a different feature schema.
 pub const ENCODER_SIGNATURE: &str =
-    "36b2ffa5cfd58e5b16aaa5b515f70ce6ccd49d27bd1ab8eb52355c223960c4e3";
+    "18bf9baf715f88d00043a9130e2a02cea4147afafafe64e040dd6e3bea28e83d";
 
 /// Feature-vector length per token type, in `TokenType` order. The encoder
 /// asserts every emitted token matches (debug builds + `cargo test`); the
 /// bit-exact gate enforces it in release via the value comparison.
-pub const FEATURE_COUNTS: [usize; 9] = [133, 1, 32, 1, 8, 4, 1, 79, 14];
+pub const FEATURE_COUNTS: [usize; 9] = [133, 1, 37, 1, 8, 4, 1, 79, 14];
 
 /// Widest token feature vector — the padded row width every packed batch uses.
 ///
@@ -148,6 +148,10 @@ struct Enc<'a> {
     /// per-seat discard cards that seat can still revive (unbuilt Mausoleum).
     /// Seat-specific, so it cannot join `obtainable`.
     revivable: [Vec<usize>; 2],
+    /// Unseen pool cards of the still-relevant backs -- what a reveal can turn
+    /// over. Narrower than `obtainable`, which also holds the cards already
+    /// face up on the board and so cannot be revealed by anything.
+    unseen_relevant: Vec<usize>,
 }
 
 /// Allocating wrapper for cold callers (tests, single-state paths). The hot
@@ -168,6 +172,10 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
     let pool = unseen_pool(g);
     let obtainable = obtainable_cards(g, &pool);
     let revivable = [revivable_cards(g, 0), revivable_cards(g, 1)];
+    let unseen_relevant: Vec<usize> = relevant_backs(g)
+        .into_iter()
+        .flat_map(|back| pool.cards[back].iter().copied())
+        .collect();
     let e = Enc {
         g,
         actor,
@@ -175,6 +183,7 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
         symbols: [compute_symbols(g, 0), compute_symbols(g, 1)],
         obtainable,
         revivable,
+        unseen_relevant,
     };
     e.global_token(out);
     e.draft_offer_tokens(out);
@@ -259,7 +268,7 @@ fn revivable_cards(g: &GameState, seat: usize) -> Vec<usize> {
     Vec::new()
 }
 
-fn rel_position(g: &GameState, seat: usize) -> i32 {
+pub(crate) fn rel_position(g: &GameState, seat: usize) -> i32 {
     if seat == 0 {
         g.conflict_position
     } else {
@@ -292,7 +301,7 @@ fn tokens_remaining(g: &GameState, seat: usize) -> (f64, f64) {
     )
 }
 
-fn effective_shields(g: &GameState, seat: usize, cid: usize) -> i32 {
+pub(crate) fn effective_shields(g: &GameState, seat: usize, cid: usize) -> i32 {
     let c = card(cid);
     let mut shields = c.shields;
     if c.color == CardColor::Red
@@ -583,6 +592,17 @@ impl Enc<'_> {
         present.sort_by_key(|&(row, x, _)| (row, x));
         // One key and three lookups for the whole position, not per slot.
         let control = crate::control::control_maps(g);
+        // Likewise once, not per slot: the counts are local geometry and the
+        // pool fractions are one pass per seat, both shared by every token.
+        let reveal = crate::reveal::reveal_values(
+            g,
+            &present,
+            self.actor,
+            &self.symbols,
+            &self.unseen_relevant,
+            rel_position,
+            effective_shields,
+        );
 
         for &(row, x, i) in &present {
             let slot_card = &g.tableau.slots[i];
@@ -639,6 +659,8 @@ impl Enc<'_> {
                     }
                 }
             }
+            // Reveal risk, appended after control to match TABLEAU_FEATURES.
+            v.extend_from_slice(&reveal[i]);
             out.set_entity(entity);
         }
     }

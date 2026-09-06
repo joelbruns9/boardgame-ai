@@ -62,11 +62,10 @@ REVEAL_FEATURES = (
     "reveal_opp_mil",
 )
 
-#: Default OFF. The Rust encoder has no reveal block, so leaving these on would
-#: make the two languages disagree on every tableau token -- the exact failure
-#: `test_both_languages_agree_in_off_mode` exists to catch. Python-only
-#: experiments (the offline A/B replays through Python) turn them on explicitly;
-#: self-play cannot use them until Rust computes them too.
+#: Default OFF, in both languages: `reveal.rs` reads the same variable with the
+#: same parsing rather than assuming a default, so the two agree whether or not
+#: anyone calls the setter. Rust computes the block now, so ON is no longer
+#: Python-only -- but a self-play run still has to turn it on deliberately.
 _ENABLED = os.environ.get(
     "SWD_REVEAL_FEATURES", "0"
 ).strip().lower() not in ("0", "false", "no", "off")
@@ -77,15 +76,25 @@ def reveal_features_enabled() -> bool:
 
 
 def set_reveal_features(enabled: bool) -> None:
-    """Toggle the reveal channels. Zero-filled when off, exactly like control.
+    """Toggle the reveal channels, in Python and in Rust together.
 
     Off-mode emits zeros rather than dropping the columns, so the schema -- and
     therefore the encoder signature -- is identical in both arms and a single
     checkpoint can be evaluated either way.
+
+    Setting one language only would be worse than either arm: the replay path
+    and the self-play path would disagree about what the model is being shown.
     """
 
     global _ENABLED
     _ENABLED = bool(enabled)
+    try:
+        import seven_wonders_rust
+    except ImportError:
+        return
+    setter = getattr(seven_wonders_rust, "set_reveal_features_enabled", None)
+    if setter is not None:
+        setter(bool(enabled))
 
 
 def newly_revealed_counts(obs) -> dict:
