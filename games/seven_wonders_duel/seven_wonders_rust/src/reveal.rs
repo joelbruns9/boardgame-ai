@@ -20,8 +20,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use crate::data::card;
+use crate::data::{back_type_of, card};
 use crate::state::GameState;
+
+/// Back count, and the fixed order the per-back sums below accumulate in --
+/// `BackType as usize`, shared with Python's `_BACKS`, so the two languages add
+/// the same floats in the same order.
+const NUM_BACKS: usize = 4;
 
 /// Channels per tableau token, in `REVEAL_FEATURES` order.
 pub const WIDTH: usize = 5;
@@ -60,13 +65,21 @@ pub fn enabled() -> bool {
     flag().load(Ordering::Relaxed)
 }
 
-/// `slot index -> how many hidden slots removing it would reveal`.
+/// `slot index -> how many hidden slots of each BACK removing it would reveal`.
 ///
 /// A slot at row `r` is covered by slots at `r + 1`. Removing a coverer reveals
 /// a covered slot only when it was the **last** present coverer -- the same
 /// condition `take_accessible` reports as newly accessible.
-fn newly_revealed_counts(g: &GameState, present: &[(i32, i32, usize)]) -> Vec<u32> {
-    let mut counts = vec![0u32; g.tableau.slots.len()];
+///
+/// The back is carried, not just the count: a card's back is public while its
+/// face is not, and it says which pool the card comes from. A Guild-backed slot
+/// cannot turn over an Age III card, so pooling the backs -- as this did until
+/// 2026-09-07 -- priced a reveal with cards it could never produce.
+fn newly_revealed_backs(
+    g: &GameState,
+    present: &[(i32, i32, usize)],
+) -> Vec<[u32; NUM_BACKS]> {
+    let mut counts = vec![[0u32; NUM_BACKS]; g.tableau.slots.len()];
     for &(row, x, i) in present {
         if g.tableau.slots[i].revealed {
             continue;
@@ -76,7 +89,7 @@ fn newly_revealed_counts(g: &GameState, present: &[(i32, i32, usize)]) -> Vec<u3
             .filter(|&&(orow, ox, _)| orow == row + 1 && (ox - x).abs() == 1);
         // Exactly one coverer left: removing it uncovers this hidden card.
         if let (Some(&(_, _, only)), None) = (coverers.next(), coverers.next()) {
-            counts[only] += 1;
+            counts[only][back_type_of(g.tableau.slots[i].card_id) as usize] += 1;
         }
     }
     counts
@@ -95,6 +108,8 @@ fn decisive_fractions(
     dist_win: i32,
     effective_shields: impl Fn(&GameState, usize, usize) -> i32,
 ) -> (f64, f64) {
+    // `names` is ONE back's unseen pool, never the pooled relevant backs: see
+    // `newly_revealed_backs`.
     if names.is_empty() {
         return (0.0, 0.0);
     }
@@ -129,7 +144,7 @@ pub fn reveal_values(
     present: &[(i32, i32, usize)],
     actor: usize,
     symbols: &[[bool; 7]; 2],
-    unseen: &[usize],
+    unseen_by_back: &[Vec<usize>; NUM_BACKS],
     rel_position: impl Fn(&GameState, usize) -> i32,
     effective_shields: impl Fn(&GameState, usize, usize) -> i32 + Copy,
 ) -> Vec<[f64; WIDTH]> {
@@ -137,33 +152,57 @@ pub fn reveal_values(
     if !enabled() || present.is_empty() {
         return zeros;
     }
-    let counts = newly_revealed_counts(g, present);
-    if counts.iter().all(|&c| c == 0) {
+    let counts = newly_revealed_backs(g, present);
+    if counts.iter().all(|c| c.iter().all(|&n| n == 0)) {
         return zeros;
     }
 
+    // One pass per (seat, back), not per slot, and only for the backs this
+    // position can actually turn over -- in Age III that is two of the four.
+    let mut occurs = [false; NUM_BACKS];
+    for per_back in &counts {
+        for back in 0..NUM_BACKS {
+            occurs[back] |= per_back[back] > 0;
+        }
+    }
     let opponent = 1 - actor;
-    let mine = decisive_fractions(
-        g,
-        actor,
-        &symbols[actor],
-        unseen,
-        9 - rel_position(g, actor),
-        effective_shields,
-    );
-    let theirs = decisive_fractions(
-        g,
-        opponent,
-        &symbols[opponent],
-        unseen,
-        9 - rel_position(g, opponent),
-        effective_shields,
-    );
+    let mut fractions = [[(0.0, 0.0); NUM_BACKS]; 2];
+    for (index, seat) in [actor, opponent].into_iter().enumerate() {
+        let dist_win = 9 - rel_position(g, seat);
+        for back in 0..NUM_BACKS {
+            if !occurs[back] {
+                continue;
+            }
+            fractions[index][back] = decisive_fractions(
+                g,
+                seat,
+                &symbols[seat],
+                &unseen_by_back[back],
+                dist_win,
+                effective_shields,
+            );
+        }
+    }
 
     let mut out = zeros;
     for &(_, _, i) in present {
-        let n = counts[i] as f64;
-        out[i] = [n / 2.0, n * mine.0, n * theirs.0, n * mine.1, n * theirs.1];
+        let per_back = &counts[i];
+        let n: u32 = per_back.iter().sum();
+        // Summed over backs in a FIXED order, so Python accumulates the same
+        // floats in the same order.
+        let mut totals = [0.0f64; 4];
+        for back in 0..NUM_BACKS {
+            let count = per_back[back];
+            if count == 0 {
+                continue;
+            }
+            let count = count as f64;
+            totals[0] += count * fractions[0][back].0;
+            totals[1] += count * fractions[1][back].0;
+            totals[2] += count * fractions[0][back].1;
+            totals[3] += count * fractions[1][back].1;
+        }
+        out[i] = [n as f64 / 2.0, totals[0], totals[1], totals[2], totals[3]];
     }
     out
 }

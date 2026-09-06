@@ -22,20 +22,27 @@ No search and no joint enumeration. For each present slot:
 
 ``reveal_n``          how many currently-hidden slots become accessible (and so
                       are revealed) when this slot is removed.
-``reveal_*_sixth``    ``reveal_n`` x the fraction of the unseen pool that would
-                      give that seat a sixth distinct science symbol.
-``reveal_*_mil``      ``reveal_n`` x the fraction that would end it militarily
-                      for that seat at once.
+``reveal_*_sixth``    summed over the slots it uncovers: the fraction of THAT
+                      SLOT'S back-specific pool that would give that seat a
+                      sixth distinct science symbol.
+``reveal_*_mil``      the same, for cards that would end it militarily at once.
 
-The fractions are one pass over the unseen pool per seat; the counts are local
-geometry. So the whole block is O(unseen pool + slots), which is the same price
-class as the features already in the encoder -- unlike a proof, which has to
-enumerate reveals jointly.
+The fractions are one pass over each back's unseen pool per seat; the counts are
+local geometry. So the whole block is O(unseen pool + slots), which is the same
+price class as the features already in the encoder -- unlike a proof, which has
+to enumerate reveals jointly.
+
+A card's back is public even while its face is not, and it says which pool the
+card comes from: a Guild-backed slot cannot turn over an Age III card, and an
+Age III slot cannot turn over a Guild. Pooling every relevant back and scaling
+by the count -- which this did until 2026-09-07 -- therefore priced a Guild
+reveal with cards it could never produce. Per-back is also the only reading that
+is right in Ages I and II, where the pooled version mixed in whole future ages.
 
 The ``*_sixth`` and ``*_mil`` values are **expected counts of decisive cards
-revealed**, not probabilities: with ``reveal_n = 2`` and a pool 40% decisive the
-value is 0.8. That keeps the two factors the network needs -- how much you
-uncover, and how dangerous the pool is -- in one number, while ``reveal_n`` is
+revealed**, not probabilities: uncovering two slots whose pools are 40% decisive
+reads 0.8. That keeps the two factors the network needs -- how much you uncover,
+and how dangerous what you uncover is -- in one number, while ``reveal_n`` is
 still there separately if it wants them apart.
 
 What this is NOT
@@ -51,7 +58,11 @@ from __future__ import annotations
 
 import os
 
-from .data import CARDS_BY_NAME, TABLEAU_LAYOUTS, covering_slots
+from .data import CARDS_BY_NAME, TABLEAU_LAYOUTS, BackType, covering_slots
+
+#: Back order for the per-back sums below. Fixed, and shared with Rust, so the
+#: two languages accumulate the same floats in the same order.
+_BACKS = tuple(BackType)
 
 #: Per-slot channels, appended to TABLEAU_FEATURES. Order is the schema.
 REVEAL_FEATURES = (
@@ -97,13 +108,19 @@ def set_reveal_features(enabled: bool) -> None:
         setter(bool(enabled))
 
 
-def newly_revealed_counts(obs) -> dict:
-    """``slot_id -> how many hidden slots removing it would reveal``.
+def newly_revealed_backs(obs) -> dict:
+    """``slot_id -> {back: how many hidden slots of that back it would reveal}``.
 
     A slot at row ``r`` is covered by slots at ``r + 1`` (``covering_slots``).
     Removing a coverer reveals a covered slot only when it was the **last**
     present coverer, which is the same condition ``TableauState.take_accessible``
     reports as newly accessible.
+
+    The BACK of each uncovered slot is carried, not just the count, because a
+    card's back is public even while its face is not, and it says which pool the
+    card comes from. A Guild-backed slot cannot turn over an Age III card and an
+    Age III slot cannot turn over a Guild -- so pooling them, as this did until
+    2026-09-07, priced a Guild reveal with Age III cards it could never produce.
     """
 
     present = {card.slot_id: card for card in obs.tableau if card.present}
@@ -112,7 +129,7 @@ def newly_revealed_counts(obs) -> dict:
     layout = TABLEAU_LAYOUTS[max(obs.age, 1)]
     by_id = {(slot.row, slot.x): slot for slot in layout}
 
-    counts = {slot_id: 0 for slot_id in present}
+    revealed = {slot_id: {} for slot_id in present}
     for slot_id, card in present.items():
         if card.revealed:
             continue
@@ -123,20 +140,40 @@ def newly_revealed_counts(obs) -> dict:
         ]
         # Exactly one coverer left: removing it uncovers this hidden card.
         if len(coverers) == 1:
-            counts[coverers[0]] += 1
-    return counts
+            # `card.back`, never `card.card_name`: this card is face DOWN, so
+            # the observation carries no name for it. The back is public.
+            back = card.back
+            counts = revealed[coverers[0]]
+            counts[back] = counts.get(back, 0) + 1
+    return revealed
 
 
-def decisive_fractions(derived, seat: int) -> tuple[float, float]:
-    """``(sixth-symbol fraction, immediate-military fraction)`` of the unseen pool.
+def newly_revealed_counts(obs) -> dict:
+    """``slot_id -> how many hidden slots removing it would reveal``."""
+
+    return {
+        slot_id: sum(counts.values())
+        for slot_id, counts in newly_revealed_backs(obs).items()
+    }
+
+
+def decisive_fractions(derived, seat: int, back=None) -> tuple[float, float]:
+    """``(sixth-symbol fraction, immediate-military fraction)`` of a card pool.
 
     Mirrors the per-card tests the encoder already applies to face-up cards, so
     a revealed card is judged by the same rule whether it is visible or not.
+
+    ``back`` restricts the pool to the cards that could actually be under a slot
+    with that back. Omitted, every relevant back is pooled -- which is what a
+    caller wants for "the pool at large", and is exactly wrong for one slot.
     """
 
-    names = []
-    for back in derived.relevant_backs:
-        names.extend(derived.pool.cards[back])
+    if back is None:
+        names = []
+        for relevant in derived.relevant_backs:
+            names.extend(derived.pool.cards[relevant])
+    else:
+        names = list(derived.pool.cards.get(back, ()))
     if not names:
         return 0.0, 0.0
 
@@ -170,21 +207,38 @@ def reveal_values(derived) -> dict:
     if not _ENABLED or not present:
         return {slot_id: list(zeros) for slot_id in present}
 
-    counts = newly_revealed_counts(obs)
-    if not any(counts.values()):
+    revealed = newly_revealed_backs(obs)
+    if not any(counts for counts in revealed.values()):
         return {slot_id: list(zeros) for slot_id in present}
 
-    mine = decisive_fractions(derived, derived.actor)
-    theirs = decisive_fractions(derived, 1 - derived.actor)
+    # One pass per (seat, back) rather than per slot, and only for the backs
+    # this position can actually turn over -- in Age III that is two of four.
+    occurs = {back for counts in revealed.values() for back in counts}
+    fractions = {}
+    for seat in (derived.actor, 1 - derived.actor):
+        for back in _BACKS:
+            fractions[(seat, back)] = (
+                decisive_fractions(derived, seat, back)
+                if back in occurs else (0.0, 0.0)
+            )
 
+    opponent = 1 - derived.actor
     out = {}
     for slot_id in present:
-        n = float(counts.get(slot_id, 0))
-        out[slot_id] = [
-            n / 2.0,
-            n * mine[0],
-            n * theirs[0],
-            n * mine[1],
-            n * theirs[1],
-        ]
+        counts = revealed.get(slot_id, {})
+        n = float(sum(counts.values()))
+        # Summed over backs in a FIXED order, so the two languages accumulate
+        # the same floats in the same order and stay bit-identical.
+        totals = [0.0, 0.0, 0.0, 0.0]
+        for back in _BACKS:
+            count = counts.get(back)
+            if not count:
+                continue
+            mine = fractions[(derived.actor, back)]
+            theirs = fractions[(opponent, back)]
+            totals[0] += count * mine[0]
+            totals[1] += count * theirs[0]
+            totals[2] += count * mine[1]
+            totals[3] += count * theirs[1]
+        out[slot_id] = [n / 2.0, totals[0], totals[1], totals[2], totals[3]]
     return out

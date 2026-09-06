@@ -148,10 +148,6 @@ struct Enc<'a> {
     /// per-seat discard cards that seat can still revive (unbuilt Mausoleum).
     /// Seat-specific, so it cannot join `obtainable`.
     revivable: [Vec<usize>; 2],
-    /// Unseen pool cards of the still-relevant backs -- what a reveal can turn
-    /// over. Narrower than `obtainable`, which also holds the cards already
-    /// face up on the board and so cannot be revealed by anything.
-    unseen_relevant: Vec<usize>,
 }
 
 /// Allocating wrapper for cold callers (tests, single-state paths). The hot
@@ -172,10 +168,6 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
     let pool = unseen_pool(g);
     let obtainable = obtainable_cards(g, &pool);
     let revivable = [revivable_cards(g, 0), revivable_cards(g, 1)];
-    let unseen_relevant: Vec<usize> = relevant_backs(g)
-        .into_iter()
-        .flat_map(|back| pool.cards[back].iter().copied())
-        .collect();
     let e = Enc {
         g,
         actor,
@@ -183,7 +175,6 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
         symbols: [compute_symbols(g, 0), compute_symbols(g, 1)],
         obtainable,
         revivable,
-        unseen_relevant,
     };
     e.global_token(out);
     e.draft_offer_tokens(out);
@@ -599,7 +590,7 @@ impl Enc<'_> {
             &present,
             self.actor,
             &self.symbols,
-            &self.unseen_relevant,
+            &self.pool.cards,
             rel_position,
             effective_shields,
         );

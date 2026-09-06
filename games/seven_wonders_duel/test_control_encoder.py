@@ -356,3 +356,104 @@ def test_both_languages_agree_with_reveal_on():
     # A whole game must actually exercise the channels, or the comparison above
     # is agreement about zeros with extra steps.
     assert nonzero > 0, "no reveal channel was ever nonzero; the test proves nothing"
+
+
+def _age_three_position(seed=11, rng_seed=1101):
+    """Play randomly into Age III and return the game."""
+
+    from .buffer import GameRecorder
+    from .codec import legal_action_indices
+
+    recorder = GameRecorder(seed, agents={"p0": "t", "p1": "t"})
+    rng = random.Random(rng_seed)
+    while recorder.game.phase.value != "complete":
+        if recorder.game.age == 3 and recorder.game.phase is Phase.PLAY_AGE:
+            return recorder.game
+        choice = rng.choice(legal_action_indices(recorder.game))
+        recorder.play(choice, policy_target={choice: 1.0})
+    raise AssertionError("never reached Age III")
+
+
+def test_reveal_risk_uses_the_uncovered_slots_own_back():
+    """A Guild-backed slot cannot turn over an Age III card.
+
+    Until 2026-09-07 the fractions came from every relevant back pooled and were
+    scaled by the count, so uncovering a GUILD slot was priced with Age III
+    cards it could never produce -- military risk on a pool (the Guilds) that
+    carries no shields at all.
+    """
+
+    from .data import BackType, CARDS_BY_NAME, GUILD_CARDS
+    from .encoder import _Derived
+    from .pool import unseen_pool
+    from .reveal_risk import decisive_fractions, newly_revealed_backs, set_reveal_features
+
+    game = _age_three_position()
+    # Put the opponent one shield from a military win, so the Age III pool is
+    # genuinely dangerous and the test cannot pass vacuously.
+    game.conflict_position = 8 if game.active_player == 0 else -8
+
+    observation = game.observation(game.active_player)
+    revealed = newly_revealed_backs(observation)
+    uncovering = {slot: counts for slot, counts in revealed.items() if counts}
+    assert uncovering, "position uncovers nothing; the test would prove nothing"
+
+    # Force every uncovered slot to a Guild back, using guilds that are not
+    # visible anywhere else so the unseen pool stays consistent.
+    visible = {
+        card.card_name for card in observation.tableau
+        if card.present and card.card_name
+    }
+    for city in game.cities:
+        visible.update(city.buildings)
+    visible.update(game.discard_pile)
+    spare = [g.name for g in GUILD_CARDS if g.name not in visible]
+    hidden = [
+        slot for slot, card in game.tableau.cards.items()
+        if card.present and not card.revealed
+    ]
+    for slot in hidden:
+        if not spare:
+            break
+        game.tableau.cards[slot].card_name = spare.pop()
+
+    observation = game.observation(game.active_player)
+    derived = _Derived(observation, unseen_pool(observation), game.active_player)
+    seat = derived.actor
+
+    pooled = decisive_fractions(derived, seat)
+    guild_only = decisive_fractions(derived, seat, BackType.GUILD)
+
+    # Non-vacuity: the pooled reading really is nonzero here, which is what the
+    # old code would have charged the Guild slot with.
+    assert pooled[1] > 0.0, "pool carries no military threat; nothing to get wrong"
+    # And no guild card carries a shield, so the honest answer is zero.
+    assert guild_only[1] == 0.0
+    assert all(CARDS_BY_NAME[name].shields == 0 for name in derived.pool.cards[BackType.GUILD])
+
+    set_reveal_features(True)
+    try:
+        encoding = encode(observation)
+    finally:
+        set_reveal_features(False)
+
+    # Tableau tokens are emitted in sorted (row, x) order of the present slots,
+    # so they can be matched back to slot ids.
+    columns = _reveal_columns()
+    order = sorted(card.slot_id for card in observation.tableau if card.present)
+    tokens = [t for t in encoding.tokens if t.type is TokenType.TABLEAU]
+    assert len(order) == len(tokens)
+
+    revealed = newly_revealed_backs(observation)
+    guild_only = [
+        slot for slot, counts in revealed.items()
+        if counts and set(counts) == {BackType.GUILD}
+    ]
+    assert guild_only, "no slot uncovers only Guild backs; the test proves nothing"
+
+    for slot, token in zip(order, tokens):
+        if slot not in guild_only:
+            continue
+        assert token.features[columns[0]] > 0.0  # it does uncover something
+        assert token.features[columns[3]] == 0.0  # and no Guild card wins a war
+        assert token.features[columns[4]] == 0.0
