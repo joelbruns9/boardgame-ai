@@ -13,7 +13,8 @@ use crate::data::{
     ScienceSymbol, NUM_CARDS, NUM_WONDERS,
 };
 use crate::engine::{
-    choice_producers, fixed_production, minimum_payment, opponent_trade_production, trade_discounts,
+    choice_producers, fixed_production, minimum_payment_with, opponent_trade_production,
+    trade_discounts, PricingContext,
 };
 use crate::pool::{unseen_pool, UnseenPool};
 use crate::rules::discard_income;
@@ -148,6 +149,11 @@ struct Enc<'a> {
     /// per-seat discard cards that seat can still revive (unbuilt Mausoleum).
     /// Seat-specific, so it cannot join `obtainable`.
     revivable: [Vec<usize>; 2],
+    /// One pricing snapshot per seat, built once for the whole encode. Every
+    /// price below goes through these: the pool tokens alone price ~23 cards
+    /// per back for BOTH seats, and each of those was rebuilding four city
+    /// scans and a producer cartesian product.
+    pricing: [PricingContext; 2],
 }
 
 /// Allocating wrapper for cold callers (tests, single-state paths). The hot
@@ -171,6 +177,10 @@ pub fn encode_into(g: &GameState, out: &mut TokenBuf) {
     let e = Enc {
         g,
         actor,
+        pricing: [
+            PricingContext::for_player(g, 0),
+            PricingContext::for_player(g, 1),
+        ],
         pool,
         symbols: [compute_symbols(g, 0), compute_symbols(g, 1)],
         obtainable,
@@ -533,7 +543,8 @@ impl Enc<'_> {
     fn tableau_card_per_player(&self, seat: usize, cid: usize) -> Vec<f64> {
         let g = self.g;
         let c = card(cid);
-        let payment = minimum_payment(g, seat, &c.cost, Some(c), false);
+        let payment =
+            minimum_payment_with(g, seat, &c.cost, Some(c), false, &self.pricing[seat]);
         let cost = payment.total_coins;
         let affordable = g.cities[seat].coins >= cost;
         let have = &self.symbols[seat];
@@ -692,8 +703,14 @@ impl Enc<'_> {
                 let (affordable, cost) = if built || retired {
                     (0.0, 0)
                 } else {
-                    let payment =
-                        minimum_payment(g, seat, w.cost.as_ref().expect("wonder cost"), None, true);
+                    let payment = minimum_payment_with(
+                        g,
+                        seat,
+                        w.cost.as_ref().expect("wonder cost"),
+                        None,
+                        true,
+                        &self.pricing[seat],
+                    );
                     (
                         if city.coins >= payment.total_coins {
                             1.0
@@ -773,19 +790,27 @@ impl Enc<'_> {
             let my_costs: Vec<i32> = members
                 .iter()
                 .map(|&cid| {
-                    minimum_payment(self.g, self.actor, &card(cid).cost, Some(card(cid)), false)
-                        .total_coins
+                    minimum_payment_with(
+                        self.g,
+                        self.actor,
+                        &card(cid).cost,
+                        Some(card(cid)),
+                        false,
+                        &self.pricing[self.actor],
+                    )
+                    .total_coins
                 })
                 .collect();
             let opp_costs: Vec<i32> = members
                 .iter()
                 .map(|&cid| {
-                    minimum_payment(
+                    minimum_payment_with(
                         self.g,
                         1 - self.actor,
                         &card(cid).cost,
                         Some(card(cid)),
                         false,
+                        &self.pricing[1 - self.actor],
                     )
                     .total_coins
                 })

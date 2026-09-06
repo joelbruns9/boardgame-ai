@@ -3251,6 +3251,65 @@ mod tests {
     }
 
     #[test]
+    /// In-process A/B for the pricing context, `#[ignore]`d so it costs the
+    /// suite nothing:
+    ///
+    ///     cargo test --release bench_pricing -- --ignored --nocapture
+    ///
+    /// Both paths are timed in the same binary and the same run deliberately.
+    /// Measured through Python across two rebuilds this change read as anywhere
+    /// from 14% to nothing, because run-to-run drift on this laptop (+/-6%) is
+    /// larger than the end-to-end effect. In-process it is unambiguous: 0.13
+    /// us/call building a context per price against 0.022 us/call sharing one.
+    #[test]
+    #[ignore]
+    fn bench_pricing_context() {
+        use crate::data::card;
+        use crate::engine::{minimum_payment, minimum_payment_with, PricingContext};
+        use std::time::Instant;
+
+        let mut g = GameState::from_setup(sample_setup(), VecDeque::new());
+        let mut steps = 0;
+        while g.phase != Phase::Complete && steps < 40 {
+            let legal = codec::legal_action_indices(&g);
+            if legal.is_empty() {
+                break;
+            }
+            g.apply_action(&codec::decode_action(&g, legal[steps % legal.len()]));
+            steps += 1;
+        }
+        let cards: Vec<usize> = (0..73).collect();
+        let reps = 200;
+
+        let start = Instant::now();
+        let mut sink = 0i32;
+        for _ in 0..reps {
+            for &cid in &cards {
+                let c = card(cid);
+                sink += minimum_payment(&g, 0, &c.cost, Some(c), false).total_coins;
+            }
+        }
+        let per_call = start.elapsed().as_secs_f64() / (reps * cards.len()) as f64;
+
+        let start = Instant::now();
+        for _ in 0..reps {
+            let ctx = PricingContext::for_player(&g, 0);
+            for &cid in &cards {
+                let c = card(cid);
+                sink += minimum_payment_with(&g, 0, &c.cost, Some(c), false, &ctx).total_coins;
+            }
+        }
+        let per_call_shared = start.elapsed().as_secs_f64() / (reps * cards.len()) as f64;
+
+        println!(
+            "own context {:.3} us/call | shared {:.3} us/call | {:.2}x  (sink {sink})",
+            per_call * 1e6,
+            per_call_shared * 1e6,
+            per_call / per_call_shared,
+        );
+    }
+
+    #[test]
     fn encoder_feature_counts_match_schema() {
         use crate::encoder::{encode, FEATURE_COUNTS};
         let mut g = GameState::from_setup(sample_setup(), VecDeque::new());

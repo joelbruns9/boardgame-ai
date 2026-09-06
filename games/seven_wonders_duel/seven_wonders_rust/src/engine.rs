@@ -170,6 +170,54 @@ fn chain_is_free(g: &GameState, player: usize, c: &data::CardData) -> bool {
     }
 }
 
+/// Everything a price needs about the two cities, and nothing about the card.
+///
+/// Port of `engine.py::PricingContext`. Each field is a scan of a whole city
+/// rebuilt from card ids, and `assignments` is a cartesian product over the
+/// flexible producers -- all of it identical for every card priced against the
+/// same state. The encoder prices the whole unseen pool for BOTH seats on every
+/// encode, so rebuilding this per call was the largest repeated cost on the
+/// self-play hot path.
+///
+/// It is a snapshot: valid only until the state changes. Build it where the
+/// prices are taken and pass it down; never store one.
+pub(crate) struct PricingContext {
+    fixed: [i32; 5],
+    opponent: [i32; 5],
+    discounts: [bool; 5],
+    architecture: bool,
+    masonry: bool,
+    /// Producer assignments as per-resource added-production vectors. One entry
+    /// (`[0; 5]`) when the city has no flexible producers.
+    assignments: Vec<[i32; 5]>,
+}
+
+impl PricingContext {
+    pub(crate) fn for_player(g: &GameState, player: usize) -> Self {
+        let producers = choice_producers(g, player);
+        let mut assignments: Vec<[i32; 5]> = vec![[0i32; 5]];
+        for prod in &producers {
+            let mut next = Vec::with_capacity(assignments.len() * prod.len());
+            for base in &assignments {
+                for &r in *prod {
+                    let mut v = *base;
+                    v[r as usize] += 1;
+                    next.push(v);
+                }
+            }
+            assignments = next;
+        }
+        Self {
+            fixed: fixed_production(g, player),
+            opponent: opponent_trade_production(g, player),
+            discounts: trade_discounts(g, player),
+            architecture: has_token(g, player, "Architecture"),
+            masonry: has_token(g, player, "Masonry"),
+            assignments,
+        }
+    }
+}
+
 /// Enumerate rebate allocations (per-resource reductions summing to ≤ rebate,
 /// each ≤ the cost's count) and, over each, the minimal trade cost across
 /// flexible producers. Returns (total_coins, trade_coins, used_chain).
@@ -179,6 +227,19 @@ pub(crate) fn minimum_payment(
     cost: &Cost,
     card_opt: Option<&data::CardData>,
     is_wonder: bool,
+) -> Payment {
+    let ctx = PricingContext::for_player(g, player);
+    minimum_payment_with(g, player, cost, card_opt, is_wonder, &ctx)
+}
+
+/// `minimum_payment` against a context the caller already built.
+pub(crate) fn minimum_payment_with(
+    g: &GameState,
+    player: usize,
+    cost: &Cost,
+    card_opt: Option<&data::CardData>,
+    is_wonder: bool,
+    ctx: &PricingContext,
 ) -> Payment {
     if let Some(c) = card_opt {
         if chain_is_free(g, player, c) {
@@ -190,34 +251,30 @@ pub(crate) fn minimum_payment(
         }
     }
     let mut rebate = 0;
-    if is_wonder && has_token(g, player, "Architecture") {
+    if is_wonder && ctx.architecture {
         rebate = 2;
     } else if let Some(c) = card_opt {
-        if c.color == CardColor::Blue && has_token(g, player, "Masonry") {
+        if c.color == CardColor::Blue && ctx.masonry {
             rebate = 2;
         }
     }
 
-    let fixed = fixed_production(g, player);
-    let producers = choice_producers(g, player);
-    let opponent = opponent_trade_production(g, player);
-    let discounts = trade_discounts(g, player);
+    let fixed = ctx.fixed;
+    let opponent = ctx.opponent;
+    let discounts = ctx.discounts;
+    let assignments = &ctx.assignments;
 
     let cost_counts: [i32; 5] = [cost.wood, cost.clay, cost.stone, cost.glass, cost.papyrus];
 
-    // Precompute all producer assignments (cartesian product), as per-resource
-    // added-production vectors.
-    let mut assignments: Vec<[i32; 5]> = vec![[0i32; 5]];
-    for prod in &producers {
-        let mut next = Vec::with_capacity(assignments.len() * prod.len());
-        for base in &assignments {
-            for &r in *prod {
-                let mut v = *base;
-                v[r as usize] += 1;
-                next.push(v);
-            }
-        }
-        assignments = next;
+    // A cost with no resources in it has exactly one payment, and the search
+    // below would spend a full pass over allocations and assignments finding
+    // it. Mirrors the Python shortcut.
+    if cost_counts.iter().all(|&n| n == 0) {
+        return Payment {
+            total_coins: cost.coins,
+            trade_coins: 0,
+            used_chain: false,
+        };
     }
 
     let mut best_trade = i32::MAX;
@@ -281,7 +338,7 @@ pub(crate) fn minimum_payment(
         &fixed,
         &opponent,
         &discounts,
-        &assignments,
+        assignments,
         &mut best_trade,
     );
 
@@ -344,24 +401,33 @@ impl GameState {
             Phase::PlayAge => {
                 let player = self.active_player;
                 let mut actions = Vec::new();
+                let ctx = PricingContext::for_player(self, player);
+                // A Wonder's price does not depend on which card is spent to
+                // build it, so it is taken once rather than once per slot. The
+                // affordable ones are still appended per slot, in the same
+                // order: action order is part of the codec.
+                let affordable_wonders: Vec<usize> = unbuilt_wonders(self, player)
+                    .into_iter()
+                    .filter(|&wid| {
+                        let wc = wonder(wid).cost.expect("wonder missing cost");
+                        let wpay =
+                            minimum_payment_with(self, player, &wc, None, true, &ctx);
+                        can_afford(self, player, &wpay)
+                    })
+                    .collect();
                 for slot in self.tableau.accessible_indices() {
                     let c = card(self.tableau.slots[slot].card_id);
-                    let pay = minimum_payment(self, player, &c.cost, Some(c), false);
+                    let pay = minimum_payment_with(self, player, &c.cost, Some(c), false, &ctx);
                     if can_afford(self, player, &pay) {
                         actions.push(Action::primary(ActionUse::ConstructBuilding, slot, None));
                     }
                     actions.push(Action::primary(ActionUse::DiscardForCoins, slot, None));
-                    for wid in unbuilt_wonders(self, player) {
-                        let w = wonder(wid);
-                        let wc = w.cost.expect("wonder missing cost");
-                        let wpay = minimum_payment(self, player, &wc, None, true);
-                        if can_afford(self, player, &wpay) {
-                            actions.push(Action::primary(
-                                ActionUse::ConstructWonder,
-                                slot,
-                                Some(wid),
-                            ));
-                        }
+                    for &wid in &affordable_wonders {
+                        actions.push(Action::primary(
+                            ActionUse::ConstructWonder,
+                            slot,
+                            Some(wid),
+                        ));
                     }
                 }
                 actions

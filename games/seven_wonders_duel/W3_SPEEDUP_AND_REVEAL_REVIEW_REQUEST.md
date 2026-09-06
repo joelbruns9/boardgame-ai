@@ -215,6 +215,16 @@ holds in Rust: `engine.rs::minimum_payment` rebuilds its context per call and
 taken.** Porting `PricingContext` into the Rust encoder would speed up every
 leaf of every search; the certifier work only sped up an offline tool.
 
+> **Done 2026-09-07, and the claim above was too strong.** Per price call the
+> shared context is 5.4-6.0x cheaper in Rust (0.13 us against 0.022 us, timed
+> in-process). But pricing is a much smaller share of the Rust encoder than of
+> the Python one -- stubbing the pool-token pricing out entirely leaves encode
+> at 24.6 us against 27.7 us, about 11% -- so end-to-end it is ~3% of the derive
+> path and invisible against this laptop's +/-6% run-to-run drift. Python's
+> version of the same pattern was worth 1.5-2.3x because it was rebuilding
+> `Counter`s and dicts; Rust was already rebuilding cheap stack arrays. Real
+> encode work now lies elsewhere.
+
 ### 5.2 Two contexts per node, not one
 
 `apply_action` validates with `action not in legal_actions(game)`, so every
