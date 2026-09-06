@@ -88,7 +88,7 @@ def arm_choice(game, evaluator, sims: int, seed: int) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--reference-dir", required=True,
+    parser.add_argument("--reference-dir", default=None,
                         help="a threat_corpus_measure output directory: the "
                              "COMMON yardstick every arm is scored against")
     parser.add_argument("--arm", action="append", default=[], metavar="NAME=PATH",
@@ -107,7 +107,17 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--out",
                         default="runs/seven_wonders_duel/w3_corpus_regret.json")
+    parser.add_argument("--merge", default=None, metavar="GLOB",
+                        help="combine finished shard reports into one, and do "
+                             "nothing else. Arms are independent, so a long run "
+                             "is best split one process per arm; this is what "
+                             "puts them back on a single yardstick.")
     args = parser.parse_args(argv)
+
+    if args.merge:
+        return _merge(args.merge, args.out)
+    if not args.reference_dir:
+        raise SystemExit("--reference-dir is required (or use --merge)")
 
     arms = {}
     for spec in args.arm:
@@ -222,6 +232,63 @@ def main(argv=None) -> int:
     print("\nLower regret is better. Both columns are agreement with the "
           "reference model's search, not with ground truth.")
     print(f"\nwrote {out}")
+    return 0
+
+
+def _merge(pattern: str, out: str) -> int:
+    """Combine shard reports written by separate processes.
+
+    The summary is recomputed from the merged rows by the same function that
+    writes a single-process report, so a merged file cannot disagree with an
+    unmerged one about how a number was derived.
+    """
+
+    import glob
+    from argparse import Namespace
+
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise SystemExit(f"--merge matched no files: {pattern}")
+
+    shards = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
+    sims = {s.get("sims") for s in shards}
+    seeds = {s.get("seed") for s in shards}
+    if len(sims) > 1 or len(seeds) > 1:
+        # A budget difference between shards would BE the effect being measured.
+        raise SystemExit(
+            f"shards disagree about the search budget (sims {sorted(sims)}, "
+            f"seed {sorted(seeds)}); they are not comparable"
+        )
+
+    rows, arms, arm_inputs, refs = [], {}, {}, set()
+    for shard in shards:
+        rows.extend(shard["rows"])
+        arms.update(shard["arms"])
+        arm_inputs.update(shard.get("arm_inputs", {}))
+        refs.update(shard.get("reference_models", []))
+
+    destination = Path(out)
+    if not destination.is_absolute():
+        destination = REPO_ROOT / destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    report = _write_report(
+        destination,
+        Namespace(sims=shards[0].get("sims"), seed=shards[0].get("seed")),
+        arms,
+        shards[0].get("reference_dir"),
+        refs,
+        rows,
+        arm_inputs,
+    )
+
+    print(f"merged {len(paths)} shards, {len(rows)} rows")
+    print(f"{'arm':<20}{'positions':>10}{'scored':>8}{'mean regret':>13}{'agreement':>11}")
+    print("-" * 62)
+    for name, entry in sorted(report["summary"].items()):
+        print(f"{name:<20}{entry['n']:>10}{entry['scored']:>8}"
+              f"{entry['mean_regret']!s:>13}{entry['agreement']!s:>11}")
+    print("")
+    print(f"wrote {destination}")
     return 0
 
 
