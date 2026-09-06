@@ -561,6 +561,14 @@ def make_checkpoint(model, config: dict) -> dict:
         out["control_features"] = "on" if control_features_enabled() else "off"
         if control_features_enabled():
             out["control_table_digest"] = table_content_digest()
+    # Which REVEAL arm this is, on the same argument and unconditionally: the
+    # channels are in the schema whether or not they are switched on, so a file
+    # that does not say which arm trained it is indistinguishable on disk from
+    # the other arm -- and the default is OFF, so an unmarked reveal-arm model
+    # would be served zeros in channels it was trained to read.
+    from .reveal_risk import reveal_features_enabled
+
+    out["reveal_features"] = "on" if reveal_features_enabled() else "off"
     return out
 
 
@@ -724,6 +732,19 @@ def _check_control_table(checkpoint: dict, *, migrating: bool) -> None:
         if arm != live:
             checkpoint["control_features_mismatch"] = {
                 "trained_with": arm, "loaded_with": live,
+            }
+
+    # Same for the reveal arm. Surfaced rather than fatal for the same reason:
+    # a model is loadable under either setting, and serving it under the other
+    # one is a silent change in what it is shown, not an error.
+    reveal_arm = checkpoint.get("reveal_features")
+    if reveal_arm is not None:
+        from .reveal_risk import reveal_features_enabled
+
+        live = "on" if reveal_features_enabled() else "off"
+        if reveal_arm != live:
+            checkpoint["reveal_features_mismatch"] = {
+                "trained_with": reveal_arm, "loaded_with": live,
             }
 
     recorded = checkpoint.get("control_table_digest")

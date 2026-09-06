@@ -93,6 +93,12 @@ def main(argv=None) -> int:
                              "COMMON yardstick every arm is scored against")
     parser.add_argument("--arm", action="append", default=[], metavar="NAME=PATH",
                         help="repeatable; the arm's checkpoint")
+    parser.add_argument("--reveal-arm", action="append", default=[],
+                        metavar="NAME=on|off",
+                        help="reveal setting for an arm whose checkpoint "
+                             "predates the stamp (every arm trained before "
+                             "2026-09-07). Without it such an arm is scored at "
+                             "the live setting and the report says so.")
     parser.add_argument("--sims", type=int, default=600,
                         help="search budget for the arm's CHOICE. Fixed across "
                              "arms: a budget difference would be the effect.")
@@ -111,6 +117,17 @@ def main(argv=None) -> int:
         arms[name] = path
     if not arms:
         raise SystemExit("no --arm given")
+
+    reveal_overrides = {}
+    for spec in args.reveal_arm:
+        if "=" not in spec:
+            raise SystemExit(f"--reveal-arm expects NAME=on|off, got {spec!r}")
+        name, setting = spec.split("=", 1)
+        if setting not in ("on", "off"):
+            raise SystemExit(f"--reveal-arm setting must be on or off, got {setting!r}")
+        if name not in arms:
+            raise SystemExit(f"--reveal-arm names {name!r}, which is not an arm")
+        reveal_overrides[name] = setting
 
     reference_dir = Path(args.reference_dir)
     if not reference_dir.is_absolute():
@@ -137,8 +154,17 @@ def main(argv=None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    arm_inputs = {}
     for name, path in arms.items():
         print(f"\n=== arm {name}: {path}")
+        # Each arm is shown what it was TRAINED on. The control and reveal
+        # channels are process-wide switches defaulting to on and off
+        # respectively, so scoring a reveal arm without this fed zeros into the
+        # channels it was trained to read -- and the arm would have looked like
+        # a null for a reason that had nothing to do with the feature.
+        stamped = _restore_input_arms(str(path), reveal_overrides.get(name))
+        arm_inputs[name] = stamped
+        print("  inputs: control %s, reveal %s" % (stamped["control"], stamped["reveal"]))
         evaluator = load_evaluator(str(path), args.device, migrate=True)
         started = time.perf_counter()
         for index, position in enumerate(positions):
@@ -180,10 +206,12 @@ def main(argv=None) -> int:
         # arm used to discard every arm already measured -- hours of search
         # thrown away by one checkpoint that would not load. The file is
         # rewritten whole, so it always describes exactly the arms it holds.
-        _write_report(out, args, arms, reference_dir, refs, rows)
+        _write_report(out, args, arms, reference_dir, refs, rows, arm_inputs)
         print(f"  wrote {out} ({len(rows)} rows so far)")
 
-    summary = _write_report(out, args, arms, reference_dir, refs, rows)["summary"]
+    summary = _write_report(
+        out, args, arms, reference_dir, refs, rows, arm_inputs
+    )["summary"]
 
     print("\n" + "=" * 66)
     print(f"{'arm':<12}{'positions':>10}{'scored':>8}{'mean regret':>13}{'agreement':>11}")
@@ -197,7 +225,43 @@ def main(argv=None) -> int:
     return 0
 
 
-def _write_report(out, args, arms, reference_dir, refs, rows) -> dict:
+def _restore_input_arms(path: str, reveal_override: str | None = None) -> dict:
+    """Set the control/reveal switches to what this checkpoint was trained with.
+
+    Returns what was applied, so the report records it. A checkpoint predating a
+    stamp carries none; the live setting is then left alone and reported as
+    "unstamped" rather than guessed -- an older file genuinely does not say, and
+    inventing an answer is how a measurement becomes a fiction.
+    """
+
+    import torch
+
+    from .encoder import control_features_enabled, set_control_features
+    from .reveal_risk import reveal_features_enabled, set_reveal_features
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    applied = {}
+    for key, setter, live in (
+        ("control_features", set_control_features, control_features_enabled),
+        ("reveal_features", set_reveal_features, reveal_features_enabled),
+    ):
+        stamp = checkpoint.get(key)
+        short = key.split("_")[0]
+        if short == "reveal" and reveal_override is not None:
+            setter(reveal_override == "on")
+            applied[short] = "%s (from --reveal-arm)" % reveal_override
+            continue
+        if stamp in ("on", "off"):
+            setter(stamp == "on")
+            applied[short] = stamp
+        else:
+            applied[short] = "unstamped (left %s)" % ("on" if live() else "off")
+    return applied
+
+
+def _write_report(
+    out, args, arms, reference_dir, refs, rows, arm_inputs=None
+) -> dict:
     """Serialise what has been measured so far, summary included."""
 
     report = {
@@ -207,6 +271,7 @@ def _write_report(out, args, arms, reference_dir, refs, rows) -> dict:
         "sims": args.sims,
         "seed": args.seed,
         "arms": arms,
+        "arm_inputs": dict(arm_inputs or {}),
         # Which of them this file actually holds. An interrupted run leaves a
         # report whose `arms` names more than its rows measure, and a reader
         # comparing arms must be able to see that from the file itself.
