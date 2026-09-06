@@ -131,6 +131,11 @@ def main(argv=None) -> int:
     from .phase_e import load_evaluator
     from .w9_reference_case import load_position
 
+    out = Path(args.out)
+    if not out.is_absolute():
+        out = REPO_ROOT / out
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     rows = []
     for name, path in arms.items():
         print(f"\n=== arm {name}: {path}")
@@ -171,6 +176,29 @@ def main(argv=None) -> int:
                   f"{position['labels'].get(chosen, chosen)} "
                   f"regret {rows[-1]['regret']}")
         print(f"  arm {name} took {(time.perf_counter() - started) / 60:.1f} min")
+        # After EVERY arm, not once at the end. A failure rebuilding a later
+        # arm used to discard every arm already measured -- hours of search
+        # thrown away by one checkpoint that would not load. The file is
+        # rewritten whole, so it always describes exactly the arms it holds.
+        _write_report(out, args, arms, reference_dir, refs, rows)
+        print(f"  wrote {out} ({len(rows)} rows so far)")
+
+    summary = _write_report(out, args, arms, reference_dir, refs, rows)["summary"]
+
+    print("\n" + "=" * 66)
+    print(f"{'arm':<12}{'positions':>10}{'scored':>8}{'mean regret':>13}{'agreement':>11}")
+    print("-" * 66)
+    for name, entry in summary.items():
+        print(f"{name:<12}{entry['n']:>10}{entry['scored']:>8}"
+              f"{entry['mean_regret']!s:>13}{entry['agreement']!s:>11}")
+    print("\nLower regret is better. Both columns are agreement with the "
+          "reference model's search, not with ground truth.")
+    print(f"\nwrote {out}")
+    return 0
+
+
+def _write_report(out, args, arms, reference_dir, refs, rows) -> dict:
+    """Serialise what has been measured so far, summary included."""
 
     report = {
         "harness": "w3_corpus_regret",
@@ -179,6 +207,10 @@ def main(argv=None) -> int:
         "sims": args.sims,
         "seed": args.seed,
         "arms": arms,
+        # Which of them this file actually holds. An interrupted run leaves a
+        # report whose `arms` names more than its rows measure, and a reader
+        # comparing arms must be able to see that from the file itself.
+        "arms_measured": sorted({row["arm"] for row in rows}),
         "rows": rows,
         "note": (
             "Regret is measured against the reference model's own action "
@@ -207,23 +239,8 @@ def main(argv=None) -> int:
             round(entry["agree"] / entry["scored"], 3) if entry["scored"] else None
         )
     report["summary"] = summary
-
-    out = Path(args.out)
-    if not out.is_absolute():
-        out = REPO_ROOT / out
-    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-
-    print("\n" + "=" * 66)
-    print(f"{'arm':<12}{'positions':>10}{'scored':>8}{'mean regret':>13}{'agreement':>11}")
-    print("-" * 66)
-    for name, entry in summary.items():
-        print(f"{name:<12}{entry['n']:>10}{entry['scored']:>8}"
-              f"{entry['mean_regret']!s:>13}{entry['agreement']!s:>11}")
-    print("\nLower regret is better. Both columns are agreement with the "
-          "reference model's search, not with ground truth.")
-    print(f"\nwrote {out}")
-    return 0
+    return report
 
 
 if __name__ == "__main__":

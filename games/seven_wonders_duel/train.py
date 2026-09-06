@@ -459,7 +459,12 @@ def stable_game_split(
 # Architecture switches that change which parameters exist. A checkpoint whose
 # config omits one cannot rebuild its own weights, so they are read off the model
 # rather than trusted from the caller's dict.
-ARCHITECTURE_SWITCHES = ("pooled_readout", "reply_head", "action_residual")
+ARCHITECTURE_SWITCHES = (
+    "pooled_readout",
+    "reply_head",
+    "action_residual",
+    "control_head",
+)
 
 
 def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):

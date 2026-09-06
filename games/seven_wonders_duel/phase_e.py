@@ -534,25 +534,21 @@ def load_evaluator(
     import torch
 
     from .inference import Evaluator
-    from .train import (
-        build_model,
-        heads_from_config,
-        load_checkpoint,
-        pooled_readout_from_config,
-        reply_head_from_config,
-        action_residual_from_config,
-    )
+    from .train import load_checkpoint, model_from_config
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
-    model = build_model(
-        config.get("model", "transformer"),
-        config.get("d_model", 128),
-        config.get("layers", 4),
-        heads_from_config(config),
-        pooled_readout_from_config(config),
-        reply_head_from_config(config),
-        action_residual_from_config(config),
+    # Through `model_from_config`, never by naming the switches here: this was
+    # the seventh rebuild site, and it named every architecture flag EXCEPT
+    # `control_head`, so a W3 aux-arm checkpoint rebuilt without its control
+    # head and the additive-only migration refused the four orphaned
+    # `control_scorer` parameters -- after the run had already paid for the
+    # arms before it.
+    model = model_from_config(
+        config,
+        name=config.get("model", "transformer"),
+        d_model=128,
+        layers=4,
     )
     load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
     if migrate and checkpoint.get("migration"):

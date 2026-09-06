@@ -40,6 +40,11 @@ ALLOWED = {
     "phase_d.py",
     # Rebuilds via model_from_config.
     "build_equiv_corpus.py",
+    # Rebuilds via model_from_config. Converted after the hand-written list
+    # here omitted `control_head` and a W3 aux-arm checkpoint could not be
+    # rebuilt at all: the head's parameters had no counterpart, so the
+    # additive-only migration refused the file.
+    "phase_e.py",
     # Builds FRESH models from an explicit spec, never from saved weights, so
     # there is nothing for a config to be stale against. They still have to
     # take the architecture switches, which is what `parameter_count` is
@@ -53,7 +58,6 @@ ALLOWED = {
 #: there fails loudly at the tool rather than mid-run.
 NOT_YET_CONVERTED = {
     "ablate_value_head.py",
-    "phase_e.py",
     "search_gain_probe.py",
     "value_ceiling_probe.py",
     "w0_sizing.py",

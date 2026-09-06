@@ -242,3 +242,43 @@ def test_regret_cannot_see_a_distribution_that_improves_under_an_unchanged_top1(
     sharp = _regret(values, 2)
     blunt = _regret(values, 2)
     assert sharp == blunt == 25.0
+
+
+# -- the report survives an arm that never runs -----------------------------
+
+
+def test_report_is_written_from_the_arms_measured_so_far(tmp_path):
+    """A later arm that cannot be loaded must not destroy the earlier ones.
+
+    The 2026-09-05 run measured ten arms and wrote nothing: the eleventh
+    checkpoint could not be rebuilt, and the report was assembled only after the
+    loop. `_write_report` is now called per arm, so it has to produce a valid,
+    self-describing file from a PARTIAL row set.
+    """
+
+    from argparse import Namespace
+
+    from .w3_corpus_regret import _write_report
+
+    rows = [
+        {"arm": "baseline", "regret": 0.0, "agrees_with_reference_best": True},
+        {"arm": "baseline", "regret": 4.0, "agrees_with_reference_best": False},
+    ]
+    out = tmp_path / "partial.json"
+    report = _write_report(
+        out,
+        Namespace(sims=64, seed=7),
+        {"baseline": "b.pt", "aux": "a.pt"},
+        tmp_path,
+        {"ref.pt"},
+        rows,
+    )
+
+    on_disk = json.loads(out.read_text(encoding="utf-8"))
+    assert on_disk == report
+    # The file says which arms it holds, so a reader cannot mistake a partial
+    # report for a complete comparison.
+    assert on_disk["arms_measured"] == ["baseline"]
+    assert set(on_disk["arms"]) == {"baseline", "aux"}
+    assert on_disk["summary"]["baseline"]["mean_regret"] == 2.0
+    assert "aux" not in on_disk["summary"]

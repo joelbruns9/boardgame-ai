@@ -221,3 +221,26 @@ def test_a_legacy_config_rebuilds_without_the_head():
     assert model_from_config(
         {"d_model": 32, "layers": 1, "control_head": True}
     ).control_scorer is not None
+
+
+def test_an_aux_arm_checkpoint_round_trips_through_load_evaluator(tmp_path):
+    """The failure that cost the 2026-09-05 scoring run.
+
+    `phase_e.load_evaluator` named every architecture switch by hand except
+    `control_head`, so an aux-arm checkpoint rebuilt WITHOUT the head; its four
+    `control_scorer` parameters then had no counterpart and the additive-only
+    migration refused the file -- after ten arms had already been measured.
+    """
+
+    from .phase_e import load_evaluator
+    from .train import build_model, make_checkpoint
+
+    model = build_model("transformer", 32, 1, control_head=True)
+    checkpoint = make_checkpoint(model, {"d_model": 32, "layers": 1})
+    assert checkpoint["config"]["control_head"] is True
+    assert any(key.startswith("control_scorer.") for key in checkpoint["model_state"])
+
+    path = tmp_path / "aux.pt"
+    torch.save(checkpoint, path)
+    rebuilt = load_evaluator(str(path), "cpu", migrate=True).model
+    assert rebuilt.control_scorer is not None
