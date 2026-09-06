@@ -714,6 +714,8 @@ has still never been run.
 * `SWD_REVEAL_FEATURES` defaults **off**. With it on, `test_both_languages_
   agree_in_off_mode` fails: the Rust encoder has no reveal block, and self-play
   encodes in Rust. This cannot ship to self-play until Rust computes it too.
+  **Superseded by §13 (2026-09-06): Rust computes it, and the two languages
+  agree bit-for-bit with the channels live.**
 * The digest test now strips control **and** reveal, since the claim under test
   is "removing everything W3 added reproduces the pre-W3 digest".
 * All 11 `test_control_encoder.py` tests pass.
@@ -809,3 +811,149 @@ what remains. The certifier decodes its actions **from** `legal_action_indices`
 on the same state, so it already knows they are legal. Skipping the re-check
 needs an explicit opt-in keyword on `apply_action`, which trades a guard the
 whole engine leans on for speed — a judgment call, deliberately left to a human.
+
+---
+
+## 13. Reveal risk in Rust (2026-09-06)
+
+§11's shipping blocker is gone: `seven_wonders_rust/src/reveal.rs` computes the
+same five channels, so self-play (which encodes in Rust) can be shown them.
+
+Both languages now agree **bit-for-bit with the channels live**, over a whole
+random game, in `test_both_languages_agree_with_reveal_on`. Off-mode agreement
+was never enough on its own -- it proves only that both sides emit zeros -- so
+the test also asserts the channels were nonzero somewhere, or the comparison is
+agreement about zeros with extra steps.
+
+Ported faithfully rather than reimplemented: `rel_position` and
+`effective_shields` are the encoder's own helpers, made `pub(crate)` and passed
+in, so a revealed card is judged by the same rule as a face-up one in both
+languages. The unseen pool is narrower than `obtainable_cards` -- cards already
+face up on the board cannot be revealed by anything.
+
+### A latent two-language disagreement, found on the way
+
+`encoder.py` reads `SWD_CONTROL_FEATURES` for its default; `control.rs` assumed
+`true`. Exporting `SWD_CONTROL_FEATURES=0` therefore turned the control channels
+off in Python and left them on in Rust -- the replay path and the self-play path
+shown different inputs, with nothing reporting it. Both flags now read their
+variable, with Python's parsing, so the two agree without anyone remembering to
+call the setter. `SWD_REVEAL_FEATURES` was built that way from the start.
+
+### Cost
+
++8% on the Rust derive path with the channels on (0.359 s -> 0.391 s cpu for
+2,868 rows, best of 15). That is the encode-only path; in self-play the network
+forward dominates, so the end-to-end share is smaller.
+
+### Test state
+
+Eight red tests are now none. `ENCODER_VERSION` is `7wd-encoder-7` and the
+signature and goldens are re-pinned, deliberately and with the evidence
+recorded in `test_encoder_signature_is_pinned` -- including one check that only
+a correct widening passes: the DRAFT golden is byte-identical across the bump,
+because a draft observation carries no tableau tokens. A change there would
+have meant the new channels leaked into token types they have no business in.
+
+The earlier state, for the record: eight red tests were three once Rust
+computed the block. `test_rust_engine_equiv` (33) and
+`test_f4_boundary` (20) are green. Unrelated and pre-existing: `cargo test` fails
+`tests::encoder_feature_counts_match_schema`, which encodes a PlayAge state
+without installing the control table and hits the deliberate panic. It fails
+identically with every change here stashed.
+
+---
+
+## 14. Row 85 is not a gate (2026-09-06)
+
+§10 left "the row-85 negative control" as the single open question. It is now
+closed, by measurement rather than by a longer run, and the answer is that the
+question as §10 posed it cannot be answered by compute at all.
+
+### The branching, measured
+
+| | legal actions | chance children **per action** | face-down slots |
+|---|---|---|---|
+| row 86 | 4 | **1** | 5 |
+| row 85 | 3 | **90** | 7 |
+
+Each of row 85's actions uncovers two hidden slots against a 10-card Age III +
+Guild unseen pool, so every action forks into 10x9 = 90 ordered worlds, and
+every later uncovering ply multiplies again: 90, 8,100, 729,000. This -- not
+the interpreter, not `deepcopy` -- is why row 86 proves in 3,373 nodes and row
+85 does not prove in 400,000. **A Rust port would not settle row 85**: 20-50x
+against a 90x per-ply fan-out buys less than one extra ply.
+
+It also explains the cost asymmetry that had been read as being about the
+Wonder: row 86 is cheap because nothing is revealed there at all.
+
+### The two directions have opposite costs
+
+* **PROVEN** needs ONE forcing move that survives every reply and every
+  outcome. Short, and cheap when the forcing line uncovers nothing.
+* **REFUTED** needs one defence after which the winner has NO forced win, and
+  establishing "no forced win" is exhaustive over every winner option in every
+  chance world. Combinatorially out of reach in Age III.
+
+Only PROVEN reaches the mechanism -- §10 already says failed proofs and
+unresolved continuations get no clamp and no mask -- so the intractable
+direction is one the certifier never needs in search. What it blocks is the
+negative control as posed.
+
+### And the control had already passed
+
+`control_certify_probe`'s own criterion is "does it decline (REFUTED or
+UNKNOWN) rather than fire?". Row 85 returned UNKNOWN on the first run, which is
+a decline. Two questions had been merged: the control (wants a decline; passed)
+and earliness (wants a PROVEN at row 85, meaning the loss was already forced a
+ply earlier). They want opposite verdicts, and only the second is open. It is
+also the cheap direction, so it was not unreasonable to chase -- it simply has
+not succeeded against a 90x first-ply fan-out.
+
+### Transposition: measured and rejected
+
+The remaining §10 option. It does not pay:
+
+| | visits | distinct positions | a sound TT would skip |
+|---|---|---|---|
+| row 86, plies 8 | 12,763 | 12,315 | **3.5%** |
+| row 85, plies 14 | 1,012,713 | 949,525 | **6.2%** |
+
+1.04 and 1.07 visits per position: each chance outcome carries its own deck, so
+positions essentially never coincide. (Sound means keyed on (state, remaining
+plies): PROVEN at a shorter horizon carries to a longer one, REFUTED does not.)
+
+### The reporting trap, again, one layer out
+
+The row-85 runs were read as "died on the node cap, so it needs more nodes".
+That was wrong. At plies 14, **87.9% of the recursion hits the ply horizon**
+(439,798 of 500,253 calls) and `limits_hit` is `nodes` AND `plies`. The console
+line printed `stopped_by` alone -- the binding limit -- and `limits_hit` goes
+only to the JSON, which is not written without `--out`.
+
+`_Budget` records every limit precisely because "the horizon was too short" and
+"the machine was too slow" call for opposite fixes; the display layer then threw
+one away and reproduced the trap the class was written to prevent. The probe now
+prints both. Row 86's PROVEN also truncated branches on the horizon -- its proof
+just did not need them.
+
+Consequence: a `--max-plies 4` probe cannot help. A shorter horizon truncates
+MORE branches, so it can reach UNKNOWN faster but can never produce the REFUTED
+that would settle the Wonder question.
+
+### What to do instead
+
+Stop treating row 85 as a gate; fan-out and horizon each explain its UNKNOWN on
+their own, so it has never been evidence about the extra-turn Wonder. The open
+question worth answering is §9.4's coverage one, and it is cheap: across the
+267-episode corpus, how often does a *certifiable* position occur, and how many
+plies before the blunder? That decides whether the certifier changes training at
+all.
+
+If the Wonder question itself matters, the tractable route is symmetry
+reduction, not compute: of those 10 unseen cards exactly ONE carries a science
+symbol, and the proof reads only a revealed card's symbol, shields, colour and
+cost. Cards identical on what the rules read are interchangeable within the
+horizon, collapsing 90 worlds to a handful of classes -- soundly, if the
+equivalence is proved against what is actually read. That is a real build, and
+it must buy depth as well as width.

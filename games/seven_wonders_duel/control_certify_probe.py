@@ -98,7 +98,15 @@ def main(argv=None) -> int:
             f"conflict {game.conflict_position:+d}  "
             f"threat={threat}  -> {certificate.verdict.value.upper()}"
             f" ({certificate.nodes} nodes, {certificate.seconds}s"
-            f"{', ' + certificate.stopped_by if certificate.stopped_by else ''})"
+            # EVERY limit that fired, not just the binding one. `Certificate`
+            # carries both because "the horizon was too short" and "the machine
+            # was too slow" call for opposite fixes -- and then this line
+            # printed `stopped_by` alone and reintroduced the same trap one
+            # layer out: a run whose branches were truncated by the ply horizon
+            # 88% of the time reported simply "nodes", and was read as needing a
+            # bigger node budget.
+            f"{', stopped by ' + certificate.stopped_by if certificate.stopped_by else ''}"
+            f"{', limits ' + '+'.join(sorted(certificate.limits_hit)) if certificate.limits_hit else ''})"
         )
         if certificate.principal_line:
             print("      line: " + " | ".join(certificate.principal_line[:8]))
