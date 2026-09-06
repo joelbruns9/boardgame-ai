@@ -1,5 +1,16 @@
 # Review request: engine pricing, the reveal port, and the certifier findings
 
+> **Reviewed 2026-09-07.** Five findings, all accepted and fixed in
+> `0ba21f9`, `8202fcf`, `2549e5c` and `31b2f2b`:
+> the reveal channels now use each uncovered slot's own back-specific pool; the
+> advisor's outlook loads through the shared, migration-aware loader; arm
+> checkpoints record their reveal setting and `w3_corpus_regret` restores it;
+> the certifier's victory type comes from the proof's terminals instead of the
+> root threat gate; and an exhausted budget stops expanding (271 clones to 91 at
+> `max_nodes=1`). `test_control_certify.py` now exists, answering §4.2 in part.
+> The pricing shortcuts in §3.1/§3.2 were confirmed correct by the reviewer,
+> with 24,768 payment comparisons and 717 ordered action-list comparisons.
+
 Six commits from 2026-09-06, none reviewed by anyone but their author. Branch
 `sevenwd-w9-prototype`, `fab62f9..b2928b8`. The suite is green (1,428 passed, 5
 skipped) — which is exactly why this document exists: the tests passing is the
