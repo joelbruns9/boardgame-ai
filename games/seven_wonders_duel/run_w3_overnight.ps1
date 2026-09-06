@@ -85,8 +85,24 @@ while (Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
 }
 "reference pass finished $(Get-Date -Format o)"
 
-& $py -m games.seven_wonders_duel.threat_corpus_triage_report `
-  --triage-dir $refDir *> "$logs/reference_summary.txt"
+$referenceSummaries = 0..3 | ForEach-Object {
+  $path = "$refDir/summary_shard$_.json"
+  if (-not (Test-Path $path)) { throw "missing reference summary: $path" }
+  Get-Content $path -Raw | ConvertFrom-Json
+}
+if ($referenceSummaries.totals.failed | Where-Object { $_ -ne 0 }) {
+  throw "one or more reference shards reported failed positions"
+}
+@(
+  "reference measurement complete"
+  $referenceSummaries | ForEach-Object {
+    "shard $($_.params.shard): positions=$($_.totals.positions) ok=$($_.totals.ok) " +
+      "failed=$($_.totals.failed) rechecked=$($_.totals.rechecked) " +
+      "rank_changed=$($_.totals.rank_changed_on_recheck) " +
+      "minutes=$($_.totals.wall_clock_minutes)"
+  }
+  "total positions=$(($referenceSummaries.totals.positions | Measure-Object -Sum).Sum)"
+) | Set-Content -Encoding utf8 "$logs/reference_summary.txt"
 
 "done $(Get-Date -Format o)" | Out-File -Append -Encoding utf8 "$logs/START.txt"
 "logs in $logs"

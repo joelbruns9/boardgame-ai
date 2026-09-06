@@ -19,6 +19,7 @@ import pytest
 
 from .codec import legal_actions
 from .control_table import control_key_from_observation
+from .reveal_risk import REVEAL_FEATURES
 from .encoder import (
     CONTROL_FEATURES,
     GLOBAL_FEATURES,
@@ -49,7 +50,14 @@ def _strip_control(encoding):
         if token.type is TokenType.GLOBAL:
             features = features[:_VALID] + features[_VALID + 1:]
         elif token.type is TokenType.TABLEAU:
-            features = features[:_FIRST] + features[_FIRST + len(CONTROL_FEATURES):]
+            # Strip BOTH appended blocks: control, then the reveal-risk
+            # channels that follow it. The claim under test is "the pre-W3
+            # digest survives removing everything W3 added", so a later
+            # appended block has to come off too.
+            features = (
+                features[:_FIRST]
+                + features[_FIRST + len(CONTROL_FEATURES):-len(REVEAL_FEATURES)]
+            )
         tokens.append(dataclasses.replace(token, features=features))
     return dataclasses.replace(encoding, tokens=tuple(tokens))
 

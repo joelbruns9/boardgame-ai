@@ -56,6 +56,7 @@ from .game import (
     TableauState,
 )
 from .pool import BACK_UNIVERSES, UnseenPool, unseen_pool
+from .reveal_risk import REVEAL_FEATURES, reveal_values
 from .rules import Resource, discard_income
 
 # Bumped to -3 (2026-08-14): `science_missing_obtainable` / `military_bound` now
@@ -265,6 +266,10 @@ TABLEAU_FEATURES = (
     *(f"my_{name}" for name in _TABLEAU_PER_PLAYER),
     *(f"opp_{name}" for name in _TABLEAU_PER_PLAYER),
     *CONTROL_FEATURES,
+    # Appended AFTER control: migration zero-pads a grown input width only when
+    # new columns are at the end (train.py:616-638). Inserting mid-vector lands
+    # every later column on the wrong feature.
+    *REVEAL_FEATURES,
 )
 
 DRAFT_OFFER_FEATURES = ("second_round",)
@@ -831,6 +836,7 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
     }
     present = {card.slot_id: card for card in obs.tableau if card.present}
     control = _control_maps(obs)
+    reveal = reveal_values(derived)
     tokens = []
     for slot_id in sorted(present):
         public = present[slot_id]
@@ -867,6 +873,7 @@ def _tableau_tokens(derived: _Derived) -> list[Token]:
             entity = 73 + _BACK_ID[public.back]
             values.extend([0.0] * (2 * len(_TABLEAU_PER_PLAYER)))
         values.extend(_control_values(control, slot_id))
+        values.extend(reveal[slot_id])
         tokens.append(_token(TokenType.TABLEAU, entity, values))
     return tokens
 

@@ -40,13 +40,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: (control inputs on, auxiliary head on, shuffle the control channels)
+#: (control inputs, auxiliary head, shuffle control, reveal inputs, shuffle reveal)
+#:
+#: The reveal arms answer the question the control arms could not: control is
+#: chance-INVARIANT by construction (`control_key_word` carries no card
+#: identities), so it reads the same in every reveal-world of a position whose
+#: value ranges 0.02%-54%. `reveal` carries the per-slot uncovering risk
+#: instead. `reveal_shuffled` is its causal control and is the only arm that
+#: makes a positive result mean anything.
 ARMS = {
-    "baseline": (False, False, False),
-    "inputs": (True, False, False),
-    "aux": (False, True, False),
-    "both": (True, True, False),
-    "shuffled": (True, False, True),
+    "baseline": (False, False, False, False, False),
+    "inputs": (True, False, False, False, False),
+    "aux": (False, True, False, False, False),
+    "both": (True, True, False, False, False),
+    "shuffled": (True, False, True, False, False),
+    "reveal": (False, False, False, True, False),
+    "reveal_shuffled": (False, False, False, True, True),
 }
 
 
@@ -81,6 +90,60 @@ def game_honest_split(examples, holdout: float, seed: int):
     train = [e for e in examples if int(e.game_key) not in held]
     val = [e for e in examples if int(e.game_key) in held]
     return train, val
+
+
+def shuffle_reveal_features(examples, seed: int, log) -> list:
+    """Permute the reveal channels between positions with the same token count.
+
+    Same donor swap as `shuffle_control_features`, on the appended reveal block.
+    A `reveal` arm that beats `reveal_shuffled` learned from the information; one
+    that does not learned from having five more input channels -- which is what
+    `inputs` vs `shuffled` turned out to be.
+    """
+
+    import numpy as np
+
+    from .dataset import TYPE_IDS
+    from .encoder import TABLEAU_FEATURES, TokenType
+    from .reveal_risk import REVEAL_FEATURES
+
+    first = TABLEAU_FEATURES.index(REVEAL_FEATURES[0])
+    stop = first + len(REVEAL_FEATURES)
+    tableau_id = TYPE_IDS[TokenType.TABLEAU]
+
+    rows, groups = [], {}
+    for index, example in enumerate(examples):
+        types = np.asarray(example.type_ids)
+        tableau = np.flatnonzero(types == tableau_id)
+        rows.append(tableau)
+        groups.setdefault(len(tableau), []).append(index)
+
+    rng = random.Random(seed)
+    donors = {}
+    for members in groups.values():
+        shuffled = members[:]
+        rng.shuffle(shuffled)
+        donors.update(dict(zip(members, shuffled)))
+
+    out, swapped = [], 0
+    for index, example in enumerate(examples):
+        donor = donors[index]
+        if donor == index:
+            out.append(example)
+            continue
+        features = np.array(example.features, dtype=np.float32, copy=True)
+        source = np.asarray(examples[donor].features, dtype=np.float32)
+        for a, b in zip(rows[index], rows[donor]):
+            features[a, first:stop] = source[b, first:stop]
+        out.append(
+            dataclasses.replace(
+                example, features=features.astype(example.features.dtype)
+            )
+        )
+        swapped += 1
+    log(f"  shuffled reveal on {swapped}/{len(examples)} positions "
+        f"({len(groups)} token-count groups)")
+    return out
 
 
 def shuffle_control_features(examples, seed: int, log) -> list:
@@ -160,6 +223,7 @@ def run_arm(name, args, examples, log) -> dict:
     import torch
 
     from .encoder import set_control_features
+    from .reveal_risk import set_reveal_features
     from .train import (
         evaluate,
         load_checkpoint,
@@ -168,10 +232,13 @@ def run_arm(name, args, examples, log) -> dict:
         train_steps,
     )
 
-    inputs_on, aux_on, shuffled = ARMS[name]
+    inputs_on, aux_on, shuffled, reveal_on, reveal_shuffled = ARMS[name]
     set_control_features(inputs_on)
+    set_reveal_features(reveal_on)
     if shuffled:
         examples = shuffle_control_features(examples, args.split_seed, log)
+    if reveal_shuffled:
+        examples = shuffle_reveal_features(examples, args.split_seed, log)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = dict(checkpoint["config"])
@@ -219,6 +286,8 @@ def run_arm(name, args, examples, log) -> dict:
         "arm": name,
         "seed": args.seed,
         "control_inputs": inputs_on,
+        "reveal_inputs": reveal_on,
+        "reveal_shuffled": reveal_shuffled,
         "control_head": aux_on,
         "shuffled": shuffled,
         "minutes": round(elapsed / 60, 2),
@@ -264,6 +333,7 @@ def main(argv=None) -> int:
         raise SystemExit(f"unknown arms {unknown}; known: {sorted(ARMS)}")
 
     from .encoder import set_control_features
+    from .reveal_risk import set_reveal_features
 
     # Derived ONCE per input setting and shared across arms and seeds. Control
     # values are baked into tokens at encode time, so only the two encodings
@@ -278,16 +348,24 @@ def main(argv=None) -> int:
         for name in arms:
             log("")
             log(f"=== {name} (seed {args.seed}) ===")
+            # Key on every toggle that changes the ENCODING, not just control.
+            # Keyed on control alone, `reveal` reused baseline-encoded examples
+            # and produced a perfect null that looked like a real measurement.
             inputs_on = ARMS[name][0]
-            if inputs_on not in cache:
+            reveal_on = ARMS[name][3]
+            key = (inputs_on, reveal_on)
+            if key not in cache:
                 set_control_features(inputs_on)
-                cache[inputs_on] = load_examples(Path(args.buffers), args.games, log)
+                set_reveal_features(reveal_on)
+                cache[key] = load_examples(Path(args.buffers), args.games, log)
             set_control_features(inputs_on)
-            row = run_arm(name, args, list(cache[inputs_on]), log)
+            set_reveal_features(reveal_on)
+            row = run_arm(name, args, list(cache[key]), log)
             results.append(row)
             log(f"  -> {json.dumps(row['val'])}")
     args.seed = base_seed
     set_control_features(True)
+    set_reveal_features(False)
 
     report = {
         "harness": "w3_offline_ab",
