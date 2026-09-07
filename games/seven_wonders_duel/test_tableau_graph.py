@@ -308,3 +308,31 @@ def test_the_fused_inference_path_agrees(batch):
         fused = model(batch)
     for key, value in loop.items():
         assert torch.allclose(value, fused[key], atol=1e-5), key
+
+
+def test_the_new_arms_survive_bf16(examples):
+    """The lesson W5a taught, applied before it can be taught again.
+
+    The W5a scorer crashed at its first forward under `--precision bf16` -- the
+    setting every cloud run uses -- because autocast handed it bf16 while
+    `policy` stayed fp32 and `scatter_add_` requires the two to match. Nothing
+    caught it because the suite runs fp32. W1 and W2 both do index arithmetic
+    on autocast tensors, which is the same class of hazard, so they are checked
+    here rather than in a rented box's first minute.
+    """
+
+    _batch = collate(examples, contextual_actions=True)
+    model = SWDNet(
+        d_model=32,
+        layers=2,
+        heads=4,
+        slot_embedding=True,
+        graph_module=True,
+        action_residual=True,
+    )
+    model.train()
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        out = model(_batch)
+        out["policy"].float().square().mean().backward()
+    assert model.embedder.slot.weight.grad.abs().sum() > 0
+    assert model.graph.layers[0].basis.grad.abs().sum() > 0
