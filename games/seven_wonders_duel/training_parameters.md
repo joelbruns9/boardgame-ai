@@ -2576,6 +2576,34 @@ The index is derived from features the encoder already emits, so turning this
 on moves neither `ENCODER_SIGNATURE` nor any buffer: an existing checkpoint
 migrates in seconds and an existing buffer is reused as it is.
 
+## Workstream 4: the hierarchical winner/victory-type head
+
+Off by default. `value` (W/D/L) and `joint7` (winner x victory type) are
+separate linear heads today, so nothing makes them agree -- the model can serve
+60% win while its 7-way distribution marginalises to 55%, and there is no fact
+of the matter about which to believe. W4 emits the factors instead of the
+products, `P(outcome) * P(type | outcome)`, so the two are one object.
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--hierarchical-value` / `--no-hierarchical-value` | off | build the head. Shadow only: `value` and `joint7` stay authoritative for search. |
+| `--hierarchical-value-detach` / `--no-...` | **on** | learn from a stop-gradient readout |
+| `--hier-value-weight` | 0.15 with the head, else 0 | loss weight |
+
+**Read the detach flag before running an arm.** A shadow head protects the
+served numbers but not the shared trunk: attached, its loss shapes
+representations, which is the KataGo lesson this project follows and is equally
+a way to interfere with policy and value. Detached, only the head's own three
+projections receive gradient, so the addition provably costs throughput and
+nothing else -- measured at **1.004x** on an unfused single-thread CPU forward,
+d384 L8, for 3,465 parameters. `--no-hierarchical-value-detach` is the arm that
+can change playing strength, in either direction; it is not the default because
+a strong incumbent makes those two risks asymmetric.
+
+A built head with a zero weight is refused. It is shadow-only, so an untrained
+one is parameters and throughput buying nothing, which reads like a configured
+arm and is not one.
+
 ## Workstream 2: the tableau graph module
 
 Off by default. Relational message passing over the printed cover graph, run on

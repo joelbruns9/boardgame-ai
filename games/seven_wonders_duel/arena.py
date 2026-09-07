@@ -315,6 +315,7 @@ def load_side(
                 "slot_embedding",
                 "graph_module",
                 "graph_alpha",
+                "hierarchical_value",
                 "iteration",
             )
         },

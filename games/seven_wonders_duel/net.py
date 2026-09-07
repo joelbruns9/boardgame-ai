@@ -22,6 +22,7 @@ from torch import nn
 from .codec import NUM_ACTIONS, NUM_ACTION_FAMILIES
 from .dataset import (
     ENTITY_SPACES,
+    JOINT7_CLASSES,
     FEATURE_COUNTS,
     MAX_FEATURES,
     NUM_AUX_CARDS,
@@ -624,6 +625,95 @@ class ControlHead(nn.Module):
         }
 
 
+def _check_joint7_layout() -> None:
+    """The factorisation hard-codes `JOINT7_CLASSES`'s ORDER.
+
+    `HierarchicalValue` concatenates the three my-* classes, then the three
+    opp-* classes, then draw. Reordering that tuple would leave the arithmetic
+    valid and the meaning wrong -- a silent remap of victory types onto the
+    wrong outcome -- so the assumption is checked here rather than trusted.
+    """
+
+    expected = (
+        *(f"my_{kind}" for kind in ("civilian", "scientific", "military")),
+        *(f"opp_{kind}" for kind in ("civilian", "scientific", "military")),
+        "draw",
+    )
+    if tuple(JOINT7_CLASSES) != expected:
+        raise RuntimeError(
+            "JOINT7_CLASSES changed order; HierarchicalValue's factorisation "
+            f"assumes {expected} and would silently mislabel victory types "
+            f"under {tuple(JOINT7_CLASSES)}"
+        )
+
+
+_check_joint7_layout()
+
+
+class HierarchicalValue(nn.Module):
+    """W4: ONE distribution over winner and victory type.
+
+    `value` and `joint7` are separate linear heads today, so nothing makes them
+    agree: the model can serve 60% win while its 7-way distribution marginalises
+    to 55%. Neither is wrong on its own terms and there is no fact of the matter
+    about which to believe, which is the defect -- a distributional backup, or
+    an advisor panel, has to pick one.
+
+    This head emits the factors instead of the products::
+
+        P(class) = P(outcome) * P(type | outcome)
+
+    so the 7-way distribution and its win/draw/loss marginal are the same
+    object seen from two sides, and consistency is arithmetic rather than
+    something training has to discover. Draw carries no type, which is why the
+    conditionals are two 3-way heads rather than one.
+
+    **Shadow only.** `value` and `joint7` stay authoritative for search; nothing
+    reads `hier_*` except the loss and diagnostics. The plan's rule is that a
+    replacement head earns its promotion in an arena, and this has not run one.
+
+    `detach` decides the one way a shadow head can still cost strength. Attached,
+    its loss reaches the shared trunk and may shape representations for better
+    (the KataGo lesson this project follows) or worse (gradient interference
+    with policy and value). Detached, it learns from a stop-gradient copy and
+    provably cannot move a single trunk weight -- so it costs throughput and
+    nothing else, at the price of the representation benefit that is the usual
+    reason to want an auxiliary head at all. Detached is the default because a
+    strong incumbent makes those two risks asymmetric.
+    """
+
+    def __init__(self, d_model: int, detach: bool = True):
+        super().__init__()
+        self.detach = bool(detach)
+        self.outcome = nn.Linear(d_model, 3)
+        self.type_win = nn.Linear(d_model, 3)
+        self.type_loss = nn.Linear(d_model, 3)
+
+    def forward(self, readout: torch.Tensor) -> dict[str, torch.Tensor]:
+        source = readout.detach() if self.detach else readout
+        outcome = torch.log_softmax(self.outcome(source), dim=-1)
+        win = torch.log_softmax(self.type_win(source), dim=-1)
+        loss = torch.log_softmax(self.type_loss(source), dim=-1)
+        # log P(class) for the seven joint classes, in JOINT7_CLASSES order --
+        # the order `_check_joint7_layout` pins at import.
+        joint = torch.cat(
+            [
+                outcome[:, 0:1] + win,
+                outcome[:, 2:3] + loss,
+                outcome[:, 1:2],
+            ],
+            dim=-1,
+        )
+        return {
+            # Log-probabilities, not logits: these are already normalised, and
+            # calling them logits invites a second softmax somewhere downstream.
+            "hier_value": outcome,
+            "hier_type_win": win,
+            "hier_type_loss": loss,
+            "hier_joint7": joint,
+        }
+
+
 class Heads(nn.Module):
     def __init__(self, d_model: int, reply: bool = False):
         super().__init__()
@@ -697,6 +787,8 @@ class SWDNet(nn.Module):
         reply_head: bool = False,
         action_residual: bool = False,
         control_head: bool = False,
+        hierarchical_value: bool = False,
+        hierarchical_value_detach: bool = True,
         slot_embedding: bool = False,
         graph_module: bool = False,
         graph_layers: int = 2,
@@ -777,6 +869,16 @@ class SWDNet(nn.Module):
         )
         self.control_head = bool(control_head)
         self.control_scorer = ControlHead(d_model) if self.control_head else None
+        #: W4. Recorded on the model like every other switch, and `detach` with
+        #: it: it changes which gradients exist, so a rebuild that dropped it
+        #: would train a different thing while loading every weight.
+        self.hierarchical_value = bool(hierarchical_value)
+        self.hierarchical_value_detach = bool(hierarchical_value_detach)
+        self.hier_value = (
+            HierarchicalValue(d_model, detach=self.hierarchical_value_detach)
+            if self.hierarchical_value
+            else None
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         tokens = self.embedder(batch)
@@ -826,6 +928,8 @@ class SWDNet(nn.Module):
             out["policy"] = out["policy"] + alpha * residual
         if self.control_scorer is not None and "control_token_index" in batch:
             out.update(self.control_scorer(normed, batch))
+        if self.hier_value is not None:
+            out.update(self.hier_value(readout))
         return out
 
 

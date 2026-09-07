@@ -45,6 +45,16 @@ REPLY_WEIGHT_DEFAULT = 0.15
 CONTROL_WEIGHT_DEFAULT = 1.0
 ACTION_POLICY_WEIGHT_DEFAULT = 0.0
 
+#: Weight on W4's hierarchical winner x victory-type head.
+#:
+#: In the same range as the reply head, and for the same reason: it fits a
+#: per-GAME label, so it carries about one independent observation per game
+#: however many rows it is asked about. Zero is a legal setting and makes the
+#: head a dead read-out -- with `hierarchical_value_detach` the head cannot
+#: touch the trunk either way, so zero and detached together mean the module
+#: is present, untrained and inert.
+HIER_VALUE_WEIGHT_DEFAULT = 0.15
+
 #: Multiplier on every head that fits a per-GAME label rather than a
 #: per-position one: value, joint7, margin, military, science.
 #:
@@ -87,6 +97,7 @@ def compute_losses(
     reply_weight: float = REPLY_WEIGHT_DEFAULT,
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
+    hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -187,6 +198,16 @@ def compute_losses(
         margin_loss = outputs["margin"].new_zeros(())
     military_loss = F.mse_loss(outputs["military"], batch["military_final"])
     science_loss = F.mse_loss(outputs["science"], batch["sci_final"])
+    hier_value_loss = outputs["policy"].new_zeros(())
+    if "hier_joint7" in outputs:
+        # ONE term, not two. The head emits log P(outcome) + log P(type|outcome)
+        # already summed into the seven joint classes, so the negative
+        # log-likelihood of the true class trains the outcome factor and the
+        # conditional factor together, weighted exactly as the data weights
+        # them. Fitting the marginal separately would double-count the rows and
+        # let the two factors disagree, which is the defect this head exists to
+        # remove.
+        hier_value_loss = F.nll_loss(outputs["hier_joint7"], batch["joint7"])
     reply_loss = outputs["policy"].new_zeros(())
     if "reply" in outputs and batch.get("has_reply") is not None:
         rows = batch["has_reply"]
@@ -211,6 +232,7 @@ def compute_losses(
         * aux_weight
         * (joint7_loss + margin_loss + military_loss + science_loss)
         + reply_weight * reply_loss
+        + hier_value_weight * hier_value_loss
     )
     return total, {
         "total": float(total.detach()),
@@ -223,6 +245,7 @@ def compute_losses(
         "military": float(military_loss.detach()),
         "science": float(science_loss.detach()),
         "reply": float(reply_loss.detach()),
+        "hier_value": float(hier_value_loss.detach()),
     }
 
 
@@ -262,6 +285,7 @@ def evaluate(
     precision: str = "fp32",
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
+    hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
 ):
     model.eval()
     control_labels = control_table_for(model)
@@ -292,6 +316,7 @@ def evaluate(
                 value_weight,
                 value_bootstrap,
                 control_weight=control_weight,
+                hier_value_weight=hier_value_weight,
                 solver_value_target=False,
                 # Unweighted for the same reason: a held-out number has to mean
                 # the same thing across runs. Upweighting solved rows in
@@ -466,6 +491,11 @@ ARCHITECTURE_SWITCHES = (
     "control_head",
     "slot_embedding",
     "graph_module",
+    "hierarchical_value",
+    # Not a presence flag but an architecture fact all the same: it decides
+    # whether the head's loss reaches the shared trunk, so two checkpoints with
+    # identical parameters can have been trained on different objectives.
+    "hierarchical_value_detach",
 )
 
 
@@ -518,6 +548,7 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         slot_embedding_from_config(config),
         graph_module_from_config(config),
         **graph_shape_from_config(config),
+        **hierarchical_value_from_config(config),
     )
 
 
@@ -693,7 +724,9 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[:, : old_state[key].shape[1]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
-        elif key.startswith(("action_scorer.", "control_scorer.", "graph.")):
+        elif key.startswith(
+            ("action_scorer.", "control_scorer.", "graph.", "hier_value.")
+        ):
             # ``tensor`` is the new model's initialized value. In particular,
             # action_scorer.gate was constructed as exact zero while the layers
             # behind it retain symmetry-breaking initialization.
@@ -839,6 +872,8 @@ def build_model(
     graph_layers: int = 2,
     graph_bases: int = 4,
     graph_alpha: float = 1e-3,
+    hierarchical_value: bool = False,
+    hierarchical_value_detach: bool = True,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -862,6 +897,8 @@ def build_model(
             graph_layers=graph_layers,
             graph_bases=graph_bases,
             graph_alpha=graph_alpha,
+            hierarchical_value=hierarchical_value,
+            hierarchical_value_detach=hierarchical_value_detach,
         )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
@@ -898,6 +935,24 @@ def slot_embedding_from_config(config: dict) -> bool:
     until training moves it."""
 
     return bool(config.get("slot_embedding", False))
+
+
+def hierarchical_value_from_config(config: dict) -> dict:
+    """W4 head presence and its gradient path, false for older checkpoints.
+
+    `detach` defaults TRUE, matching the model, so a config that names the head
+    without naming its gradient path rebuilds the safe arm rather than the one
+    that can move the trunk.
+    """
+
+    if not config.get("hierarchical_value", False):
+        return {"hierarchical_value": False}
+    return {
+        "hierarchical_value": True,
+        "hierarchical_value_detach": bool(
+            config.get("hierarchical_value_detach", True)
+        ),
+    }
 
 
 def graph_module_from_config(config: dict) -> bool:
@@ -967,6 +1022,7 @@ def train_loop(
     optimizer_name: str = "adamw",
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
+    hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     log=print,
 ):
     """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
@@ -1027,6 +1083,7 @@ def train_loop(
                     value_bootstrap,
                     action_policy_weight=action_policy_weight,
                     control_weight=control_weight,
+                    hier_value_weight=hier_value_weight,
                 )
             scaler.scale(total).backward()
             scaler.step(optimizer)
@@ -1111,6 +1168,7 @@ def train_steps(
     batch_getter=None,
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
+    hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -1204,6 +1262,7 @@ def train_steps(
                 value_bootstrap,
                 action_policy_weight=action_policy_weight,
                 control_weight=control_weight,
+                hier_value_weight=hier_value_weight,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
@@ -1333,6 +1392,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="enable the W1 learned Age/slot embedding (zero-initialized, so "
         "a warm start reproduces the inherited model until it trains)",
+    )
+    parser.add_argument(
+        "--hierarchical-value",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="build the W4 hierarchical winner x victory-type head (shadow "
+        "only; `value` and `joint7` stay authoritative)",
+    )
+    parser.add_argument(
+        "--hierarchical-value-detach",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="learn the W4 head from a stop-gradient readout, so it cannot "
+        "move a trunk weight. --no-hierarchical-value-detach is the arm that "
+        "lets it shape representations, and the only one that can change "
+        "playing strength in either direction",
+    )
+    parser.add_argument(
+        "--hier-value-weight",
+        type=float,
+        default=None,
+        help="loss weight for the W4 head (default 0.15 when the head is on, "
+        "else 0; a present-but-unweighted head is throughput buying nothing)",
     )
     parser.add_argument(
         "--graph-module",
@@ -1480,6 +1562,18 @@ def main(argv=None) -> int:
         raise SystemExit("--slot-embedding is available only for --model transformer")
     if args.graph_module and args.model != "transformer":
         raise SystemExit("--graph-module is available only for --model transformer")
+    if args.hierarchical_value and args.model != "transformer":
+        raise SystemExit(
+            "--hierarchical-value is available only for --model transformer"
+        )
+    if args.hier_value_weight is None:
+        args.hier_value_weight = (
+            HIER_VALUE_WEIGHT_DEFAULT if args.hierarchical_value else 0.0
+        )
+    if args.hier_value_weight < 0 or not math.isfinite(args.hier_value_weight):
+        raise SystemExit("--hier-value-weight must be finite and non-negative")
+    if args.hier_value_weight > 0 and not args.hierarchical_value:
+        raise SystemExit("--hier-value-weight requires --hierarchical-value")
     if not math.isfinite(args.action_policy_weight) or args.action_policy_weight < 0:
         raise SystemExit("--action-policy-weight must be finite and non-negative")
     if args.init_checkpoint:
@@ -1505,6 +1599,17 @@ def main(argv=None) -> int:
         args.graph_module = bool(
             args.graph_module or graph_module_from_config(stored)
         )
+        inherited_hier = hierarchical_value_from_config(stored)
+        args.hierarchical_value = bool(
+            args.hierarchical_value or inherited_hier["hierarchical_value"]
+        )
+        if inherited_hier["hierarchical_value"]:
+            # Same rule as the graph gate: what is not in the state dict cannot
+            # be recovered by loading it, so an inherited head keeps the
+            # gradient path it was trained under unless asked otherwise.
+            args.hierarchical_value_detach = inherited_hier[
+                "hierarchical_value_detach"
+            ]
         resolve_graph_args(args, stored)
         print(
             "warm-start architecture: "
@@ -1526,6 +1631,8 @@ def main(argv=None) -> int:
         graph_layers=args.graph_layers,
         graph_bases=args.graph_bases,
         graph_alpha=args.graph_alpha,
+        hierarchical_value=args.hierarchical_value,
+        hierarchical_value_detach=args.hierarchical_value_detach,
     )
     if initial is not None:
         load_checkpoint(

@@ -373,6 +373,32 @@ class PhaseDConfig:
     action_residual: bool = False
     """W5a contextual scorer over legal actions, blended behind a zero gate."""
 
+    hierarchical_value: bool = False
+    """W4 head: one consistent distribution over winner and victory type.
+
+    Shadow only -- `value` and `joint7` stay authoritative for search, so the
+    head cannot change a served number. What it can still change is the TRUNK,
+    unless detached.
+    """
+
+    hierarchical_value_detach: bool = True
+    """Learn W4 from a stop-gradient readout.
+
+    True makes the head provably unable to move a trunk weight, so its only
+    cost is throughput. False is the arm that lets it shape representations --
+    the KataGo lesson this project follows -- and is the only setting under
+    which it can change playing strength in either direction.
+    """
+
+    hier_value_weight: float = 0.0
+    """Loss weight for the W4 head.
+
+    Zero by default, and refused alongside a built head, on the same grounds as
+    `action_policy_weight`: a present-but-untrained head is a configured run
+    that does nothing, which reads like an arm and is not one. The CLI supplies
+    0.15 when the head is switched on.
+    """
+
     graph_module: bool = False
     """W2 relational message passing over the printed tableau graph.
 
@@ -1167,6 +1193,16 @@ class PhaseDConfig:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
         if not math.isfinite(self.action_policy_weight) or self.action_policy_weight < 0:
             raise ValueError("action_policy_weight must be finite and non-negative")
+        if not math.isfinite(self.hier_value_weight) or self.hier_value_weight < 0:
+            raise ValueError("hier_value_weight must be finite and non-negative")
+        if self.hier_value_weight > 0 and not self.hierarchical_value:
+            raise ValueError("hier_value_weight requires --hierarchical-value")
+        if self.hierarchical_value and self.hier_value_weight == 0:
+            raise ValueError(
+                "--hierarchical-value requires a positive --hier-value-weight; "
+                "the head is shadow-only, so an unweighted one is parameters "
+                "and throughput buying nothing"
+            )
         if self.action_policy_weight > 0 and not self.action_residual:
             raise ValueError("action_policy_weight requires --action-residual")
         if self.train_action_gate and not self.action_residual:
@@ -1821,6 +1857,23 @@ def generate_seed_buffer(
 _PROCESS_STATE: dict[str, Any] = {}
 
 
+def _hier_value(source) -> dict:
+    """The W4 switch and its gradient path, or nothing when the head is off.
+
+    Separate from `_graph_shape` only because they gate on different flags;
+    both exist for the same reason, which is that a site passing the presence
+    flag while forgetting the gradient path would rebuild a model that loads
+    every weight and trains a different objective.
+    """
+
+    if not getattr(source, "hierarchical_value", False):
+        return {}
+    return {
+        "hierarchical_value": True,
+        "hierarchical_value_detach": bool(source.hierarchical_value_detach),
+    }
+
+
 def _graph_shape(source) -> dict:
     """The W2 shape, or nothing when the module is off.
 
@@ -1858,6 +1911,7 @@ def _process_generation_init(
         slot_embedding=config.slot_embedding,
         graph_module=config.graph_module,
         **_graph_shape(config),
+        **_hier_value(config),
     )
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
@@ -1911,6 +1965,8 @@ class ModelAgentSpec:
     graph_layers: int = 2
     graph_bases: int = 4
     graph_alpha: float = 1e-3
+    hierarchical_value: bool = False
+    hierarchical_value_detach: bool = True
     """Architecture switches the weights were built under.
 
     Here for the same reason ``heads`` is: a gate rebuilds the model from this
@@ -1950,6 +2006,7 @@ def _model_from_spec(spec: ModelAgentSpec):
         slot_embedding=spec.slot_embedding,
         graph_module=spec.graph_module,
         **_graph_shape(spec),
+        **_hier_value(spec),
     )
     model.load_state_dict(spec.model_state)
     return model
@@ -3057,6 +3114,13 @@ class PhaseDLoop:
             "graph_layers": int(getattr(model, "graph_layers", 2)),
             "graph_bases": int(getattr(model, "graph_bases", 4)),
             "graph_alpha": float(getattr(model, "graph_alpha", 0.0)),
+            "hierarchical_value": bool(
+                getattr(model, "hierarchical_value", False)
+            ),
+            "hierarchical_value_detach": bool(
+                getattr(model, "hierarchical_value_detach", True)
+            ),
+            "hier_value_weight": self.config.hier_value_weight,
             "action_policy_weight": self.config.action_policy_weight,
             "train_action_gate": self.config.train_action_gate,
             "precision": self.config.precision,
@@ -3075,6 +3139,7 @@ class PhaseDLoop:
             slot_embedding=self.config.slot_embedding,
             graph_module=self.config.graph_module,
             **_graph_shape(self.config),
+            **_hier_value(self.config),
         )
         if model.action_scorer is not None:
             model.action_scorer.gate.requires_grad_(self.config.train_action_gate)
@@ -4144,6 +4209,7 @@ class PhaseDLoop:
                 self.config.aux_weight,
                 precision=self.config.precision,
                 action_policy_weight=self.config.action_policy_weight,
+                hier_value_weight=self.config.hier_value_weight,
             )
         training_started = time.monotonic()
         history, optimizer_state = train_steps(
@@ -4160,6 +4226,7 @@ class PhaseDLoop:
             value_weight=self.config.value_weight,
             value_bootstrap=self.config.value_bootstrap,
             action_policy_weight=self.config.action_policy_weight,
+            hier_value_weight=self.config.hier_value_weight,
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -4240,6 +4307,12 @@ class PhaseDLoop:
             graph_layers=int(getattr(source, "graph_layers", 2)),
             graph_bases=int(getattr(source, "graph_bases", 4)),
             graph_alpha=float(getattr(source, "graph_alpha", 0.0)),
+            hierarchical_value=bool(
+                getattr(source, "hierarchical_value", False)
+            ),
+            hierarchical_value_detach=bool(
+                getattr(source, "hierarchical_value_detach", True)
+            ),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -5601,6 +5674,31 @@ def build_parser() -> argparse.ArgumentParser:
         "intent, which denial depends on. ~3%% more parameters; train-only.",
     )
     parser.add_argument(
+        "--hierarchical-value",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W4: one consistent distribution over winner and victory type, "
+        "trained in shadow. `value` and `joint7` stay authoritative.",
+    )
+    parser.add_argument(
+        "--hierarchical-value-detach",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="learn W4 from a stop-gradient readout, so it cannot move a trunk "
+        "weight and costs only throughput. --no-hierarchical-value-detach lets "
+        "it shape representations, and is the only arm that can change playing "
+        "strength in either direction.",
+    )
+    # None, then resolved against the switch: 0.15 with the head, 0 without.
+    # Defaulting to 0.15 outright would make every existing config fail
+    # validation, and defaulting to 0 would silently build an untrained head.
+    parser.add_argument(
+        "--hier-value-weight",
+        type=float,
+        default=None,
+        help="W4 loss weight (default 0.15 when the head is on, else 0)",
+    )
+    parser.add_argument(
         "--graph-module",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6310,6 +6408,13 @@ def main(argv=None) -> int:
         graph_layers=args.graph_layers,
         graph_bases=args.graph_bases,
         graph_alpha=args.graph_alpha,
+        hierarchical_value=args.hierarchical_value,
+        hierarchical_value_detach=args.hierarchical_value_detach,
+        hier_value_weight=(
+            (0.15 if args.hierarchical_value else 0.0)
+            if args.hier_value_weight is None
+            else args.hier_value_weight
+        ),
         train_action_gate=args.train_action_gate,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,

@@ -1016,7 +1016,34 @@ additional neural simulations it displaces.
 
 ## Workstream 4: consistent winner/victory-type value
 
-**Status: NOT STARTED.** Hierarchical `P(win,draw,loss)` x `P(type | win/loss)` head. Distinct from the W3 auxiliary control head, which predicts the control map -- the two are easy to conflate because both are shadow-mode heads that defer a Rust integration. Distributional MCTS backup is separate work again.
+**Status: BUILT 2026-09-07, UNTRAINED.** Hierarchical `P(win,draw,loss)` x `P(type | win/loss)` head behind `--hierarchical-value`, default off. Distinct from the W3 auxiliary control head, which predicts the control map -- the two are easy to conflate because both are shadow-mode heads that defer a Rust integration. Distributional MCTS backup is separate work again and remains deferred.
+
+### What was built, and the risk it was built around
+
+`HierarchicalValue` emits three factors -- outcome, type-given-win,
+type-given-loss -- and combines them into the seven joint classes, so the 7-way
+distribution and its win/draw/loss marginal are the same object rather than two
+heads that happen to agree. One NLL term over the true joint class trains both
+factors together, weighted as the data weights them; fitting the marginal
+separately would double-count rows and re-admit the disagreement the head exists
+to remove. `value` and `joint7` stay authoritative for search.
+
+**`--hierarchical-value-detach`, on by default, is the part that matters.** A
+shadow head protects the served numbers but not the shared trunk: attached, its
+loss shapes representations, which is the KataGo lesson this project follows and
+equally a way to interfere with policy and value. Detached, only the head's own
+three projections receive gradient, so the addition provably costs throughput
+and nothing else. Measured at **1.004x** on an unfused single-thread CPU
+forward, d384 L8, for 3,465 parameters.
+
+That default follows a standing instruction rather than a preference: the
+incumbent is a very strong model, so a change that might help and might hurt is
+not symmetric with one that cannot hurt. The attached arm is available and is
+the only one that can move strength in either direction.
+
+The factorisation hard-codes `JOINT7_CLASSES`'s ORDER, which `net._check_joint7_layout` pins at import -- reordering that tuple would leave the arithmetic valid and silently map victory types onto the wrong outcome.
+
+A built head with a zero loss weight is refused, on the same grounds as W5's scorer: shadow-only and untrained is parameters and throughput buying nothing, which reads like a configured arm and is not one.
 
 ### Current limitation
 
@@ -2398,7 +2425,8 @@ plan, it is a preference list.
    comes after those exist.
 6. **Workstream 4's hierarchical head in parallel**, trained in shadow mode. Defer
    the Rust distributional backup; it is separate work with a separate
-   justification.
+   justification. **BUILT 2026-09-07, detached by default -- see Workstream 4
+   for why the gradient path, not the head, is the decision.**
 7. **Bundle whatever survived into the one justified cloud run.**
 
 #### What the warm-start test must measure
