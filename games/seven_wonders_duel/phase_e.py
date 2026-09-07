@@ -519,6 +519,9 @@ def load_evaluator(
 
     * **zeroed** -- a parameter has no counterpart at all, so it is reset. The
       net is then partly random and nothing it says means anything. Refused.
+    * **neutral** -- a parameter is new and its zero value is the designed
+      switch-neutral start (the W1 slot table), so the net computes exactly
+      what it did before. Accepted, and reported.
     * **grown** -- a parameter was zero-padded because the schema APPENDED
       something. For a projection whose input width grew this is exactly
       neutral: zero weights on the new columns contribute nothing whatever the
@@ -559,16 +562,28 @@ def load_evaluator(
                 f"were reset ({report['zeroed']}), so the net is partly random "
                 "-- the schema changed shape in a way padding cannot recover"
             )
+        if report.get("neutral"):
+            # Zero by design (the W1 slot table), so the net computes exactly
+            # what it did before. Printed rather than refused, and printed
+            # rather than silent, because it is still an architecture change.
+            print(
+                "migrated a switch-neutral addition; zero-initialized "
+                f"{report['neutral']}, which contributes nothing until trained."
+            )
         if report.get("grown"):
-            # `migrate_state_dict` has already loaded the padded weights into
-            # `model`. Re-loading the raw state dict here would shape-mismatch,
-            # and did until the additive case was allowed through.
             print(
                 "WARNING: migrated an additive schema change; zero-padded "
                 f"{report['grown']}. The appended features contribute nothing, "
                 "so this net behaves as it did when trained."
             )
-        else:
+        if not (report.get("grown") or report.get("neutral") or
+                report.get("initialized")):
+            # Nothing changed shape and nothing is new, so the stored state
+            # dict still fits and re-loading it is a no-op assertion that it
+            # does. Any of the three above means `migrate_state_dict` has
+            # ALREADY put the right tensors in `model` and the raw dict no
+            # longer matches it -- re-loading would raise on the missing or
+            # mis-shaped keys, which is what the `grown` case found.
             model.load_state_dict(checkpoint["model_state"])
     return Evaluator(model, device=device, precision=precision)
 

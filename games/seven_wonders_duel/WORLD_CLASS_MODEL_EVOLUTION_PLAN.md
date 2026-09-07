@@ -613,7 +613,34 @@ was enumerated or sampled.
 
 ## Workstream 1: learned tableau positions
 
-**Status: NOT STARTED.** Learned `AGE_AND_SLOT` embedding. Not superseded by W3 -- W3 supplies an exact VALUE, W1 supplies the stable slot identity to attach it to, and the existing row/x features stay. Zero-init migration is minutes; training the embeddings is the overnight part.
+**Status: BUILT 2026-09-07, UNTRAINED.** Learned `AGE_AND_SLOT` embedding behind `--slot-embedding` / `slot_embedding=True`, default off. Not superseded by W3 -- W3 supplies an exact VALUE, W1 supplies the stable slot identity to attach it to, and the existing row/x features stay. The migration is proved bit-identical (`test_slot_embedding.py`); training the embeddings is the overnight part and has not run.
+
+### What was built, and the one design choice worth recording
+
+The identity is **derived from features the encoder already emits**, not appended to the schema: `row` and `x` on the tableau token, plus the Age one-hot on the GLOBAL token, together name exactly one printed location, and `net.TokenEmbedder.slot_ids` reconstructs the index with one lookup into a `[age, row, x]` table built from `TABLEAU_LAYOUTS`.
+
+The appended-column alternative -- a 38th `TABLEAU_FEATURES` column -- was rejected because it costs three things this does not: a moved `ENCODER_SIGNATURE` (so every checkpoint needs `migrate=True` and every materialized buffer re-derives), a matching change in `encoder.rs`, and a regenerated equivalence corpus. It buys nothing in exchange: the index is already determined by the batch.
+
+The price is that `net.py` now reads feature COLUMNS. Both lookups are by NAME, so an appended feature cannot shift them; only reordering an existing tuple could, which the migration rules already forbid.
+
+`slot_identity.py` is a separate module rather than an addition to `data.py` for a reason worth knowing before anyone adds a constant there: **`control_table.rule_identity` digests the BYTES of `data.py`**, so appending even a derived constant that changes no rule invalidates every installed control table, and the encoder then refuses to import. Found by doing it.
+
+Zero-init needs no warm-up gate here, unlike the W3 head. A zeroed MLP is dead -- GELU(0) = 0 and both layers get zero gradient -- but a lookup's gradient does not pass through its own value, so every row a batch touches moves on step one. `migrate_state_dict` reports it in a new `neutral` bucket rather than `zeroed`, because `phase_e` refuses a migration that zeroed anything on the grounds that the net is then partly random, which is exactly untrue of this table.
+
+### Throughput, measured 2026-09-07
+
+Interleaved A/B on the fused inference path, d384 L8 pooled, CPU fp32, 4 threads,
+25 alternating samples per arm: **ratio 1.002 at 8 rows and 0.997 at 64 rows**
+on the best-decile time, with medians straddling 1.0 in both directions. The
+cost is not distinguishable from zero at this precision, which is the expected
+shape -- the addition is one gather and a handful of elementwise ops against a
+forward measured in tens of milliseconds. Not measured on GPU or under bf16;
+neither is likely to change the sign, but neither has been run.
+
+### Still to do
+
+- Train the table (the overnight part), then the gates below.
+- W2 consumes these identities, so it waits on the trained arm rather than on the build.
 
 ### Change
 
@@ -653,7 +680,37 @@ tolerance. Train the new table while retaining all existing weights.
 
 ## Workstream 2: graph-aware tableau encoding
 
-**Status: NOT STARTED.** Tableau graph module. Depends on W1 (consumes slot identities) and solves over the same cover relation W3 does.
+**Status: BUILT 2026-09-07, UNTRAINED.** Tableau graph module behind `--graph-module`, default off, with `--graph-layers` / `--graph-bases` / `--graph-alpha`. Solves over the same cover relation W3 does.
+
+**The dependency on W1 is narrower than this plan said.** W2 does not consume the learned table; it consumes the *numbering*. Nodes are ordered by the within-Age slot index W1 fixed, which is what makes the edge set one static matrix per Age instead of something rebuilt per position. So the two are independently switchable -- `--graph-module` without `--slot-embedding` is a legal, tested arm -- and that is precisely why they belong in one training run rather than two.
+
+### What was built
+
+Relational message passing over the tableau tokens only, ahead of the main Transformer, every other token passing through untouched. Fifteen relation types: self, covers, covered_by, sibling (shares a parent or a child), and directional ancestor/descendant at every distance the layouts actually admit. The plan named distances 2-5; **Age III is seven rows deep, so distance 6 exists**, and truncating at 5 would have declared the apex and the bottom row structurally unrelated -- the one pair transitive edges are for. The range is derived from `TABLEAU_LAYOUTS`, not written down.
+
+Per-relation transforms use R-GCN's basis decomposition, `W_e = sum_b a[e,b] V_b` with four bases. Fifteen full `d x d` matrices per layer would have been the honest reading of "message passing" and roughly four times the cost; the algebra also reorders into `sum_b V_b (sum_e a[e,b] A_e) h`, so the per-relation adjacencies are one embedding lookup over the static matrix and what remains is four small matmuls.
+
+Edges are **structural** and ignore which cards are still present: a slot two rows down is a distance-2 descendant whether or not the card between them has been taken. The dynamic half is already carried by `accessible` / `coverers` and, exactly, by W3. Absent slots are masked out as message sources, so a taken card is not there rather than being a zero-vector neighbour.
+
+### Throughput, measured 2026-09-07
+
+Interleaved arms, fused inference path, d384 L8 pooled, CPU fp32, best-decile of 25 samples:
+
+| arm | 8 rows | 64 rows |
+| --- | --- | --- |
+| W1 alone | 1.029x | 0.993x |
+| W2, 2 layers | 1.066x | 1.031x |
+| W1 + W2 | 1.060x | 1.044x |
+| W2, 3 layers | 1.089x | 1.061x |
+
+So W2 costs roughly **3-7% at two layers**, the same order as the W5a scorer's accepted -9% / -3%, and not the "substantial throughput cost" that the bundling rule reserves a separate arm for. It shares W1's run. Generation is the CPU path so this is the number that governs; GPU and bf16 are unmeasured.
+
+### Gate
+
+- `graph_alpha = 0` equivalence, asserted bit-identical (`test_tableau_graph.py`).
+- Edges asserted against `data.covering_slots` -- the engine's own definition -- rather than against a second copy of the same expression.
+- One test proves a message actually crosses a cover edge and that a non-edge sends a different one; a module that silently did nothing would pass every other test in the file.
+- Still to do: training, then the strength gates.
 
 ### First implementation
 
@@ -705,6 +762,16 @@ tableau_output = tableau_input + alpha_graph * graph_update
 Use `alpha_graph = 0` to prove exact migration equivalence. For training, switch
 to a normalized small nonzero value such as `1e-3` so the graph parameters learn
 from the first step. Retain an ablation mode that forces the gate back to zero.
+
+**As built.** `graph_alpha` is a plain float on the model, recorded in the
+checkpoint config beside `graph_layers` and `graph_bases`, so an ablation is a
+config change rather than a weight edit and a rebuild cannot forget it. The
+module's own parameters keep ordinary initialisation through a migration --
+they are exempt from zeroing alongside the W5 scorer and the W3 head, and for a
+sharper reason than either: **a zeroed LayerNorm emits zeros whatever it is
+fed**, so zeroing this module would not start it softly, it would kill it
+permanently, gradients included. Neutrality comes from the gate, which is
+outside the state dict.
 
 ### Later option
 
@@ -2317,8 +2384,12 @@ plan, it is a preference list.
 3. **Workstream 1 migration**, then train the slot embeddings. The equivalence
    check itself is MINUTES -- load the checkpoint, assert bit-identical output
    at zero initialisation. Training the embeddings is the overnight part.
+   **The migration is DONE and the equivalence is asserted; the training is not.**
 4. **Workstream 2 on top of Workstream 1**, since the graph module consumes slot
-   identities.
+   identities. **BUILT 2026-09-07.** In the event it consumes the slot
+   *numbering*, not the learned table, so the two are separately switchable and
+   share one training run -- which is what the bundling rule asks for, its
+   throughput cost having been measured at 3-7% rather than substantial.
 5. **Workstream 5, in two steps.** A minimal action residual over the CURRENT
    tokens can be prototyped independently and early -- it needs neither 1 nor 3.
    The full form, with contextual slot, graph and proven-useful control outputs,
@@ -2384,8 +2455,11 @@ Workstream 9 prototype -- and remain the largest outstanding block of Stage 0.
 
 ### Stage 1: cheap structural, action, and search prototypes
 
-- Add zero-initialized learned Age/slot embeddings.
-- Add the small-gated lightweight tableau graph module.
+- **BUILT 2026-09-07; migration equivalence proved, training and strength gates
+  pending.** Add zero-initialized learned Age/slot embeddings. See Workstream 1.
+- **BUILT 2026-09-07; equivalence and edge tests pass, training and strength
+  gates pending.** Add the small-gated lightweight tableau graph module. See
+  Workstream 2.
 - **BUILT 2026-09-03; mechanism tests pass, strength/throughput gates pending.** Add a minimal legal-action residual
   using existing state tokens and legal action IDs; do not wait for the online
   control engine to test whether compositional action scoring has value.

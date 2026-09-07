@@ -27,6 +27,54 @@ from .dataset import (
     NUM_AUX_CARDS,
     TOKEN_TYPES,
 )
+from .encoder import GLOBAL_FEATURES, TABLEAU_FEATURES, TokenType
+from .slot_identity import (
+    AGE_OF_SLOT,
+    AGE_SLOT_IDS,
+    MAX_AGE,
+    MAX_SLOTS_PER_AGE,
+    MAX_SLOT_ROW,
+    MAX_SLOT_X,
+    NUM_AGE_SLOTS,
+    NUM_RELATIONS,
+    WITHIN_AGE_INDEX,
+    relation_planes,
+)
+
+
+# --- Workstream 1: learned Age/slot identity --------------------------------
+#
+# The identity is DERIVED from features the encoder already emits rather than
+# appended to the schema: `row` and `x` on the tableau token, and the Age
+# one-hot on the GLOBAL token, together name exactly one printed location. That
+# keeps `ENCODER_SIGNATURE` still, so every existing checkpoint and every
+# materialized buffer stays loadable, and it needs no matching change in the
+# Rust encoder -- the appended-column alternative would have cost all three for
+# an index the batch already determines.
+#
+# The price is that this module reads feature COLUMNS. Both lookups are by
+# NAME, so an appended feature cannot silently shift them; only reordering an
+# existing tuple could, which `migrate_state_dict` already forbids for its own
+# reasons.
+_TABLEAU_TYPE_INDEX = TOKEN_TYPES.index(TokenType.TABLEAU)
+_AGE_COLUMNS = tuple(GLOBAL_FEATURES.index(f"age_{age}") for age in (1, 2, 3))
+_ROW_COLUMN = TABLEAU_FEATURES.index("row")
+_X_COLUMN = TABLEAU_FEATURES.index("x")
+
+
+def _slot_lookup_table() -> torch.Tensor:
+    """``[age, row, x] -> slot id + 1``; 0 means "no slot", i.e. embedding row 0.
+
+    Age 0 is the padding plane: a row whose token 0 is not a GLOBAL token (a
+    synthetic bench batch) resolves there rather than indexing out of bounds.
+    """
+
+    table = torch.zeros(
+        MAX_AGE + 1, MAX_SLOT_ROW + 1, MAX_SLOT_X + 1, dtype=torch.long
+    )
+    for (age, row, x), slot_id in AGE_SLOT_IDS.items():
+        table[age, row, x] = slot_id + 1
+    return table
 
 
 class TokenEmbedder(nn.Module):
@@ -38,7 +86,12 @@ class TokenEmbedder(nn.Module):
     keys that have no counterpart in an older checkpoint).
     """
 
-    def __init__(self, d_model: int):
+    def __init__(
+        self,
+        d_model: int,
+        slot_embedding: bool = False,
+        slot_index: bool = False,
+    ):
         super().__init__()
         self.d_model = d_model
         self.entity = nn.ModuleDict(
@@ -57,6 +110,29 @@ class TokenEmbedder(nn.Module):
         # padding_idx keeps the "no aux entity" row at zero permanently —
         # it receives no gradient, so real tokens never drift it.
         self.aux = nn.Embedding(NUM_AUX_CARDS, d_model, padding_idx=0)
+        #: W1: a learned identity per printed tableau location, per Age.
+        #:
+        #: Zero-initialized, so loading an inherited checkpoint reproduces its
+        #: computation EXACTLY -- not merely near-neutrally, as an added token
+        #: type would, because this adds nothing to the sequence and therefore
+        #: nothing to attention normalization. Unlike a zeroed MLP a zero table
+        #: is still trainable: the gradient of a lookup does not pass through
+        #: its own value, so every row that a batch touches moves on step one.
+        #: That is why it needs no warm-up gate.
+        #:
+        #: `padding_idx=0` pins the "not a tableau token" row at zero for good.
+        self.slot_embedding = bool(slot_embedding)
+        self.slot = None
+        if self.slot_embedding:
+            self.slot = nn.Embedding(NUM_AGE_SLOTS + 1, d_model, padding_idx=0)
+            nn.init.zeros_(self.slot.weight)
+        #: W2 needs the same identity to order its graph nodes but none of the
+        #: table, so the INDEX and the EMBEDDING are separate requests.
+        self.slot_index = bool(slot_embedding or slot_index)
+        if self.slot_index:
+            self.register_buffer(
+                "slot_lookup", _slot_lookup_table(), persistent=False
+            )
         #: Fused inference tensors, built by `fuse()`. `None` = use the per-type
         #: loop, which is the training path and stays untouched.
         self._fused: dict[str, torch.Tensor] | None = None
@@ -233,6 +309,49 @@ class TokenEmbedder(nn.Module):
         )
         return needed <= self.MAX_PROJECTION_BYTES
 
+    def slot_ids(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """W1: the Age/slot identity of every token, 0 where there is none.
+
+        The index is reconstructed, not carried: `row` and `x` are on the
+        tableau token itself, and the Age is the one-hot on the GLOBAL token,
+        which is always position 0. A row whose token 0 carries no Age -- the
+        Wonder draft, or a synthetic bench batch -- resolves to Age 0, whose
+        lookup plane is empty, and every token there scores the zero row.
+
+        Non-tableau tokens read whatever their own type happens to hold in the
+        `row`/`x` columns, which is meaningless; `clamp` keeps that in bounds
+        and the type mask discards it. Clamping is not a silent repair here,
+        because no value it changes survives the mask.
+        """
+
+        assert self.slot_index, "slot_ids needs the lookup table"
+        features = batch["features"]
+        type_ids = batch["type_ids"]
+        age = self.row_ages(batch)
+        rows = features[..., _ROW_COLUMN].round().long().clamp(0, MAX_SLOT_ROW)
+        xs = features[..., _X_COLUMN].round().long().clamp(0, MAX_SLOT_X)
+        ids = self.slot_lookup[age.unsqueeze(-1).expand_as(rows), rows, xs]
+        return ids.where(type_ids == _TABLEAU_TYPE_INDEX, torch.zeros_like(ids))
+
+    @staticmethod
+    def row_ages(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The Age each row was encoded under, 0 where the row names none.
+
+        Read from the GLOBAL token's one-hot, which is always position 0.
+        """
+
+        age_onehot = batch["features"][:, 0, list(_AGE_COLUMNS)]
+        # `argmax` alone would call an all-zero row Age I. Ages are exclusive,
+        # so the sum is 1 exactly when one is set.
+        return torch.where(
+            age_onehot.sum(-1) > 0.5,
+            age_onehot.argmax(-1) + 1,
+            torch.zeros_like(batch["type_ids"][:, 0]),
+        )
+
+    def _slot_contribution(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.slot(self.slot_ids(batch))
+
     def _forward_fused(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         fused = self._fused
         assert fused is not None
@@ -249,6 +368,8 @@ class TokenEmbedder(nn.Module):
             *type_ids.shape, 1, self.d_model
         )
         out = out + projected.gather(-2, picker).squeeze(-2)
+        if self.slot is not None:
+            out = out + self._slot_contribution(batch)
         return out.masked_fill(batch["pad_mask"].unsqueeze(-1), 0.0)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -272,7 +393,148 @@ class TokenEmbedder(nn.Module):
             rows = rows + feature(batch["features"][mask][:, : feature.in_features])
             per_type[mask] = rows
         out = out + per_type
+        if self.slot is not None:
+            out = out + self._slot_contribution(batch)
         return out.masked_fill(batch["pad_mask"].unsqueeze(-1), 0.0)
+
+
+class TableauGraphLayer(nn.Module):
+    """One relational message-passing step over the printed tableau graph.
+
+    Per-relation transforms, in the basis-decomposed form R-GCN uses:
+    ``W_e = sum_b a[e, b] V_b``. The point of the decomposition is cost. With
+    15 relation types, a full ``d x d`` matrix each would be 15 projections per
+    layer, and the plan requires this module to be cheap enough to sit in front
+    of every forward on the generation path; four shared bases keep the
+    per-relation transform real while paying for four.
+
+    The algebra also reorders into something much cheaper than it looks:
+
+        sum_e W_e (A_e h) = sum_b V_b (sum_e a[e, b] A_e) h
+
+    so the per-relation adjacencies never have to be materialized separately.
+    ``sum_e a[e, b] A_e`` is one embedding lookup over the static relation
+    matrix, and what remains is four small matmuls.
+
+    Messages are averaged over the PRESENT slots rather than over each
+    relation's own degree. Per-relation normalization would make a node with
+    one coverer and a node with two send messages of the same size, which is
+    exactly the distinction "how exposed am I" needs.
+    """
+
+    def __init__(self, d_model: int, bases: int = 4):
+        super().__init__()
+        self.mix = nn.Embedding(NUM_RELATIONS, bases)
+        self.basis = nn.Parameter(torch.empty(bases, d_model, d_model))
+        self.self_transform = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        nn.init.normal_(self.mix.weight, std=1.0)
+        nn.init.normal_(self.basis, std=d_model ** -0.5)
+
+    def forward(
+        self,
+        nodes: torch.Tensor,
+        relations: torch.Tensor,
+        present: torch.Tensor,
+    ) -> torch.Tensor:
+        normed = self.norm(nodes)
+        # [rows, i, j, bases], zeroed where the SOURCE slot is absent.
+        coefficients = self.mix(relations) * present[:, None, :, None]
+        degree = present.sum(-1).clamp(min=1)
+        coefficients = coefficients / degree[:, None, None, None].to(normed.dtype)
+        aggregate = torch.einsum("rijb,rjd->rbid", coefficients.to(normed.dtype), normed)
+        message = torch.einsum("rbid,bde->rie", aggregate, self.basis)
+        update = nn.functional.gelu(message + self.self_transform(normed))
+        return nodes + update * present.unsqueeze(-1)
+
+
+class TableauGraph(nn.Module):
+    """W2: a tableau-only graph module ahead of the main Transformer.
+
+    Nodes are the present tableau slots, ordered by their within-Age slot
+    index, so the edge set is one STATIC matrix per Age -- looked up, never
+    rebuilt per position. Every non-tableau token passes through untouched.
+
+    Why this is not just more layers. Learned slots (W1) make the cover graph
+    learnable, but the model still has to discover each relationship
+    statistically, and a five-step cover chain would need five neural layers
+    merely to move information along it. The transitive edges make that one
+    hop. Neither replaces W3: these make the topology easier to LEARN, while
+    the control questions are exactly COMPUTABLE, and a learned answer is
+    wrong precisely in the rare high-regret positions self-play seldom visits.
+
+    The residual gate follows the plan: ``output = input + alpha * update``.
+    At ``alpha = 0`` the module is exactly inert AND receives no gradient, so
+    zero is the equivalence and ablation setting, not the training one; the
+    default is the plan's small nonzero value, which lets the graph parameters
+    learn from the first step.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        layers: int = 2,
+        bases: int = 4,
+        alpha: float = 1e-3,
+    ):
+        super().__init__()
+        if layers <= 0:
+            raise ValueError("a graph module with no layers is not a module")
+        self.layers = nn.ModuleList(
+            TableauGraphLayer(d_model, bases) for _ in range(layers)
+        )
+        self.alpha = float(alpha)
+        self.register_buffer(
+            "relation_planes",
+            torch.tensor(relation_planes(), dtype=torch.long),
+            persistent=False,
+        )
+        # `slot id - 1 -> within-Age index` and `-> Age`. Global ids are
+        # consecutive across Ages, so the arithmetic would work today; the
+        # tables are read instead, because "every Age has exactly 20 slots" is
+        # a fact about the current layouts rather than a rule of the game.
+        self.register_buffer(
+            "within_age", torch.tensor(WITHIN_AGE_INDEX, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "slot_age", torch.tensor(AGE_OF_SLOT, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        slot_ids: torch.Tensor,
+        row_ages: torch.Tensor,
+    ) -> torch.Tensor:
+        rows, _, width = tokens.shape
+        nodes_wide = MAX_SLOTS_PER_AGE
+        is_slot = slot_ids > 0
+        global_ids = (slot_ids - 1).clamp(min=0)
+        within = self.within_age[global_ids]
+        # Everything that is not a tableau token is parked in a sink node that
+        # is dropped before any message passing. Without it they would all
+        # collide on node 0 and overwrite a real slot.
+        node_index = torch.where(is_slot, within, torch.full_like(within, nodes_wide))
+        picker = node_index.unsqueeze(-1).expand(-1, -1, width)
+
+        nodes = tokens.new_zeros(rows, nodes_wide + 1, width)
+        nodes.scatter_(1, picker, tokens)
+        nodes = nodes[:, :nodes_wide]
+        present = tokens.new_zeros(
+            rows, nodes_wide + 1, dtype=torch.bool
+        ).scatter_(1, node_index, torch.ones_like(node_index, dtype=torch.bool))
+        present = present[:, :nodes_wide]
+
+        relations = self.relation_planes[row_ages]
+        updated = nodes
+        for layer in self.layers:
+            updated = layer(updated, relations, present.to(updated.dtype))
+        update = torch.cat(
+            [updated - nodes, tokens.new_zeros(rows, 1, width)], dim=1
+        ).gather(1, picker)
+        return tokens + self.alpha * update
 
 
 class ContextualActionResidual(nn.Module):
@@ -435,6 +697,11 @@ class SWDNet(nn.Module):
         reply_head: bool = False,
         action_residual: bool = False,
         control_head: bool = False,
+        slot_embedding: bool = False,
+        graph_module: bool = False,
+        graph_layers: int = 2,
+        graph_bases: int = 4,
+        graph_alpha: float = 1e-3,
     ):
         super().__init__()
         heads = default_heads(d_model) if heads is None else int(heads)
@@ -444,7 +711,32 @@ class SWDNet(nn.Module):
             )
         # NOT `self.heads` -- that name is the output-head bundle assigned below.
         self.attention_heads = heads
-        self.embedder = TokenEmbedder(d_model)
+        #: W1. Recorded on the model because it changes which parameters
+        #: exist, so a checkpoint rebuilt without it would load everything but
+        #: `embedder.slot.weight` and quietly compute the pre-W1 network.
+        self.slot_embedding = bool(slot_embedding)
+        #: W2. Its node ordering is W1's slot identity, so it asks the embedder
+        #: for the INDEX; it does not need the learned table and can run
+        #: without it, which is what makes the two independently ablatable.
+        self.graph_module = bool(graph_module)
+        self.graph_layers = int(graph_layers)
+        self.graph_bases = int(graph_bases)
+        self.graph_alpha = float(graph_alpha)
+        self.embedder = TokenEmbedder(
+            d_model,
+            slot_embedding=self.slot_embedding,
+            slot_index=self.graph_module,
+        )
+        self.graph = (
+            TableauGraph(
+                d_model,
+                layers=self.graph_layers,
+                bases=self.graph_bases,
+                alpha=self.graph_alpha,
+            )
+            if self.graph_module
+            else None
+        )
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=heads,
@@ -488,6 +780,12 @@ class SWDNet(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         tokens = self.embedder(batch)
+        if self.graph is not None:
+            tokens = self.graph(
+                tokens,
+                self.embedder.slot_ids(batch),
+                self.embedder.row_ages(batch),
+            )
         encoded = self.encoder(tokens, src_key_padding_mask=batch["pad_mask"])
         normed = self.final_norm(encoded)
         if self.readout_proj is None:

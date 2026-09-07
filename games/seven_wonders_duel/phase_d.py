@@ -373,6 +373,35 @@ class PhaseDConfig:
     action_residual: bool = False
     """W5a contextual scorer over legal actions, blended behind a zero gate."""
 
+    graph_module: bool = False
+    """W2 relational message passing over the printed tableau graph.
+
+    Runs ahead of the Transformer on the tableau tokens only. Its node ordering
+    is W1's slot identity, but it does not need W1's learned table, so the two
+    are separately switchable -- which is the point of running them in one
+    training run rather than two.
+    """
+
+    graph_layers: int = 2
+    graph_bases: int = 4
+    graph_alpha: float = 1e-3
+    """Shape and residual gate of the W2 module.
+
+    ``graph_alpha = 0`` is exactly inert AND receives no gradient, so it is the
+    equivalence and ablation setting rather than a training one. The default is
+    the plan's small nonzero value.
+    """
+
+    slot_embedding: bool = False
+    """W1 learned Age/slot identity on tableau tokens.
+
+    A stable name for each printed location, so attention can learn that a slot
+    has the same structural role in every game of that Age -- which the raw
+    `row`/`x` numbers cannot express. Zero-initialized: a warm start computes
+    what it inherited until training moves the table, and the table trains from
+    step one because a lookup's gradient does not pass through its own value.
+    """
+
     train_action_gate: bool = False
     """Allow W5a to affect served logits; false trains it in shadow mode."""
 
@@ -1792,6 +1821,23 @@ def generate_seed_buffer(
 _PROCESS_STATE: dict[str, Any] = {}
 
 
+def _graph_shape(source) -> dict:
+    """The W2 shape, or nothing when the module is off.
+
+    One helper because three separate sites build a model from a config-like
+    object, and a site that passed `graph_module` while forgetting `graph_alpha`
+    would rebuild a net that loads every weight and computes something else.
+    """
+
+    if not getattr(source, "graph_module", False):
+        return {}
+    return {
+        "graph_layers": int(source.graph_layers),
+        "graph_bases": int(source.graph_bases),
+        "graph_alpha": float(source.graph_alpha),
+    }
+
+
 def _process_generation_init(
     model_state: dict[str, torch.Tensor],
     config: PhaseDConfig,
@@ -1809,6 +1855,9 @@ def _process_generation_init(
         config.pooled_readout,
         config.reply_head,
         config.action_residual,
+        slot_embedding=config.slot_embedding,
+        graph_module=config.graph_module,
+        **_graph_shape(config),
     )
     model.load_state_dict(model_state)
     # CPU inference per process: at generation batch sizes the tiny network is
@@ -1857,6 +1906,11 @@ class ModelAgentSpec:
     pooled_readout: bool = False
     reply_head: bool = False
     action_residual: bool = False
+    slot_embedding: bool = False
+    graph_module: bool = False
+    graph_layers: int = 2
+    graph_bases: int = 4
+    graph_alpha: float = 1e-3
     """Architecture switches the weights were built under.
 
     Here for the same reason ``heads`` is: a gate rebuilds the model from this
@@ -1893,6 +1947,9 @@ def _model_from_spec(spec: ModelAgentSpec):
         spec.pooled_readout,
         spec.reply_head,
         spec.action_residual,
+        slot_embedding=spec.slot_embedding,
+        graph_module=spec.graph_module,
+        **_graph_shape(spec),
     )
     model.load_state_dict(spec.model_state)
     return model
@@ -2995,6 +3052,11 @@ class PhaseDLoop:
             "pooled_readout": bool(getattr(model, "pooled_readout", False)),
             "reply_head": bool(getattr(model, "reply_head", False)),
             "action_residual": bool(getattr(model, "action_residual", False)),
+            "slot_embedding": bool(getattr(model, "slot_embedding", False)),
+            "graph_module": bool(getattr(model, "graph_module", False)),
+            "graph_layers": int(getattr(model, "graph_layers", 2)),
+            "graph_bases": int(getattr(model, "graph_bases", 4)),
+            "graph_alpha": float(getattr(model, "graph_alpha", 0.0)),
             "action_policy_weight": self.config.action_policy_weight,
             "train_action_gate": self.config.train_action_gate,
             "precision": self.config.precision,
@@ -3010,6 +3072,9 @@ class PhaseDLoop:
             self.config.pooled_readout,
             self.config.reply_head,
             self.config.action_residual,
+            slot_embedding=self.config.slot_embedding,
+            graph_module=self.config.graph_module,
+            **_graph_shape(self.config),
         )
         if model.action_scorer is not None:
             model.action_scorer.gate.requires_grad_(self.config.train_action_gate)
@@ -4170,6 +4235,11 @@ class PhaseDLoop:
             pooled_readout=bool(getattr(source, "pooled_readout", False)),
             reply_head=bool(getattr(source, "reply_head", False)),
             action_residual=bool(getattr(source, "action_residual", False)),
+            slot_embedding=bool(getattr(source, "slot_embedding", False)),
+            graph_module=bool(getattr(source, "graph_module", False)),
+            graph_layers=int(getattr(source, "graph_layers", 2)),
+            graph_bases=int(getattr(source, "graph_bases", 4)),
+            graph_alpha=float(getattr(source, "graph_alpha", 0.0)),
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -5531,6 +5601,35 @@ def build_parser() -> argparse.ArgumentParser:
         "intent, which denial depends on. ~3%% more parameters; train-only.",
     )
     parser.add_argument(
+        "--graph-module",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W2: relational message passing over the printed tableau graph, "
+        "ahead of the Transformer and over the tableau tokens only. Makes a "
+        "five-step cover chain one hop instead of five neural layers.",
+    )
+    parser.add_argument("--graph-layers", type=int, default=2,
+                        help="W2 message-passing layers")
+    parser.add_argument("--graph-bases", type=int, default=4,
+                        help="W2 shared basis matrices behind the per-relation "
+                        "transforms")
+    parser.add_argument(
+        "--graph-alpha",
+        type=float,
+        default=1e-3,
+        help="W2 residual gate. Exactly 0 is inert AND ungradiented, so it is "
+        "the ablation setting, not a training one.",
+    )
+    parser.add_argument(
+        "--slot-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W1: a learned identity per printed tableau location, separate by "
+        "Age, added to the tableau tokens alongside the existing row/x "
+        "features. Zero-initialized, so a warm-started run begins as the model "
+        "it inherited and the table trains from there.",
+    )
+    parser.add_argument(
         "--action-residual",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6206,6 +6305,11 @@ def main(argv=None) -> int:
         pooled_readout=args.pooled_readout,
         reply_head=args.reply_head,
         action_residual=args.action_residual,
+        slot_embedding=args.slot_embedding,
+        graph_module=args.graph_module,
+        graph_layers=args.graph_layers,
+        graph_bases=args.graph_bases,
+        graph_alpha=args.graph_alpha,
         train_action_gate=args.train_action_gate,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,

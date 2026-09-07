@@ -464,6 +464,8 @@ ARCHITECTURE_SWITCHES = (
     "reply_head",
     "action_residual",
     "control_head",
+    "slot_embedding",
+    "graph_module",
 )
 
 
@@ -513,6 +515,9 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         reply_head_from_config(config),
         action_residual_from_config(config),
         control_head_from_config(config),
+        slot_embedding_from_config(config),
+        graph_module_from_config(config),
+        **graph_shape_from_config(config),
     )
 
 
@@ -543,6 +548,20 @@ def make_checkpoint(model, config: dict) -> dict:
                 "able to rebuild its own weights"
             )
         config[switch] = actual
+    # The W2 shape is architecture too, and equally derived from the model: a
+    # config that named a different `graph_alpha` than the weights were trained
+    # under would rebuild a net that computes something else.
+    if bool(getattr(model, "graph_module", False)):
+        for field in GRAPH_SHAPE_DEFAULTS:
+            actual = getattr(model, field)
+            stated = config.get(field)
+            if stated is not None and type(actual)(stated) != actual:
+                raise ValueError(
+                    f"checkpoint config says {field}={stated!r} but the model "
+                    f"was built with {field}={actual!r}; the checkpoint would "
+                    "not be able to rebuild its own weights"
+                )
+            config[field] = actual
     out = {
         "model_state": model.state_dict(),
         "config": config,
@@ -585,6 +604,17 @@ def _reads_control_features(model) -> bool:
     return bool(set(CONTROL_FEATURES) & set(TABLEAU_FEATURES))
 
 
+#: Parameters whose ZERO value is the designed switch-neutral start, not a
+#: reset for want of a counterpart.
+#:
+#: The W1 slot table adds nothing to the token sequence, so at zero the model
+#: computes bit-for-bit what it did before -- stronger than the near-neutrality
+#: an appended token type gets, since there is no extra token to dilute
+#: attention normalization. And unlike a zeroed MLP it still trains: a lookup's
+#: gradient does not pass through its own value.
+NEUTRAL_ZERO_PARAMETERS = frozenset({"embedder.slot.weight"})
+
+
 def migrate_state_dict(old_state: dict, model) -> dict:
     """Additive-schema warm start (spec §5.8a): load every parameter that still
     matches, zero-initialize parameters with no counterpart (new token types'
@@ -593,6 +623,10 @@ def migrate_state_dict(old_state: dict, model) -> dict:
     scorer parameters retain their ordinary random initialization behind their
     exactly-zero gate; zeroing every layer of a residual MLP would destroy the
     gradients the independent action-policy loss is meant to train.
+
+    ``NEUTRAL_ZERO_PARAMETERS`` are also zeroed, but reported apart: their zero
+    is the designed switch-neutral start rather than a lost counterpart, so a
+    reader that refuses a partly-random migration should still accept them.
 
     Zero-init makes the new tokens' pre-activation contribution exactly zero.
     Note the honest caveat (also in the spec): zero-VALUE tokens still
@@ -611,7 +645,17 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             "checkpoint migration is additive only; the target would remove "
             f"{len(removed)} parameter(s): {preview}{suffix}"
         )
-    report = {"loaded": [], "grown": [], "initialized": [], "zeroed": []}
+    report = {
+        "loaded": [],
+        "grown": [],
+        "initialized": [],
+        "zeroed": [],
+        # Zeroed BY DESIGN rather than for want of a counterpart. Kept apart
+        # because readers act on the difference: `phase_e` refuses a migration
+        # that zeroed anything, on the grounds that the net is then partly
+        # random, which is exactly untrue of these.
+        "neutral": [],
+    }
     for key, tensor in new_state.items():
         if key in old_state and old_state[key].shape == tensor.shape:
             new_state[key] = old_state[key]
@@ -649,10 +693,17 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[:, : old_state[key].shape[1]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
-        elif key.startswith(("action_scorer.", "control_scorer.")):
+        elif key.startswith(("action_scorer.", "control_scorer.", "graph.")):
             # ``tensor`` is the new model's initialized value. In particular,
             # action_scorer.gate was constructed as exact zero while the layers
             # behind it retain symmetry-breaking initialization.
+            #
+            # The W2 graph module is exempt for the same reason as W5's
+            # scorer, and it is the sharper case: zeroing it is not a soft
+            # start but a permanent one. A zeroed LayerNorm emits zeros
+            # whatever it is fed, so every downstream activation, and every
+            # gradient that would revive them, is zero as well. Its neutrality
+            # comes from `graph_alpha`, which is a gate outside the state dict.
             #
             # The W3 control head is exempt for the same reason and one more:
             # zeroing a plain MLP is not a soft start, it is a dead one. With
@@ -662,6 +713,9 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             # output: policy and value are bit-identical whether it is present
             # or not, so ordinary initialization is already switch-neutral.
             report["initialized"].append(key)
+        elif key in NEUTRAL_ZERO_PARAMETERS:
+            new_state[key] = torch.zeros_like(tensor)
+            report["neutral"].append(key)
         else:
             new_state[key] = torch.zeros_like(tensor)
             report["zeroed"].append(key)
@@ -780,6 +834,11 @@ def build_model(
     reply_head: bool = False,
     action_residual: bool = False,
     control_head: bool = False,
+    slot_embedding: bool = False,
+    graph_module: bool = False,
+    graph_layers: int = 2,
+    graph_bases: int = 4,
+    graph_alpha: float = 1e-3,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -798,6 +857,11 @@ def build_model(
             reply_head=reply_head,
             action_residual=action_residual,
             control_head=control_head,
+            slot_embedding=slot_embedding,
+            graph_module=graph_module,
+            graph_layers=graph_layers,
+            graph_bases=graph_bases,
+            graph_alpha=graph_alpha,
         )
     if name == "mlp":
         return SWDMlp(d_model=d_model)
@@ -823,6 +887,46 @@ def control_head_from_config(config: dict) -> bool:
     the model it was saved as."""
 
     return bool(config.get("control_head", False))
+
+
+def slot_embedding_from_config(config: dict) -> bool:
+    """W1 learned Age/slot embedding, false for every checkpoint predating it.
+
+    Append-only and default-off, so an inherited checkpoint rebuilds as exactly
+    the model it was saved as -- and, because the table is zero-initialized,
+    switching it ON by migration reproduces that model's outputs bit for bit
+    until training moves it."""
+
+    return bool(config.get("slot_embedding", False))
+
+
+def graph_module_from_config(config: dict) -> bool:
+    """W2 tableau graph, false for every checkpoint predating it."""
+
+    return bool(config.get("graph_module", False))
+
+
+#: Shape and gate of the W2 module. Not booleans, so they travel beside
+#: `ARCHITECTURE_SWITCHES` rather than in it -- but they are architecture all
+#: the same: `graph_layers` and `graph_bases` decide which parameters exist,
+#: and `graph_alpha` decides what the model COMPUTES with them. A rebuild that
+#: dropped alpha would load every weight and silently serve a different net,
+#: which is the failure `heads` is documented for.
+GRAPH_SHAPE_DEFAULTS = {
+    "graph_layers": 2,
+    "graph_bases": 4,
+    "graph_alpha": 1e-3,
+}
+
+
+def graph_shape_from_config(config: dict) -> dict:
+    if not graph_module_from_config(config):
+        return {}
+    return {
+        "graph_layers": int(config.get("graph_layers", GRAPH_SHAPE_DEFAULTS["graph_layers"])),
+        "graph_bases": int(config.get("graph_bases", GRAPH_SHAPE_DEFAULTS["graph_bases"])),
+        "graph_alpha": float(config.get("graph_alpha", GRAPH_SHAPE_DEFAULTS["graph_alpha"])),
+    }
 
 
 def pooled_readout_from_config(config: dict) -> bool:
@@ -1221,6 +1325,28 @@ def main(argv=None) -> int:
         help="enable the W5a contextual legal-action residual",
     )
     parser.add_argument(
+        "--slot-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable the W1 learned Age/slot embedding (zero-initialized, so "
+        "a warm start reproduces the inherited model until it trains)",
+    )
+    parser.add_argument(
+        "--graph-module",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable the W2 tableau graph module",
+    )
+    parser.add_argument("--graph-layers", type=int, default=2)
+    parser.add_argument("--graph-bases", type=int, default=4)
+    parser.add_argument(
+        "--graph-alpha",
+        type=float,
+        default=1e-3,
+        help="W2 residual gate; exactly 0 is inert and ungradiented, so it is "
+        "the ablation setting rather than a training one",
+    )
+    parser.add_argument(
         "--action-policy-weight",
         type=float,
         default=ACTION_POLICY_WEIGHT_DEFAULT,
@@ -1284,6 +1410,10 @@ def main(argv=None) -> int:
     initial = None
     if args.action_residual and args.model != "transformer":
         raise SystemExit("--action-residual is available only for --model transformer")
+    if args.slot_embedding and args.model != "transformer":
+        raise SystemExit("--slot-embedding is available only for --model transformer")
+    if args.graph_module and args.model != "transformer":
+        raise SystemExit("--graph-module is available only for --model transformer")
     if not math.isfinite(args.action_policy_weight) or args.action_policy_weight < 0:
         raise SystemExit("--action-policy-weight must be finite and non-negative")
     if args.init_checkpoint:
@@ -1303,10 +1433,23 @@ def main(argv=None) -> int:
         args.action_residual = bool(
             args.action_residual or action_residual_from_config(stored)
         )
+        args.slot_embedding = bool(
+            args.slot_embedding or slot_embedding_from_config(stored)
+        )
+        args.graph_module = bool(
+            args.graph_module or graph_module_from_config(stored)
+        )
+        # An inherited graph keeps the SHAPE it was trained with; only the gate
+        # is a knob a warm start may legitimately change.
+        if graph_module_from_config(stored):
+            shape = graph_shape_from_config(stored)
+            args.graph_layers = shape["graph_layers"]
+            args.graph_bases = shape["graph_bases"]
         print(
             "warm-start architecture: "
             f"d{effective_d_model} L{effective_layers} h{effective_heads} "
-            f"pooled={effective_pooled} reply={effective_reply}"
+            f"pooled={effective_pooled} reply={effective_reply} "
+            f"slots={args.slot_embedding} graph={args.graph_module}"
         )
     model = build_model(
         args.model,
@@ -1316,6 +1459,11 @@ def main(argv=None) -> int:
         effective_pooled,
         effective_reply,
         args.action_residual,
+        slot_embedding=args.slot_embedding,
+        graph_module=args.graph_module,
+        graph_layers=args.graph_layers,
+        graph_bases=args.graph_bases,
+        graph_alpha=args.graph_alpha,
     )
     if initial is not None:
         load_checkpoint(

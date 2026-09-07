@@ -2553,6 +2553,58 @@ its weights and keeps training, and only the third reverting gate rolls the
 learner back. Probations do not erase that decisive evidence, but an explicitly
 suppressed schedule-knot revert advances none of the lifecycle counters.
 
+## Workstream 1: the learned Age/slot embedding
+
+Off by default. A learned identity per printed tableau location, separate by
+Age, added to the tableau tokens alongside the `row`/`x` features rather than
+replacing them: numbers say where a slot is, not which slot it *is*, and a
+stable name lets attention learn that a location has the same structural role
+in every game of that Age.
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--slot-embedding` / `--no-slot-embedding` | off | build the 60-row slot table. Off means the parameters do not exist, not that they are ignored. |
+
+The table is zero-initialised, so a warm start reproduces the inherited model
+**bit for bit** -- stronger than the near-neutrality an added token type gets,
+because this adds no token to the sequence and so nothing to attention
+normalisation. It still trains from step one: a lookup's gradient does not pass
+through its own value, which is why it needs no warm-up gate of the kind W5a
+carries.
+
+The index is derived from features the encoder already emits, so turning this
+on moves neither `ENCODER_SIGNATURE` nor any buffer: an existing checkpoint
+migrates in seconds and an existing buffer is reused as it is.
+
+## Workstream 2: the tableau graph module
+
+Off by default. Relational message passing over the printed cover graph, run on
+the tableau tokens only and ahead of the main Transformer; every other token
+passes through untouched.
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--graph-module` / `--no-graph-module` | off | build the module. Off means its parameters do not exist. |
+| `--graph-layers` | 2 | message-passing steps |
+| `--graph-bases` | 4 | shared basis matrices behind the 15 per-relation transforms |
+| `--graph-alpha` | 1e-3 | residual gate on `output = input + alpha * update` |
+
+`--graph-alpha 0` is **exactly** inert and also receives no gradient, so it is
+the equivalence and ablation setting rather than a training one. That is why the
+default is small-but-nonzero: the graph parameters learn from the first step.
+They keep ordinary initialisation through a migration rather than being zeroed,
+because a zeroed LayerNorm emits zeros whatever it is fed — every activation
+downstream of it, and every gradient that would revive them, would be zero too.
+
+The node ordering is W1's slot identity, so the edge set is one static matrix
+per Age rather than something rebuilt per position. It does not read W1's
+learned table, so the two are independently switchable and belong in one
+training run rather than two.
+
+Measured cost, CPU fp32 d384 L8, interleaved best-decile: **1.066x at 8 rows and
+1.031x at 64** for two layers, 1.089x / 1.061x for three. Generation is the CPU
+path, so this is the number that matters; GPU is unmeasured.
+
 ## Workstream 5a: the contextual action residual
 
 Off by default. The shared scorer exists behind a gate initialised to exactly

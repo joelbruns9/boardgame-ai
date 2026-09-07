@@ -25,8 +25,9 @@ Wilson interval -- while making four things explicit that the fused gate could
 not.
 
 **Each side is rebuilt from its own checkpoint.**  `d_model`, `layers`, `heads`,
-`pooled_readout`, `reply_head`, `action_residual` and `control_head` all come
-from the file being played, through `train.model_from_config`.  So a W5b width
+`pooled_readout`, `reply_head`, `action_residual`, `control_head`,
+`slot_embedding` and the W2 `graph_*` fields all come from the file being
+played, through `train.model_from_config`.  So a W5b width
 change or a W1 head change can be played against the incumbent; the fused gate
 would have loaded both under the run's config and either crashed on shape or --
 for `heads`, whose parameter shapes are head-count independent -- silently
@@ -311,6 +312,9 @@ def load_side(
                 "reply_head",
                 "action_residual",
                 "control_head",
+                "slot_embedding",
+                "graph_module",
+                "graph_alpha",
                 "iteration",
             )
         },
