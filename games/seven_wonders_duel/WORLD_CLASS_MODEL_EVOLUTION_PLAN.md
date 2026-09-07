@@ -1046,7 +1046,73 @@ forward pass is needed -- the cost is carrying it across the boundary.
 
 ## Workstream 5: legal-action tokens
 
-**Status: PARTIAL -- W5a built, not strength tested.** W5a prototype (2026-09-03, `08be645`): all 1,202 actions decomposed, shared contextual scorer behind `action_residual=False` and an exactly-zero gate. Strength and throughput unvalidated. W5b -- the same scorer fed contextual slot (W1), graph (W2) and control (W3) outputs, plus an `exposes` index so a burial action can reach the slot it uncovers -- needs those first.
+**Status: PARTIAL -- W5a built, THROUGHPUT NOW VALIDATED, strength still untested.** W5a prototype (2026-09-03, `08be645`): all 1,202 actions decomposed, shared contextual scorer behind `action_residual=False` and an exactly-zero gate. Throughput measured and fixed 2026-09-07 (`64cee29`, see below): the scorer costs **-9% on CUDA/bf16 and -3% on CPU/fp32**, down from -51% and -22%. Strength unvalidated. W5b -- the same scorer fed contextual slot (W1), graph (W2) and control (W3) outputs, plus an `exposes` index so a burial action can reach the slot it uncovers -- needs those first.
+
+### Throughput, measured and repaired (2026-09-07)
+
+Two defects, both surfaced by a bench asking a different question.
+
+**W5a crashed under bf16.** Autocast hands the scorer bf16 while `policy` stays
+fp32, and `scatter_add_` requires the two to match, so `action_residual=True`
+died at the first forward: *"Expected self.dtype to be equal to src.dtype"*.
+Every cloud run passes `--precision bf16`, so turning this arm on in a real run
+would have failed immediately. Nothing caught it because the suite runs fp32.
+
+**The candidate axis cost more than the rest of the pipeline combined.** At
+384x8 on CUDA/bf16 the scorer took search from 3,789 to 1,858 sims/s. Almost
+none of that was the scorer itself -- it runs AFTER the trunk, adds no tokens,
+and its arithmetic is nearly free on GPU. It was `legal_action_tensors`, a
+Python loop doing ~40 dict inserts and ~120 single-element tensor writes per
+row, at **0.297 ms/row**, against a whole-pipeline baseline of about 0.3 ms/row.
+
+| | OFF | ON | cost |
+|---|---|---|---|
+| CUDA bf16, before | 3,789 sims/s | 1,858 sims/s | **-51%** |
+| CUDA bf16, after | 4,436-4,784 | 4,006-4,325 | **-9%** |
+| CPU fp32, before | 529 sims/s | 413 sims/s | -22% |
+| CPU fp32, after | 559 sims/s | 543 sims/s | **-3%** |
+
+The fix vectorises the axis -- codec fields resolved once at import into
+1,203-entry tables, the identity dict replaced by a dense scatter over
+`type * 128 + entity` with duplicates knocked to the ambiguity sentinel by a
+parallel count, one gather per field -- plus `legal_action_tensors_packed`,
+which takes the Rust boundary's padded tensors and lengths directly and does no
+per-row Python at all. Equivalence is tested element for element against the
+retained scalar implementation on 651 real rows across six batch sizes.
+
+### The Rust port of the candidate axis: MEASURED, deliberately NOT taken
+
+The obvious next step was to have Rust emit the candidate axis, since it already
+knows legality and token identities when it packs the flat batch. Measured
+first: the packed path costs **1.90 ms for a search's worth of rows (362), i.e.
+5.3 us/row, about 2.2% of an 85 ms search**. That is the whole addressable
+prize, and Rust would not recover all of it -- the tensors still have to be
+built and shipped. The other ~7% of the remaining 9% is the scorer's forward,
+which is the model and which Rust cannot touch.
+
+Declined because the cost is a THIRD copy of the legality-to-token mapping, in a
+language whose codec constants are generated into `data_gen.rs` and must stay in
+lockstep with Python. That mapping has produced bugs before. **Revisit only if
+W5a ships and throughput becomes binding**; the measurement above is one bench
+to redo.
+
+### What the strength case actually is, and its one caveat
+
+The dense 1,202-way head gives every action index a private row of weights:
+"build this card in slot (2,4)" and the same card in slot (3,5) share nothing,
+and rarely-legal indices are barely trained. W5a scores each legal action from
+the contextual token of the card it acts on, so one scorer serves all actions,
+evidence transfers across slots and games, and each action inherits everything
+the trunk knows about its card -- affordability, science, shields, cover
+relations, control channels.
+
+**Caveat, and it is the same trap the W3 arms fell into:**
+`PLATEAU_FINDINGS.md` measures the policy head within **0.19 nats of its
+cross-entropy floor**. If the policy is already near the best fit to its targets,
+a better parameterisation has limited room on the average move; any gain has to
+appear in the tail -- rare, tactically decisive actions -- which aggregate CE
+cannot see. Judge this arm on `proven_benchmark.py` and the 907773062 ladder,
+never on policy loss.
 
 **Prototype implementation status (2026-09-03): focused mechanism tests pass;
 playing strength and throughput not yet validated.** The
