@@ -405,25 +405,22 @@ class _RustFlatBatchAdapter:
         # one existed.
         if bool(getattr(getattr(self.evaluator, "model", None),
                         "action_residual", False)):
-            # The flat Rust boundary already supplies both ingredients. Build
-            # the same padded legal-action view as Python inference without
-            # changing the wire format or reimplementing legality in Python.
-            from .dataset import legal_action_tensors
+            # The flat Rust boundary already supplies both ingredients, padded
+            # and with lengths, so hand them over as they are. Slicing them into
+            # per-row lists for the generic entry point cost 0.297 ms/row -- on
+            # GPU that was the ENTIRE price of W5a (106 -> 215 ms/search),
+            # because the rest of the pipeline also runs at about 0.3 ms/row.
+            from .dataset import legal_action_tensors_packed
 
-            token_rows = [
-                (
-                    type_ids[row, : int(length)],
-                    entity_ids[row, : int(length)],
+            batch.update(
+                legal_action_tensors_packed(
+                    type_ids,
+                    entity_ids,
+                    torch.as_tensor(lengths, dtype=torch.long),
+                    torch.as_tensor(legal_actions, dtype=torch.long),
+                    torch.as_tensor(legal_lengths, dtype=torch.long),
                 )
-                for row, length in enumerate(lengths)
-            ]
-            legal_rows = []
-            offset = 0
-            for count in legal_lengths:
-                size = int(count)
-                legal_rows.append(legal_actions[offset : offset + size])
-                offset += size
-            batch.update(legal_action_tensors(token_rows, legal_rows))
+            )
         tensor_seconds = time.perf_counter() - tensor_start
 
         h2d_start = time.perf_counter()

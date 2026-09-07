@@ -512,6 +512,12 @@ class SWDNet(nn.Module):
         out = self.heads(readout)
         if self.action_scorer is not None:
             candidate_logits = self.action_scorer(normed, readout, batch)
+            # Under autocast the scorer returns bf16 while `policy` is fp32, and
+            # `scatter_add_` requires both to match -- so W5a crashed outright at
+            # `--precision bf16`, which is what every cloud run uses. Match the
+            # destination rather than the source: the residual is added to
+            # `policy`, so fp32 is the dtype it has to end up in anyway.
+            candidate_logits = candidate_logits.to(out["policy"].dtype)
             # Padded candidates land in a disposable sink, never action 0.
             # This also isolates their gradients if scorer masking changes.
             residual = out["policy"].new_zeros((candidate_logits.shape[0], NUM_ACTIONS + 1))

@@ -29,6 +29,7 @@ from .codec import (
     ActionFamily,
     ActionSource,
     action_components,
+    decode_action,
     legal_action_indices,
 )
 from . import dataset, train
@@ -37,6 +38,7 @@ from .dataset import (
     legal_action_tensors, vectorize,
 )
 from .encoder import TokenType, encode
+from .engine import apply_action
 from .game import Phase, new_game
 from .inference import Evaluator
 from .rust_bridge import rust_flat_batch_adapter
@@ -335,3 +337,106 @@ def test_flat_rust_boundary_builds_w5_metadata_only_when_enabled():
     assert contextual_batch["legal_indices"][0, : len(legal)].tolist() == list(legal)
     with torch.no_grad():
         assert model(contextual_batch)["policy"].shape == (1, NUM_ACTIONS)
+
+
+# --- bf16, and the vectorised candidate axis --------------------------------
+
+
+def test_the_scorer_survives_autocast():
+    """W5a crashed outright at `--precision bf16`, which every cloud run uses.
+
+    Under autocast the scorer returns bf16 while `policy` stays fp32, and
+    `scatter_add_` requires the two to match: "Expected self.dtype to be equal
+    to src.dtype", at the first forward. Nothing caught it because every test
+    ran in fp32, and the throughput bench that found it was measuring something
+    else entirely.
+    """
+
+    game = _playing_game()
+    batch, _vectorized, _legal = _input_batch(game)
+    model = SWDNet(32, 1, 2, action_residual=True)
+
+    # `torch.autocast("cpu", bfloat16)` reproduces the dtype split without a
+    # GPU; `Evaluator` only enables autocast on CUDA, so this is the mechanism
+    # rather than the production path.
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(batch)
+    assert out["policy"].shape == (1, NUM_ACTIONS)
+    assert torch.isfinite(out["policy"]).all()
+
+
+def _real_candidate_rows(count=120):
+    """Token identities and legal actions from real play, every phase included."""
+
+    rng = random.Random(3)
+    token_rows, legal_lists = [], []
+    seed = 0
+    while len(token_rows) < count:
+        game = new_game(seed)
+        seed += 1
+        while game.winner is None and game.phase is not Phase.COMPLETE:
+            legal = legal_action_indices(game)
+            if not legal:
+                break
+            encoding = encode(game.observation(game.active_player))
+            token_rows.append((
+                [TYPE_IDS[token.type] for token in encoding.tokens],
+                [token.entity_id for token in encoding.tokens],
+            ))
+            legal_lists.append(list(legal))
+            apply_action(game, decode_action(game, rng.choice(legal)))
+    return token_rows, legal_lists
+
+
+def test_vectorised_candidate_axis_matches_the_scalar_reference():
+    """The scalar version is the definition; the fast one must not reinterpret it.
+
+    It cost 0.297 ms/row, which on GPU was the whole price of W5a -- the rest of
+    the pipeline runs at about the same rate, so a Python loop over ~40 dict
+    inserts and ~120 single-element tensor writes per row doubled the cost of a
+    search.
+    """
+
+    token_rows, legal_lists = _real_candidate_rows()
+    for size in (1, 2, 17, len(token_rows)):
+        fast = dataset.legal_action_tensors(token_rows[:size], legal_lists[:size])
+        slow = dataset._legal_action_tensors_scalar(
+            token_rows[:size], legal_lists[:size]
+        )
+        assert fast.keys() == slow.keys()
+        for key in slow:
+            assert fast[key].dtype == slow[key].dtype, key
+            assert torch.equal(fast[key], slow[key]), (size, key)
+
+
+def test_packed_candidate_axis_matches_the_generic_one():
+    """The Rust boundary's route skips per-row Python; it must not skip meaning."""
+
+    token_rows, legal_lists = _real_candidate_rows()
+    size = len(token_rows)
+    tokens = max(len(types) for types, _ in token_rows)
+    type_ids = torch.zeros(size, tokens, dtype=torch.long)
+    entity_ids = torch.zeros(size, tokens, dtype=torch.long)
+    for row, (types, entities) in enumerate(token_rows):
+        type_ids[row, : len(types)] = torch.as_tensor(types, dtype=torch.long)
+        entity_ids[row, : len(entities)] = torch.as_tensor(entities, dtype=torch.long)
+    lengths = torch.tensor([len(t) for t, _ in token_rows], dtype=torch.long)
+    flat = torch.tensor([a for legal in legal_lists for a in legal], dtype=torch.long)
+    legal_lengths = torch.tensor([len(l) for l in legal_lists], dtype=torch.long)
+
+    packed = dataset.legal_action_tensors_packed(
+        type_ids, entity_ids, lengths, flat, legal_lengths
+    )
+    generic = dataset.legal_action_tensors(token_rows, legal_lists)
+    for key in generic:
+        assert torch.equal(packed[key], generic[key]), key
+
+
+def test_an_action_with_no_contextual_token_is_still_refused():
+    """The loud failure the scalar version had, kept: an action whose source
+    token is missing must raise and name the action, not silently gather token
+    0 and score every such move against the GLOBAL token."""
+
+    tableau = TYPE_IDS[TokenType.TABLEAU]
+    with pytest.raises(ValueError, match=r"legal action \d+"):
+        dataset.legal_action_tensors([([tableau], [999])], [[BUILD_BASE]])

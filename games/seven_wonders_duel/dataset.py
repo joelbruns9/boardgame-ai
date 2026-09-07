@@ -195,6 +195,43 @@ _ACTION_SOURCE_TOKEN = {
 }
 
 
+#: Per-action codec fields, resolved once at import instead of per row per
+#: column. `action_components` is arithmetic over a frozen 1,202-action layout,
+#: so every answer it can give is known before any batch exists.
+#:
+#: The last slot is the padding sink (`NUM_ACTIONS`): family 0, no source, no
+#: Wonder, matching what the scalar loop left in padded columns.
+def _action_component_tables():
+    family = torch.zeros(NUM_ACTIONS + 1, dtype=torch.long)
+    source_type = torch.full((NUM_ACTIONS + 1,), -1, dtype=torch.long)
+    source_entity = torch.zeros(NUM_ACTIONS + 1, dtype=torch.long)
+    wonder_entity = torch.full((NUM_ACTIONS + 1,), -1, dtype=torch.long)
+    for index in range(NUM_ACTIONS):
+        component = action_components(index)
+        family[index] = int(component.family)
+        if component.source != ActionSource.NONE:
+            source_type[index] = TYPE_IDS[_ACTION_SOURCE_TOKEN[component.source]]
+            source_entity[index] = int(component.source_entity)
+        wonder_entity[index] = int(component.wonder_entity)
+    return family, source_type, source_entity, wonder_entity
+
+
+(
+    _ACTION_FAMILY,
+    _ACTION_SOURCE_TYPE,
+    _ACTION_SOURCE_ENTITY,
+    _ACTION_WONDER_ENTITY,
+) = _action_component_tables()
+
+#: `(type_id, entity_id)` packed into one integer so the per-row lookup can be a
+#: scatter into a dense table rather than a Python dict. Entity spaces top out
+#: at 77 (TABLEAU: 73 cards + 4 backs), so 128 is a safe stride, and the extra
+#: slot at the end absorbs padding and sourceless actions.
+_KEY_STRIDE = 128
+_KEY_SPACE = len(TOKEN_TYPES) * _KEY_STRIDE
+_KEY_PAD = _KEY_SPACE
+
+
 def legal_action_tensors(
     token_rows: list[tuple],
     legal_lists: list,
@@ -205,7 +242,171 @@ def legal_action_tensors(
     an internal legal-only view used by the optional contextual action scorer.
     Source lookup is done once while collating rather than by constructing a
     ``[batch, legal, tokens]`` equality tensor during every model forward.
+
+    Vectorised 2026-09-07. The scalar version cost **0.297 ms/row**, which on
+    GPU was the entire price of W5a -- 106 to 215 ms/search, because the whole
+    rest of the pipeline (Rust search, transfer, bf16 forward) also costs about
+    0.3 ms/row. It was not the scorer's arithmetic, which is nearly free: it was
+    ~40 dict inserts and ~120 single-element tensor writes per row, in Python.
+
+    `_legal_action_tensors_scalar` is kept as the reference the vectorised path
+    is tested against, element for element.
     """
+
+    rows = len(legal_lists)
+    width = max(1, max((len(legal) for legal in legal_lists), default=0))
+    tokens = max(1, max((len(types) for types, _ in token_rows), default=0))
+
+    # --- token identity -> token index, one dense table per row -------------
+    # Collect the ids first and pack once over the whole matrix: `_pack_keys`
+    # inside the loop doubled the per-row cost for no extra safety. -1 marks a
+    # padded slot, which packs to the pad key like any other out-of-range id.
+    type_matrix = torch.full((rows, tokens), -1, dtype=torch.long)
+    entity_matrix = torch.full((rows, tokens), -1, dtype=torch.long)
+    for row, (types, entities) in enumerate(token_rows):
+        count = len(types)
+        if not count:
+            continue
+        type_matrix[row, :count] = torch.as_tensor(types, dtype=torch.long)
+        entity_matrix[row, :count] = torch.as_tensor(entities, dtype=torch.long)
+    keys = _pack_keys(type_matrix, entity_matrix)
+
+    positions = torch.arange(tokens, dtype=torch.long).expand(rows, tokens)
+
+    actions = torch.full((rows, width), NUM_ACTIONS, dtype=torch.long)
+    for row, legal in enumerate(legal_lists):
+        count = len(legal)
+        if count:
+            actions[row, :count] = torch.as_tensor(legal, dtype=torch.long)
+    return _candidate_axis(keys, positions, actions)
+
+
+def _pack_keys(type_ids: torch.Tensor, entity_ids: torch.Tensor) -> torch.Tensor:
+    """`(type, entity)` as one integer, with out-of-range entities sent to the
+    pad slot rather than off the end of the table.
+
+    Every schema entity space fits in `_KEY_STRIDE` (the widest is TABLEAU's 77),
+    so this cannot fire on encoder output. It fires on malformed input, and the
+    scalar version answered that with "no such token" and a named action -- an
+    index error naming a stride would send the reader somewhere else entirely.
+    """
+
+    packed = type_ids * _KEY_STRIDE + entity_ids
+    in_range = (entity_ids >= 0) & (entity_ids < _KEY_STRIDE) & (type_ids >= 0)
+    return torch.where(in_range, packed, torch.full_like(packed, _KEY_PAD))
+
+
+def _candidate_axis(keys, positions, actions) -> dict[str, torch.Tensor]:
+    """Shared tail: identity table, then one gather per action field."""
+
+    rows = keys.shape[0]
+    table = torch.full((rows, _KEY_SPACE + 1), -1, dtype=torch.long,
+                       device=keys.device)
+    table.scatter_(1, keys, positions)
+    # Hidden tableau cards legitimately repeat a back-type entity. They can
+    # never be legal sources, so a repeated key keeps the ambiguity sentinel and
+    # is rejected only if some action actually tries to gather one.
+    counts = torch.zeros((rows, _KEY_SPACE + 1), dtype=torch.long,
+                         device=keys.device)
+    counts.scatter_add_(1, keys, torch.ones_like(keys))
+    table = torch.where(counts > 1, torch.full_like(table, -1), table)
+
+    pad = actions == NUM_ACTIONS
+    families = _ACTION_FAMILY.to(actions.device)[actions]
+    source_type = _ACTION_SOURCE_TYPE.to(actions.device)[actions]
+    source_present = source_type >= 0
+    source_keys = torch.where(
+        source_present,
+        _pack_keys(source_type, _ACTION_SOURCE_ENTITY.to(actions.device)[actions]),
+        torch.full_like(source_type, _KEY_PAD),
+    )
+    source_indices = table.gather(1, source_keys)
+
+    wonder_entity = _ACTION_WONDER_ENTITY.to(actions.device)[actions]
+    wonder_present = wonder_entity >= 0
+    wonder_keys = torch.where(
+        wonder_present,
+        _pack_keys(torch.full_like(wonder_entity, TYPE_IDS[TokenType.WONDER]),
+                   wonder_entity),
+        torch.full_like(wonder_entity, _KEY_PAD),
+    )
+    wonder_indices = table.gather(1, wonder_keys)
+
+    _reject_missing_token(actions, source_present, source_indices, "source")
+    _reject_missing_token(actions, wonder_present, wonder_indices, "Wonder")
+
+    return {
+        "legal_indices": actions,
+        "legal_pad_mask": pad,
+        "action_families": families.masked_fill(pad, 0),
+        "action_source_indices": source_indices.masked_fill(~source_present, 0),
+        "action_source_present": source_present,
+        "action_wonder_indices": wonder_indices.masked_fill(~wonder_present, 0),
+        "action_wonder_present": wonder_present,
+    }
+
+
+def legal_action_tensors_packed(
+    type_ids: torch.Tensor,
+    entity_ids: torch.Tensor,
+    lengths: torch.Tensor,
+    legal_flat: torch.Tensor,
+    legal_lengths: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """`legal_action_tensors` for a caller that already has padded tensors.
+
+    The Rust flat boundary hands over `[rows, tokens]` id tensors plus lengths,
+    and a single concatenated legal-action vector plus its own lengths. Slicing
+    those into per-row lists so the generic entry point can stack them back up
+    is the last per-row Python on this path, and on GPU per-row Python is the
+    whole cost of W5a -- so this route never leaves tensor land.
+    """
+
+    rows, tokens = type_ids.shape
+    device = type_ids.device
+    token_columns = torch.arange(tokens, device=device).expand(rows, tokens)
+    real = token_columns < lengths.reshape(-1, 1)
+    keys = torch.where(
+        real,
+        _pack_keys(type_ids.long(), entity_ids.long()),
+        torch.full_like(token_columns, _KEY_PAD),
+    )
+
+    width = max(1, int(legal_lengths.max()) if legal_lengths.numel() else 1)
+    action_columns = torch.arange(width, device=device).expand(rows, width)
+    valid = action_columns < legal_lengths.reshape(-1, 1)
+    starts = torch.cumsum(legal_lengths, 0) - legal_lengths
+    positions = (starts.reshape(-1, 1) + action_columns).clamp(max=max(0, legal_flat.numel() - 1))
+    actions = torch.where(
+        valid, legal_flat.long().gather(0, positions.reshape(-1)).reshape(rows, width),
+        torch.full_like(action_columns, NUM_ACTIONS),
+    )
+    return _candidate_axis(keys, token_columns, actions)
+
+
+def _reject_missing_token(actions, present, gathered, what: str) -> None:
+    """A legal action whose source token is absent or ambiguous is a bug.
+
+    Loud, and naming the action, exactly as the scalar version was -- an action
+    silently gathering token 0 would score every such move against the GLOBAL
+    token and look like a mediocre policy rather than a defect.
+    """
+
+    bad = present & (gathered < 0)
+    if not bool(bad.any()):
+        return
+    row, column = (int(x) for x in bad.nonzero()[0])
+    raise ValueError(
+        f"legal action {int(actions[row, column])} has no contextual {what} "
+        "token for its entity"
+    )
+
+
+def _legal_action_tensors_scalar(
+    token_rows: list[tuple],
+    legal_lists: list,
+) -> dict[str, torch.Tensor]:
+    """The pre-2026-09-07 scalar implementation, kept as the test reference."""
 
     rows = len(legal_lists)
     width = max(1, max((len(legal) for legal in legal_lists), default=0))
