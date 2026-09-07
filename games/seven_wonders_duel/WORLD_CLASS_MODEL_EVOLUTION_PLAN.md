@@ -714,7 +714,7 @@ attention path reduces optimized inference throughput.
 
 ## Workstream 3: public tableau-control engine
 
-**Status: PARTIAL -- built, no strength evidence.** BUILT: exact solver (`tableau_control.py`, three independent oracles), the 434,720-key precomputed table (`control_table.py`, ~8.7 MB, 0.4 core-hours), the auxiliary control head, and the Rust key path with Python/Rust parity. NOT BUILT: control as an encoder INPUT, which is the actual W3 change. No arm has run. See `W3_ENCODER_INTEGRATION_REVIEW_REQUEST.md`.
+**Status: BUILT and SHIPPING, offline arms inconclusive.** BUILT: exact solver (`tableau_control.py`, three independent oracles), the 434,720-key precomputed table (`control_table.py`, ~8.7 MB, 0.4 core-hours), the auxiliary control head, the Rust key path with Python/Rust parity, and control as an encoder INPUT -- the actual W3 change, now on by default. ARMS RUN (2026-09-04/07): the offline A/B and the full corpus-regret sweep both failed to separate `inputs`, `aux` and a `shuffled` placebo, with the placebo best overall. DECIDED 2026-09-07: that evidence is judged insufficient either way and the channels go into the next training run, which becomes the test. Numbers and both readings in `BOARD_CONTROL_RESEARCH_REQUEST.md` §15; see also `W3_ENCODER_INTEGRATION_REVIEW_REQUEST.md`.
 
 ### Purpose
 

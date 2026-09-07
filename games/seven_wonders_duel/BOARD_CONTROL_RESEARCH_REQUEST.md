@@ -957,3 +957,73 @@ cost. Cards identical on what the rules read are interchangeable within the
 horizon, collapsing 90 worlds to a handful of classes -- soundly, if the
 equivalence is proved against what is actually read. That is a real build, and
 it must buy depth as well as width.
+
+---
+
+## 15. Corpus regret measured, and the decision to ship anyway (2026-09-07)
+
+`w3_corpus_regret` — the instrument §11 named as the right one, and which had
+never been run — has now scored all 20 arm checkpoints over 48 reference
+positions: four arms, five seeds each, ~1.5 h across four shards.
+
+### The numbers
+
+| arm | mean regret | sd | agreement |
+|---|---|---|---|
+| baseline | 3.284 | 0.562 | 0.492 |
+| inputs | 3.487 | 0.759 | 0.496 |
+| aux | 3.372 | 0.970 | 0.500 |
+| **shuffled** | **3.218** | 0.524 | 0.496 |
+
+Paired per seed against the baseline that saw the same split (negative is
+better): `inputs` **+0.203 ± 0.341**, `aux` **+0.088 ± 0.462**, `shuffled`
+**−0.066 ± 0.059**. Agreement is flat to three decimals across all four arms.
+
+Split by whether the channels discriminate at all — `control_now_can_force`
+neither all-ones nor all-zeros across the slots, true at 27 of 48 positions:
+
+| subset | inputs | aux | shuffled |
+|---|---|---|---|
+| discriminating (27) | −0.030 ± 0.138 | **−0.227 ± 0.119** | −0.075 ± 0.066 |
+| not discriminating (21) | +0.502 ± 0.757 | +0.493 ± 1.050 | −0.055 ± 0.128 |
+
+### How to read it, honestly, in both directions
+
+Against the channels: the placebo won overall. `shuffled` carries the same six
+columns with the same marginals and the position-to-map correspondence
+destroyed, and it scored better than `inputs`. Agreement moved by 0.004.
+
+For the channels: n is 5 seeds. The whole positive tail is seed 6 (+1.52 for
+`inputs`, +1.86 for `aux`, against ~0 for every other seed), and it lands
+entirely on positions where the channels say nothing. On the 27 positions where
+they discriminate, both real arms are negative and `aux` is the largest effect
+in the study. The subset split was chosen after seeing the data, so it is
+exploratory, not evidence — but "underpowered" and "null" are different claims,
+and this instrument has now returned the same verdict as the aggregate one while
+resolving effects of a size nobody has bounded.
+
+### Decision (user, 2026-09-07): the W3 encoder inputs SHIP
+
+**The testing to date is judged insufficient to decide either way, and the
+control channels go into the next training run.** Rationale on the record: three
+instruments have now failed to separate the arms, none of them measures *playing
+strength*, and every one of them scores checkpoints trained for 400 steps on
+buffers from a policy that never saw the channels. That is not the setting the
+feature is for. The project has spent enough on offline proxies; the next real
+signal comes from a training run that uses them.
+
+Concretely:
+
+* `SWD_CONTROL_FEATURES` stays **on** (its default). No code change.
+* The auxiliary control head stays **off** — it is a separate arm, and nothing
+  here argues for it.
+* The reveal channels stay **off** (`SWD_REVEAL_FEATURES`), likewise separate.
+  Rust computes them now, so switching them on later is a flag, not a build.
+* The earlier recommendation in this document to default the channels off is
+  **superseded**.
+
+What would make this decision reviewable later: the run's own gates and arena,
+not another offline arm. If the channels are inert, that shows up as no promoted
+candidate differing from the baseline lineage; if they help, the milestone in
+§9.2 (table `907773062` read correctly at 800 sims) is the first place it should
+appear.

@@ -123,6 +123,23 @@ exist. `exact_expectimax` rows keep the realised outcome. Recovering them needs
 the solver to propagate a real (win, draw, loss) distribution under a stated tie
 policy; the scalar cannot be post-processed into one.
 
+**The W3 control channels ship, on, in the next run.** Decided 2026-09-07 after
+`w3_corpus_regret` scored all 20 arm checkpoints (4 arms x 5 seeds, 48
+positions): `inputs` +0.203 +/- 0.341 paired against baseline, `aux` +0.088 +/-
+0.462, and the `shuffled` placebo best of all at -0.066. Three instruments have
+now failed to separate the arms -- aggregate top-1, per-position regret, and
+top-1 agreement -- and the decision is that this does not settle the question,
+because none of them measures playing strength and all of them score models
+trained for 400 steps on buffers from a policy that never saw the channels.
+`SWD_CONTROL_FEATURES` stays at its default of on; no code change. The aux head
+and the reveal channels stay off -- separate arms, no evidence for either. The
+full numbers and both readings are in `BOARD_CONTROL_RESEARCH_REQUEST.md` §15.
+
+The corollary is that **this run is the test**. Do not re-run offline arms
+against these channels; the next real signal is the run's own gates and arena,
+and the §9.2 milestone in that document (table `907773062` read correctly at 800
+sims) is where a genuine effect should first appear.
+
 **Keep the encoder feasibility flags.** `military_bound` /
 `science_missing_obtainable` are thresholds on *sums over reachable sets*;
 max-pooling computes *existentials*. Different operators, not duplicates.
