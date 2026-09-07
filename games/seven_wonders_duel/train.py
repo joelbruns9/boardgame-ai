@@ -1301,7 +1301,10 @@ def train_steps(
     return history, optimizer.state_dict()
 
 
-def main(argv=None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Every offline-trainer flag. Constructed here so `build_arg_parser`
+    can hand it to a test without entering `main`."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--buffer", nargs="+", required=True)
     parser.add_argument("--model", choices=("transformer", "mlp"), default="transformer")
@@ -1337,14 +1340,20 @@ def main(argv=None) -> int:
         default=False,
         help="enable the W2 tableau graph module",
     )
-    parser.add_argument("--graph-layers", type=int, default=2)
-    parser.add_argument("--graph-bases", type=int, default=4)
+    # Defaulted to None, not to the value: the gate and the shape live outside
+    # the state dict, so a warm start cannot recover them by loading weights,
+    # and argparse cannot otherwise tell "omitted" from "passed the default".
+    # An omitted flag therefore INHERITS; an explicit one overrides, including
+    # an explicit zero.
+    parser.add_argument("--graph-layers", type=int, default=None)
+    parser.add_argument("--graph-bases", type=int, default=None)
     parser.add_argument(
         "--graph-alpha",
         type=float,
-        default=1e-3,
-        help="W2 residual gate; exactly 0 is inert and ungradiented, so it is "
-        "the ablation setting rather than a training one",
+        default=None,
+        help="W2 residual gate (default 1e-3 for a new graph, else inherited); "
+        "exactly 0 is inert and ungradiented, so it is the ablation setting "
+        "rather than a training one",
     )
     parser.add_argument(
         "--action-policy-weight",
@@ -1385,6 +1394,63 @@ def main(argv=None) -> int:
         help="model-call precision; bf16 is opt-in",
     )
     parser.add_argument("--out", default=None)
+    return parser
+
+def resolve_graph_args(args, stored: dict | None) -> None:
+    """Settle the W2 shape and gate, in place, and refuse the ambiguous case.
+
+    The three graph flags default to None rather than to a value, because they
+    live OUTSIDE the state dict: loading every weight successfully does not
+    restore them, so argparse's inability to distinguish "omitted" from "passed
+    the default" is not cosmetic here. An omitted flag used to overwrite a
+    warm-started checkpoint's saved gate with 1e-3, which silently turned a
+    saved zero-gate ablation on before the first training step.
+
+    * With an inherited graph, the SHAPE is the shape its weights have. A flag
+      that disagrees is refused rather than resolved in either direction:
+      obeying it would fail to load, and ignoring it would run an arm the
+      operator did not ask for.
+    * The GATE is a knob a warm start may legitimately turn -- it is the
+      ablation control -- but only when asked. Omitted inherits.
+    * Anything still unset falls back to the fresh-graph defaults.
+
+    Called twice: once with the warm-start config, once with None to fill the
+    remainder. It is idempotent, which is what makes that safe.
+    """
+
+    if stored is not None and graph_module_from_config(stored):
+        inherited = graph_shape_from_config(stored)
+        for field in ("graph_layers", "graph_bases"):
+            asked = getattr(args, field)
+            if asked is not None and asked != inherited[field]:
+                raise SystemExit(
+                    f"--{field.replace('_', '-')} {asked} disagrees with the "
+                    f"warm-start checkpoint's {inherited[field]}; its graph "
+                    "weights have that shape, so the run must either inherit "
+                    "it or start from scratch"
+                )
+            setattr(args, field, inherited[field])
+        if args.graph_alpha is None:
+            args.graph_alpha = inherited["graph_alpha"]
+        return
+    for field, fallback in GRAPH_SHAPE_DEFAULTS.items():
+        if getattr(args, field) is None:
+            setattr(args, field, fallback)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The offline trainer's parser, separated so flag resolution is testable.
+
+    A run's architecture is decided here and in `resolve_graph_args`; both had
+    to be reachable without also reaching the trainer, which has its own
+    pre-existing launch defect.
+    """
+
+    return _build_arg_parser()
+
+
+def main(argv=None) -> int:
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     records = [record for path in args.buffer for record in read_records(path)]
@@ -1439,18 +1505,14 @@ def main(argv=None) -> int:
         args.graph_module = bool(
             args.graph_module or graph_module_from_config(stored)
         )
-        # An inherited graph keeps the SHAPE it was trained with; only the gate
-        # is a knob a warm start may legitimately change.
-        if graph_module_from_config(stored):
-            shape = graph_shape_from_config(stored)
-            args.graph_layers = shape["graph_layers"]
-            args.graph_bases = shape["graph_bases"]
+        resolve_graph_args(args, stored)
         print(
             "warm-start architecture: "
             f"d{effective_d_model} L{effective_layers} h{effective_heads} "
             f"pooled={effective_pooled} reply={effective_reply} "
             f"slots={args.slot_embedding} graph={args.graph_module}"
         )
+    resolve_graph_args(args, None)
     model = build_model(
         args.model,
         effective_d_model,

@@ -67,9 +67,8 @@ from pathlib import Path
 from .buffer import read_records
 from .dataset import examples_from_record
 from .train import (
-    build_model,
-    heads_from_config,
     load_checkpoint,
+    model_from_config,
     stable_game_split,
     train_steps,
 )
@@ -113,11 +112,11 @@ def run_arm(
 
     raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
     config = raw.get("config") or {}
-    model = build_model(
-        config.get("model", "transformer"),
-        config.get("d_model", 128),
-        config.get("layers", 4),
-        heads_from_config(config),
+    model = model_from_config(
+        config,
+        name=config.get("model", "transformer"),
+        d_model=128,
+        layers=4,
     )
     load_checkpoint(checkpoint, model)
 

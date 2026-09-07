@@ -515,18 +515,24 @@ def load_evaluator(
     Callers should surface it to the human -- the model is being served
     off-distribution either way.
 
-    Two kinds of mismatch, and only one is recoverable:
+    **Only one kind of mismatch is recoverable here, and it is narrower than it
+    looks.** This function rebuilds the model from the CHECKPOINT'S OWN config,
+    so the architecture always matches what the file declares. A missing
+    parameter therefore never means "a module was deliberately added" -- that
+    happens at training time, through `--init-checkpoint`, not here. It means
+    the file does not carry the weights its own config claims.
 
-    * **zeroed** -- a parameter has no counterpart at all, so it is reset. The
-      net is then partly random and nothing it says means anything. Refused.
-    * **neutral** -- a parameter is new and its zero value is the designed
-      switch-neutral start (the W1 slot table), so the net computes exactly
-      what it did before. Accepted, and reported.
-    * **grown** -- a parameter was zero-padded because the schema APPENDED
-      something. For a projection whose input width grew this is exactly
-      neutral: zero weights on the new columns contribute nothing whatever the
-      new features hold, so the model computes what it always did. Accepted,
-      and reported.
+    * **grown** -- a projection's input width grew because the ENCODER schema
+      appended features. Zero weights on the new columns contribute nothing
+      whatever those features hold, so the model computes what it always did.
+      This is the case `migrate=True` exists for, and the only one accepted.
+    * **zeroed / neutral / initialized** -- a parameter the config declares is
+      absent from the file, and was reset, zeroed by design, or freshly
+      initialized. All three are refused. The distinction between them matters
+      when *training* migrates a checkpoint into a new architecture; at the
+      inference boundary they are the same fact, an incomplete file, and the
+      most dangerous of them is `initialized`, which serves plausible
+      seed-dependent numbers rather than obvious nonsense.
 
     The distinction only holds because additive features go at the END of a
     schema. Inserted mid-vector they shift every later column and the padding
@@ -556,34 +562,34 @@ def load_evaluator(
     load_checkpoint(checkpoint_path, model, migrate=migrate, checkpoint=checkpoint)
     if migrate and checkpoint.get("migration"):
         report = checkpoint["migration"]
-        if report.get("zeroed"):
-            raise ValueError(
-                "refusing to migrate: these parameters have no counterpart and "
-                f"were reset ({report['zeroed']}), so the net is partly random "
-                "-- the schema changed shape in a way padding cannot recover"
+        absent = {
+            bucket: report[bucket]
+            for bucket in ("zeroed", "neutral", "initialized")
+            if report.get(bucket)
+        }
+        if absent:
+            detail = "; ".join(
+                f"{bucket}: {', '.join(keys)}" for bucket, keys in absent.items()
             )
-        if report.get("neutral"):
-            # Zero by design (the W1 slot table), so the net computes exactly
-            # what it did before. Printed rather than refused, and printed
-            # rather than silent, because it is still an architecture change.
-            print(
-                "migrated a switch-neutral addition; zero-initialized "
-                f"{report['neutral']}, which contributes nothing until trained."
+            raise ValueError(
+                "refusing to migrate: the checkpoint's own config declares "
+                "parameters the file does not carry, so they were invented "
+                f"here ({detail}). A model rebuilt from its own config should "
+                "need no new parameters; this file is incomplete or was "
+                "written by a different architecture."
             )
         if report.get("grown"):
+            # `migrate_state_dict` has already loaded the padded weights into
+            # `model`. Re-loading the raw state dict here would shape-mismatch,
+            # and did until the additive case was allowed through.
             print(
                 "WARNING: migrated an additive schema change; zero-padded "
                 f"{report['grown']}. The appended features contribute nothing, "
                 "so this net behaves as it did when trained."
             )
-        if not (report.get("grown") or report.get("neutral") or
-                report.get("initialized")):
-            # Nothing changed shape and nothing is new, so the stored state
-            # dict still fits and re-loading it is a no-op assertion that it
-            # does. Any of the three above means `migrate_state_dict` has
-            # ALREADY put the right tensors in `model` and the raw dict no
-            # longer matches it -- re-loading would raise on the missing or
-            # mis-shaped keys, which is what the `grown` case found.
+        else:
+            # Nothing changed shape, so the stored state dict still fits and
+            # re-loading it is a no-op assertion that it does.
             model.load_state_dict(checkpoint["model_state"])
     return Evaluator(model, device=device, precision=precision)
 

@@ -703,6 +703,8 @@ Interleaved arms, fused inference path, d384 L8 pooled, CPU fp32, best-decile of
 | W1 + W2 | 1.060x | 1.044x |
 | W2, 3 layers | 1.089x | 1.061x |
 
+Reviewed 2026-09-07 on the path `Evaluator` actually constructs on CPU -- unfused, one thread -- which is the better measurement of the two: **4.51% at 8 rows, 3.25% at 64**. The figures above forced fusion and four threads.
+
 So W2 costs roughly **3-7% at two layers**, the same order as the W5a scorer's accepted -9% / -3%, and not the "substantial throughput cost" that the bundling rule reserves a separate arm for. It shares W1's run. Generation is the CPU path so this is the number that governs; GPU and bf16 are unmeasured.
 
 ### Gate

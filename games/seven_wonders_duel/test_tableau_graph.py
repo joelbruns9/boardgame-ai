@@ -336,3 +336,128 @@ def test_the_new_arms_survive_bf16(examples):
         out["policy"].float().square().mean().backward()
     assert model.embedder.slot.weight.grad.abs().sum() > 0
     assert model.graph.layers[0].basis.grad.abs().sum() > 0
+
+
+# --- what the checkpoint boundary must not do quietly ------------------------
+
+
+def _graph_checkpoint(tmp_path, alpha, name="graph.pt"):
+    from games.seven_wonders_duel.train import make_checkpoint
+
+    model = _model(graph_module=True, graph_alpha=alpha)
+    checkpoint = make_checkpoint(model, {"d_model": 32, "layers": 2, "heads": 4})
+    path = tmp_path / name
+    torch.save(checkpoint, path)
+    return model, path, checkpoint
+
+
+def _args(extra, stored=None):
+    """Resolve the trainer's architecture flags without entering the trainer.
+
+    Stops at flag resolution deliberately: the offline epoch trainer has a
+    separate pre-existing launch defect, and this is a test about flags.
+    """
+
+    from games.seven_wonders_duel import train
+
+    args = train.build_arg_parser().parse_args(["--buffer", "unused.jsonl", *extra])
+    train.resolve_graph_args(args, stored)
+    return args
+
+
+def test_a_warm_start_inherits_the_gate_it_does_not_override():
+    """The gate lives outside the state dict.
+
+    Loading every weight successfully does not restore it, so an omitted
+    `--graph-alpha` used to replace a checkpoint's saved value with the parser
+    default -- turning a saved zero-gate ablation ON before the first step, in
+    a run whose operator asked for no architecture change at all.
+    """
+
+    stored = {
+        "graph_module": True,
+        "graph_layers": 2,
+        "graph_bases": 4,
+        "graph_alpha": 0.5,
+    }
+    assert _args([], stored).graph_alpha == pytest.approx(0.5)
+    # An explicit override still wins, INCLUDING zero, which is the ablation.
+    assert _args(["--graph-alpha", "0"], stored).graph_alpha == 0.0
+    assert _args(["--graph-alpha", "0.25"], stored).graph_alpha == pytest.approx(0.25)
+
+    ablation = dict(stored, graph_alpha=0.0)
+    assert _args([], ablation).graph_alpha == 0.0, (
+        "a saved zero-gate ablation must not come back active"
+    )
+
+
+def test_a_fresh_graph_gets_the_default_gate():
+    args = _args(["--graph-module"])
+    assert args.graph_alpha == pytest.approx(1e-3)
+    assert (args.graph_layers, args.graph_bases) == (2, 4)
+
+
+def test_a_conflicting_shape_is_refused_rather_than_resolved():
+    """Obeying the flag would fail to load; ignoring it would run another arm."""
+
+    stored = {
+        "graph_module": True,
+        "graph_layers": 2,
+        "graph_bases": 4,
+        "graph_alpha": 0.5,
+    }
+    with pytest.raises(SystemExit, match="graph-layers"):
+        _args(["--graph-layers", "3"], stored)
+    with pytest.raises(SystemExit, match="graph-bases"):
+        _args(["--graph-bases", "8"], stored)
+    # Agreeing with the checkpoint is not a conflict.
+    assert _args(["--graph-layers", "2"], stored).graph_layers == 2
+
+
+def test_an_incomplete_graph_checkpoint_is_refused_by_the_evaluator(tmp_path):
+    """Serving is not the boundary where a module gets added.
+
+    `load_evaluator` rebuilds from the checkpoint's OWN config, so a parameter
+    it has to invent is never a deliberate new branch -- it means the file does
+    not carry the weights its config declares. Randomly initialized graph
+    weights are the dangerous case: they serve plausible seed-dependent numbers
+    rather than obvious nonsense.
+    """
+
+    from games.seven_wonders_duel.phase_e import load_evaluator
+
+    _, path, checkpoint = _graph_checkpoint(tmp_path, 0.5)
+    load_evaluator(path, "cpu", migrate=True)  # complete: fine
+
+    del checkpoint["model_state"]["graph.layers.0.basis"]
+    broken = tmp_path / "broken.pt"
+    torch.save(checkpoint, broken)
+    with pytest.raises(ValueError, match="does not carry"):
+        load_evaluator(broken, "cpu", migrate=True)
+
+
+def test_the_search_gain_probe_rebuilds_the_new_architecture(tmp_path):
+    """It named every switch up to `action_residual` and would have stopped at
+    `load_state_dict` on any W1/W2 checkpoint, before playing a game."""
+
+    from games.seven_wonders_duel.phase_d import _model_from_spec, ModelAgentSpec
+
+    model = _model(slot_embedding=True, graph_module=True, graph_alpha=0.25)
+    spec = ModelAgentSpec(
+        name="probe",
+        model_state=model.state_dict(),
+        d_model=32,
+        layers=2,
+        heads=4,
+        slot_embedding=True,
+        graph_module=True,
+        graph_layers=2,
+        graph_bases=4,
+        graph_alpha=0.25,
+        sims=1,
+        mode="closed",
+        top_k=2,
+    )
+    rebuilt = _model_from_spec(spec)
+    assert rebuilt.graph_alpha == pytest.approx(0.25)
+    assert rebuilt.embedder.slot is not None

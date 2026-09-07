@@ -46,9 +46,8 @@ import torch
 from .buffer import from_json_line
 from .dataset import examples_from_records
 from .train import (
-    build_model,
-    heads_from_config,
     load_checkpoint,
+    model_from_config,
     stable_game_split,
     train_steps,
 )
@@ -96,12 +95,7 @@ def run_arm(
     # (`phase_d.py:2752-2759`).
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     stored = checkpoint.get("config", {})
-    model = build_model(
-        "transformer",
-        int(stored["d_model"]),
-        int(stored["layers"]),
-        heads_from_config(stored),
-    )
+    model = model_from_config(stored)
     load_checkpoint(checkpoint_path, model, checkpoint=checkpoint)
     model.to(args.device)
     start_norm = parameter_norm(model)

@@ -158,9 +158,15 @@ the compressed one.
 
 Per-relation normalization would make a node with one coverer and a node with
 two send messages of the same size. "How exposed am I" is exactly that
-distinction, so the divisor is the count of present slots. The cost is that
-magnitudes shrink as the tableau empties, which is real but bounded and moves
-in the same direction as the information content.
+distinction, so the divisor is the count of present slots.
+
+**Retracted 2026-09-07, on review.** This section previously claimed the cost
+was that "magnitudes shrink as the tableau empties". That is wrong, and wrong in
+the direction that flattered the choice: the divisor is the number of present
+slots, so as the tableau empties each surviving source gets a *larger*
+coefficient. The resulting magnitude depends on which vectors and relations
+survive and is not monotonic either way. The normalization is still a reasonable
+first setting; the claimed behaviour was not a reason for it.
 
 ### 7. "No structural relation" is a learned edge type
 
@@ -254,6 +260,49 @@ Arms are `--slot-embedding`, `--graph-module` (with `--graph-layers`,
 and `phase_d.py`. `--graph-alpha 0` is the W2 ablation and is exactly inert.
 
 ---
+
+## Review outcome (2026-09-07)
+
+Reviewed against `361a03f`. **Three P2 findings, all accepted and fixed**; all
+seven sign-offs granted; one of my explanations retracted (§6 above).
+
+| finding | disposition |
+|---|---|
+| warm start silently replaces the saved `graph_alpha` | **Fixed.** The three graph flags now default to `None`, so omitted inherits and explicit overrides — including an explicit `0`. A shape flag that disagrees with the inherited weights is refused rather than resolved in either direction. `train.build_arg_parser` / `train.resolve_graph_args` were extracted so this is testable without entering the trainer. |
+| evaluator accepts randomly initialized graph weights | **Fixed, and my fix was aimed at the wrong boundary.** See below. |
+| `search_gain_probe` cannot rebuild W1/W2 checkpoints | **Fixed, and five more like it.** |
+
+**On the second finding, the reviewer was right and my reasoning in §3 was
+wrong in a way worth stating plainly.** I generalized from training-time
+migration, where adding a module is deliberate, to `load_evaluator`, where it
+never is. That function rebuilds the model from *the checkpoint's own config*,
+so a parameter it must invent can only mean the file does not carry the weights
+its config declares. The distinction between `zeroed`, `neutral` and
+`initialized` matters when training migrates into a new architecture; at the
+inference boundary all three are the same fact, and `initialized` is the worst
+of them because it serves plausible seed-dependent numbers instead of obvious
+nonsense. `load_evaluator` now accepts only `grown` — the encoder-schema case it
+was written for — and refuses the rest by name.
+
+**On the third, the finding was narrower than the defect.** `search_gain_probe`
+was one of six hand-rebuild sites on a documented debt list whose stated
+justification was that a stale rebuild "fails loudly at the tool rather than
+mid-run". W1/W2 showed what that is worth: the probe fails loudly, but
+`w0_sizing_v2` names *no* architecture switch at all and would have silently
+rebuilt a pooled/reply/W5 checkpoint as a plain net. Five modules are converted
+to `model_from_config` / `phase_d._model_from_spec`; `w0_sizing` moved to the
+allow-list because it builds fresh models from a sizing arm rather than from
+saved weights. **`NOT_YET_CONVERTED` is now empty.**
+
+Not adopted, because the review did not ask for it and it would change an arm:
+`graph_bases` remains 4 and the `none` relation remains learned, per the
+sign-offs. The reviewer's suggestion to describe the module as *relation-aware
+mixing* rather than strictly local is adopted in wording.
+
+The reviewer's own measurement is the better one for the cost question and
+supersedes mine for the unfused path: **4.51% at 8 rows and 3.25% at 64**, on a
+single-threaded unfused CPU forward, which is what `Evaluator` actually
+constructs on CPU. My figures forced fusion and four threads.
 
 ## Sign-offs requested
 

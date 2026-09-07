@@ -23,9 +23,9 @@ from games.kingdomino.promotion import wilson_lower_bound
 from .buffer import read_records
 from .dataset import examples_from_record
 from .inference import Evaluator
-from .phase_d import MatchOutcome, PhaseDConfig, PhaseDLoop
+from .phase_d import MatchOutcome, PhaseDConfig, PhaseDLoop, _model_from_spec
 from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
-from .train import build_model, heads_from_config
+from .train import heads_from_config, model_from_config
 from .w0_sizing import (
     _evaluate_tensor_cache,
     _load_agent,
@@ -429,8 +429,9 @@ def search_lift_one(args) -> None:
     spec = _load_agent(
         checkpoint_path, args.label, args.sims, "closed", args.top_k
     )
-    model = build_model("transformer", spec.d_model, spec.layers, spec.heads)
-    model.load_state_dict(spec.model_state)
+    # Same helper, same reason: this site named no architecture switch at all,
+    # so it silently rebuilt a pooled/reply/W5 checkpoint as a plain net.
+    model = _model_from_spec(spec)
     evaluator = Evaluator(
         model,
         args.device,
@@ -639,12 +640,7 @@ def evaluate_holdout(args) -> None:
         checkpoint_path, map_location="cpu", weights_only=False
     )
     config = checkpoint["config"]
-    model = build_model(
-        config.get("model", "transformer"),
-        int(config["d_model"]),
-        int(config["layers"]),
-        heads_from_config(config),
-    )
+    model = model_from_config(config, name=config.get("model", "transformer"))
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device)
     indices = torch.arange(
@@ -702,12 +698,7 @@ def forward_bench(args) -> None:
         checkpoint_path, map_location="cpu", weights_only=False
     )
     config = checkpoint["config"]
-    model = build_model(
-        config.get("model", "transformer"),
-        int(config["d_model"]),
-        int(config["layers"]),
-        heads_from_config(config),
-    )
+    model = model_from_config(config, name=config.get("model", "transformer"))
     model.load_state_dict(checkpoint["model_state"])
     evaluator = Evaluator(
         model,

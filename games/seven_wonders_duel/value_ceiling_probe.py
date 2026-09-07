@@ -37,7 +37,7 @@ import torch
 
 from .buffer import from_json_line
 from .dataset import collate, examples_from_record, is_fast_search_move
-from .train import build_model, heads_from_config
+from .train import model_from_config
 
 # Example.value_class: 0 win / 1 draw / 2 loss, actor-relative.
 WIN, DRAW, LOSS = 0, 1, 2
@@ -78,12 +78,7 @@ def _rows(buffers: Path, games: int, from_iteration: int):
 def run(checkpoint: Path, buffers: Path, *, games: int, device: str, batch: int, from_iteration: int = 0) -> dict:
     stored = torch.load(checkpoint, map_location="cpu", weights_only=False)
     config = stored.get("config", {})
-    model = build_model(
-        "transformer",
-        int(config.get("d_model", 384)),
-        int(config.get("layers", 8)),
-        heads_from_config(config),
-    )
+    model = model_from_config(config, d_model=384, layers=8)
     model.load_state_dict(stored["model_state"])
     model.to(device).eval()
 

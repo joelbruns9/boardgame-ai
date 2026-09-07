@@ -51,19 +51,25 @@ ALLOWED = {
     # asserted on below.
     "cloud_preflight.py",
     "phase_b_gate.py",
+    # Same: builds a fresh model from a SIZING arm's width/depth, not from a
+    # checkpoint. Moved here rather than converted, because there is no config
+    # to rebuild from.
+    "w0_sizing.py",
 }
 
-#: Modules that still rebuild by hand. All are offline analysis tools -- probes,
-#: benches and sweeps -- none on the training or gate path, so a stale rebuild
-#: there fails loudly at the tool rather than mid-run.
-NOT_YET_CONVERTED = {
-    "ablate_value_head.py",
-    "search_gain_probe.py",
-    "value_ceiling_probe.py",
-    "w0_sizing.py",
-    "w0_sizing_v2.py",
-    "weight_decay_probe.py",
-}
+#: Modules that still rebuild by hand.
+#:
+#: **Empty as of 2026-09-07.** "Fails loudly at the tool rather than mid-run"
+#: was the argument for leaving these, and W1/W2 showed what it is worth: a
+#: review found `search_gain_probe` unable to load a W1/W2 checkpoint at all,
+#: and `w0_sizing_v2` -- which named no switch whatever -- silently rebuilding a
+#: pooled/reply/W5 checkpoint as a plain net, which is not loud at all. Five
+#: modules were converted; `w0_sizing` moved to ALLOWED because it builds fresh
+#: models from a sizing arm rather than from saved weights.
+#:
+#: Do not grow this set. A new entry needs a reason that survives the next
+#: architecture switch.
+NOT_YET_CONVERTED: set[str] = set()
 
 #: A separate, UNAUDITED class this test does not cover: modules that read a
 #: checkpoint's head count and pass it onward into a config dict or a subprocess

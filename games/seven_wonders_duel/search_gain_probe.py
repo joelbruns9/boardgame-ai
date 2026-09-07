@@ -44,9 +44,9 @@ import time
 from games.az_loop import hardware_identity, wilson_interval
 
 from .inference import Evaluator
-from .phase_d import PhaseDConfig, PhaseDLoop
+from .phase_d import PhaseDConfig, PhaseDLoop, _model_from_spec
 from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
-from .train import build_model, heads_from_config
+from .train import heads_from_config
 
 
 def _play(swr, config, games, seeds, adapter, seat_sims: tuple[int, int]) -> list[dict]:
@@ -137,16 +137,11 @@ def run(
     loop = PhaseDLoop(config)
     spec = loop._model_agent_spec(checkpoint, "search_gain_probe")
 
-    model = build_model(
-        "transformer",
-        spec.d_model,
-        spec.layers,
-        spec.heads,
-        spec.pooled_readout,
-        spec.reply_head,
-        spec.action_residual,
-    )
-    model.load_state_dict(spec.model_state)
+    # Through phase_d's own helper, never a second field list here: this site
+    # named every switch up to `action_residual`, so a W1 or W2 checkpoint
+    # failed at `load_state_dict` with unexpected keys before a single game was
+    # played, and the next switch would have done it again.
+    model = _model_from_spec(spec)
     adapter = rust_flat_batch_adapter(
         Evaluator(model, device, config.gate_batch_cap(), precision=config.precision)
     )
