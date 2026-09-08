@@ -613,7 +613,7 @@ class SevenWondersAdvisor:
         except Exception:
             return None
         joint = [float(p) for p in row.joint7]
-        return {
+        outlook = {
             "victory_type": dict(zip(self._JOINT7_LABELS, joint)),
             "you_win": sum(joint[0:3]),
             "opponent_wins": sum(joint[3:6]),
@@ -625,6 +625,28 @@ class SevenWondersAdvisor:
             # a scientific win. See dataset.py "sci_final my/opp: ... /6".
             "final_science": [float(x) for x in row.science],
         }
+        # W4, when the served checkpoint has the head. Reported ALONGSIDE the
+        # flat numbers rather than replacing them: the flat pair is what every
+        # existing checkpoint and every recorded measurement used, and the plan
+        # promotes this to the authoritative outlook only after calibration and
+        # the perspective/chance-node tests pass.
+        #
+        # The difference is not a second opinion. `victory_type` and `wdl` come
+        # from independent projections, so "62% you win" can sit beside a type
+        # split summing to 0.55; these two are one object, so they cannot.
+        if row.hier_joint7 is not None:
+            hier = [float(p) for p in row.hier_joint7]
+            outlook["hierarchical"] = {
+                "victory_type": dict(zip(self._JOINT7_LABELS, hier)),
+                "you_win": sum(hier[0:3]),
+                "opponent_wins": sum(hier[3:6]),
+                "draw": hier[6],
+                "wdl": [float(x) for x in row.hier_wdl],
+                # How far the flat pair was from agreeing with itself. Zero is
+                # not expected and a large value is the argument for the head.
+                "flat_disagreement": abs(sum(joint[0:3]) - float(row.wdl[0])),
+            }
+        return outlook
 
     def state_key(self, state: _Position) -> str:
         if state.key is not None:

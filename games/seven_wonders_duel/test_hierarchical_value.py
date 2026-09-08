@@ -204,6 +204,93 @@ def test_the_head_fits_a_position_it_is_shown(batch):
         loss.backward()
         optimizer.step()
         if step == 0:
-            first = float(loss)
-        last = float(loss)
+            first = float(loss.detach())
+        last = float(loss.detach())
     assert last < first
+
+
+# --- option 1: the head's output escapes the model ---------------------------
+
+
+def test_the_evaluator_reports_the_hierarchical_read():
+    """`Evaluation` carries it, and reports None for a model without the head.
+
+    None rather than a copy of the flat numbers: a caller must be able to tell
+    "this checkpoint has no W4 head" from "its head agrees with the flat one".
+    """
+
+    from games.seven_wonders_duel.game import GameState
+    from games.seven_wonders_duel.inference import Evaluator
+
+    states = [GameState.new(seed=11)]
+    plain = Evaluator(_model(), "cpu", 8, fuse_embedder=False)
+    assert plain.evaluate_states(states)[0].hier_joint7 is None
+
+    withhead = Evaluator(
+        _model(hierarchical_value=True), "cpu", 8, fuse_embedder=False
+    )
+    row = withhead.evaluate_states(states)[0]
+    assert row.hier_joint7 is not None and row.hier_wdl is not None
+    assert row.hier_joint7.shape == (7,)
+    # Probabilities, not log-probabilities: `exp` at the boundary, and never a
+    # second softmax over an already-normalised vector, which would silently
+    # flatten it rather than fail.
+    assert row.hier_joint7.sum() == pytest.approx(1.0, abs=1e-5)
+    assert row.hier_joint7[0:3].sum() == pytest.approx(
+        float(row.hier_wdl[0]), abs=1e-5
+    )
+
+
+def test_the_advisor_reports_both_reads_and_their_disagreement():
+    """Alongside the flat numbers, never instead of them.
+
+    Every existing checkpoint and every recorded measurement used the flat
+    pair, and the plan promotes the new one only after calibration. The panel
+    itself still renders the flat read, because the head is untrained: showing
+    it today would render noise.
+    """
+
+    from games.seven_wonders_duel.advisor_adapter import SevenWondersAdvisor
+    from games.seven_wonders_duel.inference import Evaluator
+
+    adapter = SevenWondersAdvisor(
+        evaluator=Evaluator(
+            _model(hierarchical_value=True), "cpu", 8, fuse_embedder=False
+        )
+    )
+    # Past the draft, where the outlook is deliberately withheld.
+    state = adapter.state_from_wire(
+        {"seed": 7, "first_player": 0, "prefix": _draft_prefix(7)}
+    )
+    outlook = adapter.state_to_public(state)["victory_outlook"]
+    assert outlook is not None
+    assert "victory_type" in outlook  # the flat read survives untouched
+    hier = outlook["hierarchical"]
+    assert hier["you_win"] + hier["opponent_wins"] + hier["draw"] == pytest.approx(
+        1.0, abs=1e-5
+    )
+    assert hier["you_win"] == pytest.approx(hier["wdl"][0], abs=1e-5)
+    assert hier["flat_disagreement"] >= 0.0
+
+
+def _draft_prefix(seed: int) -> list[int]:
+    """A legal action prefix that walks the Wonder draft to the first Age.
+
+    Built by playing, not written down: the draft's legal set depends on the
+    deal, so a hard-coded prefix would be a different position under any seed
+    change and an illegal one under most.
+    """
+
+    from games.seven_wonders_duel.game import GameState, Phase
+
+    game = GameState.new(seed=seed, first_player=0)
+    prefix = []
+    while game.phase is Phase.WONDER_DRAFT:
+        action = legal_action_indices(game)[0]
+        prefix.append(action)
+        from games.seven_wonders_duel.codec import decode_action
+        from games.seven_wonders_duel.engine import apply_action
+
+        # `apply_action` mutates in place and returns only the chance events.
+        apply_action(game, decode_action(game, action))
+    return prefix

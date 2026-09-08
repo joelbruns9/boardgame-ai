@@ -33,6 +33,18 @@ class Evaluation:
     margin: float
     military: float
     science: np.ndarray  # [2] my/opp final symbol-count forecasts
+    #: W4's hierarchical read of the same seven classes, or None when the model
+    #: has no such head.
+    #:
+    #: Not a second opinion to average with `joint7`. The two differ in a
+    #: specific way: `joint7` and `wdl` are independent projections, so their
+    #: implied win probabilities can contradict each other, while this one is
+    #: `P(outcome) * P(type | outcome)` and marginalises to `hier_wdl` exactly.
+    #: A caller that needs the victory split and the win probability to be the
+    #: same claim should read this pair; one that wants the historical numbers
+    #: should read `joint7` and `wdl`.
+    hier_joint7: np.ndarray | None = None
+    hier_wdl: np.ndarray | None = None
 
 
 class Evaluator:
@@ -109,6 +121,19 @@ class Evaluator:
             margin = outputs["margin"].float().cpu().numpy()
             military = outputs["military"].float().cpu().numpy()
             science = outputs["science"].float().cpu().numpy()
+            # Already log-probabilities out of the head, so `exp`, not softmax.
+            # Softmaxing them again would renormalise a normalised vector --
+            # silently flattening it rather than failing.
+            hier_joint7 = (
+                outputs["hier_joint7"].float().exp().cpu().numpy()
+                if "hier_joint7" in outputs
+                else None
+            )
+            hier_wdl = (
+                outputs["hier_value"].float().exp().cpu().numpy()
+                if "hier_value" in outputs
+                else None
+            )
             for row, legal in enumerate(legals):
                 legal_indices = np.asarray(list(legal), dtype=np.int64)
                 results.append(
@@ -119,6 +144,14 @@ class Evaluator:
                         margin=float(margin[row]),
                         military=float(military[row]),
                         science=science[row].astype(np.float32),
+                        hier_joint7=(
+                            None if hier_joint7 is None
+                            else hier_joint7[row].astype(np.float32)
+                        ),
+                        hier_wdl=(
+                            None if hier_wdl is None
+                            else hier_wdl[row].astype(np.float32)
+                        ),
                     )
                 )
         return results
