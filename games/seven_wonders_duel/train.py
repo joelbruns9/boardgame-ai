@@ -98,6 +98,7 @@ def compute_losses(
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
+    hier_value_replaces_joint7: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_policy = masked_policy_log_softmax(outputs["policy"], batch["legal_mask"])
     # Targets are zero on illegal actions where log_policy is -inf; read only
@@ -189,6 +190,19 @@ def compute_losses(
         per_value = F.cross_entropy(outputs["value"], target, reduction="none")
     value_loss = (per_value * value_w).sum() / value_w.sum().clamp(min=1e-9)
     joint7_loss = F.cross_entropy(outputs["joint7"], batch["joint7"])
+    # The REPLACEMENT arm. `joint7` and W4's head fit the same per-game label,
+    # so running both trains two heads on one observation and mostly re-weights
+    # the outcome objective against policy -- which measures the weight, not the
+    # parameterisation. Dropping the flat term makes the comparison the one
+    # worth making: same information, same weight, structured or not.
+    #
+    # The flat head's PARAMETERS are then frozen wherever they were inherited,
+    # and its outputs go stale. Nothing in search reads them, but the advisor
+    # does, which is why this is recorded in the checkpoint config rather than
+    # left for a reader to infer.
+    reported_joint7 = float(joint7_loss.detach())
+    if hier_value_replaces_joint7:
+        joint7_loss = joint7_loss.new_zeros(())
     margin_valid = batch["margin_valid"]
     if margin_valid.any():
         margin_loss = F.mse_loss(
@@ -240,7 +254,7 @@ def compute_losses(
         "action_policy": float(action_policy_loss.detach()),
         "control": float(control_loss.detach()),
         "value": float(value_loss.detach()),
-        "joint7": float(joint7_loss.detach()),
+        "joint7": reported_joint7,
         "margin": float(margin_loss.detach()),
         "military": float(military_loss.detach()),
         "science": float(science_loss.detach()),
@@ -286,6 +300,7 @@ def evaluate(
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
+    hier_value_replaces_joint7: bool = False,
 ):
     model.eval()
     control_labels = control_table_for(model)
@@ -317,6 +332,7 @@ def evaluate(
                 value_bootstrap,
                 control_weight=control_weight,
                 hier_value_weight=hier_value_weight,
+                hier_value_replaces_joint7=hier_value_replaces_joint7,
                 solver_value_target=False,
                 # Unweighted for the same reason: a held-out number has to mean
                 # the same thing across runs. Upweighting solved rows in
@@ -593,6 +609,11 @@ def make_checkpoint(model, config: dict) -> dict:
                     "not be able to rebuild its own weights"
                 )
             config[field] = actual
+    # A TRAINING-recipe fact, not an architecture one, so it is carried through
+    # rather than derived from the model: it shapes no parameter, but it changes
+    # what the flat `joint7` head MEANS -- under that arm the head is frozen
+    # wherever it was inherited and its outputs are stale, which a reader of the
+    # checkpoint has to be able to see.
     out = {
         "model_state": model.state_dict(),
         "config": config,
@@ -1023,6 +1044,7 @@ def train_loop(
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
+    hier_value_replaces_joint7: bool = False,
     log=print,
 ):
     """Offline epoch trainer for a fixed buffer (Phase B gate, ``train.py`` CLI).
@@ -1084,6 +1106,7 @@ def train_loop(
                     action_policy_weight=action_policy_weight,
                     control_weight=control_weight,
                     hier_value_weight=hier_value_weight,
+                    hier_value_replaces_joint7=hier_value_replaces_joint7,
                 )
             scaler.scale(total).backward()
             scaler.step(optimizer)
@@ -1169,6 +1192,7 @@ def train_steps(
     action_policy_weight: float = ACTION_POLICY_WEIGHT_DEFAULT,
     control_weight: float = CONTROL_WEIGHT_DEFAULT,
     hier_value_weight: float = HIER_VALUE_WEIGHT_DEFAULT,
+    hier_value_replaces_joint7: bool = False,
     log=print,
 ) -> tuple[list[dict], dict]:
     """Fixed-budget training on uniform random minibatches from the replay.
@@ -1263,6 +1287,7 @@ def train_steps(
                 action_policy_weight=action_policy_weight,
                 control_weight=control_weight,
                 hier_value_weight=hier_value_weight,
+                hier_value_replaces_joint7=hier_value_replaces_joint7,
             )
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
@@ -1408,6 +1433,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "move a trunk weight. --no-hierarchical-value-detach is the arm that "
         "lets it shape representations, and the only one that can change "
         "playing strength in either direction",
+    )
+    parser.add_argument(
+        "--hier-value-replaces-joint7",
+        action="store_true",
+        help="drop the flat joint7 loss so W4 is the only victory-type "
+        "supervision. The comparison worth making -- running both trains two "
+        "heads on one per-game label and measures the weight, not the "
+        "parameterisation. Leaves the flat head's outputs stale.",
     )
     parser.add_argument(
         "--hier-value-weight",
@@ -1574,6 +1607,20 @@ def main(argv=None) -> int:
         raise SystemExit("--hier-value-weight must be finite and non-negative")
     if args.hier_value_weight > 0 and not args.hierarchical_value:
         raise SystemExit("--hier-value-weight requires --hierarchical-value")
+    if args.hier_value_replaces_joint7:
+        if not args.hierarchical_value:
+            raise SystemExit(
+                "--hier-value-replaces-joint7 requires --hierarchical-value"
+            )
+        if args.hierarchical_value_detach:
+            # Replacing the flat term with a detached head would remove the
+            # trunk's ONLY victory-type supervision and put nothing back --
+            # not an arm, a deletion.
+            raise SystemExit(
+                "--hier-value-replaces-joint7 requires "
+                "--no-hierarchical-value-detach; a detached head cannot replace "
+                "supervision it never delivers to the trunk"
+            )
     if not math.isfinite(args.action_policy_weight) or args.action_policy_weight < 0:
         raise SystemExit("--action-policy-weight must be finite and non-negative")
     if args.init_checkpoint:
@@ -1688,6 +1735,8 @@ def main(argv=None) -> int:
         patience=args.patience,
         precision=args.precision,
         action_policy_weight=args.action_policy_weight,
+        hier_value_weight=args.hier_value_weight,
+        hier_value_replaces_joint7=args.hier_value_replaces_joint7,
     )
     final = evaluate(
         model,
@@ -1697,6 +1746,8 @@ def main(argv=None) -> int:
         args.aux_weight,
         precision=args.precision,
         action_policy_weight=args.action_policy_weight,
+        hier_value_weight=args.hier_value_weight,
+        hier_value_replaces_joint7=args.hier_value_replaces_joint7,
     )
     print(f"final: {json.dumps({k: round(v, 4) for k, v in final.items()})}")
 
@@ -1721,6 +1772,8 @@ def main(argv=None) -> int:
             "weight_decay": args.weight_decay,
             "aux_weight": args.aux_weight,
             "action_policy_weight": args.action_policy_weight,
+            "hier_value_weight": args.hier_value_weight,
+            "hier_value_replaces_joint7": bool(args.hier_value_replaces_joint7),
         }
         torch.save(make_checkpoint(model, config), out / f"{args.model}.pt")
         (out / "summary.json").write_text(

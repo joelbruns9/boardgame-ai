@@ -2604,6 +2604,39 @@ A built head with a zero weight is refused. It is shadow-only, so an untrained
 one is parameters and throughput buying nothing, which reads like a configured
 arm and is not one.
 
+### The two arms that can actually move strength
+
+The head's mere presence cannot. These two can, and both are cheap:
+
+| flag | what changes |
+| --- | --- |
+| `--hier-value-replaces-joint7` | the flat `joint7` loss is dropped, so W4 is the ONLY victory-type supervision |
+| `--value-source hierarchical` | the scalar search value is read from W4's outcome factor instead of the flat `value` head |
+
+**Replacement, not addition, is the comparison worth making.** `joint7` and W4
+fit the same per-game label, so running both trains two heads on one
+observation and mostly re-weights the outcome objective against policy --
+which measures the weight, not the parameterisation. Replacement holds the
+information and the weight fixed and varies only the structure. It requires
+`--no-hierarchical-value-detach`: replacing the flat term with a detached head
+would remove the trunk's only victory-type supervision and put nothing back,
+which is a deletion rather than an arm. The flat head's outputs then go stale,
+which is why the arm is recorded in the checkpoint config.
+
+**`--value-source hierarchical` changes every leaf value in every search**, on
+the hypothesis that a marginal constrained to agree with its own victory-type
+split is better calibrated than a free one. It governs `wdl` only; `joint7` is
+untouched, because search never reads it and leaving it alone keeps the arm to
+one variable. Routed league evaluators must agree on the source -- a batch
+stitched from several nets cannot read a different head per row, and taking the
+first one's would report an arm half the rows never ran.
+
+Note what neither of these is: backing the seven-way distribution up through
+the tree cannot change move selection at all. `P(win) - P(loss)` is LINEAR in
+the seven probabilities, so averaging the vector and then collapsing equals
+collapsing at each leaf and averaging. That backup is a training-data and
+display capability, not a search one.
+
 ## Workstream 2: the tableau graph module
 
 Off by default. Relational message passing over the printed cover graph, run on

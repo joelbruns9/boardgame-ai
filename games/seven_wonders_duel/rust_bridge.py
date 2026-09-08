@@ -506,7 +506,9 @@ class _RustFlatBatchAdapter:
                 )
                 offset += count
             compact_policy_tensor = torch.cat(compact_policy)
-        wdl = torch.softmax(outputs["value"].float(), dim=-1)
+        # Through the evaluator, so the production flat path and the scalar
+        # adapters cannot disagree about which head the search value came from.
+        wdl = self.evaluator.wdl_tensor(outputs)
         value_actor = wdl[:, 0] - wdl[:, 2]
         self._end_event("gather", gather_event)
         self._sync()
@@ -712,12 +714,34 @@ def rust_searcher_routed_flat_batch_adapter(
                 raise ValueError("searcher-routed batch cannot be empty")
             return combined
 
+    # One head for the whole batch, or none. The routed forward stitches every
+    # net's rows into ONE `outputs` dict, so a per-row choice of head is not
+    # expressible here -- and silently taking the first evaluator's would report
+    # an arm that half the rows never ran. Refuse instead.
+    sources = {
+        getattr(evaluator, "value_source", "flat") for evaluator in evaluators
+    }
+    if len(sources) > 1:
+        raise ValueError(
+            f"routed evaluators disagree about value_source ({sorted(sources)}); "
+            "a batch stitched from several nets cannot read a different head per "
+            "row"
+        )
+    routed_source = sources.pop()
+
     class _EvaluatorProxy:
+        value_source = routed_source
+
         def autocast(self):
             if mixed_precision:
                 # Each net applies its own inside the routed forward.
                 return contextlib.nullcontext()
             return evaluators[0].autocast()
+
+        def wdl_tensor(self, outputs):
+            from .inference import Evaluator
+
+            return Evaluator.wdl_tensor(self, outputs)
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device
@@ -823,9 +847,25 @@ def rust_seat_routed_flat_batch_adapter(
                 raise ValueError("seat-routed batch cannot be empty")
             return combined
 
+    sources = {
+        getattr(evaluator, "value_source", "flat") for evaluator in evaluators
+    }
+    if len(sources) > 1:
+        raise ValueError(
+            f"evaluators disagree about value_source ({sorted(sources)})"
+        )
+    shared_source = sources.pop()
+
     class _EvaluatorProxy:
+        value_source = shared_source
+
         def autocast(self):
             return evaluators[0].autocast()
+
+        def wdl_tensor(self, outputs):
+            from .inference import Evaluator
+
+            return Evaluator.wdl_tensor(self, outputs)
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device

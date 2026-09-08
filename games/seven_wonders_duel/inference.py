@@ -51,6 +51,19 @@ class Evaluator:
     """Synchronous batched evaluator. Thread-safety and cross-caller
     coalescing arrive with the Phase F service; the API does not change."""
 
+    #: Which head produces the W/D/L the SCALAR search value is read from.
+    #:
+    #: `"flat"` is the historical `value` head. `"hierarchical"` is W4's outcome
+    #: factor, which is constrained to agree with its own victory-type split --
+    #: the hypothesis being that a marginal forced into consistency is better
+    #: calibrated than a free one. This governs `wdl` ONLY, so `joint7` still
+    #: comes from the flat head; search does not read `joint7`, and leaving it
+    #: alone keeps the arm to the one variable it is testing.
+    #:
+    #: A real strength arm, unlike the head's mere presence: every leaf value in
+    #: every search changes.
+    VALUE_SOURCES = ("flat", "hierarchical")
+
     def __init__(
         self,
         model,
@@ -58,7 +71,23 @@ class Evaluator:
         max_batch: int = 512,
         fuse_embedder: bool = True,
         precision: str = "fp32",
+        value_source: str = "flat",
     ):
+        if value_source not in self.VALUE_SOURCES:
+            raise ValueError(
+                f"value_source must be one of {self.VALUE_SOURCES}, got {value_source!r}"
+            )
+        if value_source == "hierarchical" and not getattr(
+            getattr(model, "_orig_mod", model), "hierarchical_value", False
+        ):
+            # Loud here rather than a KeyError at the first forward, or -- worse
+            # -- a silent fall back to the flat head, which would report an arm
+            # that never ran.
+            raise ValueError(
+                "value_source='hierarchical' needs a model built with "
+                "hierarchical_value=True; this one has no such head"
+            )
+        self.value_source = value_source
         if precision not in {"fp32", "bf16"}:
             raise ValueError("precision must be fp32 or bf16")
         self.model = model.to(device).eval()
@@ -114,7 +143,7 @@ class Evaluator:
                 outputs["policy"].float(), batch["legal_mask"]
             )
             policy = log_policy.exp().cpu().numpy()
-            wdl = torch.softmax(outputs["value"].float(), dim=-1).cpu().numpy()
+            wdl = self.wdl_tensor(outputs).cpu().numpy()
             joint7 = (
                 torch.softmax(outputs["joint7"].float(), dim=-1).cpu().numpy()
             )
@@ -155,6 +184,19 @@ class Evaluator:
                     )
                 )
         return results
+
+    def wdl_tensor(self, outputs: dict) -> "torch.Tensor":
+        """The W/D/L this evaluator serves, per `value_source`.
+
+        One place, because the scalar search value is derived from it in three
+        of them -- here, the flat Rust batch path, and the scalar adapters --
+        and an arm that switched only some would be measuring a mixture.
+        """
+
+        if self.value_source == "hierarchical":
+            # Already log-probabilities; `exp`, never a second softmax.
+            return outputs["hier_value"].float().exp()
+        return torch.softmax(outputs["value"].float(), dim=-1)
 
     def evaluate_states(self, games) -> list[Evaluation]:
         """Convenience for callers holding engine states rather than

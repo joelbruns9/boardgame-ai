@@ -294,3 +294,101 @@ def _draft_prefix(seed: int) -> list[int]:
         # `apply_action` mutates in place and returns only the chance events.
         apply_action(game, decode_action(game, action))
     return prefix
+
+
+# --- option 2: the arms that can actually move strength ----------------------
+
+
+def test_replacing_joint7_drops_its_term_but_still_reports_it(batch):
+    """The comparison worth making: same label, same weight, structured or not.
+
+    Running both heads trains two of them on one per-game observation and
+    mostly re-weights the outcome objective against policy, which measures the
+    weight rather than the parameterisation.
+    """
+
+    model = _model(hierarchical_value=True, hierarchical_value_detach=False)
+    outputs = model(batch)
+
+    both, parts_both = compute_losses(outputs, batch, hier_value_weight=0.15)
+    replaced, parts_replaced = compute_losses(
+        outputs, batch, hier_value_weight=0.15, hier_value_replaces_joint7=True
+    )
+    # Still REPORTED -- the arm changes what is optimised, and a diagnostic that
+    # went blank would hide whether the flat head was drifting.
+    assert parts_replaced["joint7"] == pytest.approx(parts_both["joint7"])
+    assert float(replaced.detach()) < float(both.detach())
+
+
+def test_replacing_with_a_detached_head_is_refused():
+    """It would remove the trunk's only victory-type supervision and add none.
+
+    A detached head delivers nothing to the trunk, so "replacement" there is a
+    deletion wearing an arm's name.
+    """
+
+    from games.seven_wonders_duel.phase_d import PhaseDConfig
+
+    config = PhaseDConfig(
+        run_dir="x",
+        hierarchical_value=True,
+        hier_value_weight=0.15,
+        hier_value_replaces_joint7=True,
+    )
+    with pytest.raises(ValueError, match="detached head cannot replace"):
+        config.validate()
+
+
+# --- option 3: the hierarchical marginal as the search value -----------------
+
+
+def test_the_search_value_can_come_from_either_head():
+    """A real strength arm: every leaf value in every search changes."""
+
+    from games.seven_wonders_duel.game import GameState
+    from games.seven_wonders_duel.inference import Evaluator
+
+    model = _model(hierarchical_value=True)
+    states = [GameState.new(seed=11)]
+    flat = Evaluator(model, "cpu", 8, fuse_embedder=False).evaluate_states(states)[0]
+    hier = Evaluator(
+        model, "cpu", 8, fuse_embedder=False, value_source="hierarchical"
+    ).evaluate_states(states)[0]
+
+    assert not torch.allclose(
+        torch.tensor(flat.wdl), torch.tensor(hier.wdl), atol=1e-4
+    ), "the two heads should not agree by accident at initialization"
+    # `wdl` is what the scalar search value is derived from, so switching the
+    # source moves it. `joint7` is deliberately untouched: search never reads
+    # it, and leaving it alone keeps the arm to one variable.
+    assert torch.allclose(torch.tensor(flat.joint7), torch.tensor(hier.joint7))
+    # And the served pair is now self-consistent under the hierarchical source.
+    assert hier.wdl[0] == pytest.approx(float(hier.hier_joint7[0:3].sum()), abs=1e-5)
+
+
+def test_the_hierarchical_source_needs_the_head():
+    """Loud, rather than a KeyError at the first forward or a silent fallback."""
+
+    from games.seven_wonders_duel.inference import Evaluator
+
+    with pytest.raises(ValueError, match="needs a model built with"):
+        Evaluator(_model(), "cpu", 8, value_source="hierarchical")
+
+
+def test_routed_evaluators_must_agree_on_the_source():
+    """A stitched batch cannot read a different head per row.
+
+    Taking the first evaluator's silently would report an arm that half the
+    rows never ran.
+    """
+
+    from games.seven_wonders_duel.inference import Evaluator
+    from games.seven_wonders_duel.rust_bridge import (
+        rust_searcher_routed_flat_batch_adapter,
+    )
+
+    model = _model(hierarchical_value=True)
+    flat = Evaluator(model, "cpu", 8, fuse_embedder=False)
+    hier = Evaluator(model, "cpu", 8, fuse_embedder=False, value_source="hierarchical")
+    with pytest.raises(ValueError, match="disagree about value_source"):
+        rust_searcher_routed_flat_batch_adapter([flat, hier])

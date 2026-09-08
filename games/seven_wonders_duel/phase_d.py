@@ -390,6 +390,25 @@ class PhaseDConfig:
     which it can change playing strength in either direction.
     """
 
+    hier_value_replaces_joint7: bool = False
+    """Drop the flat joint7 loss so W4 is the only victory-type supervision.
+
+    The comparison worth making. Running both trains two heads on one per-game
+    label and mostly re-weights the outcome objective against policy, which
+    measures the weight rather than the parameterisation. Requires an ATTACHED
+    head: replacing the flat term with a detached one would remove the trunk's
+    only victory-type supervision and put nothing back.
+    """
+
+    value_source: str = "flat"
+    """Which head's W/D/L the scalar search value is read from.
+
+    `hierarchical` is a genuine strength arm rather than a shadow one -- every
+    leaf value in every search changes -- on the hypothesis that a marginal
+    constrained to agree with its own victory-type split is better calibrated
+    than a free one.
+    """
+
     hier_value_weight: float = 0.0
     """Loss weight for the W4 head.
 
@@ -1197,6 +1216,21 @@ class PhaseDConfig:
             raise ValueError("hier_value_weight must be finite and non-negative")
         if self.hier_value_weight > 0 and not self.hierarchical_value:
             raise ValueError("hier_value_weight requires --hierarchical-value")
+        if self.value_source not in ("flat", "hierarchical"):
+            raise ValueError("value_source must be 'flat' or 'hierarchical'")
+        if self.value_source == "hierarchical" and not self.hierarchical_value:
+            raise ValueError("value_source='hierarchical' requires --hierarchical-value")
+        if self.hier_value_replaces_joint7:
+            if not self.hierarchical_value:
+                raise ValueError(
+                    "hier_value_replaces_joint7 requires --hierarchical-value"
+                )
+            if self.hierarchical_value_detach:
+                raise ValueError(
+                    "hier_value_replaces_joint7 requires "
+                    "--no-hierarchical-value-detach; a detached head cannot "
+                    "replace supervision it never delivers to the trunk"
+                )
         if self.hierarchical_value and self.hier_value_weight == 0:
             raise ValueError(
                 "--hierarchical-value requires a positive --hier-value-weight; "
@@ -1922,6 +1956,7 @@ def _process_generation_init(
         "cpu",
         config.inference_batch,
         precision=config.precision,
+        value_source=config.value_source,
     )
     _PROCESS_STATE["config"] = config
     _PROCESS_STATE["iteration"] = iteration
@@ -1967,7 +2002,13 @@ class ModelAgentSpec:
     graph_alpha: float = 1e-3
     hierarchical_value: bool = False
     hierarchical_value_detach: bool = True
+    value_source: str = "flat"
     """Architecture switches the weights were built under.
+
+    ``value_source`` is not a parameter shape but belongs here for the same
+    reason ``heads`` does: a gate that rebuilt the weights correctly and then
+    read the OTHER head's marginal would play a different agent than the one
+    being gated.
 
     Here for the same reason ``heads`` is: a gate rebuilds the model from this
     spec, and whatever the spec does not carry is silently the default. Unlike
@@ -2023,7 +2064,13 @@ def _build_gate_agent(
     model = _model_from_spec(spec)
     return SearchAgent(
         spec.name,
-        Evaluator(model, device, inference_batch, precision=precision),
+        Evaluator(
+            model,
+            device,
+            inference_batch,
+            precision=precision,
+            value_source=getattr(spec, "value_source", "flat"),
+        ),
         sims=spec.sims,
         mode=spec.mode,
         top_k=spec.top_k,
@@ -3121,6 +3168,10 @@ class PhaseDLoop:
                 getattr(model, "hierarchical_value_detach", True)
             ),
             "hier_value_weight": self.config.hier_value_weight,
+            "hier_value_replaces_joint7": bool(
+                self.config.hier_value_replaces_joint7
+            ),
+            "value_source": self.config.value_source,
             "action_policy_weight": self.config.action_policy_weight,
             "train_action_gate": self.config.train_action_gate,
             "precision": self.config.precision,
@@ -3681,6 +3732,7 @@ class PhaseDLoop:
             self.config.device,
             self.config.rust_global_batch_cap,
             precision=self.config.precision,
+            value_source=self.config.value_source,
         )
         league = self.league_assignment(iteration, len(jobs))
         if league is None:
@@ -4210,6 +4262,7 @@ class PhaseDLoop:
                 precision=self.config.precision,
                 action_policy_weight=self.config.action_policy_weight,
                 hier_value_weight=self.config.hier_value_weight,
+                hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
             )
         training_started = time.monotonic()
         history, optimizer_state = train_steps(
@@ -4227,6 +4280,7 @@ class PhaseDLoop:
             value_bootstrap=self.config.value_bootstrap,
             action_policy_weight=self.config.action_policy_weight,
             hier_value_weight=self.config.hier_value_weight,
+            hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
             validate_every=self.config.validate_every,
             optimizer_state=self._load_optimizer_state(),
             restore_best_val=self.config.restore_best_val,
@@ -4313,6 +4367,7 @@ class PhaseDLoop:
             hierarchical_value_detach=bool(
                 getattr(source, "hierarchical_value_detach", True)
             ),
+            value_source=self.config.value_source,
             sims=self.config.gate_sims,
             mode=self.config.search_mode,
             top_k=self.config.top_k,
@@ -5689,6 +5744,20 @@ def build_parser() -> argparse.ArgumentParser:
         "it shape representations, and is the only arm that can change playing "
         "strength in either direction.",
     )
+    parser.add_argument(
+        "--hier-value-replaces-joint7",
+        action="store_true",
+        help="drop the flat joint7 loss so W4 is the only victory-type "
+        "supervision; requires --no-hierarchical-value-detach",
+    )
+    parser.add_argument(
+        "--value-source",
+        choices=("flat", "hierarchical"),
+        default="flat",
+        help="which head's W/D/L the scalar search value comes from. "
+        "'hierarchical' is a strength arm: every leaf value in every search "
+        "changes.",
+    )
     # None, then resolved against the switch: 0.15 with the head, 0 without.
     # Defaulting to 0.15 outright would make every existing config fail
     # validation, and defaulting to 0 would silently build an untrained head.
@@ -6410,6 +6479,8 @@ def main(argv=None) -> int:
         graph_alpha=args.graph_alpha,
         hierarchical_value=args.hierarchical_value,
         hierarchical_value_detach=args.hierarchical_value_detach,
+        hier_value_replaces_joint7=args.hier_value_replaces_joint7,
+        value_source=args.value_source,
         hier_value_weight=(
             (0.15 if args.hierarchical_value else 0.0)
             if args.hier_value_weight is None
