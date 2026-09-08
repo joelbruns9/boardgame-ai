@@ -118,6 +118,16 @@ class Example:
     #: `root_value` this is not an estimate to blend against the outcome: it is
     #: the position's true value, and the realised result of the game is at best
     #: a noisy sample of it, so where it exists it REPLACES the outcome label.
+    #: W4: search's own seven-way outlook at this position, actor-relative, in
+    #: `JOINT7_CLASSES` order. `None` wherever the search recorded none.
+    #:
+    #: Carried but NOT yet consumed by any loss. It is the position-specific
+    #: victory-type signal the realised label cannot give: that label makes
+    #: every row of a science-win game read `my_scientific`, move 3 included.
+    #: Blending, not replacing, is the established pattern here -- `root_value`
+    #: blends because cloud3 produced a confidently wrong head from a hard fit,
+    #: and only `solver_value` replaces outright, because it is proof.
+    root_outlook: list[float] | None = None
     solver_value: float | None = None
     #: True when the solve crossed no chance edge, so `solver_value` is exactly
     #: -1, 0 or +1 and the W/D/L target is one-hot. False means expectimax: the
@@ -769,6 +779,7 @@ def examples_from_record(
                 not move.policy_excluded and actor not in archive_seats,
                 actor,
                 move.root_value,
+                move.root_outlook,
                 move.solver_value,
                 move.solver_regime == "exact",
                 move.i,
@@ -815,6 +826,7 @@ def examples_from_record(
         has_policy,
         actor,
         root_value,
+        root_outlook,
         solver_value,
         solver_exact,
         move_index,
@@ -838,6 +850,7 @@ def examples_from_record(
                 has_policy=has_policy,
                 value_class=_actor_value_class(game.winner, actor),
                 root_value=root_value,
+                root_outlook=root_outlook,
                 solver_value=solver_value,
                 solver_exact=solver_exact,
                 value_weight=row_weights.get(move_index, (1.0, 1.0))[0],
@@ -998,6 +1011,7 @@ def _examples_from_rust_payload(
                 has_policy=not move.policy_excluded and actor not in archive_seats,
                 value_class=_actor_value_class(record.winner, actor),
                 root_value=move.root_value,
+                root_outlook=move.root_outlook,
                 solver_value=move.solver_value,
                 solver_exact=move.solver_regime == "exact",
                 value_weight=row_weights.get(move.i, (1.0, 1.0))[0],

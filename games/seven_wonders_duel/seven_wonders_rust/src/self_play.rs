@@ -10,7 +10,7 @@ use crate::bots::{self, BotKind};
 use crate::chance::{self, ChanceKind};
 use crate::codec::{decode_action, legal_action_indices};
 use crate::data::{self, wonder};
-use crate::eval::{Eval, EvalTicket, EvalWorker};
+use crate::eval::{Eval, EvalTicket, EvalWorker, LeafOut};
 use crate::rng::Rng;
 use crate::state::{GameState, Phase, VictoryType};
 use crate::tree::SearchConfig;
@@ -324,6 +324,14 @@ pub struct MoveRecord {
     /// search backed anything up. Paired with `root_value` and `solver_value`
     /// it separates a value head that is wrong from a search that is.
     pub net_root_value: f64,
+    /// W4: search's own seven-way winner x victory-type distribution for this
+    /// root, actor-relative. `None` when the evaluator produced no outlook.
+    ///
+    /// Recorded because it is the only position-specific victory-type signal
+    /// there is: the realised label makes every row of a game that ended
+    /// scientifically read `my_scientific`, move 3 included. Nothing consumes
+    /// it yet -- that loss is offline work against a buffer this produces.
+    pub root_outlook: Option<Vec<f64>>,
     pub sims: usize,
     pub gumbel_topk: Vec<usize>,
     pub policy_excluded: bool,
@@ -440,12 +448,15 @@ struct DraftPriorEval<'a, E> {
 }
 
 impl<E: Eval> Eval for DraftPriorEval<'_, E> {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
-        let (value, priors) = self.base.evaluate(state)?;
-        Ok((value, blend_priors(state, priors, self.amount)))
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
+        let leaf = self.base.evaluate(state)?;
+        Ok(LeafOut {
+            priors: blend_priors(state, leaf.priors, self.amount),
+            ..leaf
+        })
     }
 
-    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<LeafOut>> {
         let rows = self.base.evaluate_batch(states)?;
         if rows.len() != states.len() {
             return Err(PyValueError::new_err(format!(
@@ -457,7 +468,10 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
         Ok(rows
             .into_iter()
             .zip(states)
-            .map(|((value, priors), state)| (value, blend_priors(state, priors, self.amount)))
+            .map(|(leaf, state)| LeafOut {
+                priors: blend_priors(state, leaf.priors, self.amount),
+                ..leaf
+            })
             .collect())
     }
 
@@ -467,7 +481,7 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
         actors: &[usize],
         legals: &[Vec<usize>],
         net_ids: &[u8],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         let rows = self
             .base
             .evaluate_batch_prepared_routed(states, actors, legals, net_ids)?;
@@ -481,7 +495,10 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
         Ok(rows
             .into_iter()
             .zip(states)
-            .map(|((value, priors), state)| (value, blend_priors(state, priors, self.amount)))
+            .map(|(leaf, state)| LeafOut {
+                priors: blend_priors(state, leaf.priors, self.amount),
+                ..leaf
+            })
             .collect())
     }
 
@@ -490,7 +507,7 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
         states: &[&GameState],
         actors: &[usize],
         legals: &[Vec<usize>],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         let rows = self.base.evaluate_batch_prepared(states, actors, legals)?;
         if rows.len() != states.len() {
             return Err(PyValueError::new_err(format!(
@@ -502,7 +519,10 @@ impl<E: Eval> Eval for DraftPriorEval<'_, E> {
         Ok(rows
             .into_iter()
             .zip(states)
-            .map(|((value, priors), state)| (value, blend_priors(state, priors, self.amount)))
+            .map(|(leaf, state)| LeafOut {
+                priors: blend_priors(state, leaf.priors, self.amount),
+                ..leaf
+            })
             .collect())
     }
 }
@@ -1120,6 +1140,7 @@ pub fn run<E: Eval>(
             root_value: result.root_value,
             action_value: result.action_value,
             net_root_value: result.net_root_value,
+            root_outlook: result.root_outlook.map(|o| o.to_vec()),
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
             policy_excluded: !full,
@@ -2175,7 +2196,7 @@ impl GameSlot {
         }
     }
 
-    fn apply_root(&mut self, evaluation: (f64, Vec<f64>)) -> PyResult<()> {
+    fn apply_root(&mut self, evaluation: LeafOut) -> PyResult<()> {
         let timer = Instant::now();
         let old_stage = std::mem::replace(&mut self.stage, SlotStage::Complete);
         let SlotStage::NeedRoot(meta) = old_stage else {
@@ -2183,10 +2204,10 @@ impl GameSlot {
                 "root evaluation delivered to a slot not waiting for its root",
             ));
         };
-        let evaluation = (
-            evaluation.0,
-            blend_priors(&self.state, evaluation.1, self.cfg.draft_prior),
-        );
+        let evaluation = LeafOut {
+            priors: blend_priors(&self.state, evaluation.priors, self.cfg.draft_prior),
+            ..evaluation
+        };
         // The virtual-loss twins are reachable only with the opt-in AND an
         // actual batch: at leaf_batch = 1 there is no wave to collide, so
         // routing there anyway would change the entry point for every existing
@@ -2233,7 +2254,7 @@ impl GameSlot {
         &mut self,
         request: tree_resumable::EvalBatchRequest,
         states: &[GameState],
-        evaluations: Vec<(f64, Vec<f64>)>,
+        evaluations: Vec<LeafOut>,
     ) -> PyResult<()> {
         let started = Instant::now();
         let SlotStage::Searching { session, .. } = &mut self.stage else {
@@ -2250,8 +2271,9 @@ impl GameSlot {
         let rows = evaluations
             .into_iter()
             .zip(states)
-            .map(|((value, priors), state)| {
-                (value, blend_priors(state, priors, self.cfg.draft_prior))
+            .map(|(leaf, state)| LeafOut {
+                priors: blend_priors(state, leaf.priors, self.cfg.draft_prior),
+                ..leaf
             })
             .collect();
         let result = session.apply_evaluations(request.request_id, rows);
@@ -2424,6 +2446,7 @@ impl GameSlot {
             root_value: result.root_value,
             action_value: result.action_value,
             net_root_value: result.net_root_value,
+            root_outlook: result.root_outlook.map(|o| o.to_vec()),
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
             // Cheap searches are excluded as always, and so is anything the
@@ -2481,6 +2504,7 @@ impl GameSlot {
             root_value: 0.0,
             action_value: 0.0,
             net_root_value: 0.0,
+            root_outlook: None,
             sims: 0,
             gumbel_topk: Vec::new(),
             policy_excluded: self
@@ -2762,7 +2786,7 @@ fn scatter_batch(
     pool: &mut SlotPool,
     metrics: &mut SchedulerMetrics,
     batch: Vec<EvalGroup>,
-    evaluations: Vec<(f64, Vec<f64>)>,
+    evaluations: Vec<LeafOut>,
 ) -> PyResult<()> {
     let mut cursor = 0;
     for group in batch {

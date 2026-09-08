@@ -118,6 +118,20 @@ class MoveRecord:
     """Improved (completed-Q) policy from Gumbel search — the preferred
     training target; visits are kept as raw search evidence for reanalyze."""
     root_value: float | None = None
+    #: W4: search's own seven-way winner x victory-type distribution for this
+    #: position, actor-relative, in `dataset.JOINT7_CLASSES` order.
+    #:
+    #: The same relationship to `joint7` that `root_value` has to the outcome
+    #: label, and for a sharper reason. Victory TYPE is more game-constant than
+    #: win/loss: every row of a game that ended scientifically carries
+    #: `my_scientific`, including move-3 positions where science was one of
+    #: three live possibilities and not the likeliest. There the label is not
+    #: merely uninformative, it is wrong about that position.
+    #:
+    #: `None` for bot moves, for cheap searches that record none, and for every
+    #: checkpoint without W4's head. Recorded, not yet consumed: the loss that
+    #: trains against it is offline work against buffers this produces.
+    root_outlook: list[float] | None = None
     sims: int = 0
     mode: str = "simulator"
     gumbel_topk: tuple[int, ...] | None = None
@@ -549,6 +563,7 @@ class GameRecorder:
         visits: dict[int, int] | None = None,
         policy_target: dict[int, float] | None = None,
         root_value: float | None = None,
+        root_outlook: list[float] | None = None,
         sims: int = 0,
         mode: str = "simulator",
         gumbel_topk: tuple[int, ...] | None = None,
@@ -569,6 +584,7 @@ class GameRecorder:
             visits=dict(visits) if visits is not None else {},
             policy_target=dict(policy_target) if policy_target is not None else None,
             root_value=root_value,
+            root_outlook=list(root_outlook) if root_outlook is not None else None,
             sims=sims,
             mode=mode,
             gumbel_topk=gumbel_topk,
@@ -732,6 +748,11 @@ def to_json_line(record: GameRecord) -> str:
                     else None
                 ),
                 "root_value": move.root_value,
+                "root_outlook": (
+                    list(move.root_outlook)
+                    if move.root_outlook is not None
+                    else None
+                ),
                 "sims": move.sims,
                 "mode": move.mode,
                 "gumbel_topk": list(move.gumbel_topk)
@@ -791,6 +812,9 @@ def from_json_line(line: str) -> GameRecord:
                     else None
                 ),
                 root_value=move["root_value"],
+                # `.get`, not `[...]`: every buffer written before W4 lacks the
+                # key, and those files stay readable.
+                root_outlook=move.get("root_outlook"),
                 sims=move["sims"],
                 mode=move["mode"],
                 gumbel_topk=tuple(move["gumbel_topk"])

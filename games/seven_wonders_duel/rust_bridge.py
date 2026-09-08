@@ -510,6 +510,14 @@ class _RustFlatBatchAdapter:
         # adapters cannot disagree about which head the search value came from.
         wdl = self.evaluator.wdl_tensor(outputs)
         value_actor = wdl[:, 0] - wdl[:, 2]
+        # W4: the leaf outlook, when the served net has the head. Rust accepts
+        # rows with or without it, so a net without one simply sends the old
+        # two-element shape. Probabilities, so `exp` -- never a second softmax.
+        outlook_rows = (
+            outputs["hier_joint7"].float().exp()
+            if "hier_joint7" in outputs
+            else None
+        )
         self._end_event("gather", gather_event)
         self._sync()
         gather_seconds = time.perf_counter() - gather_start
@@ -537,21 +545,33 @@ class _RustFlatBatchAdapter:
         legal_counts = legal_lengths.tolist()
         result = []
         offset = 0
+        # One `tolist()` for the whole batch, like the values and policies: a
+        # per-row conversion would reintroduce exactly the per-row Python that
+        # cost W5a 51% of its throughput.
+        outlooks = None if outlook_rows is None else outlook_rows.cpu().tolist()
         if self.vectorized_gather:
             # `tolist()` converts in one C call; indexing element by element cost
             # a Python `float()` per legal action, millions of them per run.
             values = value_cpu.tolist()
             policies = policy_cpu.tolist()
             for row, count in enumerate(legal_counts):
-                result.append((values[row], policies[offset : offset + count]))
+                policy = policies[offset : offset + count]
+                result.append(
+                    (values[row], policy)
+                    if outlooks is None
+                    else (values[row], policy, outlooks[row])
+                )
                 offset += count
         else:
             for row, count in enumerate(legal_counts):
+                row_result = (
+                    float(value_cpu[row]),
+                    [float(value) for value in policy_cpu[offset : offset + count]],
+                )
                 result.append(
-                    (
-                        float(value_cpu[row]),
-                        [float(value) for value in policy_cpu[offset : offset + count]],
-                    )
+                    row_result
+                    if outlooks is None
+                    else (*row_result, outlooks[row])
                 )
                 offset += count
 
@@ -964,6 +984,13 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
                 root_value=(
                     float(row["root_value"])
                     if row["root_value"] is not None
+                    else None
+                ),
+                # `.get`: a Rust build predating W4 sends no such key, and a
+                # buffer written by one stays readable.
+                root_outlook=(
+                    [float(x) for x in row["root_outlook"]]
+                    if row.get("root_outlook") is not None
                     else None
                 ),
                 sims=int(row["sims"]),

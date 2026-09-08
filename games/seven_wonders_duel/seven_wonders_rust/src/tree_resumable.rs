@@ -10,7 +10,7 @@
 
 use crate::chance::{self, ChanceKind, ChanceSpec};
 use crate::codec::{decode_action, legal_action_indices};
-use crate::eval::{terminal_value_p0, Eval};
+use crate::eval::{terminal_value_p0, Eval, LeafOut, Outlook};
 use crate::rng::Rng;
 use crate::state::{GameState, Phase};
 use crate::tree::{SearchConfig, SearchResult};
@@ -855,6 +855,11 @@ enum PendingEvaluation {
 /// schedule/RNG order, WU incomplete counts influence only deeper PUCT, and a
 /// leaf wave is always drained before a halving-round reduction.
 pub struct SearchSession {
+    /// W4 accumulation, at the ROOT only -- see `tree::SearchResult::root_outlook`.
+    /// Player-0 terms, summed once per SIMULATION so it is weighted exactly as
+    /// the scalar value is.
+    outlook_sum: Outlook,
+    outlook_visits: u32,
     arena: Arena,
     /// Root priors as the network gave them, before Dirichlet noise.
     clean_priors: Vec<f64>,
@@ -924,7 +929,17 @@ fn settle_terminal_forced(
 }
 
 impl SearchSession {
-    fn new(mut arena: Arena, cfg: &SearchConfig, leaf_batch: usize, forced_nodes: Vec<NodeId>) -> Self {
+    fn new(
+        mut arena: Arena,
+        cfg: &SearchConfig,
+        leaf_batch: usize,
+        forced_nodes: Vec<NodeId>,
+        // The ROOT's own expansion, which `arena` has already counted into
+        // `visits` and `value_sum_p0`. The outlook mean has to include it too,
+        // or the two means are over different sets of leaves and the panel's
+        // seven-way split silently stops summing to search's own value.
+        root_outlook: Option<Outlook>,
+    ) -> Self {
         let mut settled = 0;
         let forced_nodes = settle_terminal_forced(&mut arena, forced_nodes, &mut settled);
         let root = &arena.nodes[arena.root_id];
@@ -986,6 +1001,8 @@ impl SearchSession {
         let rounds_total = ((candidates.len().max(2) as f64).log2().ceil() as usize).max(1);
         let per_action = (cfg.sims / (rounds_total * candidates.len())).max(1);
         Self {
+            outlook_sum: root_outlook.unwrap_or([0.0; 7]),
+            outlook_visits: u32::from(root_outlook.is_some()),
             arena,
             clean_priors,
             cfg: SearchConfig {
@@ -1619,7 +1636,7 @@ impl SearchSession {
     pub fn apply_evaluations(
         &mut self,
         request_id: u64,
-        evaluations: Vec<(f64, Vec<f64>)>,
+        evaluations: Vec<LeafOut>,
     ) -> PyResult<()> {
         let Some(pending) = self.waiting.take() else {
             return Err(PyRuntimeError::new_err(
@@ -1638,7 +1655,8 @@ impl SearchSession {
                     node_ids.len()
                 )));
             }
-            for (&node_id, (value_p0, priors)) in node_ids.iter().zip(evaluations) {
+            for (&node_id, leaf) in node_ids.iter().zip(evaluations) {
+                let (value_p0, priors) = (leaf.value_p0, leaf.priors);
                 if priors.len() != self.arena.nodes[node_id].legal.len() {
                     return Err(PyValueError::new_err(format!(
                         "forced child {node_id} returned {} priors for {} legal actions",
@@ -1665,7 +1683,8 @@ impl SearchSession {
                 wave.unique_leaf_ids.len()
             )));
         }
-        for (&leaf_id, (_, priors)) in wave.unique_leaf_ids.iter().zip(&evaluations) {
+        for (&leaf_id, leaf) in wave.unique_leaf_ids.iter().zip(&evaluations) {
+            let priors = &leaf.priors;
             if let Err(err) = expand(&mut self.arena, leaf_id, priors.clone()) {
                 self.clear_wave(&mut wave);
                 return Err(err);
@@ -1674,17 +1693,35 @@ impl SearchSession {
         for mut pending in wave.simulations {
             // Members that carry their own value never asked for a row; taking
             // it from `unique_leaf_ids` would mis-align every later member.
-            let value_p0 = match pending.immediate_value {
-                Some(value) => value,
+            let (value_p0, outlook) = match pending.immediate_value {
+                // A member that carried its own value is a terminal or already
+                // known node; a terminal one knows its victory type EXACTLY,
+                // which is the part of a backed-up distribution with no model
+                // error in it at all.
+                Some(value) => {
+                    let node = &self.arena.nodes[pending.leaf_id];
+                    let outlook = if node.terminal {
+                        Some(crate::eval::terminal_outlook_p0(&node.state))
+                    } else {
+                        None
+                    };
+                    (value, outlook)
+                }
                 None => {
                     let row = wave
                         .unique_leaf_ids
                         .iter()
                         .position(|&leaf_id| leaf_id == pending.leaf_id)
                         .expect("pending leaf must have an evaluation row");
-                    evaluations[row].0
+                    (evaluations[row].value_p0, evaluations[row].outlook_p0)
                 }
             };
+            if let Some(o) = outlook {
+                for k in 0..7 {
+                    self.outlook_sum[k] += o[k];
+                }
+                self.outlook_visits += 1;
+            }
             clear_incomplete(&mut self.arena, &mut pending);
             let root_edge = pending.root_edge;
             backup(&mut self.arena, pending, value_p0);
@@ -1741,6 +1778,11 @@ impl SearchSession {
         } else {
             None
         };
+        let root_outlook = crate::tree::session_root_outlook(
+            self.outlook_sum,
+            self.outlook_visits,
+            self.arena.nodes[self.arena.root_id].actor,
+        );
         let result = SearchResult {
             action_index: self.legal[best],
             action_value: completed[best],
@@ -1753,6 +1795,7 @@ impl SearchSession {
             prior: crate::tree::root_prior_from(self.clean_priors.iter().copied()),
             gumbel_topk: Vec::new(),
             sims: self.sims_completed,
+            root_outlook,
         };
         Ok((result, self.arena, self.metrics))
     }
@@ -1790,6 +1833,11 @@ impl SearchSession {
         let root_value = self.sign * self.arena.nodes[self.arena.root_id].value_p0();
         let root_completed_q = (0..self.legal.len()).map(|j| self.completed_q(j)).collect();
         self.metrics.root_completed_q = root_completed_q;
+        let root_outlook = crate::tree::session_root_outlook(
+            self.outlook_sum,
+            self.outlook_visits,
+            self.arena.nodes[self.arena.root_id].actor,
+        );
         let result = SearchResult {
             action_index: self.legal[best],
             action_value: self.completed_q(best),
@@ -1807,6 +1855,7 @@ impl SearchSession {
             ),
             gumbel_topk: self.topk,
             sims: self.sims_completed,
+            root_outlook,
         };
         Ok((result, self.arena, self.metrics))
     }
@@ -1820,7 +1869,7 @@ pub fn begin_search_from_root(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
 ) -> PyResult<SearchSession> {
     begin_search_from_root_inner(state, cfg, leaf_batch, root_evaluation, false)
 }
@@ -1845,7 +1894,7 @@ pub fn begin_search_from_root_virtual_loss(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
 ) -> PyResult<SearchSession> {
     begin_search_from_root_inner(state, cfg, leaf_batch, root_evaluation, true)
 }
@@ -1854,7 +1903,7 @@ fn begin_search_from_root_inner(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
     allow_virtual_loss_root: bool,
 ) -> PyResult<SearchSession> {
     if cfg.sims < 1 || cfg.top_k < 1 || leaf_batch < 1 {
@@ -1882,11 +1931,12 @@ fn begin_search_from_root_inner(
     }
     let mut arena = Arena::new(root);
     let root_id = arena.root_id;
-    let (root_value_p0, root_priors) = root_evaluation;
+    let root_outlook = root_evaluation.outlook_p0;
+    let (root_value_p0, root_priors) = (root_evaluation.value_p0, root_evaluation.priors);
     expand(&mut arena, root_id, root_priors)?;
     arena.nodes[root_id].visits += 1;
     arena.nodes[root_id].value_sum_p0 += root_value_p0;
-    Ok(SearchSession::new(arena, cfg, leaf_batch, Vec::new()))
+    Ok(SearchSession::new(arena, cfg, leaf_batch, Vec::new(), root_outlook))
 }
 
 /// F4-R1 force-enabled scheduler boundary. Forced children are materialized
@@ -1895,7 +1945,7 @@ pub fn begin_search_from_root_forced(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
 ) -> PyResult<SearchSession> {
     begin_search_from_root_forced_inner(state, cfg, leaf_batch, root_evaluation, false)
 }
@@ -1911,7 +1961,7 @@ pub fn begin_search_from_root_forced_virtual_loss(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
 ) -> PyResult<SearchSession> {
     begin_search_from_root_forced_inner(state, cfg, leaf_batch, root_evaluation, true)
 }
@@ -1920,7 +1970,7 @@ fn begin_search_from_root_forced_inner(
     state: &GameState,
     cfg: &SearchConfig,
     leaf_batch: usize,
-    root_evaluation: (f64, Vec<f64>),
+    root_evaluation: LeafOut,
     allow_virtual_loss_root: bool,
 ) -> PyResult<SearchSession> {
     let force = cfg.force_expand_root_chance;
@@ -1984,7 +2034,9 @@ pub fn search_closed_batched<E: Eval>(
     }
     let mut arena = Arena::new(root);
     let root_id = arena.root_id;
-    let (root_value_p0, root_priors) = eval.evaluate(&arena.nodes[root_id].state)?;
+    let root_leaf = eval.evaluate(&arena.nodes[root_id].state)?;
+    let root_outlook = root_leaf.outlook_p0;
+    let (root_value_p0, root_priors) = (root_leaf.value_p0, root_leaf.priors);
     expand(&mut arena, root_id, root_priors)?;
     arena.nodes[root_id].visits += 1;
     arena.nodes[root_id].value_sum_p0 += root_value_p0;
@@ -2000,7 +2052,8 @@ pub fn search_closed_batched<E: Eval>(
     } else {
         ForcedRows::default()
     };
-    let mut session = SearchSession::new(arena, cfg, leaf_batch, forced_nodes.nodes);
+    let mut session =
+        SearchSession::new(arena, cfg, leaf_batch, forced_nodes.nodes, root_outlook);
     session.metrics.forced_rows_by_kind = forced_nodes.by_kind;
     session.metrics.fixed_support_edges = forced_nodes.fixed_support_edges;
     loop {

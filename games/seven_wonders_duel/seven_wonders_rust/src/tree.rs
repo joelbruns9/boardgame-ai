@@ -10,7 +10,7 @@
 
 use crate::chance::{self, ChanceSpec};
 use crate::codec::{decode_action, legal_action_indices};
-use crate::eval::{terminal_value_p0, Eval};
+use crate::eval::{terminal_value_p0, Eval, Outlook};
 use crate::rng::Rng;
 use crate::state::{GameState, Phase};
 use pyo3::exceptions::PyValueError;
@@ -120,8 +120,17 @@ impl Node {
         }
     }
 
-    fn expand<E: Eval>(&mut self, eval: &E) -> PyResult<f64> {
-        let (value_p0, priors) = eval.evaluate(&self.state)?;
+    /// Expand and return the leaf's evaluation.
+    ///
+    /// The OUTLOOK travels back with the value rather than being stored: W4's
+    /// seven-way vector is accumulated at the root only (see `search_closed`),
+    /// because that is the only place anything reads it -- the advisor shows
+    /// root moves and every training row is a search root. Storing it per node
+    /// would multiply the resumable tree's footprint for nothing.
+    fn expand<E: Eval>(&mut self, eval: &E) -> PyResult<(f64, Option<Outlook>)> {
+        let leaf = eval.evaluate(&self.state)?;
+        let (value_p0, priors) = (leaf.value_p0, leaf.priors);
+        let leaf_outlook = leaf.outlook_p0;
         if !self.terminal {
             self.edges = self
                 .legal
@@ -143,7 +152,7 @@ impl Node {
                 })
                 .collect();
         }
-        Ok(value_p0)
+        Ok((value_p0, leaf_outlook))
     }
 
     fn select(&self, c_puct: f64) -> usize {
@@ -242,28 +251,36 @@ fn closed_child(node: &mut Node, edge_idx: usize, rng: &mut Rng) -> usize {
 
 /// One simulation from `node` (player-0-relative leaf value). `forced` picks the
 /// edge at this level (used at the root); deeper levels select via PUCT.
+/// One simulation. Returns the LEAF's value and, when the evaluator produced
+/// one, its seven-way outlook -- both in player-0 terms.
+///
+/// The outlook is passed through untouched at every interior node. Only the
+/// caller at the root accumulates it, which is what keeps this free: no node
+/// grows a field, no serialized tree changes shape, and a search whose
+/// evaluator supplies no outlook does exactly what it did before.
 fn descend<E: Eval>(
     node: &mut Node,
     forced: Option<usize>,
     eval: &E,
     rng: &mut Rng,
     c_puct: f64,
-) -> PyResult<f64> {
+) -> PyResult<(f64, Option<Outlook>)> {
     if node.terminal {
         let v = terminal_value_p0(&node.state);
         node.visits += 1;
         node.value_sum_p0 += v;
-        return Ok(v);
+        // Exact, not predicted: a finished game knows how it ended.
+        return Ok((v, Some(crate::eval::terminal_outlook_p0(&node.state))));
     }
     if node.edges.is_empty() {
-        let v = node.expand(eval)?;
+        let (v, outlook) = node.expand(eval)?;
         node.visits += 1;
         node.value_sum_p0 += v;
-        return Ok(v);
+        return Ok((v, outlook));
     }
     let edge_idx = forced.unwrap_or_else(|| node.select(c_puct));
     let child_idx = closed_child(node, edge_idx, rng);
-    let v = {
+    let (v, outlook) = {
         let child = &mut *node.edges[edge_idx].children[child_idx].1.node;
         descend(child, None, eval, rng, c_puct)?
     };
@@ -271,7 +288,7 @@ fn descend<E: Eval>(
     node.edges[edge_idx].value_sum_p0 += v;
     node.visits += 1;
     node.value_sum_p0 += v;
-    Ok(v)
+    Ok((v, outlook))
 }
 
 #[cfg(test)]
@@ -327,7 +344,7 @@ pub fn closed_tree_fixed<E: Eval>(
 ) -> PyResult<Node> {
     let root_state = state.clone();
     let mut root = Node::make(root_state);
-    let v = root.expand(eval)?;
+    let (v, _) = root.expand(eval)?;
     root.visits += 1;
     root.value_sum_p0 += v;
     let mut rng = Rng::new(seed);
@@ -445,6 +462,46 @@ pub struct SearchResult {
     pub prior: Vec<f64>,
     pub gumbel_topk: Vec<usize>, // action indices
     pub sims: usize,
+    /// W4: search's own seven-way winner x victory-type distribution for this
+    /// ROOT, in the root actor's terms, or `None` when the evaluator supplied
+    /// no outlook.
+    ///
+    /// The visit-weighted mean over every leaf the search reached -- exact at
+    /// the terminals it proved, the net's estimate elsewhere. It is a strictly
+    /// better victory-type label than the game's eventual result: every row of
+    /// a game that ended scientifically carries `my_scientific` today, move 3
+    /// included, where science was one of three live possibilities and not the
+    /// likeliest.
+    ///
+    /// It cannot change move selection and is not meant to. `P(win) - P(loss)`
+    /// is LINEAR in these seven numbers, so averaging the vector and then
+    /// collapsing is identical to collapsing at each leaf and averaging -- the
+    /// scalar backup already computes it. This exists to be RECORDED.
+    pub root_outlook: Option<[f64; 7]>,
+}
+
+/// Actor-relative view of a player-0 outlook. Its own inverse.
+fn outlook_for_actor(outlook: Outlook, actor: usize) -> Outlook {
+    crate::eval::outlook_to_p0(outlook, actor)
+}
+
+/// The resumable tree's accumulation, finished the same way `search_closed`
+/// finishes its own: mean over contributing simulations, then back into the
+/// root actor's terms.
+pub fn session_root_outlook(sum: Outlook, count: u32, actor: usize) -> Option<Outlook> {
+    mean_outlook(sum, count).map(|o| outlook_for_actor(o, actor))
+}
+
+/// Visit-weighted mean, or `None` when nothing contributed one.
+fn mean_outlook(sum: Outlook, count: u32) -> Option<Outlook> {
+    if count == 0 {
+        return None;
+    }
+    let mut out = sum;
+    for value in out.iter_mut() {
+        *value /= count as f64;
+    }
+    Some(out)
 }
 
 /// Gumbel-AlphaZero sigma over MIN-MAX NORMALISED completed Q values.
@@ -503,7 +560,7 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E, cfg: &SearchConfig) -> 
                 .apply_with_chance(&action, &outcomes)
                 .expect("enumerated outcome must be valid");
             let mut child_node = Node::make(child_state);
-            let (value_p0, _) = eval.evaluate(&child_node.state)?;
+            let value_p0 = eval.evaluate(&child_node.state)?.value_p0;
             child_node.visits = 1;
             child_node.value_sum_p0 = value_p0;
             edge.children.push((
@@ -600,9 +657,19 @@ fn puct_root<E: Eval>(
     // policy-target fallback below uses the same clean copy.
     let clean_priors: Vec<f64> = root.edges.iter().map(|e| e.prior).collect();
     add_dirichlet_noise(&mut root, cfg, &mut rng);
+    // W4 accumulation. At the root only: nothing reads an interior node's
+    // outlook, and a per-node field would grow every serialized tree.
+    let mut outlook_sum: Outlook = [0.0; 7];
+    let mut outlook_visits: u32 = 0;
     for _ in 0..cfg.sims {
         let forced = forced_playout_edge(&root, cfg);
-        descend(&mut root, forced, eval, &mut rng, cfg.c_puct)?;
+        let (_, outlook) = descend(&mut root, forced, eval, &mut rng, cfg.c_puct)?;
+        if let Some(o) = outlook {
+            for k in 0..7 {
+                outlook_sum[k] += o[k];
+            }
+            outlook_visits += 1;
+        }
     }
     let visits: Vec<u32> = root.edges.iter().map(|e| e.visits).collect();
     let completed: Vec<f64> = root
@@ -667,6 +734,11 @@ fn puct_root<E: Eval>(
         // claim a candidate set that never happened.
         gumbel_topk: Vec::new(),
         sims: cfg.sims,
+        // Reported in the ROOT ACTOR's terms, matching every other value in
+        // this struct; the accumulation is in player-0 terms so leaves with
+        // different actors are summing the same question.
+        root_outlook: mean_outlook(outlook_sum, outlook_visits)
+            .map(|o| outlook_for_actor(o, root.actor)),
     };
     Ok((result, root))
 }
@@ -688,9 +760,19 @@ pub fn search_closed<E: Eval>(
             "cannot search a terminal or action-less root",
         ));
     }
-    let root_value_p0 = root.expand(eval)?;
+    let (root_value_p0, root_leaf_outlook) = root.expand(eval)?;
     root.visits += 1;
     root.value_sum_p0 += root_value_p0;
+    // W4 accumulation, at the ROOT only: nothing reads an interior node's
+    // outlook, and a per-node field would grow every serialized tree for it.
+    let mut outlook_sum: Outlook = [0.0; 7];
+    let mut outlook_visits: u32 = 0;
+    if let Some(o) = root_leaf_outlook {
+        for k in 0..7 {
+            outlook_sum[k] += o[k];
+        }
+        outlook_visits += 1;
+    }
     if cfg.force_expand_root_chance {
         force_expand_root(&mut root, eval, cfg)?;
     }
@@ -751,7 +833,13 @@ pub fn search_closed<E: Eval>(
                 if sims_used >= budget {
                     break 'outer;
                 }
-                descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct)?;
+                let (_, outlook) = descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct)?;
+                if let Some(o) = outlook {
+                    for k in 0..7 {
+                        outlook_sum[k] += o[k];
+                    }
+                    outlook_visits += 1;
+                }
                 q_hat[j] = Some(sign * root.edges[j].q_p0());
                 visits[j] = root.edges[j].visits;
                 sims_used += 1;
@@ -807,6 +895,8 @@ pub fn search_closed<E: Eval>(
         prior: root_prior_from(root.edges.iter().map(|e| e.prior)),
         gumbel_topk: topk,
         sims: sims_used,
+        root_outlook: mean_outlook(outlook_sum, outlook_visits)
+            .map(|o| outlook_for_actor(o, root.actor)),
     };
     Ok((result, root))
 }

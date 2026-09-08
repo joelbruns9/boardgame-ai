@@ -133,6 +133,7 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
             },
         )?;
         item.set_item("sims", row.sims)?;
+        item.set_item("root_outlook", row.root_outlook.clone())?;
         item.set_item("mode", if row.is_bot { "bot" } else { "closed" })?;
         item.set_item(
             "gumbel_topk",
@@ -1805,6 +1806,13 @@ fn search_result_to_py(
     out.set_item("policy", result.policy_target)?;
     out.set_item("topk", result.gumbel_topk)?;
     out.set_item("sims", result.sims)?;
+    // W4: search's own seven-way outlook for this root, or None when the
+    // evaluator supplied none. Recorded, never used for selection -- see
+    // `SearchResult::root_outlook`.
+    out.set_item(
+        "root_outlook",
+        result.root_outlook.map(|o| o.to_vec()),
+    )?;
     out.set_item("completed_q", metrics.root_completed_q)?;
     out.set_item("survivors", metrics.halving_survivors.clone())?;
     out.set_item("digest", digest)?;

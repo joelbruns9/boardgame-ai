@@ -29,14 +29,61 @@ fn checked_bytearray<'py>(py: Python<'py>, src: &[u8]) -> PyResult<Bound<'py, Py
 /// Terminal states return the game value and empty priors. Fallible so a real
 /// evaluator can surface operational errors (CUDA OOM, a bad checkpoint, a
 /// contract violation) as a `PyErr` through the search rather than panicking.
+/// W4: the seven-way winner x victory-type distribution for one leaf,
+/// canonicalised to player 0 exactly as `value_p0` is.
+///
+/// Class order is `dataset.JOINT7_CLASSES`: p0 civil/science/military, then
+/// p1's three, then draw. Canonicalising means SWAPPING the two triples when
+/// the evaluated actor is player 1 -- the same operation as negating the
+/// scalar, and for the same reason: sums taken across leaves with different
+/// actors are otherwise adding two different questions together.
+pub type Outlook = [f64; 7];
+
+/// Actor-relative to player-0 terms. The draw class is its own mirror.
+pub fn outlook_to_p0(outlook: Outlook, actor: usize) -> Outlook {
+    if actor == 0 {
+        return outlook;
+    }
+    [
+        outlook[3], outlook[4], outlook[5],
+        outlook[0], outlook[1], outlook[2],
+        outlook[6],
+    ]
+}
+
+/// One leaf's evaluation.
+///
+/// `outlook_p0` is `None` for every evaluator that does not produce one --
+/// mock evaluators, the solver's boundary, and any net without W4's head -- so
+/// carrying it costs nothing where it does not exist.
+#[derive(Clone, Debug)]
+pub struct LeafOut {
+    pub value_p0: f64,
+    pub priors: Vec<f64>,
+    pub outlook_p0: Option<Outlook>,
+}
+
+impl LeafOut {
+    /// The historical `(value, priors)` shape, with no outlook.
+    pub fn scalar(value_p0: f64, priors: Vec<f64>) -> Self {
+        Self { value_p0, priors, outlook_p0: None }
+    }
+}
+
+impl From<(f64, Vec<f64>)> for LeafOut {
+    fn from(pair: (f64, Vec<f64>)) -> Self {
+        LeafOut::scalar(pair.0, pair.1)
+    }
+}
+
 pub trait Eval {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)>;
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut>;
 
     /// F4.2 local batching boundary. Implementations may override this with a
     /// true vectorized evaluator; the default preserves alignment and error
     /// propagation by evaluating the supplied states in order. F4.4/F4.5 replace
     /// `PyEval`'s scalar fallback with the global Torch bridge.
-    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<LeafOut>> {
         states.iter().map(|state| self.evaluate(state)).collect()
     }
 
@@ -48,7 +95,7 @@ pub trait Eval {
         states: &[&GameState],
         actors: &[usize],
         legals: &[Vec<usize>],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         if states.len() != actors.len() || states.len() != legals.len() {
             return Err(PyValueError::new_err(
                 "prepared evaluator metadata is not row-aligned",
@@ -79,7 +126,7 @@ pub trait Eval {
         actors: &[usize],
         legals: &[Vec<usize>],
         net_ids: &[u8],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         // Empty means "one network for every row" -- the ordinary self-play
         // case, which the scheduler signals by sending no ids at all. Only a
         // non-empty, wrongly-sized slice is a caller error.
@@ -90,6 +137,83 @@ pub trait Eval {
         }
         self.evaluate_batch_prepared(states, actors, legals)
     }
+}
+
+/// The EXACT seven-way outlook of a finished game, in player-0 terms.
+///
+/// Ground truth, not an estimate: a terminal state knows both who won and how.
+/// Deep searches reach many terminals, so this is the part of a backed-up
+/// distribution that carries no model error at all -- which matters, because a
+/// searched target is otherwise only as good as the net that produced it.
+///
+/// Mirrors `dataset._joint7_class`: no winner is a draw, and a SHARED civilian
+/// finish is a draw too -- it is the tie-break class, not a civilian win.
+/// One adapter row: the historical `(value, priors)` pair, or that pair plus a
+/// seven-way outlook.
+///
+/// Both shapes are accepted so every existing Python adapter -- and every test
+/// stub -- keeps working untouched. A net without W4's head has nothing to send
+/// and says so by sending the short form, which is not an error.
+type RawRow = (f64, Vec<f64>, Option<Vec<f64>>);
+
+fn extract_rows(out: &Bound<'_, PyAny>) -> PyResult<Vec<RawRow>> {
+    if let Ok(rows) = out.extract::<Vec<RawRow>>() {
+        return Ok(rows);
+    }
+    let short: Vec<(f64, Vec<f64>)> = out.extract()?;
+    Ok(short
+        .into_iter()
+        .map(|(value, priors)| (value, priors, None))
+        .collect())
+}
+
+/// Validate and canonicalise one adapter-supplied outlook.
+fn adapter_outlook(row: usize, raw: Option<Vec<f64>>, actor: usize) -> PyResult<Option<Outlook>> {
+    let Some(values) = raw else { return Ok(None) };
+    if values.len() != 7 {
+        return Err(PyValueError::new_err(format!(
+            "net row {row} returned {} outlook classes, expected 7",
+            values.len()
+        )));
+    }
+    let mut outlook = [0.0f64; 7];
+    let mut mass = 0.0;
+    for (k, &value) in values.iter().enumerate() {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "net row {row} returned a non-finite or negative outlook class"
+            )));
+        }
+        outlook[k] = value;
+        mass += value;
+    }
+    // A distribution, not logits. Loud, because a caller that sent logits would
+    // otherwise poison every backed-up sum with plausible-looking numbers.
+    if (mass - 1.0).abs() > 1e-3 {
+        return Err(PyValueError::new_err(format!(
+            "net row {row} returned an outlook summing to {mass}, not 1"
+        )));
+    }
+    Ok(Some(outlook_to_p0(outlook, actor)))
+}
+
+pub fn terminal_outlook_p0(state: &GameState) -> Outlook {
+    let mut out = [0.0; 7];
+    let offset = match state.victory_type {
+        Some(crate::state::VictoryType::Civilian) => 0,
+        Some(crate::state::VictoryType::Scientific) => 1,
+        Some(crate::state::VictoryType::Military) => 2,
+        _ => {
+            out[6] = 1.0;
+            return out;
+        }
+    };
+    match state.winner {
+        Some(0) => out[offset] = 1.0,
+        Some(_) => out[3 + offset] = 1.0,
+        None => out[6] = 1.0,
+    }
+    out
 }
 
 pub fn terminal_value_p0(state: &GameState) -> f64 {
@@ -151,8 +275,8 @@ impl MockEval {
 }
 
 impl Eval for MockEval {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
-        Ok(MockEval::eval_state(state))
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
+        Ok(MockEval::eval_state(state).into())
     }
 }
 
@@ -173,9 +297,13 @@ impl PyEval {
 }
 
 impl Eval for PyEval {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
         if state.phase == Phase::Complete {
-            return Ok((terminal_value_p0(state), Vec::new()));
+            return Ok(LeafOut {
+                value_p0: terminal_value_p0(state),
+                priors: Vec::new(),
+                outlook_p0: Some(terminal_outlook_p0(state)),
+            });
         }
         let actor = crate::tree::state_actor(state);
         let tokens: Vec<(usize, i32, i32, Vec<f64>)> = crate::encoder::encode(state)
@@ -215,7 +343,7 @@ impl Eval for PyEval {
             } else {
                 -value_actor
             };
-            Ok((value_p0, priors))
+            Ok(LeafOut::scalar(value_p0, priors))
         })
     }
 }
@@ -235,12 +363,12 @@ impl PyBatchEval {
 }
 
 impl Eval for PyBatchEval {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
         let mut rows = self.evaluate_batch(&[state])?;
         Ok(rows.remove(0))
     }
 
-    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<LeafOut>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
@@ -262,7 +390,7 @@ impl Eval for PyBatchEval {
             .collect();
         Python::attach(|py| {
             let out = self.adapter.bind(py).call1((rows,))?;
-            let raw: Vec<(f64, Vec<f64>)> = out.extract()?;
+            let raw = extract_rows(&out)?;
             if raw.len() != states.len() {
                 return Err(PyValueError::new_err(format!(
                     "batch net returned {} rows for {} states",
@@ -272,14 +400,18 @@ impl Eval for PyBatchEval {
             }
             raw.into_iter()
                 .enumerate()
-                .map(|(row, (value_actor, priors))| {
+                .map(|(row, (value_actor, priors, raw_outlook))| {
                     if states[row].phase == Phase::Complete {
                         if !priors.is_empty() {
                             return Err(PyValueError::new_err(format!(
                                 "batch net terminal row {row} returned policy priors"
                             )));
                         }
-                        return Ok((terminal_value_p0(states[row]), Vec::new()));
+                        return Ok(LeafOut {
+                            value_p0: terminal_value_p0(states[row]),
+                            priors: Vec::new(),
+                            outlook_p0: Some(terminal_outlook_p0(states[row])),
+                        });
                     }
                     if !value_actor.is_finite() {
                         return Err(PyValueError::new_err(format!(
@@ -312,7 +444,11 @@ impl Eval for PyBatchEval {
                     } else {
                         -value_actor
                     };
-                    Ok((value_p0, priors))
+                    Ok(LeafOut {
+                        value_p0,
+                        priors,
+                        outlook_p0: adapter_outlook(row, raw_outlook, actors[row])?,
+                    })
                 })
                 .collect()
         })
@@ -630,12 +766,12 @@ impl PyFlatBatchEval {
 }
 
 impl Eval for PyFlatBatchEval {
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
         let mut rows = self.evaluate_batch(&[state])?;
         Ok(rows.remove(0))
     }
 
-    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<LeafOut>> {
         let actors: Vec<_> = states
             .iter()
             .map(|state| crate::tree::state_actor(state))
@@ -652,7 +788,7 @@ impl Eval for PyFlatBatchEval {
         states: &[&GameState],
         actors: &[usize],
         legals: &[Vec<usize>],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         self.evaluate_batch_prepared_routed(states, actors, legals, &[])
     }
 
@@ -662,7 +798,7 @@ impl Eval for PyFlatBatchEval {
         actors: &[usize],
         legals: &[Vec<usize>],
         net_ids: &[u8],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
@@ -726,7 +862,7 @@ impl Eval for PyFlatBatchEval {
             let out = self.adapter.bind(py).call1((payload,))?;
             let call_ns = call_start.elapsed().as_nanos() as u64;
             let extract_start = Instant::now();
-            let raw: Vec<(f64, Vec<f64>)> = out.extract()?;
+            let raw = extract_rows(&out)?;
             let extract_ns = extract_start.elapsed().as_nanos() as u64;
             Ok::<_, PyErr>((raw, call_ns, extract_ns, attach_ns, payload_ns))
         })?;
@@ -740,14 +876,18 @@ impl Eval for PyFlatBatchEval {
         }
         let validate_start = Instant::now();
         let mut validated = Vec::with_capacity(raw.len());
-        for (row, (value_actor, priors)) in raw.into_iter().enumerate() {
+        for (row, (value_actor, priors, raw_outlook)) in raw.into_iter().enumerate() {
             if states[row].phase == Phase::Complete {
                 if !priors.is_empty() {
                     return Err(PyValueError::new_err(format!(
                         "flat net terminal row {row} returned policy priors"
                     )));
                 }
-                validated.push((terminal_value_p0(states[row]), Vec::new()));
+                validated.push(LeafOut {
+                    value_p0: terminal_value_p0(states[row]),
+                    priors: Vec::new(),
+                    outlook_p0: Some(terminal_outlook_p0(states[row])),
+                });
                 continue;
             }
             if !value_actor.is_finite() || priors.len() != legal_counts[row] {
@@ -761,14 +901,15 @@ impl Eval for PyFlatBatchEval {
                     "flat net row {row} returned an invalid policy"
                 )));
             }
-            validated.push((
-                if actors[row] == 0 {
+            validated.push(LeafOut {
+                value_p0: if actors[row] == 0 {
                     value_actor
                 } else {
                     -value_actor
                 },
                 priors,
-            ));
+                outlook_p0: adapter_outlook(row, raw_outlook, actors[row])?,
+            });
         }
         let validate_ns = validate_start.elapsed().as_nanos() as u64;
         let metrics_start = Instant::now();
@@ -798,7 +939,7 @@ impl Eval for PyFlatBatchEval {
     }
 }
 
-type WorkerResponse = PyResult<Vec<(f64, Vec<f64>)>>;
+type WorkerResponse = PyResult<Vec<LeafOut>>;
 struct WorkerRequest {
     states: Vec<GameState>,
     actors: Vec<usize>,
@@ -1034,7 +1175,7 @@ impl Eval for EvalWorker {
         actors: &[usize],
         legals: &[Vec<usize>],
         net_ids: &[u8],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         let ticket = self.submit_prepared_routed(
             states.iter().map(|state| (*state).clone()).collect(),
             actors.to_vec(),
@@ -1044,12 +1185,12 @@ impl Eval for EvalWorker {
         ticket.wait()
     }
 
-    fn evaluate(&self, state: &GameState) -> PyResult<(f64, Vec<f64>)> {
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
         let mut rows = self.evaluate_batch(&[state])?;
         Ok(rows.remove(0))
     }
 
-    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    fn evaluate_batch(&self, states: &[&GameState]) -> PyResult<Vec<LeafOut>> {
         let actors = states
             .iter()
             .map(|state| crate::tree::state_actor(state))
@@ -1066,7 +1207,7 @@ impl Eval for EvalWorker {
         states: &[&GameState],
         actors: &[usize],
         legals: &[Vec<usize>],
-    ) -> PyResult<Vec<(f64, Vec<f64>)>> {
+    ) -> PyResult<Vec<LeafOut>> {
         if states.len() != actors.len() || states.len() != legals.len() {
             return Err(PyValueError::new_err(
                 "worker evaluator metadata is not row-aligned",

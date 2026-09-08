@@ -1098,6 +1098,43 @@ consistently wrong.
 
 ### Distributional MCTS backup
 
+**Status: BUILT 2026-09-07 for RECORDING; no loss consumes it yet.**
+`SearchResult.root_outlook` carries search's own seven-way distribution, it
+reaches `MoveRecord.root_outlook` and `Example.root_outlook`, and the training
+loss that would use it is deliberately left as offline work against the buffers
+this produces.
+
+**Two corrections to the section below, both from building it.**
+
+*The backup cannot change move selection, and never could.* This section says
+"selection continues to use the scalar", framing that as a safety choice. It is
+not a choice: `P(win) - P(loss)` is LINEAR in the seven probabilities, so
+averaging the vector and then collapsing is arithmetically identical to
+collapsing at each leaf and averaging, which is what the scalar backup already
+computes. Carrying six more numbers adds no tactical discrimination to
+selection. The capability is a training-data and display one. (A NON-linear
+selection rule -- penalising lines that carry military-loss mass, say -- would
+extract something the scalar cannot represent, and is unexplored.)
+
+*It is far cheaper than "per-edge sums at every node".* Nothing reads an
+interior node's outlook: the advisor shows root moves, and every training row
+is a search root. So the vector is passed up untouched and accumulated at the
+ROOT only. No node grew a field, no serialized tree changed shape, and the
+resumable tree the streaming advisor depends on kept its footprint.
+
+**Terminals contribute their EXACT victory type.** A finished game knows both
+who won and how, so `terminal_outlook_p0` is ground truth rather than a
+prediction -- the part of a backed-up distribution carrying no model error at
+all, and the answer to the objection that searched targets are only estimates.
+
+**The two arms are coupled, which was not obvious in advance.** The scalar
+backup averages whichever head `value_source` names; the outlook averages W4's.
+Under `flat` those are two different predictions, so search's Q and search's
+seven-way split need not agree -- the flat-head inconsistency reappearing one
+level up. A coherent SEARCHED panel therefore needs `--value-source
+hierarchical`; anything else has to be labelled as two heads talking past each
+other. Pinned in `test_root_outlook.py`.
+
 Treat this as a separate production integration from the hierarchical neural
 head. The current Rust evaluator boundary returns only `(value_p0, priors)`.
 Backing up seven outcomes requires a cross-language API change plus additional
