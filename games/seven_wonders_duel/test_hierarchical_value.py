@@ -375,11 +375,14 @@ def test_the_hierarchical_source_needs_the_head():
         Evaluator(_model(), "cpu", 8, value_source="hierarchical")
 
 
-def test_routed_evaluators_must_agree_on_the_source():
-    """A stitched batch cannot read a different head per row.
+def test_routed_evaluators_may_use_different_heads():
+    """RETRACTED: the first version refused a mixture.
 
-    Taking the first evaluator's silently would report an arm that half the
-    rows never ran.
+    That was true of the merge as written, not of batching, and it blocked the
+    comparison an arena exists for -- a hierarchical candidate against a flat
+    incumbent. Each net's W/D/L is now resolved BEFORE its rows are merged, so
+    the mixture is expressible, and a net without the head contributes rows
+    with no outlook rather than a fabricated uniform one.
     """
 
     from games.seven_wonders_duel.inference import Evaluator
@@ -387,8 +390,151 @@ def test_routed_evaluators_must_agree_on_the_source():
         rust_searcher_routed_flat_batch_adapter,
     )
 
+    hier = Evaluator(
+        _model(hierarchical_value=True),
+        "cpu",
+        8,
+        fuse_embedder=False,
+        value_source="hierarchical",
+    )
+    flat = Evaluator(_model(), "cpu", 8, fuse_embedder=False)
+    adapter = rust_searcher_routed_flat_batch_adapter([hier, flat])
+    assert adapter is not None
+
+
+def test_the_routed_proxy_serves_each_net_its_own_head(batch):
+    """The KeyError finding: the merge filtered W4's outputs away, then asked
+    for them. It now merges finished probabilities, so there is no head left
+    for a downstream reader to pick wrongly."""
+
+    from games.seven_wonders_duel.inference import Evaluator
+    from games.seven_wonders_duel.rust_bridge import (
+        rust_searcher_routed_flat_batch_adapter,
+    )
+
+    hier_model = _model(hierarchical_value=True)
+    hier = Evaluator(
+        hier_model, "cpu", 8, fuse_embedder=False, value_source="hierarchical"
+    )
+    flat = Evaluator(_model(), "cpu", 8, fuse_embedder=False)
+    proxy = rust_searcher_routed_flat_batch_adapter([hier, flat]).evaluator
+
+    routed = dict(batch)
+    rows = batch["type_ids"].shape[0]
+    routed["net_ids"] = torch.zeros(rows, dtype=torch.long)
+    routed["net_ids"][rows // 2 :] = 1
+    with torch.no_grad():
+        outputs = proxy.model(routed)
+
+    # No `value` or `hier_value` survives the merge: both were resolved per net.
+    assert "wdl" in outputs and "value" not in outputs
+    wdl = proxy.wdl_tensor(outputs)
+    assert torch.allclose(wdl.sum(-1), torch.ones(rows), atol=1e-5)
+
+    probabilities, present = proxy.outlook_tensor(outputs)
+    assert probabilities is not None
+    # Only the W4 net's rows have one. The other net predicted nothing, and a
+    # uniform stand-in would put a fabricated observation into a backed-up sum.
+    assert bool(present[0]) and not bool(present[-1])
+
+
+# --- the recipe reaches every boundary it decides ---------------------------
+
+
+def test_an_explicit_attach_survives_a_detached_warm_start(tmp_path):
+    """Finding 4: validation ran BEFORE inheritance, so an explicit
+    `--no-hierarchical-value-detach` passed the check and was then silently
+    reverted -- leaving replacement enabled with a detached head, the exact
+    configuration the check exists to prohibit."""
+
+    from games.seven_wonders_duel import train
+
+    stored = {"hierarchical_value": True, "hierarchical_value_detach": True}
+    args = train.build_arg_parser().parse_args(
+        [
+            "--buffer",
+            "unused.jsonl",
+            "--hierarchical-value",
+            "--no-hierarchical-value-detach",
+            "--hier-value-replaces-joint7",
+        ]
+    )
+    inherited = train.hierarchical_value_from_config(stored)
+    if inherited["hierarchical_value"] and args.hierarchical_value_detach is None:
+        args.hierarchical_value_detach = inherited["hierarchical_value_detach"]
+    train.resolve_hier_value_args(args)
+    assert args.hierarchical_value_detach is False
+    assert args.hier_value_weight == pytest.approx(0.15)
+
+
+def test_an_omitted_flag_inherits_and_still_gets_a_weight(tmp_path):
+    """The second half of finding 4: resuming a W4 checkpoint with no W4 flags
+    inherited the head but resolved its weight to 0, because the default was
+    settled while the head still looked absent."""
+
+    from games.seven_wonders_duel import train
+
+    stored = {"hierarchical_value": True, "hierarchical_value_detach": True}
+    args = train.build_arg_parser().parse_args(["--buffer", "unused.jsonl"])
+    inherited = train.hierarchical_value_from_config(stored)
+    args.hierarchical_value = bool(
+        args.hierarchical_value or inherited["hierarchical_value"]
+    )
+    if inherited["hierarchical_value"] and args.hierarchical_value_detach is None:
+        args.hierarchical_value_detach = inherited["hierarchical_value_detach"]
+    train.resolve_hier_value_args(args)
+    assert args.hierarchical_value is True
+    assert args.hierarchical_value_detach is True
+    assert args.hier_value_weight > 0
+
+
+def test_validation_grades_the_recipe_that_was_trained(batch):
+    """Finding 6: validation selects the early stop and the restored best
+    checkpoint, so grading it under weight 0.15 with replacement off picks the
+    winner of a race nobody ran."""
+
+    import inspect
+
+    from games.seven_wonders_duel import train
+
+    for name in ("train_loop", "train_steps"):
+        source = inspect.getsource(getattr(train, name))
+        evaluate_call = source[source.index("evaluate("):]
+        head = evaluate_call[: evaluate_call.index("row[\"val\"]")]
+        assert "hier_value_weight=hier_value_weight" in head, name
+        assert "hier_value_replaces_joint7=hier_value_replaces_joint7" in head, name
+
+
+def test_an_arena_side_is_played_with_its_own_value_head(tmp_path):
+    """Finding 3: a candidate generated under the hierarchical head and played
+    under the flat one is a different player, and the arena's number is what a
+    promotion decision is made on."""
+
+    from games.seven_wonders_duel import arena
+    from games.seven_wonders_duel.train import make_checkpoint
+
     model = _model(hierarchical_value=True)
-    flat = Evaluator(model, "cpu", 8, fuse_embedder=False)
-    hier = Evaluator(model, "cpu", 8, fuse_embedder=False, value_source="hierarchical")
-    with pytest.raises(ValueError, match="disagree about value_source"):
-        rust_searcher_routed_flat_batch_adapter([flat, hier])
+    checkpoint = make_checkpoint(model, {"d_model": 32, "layers": 2, "heads": 4})
+    checkpoint["config"]["value_source"] = "hierarchical"
+    path = tmp_path / "hier.pt"
+    torch.save(checkpoint, path)
+
+    side = arena.load_side(
+        "candidate", path, device="cpu", precision="fp32", batch_cap=8
+    )
+    assert side.evaluator.value_source == "hierarchical"
+    assert side.architecture["value_source"] == "hierarchical"
+
+
+def test_a_checkpoint_cannot_ask_for_a_head_it_lacks(tmp_path):
+    from games.seven_wonders_duel import arena
+    from games.seven_wonders_duel.train import make_checkpoint
+
+    checkpoint = make_checkpoint(_model(), {"d_model": 32, "layers": 2, "heads": 4})
+    checkpoint["config"]["value_source"] = "hierarchical"
+    path = tmp_path / "broken.pt"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match="records"):
+        arena.load_side(
+            "candidate", path, device="cpu", precision="fp32", batch_cap=8
+        )

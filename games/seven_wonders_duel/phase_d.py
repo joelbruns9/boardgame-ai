@@ -1891,6 +1891,39 @@ def generate_seed_buffer(
 _PROCESS_STATE: dict[str, Any] = {}
 
 
+def _checkpoint_value_source(path) -> str:
+    """The value head a checkpoint on disk was meant to be played with."""
+
+    import torch
+
+    stored = torch.load(path, map_location="cpu", weights_only=False)
+    config = stored.get("config", {})
+    source = config.get("value_source") or "flat"
+    if source == "hierarchical" and not config.get("hierarchical_value", False):
+        raise ValueError(
+            f"{path} asks for the hierarchical value head but records none"
+        )
+    return source
+
+
+def _spec_value_source(spec) -> str:
+    """The value head a saved agent was meant to be played with.
+
+    Defaults to `flat`, which is what every checkpoint predating W4 used and
+    what a spec that never recorded one means. Read from the SPEC rather than
+    the run config so an arena cannot evaluate an incumbent as a player it is
+    not -- the gate promotes on that number.
+    """
+
+    source = getattr(spec, "value_source", None) or "flat"
+    if source == "hierarchical" and not getattr(spec, "hierarchical_value", False):
+        raise ValueError(
+            "agent spec asks for the hierarchical value head but records no "
+            "such head; it cannot be played as itself"
+        )
+    return source
+
+
 def _hier_value(source) -> dict:
     """The W4 switch and its gradient path, or nothing when the head is off.
 
@@ -3665,6 +3698,7 @@ class PhaseDLoop:
             self.config.device,
             self.config.inference_batch,
             precision=self.config.precision,
+            value_source=self.config.value_source,
         )
         started = time.monotonic()
         with CoalescingEvaluator(
@@ -3751,6 +3785,10 @@ class PhaseDLoop:
                         self.config.device,
                         self.config.rust_global_batch_cap,
                         precision=self.config.precision,
+                        # An archived opponent keeps ITS source, read from the
+                        # checkpoint it was loaded from. Routing merges each
+                        # net's own W/D/L, so the two need not match.
+                        value_source=_checkpoint_value_source(league.checkpoint),
                     ),
                 )
             )
@@ -4504,6 +4542,10 @@ class PhaseDLoop:
                 self.config.device,
                 self.config.gate_batch_cap(),
                 precision=self.config.precision,
+                # From the SPEC, not the run config: an incumbent trained under
+                # the flat head must be played as the player it is, or the gate
+                # measures a different one and promotes on it.
+                value_source=_spec_value_source(spec),
             )
 
         candidate_eval = evaluator(candidate_spec)
@@ -4610,6 +4652,7 @@ class PhaseDLoop:
                 self.config.device,
                 self.config.gate_batch_cap(),
                 precision=precision,
+                value_source=_spec_value_source(spec),
             )
 
         candidate_eval = evaluator(candidate_spec, candidate_precision)
@@ -4772,6 +4815,7 @@ class PhaseDLoop:
             self.config.device,
             self.config.gate_batch_cap(),
             precision=self.config.precision,
+            value_source=_spec_value_source(candidate_spec),
         )
         adapter = rust_flat_batch_adapter(evaluator)
         outcomes: list[MatchOutcome] = []

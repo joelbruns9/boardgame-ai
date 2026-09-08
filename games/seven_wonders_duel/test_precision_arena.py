@@ -157,9 +157,18 @@ def test_routing_merges_two_precisions_without_a_dtype_clash():
     combined = model(batch)
 
     # Widened to the common dtype, and every row is filled by its own net.
-    assert combined["value"].dtype is torch.float32
+    #
+    # Asserted on POLICY, which is still merged in the nets' own dtypes. `value`
+    # no longer survives the merge: W4 made each net resolve its own W/D/L
+    # first, so the merged dict carries finished `wdl` probabilities and there
+    # is no logit tensor left for a reader to pick the wrong head from. That
+    # resolution goes through `.float()`, so `wdl` cannot clash by construction
+    # -- `policy` is what still can, and is what this pins.
+    assert combined["policy"].dtype is torch.float32
     assert combined["policy"].shape == (4, 3)
-    assert torch.allclose(combined["value"], torch.full((4, 1), 0.25))
+    assert "value" not in combined
+    assert combined["wdl"].dtype is torch.float32
+    assert torch.allclose(combined["wdl"], torch.ones((4, 1)))
 
 
 def test_single_precision_routing_keeps_the_nets_own_dtype():
@@ -184,7 +193,9 @@ def test_single_precision_routing_keeps_the_nets_own_dtype():
     combined = adapter.evaluator.model(
         {"net_ids": torch.tensor([0, 1]), "features": torch.zeros((2, 2))}
     )
-    assert combined["value"].dtype is torch.float32
+    # `policy` is the tensor still merged in the nets' own dtype; see the note
+    # in the mixed-precision test above for why `value` no longer appears.
+    assert combined["policy"].dtype is torch.float32
 
 
 def test_a_normal_gate_still_uses_one_precision_for_both_sides(tmp_path):

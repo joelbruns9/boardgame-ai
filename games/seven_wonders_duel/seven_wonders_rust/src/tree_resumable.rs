@@ -78,7 +78,7 @@ pub struct Node {
     pub incomplete: u32,
     /// F4.5 forced-child cache. Force expansion seeds the child's value/visit
     /// exactly as before but retains priors for the first ordinary visit.
-    cached_evaluation: Option<(f64, Vec<f64>)>,
+    cached_evaluation: Option<(f64, Vec<f64>, Option<Outlook>)>,
 }
 
 impl Node {
@@ -288,6 +288,11 @@ struct PendingSimulation {
     /// the shared root sum, and float addition is not associative, so reordering
     /// perturbs `root_value` in its last bits.
     immediate_value: Option<f64>,
+    /// Set with `immediate_value`, and by the same rule: a simulation that
+    /// carries its own value carries its own outlook, or explicitly none.
+    /// Keeping them together is what stops the scalar and the vector being
+    /// accounted on different paths.
+    immediate_outlook: Option<Outlook>,
 }
 
 /// Metadata needed to align an evaluator response to its pending simulation.
@@ -367,13 +372,23 @@ fn closed_child(arena: &mut Arena, node_id: NodeId, edge_idx: usize, rng: &mut R
     child_id
 }
 
+/// A leaf that needs no network call: a terminal, or a forced child whose
+/// evaluation was cached when the root was expanded.
+struct ImmediateLeaf {
+    value_p0: f64,
+    /// `Some` for a cached forced child (which must be expanded), `None` for a
+    /// terminal.
+    priors: Option<Vec<f64>>,
+    outlook: Option<Outlook>,
+}
+
 fn select_leaf(
     arena: &mut Arena,
     root_id: NodeId,
     forced_edge: usize,
     rng: &mut Rng,
     c_puct: f64,
-) -> (PendingSimulation, Option<(f64, Option<Vec<f64>>)>) {
+) -> (PendingSimulation, Option<ImmediateLeaf>) {
     let mut path = Vec::new();
     let mut node_id = root_id;
     let mut forced = Some(forced_edge);
@@ -388,8 +403,14 @@ fn select_leaf(
                     root_edge: forced_edge,
                     has_incomplete: false,
                     immediate_value: None,
+                    immediate_outlook: None,
                 },
-                Some((value, None)),
+                // EXACT, not predicted: a finished game knows how it ended.
+                Some(ImmediateLeaf {
+                    value_p0: value,
+                    priors: None,
+                    outlook: Some(crate::eval::terminal_outlook_p0(&node.state)),
+                }),
             );
         }
         if node.edges.is_empty() {
@@ -401,8 +422,13 @@ fn select_leaf(
                     root_edge: forced_edge,
                     has_incomplete: false,
                     immediate_value: None,
+                    immediate_outlook: None,
                 },
-                cached.map(|(value, priors)| (value, Some(priors))),
+                cached.map(|(value, priors, outlook)| ImmediateLeaf {
+                    value_p0: value,
+                    priors: Some(priors),
+                    outlook,
+                }),
             );
         }
         let edge_idx = forced
@@ -918,10 +944,14 @@ fn settle_terminal_forced(
                 return true;
             }
             let value_p0 = terminal_value_p0(&arena.nodes[node_id].state);
+            let outlook = crate::eval::terminal_outlook_p0(&arena.nodes[node_id].state);
             let node = &mut arena.nodes[node_id];
             node.visits = 1;
             node.value_sum_p0 = value_p0;
-            node.cached_evaluation = Some((value_p0, Vec::new()));
+            // A settled terminal: its victory type is known exactly, and
+            // dropping it here is what made a search of two winning moves
+            // report 100% draw.
+            node.cached_evaluation = Some((value_p0, Vec::new(), Some(outlook)));
             *settled += 1;
             false
         })
@@ -1209,17 +1239,41 @@ impl SearchSession {
     /// Only reachable when every member carries its own value (terminal leaves
     /// and cached forced children); submitting a zero-row batch instead would be
     /// a protocol error at the boundary.
+    /// Back one simulation up, scalar AND vector, and close it out.
+    ///
+    /// The single place either is accounted. Three paths reach a backup --
+    /// evaluated leaves, immediate leaves under ordinary waves, and immediate
+    /// leaves drained from a wave with nothing to evaluate -- and when the
+    /// outlook was accumulated in only one of them, a search of two winning
+    /// moves reported Q 0.97 beside a 100% draw. They cannot diverge now
+    /// because there is nowhere for them to diverge.
+    fn settle_simulation(
+        &mut self,
+        mut pending: PendingSimulation,
+        value_p0: f64,
+        outlook: Option<Outlook>,
+    ) {
+        let root_edge = pending.root_edge;
+        clear_incomplete(&mut self.arena, &mut pending);
+        backup(&mut self.arena, pending, value_p0);
+        if let Some(o) = outlook {
+            for k in 0..7 {
+                self.outlook_sum[k] += o[k];
+            }
+            self.outlook_visits += 1;
+        }
+        self.complete_simulation(root_edge);
+    }
+
     fn drain_immediate_wave(&mut self, wave: &mut PendingWave) -> PyResult<()> {
-        for mut pending in std::mem::take(&mut wave.simulations) {
+        for pending in std::mem::take(&mut wave.simulations) {
             let Some(value_p0) = pending.immediate_value else {
                 return Err(PyRuntimeError::new_err(
                     "a wave with no evaluation rows holds a simulation that needs one",
                 ));
             };
-            let root_edge = pending.root_edge;
-            clear_incomplete(&mut self.arena, &mut pending);
-            backup(&mut self.arena, pending, value_p0);
-            self.complete_simulation(root_edge);
+            let outlook = pending.immediate_outlook;
+            self.settle_simulation(pending, value_p0, outlook);
         }
         wave.root_edges.clear();
         Ok(())
@@ -1388,7 +1442,9 @@ impl SearchSession {
                 self.cfg.c_puct,
             );
             self.launch_simulation();
-            if let Some((value_p0, cached_priors)) = immediate {
+            if let Some(ImmediateLeaf { value_p0, priors: cached_priors, outlook }) =
+                immediate
+            {
                 if let Some(priors) = cached_priors {
                     expand(&mut self.arena, pending.leaf_id, priors)?;
                     self.metrics.cached_forced_leaves += 1;
@@ -1396,13 +1452,13 @@ impl SearchSession {
                     self.metrics.terminal_leaves += 1;
                 }
                 if !self.cfg.conflict_free_waves {
-                    backup(&mut self.arena, pending, value_p0);
-                    self.complete_simulation(root_edge);
+                    self.settle_simulation(pending, value_p0, outlook);
                     continue;
                 }
                 // Exact order: this simulation carries its own value, but it
                 // must not back up before simulations launched ahead of it.
                 pending.immediate_value = Some(value_p0);
+                pending.immediate_outlook = outlook;
                 wave.simulations.push(pending);
                 wave.root_edges.push(root_edge);
                 if wave.simulations.len() >= self.leaf_batch {
@@ -1666,7 +1722,8 @@ impl SearchSession {
                 }
                 self.arena.nodes[node_id].visits = 1;
                 self.arena.nodes[node_id].value_sum_p0 = value_p0;
-                self.arena.nodes[node_id].cached_evaluation = Some((value_p0, priors));
+                self.arena.nodes[node_id].cached_evaluation =
+                    Some((value_p0, priors, leaf.outlook_p0));
                 self.metrics.forced_outcome_rows += 1;
             }
             return Ok(());
@@ -1694,19 +1751,9 @@ impl SearchSession {
             // Members that carry their own value never asked for a row; taking
             // it from `unique_leaf_ids` would mis-align every later member.
             let (value_p0, outlook) = match pending.immediate_value {
-                // A member that carried its own value is a terminal or already
-                // known node; a terminal one knows its victory type EXACTLY,
-                // which is the part of a backed-up distribution with no model
-                // error in it at all.
-                Some(value) => {
-                    let node = &self.arena.nodes[pending.leaf_id];
-                    let outlook = if node.terminal {
-                        Some(crate::eval::terminal_outlook_p0(&node.state))
-                    } else {
-                        None
-                    };
-                    (value, outlook)
-                }
+                // Decided when the leaf was selected, not re-derived here: the
+                // two must be the same fact whichever path settles it.
+                Some(value) => (value, pending.immediate_outlook),
                 None => {
                     let row = wave
                         .unique_leaf_ids
@@ -1716,16 +1763,7 @@ impl SearchSession {
                     (evaluations[row].value_p0, evaluations[row].outlook_p0)
                 }
             };
-            if let Some(o) = outlook {
-                for k in 0..7 {
-                    self.outlook_sum[k] += o[k];
-                }
-                self.outlook_visits += 1;
-            }
-            clear_incomplete(&mut self.arena, &mut pending);
-            let root_edge = pending.root_edge;
-            backup(&mut self.arena, pending, value_p0);
-            self.complete_simulation(root_edge);
+            self.settle_simulation(pending, value_p0, outlook);
         }
         Ok(())
     }

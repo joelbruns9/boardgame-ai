@@ -648,6 +648,7 @@ fn puct_root<E: Eval>(
     sign: f64,
     root_value: f64,
     legal: Vec<usize>,
+    root_leaf_outlook: Option<Outlook>,
 ) -> PyResult<(SearchResult, Node)> {
     let n = root.edges.len();
     let mut rng = Rng::new(cfg.seed);
@@ -659,8 +660,12 @@ fn puct_root<E: Eval>(
     add_dirichlet_noise(&mut root, cfg, &mut rng);
     // W4 accumulation. At the root only: nothing reads an interior node's
     // outlook, and a per-node field would grow every serialized tree.
-    let mut outlook_sum: Outlook = [0.0; 7];
-    let mut outlook_visits: u32 = 0;
+    //
+    // SEEDED with the root's own expansion, because the scalar mean counts it:
+    // two means over different sets of leaves do not have to agree, and the
+    // whole point of the vector is that its marginal reproduces the scalar.
+    let mut outlook_sum: Outlook = root_leaf_outlook.unwrap_or([0.0; 7]);
+    let mut outlook_visits: u32 = u32::from(root_leaf_outlook.is_some());
     for _ in 0..cfg.sims {
         let forced = forced_playout_edge(&root, cfg);
         let (_, outlook) = descend(&mut root, forced, eval, &mut rng, cfg.c_puct)?;
@@ -782,7 +787,7 @@ pub fn search_closed<E: Eval>(
     let legal: Vec<usize> = root.legal.clone();
 
     if cfg.puct_root {
-        return puct_root(root, eval, cfg, sign, root_value, legal);
+        return puct_root(root, eval, cfg, sign, root_value, legal, root_leaf_outlook);
     }
 
     // Gumbel keys (one per legal action, in sorted order) then the per-edge

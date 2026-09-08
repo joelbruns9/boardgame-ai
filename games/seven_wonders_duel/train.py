@@ -1130,6 +1130,13 @@ def train_loop(
                 aux_weight,
                 precision=precision,
                 action_policy_weight=action_policy_weight,
+                # The SAME objective the step optimised. Validation selects the
+                # early stop and the restored best checkpoint, so grading it
+                # under a different recipe -- weight 0.15, replacement off --
+                # picks the winner of a race nobody ran. In the replacement arm
+                # it graded the stale flat head.
+                hier_value_weight=hier_value_weight,
+                hier_value_replaces_joint7=hier_value_replaces_joint7,
             )
             row["val"] = val_metrics
             log(
@@ -1346,6 +1353,13 @@ def train_steps(
                 aux_weight,
                 precision=precision,
                 action_policy_weight=action_policy_weight,
+                # The SAME objective the step optimised. Validation selects the
+                # early stop and the restored best checkpoint, so grading it
+                # under a different recipe -- weight 0.15, replacement off --
+                # picks the winner of a race nobody ran. In the replacement arm
+                # it graded the stale flat head.
+                hier_value_weight=hier_value_weight,
+                hier_value_replaces_joint7=hier_value_replaces_joint7,
             )
             row["val"] = val_metrics
             log(
@@ -1428,7 +1442,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hierarchical-value-detach",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        # UNSET, not True: this and the weight live outside the state dict, so
+        # a warm start cannot recover them by loading, and argparse cannot
+        # otherwise tell "omitted" from "passed the default". Omitting it used
+        # to be indistinguishable from asking for detached, so an explicit
+        # --no-hierarchical-value-detach was overwritten by the inherited value
+        # AFTER validation had already approved the combination -- producing
+        # exactly the replacement-with-a-detached-head this refuses.
+        default=None,
         help="learn the W4 head from a stop-gradient readout, so it cannot "
         "move a trunk weight. --no-hierarchical-value-detach is the arm that "
         "lets it shape representations, and the only one that can change "
@@ -1553,6 +1574,53 @@ def resolve_graph_args(args, stored: dict | None) -> None:
             setattr(args, field, fallback)
 
 
+def resolve_hier_value_args(args) -> None:
+    """Settle the W4 recipe, in place, and refuse the combinations that lie.
+
+    Called AFTER any warm-start inheritance, which is the whole point: the
+    first version validated first and inherited afterwards, so an explicit
+    request to attach a previously detached head passed validation and was then
+    silently reverted -- leaving replacement enabled with a detached head, the
+    exact configuration validation exists to prohibit. Resolving before
+    validating makes that unrepresentable.
+
+    Both fields default to None from the parser so "omitted" is distinguishable
+    from "passed the default"; they live outside the state dict and cannot be
+    recovered by loading weights.
+    """
+
+    if args.hierarchical_value_detach is None:
+        args.hierarchical_value_detach = True
+    if args.hier_value_weight is None:
+        args.hier_value_weight = (
+            HIER_VALUE_WEIGHT_DEFAULT if args.hierarchical_value else 0.0
+        )
+    if args.hier_value_weight < 0 or not math.isfinite(args.hier_value_weight):
+        raise SystemExit("--hier-value-weight must be finite and non-negative")
+    if args.hier_value_weight > 0 and not args.hierarchical_value:
+        raise SystemExit("--hier-value-weight requires --hierarchical-value")
+    if args.hierarchical_value and args.hier_value_weight == 0:
+        raise SystemExit(
+            "--hierarchical-value requires a positive --hier-value-weight; the "
+            "head is shadow-only, so an unweighted one is parameters and "
+            "throughput buying nothing"
+        )
+    if args.hier_value_replaces_joint7:
+        if not args.hierarchical_value:
+            raise SystemExit(
+                "--hier-value-replaces-joint7 requires --hierarchical-value"
+            )
+        if args.hierarchical_value_detach:
+            # Replacing the flat term with a detached head would remove the
+            # trunk's ONLY victory-type supervision and put nothing back --
+            # not an arm, a deletion.
+            raise SystemExit(
+                "--hier-value-replaces-joint7 requires "
+                "--no-hierarchical-value-detach; a detached head cannot replace "
+                "supervision it never delivers to the trunk"
+            )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """The offline trainer's parser, separated so flag resolution is testable.
 
@@ -1599,28 +1667,6 @@ def main(argv=None) -> int:
         raise SystemExit(
             "--hierarchical-value is available only for --model transformer"
         )
-    if args.hier_value_weight is None:
-        args.hier_value_weight = (
-            HIER_VALUE_WEIGHT_DEFAULT if args.hierarchical_value else 0.0
-        )
-    if args.hier_value_weight < 0 or not math.isfinite(args.hier_value_weight):
-        raise SystemExit("--hier-value-weight must be finite and non-negative")
-    if args.hier_value_weight > 0 and not args.hierarchical_value:
-        raise SystemExit("--hier-value-weight requires --hierarchical-value")
-    if args.hier_value_replaces_joint7:
-        if not args.hierarchical_value:
-            raise SystemExit(
-                "--hier-value-replaces-joint7 requires --hierarchical-value"
-            )
-        if args.hierarchical_value_detach:
-            # Replacing the flat term with a detached head would remove the
-            # trunk's ONLY victory-type supervision and put nothing back --
-            # not an arm, a deletion.
-            raise SystemExit(
-                "--hier-value-replaces-joint7 requires "
-                "--no-hierarchical-value-detach; a detached head cannot replace "
-                "supervision it never delivers to the trunk"
-            )
     if not math.isfinite(args.action_policy_weight) or args.action_policy_weight < 0:
         raise SystemExit("--action-policy-weight must be finite and non-negative")
     if args.init_checkpoint:
@@ -1650,10 +1696,10 @@ def main(argv=None) -> int:
         args.hierarchical_value = bool(
             args.hierarchical_value or inherited_hier["hierarchical_value"]
         )
-        if inherited_hier["hierarchical_value"]:
-            # Same rule as the graph gate: what is not in the state dict cannot
-            # be recovered by loading it, so an inherited head keeps the
-            # gradient path it was trained under unless asked otherwise.
+        if inherited_hier["hierarchical_value"] and args.hierarchical_value_detach is None:
+            # Omitted INHERITS; explicit overrides. Moving a head from detached
+            # to attached is the whole representation-learning experiment, so
+            # it must be expressible.
             args.hierarchical_value_detach = inherited_hier[
                 "hierarchical_value_detach"
             ]
@@ -1665,6 +1711,7 @@ def main(argv=None) -> int:
             f"slots={args.slot_embedding} graph={args.graph_module}"
         )
     resolve_graph_args(args, None)
+    resolve_hier_value_args(args)
     model = build_model(
         args.model,
         effective_d_model,

@@ -31,7 +31,7 @@ here and have not themselves been reviewed** — see §1 below.
 | `train.py` | `hierarchical_value` / `_detach` switches, `hier_value_weight`, `hier_value_replaces_joint7`, the NLL term, `build_arg_parser` / `resolve_graph_args` extraction |
 | `inference.py` | `Evaluation.hier_joint7` / `hier_wdl`; `Evaluator.value_source` + `wdl_tensor` |
 | `advisor_adapter.py` | `victory_outlook["hierarchical"]` + `flat_disagreement` |
-| `rust_bridge.py` | outlook on the flat batch path; routed proxies refuse a mixed `value_source` |
+| `rust_bridge.py` | outlook on the flat batch path; routed models resolve each net's own W/D/L and outlook before merging |
 | `buffer.py`, `dataset.py` | `root_outlook` on `MoveRecord` and `Example` |
 | `phase_d.py`, `arena.py` | switches carried through every rebuild, spec and reporting site |
 | **Rust** `eval.rs` | `LeafOut`, `Outlook`, `outlook_to_p0`, `terminal_outlook_p0`, `extract_rows`, `adapter_outlook` |
@@ -58,7 +58,7 @@ here and have not themselves been reviewed** — see §1 below.
 | replacement drops the term but still **reports** it | `test_replacing_joint7_drops_its_term_but_still_reports_it` |
 | replacement with a detached head is refused | it would delete supervision, not vary it |
 | `value_source` moves `wdl` and leaves `joint7` alone | one variable per arm |
-| routed evaluators refuse a mixed `value_source` | a stitched batch cannot read a different head per row |
+| routed evaluators may use DIFFERENT heads | each net's W/D/L resolved before the merge; a net without W4 contributes rows with no outlook |
 | a net with no head records no outlook | the short adapter row stays legal |
 | the searched outlook is a distribution over 7 classes | sums to 1, non-negative |
 | its marginal equals search's value **under the same head** | exact to 2e-6, and asserted to differ under mixed heads |
@@ -230,8 +230,9 @@ limitations.
   so.
 - The extension panel still renders the flat outlook. The head is untrained, so
   displaying it today would render noise.
-- The pre-existing `train_loop` `optimizer_name` defect still blocks the offline
-  CLI trainer.
+- ~~The pre-existing `train_loop` `optimizer_name` defect still blocks the
+  offline CLI trainer.~~ **STALE, corrected on review 2026-09-07**: the epoch
+  trainer defines that argument (`train.py`), and both trainer probes ran.
 
 ---
 

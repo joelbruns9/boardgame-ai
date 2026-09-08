@@ -236,8 +236,8 @@ thinks 2.2% is worth a third mapping should say so.
   main Transformer — is not built and should not be until the module earns it.
 - W5a still has no strength evidence either; the repairs were throughput and a
   crash, not a case for the arm.
-- The pre-existing `train_loop` `optimizer_name` blocker recorded in the plan is
-  still unfixed and still blocks an offline CLI training run.
+- ~~The pre-existing `train_loop` `optimizer_name` blocker recorded in the plan
+  is still unfixed.~~ **STALE, corrected 2026-09-07**: it is defined.
 
 ---
 

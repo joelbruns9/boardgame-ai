@@ -511,13 +511,10 @@ class _RustFlatBatchAdapter:
         wdl = self.evaluator.wdl_tensor(outputs)
         value_actor = wdl[:, 0] - wdl[:, 2]
         # W4: the leaf outlook, when the served net has the head. Rust accepts
-        # rows with or without it, so a net without one simply sends the old
-        # two-element shape. Probabilities, so `exp` -- never a second softmax.
-        outlook_rows = (
-            outputs["hier_joint7"].float().exp()
-            if "hier_joint7" in outputs
-            else None
-        )
+        # rows with or without it, so a batch where nothing has one simply
+        # sends the old two-element shape. A ROUTED batch can be mixed, which
+        # is why presence is per row rather than per batch.
+        outlook_rows, outlook_present = self.evaluator.outlook_tensor(outputs)
         self._end_event("gather", gather_event)
         self._sync()
         gather_seconds = time.perf_counter() - gather_start
@@ -549,6 +546,9 @@ class _RustFlatBatchAdapter:
         # per-row conversion would reintroduce exactly the per-row Python that
         # cost W5a 51% of its throughput.
         outlooks = None if outlook_rows is None else outlook_rows.cpu().tolist()
+        present = (
+            None if outlook_present is None else outlook_present.cpu().tolist()
+        )
         if self.vectorized_gather:
             # `tolist()` converts in one C call; indexing element by element cost
             # a Python `float()` per legal action, millions of them per run.
@@ -559,7 +559,11 @@ class _RustFlatBatchAdapter:
                 result.append(
                     (values[row], policy)
                     if outlooks is None
-                    else (values[row], policy, outlooks[row])
+                    else (
+                        values[row],
+                        policy,
+                        outlooks[row] if present[row] else None,
+                    )
                 )
                 offset += count
         else:
@@ -571,7 +575,7 @@ class _RustFlatBatchAdapter:
                 result.append(
                     row_result
                     if outlooks is None
-                    else (*row_result, outlooks[row])
+                    else (*row_result, outlooks[row] if present[row] else None)
                 )
                 offset += count
 
@@ -667,7 +671,7 @@ def rust_searcher_routed_flat_batch_adapter(
     )
 
     class _SearcherRoutedModel(torch.nn.Module):
-        def __init__(self, models, autocasts=None):
+        def __init__(self, models, autocasts=None, sources=None):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
             self.action_residual = any(
@@ -676,6 +680,15 @@ def rust_searcher_routed_flat_batch_adapter(
             # None keeps the single-precision path byte-identical to the one
             # W1's routing equivalence was verified against.
             self.autocasts = autocasts
+            #: Each net's own `Evaluator`, so its W/D/L is resolved from the
+            #: head IT was configured with, BEFORE the rows are merged.
+            #:
+            #: Per net, not per batch: a hierarchical candidate against a flat
+            #: incumbent is exactly the comparison an arena exists for, and
+            #: forcing one source on both would evaluate one side as a
+            #: different player. The earlier version refused the mixture; that
+            #: was a restriction of this merge, not of the batching.
+            self.sources = sources
 
         def forward(self, batch):
             net_ids = batch["net_ids"]
@@ -696,36 +709,74 @@ def rust_searcher_routed_flat_batch_adapter(
                 else:
                     with self.autocasts[net]():
                         outputs = model(net_batch)
-                # Rust consumes only these two outputs. In particular, do not
+                # Rust consumes only these outputs. In particular, do not
                 # merge W5's train-only action-policy tensor across an arena in
                 # which one checkpoint predates the optional scorer.
+                #
+                # `wdl` and `outlook` are resolved HERE, per net, and merged as
+                # finished probabilities: the merged dict has no `value` or
+                # `hier_value` for a downstream reader to pick between, so it
+                # cannot pick the wrong one. This is also what stopped
+                # `KeyError: 'hier_value'` -- the head's outputs were being
+                # filtered away and then asked for.
+                # `getattr`, because a test probe may stand in for an
+                # evaluator and carry neither method; it then gets the
+                # historical flat behaviour, which is what it was written
+                # against.
+                source = self.sources[net] if self.sources is not None else None
+                wdl_of = getattr(source, "wdl_tensor", None)
+                # Tolerant of a model that returns neither, exactly as the
+                # `key in outputs` filter this replaced was: routing probes
+                # stand in for a net with `Identity`.
+                resolved = {}
+                if wdl_of is not None and (
+                    "value" in outputs or "hier_value" in outputs
+                ):
+                    resolved["wdl"] = wdl_of(outputs)
+                elif "value" in outputs:
+                    resolved["wdl"] = torch.softmax(outputs["value"].float(), dim=-1)
+                outlook_of = getattr(source, "outlook_tensor", None)
+                if outlook_of is not None and "hier_joint7" in outputs:
+                    probabilities, _ = outlook_of(outputs)
+                    if probabilities is not None:
+                        resolved["outlook"] = probabilities
+                        resolved["outlook_present"] = torch.ones(
+                            probabilities.shape[0],
+                            dtype=torch.float32,
+                            device=probabilities.device,
+                        )
                 outputs = {
-                    key: outputs[key]
-                    for key in ("policy", "value")
-                    if key in outputs
+                    **{key: outputs[key] for key in ("policy",) if key in outputs},
+                    **resolved,
                 }
+                # Under mixed precision the two nets return different
+                # dtypes -- that IS the treatment -- so the merged buffer
+                # cannot inherit whichever net happened to be evaluated
+                # first. It is float32 (the wider of the two), and each
+                # net's rows are widened into it below. Widening a bf16
+                # result is exact and changes nothing about the comparison:
+                # the treatment is the precision the forward pass ran at,
+                # not the dtype its answer is stored in.
+                #
+                # `None` keeps the single-precision path allocating exactly
+                # as before, since W1's routing equivalence was verified
+                # against it.
+                merge_dtype = torch.float32 if self.autocasts is not None else None
                 if combined is None:
-                    # Under mixed precision the two nets return different
-                    # dtypes -- that IS the treatment -- so the merged buffer
-                    # cannot inherit whichever net happened to be evaluated
-                    # first. It is float32 (the wider of the two), and each
-                    # net's rows are widened into it below. Widening a bf16
-                    # result is exact and changes nothing about the comparison:
-                    # the treatment is the precision the forward pass ran at,
-                    # not the dtype its answer is stored in.
-                    #
-                    # `None` keeps the single-precision path allocating exactly
-                    # as before, since W1's routing equivalence was verified
-                    # against it.
-                    merge_dtype = torch.float32 if self.autocasts is not None else None
-                    combined = {
-                        key: value.new_empty(
+                    combined = {}
+                for key, value in outputs.items():
+                    if key not in combined:
+                        # Allocated when a key FIRST appears, and zero-filled:
+                        # a net without W4 contributes no `outlook`, and its
+                        # rows must stay absent rather than inherit whatever
+                        # `new_empty` left there. `outlook_present` is 0 for
+                        # exactly those rows, which is how the adapter knows
+                        # not to send a fabricated distribution for an opponent
+                        # that never predicted one.
+                        combined[key] = value.new_zeros(
                             (len(net_ids), *value.shape[1:]),
                             **({} if merge_dtype is None else {"dtype": merge_dtype}),
                         )
-                        for key, value in outputs.items()
-                    }
-                for key, value in outputs.items():
                     target = combined[key]
                     if value.dtype != target.dtype:
                         value = value.to(target.dtype)
@@ -734,23 +785,16 @@ def rust_searcher_routed_flat_batch_adapter(
                 raise ValueError("searcher-routed batch cannot be empty")
             return combined
 
-    # One head for the whole batch, or none. The routed forward stitches every
-    # net's rows into ONE `outputs` dict, so a per-row choice of head is not
-    # expressible here -- and silently taking the first evaluator's would report
-    # an arm that half the rows never ran. Refuse instead.
-    sources = {
-        getattr(evaluator, "value_source", "flat") for evaluator in evaluators
-    }
-    if len(sources) > 1:
-        raise ValueError(
-            f"routed evaluators disagree about value_source ({sorted(sources)}); "
-            "a batch stitched from several nets cannot read a different head per "
-            "row"
-        )
-    routed_source = sources.pop()
-
+    # Each net keeps its OWN value source. The earlier version refused a
+    # mixture on the grounds that a stitched batch cannot read a different head
+    # per row; that was true of the merge as written, not of batching, and it
+    # blocked the comparison an arena exists for -- a hierarchical candidate
+    # against a flat incumbent. Resolving each net's W/D/L before the merge
+    # removes the restriction.
     class _EvaluatorProxy:
-        value_source = routed_source
+        #: The merge already resolved every row, so the proxy has no head to
+        #: choose between -- and reporting one would misdescribe a mixed batch.
+        value_source = "routed"
 
         def autocast(self):
             if mixed_precision:
@@ -759,16 +803,19 @@ def rust_searcher_routed_flat_batch_adapter(
             return evaluators[0].autocast()
 
         def wdl_tensor(self, outputs):
-            from .inference import Evaluator
+            return outputs["wdl"]
 
-            return Evaluator.wdl_tensor(self, outputs)
+        def outlook_tensor(self, outputs):
+            if "outlook" not in outputs:
+                return None, None
+            return outputs["outlook"], outputs["outlook_present"] > 0.5
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device
     proxy.max_batch = min(evaluator.max_batch for evaluator in evaluators)
     proxy.precision = "mixed" if mixed_precision else next(iter(precisions))
     proxy.model = _SearcherRoutedModel(
-        [evaluator.model for evaluator in evaluators], autocasts
+        [evaluator.model for evaluator in evaluators], autocasts, list(evaluators)
     )
     proxy.model.to(proxy.device).eval()
     # `.to()` runs `_apply` on every child, which invalidates each embedder's
@@ -829,9 +876,12 @@ def rust_seat_routed_flat_batch_adapter(
         raise ValueError("seat-routed evaluators must use the same precision")
 
     class _SeatRoutedModel(torch.nn.Module):
-        def __init__(self, models):
+        def __init__(self, models, sources=None):
             super().__init__()
             self.models = torch.nn.ModuleList(models)
+            #: Each seat's own evaluator -- see the searcher-routed model for
+            #: why the head is resolved per net and not per batch.
+            self.sources = sources
             self.action_residual = any(
                 bool(getattr(model, "action_residual", False)) for model in models
             )
@@ -851,46 +901,66 @@ def rust_seat_routed_flat_batch_adapter(
                     if key not in ("actors", "net_ids")
                 }
                 outputs = model(seat_batch)
+                source = self.sources[seat] if self.sources is not None else None
+                resolved = {}
+                wdl_of = getattr(source, "wdl_tensor", None)
+                if wdl_of is not None and (
+                    "value" in outputs or "hier_value" in outputs
+                ):
+                    resolved["wdl"] = wdl_of(outputs)
+                elif "value" in outputs:
+                    resolved["wdl"] = torch.softmax(outputs["value"].float(), dim=-1)
+                outlook_of = getattr(source, "outlook_tensor", None)
+                if outlook_of is not None and "hier_joint7" in outputs:
+                    probabilities, _ = outlook_of(outputs)
+                    if probabilities is not None:
+                        resolved["outlook"] = probabilities
+                        resolved["outlook_present"] = torch.ones(
+                            probabilities.shape[0],
+                            dtype=torch.float32,
+                            device=probabilities.device,
+                        )
                 outputs = {
-                    key: outputs[key]
-                    for key in ("policy", "value")
-                    if key in outputs
+                    **{key: outputs[key] for key in ("policy",) if key in outputs},
+                    **resolved,
                 }
                 if combined is None:
-                    combined = {
-                        key: value.new_empty((len(actors), *value.shape[1:]))
-                        for key, value in outputs.items()
-                    }
+                    combined = {}
                 for key, value in outputs.items():
+                    if key not in combined:
+                        # Zero-filled and allocated on first sight, so a seat
+                        # whose net has no W4 head leaves its rows absent
+                        # rather than inheriting uninitialised memory.
+                        combined[key] = value.new_zeros(
+                            (len(actors), *value.shape[1:])
+                        )
                     combined[key].index_copy_(0, indices, value)
             if combined is None:
                 raise ValueError("seat-routed batch cannot be empty")
             return combined
 
-    sources = {
-        getattr(evaluator, "value_source", "flat") for evaluator in evaluators
-    }
-    if len(sources) > 1:
-        raise ValueError(
-            f"evaluators disagree about value_source ({sorted(sources)})"
-        )
-    shared_source = sources.pop()
-
     class _EvaluatorProxy:
-        value_source = shared_source
+        # Resolved per seat in the merge above; nothing here has a head left to
+        # choose between.
+        value_source = "routed"
 
         def autocast(self):
             return evaluators[0].autocast()
 
         def wdl_tensor(self, outputs):
-            from .inference import Evaluator
+            return outputs["wdl"]
 
-            return Evaluator.wdl_tensor(self, outputs)
+        def outlook_tensor(self, outputs):
+            if "outlook" not in outputs:
+                return None, None
+            return outputs["outlook"], outputs["outlook_present"] > 0.5
 
     proxy = _EvaluatorProxy()
     proxy.device = evaluators[0].device
     proxy.max_batch = min(evaluator.max_batch for evaluator in evaluators)
-    proxy.model = _SeatRoutedModel([evaluator.model for evaluator in evaluators])
+    proxy.model = _SeatRoutedModel(
+        [evaluator.model for evaluator in evaluators], list(evaluators)
+    )
     proxy.model.to(proxy.device).eval()
     # `.to()` runs `_apply` on every child, which invalidates each embedder's
     # fused cache by design. Re-fuse, or seat-routed arena play would silently

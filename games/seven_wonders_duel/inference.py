@@ -198,6 +198,24 @@ class Evaluator:
             return outputs["hier_value"].float().exp()
         return torch.softmax(outputs["value"].float(), dim=-1)
 
+    def outlook_tensor(self, outputs: dict):
+        """W4's seven-way probabilities and a per-row presence mask.
+
+        A pair rather than one tensor because a ROUTED batch can be
+        heterogeneous: an older opponent without the head contributes rows that
+        have no outlook, and inventing a uniform distribution for them would
+        put a fabricated observation into a backed-up sum. `(None, None)` means
+        no row in this batch has one.
+        """
+
+        if "hier_joint7" not in outputs:
+            return None, None
+        probabilities = outputs["hier_joint7"].float().exp()
+        present = torch.ones(
+            probabilities.shape[0], dtype=torch.bool, device=probabilities.device
+        )
+        return probabilities, present
+
     def evaluate_states(self, games) -> list[Evaluation]:
         """Convenience for callers holding engine states rather than
         encodings; uses each state's actor observation and legal indices."""

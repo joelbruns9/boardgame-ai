@@ -296,7 +296,19 @@ def load_side(
             "the arena as measuring the migrated model, not the trained one."
         ) from error
     arm = control_arm(checkpoint)
-    evaluator = Evaluator(model, device, batch_cap, precision=precision)
+    # From the CHECKPOINT, not the arena's default: a side generated under the
+    # hierarchical value head and played under the flat one is a different
+    # player, and the number this returns is what a promotion decision is made
+    # on. `flat` for every file predating W4.
+    value_source = stored.get("value_source") or "flat"
+    if value_source == "hierarchical" and not stored.get("hierarchical_value", False):
+        raise ValueError(
+            f"{label}: {path} asks for the hierarchical value head but records "
+            "no such head; it cannot be played as itself"
+        )
+    evaluator = Evaluator(
+        model, device, batch_cap, precision=precision, value_source=value_source
+    )
     return Side(
         label=label,
         source=str(path.resolve()),
@@ -316,6 +328,9 @@ def load_side(
                 "graph_module",
                 "graph_alpha",
                 "hierarchical_value",
+                # Reported because it changes which player the file IS, not
+                # merely how it was trained.
+                "value_source",
                 "iteration",
             )
         },

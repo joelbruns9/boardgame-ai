@@ -1275,10 +1275,12 @@ dedicated padding scatter sink with zero influence on real-action gradients.
 The expanded focused suite passes: **15 tests in 4.87 s**. No playing-strength
 or end-to-end throughput claim is licensed by these correctness tests.
 
-Separate pre-existing launch blocker found during this review: the offline
-epoch trainer (`train_loop`) references `optimizer_name` without defining it.
-That is not fixed by the W5 collation change; resolve it before an offline CLI
-training run. The fixed-step trainer used by Phase D is covered by the focused
+~~Separate pre-existing launch blocker found during this review: the offline
+epoch trainer (`train_loop`) references `optimizer_name` without defining it.~~
+**RESOLVED, and the claim went stale before it was noticed (2026-09-07):**
+`train_loop` takes `optimizer_name` as a parameter and both trainer entry
+points run. Two later review requests repeated the blocker from here without
+rechecking it, which is the cost of carrying a stale limitation forward. The fixed-step trainer used by Phase D is covered by the focused
 opt-in/opt-out regressions.
 
 ### Current limitation

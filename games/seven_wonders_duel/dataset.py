@@ -121,9 +121,12 @@ class Example:
     #: W4: search's own seven-way outlook at this position, actor-relative, in
     #: `JOINT7_CLASSES` order. `None` wherever the search recorded none.
     #:
-    #: Carried but NOT yet consumed by any loss. It is the position-specific
-    #: victory-type signal the realised label cannot give: that label makes
-    #: every row of a science-win game read `my_scientific`, move 3 included.
+    #: Carried but NOT yet consumed by any loss. It is position-specific where
+    #: the realised label is game-constant -- that label makes every row of a
+    #: science-win game read `my_scientific`, move 3 included -- but it is an
+    #: estimate under the search's own exploration, not ground truth, and its
+    #: bias/variance tradeoff against the realised label is unmeasured.
+    #:
     #: Blending, not replacing, is the established pattern here -- `root_value`
     #: blends because cloud3 produced a confidently wrong head from a hard fit,
     #: and only `solver_value` replaces outright, because it is proof.

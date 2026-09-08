@@ -1,12 +1,17 @@
 """W4's searched seven-way outlook: backed up, recorded, not yet consumed.
 
 What this is for, stated once so the tests below read as one argument: the
-realised game outcome is a poor victory-TYPE label. Every row of a game that
-ended scientifically carries `my_scientific`, move 3 included, where science
-was one of three live possibilities and not the likeliest. There the label is
-not merely uninformative, it is wrong about that position. Search's own
-distribution over the seven classes is position-specific, and at the terminals
-it proved it is exact.
+realised outcome is a GAME-CONSTANT victory-type label. Every row of a game
+that ended scientifically carries `my_scientific`, move 3 included, where
+science was one of three live possibilities. Search's own distribution over the
+seven classes varies by position instead, and at the terminals it reached it is
+exact.
+
+That is a different signal, not a better one -- the realised label is a
+stochastic sample under the policy actually played, this is a model-assisted
+estimate under the search's own exploration, and exact leaves do not make a
+root estimate proven. Which is preferable is for a measured bias/variance
+comparison to settle, which is why nothing trains on it yet.
 
 What it is NOT for: changing moves. `P(win) - P(loss)` is LINEAR in the seven
 probabilities, so averaging the vector and then collapsing is identical to
@@ -244,3 +249,111 @@ def test_a_buffer_written_before_w4_still_loads():
         move.pop("root_outlook", None)
     reloaded = from_json_line(json.dumps(payload))
     assert all(move.root_outlook is None for move in reloaded.moves)
+
+
+# --- every backup path, not just the evaluated one --------------------------
+
+
+def _near_terminal_game():
+    """A position whose searches end immediately, reached by playing seed 1.
+
+    Built by search rather than by hand: what matters is that simulations
+    settle on TERMINALS, which is the path that bypassed the outlook.
+    """
+
+    from games.seven_wonders_duel.rust_bridge import rust_games_for_self_play
+
+    # Replayed rather than snapshotted: `RustGame` has no cheap clone, so the
+    # prefix that stops one ply short is played again from a fresh game.
+    prefix = []
+    game = rust_games_for_self_play([1], [0])[0]
+    rng = random.Random(1)
+    while not game.is_complete():
+        legal = game.legal_action_indices()
+        if not legal:
+            break
+        action = rng.choice(legal)
+        game.apply_index(action)
+        if game.is_complete():
+            break
+        prefix.append(action)
+    if not prefix:
+        return None
+    replay = rust_games_for_self_play([1], [0])[0]
+    for action in prefix:
+        replay.apply_index(action)
+    return replay
+
+
+@pytest.mark.parametrize("conflict_free", [False, True])
+def test_terminal_simulations_reach_the_outlook(conflict_free):
+    """The P1 the first version shipped: Q 0.97 beside a 100% draw.
+
+    Terminal simulations back up their scalar through three different paths --
+    evaluated waves, ordinary immediate leaves, and a wave drained because it
+    had nothing to evaluate -- and the outlook was accumulated in only one of
+    them. A position whose every line ends at once therefore reported the
+    search's value correctly and its victory type as certainly a draw.
+    """
+
+    from games.seven_wonders_duel.inference import Evaluator
+    from games.seven_wonders_duel.rust_bridge import rust_flat_batch_adapter
+
+    game = _near_terminal_game()
+    if game is None:
+        pytest.skip("no near-terminal position found on this stream")
+
+    adapter = rust_flat_batch_adapter(
+        Evaluator(
+            _model(hierarchical_value=True),
+            "cpu",
+            64,
+            fuse_embedder=False,
+            value_source="hierarchical",
+        )
+    )
+    result = seven_wonders_rust.search_many_flat_net(
+        adapter,
+        [game],
+        [3],
+        64,
+        4,
+        32,
+        4,
+        conflict_free_waves=conflict_free,
+    )[0]
+    outlook = result["root_outlook"]
+    assert outlook is not None
+    implied = sum(outlook[0:3]) - sum(outlook[3:6])
+    assert implied == pytest.approx(result["root_value"], abs=2e-6), (
+        "the scalar and the vector are means over the same simulations; a gap "
+        "means one of the backup paths is not accounting for both"
+    )
+
+
+def test_forced_root_children_keep_their_outlook():
+    """Finding 5: the forced-child cache dropped the vector but kept the scalar.
+
+    A normal, measurable path under forced-root search -- 42 of 64 simulations
+    in the reviewer's probe -- not an unlikely malformed input.
+    """
+
+    from games.seven_wonders_duel.inference import Evaluator
+    from games.seven_wonders_duel.rust_bridge import rust_flat_batch_adapter
+
+    adapter = rust_flat_batch_adapter(
+        Evaluator(
+            _model(hierarchical_value=True),
+            "cpu",
+            64,
+            fuse_embedder=False,
+            value_source="hierarchical",
+        )
+    )
+    result = seven_wonders_rust.search_many_flat_net(
+        adapter, [_mid_game()], [5], 64, 4, 64, 4, force=True
+    )[0]
+    outlook = result["root_outlook"]
+    assert outlook is not None
+    implied = sum(outlook[0:3]) - sum(outlook[3:6])
+    assert implied == pytest.approx(result["root_value"], abs=2e-6)

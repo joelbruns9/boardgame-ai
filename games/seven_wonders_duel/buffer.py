@@ -122,11 +122,16 @@ class MoveRecord:
     #: position, actor-relative, in `dataset.JOINT7_CLASSES` order.
     #:
     #: The same relationship to `joint7` that `root_value` has to the outcome
-    #: label, and for a sharper reason. Victory TYPE is more game-constant than
-    #: win/loss: every row of a game that ended scientifically carries
-    #: `my_scientific`, including move-3 positions where science was one of
-    #: three live possibilities and not the likeliest. There the label is not
-    #: merely uninformative, it is wrong about that position.
+    #: label. Victory TYPE is more game-constant than win/loss: every row of a
+    #: game that ended scientifically carries `my_scientific`, move-3 positions
+    #: included. This varies by position instead.
+    #:
+    #: NOT "better", and the distinction matters before anything trains on it:
+    #: the realised label is a stochastic sample under the policy actually
+    #: played, while this is a model-assisted estimate under the search's own
+    #: exploration and continuation behaviour. Terminal leaves are exact, but
+    #: exact leaves do not make a root estimate proven. The bias/variance
+    #: tradeoff is to be measured.
     #:
     #: `None` for bot moves, for cheap searches that record none, and for every
     #: checkpoint without W4's head. Recorded, not yet consumed: the loss that
