@@ -33,6 +33,11 @@ Usage (from the repo root)::
 
     python -m games.seven_wonders_duel.build_equiv_corpus
     python -m games.seven_wonders_duel.build_equiv_corpus --check   # no writes
+    python -m games.seven_wonders_duel.build_equiv_corpus         --late-checkpoint <path> --late-iteration 85 --migrate
+
+``--migrate`` warm-starts a late checkpoint whose encoder signature predates the
+current one. Coverage is asserted before anything is written either way, so a
+run that fails verification leaves the committed corpus untouched.
 
 Provenance of the committed files is recorded in ``testdata/equiv_corpus/
 PROVENANCE.md``; re-running with the same flags and checkpoint reproduces them.
@@ -118,13 +123,25 @@ def _selfplay_records(
 
 
 def _evaluator_for(
-    checkpoint_path: Path | None, config: pd.PhaseDConfig, *, seed: int
+    checkpoint_path: Path | None,
+    config: pd.PhaseDConfig,
+    *,
+    seed: int,
+    migrate: bool = False,
 ) -> Evaluator:
     """An evaluator over a trained checkpoint, or over a seeded untrained net.
 
     The untrained net is seeded so the early stratum is reproducible; without
     that, "regenerate the corpus" would produce different games every run and
     the committed files could never be checked against the script.
+
+    `migrate` is off by default because a silent migration is the wrong default
+    for a gate: a signature mismatch usually means the checkpoint predates a
+    rules change and should not be trusted to play. It exists because the
+    ADDITIVE case is real and common -- new encoder channels widen a feature
+    projection, the grown columns are zero-filled, and the net therefore plays
+    exactly as it did when trained. `--migrate` prints what moved so the caller
+    can see which case they are in before the corpus is written.
     """
 
     if checkpoint_path is None:
@@ -137,7 +154,26 @@ def _evaluator_for(
             d_model=config.d_model,
             layers=config.layers,
         )
-        load_checkpoint(checkpoint_path, model, checkpoint=payload)
+        loaded = load_checkpoint(
+            checkpoint_path, model, migrate=migrate, checkpoint=payload
+        )
+        # `load_checkpoint` returns the CHECKPOINT, not the migration report --
+        # the report is one key inside it, and only when a migration happened.
+        report = loaded.get("migration")
+        if report is not None:
+            print(
+                "  migration: "
+                + ", ".join(
+                    f"{name}={len(report.get(name, ()))}"
+                    for name in ("loaded", "grown", "initialized", "zeroed", "neutral")
+                )
+            )
+            for name in ("grown", "initialized"):
+                for key in report.get(name, ()):
+                    print(f"    {name}: {key}")
+        for key in ("control_features_mismatch", "reveal_features_mismatch"):
+            if key in loaded:
+                print(f"  {key}: {loaded[key]}")
     return Evaluator(model, config.device, precision="fp32")
 
 
@@ -193,7 +229,8 @@ def build(args) -> int:
             f"late-stratum checkpoint not found: {late_checkpoint}\n"
             "The corpus needs a trained net for its late self-play stratum; an "
             "untrained one would leave the corpus with no late distribution "
-            "while still reporting 50 games. Pass --late-checkpoint."
+            "while still reporting 50 games. Pass --late-checkpoint (and "
+            "--migrate if its encoder signature predates this one)."
         )
 
     print(f"curriculum_seed: {CURRICULUM_GAMES} bot games")
@@ -215,7 +252,12 @@ def build(args) -> int:
     late = _selfplay_records(
         LATE_GAMES,
         seed_base=LATE_SEED_BASE,
-        evaluator=_evaluator_for(late_checkpoint, config, seed=args.untrained_seed),
+        evaluator=_evaluator_for(
+            late_checkpoint,
+            config,
+            seed=args.untrained_seed,
+            migrate=args.migrate,
+        ),
         config=config,
         iteration=args.late_iteration,
         # Past both anneals: no bot mix, no draft prior.
@@ -284,6 +326,14 @@ def main() -> int:
     parser.add_argument("--cheap-sims-max", type=int, default=24)
     parser.add_argument("--full-sims-min", type=int, default=64)
     parser.add_argument("--full-sims-max", type=int, default=128)
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help=(
+            "warm-start the late checkpoint across an encoder-signature or "
+            "architecture change; prints what was grown or initialized"
+        ),
+    )
     parser.add_argument(
         "--check",
         action="store_true",

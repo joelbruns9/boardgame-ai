@@ -11,8 +11,10 @@ slot, and `slot_identity.covered_slots` knows which slots a slot covers. So it
 costs two gathers, no schema change, and no Rust change.
 
 The test that matters here is `test_it_finds_the_slots_the_layout_says_it
-_should`. A branch that selected nothing would pass every neutrality and
-gradient assertion in this file.
+_should`, and it asserts the COMPLETE expected set per action rather than only
+that what was selected is legitimate. A branch that selected nothing -- or that
+dropped one of the two slots a card overlaps -- would pass every neutrality and
+gradient assertion in this file, and a membership-only check as well.
 """
 
 import random
@@ -42,6 +44,11 @@ from games.seven_wonders_duel.train import migrate_state_dict
 _TABLEAU = TOKEN_TYPES.index(TokenType.TABLEAU)
 _COVERERS = TABLEAU_FEATURES.index("coverers")
 _SLOT_COORDINATES = {value: key for key, value in AGE_SLOT_IDS.items()}
+_WITHIN_AGE = {
+    (age, slot.row, slot.x): index
+    for age, layout in TABLEAU_LAYOUTS.items()
+    for index, slot in enumerate(layout)
+}
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +71,13 @@ def _model(**kwargs):
 def test_it_finds_the_slots_the_layout_says_it_should(batch):
     """Checked against `slot_identity.covered_slots`, which is itself checked
     against `data.covering_slots` -- so this compares the tensor path to the
-    geometry, not to a second copy of itself."""
+    geometry, not to a second copy of itself.
+
+    The assertion is set EQUALITY, not membership. A branch that dropped one of
+    the two slots a card overlaps -- or that stopped selecting anything at all
+    -- would satisfy "everything selected is legitimate" and still be broken,
+    so the expected set is built independently and compared whole.
+    """
 
     model = _model(action_exposes=True)
     with torch.no_grad():
@@ -74,44 +87,60 @@ def test_it_finds_the_slots_the_layout_says_it_should(batch):
             tokens, {**batch, "slot_ids": slot_ids}, slot_ids
         )
 
+    coverers = batch["features"][..., _COVERERS]
     checked = 0
+    nonempty = 0
     rows = batch["type_ids"].shape[0]
     for row in range(rows):
         sources = batch["action_source_indices"][row]
         present = batch["action_source_present"][row].bool()
+        # slot identity -> the token carrying it, for this position.
+        token_of_slot = {}
+        for token in range(slot_ids.shape[1]):
+            identity = int(slot_ids[row, token])
+            if identity:
+                assert identity - 1 not in token_of_slot, "two tokens, one slot"
+                token_of_slot[identity - 1] = token
+
         for action in range(sources.shape[0]):
             token = int(sources[action])
+            found = {
+                int(covered_token[row, action, k])
+                for k in range(MAX_COVERED)
+                if bool(uncovers[row, action, k])
+            }
             if not bool(present[action]) or int(slot_ids[row, token]) == 0:
                 # Not a tableau source: nothing can be uncovered by it, and the
                 # branch must contribute nothing.
-                assert not bool(uncovers[row, action].any())
+                assert not found
                 continue
             age, source_row, source_x = _SLOT_COORDINATES[
                 int(slot_ids[row, token]) - 1
             ]
             layout = TABLEAU_LAYOUTS[age]
-            within = layout.index(
-                next(s for s in layout if (s.row, s.x) == (source_row, source_x))
-            )
-            expected = {j for j in covered_slots(age)[within] if j >= 0}
+            within = _WITHIN_AGE[(age, source_row, source_x)]
 
-            for k in range(MAX_COVERED):
-                if not bool(uncovers[row, action, k]):
+            expected = set()
+            for j in covered_slots(age)[within]:
+                if j < 0:
                     continue
-                found = int(covered_token[row, action, k])
-                found_age, found_row, found_x = _SLOT_COORDINATES[
-                    int(slot_ids[row, found]) - 1
-                ]
-                assert found_age == age
-                found_within = layout.index(
-                    next(s for s in layout if (s.row, s.x) == (found_row, found_x))
-                )
-                assert found_within in expected
-                # And it is genuinely an UNCOVERING: this action's removal is
-                # what makes that slot reachable.
-                assert round(float(batch["features"][row, found, _COVERERS])) == 1
-                checked += 1
-    assert checked > 0, "no action in a whole game uncovered anything"
+                slot = layout[j]
+                covered = token_of_slot.get(AGE_SLOT_IDS[(age, slot.row, slot.x)])
+                if covered is None:
+                    # That slot is not on the board any more, so this action
+                    # uncovers nothing there.
+                    continue
+                # And it is only an UNCOVERING when this action's removal is
+                # what makes the slot reachable: exactly one coverer.
+                if round(float(coverers[row, covered])) == 1:
+                    expected.add(covered)
+
+            assert found == expected, (row, action, sorted(found), sorted(expected))
+            checked += 1
+            nonempty += bool(found)
+
+    assert checked > 0, "no tableau action in a whole game"
+    assert nonempty > 0, "no action in a whole game uncovered anything"
 
 
 def test_a_doubly_covered_slot_is_not_counted(batch):
