@@ -1098,7 +1098,8 @@ consistently wrong.
 
 ### Distributional MCTS backup
 
-**Status: BUILT 2026-09-07 for RECORDING; no loss consumes it yet.**
+**Status: BUILT 2026-09-07 for RECORDING; no loss consumes it yet.** Under
+review: `W4_REVIEW_REQUEST.md`.
 `SearchResult.root_outlook` carries search's own seven-way distribution, it
 reaches `MoveRecord.root_outlook` and `Example.root_outlook`, and the training
 loss that would use it is deliberately left as offline work against the buffers
