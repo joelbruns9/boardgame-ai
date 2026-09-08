@@ -373,6 +373,14 @@ class PhaseDConfig:
     action_residual: bool = False
     """W5a contextual scorer over legal actions, blended behind a zero gate."""
 
+    action_exposes: bool = False
+    """W5b: each action reaches the contextual tokens of the slots it uncovers.
+
+    The action's CONSEQUENCE rather than its identity. Reached through geometry
+    already in the repo -- W5a's source token, W1's slot index, and the printed
+    cover relation -- so it needs no encoder feature and no Rust change.
+    """
+
     hierarchical_value: bool = False
     """W4 head: one consistent distribution over winner and victory type.
 
@@ -1250,6 +1258,11 @@ class PhaseDConfig:
                 "the head is shadow-only, so an unweighted one is parameters "
                 "and throughput buying nothing"
             )
+        if self.action_exposes and not self.action_residual:
+            raise ValueError(
+                "action_exposes requires --action-residual; it is a branch of "
+                "that scorer, not a scorer of its own"
+            )
         if self.action_policy_weight > 0 and not self.action_residual:
             raise ValueError("action_policy_weight requires --action-residual")
         if self.train_action_gate and not self.action_residual:
@@ -2007,6 +2020,7 @@ def _process_generation_init(
         config.reply_head,
         config.action_residual,
         slot_embedding=config.slot_embedding,
+        action_exposes=config.action_exposes,
         graph_module=config.graph_module,
         **_graph_shape(config),
         **_hier_value(config),
@@ -2059,6 +2073,7 @@ class ModelAgentSpec:
     pooled_readout: bool = False
     reply_head: bool = False
     action_residual: bool = False
+    action_exposes: bool = False
     slot_embedding: bool = False
     graph_module: bool = False
     graph_layers: int = 2
@@ -2109,6 +2124,7 @@ def _model_from_spec(spec: ModelAgentSpec):
         spec.reply_head,
         spec.action_residual,
         slot_embedding=spec.slot_embedding,
+        action_exposes=spec.action_exposes,
         graph_module=spec.graph_module,
         **_graph_shape(spec),
         **_hier_value(spec),
@@ -3220,6 +3236,7 @@ class PhaseDLoop:
             "pooled_readout": bool(getattr(model, "pooled_readout", False)),
             "reply_head": bool(getattr(model, "reply_head", False)),
             "action_residual": bool(getattr(model, "action_residual", False)),
+            "action_exposes": bool(getattr(model, "action_exposes", False)),
             "slot_embedding": bool(getattr(model, "slot_embedding", False)),
             "graph_module": bool(getattr(model, "graph_module", False)),
             "graph_layers": int(getattr(model, "graph_layers", 2)),
@@ -3252,6 +3269,7 @@ class PhaseDLoop:
             self.config.reply_head,
             self.config.action_residual,
             slot_embedding=self.config.slot_embedding,
+            action_exposes=self.config.action_exposes,
             graph_module=self.config.graph_module,
             **_graph_shape(self.config),
             **_hier_value(self.config),
@@ -4425,6 +4443,7 @@ class PhaseDLoop:
             pooled_readout=bool(getattr(source, "pooled_readout", False)),
             reply_head=bool(getattr(source, "reply_head", False)),
             action_residual=bool(getattr(source, "action_residual", False)),
+            action_exposes=bool(getattr(source, "action_exposes", False)),
             slot_embedding=bool(getattr(source, "slot_embedding", False)),
             graph_module=bool(getattr(source, "graph_module", False)),
             graph_layers=int(getattr(source, "graph_layers", 2)),
@@ -5879,6 +5898,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Keeps the fixed 1,202-action policy interface.",
     )
     parser.add_argument(
+        "--action-exposes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W5b: let each action reach the contextual tokens of the slots it "
+        "uncovers. Requires --action-residual.",
+    )
+    parser.add_argument(
         "--action-policy-weight",
         type=float,
         default=0.0,
@@ -6547,6 +6573,7 @@ def main(argv=None) -> int:
         pooled_readout=args.pooled_readout,
         reply_head=args.reply_head,
         action_residual=args.action_residual,
+        action_exposes=args.action_exposes,
         slot_embedding=args.slot_embedding,
         graph_module=args.graph_module,
         graph_layers=args.graph_layers,

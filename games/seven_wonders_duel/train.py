@@ -504,6 +504,7 @@ ARCHITECTURE_SWITCHES = (
     "pooled_readout",
     "reply_head",
     "action_residual",
+    "action_exposes",
     "control_head",
     "slot_embedding",
     "graph_module",
@@ -563,6 +564,7 @@ def model_from_config(config: dict, *, name: str = "transformer", **fallbacks):
         control_head_from_config(config),
         slot_embedding_from_config(config),
         graph_module_from_config(config),
+        action_exposes=action_exposes_from_config(config),
         **graph_shape_from_config(config),
         **hierarchical_value_from_config(config),
     )
@@ -745,6 +747,13 @@ def migrate_state_dict(old_state: dict, model) -> dict:
             grown[:, : old_state[key].shape[1]] = old_state[key]
             new_state[key] = grown
             report["grown"].append(key)
+        elif key == "action_scorer.exposed.weight":
+            # W5b's OUTPUT projection, zero by design: switching the branch on
+            # reproduces the W5a scorer exactly, and the branch still trains,
+            # because a zeroed output projection receives gradient where a
+            # zeroed gate over the whole branch would not.
+            new_state[key] = torch.zeros_like(tensor)
+            report["initialized"].append(key)
         elif key.startswith(
             ("action_scorer.", "control_scorer.", "graph.", "hier_value.")
         ):
@@ -895,6 +904,11 @@ def build_model(
     graph_alpha: float = 1e-3,
     hierarchical_value: bool = False,
     hierarchical_value_detach: bool = True,
+    # APPENDED, not inserted. `model_from_config` and three phase_d sites pass
+    # the earlier arguments POSITIONALLY, so a parameter added in the middle
+    # silently receives `slot_embedding` and every later flag shifts by one --
+    # a model that builds cleanly and is not the one asked for.
+    action_exposes: bool = False,
 ):
     """Build a model. ``heads=None`` derives the width-appropriate head count.
 
@@ -912,6 +926,7 @@ def build_model(
             pooled_readout=pooled_readout,
             reply_head=reply_head,
             action_residual=action_residual,
+            action_exposes=action_exposes,
             control_head=control_head,
             slot_embedding=slot_embedding,
             graph_module=graph_module,
@@ -974,6 +989,12 @@ def hierarchical_value_from_config(config: dict) -> dict:
             config.get("hierarchical_value_detach", True)
         ),
     }
+
+
+def action_exposes_from_config(config: dict) -> bool:
+    """W5b's uncovering edge, false for every checkpoint predating it."""
+
+    return bool(config.get("action_exposes", False))
 
 
 def graph_module_from_config(config: dict) -> bool:
@@ -1492,6 +1513,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "rather than a training one",
     )
     parser.add_argument(
+        "--action-exposes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="W5b: let each action reach the contextual tokens of the slots it "
+        "uncovers. Requires --action-residual; zero-initialised, so switching "
+        "it on reproduces the W5a scorer until it trains.",
+    )
+    parser.add_argument(
         "--action-policy-weight",
         type=float,
         default=ACTION_POLICY_WEIGHT_DEFAULT,
@@ -1729,6 +1758,9 @@ def main(argv=None) -> int:
         args.action_residual = bool(
             args.action_residual or action_residual_from_config(stored)
         )
+        args.action_exposes = bool(
+            args.action_exposes or action_exposes_from_config(stored)
+        )
         args.slot_embedding = bool(
             args.slot_embedding or slot_embedding_from_config(stored)
         )
@@ -1763,6 +1795,7 @@ def main(argv=None) -> int:
         effective_pooled,
         effective_reply,
         args.action_residual,
+        action_exposes=args.action_exposes,
         slot_embedding=args.slot_embedding,
         graph_module=args.graph_module,
         graph_layers=args.graph_layers,
@@ -1797,6 +1830,11 @@ def main(argv=None) -> int:
         raise SystemExit("--action-policy-weight requires --action-residual")
     if args.train_action_gate and not args.action_residual:
         raise SystemExit("--train-action-gate requires --action-residual")
+    if args.action_exposes and not args.action_residual:
+        raise SystemExit(
+            "--action-exposes requires --action-residual; it is a branch of "
+            "that scorer, not a scorer of its own"
+        )
     params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {params:,} params on {args.device}")
     if args.compile:

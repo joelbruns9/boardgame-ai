@@ -1182,7 +1182,17 @@ forward pass is needed -- the cost is carrying it across the boundary.
 
 ## Workstream 5: legal-action tokens
 
-**Status: PARTIAL -- W5a built, THROUGHPUT NOW VALIDATED, strength still untested.** W5a prototype (2026-09-03, `08be645`): all 1,202 actions decomposed, shared contextual scorer behind `action_residual=False` and an exactly-zero gate. Throughput measured and fixed 2026-09-07 (`64cee29`, see below): the scorer costs **-9% on CUDA/bf16 and -3% on CPU/fp32**, down from -51% and -22%. Strength unvalidated. W5b -- the same scorer fed contextual slot (W1), graph (W2) and control (W3) outputs, plus an `exposes` index so a burial action can reach the slot it uncovers -- needs those first.
+**Status: PARTIAL -- W5a and W5b's `exposes` edge BUILT, strength still untested.** W5a prototype (2026-09-03, `08be645`): all 1,202 actions decomposed, shared contextual scorer behind `action_residual=False` and an exactly-zero gate. Throughput measured and fixed 2026-09-07 (`64cee29`, see below): the scorer costs **-9% on CUDA/bf16 and -3% on CPU/fp32**, down from -51% and -22%. Strength unvalidated. W5b's **`exposes` edge is BUILT 2026-09-08** behind `--action-exposes` (see below); the rest of W5b -- feeding the scorer contextual slot (W1), graph (W2) and control (W3) outputs -- is not, and those arms should earn their place before being wired into the action representation.
+
+### W5b's `exposes` edge, as built
+
+The action's CONSEQUENCE rather than its identity: each legal action reaches the contextual tokens of the slots it uncovers. Reached entirely through geometry already in the repo -- W5a's source token, W1's slot index, and the printed cover relation -- so it needs **no encoder feature and no Rust change**, and `ENCODER_SIGNATURE` does not move.
+
+A covered slot counts only when the action's removal is what makes it reachable, i.e. when that slot has exactly one coverer. Two coverers and the card stays buried; the action is a step towards uncovering it, not an uncovering. `reveal_risk` already gives the COUNT of what a removal exposes and the pooled danger of it; this gives the IDENTITY, so the scorer can read the actual card's contextual embedding rather than a summary statistic.
+
+Zero-initialised output projection: switching it on reproduces the W5a scorer exactly, and unlike a gate over the whole branch it stays trainable, because a zeroed output projection still receives gradient. Cost **1.019x** on an unfused single-thread CPU forward at d384 L8.
+
+Note what it does NOT establish. W9 showed the structural key `(use, slot, wonder)` is what corresponds across chance worlds, and this is that thesis wired into the representation -- but the plan's own caveat stands: a tactical or value failure would produce the same observation, and the discovery trace shows the value at that node is independently 36 points wrong. The testable form remains narrow: after training, does the prior on the exact refutation rise relative to a flat-policy control on the same data?
 
 ### Throughput, measured and repaired (2026-09-07)
 

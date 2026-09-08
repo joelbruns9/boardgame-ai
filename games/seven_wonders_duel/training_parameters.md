@@ -2576,6 +2576,39 @@ The index is derived from features the encoder already emits, so turning this
 on moves neither `ENCODER_SIGNATURE` nor any buffer: an existing checkpoint
 migrates in seconds and an existing buffer is reused as it is.
 
+## Workstream 5b: what an action uncovers
+
+Off by default, and a branch of W5a's scorer rather than a scorer of its own --
+`--action-exposes` requires `--action-residual`.
+
+W5a scores an action from the contextual token of the card it acts on: *this is
+a build of the Sawmill*. W5b adds the consequence: *...and it uncovers those two
+slots*, by letting the action reach those slots' contextual tokens. Every
+reviewed failure in the plan is in the second sentence; table 908370787 is a
+burial that uncovered a threat.
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--action-exposes` / `--no-action-exposes` | off | let each action read the tokens of the slots it uncovers |
+
+**No encoder feature and no Rust change.** The edge is reached through geometry
+already in the repo: W5a knows the action's source token, W1 knows that token's
+slot, and the printed cover relation knows which slots a slot covers. Nothing
+new crosses the boundary, so `ENCODER_SIGNATURE` does not move and no buffer
+re-derives.
+
+**A covered slot counts only when this action's removal is what makes it
+reachable** -- when the slot has exactly one coverer. Two coverers and the card
+stays buried: the action is a step towards uncovering it, not an uncovering,
+and treating those alike is the difference between "this hands them the sixth
+symbol" and "this might, eventually".
+
+The output projection is zero-initialised, so switching the branch on
+reproduces the W5a scorer exactly. Unlike a gate over the whole branch it is
+neutral without being dead: a zeroed output projection still receives gradient.
+Measured at **1.019x** on an unfused single-thread CPU forward, d384 L8, 71
+rows.
+
 ## Workstream 4: the hierarchical winner/victory-type head
 
 Off by default. `value` (W/D/L) and `joint7` (winner x victory type) are

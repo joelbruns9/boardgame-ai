@@ -323,6 +323,7 @@ def load_side(
                 "pooled_readout",
                 "reply_head",
                 "action_residual",
+                "action_exposes",
                 "control_head",
                 "slot_embedding",
                 "graph_module",

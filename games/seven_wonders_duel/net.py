@@ -33,12 +33,14 @@ from .slot_identity import (
     AGE_OF_SLOT,
     AGE_SLOT_IDS,
     MAX_AGE,
+    MAX_COVERED,
     MAX_SLOTS_PER_AGE,
     MAX_SLOT_ROW,
     MAX_SLOT_X,
     NUM_AGE_SLOTS,
     NUM_RELATIONS,
     WITHIN_AGE_INDEX,
+    covered_planes,
     relation_planes,
 )
 
@@ -61,6 +63,10 @@ _TABLEAU_TYPE_INDEX = TOKEN_TYPES.index(TokenType.TABLEAU)
 _AGE_COLUMNS = tuple(GLOBAL_FEATURES.index(f"age_{age}") for age in (1, 2, 3))
 _ROW_COLUMN = TABLEAU_FEATURES.index("row")
 _X_COLUMN = TABLEAU_FEATURES.index("x")
+#: How many present slots overlap and cover this one. A slot becomes reachable
+#: when its last coverer is taken, so `coverers == 1` is what makes an action's
+#: removal an UNCOVERING rather than a step towards one.
+_COVERERS_COLUMN = TABLEAU_FEATURES.index("coverers")
 
 
 def _slot_lookup_table() -> torch.Tensor:
@@ -547,9 +553,33 @@ class ContextualActionResidual(nn.Module):
     scatters it back into the frozen 1,202-action interface.
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, exposes: bool = False):
         super().__init__()
         self.d_model = d_model
+        #: W5b. The action's CONSEQUENCE, not just its identity: the contextual
+        #: tokens of the slots this action uncovers.
+        #:
+        #: W5a says "this is a build of the Sawmill". W5b says "...and it
+        #: uncovers those two slots". Every reviewed failure in the plan is in
+        #: the second sentence -- 908370787 is a burial that uncovered a threat.
+        #:
+        #: Zero-initialised, so switching it on reproduces the W5a scorer
+        #: exactly until it trains. Unlike a gate that would also freeze the
+        #: branch, a zeroed OUTPUT projection still leaves the branch's own
+        #: gradients alive: they flow through the non-zero input weights.
+        self.exposes = bool(exposes)
+        self.exposed = nn.Linear(d_model, d_model, bias=False) if exposes else None
+        if self.exposed is not None:
+            nn.init.zeros_(self.exposed.weight)
+            self.register_buffer(
+                "covered_planes",
+                torch.tensor(covered_planes(), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "within_age", torch.tensor(WITHIN_AGE_INDEX, dtype=torch.long),
+                persistent=False,
+            )
         self.family = nn.Embedding(NUM_ACTION_FAMILIES, d_model)
         self.source = nn.Linear(d_model, d_model, bias=False)
         self.wonder = nn.Linear(d_model, d_model, bias=False)
@@ -568,6 +598,100 @@ class ContextualActionResidual(nn.Module):
         picker = indices.unsqueeze(-1).expand(*indices.shape, tokens.shape[-1])
         return tokens.gather(1, picker)
 
+    def uncovered_tokens(
+        self,
+        tokens: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        slot_ids: torch.Tensor,
+    ):
+        """W5b: the contextual tokens of the slots each action would uncover.
+
+        Reached through the geometry rather than a new encoder feature. The
+        action's source token is already known (W5a); its slot identity is
+        already known (W1); which slots that one covers is a property of the
+        printed shape (`slot_identity.covered_slots`). So the edge costs two
+        gathers and no schema change -- which also means no Rust change, since
+        nothing new crosses the boundary.
+
+        A covered slot counts only when this action's removal is what makes it
+        reachable, i.e. when the slot has exactly ONE coverer. Two coverers and
+        the card stays buried; the action is a step towards uncovering it, not
+        an uncovering, and treating those alike is the difference between "this
+        hands them the sixth symbol" and "this might, eventually".
+
+        Returns `(covered_token, uncovers)` -- token indices and the mask --
+        rather than only their embedding, so a test can check WHICH slots were
+        found against the printed geometry. A branch that selected nothing
+        would otherwise pass every neutrality and gradient test in the file.
+        """
+
+        assert self.exposed is not None
+        rows, token_count, width = tokens.shape
+        actions = batch["action_source_indices"]
+
+        is_slot = slot_ids > 0
+        within = self.within_age[(slot_ids - 1).clamp(min=0)]
+        sink = torch.full_like(within, MAX_SLOTS_PER_AGE)
+        node_index = torch.where(is_slot, within, sink)
+        # Slot -> token, the inverse of `slot_ids`. Built by scatter, with the
+        # non-tableau tokens parked in a sink that is then dropped: without it
+        # they would all collide on slot 0 and overwrite a real one.
+        positions = torch.arange(token_count, device=tokens.device)
+        slot_token = tokens.new_zeros(
+            (rows, MAX_SLOTS_PER_AGE + 1), dtype=torch.long
+        )
+        slot_token.scatter_(
+            1, node_index, positions.expand(rows, token_count)
+        )
+        slot_present = tokens.new_zeros(
+            (rows, MAX_SLOTS_PER_AGE + 1), dtype=torch.bool
+        )
+        slot_present.scatter_(
+            1, node_index, torch.ones_like(node_index, dtype=torch.bool)
+        )
+
+        source_slot = within.gather(1, actions)
+        source_is_slot = is_slot.gather(1, actions) & batch["action_source_present"].bool()
+        ages = TokenEmbedder.row_ages(batch)
+        planes = self.covered_planes[ages]                       # [rows, N, K]
+        picker = source_slot.unsqueeze(-1).expand(
+            *source_slot.shape, MAX_COVERED
+        )
+        covered = planes.gather(1, picker)                       # [rows, A, K]
+        covered_exists = (covered >= 0) & source_is_slot.unsqueeze(-1)
+        covered_index = torch.where(
+            covered_exists, covered, torch.full_like(covered, MAX_SLOTS_PER_AGE)
+        )
+
+        flat = covered_index.reshape(rows, -1)
+        covered_token = slot_token.gather(1, flat).reshape_as(covered_index)
+        covered_here = slot_present.gather(1, flat).reshape_as(covered_index)
+
+        coverers = (
+            batch["features"][..., _COVERERS_COLUMN]
+            .gather(1, covered_token.reshape(rows, -1))
+            .reshape_as(covered_index)
+        )
+        # The uncovering condition. `round` because the feature is stored as a
+        # count in a float tensor, not because the value is uncertain.
+        uncovers = covered_exists & covered_here & (coverers.round() == 1)
+
+        return covered_token, uncovers
+
+    def _exposed_context(
+        self,
+        tokens: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        slot_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum of the contextual tokens each action actually uncovers."""
+
+        rows, _, width = tokens.shape
+        covered_token, uncovers = self.uncovered_tokens(tokens, batch, slot_ids)
+        gathered = self._gather(tokens, covered_token.reshape(rows, -1))
+        gathered = gathered.reshape(rows, covered_token.shape[1], MAX_COVERED, width)
+        return (gathered * uncovers.unsqueeze(-1)).sum(dim=2)
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -580,6 +704,10 @@ class ContextualActionResidual(nn.Module):
         wonder = wonder * batch["action_wonder_present"].unsqueeze(-1)
         action = self.family(batch["action_families"])
         action = action + self.source(source) + self.wonder(wonder)
+        if self.exposed is not None:
+            action = action + self.exposed(
+                self._exposed_context(tokens, batch, batch["slot_ids"])
+            )
         action = self.action_key(self.action_norm(action))
         query = self.state_query(readout).unsqueeze(1)
         score = (query * action).sum(dim=-1) / (self.d_model ** 0.5)
@@ -786,6 +914,7 @@ class SWDNet(nn.Module):
         pooled_readout: bool = False,
         reply_head: bool = False,
         action_residual: bool = False,
+        action_exposes: bool = False,
         control_head: bool = False,
         hierarchical_value: bool = False,
         hierarchical_value_detach: bool = True,
@@ -817,7 +946,7 @@ class SWDNet(nn.Module):
         self.embedder = TokenEmbedder(
             d_model,
             slot_embedding=self.slot_embedding,
-            slot_index=self.graph_module,
+            slot_index=self.graph_module or bool(action_exposes and action_residual),
         )
         self.graph = (
             TableauGraph(
@@ -863,9 +992,14 @@ class SWDNet(nn.Module):
         )
         self.reply_head = bool(reply_head)
         self.action_residual = bool(action_residual)
+        #: W5b. Needs W1's slot INDEX (not its table) to find what an action
+        #: uncovers, so it asks the embedder for one exactly as W2 does.
+        self.action_exposes = bool(action_exposes and action_residual)
         self.heads = Heads(d_model, reply=self.reply_head)
         self.action_scorer = (
-            ContextualActionResidual(d_model) if self.action_residual else None
+            ContextualActionResidual(d_model, exposes=self.action_exposes)
+            if self.action_residual
+            else None
         )
         self.control_head = bool(control_head)
         self.control_scorer = ControlHead(d_model) if self.control_head else None
@@ -911,6 +1045,10 @@ class SWDNet(nn.Module):
             )
         out = self.heads(readout)
         if self.action_scorer is not None:
+            if self.action_scorer.exposed is not None:
+                # Computed once and passed in, rather than recomputed inside the
+                # scorer: W1 and W2 may already have it for this batch.
+                batch = {**batch, "slot_ids": self.embedder.slot_ids(batch)}
             candidate_logits = self.action_scorer(normed, readout, batch)
             # Under autocast the scorer returns bf16 while `policy` is fp32, and
             # `scatter_add_` requires both to match -- so W5a crashed outright at

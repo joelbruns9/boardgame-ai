@@ -210,3 +210,55 @@ def relation_planes() -> list[list[list[int]]]:
                 plane[i][j] = value
         planes.append(plane)
     return planes
+
+
+# --- Workstream 5b: what an action uncovers ---------------------------------
+
+#: The most slots any one slot covers. Two, in every printed Age: a card
+#: overlaps the two below it. Derived rather than asserted, so a future layout
+#: cannot quietly overflow the tensor built from it.
+MAX_COVERED = max(
+    max(sum(1 for value in row if value) for row in _cover_matrix(age))
+    for age in TABLEAU_LAYOUTS
+)
+
+
+def covered_slots(age: int) -> list[list[int]]:
+    """For each slot, the slots it COVERS -- the ones taking it can uncover.
+
+    Direction matters and is easy to invert: `_cover_matrix(age)[i][j]` is "i
+    covers j", and a card covers the two beneath it in the row numbering. So
+    removing slot `i` is what can make its `covered_slots` reachable, and the
+    coverers of `i` are a different set entirely.
+
+    Padded to `MAX_COVERED` with `-1`, because a slot on the bottom row covers
+    nothing and the tensor built from this is rectangular.
+    """
+
+    cover = _cover_matrix(age)
+    size = len(cover)
+    out = []
+    for i in range(size):
+        covered = [j for j in range(size) if cover[i][j]]
+        out.append(covered + [-1] * (MAX_COVERED - len(covered)))
+    return out
+
+
+def covered_planes() -> list[list[list[int]]]:
+    """One `[MAX_SLOTS_PER_AGE, MAX_COVERED]` plane per Age, plus an empty
+    plane 0 for a row that names no Age.
+
+    Values are WITHIN-AGE slot indices, or -1. Padded to a common size so the
+    planes stack into one tensor, exactly as `relation_planes` is.
+    """
+
+    size = MAX_SLOTS_PER_AGE
+    empty = [[-1] * MAX_COVERED for _ in range(size)]
+    planes = [empty]
+    for age in sorted(TABLEAU_LAYOUTS):
+        source = covered_slots(age)
+        plane = [[-1] * MAX_COVERED for _ in range(size)]
+        for i, covered in enumerate(source):
+            plane[i] = list(covered)
+        planes.append(plane)
+    return planes
