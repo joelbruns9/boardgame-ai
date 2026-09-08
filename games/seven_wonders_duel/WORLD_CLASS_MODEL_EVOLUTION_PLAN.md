@@ -1045,6 +1045,8 @@ The factorisation hard-codes `JOINT7_CLASSES`'s ORDER, which `net._check_joint7_
 
 A built head with a zero loss weight is refused, on the same grounds as W5's scorer: shadow-only and untrained is parameters and throughput buying nothing, which reads like a configured arm and is not one.
 
+**The replacement arm takes the coefficient it replaces.** `joint7` enters the total at `value_weight * aux_weight`; W4 entered at a flat 0.15, so the arm varied the weight as well as the parameterisation -- the exact confound replacement exists to remove. It is now derived from the run's own knobs. What makes matching meaningful rather than cosmetic is that both losses are the same functional: the negative log-likelihood of the same true class under a seven-way distribution, differing only in how that distribution is parameterised. Equal coefficients therefore mean equal weight, which is not generally true of two auxiliary losses.
+
 ### Current limitation
 
 The existing WDL and seven-way (`joint7`) heads are independent. MCTS backs up

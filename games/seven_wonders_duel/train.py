@@ -1574,6 +1574,25 @@ def resolve_graph_args(args, stored: dict | None) -> None:
             setattr(args, field, fallback)
 
 
+def matched_hier_value_weight(value_weight: float, aux_weight: float) -> float:
+    """The weight that makes W4 a REPLACEMENT for the flat joint7 term.
+
+    `joint7` enters the total at `value_weight * aux_weight`; W4 enters at
+    `hier_value_weight`. The two losses are the same functional -- the negative
+    log-likelihood of the same true class under a seven-way distribution,
+    differing only in how the distribution is parameterised -- so their
+    gradients are directly comparable and equal coefficients really do mean
+    equal weight. That is what makes the replacement arm a clean test of the
+    PARAMETERISATION rather than of the weight.
+
+    Derived, never a constant: `--aux-weight` and `--value-weight` are run
+    knobs, so a hard-coded 0.2 would silently stop matching the moment either
+    moved.
+    """
+
+    return value_weight * aux_weight
+
+
 def resolve_hier_value_args(args) -> None:
     """Settle the W4 recipe, in place, and refuse the combinations that lie.
 
@@ -1592,9 +1611,33 @@ def resolve_hier_value_args(args) -> None:
     if args.hierarchical_value_detach is None:
         args.hierarchical_value_detach = True
     if args.hier_value_weight is None:
-        args.hier_value_weight = (
-            HIER_VALUE_WEIGHT_DEFAULT if args.hierarchical_value else 0.0
+        if args.hier_value_replaces_joint7:
+            # The replacement arm holds the weight fixed and varies only the
+            # structure, so it takes the coefficient it is replacing.
+            args.hier_value_weight = matched_hier_value_weight(
+                getattr(args, "value_weight", VALUE_WEIGHT_DEFAULT),
+                args.aux_weight,
+            )
+        else:
+            args.hier_value_weight = (
+                HIER_VALUE_WEIGHT_DEFAULT if args.hierarchical_value else 0.0
+            )
+    elif args.hier_value_replaces_joint7:
+        matched = matched_hier_value_weight(
+            getattr(args, "value_weight", VALUE_WEIGHT_DEFAULT), args.aux_weight
         )
+        if abs(args.hier_value_weight - matched) > 1e-12:
+            # Warned, not refused: a deliberate sweep of the replacement arm's
+            # weight is a legitimate experiment. But shipping a mismatch by
+            # accident makes the arm vary structure AND weight, which is the
+            # confound replacement exists to remove, so it cannot pass quietly.
+            print(
+                f"WARNING: --hier-value-weight {args.hier_value_weight} does not "
+                f"match the flat joint7 coefficient it replaces ({matched} = "
+                f"value_weight x aux_weight). The replacement arm then varies "
+                "the weight as well as the parameterisation, and a difference "
+                "cannot be attributed to either."
+            )
     if args.hier_value_weight < 0 or not math.isfinite(args.hier_value_weight):
         raise SystemExit("--hier-value-weight must be finite and non-negative")
     if args.hier_value_weight > 0 and not args.hierarchical_value:

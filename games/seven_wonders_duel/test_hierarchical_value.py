@@ -464,7 +464,11 @@ def test_an_explicit_attach_survives_a_detached_warm_start(tmp_path):
         args.hierarchical_value_detach = inherited["hierarchical_value_detach"]
     train.resolve_hier_value_args(args)
     assert args.hierarchical_value_detach is False
-    assert args.hier_value_weight == pytest.approx(0.15)
+    # The replacement coefficient, not the shadow default -- see
+    # `test_the_replacement_arm_takes_the_coefficient_it_replaces`.
+    assert args.hier_value_weight == pytest.approx(
+        train.VALUE_WEIGHT_DEFAULT * train.AUX_WEIGHT_DEFAULT
+    )
 
 
 def test_an_omitted_flag_inherits_and_still_gets_a_weight(tmp_path):
@@ -538,3 +542,69 @@ def test_a_checkpoint_cannot_ask_for_a_head_it_lacks(tmp_path):
         arena.load_side(
             "candidate", path, device="cpu", precision="fp32", batch_cap=8
         )
+
+
+def test_the_replacement_arm_takes_the_coefficient_it_replaces():
+    """Otherwise it varies structure AND weight, which is the confound it
+    exists to remove.
+
+    `joint7` enters the total at `value_weight * aux_weight`; W4 entered at a
+    constant 0.15. Both losses are the negative log-likelihood of the same true
+    class under a seven-way distribution, so their coefficients are directly
+    comparable and equal ones really do mean equal weight -- which is what
+    makes matching them meaningful rather than cosmetic.
+    """
+
+    from games.seven_wonders_duel import train
+
+    def resolved(extra):
+        args = train.build_arg_parser().parse_args(
+            [
+                "--buffer",
+                "unused.jsonl",
+                "--hierarchical-value",
+                "--no-hierarchical-value-detach",
+                *extra,
+            ]
+        )
+        train.resolve_hier_value_args(args)
+        return args
+
+    replacing = resolved(["--hier-value-replaces-joint7"])
+    assert replacing.hier_value_weight == pytest.approx(
+        train.VALUE_WEIGHT_DEFAULT * train.AUX_WEIGHT_DEFAULT
+    )
+
+    # Derived, not a constant: both inputs are run knobs, so a hard-coded 0.2
+    # would stop matching the moment either moved.
+    swept = resolved(["--hier-value-replaces-joint7", "--aux-weight", "0.5"])
+    assert swept.hier_value_weight == pytest.approx(0.5)
+
+    # The shadow arm is unaffected: its loss reaches only the head's own
+    # projections, so the coefficient decides how fast a read-out fits and
+    # nothing else.
+    assert resolved([]).hier_value_weight == pytest.approx(
+        train.HIER_VALUE_WEIGHT_DEFAULT
+    )
+
+
+def test_an_explicit_mismatch_warns_but_is_allowed(capsys):
+    """Sweeping the replacement arm's weight is a legitimate experiment;
+    shipping a mismatch by accident is not."""
+
+    from games.seven_wonders_duel import train
+
+    args = train.build_arg_parser().parse_args(
+        [
+            "--buffer",
+            "unused.jsonl",
+            "--hierarchical-value",
+            "--no-hierarchical-value-detach",
+            "--hier-value-replaces-joint7",
+            "--hier-value-weight",
+            "0.15",
+        ]
+    )
+    train.resolve_hier_value_args(args)
+    assert args.hier_value_weight == pytest.approx(0.15)
+    assert "does not match" in capsys.readouterr().out

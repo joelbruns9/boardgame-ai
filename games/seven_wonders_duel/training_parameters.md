@@ -2588,7 +2588,17 @@ products, `P(outcome) * P(type | outcome)`, so the two are one object.
 | --- | --- | --- |
 | `--hierarchical-value` / `--no-hierarchical-value` | off | build the head. Shadow only: `value` and `joint7` stay authoritative for search. |
 | `--hierarchical-value-detach` / `--no-...` | **on** | learn from a stop-gradient readout |
-| `--hier-value-weight` | 0.15 with the head, else 0 | loss weight |
+| `--hier-value-weight` | see below | loss weight |
+
+`--hier-value-weight` resolves to 0 without the head, to
+**`value_weight x aux_weight`** in the replacement arm, and to 0.15 otherwise.
+The replacement value is DERIVED, not a constant: `joint7` enters the total at
+that coefficient, and both losses are the negative log-likelihood of the same
+true class under a seven-way distribution -- the same functional, differing
+only in how the distribution is parameterised -- so equal coefficients really
+do mean equal weight. Setting it by hand in the replacement arm warns rather
+than refuses, because sweeping it is a legitimate experiment and shipping a
+mismatch by accident is not.
 
 **Read the detach flag before running an arm.** A shadow head protects the
 served numbers but not the shared trunk: attached, its loss shapes
@@ -2613,7 +2623,9 @@ The head's mere presence cannot. These two can, and both are cheap:
 | `--hier-value-replaces-joint7` | the flat `joint7` loss is dropped, so W4 is the ONLY victory-type supervision |
 | `--value-source hierarchical` | the scalar search value is read from W4's outcome factor instead of the flat `value` head |
 
-**Replacement, not addition, is the comparison worth making.** `joint7` and W4
+**Replacement, not addition, is the comparison worth making**, and it only
+holds the weight fixed because the coefficient is matched -- see above; it was
+0.15 against 0.2 until 2026-09-07, which varied both. `joint7` and W4
 fit the same per-game label, so running both trains two heads on one
 observation and mostly re-weights the outcome objective against policy --
 which measures the weight, not the parameterisation. Replacement holds the

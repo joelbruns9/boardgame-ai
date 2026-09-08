@@ -1231,6 +1231,19 @@ class PhaseDConfig:
                     "--no-hierarchical-value-detach; a detached head cannot "
                     "replace supervision it never delivers to the trunk"
                 )
+        if self.hier_value_replaces_joint7:
+            matched = self.value_weight * self.aux_weight
+            if abs(self.hier_value_weight - matched) > 1e-12:
+                # Warned, not refused: sweeping the replacement arm's weight is
+                # a legitimate experiment. Shipping a mismatch unnoticed is not
+                # -- the arm would vary structure AND weight, which is the
+                # confound replacement exists to remove.
+                print(
+                    f"WARNING: hier_value_weight {self.hier_value_weight} does "
+                    f"not match the flat joint7 coefficient it replaces "
+                    f"({matched} = value_weight x aux_weight); the arm then "
+                    "varies the weight as well as the parameterisation."
+                )
         if self.hierarchical_value and self.hier_value_weight == 0:
             raise ValueError(
                 "--hierarchical-value requires a positive --hier-value-weight; "
@@ -1889,6 +1902,24 @@ def generate_seed_buffer(
 # Per-process state for run_jobs_in_processes generation. The initializer runs
 # once per spawned worker; the dict never leaks between processes.
 _PROCESS_STATE: dict[str, Any] = {}
+
+
+def _resolved_hier_value_weight(args) -> float:
+    """0 without the head, the replaced coefficient in the replacement arm, and
+    the shadow default otherwise.
+
+    The replacement arm takes `value_weight * aux_weight` -- the coefficient the
+    flat joint7 term enters at -- so it varies the parameterisation and not the
+    weight. Derived rather than constant, because both are run knobs.
+    """
+
+    if args.hier_value_weight is not None:
+        return args.hier_value_weight
+    if not args.hierarchical_value:
+        return 0.0
+    if args.hier_value_replaces_joint7:
+        return args.value_weight * args.aux_weight
+    return 0.15
 
 
 def _checkpoint_value_source(path) -> str:
@@ -6525,11 +6556,7 @@ def main(argv=None) -> int:
         hierarchical_value_detach=args.hierarchical_value_detach,
         hier_value_replaces_joint7=args.hier_value_replaces_joint7,
         value_source=args.value_source,
-        hier_value_weight=(
-            (0.15 if args.hierarchical_value else 0.0)
-            if args.hier_value_weight is None
-            else args.hier_value_weight
-        ),
+        hier_value_weight=_resolved_hier_value_weight(args),
         train_action_gate=args.train_action_gate,
         forced_playout_k=args.forced_playout_k,
         cheap_search_mode=args.cheap_search_mode,
