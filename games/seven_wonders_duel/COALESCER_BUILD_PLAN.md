@@ -339,6 +339,12 @@ CUDA. So the contract splits:
 3. **Trajectory fingerprints** on the real net path — actions, digests, visit
    counts only. Float targets legitimately drift ~1e-5 with batch shape, the
    same contract `--rust-global-batch-cap` already lives under.
+
+   > **Measured, and half of this was wrong.** The fingerprint holds at fp32
+   > (drift 2.4e-6). At bf16 it does not: 2 of 8 games diverge. And the cited
+   > precedent is the wrong knob — the batch cap does NOT diverge (0 of 8 at
+   > 512 vs 64). The real precedent is `--rust-scheduler-workers`, which
+   > diverges the same 2 of 8 with coalescing off. §10.
 4. **Unit tests**, each written to fail on a wrong merge *and* on the
    pre-coalescer path:
    * members with different row counts scatter correctly;
@@ -503,7 +509,9 @@ before running the full grid**, and drop grid points above what fits.
   46.9~~ **met on the laptop harness** (see §9); the 46.9 figure itself is
   cloud2's and can only be re-measured on the box.
 * ~~Discrete fingerprints unchanged; bit-identical on the deterministic
-  path~~ **met** — strict equality, including float targets.
+  path~~ **PARTLY MET, and the criterion as written is FALSE.** Bit-identical on
+  the deterministic path, yes. Discrete fingerprints unchanged holds at fp32 on
+  CUDA — and **does not hold at bf16, which is what production runs**. See §10.
 * **Games per hour up, with an interval that excludes no change.** OUTSTANDING,
   and the only criterion that matters. Needs the box: the laptop numbers below
   are batch WIDTH, which is the mechanism, not the prize. If width rises and
@@ -575,3 +583,41 @@ revision argued against having this and was wrong.
 **Not measured, and not to be inferred from any of this:** games per hour.
 Every number above is width. The 91.8% `py_call_ns` share that motivates the
 work is cloud2's, and the prize can only be claimed on the box.
+
+---
+
+## 10. bf16 changes trajectories, and the precedent that makes that acceptable
+
+Measured 2026-09-09 on a laptop 3070, 8 games, a 128×4 net, coalescing on
+(4 shards, 2 ms) against off (one request per forward):
+
+| precision | knob varied | games diverged of 8 | max float drift |
+|---|---|---|---|
+| fp32 | coalescing on/off | **0** | 2.4e-6 |
+| bf16 | coalescing on/off | **2** | — (post-divergence) |
+| bf16 | `scheduler_workers` 4 vs 1, coalescing **off** | **2** | — |
+| bf16 | `global_batch_cap` 512 vs 64, coalescing off | 0 | — |
+| fp32 | either of those knobs | 0 | — |
+
+**A fixed composition is exactly reproducible at both precisions** (self-check
+run twice: identical, zero drift). So none of the above is GPU
+nondeterminism — it is composition, deterministically.
+
+At bf16 (~3 decimal digits) a reduction-order difference is large enough to flip
+an argmax between two near-equal moves, and one flip diverges the rest of that
+game.
+
+**Why this is acceptable, and the precise form of the argument.** Not because
+the drift is small — at bf16 it is not. Because
+**`--rust-scheduler-workers` already does exactly this, by the same mechanism,
+and is swept on every box run.** The coalescer joins a class that already
+exists rather than creating one. If that ever stops holding on some hardware,
+`test_cuda_bf16_composition_changes_trajectories_and_that_is_not_new` fails and
+the change needs its own justification.
+
+**What this costs on the box.** An on/off A/B at bf16 compares two different
+sets of games. That is fine for games per hour, which is a rate over many games,
+and it means the comparison **cannot be paired** — seed variance has to be in
+the interval. Run enough games that it is.
+
+The fp32 identity is the stronger statement and is gated outright.

@@ -22,7 +22,7 @@ import threading
 
 import pytest
 
-from .rust_bridge import rust_games_for_self_play
+from .rust_bridge import rust_flat_batch_adapter, rust_games_for_self_play
 
 
 def _games(count: int):
@@ -802,4 +802,148 @@ def test_a_wait_with_coalescing_off_is_refused():
     with pytest.raises(ValueError, match="coalescing disabled"):
         swr._coalescer_probe(
             _Adapter(), _games(2), [1], [None], 8, 0.0, 2.0, 0, None, [], False
+        )
+
+
+# ---------------------------------------------------------------------------
+# CUDA, where batch composition moves float reductions
+# ---------------------------------------------------------------------------
+def _cuda_run(coalesce, wait_ms, precision, *, workers=4, cap=512, games=4):
+    import torch
+
+    import seven_wonders_rust as swr
+
+    from .control_table import ensure_rust_table
+    from .inference import Evaluator
+    from .net import SWDNet
+
+    ensure_rust_table()
+    seeds = [2026091100 + index for index in range(games)]
+    # Same weights every call: the comparison is about batch composition, and a
+    # reseeded net would confound it with a different function.
+    torch.manual_seed(0)
+    evaluator = Evaluator(
+        SWDNet(d_model=64, layers=2, heads=4),
+        "cuda",
+        cap,
+        fuse_embedder=False,
+        precision=precision,
+    )
+    return swr.self_play_many_flat_net(
+        adapter=rust_flat_batch_adapter(evaluator),
+        games=rust_games_for_self_play(seeds, [i % 2 for i in range(games)]),
+        game_seeds=seeds,
+        global_batch_cap=cap,
+        leaf_batch=1,
+        cheap_sims_min=6,
+        cheap_sims_max=8,
+        full_sims_min=12,
+        full_sims_max=16,
+        full_search_fraction=0.4,
+        top_k=3,
+        draft_prior=0.0,
+        iteration=1,
+        scheduler_workers=workers,
+        max_active_slots=games,
+        max_moves=256,
+        inference_wait_ms=wait_ms,
+        inference_coalesce=coalesce,
+    )
+
+
+def _discrete(records):
+    """The fingerprint contract: digests, actions, visits. Nothing float."""
+
+    return [
+        (
+            record["trajectory_digest"],
+            record["final_digest"],
+            tuple(
+                (move["action"], tuple(move["visits"])) for move in record["moves"]
+            ),
+        )
+        for record in records
+    ]
+
+
+def _requires_cuda():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required: this is about float reductions on a GPU")
+
+
+def test_cuda_is_self_consistent_for_a_fixed_batch_composition():
+    """The precondition for every CUDA comparison below.
+
+    If a config were not reproducible against itself, no on/off comparison could
+    attribute anything. Measured exact at both precisions -- so what the tests
+    below see is composition, never GPU nondeterminism.
+    """
+
+    _requires_cuda()
+    for precision in ("fp32", "bf16"):
+        first, _ = _cuda_run(True, 2.0, precision)
+        second, _ = _cuda_run(True, 2.0, precision)
+        assert _discrete(first) == _discrete(second), precision
+
+
+def test_cuda_fp32_trajectories_survive_coalescing():
+    """At fp32 the fingerprint contract holds outright.
+
+    Measured at 8 games, 128x4 net: identical digests, actions and visits, with
+    float targets drifting at most 2.4e-6 -- the reduction-order noise the plan
+    predicts.
+    """
+
+    _requires_cuda()
+    merged, metrics = _cuda_run(True, 2.0, "fp32")
+    serial, _ = _cuda_run(False, 0.0, "fp32")
+    assert _discrete(merged) == _discrete(serial)
+    # And the arms really were different arms.
+    assert metrics["worker_requests"] > metrics["boundary_forwards"]
+
+
+def test_cuda_bf16_composition_changes_trajectories_and_that_is_not_new():
+    """⚠ At bf16 -- WHAT PRODUCTION RUNS -- coalescing changes trajectories.
+
+    Measured at 8 games: 2 of 8 diverged. bf16 carries ~3 decimal digits, so a
+    reduction-order difference is large enough to flip an argmax between two
+    near-equal moves, and one flip diverges the rest of the game.
+
+    The plan's success criterion said "discrete fingerprints unchanged". That is
+    FALSE at bf16 and is corrected in COALESCER_BUILD_PLAN.md rather than
+    reworded.
+
+    What makes it acceptable is not the coalescer: it is that
+    `--rust-scheduler-workers` ALREADY does exactly this, by exactly the same
+    mechanism, and is swept on every box run. Measured with coalescing OFF, 4
+    shards against 1 diverged the same 2 of 8 games. The coalescer joins a class
+    that already exists; it does not create one.
+
+    (The plan cited `--rust-global-batch-cap` as that precedent. Measured, the
+    cap does NOT diverge -- 0 of 8 at 512 vs 64 -- because with one request per
+    forward the cap barely changes composition. The real precedent is the shard
+    count.)
+
+    This test pins the PRECEDENT, since that is the load-bearing claim. It does
+    not assert that divergence occurs: how many games flip depends on the net
+    and the seeds, and asserting a flake helps nobody.
+    """
+
+    _requires_cuda()
+    # Two configs that differ only in shard count, coalescing off in both.
+    four_shards, _ = _cuda_run(False, 0.0, "bf16", workers=4)
+    one_shard, _ = _cuda_run(False, 0.0, "bf16", workers=1)
+    shard_count_diverges = _discrete(four_shards) != _discrete(one_shard)
+
+    merged, _ = _cuda_run(True, 2.0, "bf16", workers=4)
+    coalescing_diverges = _discrete(merged) != _discrete(four_shards)
+
+    if coalescing_diverges:
+        assert shard_count_diverges, (
+            "coalescing changed bf16 trajectories where the SHARD COUNT did "
+            "not. The precedent this rests on does not hold on this hardware, "
+            "and the change needs its own justification rather than an appeal "
+            "to an existing knob."
         )

@@ -35,8 +35,12 @@
 # Env:
 #   REHEARSE_CHECKPOINT   an L checkpoint carrying the RUN's architecture.
 #                         Built for you if unset -- see §"checkpoint" below.
-#   REHEARSE_GAMES=12     games per sweep point
+#   REHEARSE_GAMES=24     games per sweep point (3 per slot; below that the
+#                         sweep warns that ramp and drain dominate)
 #   REHEARSE_MANIFEST     a run_manifest.json to check the config path against
+#   REHEARSE_WAIT_CSV=0,2 coalescing waits in ms. Swept, not pinned: a wait
+#                         reaching the harness and merging nothing looks the
+#                         same in a log as a wait that helped.
 #   REHEARSE_SOLVER_NODES=2000000
 #                         node budget installed at every solver-on point. The
 #                         axis measures nothing without it -- see the check.
@@ -45,7 +49,9 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/rehearse_sweep}"
-GAMES="${REHEARSE_GAMES:-12}"
+# 3 games per slot: the steady-state threshold the sweep now warns below. At
+# 8 slots that is 24. Raising --slots here means raising this too.
+GAMES="${REHEARSE_GAMES:-24}"
 DEVICE="${REHEARSE_DEVICE:-cuda}"
 PY="${PYTHON_BIN:-python}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,13 +139,18 @@ fi
 # On the BOX the manifest flag is mandatory, for exactly the reason §3.1 gives.
 # Dropping it there would repeat the defect that sweep once committed: measuring
 # Gumbel at 24/128 to configure a PUCT run at 100/1600.
-say "Generation sweep (toy grid, solver split as an axis, LAPTOP-SCALE search)"
+# The coalescing wait is swept here for the same reason the solver split is:
+# it is an axis the box will run, and this script exists to prove the plumbing
+# of that axis before it is rented. A wait that reaches the harness and merges
+# nothing looks identical, in a log, to a wait that helps a little.
+say "Generation sweep (toy grid; solver split and coalescing wait as axes, LAPTOP-SCALE search)"
 "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
   --checkpoint "$CKPT" \
   --output "$OUT/generation" \
   --games "$GAMES" --warmup-games 2 --repetitions 1 \
   --slots 8 --caps 256 --inflight 1 \
   --workers 1,2 \
+  --inference-wait-ms "${REHEARSE_WAIT_CSV:-0,2}" \
   --solver-threads-total "0,4" \
   --solver-max-nodes "${REHEARSE_SOLVER_NODES:-2000000}" \
   --device "$DEVICE" --precision bf16 \
@@ -201,13 +212,46 @@ if any(row.get("solves_attempted", 0) > 0 for row in off):
 attempted = sum(row.get("solves_attempted", 0) for row in on)
 answered = sum(row.get("solves_answered", 0) for row in on)
 
-# 3. Every point measured throughput, not activation: more games than slots.
+# 3. The coalescer actually MERGED where there was something to merge.
+#
+#    Liveness, not configuration -- the same rule the solver check above learned
+#    the hard way. `requests_per_forward` is exactly 1.00 when nothing coalesced,
+#    so a wait that reaches the harness and merges nothing is indistinguishable,
+#    in a wall-clock log, from a wait that helped a little.
+#
+#    Only multi-shard points can merge: at one shard there is a single submitter
+#    and the ratio is 1.00 by construction, which is a fact about the geometry
+#    rather than a failure.
+waits = sorted({row.get("inference_wait_ms", 0.0) for row in summary})
+if len(waits) < 2:
+    problems.append(f"coalescing wait did not vary: {waits}")
+sharded = [row for row in summary if row["scheduler_workers"] > 1]
+single = [row for row in summary if row["scheduler_workers"] == 1]
+if not sharded:
+    problems.append("no multi-shard point, so coalescing could not be exercised")
+elif not any(row.get("median_requests_per_forward", 0.0) > 1.0 for row in sharded):
+    problems.append(
+        "every multi-shard point reported requests_per_forward == 1.00 -- the "
+        "coalescer was configured and did not merge"
+    )
+for row in single:
+    if row.get("median_requests_per_forward", 0.0) > 1.0:
+        problems.append(
+            "a SINGLE-shard point reported a merge; one submitter has nothing "
+            "to merge with, so this counter is measuring the wrong thing"
+        )
+merged = max(
+    (row.get("median_requests_per_forward", 0.0) for row in sharded), default=0.0
+)
+
+# 4. Every point measured throughput, not activation: more games than slots.
 for row in summary:
     if row.get("runs", 0) < 1:
         problems.append(f"point {row['slots']}/{row['scheduler_workers']} has no runs")
 
-# 4. The env file exists, sources cleanly, and carries the provenance marker
-#    the launcher's pass-2 guard refuses without.
+# 5. The env file exists, sources cleanly, and carries the provenance marker
+#    the launcher's pass-2 guard refuses without -- and carries the measured
+#    WAIT, which production silently replaces with 0 when it is missing.
 env = out / "measured_env.sh"
 if not env.is_file():
     problems.append("measured_env.sh was not written")
@@ -215,27 +259,40 @@ else:
     probe = subprocess.run(
         ["bash", "-c",
          f'source "{env.as_posix()}"; '
-         'echo "$RUST_SLOTS|$RUST_SCHEDULER_WORKERS|$GATE_SLOTS|$SWEEP_MEASURED"'],
+         'echo "$RUST_SLOTS|$RUST_SCHEDULER_WORKERS|$GATE_SLOTS|$SWEEP_MEASURED'
+         '|$RUST_INFERENCE_WAIT_MS"'],
         capture_output=True, text=True,
     )
     if probe.returncode != 0:
         problems.append(f"measured_env.sh does not source: {probe.stderr.strip()}")
     else:
-        slots, workers, gate, measured = probe.stdout.strip().split("|")
+        slots, workers, gate, measured, wait = probe.stdout.strip().split("|")
         if measured != "1":
             problems.append("SWEEP_MEASURED is not set; pass 2 would refuse to launch")
         for name, value in (("RUST_SLOTS", slots), ("RUST_SCHEDULER_WORKERS", workers),
                             ("GATE_SLOTS", gate)):
             if not value:
                 problems.append(f"{name} is empty in measured_env.sh")
-        print(f"  measured_env.sh -> slots={slots} workers={workers} gate_slots={gate}")
+        # The wait was swept, so a winner exists and must be carried. An absent
+        # one means production runs 0 ms while every other number in the file
+        # describes a geometry measured at something else.
+        if not wait:
+            problems.append(
+                "RUST_INFERENCE_WAIT_MS is absent although the sweep varied the "
+                "wait; the run would silently take the 0 ms default"
+            )
+        print(
+            f"  measured_env.sh -> slots={slots} workers={workers} "
+            f"gate_slots={gate} wait={wait}ms"
+        )
 
 if problems:
     print("\n".join(f"  - {p}" for p in problems))
     raise SystemExit(1)
 
-print(f"  {len(summary)} points, solver totals {splits}")
+print(f"  {len(summary)} points, solver totals {splits}, waits {waits}")
 print(f"  solver LIVE: {attempted} solves attempted, {answered} answered")
+print(f"  coalescer LIVE: best multi-shard merge {merged:.2f} requests/forward")
 print("  every subsystem live; env file sourceable and marked measured")
 PYCHECK
 

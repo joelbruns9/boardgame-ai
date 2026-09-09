@@ -165,11 +165,33 @@ def render(env: dict[str, object]) -> str:
                 "#   at 0 would not be the run that was measured.",
             ]
         if engaged is not None:
-            lines += [
-                f"# The winning point merged {float(engaged):.2f} requests per",
-                "# forward. A ratio of 1.00 would mean nothing coalesced and the",
-                "# wait bought only latency -- read it before trusting the pick.",
-            ]
+            # 1.00 means two very different things and the operator reading this
+            # on a rented box should not have to work out which.
+            #
+            # At ONE shard there is a single submitter, so 1.00 is arithmetic,
+            # not a failure -- nothing existed to merge with. Above one shard it
+            # IS a failure: the coalescer was configured and merged nothing, and
+            # any wait above 0 bought pure latency.
+            workers = int(env.get("RUST_SCHEDULER_WORKERS", 1) or 1)
+            ratio = float(engaged)
+            if workers <= 1:
+                lines += [
+                    f"# The winning point merged {ratio:.2f} requests per forward,",
+                    "# which at ONE shard is by construction -- a single submitter",
+                    "# has nothing to merge with. Not a failed merge.",
+                ]
+            elif ratio <= 1.0:
+                lines += [
+                    f"# ! The winning point merged {ratio:.2f} requests per forward",
+                    f"#   across {workers} shards. The coalescer was configured and",
+                    "#   did NOT merge; a wait above 0 bought only latency. Check",
+                    "#   the sweep before trusting this pick.",
+                ]
+            else:
+                lines += [
+                    f"# The winning point merged {ratio:.2f} requests per forward",
+                    f"# across {workers} shards -- the coalescer is doing work here.",
+                ]
     # QUOTED. This file is `source`d, so a value containing a space -- a run
     # directory under one, most obviously -- would otherwise split into two
     # words and export something that is not the measurement. The integers are
@@ -200,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     destination = args.output or (args.sweep_dir / "measured_env.sh")
     destination.write_text(render(env), encoding="utf-8")
     for key, value in env.items():
+        # `_`-prefixed keys steer `render`'s comments and are never exported;
+        # printing them invites someone to set one by hand.
+        if key.startswith("_"):
+            continue
         print(f"{key}={value}")
     print(f"written: {destination}")
     return 0
