@@ -124,11 +124,16 @@ class SpecialistConfig:
 
 
 def parse_specialists(spec: str) -> tuple[SpecialistConfig, ...]:
-    """``"science:0.15:0.5,military:0.10:0.5"`` -> configs.
+    """``"science:0.15:3,military:0.10:3"`` -> configs.
 
     Fields are ``name:share:lambda`` with optional ``:train_every``. A string
     form rather than a dict so the whole league fits in one CLI flag and lands
     verbatim in the run manifest, where a schedule change has to be visible.
+
+    **The middle field is the SHARE, not lambda.** They are both small decimals
+    and the older example (``science:0.15:0.5``) had a share of 0.15 next to a
+    lambda of 0.5, which reads as one number twice. Lambda is the third field
+    and wants a value near 3 -- see `specialist_probe`.
     """
 
     if not spec.strip():

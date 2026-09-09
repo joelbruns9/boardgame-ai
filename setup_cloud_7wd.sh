@@ -116,7 +116,12 @@
 #   SWD_CONTROL_FEATURES=1  W3 control channels (on by default; pinned here)
 #   HIERARCHICAL_VALUE=0 HIER_VALUE_WEIGHT=0 HIER_VALUE_DETACH=1   W4
 #   ACTION_RESIDUAL=0 ACTION_EXPOSES=0 ACTION_POLICY_WEIGHT=0      W5
-#   SPECIALISTS=""          W7, e.g. "science:0.15:0.5,military:0.10:0.4"
+#   SPECIALISTS=""          W7, name:share:LAMBDA, e.g. "science:0.15:3".
+#                         Lambda 3 is MEASURED, not chosen: pursuit peaks there
+#                         and declines above. Needs HIERARCHICAL_VALUE=1 -- the
+#                         bias reads `hier_joint7`, and a net without that head
+#                         makes every biased leaf a hard error, not an unbiased
+#                         search.
 #     SPECIALIST_BOOTSTRAP_GAMES=0 SPECIALIST_FLOOR_EVERY=5
 #     SPECIALIST_REANALYSIS=0
 #                   SPECIALISTS requires HIERARCHICAL_VALUE=1: the leaf bias

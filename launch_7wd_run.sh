@@ -81,7 +81,17 @@ export HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
 #
 # and read `moved_fraction` and `credible_fraction_of_moved` before trusting
 # the value below.
-export SPECIALISTS="${SPECIALISTS:-science:0.15:0.5,military:0.10:0.4}"
+# name:share:LAMBDA. Lambda 3, measured -- see COALESCER-era probe results in
+# SPECIALIST_LEAGUE_REVIEW_REQUEST.md 10. On a cloud2-trained net the pursuit
+# gain peaks at lambda ~= 3 and DECLINES above it, while credibility falls
+# monotonically, so 3 is a bracket to calibrate around at bootstrap rather than
+# a ceiling to raise. The previous 0.5 / 0.4 moved 6% of decisions against 15%
+# at 3, for +2.2% pursuit against +6.2%.
+#
+# Expect a strong net to want LESS than 3, not more: lambda's bite scales with
+# how sharply the outlook head separates sibling moves, and this was measured
+# on a 5.2M-param net at joint7_acc 0.512.
+export SPECIALISTS="${SPECIALISTS:-science:0.15:3,military:0.10:3}"
 export HOF_FRACTION="${HOF_FRACTION:-0.15}"
 export SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"   # 0 = follow HOF_START_GAMES
 export SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"

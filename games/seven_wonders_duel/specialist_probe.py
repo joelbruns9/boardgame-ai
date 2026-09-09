@@ -95,7 +95,7 @@ def _search(
 ):
     import seven_wonders_rust as swr
 
-    lam, victory, seats = bias
+    lam, victory, seats, symmetric = bias
     if lam <= 0.0:
         return swr.search_many_flat_net(
             adapter,
@@ -127,6 +127,7 @@ def _search(
             specialist_lambda=lam,
             specialist_victory=victory,
             specialist_seat=seat,
+            specialist_symmetric=symmetric,
         )
         for index, row in zip(rows, batch):
             results[index] = row
@@ -149,6 +150,7 @@ def probe(
     batch_cap: int = 256,
     leaf_batch: int = 8,
     root_selection: str = "puct",
+    symmetric: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -199,7 +201,7 @@ def probe(
         seeds,
         sims=sims,
         top_k=top_k,
-        bias=(0.0, victory, seats),
+        bias=(0.0, victory, seats, symmetric),
         batch_cap=batch_cap,
         leaf_batch=leaf_batch,
         puct_root=puct_root,
@@ -210,7 +212,7 @@ def probe(
         seeds,
         sims=sims,
         top_k=top_k,
-        bias=(lam, victory, seats),
+        bias=(lam, victory, seats, symmetric),
         batch_cap=batch_cap,
         leaf_batch=leaf_batch,
         puct_root=puct_root,
@@ -280,6 +282,12 @@ def probe(
         "positions": len(rows),
         "lambda": lam,
         "victory": victory,
+        # WHICH FORM. `own` alone against `own - other`. Measured on this net,
+        # the difference discriminates between sibling moves 2.6x better for
+        # science and 2.1x better for military, so the same lambda has that
+        # much more steering authority under the symmetric form. Reporting a
+        # lambda without the form it was measured under is meaningless.
+        "symmetric": symmetric,
         "sims": sims,
         "credible_gap": credible_gap,
         "moved_fraction": len(moved) / len(rows),
@@ -334,6 +342,17 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--lambda", dest="lam", type=float, required=True)
     parser.add_argument(
+        "--symmetric",
+        action="store_true",
+        help="bias on (own - opponent) rather than own alone. Measured on a "
+        "cloud2-trained net, the difference separates sibling moves 2.6x "
+        "better for science and 2.1x better for military, so a given lambda "
+        "steers that much harder. In 7WD science the two are not rival "
+        "strategies -- taking a symbol advances you AND denies them -- so this "
+        "is a better-conditioned reading of the same intent, not a different "
+        "one. Lambda is only meaningful together with this flag.",
+    )
+    parser.add_argument(
         "--victory", choices=sorted(VICTORY_INDEX), default="scientific"
     )
     parser.add_argument("--positions", type=int, default=200)
@@ -379,6 +398,7 @@ def main(argv=None) -> int:
         device=args.device,
         batch_cap=args.batch_cap,
         leaf_batch=args.leaf_batch,
+        symmetric=args.symmetric,
         root_selection=args.root_selection,
     )
     print(json.dumps(report["summary"], indent=2, sort_keys=True))

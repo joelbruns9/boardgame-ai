@@ -615,3 +615,102 @@ committed corpus and the resumable-vs-oracle gate), `test_search.py` (46),
 `test_league_routing.py` (29), `test_training_adapter.py`, `test_train_loop.py`,
 `test_buffer.py`, `test_data.py`, `test_rust_derivation.py`,
 `test_target_version.py`, `test_training_parameters_doc.py`.
+
+---
+
+## 10. S0a measured (2026-09-09) — lambda is ~6x larger than shipped, and the
+##     search-time steer is small
+
+**Run at last.** S0a had never been executed against a real net. It has now,
+and it moves the shipped default and bounds what the mechanism can do.
+
+### The net
+
+No existing checkpoint could serve, on two independent counts:
+
+* **Encoder** — iter0085's `tableau` block is 26 features against today's 37
+  (W3's control channels) and `global` is 132 against 133. The embedder's
+  `Linear` shapes do not fit; this is not a fussy signature check.
+* **No `hier_joint7`** — the bias reads W4's hierarchical outlook via
+  `Evaluator.outlook_tensor`, NOT the flat `joint7` head. iter0085 has
+  `heads.joint7` and no hierarchical head, so it would have hard-errored at the
+  first biased leaf even with a matching encoder.
+
+So a net was trained from cloud2's own buffers, which store **game records, not
+encoded tensors** and therefore re-derive through the current encoder: 8k games,
+3 epochs, 256x6 (5.2M params), `--hierarchical-value`. `joint7_acc` 0.512
+against a 0.334 base rate (iter0085 reached 0.582 — this net is weaker, which
+matters below).
+
+### The ladder, scientific, 200 positions at 256 sims
+
+| lambda | moved | credible | q_cost | pursuit (rel) |
+|---|---|---|---|---|
+| 0 | 0.000 | — | — | +0.0% (clean control) |
+| 0.5 | 0.060 | 0.583 | 0.079 | +2.2% |
+| 1 | 0.075 | 0.600 | 0.071 | +3.6% |
+| 2 | 0.105 | 0.571 | 0.066 | +5.8% |
+| **3** | 0.155 | 0.516 | 0.076 | **+6.2%** |
+| 5 | 0.170 | 0.471 | 0.085 | +6.0% |
+| 8 | 0.225 | 0.511 | 0.094 | +5.1% |
+| 12 | 0.230 | 0.435 | 0.105 | +3.6% |
+
+**Pursuit peaks at lambda 3 and DECLINES above it** while credibility falls
+monotonically: past the peak the specialist pays more Q, breaks more moves, and
+pursues its type *less*. The shipped `science:0.15:0.5` carries lambda **0.5**
+(the 0.15 is the share), which sits at 6% of decisions and +2.2% pursuit. Now
+`science:0.15:3,military:0.10:3`.
+
+### Why the ceiling is where it is
+
+Measured directly across sibling moves, median spread:
+
+| quantity | spread |
+|---|---|
+| **utility** | **0.567** |
+| science outlook | 0.031 |
+| military outlook | 0.058 |
+
+**The outlook separates moves ~18x less than value does.** For the science bias
+to rival the value difference between moves, lambda would have to be ~18 — at
+which point move choice is nearly independent of strength.
+
+### The symmetric arm: a hypothesis raised and killed
+
+`own - other` separates siblings 2.6x better than `own` alone (0.081 vs 0.031),
+which predicted more steering authority per unit lambda. It delivered more
+CHURN and no more pursuit:
+
+| lambda 3 | moved | credible | q_cost | pursuit |
+|---|---|---|---|---|
+| asymmetric | 0.155 | **0.516** | 0.076 | **+6.2%** |
+| symmetric | 0.200 | 0.425 | 0.107 | +6.0% |
+
+The ceiling did not move when the discriminative power changed by 2.6x, so the
+ceiling is **not** set by the bias's steering power. It is set by what is
+reachable one ply out: the bias selects among available moves and cannot
+manufacture science potential that is not on the board. `--symmetric` is kept
+because it is the arm that rules the hypothesis out; asymmetric is what to run.
+
+Military is the same story at lower amplitude: up to 26% of moves changed at
+**zero or negative** pursuit, in both forms, at every lambda.
+
+### What this does and does not say
+
+It does **not** reject the workstream, and the plan already says why: S0a is
+frozen-weights and single-ply. A specialist plays ~40 decisions, and whether a
++6% steer at each compounds into a materially different game is **exactly what
+this probe cannot see.** Pursuit over a game is S0b and the pilot.
+
+It does say: **lambda alone will not double the science rate.** The target of
+20% -> 40% of wins corresponds to root outlook ~0.11 -> ~0.21; the best any
+lambda achieved was 0.119. If the workstream delivers, the training loop
+delivers it and the bias only bends data collection.
+
+### Caveats on the number 3
+
+Lambda's bite scales with how sharply the outlook head separates sibling moves,
+and this was measured on a deliberately small net. **A stronger net should want
+LESS than 3, not more** — bracket downward at bootstrap. 200 positions, one
+buffer file, PUCT root.
+
