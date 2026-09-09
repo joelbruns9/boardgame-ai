@@ -1557,6 +1557,53 @@ Maximum Torch batches submitted but not yet completed. One is the verified
 laptop setting. Additional inflight batches can overlap work on other hardware,
 but also increase queueing, memory use, and scheduling variability.
 
+> **Retest this after the coalescer, not before it.** Until 2026-09 the
+> evaluator worker was a single-consumer loop -- one `recv`, one forward, one
+> reply -- and a serial consumer cannot use queue depth. Any measurement of this
+> flag taken before that change correctly measured **nothing**, including the
+> null this project already has. See `COALESCER_BUILD_PLAN.md` §1.2.
+
+### `--rust-inference-wait-ms`
+
+**Default:** `0.0`. **Value:** non-negative float, strictly below
+`inference_timeout_ms` when that is set
+
+How long the Rust evaluator worker may **block** to widen a batch after the
+first request of one arrives.
+
+**0 is a real operating point, not "coalescing off".** The worker always drains
+whatever is *already* queued into a single forward; this flag only buys further
+width by waiting for arrivals that have not happened yet. Measured on the laptop
+at 8 games and 4 shards: zero-wait drainage alone took 1,521 requests down to
+785 forwards (1.94 requests per forward), and a 2 ms wait took them to 401 --
+exactly the single-shard forward count, i.e. all of the fragmentation recovered.
+
+Why the flag exists at all: shards do not pool their leaves. Each assembles a
+request from its own ready leaves, so the same work arrives as more, narrower
+calls as shards rise -- measured at 1 shard = 400 requests of 7.45 rows against
+4 shards = 1,558 of 1.91. The cloud2 run paid for that at **46.9 rows against a
+2,048-row cap**, with `py_call_ns` at 91.8% of scheduler wall.
+
+**Sweep it; do not carry a value between boxes.** Its whole effect is on batch
+WIDTH, which no wall-clock total reports, so a wrong value looks harmless while
+changing what the GPU sees on every forward. `setup_cloud_7wd.sh` sweeps
+`SWEEP_INFERENCE_WAIT_CSV` (default `0,1,2`) and `sweep_launch_env.py` emits
+`RUST_INFERENCE_WAIT_MS` **only when the sweep actually varied it**.
+
+It can only pay where there is more than one shard to merge across: at
+`--rust-scheduler-workers 1` there is a single submitter and the ratio is 1.00
+by construction, so the sweep drops single-shard points that carry a wait.
+
+Read `requests_per_forward` beside the wall clock. It is exactly 1.00 when
+nothing merged, which distinguishes "the wait bought no throughput" from "the
+coalescer did not run" -- two results that lead to opposite decisions. The
+heartbeat prints it as `fwd=<rows>x<ratio>`.
+
+Note the interaction with the ticket deadline: the wait is spent *inside*
+`inference_timeout_ms`, so a wait at or above it would expire every ticket
+before its forward was issued. That combination is refused at startup rather
+than left to fail slowly with a message that points at the network.
+
 ### `--rust-scheduler-workers`
 
 **Default:** `1`. **Value:** positive integer

@@ -704,6 +704,25 @@ pub struct BoundaryMetrics {
     pub validate_ns: u64,
     /// Taking the metrics mutex and updating it.
     pub metrics_ns: u64,
+    // --- Coalescing (COALESCER_BUILD_PLAN.md §3) ----------------------------
+    /// Requests the worker RECEIVED, against `batches` forwards it ISSUED. The
+    /// ratio is the coalescing engagement, and it is exactly 1.00 when nothing
+    /// merged -- which is what makes a silent revert to one-request-per-forward
+    /// visible instead of merely slow.
+    ///
+    /// The scheduler-side `global_batches` cannot answer this. It is
+    /// incremented inside the shard, before anything could merge, so it counts
+    /// requests no matter what the worker does with them.
+    pub worker_requests: usize,
+    /// Time the drain loop spent WAITING for more work after the first request
+    /// of a batch arrived. Zero under the `try_recv`-only default; a positive
+    /// `inference_wait_ms` buys batch width with exactly this.
+    pub coalesce_wait_ns: u64,
+    /// Batches closed early because admitting the next request would have
+    /// exceeded `max_rows`. The held request heads the following batch. A large
+    /// count means the CAP is what limits width, not the arrival rate -- a
+    /// different lever from the wait.
+    pub coalesce_carried: usize,
 }
 
 #[derive(Default)]
@@ -1147,6 +1166,83 @@ impl Eval for PyFlatBatchEval {
 }
 
 type WorkerResponse = PyResult<Vec<LeafOut>>;
+
+/// Several `WorkerRequest`s concatenated into ONE forward, with enough
+/// bookkeeping to take the single answer apart again.
+///
+/// The evaluator boundary is what binds generation: on the iter85 run
+/// `py_call_ns` was 91.8% of scheduler wall at **46.9 rows against a 2,048-row
+/// cap**, because every shard's request crossed it alone. Merging is worth
+/// having precisely because the cost is nearly all fixed per call.
+#[derive(Default)]
+struct CoalescedBatch {
+    states: Vec<GameState>,
+    actors: Vec<usize>,
+    legals: Vec<Vec<usize>>,
+    /// Empty only while EVERY member so far was unrouted, which the packer
+    /// reads as "all rows on network 0". As soon as one member routes, the
+    /// unrouted members are expanded to explicit zeros: concatenating a short
+    /// `net_ids` onto a long batch would silently shift rows onto the wrong
+    /// network, and a league game evaluated by its opponent's net is a bug that
+    /// produces plausible numbers.
+    net_ids: Vec<u8>,
+    routed: bool,
+    /// Reply channel and row count per member, IN RECEIPT ORDER -- so a shard
+    /// running `max_inflight_batches > 1` keeps its own sequencing.
+    members: Vec<(mpsc::Sender<WorkerResponse>, usize)>,
+}
+
+impl CoalescedBatch {
+    fn rows(&self) -> usize {
+        self.states.len()
+    }
+
+    fn push(&mut self, request: WorkerRequest) {
+        let rows = request.states.len();
+        if request.net_ids.is_empty() {
+            // Unrouted means network 0. Only materialise that once some other
+            // member has forced the batch to carry ids at all.
+            if self.routed {
+                self.net_ids.resize(self.states.len() + rows, 0);
+            }
+        } else {
+            if !self.routed {
+                // Every row admitted so far was unrouted, i.e. network 0.
+                self.net_ids = vec![0u8; self.states.len()];
+                self.routed = true;
+            }
+            self.net_ids.extend_from_slice(&request.net_ids);
+        }
+        self.states.extend(request.states);
+        self.actors.extend(request.actors);
+        self.legals.extend(request.legals);
+        self.members.push((request.reply, rows));
+    }
+
+    /// Slice the forward's rows back to their submitters by running offset.
+    fn scatter(self, rows: Vec<LeafOut>) {
+        let mut rows = rows.into_iter();
+        for (reply, count) in self.members {
+            let slice: Vec<LeafOut> = rows.by_ref().take(count).collect();
+            // A dropped receiver is an ABANDONED TICKET -- its owner timed out
+            // and walked away. Before coalescing, the worker broke its loop on
+            // this. It must not now, because the other members of this batch
+            // are still waiting on a forward that already succeeded.
+            let _ = reply.send(Ok(slice));
+        }
+    }
+
+    /// Every member of a merged batch gets the failure. One request's error is
+    /// all of their errors: they shared the forward that raised it.
+    fn fan_error(&self, error: &PyErr) {
+        Python::attach(|py| {
+            for (reply, _) in &self.members {
+                let _ = reply.send(Err(error.clone_ref(py)));
+            }
+        });
+    }
+}
+
 struct WorkerRequest {
     states: Vec<GameState>,
     actors: Vec<usize>,
@@ -1504,10 +1600,18 @@ pub fn spawn_py_batch_worker(
     ))
 }
 
+/// The flat inference worker, with cross-shard coalescing.
+///
+/// `wait_ms` is the drain policy, and 0 is the intended default rather than a
+/// disabled feature: the loop still drains everything ALREADY queued into one
+/// forward, it just never blocks to grow a batch further. That is the whole
+/// mechanism at a queue measured ~3 deep. A positive wait trades latency for
+/// width and is an axis to sweep, not a number to assume.
 pub fn spawn_py_flat_worker(
     adapter: Py<PyAny>,
     timeout_ms: f64,
     max_rows: usize,
+    wait_ms: f64,
 ) -> PyResult<(
     EvalWorker,
     Arc<AtomicBool>,
@@ -1519,15 +1623,36 @@ pub fn spawn_py_flat_worker(
             "inference_timeout_ms must be finite and non-negative",
         ));
     }
+    if !wait_ms.is_finite() || wait_ms < 0.0 {
+        return Err(PyValueError::new_err(
+            "inference_wait_ms must be finite and non-negative",
+        ));
+    }
     if max_rows == 0 {
         return Err(PyValueError::new_err(
             "inference worker max_rows must be positive",
         ));
     }
+    if timeout_ms > 0.0 && wait_ms >= timeout_ms {
+        // The wait is spent INSIDE each ticket's deadline, so a wait at or
+        // above it guarantees every ticket expires before its forward is even
+        // issued. The run then fails slowly, with a timeout message that points
+        // at the network.
+        return Err(PyValueError::new_err(format!(
+            "inference_wait_ms={wait_ms} must be below \
+             inference_timeout_ms={timeout_ms}; the coalescing wait is spent \
+             inside each ticket's deadline"
+        )));
+    }
     let timeout = if timeout_ms == 0.0 {
         None
     } else {
         Some(Duration::from_secs_f64(timeout_ms / 1000.0))
+    };
+    let wait = if wait_ms == 0.0 {
+        None
+    } else {
+        Some(Duration::from_secs_f64(wait_ms / 1000.0))
     };
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -1537,29 +1662,85 @@ pub fn spawn_py_flat_worker(
     let worker_metrics = Arc::clone(&metrics);
     let handle = run_pooled(move || {
         let evaluator = PyFlatBatchEval::new(adapter, Arc::clone(&worker_metrics));
-        while let Ok(request) = request_rx.recv() {
-            if let Ok(mut counters) = worker_metrics.lock() {
-                counters.queue_wait_ns += request.enqueued.elapsed().as_nanos() as u64;
-            }
-            let refs: Vec<&GameState> = request.states.iter().collect();
-            let result = evaluator.evaluate_batch_prepared_routed(
-                &refs,
-                &request.actors,
-                &request.legals,
-                &request.net_ids,
-            );
-            match result {
-                Ok(rows) => {
-                    if request.reply.send(Ok(rows)).is_err() {
-                        break;
-                    }
+        // A request that would overflow `max_rows` is HELD, never dropped: an
+        // `mpsc::Receiver` cannot un-receive, and the submitter is blocked on a
+        // ticket nothing else will complete. It heads the next batch.
+        let mut carried: Option<WorkerRequest> = None;
+        loop {
+            let first = match carried.take() {
+                Some(request) => request,
+                None => match request_rx.recv() {
+                    Ok(request) => request,
+                    // Every scheduler has gone. `recv` yields what is still
+                    // buffered before reporting this, so nothing is stranded.
+                    Err(_) => break,
+                },
+            };
+            let mut queue_wait_ns = first.enqueued.elapsed().as_nanos() as u64;
+            let mut waited_ns = 0u64;
+            let mut batch = CoalescedBatch::default();
+            batch.push(first);
+            let deadline = wait.map(|wait| Instant::now() + wait);
+            loop {
+                if batch.rows() >= max_rows {
+                    break;
                 }
+                let next = match deadline {
+                    Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                        Some(left) => {
+                            let started = Instant::now();
+                            let next = request_rx.recv_timeout(left).ok();
+                            waited_ns += started.elapsed().as_nanos() as u64;
+                            next
+                        }
+                        // Deadline passed; still take whatever is already
+                        // sitting there rather than issuing a narrow batch
+                        // beside a full queue.
+                        None => request_rx.try_recv().ok(),
+                    },
+                    None => request_rx.try_recv().ok(),
+                };
+                let Some(next) = next else { break };
+                if batch.rows() + next.states.len() > max_rows {
+                    carried = Some(next);
+                    break;
+                }
+                queue_wait_ns += next.enqueued.elapsed().as_nanos() as u64;
+                batch.push(next);
+            }
+            if let Ok(mut counters) = worker_metrics.lock() {
+                counters.queue_wait_ns += queue_wait_ns;
+                counters.worker_requests += batch.members.len();
+                counters.coalesce_wait_ns += waited_ns;
+                if carried.is_some() {
+                    counters.coalesce_carried += 1;
+                }
+            }
+            // Scoped so the borrow of `batch.states` ends before `scatter`
+            // consumes the batch.
+            let result = {
+                let refs: Vec<&GameState> = batch.states.iter().collect();
+                evaluator.evaluate_batch_prepared_routed(
+                    &refs,
+                    &batch.actors,
+                    &batch.legals,
+                    &batch.net_ids,
+                )
+            };
+            match result {
+                Ok(rows) => batch.scatter(rows),
                 Err(error) => {
-                    let reply_error = Python::attach(|py| error.clone_ref(py));
+                    batch.fan_error(&error);
+                    // The held-over request shares this worker's fate and is
+                    // waiting on a ticket nothing else will ever answer.
+                    if let Some(request) = carried.take() {
+                        let _ = request
+                            .reply
+                            .send(Err(Python::attach(|py| error.clone_ref(py))));
+                    }
                     if let Ok(mut terminal) = worker_terminal_error.lock() {
                         *terminal = Some(error);
                     }
-                    let _ = request.reply.send(Err(reply_error));
                     break;
                 }
             }

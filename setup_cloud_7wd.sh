@@ -91,6 +91,13 @@
 #   SWEEP_SLOTS / SWEEP_CAPS  gate grid (space separated; different harness)
 #   SWEEP_GENERATION_GAMES=200 SWEEP_REPETITIONS=1
 #   SKIP_SWEEPS=0   set 1 to launch on defaults rather than this box
+#   SWEEP_INFERENCE_WAIT_CSV  evaluator coalescing waits in ms (default 0,1,2).
+#                         0 is a real point, not "off": the worker always merges
+#                         what is already queued, and a positive wait only buys
+#                         width by blocking for arrivals that have not happened.
+#                         It can only pay where there is more than one shard to
+#                         merge across, so it is read with --workers, and the
+#                         sweep drops single-shard points that carry one.
 #   SWEEP_SOLVER_THREADS_CSV  TOTAL solver threads to sweep (e.g. "0,4,8,16").
 #                   The generation/solver core split, as an axis. Unset keeps
 #                   the previous behaviour of measuring one fixed split.
@@ -814,6 +821,7 @@ else
     --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
     --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
     --workers "${SWEEP_WORKERS_CSV:-$RUST_SCHEDULER_WORKERS}" \
+    --inference-wait-ms "${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}" \
     ${SWEEP_SOLVER_ARGS[@]+"${SWEEP_SOLVER_ARGS[@]}"} \
     --device cuda \
     --precision "$PRECISION" \
@@ -906,6 +914,12 @@ TUNED_FLAGS=()
   TUNED_FLAGS+=(--rust-global-batch-cap "$RUST_GLOBAL_BATCH_CAP")
 [ -n "$RUST_MAX_INFLIGHT_BATCHES" ] &&
   TUNED_FLAGS+=(--rust-max-inflight-batches "$RUST_MAX_INFLIGHT_BATCHES")
+# The evaluator coalescing wait. Only ever set from a sweep that VARIED it --
+# `sweep_launch_env` refuses to emit it otherwise -- so an unset value here
+# means the run takes the 0 default, which still merges everything already
+# queued. It does NOT mean coalescing is off.
+[ -n "${RUST_INFERENCE_WAIT_MS:-}" ] &&
+  TUNED_FLAGS+=(--rust-inference-wait-ms "$RUST_INFERENCE_WAIT_MS")
 if [ ${#TUNED_FLAGS[@]} -gt 0 ]; then
   if [ "$SWEEP_MEASURED" = "1" ]; then
     ok "Measured generation flags: ${TUNED_FLAGS[*]}"

@@ -148,6 +148,12 @@ def _record_stats(
     scheduler = performance.get("rust_scheduler", {})
     rows = int(scheduler.get("global_rows", 0))
     batches = int(scheduler.get("global_batches", 0))
+    # What the WORKER did, beside what the scheduler submitted. `global_batches`
+    # is incremented inside the shard, upstream of any coalescing, so it is
+    # structurally incapable of showing a merge.
+    forwards = int(scheduler.get("boundary_forwards", 0))
+    forward_rows = int(scheduler.get("boundary_forward_rows", 0))
+    worker_requests = int(scheduler.get("worker_requests", 0))
     forced = int(scheduler.get("forced_rows", 0))
     seconds = float(performance.get("seconds", 0.0))
     opponent_mix = {opponent: 0 for opponent in OPPONENT_TYPES}
@@ -216,6 +222,8 @@ def _record_stats(
         rows_per_second=rows / seconds if seconds else 0.0,
         forced_row_share=forced / rows if rows else 0.0,
         mean_batch_size=rows / batches if batches else 0.0,
+        mean_forward_size=forward_rows / forwards if forwards else 0.0,
+        requests_per_forward=worker_requests / forwards if forwards else 0.0,
         opponent_mix=opponent_mix,
     )
     outcomes = OutcomeStats(

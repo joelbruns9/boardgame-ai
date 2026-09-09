@@ -53,6 +53,17 @@ class GenerationStats:
     rows_per_second: float = 0.0
     forced_row_share: float = 0.0
     mean_batch_size: float = 0.0
+    #: Rows per FORWARD the evaluator actually issued, against
+    #: ``mean_batch_size``'s rows per request the scheduler SUBMITTED.
+    #:
+    #: They are equal on an engine that services one request per forward. On one
+    #: that coalesces, ``mean_batch_size`` cannot move -- it is computed
+    #: upstream of the merge -- so it would report a coalescer as having done
+    #: nothing. 0.0 means the engine does not report forwards.
+    mean_forward_size: float = 0.0
+    #: Requests merged into each forward. Exactly 1.0 when nothing coalesces,
+    #: which is what makes a silent revert visible rather than merely slow.
+    requests_per_forward: float = 0.0
     opponent_mix: dict[str, int] = field(default_factory=dict)
 
 

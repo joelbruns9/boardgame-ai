@@ -65,6 +65,22 @@ from .stats import (
 LOG_SCHEMA_VERSION = 2
 
 
+def _coalescing_suffix(gen: dict) -> str:
+    """` fwd=N x R` when the engine reports evaluator forwards, else "".
+
+    Two numbers, because either alone misleads. `fwd` is rows per forward --
+    the width the network actually sees. `x` is requests merged into each one,
+    and it reads 1.0 exactly when nothing coalesced, so a coalescer that
+    silently stopped engaging shows up here rather than only in the wall clock.
+    """
+
+    forward_size = float(gen.get("mean_forward_size", 0.0) or 0.0)
+    if forward_size <= 0.0:
+        return ""
+    ratio = float(gen.get("requests_per_forward", 0.0) or 0.0)
+    return f" fwd={forward_size:.0f}x{ratio:.2f}"
+
+
 class RunStore(Protocol):
     """Minimal persistence surface the controller needs for append/resume."""
 
@@ -589,7 +605,8 @@ class RunController:
                 f"({float(gen.get('games_per_second', 0.0) or 0.0):.2f}/s) "
                 f"src={row.get('generator_source')} "
                 f"sims={float(gen.get('mean_sims', 0.0) or 0.0):.1f} "
-                f"batch={float(gen.get('mean_batch_size', 0.0) or 0.0):.0f}",
+                f"batch={float(gen.get('mean_batch_size', 0.0) or 0.0):.0f}"
+                + _coalescing_suffix(gen),
             )
 
         outcomes = (stats.get("outcomes") or {}).get("terminal_reason") or {}

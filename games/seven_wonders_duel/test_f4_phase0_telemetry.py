@@ -473,16 +473,22 @@ def test_requests_and_forwards_are_counted_separately():
     it as the headline success metric, where it would have been blind to its own
     subject. `boundary_forwards` comes from the worker instead.
 
-    Today the worker issues one forward per request, so the two are equal. That
-    equality is the pre-coalescer baseline, and breaking it is what the
-    coalescer is FOR: this assertion is expected to be inverted by that change,
-    not preserved.
+    The equality that used to hold here -- one forward per request -- was the
+    pre-coalescer baseline, and the coalescer inverted it, as this docstring
+    said it would. What survives is the part that was always the point: the two
+    counters measure different things, and only one of them can see a merge.
+
+    `test_coalescer.py` owns the repair; this owns the distinction.
     """
 
     metrics = _flat_run(workers=4)
     assert metrics["boundary_forwards"] > 0
-    assert metrics["boundary_forwards"] == metrics["global_batches"]
+    # Rows are conserved -- merging changes how they travel, not how many.
     assert metrics["boundary_forward_rows"] == metrics["global_rows"]
+    # ... while forwards are strictly fewer than the requests that produced
+    # them. `global_batches` is incremented in the shard and cannot show this.
+    assert metrics["worker_requests"] == metrics["global_batches"]
+    assert metrics["boundary_forwards"] < metrics["global_batches"]
 
 
 def test_shards_fragment_batches_rather_than_pooling_them():

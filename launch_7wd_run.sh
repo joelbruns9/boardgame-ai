@@ -104,6 +104,10 @@ export SWEEP_WORKERS_CSV="${SWEEP_WORKERS_CSV:-2,4,8}"
 # so a thread given to it is a thread taken from leaf production; 0 measures
 # with the solver off, which is the baseline the others are read against.
 export SWEEP_SOLVER_THREADS_CSV="${SWEEP_SOLVER_THREADS_CSV:-0,4,8,16}"
+# The coalescing wait. Swept, never pinned: its effect is on batch WIDTH, which
+# no wall-clock total reports, so a value carried over from another box would
+# look harmless and change what the GPU sees on every forward.
+export SWEEP_INFERENCE_WAIT_CSV="${SWEEP_INFERENCE_WAIT_CSV:-0,1,2}"
 export SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-200}"
 
 # ── Hand over ───────────────────────────────────────────────────────────────

@@ -1924,6 +1924,11 @@ fn scheduler_result_to_py(
     // Worker-side forwards, beside the scheduler-side requests above.
     metrics.set_item("boundary_forwards", m.boundary_forwards)?;
     metrics.set_item("boundary_forward_rows", m.boundary_forward_rows)?;
+    // Coalescing engagement. `worker_requests / boundary_forwards` is 1.00
+    // exactly when nothing merged.
+    metrics.set_item("worker_requests", m.worker_requests)?;
+    metrics.set_item("coalesce_wait_ns", m.coalesce_wait_ns)?;
+    metrics.set_item("coalesce_carried", m.coalesce_carried)?;
     metrics.set_item("scheduler_ready_slot_cycles", m.scheduler_ready_slot_cycles)?;
     metrics.set_item(
         "scheduler_waiting_slot_cycles",
@@ -2052,7 +2057,7 @@ fn search_result_to_py(
     age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false,
     double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false,
     specialist_lambda=0.0, specialist_victory=None, specialist_seat=0,
-    specialist_symmetric=false
+    specialist_symmetric=false, inference_wait_ms=0.0
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -2079,6 +2084,7 @@ fn search_many_flat_net(
     specialist_victory: Option<String>,
     specialist_seat: usize,
     specialist_symmetric: bool,
+    inference_wait_ms: f64,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let leaf_bias = match parse_specialist(
         specialist_lambda,
@@ -2114,7 +2120,12 @@ fn search_many_flat_net(
         .map(|game| game.borrow(py).state.clone())
         .collect();
     let (worker, timed_out, _boundary_metrics, worker_handle) =
-        eval::spawn_py_flat_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+        eval::spawn_py_flat_worker(
+            adapter,
+            inference_timeout_ms,
+            global_batch_cap,
+            inference_wait_ms,
+        )?;
     let outputs = py.detach(move || {
         let state_refs: Vec<&GameState> = states.iter().collect();
         let actors: Vec<_> = states.iter().map(tree::state_actor).collect();
@@ -2657,7 +2668,7 @@ fn self_play_many_net(
     virtual_loss_root=false, cheap_conflict_free_waves=None,
     cheap_round_robin_candidates=None, specialist_lambda=0.0,
     specialist_victory=None, specialist_symmetric=false,
-    specialist_class_id=0, specialist_net=1))]
+    specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2727,6 +2738,11 @@ fn self_play_many_flat_net(
     // measures a different player from the one that generated the data -- so
     // the side is a parameter rather than a constant.
     specialist_net: usize,
+    // How long the evaluator worker may block to widen a batch after the first
+    // request of one arrives. 0 -- the default -- still coalesces everything
+    // already queued; it just never waits for more. See
+    // `eval::spawn_py_flat_worker`.
+    inference_wait_ms: f64,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2945,7 +2961,12 @@ fn self_play_many_flat_net(
         }
     }
     let (worker, timed_out, boundary_metrics, worker_handle) =
-        eval::spawn_py_flat_worker(adapter, inference_timeout_ms, global_batch_cap)?;
+        eval::spawn_py_flat_worker(
+            adapter,
+            inference_timeout_ms,
+            global_batch_cap,
+            inference_wait_ms,
+        )?;
     let result = py.detach(move || {
         let mut result = self_play::run_many_pipelined_sharded(
             jobs,
@@ -2972,6 +2993,9 @@ fn self_play_many_flat_net(
                 .clone();
             output.metrics.boundary_forwards = counters.batches;
             output.metrics.boundary_forward_rows = counters.rows;
+            output.metrics.worker_requests = counters.worker_requests;
+            output.metrics.coalesce_wait_ns = counters.coalesce_wait_ns;
+            output.metrics.coalesce_carried = counters.coalesce_carried;
             output.metrics.boundary_tokens = counters.tokens;
             output.metrics.boundary_padded_tokens = counters.padded_tokens;
             output.metrics.boundary_tokens_sq = counters.tokens_sq;
@@ -3296,6 +3320,143 @@ fn reveal_features_enabled() -> bool {
     crate::reveal::enabled()
 }
 
+/// Drive the flat evaluator worker directly, one submission per spec.
+///
+/// The coalescer lives inside `spawn_py_flat_worker` and merges requests from
+/// CONCURRENT shards. Nothing reachable from Python could previously observe
+/// that: `self_play_many_flat_net` decides its own request shapes from search
+/// state, so a test written through it can hope for a merge but cannot force
+/// one, and `requests_per_forward > 1` would be a flake either way.
+///
+/// This submits an exact list of requests with exact row counts and exact
+/// routing, holds every ticket, then waits. Because the worker only begins
+/// draining once the first request lands, an adapter that blocks on its first
+/// call lets a test pin down precisely which requests share a forward.
+///
+/// Returns one entry per request -- `("ok", values, actors)` or
+/// `("err", message)` -- beside the worker's own boundary counters.
+#[pyfunction]
+#[pyo3(signature = (
+    adapter, games, request_rows, request_nets, max_rows,
+    timeout_ms=0.0, wait_ms=0.0, pause_after=0, gate=None,
+    drop_tickets=vec![]
+))]
+fn _coalescer_probe(
+    py: Python<'_>,
+    adapter: Py<PyAny>,
+    games: Vec<Py<RustGame>>,
+    request_rows: Vec<usize>,
+    request_nets: Vec<Option<Vec<u8>>>,
+    max_rows: usize,
+    timeout_ms: f64,
+    wait_ms: f64,
+    // Called once, after `pause_after` requests have been submitted. Without
+    // it the split between forwards is a RACE: submission is a few clones and
+    // a channel send, the worker has to acquire the GIL to call the adapter,
+    // and everything lands before the first forward starts. The test then sees
+    // one big merge whatever the drain loop does -- which happens to pass, and
+    // would keep passing if the carry-over or the cap were broken.
+    //
+    // The gate blocks (on a `threading.Event`, which releases the GIL) until
+    // the adapter's first call has actually been entered, so which requests
+    // share which forward is decided, not observed.
+    pause_after: usize,
+    gate: Option<Py<PyAny>>,
+    // Tickets to ABANDON: dropped after submission, before anything is waited
+    // on. That is what a timed-out shard leaves behind, and dropping it here
+    // models it without a stopwatch -- a shared `inference_timeout_ms` would
+    // expire every ticket in the batch, not the one under test.
+    drop_tickets: Vec<usize>,
+) -> PyResult<(Vec<Py<PyAny>>, Py<PyDict>)> {
+    if games.is_empty() {
+        return Err(PyValueError::new_err("probe needs at least one game"));
+    }
+    if request_rows.len() != request_nets.len() {
+        return Err(PyValueError::new_err(
+            "request_rows and request_nets must be aligned",
+        ));
+    }
+    let states: Vec<GameState> = games
+        .iter()
+        .map(|game| game.borrow(py).state.clone())
+        .collect();
+    let (worker, _timed_out, metrics, handle) =
+        eval::spawn_py_flat_worker(adapter, timeout_ms, max_rows, wait_ms)?;
+    type ProbeAnswer = Result<(Vec<f64>, Vec<usize>), String>;
+    let answers: Vec<ProbeAnswer> = py.detach(move || -> PyResult<Vec<ProbeAnswer>> {
+        let mut tickets = Vec::with_capacity(request_rows.len());
+        let mut actors_by_request = Vec::with_capacity(request_rows.len());
+        for (index, rows) in request_rows.iter().enumerate() {
+            let picked: Vec<GameState> = (0..*rows)
+                .map(|row| states[(index + row) % states.len()].clone())
+                .collect();
+            let actors: Vec<usize> = picked.iter().map(tree::state_actor).collect();
+            let legals: Vec<Vec<usize>> =
+                picked.iter().map(codec::legal_action_indices).collect();
+            let nets = request_nets[index].clone().unwrap_or_default();
+            actors_by_request.push(actors.clone());
+            // A rejected submission is an answer too: `max_rows` validation
+            // lives on this side of the channel.
+            tickets.push(
+                worker
+                    .submit_prepared_routed(picked, actors, legals, nets)
+                    .map_err(|error| Python::attach(|py| error.value(py).to_string())),
+            );
+            if pause_after > 0 && index + 1 == pause_after {
+                if let Some(gate) = gate.as_ref() {
+                    Python::attach(|py| gate.call0(py))?;
+                }
+            }
+        }
+        for index in &drop_tickets {
+            if let Some(slot) = tickets.get_mut(*index) {
+                // Replacing the ticket drops its receiver, which is exactly the
+                // state an abandoned ticket leaves the channel in.
+                *slot = Err("abandoned".to_owned());
+            }
+        }
+        let mut answers = Vec::with_capacity(tickets.len());
+        for (index, ticket) in tickets.into_iter().enumerate() {
+            answers.push(match ticket {
+                Err(message) => Err(message),
+                Ok(ticket) => match ticket.wait() {
+                    Ok(rows) => Ok((
+                        rows.iter().map(|row| row.value_p0).collect(),
+                        actors_by_request[index].clone(),
+                    )),
+                    Err(error) => {
+                        Err(Python::attach(|py| error.value(py).to_string()))
+                    }
+                },
+            });
+        }
+        drop(worker);
+        let _ = handle.join();
+        Ok(answers)
+    })?;
+    let counters = metrics
+        .lock()
+        .map_err(|_| PyValueError::new_err("boundary metrics lock poisoned"))?
+        .clone();
+    let out = PyDict::new(py);
+    out.set_item("forwards", counters.batches)?;
+    out.set_item("forward_rows", counters.rows)?;
+    out.set_item("worker_requests", counters.worker_requests)?;
+    out.set_item("coalesce_wait_ns", counters.coalesce_wait_ns)?;
+    out.set_item("coalesce_carried", counters.coalesce_carried)?;
+    let mut rendered = Vec::with_capacity(answers.len());
+    for answer in answers {
+        rendered.push(match answer {
+            Ok((values, actors)) => ("ok", values, actors)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind(),
+            Err(message) => ("err", message).into_pyobject(py)?.into_any().unbind(),
+        });
+    }
+    Ok((rendered, out.unbind()))
+}
+
 #[pymodule]
 mod seven_wonders_rust {
     #[pymodule_export]
@@ -3399,6 +3560,9 @@ mod seven_wonders_rust {
 
     #[pymodule_export]
     use super::self_play_many_flat_net;
+
+    #[pymodule_export]
+    use super::_coalescer_probe;
 
     #[pymodule_export]
     use super::search_many_flat_net;

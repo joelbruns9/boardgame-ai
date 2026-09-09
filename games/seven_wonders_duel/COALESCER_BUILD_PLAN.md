@@ -498,10 +498,64 @@ before running the full grid**, and drop grid points above what fits.
   `merge` guard fails to compile on an unhandled field, and five telemetry tests
   pin the repaired counters. A warm baseline with a stated interval remains
   outstanding and needs the box.
-* `requests_per_forward > 1` in the forced deterministic test — the mechanism
-  engages.
-* Worker-reported rows per **forward** materially above the request-level 46.9.
-* Discrete fingerprints unchanged; bit-identical on the deterministic path.
-* **Games per hour up, with an interval that excludes no change.** If width
-  rises and games/hour does not, the bottleneck is not where this document says,
-  and the honest outcome is to say so rather than bank the width.
+* ~~`requests_per_forward > 1` in the forced deterministic test~~ **met**.
+* ~~Worker-reported rows per **forward** materially above the request-level
+  46.9~~ **met on the laptop harness** (see §9); the 46.9 figure itself is
+  cloud2's and can only be re-measured on the box.
+* ~~Discrete fingerprints unchanged; bit-identical on the deterministic
+  path~~ **met** — strict equality, including float targets.
+* **Games per hour up, with an interval that excludes no change.** OUTSTANDING,
+  and the only criterion that matters. Needs the box: the laptop numbers below
+  are batch WIDTH, which is the mechanism, not the prize. If width rises and
+  games/hour does not, the bottleneck is not where this document says, and the
+  honest outcome is to say so rather than bank the width.
+
+---
+
+## 9. What the build measured (laptop, 2026-09-09)
+
+Built as §3 specifies: the drain loop with carry-over in `eval.rs`, the wait
+plumbed through `lib.rs` / `phase_d.py` / the sweep / `sweep_launch_env`, and
+adapter-call vs model-forward separated in `rust_bridge.py`.
+
+**Engagement**, 8 games through the real scheduler, deterministic evaluator,
+identical seeds and search budget:
+
+| shards | wait | requests | forwards | requests/forward |
+|---|---|---|---|---|
+| 1 | 0 ms | 401 | 401 | 1.00 |
+| 4 | 0 ms | 1,521 | 785 | 1.94 |
+| 4 | 2 ms | 1,521 | **401** | **3.79** |
+
+At 4 shards and a 2 ms wait the forward count lands **exactly on the
+single-shard count**: the fragmentation `test_shards_fragment_batches_rather
+_than_pooling_them` pins is fully recovered, not merely reduced.
+
+Note the shape of the 0 ms row. `try_recv`-only drainage recovers about half
+the loss on its own, without blocking at all — so 0 is a real operating point,
+not a disabled feature, and it is the default for exactly that reason. The
+remaining half costs a wait, which is why the wait is a **swept axis** and why
+`sweep_launch_env` refuses to emit one the sweep did not vary.
+
+**Correctness.** Trajectories are bit-identical across every composition above —
+digests, actions, visit counts *and* float targets — under an evaluator whose
+answer depends only on its own row. So the strict-equality gate of §4.2 is a
+real gate here, and the fingerprint-only contract of §4.3 is reserved for the
+real net on CUDA, where batch shape moves float reductions.
+
+Three mutations were introduced and each was caught:
+
+| mutation | caught by |
+|---|---|
+| unrouted member not expanded to explicit zeros | the routing gates |
+| over-cap request dropped instead of carried | the cap gate |
+| replies scattered in reverse receipt order | the scatter and order gates |
+
+The first mutation **initially survived**, and that is the useful finding: the
+routing test only had the unrouted request arriving *before* the routed one,
+which never reaches the expansion branch. Both orders are now parametrised. A
+gate written against a trap the plan spells out can still miss it.
+
+**Not measured, and not to be inferred from any of this:** games per hour.
+Every number above is width. The 91.8% `py_call_ns` share that motivates the
+work is cloud2's, and the prize can only be claimed on the box.

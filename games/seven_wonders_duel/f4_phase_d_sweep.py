@@ -73,8 +73,22 @@ def timed_scheduler_calls():
         # so on its own.
         rows: list[int] = []
         wave = 0.0
+        # Worker-side counters, summed across calls in `run_point`. Kept here
+        # because this wrapper is the only place the metrics dict is seen.
+        coalescing = {
+            key: 0
+            for key in (
+                "worker_requests",
+                "boundary_forwards",
+                "boundary_forward_rows",
+                "coalesce_wait_ns",
+                "coalesce_carried",
+            )
+        }
         try:
             metrics = result[1] or {}
+            for key in coalescing:
+                coalescing[key] = int(metrics.get(key, 0) or 0)
             rows = [int(value) for value in metrics.get("batch_rows", ())]
             # Leaves in flight for ONE game. Batch width is leaves summed across
             # games, so batch alone cannot distinguish "leaf batching is not
@@ -91,6 +105,7 @@ def timed_scheduler_calls():
                 "bot": bot,
                 "batch_rows": rows,
                 "mean_wave_width": wave,
+                **coalescing,
             }
         )
         return result
@@ -267,11 +282,17 @@ def _find_manifest_value(payload, key):
 def run_point(
     loop, model, iteration, jobs, destination, slots, cap, inflight,
     workers=1, solver_threads=0, solver_max_nodes=0, solver_max_secs=0.0,
+    inference_wait_ms=0.0,
 ):
     loop.config.rust_slots = slots
     loop.config.rust_global_batch_cap = cap
     loop.config.rust_max_inflight_batches = inflight
     loop.config.rust_scheduler_workers = workers
+    # The coalescing wait. It only has anything to buy when there is more than
+    # one shard to merge ACROSS -- at workers=1 the ratio is 1.00 by
+    # construction -- so this axis is read together with the worker axis, never
+    # alone.
+    loop.config.rust_inference_wait_ms = inference_wait_ms
     # Per SHARD, so the load this point puts on the CPU is threads x workers.
     # Applied per point rather than once at startup: the total moves with the
     # worker axis, and a sweep that solved on one thread count while measuring
@@ -333,12 +354,40 @@ def run_point(
         for record in records
     )
     batch_rows = [row for call in calls for row in call.get("batch_rows", ())]
+    scheduler = {
+        key: sum(call.get(key, 0) for call in calls)
+        for key in (
+            "worker_requests",
+            "boundary_forwards",
+            "boundary_forward_rows",
+            "coalesce_wait_ns",
+            "coalesce_carried",
+        )
+    }
     waves = [call["mean_wave_width"] for call in calls if call.get("mean_wave_width")]
     stats = {
         "slots": slots,
         "global_batch_cap": cap,
         "max_inflight_batches": inflight,
         "scheduler_workers": workers,
+        "inference_wait_ms": inference_wait_ms,
+        # ENGAGEMENT, the same way `solves_attempted` is liveness rather than a
+        # thread count. `requests_per_forward` is exactly 1.00 when nothing
+        # merged, so a point that reports a wait and a ratio of 1.00 measured a
+        # coalescer that did not run -- and the wall clock alone would call that
+        # "the wait didn't help".
+        "worker_requests": int(scheduler.get("worker_requests", 0)),
+        "boundary_forwards": int(scheduler.get("boundary_forwards", 0)),
+        "requests_per_forward": (
+            int(scheduler.get("worker_requests", 0))
+            / int(scheduler.get("boundary_forwards", 1) or 1)
+        ),
+        "mean_forward_rows": (
+            int(scheduler.get("boundary_forward_rows", 0))
+            / int(scheduler.get("boundary_forwards", 1) or 1)
+        ),
+        "coalesce_wait_seconds": int(scheduler.get("coalesce_wait_ns", 0)) / 1e9,
+        "coalesce_carried": int(scheduler.get("coalesce_carried", 0)),
         "solver_threads_per_shard": solver_threads,
         "solver_threads_total": solver_threads * workers,
         # LIVENESS, not configuration. `THROUGHPUT_LEVERS.md` §3.1: "assert
@@ -418,6 +467,15 @@ def main() -> None:
     parser.add_argument("--caps", default="256,512")
     parser.add_argument("--inflight", default="1,2")
     parser.add_argument(
+        "--inference-wait-ms",
+        default="0",
+        help="coalescing-wait axis, comma separated (e.g. \"0,1,2\"). 0 still "
+        "merges everything already queued; a positive value blocks that long "
+        "for more. It buys nothing at --workers 1, where there is only one "
+        "submitter, so sweep it against the worker axis and read "
+        "requests_per_forward beside the wall clock.",
+    )
+    parser.add_argument(
         "--workers",
         default="1",
         help="scheduler shard counts to sweep. Swept rather than fixed because "
@@ -476,6 +534,8 @@ def main() -> None:
     # per-shard count so that a point's solver load does not move with the
     # worker axis beside it -- see `--solver-threads-total`.
     solver_totals = numbers(args.solver_threads_total) or [0]
+    waits = [float(part) for part in args.inference_wait_ms.split(",") if part.strip()]
+    waits = waits or [0.0]
     grid = list(
         itertools.product(
             numbers(args.slots),
@@ -483,6 +543,7 @@ def main() -> None:
             numbers(args.inflight),
             numbers(args.workers),
             solver_totals,
+            waits,
         )
     )
     # A shard with no slot cannot make progress, and `SlotBudget::new` refuses
@@ -493,7 +554,19 @@ def main() -> None:
     if dropped:
         print(
             f"skipping {len(dropped)} point(s) with fewer slots than shards: "
-            f"{sorted({(slots, workers) for slots, _, _, workers, _ in dropped})}",
+            f"{sorted({(slots, workers) for slots, _, _, workers, _, _ in dropped})}",
+            flush=True,
+        )
+    # A positive wait at one shard is a point that cannot differ from wait=0
+    # except by adding latency: there is no second submitter to merge with. It
+    # would enter the grid, cost a full measurement, and land in the ranking as
+    # noise around a duplicate.
+    single_shard_waits = [point for point in grid if point[3] == 1 and point[5] > 0.0]
+    grid = [point for point in grid if not (point[3] == 1 and point[5] > 0.0)]
+    if single_shard_waits:
+        print(
+            f"skipping {len(single_shard_waits)} single-shard point(s) with a "
+            "positive coalescing wait: one submitter has nothing to merge with",
             flush=True,
         )
     if not grid:
@@ -617,6 +690,7 @@ def main() -> None:
             solver_threads=solver_threads_for(grid[0][3], grid[0][4]),
             solver_max_nodes=solver_max_nodes,
             solver_max_secs=args.solver_max_secs,
+            inference_wait_ms=grid[0][5],
         )
 
     jobs = jobs_for(args.games, args.iteration)
@@ -632,18 +706,20 @@ def main() -> None:
     fingerprints: set = set()
     for repetition in range(args.repetitions):
         order = grid if repetition % 2 == 0 else list(reversed(grid))
-        for position, (slots, cap, inflight, workers, solver_total) in enumerate(order):
+        for position, point in enumerate(order):
+            slots, cap, inflight, workers, solver_total, wait_ms = point
             stats, fingerprint = run_point(
                 loop, model, args.iteration, jobs,
                 output
                 / (
                     f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}"
-                    f"_w{workers}_t{solver_total}.jsonl"
+                    f"_w{workers}_t{solver_total}_q{wait_ms:g}.jsonl"
                 ),
                 slots, cap, inflight, workers,
                 solver_threads_for(workers, solver_total),
                 solver_max_nodes,
                 args.solver_max_secs,
+                wait_ms,
             )
             stats["repetition"] = repetition
             results.append(stats)
@@ -663,6 +739,8 @@ def main() -> None:
             print(
                 f"slots={slots:<4} cap={cap:<4} inflight={inflight} workers={workers:<2} "
                 f"solver={stats['solver_threads_total']:<3} "
+                f"wait={wait_ms:<4g} "
+                f"fwd={stats['mean_forward_rows']:6.1f}x{stats['requests_per_forward']:.2f} "
                 f"batch={stats['mean_batch_size']:6.1f} "
                 f"wave={stats['mean_wave_width']:4.2f}  "
                 f"{stats['wall_seconds']:7.1f}s  {stats['games_per_hour']:7.0f} games/h  "
@@ -672,7 +750,7 @@ def main() -> None:
 
     summary = []
     for point in grid:
-        slots, cap, inflight, workers, solver_total = point
+        slots, cap, inflight, workers, solver_total, wait_ms = point
         per_shard = solver_threads_for(workers, solver_total)
         matching = [
             row for row in results
@@ -682,7 +760,8 @@ def main() -> None:
                 row["max_inflight_batches"],
                 row["scheduler_workers"],
                 row["solver_threads_per_shard"],
-            ) == (slots, cap, inflight, workers, per_shard)
+                row["inference_wait_ms"],
+            ) == (slots, cap, inflight, workers, per_shard, wait_ms)
         ]
         summary.append(
             {
@@ -690,6 +769,16 @@ def main() -> None:
                 "global_batch_cap": cap,
                 "max_inflight_batches": inflight,
                 "scheduler_workers": workers,
+                "inference_wait_ms": wait_ms,
+                "median_requests_per_forward": statistics.median(
+                    row["requests_per_forward"] for row in matching
+                ),
+                "median_forward_rows": statistics.median(
+                    row["mean_forward_rows"] for row in matching
+                ),
+                "coalesce_wait_seconds": sum(
+                    row["coalesce_wait_seconds"] for row in matching
+                ),
                 "solver_threads_per_shard": per_shard,
                 "solver_threads_total": per_shard * workers,
                 # LIVENESS. A thread count is what was configured; these are
@@ -782,6 +871,9 @@ def main() -> None:
             f"  slots={row['slots']:<4} cap={row['global_batch_cap']:<5} "
             f"inflight={row['max_inflight_batches']} "
             f"workers={row['scheduler_workers']:<2} "
+            f"wait={row['inference_wait_ms']:<4g} "
+            f"fwd={row['median_forward_rows']:5.0f}"
+            f"x{row['median_requests_per_forward']:.2f} "
             f"batch={row['median_batch_size']:5.0f} "
             f"wave={row['median_wave_width']:4.2f}  "
             f"{row['median_games_per_hour']:7.0f} games/h  "

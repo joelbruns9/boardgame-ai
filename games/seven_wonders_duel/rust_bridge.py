@@ -235,6 +235,17 @@ class _RustFlatBatchAdapter:
             "batches": 0,
             "rows": 0,
             "tokens": 0,
+            # MODEL forwards, which stops being the same as adapter calls the
+            # moment anything coalesces.
+            #
+            # `batches` counts calls across the Rust boundary. A routed model
+            # (`_SearcherRoutedModel`, `_SeatRoutedModel`) runs one forward per
+            # NETWORK present in the batch, so merging two shards that happen to
+            # sit on different nets saves the boundary hop, the pack and the H2D
+            # copy -- and saves no GPU forward at all. Reporting the coalescing
+            # ratio without this would overstate the win on exactly the league
+            # runs where the merge is widest.
+            "model_forwards": 0,
             "tensor_seconds": 0.0,
             "h2d_seconds": 0.0,
             "forward_seconds": 0.0,
@@ -451,9 +462,18 @@ class _RustFlatBatchAdapter:
 
         forward_start = time.perf_counter()
         forward_event = self._begin_event()
+        # A routed model counts its own sub-forwards; a plain one has no such
+        # attribute and is exactly one forward per call.
+        forwards_before = getattr(self.evaluator.model, "model_forwards", None)
         with torch.no_grad():
             with self.evaluator.autocast():
                 outputs = self.evaluator.model(batch)
+        if forwards_before is None:
+            self.total_metrics["model_forwards"] += 1
+        else:
+            self.total_metrics["model_forwards"] += (
+                self.evaluator.model.model_forwards - forwards_before
+            )
         self._end_event("forward", forward_event)
         self._sync()
         forward_seconds = time.perf_counter() - forward_start
@@ -689,6 +709,10 @@ def rust_searcher_routed_flat_batch_adapter(
             #: different player. The earlier version refused the mixture; that
             #: was a restriction of this merge, not of the batching.
             self.sources = sources
+            #: Forwards this module has actually run: one per network PRESENT
+            #: in a batch. Read by `_RustFlatBatchAdapter` to keep adapter
+            #: calls and GPU work apart once requests merge.
+            self.model_forwards = 0
 
         def forward(self, batch):
             net_ids = batch["net_ids"]
@@ -704,6 +728,9 @@ def rust_searcher_routed_flat_batch_adapter(
                     for key, value in batch.items()
                     if key not in ("net_ids", "actors")
                 }
+                # One forward per network present -- the cost coalescing
+                # across nets does NOT remove.
+                self.model_forwards += 1
                 if self.autocasts is None:
                     outputs = model(net_batch)
                 else:
@@ -885,6 +912,8 @@ def rust_seat_routed_flat_batch_adapter(
             self.action_residual = any(
                 bool(getattr(model, "action_residual", False)) for model in models
             )
+            #: See the searcher-routed model: one forward per SEAT present.
+            self.model_forwards = 0
 
         def forward(self, batch):
             actors = batch["actors"]
@@ -900,6 +929,7 @@ def rust_seat_routed_flat_batch_adapter(
                     for key, value in batch.items()
                     if key not in ("actors", "net_ids")
                 }
+                self.model_forwards += 1
                 outputs = model(seat_batch)
                 source = self.sources[seat] if self.sources is not None else None
                 resolved = {}

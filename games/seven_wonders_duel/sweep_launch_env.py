@@ -83,9 +83,28 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
     }
     if len(splits) > 1:
         env["SOLVER_THREADS"] = int(best_generation["solver_threads_per_shard"])
+    # The coalescing wait, on the same conditional rule as the two axes above:
+    # emitted only when the sweep VARIED it. A grid pinned at one wait measured
+    # one wait.
+    #
+    # This is the axis that most needs the rule. The wait's whole effect is on
+    # batch WIDTH, which no wall-clock total reports, so a value copied from
+    # someone else's box would look harmless and change what the GPU sees on
+    # every forward of the run.
+    waits = {
+        row["inference_wait_ms"] for row in summary if "inference_wait_ms" in row
+    }
+    if len(waits) > 1:
+        env["RUST_INFERENCE_WAIT_MS"] = float(best_generation["inference_wait_ms"])
     # Provenance. `SKIP_SWEEPS` cannot serve as this marker: an operator sets
     # that by hand to skip measuring altogether, so it is true in exactly the
     # case this needs to detect.
+    if "median_requests_per_forward" in best_generation:
+        # Underscore-prefixed: read by `render` for the comment above, and
+        # dropped before anything is exported.
+        env["_REQUESTS_PER_FORWARD"] = float(
+            best_generation["median_requests_per_forward"]
+        )
     env["SWEEP_MEASURED"] = "1"
     env["SWEEP_MEASURED_FROM"] = str(sweep_dir.resolve())
     return env
@@ -119,12 +138,29 @@ def render(env: dict[str, object]) -> str:
             "# winning value belongs to the worker count beside it -- change one",
             "# and the other is no longer measured.",
         ]
+    if "RUST_INFERENCE_WAIT_MS" in env:
+        engaged = env.get("_REQUESTS_PER_FORWARD")
+        lines += [
+            "#",
+            "# RUST_INFERENCE_WAIT_MS is the evaluator COALESCING wait, measured",
+            "# here rather than assumed. 0 is a real answer, not a disabled",
+            "# feature: the worker always merges what is already queued and this",
+            "# only buys width by waiting for more.",
+        ]
+        if engaged is not None:
+            lines += [
+                f"# The winning point merged {float(engaged):.2f} requests per",
+                "# forward. A ratio of 1.00 would mean nothing coalesced and the",
+                "# wait bought only latency -- read it before trusting the pick.",
+            ]
     # QUOTED. This file is `source`d, so a value containing a space -- a run
     # directory under one, most obviously -- would otherwise split into two
     # words and export something that is not the measurement. The integers are
     # unaffected; the path is the reason.
     lines += [
-        f"export {key}={shlex.quote(str(value))}" for key, value in env.items()
+        f"export {key}={shlex.quote(str(value))}"
+        for key, value in env.items()
+        if not key.startswith("_")
     ]
     # Pass 2 must not re-measure: the sweeps are the expensive part of setup.
     lines.append("export SKIP_SWEEPS=1")

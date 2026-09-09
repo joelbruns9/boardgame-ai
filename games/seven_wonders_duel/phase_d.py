@@ -745,6 +745,25 @@ class PhaseDConfig:
     gate_backend: str = "rust"
     rust_slots: int = 16
     rust_global_batch_cap: int = 256
+    rust_inference_wait_ms: float = 0.0
+    """How long the Rust evaluator worker may BLOCK to widen a batch.
+
+    Deliberately separate from ``inference_wait_ms`` (2.0), which belongs to the
+    Python ``CoalescingEvaluator`` and means something else: that one waits a
+    deadline out from an empty queue, this one drains a queue that is already
+    full.
+
+    0 is a real default, not a disabled feature. The Rust worker always
+    coalesces whatever is *already* queued into one forward; this only buys
+    additional width by waiting for arrivals that have not happened yet. On the
+    iter85 run the queue sat ~3 deep against a 5.19 ms service time, so there
+    was standing work to merge without waiting at all.
+
+    A positive value is an axis to sweep, never a number to assume: it is spent
+    inside every ticket's ``inference_timeout_ms`` deadline, and it adds latency
+    to every batch in exchange for width on the batches that were going to be
+    narrow anyway.
+    """
     gate_global_batch_cap: int = 0
     """Gate-path batch cap; 0 follows ``rust_global_batch_cap``.
 
@@ -4114,6 +4133,12 @@ class PhaseDLoop:
             games=rust_games_for_self_play(seeds, first_players),
             game_seeds=seeds,
             global_batch_cap=self.config.rust_global_batch_cap,
+            # Generation is the shard-fragmented path the coalescer was built
+            # for: 4 shards measured 1,558 requests at 1.91 rows against 1
+            # shard's 400 at 7.45. The gate below is left at the 0 default --
+            # it runs a different shard count and arrival pattern, and a wait
+            # swept on generation was not measured on it.
+            inference_wait_ms=self.config.rust_inference_wait_ms,
             leaf_batch=self.config.leaf_batch,
             cheap_sims_min=self.config.cheap_sims_min,
             cheap_sims_max=self.config.cheap_sims_max,
@@ -6553,6 +6578,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rust-slots", type=int, default=16)
     parser.add_argument("--rust-global-batch-cap", type=int, default=256)
     parser.add_argument(
+        "--rust-inference-wait-ms",
+        type=float,
+        default=0.0,
+        help="how long the Rust evaluator worker may block to widen a batch. 0 "
+        "(the default) still merges everything already queued into one forward; "
+        "this only buys width by waiting for arrivals that have not happened "
+        "yet, and it is spent inside each ticket's inference timeout. Sweep it, "
+        "do not guess it.",
+    )
+    parser.add_argument(
         "--gate-global-batch-cap",
         type=int,
         default=0,
@@ -7387,6 +7422,7 @@ def main(argv=None) -> int:
         gate_slots=args.gate_slots,
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
+        rust_inference_wait_ms=args.rust_inference_wait_ms,
         gate_global_batch_cap=args.gate_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,
         rust_scheduler_workers=args.rust_scheduler_workers,

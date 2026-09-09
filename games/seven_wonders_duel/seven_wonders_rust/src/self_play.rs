@@ -1360,6 +1360,22 @@ pub struct SchedulerMetrics {
     /// metric.
     pub boundary_forwards: usize,
     pub boundary_forward_rows: usize,
+    /// Requests the evaluator worker RECEIVED, against `boundary_forwards` it
+    /// issued. `worker_requests / boundary_forwards` is the coalescing ratio.
+    ///
+    /// This is the number that says whether the coalescer is doing anything.
+    /// It reads exactly 1.00 when nothing merges, so a silent revert to
+    /// one-request-per-forward is visible rather than merely slow -- and it
+    /// cannot be read off `global_batches`, which counts submissions inside the
+    /// shard, upstream of any merge.
+    pub worker_requests: usize,
+    /// Time the worker spent blocking for more work to widen a batch. Zero
+    /// under the try_recv-only default, and the price of a positive
+    /// `inference_wait_ms`.
+    pub coalesce_wait_ns: u64,
+    /// Batches closed early at `max_rows` with a request held over. High means
+    /// the CAP limits width, not the arrival rate.
+    pub coalesce_carried: usize,
     pub boundary_tokens: usize,
     pub boundary_padded_tokens: usize,
     pub boundary_max_tokens: usize,
@@ -1522,6 +1538,9 @@ impl SchedulerMetrics {
             batch_rows: _,
             boundary_forwards: _,
             boundary_forward_rows: _,
+            worker_requests: _,
+            coalesce_wait_ns: _,
+            coalesce_carried: _,
             boundary_tokens: _,
             boundary_padded_tokens: _,
             boundary_max_tokens: _,
@@ -1596,6 +1615,9 @@ impl SchedulerMetrics {
         self.batch_rows.extend(other.batch_rows);
         self.boundary_forwards += other.boundary_forwards;
         self.boundary_forward_rows += other.boundary_forward_rows;
+        self.worker_requests += other.worker_requests;
+        self.coalesce_wait_ns += other.coalesce_wait_ns;
+        self.coalesce_carried += other.coalesce_carried;
         self.boundary_tokens += other.boundary_tokens;
         self.boundary_padded_tokens += other.boundary_padded_tokens;
         self.boundary_max_tokens = self.boundary_max_tokens.max(other.boundary_max_tokens);
