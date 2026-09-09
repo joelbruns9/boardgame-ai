@@ -483,6 +483,64 @@ sweep harness has to prove before its numbers mean anything.
 
 ---
 
+## 9b. The two passes, and why the second one can refuse
+
+A run is launched in two passes, because the scheduler geometry that makes a box
+fast is a property of *that* box and cannot be known before it exists.
+
+```bash
+# PASS 1 — set up the box and MEASURE it. Ends without launching.
+SWEEP_CHECKPOINT=/path/to/L_checkpoint.pt bash launch_7wd_run.sh
+
+# PASS 2 — launch on this box's numbers.
+source ~/boardgame-ai/runs/seven_wonders_duel/<run>/sweeps/measured_env.sh
+bash launch_7wd_run.sh
+```
+
+`launch_7wd_run.sh` holds the **decision** — which workstreams the run carries,
+the league composition, the schedules — and belongs in git. `measured_env.sh`
+holds the **measurement** and belongs to one rented instance. Pinning a slot
+count into the decision file is how a dead box's geometry gets carried onto a
+live one.
+
+**Pass 2 refuses to launch if a sweep exists on the box and was not sourced.**
+This is not fussiness. `RUST_SLOTS` and its neighbours carry cloud6's values as
+defaults, so the un-sourced launch produced a run on those defaults *and printed
+"Measured generation flags"* — the two cases had identical command lines and the
+run is a day long. The guard reads `SWEEP_MEASURED`, which only
+`sweep_launch_env.py` exports; `SKIP_SWEEPS` cannot serve the purpose because an
+operator sets that by hand to skip measuring altogether, which is exactly the
+case to catch. `ALLOW_UNMEASURED_LAUNCH=1` launches on defaults deliberately.
+
+### What pass 1 measures
+
+Slots, global batch cap, in-flight batches, scheduler shards — and the
+**generation/solver core split**, which is the one that is easy to leave as a
+constant and call measured. Generation and the endgame solver contend for the
+same cores, and the solver runs synchronously inside a scheduler shard, so a
+thread given to it is a thread taken from leaf production. `0` is in the grid
+because "solver off" is the baseline the other splits are read against.
+
+The gate is swept separately from generation, and must be: the batch cap's
+*sign* flips with slot count, so one value cannot serve both paths.
+
+### What pass 1 cannot measure
+
+**The league's generation cost.** Specialists seed at `hof_start_games`, so at
+sweep time there is no specialist checkpoint to play against — the sweep
+measures pure self-play, and league games route two networks through one
+adapter. The run reports the difference instead: `specialist_training` and
+`specialist_floor` are their own phases in the training log, and the floor is
+deliberately not folded into `gate`, where it would read as the gate getting
+slower.
+
+**Disk, after the fact.** The preflight is told the league spec
+(`--specialists`) because a specialist has no promotion gate: it archives a
+checkpoint per *train step* and prunes none, so at `train_every = 1` that is one
+per iteration per class against the general's one per `promotion_every`. Two
+classes over 200 iterations can add as much as the general's entire checkpoint
+budget, and disk is chosen when the instance is rented.
+
 ## 10. The one-line version
 
 Everything above reduces to: **verify the thing you are about to pay for, using

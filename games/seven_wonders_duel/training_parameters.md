@@ -648,6 +648,101 @@ How an archived opponent is drawn. `recency` weights newer archives linearly.
 Games before league play begins. Early archives are weak enough that playing
 them is closer to curriculum than to opponent diversity.
 
+### `--specialists`
+
+**Default:** `""` (off). **Value:** `name:share:lambda[:train_every]` entries,
+comma separated -- e.g. `science:0.15:0.5,military:0.10:0.5`
+
+W7's specialist league. A specialist is the same architecture as the general,
+fine-tuned from a promoted general checkpoint, whose **search leaf value carries
+a bonus for its intended victory type**. It gets no self-play campaign of its
+own: it plays the opponent seat inside the ordinary loop, exactly where an
+archived HOF checkpoint sits. One loop, one buffer per model, one train step per
+model.
+
+**Why the bias is in the search and not in the labels.** The value target is a
+3-class label and the outcome target is the 7-class `joint7`, so
+`result + lambda * indicator` is not expressible as a class -- and more
+importantly, behaviour reaches the model through the *search targets*. Biasing
+the leaf moves the visits; reweighting a stored label moves nothing, because that
+target already points where the unbiased search pointed. Every value head
+therefore stays a calibrated win probability.
+
+**Shares are fractions of ALL games**, in one budget with
+`--hof-opponent-fraction`. With `--hof-opponent-fraction 0.15` and
+`science:0.15:...,military:0.10:...`, 40% of games are league games and the
+expected per-class shares are 15/15/10. One class is drawn per iteration (the
+Rust evaluation boundary accepts at most two networks per call), and the draw
+renormalises among the classes -- using the shares directly as draw
+probabilities would deliver `share * L`, i.e. 6% where 15% was intended.
+
+**Lambda widens the utility scale** to `[-1-lambda, 1+lambda]`, and PUCT's
+exploration term is not scale invariant, so a nonzero lambda makes exploration
+relatively cheaper. This holds under a Gumbel root too: sigma min-max rescales
+completed Q at the *root*, but every interior node still selects by PUCT on the
+raw utility. It is not silently compensated -- rescaling `c_puct` with lambda
+would fold two changes into one flag and make a training A/B uninterpretable.
+
+**A specialist requires an outlook head.** The bias reads W4's seven-way
+`hier_joint7`; a leaf with no outlook under a live lambda is a hard error, never
+a silent zero bias, because a treatment that reaches some leaves and not others
+measures nothing. A biased searcher also does not take the endgame-solver
+shortcut: that mask is a proof of *unbiased* optimality and would delete exactly
+the attacking continuations the bias funded.
+
+**Targets are routed, not dropped.** `MoveRecord.target_route` says which
+model's buffer a policy label belongs to (`general`, `specialist:<id>`, `none`);
+`policy_excluded` keeps its existing meaning and its existing consumers.
+Value and outcome labels stay shared across models -- the general is *meant* to
+learn value from a specialist's positions -- but the bootstrapped `value_soft`
+is routed too, from `root_value_unshaped`, because `--value-bootstrap` blends the
+recorded root straight into the value target and a shaped root would teach a
+distorted win probability at full strength.
+
+### `--specialist-bootstrap-games`
+
+**Default:** `0` (follow `--hof-start-games`). **Value:** non-negative integer
+
+Games before a specialist is seeded from the current promoted general. A
+specialist fine-tuned from a checkpoint that cannot yet play is a random
+attacker, and defending against a random attacker teaches the general nothing.
+
+### `--specialist-floor-every`
+
+**Default:** `5`. **Value:** non-negative integer; `0` disables
+
+Iterations between collapse-floor matches. Each specialist's score rate is
+measured against the **frozen general anchor** -- pinned when the league starts
+and never rebuilt -- and a specialist that falls through its floor is reverted
+to its last good checkpoint and logged loudly.
+
+Specialists are *expected* to score worse than the general; that is what a
+specialist is. The floor catches divergence, not an absence of improvement, and
+it is deliberately not the general's soft gate: that gate produced 0 promotions
+over 38k games in cloud6, and a specialist population that silently never
+advances is a full run wasted before anyone notices.
+
+### `--specialist-reanalysis`
+
+**Default:** off
+
+W7 S2b. Facing specialists teaches the general to **defend**; nothing in the seat
+arrangement teaches it to **execute** those attacks, because the attacking policy
+targets belong to the specialist. With this flag the positions where the bias
+materially moved the search's own valuation are re-searched at `lambda = 0`
+under the general's current net, and those targets are routed to the general --
+what the *unbiased* search makes of the position the biased agent steered into,
+without teaching the general to trade wins for a preferred victory type.
+
+Re-search runs from the recorded pre-move state, which contains no hidden card
+identities (they are sampled as chance outcomes during search), so it cannot
+produce clairvoyant targets. The reanalysis share of the general's policy inflow
+is capped and reported.
+
+Off by default because it is an arm of the S5 pilot, not a setting: whether
+attack transfer earns its search compute is the one question the seat
+arrangement cannot answer by itself.
+
 ## Search and Training-Target Quality
 
 ### `--cheap-sims-min`, `--cheap-sims-max`

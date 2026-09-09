@@ -69,6 +69,15 @@ simply be deleted; the candidate is what makes an interrupted iteration
 restartable. Both are kept for the life of the run.
 """
 
+SPECIALIST_FIXED_CHECKPOINTS = 2
+"""``latest.pt`` and ``last_good.pt``, per specialist class.
+
+The two optimizer files beside them are not counted as checkpoints: AdamW state
+is roughly twice the parameter bytes, but it is REWRITTEN rather than
+accumulated, so it is a constant per class and disappears into the headroom.
+The archive below is the term that grows."""
+
+
 RECORD_DISK_BYTES = 32 * 1024
 """On-disk JSONL bytes per game record: 2,613 MB over 84,000 games in run 03."""
 
@@ -137,6 +146,7 @@ class DiskSizing:
     parameters: int
     checkpoint_bytes: int
     hof_bytes: int
+    specialist_bytes: int
     buffer_bytes: int
     log_bytes: int
     headroom_bytes: int
@@ -154,6 +164,7 @@ class DiskSizing:
             "parameters": self.parameters,
             "checkpoint_bytes": self.checkpoint_bytes,
             "hof_bytes": self.hof_bytes,
+            "specialist_bytes": self.specialist_bytes,
             "buffer_bytes": self.buffer_bytes,
             "log_bytes": self.log_bytes,
             "headroom_bytes": self.headroom_bytes,
@@ -198,6 +209,8 @@ def disk_sizing(
     promotion_every: int,
     disk_budget_bytes: int,
     headroom_bytes: int,
+    specialist_classes: int = 0,
+    specialist_train_every: int = 1,
 ) -> DiskSizing:
     """Bytes the run will have written by its last iteration.
 
@@ -206,6 +219,19 @@ def disk_sizing(
     checkpoint per promotion and prunes none, and being wrong in the cheap
     direction here costs a few GB of stated requirement rather than a dead run
     on day three.
+
+    ``specialist_classes`` is W7's addition, and it is the term most likely to
+    be forgotten because it looks small per iteration. A specialist has NO
+    promotion gate: it advances on every train step and archives every accepted
+    candidate, pruning none. So its archive grows once per TRAIN STEP, not once
+    per promotion -- at ``train_every = 1`` that is one checkpoint per iteration
+    per class, against the general's one per ``promotion_every`` iterations.
+    Two classes over 200 iterations add as much as the general's entire
+    checkpoint budget.
+
+    Disk is chosen when the instance is rented and is the one budget here that
+    cannot be lowered by a flag afterwards, which is why this is sized rather
+    than left to be discovered.
     """
 
     iterations = max(0, int(iterations))
@@ -218,6 +244,7 @@ def disk_sizing(
             parameters=int(parameters),
             checkpoint_bytes=0,
             hof_bytes=0,
+            specialist_bytes=0,
             buffer_bytes=0,
             log_bytes=0,
             headroom_bytes=0,
@@ -229,11 +256,17 @@ def disk_sizing(
     checkpoint_bytes = iterations * CHECKPOINTS_PER_ITERATION * checkpoint
     gates = iterations // max(1, int(promotion_every))
     hof_bytes = gates * checkpoint
+    classes = max(0, int(specialist_classes))
+    train_steps_each = iterations // max(1, int(specialist_train_every))
+    specialist_bytes = classes * checkpoint * (
+        SPECIALIST_FIXED_CHECKPOINTS + train_steps_each
+    )
     buffer_bytes = total_games * RECORD_DISK_BYTES
     log_bytes = iterations * LOG_ROW_BYTES
     required = (
         checkpoint_bytes
         + hof_bytes
+        + specialist_bytes
         + buffer_bytes
         + log_bytes
         + int(headroom_bytes)
@@ -244,6 +277,7 @@ def disk_sizing(
         parameters=int(parameters),
         checkpoint_bytes=checkpoint_bytes,
         hof_bytes=hof_bytes,
+        specialist_bytes=specialist_bytes,
         buffer_bytes=buffer_bytes,
         log_bytes=log_bytes,
         headroom_bytes=int(headroom_bytes),
@@ -541,6 +575,18 @@ def evaluate(
             bool(getattr(args, "pooled_readout", False)),
             bool(getattr(args, "reply_head", False)),
         )
+    # Parsed with the same code the run uses, so a spec this accepts is a spec
+    # the run accepts -- and a malformed one fails at preflight rather than at
+    # launch.
+    from .specialist import parse_specialists
+
+    # `getattr` with a default, like every other optional field here: callers
+    # build an argparse Namespace by hand, and a missing attribute must mean
+    # "no league" rather than an exception dressed up as a parse error.
+    try:
+        specialist_configs = parse_specialists(getattr(args, "specialists", ""))
+    except ValueError as error:
+        raise SystemExit(f"--specialists is not a valid league spec: {error}")
     disk_sizing_result = disk_sizing(
         iterations=planned_iterations,
         games_per_iteration=getattr(args, "games_per_iteration", 0),
@@ -549,6 +595,13 @@ def evaluate(
         promotion_every=getattr(args, "promotion_every", 5),
         disk_budget_bytes=disk_budget,
         headroom_bytes=int(getattr(args, "disk_headroom_gb", 5.0) * GIB),
+        specialist_classes=len(specialist_configs),
+        # The SHORTEST cadence, not the mean: a class training every iteration
+        # sets the growth rate, and sizing on an average would under-reserve for
+        # exactly the class that fills the disk.
+        specialist_train_every=min(
+            (config.train_every for config in specialist_configs), default=1
+        ),
     )
     # The floor is about the GPU the run will actually use. A deliberate CPU run
     # is not subject to it; a CUDA run that cannot see a device is.
@@ -589,6 +642,8 @@ def evaluate(
             f"({disk_sizing_result.checkpoint_bytes / GIB:.0f} GiB of "
             f"per-iteration checkpoints + "
             f"{disk_sizing_result.hof_bytes / GIB:.0f} GiB of HOF archive + "
+            f"{disk_sizing_result.specialist_bytes / GIB:.0f} GiB of specialist "
+            f"archive + "
             f"{disk_sizing_result.buffer_bytes / GIB:.0f} GiB of game records + "
             f"{disk_sizing_result.log_bytes / GIB:.1f} GiB of log + "
             f"{disk_sizing_result.headroom_bytes / GIB:.0f} GiB headroom) but "
@@ -651,6 +706,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--games-per-iteration", type=int, default=0)
     parser.add_argument("--seed-games", type=int, default=0)
     parser.add_argument("--promotion-every", type=int, default=5)
+    parser.add_argument(
+        "--specialists",
+        default="",
+        help="the W7 league spec the run will launch with, e.g. "
+        "'science:0.15:0.5,military:0.10:0.4'. Only its SHAPE is read here -- "
+        "how many classes and how often each trains -- because each class "
+        "archives a checkpoint per train step and prunes none. Disk is chosen "
+        "when the instance is rented and cannot be lowered by a flag later, so "
+        "leaving this out of the preflight is how a specialist run runs out of "
+        "disk on day three.",
+    )
     parser.add_argument(
         "--run-dir",
         default=".",

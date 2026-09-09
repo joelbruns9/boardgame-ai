@@ -91,6 +91,24 @@
 #   SWEEP_SLOTS / SWEEP_CAPS  gate grid (space separated; different harness)
 #   SWEEP_GENERATION_GAMES=200 SWEEP_REPETITIONS=1
 #   SKIP_SWEEPS=0   set 1 to launch on defaults rather than this box
+#   SWEEP_SOLVER_THREADS_CSV  TOTAL solver threads to sweep (e.g. "0,4,8,16").
+#                   The generation/solver core split, as an axis. Unset keeps
+#                   the previous behaviour of measuring one fixed split.
+#   ALLOW_UNMEASURED_LAUNCH=0  set 1 to launch on defaults even though this box
+#                   has an unsourced measured_env.sh
+#
+#   Workstream switches -- ALL default off, and none was reachable before:
+#   SLOT_EMBEDDING=0        W1 learned tableau positions
+#   GRAPH_MODULE=0          W2 graph-aware tableau encoding
+#     GRAPH_LAYERS / GRAPH_BASES / GRAPH_ALPHA
+#   SWD_CONTROL_FEATURES=1  W3 control channels (on by default; pinned here)
+#   HIERARCHICAL_VALUE=0 HIER_VALUE_WEIGHT=0 HIER_VALUE_DETACH=1   W4
+#   ACTION_RESIDUAL=0 ACTION_EXPOSES=0 ACTION_POLICY_WEIGHT=0      W5
+#   SPECIALISTS=""          W7, e.g. "science:0.15:0.5,military:0.10:0.4"
+#     SPECIALIST_BOOTSTRAP_GAMES=0 SPECIALIST_FLOOR_EVERY=5
+#     SPECIALIST_REANALYSIS=0
+#                   SPECIALISTS requires HIERARCHICAL_VALUE=1: the leaf bias
+#                   reads W4's outlook head.
 #   GATE_SWEEP_RUNGS  gate sizes to sweep (default: ladder's middle rung)
 #   GATE_SLOTS / GATE_GLOBAL_BATCH_CAP  gate-side scheduler settings; the
 #                   gate wants a wider pool and cap than generation, and
@@ -424,6 +442,46 @@ LAUNCH="${LAUNCH:-1}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 SKIP_EQUIV="${SKIP_EQUIV:-0}"
 SKIP_SWEEPS="${SKIP_SWEEPS:-0}"
+# Provenance for pass 2. `sweep_launch_env.py` exports this; nothing else does.
+# `SKIP_SWEEPS` cannot serve the purpose -- an operator sets that by hand to
+# skip measuring altogether, which is exactly the case the guard below must
+# catch.
+SWEEP_MEASURED="${SWEEP_MEASURED:-0}"
+SWEEP_MEASURED_FROM="${SWEEP_MEASURED_FROM:-}"
+# Set 1 to launch on defaults even though this box has an unsourced sweep. The
+# guard exists because "I forgot to source measured_env.sh" and "I chose the
+# defaults" produce identical command lines otherwise.
+ALLOW_UNMEASURED_LAUNCH="${ALLOW_UNMEASURED_LAUNCH:-0}"
+
+# ── Workstream switches (W1/W2/W3/W4/W5/W7) ─────────────────────────────────
+#
+# Every one of these defaults OFF in `phase_d`, and until now none was reachable
+# from this launcher -- so a run that intended to carry the new architecture
+# would have carried none of it, silently, while the manifest recorded a commit
+# that contained all of it.
+#
+# W3 is the exception: `encoder` reads SWD_CONTROL_FEATURES and defaults it on.
+# It is pinned explicitly here anyway, so the run records a decision rather than
+# inheriting a default that could change.
+SLOT_EMBEDDING="${SLOT_EMBEDDING:-0}"          # W1
+GRAPH_MODULE="${GRAPH_MODULE:-0}"              # W2
+GRAPH_LAYERS="${GRAPH_LAYERS:-}"
+GRAPH_BASES="${GRAPH_BASES:-}"
+GRAPH_ALPHA="${GRAPH_ALPHA:-}"
+SWD_CONTROL_FEATURES="${SWD_CONTROL_FEATURES:-1}"   # W3
+export SWD_CONTROL_FEATURES
+HIERARCHICAL_VALUE="${HIERARCHICAL_VALUE:-0}"  # W4
+HIER_VALUE_WEIGHT="${HIER_VALUE_WEIGHT:-0}"
+HIER_VALUE_DETACH="${HIER_VALUE_DETACH:-1}"
+ACTION_RESIDUAL="${ACTION_RESIDUAL:-0}"        # W5
+ACTION_EXPOSES="${ACTION_EXPOSES:-0}"
+ACTION_POLICY_WEIGHT="${ACTION_POLICY_WEIGHT:-0}"
+# W7. Empty is HOF-only league play with no biased search, which is what every
+# run before this one did.
+SPECIALISTS="${SPECIALISTS:-}"
+SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"
+SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
+SPECIALIST_REANALYSIS="${SPECIALIST_REANALYSIS:-0}"
 # Scheduler geometry. Empty meant "let the parser decide", and the parser's
 # defaults are LAPTOP scale -- 16 slots against cloud6's 256, a 256-row global
 # batch against 2,048. On a rented GPU that is not a conservative default, it is
@@ -553,6 +611,7 @@ stage 6 "Launch preflight (host memory at the window cap, VRAM floor, disk)"
   --games-per-iteration "$GAMES_PER_ITERATION" \
   --seed-games "$SEED_GAMES" \
   --promotion-every "$PROMOTION_EVERY" \
+  --specialists "$SPECIALISTS" \
   --run-dir "$REPO_DIR/$RUN_DIR_REL" \
   --disk-budget-gb "${DISK_BUDGET_GB:-0}" \
   --disk-headroom-gb "${DISK_HEADROOM_GB:-5}" \
@@ -717,6 +776,31 @@ else
   SWEEP_DIR="$REPO_DIR/$RUN_DIR_REL/sweeps"
   mkdir -p "$SWEEP_DIR"
 
+  # The generation/solver CORE SPLIT, as an axis rather than a constant.
+  #
+  # Generation and the endgame solver compete for the same physical cores, and
+  # the solver runs SYNCHRONOUSLY inside a scheduler shard -- so a thread given
+  # to it is a thread taken from leaf production, and the best split is a
+  # property of this box's core count, not of the algorithm. Until now this
+  # stage passed a single fixed --solver-threads, which measures one split and
+  # reports it as the answer.
+  #
+  # Swept as a TOTAL, because --solver-threads is per shard and the worker count
+  # is itself an axis: holding "threads per shard" fixed across worker counts
+  # would silently vary the total, and the total is what competes with
+  # generation. `f4_phase_d_sweep --solver-threads-total` divides at each point.
+  SWEEP_SOLVER_ARGS=()
+  if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
+    if [ -n "${SWEEP_SOLVER_THREADS_CSV:-}" ]; then
+      SWEEP_SOLVER_ARGS=(--solver-threads-total "$SWEEP_SOLVER_THREADS_CSV")
+    elif [ -n "$SOLVER_THREADS" ]; then
+      SWEEP_SOLVER_ARGS=(--solver-threads "$SOLVER_THREADS")
+    fi
+  else
+    # The solver is off for this run, so a split has nothing to divide.
+    SWEEP_SOLVER_ARGS=(--solver-threads 0)
+  fi
+
   # f4_phase_d_sweep takes COMMA-separated axes and an --output DIRECTORY (it
   # writes phase_d_sweep.json inside). w5_gate_slots_sweep takes space-separated
   # axes and an --output FILE. They are different harnesses; test_setup_cloud
@@ -730,7 +814,7 @@ else
     --caps "${SWEEP_CAPS_CSV:-1024,2048}" \
     --inflight "${SWEEP_INFLIGHT_CSV:-1,2}" \
     --workers "${SWEEP_WORKERS_CSV:-$RUST_SCHEDULER_WORKERS}" \
-    --solver-threads "$SOLVER_THREADS" \
+    ${SWEEP_SOLVER_ARGS[@]+"${SWEEP_SOLVER_ARGS[@]}"} \
     --device cuda \
     --precision "$PRECISION" \
     || die "Generation sweep did not complete - see the error above. Nothing was measured, so this says nothing about the settings."
@@ -791,6 +875,31 @@ LOG_FILE="$RUN_DIR/launch_$(date +%Y%m%dT%H%M%S).log"
 
 # W6.3: the throughput sweep and Phase D spell the same four settings
 # differently. Translate rather than re-type.
+# ── The pass-2 guard: were this box's measured numbers actually applied? ─────
+#
+# `RUST_SLOTS` and friends carry cloud6 defaults, so pass 2 without sourcing
+# `measured_env.sh` launches on those and prints "Measured generation flags",
+# which is a lie: they came from a default, not from this box. The two cases
+# produce identical command lines, and the run is 24 hours long.
+#
+# `SWEEP_MEASURED` is exported only by `sweep_launch_env.py`. If a sweep exists
+# on this box and that marker is absent, the operator forgot to source it.
+if [ "$SWEEP_MEASURED" = "1" ]; then
+  ok "Using this box's measured sweep: ${SWEEP_MEASURED_FROM:-unknown}"
+elif [ -f "$REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh" ]; then
+  if [ "$ALLOW_UNMEASURED_LAUNCH" = "1" ]; then
+    warn "This box has a measured sweep that was NOT sourced, and"
+    warn "ALLOW_UNMEASURED_LAUNCH=1, so the run proceeds on defaults."
+  else
+    die "This box has a measured sweep that was not sourced, so the launch would
+use built-in defaults while reporting them as measured. Run:
+
+  source $REPO_DIR/$RUN_DIR_REL/sweeps/measured_env.sh && bash \$0
+
+Set ALLOW_UNMEASURED_LAUNCH=1 to launch on defaults deliberately."
+  fi
+fi
+
 TUNED_FLAGS=()
 [ -n "$RUST_SLOTS" ] && TUNED_FLAGS+=(--rust-slots "$RUST_SLOTS")
 [ -n "$RUST_GLOBAL_BATCH_CAP" ] &&
@@ -798,7 +907,11 @@ TUNED_FLAGS=()
 [ -n "$RUST_MAX_INFLIGHT_BATCHES" ] &&
   TUNED_FLAGS+=(--rust-max-inflight-batches "$RUST_MAX_INFLIGHT_BATCHES")
 if [ ${#TUNED_FLAGS[@]} -gt 0 ]; then
-  ok "Measured generation flags: ${TUNED_FLAGS[*]}"
+  if [ "$SWEEP_MEASURED" = "1" ]; then
+    ok "Measured generation flags: ${TUNED_FLAGS[*]}"
+  else
+    warn "Generation flags (NOT measured on this box): ${TUNED_FLAGS[*]}"
+  fi
 elif [ -n "${LAUNCH_FLAGS_JSON:-}" ]; then
   read -r -a TUNED_FLAGS <<< "$(
     "$PY" -m games.seven_wonders_duel.f4_launch_flags "$LAUNCH_FLAGS_JSON"
@@ -847,6 +960,44 @@ LEAF_BATCH_FLAGS=()
 ARCH_FLAGS=()
 [ "$POOLED_READOUT" = "1" ] && ARCH_FLAGS+=(--pooled-readout)
 [ "$REPLY_HEAD" = "1" ] && ARCH_FLAGS+=(--reply-head)
+# W1/W2/W4/W5. Each is a MODEL SHAPE change, so a resume that flips one is
+# refused by Phase D's own contract check rather than silently loading a
+# checkpoint the weights no longer fit.
+[ "$SLOT_EMBEDDING" = "1" ] && ARCH_FLAGS+=(--slot-embedding)
+if [ "$GRAPH_MODULE" = "1" ]; then
+  ARCH_FLAGS+=(--graph-module)
+  [ -n "$GRAPH_LAYERS" ] && ARCH_FLAGS+=(--graph-layers "$GRAPH_LAYERS")
+  [ -n "$GRAPH_BASES" ] && ARCH_FLAGS+=(--graph-bases "$GRAPH_BASES")
+  [ -n "$GRAPH_ALPHA" ] && ARCH_FLAGS+=(--graph-alpha "$GRAPH_ALPHA")
+fi
+if [ "$HIERARCHICAL_VALUE" = "1" ]; then
+  ARCH_FLAGS+=(--hierarchical-value --hier-value-weight "$HIER_VALUE_WEIGHT")
+  [ "$HIER_VALUE_DETACH" = "0" ] && ARCH_FLAGS+=(--no-hierarchical-value-detach)
+fi
+[ "$ACTION_RESIDUAL" = "1" ] && ARCH_FLAGS+=(--action-residual)
+[ "$ACTION_EXPOSES" = "1" ] && ARCH_FLAGS+=(--action-exposes)
+ARCH_FLAGS+=(--action-policy-weight "$ACTION_POLICY_WEIGHT")
+
+# W7 specialist league. Separate from ARCH_FLAGS because these change the
+# TRAINING ARRANGEMENT rather than the model shape: the same weights, played and
+# trained differently.
+SPECIALIST_FLAGS=()
+if [ -n "$SPECIALISTS" ]; then
+  # A biased search reads W4's seven-way outlook, and a leaf without one is a
+  # hard error rather than a silent zero bias. Phase D refuses the combination
+  # at launch, but failing here names the launcher knob rather than the flag.
+  if [ "$HIERARCHICAL_VALUE" != "1" ]; then
+    die "SPECIALISTS is set but HIERARCHICAL_VALUE=0. The specialist leaf bias
+reads W4's outlook head; without it every biased leaf raises. Set
+HIERARCHICAL_VALUE=1 and a positive HIER_VALUE_WEIGHT."
+  fi
+  SPECIALIST_FLAGS+=(
+    --specialists "$SPECIALISTS"
+    --specialist-bootstrap-games "$SPECIALIST_BOOTSTRAP_GAMES"
+    --specialist-floor-every "$SPECIALIST_FLOOR_EVERY"
+  )
+  [ "$SPECIALIST_REANALYSIS" = "1" ] && SPECIALIST_FLAGS+=(--specialist-reanalysis)
+fi
 
 SOLVER_FLAGS=()
 if [ "$ENDGAME_SOLVER_MAX_NODES" -gt 0 ]; then
@@ -918,6 +1069,7 @@ TRAIN_CMD=(
   # that governs archived opponents.
   --opponent-fraction "$OPPONENT_FRACTION"
   "${ARCH_FLAGS[@]}"
+  "${SPECIALIST_FLAGS[@]}"
   "${SOLVER_FLAGS[@]}"
   --hof-opponent-fraction "$HOF_FRACTION" --hof-start-games "$HOF_START_GAMES"
   --selfplay-generator-mode soft_gate

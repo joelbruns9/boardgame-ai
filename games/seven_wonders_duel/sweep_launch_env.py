@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shlex
 
 
 def _require(payload: dict, key: str, source: Path) -> object:
@@ -38,7 +39,7 @@ def _require(payload: dict, key: str, source: Path) -> object:
     return payload[key]
 
 
-def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, int]:
+def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
     """The measured settings, as the environment variables the launcher reads."""
 
     generation_path = sweep_dir / "generation" / "phase_d_sweep.json"
@@ -59,7 +60,7 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, int]:
     best_generation = summary[0]
     best_gate = _require(gate, "best", gate_path)
 
-    env = {
+    env: dict[str, object] = {
         "RUST_SLOTS": int(best_generation["slots"]),
         "RUST_GLOBAL_BATCH_CAP": int(best_generation["global_batch_cap"]),
         "RUST_MAX_INFLIGHT_BATCHES": int(best_generation["max_inflight_batches"]),
@@ -71,15 +72,31 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, int]:
     # a measurement.
     if "scheduler_workers" in best_generation:
         env["RUST_SCHEDULER_WORKERS"] = int(best_generation["scheduler_workers"])
+    # The generation/solver core split, but ONLY when the sweep actually varied
+    # it. A grid that held solver threads fixed measured one split and says
+    # nothing about the others, so emitting its value would dress a constant up
+    # as a result -- the same reason the worker axis is conditional above.
+    splits = {
+        row["solver_threads_per_shard"]
+        for row in summary
+        if "solver_threads_per_shard" in row
+    }
+    if len(splits) > 1:
+        env["SOLVER_THREADS"] = int(best_generation["solver_threads_per_shard"])
+    # Provenance. `SKIP_SWEEPS` cannot serve as this marker: an operator sets
+    # that by hand to skip measuring altogether, so it is true in exactly the
+    # case this needs to detect.
+    env["SWEEP_MEASURED"] = "1"
+    env["SWEEP_MEASURED_FROM"] = str(sweep_dir.resolve())
     return env
 
 
-def render(env: dict[str, int]) -> str:
+def render(env: dict[str, object]) -> str:
     lines = [
         "# Measured on this box (setup_cloud_7wd.sh stage 8b, or sweep_7wd.sh).",
         "# Source this, then re-run the launcher to launch on these numbers.",
     ]
-    if "RUST_SCHEDULER_WORKERS" in env:
+    if "RUST_SCHEDULER_WORKERS" in env and "SOLVER_THREADS" not in env:
         workers = env["RUST_SCHEDULER_WORKERS"]
         lines += [
             "#",
@@ -89,8 +106,26 @@ def render(env: dict[str, int]) -> str:
             "# worker count above, keeping the split tied to the geometry.",
             "# Pinning a value here would freeze a split that should follow it.",
             "# Set it only to override that derivation deliberately.",
+            "# This sweep did not VARY the split, so there is nothing measured",
+            "# to pin; sweep SWEEP_SOLVER_THREADS_CSV to get one.",
         ]
-    lines += [f"export {key}={value}" for key, value in env.items()]
+    elif "SOLVER_THREADS" in env:
+        lines += [
+            "#",
+            "# SOLVER_THREADS is PER SHARD and was MEASURED here, so it is pinned",
+            f"# rather than derived: total solver threads are "
+            f"{env.get('RUST_SCHEDULER_WORKERS', '?')} x {env['SOLVER_THREADS']}.",
+            "# The generation/solver split competes for the same cores, so the",
+            "# winning value belongs to the worker count beside it -- change one",
+            "# and the other is no longer measured.",
+        ]
+    # QUOTED. This file is `source`d, so a value containing a space -- a run
+    # directory under one, most obviously -- would otherwise split into two
+    # words and export something that is not the measurement. The integers are
+    # unaffected; the path is the reason.
+    lines += [
+        f"export {key}={shlex.quote(str(value))}" for key, value in env.items()
+    ]
     # Pass 2 must not re-measure: the sweeps are the expensive part of setup.
     lines.append("export SKIP_SWEEPS=1")
     return "\n".join(lines) + "\n"

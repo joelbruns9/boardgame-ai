@@ -1507,3 +1507,223 @@ def test_validate_config_exists_and_does_not_train():
     block = source[source.index("if args.validate_config:") :][:600]
     assert "return 0" in block
     assert "loop.run()" not in block, "validation must not start training"
+
+
+# ---------------------------------------------------------------------------
+# The two-pass contract: the run carries what you chose, on numbers this box
+# measured
+# ---------------------------------------------------------------------------
+
+RUN_FILE = REPO_ROOT / "launch_7wd_run.sh"
+
+
+def test_every_workstream_is_reachable_from_the_launcher(setup_text):
+    """Until W7 these all defaulted off in `phase_d` and NONE was reachable
+    here, so a run meant to carry the new architecture would have carried none
+    of it while the manifest recorded a commit containing all of it.
+    """
+
+    for flag in (
+        "--slot-embedding",        # W1
+        "--graph-module",          # W2
+        "--hierarchical-value",    # W4
+        "--hier-value-weight",
+        "--action-residual",       # W5
+        "--action-exposes",
+        "--action-policy-weight",
+        "--specialists",           # W7
+        "--specialist-floor-every",
+        "--specialist-reanalysis",
+    ):
+        assert flag in setup_text, f"{flag} is not reachable from the launcher"
+
+
+def test_w3_control_is_pinned_rather_than_inherited(setup_text):
+    """W3 rides on an encoder env var that happens to default on. A run should
+    record a decision, not inherit a default that could change."""
+
+    assert "SWD_CONTROL_FEATURES" in setup_text
+    assert "export SWD_CONTROL_FEATURES" in setup_text
+
+
+def test_specialists_without_the_outlook_head_is_refused_by_the_launcher(
+    setup_text,
+):
+    """The bias reads W4's outlook and a leaf without one is a hard error.
+    Phase D refuses the combination too, but failing here names the launcher
+    knob rather than the flag."""
+
+    assert 'if [ "$HIERARCHICAL_VALUE" != "1" ]; then' in setup_text
+    index = setup_text.index('if [ "$HIERARCHICAL_VALUE" != "1" ]; then')
+    assert "die" in setup_text[index : index + 400]
+
+
+def test_pass_two_refuses_to_launch_on_defaults_when_a_sweep_exists(setup_text):
+    """The whole point of two passes.
+
+    `RUST_SLOTS` and friends carry cloud6 defaults, so pass 2 without sourcing
+    `measured_env.sh` launches on those while printing "Measured generation
+    flags" -- and the two cases produce identical command lines on a run that
+    lasts a day.
+    """
+
+    assert "SWEEP_MEASURED" in setup_text
+    assert "measured_env.sh" in setup_text
+    assert "ALLOW_UNMEASURED_LAUNCH" in setup_text
+    guard = setup_text[setup_text.index("The pass-2 guard") :][:1500]
+    assert "die" in guard, "the guard must refuse, not warn"
+
+
+def test_the_measured_wording_is_only_used_when_it_was_measured(setup_text):
+    """Reporting defaults as "measured" is worse than reporting nothing."""
+
+    # The emitting line, not the comment above the guard that quotes it.
+    index = setup_text.index('ok "Measured generation flags')
+    window = setup_text[max(0, index - 200) : index]
+    assert 'SWEEP_MEASURED" = "1"' in window
+    # ... and the unmeasured branch must say so rather than staying silent.
+    assert "NOT measured on this box" in setup_text
+
+
+def test_the_sweep_measures_the_generation_solver_core_split(setup_text):
+    """The split is contended -- the solver runs synchronously inside a shard,
+    so a thread given to it is a thread taken from leaf production. A single
+    fixed value measures one split and reports it as the answer."""
+
+    assert "SWEEP_SOLVER_THREADS_CSV" in setup_text
+    assert "--solver-threads-total" in setup_text
+
+
+def test_the_preflight_is_told_which_league_the_run_will_play(setup_text):
+    """A specialist archives a checkpoint per TRAIN STEP and prunes none, and
+    disk cannot be raised after the instance is rented."""
+
+    preflight = _block(setup_text, '"$PY" -m games.seven_wonders_duel.cloud_preflight', "  &&")
+    assert "--specialists" in preflight
+
+
+@pytest.mark.skipif(not RUN_FILE.is_file(), reason="run file not present")
+def test_the_run_file_sets_no_scheduler_geometry():
+    """The decision file is portable; the geometry belongs to one rented box.
+
+    Baking a slot count into the run file would silently carry a dead box's
+    measurement onto a live one.
+    """
+
+    text = RUN_FILE.read_text(encoding="utf-8")
+    for measured in (
+        "export RUST_SLOTS=",
+        "export RUST_GLOBAL_BATCH_CAP=",
+        "export RUST_MAX_INFLIGHT_BATCHES=",
+        "export GATE_SLOTS=",
+        "export SOLVER_THREADS=",
+    ):
+        assert measured not in text, f"{measured} pins a per-box measurement"
+
+
+@pytest.mark.skipif(not RUN_FILE.is_file(), reason="run file not present")
+def test_the_run_file_only_sets_knobs_the_launcher_reads():
+    """A typo here is silent: an unread export is indistinguishable from a
+    setting that had no effect."""
+
+    text = RUN_FILE.read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+    exported = set(re.findall(r"^export ([A-Z0-9_]+)=", text, flags=re.M))
+    unread = sorted(name for name in exported if name not in setup)
+    assert not unread, f"the launcher never reads: {unread}"
+
+
+# ---------------------------------------------------------------------------
+# measured_env.sh is SOURCED, so it has to be sourceable
+# ---------------------------------------------------------------------------
+
+
+def _sweep_dir(tmp_path, *, vary_solver: bool):
+    import json
+
+    generation = tmp_path / "generation"
+    generation.mkdir(parents=True)
+    rows = [
+        {
+            "slots": 256,
+            "global_batch_cap": 2048,
+            "max_inflight_batches": 1,
+            "scheduler_workers": 4,
+            "solver_threads_per_shard": 2,
+            "median_seconds": 10.0,
+        },
+        {
+            "slots": 128,
+            "global_batch_cap": 1024,
+            "max_inflight_batches": 1,
+            "scheduler_workers": 4,
+            "solver_threads_per_shard": 2 if not vary_solver else 0,
+            "median_seconds": 12.0,
+        },
+    ]
+    (generation / "phase_d_sweep.json").write_text(
+        json.dumps({"summary": rows}), encoding="utf-8"
+    )
+    (tmp_path / "gate_200.json").write_text(
+        json.dumps({"best": {"slots": 144, "global_batch_cap": 256}}),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _render(tmp_path, *, vary_solver: bool) -> str:
+    from games.seven_wonders_duel.sweep_launch_env import build_env, render
+
+    directory = _sweep_dir(tmp_path, vary_solver=vary_solver)
+    return render(build_env(directory, "200"))
+
+
+def test_the_measured_env_carries_the_provenance_the_guard_reads(tmp_path):
+    """`SKIP_SWEEPS` cannot serve as the marker -- an operator sets that by hand
+    to skip measuring, which is exactly the case the guard must catch."""
+
+    text = _render(tmp_path, vary_solver=True)
+    assert "export SWEEP_MEASURED=1" in text
+    assert "SWEEP_MEASURED_FROM=" in text
+    assert "export SKIP_SWEEPS=1" in text
+
+
+def test_the_solver_split_is_pinned_only_when_it_was_varied(tmp_path):
+    """A grid that held the split fixed measured one split and says nothing
+    about the others; emitting its value would dress a constant as a result."""
+
+    varied = _render(tmp_path / "a", vary_solver=True)
+    assert "export SOLVER_THREADS=2" in varied
+    fixed = _render(tmp_path / "b", vary_solver=False)
+    assert "export SOLVER_THREADS=" not in fixed
+    assert "deliberately ABSENT" in fixed
+
+
+def test_the_measured_env_survives_a_path_with_a_space(tmp_path):
+    """The file is `source`d, so an unquoted value containing a space would
+    split into two words and export something that is not the measurement."""
+
+    directory = tmp_path / "run dir with spaces"
+    directory.mkdir()
+    text = _render(directory, vary_solver=True)
+    written = directory / "measured_env.sh"
+    written.write_text(text, encoding="utf-8")
+
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - environment dependent
+        pytest.skip("bash is not available")
+    probe = subprocess.run(
+        [
+            bash,
+            "-c",
+            f'source "{written.as_posix()}"; '
+            'echo "$RUST_SLOTS|$SWEEP_MEASURED|$SWEEP_MEASURED_FROM"',
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    slots, measured, source = probe.stdout.strip().split("|", 2)
+    assert slots == "256"
+    assert measured == "1"
+    assert source.endswith("run dir with spaces")
