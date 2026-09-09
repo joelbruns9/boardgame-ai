@@ -327,3 +327,180 @@ def test_adapter_separates_sync_and_device_timers_on_cpu():
     ):
         assert adapter.total_metrics[key] == 0.0
     assert adapter.batch_device_forward_ms == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 of COALESCER_BUILD_PLAN.md: the counters the coalescer will be
+# judged by, and the two defects that made the previous judgement wrong.
+# ---------------------------------------------------------------------------
+
+
+def _solver_run(workers, solver_threads, *, seeds=range(400, 408)):
+    """One sharded self-play run with the endgame solver live.
+
+    The solver's eligibility and thread count are process globals, so they are
+    saved and restored: a leak would silently change every later test in the
+    process.
+    """
+
+    import seven_wonders_rust as swr
+
+    from .control_table import ensure_rust_table
+    from .test_f4_scheduler import _row_eval
+
+    ensure_rust_table()
+    saved_solver = swr.endgame_solver()
+    saved_threads = swr.solver_threads()
+    swr.set_endgame_solver(2_000_000, 5.0, 8, True)
+    swr.set_solver_threads(solver_threads)
+    try:
+        seeds = list(seeds)
+        _records, metrics = swr.self_play_many_net(
+            adapter=lambda rows: [_row_eval(t, a, l) for t, a, l in rows],
+            games=rust_games_for_self_play(
+                seeds, [index % 2 for index in range(len(seeds))]
+            ),
+            game_seeds=seeds,
+            scheduler_workers=workers,
+            max_active_slots=len(seeds),
+            solve_endgames=True,
+            **_common(leaf_batch=1, global_batch_cap=32),
+        )
+        return metrics
+    finally:
+        if saved_solver[0] == 0:
+            swr.set_endgame_solver(0, 1.0, 0, False)
+        else:
+            swr.set_endgame_solver(*saved_solver)
+        swr.set_solver_threads(saved_threads)
+
+
+def test_solver_blocking_survives_multi_shard_aggregation():
+    """`sched_solve_wait_ns` was omitted from `SchedulerMetrics::merge`.
+
+    It was declared, incremented and exported, so every consumer looked correct
+    -- including `generation_profile.py`, which reports `solve_wait_share` and
+    therefore answered "does the solver block generation?" with a guaranteed no
+    on every run with more than one shard. cloud2 ran four.
+
+    `THROUGHPUT_LEVERS.md` §3.3 records the identical defect happening once
+    before to a different counter, which is why the compile-time guard in
+    `merge` matters more than this test does.
+    """
+
+    one = _solver_run(workers=1, solver_threads=2)
+    many = _solver_run(workers=4, solver_threads=2)
+    assert one["sched_solve_wait_ns"] > 0
+    # The pre-fix code reported exactly zero here however long it blocked.
+    assert many["sched_solve_wait_ns"] > 0
+
+
+def test_solver_blocking_is_separated_from_the_work_around_it():
+    """The span used to cover the whole pump -- harvesting outcomes, resuming
+    slots, re-collecting ready groups, retiring them -- as well as the block.
+    All but the block is work the scheduler owed anyway, and some of it was
+    double-counted against `sched_collect_ns`."""
+
+    metrics = _solver_run(workers=4, solver_threads=2)
+    assert metrics["sched_solve_pump_ns"] >= metrics["sched_solve_wait_ns"]
+    assert metrics["sched_solve_pump_ns"] > 0
+
+
+def test_inline_solving_is_visible_rather_than_free():
+    """With no pool, `finish_move` solves on the scheduler thread, so there is
+    nothing to block on and no blocking counter can see the cost.
+
+    Without `sched_solve_inline_ns`, an inline run and a perfectly-parallel run
+    both report ~zero blocking, for opposite reasons -- and the inline one is
+    the expensive case.
+    """
+
+    inline = _solver_run(workers=4, solver_threads=0)
+    assert inline["sched_solve_inline_ns"] > 0
+    assert inline["sched_solve_wait_ns"] == 0
+    assert inline["sched_solve_pump_ns"] == 0
+
+    pooled = _solver_run(workers=4, solver_threads=2)
+    assert pooled["sched_solve_wait_ns"] > 0
+
+
+def _flat_run(workers, *, seeds=range(900, 908)):
+    """A run through the PRODUCTION flat worker, which is the only path whose
+    boundary counters move."""
+
+    import seven_wonders_rust as swr
+    import torch
+
+    from .control_table import ensure_rust_table
+    from .inference import Evaluator
+    from .net import SWDNet
+
+    ensure_rust_table()
+    torch.manual_seed(0)
+    evaluator = Evaluator(
+        SWDNet(d_model=32, layers=2, heads=4), "cpu", 64, fuse_embedder=False
+    )
+    seeds = list(seeds)
+    _records, metrics = swr.self_play_many_flat_net(
+        adapter=rust_flat_batch_adapter(evaluator),
+        games=rust_games_for_self_play(
+            seeds, [index % 2 for index in range(len(seeds))]
+        ),
+        game_seeds=seeds,
+        global_batch_cap=64,
+        leaf_batch=1,
+        cheap_sims_min=2,
+        cheap_sims_max=3,
+        full_sims_min=6,
+        full_sims_max=8,
+        full_search_fraction=0.4,
+        top_k=3,
+        draft_prior=0.0,
+        iteration=1,
+        scheduler_workers=workers,
+        max_active_slots=len(seeds),
+        max_moves=256,
+    )
+    return metrics
+
+
+def test_requests_and_forwards_are_counted_separately():
+    """`global_batches` is incremented in the SHARD, once per submitted request,
+    before anything could merge it.
+
+    So `global_rows / global_batches` is rows per REQUEST and cannot move when a
+    coalescer lands -- an earlier revision of `COALESCER_BUILD_PLAN.md` proposed
+    it as the headline success metric, where it would have been blind to its own
+    subject. `boundary_forwards` comes from the worker instead.
+
+    Today the worker issues one forward per request, so the two are equal. That
+    equality is the pre-coalescer baseline, and breaking it is what the
+    coalescer is FOR: this assertion is expected to be inverted by that change,
+    not preserved.
+    """
+
+    metrics = _flat_run(workers=4)
+    assert metrics["boundary_forwards"] > 0
+    assert metrics["boundary_forwards"] == metrics["global_batches"]
+    assert metrics["boundary_forward_rows"] == metrics["global_rows"]
+
+
+def test_shards_fragment_batches_rather_than_pooling_them():
+    """The mechanism behind cloud2's 46.9 rows per call.
+
+    Nothing merges requests from concurrent shards, so each assembles only from
+    its own ready leaves: the same total work arrives as more, narrower calls as
+    shards rise. Measured here at 1 against 4 shards on identical seeds.
+
+    This is the quantity the coalescer is meant to recover, so it is pinned
+    before the change rather than argued about after it.
+    """
+
+    one = _flat_run(workers=1)
+    many = _flat_run(workers=4)
+    # Identical work: same games, same seeds, same search budget.
+    assert one["global_rows"] == many["global_rows"]
+    # ... arriving in materially more, materially narrower calls.
+    assert many["global_batches"] > one["global_batches"] * 2
+    width = lambda m: m["global_rows"] / m["global_batches"]
+    assert width(many) < width(one) / 2

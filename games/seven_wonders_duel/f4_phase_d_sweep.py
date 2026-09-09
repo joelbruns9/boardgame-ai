@@ -30,6 +30,7 @@ import argparse
 import dataclasses
 import itertools
 import json
+import pathlib
 import statistics
 import time
 from pathlib import Path
@@ -245,9 +246,27 @@ def steady_state_schedules(loop) -> "pd.ResolvedSchedules":
     return pd.ResolvedSchedules(curriculum_mix_fraction=0.0, draft_prior=0.0)
 
 
+def _find_manifest_value(payload, key):
+    """First occurrence of `key` anywhere in a nested manifest."""
+
+    if isinstance(payload, dict):
+        if key in payload:
+            return payload[key]
+        for value in payload.values():
+            found = _find_manifest_value(value, key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_manifest_value(value, key)
+            if found is not None:
+                return found
+    return None
+
+
 def run_point(
     loop, model, iteration, jobs, destination, slots, cap, inflight,
-    workers=1, solver_threads=0,
+    workers=1, solver_threads=0, solver_max_nodes=0, solver_max_secs=0.0,
 ):
     loop.config.rust_slots = slots
     loop.config.rust_global_batch_cap = cap
@@ -258,6 +277,32 @@ def run_point(
     # worker axis, and a sweep that solved on one thread count while measuring
     # another would attribute the solver's core contention to the axis.
     pd.configure_solver_threads(solver_threads, workers)
+    # THE NODE BUDGET, which is what makes the solver run at all.
+    #
+    # This function used to size the thread pool and never install the budget.
+    # `endgame_solver()` then reported `max_nodes = 0`, `solver_wants` returned
+    # false at every position, and EVERY POINT WAS MEASURED WITH SOLVING
+    # DISABLED -- while the harness printed the thread count it had dutifully
+    # configured. `THROUGHPUT_LEVERS.md` §3.1 records this exact incident as
+    # having already cost a day of rented box; it was documented and not fixed.
+    #
+    # `solve_endgames` is the second half: it is a per-CALL grant, so a budget
+    # without it still solves nothing.
+    solving = solver_threads > 0 and solver_max_nodes > 0
+    # `_generate_iteration_rust` derives the per-call grant from this field
+    # (`solve_endgames=self.config.endgame_solver_max_nodes > 0`), so setting it
+    # is what the RUN does -- one source of truth rather than a second switch
+    # the sweep could set differently.
+    loop.config.endgame_solver_max_nodes = solver_max_nodes if solving else 0
+    if solving:
+        pd.configure_endgame_solver(
+            solver_max_nodes,
+            solver_max_secs or float(solver_max_nodes) / 1_200_000.0 * 5.0,
+            0,
+            True,
+        )
+    else:
+        pd.configure_endgame_solver(0, 1.0, 0, False)
 
     calls, restore = timed_scheduler_calls()
     try:
@@ -296,6 +341,19 @@ def run_point(
         "scheduler_workers": workers,
         "solver_threads_per_shard": solver_threads,
         "solver_threads_total": solver_threads * workers,
+        # LIVENESS, not configuration. `THROUGHPUT_LEVERS.md` §3.1: "assert
+        # every subsystem is live, not merely configured -- print a count of
+        # work each one actually did". A thread count says what was asked for;
+        # this says what happened.
+        "solves_attempted": sum(
+            1 for record in records for move in record.moves if move.solver_attempted
+        ),
+        "solves_answered": sum(
+            1
+            for record in records
+            for move in record.moves
+            if move.solver_value is not None
+        ),
         "mean_batch_size": statistics.fmean(batch_rows) if batch_rows else 0.0,
         "mean_wave_width": statistics.fmean(waves) if waves else 0.0,
         "max_batch_size": max(batch_rows) if batch_rows else 0,
@@ -376,27 +434,55 @@ def main() -> None:
         "run that solves: those threads compete with generation for cores.",
     )
     parser.add_argument(
-        "--solver-threads-total",
+        "--solver-max-nodes",
         type=int,
         default=0,
-        help="total solver threads, divided across shards at each point. Use "
-        "this whenever --workers has more than one value: --solver-threads is "
-        "PER SHARD, so holding it fixed across the worker axis silently varies "
-        "the solver load with the axis being measured, and fewer shards would "
-        "lose partly because they were under-solving. Overrides "
-        "--solver-threads.",
+        help="endgame-solver node budget to install at every point. Without it "
+        "the budget stays 0, `solver_wants` refuses every position, and the "
+        "whole solver axis measures a solver that never ran -- the defect "
+        "THROUGHPUT_LEVERS.md 3.1 records. Taken from the manifest when "
+        "--config-from-manifest is given and this is left at 0.",
+    )
+    parser.add_argument(
+        "--solver-max-secs",
+        type=float,
+        default=0.0,
+        help="deadline per solve; derived from the node budget when 0.",
+    )
+    parser.add_argument(
+        "--solver-threads-total",
+        default="0",
+        help="TOTAL solver threads, divided across shards at each point. Takes "
+        "a comma-separated list, and is then a swept AXIS like the others. "
+        "Use it whenever --workers has more than one value: --solver-threads "
+        "is PER SHARD, so holding it fixed across the worker axis silently "
+        "varies the solver load with the axis being measured, and fewer shards "
+        "would lose partly because they were under-solving. Overrides "
+        "--solver-threads.\n\n"
+        "Swept rather than fixed because the generation/solver split is a "
+        "CONTENDED one: the solver runs synchronously inside a shard, so a "
+        "thread given to it is a thread taken from leaf production, and the "
+        "best split is a property of the box's core count rather than of the "
+        "algorithm. A single value measures one split and reports it as the "
+        "answer. `0` in the list measures with the solver off, which is the "
+        "honest baseline for what solving costs.",
     )
     args = parser.parse_args()
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     numbers = lambda text: [int(part) for part in text.split(",") if part.strip()]
+    # The solver total is the fourth free axis. It is a TOTAL rather than a
+    # per-shard count so that a point's solver load does not move with the
+    # worker axis beside it -- see `--solver-threads-total`.
+    solver_totals = numbers(args.solver_threads_total) or [0]
     grid = list(
         itertools.product(
             numbers(args.slots),
             numbers(args.caps),
             numbers(args.inflight),
             numbers(args.workers),
+            solver_totals,
         )
     )
     # A shard with no slot cannot make progress, and `SlotBudget::new` refuses
@@ -407,28 +493,65 @@ def main() -> None:
     if dropped:
         print(
             f"skipping {len(dropped)} point(s) with fewer slots than shards: "
-            f"{sorted({(slots, workers) for slots, _, _, workers in dropped})}",
+            f"{sorted({(slots, workers) for slots, _, _, workers, _ in dropped})}",
             flush=True,
         )
     if not grid:
         raise SystemExit("every grid point has fewer slots than shards")
 
-    def solver_threads_for(workers: int) -> int:
-        """Per-shard threads at this point, holding the TOTAL fixed when asked."""
+    def solver_threads_for(workers: int, total: int) -> int:
+        """Per-shard threads at this point, holding the TOTAL fixed.
 
-        if args.solver_threads_total <= 0:
-            return args.solver_threads
-        return max(1, args.solver_threads_total // max(1, workers))
+        A total of 0 means the solver is off at this point, and that must stay
+        0 rather than being widened to 1: "off" is a grid point with its own
+        cost curve, and rounding it up would delete the baseline the other
+        points are measured against.
+        """
 
-    if args.solver_threads_total > 0 and len(numbers(args.workers)) > 1:
+        if total <= 0:
+            return args.solver_threads if solver_totals == [0] else 0
+        return max(1, total // max(1, workers))
+
+    if len(solver_totals) > 1:
+        print(
+            "solver split is an AXIS: totals "
+            + ",".join(str(total) for total in solver_totals)
+            + " over workers "
+            + ",".join(str(workers) for workers in numbers(args.workers)),
+            flush=True,
+        )
+    elif solver_totals != [0] and len(numbers(args.workers)) > 1:
         print(
             "solver: holding "
-            f"{args.solver_threads_total} threads TOTAL across the worker axis "
+            f"{solver_totals[0]} threads TOTAL across the worker axis "
             + ", ".join(
-                f"{workers}x{solver_threads_for(workers)}"
+                f"{workers}x{solver_threads_for(workers, solver_totals[0])}"
                 for workers in numbers(args.workers)
             ),
             flush=True,
+        )
+
+    # The budget the RUN uses, unless overridden. A sweep that installs a
+    # different budget from the run is measuring a different workload: the
+    # budget is the solver's ADMISSION THRESHOLD, not a ceiling
+    # (`THROUGHPUT_LEVERS.md` class D).
+    solver_max_nodes = args.solver_max_nodes
+    if solver_max_nodes <= 0 and args.config_from_manifest:
+        import json as _json
+
+        manifest = _json.loads(
+            pathlib.Path(args.config_from_manifest).read_text(encoding="utf-8")
+        )
+        found = _find_manifest_value(manifest, "endgame_solver_max_nodes")
+        if found:
+            solver_max_nodes = int(found)
+            print(f"solver budget from manifest: {solver_max_nodes:,} nodes", flush=True)
+    if solver_totals != [0] and solver_max_nodes <= 0:
+        raise SystemExit(
+            "a solver split was requested but no node budget is available, so "
+            "every point would run with solving DISABLED and the axis would "
+            "measure nothing. Pass --solver-max-nodes, or --config-from-manifest "
+            "for a run that records one."
         )
 
     geometry = geometry_from_checkpoint(args.checkpoint)
@@ -490,8 +613,10 @@ def main() -> None:
         print(f"warmup: {args.warmup_games} games", flush=True)
         run_point(
             loop, model, args.iteration, jobs_for(args.warmup_games, 999),
-            output / "warmup.jsonl", *grid[0],
-            solver_threads=solver_threads_for(grid[0][3]),
+            output / "warmup.jsonl", *grid[0][:4],
+            solver_threads=solver_threads_for(grid[0][3], grid[0][4]),
+            solver_max_nodes=solver_max_nodes,
+            solver_max_secs=args.solver_max_secs,
         )
 
     jobs = jobs_for(args.games, args.iteration)
@@ -507,12 +632,18 @@ def main() -> None:
     fingerprints: set = set()
     for repetition in range(args.repetitions):
         order = grid if repetition % 2 == 0 else list(reversed(grid))
-        for position, (slots, cap, inflight, workers) in enumerate(order):
+        for position, (slots, cap, inflight, workers, solver_total) in enumerate(order):
             stats, fingerprint = run_point(
                 loop, model, args.iteration, jobs,
                 output
-                / f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}_w{workers}.jsonl",
-                slots, cap, inflight, workers, solver_threads_for(workers),
+                / (
+                    f"r{repetition}_{position:02d}_s{slots}_c{cap}_i{inflight}"
+                    f"_w{workers}_t{solver_total}.jsonl"
+                ),
+                slots, cap, inflight, workers,
+                solver_threads_for(workers, solver_total),
+                solver_max_nodes,
+                args.solver_max_secs,
             )
             stats["repetition"] = repetition
             results.append(stats)
@@ -531,6 +662,7 @@ def main() -> None:
                 )
             print(
                 f"slots={slots:<4} cap={cap:<4} inflight={inflight} workers={workers:<2} "
+                f"solver={stats['solver_threads_total']:<3} "
                 f"batch={stats['mean_batch_size']:6.1f} "
                 f"wave={stats['mean_wave_width']:4.2f}  "
                 f"{stats['wall_seconds']:7.1f}s  {stats['games_per_hour']:7.0f} games/h  "
@@ -540,7 +672,8 @@ def main() -> None:
 
     summary = []
     for point in grid:
-        slots, cap, inflight, workers = point
+        slots, cap, inflight, workers, solver_total = point
+        per_shard = solver_threads_for(workers, solver_total)
         matching = [
             row for row in results
             if (
@@ -548,7 +681,8 @@ def main() -> None:
                 row["global_batch_cap"],
                 row["max_inflight_batches"],
                 row["scheduler_workers"],
-            ) == point
+                row["solver_threads_per_shard"],
+            ) == (slots, cap, inflight, workers, per_shard)
         ]
         summary.append(
             {
@@ -556,8 +690,20 @@ def main() -> None:
                 "global_batch_cap": cap,
                 "max_inflight_batches": inflight,
                 "scheduler_workers": workers,
-                "solver_threads_per_shard": solver_threads_for(workers),
-                "solver_threads_total": solver_threads_for(workers) * workers,
+                "solver_threads_per_shard": per_shard,
+                "solver_threads_total": per_shard * workers,
+                # LIVENESS. A thread count is what was configured; these are
+                # what happened. `THROUGHPUT_LEVERS.md` 3.1 requires a sweep to
+                # refuse a result when a subsystem it claims to measure did no
+                # work -- and this harness previously configured solver threads
+                # while never installing the node budget, so every point ran
+                # with solving disabled.
+                "solves_attempted": sum(
+                    row.get("solves_attempted", 0) for row in matching
+                ),
+                "solves_answered": sum(
+                    row.get("solves_answered", 0) for row in matching
+                ),
                 "median_seconds": statistics.median(row["wall_seconds"] for row in matching),
                 "median_games_per_hour": statistics.median(
                     row["games_per_hour"] for row in matching
