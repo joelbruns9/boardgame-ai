@@ -66,19 +66,31 @@ LOG_SCHEMA_VERSION = 2
 
 
 def _coalescing_suffix(gen: dict) -> str:
-    """` fwd=N x R` when the engine reports evaluator forwards, else "".
+    """` fwd=<rows>x<ratio>[ net=<split>]`, or "" when unreported.
 
-    Two numbers, because either alone misleads. `fwd` is rows per forward --
-    the width the network actually sees. `x` is requests merged into each one,
-    and it reads 1.0 exactly when nothing coalesced, so a coalescer that
-    silently stopped engaging shows up here rather than only in the wall clock.
+    `fwd` is rows per forward -- the width the network actually sees. `x` is
+    requests merged into each one, and it reads 1.0 exactly when nothing
+    coalesced, so a coalescer that silently stopped engaging shows up here
+    rather than only in the wall clock.
+
+    `net` appears only when a ROUTED model split the merged batches apart
+    again: it runs one forward per network present, so a merge across nets buys
+    the boundary hop and no GPU work. At `net=2.00` the coalescing ratio beside
+    it overstates the GPU-side win twofold.
     """
 
     forward_size = float(gen.get("mean_forward_size", 0.0) or 0.0)
     if forward_size <= 0.0:
         return ""
     ratio = float(gen.get("requests_per_forward", 0.0) or 0.0)
-    return f" fwd={forward_size:.0f}x{ratio:.2f}"
+    suffix = f" fwd={forward_size:.0f}x{ratio:.2f}"
+    # Only when the model split the merged batches back apart -- i.e. a routed
+    # model saw more than one network. Printing "x1.00" every iteration would
+    # bury the case that matters.
+    split = float(gen.get("model_forwards_per_forward", 0.0) or 0.0)
+    if split > 1.0:
+        suffix += f" net={split:.2f}"
+    return suffix
 
 
 class RunStore(Protocol):

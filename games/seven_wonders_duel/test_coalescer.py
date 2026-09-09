@@ -75,7 +75,8 @@ class _Adapter:
 
 
 def _probe(adapter, request_rows, *, request_nets=None, max_rows=64, wait_ms=0.0,
-           timeout_ms=0.0, games=6, pause_after=0, gate=None, drop_tickets=()):
+           timeout_ms=0.0, games=6, pause_after=0, gate=None, drop_tickets=(),
+           coalesce=True):
     import seven_wonders_rust as swr
 
     if request_nets is None:
@@ -91,6 +92,7 @@ def _probe(adapter, request_rows, *, request_nets=None, max_rows=64, wait_ms=0.0
         pause_after,
         gate,
         list(drop_tickets),
+        coalesce,
     )
 
 
@@ -463,7 +465,7 @@ def _deterministic_adapter(payload):
     return out
 
 
-def _self_play(workers, wait_ms):
+def _self_play(workers, wait_ms, coalesce=True):
     import seven_wonders_rust as swr
 
     from .control_table import ensure_rust_table
@@ -490,21 +492,88 @@ def _self_play(workers, wait_ms):
         max_active_slots=len(seeds),
         max_moves=256,
         inference_wait_ms=wait_ms,
+        inference_coalesce=coalesce,
     )
 
 
+# Fields that must exist. Named here so a rename is a KeyError in one obvious
+# place rather than a silently weaker assertion everywhere.
+#
+# The first version of this helper read `state_digest` and `policy` off each
+# move with `.get()`. Neither key exists -- the digests are RECORD level
+# (`trajectory_digest`, `final_digest`) and the target is `policy_target` -- so
+# it compared `None` against `None` and `()` against `()` and passed while
+# establishing nothing about either. Every access below is required-key.
+_RECORD_FIELDS = ("trajectory_digest", "final_digest", "winner", "victory_type")
+_MOVE_FIELDS = ("action", "visits", "policy_target", "root_value", "actor")
+
+
 def _trajectories(records):
+    """Everything a merge could disturb, per record and per move.
+
+    Record boundaries are PRESERVED rather than flattened: a merge that moved a
+    move from the end of one game to the start of the next would produce an
+    identical flat sequence.
+    """
+
     return [
         (
-            move.get("state_digest"),
-            move.get("action"),
-            tuple(move.get("visits") or ()),
-            tuple(move.get("policy") or ()),
-            move.get("root_value"),
+            tuple(record[field] for field in _RECORD_FIELDS),
+            tuple(
+                tuple(
+                    tuple(move[field]) if isinstance(move[field], list) else move[field]
+                    for field in _MOVE_FIELDS
+                )
+                for move in record["moves"]
+            ),
         )
         for record in records
-        for move in record["moves"]
     ]
+
+
+def test_the_identity_comparison_can_actually_fail():
+    """A gate on the gate above.
+
+    `_trajectories` used to read two field names that do not exist, so it
+    compared None against None and passed on any input at all -- including a
+    corrupted digest and a corrupted policy target. An equality assertion whose
+    inputs are structurally empty is not evidence of equality.
+
+    So: perturb each field this claims to cover, and require the comparison to
+    notice. Anything that survives here is a field the identity gate does not
+    really check.
+    """
+
+    records, _ = _self_play(workers=1, wait_ms=0.0)
+    baseline = _trajectories(records)
+    assert baseline, "no records to compare"
+    assert baseline == _trajectories(records)
+
+    import copy
+
+    for field in _RECORD_FIELDS:
+        mutated = copy.deepcopy(records)
+        original = mutated[0][field]
+        mutated[0][field] = "CORRUPT" if isinstance(original, str) else 12345
+        assert _trajectories(mutated) != baseline, f"record field {field} unchecked"
+
+    for field in _MOVE_FIELDS:
+        mutated = copy.deepcopy(records)
+        move = mutated[0]["moves"][0]
+        original = move[field]
+        if isinstance(original, list):
+            move[field] = [value + 0.5 for value in original]
+        elif isinstance(original, bool):
+            move[field] = not original
+        else:
+            move[field] = (original or 0) + 7
+        assert _trajectories(mutated) != baseline, f"move field {field} unchecked"
+
+    # And the record boundary itself: moving a move between games must show up.
+    mutated = copy.deepcopy(records)
+    if len(mutated) > 1 and mutated[0]["moves"]:
+        mutated[1]["moves"].insert(0, mutated[0]["moves"].pop())
+        assert _trajectories(mutated) != baseline, "record boundaries unchecked"
 
 
 @pytest.mark.parametrize("workers,wait_ms", [(1, 2.0), (4, 0.0), (4, 2.0)])
@@ -513,7 +582,10 @@ def test_batch_composition_does_not_change_what_the_search_produces(workers, wai
 
     Coalescing changes which rows travel together, and nothing else. Under an
     evaluator whose answer depends only on the row, that has to mean identical
-    digests, actions, visit counts AND float targets -- not "close".
+    trajectory and final digests, actions, visit counts AND float policy
+    targets -- not "close". `_trajectories` names the exact fields, and
+    `test_the_identity_comparison_can_actually_fail` proves each one is really
+    compared.
 
     On the real net path this is a fingerprint contract instead (actions,
     digests, visits only): batch shape moves float reductions on CUDA by ~1e-5,
@@ -560,3 +632,174 @@ def test_a_single_shard_has_nothing_to_merge_and_says_so():
     _records, metrics = _self_play(workers=1, wait_ms=0.0)
     assert metrics["worker_requests"] == metrics["boundary_forwards"]
     assert metrics["worker_requests"] == metrics["global_batches"]
+
+
+# ---------------------------------------------------------------------------
+# Model forwards -- the caveat that keeps the ratio honest
+# ---------------------------------------------------------------------------
+def _routed_adapter(nets):
+    """The production league adapter over two distinct tiny nets."""
+
+    from .net import SWDNet
+    from .rust_bridge import rust_searcher_routed_flat_batch_adapter
+    from .inference import Evaluator
+
+    return rust_searcher_routed_flat_batch_adapter(
+        tuple(
+            Evaluator(SWDNet(d_model=32, layers=2, heads=4), "cpu", 64,
+                      fuse_embedder=False)
+            for _ in range(nets)
+        )
+    )
+
+
+def test_a_routed_batch_costs_one_model_forward_per_network_present():
+    """The number that stops `requests_per_forward` overstating the win.
+
+    A routed model runs one forward per NETWORK present in a batch. So merging
+    two shards that sit on different nets saves the boundary hop, the pack and
+    the H2D copy -- and saves no GPU forward at all. That is precisely the
+    league configuration, where the merge is widest.
+
+    Asserted through the real adapter rather than by reading the code: the
+    counter has to survive `_RustFlatBatchAdapter.__call__`, which is where it
+    is read.
+    """
+
+    import seven_wonders_rust as swr
+
+    from .control_table import ensure_rust_table
+
+    ensure_rust_table()
+    adapter = _routed_adapter(2)
+    seeds = [2026091000 + index for index in range(4)]
+    swr.self_play_many_flat_net(
+        adapter=adapter,
+        games=rust_games_for_self_play(seeds, [0, 1, 0, 1]),
+        game_seeds=seeds,
+        global_batch_cap=64,
+        leaf_batch=1,
+        cheap_sims_min=2,
+        cheap_sims_max=3,
+        full_sims_min=6,
+        full_sims_max=8,
+        full_search_fraction=0.4,
+        top_k=3,
+        draft_prior=0.0,
+        iteration=1,
+        scheduler_workers=4,
+        max_active_slots=len(seeds),
+        max_moves=256,
+        inference_wait_ms=2.0,
+        # Half the games on each network, so merged batches genuinely mix them.
+        nets_p0=[0, 1, 0, 1],
+        nets_p1=[1, 0, 1, 0],
+    )
+
+    calls = int(adapter.total_metrics["batches"])
+    forwards = int(adapter.total_metrics["model_forwards"])
+    assert calls > 0
+    # Every call runs at least one forward, and a mixed call runs two.
+    assert forwards >= calls
+    assert forwards > calls, (
+        "no batch mixed networks, so this measured nothing -- the whole point "
+        f"is the mixed case ({calls} calls, {forwards} forwards)"
+    )
+    assert forwards <= calls * 2
+
+
+def test_the_model_forward_count_reaches_the_generation_stats():
+    """The counter existing is not the same as the counter being reported.
+
+    It lives on `_RustFlatBatchAdapter.total_metrics`, and
+    `_generate_iteration_rust` used to build the adapter locally, keep only the
+    Rust scheduler dict and drop it. Neither the training log nor the sweep
+    could see it, so the caveat above was documented and unmeasurable.
+    """
+
+    from games.az_loop.stats import GenerationStats
+
+    from .training_adapter import _record_stats
+
+    assert hasattr(GenerationStats, "__dataclass_fields__")
+    assert "model_forwards" in GenerationStats.__dataclass_fields__
+    assert "model_forwards_per_forward" in GenerationStats.__dataclass_fields__
+
+    performance = {
+        "seconds": 1.0,
+        "games_per_second": 1.0,
+        "rust_scheduler": {
+            "global_rows": 800,
+            "global_batches": 400,
+            "boundary_forwards": 100,
+            "boundary_forward_rows": 800,
+            "worker_requests": 400,
+            "forced_rows": 0,
+        },
+        "rust_boundary": {"batches": 100, "model_forwards": 175},
+    }
+    generation, _outcomes, _specific = _record_stats([], performance)
+    assert generation.requests_per_forward == pytest.approx(4.0)
+    assert generation.model_forwards == 175
+    assert generation.model_forwards_per_forward == pytest.approx(1.75)
+
+
+def test_the_heartbeat_shows_the_network_split_only_when_there_is_one():
+    from games.az_loop.run_controller import _coalescing_suffix
+
+    plain = {"mean_forward_size": 48.0, "requests_per_forward": 3.79}
+    assert _coalescing_suffix(plain) == " fwd=48x3.79"
+    assert _coalescing_suffix({**plain, "model_forwards_per_forward": 1.0}) == (
+        " fwd=48x3.79"
+    )
+    assert _coalescing_suffix({**plain, "model_forwards_per_forward": 1.75}) == (
+        " fwd=48x3.79 net=1.75"
+    )
+    # An engine that reports nothing says nothing.
+    assert _coalescing_suffix({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# The A/B arm
+# ---------------------------------------------------------------------------
+def test_coalescing_off_restores_one_request_per_forward():
+    """The control arm for a same-box benchmark.
+
+    Without it the only available comparison is against cloud2's recorded
+    numbers, at a different geometry, on different hardware -- which cannot
+    attribute a throughput change to this implementation. An earlier revision of
+    the review request argued the switch was not worth a second code path; that
+    was wrong twice over, because the comparison is necessary and because this
+    is one branch in the same loop rather than a second path.
+    """
+
+    adapter = _Adapter(block_first=True)
+    _answers, metrics = _run_blocking(adapter, [2, 3, 4, 5], coalesce=False)
+
+    assert metrics["worker_requests"] == 4
+    assert metrics["forwards"] == 4
+    assert metrics["worker_requests"] == metrics["forwards"]
+    assert metrics["coalesce_carried"] == 0
+    assert [call["rows"] for call in adapter.calls] == [2, 3, 4, 5]
+
+
+def test_the_off_arm_produces_the_same_trajectories_as_the_on_arm():
+    """The A/B has to differ in timing and in nothing else, or it measures two
+    different runs rather than one change."""
+
+    baseline, _ = _self_play(workers=4, wait_ms=0.0, coalesce=False)
+    merged, metrics = _self_play(workers=4, wait_ms=2.0, coalesce=True)
+    assert _trajectories(merged) == _trajectories(baseline)
+    # And the arms really were different arms.
+    assert metrics["worker_requests"] > metrics["boundary_forwards"]
+
+
+def test_a_wait_with_coalescing_off_is_refused():
+    """Latency on every forward, width on none."""
+
+    import seven_wonders_rust as swr
+
+    with pytest.raises(ValueError, match="coalescing disabled"):
+        swr._coalescer_probe(
+            _Adapter(), _games(2), [1], [None], 8, 0.0, 2.0, 0, None, [], False
+        )

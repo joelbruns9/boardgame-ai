@@ -538,10 +538,19 @@ remaining half costs a wait, which is why the wait is a **swept axis** and why
 `sweep_launch_env` refuses to emit one the sweep did not vary.
 
 **Correctness.** Trajectories are bit-identical across every composition above —
-digests, actions, visit counts *and* float targets — under an evaluator whose
-answer depends only on its own row. So the strict-equality gate of §4.2 is a
-real gate here, and the fingerprint-only contract of §4.3 is reserved for the
-real net on CUDA, where batch shape moves float reductions.
+trajectory and final digests, actions, visit counts *and* float policy targets —
+under an evaluator whose answer depends only on its own row. So the
+strict-equality gate of §4.2 is a real gate here, and the fingerprint-only
+contract of §4.3 is reserved for the real net on CUDA, where batch shape moves
+float reductions.
+
+> **The first version of that gate established none of this.** It read two move
+> fields that do not exist (`state_digest`, `policy`) through `.get()`, so it
+> compared `None` against `None` and passed on any input. Found by review, not
+> by me. The gate now uses required-key access over named fields, preserves
+> record boundaries, and carries `test_the_identity_comparison_can_actually
+> _fail`, which perturbs each covered field and requires the comparison to
+> notice. The claim held; the evidence for it did not exist until then.
 
 Three mutations were introduced and each was caught:
 
@@ -550,11 +559,18 @@ Three mutations were introduced and each was caught:
 | unrouted member not expanded to explicit zeros | the routing gates |
 | over-cap request dropped instead of carried | the cap gate |
 | replies scattered in reverse receipt order | the scatter and order gates |
+| coalescing disabled (`--no-rust-coalesce`) | the A/B arm gates |
 
 The first mutation **initially survived**, and that is the useful finding: the
 routing test only had the unrouted request arriving *before* the routed one,
 which never reaches the expansion branch. Both orders are now parametrised. A
 gate written against a trap the plan spells out can still miss it.
+
+**The A/B arm.** `--no-rust-coalesce` restores one request per forward, so the
+box can compare this change against itself — same machine, same checkpoint, same
+seeds — instead of against cloud2 at a different geometry. Trajectories are
+identical between arms. §7 of the review request records that an earlier
+revision argued against having this and was wrong.
 
 **Not measured, and not to be inferred from any of this:** games per hour.
 Every number above is width. The 91.8% `py_call_ns` share that motivates the

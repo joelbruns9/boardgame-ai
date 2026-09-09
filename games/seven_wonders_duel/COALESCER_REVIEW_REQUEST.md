@@ -6,15 +6,19 @@ and is still the specification; this says what was built, where it departs from
 the plan, what is measured versus assumed, and where I think a reviewer will
 find something.
 
+**Reviewed 2026-09-09**: four findings, all reproduced, all fixed, plus two
+pre-box items. **One of them invalidated a claim this document made** — the
+identity gate was not testing the digests or the policy targets it said it was.
+See §9 for the audit trail. Sections 2–8 describe the code as it now stands.
+
 **Status: built, gated, UNRUN ON A BOX.** The mechanism engages and is
 bit-safe. Whether it buys throughput is not known and cannot be inferred from
 anything here — see §2.
 
-**Default behaviour changes.** This is not an opt-in feature. Coalescing is
-always on; `--rust-inference-wait-ms` only controls whether the worker
-additionally *blocks* to widen a batch. Any run on this branch gets merged
-forwards whether or not it passes the flag. That is deliberate (§4.1) and is
-the single most important thing to disagree with me about if you are going to.
+**Default behaviour changes.** Coalescing is on by default;
+`--rust-inference-wait-ms` only controls whether the worker additionally
+*blocks* to widen a batch. `--no-rust-coalesce` restores one request per
+forward, for a same-box A/B (§4.1).
 
 ---
 
@@ -48,8 +52,12 @@ At 4 shards and 2 ms the forward count lands *exactly* on the single-shard
 count. The fragmentation `test_shards_fragment_batches_rather_than_pooling_them`
 pins is fully recovered, not merely reduced.
 
-Bit-identity across every composition above: digests, actions, visit counts and
-float targets, by strict equality.
+Bit-identity across every composition above: trajectory and final digests,
+actions, visit counts and float policy targets, by strict equality on
+required-key access. `test_the_identity_comparison_can_actually_fail`
+perturbs each of those fields in turn and requires the comparison to notice —
+because the first version of this gate read two field names that do not exist
+and passed on any input at all (§9, R1).
 
 ### Not measured, and not inferable from the above
 
@@ -118,23 +126,23 @@ and reads them in submission order.
 
 ## 4. Where I departed from the plan
 
-### 4.1 There is no off switch, and I think there should not be
+### 4.1 There is an off switch — I argued against one and was wrong
 
-The plan does not ask for one, but a reviewer reasonably might: an A/B against
-the pre-coalescer path would be the cleanest way to attribute a throughput
-change on the box.
+An earlier revision of this document defended having no off switch, on the
+grounds that a second path through the worker is a second path to keep correct.
 
-I did not add one, for two reasons. Coalescing at zero wait has no cost to
-switch off — it does not block, it drains a queue that already exists — so an
-"off" mode would exist only to reproduce a defect. And a second code path
-through the worker is a second path to keep correct; the value-leak contract in
-W7 is a fresh reminder of what a rarely-taken branch costs.
+That was wrong on both halves. The comparison is **necessary**: without it the
+only available baseline is cloud2's recorded numbers, at a different geometry
+on different hardware, which cannot attribute a throughput change to this
+implementation. And the cost I invoked was imaginary — `--no-rust-coalesce` is
+one branch at the top of the drain loop, not a second path. The batch, the
+scatter, the carry-over and the error fan-out are the same code, just never
+given a second member.
 
-**The consequence is real and I want it named:** there is no way to measure the
-coalescer against itself on the box. The comparison available is against
-cloud2's recorded numbers, at a different geometry, with the caveats in §2. If
-you think that is not good enough, the cheap fix is a `--rust-inference-wait-ms
--1` sentinel meaning "one request per forward", and it is about ten lines.
+`test_coalescing_off_restores_one_request_per_forward` pins the arm, and
+`test_the_off_arm_produces_the_same_trajectories_as_the_on_arm` pins that the
+two arms differ in timing and nothing else. A wait with coalescing off is
+refused: latency on every forward, width on none.
 
 ### 4.2 `phase_d.py` gets a new flag rather than reusing `inference_wait_ms`
 
@@ -213,45 +221,53 @@ That is exactly the league configuration where the merge is widest. So
 `rust_bridge.py` now counts `model_forwards` separately from adapter calls.
 
 **Reporting `requests_per_forward` alone would overstate the win on precisely
-the runs this project is about to do.** I have not measured how much: the
-laptop's routed path was not exercised at width here. That is a gap.
+the runs this project is about to do.**
+
+The count now reaches production: `_generate_iteration_rust` publishes the
+adapter's counters as `rust_boundary`, `GenerationStats` carries
+`model_forwards` and `model_forwards_per_forward`, the sweep reports a median
+per point, and the heartbeat appends `net=<split>` when a routed model split
+merged batches apart. `test_a_routed_batch_costs_one_model_forward_per_network
+_present` drives the real league adapter over two nets and requires
+`forwards > calls` — it fails rather than passing vacuously if no batch mixed
+networks.
+
+It was previously computed and thrown away (§9, R3): the adapter was local to
+`_generate_iteration_rust`, which kept only the Rust scheduler dict.
 
 ---
 
 ## 7. Where I would attack this first
 
-1. **§4.1.** The absence of an off switch is the decision I am least sure of and
-   the one with the largest consequence for the box.
-
-2. **The cap became reachable.** Batches previously ran ~47 rows; they can now
+1. **The cap became reachable.** Batches previously ran ~47 rows; they can now
    reach `global_batch_cap` (2,048). Peak boundary memory rises to what that cap
    always implied but never spent — pack buffers, eleven `PyByteArray` copies,
    H2D, and the tensor build, all at up to 43× the rows. §5.5 stages a memory
    check on the box. I have not run one.
 
-3. **Token padding is now worse, not better.** `padded_tokens = rows ×
+2. **Token padding is now worse, not better.** `padded_tokens = rows ×
    max_tokens`: one long row pads every row it travels with, so a wider batch
    pads harder. Cloud2 measured 26.6% of slots wasted, already above the 20%
    bucketing trigger. Coalescing raises the value of fixing that and I have not
    touched it.
 
-4. **A failed reply send no longer stops the worker.** Before, it broke the
+3. **A failed reply send no longer stops the worker.** Before, it broke the
    loop. It means an abandoned ticket, and under merging that would strand every
    other member of the batch. But it also means a genuinely wedged reply channel
    is now silent. I think that is right — the ticket owner already got a timeout
    error — and I would like it checked.
 
-5. **`queue_wait_ns` changed meaning slightly.** It was enqueue → worker pickup.
+4. **`queue_wait_ns` changed meaning slightly.** It was enqueue → worker pickup.
    It is now enqueue → admission into a batch, summed over members. Both are
    "queue wait"; the second is larger under merging, and anything comparing it
    across this change is comparing two things.
 
-6. **`max_inflight_batches` must be retested and its existing null discarded.**
+5. **`max_inflight_batches` must be retested and its existing null discarded.**
    A serial consumer could not use queue depth, so that measurement was
    structurally incapable of a non-null result. `training_parameters.md` now
    says so at the flag.
 
-7. **The wait interacts with the ticket deadline.** It is spent *inside*
+6. **The wait interacts with the ticket deadline.** It is spent *inside*
    `inference_timeout_ms`. `wait >= timeout` is refused at startup, but a wait
    close to it eats the margin, and I have not thought hard about what fraction
    is safe under a loaded box.
@@ -268,3 +284,82 @@ laptop's routed path was not exercised at width here. That is a gap.
 * Trajectories, targets and digests, by strict equality on the deterministic
   path.
 * `spawn_py_batch_worker` (the non-flat path) is untouched.
+
+---
+
+## 9. Response to the 2026-09-09 review
+
+Four findings. All reproduced against the code, all fixed. Two pre-box items,
+both addressed. Nothing was disputed.
+
+### R1 — the identity gate compared nothing *(P1, fixed)*
+
+**Correct, and it invalidated a claim I made in this document and in the commit
+message.** `_trajectories` read `move["state_digest"]` and `move["policy"]` with
+`.get()`. Neither key exists: the digests are RECORD level
+(`trajectory_digest`, `final_digest`) and the target is `policy_target`. So the
+helper compared `None` against `None` and `()` against `()`.
+
+Reproduced by dumping the real key names. The claim "bit-identical including
+digests and float targets" was **not established** by that test — what it
+actually compared was actions, visits and `root_value`.
+
+Fixed: required-key access over named field tuples, record boundaries preserved
+(a flattened sequence cannot see a move moved between games), and a new
+`test_the_identity_comparison_can_actually_fail` that perturbs every covered
+field and requires the comparison to notice.
+
+**The claim itself survives** — the composition tests still pass against the
+real fields — but it survived on evidence that did not exist until now, which
+is not the same thing, and I should not have written it.
+
+### R2 — the measured wait was dropped when held constant *(P2, fixed)*
+
+Correct. I had copied the `len(splits) > 1` rule from `SOLVER_THREADS` without
+noticing the rule depends on the **fallback**. An unset `SOLVER_THREADS` is
+derived at stage 6b from the box's cores, which is better than a pin. An unset
+`RUST_INFERENCE_WAIT_MS` is 0, or a stale environment value — neither of which
+is what was measured. A confirmation sweep pinned at 2 ms therefore handed
+production a 0 ms run while every other number described a 2 ms geometry.
+
+Fixed: emitted whenever the winning row carries one. `render` says explicitly
+whether the sweep varied it, so "this is a winner" and "this is what the
+measured points ran at" are not confused.
+
+### R3 — the model-forward counter never left the adapter *(P2, fixed)*
+
+Correct, and the worst kind of gap: §6 of this document called the number
+essential and it was unreachable. `_generate_iteration_rust` built the adapter
+locally, kept `dict(metrics)` — the Rust scheduler only — and dropped it.
+
+Fixed end to end: `rust_boundary` in the generation stats, two fields on
+`GenerationStats`, a median per sweep point, `net=` in the heartbeat when the
+split exceeds 1.0, and two tests — one driving the real routed league adapter,
+one asserting the value reaches `_record_stats`.
+
+### R4 — the baseline ignored the new axis *(P2, fixed)*
+
+Correct. `key` covered four of six axes while `summary` is sorted fastest-first,
+so `next()` returned the fastest row matching a partial key: **the baseline
+became the winner**, and the axis the key forgot reported 1.00x. The wait
+triggered it; the solver axis was already exposed.
+
+Fixed: the key covers all six axes, `run_baseline` snapshots all six from the
+run config (rather than re-parsing the manifest — the config already holds
+`solver_threads` and `rust_inference_wait_ms`), and the label names each one.
+
+### Pre-box: games against slots *(addressed)*
+
+Correct and worse than a default problem. A point cannot hold more games live
+than it is given, so `--games 200` against a 512-slot point measured **200 slots
+wearing a 512 label**. The sweep now refuses `games < max_slots` outright and
+warns below 3 games per slot; `setup_cloud_7wd.sh` derives the default from
+`SWEEP_SLOTS_CSV` so raising the slot list cannot silently reintroduce it.
+
+### Pre-box: a same-box baseline *(addressed)*
+
+Taken, and see §4.1 — the off switch is in. Benchmarking the parent commit
+would also work, but it needs a second `cargo build` and a `.pyd` swap mid-run
+on rented time, which is a worse thing to be doing under a meter.
+
+**Still true and still the point:** none of this measures games per hour.

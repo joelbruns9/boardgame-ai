@@ -1607,11 +1607,22 @@ pub fn spawn_py_batch_worker(
 /// forward, it just never blocks to grow a batch further. That is the whole
 /// mechanism at a queue measured ~3 deep. A positive wait trades latency for
 /// width and is an axis to sweep, not a number to assume.
+///
+/// `coalesce = false` restores the pre-coalescer behaviour: one request per
+/// forward. It exists so a rented box can A/B this change against itself under
+/// identical conditions -- same machine, same checkpoint, same seeds -- rather
+/// than against cloud2's numbers at a different geometry, which cannot
+/// attribute a throughput change to this implementation.
+///
+/// It is one branch inside the same loop, not a second path: the batch, the
+/// scatter and the error fan-out are the same code, just never given a second
+/// member.
 pub fn spawn_py_flat_worker(
     adapter: Py<PyAny>,
     timeout_ms: f64,
     max_rows: usize,
     wait_ms: f64,
+    coalesce: bool,
 ) -> PyResult<(
     EvalWorker,
     Arc<AtomicBool>,
@@ -1631,6 +1642,12 @@ pub fn spawn_py_flat_worker(
     if max_rows == 0 {
         return Err(PyValueError::new_err(
             "inference worker max_rows must be positive",
+        ));
+    }
+    if !coalesce && wait_ms > 0.0 {
+        // A wait with nothing to wait FOR is pure added latency on every batch.
+        return Err(PyValueError::new_err(
+            "inference_wait_ms > 0 with coalescing disabled would add latency to              every forward and widen nothing",
         ));
     }
     if timeout_ms > 0.0 && wait_ms >= timeout_ms {
@@ -1682,7 +1699,9 @@ pub fn spawn_py_flat_worker(
             batch.push(first);
             let deadline = wait.map(|wait| Instant::now() + wait);
             loop {
-                if batch.rows() >= max_rows {
+                // `!coalesce` is the A/B arm: one request per forward, which is
+                // exactly what this worker did before the drain loop existed.
+                if !coalesce || batch.rows() >= max_rows {
                     break;
                 }
                 let next = match deadline {

@@ -89,7 +89,12 @@
 #                   sourcing measured_env.sh rather than by hand
 #   SWEEP_SLOTS_CSV / SWEEP_CAPS_CSV / SWEEP_INFLIGHT_CSV  generation grid
 #   SWEEP_SLOTS / SWEEP_CAPS  gate grid (space separated; different harness)
-#   SWEEP_GENERATION_GAMES=200 SWEEP_REPETITIONS=1
+#   SWEEP_GENERATION_GAMES  games per sweep point. DERIVED from SWEEP_SLOTS_CSV
+#                         as 3x the largest slot count, because a point cannot
+#                         hold more games live than it is given: 200 games
+#                         against 512 slots measured 200 slots wearing a 512
+#                         label. Override only upward.
+#   SWEEP_REPETITIONS=1
 #   SKIP_SWEEPS=0   set 1 to launch on defaults rather than this box
 #   SWEEP_INFERENCE_WAIT_CSV  evaluator coalescing waits in ms (default 0,1,2).
 #                         0 is a real point, not "off": the worker always merges
@@ -808,6 +813,24 @@ else
     SWEEP_SOLVER_ARGS=(--solver-threads 0)
   fi
 
+  # Games must outnumber the largest slot count, or that point never fills its
+  # slots and the slot axis is measured at an occupancy no run has. The default
+  # used to be a flat 200 against slot values up to 512 -- so the two largest
+  # points on the axis were measuring 200 slots under someone else's label, and
+  # `f4_phase_d_sweep` now refuses that outright.
+  #
+  # Derived from the slot list rather than pinned, so raising SWEEP_SLOTS_CSV
+  # cannot silently reintroduce it. 3 games per slot is the steady-state
+  # threshold; ramp and drain otherwise dominate and they favour small slot
+  # counts.
+  SWEEP_MAX_SLOTS="$(printf '%s' "${SWEEP_SLOTS_CSV:-128,256,512}" | tr ',' '\n' \
+    | sort -n | tail -1)"
+  SWEEP_GENERATION_GAMES="${SWEEP_GENERATION_GAMES:-$((SWEEP_MAX_SLOTS * 3))}"
+  if [ "$SWEEP_GENERATION_GAMES" -lt "$SWEEP_MAX_SLOTS" ]; then
+    die "SWEEP_GENERATION_GAMES=$SWEEP_GENERATION_GAMES cannot fill $SWEEP_MAX_SLOTS slots; the slot axis would measure nothing above the game count."
+  fi
+  say "Generation sweep: $SWEEP_GENERATION_GAMES games/point against max $SWEEP_MAX_SLOTS slots ($(( SWEEP_GENERATION_GAMES / SWEEP_MAX_SLOTS )) per slot)"
+
   # f4_phase_d_sweep takes COMMA-separated axes and an --output DIRECTORY (it
   # writes phase_d_sweep.json inside). w5_gate_slots_sweep takes space-separated
   # axes and an --output FILE. They are different harnesses; test_setup_cloud
@@ -815,7 +838,7 @@ else
   "$PY" -m games.seven_wonders_duel.f4_phase_d_sweep \
     --checkpoint "$SWEEP_CHECKPOINT" \
     --output "$SWEEP_DIR/generation" \
-    --games "${SWEEP_GENERATION_GAMES:-200}" \
+    --games "$SWEEP_GENERATION_GAMES" \
     --repetitions "${SWEEP_REPETITIONS:-1}" \
     --slots "${SWEEP_SLOTS_CSV:-128,256,512}" \
     --caps "${SWEEP_CAPS_CSV:-1024,2048}" \

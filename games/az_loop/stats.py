@@ -64,6 +64,15 @@ class GenerationStats:
     #: Requests merged into each forward. Exactly 1.0 when nothing coalesces,
     #: which is what makes a silent revert visible rather than merely slow.
     requests_per_forward: float = 0.0
+    #: Forwards the MODEL ran, which a boundary call is not once a batch mixes
+    #: networks: a routed model runs one per network present, so a merge across
+    #: nets saves the call and not the GPU work. 0 means the engine does not
+    #: report it.
+    model_forwards: int = 0
+    #: ``model_forwards`` per boundary forward. 1.0 means each merged forward
+    #: really was one forward; above 1.0, the coalescing ratio overstates the
+    #: GPU-side win by this factor.
+    model_forwards_per_forward: float = 0.0
     opponent_mix: dict[str, int] = field(default_factory=dict)
 
 

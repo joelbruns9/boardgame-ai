@@ -745,6 +745,17 @@ class PhaseDConfig:
     gate_backend: str = "rust"
     rust_slots: int = 16
     rust_global_batch_cap: int = 256
+    rust_coalesce: bool = True
+    """Whether the Rust evaluator worker merges queued requests into one forward.
+
+    On by default and meant to stay on. `False` restores one-request-per-forward,
+    and exists so a rented box can A/B the coalescer against ITSELF -- same
+    machine, same checkpoint, same seeds -- rather than against cloud2's recorded
+    numbers at a different geometry, which cannot attribute a throughput change
+    to this implementation.
+
+    It is one branch inside the drain loop, not a second code path.
+    """
     rust_inference_wait_ms: float = 0.0
     """How long the Rust evaluator worker may BLOCK to widen a batch.
 
@@ -4139,6 +4150,7 @@ class PhaseDLoop:
             # it runs a different shard count and arrival pattern, and a wait
             # swept on generation was not measured on it.
             inference_wait_ms=self.config.rust_inference_wait_ms,
+            inference_coalesce=self.config.rust_coalesce,
             leaf_batch=self.config.leaf_batch,
             cheap_sims_min=self.config.cheap_sims_min,
             cheap_sims_max=self.config.cheap_sims_max,
@@ -4239,6 +4251,15 @@ class PhaseDLoop:
             # number of chunks. These counters explain batch-width and forced
             # expansion throughput changes across a long run.
             "rust_scheduler": dict(metrics),
+            # The PYTHON side of the same boundary, which the Rust counters
+            # cannot see. `model_forwards` is the one that matters: a routed
+            # model runs one forward per NETWORK present in a batch, so
+            # coalescing across nets saves the boundary hop and no GPU work at
+            # all. Without this, `worker_requests / boundary_forwards` reads as
+            # pure win on exactly the league runs where it is only half of one.
+            #
+            # The adapter is local to this method and was being discarded here.
+            "rust_boundary": dict(getattr(adapter, "total_metrics", {}) or {}),
         }
         if not hasattr(self, "phase_seconds"):
             self.phase_seconds = {}
@@ -6578,6 +6599,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rust-slots", type=int, default=16)
     parser.add_argument("--rust-global-batch-cap", type=int, default=256)
     parser.add_argument(
+        "--no-rust-coalesce",
+        dest="rust_coalesce",
+        action="store_false",
+        help="restore one evaluator request per forward. For a same-box A/B of "
+        "the coalescer against itself; not a production setting.",
+    )
+    parser.add_argument(
         "--rust-inference-wait-ms",
         type=float,
         default=0.0,
@@ -7423,6 +7451,7 @@ def main(argv=None) -> int:
         rust_slots=args.rust_slots,
         rust_global_batch_cap=args.rust_global_batch_cap,
         rust_inference_wait_ms=args.rust_inference_wait_ms,
+        rust_coalesce=args.rust_coalesce,
         gate_global_batch_cap=args.gate_global_batch_cap,
         rust_max_inflight_batches=args.rust_max_inflight_batches,
         rust_scheduler_workers=args.rust_scheduler_workers,

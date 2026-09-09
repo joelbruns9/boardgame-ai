@@ -83,19 +83,28 @@ def build_env(sweep_dir: Path, gate_rung: str) -> dict[str, object]:
     }
     if len(splits) > 1:
         env["SOLVER_THREADS"] = int(best_generation["solver_threads_per_shard"])
-    # The coalescing wait, on the same conditional rule as the two axes above:
-    # emitted only when the sweep VARIED it. A grid pinned at one wait measured
-    # one wait.
+    # The coalescing wait: emitted whenever the winning row HAS one, varied or
+    # not.
     #
-    # This is the axis that most needs the rule. The wait's whole effect is on
-    # batch WIDTH, which no wall-clock total reports, so a value copied from
-    # someone else's box would look harmless and change what the GPU sees on
-    # every forward of the run.
-    waits = {
-        row["inference_wait_ms"] for row in summary if "inference_wait_ms" in row
-    }
-    if len(waits) > 1:
+    # This deliberately does NOT follow the `len(splits) > 1` rule that guards
+    # SOLVER_THREADS above, and the difference is the fallback. An unset
+    # SOLVER_THREADS is DERIVED at stage 6b from the box's cores and the worker
+    # count, which is a better answer than a pinned one. An unset
+    # RUST_INFERENCE_WAIT_MS is 0, or whatever stale value the environment
+    # happens to carry -- neither of which is what was measured.
+    #
+    # So a confirmation sweep pinned at 2 ms used to emit nothing and hand
+    # production a 0 ms run, while every other number in the file described a
+    # geometry measured at 2 ms. "Did the sweep optimise this axis" and "can
+    # production reproduce what the sweep ran" are different questions; this
+    # file answers the second.
+    if "inference_wait_ms" in best_generation:
         env["RUST_INFERENCE_WAIT_MS"] = float(best_generation["inference_wait_ms"])
+        # Whether it was actually a free axis, for the comment `render` writes.
+        waits = {
+            row["inference_wait_ms"] for row in summary if "inference_wait_ms" in row
+        }
+        env["_WAIT_WAS_SWEPT"] = len(waits) > 1
     # Provenance. `SKIP_SWEEPS` cannot serve as this marker: an operator sets
     # that by hand to skip measuring altogether, so it is true in exactly the
     # case this needs to detect.
@@ -142,11 +151,19 @@ def render(env: dict[str, object]) -> str:
         engaged = env.get("_REQUESTS_PER_FORWARD")
         lines += [
             "#",
-            "# RUST_INFERENCE_WAIT_MS is the evaluator COALESCING wait, measured",
-            "# here rather than assumed. 0 is a real answer, not a disabled",
-            "# feature: the worker always merges what is already queued and this",
-            "# only buys width by waiting for more.",
+            "# RUST_INFERENCE_WAIT_MS is the evaluator COALESCING wait. 0 is a",
+            "# real answer, not a disabled feature: the worker always merges what",
+            "# is already queued and this only buys width by waiting for more.",
         ]
+        if env.get("_WAIT_WAS_SWEPT"):
+            lines.append("# This sweep VARIED the wait, so the value is a winner.")
+        else:
+            lines += [
+                "# ! This sweep held the wait FIXED, so the value is not a",
+                "#   winner -- it is what the measured points actually ran at.",
+                "#   It is pinned anyway because the alternative is 0, and a run",
+                "#   at 0 would not be the run that was measured.",
+            ]
         if engaged is not None:
             lines += [
                 f"# The winning point merged {float(engaged):.2f} requests per",

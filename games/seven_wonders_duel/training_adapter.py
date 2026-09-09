@@ -154,6 +154,10 @@ def _record_stats(
     forwards = int(scheduler.get("boundary_forwards", 0))
     forward_rows = int(scheduler.get("boundary_forward_rows", 0))
     worker_requests = int(scheduler.get("worker_requests", 0))
+    # Python-side boundary counters. `model_forwards` is not `boundary_forwards`
+    # whenever a routed model is in play -- see `_generate_iteration_rust`.
+    boundary = performance.get("rust_boundary", {}) or {}
+    model_forwards = int(boundary.get("model_forwards", 0))
     forced = int(scheduler.get("forced_rows", 0))
     seconds = float(performance.get("seconds", 0.0))
     opponent_mix = {opponent: 0 for opponent in OPPONENT_TYPES}
@@ -224,6 +228,12 @@ def _record_stats(
         mean_batch_size=rows / batches if batches else 0.0,
         mean_forward_size=forward_rows / forwards if forwards else 0.0,
         requests_per_forward=worker_requests / forwards if forwards else 0.0,
+        model_forwards=model_forwards,
+        # >1.0 means the routed model split merged batches back apart on the
+        # GPU. 1.0 means every merged forward really was one forward.
+        model_forwards_per_forward=(
+            model_forwards / forwards if forwards and model_forwards else 0.0
+        ),
         opponent_mix=opponent_mix,
     )
     outcomes = OutcomeStats(

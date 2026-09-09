@@ -2057,7 +2057,7 @@ fn search_result_to_py(
     age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false,
     double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false,
     specialist_lambda=0.0, specialist_victory=None, specialist_seat=0,
-    specialist_symmetric=false, inference_wait_ms=0.0
+    specialist_symmetric=false, inference_wait_ms=0.0, inference_coalesce=true
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -2085,6 +2085,7 @@ fn search_many_flat_net(
     specialist_seat: usize,
     specialist_symmetric: bool,
     inference_wait_ms: f64,
+    inference_coalesce: bool,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let leaf_bias = match parse_specialist(
         specialist_lambda,
@@ -2125,6 +2126,7 @@ fn search_many_flat_net(
             inference_timeout_ms,
             global_batch_cap,
             inference_wait_ms,
+            inference_coalesce,
         )?;
     let outputs = py.detach(move || {
         let state_refs: Vec<&GameState> = states.iter().collect();
@@ -2668,7 +2670,8 @@ fn self_play_many_net(
     virtual_loss_root=false, cheap_conflict_free_waves=None,
     cheap_round_robin_candidates=None, specialist_lambda=0.0,
     specialist_victory=None, specialist_symmetric=false,
-    specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0))]
+    specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0,
+    inference_coalesce=true))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2743,6 +2746,9 @@ fn self_play_many_flat_net(
     // already queued; it just never waits for more. See
     // `eval::spawn_py_flat_worker`.
     inference_wait_ms: f64,
+    // false restores one-request-per-forward, for a same-box A/B of the
+    // coalescer against itself. See `eval::spawn_py_flat_worker`.
+    inference_coalesce: bool,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2966,6 +2972,7 @@ fn self_play_many_flat_net(
             inference_timeout_ms,
             global_batch_cap,
             inference_wait_ms,
+            inference_coalesce,
         )?;
     let result = py.detach(move || {
         let mut result = self_play::run_many_pipelined_sharded(
@@ -3339,7 +3346,7 @@ fn reveal_features_enabled() -> bool {
 #[pyo3(signature = (
     adapter, games, request_rows, request_nets, max_rows,
     timeout_ms=0.0, wait_ms=0.0, pause_after=0, gate=None,
-    drop_tickets=vec![]
+    drop_tickets=vec![], coalesce=true
 ))]
 fn _coalescer_probe(
     py: Python<'_>,
@@ -3367,6 +3374,7 @@ fn _coalescer_probe(
     // models it without a stopwatch -- a shared `inference_timeout_ms` would
     // expire every ticket in the batch, not the one under test.
     drop_tickets: Vec<usize>,
+    coalesce: bool,
 ) -> PyResult<(Vec<Py<PyAny>>, Py<PyDict>)> {
     if games.is_empty() {
         return Err(PyValueError::new_err("probe needs at least one game"));
@@ -3381,7 +3389,7 @@ fn _coalescer_probe(
         .map(|game| game.borrow(py).state.clone())
         .collect();
     let (worker, _timed_out, metrics, handle) =
-        eval::spawn_py_flat_worker(adapter, timeout_ms, max_rows, wait_ms)?;
+        eval::spawn_py_flat_worker(adapter, timeout_ms, max_rows, wait_ms, coalesce)?;
     type ProbeAnswer = Result<(Vec<f64>, Vec<usize>), String>;
     let answers: Vec<ProbeAnswer> = py.detach(move || -> PyResult<Vec<ProbeAnswer>> {
         let mut tickets = Vec::with_capacity(request_rows.len());

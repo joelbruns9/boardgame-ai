@@ -1563,6 +1563,22 @@ but also increase queueing, memory use, and scheduling variability.
 > flag taken before that change correctly measured **nothing**, including the
 > null this project already has. See `COALESCER_BUILD_PLAN.md` §1.2.
 
+### `--no-rust-coalesce`
+
+**Default:** absent (coalescing ON). **Value:** flag
+
+Restores one evaluator request per forward -- the behaviour before the
+coalescer. **Not a production setting.** It exists so a rented box can A/B the
+coalescer against *itself* under identical conditions: same machine, same
+checkpoint, same seeds, same iteration. Comparing against cloud2's recorded
+numbers cannot attribute a throughput change to this implementation, because
+the geometry and the hardware both differ.
+
+Trajectories are identical between the two arms (`test_coalescer.py` gates
+this), so the arms differ in timing and nothing else. Passing
+`--rust-inference-wait-ms` with this is refused: a wait with nothing to wait for
+is latency on every forward and width on none.
+
 ### `--rust-inference-wait-ms`
 
 **Default:** `0.0`. **Value:** non-negative float, strictly below

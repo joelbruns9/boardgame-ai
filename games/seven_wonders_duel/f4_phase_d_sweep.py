@@ -354,6 +354,12 @@ def run_point(
         for record in records
     )
     batch_rows = [row for call in calls for row in call.get("batch_rows", ())]
+    # Python-side boundary counters, published by `_generate_iteration_rust`.
+    boundary_model_forwards = int(
+        (getattr(loop, "last_generation_stats", {}) or {})
+        .get("rust_boundary", {})
+        .get("model_forwards", 0)
+    )
     scheduler = {
         key: sum(call.get(key, 0) for call in calls)
         for key in (
@@ -388,6 +394,13 @@ def run_point(
         ),
         "coalesce_wait_seconds": int(scheduler.get("coalesce_wait_ns", 0)) / 1e9,
         "coalesce_carried": int(scheduler.get("coalesce_carried", 0)),
+        # GPU-side forwards, from the Python adapter. A routed model runs one
+        # per network present, so this is the number that says whether a merge
+        # actually reduced GPU work or only the boundary hop.
+        "model_forwards": boundary_model_forwards,
+        "model_forwards_per_forward": (
+            boundary_model_forwards / int(scheduler.get("boundary_forwards", 1) or 1)
+        ),
         "solver_threads_per_shard": solver_threads,
         "solver_threads_total": solver_threads * workers,
         # LIVENESS, not configuration. `THROUGHPUT_LEVERS.md` §3.1: "assert
@@ -572,6 +585,34 @@ def main() -> None:
     if not grid:
         raise SystemExit("every grid point has fewer slots than shards")
 
+    # A point cannot hold more games live than it is GIVEN. The scheduler
+    # activates a queued game whenever one finishes, so at `--games 200` a
+    # 512-slot point never has more than 200 games live: it measures 200 slots
+    # wearing a 512 label, and the slot axis is flat above the game count for
+    # reasons that have nothing to do with the hardware.
+    #
+    # Above that floor there is still a ramp and a drain at every point, and
+    # they are a larger fraction of a short run. Three games per slot is the
+    # threshold `THROUGHPUT_LEVERS.md` uses to call a measurement steady state.
+    max_slots = max(point[0] for point in grid)
+    if args.games < max_slots:
+        raise SystemExit(
+            f"--games {args.games} is below the largest slot count in the grid "
+            f"({max_slots}), so that point can never fill its slots and the "
+            "slot axis would be measured at an occupancy no run has. Raise "
+            f"--games to at least {3 * max_slots}, or drop the slot values "
+            "above the game count."
+        )
+    if args.games < 3 * max_slots:
+        print(
+            f"WARNING: --games {args.games} against {max_slots} slots is "
+            f"{args.games / max_slots:.1f} games per slot. Ramp and drain are a "
+            "large share of a run that short, and they favour SMALL slot "
+            f"counts. {3 * max_slots} or more makes the comparison steady "
+            "state.",
+            flush=True,
+        )
+
     def solver_threads_for(workers: int, total: int) -> int:
         """Per-shard threads at this point, holding the TOTAL fixed.
 
@@ -668,6 +709,9 @@ def main() -> None:
             run_config.rust_global_batch_cap,
             run_config.rust_max_inflight_batches,
             run_config.rust_scheduler_workers,
+            # `solver_threads` is PER SHARD; the grid axis is the TOTAL.
+            run_config.solver_threads * run_config.rust_scheduler_workers,
+            run_config.rust_inference_wait_ms,
         )
         if run_config is not None
         else None
@@ -779,6 +823,9 @@ def main() -> None:
                 "coalesce_wait_seconds": sum(
                     row["coalesce_wait_seconds"] for row in matching
                 ),
+                "median_model_forwards_per_forward": statistics.median(
+                    row["model_forwards_per_forward"] for row in matching
+                ),
                 "solver_threads_per_shard": per_shard,
                 "solver_threads_total": per_shard * workers,
                 # LIVENESS. A thread count is what was configured; these are
@@ -810,19 +857,38 @@ def main() -> None:
     # Compare against Phase D's current defaults when they are in the grid --
     # the number that matters is "what would changing the config buy" -- and
     # fall back to the first grid point when they are not.
+    # EVERY swept axis, or the lookup below is ambiguous.
+    #
+    # `summary` is sorted fastest-first, so a key that omits an axis matches
+    # several rows and `next()` silently returns the FASTEST of them. The
+    # baseline then IS the winner, every speedup is measured against the best
+    # point, and the axis the key forgot reports 1.00x -- the sweep concludes
+    # that changing the thing it just varied bought nothing.
+    #
+    # This bit the wait axis the moment it was added, and the solver axis was
+    # already exposed to it.
     key = lambda row: (
         row["slots"],
         row["global_batch_cap"],
         row["max_inflight_batches"],
         row["scheduler_workers"],
+        row.get("solver_threads_total", 0),
+        row.get("inference_wait_ms", 0.0),
     )
     # Baseline: what the run is CURRENTLY set to, when the manifest says and the
     # grid contains it. "What would changing this buy me" is the question a
     # sweep is run to answer, and it is only answered against the status quo --
     # comparing against dataclass defaults answers a question nobody asked.
+    def grid_key(point):
+        slots, cap, inflight, workers, solver_total, wait_ms = point
+        return (slots, cap, inflight, workers, solver_total, wait_ms)
+
     baselines = []
     if run_baseline is not None:
-        baselines.append(run_baseline)
+        # The manifest describes the four geometry axes. The run's solver split
+        # and wait complete the key; a manifest that predates either reads 0,
+        # which is what such a run was doing.
+        baselines.append(tuple(run_baseline))
     baselines.append(
         tuple(
             field_default(name)
@@ -833,8 +899,16 @@ def main() -> None:
                 "rust_scheduler_workers",
             )
         )
+        # The configured solver split and wait complete the key. Both default to
+        # "off"/0, which is what a config that never set them is running.
+        # Both default to "off", which is what a config that set neither runs.
+        + (
+            int(field_default("solver_threads"))
+            * int(field_default("rust_scheduler_workers")),
+            float(field_default("rust_inference_wait_ms")),
+        )
     )
-    baselines.append(grid[0])
+    baselines.append(grid_key(grid[0]))
     base = None
     for candidate in baselines:
         base = next((row for row in summary if key(row) == tuple(candidate)), None)
@@ -842,7 +916,14 @@ def main() -> None:
             break
     if base is None:
         base = summary[0]
-    baseline_label = "/".join(str(part) for part in key(base))
+    # Names every axis, because a label that omits one describes several points.
+    baseline_label = (
+        f"slots={base['slots']}/cap={base['global_batch_cap']}"
+        f"/inflight={base['max_inflight_batches']}"
+        f"/workers={base['scheduler_workers']}"
+        f"/solver={base.get('solver_threads_total', 0)}"
+        f"/wait={base.get('inference_wait_ms', 0.0):g}"
+    )
     for row in summary:
         row["speedup_vs_baseline"] = base["median_seconds"] / row["median_seconds"]
     payload_baseline = baseline_label
