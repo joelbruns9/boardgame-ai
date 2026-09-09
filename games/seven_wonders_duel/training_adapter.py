@@ -315,6 +315,9 @@ class SevenWondersDuelLifecycleAdapter:
         loop = self.loop
         loop.resource_monitor = ResourceMonitor()
         loop.phase_seconds = {}
+        # W7: seed any unseeded specialist BEFORE generation, so this
+        # iteration's league can already draw it.
+        seeded = loop.bootstrap_specialists(request.iteration)
         model = loop.load_model(request.generator_checkpoint)
         records = loop.generate_iteration(model, request.iteration)
         loop.sample_resources("post_generation")
@@ -341,6 +344,7 @@ class SevenWondersDuelLifecycleAdapter:
                 "performance": dict(loop.last_generation_stats),
                 "summary": summarize_records(records),
                 "model": asdict(model_stats),
+                "specialists_seeded": seeded,
             },
             stats=generation,
             outcomes=outcomes,
@@ -433,6 +437,16 @@ class SevenWondersDuelLifecycleAdapter:
         # overwrite the frontier -- an interrupted train just re-runs from the
         # last committed row (see RunController's crash-recovery journal).
         self._validate_candidate(candidate, request.iteration)
+        # After the general's own step, and before its gate: the two lifecycles
+        # must not be able to reset each other. A specialist is never reverted
+        # because the general's soft gate rejected the general's candidate.
+        specialist_rows = loop.run_specialist_iteration(
+            request.replay.payload,
+            request.iteration,
+            general_inflow=int(
+                loop.last_training_stats.get("policy_inflow_general", 0)
+            ),
+        )
         artifact = artifact_for(
             candidate,
             role="candidate",
@@ -442,7 +456,7 @@ class SevenWondersDuelLifecycleAdapter:
         return TrainingResult(
             candidate=artifact,
             trained=True,
-            metrics=dict(loop.last_training_stats),
+            metrics=dict(loop.last_training_stats) | {"specialists": specialist_rows},
             stats=self._training_stats(),
             resources=loop.resource_stats(),
         )

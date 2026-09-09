@@ -1063,6 +1063,22 @@ def phase_d_record_from_rust(raw: dict, *, validate: bool = True) -> GameRecord:
                     if row.get("root_outlook") is not None
                     else None
                 ),
+                # W7: the lambda-zero root, and the provenance that says which
+                # model may consume which of the two.
+                root_value_unshaped=(
+                    float(row["root_value_unshaped"])
+                    if row.get("root_value_unshaped") is not None
+                    else None
+                ),
+                search_lambda=float(row.get("search_lambda") or 0.0),
+                search_victory=(
+                    str(row["search_victory"])
+                    if row.get("search_victory") is not None
+                    else None
+                ),
+                search_symmetric=bool(row.get("search_symmetric") or False),
+                target_route=str(row.get("target_route") or "general"),
+                reanalysis=bool(row.get("reanalysis") or False),
                 sims=int(row["sims"]),
                 mode=str(row["mode"]),
                 gumbel_topk=(

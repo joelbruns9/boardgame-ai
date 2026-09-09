@@ -216,6 +216,167 @@ pub fn terminal_outlook_p0(state: &GameState) -> Outlook {
     out
 }
 
+
+/// Which victory type a specialist is biased toward.
+///
+/// The names are `dataset.JOINT7_CLASSES`' three victory types, and `offset`
+/// is that class's position inside a player's triple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VictoryClass {
+    Civilian,
+    Scientific,
+    Military,
+}
+
+impl VictoryClass {
+    pub fn offset(self) -> usize {
+        match self {
+            VictoryClass::Civilian => 0,
+            VictoryClass::Scientific => 1,
+            VictoryClass::Military => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VictoryClass::Civilian => "civilian",
+            VictoryClass::Scientific => "scientific",
+            VictoryClass::Military => "military",
+        }
+    }
+
+    pub fn from_name(name: &str) -> PyResult<Self> {
+        match name {
+            "civilian" => Ok(VictoryClass::Civilian),
+            "scientific" | "science" => Ok(VictoryClass::Scientific),
+            "military" => Ok(VictoryClass::Military),
+            other => Err(PyValueError::new_err(format!(
+                "unknown specialist victory type {other:?}"
+            ))),
+        }
+    }
+}
+
+/// W7 S0: the specialist's leaf-utility bias.
+///
+/// A specialist is an ordinary agent whose SEARCH values its own victory type
+/// above the win probability alone. The bias lives at the leaf, not in the
+/// stored labels: the policy learns the visit distribution, so biasing the leaf
+/// moves the visits, while reweighting a stored label moves nothing (that
+/// target already points where the unbiased search pointed). Every value head
+/// therefore stays a calibrated win probability.
+///
+/// # The sign convention, which is the whole of the difficulty
+///
+/// `Outlook` and the search utility are both **player-0 relative**
+/// (`outlook_to_p0`), but "my victory type" is **specialist relative**. Writing
+/// `value_p0 + lambda * outlook_p0[my_class]` with a specialist-relative index
+/// rewards the OPPONENT's win whenever the specialist sits on seat 1. Hence the
+/// two explicit forms:
+///
+/// ```text
+/// seat 0:  utility_p0 = value_p0 + lambda * outlook_p0[p0_<type>_win]
+/// seat 1:  utility_p0 = value_p0 - lambda * outlook_p0[p1_<type>_win]
+/// ```
+///
+/// `symmetric` is the other agent, kept behind a flag and off by default: it
+/// adds `-lambda * outlook_p0[opponent_<type>_win]` as well, which rewards
+/// pursuing the type *and* penalises conceding it -- a mirror-player rather than
+/// an attacker, and it moves defensive behaviour in exactly the dimension S0
+/// exists to measure. Note it is seat-INDEPENDENT in p0 terms, which is a
+/// property worth testing: both seats optimise the same scalar.
+///
+/// # Range
+///
+/// `value_p0` lies in [-1, 1]; the bonus lies in [0, lambda] (own-win) or
+/// [-lambda, lambda] (symmetric), so the utility scale widens to
+/// [-1-lambda, 1+lambda]. PUCT's `Q + c_puct * P * sqrt(N)/(1+n)` is NOT scale
+/// invariant, so a nonzero lambda makes exploration relatively cheaper.
+///
+/// This applies to a GUMBEL search too, which an earlier version of this
+/// comment denied. `sigma_vector` min-max rescales completed Q at the ROOT, so
+/// the root's own halving is scale free -- but every interior node of a Gumbel
+/// search still selects by PUCT on the raw utility, so the tree underneath is
+/// affected exactly as a PUCT root's is.
+///
+/// Left explicit rather than silently compensated: rescaling `c_puct` with
+/// lambda would fold two changes into one flag and make a training A/B
+/// uninterpretable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LeafBias {
+    pub lambda: f64,
+    pub victory: VictoryClass,
+    /// The SPECIALIST's seat -- the searcher's, never the leaf actor's.
+    pub seat: usize,
+    pub symmetric: bool,
+}
+
+impl LeafBias {
+    pub const NONE: LeafBias = LeafBias {
+        lambda: 0.0,
+        victory: VictoryClass::Scientific,
+        seat: 0,
+        symmetric: false,
+    };
+
+    pub fn new(lambda: f64, victory: VictoryClass, seat: usize, symmetric: bool) -> PyResult<Self> {
+        let bias = LeafBias { lambda, victory, seat, symmetric };
+        bias.validate()?;
+        Ok(bias)
+    }
+
+    pub fn validate(&self) -> PyResult<()> {
+        if !self.lambda.is_finite() || self.lambda < 0.0 {
+            return Err(PyValueError::new_err(
+                "specialist lambda must be finite and non-negative",
+            ));
+        }
+        if self.seat > 1 {
+            return Err(PyValueError::new_err("specialist seat must be 0 or 1"));
+        }
+        Ok(())
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.lambda > 0.0
+    }
+
+    /// The bonus in SPECIALIST terms: positive is good for the specialist.
+    fn bonus(&self, outlook: &Outlook) -> f64 {
+        let own = self.seat * 3 + self.victory.offset();
+        let other = (1 - self.seat) * 3 + self.victory.offset();
+        if self.symmetric {
+            self.lambda * (outlook[own] - outlook[other])
+        } else {
+            self.lambda * outlook[own]
+        }
+    }
+
+    /// Shape one leaf's player-0 value into the searcher's utility.
+    ///
+    /// A missing outlook under a live lambda is a HARD ERROR, never a silent
+    /// zero bias: several `LeafOut` branches construct `None` (mock evaluators,
+    /// nets without W4's head, the solver boundary), and a treatment that
+    /// reaches some leaves and not others measures nothing at all.
+    pub fn shape(&self, value_p0: f64, outlook: Option<Outlook>) -> PyResult<f64> {
+        if !self.is_active() {
+            return Ok(value_p0);
+        }
+        let Some(outlook) = outlook else {
+            return Err(PyValueError::new_err(
+                "a specialist search (lambda > 0) reached a leaf with no outlook; \
+                 a biased search requires an evaluator with a W4 outlook head",
+            ));
+        };
+        let bonus = self.bonus(&outlook);
+        Ok(if self.seat == 0 {
+            value_p0 + bonus
+        } else {
+            value_p0 - bonus
+        })
+    }
+}
+
 pub fn terminal_value_p0(state: &GameState) -> f64 {
     match state.winner {
         None => 0.0,
@@ -277,6 +438,52 @@ impl MockEval {
 impl Eval for MockEval {
     fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
         Ok(MockEval::eval_state(state).into())
+    }
+}
+
+/// `MockEval` plus a deterministic seven-way outlook.
+///
+/// The lambda-zero equivalence gate runs on `MockEval`, which supplies no
+/// outlook -- correctly, since nothing biased consumes one. A lambda > 0 gate
+/// needs an oracle that does, and it must be reproducible in Python to the last
+/// bit, so the distribution is folded from the same fingerprint hash and
+/// normalised by an explicit left fold (Python's `sum` and Rust's
+/// `fold(0.0, +)` associate identically).
+///
+/// Terminal states keep the EXACT outlook: a finished game knows how it ended,
+/// and a mock that invented one there would hide sign errors at precisely the
+/// leaves where the bias is unambiguous.
+pub struct MockOutlookEval;
+
+const OUTLOOK_SALT: u64 = 0x2545_F491_4F6C_DD1D;
+
+impl MockOutlookEval {
+    pub fn outlook_of(state: &GameState) -> Outlook {
+        if state.phase == Phase::Complete {
+            return terminal_outlook_p0(state);
+        }
+        let h = fold_fingerprint(&state.fingerprint());
+        let mut raw = [0.0f64; 7];
+        for (k, slot) in raw.iter_mut().enumerate() {
+            *slot = to_unit(mix(h ^ OUTLOOK_SALT.wrapping_mul(k as u64 + 1)));
+        }
+        let mass = raw.iter().fold(0.0_f64, |a, &b| a + b);
+        let mut out = [0.0f64; 7];
+        for k in 0..7 {
+            out[k] = raw[k] / mass;
+        }
+        out
+    }
+}
+
+impl Eval for MockOutlookEval {
+    fn evaluate(&self, state: &GameState) -> PyResult<LeafOut> {
+        let (value_p0, priors) = MockEval::eval_state(state);
+        Ok(LeafOut {
+            value_p0,
+            priors,
+            outlook_p0: Some(MockOutlookEval::outlook_of(state)),
+        })
     }
 }
 

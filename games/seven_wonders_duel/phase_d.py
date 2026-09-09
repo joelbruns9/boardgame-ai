@@ -83,6 +83,7 @@ from .dataset import (
     derive_records_rust,
     examples_from_record,
     examples_from_records,
+    project_examples,
     is_fast_search_move,
 )
 from .game import Phase
@@ -97,6 +98,24 @@ from .rust_bridge import (
     rust_seat_routed_flat_batch_adapter,
 )
 from .search import GumbelMCTS, SearchConfig, SearchResult, state_actor
+from .specialist import (
+    DEFAULT_REANALYSIS_GAP,
+    GENERAL_ROUTE,
+    assert_no_shaped_bootstrap,
+    SpecialistConfig,
+    SpecialistLineage,
+    collapse_verdict,
+    draw_opponent_class,
+    inflow_census,
+    league_game_count,
+    league_share,
+    cap_reanalysis,
+    parse_specialists,
+    reanalysis_candidates,
+    reanalysis_examples,
+    route_for,
+    steps_for_inflow,
+)
 from .train import (
     baselines,
     build_model,
@@ -244,6 +263,51 @@ class PhaseDConfig:
     Zero remains the compatibility default. The cloud launch value is explicitly
     pinned to 0.15; its realized share is recorded in schema-v2 stats and
     re-validated on the cloud training host.
+    """
+
+    specialists: str = ""
+    """W7: the specialist league, as ``name:share:lambda[:train_every]`` entries.
+
+    Empty -- the default -- is exactly today's behaviour: the only league
+    opponent is an archived HOF checkpoint, no search carries a bias, and every
+    target routes to the general.
+
+    Shares are fractions of ALL games and sit alongside ``hof_opponent_fraction``
+    in one budget: ``"science:0.15:0.5,military:0.10:0.5"`` with
+    ``hof_opponent_fraction = 0.15`` is the plan's 15/15/10 split over 40%
+    league games. See ``specialist.draw_opponent_class`` for why the draw
+    renormalises among the classes instead of using the shares directly.
+    """
+
+    specialist_bootstrap_games: int = 0
+    """Games before a specialist is seeded from the current promoted general.
+
+    Zero follows ``hof_start_games``. A specialist fine-tuned from a checkpoint
+    that has not yet learned to play is a random attacker, which teaches the
+    general to defend against nothing.
+    """
+
+    specialist_floor_every: int = 5
+    """Iterations between collapse-floor measurements, per specialist.
+
+    Not every iteration: the floor is a real match against the frozen anchor and
+    costs generation-equivalent time. Zero disables the check, which is only
+    reasonable in a smoke test.
+    """
+
+    reanalysis_gap: float = DEFAULT_REANALYSIS_GAP
+    """How far a biased search's own valuation must have moved for its position
+    to be worth a lambda-zero re-search. See
+    ``specialist.DEFAULT_REANALYSIS_GAP`` for what this proxy is and is not."""
+
+    specialist_reanalysis: bool = False
+    """W7 S2b: re-search the positions where the bias changed the chosen move at
+    ``lambda = 0``, and route those targets to the GENERAL.
+
+    Off by default because it is the arm of the S5 pilot, not a default: without
+    it the general learns only to defend, and whether attack transfer earns its
+    search compute is the one question the seat arrangement cannot answer by
+    itself.
     """
 
     hof_sampling_mode: str = "recency"
@@ -956,6 +1020,9 @@ class PhaseDConfig:
             hof_opponent_fraction=self.hof_opponent_fraction,
             hof_sampling_mode=self.hof_sampling_mode,
             hof_start_games=self.hof_start_games,
+            # The league composition IS a schedule: changing a share mid-run
+            # changes which opponent every later iteration draws.
+            specialists=self.specialists,
         )
         return identity
 
@@ -1020,6 +1087,22 @@ class PhaseDConfig:
             )
         if not 0.0 <= self.hof_opponent_fraction <= 1.0:
             raise ValueError("hof_opponent_fraction must lie in [0, 1]")
+        configs = parse_specialists(self.specialists)
+        if league_share(self.hof_opponent_fraction, configs) > 1.0:
+            raise ValueError(
+                "hof_opponent_fraction plus the specialist shares exceed every "
+                "game in an iteration"
+            )
+        if configs and not self.hierarchical_value:
+            # A nonzero lambda REQUIRES a net with a usable outlook source. The
+            # search raises at the first leaf without one, which is the right
+            # behaviour but the wrong moment: a run would die minutes into
+            # generation rather than at launch.
+            raise ValueError(
+                "--specialists requires --hierarchical-value: the leaf bias "
+                "reads W4's seven-way outlook, and a leaf without one is a hard "
+                "error rather than a silent zero bias"
+            )
         if self.hof_start_games < 0:
             raise ValueError("hof_start_games must be non-negative")
         if self.hof_sampling_mode not in {"recency", "uniform", "latest"}:
@@ -1536,8 +1619,8 @@ class CurriculumMCTS(GumbelMCTS):
         self.draft_prior = draft_prior
 
     def _evaluate(self, state):
-        value, priors = super()._evaluate(state)
-        return value, blend_draft_priors(state, priors, self.draft_prior)
+        value, priors, outlook = super()._evaluate(state)
+        return value, blend_draft_priors(state, priors, self.draft_prior), outlook
 
 
 def _sample_policy(
@@ -1643,6 +1726,15 @@ def _tag_league_opponents(
         )
         agents["opponent_source"] = league.checkpoint
         agents["league_assignment_used"] = "true"
+        # W7: group stats by CLASS as well as by checkpoint, and record the
+        # utility the opponent was maximising. `opponent_type` keeps its
+        # existing vocabulary (`buffer.OPPONENT_TYPES`) so every existing
+        # consumer is untouched; the class is a new, additive key.
+        agents["opponent_class"] = league.opponent_class
+        if league.is_specialist:
+            agents["opponent_lambda"] = str(league.specialist_lambda)
+            agents["opponent_victory"] = str(league.specialist_victory)
+            agents["opponent_route"] = league.opponent_route
         tagged.append(replace(record, agents=agents))
     return tagged
 
@@ -1763,7 +1855,49 @@ def summarize_records(records: Sequence[GameRecord]) -> dict[str, Any]:
             sum(move.sims for move in searched) / len(searched) if searched else 0.0
         ),
         "solver": _summarize_solver(moves),
+        # W7: never one aggregate. "Did we beat the science attacker" and "did
+        # we beat the archive" are different questions, and pooling them hides
+        # both -- which is why the class is on the record and the outcome split
+        # is reported beside the totals.
+        "opponent_classes": _summarize_opponent_classes(records),
     }
+
+
+def _summarize_opponent_classes(records: Sequence[GameRecord]) -> dict[str, Any]:
+    """Games, learner score and victory-type mix, split by opponent class.
+
+    The learner's score is over the games where an opponent actually played:
+    a pure self-play game has no opponent to score against, and folding those in
+    would pull every class toward 0.5.
+    """
+
+    out: dict[str, Any] = {}
+    for record in records:
+        agents = record.agents
+        if agents.get("league_assignment_used") != "true":
+            continue
+        name = agents.get("league_assignment")
+        opponent_seat = next(
+            (seat for seat in (0, 1) if agents.get(f"p{seat}") == name), None
+        )
+        if opponent_seat is None:
+            continue
+        entry = out.setdefault(
+            agents.get("opponent_class", "hof"),
+            {"games": 0, "learner_points": 0.0, "victory_types": Counter()},
+        )
+        entry["games"] += 1
+        entry["victory_types"][record.victory_type or "draw"] += 1
+        if record.winner is None:
+            entry["learner_points"] += 0.5
+        elif record.winner != opponent_seat:
+            entry["learner_points"] += 1.0
+    for entry in out.values():
+        entry["learner_score_rate"] = (
+            entry["learner_points"] / entry["games"] if entry["games"] else None
+        )
+        entry["victory_types"] = dict(sorted(entry["victory_types"].items()))
+    return dict(sorted(out.items()))
 
 
 def _summarize_solver(moves: Sequence[Any]) -> dict[str, Any]:
@@ -2209,6 +2343,18 @@ class LeagueAssignment:
     iteration_added: int
     nets_p0: tuple[int, ...]
     nets_p1: tuple[int, ...]
+    #: W7 S1: which OPPONENT CLASS this iteration drew -- ``"hof"`` or a
+    #: specialist class name. ``"hof"`` is the historical behaviour and every
+    #: specialist field below is then inert.
+    opponent_class: str = "hof"
+    #: The opponent's leaf-utility bias, and where its policy targets go.
+    #: Zero lambda with a ``"none"`` route is an archived checkpoint: it learns
+    #: nothing and teaches nothing but value.
+    specialist_lambda: float = 0.0
+    specialist_victory: str | None = None
+    specialist_symmetric: bool = False
+    specialist_class_id: int = 0
+    opponent_route: str = "none"
 
     @property
     def games(self) -> int:
@@ -2219,15 +2365,24 @@ class LeagueAssignment:
         )
 
     @property
+    def is_specialist(self) -> bool:
+        return self.opponent_class != "hof"
+
+    @property
     def name(self) -> str:
         """Stable opponent identity for stats and the ``agents`` block.
 
-        Carries the archive's iteration and checkpoint hash, so W3 can group
-        outcomes by opponent and two different archives can never collide under
-        one name.
+        Carries the class, the source iteration and the checkpoint hash, so
+        outcomes group by CLASS as well as by checkpoint -- "did we beat the
+        science attacker" and "did we beat the archive" are different questions
+        and pooling them hides both -- and two different opponents can never
+        collide under one name.
         """
 
-        return f"hof_iter_{self.iteration_added:04d}_{self.sha256[:12]}"
+        return (
+            f"{self.opponent_class}_iter_{self.iteration_added:04d}"
+            f"_{self.sha256[:12]}"
+        )
 
     def opponent_for(self, index: int) -> str | None:
         """The opponent in game ``index``, or ``None`` when it is pure self-play."""
@@ -2430,6 +2585,18 @@ def wilson_pair_decision(
 
 
 class PhaseDLoop:
+    #: W7 defaults at CLASS level, not only in `__init__`.
+    #:
+    #: Several harnesses build a loop with `__init__` bypassed
+    #: (`object.__new__` plus a handful of hand-set attributes) to exercise one
+    #: method without a run directory. Reading the league off an instance
+    #: attribute alone made `league_assignment` raise `AttributeError` deep
+    #: inside generation for those. These defaults are "no league", which is
+    #: what such a harness means; `__init__` rebinds both, and nothing ever
+    #: mutates them in place.
+    specialist_configs: tuple[SpecialistConfig, ...] = ()
+    specialist_lineages: dict[str, SpecialistLineage] = {}
+
     def __init__(self, config: PhaseDConfig):
         config.validate()
         self.config = config
@@ -2439,6 +2606,18 @@ class PhaseDLoop:
         self.current_best = self.checkpoint_dir / "current_best.pt"
         self.adapter = SevenWondersDuelLoopAdapter()
         self.hof = HallOfFame(self.run_dir / "hof")
+        # W7: one lineage per specialist class, under its own subtree. Separate
+        # from the general's checkpoint directory on purpose -- the two
+        # lifecycles must not be able to reset each other by sharing a path, and
+        # a specialist must not be reverted because the general's soft gate
+        # rejected the general's own candidate.
+        self.specialist_configs: tuple[SpecialistConfig, ...] = parse_specialists(
+            config.specialists
+        )
+        self.specialist_lineages: dict[str, SpecialistLineage] = {
+            spec.name: SpecialistLineage(self.run_dir, spec)
+            for spec in self.specialist_configs
+        }
         # W7. `base_config` stays exactly as launched: the resume guards compare
         # against it, and an intervention must never look like a config change
         # the operator did not make.
@@ -2918,20 +3097,42 @@ class PhaseDLoop:
         """
 
         config = self.config
-        if config.hof_opponent_fraction <= 0.0:
+        specialists = self.specialist_configs
+        if league_share(config.hof_opponent_fraction, specialists) <= 0.0:
             return None
         if self.generation_clock(iteration) < config.hof_start_games:
             return None
-        entries = self.hof.entries()
-        if not entries:
-            return None
-        league_games = int(round(games * config.hof_opponent_fraction))
+        league_games = league_game_count(
+            games, config.hof_opponent_fraction, specialists
+        )
         if league_games <= 0:
             return None
+        # ONE rng, drawn in a fixed order: class first, then the checkpoint. A
+        # resume re-runs the same iteration and must draw the same opponent, so
+        # nothing here may depend on wall clock, directory order, or how far the
+        # run got before it was interrupted.
         rng = random.Random(config.seed + iteration * 100_003)
-        entry = self.hof.sample(rng, mode=config.hof_sampling_mode)
-        if entry is None:
+        drawn = draw_opponent_class(rng, config.hof_opponent_fraction, specialists)
+        if drawn is None:
             return None
+        specialist = next(
+            (config_ for config_ in specialists if config_.name == drawn), None
+        )
+        if specialist is not None:
+            entry = self._specialist_opponent(specialist, iteration, rng)
+            if entry is None:
+                # The specialist has not been seeded yet (or its bootstrap games
+                # have not elapsed). Fall back to HOF rather than skipping the
+                # league entirely -- an iteration with no opponent is a silently
+                # different curriculum from one with an archive.
+                specialist = None
+        if specialist is None:
+            entries = self.hof.entries()
+            if not entries:
+                return None
+            entry = self.hof.sample(rng, mode=config.hof_sampling_mode)
+            if entry is None:
+                return None
 
         # Which games are league games, and on which seat the archive sits.
         # Spread by stride rather than taking a prefix: the first N games of an
@@ -2957,7 +3158,53 @@ class PhaseDLoop:
             iteration_added=entry.iteration,
             nets_p0=tuple(nets_p0),
             nets_p1=tuple(nets_p1),
+            opponent_class="hof" if specialist is None else specialist.name,
+            specialist_lambda=0.0 if specialist is None else specialist.lambda_,
+            specialist_victory=None if specialist is None else specialist.victory,
+            specialist_symmetric=(
+                False if specialist is None else specialist.symmetric
+            ),
+            specialist_class_id=0 if specialist is None else specialist.class_id,
+            # An archive learns nothing, so its policy targets go nowhere; a
+            # specialist's go to its own buffer.
+            opponent_route="none" if specialist is None else specialist.route,
         )
+
+    def _specialist_opponent(
+        self, specialist: SpecialistConfig, iteration: int, rng: random.Random
+    ):
+        """The checkpoint a specialist class plays this iteration.
+
+        Its LIVE net most of the time, and an entry from its own per-type
+        archive the rest. Archiving from the first accepted specialist is not
+        optional: attacking styles are forgotten the same way general strategies
+        are, and a specialist that drifts takes its earlier style with it.
+        """
+
+        lineage = self.specialist_lineages.get(specialist.name)
+        if lineage is None:
+            return None
+        if self.generation_clock(iteration) < self._specialist_bootstrap_games():
+            return None
+        if not lineage.archive.entries():
+            return None
+        # A third of the time reach into the archive; otherwise play the LIVE
+        # net, which is what keeps the specialist honest against the general.
+        #
+        # "Live" is resolved from `latest.pt`, never from the newest archive
+        # entry. The two diverge after a rollback -- `revert` restores
+        # `latest.pt` while the archive still ends with the rejected weights --
+        # and reading the archive here put the collapsed specialist straight
+        # back into generation as its usual opponent. Archive draws skip
+        # quarantined entries for the same reason.
+        if rng.random() < 0.34:
+            sampled = lineage.sample_archive(rng)
+            if sampled is not None:
+                return sampled
+        return lineage.live_entry()
+
+    def _specialist_bootstrap_games(self) -> int:
+        return self.config.specialist_bootstrap_games or self.config.hof_start_games
 
     def resolved_schedules(self, iteration: int) -> ResolvedSchedules:
         """Freeze this iteration's generation-time schedule values."""
@@ -3844,6 +4091,12 @@ class PhaseDLoop:
             print(
                 f"iteration {iteration}: league play -- {league.games} of "
                 f"{len(jobs)} games vs {league.name}"
+                + (
+                    f" (lambda {league.specialist_lambda} toward "
+                    f"{league.specialist_victory})"
+                    if league.is_specialist
+                    else ""
+                )
             )
         started = time.monotonic()
         rust_metrics = []
@@ -3926,6 +4179,21 @@ class PhaseDLoop:
             solver_fallback_research=self.config.solver_fallback_research,
             dirichlet_epsilon=self.config.dirichlet_epsilon,
             dirichlet_alpha=self.config.dirichlet_alpha,
+            # W7: the bias belongs to NETWORK 1, whichever seat it takes in a
+            # given game. Zero when the drawn opponent is an archive, which is
+            # bit-identical to a build without the field.
+            specialist_lambda=(
+                league.specialist_lambda if league is not None else 0.0
+            ),
+            specialist_victory=(
+                league.specialist_victory if league is not None else None
+            ),
+            specialist_symmetric=(
+                league.specialist_symmetric if league is not None else False
+            ),
+            specialist_class_id=(
+                league.specialist_class_id if league is not None else 0
+            ),
         )
         records = phase_d_records_from_rust(raw_records, validate=False)
         if league is not None:
@@ -4102,6 +4370,7 @@ class PhaseDLoop:
         on_record_derived: (
             Callable[[GameRecord, GameDerivationStats], None] | None
         ) = None,
+        derived_for: str = GENERAL_ROUTE,
     ) -> list[Example]:
         """Vectorized examples for `records`, replaying each game at most once.
 
@@ -4137,6 +4406,16 @@ class PhaseDLoop:
 
         cache = self._example_cache
         fast = self.config.record_fast_moves
+        # W7: the SAME record yields different examples per model -- the policy
+        # label is routed, and `value_soft`'s root differs between the model
+        # whose lambda produced it and everyone else. But the expensive part of
+        # derivation (replay, encode, vectorize) is IDENTICAL for every model,
+        # so the cache stores ONE entry per record, always derived for the
+        # general, and `project_examples` re-labels it for anyone else. Keying
+        # the cache on the route instead would triple a real run's replay cost
+        # and its cache footprint at two specialists, for rows differing in four
+        # scalars.
+        route = derived_for
         rss_before = int(psutil.Process().memory_info().rss)
         raw_before, _estimated_before = self._cache_totals()
         derived_games = 0
@@ -4218,7 +4497,11 @@ class PhaseDLoop:
             if on_record_derived is not None:
                 on_record_derived(record, game_stats)
             used.add(key)
-            out.extend(cached)
+            out.extend(
+                cached
+                if route == GENERAL_ROUTE
+                else project_examples(cached, record, route)
+            )
 
         if derived_games and not self._cache_calibrated:
             rss_after = int(psutil.Process().memory_info().rss)
@@ -4310,6 +4593,37 @@ class PhaseDLoop:
         )
         replay_seconds = time.monotonic() - replay_started
         self.phase_seconds["replay_derivation"] = replay_seconds
+        # W7 S2b, and the isolation check the plan asks for: assert that no
+        # shaped root reached this buffer BEFORE anything trains on it. The
+        # configuration that makes this dangerous -- `--value-bootstrap 0.5` --
+        # is the one cloud2 actually ran.
+        assert_no_shaped_bootstrap(examples, GENERAL_ROUTE)
+        reanalysis_stats = {"examples": 0, "positions": 0, "share": 0.0}
+        if self.config.specialist_reanalysis and self.specialist_configs:
+            # Measure THIS iteration's general policy inflow from the examples
+            # already in hand, and pass it. Reading `last_training_stats` here
+            # would read the PREVIOUS iteration's number, and on a fresh process
+            # there is none at all -- which is how identical inputs selected 25
+            # rows on one run and 250 on a resume.
+            newest_now = max(
+                (e.iteration for e in examples if e.iteration is not None),
+                default=None,
+            )
+            general_inflow = inflow_census(
+                [e for e in examples if e.iteration == newest_now]
+            ).get(GENERAL_ROUTE, 0)
+            extra, reanalysis_stats = self.reanalysis_for_general(
+                records,
+                iteration,
+                general_inflow=general_inflow,
+                teacher=(
+                    source_checkpoint
+                    if source_checkpoint is not None
+                    else self.current_best
+                ),
+            )
+            examples = examples + extra
+        self.last_reanalysis_stats = reanalysis_stats
         target_baselines = baselines(examples)
         train_examples, val_examples = stable_game_split(
             examples, self.config.val_fraction, self.config.val_split_salt
@@ -4397,6 +4711,16 @@ class PhaseDLoop:
             # The KataGo quantity: how hard each newly generated position is
             # trained on.  Run 02 ran at ~113x here; AlphaGo Zero sat near 1-2x.
             "new_examples": new_examples,
+            # W7: "specialist games replace general games" preserves the
+            # general's GAME count, not its policy-target inflow -- an opponent
+            # seat's moves yield the general no policy label. Tracked separately
+            # from the shared value rows because the S3 step-sizing rule depends
+            # on this number being MEASURED rather than assumed.
+            "reanalysis": dict(getattr(self, "last_reanalysis_stats", {}) or {}),
+            "policy_inflow": inflow_census(temporal_examples),
+            "policy_inflow_general": inflow_census(temporal_examples).get(
+                GENERAL_ROUTE, 0
+            ),
             "samples_consumed": samples,
             "samples_per_new_position": (
                 samples / new_examples if new_examples else None
@@ -4428,6 +4752,440 @@ class PhaseDLoop:
         torch.save(checkpoint, candidate)
         self.sample_resources("post_training")
         return candidate
+
+    def reanalysis_for_general(
+        self,
+        records: list[GameRecord],
+        iteration: int,
+        *,
+        general_inflow: int,
+        teacher: str | Path | None = None,
+    ) -> tuple[list[Example], dict[str, Any]]:
+        """S2b: lambda-zero re-search of the positions a specialist steered into.
+
+        The evaluator is the GENERAL's own current net -- these are targets for
+        the general, not a second opinion from the specialist -- and the search
+        carries no bias, so its root is a calibrated win probability and its
+        policy is what a sound player makes of the position.
+        """
+
+        started = time.monotonic()
+        selected = [
+            reanalysis_candidates(record, min_gap=self.config.reanalysis_gap)
+            for record in records
+        ]
+        cap = min(
+            (config.reanalysis_share_cap for config in self.specialist_configs),
+            default=0.0,
+        )
+        selected = cap_reanalysis(selected, general_inflow, cap)
+        positions = sum(len(entry) for entry in selected)
+        if positions == 0:
+            return [], {"examples": 0, "positions": 0, "share": 0.0, "seconds": 0.0}
+        # The teacher is the learner the general is CONTINUING, not always the
+        # protected best: under the soft gate `train_candidate` fine-tunes from
+        # `latest.pt` for many iterations without a promotion, and teaching the
+        # general from a checkpoint it has already moved past is a stale target.
+        model = self.load_model(teacher if teacher is not None else self.current_best)
+        evaluator = Evaluator(
+            model,
+            self.config.device,
+            self.config.inference_batch,
+            precision=self.config.precision,
+            value_source=self.config.value_source,
+        )
+
+        def factory_for(record: GameRecord):
+            def factory(move_index: int):
+                # Deterministic per (game, move): a resume must re-derive the
+                # same targets, and two positions in one game must not share a
+                # search seed.
+                seed = (
+                    self.config.seed
+                    + 611_953 * (record.seed & 0xFFFF)
+                    + 7 * move_index
+                    + iteration
+                )
+                return GumbelMCTS(
+                    evaluator,
+                    SearchConfig(
+                        sims=self.config.full_sims_max,
+                        top_k=self.config.top_k,
+                        mode="closed",
+                        seed=seed,
+                        root_selection=(
+                            "puct"
+                            if self.config.selfplay_search_mode == "puct"
+                            else "gumbel"
+                        ),
+                        force_expand_root_chance=self.config.force_root_chance,
+                        # No bias, by construction: this is the whole point.
+                        specialist_lambda=0.0,
+                    ),
+                )
+
+            return factory
+
+        out: list[Example] = []
+        visited = 0
+        covered = 0
+        for record, indices in zip(records, selected):
+            if not indices:
+                continue
+            rows, coverage = reanalysis_examples(
+                record, indices, factory_for(record), derived_for=GENERAL_ROUTE
+            )
+            out.extend(rows)
+            visited += coverage["specialist_move_visited"]
+            covered += coverage["positions"]
+        stats = {
+            "examples": len(out),
+            "positions": positions,
+            "share": len(out) / general_inflow if general_inflow else 0.0,
+            "cap": cap,
+            "general_inflow": general_inflow,
+            "teacher": str(teacher if teacher is not None else self.current_best),
+            # Measured, not assumed: how often the unbiased re-search funded the
+            # move the specialist played. A low number would mean the general's
+            # prior is excluding the attacks again, which is the failure the
+            # plan wants coverage reserved against -- and the cue to build that
+            # mechanism rather than assume it is needed.
+            "specialist_move_visited_fraction": (
+                visited / covered if covered else None
+            ),
+            "coverage_positions": covered,
+            "seconds": time.monotonic() - started,
+        }
+        self.phase_seconds["reanalysis"] = stats["seconds"]
+        print(
+            f"iteration {iteration}: S2b reanalysis -- {len(out)} general "
+            f"examples from {positions} positions "
+            f"({stats['share']:.1%} of policy inflow, cap {cap:.0%})"
+        )
+        return out, stats
+
+    # ---- W7: the specialist league -------------------------------------
+
+    @property
+    def general_anchor_path(self) -> Path:
+        """The FROZEN general, fixed when the league starts and never rebuilt.
+
+        Every specialist measurement is read against this. Scoring an improving
+        general against an improving specialist cannot separate "defence got
+        stronger" from "the attacks got weaker", and that ambiguity would make
+        the whole workstream unfalsifiable. The collapse floor uses it for the
+        same reason: a floor defined against the current generator moves under
+        the thing it is meant to protect.
+        """
+
+        return self.run_dir / "specialists" / "general_anchor.pt"
+
+    def freeze_general_anchor(self, source: str | Path | None = None) -> Path:
+        """Pin the frozen general once. A second call is a no-op, deliberately."""
+
+        if self.general_anchor_path.is_file():
+            return self.general_anchor_path
+        origin = Path(source) if source is not None else self.current_best
+        if not origin.is_file():
+            raise FileNotFoundError(origin)
+        self.general_anchor_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, self.general_anchor_path)
+        return self.general_anchor_path
+
+    def _specialist_optimizer_state(self, lineage: SpecialistLineage) -> dict | None:
+        path = lineage.optimizer_path
+        if not path.exists():
+            return None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:  # noqa: BLE001 - corrupt state is recoverable
+            print(f"{lineage.config.name} optimizer state unreadable ({error})")
+            return None
+        return payload.get("state")
+
+    def bootstrap_specialists(self, iteration: int) -> list[str]:
+        """Seed any specialist with no weights yet from the promoted general.
+
+        A specialist fine-tuned from a checkpoint that cannot yet play is a
+        random attacker, and defending against a random attacker teaches the
+        general nothing -- hence the games gate, which follows `hof_start_games`
+        by default so specialists appear exactly as the curriculum bots stop.
+        """
+
+        if not self.specialist_configs:
+            return []
+        if self.generation_clock(iteration) < self._specialist_bootstrap_games():
+            return []
+        if not self.current_best.is_file():
+            return []
+        # The CHECKPOINT must carry W4's head, not just the config. A resumed
+        # run whose `current_best` predates `--hierarchical-value` would seed a
+        # specialist that cannot search at all, and the failure would surface at
+        # the first biased leaf rather than here.
+        seed_model = self.load_model(self.current_best)
+        if getattr(getattr(seed_model, "_orig_mod", seed_model), "hier_value", None) is None:
+            raise ValueError(
+                f"{self.current_best} has no hierarchical value head, so a "
+                "specialist seeded from it could not read the outlook its leaf "
+                "bias needs; train the general with --hierarchical-value before "
+                "enabling --specialists"
+            )
+        del seed_model
+        seeded: list[str] = []
+        for config in self.specialist_configs:
+            lineage = self.specialist_lineages[config.name]
+            if lineage.archive.entries():
+                continue
+            self.freeze_general_anchor()
+            lineage.bootstrap(self.current_best, iteration)
+            seeded.append(config.name)
+            print(
+                f"iteration {iteration}: seeded the {config.name} specialist "
+                f"(lambda {config.lambda_}) from {self.current_best.name}"
+            )
+        return seeded
+
+    def train_specialist(
+        self,
+        config: SpecialistConfig,
+        records: list[GameRecord],
+        iteration: int,
+        *,
+        general_inflow: int,
+    ) -> dict[str, Any]:
+        """One specialist's train step, sized by ITS OWN measured inflow.
+
+        Deliberately NOT the general's promotion gate. That gate produced 0
+        promotions over 38k games in cloud6, and a specialist population that
+        silently never advances is a full run wasted before anyone notices. A
+        specialist is sparring equipment: it advances on every train step and is
+        rolled back only by the collapse floor.
+        """
+
+        started = time.monotonic()
+        lineage = self.specialist_lineages[config.name]
+        state = lineage.load()
+        row: dict[str, Any] = {
+            "class": config.name,
+            "lambda": config.lambda_,
+            "route": config.route,
+            "trained": False,
+        }
+        if state.latest is None or not lineage.latest_path.is_file():
+            row["skipped"] = "not seeded"
+            return row
+        if lineage.already_trained(iteration):
+            # A retried iteration. The controller's rollback restores GENERAL
+            # artifacts only, and this update was committed inside
+            # `adapter.train` before the iteration was; re-running generation
+            # from the same seeds reproduces the same records, which this
+            # specialist has already consumed. Spending them twice would double
+            # its effective step count on that data.
+            row["skipped"] = "already trained this iteration"
+            row["last_trained_iteration"] = state.last_trained_iteration
+            return row
+        examples = self._cached_examples(records, derived_for=config.route)
+        # The same contract from the other side: a specialist may bootstrap
+        # from its OWN shaped root and from nobody else's.
+        assert_no_shaped_bootstrap(examples, config.route)
+        newest = max(
+            (e.iteration for e in examples if e.iteration is not None), default=None
+        )
+        fresh = (
+            [e for e in examples if e.iteration == newest]
+            if newest is not None
+            else []
+        )
+        inflow = inflow_census(fresh).get(config.route, 0)
+        # Bank the ROWS, not the elapsed iterations. One opponent class is drawn
+        # per iteration, so an iteration supplying this specialist nothing is
+        # ordinary; sizing a step count off "iterations since I last trained"
+        # invents inflow that never arrived.
+        banked = lineage.bank_inflow(inflow).banked_inflow
+        row["inflow"] = inflow
+        row["banked_inflow"] = banked
+        row["general_inflow"] = general_inflow
+        # `train_every` is a CADENCE: it decides when to spend the bank, not how
+        # much is in it.
+        due = (state.iterations_since_train + 1) >= config.train_every
+        if not due:
+            lineage.note_idle_iteration()
+            row["skipped"] = "banking inflow"
+            row["iterations_since_train"] = state.iterations_since_train + 1
+            return row
+        steps = steps_for_inflow(self.config.train_steps, general_inflow, banked)
+        row["steps"] = steps
+        if steps <= 0:
+            lineage.note_idle_iteration()
+            row["skipped"] = "no inflow"
+            return row
+        train_examples, val_examples = stable_game_split(
+            examples, self.config.val_fraction, self.config.val_split_salt
+        )
+        if not train_examples:
+            row["skipped"] = "empty split"
+            return row
+        model = self.load_model(lineage.latest_path)
+        history, optimizer_state = train_steps(
+            model,
+            train_examples,
+            val_examples,
+            device=self.config.device,
+            steps=steps,
+            batch_size=self.config.train_batch_size,
+            lr=self.config.learning_rate,
+            warmup_steps=0,
+            weight_decay=self.config.weight_decay,
+            aux_weight=self.config.aux_weight,
+            value_weight=self.config.value_weight,
+            value_bootstrap=self.config.value_bootstrap,
+            action_policy_weight=self.config.action_policy_weight,
+            hier_value_weight=self.config.hier_value_weight,
+            hier_value_replaces_joint7=self.config.hier_value_replaces_joint7,
+            validate_every=self.config.validate_every,
+            optimizer_state=self._specialist_optimizer_state(lineage),
+            restore_best_val=False,
+            # Its own seed stream: two specialists trained in the same iteration
+            # must not shuffle their batches identically.
+            seed=self.config.seed + iteration + 7919 * config.class_id,
+            precision=self.config.precision,
+        )
+        lineage.directory.mkdir(parents=True, exist_ok=True)
+        candidate = lineage.directory / f"candidate_{iteration:04d}.pt"
+        torch.save(
+            make_checkpoint(
+                model,
+                self._model_contract(
+                    model,
+                    iteration=iteration,
+                    history=history,
+                    specialist={
+                        "class": config.name,
+                        "lambda": config.lambda_,
+                        "victory": config.victory,
+                        "symmetric": config.symmetric,
+                        "steps": steps,
+                        "inflow": inflow,
+                        "banked_inflow": banked,
+                    },
+                ),
+            ),
+            candidate,
+        )
+        torch.save(
+            {"state": optimizer_state, "iteration": iteration},
+            lineage.optimizer_path,
+        )
+        updated = lineage.accept(candidate, iteration, steps=steps)
+        candidate.unlink(missing_ok=True)
+        row.update(
+            trained=True,
+            update_count=updated.update_count,
+            train_examples=len(train_examples),
+            history=history,
+            seconds=time.monotonic() - started,
+        )
+        self.phase_seconds["specialist_training"] = (
+            self.phase_seconds.get("specialist_training", 0.0) + row["seconds"]
+        )
+        return row
+
+    def specialist_floor_check(
+        self, config: SpecialistConfig, iteration: int, *, games: int = 0
+    ) -> dict[str, Any]:
+        """Score one specialist against the FROZEN general anchor.
+
+        The only thing that can roll a specialist back. Specialists are expected
+        to score worse than the general by design -- that is not a failure -- so
+        the floor catches divergence, not an absence of improvement.
+        """
+
+        lineage = self.specialist_lineages[config.name]
+        if not lineage.latest_path.is_file() or not self.general_anchor_path.is_file():
+            return {"class": config.name, "measured": False}
+        games = games or self.config.anchor_games
+        if games % 2:
+            games += 1
+        # Attributed to its OWN phase, not folded into `gate`. The floor is a
+        # real match on a cadence the league chooses, and the plan's contract is
+        # to measure what the league costs end to end rather than call it free.
+        # Hidden inside the gate total it would read as the gate getting slower.
+        floor_started = time.monotonic()
+        # Reserve headroom and release the specs exactly as the promotion gate
+        # does: this loads two more models, and the memory guard is the reason
+        # a gate does not take the whole box down when the buffer is large.
+        self._admit_gate((lineage.latest_path, self.general_anchor_path))
+        try:
+            subject = self._model_agent_spec(
+                lineage.latest_path, f"{config.name}_spec"
+            )
+            anchor = self._model_agent_spec(
+                self.general_anchor_path, "general_anchor"
+            )
+            # The floor must measure the OPPONENT THAT PLAYS, which is the
+            # biased searcher. A plain model match runs these weights with the
+            # bonus switched off -- a different player, and one whose competence
+            # says nothing about whether the biased decisions are sound.
+            report, _outcomes = self._wilson_model_match(
+                subject,
+                anchor,
+                seed_offset=52_000_000 + 1_000_000 * config.class_id,
+                games=games,
+                specialist=config,
+            )
+        finally:
+            if "subject" in locals():
+                del subject
+            if "anchor" in locals():
+                del anchor
+            self._cleanup_gate_resources()
+            self.phase_seconds["specialist_floor"] = (
+                self.phase_seconds.get("specialist_floor", 0.0)
+                + time.monotonic()
+                - floor_started
+            )
+        healthy, reason = collapse_verdict(report.score_rate, config)
+        if healthy:
+            lineage.mark_good(iteration, report.score_rate)
+        else:
+            lineage.revert(iteration, report.score_rate)
+            print(f"iteration {iteration}: COLLAPSE FLOOR -- {reason}")
+        return {
+            "class": config.name,
+            "measured": True,
+            # Recorded so a report cannot be read as a measurement of the
+            # deployed opponent when it was taken with the bonus off.
+            "biased": True,
+            "lambda": config.lambda_,
+            "victory": config.victory,
+            "score_rate": report.score_rate,
+            "games": report.games,
+            "floor": config.collapse_floor,
+            "healthy": healthy,
+            "reason": reason,
+            "seconds": self.phase_seconds.get("specialist_floor", 0.0),
+        }
+
+    def run_specialist_iteration(
+        self, records: list[GameRecord], iteration: int, *, general_inflow: int
+    ) -> list[dict[str, Any]]:
+        """Train and floor-check every specialist, after the general's own step.
+
+        Separate from the general's lifecycle in both directions: a rejected
+        general candidate does not touch a specialist, and a collapsed
+        specialist does not touch the general.
+        """
+
+        rows: list[dict[str, Any]] = []
+        for config in self.specialist_configs:
+            row = self.train_specialist(
+                config, records, iteration, general_inflow=general_inflow
+            )
+            floor_every = self.config.specialist_floor_every
+            if row.get("trained") and floor_every > 0 and iteration % floor_every == 0:
+                row["floor"] = self.specialist_floor_check(config, iteration)
+            rows.append(row)
+        return rows
 
     def _model_agent_spec(self, path: str | Path, role: str) -> ModelAgentSpec:
         model, checkpoint = self._load_model_checkpoint(path)
@@ -4672,6 +5430,7 @@ class PhaseDLoop:
         seed_offset: int,
         games: int,
         precisions: tuple[str, str] | None = None,
+        specialist: SpecialistConfig | None = None,
     ) -> list[MatchOutcome]:
         """One rolling Rust scheduler call for both seat legs and all pairs.
 
@@ -4750,6 +5509,16 @@ class PhaseDLoop:
             puct_root=self.config.eval_search_mode == "puct",
             nets_p0=nets_p0,
             nets_p1=nets_p1,
+            # W7: the CANDIDATE is network 0 here, the reverse of generation,
+            # so the bias goes on network 0. Exploration noise stays off -- this
+            # is an evaluation, and `dirichlet_epsilon` defaults to 0.
+            specialist_lambda=0.0 if specialist is None else specialist.lambda_,
+            specialist_victory=None if specialist is None else specialist.victory,
+            specialist_symmetric=(
+                False if specialist is None else specialist.symmetric
+            ),
+            specialist_class_id=0 if specialist is None else specialist.class_id,
+            specialist_net=0,
         )
         elapsed = time.monotonic() - started
         self.last_gate_stats = {
@@ -5037,11 +5806,22 @@ class PhaseDLoop:
         games: int,
         revert_suppressed: bool = False,
         precisions: tuple[str, str] | None = None,
+        specialist: SpecialistConfig | None = None,
     ) -> tuple[GateResult, list[MatchOutcome]]:
-        """Play exactly ``games`` games, then decide once (W5.5)."""
+        """Play exactly ``games`` games, then decide once (W5.5).
+
+        ``specialist`` makes the CANDIDATE a biased searcher, for W7's collapse
+        floor. It is `None` for every ordinary gate, which is unchanged.
+        """
 
         if games <= 0 or games % 2:
             raise ValueError("gate games must be a positive even number")
+        if specialist is not None and self.config.gate_backend != "rust":
+            raise ValueError(
+                "a biased collapse-floor match needs the Rust gate backend: the "
+                "Python match path has no leaf bias, and running it would "
+                "silently measure the specialist with its bonus switched off"
+            )
         if self.config.gate_backend != "rust":
             candidate_agent = _build_gate_agent(
                 candidate_spec,
@@ -5079,8 +5859,13 @@ class PhaseDLoop:
                 "gate_games": games,
             }
         else:
+            # Passed only when there IS one, so an ordinary gate's call is
+            # exactly the call it was before W7 -- which is what the precision
+            # arena's spy asserts about, and the discipline the rest of this
+            # build follows: additive, and inert when off.
+            extra = {} if specialist is None else {"specialist": specialist}
             outcomes = self._rust_model_gate_rolling(
-                candidate_spec, opponent_spec, seed_offset, games, precisions
+                candidate_spec, opponent_spec, seed_offset, games, precisions, **extra
             )
         pair_scores = self._pair_scores(outcomes)
         decision, pairs, rate, lcb, ucb, stop_reason = wilson_pair_decision(
@@ -5333,6 +6118,8 @@ class PhaseDLoop:
 
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         model = self.load_model(self.current_best)
+        # Before generation, so this iteration's league can already draw them.
+        seeded = self.bootstrap_specialists(iteration)
         generated = self.generate_iteration(model, iteration)
         records = self.training_records(iteration)
         shortfall = self.buffer_warmup_shortfall(records)
@@ -5353,6 +6140,16 @@ class PhaseDLoop:
             self.manifest.note_iteration(iteration)
             return row
         candidate = self.train_candidate(records, iteration)
+        # After the general's own step and BEFORE its gate: a specialist's
+        # lifecycle must not depend on whether the general's candidate was
+        # accepted, and the general's must not depend on a specialist.
+        specialist_rows = self.run_specialist_iteration(
+            records,
+            iteration,
+            general_inflow=int(
+                self.last_training_stats.get("policy_inflow_general", 0)
+            ),
+        )
         promotion_gate = self.promotion_gate(candidate)
         promoted = promotion_gate.decision == "accept"
         previous_promotions = sum(
@@ -5385,6 +6182,8 @@ class PhaseDLoop:
             "training_summary": summarize_records(records),
             "generation_performance": self.last_generation_stats,
             "training_performance": self.last_training_stats,
+            "specialists_seeded": seeded,
+            "specialists": specialist_rows,
         }
         self._append_training_log(row)
         self.manifest.note_iteration(iteration)
@@ -5589,6 +6388,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=10_000,
         help="games before league play begins; early checkpoints are weak and "
         "near-identical, so an archive drawn from them adds cost, not diversity",
+    )
+    parser.add_argument(
+        "--specialists",
+        default="",
+        help="W7 specialist league, as name:share:lambda[:train_every] entries "
+        "(e.g. 'science:0.15:0.5,military:0.10:0.5'). Shares are fractions of "
+        "ALL games and sit alongside --hof-opponent-fraction in one budget; "
+        "empty (the default) is HOF-only league play with no biased search",
+    )
+    parser.add_argument(
+        "--specialist-bootstrap-games",
+        type=int,
+        default=0,
+        help="games before a specialist is seeded from the promoted general "
+        "(0 follows --hof-start-games)",
+    )
+    parser.add_argument(
+        "--specialist-floor-every",
+        type=int,
+        default=5,
+        help="iterations between collapse-floor matches against the FROZEN "
+        "general anchor; 0 disables the check",
+    )
+    parser.add_argument(
+        "--specialist-reanalysis",
+        action="store_true",
+        help="W7 S2b: re-search the positions where the bias changed the "
+        "search's own valuation at lambda=0 and route those targets to the "
+        "general, so it learns to execute attacks and not only defend them",
     )
     parser.add_argument("--cheap-sims-min", type=int, default=16)
     parser.add_argument("--cheap-sims-max", type=int, default=24)
@@ -6495,6 +7323,10 @@ def main(argv=None) -> int:
         replay_window_exponent=args.replay_window_exponent,
         replay_window_cap_games=args.replay_window_cap_games,
         hof_opponent_fraction=args.hof_opponent_fraction,
+        specialists=args.specialists,
+        specialist_bootstrap_games=args.specialist_bootstrap_games,
+        specialist_floor_every=args.specialist_floor_every,
+        specialist_reanalysis=args.specialist_reanalysis,
         hof_sampling_mode=args.hof_sampling_mode,
         hof_start_games=args.hof_start_games,
         cheap_sims_min=args.cheap_sims_min,

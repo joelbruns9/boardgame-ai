@@ -144,6 +144,14 @@ fn self_play_record_to_py(py: Python<'_>, record: self_play::GameRecord) -> PyRe
             },
         )?;
         item.set_item("policy_excluded", row.policy_excluded)?;
+        // W7 provenance: the utility this search maximised, the unshaped root
+        // it would have reported at lambda = 0, and which model owns the label.
+        item.set_item("root_value_unshaped", row.root_value_unshaped)?;
+        item.set_item("search_lambda", row.search_lambda)?;
+        item.set_item("search_victory", row.search_victory)?;
+        item.set_item("search_symmetric", row.search_symmetric)?;
+        item.set_item("target_route", row.target_route.name())?;
+        item.set_item("reanalysis", row.reanalysis)?;
         item.set_item("full_search", row.full_search)?;
         item.set_item("search_seed", row.search_seed)?;
         item.set_item("solver_value", row.solver_value)?;
@@ -252,7 +260,48 @@ fn make_self_play_config(
         max_moves,
         conflict_free_waves,
         round_robin_candidates,
+        specialist_by_net: [None, None],
     }
+}
+
+/// Resolve the four Python-facing specialist knobs into a `SpecialistSpec`.
+///
+/// A zero lambda is "no specialist", not "a specialist with no bias": the
+/// distinction matters because a spec also switches on root noise for network 1
+/// and re-routes its policy targets, and neither should happen for an archive.
+fn parse_specialist(
+    lambda: f64,
+    victory: Option<&str>,
+    symmetric: bool,
+    class_id: u8,
+) -> PyResult<Option<self_play::SpecialistSpec>> {
+    if lambda <= 0.0 {
+        if victory.is_some() {
+            return Err(PyValueError::new_err(
+                "specialist_victory given without a positive specialist_lambda",
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(name) = victory else {
+        return Err(PyValueError::new_err(
+            "a specialist with lambda > 0 must name its victory type",
+        ));
+    };
+    let spec = self_play::SpecialistSpec {
+        lambda,
+        victory: eval::VictoryClass::from_name(name)?,
+        symmetric,
+        class_id,
+    };
+    eval::LeafBias {
+        lambda: spec.lambda,
+        victory: spec.victory,
+        seat: 0,
+        symmetric: spec.symmetric,
+    }
+    .validate()?;
+    Ok(Some(spec))
 }
 
 /// Enum-valued fields cross the boundary as **declaration indices**. Python and
@@ -364,6 +413,7 @@ impl RustPuctSearch {
             double_reveal_offsets: 0,
             conflict_free_waves: false,
             round_robin_candidates: false,
+            leaf_bias: eval::LeafBias::NONE,
         };
         // A batched wave needs a batched boundary, or every leaf still crosses
         // into Python on its own and leaf_batch changes nothing (measured: 1.00x
@@ -422,6 +472,7 @@ impl RustPuctSearch {
             double_reveal_offsets: 0,
             conflict_free_waves: false,
             round_robin_candidates: false,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let root_evaluation = eval::MockEval.evaluate(&game.state)?;
         let session = tree_resumable::begin_search_from_root(&game.state, &cfg, 1, root_evaluation)?;
@@ -1100,6 +1151,7 @@ impl RustGame {
             double_reveal_offsets,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let (res, root) = tree::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -1114,6 +1166,111 @@ impl RustGame {
             res.sims,
             dig,
         ))
+    }
+
+    /// W7 S0 gate: the closed search under `MockOutlookEval` with a specialist
+    /// leaf bias.
+    ///
+    /// A separate entry point rather than four more arguments on
+    /// `closed_search`, for two reasons. The oracle differs -- `MockEval`
+    /// supplies no outlook, correctly, since nothing unbiased consumes one, and
+    /// a biased search must hard-error on a missing one rather than silently
+    /// apply no bias. And the return carries a ninth element, the unshaped root,
+    /// which every existing caller unpacks positionally.
+    ///
+    /// At `lambda = 0` this is bit-identical to `closed_search`, which is the
+    /// first half of the acceptance gate: the plumbing is inert until it is
+    /// asked for.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (sims, top_k, seed, specialist_lambda, specialist_victory,
+        specialist_seat, specialist_symmetric=false, c_puct=1.5, c_visit=50.0,
+        c_scale=0.1, force=false, puct_root=false, dirichlet_epsilon=0.0,
+        dirichlet_alpha=1.8, double_reveal_offsets=0, conflict_free_waves=false,
+        round_robin_candidates=false, forced_playout_k=0.0, resumable=false))]
+    fn closed_search_biased(
+        &self,
+        sims: usize,
+        top_k: usize,
+        seed: u64,
+        specialist_lambda: f64,
+        specialist_victory: &str,
+        specialist_seat: usize,
+        specialist_symmetric: bool,
+        c_puct: f64,
+        c_visit: f64,
+        c_scale: f64,
+        force: bool,
+        puct_root: bool,
+        dirichlet_epsilon: f64,
+        dirichlet_alpha: f64,
+        double_reveal_offsets: usize,
+        conflict_free_waves: bool,
+        round_robin_candidates: bool,
+        forced_playout_k: f64,
+        resumable: bool,
+    ) -> PyResult<(
+        usize,
+        f64,
+        f64,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<usize>,
+        usize,
+        Vec<f64>,
+        Option<f64>,
+    )> {
+        let cfg = tree::SearchConfig {
+            forced_playout_k,
+            sims,
+            top_k,
+            c_puct,
+            c_visit,
+            c_scale,
+            seed,
+            force_expand_root_chance: force,
+            puct_root,
+            dirichlet_epsilon,
+            dirichlet_alpha,
+            age_deal_samples: 0,
+            double_reveal_offsets,
+            conflict_free_waves,
+            round_robin_candidates,
+            leaf_bias: eval::LeafBias::new(
+                specialist_lambda,
+                eval::VictoryClass::from_name(specialist_victory)?,
+                specialist_seat,
+                specialist_symmetric,
+            )?,
+        };
+        let (res, dig) = if resumable {
+            let (res, arena) =
+                tree_resumable::search_closed(&self.state, &eval::MockOutlookEval, &cfg)?;
+            let mut dig = Vec::new();
+            tree_resumable::digest(&arena, &mut dig);
+            (res, dig)
+        } else {
+            let (res, root) = tree::search_closed(&self.state, &eval::MockOutlookEval, &cfg)?;
+            let mut dig = Vec::new();
+            tree::digest(&root, &mut dig);
+            (res, dig)
+        };
+        Ok((
+            res.action_index,
+            res.action_value,
+            res.root_value,
+            res.visits,
+            res.policy_target,
+            res.gumbel_topk,
+            res.sims,
+            dig,
+            res.root_value_unshaped,
+        ))
+    }
+
+    /// The mock seven-way outlook for the current state, for the Python mirror
+    /// to check itself against before any tree is built.
+    fn mock_outlook(&self) -> Vec<f64> {
+        eval::MockOutlookEval::outlook_of(&self.state).to_vec()
     }
 
     /// F4.1: arena-backed, phase-split closed search.  `leaf_batch=1` is the
@@ -1160,6 +1317,7 @@ impl RustGame {
             double_reveal_offsets,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let (res, arena) = tree_resumable::search_closed(&self.state, &eval::MockEval, &cfg)?;
         let mut dig = Vec::new();
@@ -1219,6 +1377,7 @@ impl RustGame {
             double_reveal_offsets: 0,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena) = tree_resumable::search_closed(&self.state, &evaluator, &cfg)?;
@@ -1283,6 +1442,7 @@ impl RustGame {
             double_reveal_offsets: 0,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let (res, arena, metrics) =
             tree_resumable::search_closed_batched(&self.state, &eval::MockEval, &cfg, leaf_batch)?;
@@ -1357,6 +1517,7 @@ impl RustGame {
             double_reveal_offsets: 0,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, arena, metrics) =
@@ -1430,6 +1591,7 @@ impl RustGame {
             double_reveal_offsets: 0,
             conflict_free_waves,
             round_robin_candidates,
+            leaf_bias: eval::LeafBias::NONE,
         };
         let evaluator = eval::PyEval::new(adapter);
         let (res, root) = tree::search_closed(&self.state, &evaluator, &cfg)?;
@@ -1648,6 +1810,39 @@ fn gumbel_stream(seed: u64, n: usize) -> Vec<f64> {
 
 /// `x.ln()` for each input — the gate uses it to confirm cross-runtime `ln`
 /// parity over the range `log_prior = ln(max(prior, 1e-12))` covers.
+/// W7: the specialist leaf-utility shaping, exposed so the sign convention can
+/// be pinned directly in BOTH languages rather than only inferred from a whole
+/// search's outputs.
+#[pyfunction]
+#[pyo3(signature = (value_p0, outlook, specialist_lambda, specialist_victory, specialist_seat, specialist_symmetric=false))]
+fn specialist_utility(
+    value_p0: f64,
+    outlook: Option<Vec<f64>>,
+    specialist_lambda: f64,
+    specialist_victory: &str,
+    specialist_seat: usize,
+    specialist_symmetric: bool,
+) -> PyResult<f64> {
+    let bias = eval::LeafBias::new(
+        specialist_lambda,
+        eval::VictoryClass::from_name(specialist_victory)?,
+        specialist_seat,
+        specialist_symmetric,
+    )?;
+    let outlook = match outlook {
+        None => None,
+        Some(values) => {
+            if values.len() != 7 {
+                return Err(PyValueError::new_err("outlook must have 7 classes"));
+            }
+            let mut array = [0.0f64; 7];
+            array.copy_from_slice(&values);
+            Some(array)
+        }
+    };
+    bias.shape(value_p0, outlook)
+}
+
 #[pyfunction]
 fn ln_values(xs: Vec<f64>) -> Vec<f64> {
     xs.iter().map(|&x| x.ln()).collect()
@@ -1724,6 +1919,11 @@ fn scheduler_result_to_py(
     // and which the sweep needs to size the solver pool -- could not be computed
     // at all. It is the time the scheduler spent pumping and blocking on solves.
     metrics.set_item("sched_solve_wait_ns", m.sched_solve_wait_ns)?;
+    metrics.set_item("sched_solve_pump_ns", m.sched_solve_pump_ns)?;
+    metrics.set_item("sched_solve_inline_ns", m.sched_solve_inline_ns)?;
+    // Worker-side forwards, beside the scheduler-side requests above.
+    metrics.set_item("boundary_forwards", m.boundary_forwards)?;
+    metrics.set_item("boundary_forward_rows", m.boundary_forward_rows)?;
     metrics.set_item("scheduler_ready_slot_cycles", m.scheduler_ready_slot_cycles)?;
     metrics.set_item(
         "scheduler_waiting_slot_cycles",
@@ -1813,6 +2013,11 @@ fn search_result_to_py(
         "root_outlook",
         result.root_outlook.map(|o| o.to_vec()),
     )?;
+    out.set_item("root_value_unshaped", result.root_value_unshaped)?;
+    // The network's own root policy, renormalised over the legal set. Recorded
+    // so an offline probe can tell "the search never funded this move" from
+    // "the prior never offered it" -- the two failure modes S0a has to separate.
+    out.set_item("prior", result.prior)?;
     out.set_item("completed_q", metrics.root_completed_q)?;
     out.set_item("survivors", metrics.halving_survivors.clone())?;
     out.set_item("digest", digest)?;
@@ -1845,7 +2050,9 @@ fn search_result_to_py(
     adapter, games, search_seeds, global_batch_cap, leaf_batch, sims, top_k,
     c_puct=1.5, c_visit=50.0, c_scale=0.1, force=false,
     age_deal_samples=0, inference_timeout_ms=0.0, puct_root=false,
-    double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false
+    double_reveal_offsets=0, conflict_free_waves=false, round_robin_candidates=false,
+    specialist_lambda=0.0, specialist_victory=None, specialist_seat=0,
+    specialist_symmetric=false
 ))]
 fn search_many_flat_net(
     py: Python<'_>,
@@ -1866,7 +2073,27 @@ fn search_many_flat_net(
     double_reveal_offsets: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
+    // W7 S0a: the offline probe searches the SAME position with and without a
+    // bias, so the position-search boundary has to be able to carry one.
+    specialist_lambda: f64,
+    specialist_victory: Option<String>,
+    specialist_seat: usize,
+    specialist_symmetric: bool,
 ) -> PyResult<Vec<Py<PyDict>>> {
+    let leaf_bias = match parse_specialist(
+        specialist_lambda,
+        specialist_victory.as_deref(),
+        specialist_symmetric,
+        0,
+    )? {
+        None => eval::LeafBias::NONE,
+        Some(spec) => eval::LeafBias::new(
+            spec.lambda,
+            spec.victory,
+            specialist_seat,
+            spec.symmetric,
+        )?,
+    };
     if games.is_empty() || games.len() != search_seeds.len() {
         return Err(PyValueError::new_err(
             "games and search_seeds must be non-empty and aligned",
@@ -1911,6 +2138,7 @@ fn search_many_flat_net(
                 double_reveal_offsets,
                 conflict_free_waves,
                 round_robin_candidates,
+                leaf_bias,
             };
             let session = if force {
                 tree_resumable::begin_search_from_root_forced(state, &cfg, leaf_batch, evaluation)?
@@ -2427,7 +2655,9 @@ fn self_play_many_net(
     cheap_double_reveal_offsets_p1=None, max_active_slots=0,
     conflict_free_waves=false, round_robin_candidates=false, cheap_leaf_batch=None,
     virtual_loss_root=false, cheap_conflict_free_waves=None,
-    cheap_round_robin_candidates=None))]
+    cheap_round_robin_candidates=None, specialist_lambda=0.0,
+    specialist_victory=None, specialist_symmetric=false,
+    specialist_class_id=0, specialist_net=1))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2484,7 +2714,29 @@ fn self_play_many_flat_net(
     virtual_loss_root: bool,
     cheap_conflict_free_waves: Option<bool>,
     cheap_round_robin_candidates: Option<bool>,
+    // W7: the specialist behind NETWORK 1. Network 0 is the general and never
+    // carries a bias; the `{0, 1}` net-id cap means one mixed call can hold at
+    // most one opponent class, which is exactly the rotation S1 specifies.
+    specialist_lambda: f64,
+    specialist_victory: Option<String>,
+    specialist_symmetric: bool,
+    specialist_class_id: u8,
+    // Which NETWORK the specialist is. 1 in generation, where network 0 is the
+    // learner by definition. A gate or a collapse-floor match puts its subject
+    // on network 0, and evaluating a specialist with the bonus switched off
+    // measures a different player from the one that generated the data -- so
+    // the side is a parameter rather than a constant.
+    specialist_net: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+    if specialist_net > 1 {
+        return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
+    }
+    let specialist = parse_specialist(
+        specialist_lambda,
+        specialist_victory.as_deref(),
+        specialist_symmetric,
+        specialist_class_id,
+    )?;
     let mut jobs = cooperative_jobs(
         py,
         &games,
@@ -2646,8 +2898,18 @@ fn self_play_many_flat_net(
             Some(nets) => nets[index],
             None => [0, 0],
         };
+        cfg.specialist_by_net = if specialist_net == 0 {
+            [specialist, None]
+        } else {
+            [None, specialist]
+        };
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;
+    }
+    if specialist.is_some() && per_game_nets.is_none() && specialist_net != 0 {
+        return Err(PyValueError::new_err(
+            "a specialist was configured on network 1 but no game routes it:              pass nets_p0/nets_p1, or the bias would reach no search at all",
+        ));
     }
     match (cheap_double_reveal_offsets_p0, cheap_double_reveal_offsets_p1) {
         (None, None) => {}
@@ -2708,6 +2970,8 @@ fn self_play_many_flat_net(
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("boundary metrics lock poisoned"))?
                 .clone();
+            output.metrics.boundary_forwards = counters.batches;
+            output.metrics.boundary_forward_rows = counters.rows;
             output.metrics.boundary_tokens = counters.tokens;
             output.metrics.boundary_padded_tokens = counters.padded_tokens;
             output.metrics.boundary_tokens_sq = counters.tokens_sq;
@@ -3034,6 +3298,9 @@ fn reveal_features_enabled() -> bool {
 
 #[pymodule]
 mod seven_wonders_rust {
+    #[pymodule_export]
+    use super::specialist_utility;
+
     #[pymodule_export]
     use super::set_control_features_enabled;
 

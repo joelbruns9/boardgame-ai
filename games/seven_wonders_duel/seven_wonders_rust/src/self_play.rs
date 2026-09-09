@@ -81,6 +81,51 @@ fn cheap_offsets(configured: usize, full: bool) -> usize {
     }
 }
 
+/// W7: which model may learn one move's POLICY label.
+///
+/// Deliberately separate from `policy_excluded`, which stays exactly what it
+/// was. That flag conflates three facts -- search quality (full vs cheap), which
+/// network searched, and whether anything may learn the label -- and the league
+/// needs the third split out without disturbing the first two, because a
+/// specialist's targets are kept and routed rather than dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRoute {
+    /// The general model's buffer. Ordinary self-play, and curriculum-bot moves
+    /// (imitating those bots is the point of the curriculum -- see
+    /// `buffer.archive_policy_seats`, which is deliberately narrow for exactly
+    /// this reason).
+    General,
+    /// A learning specialist's own buffer, keyed by its class id.
+    Specialist(u8),
+    /// Nobody: an archived opponent's search.
+    None,
+}
+
+impl TargetRoute {
+    pub fn name(self) -> String {
+        match self {
+            TargetRoute::General => "general".to_owned(),
+            TargetRoute::Specialist(id) => format!("specialist:{id}"),
+            TargetRoute::None => "none".to_owned(),
+        }
+    }
+}
+
+/// One specialist's identity, attached to the NETWORK it belongs to.
+///
+/// Held per net id rather than per seat because the seat rotates within an
+/// iteration (`LeagueAssignment` alternates it), while the network identity is
+/// what the lambda belongs to. The seat is resolved per move, at the only place
+/// that knows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpecialistSpec {
+    pub lambda: f64,
+    pub victory: crate::eval::VictoryClass,
+    pub symmetric: bool,
+    /// Buffer/class id, carried into every move this net searches.
+    pub class_id: u8,
+}
+
 #[derive(Clone, Debug)]
 pub struct SelfPlayConfig {
     pub game_seed: u64,
@@ -228,6 +273,62 @@ pub struct SelfPlayConfig {
     /// around 8, so the question is where the knee is, not whether it works --
     /// but that is a measurement this flag exists to enable, not to assume.
     pub virtual_loss_root: bool,
+    /// W7 S0/S1: the specialist behind each NETWORK id, or `None` for an
+    /// ordinary net. `[None, None]` -- the default -- reproduces a build
+    /// without the league exactly: every resolved `LeafBias` is
+    /// `LeafBias::NONE`, every route is the one today's `policy_excluded`
+    /// implies, and no outlook is ever demanded of an evaluator.
+    pub specialist_by_net: [Option<SpecialistSpec>; 2],
+}
+
+impl SelfPlayConfig {
+    /// The specialist owning the network that searches for `actor`, if any.
+    pub fn specialist_for(&self, actor: usize) -> Option<SpecialistSpec> {
+        self.specialist_by_net[self.net_by_player[actor] as usize]
+    }
+
+    /// The searcher's leaf bias for `actor`'s own search.
+    ///
+    /// The seat is the SEARCHER's, never the leaf actor's: when it is seat 1's
+    /// turn, seat 1's network drives the entire tree, including the leaves
+    /// where seat 0 is to move. Resolving from the leaf actor would reward the
+    /// opponent's victory type on half the leaves -- the same class of bug that
+    /// made `rust_seat_routed_flat_batch_adapter` the wrong routing for league
+    /// play.
+    pub fn leaf_bias_for(&self, actor: usize) -> crate::eval::LeafBias {
+        match self.specialist_for(actor) {
+            None => crate::eval::LeafBias::NONE,
+            Some(spec) => crate::eval::LeafBias {
+                lambda: spec.lambda,
+                victory: spec.victory,
+                seat: actor,
+                symmetric: spec.symmetric,
+            },
+        }
+    }
+
+    /// Is the network searching for `actor` one that is being TRAINED?
+    ///
+    /// Root noise and forced playouts were gated on `net_by_player == 0`
+    /// because network 1 was always a frozen archive, which must play clean:
+    /// handicapping it inflates the learner's league win rate. A LEARNING
+    /// specialist has the opposite requirement -- it needs exploration for the
+    /// same reason the learner does -- so the predicate is "this net trains",
+    /// which coincides with the old one whenever no specialist is configured.
+    pub fn net_is_training(&self, actor: usize) -> bool {
+        self.net_by_player[actor] == 0 || self.specialist_for(actor).is_some()
+    }
+
+    /// Where `actor`'s policy label may be learned.
+    pub fn target_route_for(&self, actor: usize) -> TargetRoute {
+        if self.net_by_player[actor] == 0 {
+            return TargetRoute::General;
+        }
+        match self.specialist_for(actor) {
+            Some(spec) => TargetRoute::Specialist(spec.class_id),
+            None => TargetRoute::None,
+        }
+    }
 }
 
 impl SelfPlayConfig {
@@ -283,6 +384,15 @@ impl SelfPlayConfig {
                 "full_search_fraction, draft_prior, and bot_exploration must be in [0, 1]",
             ));
         }
+        for spec in self.specialist_by_net.iter().flatten() {
+            crate::eval::LeafBias {
+                lambda: spec.lambda,
+                victory: spec.victory,
+                seat: 0,
+                symmetric: spec.symmetric,
+            }
+            .validate()?;
+        }
         for (name, value) in [
             ("c_puct", self.c_puct),
             ("c_visit", self.c_visit),
@@ -332,6 +442,30 @@ pub struct MoveRecord {
     /// scientifically read `my_scientific`, move 3 included. Nothing consumes
     /// it yet -- that loss is offline work against a buffer this produces.
     pub root_outlook: Option<Vec<f64>>,
+    /// W7: the same root mean this search would have produced at lambda = 0,
+    /// actor-relative. `None` on an unbiased search, where it equals
+    /// `root_value` by construction.
+    ///
+    /// This is the ONLY root scalar another model may bootstrap its value
+    /// target from. `root_value` above is the search's own utility -- whatever
+    /// that search was optimising -- and `value_bootstrap` blends it straight
+    /// into `value_soft` at whatever weight the run configured (cloud2 ran 0.5),
+    /// so feeding a shaped root to the general would teach it a distorted win
+    /// probability at full strength. Per MOVE, not per buffer: the general is
+    /// meant to learn value from the specialist's positions.
+    pub root_value_unshaped: Option<f64>,
+    /// Provenance of the utility this search maximised: the lambda, the victory
+    /// class it favoured, and whether it was the symmetric variant. Zero /
+    /// `None` / false is an ordinary unbiased search. Without this a buffer
+    /// cannot be audited after the fact.
+    pub search_lambda: f64,
+    pub search_victory: Option<&'static str>,
+    pub search_symmetric: bool,
+    /// Which model's buffer this move's POLICY label belongs to.
+    pub target_route: TargetRoute,
+    /// This row's targets came from a lambda-zero re-search (W7 S2b) rather
+    /// than from the game as played. Always false on the generation path.
+    pub reanalysis: bool,
     pub sims: usize,
     pub gumbel_topk: Vec<usize>,
     pub policy_excluded: bool,
@@ -1032,8 +1166,9 @@ pub fn run<E: Eval>(
             random_sims(&mut rng, cfg.cheap_sims_min, cfg.cheap_sims_max)
         };
         let search_seed = rng.next_u64() & ((1_u64 << 63) - 1);
+        let leaf_bias = cfg.leaf_bias_for(actor);
         let search_cfg = SearchConfig {
-            forced_playout_k: if full && cfg.net_by_player[actor] == 0 {
+            forced_playout_k: if full && cfg.net_is_training(actor) {
                 // Gated exactly like `dirichlet_epsilon` below, and for the same
                 // reasons. Forcing spends simulations on children PUCT declined,
                 // which is a handicap: on an archived opponent it inflates the
@@ -1065,7 +1200,7 @@ pub fn run<E: Eval>(
                 cfg.cheap_puct_root.unwrap_or(cfg.puct_root)
             },
             // Learner-only and full-search-only; see make_search_meta.
-            dirichlet_epsilon: if full && cfg.net_by_player[actor] == 0 {
+            dirichlet_epsilon: if full && cfg.net_is_training(actor) {
                 cfg.dirichlet_epsilon
             } else {
                 0.0
@@ -1079,6 +1214,7 @@ pub fn run<E: Eval>(
             ),
             conflict_free_waves: cfg.conflict_free_waves,
             round_robin_candidates: cfg.round_robin_candidates,
+            leaf_bias,
         };
         let leaf_batch = cfg
             .leaf_batch_by_player
@@ -1109,7 +1245,14 @@ pub fn run<E: Eval>(
         // search owns this: it is the only place that holds the noised priors
         // and the per-action Q the rule needs.
         let mut training = result.training_policy.unwrap_or(result.policy_target);
-        let overlay = if cfg.solve_endgames {
+        // A biased searcher does not take the solver shortcut. The mask is a
+        // proof of UNBIASED optimality, so applying it to a shaped search would
+        // delete exactly the attacking continuations the bias funded whenever
+        // they are provably a shade worse -- silently turning the specialist
+        // back into the general at every solved endgame. Specialists are
+        // sparring equipment; losing their endgame proofs costs nothing the
+        // experiment needs.
+        let overlay = if cfg.solve_endgames && !leaf_bias.is_active() {
             endgame_overlay(&state, &legal)
         } else {
             None
@@ -1141,9 +1284,15 @@ pub fn run<E: Eval>(
             action_value: result.action_value,
             net_root_value: result.net_root_value,
             root_outlook: result.root_outlook.map(|o| o.to_vec()),
+            root_value_unshaped: result.root_value_unshaped,
+            search_lambda: leaf_bias.lambda,
+            search_victory: leaf_bias.is_active().then(|| leaf_bias.victory.name()),
+            search_symmetric: leaf_bias.is_active() && leaf_bias.symmetric,
+            target_route: cfg.target_route_for(actor),
+            reanalysis: false,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
-            policy_excluded: !full,
+            policy_excluded: !full || !cfg.net_is_training(actor),
             full_search: full,
             search_seed,
             is_bot: false,
@@ -1202,6 +1351,15 @@ pub struct SchedulerMetrics {
     pub scheduler_workers: usize,
     pub max_inflight_batches: usize,
     pub batch_rows: Vec<usize>,
+    /// Forwards the evaluator WORKER actually issued, and the rows in them.
+    ///
+    /// Distinct from `global_batches`/`global_rows`, which count what the
+    /// scheduler SUBMITTED. The two are equal today because the worker services
+    /// one request per forward; they diverge the moment anything coalesces, and
+    /// conflating them would make a coalescer invisible to its own success
+    /// metric.
+    pub boundary_forwards: usize,
+    pub boundary_forward_rows: usize,
     pub boundary_tokens: usize,
     pub boundary_padded_tokens: usize,
     pub boundary_max_tokens: usize,
@@ -1279,10 +1437,35 @@ pub struct SchedulerMetrics {
     pub sched_collect_ns: u64,
     /// `pool.retire`: finishing games and building records.
     pub sched_retire_ns: u64,
-    /// Wall time the scheduler spent blocked on the solver pool -- i.e. the
-    /// stall async did NOT remove. The number that says whether more solver
-    /// threads would help.
+    /// Wall time the scheduler spent BLOCKED in `wait_one()` -- i.e. the stall
+    /// async did NOT remove. The number that says whether more solver threads
+    /// would help.
+    ///
+    /// This span used to cover the whole solver pump: harvesting completed
+    /// outcomes, resuming their slots, re-collecting ready groups and retiring
+    /// them, as well as the block. All of that is WORK the scheduler had to do
+    /// anyway -- some of it double-counted against `sched_collect_ns` -- so the
+    /// field did not mean what its own name and this comment claimed. It does
+    /// now; `sched_solve_pump_ns` carries the rest.
+    ///
+    /// It also did not survive `merge`, so on any multi-shard run it read zero
+    /// however long the scheduler actually blocked -- exactly the defect
+    /// `THROUGHPUT_LEVERS.md` §3.3 records as having happened once already.
+    /// `generation_profile.py` reports `solve_wait_share` from it, so that tool
+    /// answered "does the solver block generation?" with a guaranteed no.
     pub sched_solve_wait_ns: u64,
+    /// The whole solver pump: harvest, resume, re-collect, retire, and the
+    /// block. Kept beside the block itself so the work is still visible now
+    /// that it is no longer counted as a stall.
+    pub sched_solve_pump_ns: u64,
+    /// Solves run INLINE on a scheduler thread, i.e. with no solver pool
+    /// (`--solver-threads 0`) or after the pool has gone.
+    ///
+    /// Neither of the two counters above can see this: with no pool there is
+    /// nothing to block on, so an inline run and a fully-parallel run both
+    /// report ~zero blocking for opposite reasons. This is the cost that makes
+    /// them distinguishable.
+    pub sched_solve_inline_ns: u64,
     /// Cloning every row's states/actors/legals/net_ids into the batch vectors.
     /// Untimed until now and a prime suspect: it copies the whole batch.
     pub sched_assemble_ns: u64,
@@ -1300,6 +1483,92 @@ pub struct SchedulerResult {
 
 impl SchedulerMetrics {
     fn merge(&mut self, other: SchedulerMetrics) {
+        // COMPILE-TIME COVERAGE GUARD.
+        //
+        // `sched_solve_wait_ns` was declared, incremented and exported, and
+        // omitted from this function -- so it read zero on every multi-shard
+        // run, and `generation_profile.py` answered "does the solver block
+        // generation?" with a guaranteed no.
+        // `THROUGHPUT_LEVERS.md` §3.3 records the same defect happening once
+        // before, to a different counter. Twice is a pattern, and a test cannot
+        // catch the next one: a field added tomorrow is a field the test does
+        // not know to assert on.
+        //
+        // Destructuring `other` with NO `..` rest pattern makes the compiler
+        // the check. Add a field to `SchedulerMetrics` and this stops building
+        // until the field is handled below.
+        let SchedulerMetrics {
+            games: _,
+            moves: _,
+            simulations: _,
+            requested_nn_leaves: _,
+            unique_nn_leaves: _,
+            terminal_leaves: _,
+            collisions: _,
+            global_batches: _,
+            global_rows: _,
+            root_rows: _,
+            leaf_rows: _,
+            forced_rows: _,
+            forced_rows_by_kind: _,
+            ordinary_leaf_rows: _,
+            forced_cache_hits: _,
+            forced_rows_per_search: _,
+            fixed_support_edges: _,
+            max_batch_rows: _,
+            scheduler_cycles: _,
+            scheduler_workers: _,
+            max_inflight_batches: _,
+            batch_rows: _,
+            boundary_forwards: _,
+            boundary_forward_rows: _,
+            boundary_tokens: _,
+            boundary_padded_tokens: _,
+            boundary_max_tokens: _,
+            boundary_tokens_sq: _,
+            boundary_padded_tokens_sq: _,
+            boundary_feature_values_used: _,
+            boundary_feature_values_written: _,
+            encode_pack_ns: _,
+            queue_wait_ns: _,
+            py_call_ns: _,
+            extract_ns: _,
+            attach_ns: _,
+            payload_ns: _,
+            validate_ns: _,
+            metrics_ns: _,
+            rust_tree_ns: _,
+            rust_chance_ns: _,
+            rust_record_ns: _,
+            scatter_ns: _,
+            scheduler_ready_slot_cycles: _,
+            scheduler_waiting_slot_cycles: _,
+            scheduler_idle_slot_cycles: _,
+            scheduler_wall_ns: _,
+            live_slot_ns: _,
+            ready_slot_ns: _,
+            waiting_slot_ns: _,
+            idle_slot_ns: _,
+            max_live_slots: _,
+            max_active_slots: _,
+            batch_live_slots: _,
+            batch_submit_ns: _,
+            arena_nodes_live_peak: _,
+            arena_nodes_slot_peak: _,
+            arena_deep_bytes_slot_peak: _,
+            arena_node_struct_bytes: _,
+            wave_width_histogram: _,
+            conflict_cuts: _,
+            sched_refill_ns: _,
+            sched_collect_ns: _,
+            sched_retire_ns: _,
+            sched_solve_wait_ns: _,
+            sched_solve_pump_ns: _,
+            sched_solve_inline_ns: _,
+            sched_assemble_ns: _,
+            sched_submit_ns: _,
+            sched_wait_ns: _,
+        } = &other;
         self.games += other.games;
         self.moves += other.moves;
         self.simulations += other.simulations;
@@ -1325,6 +1594,8 @@ impl SchedulerMetrics {
         self.scheduler_workers += other.scheduler_workers;
         self.max_inflight_batches = self.max_inflight_batches.max(other.max_inflight_batches);
         self.batch_rows.extend(other.batch_rows);
+        self.boundary_forwards += other.boundary_forwards;
+        self.boundary_forward_rows += other.boundary_forward_rows;
         self.boundary_tokens += other.boundary_tokens;
         self.boundary_padded_tokens += other.boundary_padded_tokens;
         self.boundary_max_tokens = self.boundary_max_tokens.max(other.boundary_max_tokens);
@@ -1352,6 +1623,12 @@ impl SchedulerMetrics {
         self.sched_assemble_ns += other.sched_assemble_ns;
         self.sched_submit_ns += other.sched_submit_ns;
         self.sched_wait_ns += other.sched_wait_ns;
+        // These three were the defect: `sched_solve_wait_ns` was declared,
+        // incremented and exported, and omitted HERE, so it read zero on every
+        // run with more than one shard.
+        self.sched_solve_wait_ns += other.sched_solve_wait_ns;
+        self.sched_solve_pump_ns += other.sched_solve_pump_ns;
+        self.sched_solve_inline_ns += other.sched_solve_inline_ns;
         self.scheduler_ready_slot_cycles += other.scheduler_ready_slot_cycles;
         self.scheduler_waiting_slot_cycles += other.scheduler_waiting_slot_cycles;
         self.scheduler_idle_slot_cycles += other.scheduler_idle_slot_cycles;
@@ -1821,6 +2098,7 @@ fn absorb_slot_metrics(metrics: &mut SchedulerMetrics, slot: &GameSlot) {
         metrics.forced_rows_by_kind[kind] += slot.forced_rows_by_kind[kind];
     }
     metrics.forced_cache_hits += slot.forced_cache_hits;
+    metrics.sched_solve_inline_ns += slot.solve_inline_ns;
     metrics
         .forced_rows_per_search
         .extend(slot.forced_rows_per_search.iter().copied());
@@ -1901,6 +2179,9 @@ struct GameSlot {
     tree_ns: u64,
     chance_ns: u64,
     record_ns: u64,
+    /// Inline endgame solves run on this slot's scheduler thread. Absorbed into
+    /// `SchedulerMetrics::sched_solve_inline_ns`.
+    solve_inline_ns: u64,
     scatter_ns: u64,
     bot_rngs: [Rng; 2],
 }
@@ -1954,6 +2235,7 @@ impl GameSlot {
             tree_ns: 0,
             chance_ns: 0,
             record_ns: 0,
+            solve_inline_ns: 0,
             scatter_ns: 0,
             bot_rngs: [Rng::new(bot_seed), Rng::new(bot_seed)],
         };
@@ -2004,7 +2286,7 @@ impl GameSlot {
             researched: false,
             carried_overlay: None,
             search_cfg: SearchConfig {
-                forced_playout_k: if full && self.cfg.net_by_player[actor] == 0 {
+                forced_playout_k: if full && self.cfg.net_is_training(actor) {
                     // Gated exactly like `dirichlet_epsilon` below, and for the same
                     // reasons. Forcing spends simulations on children PUCT declined,
                     // which is a handicap: on an archived opponent it inflates the
@@ -2048,7 +2330,10 @@ impl GameSlot {
                 // exploration of the label space and only degrades the
                 // trajectory. Kingdomino settles both the same way
                 // (`hof_dirichlet_epsilon` / `fast_move_dirichlet_epsilon` = 0).
-                dirichlet_epsilon: if full && self.cfg.net_by_player[actor] == 0 {
+                // W7: "any net that is training", not "network 0". A learning
+                // specialist must explore for the same reason the learner does;
+                // a frozen archive still plays clean, because it has no spec.
+                dirichlet_epsilon: if full && self.cfg.net_is_training(actor) {
                     self.cfg.dirichlet_epsilon
                 } else {
                     0.0
@@ -2083,6 +2368,9 @@ impl GameSlot {
                         .cheap_round_robin_candidates
                         .unwrap_or(self.cfg.round_robin_candidates)
                 },
+                // Travels with the SESSION, via the per-move config the session
+                // clones. Not a global, and not derived from the leaf actor.
+                leaf_bias: self.cfg.leaf_bias_for(actor),
             },
         })
     }
@@ -2294,7 +2582,14 @@ impl GameSlot {
         slot_index: usize,
         pool: Option<&mut SolverPool>,
     ) -> PyResult<()> {
-        if !self.cfg.solve_endgames {
+        // A BIASED searcher does not take the solver shortcut. The endgame mask
+        // is a proof of UNBIASED optimality, so applying it to a shaped search
+        // would delete exactly the attacking continuations the bias funded
+        // whenever they are provably a shade worse -- silently turning the
+        // specialist back into the general at every solved endgame. Keyed on
+        // the bias, not on the seat or the network id, so an archived opponent
+        // on the same seat still solves.
+        if !self.cfg.solve_endgames || meta.search_cfg.leaf_bias.is_active() {
             return self.complete_move(meta, result, None);
         }
         if meta.researched {
@@ -2323,7 +2618,12 @@ impl GameSlot {
                 // silently drop the mask, which would change the targets.
             }
         }
+        // INLINE: no pool, so this runs on the scheduler thread and no
+        // blocking counter can see it. Timed here, or `--solver-threads 0`
+        // looks free for the same reason a perfectly-parallel run does.
+        let inline_started = Instant::now();
         let overlay = endgame_overlay(&self.state, &meta.legal);
+        self.solve_inline_ns += inline_started.elapsed().as_nanos() as u64;
         // The SYNCHRONOUS path needs the same fallback as `resume_after_solve`.
         // Without it `--solver-threads 0` would silently never re-search, and
         // sync and async would produce different games from the same seed --
@@ -2447,6 +2747,17 @@ impl GameSlot {
             action_value: result.action_value,
             net_root_value: result.net_root_value,
             root_outlook: result.root_outlook.map(|o| o.to_vec()),
+            root_value_unshaped: result.root_value_unshaped,
+            search_lambda: meta.search_cfg.leaf_bias.lambda,
+            search_victory: meta
+                .search_cfg
+                .leaf_bias
+                .is_active()
+                .then(|| meta.search_cfg.leaf_bias.victory.name()),
+            search_symmetric: meta.search_cfg.leaf_bias.is_active()
+                && meta.search_cfg.leaf_bias.symmetric,
+            target_route: self.cfg.target_route_for(meta.actor),
+            reanalysis: false,
             sims: result.sims,
             gumbel_topk: result.gumbel_topk,
             // Cheap searches are excluded as always, and so is anything the
@@ -2457,7 +2768,15 @@ impl GameSlot {
             // policy label is withheld, exactly as for curriculum-bot moves.
             // Kingdomino's `play_current_vs_hof_game` keeps "only current-owned
             // labels" the same way.
-            policy_excluded: !meta.full || self.cfg.net_by_player[meta.actor] != 0,
+            // W7 widened this from `net_by_player != 0` to "this net is not
+            // training". An ARCHIVE is unchanged -- it has no specialist spec,
+            // so it still drops its policy. A learning SPECIALIST keeps its
+            // targets, which the `target_route` above then sends to its own
+            // buffer instead of the learner's. The three facts this flag has
+            // always conflated (search quality, which net searched, who may
+            // learn the label) stay separate: `full` is still the first term,
+            // and eligibility for a PARTICULAR model is the route's job.
+            policy_excluded: !meta.full || !self.cfg.net_is_training(meta.actor),
             full_search: meta.full,
             search_seed: meta.search_seed,
             is_bot: false,
@@ -2505,6 +2824,16 @@ impl GameSlot {
             action_value: 0.0,
             net_root_value: 0.0,
             root_outlook: None,
+            root_value_unshaped: None,
+            search_lambda: 0.0,
+            search_victory: None,
+            search_symmetric: false,
+            // A curriculum bot's label belongs to the GENERAL model. Routing it
+            // to `None` would delete the curriculum's whole policy signal while
+            // every test still passed -- the trap `buffer.archive_policy_seats`
+            // is deliberately narrow to avoid.
+            target_route: TargetRoute::General,
+            reanalysis: false,
             sims: 0,
             gumbel_topk: Vec::new(),
             policy_excluded: self
@@ -2761,6 +3090,11 @@ pub fn run_many<E: Eval>(
                     evaluations.len()
                 )));
             }
+            // REQUESTS the scheduler submitted, not forwards the evaluator
+            // issued. Incremented here, in the shard, so nothing downstream of
+            // the worker can change it: `global_rows / global_batches` is rows
+            // per REQUEST and stays that way however the worker batches.
+            // `boundary_forwards` / `boundary_forward_rows` are the other half.
             metrics.global_batches += 1;
             metrics.global_rows += row_count;
             metrics.max_batch_rows = metrics.max_batch_rows.max(row_count);
@@ -2969,7 +3303,8 @@ pub fn run_many_pipelined(
         // Waiting on a solve while a leaf evaluation could be gathered instead
         // is precisely the stall this path exists to remove.
         if let Some(active_solver) = solver.as_mut() {
-            let solve_started = Instant::now();
+            let pump_started = Instant::now();
+            let mut blocked_ns: u64 = 0;
             loop {
                 for outcome in active_solver.harvest() {
                     let slot = match pool.slot_mut(outcome.slot) {
@@ -3018,7 +3353,12 @@ pub fn run_many_pipelined(
                 if !stuck {
                     break;
                 }
-                let Some(outcome) = active_solver.wait_one() else {
+                // The ONLY part of this pump that is a stall. Everything else
+                // in the loop is work the scheduler owed anyway.
+                let block_started = Instant::now();
+                let waited = active_solver.wait_one();
+                blocked_ns += block_started.elapsed().as_nanos() as u64;
+                let Some(outcome) = waited else {
                     break;
                 };
                 let slot = match pool.slot_mut(outcome.slot) {
@@ -3060,7 +3400,8 @@ pub fn run_many_pipelined(
                     }
                 }
             }
-            metrics.sched_solve_wait_ns += solve_started.elapsed().as_nanos() as u64;
+            metrics.sched_solve_wait_ns += blocked_ns;
+            metrics.sched_solve_pump_ns += pump_started.elapsed().as_nanos() as u64;
         }
 
         while inflight.len() < max_inflight_batches && !pending.is_empty() {

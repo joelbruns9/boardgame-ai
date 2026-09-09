@@ -163,7 +163,9 @@ def _closed_tree_ref(state, sims, seed):
     root_state.search_barrier = True
     root = mcts._make_closed_node(root_state)
     root.visits += 1
-    root.value_sum_p0 += mcts._expand_closed(root)
+    # `_expand_closed` returns `(utility, raw_value)` since W7's leaf bias; this
+    # reference runs unbiased, so the two are the same number.
+    root.value_sum_p0 += mcts._expand_closed(root)[0]
     n = max(len(root.edges), 1)
     for i in range(sims):
         mcts._descend_closed(root, forced_edge=root.edges[i % n])

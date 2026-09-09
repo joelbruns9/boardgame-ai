@@ -18,6 +18,7 @@ Targets (all actor-relative, §2):
 from __future__ import annotations
 
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -163,6 +164,31 @@ class Example:
     #: `_examples_from_rust_payload` has no game state, so rows from a Rust
     #: self-play payload are unlabelled and MASKED, never defaulted.
     control_key: tuple | None = None
+    #: W7 provenance, carried so a buffer can be audited after the fact.
+    #:
+    #: `target_route` is the route the SOURCE MOVE carried; `derived_for` is the
+    #: model this example was derived for. They are equal on every row whose
+    #: policy label survived (see `has_policy`), and differ on the rows that
+    #: contribute value labels across models -- which is the point: the general
+    #: is meant to learn value from a specialist's positions.
+    target_route: str = "general"
+    derived_for: str = "general"
+    #: The lambda and victory class of the search that produced this row, so the
+    #: shaped share of a buffer is measurable rather than assumed.
+    search_lambda: float = 0.0
+    search_victory: str | None = None
+    #: This row came from a lambda-zero re-search, not from the game as played.
+    reanalysis: bool = False
+    #: `root_value` above is this row's OWN search utility rather than a
+    #: calibrated win probability -- true only where the search that produced it
+    #: was biased AND this example is derived for the model that biased it.
+    #: `specialist.assert_no_shaped_bootstrap` reads this.
+    root_value_shaped: bool = False
+    #: The recorded move this row came from, or None for a row with no move
+    #: (reanalysis). Carried so one derivation can be PROJECTED onto another
+    #: model's view without replaying the game again -- see
+    #: `project_examples`, and `phase_d._cached_examples` for why that matters.
+    move_index: int | None = None
 
     def __post_init__(self) -> None:
         """Make the arrays read-only as well as the fields.
@@ -557,6 +583,49 @@ def _joint7_class(winner: int | None, victory: VictoryType | None, actor: int) -
     return offset if winner == actor else 3 + offset
 
 
+GENERAL_ROUTE = "general"
+
+
+def move_target_route(move) -> str:
+    """The route a move carries, tolerating records written before W7."""
+
+    return getattr(move, "target_route", None) or GENERAL_ROUTE
+
+
+def bootstrap_root_value(move) -> tuple[float | None, bool]:
+    """The root scalar that may be blended into a `value_soft` target.
+
+    **Always the UNSHAPED root, for every model including the one whose lambda
+    produced it.** An earlier version handed the owner its own shaped root, on
+    the plan's reading that "`root_value` is consumed only by the model whose
+    lambda produced it". That is right for the search's own arithmetic and wrong
+    here, because the thing `value_soft` trains is a W/D/L PROBABILITY head:
+
+    * `collate` turns the scalar into `(win, draw, loss)` mass, so a shaped root
+      of 0.8 against an unshaped 0.4 teaches P(win) = 0.9 where the position is
+      worth 0.7;
+    * that head is what `search.py::_evaluate` reads back as
+      `wdl[0] - wdl[2]`, so the specialist would enter its next search with the
+      bonus already inside the value and the leaf bias would add it a second
+      time;
+    * and `root_value_unshaped` is computed FROM those same net outputs, so a
+      distorted head makes even the "unshaped" root the general bootstraps from
+      untrustworthy. The leak would reach the general by the one channel the
+      quarantine exists to close.
+
+    There is no separate utility head. Until there is, the shaped root stays a
+    recorded quantity for auditing and for S2b's selection, and trains nothing.
+
+    Returns `(value, shaped)`; `shaped` is now always False, and
+    `specialist.assert_no_shaped_bootstrap` enforces that as an invariant rather
+    than trusting this function to keep holding it.
+    """
+
+    if not getattr(move, "search_lambda", 0.0):
+        return move.root_value, False
+    return getattr(move, "root_value_unshaped", None), False
+
+
 def is_fast_search_move(move) -> bool:
     """A cheap-search move: searched, but below the full simulation range.
 
@@ -708,6 +777,7 @@ def examples_from_record(
     *,
     record_fast_moves: bool = False,
     on_derived: Callable[[GameDerivationStats], None] | None = None,
+    derived_for: str = GENERAL_ROUTE,
 ) -> list[Example]:
     """Replay one game (through the VERIFIED buffer.replay path — mask hashes,
     actors, chance log, trajectory and final digests all checked) and emit an
@@ -730,6 +800,11 @@ def examples_from_record(
 
     staged: list[tuple[Example, int]] = []  # (example, actor)
     maximum_track = 0
+    # W7: one record yields the general's examples and each specialist's
+    # examples separately. Value and outcome labels are shared across models --
+    # they are properties of the game -- while the POLICY label and the
+    # bootstrapped `value_soft` are routed.
+    _ = derived_for
     # Empty except in league games. The archive's seat still contributes value
     # labels as an explicit mixed-policy experiment; only its policy is masked.
     archive_seats = archive_policy_seats(record.agents)
@@ -779,14 +854,22 @@ def examples_from_record(
                 features,
                 legal,
                 policy,
-                not move.policy_excluded and actor not in archive_seats,
+                (
+                    not move.policy_excluded
+                    and actor not in archive_seats
+                    and move_target_route(move) == derived_for
+                ),
                 actor,
-                move.root_value,
+                *bootstrap_root_value(move),
                 move.root_outlook,
                 move.solver_value,
                 move.solver_regime == "exact",
                 move.i,
                 control,
+                move_target_route(move),
+                getattr(move, "search_lambda", 0.0),
+                getattr(move, "search_victory", None),
+                bool(getattr(move, "reanalysis", False)),
             )
         )
 
@@ -829,11 +912,16 @@ def examples_from_record(
         has_policy,
         actor,
         root_value,
+        root_value_shaped,
         root_outlook,
         solver_value,
         solver_exact,
         move_index,
         control,
+        route,
+        search_lambda,
+        search_victory,
+        reanalysis,
     ) in staged:
         if game.final_scores is not None:
             mine, theirs = game.final_scores[actor], game.final_scores[1 - actor]
@@ -868,6 +956,13 @@ def examples_from_record(
                 sci_final_opp=sci_counts[1 - actor] / 6.0,
                 game_key=record.seed,
                 iteration=record.iteration,
+                target_route=route,
+                derived_for=derived_for,
+                search_lambda=search_lambda,
+                search_victory=search_victory,
+                reanalysis=reanalysis,
+                root_value_shaped=root_value_shaped,
+                move_index=move_index,
             )
         )
     return examples
@@ -911,7 +1006,7 @@ def _rust_chance_log(record: GameRecord) -> list[tuple[int, list[int]]]:
 
 
 def _examples_from_rust_payload(
-    record: GameRecord, payload: dict
+    record: GameRecord, payload: dict, derived_for: str = GENERAL_ROUTE
 ) -> tuple[list[Example], GameDerivationStats]:
     """Turn one packed Rust replay into the exact public ``Example`` objects."""
 
@@ -1011,9 +1106,14 @@ def _examples_from_rust_payload(
                 features=features[token_start:token_stop],
                 legal=legal,
                 policy_target=policy,
-                has_policy=not move.policy_excluded and actor not in archive_seats,
+                has_policy=(
+                    not move.policy_excluded
+                    and actor not in archive_seats
+                    and move_target_route(move) == derived_for
+                ),
                 value_class=_actor_value_class(record.winner, actor),
-                root_value=move.root_value,
+                root_value=bootstrap_root_value(move)[0],
+                root_value_shaped=bootstrap_root_value(move)[1],
                 root_outlook=move.root_outlook,
                 solver_value=move.solver_value,
                 solver_exact=move.solver_regime == "exact",
@@ -1029,6 +1129,12 @@ def _examples_from_rust_payload(
                 sci_final_opp=science_counts[1 - actor] / 6.0,
                 game_key=record.seed,
                 iteration=record.iteration,
+                target_route=move_target_route(move),
+                derived_for=derived_for,
+                search_lambda=getattr(move, "search_lambda", 0.0),
+                search_victory=getattr(move, "search_victory", None),
+                reanalysis=bool(getattr(move, "reanalysis", False)),
+                move_index=move.i,
             )
         )
 
@@ -1051,6 +1157,7 @@ def derive_records_rust(
     *,
     record_fast_moves: bool = False,
     batch_games: int = 32,
+    derived_for: str = GENERAL_ROUTE,
 ) -> list[tuple[list[Example], GameDerivationStats]]:
     """Rust-default replay/encode path, aligned one result per input game.
 
@@ -1136,16 +1243,76 @@ def derive_records_rust(
         if len(payloads) != len(batch):
             raise ReplayMismatchError("Rust derivation returned the wrong game count")
         output.extend(
-            _examples_from_rust_payload(record, payload)
+            _examples_from_rust_payload(record, payload, derived_for)
             for record, payload in zip(batch, payloads)
         )
     return output
 
 
-def examples_from_records(records, *, record_fast_moves: bool = False) -> list[Example]:
+def project_examples(examples, record, derived_for: str):
+    """One game's examples, re-labelled for a DIFFERENT model, without replaying.
+
+    Derivation is expensive -- replay, encode, vectorize -- and it is the same
+    work for every model: the rows a game yields, their tokens and their outcome
+    labels do not depend on who is training. Only four fields do, and all four
+    are functions of the source move:
+
+    * ``has_policy`` -- eligibility AND the route matching this model;
+    * ``root_value`` / ``root_value_shaped`` -- the value-leak contract;
+    * ``derived_for`` -- provenance.
+
+    Deriving the whole replay window once per model instead would triple a real
+    run's replay cost and its example-cache footprint at two specialists, for
+    rows that differ in four scalars.
+
+    Reanalysis rows carry no source move and are already labelled for their
+    model, so they pass through untouched.
+    """
+
+    if not examples:
+        return []
+    by_index = {move.i: move for move in record.moves}
+    archive_seats = archive_policy_seats(record.agents)
+    projected = []
+    for example in examples:
+        if example.move_index is None or example.reanalysis:
+            projected.append(example)
+            continue
+        move = by_index.get(example.move_index)
+        if move is None:
+            raise ReplayMismatchError(
+                f"example references move {example.move_index}, which the record "
+                "does not contain"
+            )
+        root_value, shaped = bootstrap_root_value(move)
+        projected.append(
+            dataclasses.replace(
+                example,
+                has_policy=(
+                    not move.policy_excluded
+                    and move.actor not in archive_seats
+                    and move_target_route(move) == derived_for
+                ),
+                root_value=root_value,
+                root_value_shaped=shaped,
+                derived_for=derived_for,
+            )
+        )
+    return projected
+
+
+def examples_from_records(
+    records, *, record_fast_moves: bool = False, derived_for: str = GENERAL_ROUTE
+) -> list[Example]:
     out: list[Example] = []
     for record in records:
-        out.extend(examples_from_record(record, record_fast_moves=record_fast_moves))
+        out.extend(
+            examples_from_record(
+                record,
+                record_fast_moves=record_fast_moves,
+                derived_for=derived_for,
+            )
+        )
     return out
 
 

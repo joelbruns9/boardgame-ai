@@ -10,7 +10,7 @@
 
 use crate::chance::{self, ChanceSpec};
 use crate::codec::{decode_action, legal_action_indices};
-use crate::eval::{terminal_value_p0, Eval, Outlook};
+use crate::eval::{terminal_value_p0, Eval, LeafBias, Outlook};
 use crate::rng::Rng;
 use crate::state::{GameState, Phase};
 use pyo3::exceptions::PyValueError;
@@ -264,31 +264,51 @@ fn descend<E: Eval>(
     eval: &E,
     rng: &mut Rng,
     c_puct: f64,
-) -> PyResult<(f64, Option<Outlook>)> {
+    bias: &LeafBias,
+) -> PyResult<Backup> {
     if node.terminal {
-        let v = terminal_value_p0(&node.state);
+        let raw = terminal_value_p0(&node.state);
+        // Exact, not predicted: a finished game knows how it ended.
+        let outlook = Some(crate::eval::terminal_outlook_p0(&node.state));
+        let v = bias.shape(raw, outlook)?;
         node.visits += 1;
         node.value_sum_p0 += v;
-        // Exact, not predicted: a finished game knows how it ended.
-        return Ok((v, Some(crate::eval::terminal_outlook_p0(&node.state))));
+        return Ok(Backup { shaped: v, raw, outlook });
     }
     if node.edges.is_empty() {
-        let (v, outlook) = node.expand(eval)?;
+        let (raw, outlook) = node.expand(eval)?;
+        let v = bias.shape(raw, outlook)?;
         node.visits += 1;
         node.value_sum_p0 += v;
-        return Ok((v, outlook));
+        return Ok(Backup { shaped: v, raw, outlook });
     }
     let edge_idx = forced.unwrap_or_else(|| node.select(c_puct));
     let child_idx = closed_child(node, edge_idx, rng);
-    let (v, outlook) = {
+    let backup = {
         let child = &mut *node.edges[edge_idx].children[child_idx].1.node;
-        descend(child, None, eval, rng, c_puct)?
+        descend(child, None, eval, rng, c_puct, bias)?
     };
     node.edges[edge_idx].visits += 1;
-    node.edges[edge_idx].value_sum_p0 += v;
+    node.edges[edge_idx].value_sum_p0 += backup.shaped;
     node.visits += 1;
-    node.value_sum_p0 += v;
-    Ok((v, outlook))
+    node.value_sum_p0 += backup.shaped;
+    Ok(backup)
+}
+
+/// One simulation's result: the utility the tree backs up, the UNSHAPED value
+/// the same leaf carried, and its outlook.
+///
+/// The two scalars are separate recorded quantities, not one derived from the
+/// other. Reconstructing the unshaped root by subtracting
+/// `lambda * root_outlook` afterwards would be exact only if the value sum and
+/// the outlook sum ran over the same visit set, and nothing guarantees that: a
+/// leaf whose evaluator supplied no outlook contributes to one and not the
+/// other. Accumulating both directly costs one f64 per simulation.
+#[derive(Clone, Copy, Debug)]
+pub struct Backup {
+    pub shaped: f64,
+    pub raw: f64,
+    pub outlook: Option<Outlook>,
 }
 
 #[cfg(test)]
@@ -350,7 +370,7 @@ pub fn closed_tree_fixed<E: Eval>(
     let mut rng = Rng::new(seed);
     let n_edges = root.edges.len().max(1);
     for i in 0..sims {
-        descend(&mut root, Some(i % n_edges), eval, &mut rng, c_puct)?;
+        descend(&mut root, Some(i % n_edges), eval, &mut rng, c_puct, &LeafBias::NONE)?;
     }
     Ok(root)
 }
@@ -418,6 +438,17 @@ pub struct SearchConfig {
     /// instead of a virtual-loss approximation of it. The taper is a consequence
     /// of the invariant, not a configured schedule.
     pub conflict_free_waves: bool,
+    /// W7 S0: the searching agent's specialist leaf-utility bias.
+    ///
+    /// `LeafBias::NONE` -- the default everywhere -- is bit-identical to a build
+    /// without this field: `shape` returns its argument untouched and no
+    /// outlook is ever demanded. It sits on the CONFIG rather than a global
+    /// because a config is built per move, per searcher, in
+    /// `self_play::GameSlot::make_search_meta`, which is the only place that
+    /// knows whose search this is. Deriving it from the leaf actor instead
+    /// would reproduce the routing bug that made
+    /// `rust_seat_routed_flat_batch_adapter` the wrong boundary for league play.
+    pub leaf_bias: LeafBias,
 }
 
 /// Root prior over the legal set, renormalised. Edge priors are already
@@ -478,6 +509,14 @@ pub struct SearchResult {
     /// collapsing is identical to collapsing at each leaf and averaging -- the
     /// scalar backup already computes it. This exists to be RECORDED.
     pub root_outlook: Option<[f64; 7]>,
+    /// W7: the same root mean recomputed with lambda = 0, root-actor relative.
+    ///
+    /// `root_value` above keeps its meaning -- the search's own utility,
+    /// whatever that search was optimising -- and is consumed only by the model
+    /// whose lambda produced it. This is the quantity every OTHER model's
+    /// `value_soft` may bootstrap from. `None` when the search carried no bias,
+    /// where the two are the same number by construction.
+    pub root_value_unshaped: Option<f64>,
 }
 
 /// Actor-relative view of a player-0 outlook. Its own inverse.
@@ -560,7 +599,11 @@ fn force_expand_root<E: Eval>(root: &mut Node, eval: &E, cfg: &SearchConfig) -> 
                 .apply_with_chance(&action, &outcomes)
                 .expect("enumerated outcome must be valid");
             let mut child_node = Node::make(child_state);
-            let value_p0 = eval.evaluate(&child_node.state)?.value_p0;
+            let child_leaf = eval.evaluate(&child_node.state)?;
+            // The seeded value is what the edge's probability-weighted Q reads,
+            // so it is the searcher's UTILITY and carries the bias like every
+            // other leaf value in the tree.
+            let value_p0 = cfg.leaf_bias.shape(child_leaf.value_p0, child_leaf.outlook_p0)?;
             child_node.visits = 1;
             child_node.value_sum_p0 = value_p0;
             edge.children.push((
@@ -649,6 +692,7 @@ fn puct_root<E: Eval>(
     root_value: f64,
     legal: Vec<usize>,
     root_leaf_outlook: Option<Outlook>,
+    raw_root_value_p0: f64,
 ) -> PyResult<(SearchResult, Node)> {
     let n = root.edges.len();
     let mut rng = Rng::new(cfg.seed);
@@ -666,10 +710,16 @@ fn puct_root<E: Eval>(
     // whole point of the vector is that its marginal reproduces the scalar.
     let mut outlook_sum: Outlook = root_leaf_outlook.unwrap_or([0.0; 7]);
     let mut outlook_visits: u32 = u32::from(root_leaf_outlook.is_some());
+    // Seeded exactly as the shaped root sum is (`root.value_sum_p0` already
+    // holds the root's own expansion), so the two means run over the same set.
+    let mut unshaped_sum = raw_root_value_p0;
+    let mut unshaped_visits: u32 = 1;
     for _ in 0..cfg.sims {
         let forced = forced_playout_edge(&root, cfg);
-        let (_, outlook) = descend(&mut root, forced, eval, &mut rng, cfg.c_puct)?;
-        if let Some(o) = outlook {
+        let backup = descend(&mut root, forced, eval, &mut rng, cfg.c_puct, &cfg.leaf_bias)?;
+        unshaped_sum += backup.raw;
+        unshaped_visits += 1;
+        if let Some(o) = backup.outlook {
             for k in 0..7 {
                 outlook_sum[k] += o[k];
             }
@@ -730,7 +780,7 @@ fn puct_root<E: Eval>(
         action_index: legal[best],
         action_value: completed[best],
         root_value: sign * root.value_p0(),
-        net_root_value: root_value,
+        net_root_value: sign * raw_root_value_p0,
         visits,
         policy_target,
         training_policy,
@@ -744,6 +794,10 @@ fn puct_root<E: Eval>(
         // different actors are summing the same question.
         root_outlook: mean_outlook(outlook_sum, outlook_visits)
             .map(|o| outlook_for_actor(o, root.actor)),
+        root_value_unshaped: cfg
+            .leaf_bias
+            .is_active()
+            .then(|| sign * unshaped_sum / unshaped_visits as f64),
     };
     Ok((result, root))
 }
@@ -765,9 +819,14 @@ pub fn search_closed<E: Eval>(
             "cannot search a terminal or action-less root",
         ));
     }
-    let (root_value_p0, root_leaf_outlook) = root.expand(eval)?;
+    let (raw_root_value_p0, root_leaf_outlook) = root.expand(eval)?;
+    // The root's own expansion is a leaf like any other: the tree's mean is a
+    // mean of UTILITIES, so it carries the bias too.
+    let root_value_p0 = cfg.leaf_bias.shape(raw_root_value_p0, root_leaf_outlook)?;
     root.visits += 1;
     root.value_sum_p0 += root_value_p0;
+    let mut unshaped_sum = raw_root_value_p0;
+    let mut unshaped_visits: u32 = 1;
     // W4 accumulation, at the ROOT only: nothing reads an interior node's
     // outlook, and a per-node field would grow every serialized tree for it.
     let mut outlook_sum: Outlook = [0.0; 7];
@@ -782,12 +841,26 @@ pub fn search_closed<E: Eval>(
         force_expand_root(&mut root, eval, cfg)?;
     }
     let sign = if root.actor == 0 { 1.0 } else { -1.0 };
-    let root_value = sign * root_value_p0;
+    // `net_root_value` reports the NETWORK's raw opinion, so it stays unshaped
+    // whatever the searcher was optimising.
+    let root_value = sign * raw_root_value_p0;
+    // ... but the fallback Q for an unvisited action must live on the same
+    // scale as every visited action's Q, which is the shaped scale.
+    let root_utility = sign * root_value_p0;
     let n = root.edges.len();
     let legal: Vec<usize> = root.legal.clone();
 
     if cfg.puct_root {
-        return puct_root(root, eval, cfg, sign, root_value, legal, root_leaf_outlook);
+        return puct_root(
+            root,
+            eval,
+            cfg,
+            sign,
+            root_utility,
+            legal,
+            root_leaf_outlook,
+            raw_root_value_p0,
+        );
     }
 
     // Gumbel keys (one per legal action, in sorted order) then the per-edge
@@ -810,7 +883,7 @@ pub fn search_closed<E: Eval>(
     let mut q_hat: Vec<Option<f64>> = vec![None; n];
     let mut visits: Vec<u32> = vec![0; n];
     let completed_q = |j: usize, q_hat: &[Option<f64>]| -> f64 {
-        q_hat[j].or(initial_q[j]).unwrap_or(root_value)
+        q_hat[j].or(initial_q[j]).unwrap_or(root_utility)
     };
 
     let mut candidates: Vec<usize> = (0..n).collect();
@@ -838,8 +911,11 @@ pub fn search_closed<E: Eval>(
                 if sims_used >= budget {
                     break 'outer;
                 }
-                let (_, outlook) = descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct)?;
-                if let Some(o) = outlook {
+                let backup =
+                    descend(&mut root, Some(j), eval, &mut rng, cfg.c_puct, &cfg.leaf_bias)?;
+                unshaped_sum += backup.raw;
+                unshaped_visits += 1;
+                if let Some(o) = backup.outlook {
                     for k in 0..7 {
                         outlook_sum[k] += o[k];
                     }
@@ -902,6 +978,10 @@ pub fn search_closed<E: Eval>(
         sims: sims_used,
         root_outlook: mean_outlook(outlook_sum, outlook_visits)
             .map(|o| outlook_for_actor(o, root.actor)),
+        root_value_unshaped: cfg
+            .leaf_bias
+            .is_active()
+            .then(|| sign * unshaped_sum / unshaped_visits as f64),
     };
     Ok((result, root))
 }

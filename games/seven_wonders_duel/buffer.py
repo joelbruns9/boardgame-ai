@@ -137,6 +137,43 @@ class MoveRecord:
     #: checkpoint without W4's head. Recorded, not yet consumed: the loss that
     #: trains against it is offline work against buffers this produces.
     root_outlook: list[float] | None = None
+    #: W7: the same root mean under ``lambda = 0``, actor-relative, or ``None``
+    #: when the search carried no bias (where it equals ``root_value``).
+    #:
+    #: ``root_value`` keeps its meaning -- the search's own utility, whatever it
+    #: was optimising -- and only the model whose lambda produced it may consume
+    #: it. Everything else must bootstrap from this instead, because
+    #: ``--value-bootstrap`` blends the root straight into ``value_soft`` at
+    #: whatever weight the run configured (cloud2 ran 0.5), so a shaped root
+    #: would teach the general a distorted win probability at full strength.
+    #:
+    #: A separately ACCUMULATED sum, not ``root_value - lambda * root_outlook``:
+    #: the bias is additive per leaf, but the outlook mean runs over its own
+    #: visit set (leaves without an outlook contribute to one sum and not the
+    #: other), so the subtraction is exact only by coincidence.
+    root_value_unshaped: float | None = None
+    #: W7 provenance: the utility this search maximised.  ``search_lambda`` is
+    #: 0.0 and ``search_victory`` ``None`` on every ordinary search, which is
+    #: also what every record written before W7 reads as.
+    search_lambda: float = 0.0
+    search_victory: str | None = None
+    search_symmetric: bool = False
+    #: Which model's buffer this move's POLICY label belongs to: ``"general"``,
+    #: ``"specialist:<id>"``, or ``"none"``.
+    #:
+    #: Deliberately NOT a replacement for ``policy_excluded``.  That flag
+    #: conflates three separate facts -- search quality (full vs cheap), which
+    #: network searched, and whether anything may learn the label -- and its
+    #: consumers (``is_fast_search_move``, ``reply_targets``, the archive-name
+    #: exclusion, the action-policy loss, the example cache) read it for
+    #: different ones.  This adds the fourth fact rather than merging any of
+    #: them.  Records written before W7 carry no route and default to
+    #: ``"general"``, which is what they were.
+    target_route: str = "general"
+    #: This row's targets came from a lambda-zero re-search (W7 S2b) rather than
+    #: from the game as played, so its share of a buffer can be capped and
+    #: measured.
+    reanalysis: bool = False
     sims: int = 0
     mode: str = "simulator"
     gumbel_topk: tuple[int, ...] | None = None
@@ -278,6 +315,15 @@ def archive_policy_seats(agents: dict[str, str]) -> frozenset[int]:
     # An archive assigned to a bot-controlled seat never evaluated a move, and
     # `_tag_league_opponents` records that as `league_assignment_used=false`.
     if agents.get("league_assignment_used") != "true":
+        return frozenset()
+    # W7: a learning SPECIALIST is not an archive. Its policy targets are kept
+    # and routed to its own buffer (`MoveRecord.target_route`), so excluding its
+    # seat here would delete the very labels the specialist trains on -- the
+    # same failure mode this predicate's narrowness exists to avoid for the
+    # curriculum bots. An archived checkpoint carries no route and is excluded
+    # exactly as before.
+    route = agents.get("opponent_route", "none")
+    if route.startswith("specialist:"):
         return frozenset()
     name = agents.get("league_assignment")
     if name is None:
@@ -701,6 +747,28 @@ def replay(record: GameRecord, on_state=None) -> GameState:
 # --- JSONL serialization ----------------------------------------------------
 
 
+def _specialist_fields(move: MoveRecord) -> dict:
+    """The W7 provenance keys, empty for an ordinary unbiased search.
+
+    Omitted when inert for the same reason ``_solver_fields`` is: emitting them
+    unconditionally would change the bytes -- and so the source digest -- of
+    records whose content is identical, invalidating the Phase D example cache
+    for fields that carry no information.
+    """
+
+    fields: dict = {}
+    if move.search_lambda:
+        fields["search_lambda"] = move.search_lambda
+        fields["search_victory"] = move.search_victory
+        fields["search_symmetric"] = move.search_symmetric
+        fields["root_value_unshaped"] = move.root_value_unshaped
+    if move.target_route != "general":
+        fields["target_route"] = move.target_route
+    if move.reanalysis:
+        fields["reanalysis"] = True
+    return fields
+
+
 def _solver_fields(move: MoveRecord) -> dict:
     """The endgame-solver keys for one move, empty when it was never solved."""
 
@@ -741,7 +809,7 @@ def to_json_line(record: GameRecord) -> str:
             # change the bytes -- and so the source digest -- of records whose
             # content is identical, invalidating the example cache for a field
             # that carries no information.
-            _solver_fields(move) | {
+            _solver_fields(move) | _specialist_fields(move) | {
                 "i": move.i,
                 "actor": move.actor,
                 "action": move.action,
@@ -820,6 +888,14 @@ def from_json_line(line: str) -> GameRecord:
                 # `.get`, not `[...]`: every buffer written before W4 lacks the
                 # key, and those files stay readable.
                 root_outlook=move.get("root_outlook"),
+                # W7 provenance; absent on every record written before it, and
+                # on every unbiased search since.
+                root_value_unshaped=move.get("root_value_unshaped"),
+                search_lambda=move.get("search_lambda", 0.0),
+                search_victory=move.get("search_victory"),
+                search_symmetric=move.get("search_symmetric", False),
+                target_route=move.get("target_route", "general"),
+                reanalysis=move.get("reanalysis", False),
                 sims=move["sims"],
                 mode=move["mode"],
                 gumbel_topk=tuple(move["gumbel_topk"])

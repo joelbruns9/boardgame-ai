@@ -57,7 +57,7 @@ from .data import (
 )
 from .encoder import encode
 from .engine import Action, ActionUse, apply_action
-from .game import ChanceKind, GameState, Phase
+from .game import ChanceKind, GameState, Phase, VictoryType
 from .inference import Evaluator
 from .portable_rng import PortableRng
 from .pool import (
@@ -362,6 +362,117 @@ def _terminal_value_p0(state: GameState) -> float:
     return 1.0 if state.winner == 0 else -1.0
 
 
+#: `dataset.JOINT7_CLASSES` order: p0 civil/science/military, p1's three, draw.
+VICTORY_OFFSETS = {"civilian": 0, "scientific": 1, "military": 2}
+_TERMINAL_OFFSETS = {
+    VictoryType.CIVILIAN: 0,
+    VictoryType.SCIENTIFIC: 1,
+    VictoryType.MILITARY: 2,
+}
+
+
+def _terminal_outlook_p0(state: GameState) -> list[float]:
+    """The EXACT seven-way outlook of a finished game, in player-0 terms.
+
+    Mirrors ``eval.rs::terminal_outlook_p0`` and ``dataset._joint7_class``: no
+    winner is a draw, and a SHARED civilian finish is a draw too -- it is the
+    tie-break class, not a civilian win.
+    """
+
+    out = [0.0] * 7
+    offset = _TERMINAL_OFFSETS.get(state.victory_type)
+    if offset is None or state.winner is None:
+        out[6] = 1.0
+        return out
+    out[offset if state.winner == 0 else 3 + offset] = 1.0
+    return out
+
+
+def _actor_outlook_to_p0(outlook, actor: int) -> list[float] | None:
+    """Actor-relative outlook -> player-0 terms; its own inverse.
+
+    Mirrors ``eval.rs::outlook_to_p0``: SWAP the two triples when the evaluated
+    actor is player 1, exactly as negating the scalar does, and for the same
+    reason -- sums across leaves with different actors otherwise add two
+    different questions together. The draw class is its own mirror.
+    """
+
+    if outlook is None:
+        return None
+    values = [float(x) for x in outlook]
+    if len(values) != 7:
+        raise ValueError(f"outlook has {len(values)} classes, expected 7")
+    if actor == 0:
+        return values
+    return values[3:6] + values[0:3] + [values[6]]
+
+
+@dataclass(frozen=True, slots=True)
+class LeafBias:
+    """W7 S0: the specialist's leaf-utility bias -- the Python reference for
+    ``eval.rs::LeafBias``, which is what production actually runs.
+
+    ``seat`` is the SEARCHER's seat, never the leaf actor's. `Outlook` and the
+    utility are both player-0 relative while "my victory type" is
+    specialist-relative, so writing ``+ lambda * outlook[my_class]`` with a
+    specialist-relative index rewards the opponent's win whenever the specialist
+    sits on seat 1:
+
+        seat 0:  utility_p0 = value_p0 + lambda * outlook_p0[p0_<type>_win]
+        seat 1:  utility_p0 = value_p0 - lambda * outlook_p0[p1_<type>_win]
+
+    ``symmetric`` also penalises conceding the type. It is seat-INDEPENDENT in
+    p0 terms, which is exactly why it is a mirror-player rather than an
+    attacker, and why it is off by default.
+    """
+
+    lambda_: float = 0.0
+    victory: str = "scientific"
+    seat: int = 0
+    symmetric: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.lambda_) or self.lambda_ < 0.0:
+            raise ValueError("specialist lambda must be finite and non-negative")
+        if self.seat not in (0, 1):
+            raise ValueError("specialist seat must be 0 or 1")
+        if self.victory not in VICTORY_OFFSETS:
+            raise ValueError(f"unknown specialist victory type {self.victory!r}")
+
+    @property
+    def active(self) -> bool:
+        return self.lambda_ > 0.0
+
+    def shape(self, value_p0: float, outlook) -> float:
+        """Leaf value -> the searcher's utility.
+
+        A missing outlook under a live lambda is a hard error, never a silent
+        zero bias: a treatment that reaches some leaves and not others measures
+        nothing.
+        """
+
+        if not self.active:
+            return value_p0
+        if outlook is None:
+            raise ValueError(
+                "a specialist search (lambda > 0) reached a leaf with no "
+                "outlook; a biased search requires an evaluator with a W4 "
+                "outlook head"
+            )
+        offset = VICTORY_OFFSETS[self.victory]
+        own = self.seat * 3 + offset
+        other = (1 - self.seat) * 3 + offset
+        bonus = (
+            self.lambda_ * (outlook[own] - outlook[other])
+            if self.symmetric
+            else self.lambda_ * outlook[own]
+        )
+        return value_p0 + bonus if self.seat == 0 else value_p0 - bonus
+
+
+NO_BIAS = LeafBias()
+
+
 # --------------------------------------------------------------------------
 # Workstream 9: one idea, many buckets
 #
@@ -616,6 +727,14 @@ class SearchResult:
     # only the Gumbel-selected action's entry; a caller that plays a different
     # action (evaluation plays argmax(policy_target)) needs that action's Q.
     completed_q: dict
+    #: W7: the same root mean this search would have produced at ``lambda = 0``,
+    #: root-actor relative, or ``None`` when the search carried no bias (where
+    #: the two are the same number by construction).
+    #:
+    #: ``root_value`` keeps its meaning -- the search's own utility, whatever it
+    #: was optimising -- and only the model whose lambda produced it may consume
+    #: that. This is what any OTHER model's ``value_soft`` may bootstrap from.
+    root_value_unshaped: float | None = None
     training_policy: dict | None = None
     """The distribution to RECORD, when it differs from `policy_target`.
 
@@ -694,6 +813,31 @@ class SearchConfig:
     extremely peaked, dumping nearly all the noise mass on one arbitrary action
     instead of spreading a mild perturbation across the root.
     """
+
+    specialist_lambda: float = 0.0
+    """W7 S0: leaf-utility bias toward ``specialist_victory``. Zero is off, and
+    a zero-lambda search is bit-identical to a build without the field.
+
+    The bias widens the utility scale to ``[-1-lambda, 1+lambda]``, and PUCT's
+    ``Q + c_puct * P * sqrt(N)/(1+n)`` is not scale invariant, so a nonzero
+    lambda makes exploration relatively cheaper.
+
+    This applies to a GUMBEL search too. ``_sigma`` min-max rescales completed Q
+    at the ROOT, so the root's own halving is scale free -- but every interior
+    node still selects by PUCT on the raw utility, so the tree underneath is
+    affected exactly as a PUCT root's is.
+
+    Left explicit rather than silently compensated: rescaling ``c_puct`` with
+    lambda would fold two changes into one flag and make a training A/B
+    uninterpretable.
+    """
+
+    specialist_victory: str = "scientific"
+    specialist_seat: int = 0
+    """The SEARCHER's seat. See ``LeafBias`` for why this cannot be derived
+    from the leaf actor."""
+
+    specialist_symmetric: bool = False
 
     wonder_group_selection: bool = False
     """Workstream 9 mechanism 2: pick the Wonder first, then the burial target.
@@ -812,14 +956,47 @@ class GumbelMCTS:
         self.config = config or SearchConfig()
         self.rng = PortableRng(self.config.seed)
         self.closed_nodes_created = 0
+        self.bias = LeafBias(
+            lambda_=self.config.specialist_lambda,
+            victory=self.config.specialist_victory,
+            seat=self.config.specialist_seat,
+            symmetric=self.config.specialist_symmetric,
+        )
+        # The lambda-zero root mean, accumulated over the SAME leaves the shaped
+        # sum runs over rather than reconstructed by subtracting
+        # `lambda * root_outlook` -- the two sums have different visit sets
+        # whenever a leaf carries no outlook, so the subtraction is not exact.
+        self._unshaped_sum = 0.0
+        self._unshaped_visits = 0
 
     # ---- shared -----------------------------------------------------------
 
-    def _evaluate(self, state: GameState) -> tuple[float, dict]:
-        """(value_p0, priors dict over legal indices) from the net."""
+    def _leaf(self, state: GameState) -> tuple[float, dict, list | None]:
+        """``(value_p0, priors, outlook_p0)`` from whatever ``_evaluate`` is.
+
+        ``_evaluate`` is monkeypatched by several harnesses, and a two-tuple
+        return is still valid there: it means "this evaluator has no outlook",
+        which is exactly what the unbiased search has always assumed. Under a
+        live lambda the missing outlook then fails loudly in ``LeafBias.shape``
+        rather than silently applying no bias.
+        """
+
+        out = self._evaluate(state)
+        if len(out) == 3:
+            return out
+        value_p0, priors = out
+        return value_p0, priors, None
+
+    def _evaluate(self, state: GameState):
+        """(value_p0, priors dict over legal indices, outlook_p0) from the net.
+
+        The outlook is W4's seven-way winner x victory-type distribution,
+        canonicalised to player 0 exactly as the scalar is, or ``None`` for a
+        checkpoint without the hierarchical head.
+        """
 
         if state.phase is Phase.COMPLETE:
-            return _terminal_value_p0(state), {}
+            return _terminal_value_p0(state), {}, _terminal_outlook_p0(state)
         actor = state_actor(state)
         legal = legal_action_indices(state)
         evaluation = self.evaluator.evaluate(
@@ -828,6 +1005,7 @@ class GumbelMCTS:
         value_actor = float(evaluation.wdl[0] - evaluation.wdl[2])
         value_p0 = value_actor if actor == 0 else -value_actor
         priors = {index: float(p) for index, p in zip(legal, evaluation.policy)}
+        outlook = _actor_outlook_to_p0(evaluation.hier_joint7, actor)
 
         if self.config.tactical_extension > 0:
             # Priors stay the node's own; only the VALUE is re-asked after the
@@ -835,7 +1013,11 @@ class GumbelMCTS:
             extended = tactical_continuation(state, self.config.tactical_extension)
             if extended is not None:
                 if extended.phase is Phase.COMPLETE:
-                    return _terminal_value_p0(extended), priors
+                    return (
+                        _terminal_value_p0(extended),
+                        priors,
+                        _terminal_outlook_p0(extended),
+                    )
                 other = state_actor(extended)
                 deep = self.evaluator.evaluate(
                     [encode(extended.observation(other))],
@@ -843,7 +1025,11 @@ class GumbelMCTS:
                 )[0]
                 deep_actor = float(deep.wdl[0] - deep.wdl[2])
                 value_p0 = deep_actor if other == 0 else -deep_actor
-        return value_p0, priors
+                # The VALUE moved to the extended position, so the outlook must
+                # follow it. Keeping the shallow one would price the utility of
+                # one position against the victory-type odds of another.
+                outlook = _actor_outlook_to_p0(deep.hier_joint7, other)
+        return value_p0, priors, outlook
 
     def _sigma(self, completed: dict, max_visits: int) -> dict:
         """Gumbel-AlphaZero sigma over MIN-MAX NORMALISED completed Q values.
@@ -898,9 +1084,13 @@ class GumbelMCTS:
         root_state = state.clone()
         root_state.search_barrier = True
         root = self._make_closed_node(root_state)
-        root_value_p0 = self._expand_closed(root)
+        root_value_p0, raw_root_value_p0 = self._expand_closed(root)
         root.visits += 1
         root.value_sum_p0 += root_value_p0
+        # Seeded exactly as the shaped root sum is, so the two means run over
+        # the same set of leaves.
+        self._unshaped_sum = raw_root_value_p0
+        self._unshaped_visits = 1
         if self.config.force_expand_root_chance and not root.terminal:
             self._force_expand_root(root)
         return root
@@ -1043,8 +1233,14 @@ class GumbelMCTS:
         child.samples += 1
         return child.node
 
-    def _expand_closed(self, node: ClosedNode) -> float:
-        value_p0, priors = self._evaluate(node.state)
+    def _expand_closed(self, node: ClosedNode) -> tuple[float, float]:
+        """``(utility_p0, raw_value_p0)`` for one newly expanded leaf.
+
+        The tree backs up the UTILITY -- the shaped value -- and the caller
+        accumulates the raw one, because they are separate recorded quantities.
+        """
+
+        value_p0, priors, outlook = self._leaf(node.state)
         if not node.terminal:
             node.edges = [
                 _Edge(
@@ -1056,7 +1252,7 @@ class GumbelMCTS:
                 )
                 for index in node.legal
             ]
-        return value_p0
+        return self.bias.shape(value_p0, outlook), value_p0
 
     def _select_closed(self, node: ClosedNode, source: "_Edge | None" = None) -> _Edge:
         """PUCT over ``node.edges``.
@@ -1313,14 +1509,18 @@ class GumbelMCTS:
         """
 
         if node.terminal:
-            value = _terminal_value_p0(node.state)
+            raw = _terminal_value_p0(node.state)
+            # Exact, not predicted: a finished game knows how it ended.
+            value = self.bias.shape(raw, _terminal_outlook_p0(node.state))
             node.visits += 1
             node.value_sum_p0 += value
+            self._accumulate_unshaped(raw)
             return value
         if not node.edges:  # unexpanded leaf
-            value = self._expand_closed(node)
+            value, raw = self._expand_closed(node)
             node.visits += 1
             node.value_sum_p0 += value
+            self._accumulate_unshaped(raw)
             return value
         edge = (
             forced_edge
@@ -1356,6 +1556,16 @@ class GumbelMCTS:
                 entry[0] += 1
                 entry[1] += value
         return value
+
+    def _accumulate_unshaped(self, raw: float) -> None:
+        """One simulation's lambda-zero leaf value, at the leaf base cases.
+
+        Exactly one call per simulation -- the recursion terminates at a leaf --
+        so this runs over the same visit set the root's shaped sum does.
+        """
+
+        self._unshaped_sum += raw
+        self._unshaped_visits += 1
 
     def _add_dirichlet_noise(self, root: ClosedNode) -> None:
         """Blend Dirichlet noise into the root edges' priors, in place.
@@ -1492,9 +1702,12 @@ class GumbelMCTS:
                     chance_outcomes=outcomes,
                 )
                 child_node = self._make_closed_node(clone)
-                value_p0, _ = self._evaluate(clone)
+                value_p0, _, outlook = self._leaf(clone)
                 child_node.visits = 1
-                child_node.value_sum_p0 = value_p0
+                # The seeded value is what the edge's probability-weighted Q
+                # reads, so it is the searcher's utility like every other value
+                # in the tree.
+                child_node.value_sum_p0 = self.bias.shape(value_p0, outlook)
                 edge.children[key] = _Child(probability=probability, node=child_node)
             if balanced is not None:
                 edge.close_fixed_support()
@@ -1510,9 +1723,13 @@ class GumbelMCTS:
         root_state = state.clone()
         root_state.search_barrier = True
         root = self._make_closed_node(root_state)
-        root_value_p0 = self._expand_closed(root)
+        root_value_p0, raw_root_value_p0 = self._expand_closed(root)
         root.visits += 1
         root.value_sum_p0 += root_value_p0
+        # Seeded exactly as the shaped root sum is, so the two means run over
+        # the same set of leaves.
+        self._unshaped_sum = raw_root_value_p0
+        self._unshaped_visits = 1
         if self.config.force_expand_root_chance and not root.terminal:
             self._force_expand_root(root)
         sign = 1.0 if root.actor == 0 else -1.0
@@ -1575,6 +1792,11 @@ class GumbelMCTS:
             mode="closed",
             completed_q=completed,
             training_policy=training_policy,
+            root_value_unshaped=(
+                sign * self._unshaped_sum / self._unshaped_visits
+                if self.bias.active
+                else None
+            ),
         )
 
     # ---- open mode --------------------------------------------------------
@@ -1592,7 +1814,7 @@ class GumbelMCTS:
             node.actor = actor
         legal = legal_action_indices(world)  # per-world masking
         if node.priors is None:
-            value, priors = self._evaluate(world)
+            value, priors, _ = self._leaf(world)
             node.priors = priors  # cached at first expansion (open-loop flaw)
             node.visits += 1
             node.value_sum_p0 += value
@@ -1631,7 +1853,12 @@ class GumbelMCTS:
         from .pool import resample_hidden
 
         root = OpenNode()
-        root_value_p0, priors = self._evaluate(state)
+        if self.bias.active:
+            # Open mode is a diagnostic path with no forced-expansion or
+            # cached-leaf machinery; rather than ship a second, untested
+            # shaping surface, refuse. Production self-play is closed mode.
+            raise ValueError("specialist_lambda is only supported in closed mode")
+        root_value_p0, priors, _ = self._leaf(state)
         root.priors = priors
         root.actor = state_actor(state)
         root.visits += 1
@@ -1850,9 +2077,9 @@ def expand_exhaustive(
         return
     if depth is not None and depth <= 0:
         if node.visits == 0:
-            value_p0, _ = mcts._evaluate(node.state)
+            value_p0, _, outlook = mcts._leaf(node.state)
             node.visits = 1
-            node.value_sum_p0 = value_p0
+            node.value_sum_p0 = mcts.bias.shape(value_p0, outlook)
         return
     if not node.edges:
         mcts._expand_closed(node)
