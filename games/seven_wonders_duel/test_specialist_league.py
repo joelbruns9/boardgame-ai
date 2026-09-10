@@ -1314,6 +1314,93 @@ def test_coalesced_reanalysis_agrees_in_distribution(tmp_path: Path):
     assert_no_shaped_bootstrap(coalesced, GENERAL_ROUTE)
 
 
+def test_coalesced_reanalysis_survives_a_batched_puct_generation_config(
+    tmp_path: Path,
+):
+    """The config the laptop soak actually runs, which killed it at iteration 3.
+
+    Generation batches its PUCT root under virtual loss. Reanalysis passed that
+    `leaf_batch` through but not `virtual_loss_root`, and Rust refused:
+    "puct_root with leaf_batch > 1 selects the root under virtual loss".
+
+    The fix is NOT to pass virtual loss along. Reanalysis pins `leaf_batch = 1`
+    because the batching it needs is across positions, not within one, and
+    virtual loss would distort the root visit distribution that IS its target.
+    Every earlier coalesced test ran at the default `leaf_batch = 1`, so none of
+    them could see this.
+    """
+
+    loop, records = _biased_run(
+        tmp_path,
+        specialist_reanalysis=True,
+        selfplay_search_mode="puct",
+        cheap_search_mode="gumbel",
+        eval_search_mode="puct",
+        leaf_batch=6,
+        virtual_loss_root=True,
+        forced_playout_k=1.0,
+    )
+    loop.config.reanalysis_backend = "rust_coalesced"
+    rows, stats = loop.reanalysis_for_general(records, 21, general_inflow=400)
+    if stats["positions"] == 0:
+        pytest.skip("no position in this sample moved the valuation far enough")
+    assert len(rows) == stats["examples"]
+    for example in rows:
+        assert example.policy_target.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_coalesced_reanalysis_does_not_inherit_forced_playouts(tmp_path: Path):
+    """`forced_playout_k` is a PROCESS GLOBAL, applied to any full move whose
+    net is training under a PUCT root -- which is exactly what a reanalysis job
+    is. Forcing spends simulations on children PUCT declined; that is
+    exploration for self-play, and here the root's visit distribution is the
+    TARGET. The per-position backends hardcode 0.0, so inheriting it would make
+    the backends disagree systematically and silently.
+
+    Asserted through the global rather than the targets: the value must also be
+    RESTORED, or reanalysis would quietly disable forcing for the generation
+    that follows it.
+    """
+
+    import seven_wonders_rust as swr
+
+    loop, records = _biased_run(
+        tmp_path,
+        specialist_reanalysis=True,
+        selfplay_search_mode="puct",
+        cheap_search_mode="gumbel",
+        eval_search_mode="puct",
+        forced_playout_k=1.0,
+    )
+    loop.config.reanalysis_backend = "rust_coalesced"
+
+    seen: list[float] = []
+    real = swr.self_play_many_flat_net
+
+    def spy(*args, **kwargs):
+        seen.append(swr.forced_playout_k())
+        return real(*args, **kwargs)
+
+    swr.set_forced_playout_k(1.0)
+    original = swr.self_play_many_flat_net
+    try:
+        swr.self_play_many_flat_net = spy  # type: ignore[assignment]
+        _rows, stats = loop.reanalysis_for_general(
+            records, 21, general_inflow=400
+        )
+    finally:
+        swr.self_play_many_flat_net = original  # type: ignore[assignment]
+
+    if stats["positions"] == 0:
+        pytest.skip("no position in this sample moved the valuation far enough")
+    assert seen, "the coalesced backend never reached the scheduler"
+    assert seen[0] == 0.0, f"reanalysis searched with forcing at {seen[0]}"
+    assert swr.forced_playout_k() == 1.0, (
+        "forcing was not restored; the next generation pass would run without it"
+    )
+    swr.set_forced_playout_k(0.0)
+
+
 def test_coalesced_reanalysis_is_deterministic(tmp_path: Path):
     """A resume must re-derive the same targets, so the same call must repeat.
 

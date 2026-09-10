@@ -945,6 +945,26 @@ class PhaseDConfig:
     force_root_chance: bool = True
     age_deal_samples: int = 32
     cheap_double_reveal_offsets: int = 0
+    double_reveal_offsets: int = 0
+    """Offsets per first-reveal stratum on pure double card-reveal edges, FULL
+    searches. 0 is exhaustive.
+
+    Separate from the cheap knob because for years only cheap moves were capped:
+    full moves carry the training targets, and the approximation had not been
+    gated for them. `CHANCE_ENUMERATION_PLAN.md` Step 2 has since measured it
+    over 600 searches -- at X=3, Q MAE 1.6e-4, action disagreement 4.8%, regret
+    0.007 -- and its verdict is that "approximation quality is not the blocker".
+
+    Why this is worth doing at all: double reveals are 54.5% of ALL forced
+    chance children (3,784 edges averaging 55 children each), and forced rows
+    were 35.5% of every network row in the laptop soak. The extremes are not the
+    cost; the unremarkable double reveal is.
+
+    STRATIFIED, not truncated -- every hidden card appears exactly X times in
+    first position and X times in second, weights summing to 1 -- so probability
+    mass is preserved. The documented residual risk is that the single worst
+    pair is retained only at a random subset's rate (47% at X=3).
+    """
     """Balanced double-reveal support on CHEAP generation moves only.
 
     Requires ``generation_backend='rust'``: the Python generator does not force
@@ -1312,6 +1332,12 @@ class PhaseDConfig:
             raise ValueError("age_deal_samples must be in [0, 32]")
         if self.cheap_double_reveal_offsets < 0:
             raise ValueError("cheap_double_reveal_offsets must be non-negative")
+        if self.double_reveal_offsets < 0:
+            raise ValueError("double_reveal_offsets must be non-negative")
+        if self.double_reveal_offsets and self.generation_backend != "rust":
+            raise ValueError(
+                "double_reveal_offsets requires generation_backend='rust'"
+            )
         if self.cheap_double_reveal_offsets and self.generation_backend != "rust":
             # The Python generation path builds its SearchConfig in `_search_move`
             # without force expansion at all, so capping there is not merely
@@ -4253,6 +4279,7 @@ class PhaseDLoop:
             cheap_double_reveal_offsets=(
                 self.config.cheap_double_reveal_offsets
             ),
+            double_reveal_offsets=self.config.double_reveal_offsets,
             max_inflight_batches=self.config.rust_max_inflight_batches,
             scheduler_workers=self.config.rust_scheduler_workers,
             max_active_slots=self.config.rust_slots,
@@ -5019,7 +5046,15 @@ class PhaseDLoop:
                 top_k=self.config.top_k,
                 force=self.config.force_root_chance,
                 puct_root=puct_root,
-                leaf_batch=self.config.leaf_batch,
+                # 1, NOT `--leaf-batch`. Three reasons, and the first is fatal:
+                # a PUCT root above 1 needs `virtual_loss_root`, which this call
+                # does not pass, so inheriting a batched generation config
+                # crashed the run at iteration 3. It should not pass it either:
+                # virtual loss distorts the root visit distribution, and that
+                # distribution IS the reanalysis target. And it buys nothing --
+                # the throughput here comes from coalescing ACROSS positions
+                # (91 rows/forward measured), not from batching within one.
+                leaf_batch=1,
                 global_batch_cap=self.config.rust_global_batch_cap,
                 scheduler_workers=self.config.rust_scheduler_workers,
                 max_active_slots=self.config.reanalysis_slots,
@@ -7069,6 +7104,18 @@ def build_parser() -> argparse.ArgumentParser:
         "it puts most of the noise mass on one arbitrary move.",
     )
     parser.add_argument(
+        "--double-reveal-offsets",
+        type=int,
+        default=0,
+        help="offsets per first-reveal stratum on pure double card-reveal edges "
+        "for FULL searches (0 = exhaustive). Double reveals are 54.5%% of all "
+        "forced chance children and forced rows were 35.5%% of every network "
+        "row, so this is the largest single throughput lever in the search. "
+        "X=3 is the value CHANCE_ENUMERATION_PLAN.md's Step 2 measurement "
+        "favours; the construction is stratified, so probability mass is "
+        "preserved rather than truncated.",
+    )
+    parser.add_argument(
         "--cheap-double-reveal-offsets",
         type=int,
         default=0,
@@ -7704,6 +7751,7 @@ def main(argv=None) -> int:
         dirichlet_epsilon=args.dirichlet_epsilon,
         dirichlet_alpha=args.dirichlet_alpha,
         cheap_double_reveal_offsets=args.cheap_double_reveal_offsets,
+        double_reveal_offsets=args.double_reveal_offsets,
         anchor_gate_every_promotions=args.anchor_gate_every_promotions,
         anchor_games=args.anchor_games,
         anchor_every_iterations=args.anchor_every_iterations,

@@ -25,8 +25,8 @@
 #
 # WHAT CHANGED, AND WHY IT IS THE POINT. The first soak (2026-09-09, killed by a
 # Windows reboot at iteration 8) passed ~50 fewer flags than the cloud launcher
-# assembles, and several were whole MECHANISMS rather than values: virtual-loss
-# leaf batching, the pooled-readout/reply-head architecture, Dirichlet noise,
+# assembles, and several were whole MECHANISMS rather than values: the
+# pooled-readout/reply-head architecture, Dirichlet noise,
 # forced playouts, the value bootstrap, the self-anchor, curriculum annealing
 # and the gate-side scheduler geometry. A long run of a configuration the box
 # will not use is worth less than a short run of the one it will. Diff this
@@ -91,10 +91,16 @@ $a = @(
     "--dirichlet-alpha", "1.8",
     # KataGo forced playouts; needs a PUCT root, and is inert without one.
     "--forced-playout-k", "1.0",
-    # Leaf batching under virtual loss. A DIFFERENT root algorithm, and on full
-    # moves the root's visit distribution IS the policy target -- so this is
-    # here because the box runs it, not because it is free.
-    "--leaf-batch", "6",
+    # 1, not 6. Leaf batching and the coalescer fill the same forward pass, and
+    # the coalescer does it from INDEPENDENT slots, exactly. Within-tree
+    # batching is the approximate version: it needs virtual loss at a PUCT root,
+    # and on full moves the root's visit distribution IS the policy target.
+    # Measured here: --leaf-batch 6 delivered a wave width of 3.33 with 75,643
+    # conflict cuts, while batch size came overwhelmingly from slot count.
+    "--leaf-batch", "1",
+    # INERT for generation at leaf-batch 1 (Rust gates it on leaf_batch > 1),
+    # but --eval-leaf-batch below is refused without it, because evaluation runs
+    # a PUCT root.
     "--virtual-loss-root",
     # The cheap root is Gumbel and batches by conflict-free waves instead. The
     # waves/round-robin pair is mandatory: without it every wave is cut back to
@@ -112,6 +118,10 @@ $a = @(
     "--top-k", "16",
     "--age-deal-samples", "32",
     "--cheap-double-reveal-offsets", "3",
+    # The same cap on FULL searches, which carry the training targets. Double
+    # reveals are 54.5% of all forced chance children; forced rows were 35.5% of
+    # every network row in the first soak. Stratified, not truncated.
+    "--double-reveal-offsets", "3",
 
     # ---- Training.
     "--train-steps", "100",

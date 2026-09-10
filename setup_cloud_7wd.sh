@@ -124,6 +124,13 @@
 #                         search.
 #     SPECIALIST_BOOTSTRAP_GAMES=0 SPECIALIST_FLOOR_EVERY=5
 #     SPECIALIST_REANALYSIS=0
+#   DOUBLE_REVEAL_OFFSETS=3  offsets per first-reveal stratum on pure double
+#                         card-reveal edges, FULL searches. Double reveals are
+#                         54.5% of ALL forced chance children, and forced rows
+#                         were 35.5% of every network row -- the largest single
+#                         throughput lever in the search. Stratified, not
+#                         truncated: probability mass is preserved. 0 restores
+#                         exhaustive expansion.
 #     REANALYSIS_BACKEND=rust_coalesced REANALYSIS_SLOTS=256
 #                         Pinned rather than inherited: both were measured on a
 #                         LAPTOP 3070 (2539 -> 45 ms/position), and a default
@@ -320,6 +327,12 @@ REPLAY_WINDOW_EXPONENT="${REPLAY_WINDOW_EXPONENT:-0.6}"
 TEMPERATURE_FLOOR="${TEMPERATURE_FLOOR:-0.35}"
 TEMPERATURE_ANNEAL_MOVES="${TEMPERATURE_ANNEAL_MOVES:-30}"
 CHEAP_DOUBLE_REVEAL_OFFSETS="${CHEAP_DOUBLE_REVEAL_OFFSETS:-3}"
+# The same cap on FULL searches, which was gated off for years because those
+# carry the training targets. CHANCE_ENUMERATION_PLAN.md Step 2 measured the
+# approximation over 600 searches and found X=3 dominates X=2 on every quality
+# metric (Q MAE 1.6e-4, action disagreement 4.8%, regret 0.007); its verdict is
+# that "approximation quality is not the blocker".
+DOUBLE_REVEAL_OFFSETS="${DOUBLE_REVEAL_OFFSETS:-3}"
 GATE_SIMS="${GATE_SIMS:-64}"
 OPPONENT_FRACTION="${OPPONENT_FRACTION:-0}"
 
@@ -424,7 +437,21 @@ RUST_SCHEDULER_WORKERS="${RUST_SCHEDULER_WORKERS:-4}"
 # It changes ONLY the code-identity refusal. Weights, buffer, games ledger and
 # every schedule position carry on exactly as a normal resume.
 ALLOW_RESUME_CODE_DRIFT="${ALLOW_RESUME_CODE_DRIFT:-0}"
-LEAF_BATCH="${LEAF_BATCH:-6}"
+# 1, not 6. Leaf batching and the cross-shard coalescer exist to fill the same
+# forward pass, and the coalescer -- which postdates this default -- fills it
+# from INDEPENDENT slots, exactly, with no algorithmic change. Within-tree
+# batching is the approximate version of the same thing: it needs virtual loss
+# at a PUCT root, and on full moves the root's visit distribution IS the policy
+# target. It was also never swept, unlike RUST_SLOTS. Measured on a laptop 3070:
+# --leaf-batch 6 delivered a realized wave width of 3.33 with 75,643 conflict
+# cuts, while batch size came overwhelmingly from slot count.
+#
+# Fill the GPU with SLOTS (swept) rather than with leaf batches (not swept).
+LEAF_BATCH="${LEAF_BATCH:-1}"
+# Kept at 1 even so: it is INERT for generation at LEAF_BATCH=1 (Rust gates it
+# on `leaf_batch > 1`), and EVAL_LEAF_BATCH below is refused without it, because
+# evaluation runs a PUCT root. Setting it to 0 makes the launch invalid five
+# stages after the decision.
 VIRTUAL_LOSS_ROOT="${VIRTUAL_LOSS_ROOT:-1}"
 # The cheap path batches under conflict-free waves instead: exact rather than a
 # virtual-loss approximation. 16 matches top_k so round one is never the
@@ -1119,6 +1146,7 @@ TRAIN_CMD=(
   --temperature-floor "$TEMPERATURE_FLOOR"
   --temperature-anneal-moves "$TEMPERATURE_ANNEAL_MOVES"
   --cheap-double-reveal-offsets "$CHEAP_DOUBLE_REVEAL_OFFSETS"
+  --double-reveal-offsets "$DOUBLE_REVEAL_OFFSETS"
   --gate-sims "$GATE_SIMS"
   --derive-backend rust
   # Explicit 0, not omitted: the parser DEFAULTS this to 0.15, so leaving it out

@@ -121,7 +121,7 @@ two is visible.
   --intervention-window-games 20000 `
   --replay-window-cap-games 40000 `
   --workers 8 --process-workers 16 --pack-threads 0 `
-  --leaf-batch 6 --virtual-loss-root --eval-leaf-batch 16 `
+  --leaf-batch 1 --virtual-loss-root --eval-leaf-batch 16 `
   --cheap-leaf-batch 16 --cheap-conflict-free-waves --cheap-round-robin-candidates `
   --example-cache-gb 40 `
   --memory-budget-gb 0 --vram-budget-gb 0 --memory-headroom-gb 2 `
@@ -133,7 +133,7 @@ two is visible.
   --min-buffer-positions 200000 `
   --replay-window-coefficient 1000 --replay-window-exponent 0.6 `
   --temperature-floor 0.35 --temperature-anneal-moves 30 `
-  --cheap-double-reveal-offsets 3 `
+  --cheap-double-reveal-offsets 3 --double-reveal-offsets 3 `
   --derive-backend rust `
   --opponent-fraction 0
 ```
@@ -765,6 +765,46 @@ rows/s against 3,781 at batch-128. The win has to come from batching leaves
 ACROSS positions, which is what `rust_coalesced` does: each position becomes a
 one-move job (`stop_after_moves = 1`) on the ordinary self-play scheduler, so
 their leaves fill the same batches generation's do.
+
+### `--double-reveal-offsets`
+
+**Default:** `0` (exhaustive). **Evidence favours `3`.**
+
+Offsets per first-reveal stratum on pure double card-reveal edges, for **FULL**
+searches. The cheap counterpart is `--cheap-double-reveal-offsets`; the two were
+gated separately for years because full moves carry the training targets and the
+approximation had not been quality-gated for them.
+
+**Why it is the largest throughput lever in the search.** Across all roots,
+forced chance children break down as:
+
+| edge kind | edges | children | share |
+| --- | ---: | ---: | ---: |
+| **card_reveal + card_reveal** | 3,784 | 208,244 | **54.5%** |
+| card_reveal | 10,989 | 86,072 | 22.5% |
+| cc + great_library_draw | 98 | 50,970 | 13.3% |
+| others | | 36,960 | 9.7% |
+
+The cost is not in the extremes -- the 900-child Great Library edges are 13.3%
+across 98 edges, while the unremarkable double reveal is 54.5% of everything.
+And forced rows were **35.5% of every network row** in the laptop soak
+(`forced_rows` 228,743 of `leaf_rows` 643,737).
+
+Measured on all-full searches after the gate was lifted: X=3 retains 69% of
+forced rows, X=2 67%, X=1 63%, against exhaustive.
+
+**Stratified, not truncated.** Every hidden card appears exactly X times in
+first position and X times in second, weights summing to exactly 1, with offsets
+drawn from a domain-separated seed rather than the search RNG. Probability mass
+is preserved, which is why catastrophe coverage largely survives -- the
+documented residual is that the single worst pair is retained only at a random
+subset's rate (47% at X=3).
+
+**X=3, not X=2.** `CHANCE_ENUMERATION_PLAN.md` Step 2 measured 600 searches:
+X=3 dominates X=2 on every quality metric (Q MAE 1.6e-4 vs 2.1e-4, action
+disagreement 4.8% vs 6.5%, regret 0.007 vs 0.013, KL 0.097 vs 0.125) while the
+throughput sweep cannot separate them. X=2 was the plan's original guess, never
+an empirically selected optimum.
 
 ### `--reanalysis-slots`
 

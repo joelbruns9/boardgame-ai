@@ -213,6 +213,7 @@ fn make_self_play_config(
     dirichlet_alpha: f64,
     age_deal_samples: usize,
     cheap_double_reveal_offsets: usize,
+    double_reveal_offsets: usize,
     max_moves: usize,
     conflict_free_waves: bool,
     round_robin_candidates: bool,
@@ -253,6 +254,7 @@ fn make_self_play_config(
         age_deal_samples_by_player: None,
         cheap_double_reveal_offsets_by_player: None,
         cheap_double_reveal_offsets,
+        double_reveal_offsets,
         bot_by_player: [None, None],
         net_by_player: [0, 0],
         bot_exploration: 0.0,
@@ -1669,6 +1671,7 @@ impl RustGame {
             1.8,
             age_deal_samples,
             cheap_double_reveal_offsets,
+            0, // double_reveal_offsets: this entry point caps cheap moves only
             max_moves,
             conflict_free_waves,
             round_robin_candidates,
@@ -1738,6 +1741,7 @@ impl RustGame {
             1.8,
             age_deal_samples,
             cheap_double_reveal_offsets,
+            0, // double_reveal_offsets: this entry point caps cheap moves only
             max_moves,
             conflict_free_waves,
             round_robin_candidates,
@@ -2369,6 +2373,9 @@ fn cooperative_jobs(
                 dirichlet_alpha,
                 age_deal_samples,
                 cheap_double_reveal_offsets,
+                // Set per job below, like `stop_after_moves`: `cooperative_jobs`
+                // serves two entry points and only the flat one exposes it.
+                0, // double_reveal_offsets
                 max_moves,
                 conflict_free_waves,
                 round_robin_candidates,
@@ -2673,7 +2680,7 @@ fn self_play_many_net(
     cheap_round_robin_candidates=None, specialist_lambda=0.0,
     specialist_victory=None, specialist_symmetric=false,
     specialist_class_id=0, specialist_net=1, inference_wait_ms=0.0,
-    inference_coalesce=true, stop_after_moves=0))]
+    inference_coalesce=true, stop_after_moves=0, double_reveal_offsets=0))]
 fn self_play_many_flat_net(
     py: Python<'_>,
     adapter: Py<PyAny>,
@@ -2755,6 +2762,9 @@ fn self_play_many_flat_net(
     // W7 S2b drives reanalysis through here as one-move jobs so a few hundred
     // independent searches share this boundary's batches.
     stop_after_moves: usize,
+    // Offsets on pure double card-reveal edges for FULL searches; 0 is
+    // exhaustive. The cheap counterpart is `cheap_double_reveal_offsets`.
+    double_reveal_offsets: usize,
 ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
     if specialist_net > 1 {
         return Err(PyValueError::new_err("specialist_net must be 0 or 1"));
@@ -2934,6 +2944,7 @@ fn self_play_many_flat_net(
         cfg.bot_exploration = bot_exploration;
         cfg.bot_policy_iterations = bot_policy_iterations;
         cfg.stop_after_moves = stop_after_moves;
+        cfg.double_reveal_offsets = double_reveal_offsets;
     }
     if specialist.is_some() && per_game_nets.is_none() && specialist_net != 0 {
         return Err(PyValueError::new_err(

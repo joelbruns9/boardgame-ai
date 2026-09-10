@@ -73,11 +73,25 @@ pub(crate) fn resolve_leaf_batch(cfg: &SelfPlayConfig, actor: usize, full: bool)
     }
 }
 
-fn cheap_offsets(configured: usize, full: bool) -> usize {
+/// Double-reveal offsets for one move, by search kind.
+///
+/// Was `cheap_offsets`, which returned 0 for every full move -- the cap was
+/// cheap-only because the full path produces training targets and the
+/// approximation had not been quality-gated for them. It has been since
+/// (`CHANCE_ENUMERATION_PLAN.md` Step 2, 600 searches): at X=3 the Q MAE is
+/// 1.6e-4, action disagreement 4.8% and regret 0.007, and the plan's verdict is
+/// that "approximation quality is not the blocker".
+///
+/// The construction is STRATIFIED, not truncated: every hidden card appears
+/// exactly X times in first position and X times in second, and the weights sum
+/// to exactly 1. That is why catastrophe coverage survives capping -- the
+/// documented residual is that the single worst pair is retained only at a
+/// random subset's rate (47% at X=3), not that mass goes missing.
+fn double_reveal_offsets_for(full_offsets: usize, cheap_offsets: usize, full: bool) -> usize {
     if full {
-        0
+        full_offsets
     } else {
-        configured
+        cheap_offsets
     }
 }
 
@@ -225,6 +239,10 @@ pub struct SelfPlayConfig {
     /// Step 3). Values large enough to retain the whole outcome space are
     /// no-ops, resolved per edge.
     pub cheap_double_reveal_offsets: usize,
+    /// Offsets on pure double card-reveal edges for FULL searches; 0 is
+    /// exhaustive. Separate from the cheap knob because the two paths were
+    /// gated separately for years -- full moves carry the training targets.
+    pub double_reveal_offsets: usize,
     /// Per-seat override, for the seat-mirrored search-strength arena: it must
     /// be possible to play capped against exhaustive with one shared net.
     pub cheap_double_reveal_offsets_by_player: Option<[usize; 2]>,
@@ -1233,7 +1251,8 @@ pub fn run<E: Eval>(
             },
             dirichlet_alpha: cfg.dirichlet_alpha,
             age_deal_samples: cfg.age_deal_samples,
-            double_reveal_offsets: cheap_offsets(
+            double_reveal_offsets: double_reveal_offsets_for(
+                cfg.double_reveal_offsets,
                 cfg.cheap_double_reveal_offsets_by_player
                     .map_or(cfg.cheap_double_reveal_offsets, |per_seat| per_seat[actor]),
                 full,
@@ -2404,7 +2423,8 @@ impl GameSlot {
                     .cfg
                     .age_deal_samples_by_player
                     .map_or(self.cfg.age_deal_samples, |samples| samples[actor]),
-                double_reveal_offsets: cheap_offsets(
+                double_reveal_offsets: double_reveal_offsets_for(
+                    self.cfg.double_reveal_offsets,
                     self.cfg
                         .cheap_double_reveal_offsets_by_player
                         .map_or(self.cfg.cheap_double_reveal_offsets, |per_seat| {
@@ -3813,6 +3833,7 @@ mod budget_tests {
             age_deal_samples: 0,
             age_deal_samples_by_player: None,
             cheap_double_reveal_offsets: 0,
+            double_reveal_offsets: 0,
             cheap_double_reveal_offsets_by_player: None,
             bot_by_player: [None, None],
             net_by_player: [0, 0],

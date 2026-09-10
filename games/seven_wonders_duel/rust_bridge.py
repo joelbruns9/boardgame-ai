@@ -1633,32 +1633,45 @@ def rust_coalesced_reanalysis_prepared(
     seeds = [int(entry[2]) & 0xFFFF_FFFF_FFFF_FFFF for entry in prepared]
     adapter = rust_flat_batch_adapter(evaluator)
 
-    records, metrics = seven_wonders_rust.self_play_many_flat_net(
-        adapter,
-        games,
-        seeds,
-        global_batch_cap,
-        leaf_batch,
-        # Cheap sims are never drawn: `full_search_fraction = 1.0` makes every
-        # move full. They must still be positive and <= their full counterparts.
-        sims,
-        sims,
-        sims,
-        sims,
-        1.0,  # full_search_fraction -- one full-budget search per position
-        top_k,
-        0.0,  # draft_prior: the Python searcher applied none here
-        max_active_slots=max_active_slots,
-        max_inflight_batches=max_inflight_batches,
-        scheduler_workers=scheduler_workers,
-        force=force,
-        puct_root=puct_root,
-        # One move per job, so nothing below the root is ever played out.
-        stop_after_moves=1,
-        # lambda zero, by construction: this is the whole point of S2b.
-        specialist_lambda=0.0,
-        inference_wait_ms=inference_wait_ms,
-    )
+    # `forced_playout_k` is a PROCESS GLOBAL, not a per-call setting, and it is
+    # applied to any full move whose net is training under a PUCT root -- which
+    # is exactly what these jobs are. Forcing deliberately spends simulations on
+    # children PUCT declined; that is exploration for self-play, and here the
+    # root's visit distribution IS the target being written. The per-position
+    # backends hardcode 0.0, so inheriting it would make the three disagree
+    # systematically. Zero it for the pass and put it back.
+    previous_forcing = seven_wonders_rust.forced_playout_k()
+    seven_wonders_rust.set_forced_playout_k(0.0)
+    try:
+        records, metrics = seven_wonders_rust.self_play_many_flat_net(
+            adapter,
+            games,
+            seeds,
+            global_batch_cap,
+            leaf_batch,
+            # Cheap sims are never drawn: `full_search_fraction = 1.0` makes
+            # every move full. They must still be positive and <= their full
+            # counterparts.
+            sims,
+            sims,
+            sims,
+            sims,
+            1.0,  # full_search_fraction -- one full-budget search per position
+            top_k,
+            0.0,  # draft_prior: the Python searcher applied none here
+            max_active_slots=max_active_slots,
+            max_inflight_batches=max_inflight_batches,
+            scheduler_workers=scheduler_workers,
+            force=force,
+            puct_root=puct_root,
+            # One move per job, so nothing below the root is ever played out.
+            stop_after_moves=1,
+            # lambda zero, by construction: this is the whole point of S2b.
+            specialist_lambda=0.0,
+            inference_wait_ms=inference_wait_ms,
+        )
+    finally:
+        seven_wonders_rust.set_forced_playout_k(previous_forcing)
 
     # Surfaced, not discarded: a coalescer that is configured, reported and
     # not actually merging is the failure this codebase keeps finding. Rows per
