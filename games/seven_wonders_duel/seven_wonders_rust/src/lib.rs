@@ -1947,6 +1947,7 @@ fn scheduler_result_to_py(
     metrics.set_item("live_slot_ns", m.live_slot_ns)?;
     metrics.set_item("ready_slot_ns", m.ready_slot_ns)?;
     metrics.set_item("waiting_slot_ns", m.waiting_slot_ns)?;
+    metrics.set_item("parked_slot_ns", m.parked_slot_ns)?;
     metrics.set_item("idle_slot_ns", m.idle_slot_ns)?;
     metrics.set_item("max_live_slots", m.max_live_slots)?;
     metrics.set_item("max_active_slots", m.max_active_slots)?;

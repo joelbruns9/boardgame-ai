@@ -1461,6 +1461,10 @@ pub struct SchedulerMetrics {
     pub live_slot_ns: u64,
     pub ready_slot_ns: u64,
     pub waiting_slot_ns: u64,
+    /// Slot-nanoseconds spent parked on an endgame solve. A parked slot holds
+    /// its budget token and its place in `active_count`, so this is capacity
+    /// the GPU is not being fed from.
+    pub parked_slot_ns: u64,
     pub idle_slot_ns: u64,
     pub max_live_slots: usize,
     /// The activation ceiling this run was given (globally, across shards).
@@ -1617,6 +1621,7 @@ impl SchedulerMetrics {
             live_slot_ns: _,
             ready_slot_ns: _,
             waiting_slot_ns: _,
+            parked_slot_ns: _,
             idle_slot_ns: _,
             max_live_slots: _,
             max_active_slots: _,
@@ -1711,6 +1716,7 @@ impl SchedulerMetrics {
         self.live_slot_ns += other.live_slot_ns;
         self.ready_slot_ns += other.ready_slot_ns;
         self.waiting_slot_ns += other.waiting_slot_ns;
+        self.parked_slot_ns += other.parked_slot_ns;
         self.idle_slot_ns += other.idle_slot_ns;
         // Both are global figures every shard already reports identically:
         // taking the max keeps them global rather than summing shard peaks that
@@ -1748,6 +1754,13 @@ struct Occupancy {
     live: usize,
     ready: usize,
     waiting: usize,
+    /// Live slots parked on an endgame solve. Split out of `ready`, which
+    /// counted them and so reported as "able to produce work" slots that
+    /// structurally cannot: a parked slot yields no evaluation group until its
+    /// solve returns. Without this there is no instrument for how much slot
+    /// capacity the solver consumes -- `waiting_slot_ns` counts slots with an
+    /// outstanding NN request, which is a different thing.
+    parked: usize,
     idle: usize,
     probe: usize,
 }
@@ -1761,6 +1774,7 @@ impl Occupancy {
             live: 0,
             ready: 0,
             waiting: 0,
+            parked: 0,
             idle: 0,
             probe: 0,
         }
@@ -1789,9 +1803,10 @@ impl Occupancy {
         metrics.live_slot_ns += dt * self.live as u64;
         metrics.ready_slot_ns += dt * self.ready as u64;
         metrics.waiting_slot_ns += dt * self.waiting as u64;
+        metrics.parked_slot_ns += dt * self.parked as u64;
         metrics.idle_slot_ns += dt * self.idle as u64;
 
-        let (mut live, mut ready, mut waiting) = (0, 0, 0);
+        let (mut live, mut ready, mut waiting, mut parked) = (0, 0, 0, 0);
         let mut live_nodes = 0;
         for (index, entry) in pool.entries.iter().enumerate() {
             let SlotEntry::Active(slot) = entry else {
@@ -1801,6 +1816,9 @@ impl Occupancy {
             live_nodes += slot.arena_nodes();
             if outstanding.get(index).copied().unwrap_or(false) {
                 waiting += 1;
+            } else if slot.is_parked() {
+                // NOT ready: it yields no group until the solve returns.
+                parked += 1;
             } else {
                 ready += 1;
             }
@@ -1808,6 +1826,7 @@ impl Occupancy {
         self.live = live;
         self.ready = ready;
         self.waiting = waiting;
+        self.parked = parked;
         self.idle = capacity.saturating_sub(live);
         metrics.max_live_slots = metrics.max_live_slots.max(live);
         metrics.arena_nodes_live_peak = metrics.arena_nodes_live_peak.max(live_nodes);

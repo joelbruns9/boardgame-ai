@@ -159,6 +159,56 @@ def test_identity_holds_across_shard_counts(threads):
     assert _records(threads, shards=3, slots=6) == _records(0, shards=3, slots=6)
 
 
+def _metrics(threads: int, *, solve: bool, max_nodes: int = 3_000_000):
+    """`_records`, but handing back the scheduler metrics instead."""
+
+    swr.set_endgame_solver(max_nodes, 120.0, MAX_CARDS, True)
+    swr.set_solver_threads(threads)
+
+    def adapter(rows):
+        return [_row_eval(tokens, actor, legal) for tokens, actor, legal in rows]
+
+    _records_out, metrics = swr.self_play_many_net(
+        adapter=adapter,
+        games=rust_games_for_self_play(SEEDS, FIRST),
+        game_seeds=SEEDS,
+        solve_endgames=solve,
+        scheduler_workers=2,
+        max_active_slots=4,
+        **(_common(leaf_batch=1, global_batch_cap=8)),
+    )
+    return metrics
+
+
+def test_parked_slot_time_is_measured_rather_than_invisible():
+    """How much slot capacity the solver consumes had NO instrument.
+
+    `waiting_slot_ns` counts slots with an outstanding NN REQUEST, which is a
+    different thing, and it read 0 in both the cloud2 run and the laptop soak.
+    Parked slots were meanwhile counted as `ready` -- the metric meaning "able
+    to produce work" included slots that structurally cannot, because a parked
+    slot yields no evaluation group until its solve returns.
+
+    Written to fail two ways: silent zero with the solver ON (the counter
+    exported but never set, which is the failure this tree keeps finding), and
+    non-zero with the solver OFF (charging time to the wrong bucket).
+    """
+
+    off = _metrics(0, solve=False)
+    assert off["parked_slot_ns"] == 0, (
+        "no solve ran, so no slot can have been parked"
+    )
+
+    on = _metrics(4, solve=True)
+    assert on["parked_slot_ns"] > 0, (
+        "the solver ran but parked slot-time is zero -- the counter is exported "
+        "and never set, which is exactly the structurally-zero failure"
+    )
+    # Parked time is slot-time, so it cannot exceed the live slot-time it is
+    # drawn from.
+    assert on["parked_slot_ns"] <= on["live_slot_ns"]
+
+
 def test_parking_loses_no_games():
     """A parked slot returns no evaluation group, which once read as 'finished'.
 
