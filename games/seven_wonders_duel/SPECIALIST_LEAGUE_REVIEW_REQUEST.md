@@ -714,3 +714,60 @@ and this was measured on a deliberately small net. **A stronger net should want
 LESS than 3, not more** — bracket downward at bootstrap. 200 positions, one
 buffer file, PUCT root.
 
+---
+
+## 11. The league RAN (2026-09-09) — first end-to-end execution, and the gate it found
+
+Until now W7 was unit-tested and S0a-probed but **no game had ever been played
+by a specialist opponent inside Phase D.** It has now, on a 4-iteration laptop
+smoke bootstrapped from a locally-trained `--hierarchical-value` net.
+
+### What is now verified live, not just unit-tested
+
+| stage | evidence |
+|---|---|
+| bootstrap from `current_best` | both lineages seeded at iteration 1 |
+| league draw selects a specialist | `opponent_type` `hof` on 14 of 24 games |
+| **the biased search actually runs** | 501 and 428 moves at `search_lambda = 3.0` |
+| target routing | `target_route = "specialist:2"` on exactly those moves |
+| lineage fine-tuning and accept | `iterations_trained: 2`, history `[bootstrap, accept, accept]` |
+| collapse-floor scoring | `last_score: 0.515` |
+| archive growth | seed + 2 accepted entries |
+
+(Only one class was drawn across the four iterations: `league_assignment` picks
+ONE class per iteration, and military won both draws. Correct behaviour, small
+sample.)
+
+### The defect: two gates, and lowering one silently disables the league
+
+`specialist_bootstrap_games` gates seeding **and** the specialist opponent draw.
+`hof_start_games` gates `league_assignment` **entirely**, upstream of both
+(`phase_d.py:3133`). Because the former defaults to *following* the latter, the
+shipped configuration keeps them equal and the conflict is invisible.
+
+Set `SPECIALIST_BOOTSTRAP_GAMES` lower on its own — exactly what "games before a
+specialist is seeded" invites an operator to do — and the run:
+
+* writes both lineage directories,
+* archives a seed checkpoint per class,
+* lists every specialist in the manifest **with its lambda**,
+* reports `skipped: "no inflow"` rather than anything alarming,
+* exits 0,
+* and generates **zero** biased games. Measured: 0 of 6,809 moves carried a
+  nonzero `search_lambda`; every `target_route` was `None`.
+
+Configured, reported, and not running — the same signature as the solver node
+budget (`THROUGHPUT_LEVERS.md` §3.1) and the three dead scheduler counters. That
+is three times now.
+
+`PhaseDConfig.validate` now **refuses** the combination at launch, naming both
+knobs, with `test_seeding_earlier_than_league_play_is_refused` pinning it.
+
+### An operational note for the box
+
+Under the launcher's defaults, **specialists do not play until 10,000 games**.
+That is deliberate — a specialist forked from a checkpoint that cannot yet play
+is a random attacker — but it means the opening stretch of a run carries no
+specialist data at all, and on a cloud2-scale run (86k games) that is roughly
+the first 12%. Worth setting deliberately rather than inheriting.
+

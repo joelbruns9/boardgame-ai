@@ -1135,6 +1135,34 @@ class PhaseDConfig:
             )
         if self.hof_start_games < 0:
             raise ValueError("hof_start_games must be non-negative")
+        if (
+            configs
+            and self.specialist_bootstrap_games
+            and self.specialist_bootstrap_games < self.hof_start_games
+        ):
+            # TWO gates, and lowering only this one produces a league that
+            # SEEDS but can never PLAY.
+            #
+            # `specialist_bootstrap_games` gates seeding and the specialist
+            # opponent draw; `hof_start_games` gates `league_assignment`
+            # entirely, upstream of both. Because this field defaults to
+            # following `hof_start_games` they coincide in the shipped config
+            # and nothing is visible. Set it lower on its own -- which is
+            # exactly what "games before a specialist is seeded" invites -- and
+            # the run writes lineage directories, archives a seed checkpoint,
+            # reports each specialist with its lambda in the manifest, and
+            # generates no biased game at all.
+            #
+            # Measured on a 4-iteration smoke: two seeded lineages on disk,
+            # `skipped: "no inflow"`, and 0 of 6,809 moves carrying a nonzero
+            # search_lambda. Configured, reported, and not running.
+            raise ValueError(
+                f"specialist_bootstrap_games={self.specialist_bootstrap_games} "
+                f"is below hof_start_games={self.hof_start_games}, so the "
+                "specialists would be seeded before league play begins and "
+                "would never be drawn as an opponent. Lower hof_start_games "
+                "too, or leave specialist_bootstrap_games at 0 to follow it."
+            )
         if self.hof_sampling_mode not in {"recency", "uniform", "latest"}:
             raise ValueError(
                 "hof_sampling_mode must be recency, uniform, or latest"

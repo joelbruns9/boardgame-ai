@@ -1547,3 +1547,38 @@ def test_the_league_reports_what_it_costs(tmp_path: Path):
     # The general's own gate is a separate number, not inflated by the floor.
     assert "specialist_floor" != "gate"
     assert loop.phase_seconds.get("gate", 0.0) == 0.0
+
+
+def test_seeding_earlier_than_league_play_is_refused():
+    """The trap the first end-to-end smoke fell into.
+
+    `specialist_bootstrap_games` gates seeding; `hof_start_games` gates
+    `league_assignment` entirely, upstream of it. They coincide in the shipped
+    config because the former defaults to following the latter, so the conflict
+    is invisible until someone lowers one alone -- which is what "games before a
+    specialist is seeded" invites.
+
+    The failure is silent and expensive: lineage directories, an archived seed
+    checkpoint, both specialists listed in the manifest with their lambdas, and
+    not one biased game.
+    """
+
+    import pytest
+
+    from .phase_d import PhaseDConfig
+
+    common = dict(
+        specialists="science:0.25:3",
+        hierarchical_value=True,
+        # The head is shadow-only, so an unweighted one is refused separately.
+        hier_value_weight=0.1,
+        hof_start_games=10_000,
+    )
+    with pytest.raises(ValueError, match="never be drawn as an opponent"):
+        PhaseDConfig(specialist_bootstrap_games=24, **common).validate()
+
+    # 0 means "follow hof_start_games" and is the shipped configuration.
+    PhaseDConfig(specialist_bootstrap_games=0, **common).validate()
+    # Equal or later is coherent: the specialist seeds once league play exists.
+    PhaseDConfig(specialist_bootstrap_games=10_000, **common).validate()
+    PhaseDConfig(specialist_bootstrap_games=20_000, **common).validate()
