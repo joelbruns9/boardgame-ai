@@ -124,6 +124,12 @@
 #                         search.
 #     SPECIALIST_BOOTSTRAP_GAMES=0 SPECIALIST_FLOOR_EVERY=5
 #     SPECIALIST_REANALYSIS=0
+#     REANALYSIS_BACKEND=rust_coalesced REANALYSIS_SLOTS=256
+#                         Pinned rather than inherited: both were measured on a
+#                         LAPTOP 3070 (2539 -> 45 ms/position), and a default
+#                         nobody chose on a rented box is the --train-steps
+#                         mistake again. 256 concurrent searches is a memory
+#                         choice; lower it if the box is tight.
 #                   SPECIALISTS requires HIERARCHICAL_VALUE=1: the leaf bias
 #                   reads W4's outlook head.
 #   GATE_SWEEP_RUNGS  gate sizes to sweep (default: ladder's middle rung)
@@ -499,6 +505,10 @@ SPECIALISTS="${SPECIALISTS:-}"
 SPECIALIST_BOOTSTRAP_GAMES="${SPECIALIST_BOOTSTRAP_GAMES:-0}"
 SPECIALIST_FLOOR_EVERY="${SPECIALIST_FLOOR_EVERY:-5}"
 SPECIALIST_REANALYSIS="${SPECIALIST_REANALYSIS:-0}"
+# Only read when SPECIALIST_REANALYSIS=1. Named here anyway so the launch line
+# records what the run used instead of whatever the parser default was that day.
+REANALYSIS_BACKEND="${REANALYSIS_BACKEND:-rust_coalesced}"
+REANALYSIS_SLOTS="${REANALYSIS_SLOTS:-256}"
 # Scheduler geometry. Empty meant "let the parser decide", and the parser's
 # defaults are LAPTOP scale -- 16 slots against cloud6's 256, a 256-row global
 # batch against 2,048. On a rented GPU that is not a conservative default, it is
@@ -1038,7 +1048,13 @@ HIERARCHICAL_VALUE=1 and a positive HIER_VALUE_WEIGHT."
     --specialist-bootstrap-games "$SPECIALIST_BOOTSTRAP_GAMES"
     --specialist-floor-every "$SPECIALIST_FLOOR_EVERY"
   )
-  [ "$SPECIALIST_REANALYSIS" = "1" ] && SPECIALIST_FLAGS+=(--specialist-reanalysis)
+  if [ "$SPECIALIST_REANALYSIS" = "1" ]; then
+    SPECIALIST_FLAGS+=(
+      --specialist-reanalysis
+      --reanalysis-backend "$REANALYSIS_BACKEND"
+      --reanalysis-slots "$REANALYSIS_SLOTS"
+    )
+  fi
 fi
 
 SOLVER_FLAGS=()

@@ -1558,6 +1558,70 @@ def test_specialists_without_the_outlook_head_is_refused_by_the_launcher(
     assert "die" in setup_text[index : index + 400]
 
 
+def test_the_reanalysis_settings_are_pinned_rather_than_inherited(setup_text):
+    """A default nobody chose is the `--train-steps` mistake again.
+
+    Both numbers were measured on a LAPTOP 3070, and `--reanalysis-slots 256`
+    is a memory choice as much as a speed one. Leaving either to the parser
+    means a rented box silently runs whatever the default was on the day, and
+    the launch log records nothing about it.
+
+    They ride inside the `SPECIALIST_REANALYSIS` branch on purpose: Phase D
+    reads them only when reanalysis is on, so passing them otherwise would put
+    a knob on the line that changes nothing and invite someone to conclude
+    reanalysis was running when it was not.
+    """
+
+    block = _block(
+        setup_text, 'if [ "$SPECIALIST_REANALYSIS" = "1" ]; then', "  fi"
+    )
+    for flag in (
+        "--specialist-reanalysis",
+        "--reanalysis-backend",
+        "--reanalysis-slots",
+    ):
+        assert flag in block, f"{flag} left to the parser default"
+
+
+# --------------------------------------------------------------------------
+# setup_dryrun.sh -- the harness that executes the launcher against stubs
+# --------------------------------------------------------------------------
+
+DRYRUN = REPO_ROOT / "setup_dryrun.sh"
+
+
+@pytest.fixture(scope="module")
+def dryrun_text() -> str:
+    return DRYRUN.read_text(encoding="utf-8")
+
+
+def test_the_dry_run_releases_the_guard_it_deliberately_trips(dryrun_text):
+    """The harness sets SKIP_SWEEPS=1, so it can never source a measured sweep
+    -- and pass 2 then refuses to launch on any machine holding an old
+    `measured_env.sh`, which a real run leaves behind. Found red: the dry run
+    stopped at stage 10 and checked no part of the launch command."""
+
+    assert "SKIP_SWEEPS=1" in dryrun_text
+    assert "export ALLOW_UNMEASURED_LAUNCH=1" in dryrun_text, (
+        "the dry run skips the sweeps, so without this it stops at the "
+        "pass-2 guard and never reaches the launch command it exists to check"
+    )
+
+
+def test_the_dry_run_cannot_die_on_its_own_empty_grep(dryrun_text):
+    """`set -e` plus `pipefail` made a grep that matched nothing kill the
+    harness ONE LINE above the check that reports exactly that -- so its most
+    important failure was the one it could not name."""
+
+    line = next(
+        line for line in dryrun_text.splitlines() if line.startswith("LAUNCH=$(")
+    )
+    assert line.rstrip().endswith("|| true"), (
+        f"{line!r} exits non-zero when no launch line was assembled, and the "
+        "harness dies before reporting it"
+    )
+
+
 def test_pass_two_refuses_to_launch_on_defaults_when_a_sweep_exists(setup_text):
     """The whole point of two passes.
 

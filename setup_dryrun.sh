@@ -75,6 +75,14 @@ export REPO_DIR="$SCRIPT_DIR"
 export PY=python
 # Skip the sweeps: they are a separate two-pass flow with their own harness.
 export SKIP_SWEEPS=1
+# ...which means pass 2's guard fires: it refuses to launch on defaults when a
+# measured sweep exists but was not sourced. That guard is CORRECT -- and with
+# SKIP_SWEEPS=1 nothing here can ever source one, so on any machine holding an
+# old `runs/seven_wonders_duel/cloud/sweeps/measured_env.sh` (a real run leaves
+# one behind) the dry run stopped at stage 10 and never checked the launch
+# command at all. Release it deliberately; the harness tests shell logic, and
+# whether the operator sourced their sweep is not shell logic.
+export ALLOW_UNMEASURED_LAUNCH=1
 
 echo "== dry run: setup_cloud_7wd.sh with stubbed externals =="
 set +e
@@ -104,7 +112,11 @@ grep -q "C toolchain" "$STUB_DIR/stdout.log"   || fail "C toolchain never checke
 
 # The launch line is the payload. Every flag below has a recorded defect behind
 # it, so absence is a regression, not a style question.
-LAUNCH=$(grep -E "phase_d --run-dir runs/seven_wonders_duel/cloud" "$CALL_LOG" | tail -1)
+# `|| true` is load-bearing. Under `set -e` with `pipefail`, a grep that matches
+# nothing makes this assignment exit 1, and the harness died HERE -- one line
+# above the `if [ -z ... ]` that exists to report exactly that. The single
+# failure this check is for was the one failure it could not report.
+LAUNCH=$(grep -E "phase_d --run-dir runs/seven_wonders_duel/cloud" "$CALL_LOG" | tail -1) || true
 if [ -z "$LAUNCH" ]; then
   fail "no phase_d launch command was assembled"
 else
